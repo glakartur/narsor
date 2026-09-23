@@ -1,0 +1,373 @@
+//! `ScriptAction` executor (`WORKFLOW_SCHEMA.md` §3.3.B).
+//!
+//! Runs a command in the workspace and turns the way it ended into an output
+//! label. The label is decided in the order §3.3.B prescribes:
+//!
+//! 1. stdout parses as a JSON object carrying an `output` key — that label
+//!    wins, and brings its `variables` and `data` (and `artifacts`, see
+//!    [`ScriptExecutor`]) along;
+//! 2. otherwise the exit code is looked up in `exit_codes`;
+//! 3. otherwise the documented default applies: `0` → `success`, anything
+//!    else → `failure`.
+//!
+//! A process that never returned an exit code — killed by a signal — is an
+//! action error, not a quiet `failure`: nothing about it says the workflow
+//! should take the failure transition rather than stop and be looked at.
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::process::Stdio;
+use std::time::Duration;
+
+use serde_json::{Map, Value};
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
+
+use super::{ActionExecutor, ActionOutcome, ActionRequest, TimedOutAction, ACTION_ID_ENV_VAR};
+use crate::domain::{ActionConfig, ActionError, ActionResult, ScriptActionConfig};
+
+/// How much of stdout and of stderr is kept in the [`ActionResult`], in bytes.
+///
+/// The result is persisted into `state.json` on every step, so unbounded logs
+/// would grow the execution record without bound and slow every later load.
+/// 64 KiB keeps the tail of a normal build log — enough to read what happened —
+/// while full logs belong in artifacts.
+pub const MAX_CAPTURED_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// Appended in place of everything that [`MAX_CAPTURED_OUTPUT_BYTES`] cut off.
+pub const TRUNCATION_MARKER: &str = "\n… [truncated by orchestrator]";
+
+/// Label for exit code 0 when `exit_codes` does not say otherwise.
+pub const DEFAULT_SUCCESS_LABEL: &str = "success";
+
+/// Label for any non-zero exit code when `exit_codes` does not say otherwise.
+pub const DEFAULT_FAILURE_LABEL: &str = "failure";
+
+/// Executes `ScriptAction` states.
+///
+/// Stateless — one instance serves the whole engine.
+///
+/// JSON on stdout may carry `artifacts` alongside `output`, `data` and
+/// `variables`. [`ActionResult`] has no artifacts field of its own (artifacts
+/// are recorded on the [`crate::domain::ActionExecution`]), so the list is
+/// carried through as `data.artifacts` for the engine to register.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScriptExecutor;
+
+impl ScriptExecutor {
+    /// Creates an executor.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ActionExecutor for ScriptExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: ActionRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
+        Box::pin(async move {
+            let config = script_config(request.action)?;
+            let working_dir = resolve_working_dir(&request.workspace.path, config);
+            let limit = request
+                .timeout
+                .or_else(|| config.timeout_secs.map(Duration::from_secs));
+
+            run(config, &working_dir, request.action_execution_id, limit).await
+        })
+    }
+}
+
+/// Narrows the action configuration to a script configuration.
+fn script_config(action: &ActionConfig) -> Result<&ScriptActionConfig, ActionError> {
+    match action {
+        ActionConfig::Script(config) => Ok(config),
+        other => Err(ActionError {
+            message: format!(
+                "ScriptExecutor received a {} action",
+                action_type_name(other)
+            ),
+            error_type: Some("wrong_action_type".to_string()),
+            details: None,
+        }),
+    }
+}
+
+/// The schema name of an action type, for error messages.
+fn action_type_name(action: &ActionConfig) -> &'static str {
+    match action {
+        ActionConfig::Agent(_) => "agent",
+        ActionConfig::Script(_) => "script",
+        ActionConfig::Human(_) => "human",
+        ActionConfig::Wait(_) => "wait",
+    }
+}
+
+/// The directory the command runs in: the workspace, or `working_dir` resolved
+/// against it. An absolute `working_dir` is taken as given.
+fn resolve_working_dir(workspace_path: &str, config: &ScriptActionConfig) -> PathBuf {
+    let workspace = PathBuf::from(workspace_path);
+
+    match &config.working_dir {
+        Some(dir) => {
+            let dir = Path::new(dir);
+            if dir.is_absolute() {
+                dir.to_path_buf()
+            } else {
+                workspace.join(dir)
+            }
+        }
+        None => workspace,
+    }
+}
+
+/// Spawns the command, waits for it (or for the time limit) and builds the
+/// outcome.
+async fn run(
+    config: &ScriptActionConfig,
+    working_dir: &Path,
+    action_execution_id: &str,
+    limit: Option<Duration>,
+) -> Result<ActionOutcome, ActionError> {
+    let mut command = Command::new(&config.command);
+    command
+        .args(&config.args)
+        .current_dir(working_dir)
+        .envs(&config.env)
+        .env(ACTION_ID_ENV_VAR, action_execution_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| spawn_error(config, working_dir, &error))?;
+
+    // Taken out of the child so the pipes can be drained while it runs: a
+    // process that fills its stdout pipe blocks until somebody reads it, which
+    // would otherwise look like a hang and trip the time limit.
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+
+    let wait = async {
+        let mut stdout_buffer = Vec::new();
+        let mut stderr_buffer = Vec::new();
+
+        let (stdout_read, stderr_read, status) = tokio::join!(
+            stdout_pipe.read_to_end(&mut stdout_buffer),
+            stderr_pipe.read_to_end(&mut stderr_buffer),
+            child.wait(),
+        );
+
+        (
+            stdout_read,
+            stderr_read,
+            status,
+            stdout_buffer,
+            stderr_buffer,
+        )
+    };
+
+    let finished = match limit {
+        Some(limit) => tokio::time::timeout(limit, wait).await,
+        None => Ok(wait.await),
+    };
+
+    let (stdout_read, stderr_read, status, stdout_buffer, stderr_buffer) = match finished {
+        Ok(finished) => finished,
+        Err(_elapsed) => {
+            // The waiting future has been dropped, so the child is free again:
+            // kill it and reap it, leaving no orphan behind.
+            let _ = child.kill().await;
+
+            return Ok(ActionOutcome::TimedOut(TimedOutAction {
+                timeout: limit.unwrap_or_default(),
+                subject: format!("script '{}'", config.command),
+            }));
+        }
+    };
+
+    stdout_read.map_err(|error| io_error(config, "stdout", &error))?;
+    stderr_read.map_err(|error| io_error(config, "stderr", &error))?;
+    let status = status.map_err(|error| io_error(config, "exit status", &error))?;
+
+    let stdout = String::from_utf8_lossy(&stdout_buffer).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_buffer).into_owned();
+
+    let Some(exit_code) = status.code() else {
+        return Err(signal_error(config, &status, &stderr));
+    };
+
+    let mut result = ActionResult {
+        output_label: String::new(),
+        data: Value::Null,
+        variables: Map::new(),
+        exit_code: Some(exit_code),
+        stdout: truncate(&stdout),
+        stderr: truncate(&stderr),
+    };
+
+    match parse_json_output(&stdout) {
+        Some(payload) => {
+            result.output_label = payload.output_label;
+            result.data = payload.data;
+            result.variables = payload.variables;
+        }
+        None => result.output_label = label_from_exit_code(exit_code, &config.exit_codes),
+    }
+
+    Ok(ActionOutcome::Completed(result))
+}
+
+/// The label an exit code maps to: `exit_codes` first, then the documented
+/// default of `0` → `success` and anything else → `failure`.
+fn label_from_exit_code(exit_code: i32, exit_codes: &HashMap<i32, String>) -> String {
+    if let Some(label) = exit_codes.get(&exit_code) {
+        return label.clone();
+    }
+
+    if exit_code == 0 {
+        DEFAULT_SUCCESS_LABEL.to_string()
+    } else {
+        DEFAULT_FAILURE_LABEL.to_string()
+    }
+}
+
+/// What a script hands back on stdout, once it parsed as the documented JSON.
+struct JsonOutput {
+    output_label: String,
+    data: Value,
+    variables: Map<String, Value>,
+}
+
+/// Reads the §3.3.B JSON payload from stdout.
+///
+/// Returns `None` — never an error — when stdout is not JSON at all (an
+/// ordinary log line) or is JSON without a usable `output` key. Scripts are
+/// explicitly allowed to print whatever they like and let the exit code decide.
+fn parse_json_output(stdout: &str) -> Option<JsonOutput> {
+    let payload: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let object = payload.as_object()?;
+    let output_label = object.get("output")?.as_str()?.to_string();
+
+    let mut data = object.get("data").cloned().unwrap_or(Value::Null);
+
+    // `ActionResult` has no artifacts field; keep the list reachable for the
+    // engine instead of dropping it.
+    if let Some(artifacts) = object.get("artifacts") {
+        match &mut data {
+            Value::Object(map) => {
+                map.insert("artifacts".to_string(), artifacts.clone());
+            }
+            Value::Null => {
+                data = serde_json::json!({ "artifacts": artifacts.clone() });
+            }
+            _ => {}
+        }
+    }
+
+    let variables = object
+        .get("variables")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    Some(JsonOutput {
+        output_label,
+        data,
+        variables,
+    })
+}
+
+/// Cuts captured output down to [`MAX_CAPTURED_OUTPUT_BYTES`], marking the cut.
+///
+/// The cut lands on a character boundary, so the result stays valid UTF-8 and
+/// the marker is always visible at the end.
+fn truncate(output: &str) -> String {
+    if output.len() <= MAX_CAPTURED_OUTPUT_BYTES {
+        return output.to_string();
+    }
+
+    let mut end = MAX_CAPTURED_OUTPUT_BYTES;
+    while end > 0 && !output.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    format!("{}{TRUNCATION_MARKER}", &output[..end])
+}
+
+/// The command could not be started at all.
+fn spawn_error(
+    config: &ScriptActionConfig,
+    working_dir: &Path,
+    error: &std::io::Error,
+) -> ActionError {
+    ActionError {
+        message: format!(
+            "failed to start '{}' in {}: {error}",
+            config.command,
+            working_dir.display()
+        ),
+        error_type: Some("spawn_failed".to_string()),
+        details: Some(serde_json::json!({
+            "command": config.command,
+            "args": config.args,
+            "working_dir": working_dir.display().to_string(),
+            "os_error": error.raw_os_error(),
+        })),
+    }
+}
+
+/// Reading a pipe or reaping the child failed.
+fn io_error(config: &ScriptActionConfig, what: &str, error: &std::io::Error) -> ActionError {
+    ActionError {
+        message: format!("failed to read {what} of '{}': {error}", config.command),
+        error_type: Some("io_failed".to_string()),
+        details: Some(serde_json::json!({ "command": config.command })),
+    }
+}
+
+/// The process died from a signal and left no exit code to map.
+fn signal_error(
+    config: &ScriptActionConfig,
+    status: &std::process::ExitStatus,
+    stderr: &str,
+) -> ActionError {
+    let signal = signal_of(status);
+
+    let message = match signal {
+        Some(signal) => format!(
+            "'{}' was killed by signal {signal} and produced no exit code",
+            config.command
+        ),
+        None => format!("'{}' ended without an exit code", config.command),
+    };
+
+    ActionError {
+        message,
+        error_type: Some("killed_by_signal".to_string()),
+        details: Some(serde_json::json!({
+            "command": config.command,
+            "signal": signal,
+            "stderr": truncate(stderr),
+        })),
+    }
+}
+
+/// The signal that killed the process, where the platform reports one.
+fn signal_of(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
