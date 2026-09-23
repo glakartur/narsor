@@ -29,15 +29,16 @@ use orchestrator::domain::{
     Event, EventData, ExecutionStatus, HumanInputType, WorkflowDefinition, WorkflowExecution,
     Workspace,
 };
-use orchestrator::engine::Engine;
+use orchestrator::engine::{ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry};
 use orchestrator::persistence::ExecutionStore;
 use orchestrator::registry::{RepositoryEntry, RepositoryRegistry};
 use orchestrator::tui::app::{
-    App, FormRow, Modal, NewTaskStage, Panel, RepositoryField, Request, StreamStatus,
-    TransitionMode, OVERRIDE_PROVIDER, OVERRIDE_REASON,
+    App, FormRow, Modal, NewTaskChoice, NewTaskStage, Panel, RepositoryField, Request,
+    StreamStatus, TransitionMode, OVERRIDE_PROVIDER, OVERRIDE_REASON,
 };
 use orchestrator::tui::views;
 use orchestrator::workflow::load_from_file;
+use orchestrator::workflows::{builtin, WorkflowResolver};
 
 // ---------------------------------------------------------------------------
 // harness
@@ -193,6 +194,10 @@ fn fill_repository_field(app: &mut App, field: RepositoryField, value: &str) {
 /// Opens the new-task modal on a loaded definition.
 fn open_new_task(app: &mut App, path: &Path) {
     app.on_key(key(KeyCode::Char('n')));
+    // The modal opens on the pick list; the last row — reached by wrapping
+    // backwards with ← — is the one that takes an arbitrary path.
+    app.on_key(key(KeyCode::Left));
+    app.on_key(key(KeyCode::Enter));
     type_text(app, &path.display().to_string());
     app.on_key(key(KeyCode::Enter));
 }
@@ -972,6 +977,427 @@ async fn removing_a_repository_needs_a_confirmation() {
 // ---------------------------------------------------------------------------
 // starting a new task
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// the new-task pick list
+// ---------------------------------------------------------------------------
+
+/// The user workflow directory of a temporary root.
+///
+/// Nothing in this file ever lets the resolver read the environment, so the
+/// developer's own `~/.config` is out of reach: every `App` built here is given
+/// a resolver pointed at this directory.
+fn user_workflows(root: &Path) -> PathBuf {
+    let path = root.join("config/orchestrator/workflows");
+    fs::create_dir_all(&path).expect("create the user workflow directory");
+    path
+}
+
+/// `{root}/workflows`.
+fn root_workflows(root: &Path) -> PathBuf {
+    let path = root.join("workflows");
+    fs::create_dir_all(&path).expect("create the root workflow directory");
+    path
+}
+
+/// An interface whose workflow search path is entirely inside `root`.
+fn app_for(engine: &Arc<Engine>, root: &Path) -> App {
+    let resolver = WorkflowResolver::with_user_dir(root.to_path_buf(), Some(user_workflows(root)));
+    let mut app = App::with_resolver(Arc::clone(engine), resolver);
+    app.refresh();
+    app
+}
+
+/// The rows of the new-task pick list, as labels.
+fn pick_labels(app: &App) -> Vec<String> {
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the new-task modal is open");
+    };
+    form.choices.iter().map(NewTaskChoice::label).collect()
+}
+
+/// Moves the pick list's cursor onto the row naming one workflow.
+fn pick_workflow(app: &mut App, name: &str) {
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the new-task modal is open");
+    };
+    let target = form
+        .choices
+        .iter()
+        .position(|choice| choice.name() == Some(name))
+        .unwrap_or_else(|| panic!("'{name}' is one of the rows: {:?}", pick_labels(app)));
+    let steps = (target + form.choices.len() - form.choice) % form.choices.len();
+    for _ in 0..steps {
+        app.on_key(key(KeyCode::Right));
+    }
+}
+
+/// Installs a `claude` stand-in that always answers with one label.
+///
+/// The shipped workflows drive the `claude-code` harness; the real CLI costs
+/// money and needs credentials, so the engine under test is built with an
+/// adapter pointed at this script instead.
+fn fake_claude(root: &Path, label: &str) -> PathBuf {
+    let directory = root.join("bin");
+    fs::create_dir_all(&directory).expect("create the bin directory");
+    let program = directory.join("claude");
+    fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",             \"is_error\":false,\"session_id\":\"fake\",             \"result\":\"Done.\\n{{\\\"output\\\": \\\"{label}\\\"}}\"}}'\n"
+        ),
+    )
+    .expect("write the fake harness");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&program).expect("stat").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).expect("make it executable");
+    }
+    program
+}
+
+/// A local git repository a declared `git` workspace can be cloned from.
+fn source_repository(root: &Path) -> PathBuf {
+    let path = root.join("source-repo");
+    fs::create_dir_all(&path).expect("create the source repository");
+    git(&path, &["init", "-q", "-b", "main", "."]);
+    fs::write(path.join("README.md"), "a repository to clone\n").expect("write a file");
+    git(&path, &["add", "."]);
+    git(
+        &path,
+        &[
+            "-c",
+            "user.email=tests@example.test",
+            "-c",
+            "user.name=tests",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+    );
+    path
+}
+
+/// Runs `git` inside a directory, failing loudly.
+fn git(path: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .current_dir(path)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The modal opens on every workflow the resolver reaches, each row naming its
+/// source, plus the row that takes an arbitrary path.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_new_task_list_is_built_from_the_resolver_and_names_each_source() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let mut app = app_for(&engine, root.path());
+
+    app.on_key(key(KeyCode::Char('n')));
+
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the new-task modal is open");
+    };
+    assert_eq!(form.stage, NewTaskStage::Pick, "it opens on the list");
+
+    let labels = pick_labels(&app);
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.starts_with("compound-engineering [built-in]")),
+        "the built-ins are offered with their source: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.starts_with("open-mercato-sdlc [built-in]")),
+        "both built-ins are offered: {labels:?}"
+    );
+    assert_eq!(
+        labels.last().map(String::as_str),
+        Some("Enter a path…"),
+        "the last row is the arbitrary-path route: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("compound engineering chain")),
+        "a row carries the workflow's description: {labels:?}"
+    );
+}
+
+/// `←` and `→` change the selection, and the selection is what is loaded.
+#[tokio::test(flavor = "multi_thread")]
+async fn left_and_right_move_the_selection_and_the_selection_is_what_is_loaded() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let mut app = app_for(&engine, root.path());
+
+    app.on_key(key(KeyCode::Char('n')));
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the new-task modal is open");
+    };
+    assert_eq!(form.choice, 0);
+
+    app.on_key(key(KeyCode::Right));
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the modal stays open");
+    };
+    assert_eq!(form.choice, 1, "→ moves forward");
+
+    app.on_key(key(KeyCode::Left));
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the modal stays open");
+    };
+    assert_eq!(form.choice, 0, "← moves back");
+
+    app.on_key(key(KeyCode::Left));
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the modal stays open");
+    };
+    assert_eq!(
+        form.choice,
+        form.choices.len() - 1,
+        "← wraps round to the last row"
+    );
+
+    // Space and j/k are the same idiom as everywhere else in the interface.
+    app.on_key(key(KeyCode::Char(' ')));
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the modal stays open");
+    };
+    assert_eq!(form.choice, 0, "space wraps forward");
+    app.on_key(key(KeyCode::Char('j')));
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the modal stays open");
+    };
+    assert_eq!(form.choice, 1, "j moves forward");
+    app.on_key(key(KeyCode::Char('k')));
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the modal stays open");
+    };
+    assert_eq!(form.choice, 0, "k moves back");
+
+    // What was picked is what is loaded.
+    pick_workflow(&mut app, "open-mercato-sdlc");
+    app.on_key(key(KeyCode::Enter));
+
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the modal stays open on the input form");
+    };
+    assert_eq!(form.stage, NewTaskStage::Inputs);
+    let definition = form.definition.as_ref().expect("the definition is loaded");
+    assert_eq!(definition.name, "open-mercato-sdlc");
+    let resolved = form.resolved.as_ref().expect("the source is remembered");
+    assert_eq!(resolved.origin.label(), "built-in");
+}
+
+/// A copy shadowing a built-in is one row, marked as the override.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_override_appears_once_and_says_what_it_overrides() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+
+    fs::write(
+        root_workflows(root.path()).join("compound-engineering.yaml"),
+        fs::read_to_string(new_task_definition_path()).expect("read the fixture"),
+    )
+    .expect("install a copy that shadows the built-in");
+
+    let mut app = app_for(&engine, root.path());
+    app.on_key(key(KeyCode::Char('n')));
+
+    let labels = pick_labels(&app);
+    let rows: Vec<&String> = labels
+        .iter()
+        .filter(|label| label.starts_with("compound-engineering "))
+        .collect();
+    assert_eq!(rows.len(), 1, "one row, not two: {labels:?}");
+    assert!(
+        rows[0].contains("[root, overrides built-in]"),
+        "the row says it is an override: {}",
+        rows[0]
+    );
+
+    // And it is the override that loads, not the built-in.
+    pick_workflow(&mut app, "compound-engineering");
+    app.on_key(key(KeyCode::Enter));
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the modal stays open");
+    };
+    let resolved = form.resolved.as_ref().expect("the source is remembered");
+    assert_eq!(resolved.origin.label(), "root");
+    assert_ne!(
+        resolved.source,
+        builtin("compound-engineering")
+            .expect("the built-in exists")
+            .source,
+        "the copy is what was loaded"
+    );
+}
+
+/// The arbitrary-path route still starts a definition in no search location.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_path_route_starts_a_definition_that_is_in_no_search_location() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let mut app = app_for(&engine, root.path());
+
+    app.on_key(key(KeyCode::Char('n')));
+    // The last row: ← wraps straight onto it.
+    app.on_key(key(KeyCode::Left));
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the modal is open");
+    };
+    assert_eq!(form.selected_choice(), Some(&NewTaskChoice::Path));
+
+    app.on_key(key(KeyCode::Enter));
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the modal is open");
+    };
+    assert_eq!(
+        form.stage,
+        NewTaskStage::Definition,
+        "it switches to the text line"
+    );
+
+    type_text(&mut app, &new_task_definition_path().display().to_string());
+    app.on_key(key(KeyCode::Enter));
+
+    focus_input(&mut app, "ticket");
+    type_text(&mut app, "ORC-42");
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::StartNewTask);
+    app.start_new_task().await;
+
+    assert!(matches!(app.modal(), Modal::None), "the task started");
+    let ids = engine.store().list_execution_ids().expect("list the store");
+    assert_eq!(ids.len(), 1, "one execution was created");
+
+    let execution = engine
+        .store()
+        .load_execution(&ids[0])
+        .expect("load the execution");
+    let resolved = orchestrator::tasks::resolve_definition(root.path(), &execution)
+        .expect("the definition resolves again");
+    assert_eq!(resolved.origin.label(), "file");
+}
+
+/// Esc on the text line returns to the list rather than closing the modal.
+#[tokio::test(flavor = "multi_thread")]
+async fn esc_on_the_path_line_returns_to_the_list() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let mut app = app_for(&engine, root.path());
+
+    app.on_key(key(KeyCode::Char('n')));
+    app.on_key(key(KeyCode::Left));
+    app.on_key(key(KeyCode::Enter));
+    app.on_key(key(KeyCode::Esc));
+
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the modal is still open");
+    };
+    assert_eq!(form.stage, NewTaskStage::Pick);
+
+    app.on_key(key(KeyCode::Esc));
+    assert!(matches!(app.modal(), Modal::None), "Esc then closes it");
+}
+
+/// Starting a **built-in** from the pick list leaves an execution that resolves
+/// its definition again — the trap this whole search path exists for.
+///
+/// A built-in has no file, so `metadata.cli.definition_path` cannot hold
+/// anything; the name is recorded instead, and a second interface over the same
+/// store — a fresh process, as far as the store is concerned — has to find the
+/// definition from it. Without that, the human gate this run stops on could
+/// never be answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn starting_a_picked_builtin_leaves_an_execution_that_resolves_its_definition() {
+    let root = TempRoot::new();
+    let engine = Arc::new(
+        Engine::new(ExecutionStore::new(root.path())).with_executor(
+            ActionKind::Agent,
+            Arc::new(AgentExecutor::with_harnesses(
+                HarnessRegistry::defaults().with_adapter(Arc::new(
+                    ClaudeCodeAdapter::with_program(
+                        fake_claude(root.path(), "needs_direction")
+                            .display()
+                            .to_string(),
+                    ),
+                )),
+            )),
+        ),
+    );
+    let repository = source_repository(root.path());
+
+    let mut app = app_for(&engine, root.path());
+    app.on_key(key(KeyCode::Char('n')));
+    pick_workflow(&mut app, "compound-engineering");
+    app.on_key(key(KeyCode::Enter));
+
+    focus_input(&mut app, "feature_description");
+    type_text(&mut app, "a thing worth building");
+    focus_input(&mut app, "target_repo");
+    type_text(&mut app, &repository.display().to_string());
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::StartNewTask);
+    app.start_new_task().await;
+
+    let selected = app
+        .selected()
+        .expect("the new execution is selected")
+        .clone();
+    assert_eq!(selected.workflow_id, "compound-engineering");
+
+    let execution = engine
+        .store()
+        .load_execution(&selected.id)
+        .expect("reload the execution");
+    assert_eq!(
+        execution.metadata["cli"]["definition_name"], "compound-engineering",
+        "the workflow name is recorded: {}",
+        execution.metadata
+    );
+    assert!(
+        execution.metadata["cli"].get("definition_path").is_none(),
+        "a built-in records no path, because it has none: {}",
+        execution.metadata
+    );
+    assert_eq!(
+        execution.status,
+        ExecutionStatus::Paused,
+        "the run stopped on the human gate"
+    );
+
+    // A second interface over the same store: it has to resolve the definition
+    // from the recorded name alone.
+    let mut reopened = app_for(&engine, root.path());
+    reopened.select_execution(&selected.id);
+    assert!(
+        reopened.definition_error().is_none(),
+        "the definition resolved: {:?}",
+        reopened.definition_error()
+    );
+    assert_eq!(
+        reopened
+            .definition()
+            .expect("the definition is available")
+            .name,
+        "compound-engineering"
+    );
+    assert!(
+        reopened.pending().is_some(),
+        "and the question it is waiting on can be answered"
+    );
+}
 
 /// A definition that fails validation is refused with every violation.
 #[tokio::test(flavor = "multi_thread")]

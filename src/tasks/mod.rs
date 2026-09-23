@@ -53,11 +53,25 @@
 //! # Finding the definition again
 //!
 //! The engine needs the [`WorkflowDefinition`] to continue an execution, but
-//! `state.json` stores only the workflow *id*. So the absolute path of the file
-//! is recorded in `metadata.cli.definition_path`
-//! ([`record_definition_path`]) and read back with [`stored_definition_path`].
-//! The key is spelled `cli` for history: every execution already on disk
-//! carries it, and renaming it would make all of them unresumable.
+//! `state.json` stores only the workflow *id*. So where the definition came
+//! from is recorded in the execution's metadata, under two keys:
+//!
+//! * `metadata.cli.definition_path` — the absolute path of the file, when the
+//!   definition came from one. The key is spelled `cli` for history: every
+//!   execution already on disk carries it, and renaming it would make all of
+//!   them unresumable;
+//! * `metadata.cli.definition_name` — the workflow's *name* in the search path
+//!   ([`crate::workflows`]). This is the key a built-in needs, because a
+//!   built-in is compiled into the binary and has no path at all: without it an
+//!   execution started as `orchestrator run compound-engineering` could never
+//!   be resumed, and both shipped workflows are full of human gates.
+//!
+//! [`resolve_definition`] reads them back, **path first**: an execution written
+//! before `definition_name` existed carries only the path and keeps resolving
+//! exactly as it did, and an execution started from a file keeps running that
+//! file even if a workflow of the same name later appears in the search path.
+//! The name is the fallback — for a built-in, which has no path, and for a file
+//! that has since moved but whose name is now reachable.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -72,6 +86,7 @@ use crate::engine::{Engine, EngineError};
 use crate::persistence::{ExecutionStore, PersistenceError};
 use crate::registry::{RegistryError, RepositoryRegistry};
 use crate::workflow::{load_from_file, validate_path, LoadError, TemplateError, TemplateScope};
+use crate::workflows::{ResolveError, ResolvedWorkflow, WorkflowOrigin, WorkflowResolver};
 use crate::workspace::{RepositorySpec, WorkspaceError, WorkspaceProvisioner, WorkspaceRequest};
 
 /// Key of the scratch area inside [`WorkflowExecution::metadata`] that holds
@@ -80,6 +95,12 @@ pub const METADATA_CLI_KEY: &str = "cli";
 
 /// Key of the recorded definition path inside that scratch area.
 pub const METADATA_DEFINITION_PATH_KEY: &str = "definition_path";
+
+/// Key of the recorded workflow name inside that scratch area.
+///
+/// Written beside [`METADATA_DEFINITION_PATH_KEY`], never instead of it, so
+/// that an execution written by an older binary keeps resolving.
+pub const METADATA_DEFINITION_NAME_KEY: &str = "definition_name";
 
 /// Directory name of the fallback workspace, used when the definition declares
 /// none.
@@ -187,6 +208,20 @@ pub fn load_definition(path: &Path) -> Result<WorkflowDefinition> {
     Ok(load_from_file(path)?)
 }
 
+/// Validates a definition the resolver found and loads it.
+///
+/// The same two steps as [`load_definition`], against the YAML the resolver
+/// carries rather than a file — which is the only form a built-in has.
+pub fn load_resolved(resolved: &ResolvedWorkflow) -> Result<WorkflowDefinition> {
+    let violations = resolved.validate()?;
+    if !violations.is_empty() {
+        return Err(TaskError::InvalidDefinition {
+            violations: violations.iter().map(ToString::to_string).collect(),
+        });
+    }
+    Ok(resolved.load()?)
+}
+
 /// Creates an execution, gives it a workspace and records where its definition
 /// lives.
 ///
@@ -197,10 +232,10 @@ pub fn start_task(
     root: &Path,
     engine: &Engine,
     definition: &WorkflowDefinition,
-    definition_path: &Path,
+    source: impl Into<DefinitionSource>,
     inputs: Map<String, Value>,
 ) -> Result<WorkflowExecution> {
-    start_task_with(root, engine, definition, definition_path, inputs, |_| {})
+    start_task_with(root, engine, definition, source, inputs, |_| {})
 }
 
 /// [`start_task`], with a hook that observes the execution the moment it exists.
@@ -212,10 +247,11 @@ pub fn start_task_with(
     root: &Path,
     engine: &Engine,
     definition: &WorkflowDefinition,
-    definition_path: &Path,
+    source: impl Into<DefinitionSource>,
     inputs: Map<String, Value>,
     on_created: impl FnOnce(&WorkflowExecution),
 ) -> Result<WorkflowExecution> {
+    let source = source.into();
     let provisioner = WorkspaceProvisioner::new(root);
     let request = workspace_request(root, definition, &inputs)?;
     if let Some(request) = &request {
@@ -250,7 +286,7 @@ pub fn start_task_with(
         workspace_type: format!("{:?}", workspace.workspace_type).to_lowercase(),
     });
     execution.workspace = workspace;
-    record_definition_path(&mut execution, definition_path);
+    record_definition_source(&mut execution, &source);
     engine
         .store()
         .save_execution(&execution)
@@ -369,19 +405,37 @@ pub fn repository_name(remote: &str) -> String {
     }
 }
 
-/// Records the definition path so the interface and `input`/`resume` can find
-/// it again.
-pub fn record_definition_path(execution: &mut WorkflowExecution, file: &Path) {
-    let path = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+/// Records where the definition came from, so the interface, `input` and
+/// `resume` can find it again.
+///
+/// Both keys are written when both are known: the path for an execution that
+/// runs a file, the name for one that runs something reachable by name — a
+/// built-in among them.
+pub fn record_definition_source(execution: &mut WorkflowExecution, source: &DefinitionSource) {
     if !execution.metadata.is_object() {
         execution.metadata = json!({});
     }
-    if let Some(metadata) = execution.metadata.as_object_mut() {
-        metadata.insert(
-            METADATA_CLI_KEY.to_string(),
-            json!({ METADATA_DEFINITION_PATH_KEY: path.display().to_string() }),
+    let mut recorded = Map::new();
+    if let Some(path) = &source.path {
+        recorded.insert(
+            METADATA_DEFINITION_PATH_KEY.to_string(),
+            Value::String(path.display().to_string()),
         );
     }
+    if let Some(name) = &source.name {
+        recorded.insert(
+            METADATA_DEFINITION_NAME_KEY.to_string(),
+            Value::String(name.clone()),
+        );
+    }
+    if let Some(metadata) = execution.metadata.as_object_mut() {
+        metadata.insert(METADATA_CLI_KEY.to_string(), Value::Object(recorded));
+    }
+}
+
+/// Records the definition path, for a caller that only has one.
+pub fn record_definition_path(execution: &mut WorkflowExecution, file: &Path) {
+    record_definition_source(execution, &DefinitionSource::from(file));
 }
 
 /// The definition path recorded when the execution was created.
@@ -392,6 +446,147 @@ pub fn stored_definition_path(execution: &WorkflowExecution) -> Option<PathBuf> 
         .get(METADATA_DEFINITION_PATH_KEY)?
         .as_str()
         .map(PathBuf::from)
+}
+
+/// The workflow name recorded when the execution was created.
+pub fn stored_definition_name(execution: &WorkflowExecution) -> Option<String> {
+    execution
+        .metadata
+        .get(METADATA_CLI_KEY)?
+        .get(METADATA_DEFINITION_NAME_KEY)?
+        .as_str()
+        .map(ToString::to_string)
+}
+
+/// Where an execution's definition came from, as it is recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DefinitionSource {
+    /// The name it is reachable by in the search path, when it has one.
+    pub name: Option<String>,
+    /// The absolute path of the file it was read from, when it has one.
+    pub path: Option<PathBuf>,
+}
+
+impl DefinitionSource {
+    /// A definition read from a file the caller named itself.
+    ///
+    /// The stem is recorded as the name too: it costs nothing, and it lets a
+    /// definition that has since moved still resolve if a copy of that name is
+    /// reachable. The path keeps winning while it exists.
+    pub fn from_path(file: &Path) -> Self {
+        let path = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(ToString::to_string)
+            .filter(|stem| !stem.is_empty());
+        Self {
+            name,
+            path: Some(path),
+        }
+    }
+
+    /// A definition the resolver found — a built-in has a name and no path.
+    pub fn from_resolved(resolved: &ResolvedWorkflow) -> Self {
+        Self {
+            name: Some(resolved.name.clone()),
+            path: resolved.path().map(|path| path.to_path_buf()),
+        }
+    }
+}
+
+impl From<&Path> for DefinitionSource {
+    fn from(path: &Path) -> Self {
+        DefinitionSource::from_path(path)
+    }
+}
+
+impl From<&PathBuf> for DefinitionSource {
+    fn from(path: &PathBuf) -> Self {
+        DefinitionSource::from_path(path)
+    }
+}
+
+impl From<&ResolvedWorkflow> for DefinitionSource {
+    fn from(resolved: &ResolvedWorkflow) -> Self {
+        DefinitionSource::from_resolved(resolved)
+    }
+}
+
+/// Why an execution's definition could not be found again.
+#[derive(Debug, thiserror::Error)]
+pub enum DefinitionLookupError {
+    /// Neither key is present — an execution created outside these entry
+    /// points.
+    #[error(
+        "Execution '{execution_id}' records no workflow definition \
+         (neither metadata.cli.definition_path nor metadata.cli.definition_name) \
+         — point at the definition with --file."
+    )]
+    NotRecorded {
+        /// The execution that carries nothing.
+        execution_id: String,
+    },
+
+    /// The recorded path is gone and the recorded name resolves to nothing.
+    #[error("Could not find the definition of execution '{execution_id}': {source}")]
+    Unresolved {
+        /// The execution whose definition vanished.
+        execution_id: String,
+        /// Everywhere the resolver looked.
+        #[source]
+        source: ResolveError,
+    },
+
+    /// A file that is there but cannot be read.
+    #[error("Could not read definition '{path}': {source}")]
+    Read {
+        /// The file that failed.
+        path: PathBuf,
+        /// What the filesystem said.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Finds the definition an execution runs, from what it recorded.
+///
+/// Path first, name second — see the module documentation for why that order
+/// is the one that keeps executions already on disk working.
+pub fn resolve_definition(
+    root: &Path,
+    execution: &WorkflowExecution,
+) -> std::result::Result<ResolvedWorkflow, DefinitionLookupError> {
+    let path = stored_definition_path(execution);
+    if let Some(path) = path.as_ref().filter(|path| path.is_file()) {
+        let source = fs::read_to_string(path).map_err(|source| DefinitionLookupError::Read {
+            path: path.clone(),
+            source,
+        })?;
+        return Ok(ResolvedWorkflow {
+            name: stored_definition_name(execution).unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_default()
+                    .to_string()
+            }),
+            origin: WorkflowOrigin::File(path.clone()),
+            source,
+        });
+    }
+
+    let Some(name) = stored_definition_name(execution) else {
+        return Err(DefinitionLookupError::NotRecorded {
+            execution_id: execution.id.clone(),
+        });
+    };
+
+    WorkflowResolver::new(root)
+        .resolve_name(&name)
+        .map_err(|source| DefinitionLookupError::Unresolved {
+            execution_id: execution.id.clone(),
+            source,
+        })
 }
 
 /// What provisioning can fail with, before it knows which execution it belongs

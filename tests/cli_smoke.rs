@@ -13,6 +13,10 @@
 //! deliberately declares no `globals.workspace` and reaches its script through
 //! an absolute path handed in as an input, so not even the script has a reason
 //! to touch the checkout.
+//!
+//! `XDG_CONFIG_HOME` and `HOME` are redirected into that same directory, so the
+//! workflow search path (`src/workflows`) can never reach — or write into — the
+//! developer's own `~/.config`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,6 +75,8 @@ impl Invocation {
 fn cli(root: &TempRoot, args: &[&str]) -> Invocation {
     let output = Command::new(env!("CARGO_BIN_EXE_orchestrator"))
         .current_dir(root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("HOME", root.path())
         .arg("--root")
         .arg(root.path())
         .args(args)
@@ -810,5 +816,100 @@ fn a_workflow_naming_an_unregistered_raw_path_still_provisions_as_before() {
     assert_eq!(
         fs::read_to_string(checkout.join("marker.txt")).expect("read the marker"),
         "from the raw path"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// resolving a workflow by name (U12)
+// ---------------------------------------------------------------------------
+
+/// `validate` takes a built-in name, not only a path.
+#[test]
+fn validate_accepts_a_builtin_by_name() {
+    let root = TempRoot::new();
+
+    let invocation = cli(&root, &["validate", "compound-engineering"]);
+
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stderr: {}",
+        invocation.stderr
+    );
+    assert!(
+        invocation.stdout.contains("The definition is valid"),
+        "stdout:\n{}",
+        invocation.stdout
+    );
+}
+
+/// A name in `{root}/workflows` is what `run` resolves, and the execution
+/// records that name beside the path.
+#[test]
+fn run_resolves_a_name_from_the_root_workflow_directory() {
+    let root = TempRoot::new();
+    let directory = root.path().join("workflows");
+    fs::create_dir_all(&directory).expect("create the workflow directory");
+    fs::copy(
+        fixtures().join("cli/greet.yaml"),
+        directory.join("greet.yaml"),
+    )
+    .expect("install the fixture under its name");
+
+    let invocation = cli(
+        &root,
+        &[
+            "run",
+            "greet",
+            "--input",
+            "greeting=Good morning",
+            "--input",
+            &announce_script(),
+        ],
+    );
+
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stderr: {}",
+        invocation.stderr
+    );
+    assert!(
+        invocation.stderr.contains("root"),
+        "it says the definition came from the data directory: {}",
+        invocation.stderr
+    );
+
+    let id = execution_id(&invocation.stdout);
+    let state = fs::read_to_string(root.path().join("executions").join(&id).join("state.json"))
+        .expect("read the stored execution");
+    assert!(
+        state.contains("\"definition_name\": \"greet\""),
+        "the name is recorded beside the path: {state}"
+    );
+    assert!(
+        state.contains("definition_path"),
+        "and the path is still recorded, because there is one: {state}"
+    );
+
+    // And it can be answered from a second process, as always.
+    let answered = cli(
+        &root,
+        &["input", &id, "--field", "approval_status=approved"],
+    );
+    assert_eq!(answered.code, EXIT_SUCCESS, "stderr: {}", answered.stderr);
+}
+
+/// An unknown workflow is a usage error, with the built-ins named.
+#[test]
+fn run_with_an_unknown_workflow_name_is_a_usage_error() {
+    let root = TempRoot::new();
+
+    let invocation = cli(&root, &["run", "nothing-of-that-name"]);
+
+    assert_eq!(invocation.code, EXIT_USAGE, "stdout: {}", invocation.stdout);
+    assert!(
+        invocation.stderr.contains("compound-engineering")
+            && invocation.stderr.contains("open-mercato-sdlc"),
+        "the message names the built-ins: {}",
+        invocation.stderr
     );
 }

@@ -75,16 +75,16 @@ pub struct Cli {
 pub enum Command {
     /// Checks a workflow definition and reports every violation at once.
     Validate {
-        /// YAML file holding the workflow definition.
-        #[arg(value_name = "FILE")]
-        file: PathBuf,
+        /// A YAML file, or the name of a workflow on the search path.
+        #[arg(value_name = "WORKFLOW")]
+        workflow: String,
     },
 
     /// Runs a workflow with the given inputs.
     Run {
-        /// YAML file holding the workflow definition.
-        #[arg(value_name = "FILE")]
-        file: PathBuf,
+        /// A YAML file, or the name of a workflow on the search path.
+        #[arg(value_name = "WORKFLOW")]
+        workflow: String,
 
         /// Workflow input, written `name=value` (may be given more than once).
         #[arg(long = "input", value_name = "NAME=VALUE")]
@@ -126,9 +126,9 @@ pub enum Command {
         #[arg(long, value_name = "LABEL")]
         label: Option<String>,
 
-        /// Workflow definition file, for when it cannot be read back from the stored execution.
-        #[arg(long = "file", value_name = "FILE")]
-        file: Option<PathBuf>,
+        /// Workflow file or name, for when it cannot be read back from the stored execution.
+        #[arg(long = "file", value_name = "WORKFLOW")]
+        file: Option<String>,
     },
 
     /// Resumes a paused execution that is not waiting for human input.
@@ -137,9 +137,16 @@ pub enum Command {
         #[arg(value_name = "EXECUTION_ID")]
         execution_id: String,
 
-        /// Workflow definition file, for when it cannot be read back from the stored execution.
-        #[arg(long = "file", value_name = "FILE")]
-        file: Option<PathBuf>,
+        /// Workflow file or name, for when it cannot be read back from the stored execution.
+        #[arg(long = "file", value_name = "WORKFLOW")]
+        file: Option<String>,
+    },
+
+    /// Lists, shows and ejects the workflow definitions that can be run by name.
+    Workflow {
+        /// What to do with the workflows.
+        #[command(subcommand)]
+        command: WorkflowCommand,
     },
 
     /// Manages the registry of repositories workflows name by id.
@@ -151,6 +158,38 @@ pub enum Command {
 
     /// Opens the full-screen terminal interface.
     Tui,
+}
+
+/// The workflow half of the command line.
+///
+/// Every one of these honours the global `--root`, because `{root}/workflows`
+/// is one of the directories the resolver searches.
+#[derive(Debug, Subcommand)]
+pub enum WorkflowCommand {
+    /// Lists every workflow reachable right now, overrides marked.
+    List,
+
+    /// Prints the YAML that would run, and says on stderr where it came from.
+    Show {
+        /// A YAML file, or the name of a workflow on the search path.
+        #[arg(value_name = "WORKFLOW")]
+        workflow: String,
+    },
+
+    /// Writes a built-in workflow out as a file that then takes precedence.
+    Eject {
+        /// The name of the built-in workflow.
+        #[arg(value_name = "NAME")]
+        name: String,
+
+        /// Where to write it. Defaults to the user workflow directory.
+        #[arg(long = "to", value_name = "DIRECTORY")]
+        to: Option<PathBuf>,
+
+        /// Overwrites a file that is already there.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// The registry half of the command line.
@@ -210,8 +249,8 @@ pub enum RepoCommand {
 /// on stderr plus one of the three documented codes.
 pub async fn run(cli: Cli) -> i32 {
     let outcome = match cli.command {
-        Command::Validate { file } => commands::validate(&file),
-        Command::Run { file, inputs } => commands::run(&cli.root, &file, &inputs).await,
+        Command::Validate { workflow } => commands::validate(&cli.root, &workflow),
+        Command::Run { workflow, inputs } => commands::run(&cli.root, &workflow, &inputs).await,
         Command::List => commands::list(&cli.root),
         Command::Show { execution_id } => commands::show(&cli.root, &execution_id),
         Command::Events {
@@ -227,6 +266,13 @@ pub async fn run(cli: Cli) -> i32 {
         Command::Resume { execution_id, file } => {
             commands::resume(&cli.root, &execution_id, file.as_deref()).await
         }
+        Command::Workflow { command } => match command {
+            WorkflowCommand::List => commands::workflow_list(&cli.root),
+            WorkflowCommand::Show { workflow } => commands::workflow_show(&cli.root, &workflow),
+            WorkflowCommand::Eject { name, to, force } => {
+                commands::workflow_eject(&cli.root, &name, to.as_deref(), force)
+            }
+        },
         Command::Repo { command } => match command {
             RepoCommand::Add {
                 id,

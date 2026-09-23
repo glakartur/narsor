@@ -759,6 +759,39 @@ fn render_new_task_modal(frame: &mut Frame, app: &App) {
     let mut lines = Vec::new();
 
     match form.stage {
+        NewTaskStage::Pick => {
+            lines.push(Line::from(Span::styled(
+                "Workflow to run",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+
+            if form.choices.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "No workflow is reachable — not even a built-in one.",
+                    Style::default().fg(Color::Red),
+                )));
+            }
+
+            for (index, choice) in form.choices.iter().enumerate() {
+                let focused = index == form.choice;
+                lines.push(Line::from(Span::styled(
+                    format!("{} {}", if focused { "›" } else { " " }, choice.label()),
+                    if focused {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    },
+                )));
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "← / → (or j / k) change the selection; Enter loads and validates the \
+                 workflow. The source says whether it is a built-in or your own copy.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
         NewTaskStage::Definition => {
             lines.push(Line::from(Span::styled(
                 "Path of the workflow definition to run",
@@ -771,8 +804,8 @@ fn render_new_task_modal(frame: &mut Frame, app: &App) {
             )));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Enter loads and validates it; the input form is generated from \
-                 what it declares.",
+                "A path or a name: Enter loads and validates it, and the input form is \
+                 generated from what it declares. Esc returns to the list.",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -782,8 +815,13 @@ fn render_new_task_modal(frame: &mut Frame, app: &App) {
                 .as_ref()
                 .map(|definition| definition.id.clone())
                 .unwrap_or_default();
+            let origin = form
+                .resolved
+                .as_ref()
+                .map(|resolved| format!("  [{}]", resolved.origin))
+                .unwrap_or_default();
             lines.push(Line::from(Span::styled(
-                format!("Inputs of '{name}'"),
+                format!("Inputs of '{name}'{origin}"),
                 Style::default().add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
@@ -876,7 +914,7 @@ fn render_help_modal(frame: &mut Frame) {
             "Operations",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from("  n                 new task (load a definition and start it)"),
+        Line::from("  n                 new task (pick a workflow and start it)"),
         Line::from("  R                 repositories (a — register, d — remove)"),
         Line::from("  s                 run / resume the selected execution"),
         Line::from("  i                 human input form"),
@@ -889,7 +927,7 @@ fn render_help_modal(frame: &mut Frame) {
         )),
         Line::from("  Tab / ↓           next field"),
         Line::from("  Shift+Tab / ↑     previous field"),
-        Line::from("  ← / → / space     change a select value"),
+        Line::from("  ← / → / space     change a select value, or the picked workflow"),
         Line::from("  letters / Backspace  edit a text field"),
         Line::from("  Enter             submit,  Esc — cancel"),
     ];

@@ -8,13 +8,23 @@
 //! lives is [`crate::tasks::start_task`], which the interface calls too. That
 //! module documents the ordering those steps have to keep.
 //!
+//! # Where a definition comes from
+//!
+//! `validate`, `run` and `--file` all take a *workflow reference*, not a path:
+//! an existing file wins, then `{root}/workflows/<name>.yaml`, then the user
+//! directory, then the built-in of that name ([`crate::workflows`]). That is
+//! what makes `orchestrator run compound-engineering` work from an installed
+//! binary, which has no checkout to read from.
+//!
 //! # How `input` and `resume` find the definition
 //!
 //! The engine needs the [`WorkflowDefinition`] to continue an execution, but
-//! `state.json` stores only the workflow *id*. So `run` records the absolute
-//! path of the file it was given in `metadata.cli.definition_path`, and the
-//! later commands read it back. `--file` overrides it, for the case where the
-//! definition has moved.
+//! `state.json` stores only the workflow *id*. So `run` records both the
+//! absolute path of the file it read (when there was one) and the workflow's
+//! name, and the later commands re-resolve from that —
+//! [`crate::tasks::resolve_definition`]. A built-in has no path at all, so
+//! without the name an execution started from one could never be resumed.
+//! `--file` overrides both, for the case where the definition has moved.
 
 use std::path::Path;
 use std::time::Duration;
@@ -28,7 +38,7 @@ use crate::engine::{Engine, HumanInputDelivery, PendingHumanInput};
 use crate::persistence::ExecutionStore;
 use crate::registry::{infer_provider, RepositoryEntry, RepositoryRegistry};
 use crate::tasks::{self, TaskError};
-use crate::workflow::load_from_file;
+use crate::workflows::{builtin, builtin_names, ResolvedWorkflow, WorkflowResolver};
 
 use super::{EXIT_FAILURE, EXIT_USAGE};
 
@@ -69,13 +79,19 @@ pub type Result<T> = std::result::Result<T, CliError>;
 // validate
 // ---------------------------------------------------------------------------
 
-/// `orchestrator validate <file>` — static validation, all violations at once.
-pub fn validate(file: &Path) -> Result<()> {
-    let definition = tasks::load_definition(file).map_err(|error| match error {
+/// `orchestrator validate <workflow>` — static validation, all violations at
+/// once.
+///
+/// The argument is a workflow reference: a file, a name in the search path, or
+/// a built-in.
+pub fn validate(root: &Path, reference: &str) -> Result<()> {
+    let resolved = resolve_workflow(root, reference)?;
+    let definition = tasks::load_resolved(&resolved).map_err(|error| match error {
         TaskError::InvalidDefinition { violations } => {
             let mut message = format!(
-                "Definition '{}' is invalid — {} {} found:",
-                file.display(),
+                "Definition '{}' ({}) is invalid — {} {} found:",
+                resolved.name,
+                resolved.origin,
                 violations.len(),
                 violation_noun(violations.len())
             );
@@ -110,9 +126,12 @@ fn violation_noun(count: usize) -> &'static str {
 // run
 // ---------------------------------------------------------------------------
 
-/// `orchestrator run <file> [--input k=v]…` — create an execution and run it.
-pub async fn run(root: &Path, file: &Path, inputs: &[String]) -> Result<()> {
-    let definition = tasks::load_definition(file).map_err(|error| match error {
+/// `orchestrator run <workflow> [--input k=v]…` — create an execution and run
+/// it.
+pub async fn run(root: &Path, reference: &str, inputs: &[String]) -> Result<()> {
+    let resolved = resolve_workflow(root, reference)?;
+    eprintln!("Workflow '{}' — {}.", resolved.name, resolved.origin);
+    let definition = tasks::load_resolved(&resolved).map_err(|error| match error {
         TaskError::InvalidDefinition { violations } => {
             let mut message = String::from("The definition is invalid — no execution was created:");
             for violation in &violations {
@@ -130,10 +149,11 @@ pub async fn run(root: &Path, file: &Path, inputs: &[String]) -> Result<()> {
     let engine = Engine::new(ExecutionStore::new(root));
     // The new id is announced the moment it exists, so that a failing clone
     // still tells the operator which execution to look at.
-    let execution = tasks::start_task_with(root, &engine, &definition, file, inputs, |execution| {
-        println!("Created execution: {}", execution.id);
-    })
-    .map_err(|error| CliError::failure(error.to_string()))?;
+    let execution =
+        tasks::start_task_with(root, &engine, &definition, &resolved, inputs, |execution| {
+            println!("Created execution: {}", execution.id);
+        })
+        .map_err(|error| CliError::failure(error.to_string()))?;
 
     let execution = engine
         .run(&definition, &execution.id)
@@ -388,7 +408,7 @@ pub async fn input(
     execution_id: &str,
     fields: &[String],
     label: Option<String>,
-    definition_file: Option<&Path>,
+    definition_file: Option<&str>,
 ) -> Result<()> {
     let store = ExecutionStore::new(root);
     let execution = load_execution(&store, execution_id)?;
@@ -415,7 +435,7 @@ pub async fn input(
         delivery = delivery.choosing(label);
     }
 
-    let definition = definition_for(&execution, definition_file)?;
+    let definition = definition_for(root, &execution, definition_file)?;
     let engine = Engine::new(store);
     let execution = engine
         .deliver_human_input(&definition, &pending.execution_id, &delivery)
@@ -441,10 +461,10 @@ pub async fn input(
 }
 
 /// `orchestrator resume <id>` — continue a paused execution.
-pub async fn resume(root: &Path, execution_id: &str, definition_file: Option<&Path>) -> Result<()> {
+pub async fn resume(root: &Path, execution_id: &str, definition_file: Option<&str>) -> Result<()> {
     let store = ExecutionStore::new(root);
     let execution = load_execution(&store, execution_id)?;
-    let definition = definition_for(&execution, definition_file)?;
+    let definition = definition_for(root, &execution, definition_file)?;
 
     let engine = Engine::new(store);
     let execution = engine
@@ -563,6 +583,133 @@ pub fn repo_remove(root: &Path, id: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// workflow
+// ---------------------------------------------------------------------------
+
+/// `orchestrator workflow list` — every workflow reachable right now.
+///
+/// One line per *name*: where the copy that wins comes from, what it overrides
+/// when it overrides something, and its `description`. A user copy shadowing a
+/// built-in is one row marked as an override, never two rows that leave the
+/// operator guessing which one would run.
+pub fn workflow_list(root: &Path) -> Result<()> {
+    let resolver = WorkflowResolver::new(root);
+    let entries = resolver.list();
+
+    if entries.is_empty() {
+        println!("No workflows are reachable.");
+        return Ok(());
+    }
+
+    println!("{:<28} {:<10} DESCRIPTION", "NAME", "SOURCE");
+    for entry in &entries {
+        let description = entry.description.as_deref().unwrap_or("-");
+        println!(
+            "{:<28} {:<10} {}",
+            entry.name,
+            entry.origin.label(),
+            truncate(description, 80)
+        );
+        if entry.is_override() {
+            println!("{:<28} {:<10} overrides: {}", "", "", entry.shadow_labels());
+        }
+        if let Some(path) = entry.origin.path() {
+            println!("{:<28} {:<10} path: {}", "", "", path.display());
+        }
+    }
+    Ok(())
+}
+
+/// `orchestrator workflow show <name>` — the YAML that would run.
+///
+/// The definition goes to stdout and nothing else does, so
+/// `orchestrator workflow show compound-engineering > mine.yaml` is a copy;
+/// where it came from is said on stderr.
+pub fn workflow_show(root: &Path, reference: &str) -> Result<()> {
+    let resolved = resolve_workflow(root, reference)?;
+    eprintln!("Workflow '{}' — {}.", resolved.name, resolved.origin);
+    print!("{}", resolved.source);
+    if !resolved.source.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+/// `orchestrator workflow eject <name> [--to <dir>] [--force]` — write a
+/// built-in out as a file.
+///
+/// The default target is the user directory, which the resolver searches ahead
+/// of the built-ins: the ejected copy takes precedence the moment it is
+/// written, which is the whole point of ejecting one.
+pub fn workflow_eject(root: &Path, name: &str, to: Option<&Path>, force: bool) -> Result<()> {
+    let builtin = builtin(name).ok_or_else(|| {
+        CliError::usage(format!(
+            "There is no built-in workflow named '{}'. Available built-in workflows: {}.",
+            crate::workflows::workflow_name(name),
+            builtin_names().join(", ")
+        ))
+    })?;
+
+    let resolver = WorkflowResolver::new(root);
+    let directory = match to {
+        Some(directory) => directory.to_path_buf(),
+        None => resolver.user_dir().map(Path::to_path_buf).ok_or_else(|| {
+            CliError::usage(
+                "There is no user configuration directory (neither XDG_CONFIG_HOME nor HOME is \
+                 set) — name a directory with --to."
+                    .to_string(),
+            )
+        })?,
+    };
+
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        CliError::failure(format!(
+            "Could not create '{}': {error}",
+            directory.display()
+        ))
+    })?;
+
+    let target = directory.join(format!("{}.yaml", builtin.name));
+    if target.exists() && !force {
+        return Err(CliError::failure(format!(
+            "'{}' already exists — pass --force to overwrite it.",
+            target.display()
+        )));
+    }
+
+    std::fs::write(&target, builtin.source).map_err(|error| {
+        CliError::failure(format!("Could not write '{}': {error}", target.display()))
+    })?;
+
+    println!("Wrote {}", target.display());
+    match resolver.resolve_name(builtin.name) {
+        Ok(resolved) if resolved.path() == Some(target.as_path()) => println!(
+            "'{}' now resolves to this copy instead of the built-in.",
+            builtin.name
+        ),
+        Ok(resolved) => println!(
+            "Note: '{}' still resolves to {} — that copy has precedence over this one.",
+            builtin.name, resolved.origin
+        ),
+        Err(_) => println!(
+            "Note: '{}' is not on the search path from this data directory; \
+             run it by path, or point --root at the directory holding it.",
+            builtin.name
+        ),
+    }
+    Ok(())
+}
+
+/// Shortens a description to one line of a listing.
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(limit.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
+// ---------------------------------------------------------------------------
 // tui (U10)
 // ---------------------------------------------------------------------------
 
@@ -608,26 +755,35 @@ fn pending_input(store: &ExecutionStore, execution_id: &str) -> Result<Option<Pe
 }
 
 /// Resolves the definition an execution continues with.
+///
+/// `--file` wins; otherwise the execution's own record decides — the path it
+/// was started from while that file is still there, and the workflow name
+/// otherwise, which is the only thing a built-in leaves behind.
 fn definition_for(
+    root: &Path,
     execution: &WorkflowExecution,
-    override_path: Option<&Path>,
+    override_reference: Option<&str>,
 ) -> Result<WorkflowDefinition> {
-    let path = match override_path {
-        Some(path) => path.to_path_buf(),
-        None => tasks::stored_definition_path(execution).ok_or_else(|| {
-            CliError::usage(format!(
-                "Execution '{}' has no recorded definition path — point at the file with --file.",
-                execution.id
-            ))
-        })?,
+    let resolved = match override_reference {
+        Some(reference) => resolve_workflow(root, reference)?,
+        None => tasks::resolve_definition(root, execution)
+            .map_err(|error| CliError::failure(error.to_string()))?,
     };
 
-    load_from_file(&path).map_err(|error| {
+    resolved.load().map_err(|error| {
         CliError::failure(format!(
-            "Could not load definition '{}': {error}",
-            path.display()
+            "Could not load definition '{}' ({}): {error}",
+            resolved.name, resolved.origin
         ))
     })
+}
+
+/// Resolves a workflow reference, turning a miss into the message that names
+/// every place that was tried.
+fn resolve_workflow(root: &Path, reference: &str) -> Result<ResolvedWorkflow> {
+    WorkflowResolver::new(root)
+        .resolve(reference)
+        .map_err(|error| CliError::usage(error.to_string()))
 }
 
 /// Status, current state and — when it stopped — the outcome.

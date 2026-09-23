@@ -16,9 +16,12 @@
 //! * Everything after that comes from [`Engine::subscribe`] — see [`on_stream`]
 //!   ([`App::on_stream`]). The log is never polled for live updates.
 //! * The [`WorkflowDefinition`] is resolved the way the CLI resolves it, from
-//!   `metadata.cli.definition_path`. Without it there is no way to know a
-//!   state's `outputs` or its `allow_manual_override`, so the panels that need
-//!   those say so instead of pretending the state has none.
+//!   what the execution recorded — `metadata.cli.definition_path` first, then
+//!   `metadata.cli.definition_name` through [`crate::workflows`], which is the
+//!   only thing an execution started from a built-in has. Without a definition
+//!   there is no way to know a state's `outputs` or its
+//!   `allow_manual_override`, so the panels that need those say so instead of
+//!   pretending the state has none.
 //!
 //! # Manual transitions (D30)
 //!
@@ -47,11 +50,17 @@
 //!   [`validate`](RepositoryEntry::validate) *before* `add()`, so a refused id
 //!   or an `ext::` remote is reported next to the field rather than as a
 //!   generic storage failure.
-//! * The new-task modal validates the definition in full (every violation, the
-//!   way `orchestrator validate` prints them), then generates the input form
-//!   from the definition's `inputs`: the declared `type` decides the JSON type
-//!   the value reaches the context as, and a `repository` input is a pick list
-//!   of what the registry holds.
+//! * The new-task modal opens on a **pick list** of every workflow the
+//!   resolver can reach — built-ins, the user's own copies and
+//!   `{root}/workflows`, each row naming its source and marking an override,
+//!   exactly as `orchestrator workflow list` does. `←`/`→` (and `space`,
+//!   `j`/`k`, `↑`/`↓`) change the selection; the last row, "Enter a path…",
+//!   switches to a text line so that a definition being developed — which is
+//!   in no search location yet — can still be run. The pick is then validated
+//!   in full (every violation, the way `orchestrator validate` prints them)
+//!   and the input form is generated from the definition's `inputs`: the
+//!   declared `type` decides the JSON type the value reaches the context as,
+//!   and a `repository` input is a pick list of what the registry holds.
 //!
 //! ## Where the workspace comes from
 //!
@@ -62,7 +71,7 @@
 //! is one copy of the rules that decide what `git` is asked to clone, and this
 //! interface does not hold a second.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -77,8 +86,8 @@ use crate::engine::{
     permitted_labels, terminal_status, Engine, HumanInputDelivery, PendingHumanInput,
 };
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
-use crate::tasks;
-use crate::workflow::{load_from_file, validate_path};
+use crate::tasks::{self, DefinitionSource};
+use crate::workflows::{ResolvedWorkflow, WorkflowEntry, WorkflowResolver};
 
 /// The decision provider recorded for an operator's ordinary manual choice.
 pub const MANUAL_PROVIDER: &str = "human";
@@ -552,10 +561,53 @@ pub struct RepositoryRemoveConfirm {
 /// Which half of the new-task modal is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NewTaskStage {
-    /// Typing the path of the definition to run.
+    /// Picking a workflow out of the list the resolver offers.
+    Pick,
+    /// Typing the path of a definition that is in no search location.
     Definition,
     /// Filling in the inputs the loaded definition declares.
     Inputs,
+}
+
+/// One row of the new-task pick list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewTaskChoice {
+    /// A workflow the resolver reached, with the source it came from.
+    Workflow(WorkflowEntry),
+    /// The escape hatch: type a path instead.
+    Path,
+}
+
+impl NewTaskChoice {
+    /// The row as the modal draws it.
+    pub fn label(&self) -> String {
+        match self {
+            NewTaskChoice::Workflow(entry) => {
+                let source = if entry.is_override() {
+                    format!(
+                        "{}, overrides {}",
+                        entry.origin.label(),
+                        entry.shadow_labels()
+                    )
+                } else {
+                    entry.origin.label().to_string()
+                };
+                match &entry.description {
+                    Some(description) => format!("{} [{source}] — {description}", entry.name),
+                    None => format!("{} [{source}]", entry.name),
+                }
+            }
+            NewTaskChoice::Path => "Enter a path…".to_string(),
+        }
+    }
+
+    /// The workflow name this row starts, when it names one.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            NewTaskChoice::Workflow(entry) => Some(entry.name.as_str()),
+            NewTaskChoice::Path => None,
+        }
+    }
 }
 
 /// How one declared input is edited.
@@ -578,6 +630,10 @@ pub enum InputEditor {
 pub struct NewTaskForm {
     /// The stage currently shown.
     pub stage: NewTaskStage,
+    /// Every workflow that can be picked, plus the "enter a path…" row.
+    pub choices: Vec<NewTaskChoice>,
+    /// The highlighted row of the pick list.
+    pub choice: usize,
     /// The typed definition path.
     pub path: String,
     /// Every violation the definition failed on — all of them, as `validate`
@@ -585,8 +641,11 @@ pub struct NewTaskForm {
     pub violations: Vec<String>,
     /// The last failure that is not a violation.
     pub error: Option<String>,
-    /// The loaded definition, once the path passed.
+    /// The loaded definition, once the pick passed.
     pub definition: Option<WorkflowDefinition>,
+    /// Where that definition came from — recorded on the execution, so an
+    /// execution started from a built-in can be resumed later.
+    pub resolved: Option<ResolvedWorkflow>,
     /// The declared parameters, in declaration order.
     pub parameters: Vec<InputParameter>,
     /// How each parameter is edited.
@@ -608,15 +667,41 @@ impl NewTaskForm {
     pub fn new() -> Self {
         Self {
             stage: NewTaskStage::Definition,
+            choices: Vec::new(),
+            choice: 0,
             path: String::new(),
             violations: Vec::new(),
             error: None,
             definition: None,
+            resolved: None,
             parameters: Vec::new(),
             editors: Vec::new(),
             values: Vec::new(),
             row: 0,
         }
+    }
+
+    /// A form opened on the pick list the resolver filled.
+    pub fn picking(choices: Vec<NewTaskChoice>) -> Self {
+        Self {
+            stage: NewTaskStage::Pick,
+            choices,
+            ..Self::new()
+        }
+    }
+
+    /// The highlighted row of the pick list.
+    pub fn selected_choice(&self) -> Option<&NewTaskChoice> {
+        self.choices.get(self.choice)
+    }
+
+    /// Moves the pick list's cursor, wrapping at both ends.
+    pub fn cycle_choice(&mut self, step: isize) {
+        let count = self.choices.len() as isize;
+        if count == 0 {
+            return;
+        }
+        self.choice = (self.choice as isize + step).rem_euclid(count) as usize;
     }
 
     /// The choices a parameter offers, when it is not a free line.
@@ -633,7 +718,13 @@ impl NewTaskForm {
     /// them instead of asking the operator to retype an id the registry already
     /// knows. With nothing registered it falls back to a free line, so a raw
     /// remote — which the resolver still accepts — stays typeable.
-    fn adopt(&mut self, definition: WorkflowDefinition, repositories: &[String]) {
+    fn adopt(
+        &mut self,
+        definition: WorkflowDefinition,
+        resolved: ResolvedWorkflow,
+        repositories: &[String],
+    ) {
+        self.resolved = Some(resolved);
         self.parameters = definition.inputs.clone();
         self.editors = self
             .parameters
@@ -824,6 +915,7 @@ impl Modal {
 /// Everything the interface knows.
 pub struct App {
     engine: Arc<Engine>,
+    resolver: WorkflowResolver,
 
     executions: Vec<ExecutionRow>,
     selected: usize,
@@ -850,8 +942,19 @@ impl App {
     /// Builds an interface over an engine. Nothing is read until
     /// [`App::refresh`].
     pub fn new(engine: Arc<Engine>) -> Self {
+        let resolver = WorkflowResolver::new(engine.store().root().to_path_buf());
+        Self::with_resolver(engine, resolver)
+    }
+
+    /// The same, with the workflow search path given explicitly.
+    ///
+    /// The interface itself always builds the resolver from the environment;
+    /// this exists so a test can point the user directory somewhere harmless
+    /// instead of reading — or writing — the developer's own `~/.config`.
+    pub fn with_resolver(engine: Arc<Engine>, resolver: WorkflowResolver) -> Self {
         Self {
             engine,
+            resolver,
             executions: Vec::new(),
             selected: 0,
             execution: None,
@@ -1043,10 +1146,16 @@ impl App {
                 ("Esc", "cancel"),
             ],
             Modal::NewTask(form) => match form.stage {
+                NewTaskStage::Pick => vec![
+                    ("←/→", "workflow"),
+                    ("j/k", "workflow"),
+                    ("Enter", "choose"),
+                    ("Esc", "cancel"),
+                ],
                 NewTaskStage::Definition => vec![
                     ("letters", "type the path"),
                     ("Enter", "load"),
-                    ("Esc", "cancel"),
+                    ("Esc", "back to the list"),
                 ],
                 NewTaskStage::Inputs => vec![
                     ("Tab/↑↓", "field"),
@@ -1200,27 +1309,33 @@ impl App {
         self.load_definition();
     }
 
-    /// Resolves the definition from `metadata.cli.definition_path`.
+    /// Resolves the definition the selected execution runs.
+    ///
+    /// The same rule the CLI uses, through the same resolver: the recorded
+    /// path while that file is there, and otherwise the recorded workflow
+    /// name — which is all an execution started from a built-in has.
     fn load_definition(&mut self) {
         let Some(execution) = self.execution.as_ref() else {
             return;
         };
-        let Some(path) = tasks::stored_definition_path(execution) else {
-            self.definition_error = Some(format!(
-                "Execution '{}' has no recorded definition path \
-                 (metadata.cli.definition_path): manual transitions and delivering \
-                 human input are unavailable.",
-                execution.id
-            ));
-            return;
+
+        let root = self.engine.store().root().to_path_buf();
+        let resolved = match tasks::resolve_definition(&root, execution) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.definition_error = Some(format!(
+                    "{error} Manual transitions and delivering human input are unavailable."
+                ));
+                return;
+            }
         };
 
-        match load_from_file(&path) {
+        match resolved.load() {
             Ok(definition) => self.definition = Some(definition),
             Err(error) => {
                 self.definition_error = Some(format!(
-                    "Could not load definition '{}': {error}",
-                    path.display()
+                    "Could not load definition '{}' ({}): {error}",
+                    resolved.name, resolved.origin
                 ))
             }
         }
@@ -1362,7 +1477,7 @@ impl App {
                 Request::None
             }
             KeyCode::Char('n') => {
-                self.modal = Modal::NewTask(Box::default());
+                self.open_new_task();
                 Request::None
             }
             KeyCode::Char('R') => {
@@ -1629,9 +1744,29 @@ impl App {
             return Request::None;
         };
 
-        if form.stage == NewTaskStage::Definition {
+        if form.stage == NewTaskStage::Pick {
             match key.code {
                 KeyCode::Esc => self.modal = Modal::None,
+                KeyCode::Enter => self.choose_new_task_workflow(),
+                // The same idiom the input forms use for a select value:
+                // ←/→ and space change it, j/k and ↑/↓ move like everywhere
+                // else in the interface.
+                KeyCode::Left | KeyCode::Up | KeyCode::Char('k') => form.cycle_choice(-1),
+                KeyCode::Right
+                | KeyCode::Down
+                | KeyCode::Char('j')
+                | KeyCode::Char(' ')
+                | KeyCode::Tab => form.cycle_choice(1),
+                _ => {}
+            }
+            return Request::None;
+        }
+
+        if form.stage == NewTaskStage::Definition {
+            match key.code {
+                // Back to the list rather than out of the modal: the path line
+                // is a detour from it, not a modal of its own.
+                KeyCode::Esc => self.back_to_new_task_list(),
                 // Loading and validating reads a file and nothing else, so it
                 // stays on this side of the `Request` seam.
                 KeyCode::Enter => self.load_new_task_definition(),
@@ -2134,6 +2269,113 @@ impl App {
     /// whole verdict on one screen, the way `orchestrator validate` prints it.
     pub fn load_new_task_definition(&mut self) {
         let repositories = self.repository_ids();
+        let reference = match &self.modal {
+            Modal::NewTask(form) => form.path.trim().to_string(),
+            _ => return,
+        };
+
+        if reference.is_empty() {
+            if let Modal::NewTask(form) = &mut self.modal {
+                form.error = Some("Type the path of a workflow definition.".to_string());
+            }
+            return;
+        }
+
+        // A path typed here is resolved by the same resolver the list is built
+        // from, so a *name* typed by hand behaves exactly as picking it does.
+        let resolved = match self.resolver.resolve(&reference) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                if let Modal::NewTask(form) = &mut self.modal {
+                    form.error = Some(error.to_string());
+                }
+                return;
+            }
+        };
+
+        self.adopt_new_task_workflow(resolved, &repositories);
+    }
+
+    /// Opens the new-task modal on the list of everything that can be run.
+    ///
+    /// The list is the resolver's own — the same enumeration
+    /// `orchestrator workflow list` prints, overrides marked — plus the row
+    /// that switches to a typed path, because a definition being written is in
+    /// no search location yet.
+    pub fn open_new_task(&mut self) {
+        let mut choices: Vec<NewTaskChoice> = self
+            .resolver
+            .list()
+            .into_iter()
+            .map(NewTaskChoice::Workflow)
+            .collect();
+        choices.push(NewTaskChoice::Path);
+        self.modal = Modal::NewTask(Box::new(NewTaskForm::picking(choices)));
+    }
+
+    /// Returns from the typed path to the pick list.
+    pub fn back_to_new_task_list(&mut self) {
+        let Modal::NewTask(form) = &mut self.modal else {
+            return;
+        };
+        if form.choices.is_empty() {
+            self.modal = Modal::None;
+            return;
+        }
+        form.stage = NewTaskStage::Pick;
+        form.violations.clear();
+        form.error = None;
+    }
+
+    /// Acts on the highlighted row of the pick list.
+    ///
+    /// A workflow is resolved by name — so the built-in, the user copy or the
+    /// root copy that would actually run is the one loaded — and
+    /// "Enter a path…" switches to the text line.
+    pub fn choose_new_task_workflow(&mut self) {
+        let repositories = self.repository_ids();
+        let choice = match &self.modal {
+            Modal::NewTask(form) => form.selected_choice().cloned(),
+            _ => return,
+        };
+
+        let Some(choice) = choice else {
+            if let Modal::NewTask(form) = &mut self.modal {
+                form.error = Some(
+                    "No workflow is reachable — press Esc and point at a definition by path."
+                        .to_string(),
+                );
+            }
+            return;
+        };
+
+        let Some(name) = choice.name().map(ToString::to_string) else {
+            if let Modal::NewTask(form) = &mut self.modal {
+                form.stage = NewTaskStage::Definition;
+                form.violations.clear();
+                form.error = None;
+            }
+            return;
+        };
+
+        let resolved = match self.resolver.resolve_name(&name) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                if let Modal::NewTask(form) = &mut self.modal {
+                    form.error = Some(error.to_string());
+                }
+                return;
+            }
+        };
+
+        self.adopt_new_task_workflow(resolved, &repositories);
+    }
+
+    /// Validates a resolved workflow in full and builds its input form.
+    ///
+    /// Every violation is kept, not the first one: the operator should see the
+    /// whole verdict on one screen, the way `orchestrator validate` prints it.
+    fn adopt_new_task_workflow(&mut self, resolved: ResolvedWorkflow, repositories: &[String]) {
         let Modal::NewTask(form) = &mut self.modal else {
             return;
         };
@@ -2141,14 +2383,9 @@ impl App {
         form.violations.clear();
         form.error = None;
         form.definition = None;
+        form.resolved = None;
 
-        let path = form.path.trim().to_string();
-        if path.is_empty() {
-            form.error = Some("Type the path of a workflow definition.".to_string());
-            return;
-        }
-
-        match validate_path(&path) {
+        match resolved.validate() {
             Ok(violations) if !violations.is_empty() => {
                 form.violations = violations.iter().map(ToString::to_string).collect();
                 form.error = Some("The definition is invalid — nothing was created.".to_string());
@@ -2161,7 +2398,7 @@ impl App {
             }
         }
 
-        let definition = match load_from_file(&path) {
+        let definition = match resolved.load() {
             Ok(definition) => definition,
             Err(error) => {
                 form.error = Some(format!("Could not load the definition: {error}"));
@@ -2169,7 +2406,7 @@ impl App {
             }
         };
 
-        form.adopt(definition, &repositories);
+        form.adopt(definition, resolved, repositories);
     }
 
     /// Creates the execution the form describes and runs it.
@@ -2187,7 +2424,13 @@ impl App {
         let Some(definition) = form.definition.clone() else {
             return;
         };
-        let file = PathBuf::from(form.path.trim());
+        // What the execution records about where its definition came from: a
+        // path when there is one, and always the name — a built-in has no path
+        // at all, and without the name it could never be resumed.
+        let source = match &form.resolved {
+            Some(resolved) => DefinitionSource::from_resolved(resolved),
+            None => DefinitionSource::from_path(Path::new(form.path.trim())),
+        };
 
         let inputs = match form.inputs() {
             Ok(inputs) => inputs,
@@ -2201,7 +2444,7 @@ impl App {
         };
 
         let root = self.engine.store().root().to_path_buf();
-        let execution = match tasks::start_task(&root, &self.engine, &definition, &file, inputs) {
+        let execution = match tasks::start_task(&root, &self.engine, &definition, source, inputs) {
             Ok(execution) => execution,
             Err(error) => {
                 let message = error.to_string();

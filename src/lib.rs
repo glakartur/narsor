@@ -12,4 +12,5 @@ pub mod registry;
 pub mod tasks;
 pub mod tui;
 pub mod workflow;
+pub mod workflows;
 pub mod workspace;
