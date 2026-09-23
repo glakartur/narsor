@@ -1,0 +1,13 @@
+# §5.1: a workflow needs at least one terminal state.
+name: no-terminal-state
+version: 1
+
+states:
+  start:
+    action:
+      type: script
+      command: ./run.sh
+    outputs:
+      - again
+    transitions:
+      again: start

@@ -1,0 +1,20 @@
+# §5.1: `terminal_states` may only name states that exist.
+name: unknown-terminal-state
+version: 1
+
+states:
+  start:
+    action:
+      type: script
+      command: ./run.sh
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  - done
+  - cancelled

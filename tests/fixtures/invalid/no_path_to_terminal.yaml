@@ -1,0 +1,40 @@
+# §5.1: `a -> b -> a` is a closed loop with no way out, so neither state can
+# ever reach a terminal state. `start` itself is fine: it has an edge to `done`.
+name: no-path-to-terminal
+version: 1
+
+states:
+  start:
+    action:
+      type: script
+      command: ./run.sh
+    outputs:
+      - finish
+      - loop
+    transitions:
+      finish: done
+      loop: a
+
+  a:
+    action:
+      type: script
+      command: ./a.sh
+    outputs:
+      - next
+    transitions:
+      next: b
+
+  b:
+    action:
+      type: script
+      command: ./b.sh
+    outputs:
+      - back
+    transitions:
+      back: a
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  - done

@@ -1,0 +1,21 @@
+# §5.1: every state named in `transitions` must exist in `states`.
+name: transition-to-unknown-state
+version: 1
+
+states:
+  start:
+    action:
+      type: script
+      command: ./run.sh
+    outputs:
+      - success
+      - failure
+    transitions:
+      success: nonexistent_state
+      failure: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  - done

@@ -1,0 +1,28 @@
+# §5.1: `orphan` has no incoming transition, so nothing can ever enter it.
+name: unreachable-state
+version: 1
+
+states:
+  start:
+    action:
+      type: script
+      command: ./run.sh
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  orphan:
+    action:
+      type: script
+      command: ./orphan.sh
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  - done

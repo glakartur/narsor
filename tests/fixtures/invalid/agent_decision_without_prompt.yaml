@@ -1,0 +1,24 @@
+# §5.3: an agent decision needs both a harness and a prompt.
+name: agent-decision-without-prompt
+version: 1
+
+states:
+  start:
+    action:
+      type: script
+      command: ./run.sh
+    outputs:
+      - success
+      - failure
+    transitions:
+      success: done
+      failure: done
+    decision:
+      type: agent
+      harness: claude-code
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  - done

@@ -1,0 +1,20 @@
+# §5.1: every label in `outputs` needs a matching entry in `transitions`.
+name: output-without-transition
+version: 1
+
+states:
+  start:
+    action:
+      type: script
+      command: ./run.sh
+    outputs:
+      - success
+      - partial_failure
+    transitions:
+      success: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  - done
