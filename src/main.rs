@@ -1,5 +1,3 @@
-mod domain;
-
 use tracing::info;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
