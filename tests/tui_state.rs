@@ -1216,6 +1216,59 @@ async fn starting_a_valid_new_task_creates_an_execution_that_is_listed_and_selec
     );
 }
 
+/// A definition declaring `globals.workspace` starts from the modal, and its
+/// workspace is provisioned — the interface no longer sends the operator to
+/// `orchestrator run` for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_definition_declaring_a_workspace_starts_from_the_modal_and_is_provisioned() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+
+    // The directory the declared `local` workspace is copied from.
+    let source = root.path().join("source");
+    fs::create_dir_all(&source).expect("create the source tree");
+    fs::write(source.join("README.md"), "hello\n").expect("write readme");
+
+    let mut app = App::new(Arc::clone(&engine));
+    app.refresh();
+
+    open_new_task(&mut app, &fixtures().join("new_task_workspace.yaml"));
+    focus_input(&mut app, "source");
+    type_text(&mut app, &source.display().to_string());
+    app.on_key(key(KeyCode::Enter));
+    app.start_new_task().await;
+
+    assert!(
+        matches!(app.modal(), Modal::None),
+        "the definition was accepted, not refused"
+    );
+    let notice = app.notice().expect("a notice");
+    assert!(!notice.is_error, "and it started: {}", notice.text);
+
+    let selected = app.selected().expect("the new execution is selected").clone();
+    assert_eq!(selected.workflow_id, "tui-new-task-workspace");
+
+    // The workspace holds the source directory's contents, under the root.
+    let execution = engine
+        .store()
+        .load_execution(&selected.id)
+        .expect("reload the execution");
+    let workspace = Path::new(&execution.workspace.path);
+    assert_eq!(
+        workspace,
+        root.path()
+            .join("tasks")
+            .join(&selected.id)
+            .join("code")
+            .join("source"),
+        "the checkout is the one `orchestrator run` would have made"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("README.md")).expect("read the copy"),
+        "hello\n"
+    );
+}
+
 /// Esc leaves every new modal without writing anything.
 #[tokio::test(flavor = "multi_thread")]
 async fn esc_cancels_every_modal_without_writing_anything() {
