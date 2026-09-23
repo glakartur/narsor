@@ -75,7 +75,8 @@ use crate::engine::actions::human::{
     self, HumanActionError, HumanInputDelivery, HumanInputRequest, PendingHumanInput,
 };
 use crate::engine::actions::{
-    ActionExecutor, ActionOutcome, ActionRequest, HumanExecutor, ScriptExecutor, SuspendedAction,
+    ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
+    ScriptExecutor, SuspendedAction,
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
@@ -112,7 +113,7 @@ pub fn terminal_status(state: &State) -> ExecutionStatus {
 /// misspelled action type cannot compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionKind {
-    /// `AgentAction` — no executor in this version; register your own.
+    /// `AgentAction`.
     Agent,
     /// `ScriptAction`.
     Script,
@@ -319,21 +320,33 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Creates an engine with the executors of this version: `script` and
-    /// `human`.
+    /// Creates an engine with the executors of this version: `script`, `human`
+    /// and `agent`.
     ///
-    /// `agent` and `wait` are deliberately unregistered — they are Phase 3 — so
-    /// a workflow that uses one fails with a clear message instead of behaving
-    /// like something it is not. [`Engine::with_executor`] fills either in.
+    /// `wait` is deliberately unregistered — it is Phase 3 — so a workflow that
+    /// uses one fails with a clear message instead of behaving like something
+    /// it is not. [`Engine::with_executor`] fills it in.
+    ///
+    /// The agent executor is given a [`LoggingEventSink`] over this engine's
+    /// own store and live channel, so the agent-session events it emits land in
+    /// the same log, in the same order, as the engine's own.
     pub fn new(store: ExecutionStore) -> Self {
+        let events = broadcast::channel(EVENT_CHANNEL_CAPACITY).0;
+
+        let agent = AgentExecutor::new().with_event_sink(Arc::new(LoggingEventSink::new(
+            store.clone(),
+            Some(events.clone()),
+        )));
+
         let mut executors: HashMap<ActionKind, Arc<dyn ActionExecutor>> = HashMap::new();
         executors.insert(ActionKind::Script, Arc::new(ScriptExecutor::new()));
         executors.insert(ActionKind::Human, Arc::new(HumanExecutor::new()));
+        executors.insert(ActionKind::Agent, Arc::new(agent));
 
         Self {
             store,
             executors,
-            events: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
+            events,
             pause_requests: Mutex::new(HashSet::new()),
         }
     }
@@ -762,7 +775,8 @@ impl Engine {
         })?;
 
         let request = ActionRequest::new(&rendered, &execution.workspace, action_execution_id)
-            .with_timeout(timeout);
+            .with_timeout(timeout)
+            .with_execution_id(&execution.id);
 
         match executor.execute(request).await {
             Ok(ActionOutcome::Completed(result)) => Ok(AttemptOutcome::Completed(result)),

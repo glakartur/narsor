@@ -5,7 +5,8 @@
 //! its output label selects, and persists the result.
 //!
 //! [`actions`] holds the execution half of that job — one executor per action
-//! type, all behind the [`actions::ActionExecutor`] trait. [`runner`] holds the
+//! type, all behind the [`actions::ActionExecutor`] trait; the agent executor
+//! reaches the AI harnesses through [`actions::harness`], one adapter per CLI. [`runner`] holds the
 //! loop itself, with the order of emitted events that recovery is derived from;
 //! [`decision`] chooses the transition a finished action selects and is the one
 //! place an output label is judged against the state; [`retry`] resolves the
@@ -25,7 +26,9 @@ pub use runner::{
 };
 
 pub use actions::{
-    ActionExecutor, ActionOutcome, ActionRequest, HumanActionError, HumanExecutor,
-    HumanInputDelivery, HumanInputRequest, PendingHumanInput, ResumedHumanAction, ScriptExecutor,
+    ActionExecutor, ActionOutcome, ActionRequest, AgentEventSink, AgentExecutor, AgentOutput,
+    ClaudeCodeAdapter, HarnessAdapter, HarnessInvocation, HarnessRegistry, HarnessRequest,
+    HarnessRun, HumanActionError, HumanExecutor, HumanInputDelivery, HumanInputRequest,
+    LoggingEventSink, OpenCodeAdapter, PendingHumanInput, ResumedHumanAction, ScriptExecutor,
     SuspendedAction, TimedOutAction, ACTION_ID_ENV_VAR,
 };
