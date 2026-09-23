@@ -630,3 +630,85 @@ fn unpushed_commits_block_cleanup_of_a_cloned_repository() {
     assert!(logs.contains("cleanup blocked"), "logs: {logs}");
     assert!(provisioned.task_dir.exists());
 }
+
+// ---------------------------------------------------------------------------
+// Argument safety and credential redaction
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_remote_using_the_ext_transport_is_rejected_before_anything_is_written() {
+    let root = TempRoot::new();
+    let provisioner = WorkspaceProvisioner::new(root.path());
+    let request = WorkspaceRequest::new(RepositorySpec::git(
+        "app",
+        "ext::sh -c 'touch /tmp/pwned'",
+        None,
+    ));
+
+    let error = provisioner
+        .provision("exec-ext", &request)
+        .expect_err("the ext:: transport must be refused");
+
+    assert!(
+        matches!(error, WorkspaceError::UnsafeRemote { .. }),
+        "expected UnsafeRemote, got {error:?}"
+    );
+    assert!(
+        !provisioner.task_dir("exec-ext").exists(),
+        "a refused request must not leave a task directory behind"
+    );
+}
+
+#[test]
+fn a_remote_that_git_would_read_as_an_option_is_rejected() {
+    let root = TempRoot::new();
+    let provisioner = WorkspaceProvisioner::new(root.path());
+    let request =
+        WorkspaceRequest::new(RepositorySpec::git("app", "--upload-pack=touch /tmp/x", None));
+
+    assert!(matches!(
+        provisioner.validate(&request),
+        Err(WorkspaceError::UnsafeRemote { .. })
+    ));
+}
+
+#[test]
+fn a_ref_that_git_would_read_as_an_option_is_rejected() {
+    let root = TempRoot::new();
+    let provisioner = WorkspaceProvisioner::new(root.path());
+    let request = WorkspaceRequest::new(RepositorySpec::git(
+        "app",
+        "https://example.invalid/app.git",
+        Some("--output=/tmp/x".to_string()),
+    ));
+
+    assert!(matches!(
+        provisioner.validate(&request),
+        Err(WorkspaceError::UnsafeRef { .. })
+    ));
+}
+
+#[test]
+fn a_password_embedded_in_a_remote_never_reaches_the_error_message() {
+    let root = TempRoot::new();
+    let provisioner = WorkspaceProvisioner::new(root.path());
+    let request = WorkspaceRequest::new(RepositorySpec::git(
+        "app",
+        "https://oauth2:glpat-SUPERSECRET@gitlab.invalid/acme/app.git",
+        None,
+    ));
+
+    let error = provisioner
+        .provision("exec-secret", &request)
+        .expect_err("cloning an unreachable host must fail");
+
+    let rendered = format!("{error} {error:?}");
+    assert!(
+        !rendered.contains("glpat-SUPERSECRET"),
+        "the token leaked into the error: {rendered}"
+    );
+    assert!(
+        rendered.contains("***"),
+        "the redaction marker is missing: {rendered}"
+    );
+}

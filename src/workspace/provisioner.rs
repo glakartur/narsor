@@ -122,6 +122,28 @@ pub enum WorkspaceError {
         stderr: String,
     },
 
+    /// A git remote that `git` would not read as a plain URL.
+    #[error("repository '{repository}' has an unusable remote '{remote}': {reason}")]
+    UnsafeRemote {
+        /// The repository the remote belongs to.
+        repository: String,
+        /// The rejected remote.
+        remote: String,
+        /// Why it was rejected.
+        reason: String,
+    },
+
+    /// A git reference that `git` would not read as a plain reference.
+    #[error("repository '{repository}' has an unusable ref '{git_ref}': {reason}")]
+    UnsafeRef {
+        /// The repository the reference belongs to.
+        repository: String,
+        /// The rejected reference.
+        git_ref: String,
+        /// Why it was rejected.
+        reason: String,
+    },
+
     /// Two repositories in one request share a name, so they would collide.
     #[error("repository name '{name}' is used more than once in the same workspace")]
     DuplicateRepositoryName {
@@ -168,9 +190,9 @@ impl WorkspaceError {
     ) -> Self {
         Self::Git {
             repository: repository.into(),
-            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            args: args.iter().map(|arg| redact_credentials(arg)).collect(),
             status,
-            stderr: stderr.into().trim().to_string(),
+            stderr: redact_credentials(stderr.into().trim()),
         }
     }
 }
@@ -413,6 +435,13 @@ impl WorkspaceProvisioner {
             }
             seen.push(&spec.name);
 
+            if let RepositorySource::Git { remote, git_ref } = &spec.source {
+                check_remote(&spec.name, remote)?;
+                if let Some(git_ref) = git_ref {
+                    check_ref(&spec.name, git_ref)?;
+                }
+            }
+
             if let RepositorySource::Local { path } = &spec.source {
                 if !path.exists() {
                     return Err(WorkspaceError::SourceNotFound {
@@ -610,6 +639,90 @@ struct GitRun {
     stdout: String,
     /// Standard error, trimmed of surrounding whitespace.
     stderr: String,
+}
+
+/// Replaces the password of any `scheme://user:password@host` URL with `***`.
+///
+/// `git` echoes the remote back in most of its error messages, so a remote
+/// carrying an embedded token would otherwise write that token into
+/// `state.json` and into the log the moment a clone fails. Redaction happens
+/// where the error is built, so no call site can forget it.
+fn redact_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(marker) = rest.find("://") {
+        let (before, after) = rest.split_at(marker + 3);
+        out.push_str(before);
+
+        // The authority ends at the first '/', or at whitespace when the URL
+        // carries no path at all.
+        let end = after
+            .find(|c: char| c == '/' || c.is_whitespace())
+            .unwrap_or(after.len());
+        let (authority, tail) = after.split_at(end);
+
+        match (authority.find('@'), authority.find(':')) {
+            (Some(at), Some(colon)) if colon < at => {
+                out.push_str(&authority[..=colon]);
+                out.push_str("***");
+                out.push_str(&authority[at..]);
+            }
+            _ => out.push_str(authority),
+        }
+        rest = tail;
+    }
+
+    out.push_str(rest);
+    out
+}
+
+/// Rejects a remote `git` would not read as a plain URL.
+///
+/// Two cases matter. A value starting with `-` is read as an option, and the
+/// `ext::` transport makes `git` run an arbitrary command. Neither is reachable
+/// from a hand-written workflow by accident, but a remote can come from
+/// `{{ inputs.* }}`, which is supplied when the workflow is *run* rather than
+/// when it is authored — a lower trust level than the file itself.
+fn check_remote(repository: &str, remote: &str) -> Result<()> {
+    let reason = if remote.trim().is_empty() {
+        Some("it is empty")
+    } else if remote.starts_with('-') {
+        Some("a value starting with '-' is read by git as an option")
+    } else if remote.len() >= 5 && remote[..5].eq_ignore_ascii_case("ext::") {
+        Some("the ext:: transport makes git execute an arbitrary command")
+    } else {
+        None
+    };
+
+    match reason {
+        Some(reason) => Err(WorkspaceError::UnsafeRemote {
+            repository: repository.to_string(),
+            remote: redact_credentials(remote),
+            reason: reason.to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Rejects a reference `git` would read as an option rather than a revision.
+fn check_ref(repository: &str, git_ref: &str) -> Result<()> {
+    let reason = if git_ref.trim().is_empty() {
+        Some("it is empty")
+    } else if git_ref.starts_with('-') {
+        Some("a value starting with '-' is read by git as an option")
+    } else {
+        None
+    };
+
+    match reason {
+        Some(reason) => Err(WorkspaceError::UnsafeRef {
+            repository: repository.to_string(),
+            git_ref: git_ref.to_string(),
+            reason: reason.to_string(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Runs the `git` command-line tool and captures both of its streams.
