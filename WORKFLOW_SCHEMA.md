@@ -235,6 +235,17 @@ action:
 
 **Wyjścia:** Zazwyczaj `received` (gdy zdarzenie nastąpiło) lub `timeout` (gdy upłynął czas).
 
+#### Zakres szablonów `{{ }}`
+
+Szablony są podstawiane tuż przed wykonaniem akcji — w promptach, komendach, argumentach, zmiennych środowiskowych i filtrach zdarzeń. Obsługiwane są wyłącznie dwie formy odwołań:
+
+- `{{ inputs.NAZWA }}` — wejście workflow zadeklarowane w sekcji `inputs`,
+- `{{ context.variables.NAZWA }}` — zmienna kontekstu, wraz ze skrótem `{{ context.NAZWA }}`, który znaczy dokładnie to samo.
+
+Białe znaki wewnątrz `{{ }}` są ignorowane. Nie ma filtrów (`| default(...)`), wyrażeń, warunków ani pętli — to świadomie prosty mechanizm podstawiania, a nie silnik szablonów. Odwołanie do nieistniejącego wejścia lub nieistniejącej zmiennej jest **błędem**, który przerywa akcję; orchestrator nigdy nie podstawia po cichu pustego stringa. Podstawianie jest jednoprzebiegowe: jeśli wartość zmiennej sama zawiera `{{ ... }}`, nie jest rozwijana ponownie.
+
+Wartości nie-stringowe renderują się jako JSON: liczba i wartość logiczna bez cudzysłowów (`123`, `true`), lista i obiekt w postaci kompaktowej (`["a","b"]`).
+
 ---
 
 ### 3.4. Decision Providers (Dostawcy Decyzji)
@@ -361,7 +372,7 @@ states:
       type: agent
       harness: claude-code
       prompt: |
-        Zaimplementuj funkcję zgodnie z planem w plan.md i doprecyzowaniem: {{ context.clarification_text | default(inputs.feature_description) }}.
+        Zaimplementuj funkcję zgodnie z planem w plan.md i doprecyzowaniem od człowieka: {{ context.clarification_text }}.
         Upewnij się, że kod kompiluje się.
     outputs:
       - implemented
