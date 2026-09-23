@@ -31,8 +31,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
 
-# Git integration
-git2 = "0.18"
+# Git integration is done by invoking the `git` command-line tool
+# (see src/workspace/provisioner.rs), which is a runtime prerequisite.
 
 # Validation
 validator = { version = "0.16", features = ["derive"] }

@@ -25,11 +25,21 @@
 //! at the user's real working directory, so an agent's writes would land in
 //! their actual repository — precisely the accident the workspace exists to
 //! prevent. Copying costs disk space; a symlink costs the user their work.
+//!
+//! # The `git` command-line tool is a runtime prerequisite
+//!
+//! Every git operation here shells out to `git`, found on `PATH`. No linked
+//! git library is used: libgit ignores `~/.ssh/config` host aliases and
+//! `IdentityFile`, git credential helpers and `url.*.insteadOf` rewrites, so
+//! it cannot clone the private repositories the user can clone by hand.
+//! Running the user's own `git` makes their existing authentication simply
+//! work, and lets every failure be reported in git's own words.
 
 use crate::domain::{RepositoryInfo, Workspace};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use thiserror::Error;
 
 /// Directory holding every execution workspace, directly under the root.
@@ -85,18 +95,31 @@ pub enum WorkspaceError {
         git_ref: String,
         /// The repository the reference was looked up in.
         repository: String,
-        /// What `git2` said about the failed lookup.
+        /// What `git` said on stderr about the failed lookup.
         detail: String,
     },
 
-    /// A git operation failed for a reason other than a missing reference.
-    #[error("git error on repository '{repository}': {source}")]
+    /// A `git` invocation failed for a reason other than a missing reference.
+    ///
+    /// Carries the whole story of the failure: which command was run, how it
+    /// ended, and everything `git` printed on stderr. The stderr is the point
+    /// — an authentication or ref-lookup failure is diagnosed by reading what
+    /// git itself said about it.
+    #[error(
+        "git error on repository '{repository}': `git {}` failed with {}: {stderr}",
+        .args.join(" "),
+        .status.map(|code| format!("exit status {code}")).unwrap_or_else(|| "a signal".to_string())
+    )]
     Git {
         /// The repository being operated on.
         repository: String,
-        /// The underlying `git2` error.
-        #[source]
-        source: git2::Error,
+        /// The arguments `git` was invoked with, without the `git` itself.
+        args: Vec<String>,
+        /// The exit status, or `None` when git was killed by a signal or
+        /// could not be started at all.
+        status: Option<i32>,
+        /// Everything `git` wrote to stderr, trimmed.
+        stderr: String,
     },
 
     /// Two repositories in one request share a name, so they would collide.
@@ -135,11 +158,19 @@ impl WorkspaceError {
         }
     }
 
-    /// Wraps a [`git2::Error`] together with the repository it happened on.
-    fn git(repository: impl Into<String>, source: git2::Error) -> Self {
+    /// Wraps a failed `git` invocation together with the repository it
+    /// happened on, keeping git's own stderr verbatim.
+    fn git(
+        repository: impl Into<String>,
+        args: &[&str],
+        status: Option<i32>,
+        stderr: impl Into<String>,
+    ) -> Self {
         Self::Git {
             repository: repository.into(),
-            source,
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            status,
+            stderr: stderr.into().trim().to_string(),
         }
     }
 }
@@ -569,6 +600,69 @@ impl WorkspaceProvisioner {
     }
 }
 
+/// One completed `git` invocation, with both streams already decoded.
+struct GitRun {
+    /// Whether git exited with status 0.
+    ok: bool,
+    /// The exit code, or `None` when git was killed by a signal.
+    code: Option<i32>,
+    /// Standard output, trimmed of surrounding whitespace.
+    stdout: String,
+    /// Standard error, trimmed of surrounding whitespace.
+    stderr: String,
+}
+
+/// Runs the `git` command-line tool and captures both of its streams.
+///
+/// `git` is looked up by name, so the `PATH` of the running process decides
+/// which installation is used — never a path hardcoded here. The orchestrator
+/// therefore requires `git` to be installed and on `PATH` at runtime; see the
+/// module documentation.
+///
+/// `GIT_TERMINAL_PROMPT=0` keeps every invocation non-interactive: a missing
+/// credential fails immediately with a message on stderr instead of blocking
+/// an unattended execution on a password prompt. Everything else about the
+/// user's environment is left alone on purpose — `~/.ssh/config` aliases,
+/// credential helpers and `url.*.insteadOf` rewrites are exactly what shelling
+/// out to `git` buys us.
+fn git_run(args: &[&str]) -> io::Result<GitRun> {
+    let output = Command::new("git")
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()?;
+    Ok(GitRun {
+        ok: output.status.success(),
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
+}
+
+/// Runs `git` and returns its stdout, turning any failure into
+/// [`WorkspaceError::Git`] with git's own stderr attached.
+fn run_git(repository: &str, args: &[&str]) -> Result<String> {
+    let run = git_run(args).map_err(|error| {
+        WorkspaceError::git(repository, args, None, format!("could not run git: {error}"))
+    })?;
+    if !run.ok {
+        return Err(WorkspaceError::git(repository, args, run.code, run.stderr));
+    }
+    Ok(run.stdout)
+}
+
+/// Runs `git` where a failure is an answer rather than an error: `None` means
+/// "git said no", which is how the absence of an upstream or of a remote is
+/// detected.
+fn git_stdout(args: &[&str]) -> Option<String> {
+    let run = git_run(args).ok()?;
+    run.ok.then_some(run.stdout)
+}
+
+/// Whether `git` exits cleanly, discarding its output.
+fn git_succeeds(args: &[&str]) -> bool {
+    git_run(args).map(|run| run.ok).unwrap_or(false)
+}
+
 /// Clones `remote` into `target` and checks out `git_ref`.
 fn clone_repository(
     remote: &str,
@@ -576,13 +670,13 @@ fn clone_repository(
     repository: &str,
     target: &Path,
 ) -> Result<()> {
-    let repo = git2::Repository::clone(remote, target)
-        .map_err(|source| WorkspaceError::git(repository, source))?;
+    let target_arg = target.to_string_lossy().into_owned();
+    run_git(repository, &["clone", "--", remote, &target_arg])?;
 
     let Some(git_ref) = git_ref else {
         return Ok(());
     };
-    checkout_ref(&repo, git_ref, repository)
+    checkout_ref(target, git_ref, repository)
 }
 
 /// Checks `git_ref` out in an already cloned repository.
@@ -592,79 +686,128 @@ fn clone_repository(
 /// still resolves. A remote branch is materialised as a local branch tracking
 /// it, which is what makes the "unpushed commits" check meaningful later;
 /// anything else (a tag or a commit) lands on a detached HEAD.
-fn checkout_ref(repo: &git2::Repository, git_ref: &str, repository: &str) -> Result<()> {
-    let (object, reference) = repo
-        .revparse_ext(git_ref)
-        .or_else(|_| repo.revparse_ext(&format!("origin/{git_ref}")))
-        .map_err(|source| WorkspaceError::RefNotFound {
+fn checkout_ref(path: &Path, git_ref: &str, repository: &str) -> Result<()> {
+    let dir = path.to_string_lossy().into_owned();
+    let candidates = [git_ref.to_string(), format!("origin/{git_ref}")];
+
+    let mut detail = String::new();
+    let mut resolved = None;
+    for candidate in &candidates {
+        // `<rev>^{commit}` refuses anything that is not a commit-ish, which is
+        // the same bar `revparse_ext` used to apply.
+        let run = git_run(&[
+            "-C",
+            &dir,
+            "rev-parse",
+            "--verify",
+            &format!("{candidate}^{{commit}}"),
+        ])
+        .map_err(|error| {
+            WorkspaceError::git(
+                repository,
+                &["rev-parse", "--verify", candidate],
+                None,
+                format!("could not run git: {error}"),
+            )
+        })?;
+        if run.ok {
+            resolved = Some(candidate.clone());
+            break;
+        }
+        detail = run.stderr;
+    }
+
+    let Some(resolved) = resolved else {
+        return Err(WorkspaceError::RefNotFound {
             git_ref: git_ref.to_string(),
             repository: repository.to_string(),
-            detail: source.message().to_string(),
-        })?;
+            detail,
+        });
+    };
 
-    let mut checkout = git2::build::CheckoutBuilder::new();
-    checkout.force();
-    repo.checkout_tree(&object, Some(&mut checkout))
-        .map_err(|source| WorkspaceError::git(repository, source))?;
-
-    match reference {
-        Some(reference) if reference.is_branch() => {
-            let name = reference
-                .name()
-                .ok_or_else(|| WorkspaceError::RefNotFound {
-                    git_ref: git_ref.to_string(),
-                    repository: repository.to_string(),
-                    detail: "reference name is not valid UTF-8".to_string(),
-                })?
-                .to_string();
-            repo.set_head(&name)
-                .map_err(|source| WorkspaceError::git(repository, source))?;
-        }
-        Some(reference) if reference.is_remote() => {
-            let commit = object
-                .peel_to_commit()
-                .map_err(|source| WorkspaceError::git(repository, source))?;
-            let short = git_ref.rsplit('/').next().unwrap_or(git_ref);
-            let mut branch = repo
-                .branch(short, &commit, true)
-                .map_err(|source| WorkspaceError::git(repository, source))?;
-            if let Some(upstream) = reference.shorthand() {
-                branch
-                    .set_upstream(Some(upstream))
-                    .map_err(|source| WorkspaceError::git(repository, source))?;
-            }
-            repo.set_head(&format!("refs/heads/{short}"))
-                .map_err(|source| WorkspaceError::git(repository, source))?;
-        }
-        _ => {
-            repo.set_head_detached(object.id())
-                .map_err(|source| WorkspaceError::git(repository, source))?;
-        }
+    if git_succeeds(&[
+        "-C",
+        &dir,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        &format!("refs/heads/{resolved}"),
+    ]) {
+        run_git(repository, &["-C", &dir, "checkout", "--force", &resolved])?;
+        return Ok(());
     }
+
+    if git_succeeds(&[
+        "-C",
+        &dir,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        &format!("refs/remotes/{resolved}"),
+    ]) {
+        // A remote-tracking ref becomes a local branch of the same short name,
+        // tracking the ref it came from.
+        let short = resolved.rsplit('/').next().unwrap_or(&resolved).to_string();
+        run_git(
+            repository,
+            &["-C", &dir, "checkout", "--force", "-B", &short, &resolved],
+        )?;
+        run_git(
+            repository,
+            &[
+                "-C",
+                &dir,
+                "branch",
+                &format!("--set-upstream-to={resolved}"),
+                &short,
+            ],
+        )?;
+        return Ok(());
+    }
+
+    run_git(
+        repository,
+        &["-C", &dir, "checkout", "--force", "--detach", &resolved],
+    )?;
     Ok(())
+}
+
+/// Whether `path` is itself the root of a git repository.
+///
+/// `git rev-parse` walks up into parent directories, which would make every
+/// directory inside a checked-out repository look like one; comparing the
+/// reported top level against `path` keeps the answer about `path` alone.
+fn is_git_repository(path: &Path) -> bool {
+    let dir = path.to_string_lossy().into_owned();
+    let Some(top_level) = git_stdout(&["-C", &dir, "rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    match (fs::canonicalize(top_level), fs::canonicalize(path)) {
+        (Ok(top_level), Ok(path)) => top_level == path,
+        _ => false,
+    }
 }
 
 /// Reports uncommitted changes or unpushed commits in one repository.
 ///
 /// Returns `None` for a directory that is not a git repository at all.
 fn unsaved_work_in_repository(path: &Path, name: &str) -> Result<Option<String>> {
-    let Ok(repo) = git2::Repository::open(path) else {
+    if !is_git_repository(path) {
         return Ok(None);
-    };
+    }
+    let dir = path.to_string_lossy().into_owned();
 
-    let mut options = git2::StatusOptions::new();
-    options.include_untracked(true).include_ignored(false);
-    let statuses = repo
-        .statuses(Some(&mut options))
-        .map_err(|source| WorkspaceError::git(name, source))?;
-    if !statuses.is_empty() {
+    // `--porcelain` is stable across git versions, configurations and locales,
+    // and lists untracked files (but not ignored ones) by default.
+    let status = run_git(name, &["-C", &dir, "status", "--porcelain"])?;
+    let changes = status.lines().filter(|line| !line.trim().is_empty()).count();
+    if changes > 0 {
         return Ok(Some(format!(
-            "repository '{name}' has {} uncommitted change(s)",
-            statuses.len()
+            "repository '{name}' has {changes} uncommitted change(s)"
         )));
     }
 
-    Ok(unpushed_commits(&repo, name))
+    Ok(unpushed_commits(path, name))
 }
 
 /// Reports commits that exist only in this checkout.
@@ -673,25 +816,39 @@ fn unsaved_work_in_repository(path: &Path, name: &str) -> Result<Option<String>>
 /// upstream counts as unpushed only when the repository has a remote at all:
 /// a repository with no remote has nowhere to push to, so its commits are as
 /// safe as they will ever get and must not block cleanup forever.
-fn unpushed_commits(repo: &git2::Repository, name: &str) -> Option<String> {
-    let head = repo.head().ok()?;
-    if !head.is_branch() {
-        return None;
-    }
-    let local_oid = head.target()?;
-    let shorthand = head.shorthand().unwrap_or("HEAD").to_string();
+fn unpushed_commits(path: &Path, name: &str) -> Option<String> {
+    let dir = path.to_string_lossy().into_owned();
 
-    let branch = git2::Branch::wrap(head);
-    match branch.upstream() {
-        Ok(upstream) => {
-            let upstream_oid = upstream.get().target()?;
-            let (ahead, _behind) = repo.graph_ahead_behind(local_oid, upstream_oid).ok()?;
+    // A detached HEAD is not a branch, and an unborn one has no commits.
+    let shorthand = git_stdout(&["-C", &dir, "symbolic-ref", "--short", "HEAD"])?;
+    git_stdout(&["-C", &dir, "rev-parse", "--verify", "HEAD"])?;
+
+    match git_stdout(&[
+        "-C",
+        &dir,
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    ]) {
+        Some(upstream) => {
+            let ahead: usize = git_stdout(&[
+                "-C",
+                &dir,
+                "rev-list",
+                "--count",
+                &format!("{upstream}..HEAD"),
+            ])?
+            .parse()
+            .ok()?;
             (ahead > 0).then(|| {
                 format!("repository '{name}' has {ahead} commit(s) not pushed to its upstream")
             })
         }
-        Err(_) => {
-            let has_remote = repo.remotes().map(|list| !list.is_empty()).unwrap_or(false);
+        None => {
+            let has_remote = git_stdout(&["-C", &dir, "remote"])
+                .map(|remotes| !remotes.is_empty())
+                .unwrap_or(false);
             has_remote.then(|| {
                 format!("repository '{name}' is on branch '{shorthand}', which has no upstream")
             })
