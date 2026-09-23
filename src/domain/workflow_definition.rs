@@ -92,18 +92,15 @@ pub enum WorkspaceSpec {
 /// Type of an input parameter
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ParamType {
+    #[default]
     String,
     Integer,
     Boolean,
     Repository,
 }
 
-impl Default for ParamType {
-    fn default() -> Self {
-        ParamType::String
-    }
-}
 
 /// Input parameter definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,17 +130,14 @@ pub type StateId = String;
 /// [`crate::domain::ExecutionStatus`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TerminalStatus {
+    #[default]
     Completed,
     Failed,
     Cancelled,
 }
 
-impl Default for TerminalStatus {
-    fn default() -> Self {
-        TerminalStatus::Completed
-    }
-}
 
 impl From<TerminalStatus> for ExecutionStatus {
     fn from(status: TerminalStatus) -> Self {

@@ -447,11 +447,13 @@ pub fn list(root: &Path) -> Result<()> {
             Err(error) => eprintln!("Skipping execution '{id}': {error}"),
         }
     }
-    executions.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+    // Newest first: the execution an operator just started is the one they
+    // are looking for.
+    executions.sort_by_key(|execution| std::cmp::Reverse(execution.started_at));
 
     println!(
-        "{:<38} {:<10} {:<22} {}",
-        "ID", "STATUS", "STATE", "WORKFLOW"
+        "{:<38} {:<10} {:<22} WORKFLOW",
+        "ID", "STATUS", "STATE"
     );
     for execution in &executions {
         println!(

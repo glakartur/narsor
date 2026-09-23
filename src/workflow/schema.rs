@@ -195,18 +195,15 @@ pub struct InputSchema {
 /// Declared type of an input parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ParamTypeSchema {
+    #[default]
     String,
     Integer,
     Boolean,
     Repository,
 }
 
-impl Default for ParamTypeSchema {
-    fn default() -> Self {
-        ParamTypeSchema::String
-    }
-}
 
 /// The `globals` section (§3.2).
 #[derive(Debug, Clone, Default, Deserialize)]

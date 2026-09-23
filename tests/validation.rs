@@ -458,7 +458,7 @@ fn five_violations_are_reported_as_five_errors() {
     ];
     for (index, matches_rule) in expected.iter().enumerate() {
         assert!(
-            errors.iter().any(|err| matches_rule(err)),
+            errors.iter().any(matches_rule),
             "violation {} is missing, got: {}",
             index + 1,
             describe(&errors)
