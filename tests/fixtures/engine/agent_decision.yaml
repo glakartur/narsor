@@ -1,0 +1,27 @@
+name: agent-decision
+version: 1
+description: >
+  A state that delegates the choice of transition to an agent, which this
+  version of the orchestrator cannot do.
+
+states:
+  check:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "ok"}'
+    outputs:
+      - ok
+    transitions:
+      ok: completed
+    decision:
+      type: agent
+      harness: claude-code
+      prompt: Decide whether this is good enough.
+
+  completed:
+    description: Done.
+
+terminal_states:
+  - completed

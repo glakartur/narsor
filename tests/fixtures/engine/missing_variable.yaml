@@ -1,0 +1,24 @@
+name: missing-context-variable
+version: 1
+description: >
+  A state whose argument refers to a context variable nobody ever set. Static
+  validation cannot catch it — the context only exists at runtime — so entering
+  the state must fail the action with a message naming the variable.
+
+states:
+  greet:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "ok", "variables": {"greeting": "{{ context.variables.nobody_set_this }}"}}'
+    outputs:
+      - ok
+    transitions:
+      ok: completed
+
+  completed:
+    description: Done.
+
+terminal_states:
+  - completed

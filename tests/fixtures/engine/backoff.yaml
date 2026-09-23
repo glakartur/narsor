@@ -1,0 +1,28 @@
+name: growing-backoff
+version: 1
+description: >
+  Three attempts with a one-second backoff. The multiplier is not part of the
+  YAML contract and defaults to 2, so the waits before the two retries are one
+  and two seconds — visible in the timestamps of the ActionRetrying events.
+
+states:
+  build:
+    action:
+      type: script
+      command: ./flaky_crash.sh
+      args:
+        - attempts.txt
+        - "2"
+    retry_policy:
+      max_attempts: 3
+      backoff: 1s
+    outputs:
+      - success
+    transitions:
+      success: completed
+
+  completed:
+    description: Done.
+
+terminal_states:
+  - completed

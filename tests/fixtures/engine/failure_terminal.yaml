@@ -1,0 +1,29 @@
+name: ends-in-failure
+version: 1
+description: >
+  A script that reports the label leading to the `failed` terminal state. The
+  action itself succeeded — the workflow is what failed.
+
+states:
+  check:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "broken", "variables": {"reason": "nothing compiles"}}'
+    outputs:
+      - ok
+      - broken
+    transitions:
+      ok: completed
+      broken: failed
+
+  completed:
+    description: All good.
+
+  failed:
+    description: Not good.
+
+terminal_states:
+  - completed
+  - failed

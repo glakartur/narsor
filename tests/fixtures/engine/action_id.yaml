@@ -1,0 +1,29 @@
+name: idempotency-key
+version: 1
+description: >
+  A state whose script records the ORCHESTRATOR_ACTION_ID it was given, twice
+  per invocation, and fails once. The recording shows that the key is stable
+  within an attempt and different in the retry (D24).
+
+states:
+  build:
+    action:
+      type: script
+      command: ./record_action_id.sh
+      args:
+        - action_ids.txt
+        - attempts.txt
+        - "1"
+    retry_policy:
+      max_attempts: 2
+      backoff: 0s
+    outputs:
+      - success
+    transitions:
+      success: completed
+
+  completed:
+    description: Done.
+
+terminal_states:
+  - completed

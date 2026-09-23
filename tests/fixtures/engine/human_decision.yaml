@@ -1,0 +1,33 @@
+name: human-decision
+version: 1
+description: >
+  The script runs to completion and a person then chooses which of the two
+  transitions to take. The choice arrives after the action finished, so the
+  engine must resume the step at its decision rather than run the action again.
+
+states:
+  check:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "ok", "variables": {"checked": true}}'
+    outputs:
+      - ok
+      - rejected
+    transitions:
+      ok: completed
+      rejected: failed
+    decision:
+      type: human
+      message: Is this good enough to ship?
+
+  completed:
+    description: Shipped.
+
+  failed:
+    description: Rejected.
+
+terminal_states:
+  - completed
+  - failed

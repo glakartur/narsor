@@ -1,0 +1,28 @@
+name: retry-until-it-works
+version: 1
+description: >
+  One state whose script dies by signal twice before succeeding, under a policy
+  of three total attempts and no backoff. `max_attempts` counts the first
+  attempt, so exactly two retries are permitted.
+
+states:
+  build:
+    action:
+      type: script
+      command: ./flaky_crash.sh
+      args:
+        - attempts.txt
+        - "2"
+    retry_policy:
+      max_attempts: 3
+      backoff: 0s
+    outputs:
+      - success
+    transitions:
+      success: completed
+
+  completed:
+    description: The build eventually went through.
+
+terminal_states:
+  - completed

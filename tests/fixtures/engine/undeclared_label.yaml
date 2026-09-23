@@ -1,0 +1,25 @@
+name: undeclared-label
+version: 1
+description: >
+  A script that reports a label the state does not declare. Executors report
+  whatever they observe; judging it against `outputs` is the engine's job.
+
+states:
+  check:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "weird"}'
+    outputs:
+      - ok
+      - broken
+    transitions:
+      ok: completed
+      broken: completed
+
+  completed:
+    description: Done.
+
+terminal_states:
+  - completed

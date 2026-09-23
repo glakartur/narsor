@@ -1,0 +1,34 @@
+name: two-steps
+version: 1
+description: >
+  Two script states in a row. Used for anything that needs a step boundary in
+  the middle of an execution: pausing, and crashing between two states.
+
+states:
+  first:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "done", "variables": {"first": "yes"}}'
+    outputs:
+      - done
+    transitions:
+      done: second
+
+  second:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "done", "variables": {"second": "yes"}}'
+    outputs:
+      - done
+    transitions:
+      done: completed
+
+  completed:
+    description: Done.
+
+terminal_states:
+  - completed

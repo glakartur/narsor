@@ -1,0 +1,36 @@
+name: pausable
+version: 1
+description: >
+  Two states whose first action takes long enough to be paused while it runs.
+  Pausing means "do not start the next action" (D34), so the slow action still
+  finishes and its transition is still taken.
+
+states:
+  slow:
+    action:
+      type: script
+      command: ./sleep_then_emit.sh
+      args:
+        - "0.4"
+        - '{"output": "done", "variables": {"slow": "finished"}}'
+    outputs:
+      - done
+    transitions:
+      done: fast
+
+  fast:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "done", "variables": {"fast": "finished"}}'
+    outputs:
+      - done
+    transitions:
+      done: completed
+
+  completed:
+    description: Done.
+
+terminal_states:
+  - completed

@@ -1,0 +1,51 @@
+name: linear-three-states
+version: 1
+description: >
+  Three script states in a row, then a success terminal. Each state reports a
+  variable, and the last one reads back a variable the first one set — which
+  only works if templates are expanded on entering the state, not at load time.
+
+inputs:
+  - name: subject
+    type: string
+    required: true
+
+states:
+  first:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "done", "variables": {"first": "one"}}'
+    outputs:
+      - done
+    transitions:
+      done: second
+
+  second:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "done", "variables": {"second": "{{ inputs.subject }}"}}'
+    outputs:
+      - done
+    transitions:
+      done: third
+
+  third:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "done", "variables": {"third": "after {{ context.variables.first }}"}}'
+    outputs:
+      - done
+    transitions:
+      done: completed
+
+  completed:
+    description: Everything went through.
+
+terminal_states:
+  - completed

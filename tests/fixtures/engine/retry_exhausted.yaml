@@ -1,0 +1,30 @@
+name: retry-exhausted
+version: 1
+description: >
+  A state whose script always dies by signal, under a global policy of two
+  attempts. The retries run out and the action fails, which fails the execution
+  without taking any transition.
+
+globals:
+  retry_policy:
+    max_attempts: 2
+    backoff: 0s
+
+states:
+  build:
+    action:
+      type: script
+      command: ./flaky_crash.sh
+      args:
+        - attempts.txt
+        - "99"
+    outputs:
+      - success
+    transitions:
+      success: completed
+
+  completed:
+    description: Unreachable in practice.
+
+terminal_states:
+  - completed

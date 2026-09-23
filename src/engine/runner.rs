@@ -1,0 +1,1331 @@
+//! The engine loop: walk the graph, one state at a time, until it stops.
+//!
+//! # The order of events is the contract
+//!
+//! One step emits, in this order (`DOMAIN_MODEL.md` §4.2–4.3):
+//!
+//! ```text
+//! StateEntered -> ActionStarted -> (ActionRetrying)* -> ActionCompleted
+//!              -> DecisionMade -> [context written] -> TransitionTaken -> [state.json written]
+//! ```
+//!
+//! Recovery is *derived* from that order (see [`crate::persistence::recovery`]),
+//! so it is not merely a convention to be tidy about: an `ActionStarted` with no
+//! `ActionCompleted` or `ActionFailed` after it is the definition of an
+//! interrupted action, and nothing else marks one.
+//!
+//! Two deliberate refinements of the diagram in the plan:
+//!
+//! * **Templates are expanded after `ActionStarted`, not before.** Expansion can
+//!   fail (an unknown `context.variables.*`), and that failure has to be
+//!   reported as an `ActionFailed` — which would otherwise be an `ActionFailed`
+//!   with no `ActionStarted` before it, the one shape recovery cannot read.
+//!   Expansion happens once per *attempt*, so a retry re-reads the context.
+//! * **Every attempt gets its own `ActionExecution` id.** D24 makes that id the
+//!   idempotency key handed to the child process; it must therefore be stable
+//!   within an attempt and different between retries. The new id is announced in
+//!   the `ActionRetrying` event, which carries one for exactly this reason.
+//!
+//! # Only the engine writes the context (D10)
+//!
+//! An action *proposes* variables in its result; they reach `context.json` here,
+//! after `DecisionMade` and before `TransitionTaken`, and nowhere else. The
+//! whole `WorkflowExecution` is written with them, because `state.json` embeds
+//! the context and is the authority — writing `context.json` alone would leave a
+//! stale copy inside `state.json`.
+//!
+//! # Resuming in the middle of a step
+//!
+//! A step can be interrupted after its action finished but before the
+//! transition was taken: by a crash, or on purpose when the state's decision
+//! provider is `human`. Re-running the action would be wrong (it may have had a
+//! side effect) and is often impossible (a person answered a question). So the
+//! result of a finished action is persisted, in `metadata.engine.pending_step`,
+//! the moment `ActionCompleted` is emitted, and the loop checks for it before
+//! entering a state: when one is there, the step resumes at the decision.
+//!
+//! # Terminal states: `Completed` or `Failed`
+//!
+//! The domain has no marker distinguishing a success terminal from a failure
+//! terminal — `WORKFLOW_SCHEMA.md` §4 just lists `completed` and `failed` under
+//! `terminal_states`. Until the schema grows one, the engine reads the state's
+//! **id**: the names in [`FAILURE_TERMINAL_STATE_IDS`], and anything starting
+//! with `fail`, end the execution as [`ExecutionStatus::Failed`]; every other
+//! terminal state completes it. See [`terminal_status`].
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use thiserror::Error;
+use tokio::sync::broadcast;
+use uuid::Uuid;
+
+use crate::domain::{
+    ActionConfig, ActionResult, Artifact, ArtifactReference, DecisionProviderType, Event,
+    EventData, ExecutionId, ExecutionStatus, OutputLabel, State, StateId, WorkflowDefinition,
+    WorkflowExecution, Workspace, WorkspaceInfo,
+};
+use crate::engine::actions::human::{
+    self, HumanActionError, HumanInputDelivery, HumanInputRequest, PendingHumanInput,
+};
+use crate::engine::actions::{
+    ActionExecutor, ActionOutcome, ActionRequest, HumanExecutor, ScriptExecutor, SuspendedAction,
+};
+use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
+use crate::engine::retry::RetrySchedule;
+use crate::persistence::{read_json, ExecutionStore, PersistenceError};
+use crate::workflow::TemplateScope;
+
+/// How many events the in-process broadcast channel buffers per receiver.
+///
+/// A receiver that falls further behind than this loses the events in between
+/// and is told so by `RecvError::Lagged`; the engine itself never blocks on it.
+pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Terminal state ids that end an execution as [`ExecutionStatus::Failed`].
+///
+/// A stopgap for the missing schema marker — see the module documentation.
+pub const FAILURE_TERMINAL_STATE_IDS: &[&str] = &[
+    "failed",
+    "failure",
+    "fail",
+    "error",
+    "aborted",
+    "abort",
+    "rejected",
+    "cancelled",
+    "canceled",
+];
+
+/// Key of the engine's own scratch area inside `WorkflowExecution::metadata`.
+pub const METADATA_ENGINE_KEY: &str = "engine";
+
+/// Key of the persisted mid-step state inside the engine's scratch area.
+pub const METADATA_PENDING_STEP_KEY: &str = "pending_step";
+
+/// How an execution ends when it enters the terminal state `state_id`.
+pub fn terminal_status(state_id: &str) -> ExecutionStatus {
+    let name = state_id.to_ascii_lowercase();
+    let failed = FAILURE_TERMINAL_STATE_IDS.contains(&name.as_str()) || name.starts_with("fail");
+
+    if failed {
+        ExecutionStatus::Failed
+    } else {
+        ExecutionStatus::Completed
+    }
+}
+
+/// The action types an executor can be registered for.
+///
+/// A typed key rather than a string, so that registering an executor for a
+/// misspelled action type cannot compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActionKind {
+    /// `AgentAction` — no executor in this version; register your own.
+    Agent,
+    /// `ScriptAction`.
+    Script,
+    /// `HumanAction`.
+    Human,
+    /// `WaitAction` — no executor in this version.
+    Wait,
+}
+
+impl ActionKind {
+    /// The kind of an action configuration.
+    pub fn of(action: &ActionConfig) -> Self {
+        match action {
+            ActionConfig::Agent(_) => Self::Agent,
+            ActionConfig::Script(_) => Self::Script,
+            ActionConfig::Human(_) => Self::Human,
+            ActionConfig::Wait(_) => Self::Wait,
+        }
+    }
+
+    /// The name this action type has in the YAML contract and in events.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Script => "script",
+            Self::Human => "human",
+            Self::Wait => "wait",
+        }
+    }
+}
+
+/// The result of a finished action, kept until its transition has been taken.
+///
+/// Persisted in `metadata.engine.pending_step` so that a step interrupted
+/// between `ActionCompleted` and `TransitionTaken` resumes at the decision
+/// instead of re-running the action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingStep {
+    /// The state whose action produced the result.
+    pub state_id: StateId,
+
+    /// The attempt that produced it (D24 idempotency key).
+    pub action_execution_id: String,
+
+    /// What the action returned.
+    pub result: ActionResult,
+
+    /// Artifacts the action reported, already recorded as events.
+    #[serde(default)]
+    pub artifacts: Vec<Artifact>,
+}
+
+/// Everything that stops the engine from running a step at all.
+///
+/// A *failing action* is not in here: an action that fails is an ordinary
+/// outcome of a workflow, recorded as `ActionFailed` and leaving the execution
+/// in [`ExecutionStatus::Failed`]. These variants are the cases where the engine
+/// itself cannot proceed.
+#[derive(Debug, Error)]
+pub enum EngineError {
+    /// The store could not be read or written.
+    #[error(transparent)]
+    Persistence(#[from] PersistenceError),
+
+    /// Delivering or recording human input failed.
+    #[error(transparent)]
+    HumanInput(#[from] HumanActionError),
+
+    /// The state's decision provider cannot be used.
+    #[error(transparent)]
+    Decision(#[from] DecisionError),
+
+    /// The definition does not pass static validation (§5).
+    #[error("workflow definition is invalid:\n  {}", violations.join("\n  "))]
+    InvalidDefinition {
+        /// Every violation, so the author sees them all at once.
+        violations: Vec<String>,
+    },
+
+    /// A running execution has no current state to step from.
+    #[error("execution '{execution_id}' has no current state")]
+    NoCurrentState {
+        /// The execution that was stepped.
+        execution_id: ExecutionId,
+    },
+
+    /// The execution points at a state the definition does not contain.
+    #[error(
+        "execution '{execution_id}' is at state '{state_id}', which workflow \
+         '{workflow_id}' does not define"
+    )]
+    UnknownState {
+        /// The execution that was stepped.
+        execution_id: ExecutionId,
+        /// The state it points at.
+        state_id: StateId,
+        /// The workflow it was started from.
+        workflow_id: String,
+    },
+
+    /// The execution is in a status the requested operation does not allow.
+    #[error("execution '{execution_id}' is {status} and cannot be {operation}")]
+    NotRunnable {
+        /// The execution that was addressed.
+        execution_id: ExecutionId,
+        /// Its status, as the schema spells it.
+        status: String,
+        /// What was attempted, e.g. `run`.
+        operation: &'static str,
+    },
+
+    /// The execution is paused on a question only a person can answer.
+    #[error(
+        "execution '{execution_id}' is waiting for human input; deliver the input \
+         instead of resuming it"
+    )]
+    AwaitingHumanInput {
+        /// The execution that was addressed.
+        execution_id: ExecutionId,
+    },
+
+    /// The engine's own bookkeeping inside `metadata` could not be read.
+    #[error("engine metadata of execution '{execution_id}' is unreadable: {message}")]
+    CorruptEngineMetadata {
+        /// The execution whose metadata is broken.
+        execution_id: ExecutionId,
+        /// What went wrong.
+        message: String,
+    },
+}
+
+/// Whether the loop keeps stepping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    /// Step again.
+    Continue,
+    /// The pass ends here: the execution finished, failed or suspended.
+    Stop,
+}
+
+/// How one attempt at an action ended, as far as the retry loop is concerned.
+enum AttemptOutcome {
+    /// The action produced a result.
+    Completed(ActionResult),
+    /// The action is waiting for a person; the pass ends.
+    AwaitingHumanInput(HumanInputRequest),
+}
+
+/// How the whole action of a state ended, retries included.
+enum ActionUpshot {
+    /// A result came back and the step can go on to its decision.
+    Completed {
+        /// The attempt that produced it.
+        action_execution_id: String,
+        /// What it produced.
+        result: ActionResult,
+    },
+    /// The execution is suspended or failed, and that is already persisted.
+    Stopped,
+}
+
+/// An attempt that produced no result.
+struct AttemptFailure {
+    /// The message that ends up in `ActionFailed`.
+    message: String,
+    /// Whether trying again could plausibly give a different answer.
+    retriable: bool,
+}
+
+impl AttemptFailure {
+    /// A failure worth another attempt: the action could not run, or ran out of
+    /// time.
+    fn retriable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retriable: true,
+        }
+    }
+
+    /// A failure that repeating cannot fix: a broken template, an unknown
+    /// action type, a label the state does not declare.
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retriable: false,
+        }
+    }
+}
+
+/// Runs workflow executions against a store.
+///
+/// One engine serves any number of executions and any number of workflow
+/// definitions: the definition is passed in per call rather than held, because
+/// an execution records the definition it belongs to and the caller (the CLI,
+/// the TUI) is the one that loaded it.
+///
+/// Every method takes `&self`, so the engine can be shared behind an [`Arc`]
+/// between a running pass and a user interface that pauses it.
+pub struct Engine {
+    store: ExecutionStore,
+    executors: HashMap<ActionKind, Arc<dyn ActionExecutor>>,
+    events: broadcast::Sender<Event>,
+    pause_requests: Mutex<HashSet<ExecutionId>>,
+}
+
+impl Engine {
+    /// Creates an engine with the executors of this version: `script` and
+    /// `human`.
+    ///
+    /// `agent` and `wait` are deliberately unregistered — they are Phase 3 — so
+    /// a workflow that uses one fails with a clear message instead of behaving
+    /// like something it is not. [`Engine::with_executor`] fills either in.
+    pub fn new(store: ExecutionStore) -> Self {
+        let mut executors: HashMap<ActionKind, Arc<dyn ActionExecutor>> = HashMap::new();
+        executors.insert(ActionKind::Script, Arc::new(ScriptExecutor::new()));
+        executors.insert(ActionKind::Human, Arc::new(HumanExecutor::new()));
+
+        Self {
+            store,
+            executors,
+            events: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
+            pause_requests: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Registers (or replaces) the executor for one action type.
+    pub fn with_executor(mut self, kind: ActionKind, executor: Arc<dyn ActionExecutor>) -> Self {
+        self.executors.insert(kind, executor);
+        self
+    }
+
+    /// The store this engine persists to.
+    pub fn store(&self) -> &ExecutionStore {
+        &self.store
+    }
+
+    /// Subscribes to the live event stream.
+    ///
+    /// Every event the engine appends to a log is published here, for every
+    /// execution it runs. This is the seam an SSE endpoint will take over
+    /// (D38): the transport changes, the contract does not. A receiver that is
+    /// dropped or falls behind never slows the engine down and never fails a
+    /// step — the send result is deliberately ignored.
+    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.events.subscribe()
+    }
+
+    // -----------------------------------------------------------------------
+    // Starting, running, pausing
+    // -----------------------------------------------------------------------
+
+    /// Creates an execution: directories, `state.json`, `context.json`,
+    /// `WorkflowStarted` (`DOMAIN_MODEL.md` §4.1).
+    ///
+    /// The definition is validated first: an invalid workflow must leave nothing
+    /// on disk. The context starts out holding the inputs, so that a template
+    /// may read a starting value through either `{{ inputs.x }}` or
+    /// `{{ context.variables.x }}`.
+    pub fn start(
+        &self,
+        definition: &WorkflowDefinition,
+        inputs: Value,
+        workspace: Workspace,
+    ) -> Result<WorkflowExecution, EngineError> {
+        definition
+            .validate()
+            .map_err(|violations| EngineError::InvalidDefinition {
+                violations: violations.iter().map(ToString::to_string).collect(),
+            })?;
+
+        let mut execution = WorkflowExecution::new(definition, inputs, workspace);
+
+        if let Some(object) = execution.inputs.as_object() {
+            execution.context.update_variables(object.clone());
+        }
+        execution.context.workspace = Some(WorkspaceInfo {
+            id: execution.workspace.id.clone(),
+            path: execution.workspace.path.clone(),
+            workspace_type: format!("{:?}", execution.workspace.workspace_type).to_lowercase(),
+        });
+
+        self.store.create_execution_dirs(&execution.id)?;
+        self.store.save_execution(&execution)?;
+
+        self.emit(
+            &execution.id,
+            EventData::WorkflowStarted {
+                workflow_id: definition.id.clone(),
+                workflow_version: definition.version,
+                inputs: execution.inputs.clone(),
+            },
+        )?;
+
+        Ok(execution)
+    }
+
+    /// Starts an execution and runs it until it stops.
+    pub async fn start_and_run(
+        &self,
+        definition: &WorkflowDefinition,
+        inputs: Value,
+        workspace: Workspace,
+    ) -> Result<WorkflowExecution, EngineError> {
+        let execution = self.start(definition, inputs, workspace)?;
+        self.run_loop(definition, execution).await
+    }
+
+    /// Runs a stored execution until it reaches a terminal state, suspends or
+    /// is paused.
+    ///
+    /// Only a `Running` execution can be run; a paused one goes through
+    /// [`Engine::resume`] or [`Engine::deliver_human_input`], which is what
+    /// keeps an answer from being delivered twice.
+    pub async fn run(
+        &self,
+        definition: &WorkflowDefinition,
+        execution_id: &str,
+    ) -> Result<WorkflowExecution, EngineError> {
+        let execution = self.store.load_execution(execution_id)?;
+        if execution.status != ExecutionStatus::Running {
+            return Err(self.not_runnable(&execution, "run"));
+        }
+        self.run_loop(definition, execution).await
+    }
+
+    /// Asks the pass currently running this execution to stop before its next
+    /// action (D34).
+    ///
+    /// Pausing never interrupts a running action: the current one finishes
+    /// normally and its transition is taken, and only then does the loop stop.
+    /// The request is in-process and is honoured by the next step boundary —
+    /// including the first one, if no pass is running yet. Use
+    /// [`Engine::pause_now`] to park an execution that nothing is stepping.
+    pub fn pause(&self, execution_id: &str) {
+        self.lock_pause_requests().insert(execution_id.to_string());
+    }
+
+    /// Whether a pause has been requested and not yet acted on.
+    pub fn is_pause_requested(&self, execution_id: &str) -> bool {
+        self.lock_pause_requests().contains(execution_id)
+    }
+
+    /// Parks a running execution immediately: status `Paused`, `WorkflowPaused`
+    /// in the log.
+    ///
+    /// For an execution no pass is stepping. Calling it on one that *is* being
+    /// stepped is harmless but pointless — the pass would save over it — so
+    /// [`Engine::pause`] is the right call there.
+    pub fn pause_now(
+        &self,
+        execution_id: &str,
+        reason: &str,
+    ) -> Result<WorkflowExecution, EngineError> {
+        let mut execution = self.store.load_execution(execution_id)?;
+        if execution.status != ExecutionStatus::Running {
+            return Err(self.not_runnable(&execution, "paused"));
+        }
+        self.pause_execution(&mut execution, reason)?;
+        Ok(execution)
+    }
+
+    /// Resumes a paused execution and runs it on.
+    ///
+    /// Refuses an execution that is paused on a question: that one needs an
+    /// answer, not a nudge.
+    pub async fn resume(
+        &self,
+        definition: &WorkflowDefinition,
+        execution_id: &str,
+    ) -> Result<WorkflowExecution, EngineError> {
+        let mut execution = self.store.load_execution(execution_id)?;
+
+        match execution.status {
+            ExecutionStatus::Running => {}
+            ExecutionStatus::Paused => {
+                if self.store.has_pending_input(execution_id) {
+                    return Err(EngineError::AwaitingHumanInput {
+                        execution_id: execution_id.to_string(),
+                    });
+                }
+                self.lock_pause_requests().remove(execution_id);
+                execution.status = ExecutionStatus::Running;
+                self.store.save_execution(&execution)?;
+                self.emit(execution_id, EventData::WorkflowResumed)?;
+            }
+            _ => return Err(self.not_runnable(&execution, "resumed")),
+        }
+
+        self.run_loop(definition, execution).await
+    }
+
+    /// The question an execution is waiting on, if it is waiting on one.
+    pub fn pending_input(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<PendingHumanInput>, EngineError> {
+        Ok(human::pending_input(&self.store, execution_id)?)
+    }
+
+    /// Delivers an answer to a paused execution and runs it on.
+    ///
+    /// Serves both places an execution can wait for a person: a `human` action,
+    /// where the answer *is* the action's result, and a `human` decision, where
+    /// the action already finished and the answer only picks the transition.
+    /// The two are told apart by the persisted mid-step state: a decision is
+    /// pending exactly when the action's result is already recorded.
+    pub async fn deliver_human_input(
+        &self,
+        definition: &WorkflowDefinition,
+        execution_id: &str,
+        delivery: &HumanInputDelivery,
+    ) -> Result<WorkflowExecution, EngineError> {
+        let from = self.store.event_log(execution_id).next_sequence()?;
+        let resumed = human::resume(&self.store, execution_id, delivery)?;
+        self.publish_from(execution_id, from)?;
+
+        let mut execution = resumed.execution;
+        self.lock_pause_requests().remove(execution_id);
+
+        let state_id = self.current_state_id(&execution)?;
+        let state = self.state_of(definition, &execution, &state_id)?;
+
+        let flow = match self.pending_step(&execution, &state_id)? {
+            Some(pending) => {
+                // The action had already finished: this answer is the decision.
+                let outcome = DecisionOutcome {
+                    label: resumed.result.output_label.clone(),
+                    provider: DecisionProviderType::Human,
+                    reasoning: None,
+                };
+                self.apply_decision(&mut execution, state, pending, outcome)?
+            }
+            None => {
+                // The answer is the human action's own result.
+                self.record_completion(
+                    &mut execution,
+                    state,
+                    resumed.pending.action_execution_id().to_string(),
+                    resumed.result,
+                )?
+            }
+        };
+
+        if flow == Flow::Stop {
+            return Ok(execution);
+        }
+        self.run_loop(definition, execution).await
+    }
+
+    // -----------------------------------------------------------------------
+    // The loop
+    // -----------------------------------------------------------------------
+
+    /// Steps until the execution stops being runnable.
+    async fn run_loop(
+        &self,
+        definition: &WorkflowDefinition,
+        mut execution: WorkflowExecution,
+    ) -> Result<WorkflowExecution, EngineError> {
+        loop {
+            if execution.status != ExecutionStatus::Running {
+                break;
+            }
+
+            if self.take_pause_request(&execution.id) {
+                self.pause_execution(&mut execution, "paused on operator request")?;
+                break;
+            }
+
+            let state_id = self.current_state_id(&execution)?;
+            let state = self.state_of(definition, &execution, &state_id)?;
+
+            let flow = match self.pending_step(&execution, &state_id)? {
+                Some(pending) => self.complete_step(&mut execution, state, pending)?,
+                None => self.enter_state(definition, &mut execution, state).await?,
+            };
+
+            if flow == Flow::Stop {
+                break;
+            }
+        }
+
+        Ok(execution)
+    }
+
+    /// Enters a state: `StateEntered`, then either the end of the workflow or
+    /// the state's action.
+    async fn enter_state(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &mut WorkflowExecution,
+        state: &State,
+    ) -> Result<Flow, EngineError> {
+        execution.current_state = Some(state.id.clone());
+        self.emit(
+            &execution.id,
+            EventData::StateEntered {
+                state_id: state.id.clone(),
+            },
+        )?;
+
+        if state.terminal {
+            self.finish(execution, state)?;
+            return Ok(Flow::Stop);
+        }
+
+        let Some(action) = &state.action else {
+            // Static validation rejects this, so reaching it means the
+            // definition was changed under a running execution.
+            let id = Uuid::new_v4().to_string();
+            self.emit(
+                &execution.id,
+                EventData::ActionStarted {
+                    action_execution_id: id.clone(),
+                    state_id: state.id.clone(),
+                    action_type: "none".to_string(),
+                },
+            )?;
+            self.fail_action(
+                execution,
+                &id,
+                format!("state '{}' is not terminal but has no action", state.id),
+            )?;
+            return Ok(Flow::Stop);
+        };
+
+        match self
+            .run_action(definition, execution, state, action)
+            .await?
+        {
+            ActionUpshot::Stopped => Ok(Flow::Stop),
+            ActionUpshot::Completed {
+                action_execution_id,
+                result,
+            } => self.record_completion(execution, state, action_execution_id, result),
+        }
+    }
+
+    /// Runs the action of a state, retrying it as the policy allows (D21).
+    ///
+    /// A failure that survived every attempt is already recorded as
+    /// `ActionFailed`, and a suspension is already persisted, so both come back
+    /// as [`ActionUpshot::Stopped`].
+    async fn run_action(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        action: &ActionConfig,
+    ) -> Result<ActionUpshot, EngineError> {
+        let schedule = RetrySchedule::resolve(state, &definition.globals);
+        let kind = ActionKind::of(action);
+        let timeout = state
+            .timeout_secs
+            .or(definition.globals.timeout_secs)
+            .map(Duration::from_secs);
+
+        let mut attempt = 1_u32;
+        let mut action_execution_id = Uuid::new_v4().to_string();
+
+        execution.current_action_execution = Some(action_execution_id.clone());
+        self.emit(
+            &execution.id,
+            EventData::ActionStarted {
+                action_execution_id: action_execution_id.clone(),
+                state_id: state.id.clone(),
+                action_type: kind.name().to_string(),
+            },
+        )?;
+
+        loop {
+            let attempted = self
+                .attempt_action(execution, state, action, &action_execution_id, timeout)
+                .await;
+
+            let failure = match attempted {
+                Ok(AttemptOutcome::AwaitingHumanInput(request)) => {
+                    self.suspend_for_input(
+                        execution,
+                        state,
+                        request,
+                        decision::permitted_labels(state),
+                    )?;
+                    return Ok(ActionUpshot::Stopped);
+                }
+                Ok(AttemptOutcome::Completed(result)) => {
+                    return Ok(ActionUpshot::Completed {
+                        action_execution_id,
+                        result,
+                    })
+                }
+                Err(failure) => failure,
+            };
+
+            if !failure.retriable || !schedule.permits_another(attempt) {
+                self.fail_action(execution, &action_execution_id, failure.message)?;
+                return Ok(ActionUpshot::Stopped);
+            }
+
+            attempt += 1;
+            let delay = schedule.delay_before(attempt);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+
+            // A fresh idempotency key per attempt (D24), announced in the event.
+            action_execution_id = Uuid::new_v4().to_string();
+            execution.current_action_execution = Some(action_execution_id.clone());
+            self.emit(
+                &execution.id,
+                EventData::ActionRetrying {
+                    action_execution_id: action_execution_id.clone(),
+                    retry_count: RetrySchedule::retry_count(attempt),
+                },
+            )?;
+        }
+    }
+
+    /// One attempt: expand the templates, hand the action to its executor,
+    /// translate what comes back.
+    async fn attempt_action(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        action: &ActionConfig,
+        action_execution_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<AttemptOutcome, AttemptFailure> {
+        let location = format!("state '{}'", state.id);
+
+        // Lazily, on entering the state, so that `{{ context.variables.x }}`
+        // picks up the value current at this moment (D31).
+        let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
+            .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
+        let rendered = scope
+            .render_action(action, &location)
+            .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
+
+        let kind = ActionKind::of(action);
+        let executor = self.executors.get(&kind).ok_or_else(|| {
+            AttemptFailure::permanent(format!(
+                "state '{}' uses a {} action, which is not available in this version \
+                 of the orchestrator",
+                state.id,
+                kind.name()
+            ))
+        })?;
+
+        let request = ActionRequest::new(&rendered, &execution.workspace, action_execution_id)
+            .with_timeout(timeout);
+
+        match executor.execute(request).await {
+            Ok(ActionOutcome::Completed(result)) => Ok(AttemptOutcome::Completed(result)),
+
+            Ok(ActionOutcome::TimedOut(timed_out)) => {
+                match timed_out.resolve(&decision::permitted_labels(state)) {
+                    Ok(result) => Ok(AttemptOutcome::Completed(result)),
+                    Err(error) => Err(AttemptFailure::retriable(error.message)),
+                }
+            }
+
+            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingHumanInput(request))) => {
+                Ok(AttemptOutcome::AwaitingHumanInput(request))
+            }
+
+            Err(error) => Err(AttemptFailure::retriable(error.message)),
+        }
+    }
+
+    /// Records a finished action: label check, `ActionCompleted`, artifacts,
+    /// and the mid-step state that makes the rest of the step resumable.
+    fn record_completion(
+        &self,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        action_execution_id: String,
+        result: ActionResult,
+    ) -> Result<Flow, EngineError> {
+        // A label the state does not declare is the engine's call, never the
+        // executor's — this is the message the operator sees.
+        if let Err(error) = decision::check_label(state, &result.output_label) {
+            self.fail_action(execution, &action_execution_id, error.to_string())?;
+            return Ok(Flow::Stop);
+        }
+
+        self.emit(
+            &execution.id,
+            EventData::ActionCompleted {
+                action_execution_id: action_execution_id.clone(),
+                output_label: result.output_label.clone(),
+            },
+        )?;
+
+        let artifacts = self.register_artifacts(execution, &action_execution_id, &result)?;
+
+        let pending = PendingStep {
+            state_id: state.id.clone(),
+            action_execution_id,
+            result,
+            artifacts,
+        };
+        self.write_pending_step(execution, &pending)?;
+        self.store.save_execution(execution)?;
+
+        self.complete_step(execution, state, pending)
+    }
+
+    /// The second half of a step: decide, write the context, transition.
+    fn complete_step(
+        &self,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        pending: PendingStep,
+    ) -> Result<Flow, EngineError> {
+        let request = match decision::decide(state, &pending.result) {
+            Ok(request) => request,
+            Err(error) => {
+                // A provider this version cannot use is a workflow-author
+                // error, not an action failure: say so and stop.
+                self.record_engine_error(execution, &error.to_string())?;
+                return Err(EngineError::Decision(error));
+            }
+        };
+
+        let outcome = match request {
+            DecisionRequest::Resolved(outcome) => outcome,
+            DecisionRequest::AwaitHuman { message } => {
+                let request = HumanInputRequest {
+                    action_execution_id: pending.action_execution_id.clone(),
+                    instruction: message,
+                    fields: Vec::new(),
+                };
+                self.suspend_for_input(
+                    execution,
+                    state,
+                    request,
+                    decision::permitted_labels(state),
+                )?;
+                return Ok(Flow::Stop);
+            }
+        };
+
+        self.apply_decision(execution, state, pending, outcome)
+    }
+
+    /// `DecisionMade` → context (D10) → `TransitionTaken` → `state.json`.
+    fn apply_decision(
+        &self,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        pending: PendingStep,
+        outcome: DecisionOutcome,
+    ) -> Result<Flow, EngineError> {
+        let target = match decision::check_label(state, &outcome.label) {
+            Ok(target) => target.clone(),
+            Err(error) => {
+                self.fail_action(execution, &pending.action_execution_id, error.to_string())?;
+                return Ok(Flow::Stop);
+            }
+        };
+
+        self.emit(
+            &execution.id,
+            EventData::DecisionMade {
+                provider: outcome.provider_name().to_string(),
+                output_label: outcome.label.clone(),
+                reasoning: outcome.reasoning.clone(),
+            },
+        )?;
+
+        // The one place the context is written (D10). `save_execution` writes
+        // `state.json` as well, because it embeds the context and is the
+        // authority; writing `context.json` alone would leave a stale copy.
+        execution
+            .context
+            .update_variables(pending.result.variables.clone());
+        for artifact in &pending.artifacts {
+            let key = artifact.name.clone().unwrap_or_else(|| artifact.id.clone());
+            execution.context.add_artifact(
+                key,
+                ArtifactReference {
+                    id: artifact.id.clone(),
+                    name: artifact.name.clone(),
+                    location: artifact.location.clone(),
+                    metadata: artifact.metadata.clone(),
+                },
+            );
+        }
+        self.clear_pending_step(execution);
+        self.store.save_execution(execution)?;
+
+        self.emit(
+            &execution.id,
+            EventData::TransitionTaken {
+                from_state: state.id.clone(),
+                to_state: target.clone(),
+                output_label: outcome.label,
+            },
+        )?;
+
+        execution.current_state = Some(target);
+        execution.current_action_execution = Some(pending.action_execution_id);
+        self.store.save_execution(execution)?;
+
+        Ok(Flow::Continue)
+    }
+
+    // -----------------------------------------------------------------------
+    // Endings
+    // -----------------------------------------------------------------------
+
+    /// Ends the execution in a terminal state (`DOMAIN_MODEL.md` §4.4).
+    fn finish(&self, execution: &mut WorkflowExecution, state: &State) -> Result<(), EngineError> {
+        let status = terminal_status(&state.id);
+
+        if status == ExecutionStatus::Completed {
+            self.emit(
+                &execution.id,
+                EventData::WorkflowCompleted {
+                    result: json!({
+                        "terminal_state": state.id,
+                        "variables": execution.context.variables,
+                    }),
+                },
+            )?;
+        } else {
+            self.emit(
+                &execution.id,
+                EventData::WorkflowFailed {
+                    error: format!("workflow ended in failure terminal state '{}'", state.id),
+                },
+            )?;
+        }
+
+        execution.status = status;
+        execution.completed_at = Some(Utc::now());
+        self.clear_pending_step(execution);
+        self.store.save_execution(execution)?;
+        Ok(())
+    }
+
+    /// Records a failed action and the failed execution that follows from it.
+    fn fail_action(
+        &self,
+        execution: &mut WorkflowExecution,
+        action_execution_id: &str,
+        message: impl Into<String>,
+    ) -> Result<(), EngineError> {
+        let message = message.into();
+        self.emit(
+            &execution.id,
+            EventData::ActionFailed {
+                action_execution_id: action_execution_id.to_string(),
+                error: message.clone(),
+            },
+        )?;
+        self.fail_execution(execution, message)
+    }
+
+    /// Ends the execution as `Failed`, with no transition taken.
+    fn fail_execution(
+        &self,
+        execution: &mut WorkflowExecution,
+        error: String,
+    ) -> Result<(), EngineError> {
+        self.emit(&execution.id, EventData::WorkflowFailed { error })?;
+        execution.status = ExecutionStatus::Failed;
+        execution.completed_at = Some(Utc::now());
+        self.clear_pending_step(execution);
+        self.store.save_execution(execution)?;
+        Ok(())
+    }
+
+    /// Records an engine-level problem and fails the execution on it.
+    fn record_engine_error(
+        &self,
+        execution: &mut WorkflowExecution,
+        message: &str,
+    ) -> Result<(), EngineError> {
+        self.emit(
+            &execution.id,
+            EventData::Error {
+                message: message.to_string(),
+                context: json!({ "state": execution.current_state }),
+            },
+        )?;
+        self.fail_execution(execution, message.to_string())
+    }
+
+    /// Parks the execution: `Paused` plus `WorkflowPaused`.
+    fn pause_execution(
+        &self,
+        execution: &mut WorkflowExecution,
+        reason: &str,
+    ) -> Result<(), EngineError> {
+        execution.status = ExecutionStatus::Paused;
+        self.store.save_execution(execution)?;
+        self.emit(
+            &execution.id,
+            EventData::WorkflowPaused {
+                reason: reason.to_string(),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Suspends the execution on a question and records it durably.
+    fn suspend_for_input(
+        &self,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        request: HumanInputRequest,
+        outputs: Vec<OutputLabel>,
+    ) -> Result<(), EngineError> {
+        let pending =
+            PendingHumanInput::new(execution.id.clone(), state.id.clone(), request, outputs);
+        let from = self.store.event_log(&execution.id).next_sequence()?;
+        human::suspend(&self.store, execution, &pending)?;
+        self.publish_from(&execution.id, from)
+    }
+
+    // -----------------------------------------------------------------------
+    // Artifacts
+    // -----------------------------------------------------------------------
+
+    /// Turns the `artifacts` list a script reported into artifact records.
+    ///
+    /// [`ActionResult`] has no artifacts field, so `ScriptExecutor` passes the
+    /// §3.3.B list through as `data.artifacts`. Each entry becomes an
+    /// `ArtifactCreated` event here and an entry in `context.artifacts` when the
+    /// context is written. An entry that names no location is skipped rather
+    /// than failing the action: a malformed artifact note is not a reason to
+    /// discard work that succeeded.
+    fn register_artifacts(
+        &self,
+        execution: &WorkflowExecution,
+        action_execution_id: &str,
+        result: &ActionResult,
+    ) -> Result<Vec<Artifact>, EngineError> {
+        let Some(entries) = result.data.get("artifacts").and_then(Value::as_array) else {
+            return Ok(Vec::new());
+        };
+
+        let mut artifacts = Vec::new();
+        for entry in entries {
+            let Some(artifact) = artifact_from(entry, action_execution_id) else {
+                continue;
+            };
+
+            self.emit(
+                &execution.id,
+                EventData::ArtifactCreated {
+                    artifact_id: artifact.id.clone(),
+                    artifact_type: artifact.artifact_type.clone(),
+                    location: artifact.location.clone(),
+                },
+            )?;
+            artifacts.push(artifact);
+        }
+        Ok(artifacts)
+    }
+
+    // -----------------------------------------------------------------------
+    // Events
+    // -----------------------------------------------------------------------
+
+    /// Appends an event and publishes it to the live stream.
+    fn emit(&self, execution_id: &str, data: EventData) -> Result<Event, EngineError> {
+        let event = self
+            .store
+            .event_log(execution_id)
+            .append_next(&execution_id.to_string(), data)?;
+        let _ = self.events.send(event.clone());
+        Ok(event)
+    }
+
+    /// Publishes the events appended since `from` by code that writes the log
+    /// itself (the human suspend/resume pair).
+    fn publish_from(&self, execution_id: &str, from: u64) -> Result<(), EngineError> {
+        let log = self.store.event_log(execution_id);
+        let last = log.last_sequence()?.unwrap_or(0);
+        for sequence in from..=last {
+            let event: Event = read_json(&log.event_path(sequence))?;
+            let _ = self.events.send(event);
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Small helpers
+    // -----------------------------------------------------------------------
+
+    /// The state an execution is at.
+    fn current_state_id(&self, execution: &WorkflowExecution) -> Result<StateId, EngineError> {
+        execution
+            .current_state
+            .clone()
+            .ok_or_else(|| EngineError::NoCurrentState {
+                execution_id: execution.id.clone(),
+            })
+    }
+
+    /// Looks a state up in the definition the execution runs on.
+    fn state_of<'a>(
+        &self,
+        definition: &'a WorkflowDefinition,
+        execution: &WorkflowExecution,
+        state_id: &str,
+    ) -> Result<&'a State, EngineError> {
+        definition
+            .states
+            .get(state_id)
+            .ok_or_else(|| EngineError::UnknownState {
+                execution_id: execution.id.clone(),
+                state_id: state_id.to_string(),
+                workflow_id: execution.workflow_id.clone(),
+            })
+    }
+
+    /// The mid-step state of this execution, when it belongs to `state_id`.
+    fn pending_step(
+        &self,
+        execution: &WorkflowExecution,
+        state_id: &str,
+    ) -> Result<Option<PendingStep>, EngineError> {
+        let Some(value) = execution
+            .metadata
+            .get(METADATA_ENGINE_KEY)
+            .and_then(|engine| engine.get(METADATA_PENDING_STEP_KEY))
+        else {
+            return Ok(None);
+        };
+
+        let pending: PendingStep = serde_json::from_value(value.clone()).map_err(|error| {
+            EngineError::CorruptEngineMetadata {
+                execution_id: execution.id.clone(),
+                message: error.to_string(),
+            }
+        })?;
+
+        Ok((pending.state_id == state_id).then_some(pending))
+    }
+
+    /// Persists the mid-step state inside the execution record.
+    fn write_pending_step(
+        &self,
+        execution: &mut WorkflowExecution,
+        pending: &PendingStep,
+    ) -> Result<(), EngineError> {
+        let value =
+            serde_json::to_value(pending).map_err(|error| EngineError::CorruptEngineMetadata {
+                execution_id: execution.id.clone(),
+                message: error.to_string(),
+            })?;
+
+        if !execution.metadata.is_object() {
+            execution.metadata = json!({});
+        }
+        let metadata = execution
+            .metadata
+            .as_object_mut()
+            .expect("metadata was just made an object");
+        let engine = metadata
+            .entry(METADATA_ENGINE_KEY.to_string())
+            .or_insert_with(|| json!({}));
+        if !engine.is_object() {
+            *engine = json!({});
+        }
+        engine
+            .as_object_mut()
+            .expect("engine metadata was just made an object")
+            .insert(METADATA_PENDING_STEP_KEY.to_string(), value);
+        Ok(())
+    }
+
+    /// Drops the mid-step state.
+    fn clear_pending_step(&self, execution: &mut WorkflowExecution) {
+        if let Some(engine) = execution
+            .metadata
+            .get_mut(METADATA_ENGINE_KEY)
+            .and_then(Value::as_object_mut)
+        {
+            engine.remove(METADATA_PENDING_STEP_KEY);
+        }
+    }
+
+    /// Consumes a pending pause request, if there is one.
+    fn take_pause_request(&self, execution_id: &str) -> bool {
+        self.lock_pause_requests().remove(execution_id)
+    }
+
+    /// Locks the pause requests, recovering from a poisoned mutex: a panic
+    /// elsewhere is no reason to make pausing impossible.
+    fn lock_pause_requests(&self) -> std::sync::MutexGuard<'_, HashSet<ExecutionId>> {
+        self.pause_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The error for an operation the execution's status does not allow.
+    fn not_runnable(&self, execution: &WorkflowExecution, operation: &'static str) -> EngineError {
+        if execution.status == ExecutionStatus::Paused
+            && self.store.has_pending_input(&execution.id)
+        {
+            return EngineError::AwaitingHumanInput {
+                execution_id: execution.id.clone(),
+            };
+        }
+        EngineError::NotRunnable {
+            execution_id: execution.id.clone(),
+            status: status_name(&execution.status).to_string(),
+            operation,
+        }
+    }
+}
+
+/// Builds an artifact record from one entry of a `data.artifacts` list.
+///
+/// Accepts either a bare path or an object with `path`/`location`, and
+/// optionally `name` and `type`.
+fn artifact_from(entry: &Value, action_execution_id: &str) -> Option<Artifact> {
+    let (location, name, artifact_type, metadata) = match entry {
+        Value::String(path) => (path.clone(), None, "file".to_string(), json!({})),
+        Value::Object(object) => {
+            let location = object
+                .get("path")
+                .or_else(|| object.get("location"))
+                .and_then(Value::as_str)?
+                .to_string();
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let artifact_type = object
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("file")
+                .to_string();
+            (location, name, artifact_type, entry.clone())
+        }
+        _ => return None,
+    };
+
+    if location.is_empty() {
+        return None;
+    }
+
+    let mut artifact = Artifact::new(artifact_type, location, action_execution_id.to_string());
+    artifact.name = name;
+    artifact.metadata = metadata;
+    Some(artifact)
+}
+
+/// The schema spelling of an execution status, for error messages.
+fn status_name(status: &ExecutionStatus) -> &'static str {
+    match status {
+        ExecutionStatus::Running => "running",
+        ExecutionStatus::Paused => "paused",
+        ExecutionStatus::WaitingForEvent => "waiting_for_event",
+        ExecutionStatus::Completed => "completed",
+        ExecutionStatus::Failed => "failed",
+        ExecutionStatus::Cancelled => "cancelled",
+        ExecutionStatus::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_terminals_are_recognised_by_name() {
+        assert_eq!(terminal_status("completed"), ExecutionStatus::Completed);
+        assert_eq!(terminal_status("done"), ExecutionStatus::Completed);
+        assert_eq!(terminal_status("merged"), ExecutionStatus::Completed);
+
+        assert_eq!(terminal_status("failed"), ExecutionStatus::Failed);
+        assert_eq!(terminal_status("Failed"), ExecutionStatus::Failed);
+        assert_eq!(terminal_status("failure"), ExecutionStatus::Failed);
+        assert_eq!(terminal_status("fail_validation"), ExecutionStatus::Failed);
+        assert_eq!(terminal_status("aborted"), ExecutionStatus::Failed);
+    }
+
+    #[test]
+    fn an_artifact_can_be_a_bare_path_or_an_object() {
+        let bare = artifact_from(&json!("reports/coverage.html"), "action-1").expect("artifact");
+        assert_eq!(bare.location, "reports/coverage.html");
+        assert_eq!(bare.artifact_type, "file");
+        assert_eq!(bare.producer, "action-1");
+
+        let described = artifact_from(
+            &json!({ "name": "report", "type": "text/markdown", "path": "plan.md" }),
+            "action-1",
+        )
+        .expect("artifact");
+        assert_eq!(described.name.as_deref(), Some("report"));
+        assert_eq!(described.artifact_type, "text/markdown");
+        assert_eq!(described.location, "plan.md");
+
+        assert!(artifact_from(&json!({ "name": "no location" }), "action-1").is_none());
+        assert!(artifact_from(&json!(42), "action-1").is_none());
+    }
+}

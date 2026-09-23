@@ -21,11 +21,16 @@ pub mod atomic;
 pub mod event_log;
 pub mod execution_store;
 pub mod paths;
+pub mod recovery;
 
 pub use atomic::{cleanup_orphaned_temp_files, read_json, write_json_atomic};
 pub use event_log::EventLog;
 pub use execution_store::{ExecutionStore, PENDING_INPUT_FILE};
 pub use paths::{Paths, CONTEXT_FILE, DEFAULT_ROOT, STATE_FILE, TEMP_SUFFIX};
+pub use recovery::{
+    reconcile, reconcile_all, recover, sweep_orphaned_workspaces, OrphanReason, OrphanedWorkspace,
+    Reconciliation, ReconciliationOutcome, RecoveryReport,
+};
 
 use std::io;
 use std::path::PathBuf;

@@ -1,0 +1,11 @@
+name: nothing-to-do
+version: 1
+description: A workflow whose only state is terminal; it finishes on the spot.
+
+states:
+  completed:
+    description: Nothing to do.
+    initial: true
+
+terminal_states:
+  - completed
