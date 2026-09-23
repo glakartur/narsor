@@ -1,0 +1,622 @@
+name: compound-engineering
+version: 1
+description: >
+  The compound engineering chain, end to end: ce-brainstorm to ce-plan to
+  ce-work to ce-code-review to ce-commit-push-pr to ce-compound, with
+  ce-doc-review over the requirements, ce-simplify-code before review and
+  ce-resolve-pr-feedback on the open pull request. The pipeline stops for a
+  person wherever a decision is irreversible, outward-facing, or beyond what an
+  agent can settle on its own: the scope, the plan (before a line of code
+  exists), a genuine ambiguity during the work, what to do with review
+  findings, and the push that makes the work public.
+
+inputs:
+  - name: feature_description
+    type: string
+    required: true
+    description: The idea, problem or feature to explore, plan and ship.
+  - name: target_repo
+    type: repository
+    required: true
+    description: The repository the work happens in.
+
+globals:
+  timeout: 4h
+  workspace:
+    type: git
+    repository: "{{ inputs.target_repo }}"
+    ref: main
+
+states:
+  # -------------------------------------------------------------------------
+  # WHAT to build
+  # -------------------------------------------------------------------------
+
+  brainstorm:
+    description: >
+      ce-brainstorm — explore the request through dialogue and write a
+      right-sized requirements document.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Run the `ce-brainstorm` skill for this request:
+
+        {{ inputs.feature_description }}
+
+        Answer WHAT to build, not HOW. Resolve product behaviour, scope
+        boundaries and success criteria, and write the requirements document
+        to `docs/brainstorms/<date>-<slug>-requirements.md` using
+        repo-relative paths. Do not write production code.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "<label>", "data": {"requirements_doc": "<repo-relative path>"}}
+        Use exactly one of these labels:
+          - "requirements_drafted" — the requirements document is written.
+          - "needs_direction" — the request is too open to write requirements
+            for without a human choosing a direction first.
+    outputs:
+      - requirements_drafted
+      - needs_direction
+    transitions:
+      requirements_drafted: doc_review
+      needs_direction: clarify_direction
+    timeout: 45m
+
+  clarify_direction:
+    description: >
+      HUMAN GATE — the brainstorm found no direction it could take on its own.
+      Only the person who wants the feature can pick one.
+    action:
+      type: human
+      message: >
+        The brainstorm could not settle a direction. Say which way to go, or
+        stop here — an agent guessing the product direction is exactly the
+        decision it has no basis to make.
+      inputs:
+        - name: direction_decision
+          type: select
+          required: true
+          options:
+            - retry_brainstorm
+            - abandon
+        - name: direction_note
+          type: text
+          required: true
+          description: The direction to explore, in your own words.
+    outputs:
+      - retry_brainstorm
+      - abandon
+    transitions:
+      retry_brainstorm: brainstorm
+      abandon: cancelled
+
+  doc_review:
+    description: >
+      ce-doc-review — parallel persona agents read the requirements document
+      and surface role-specific issues before anyone plans against it.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Run the `ce-doc-review` skill over the requirements document written by
+        `ce-brainstorm` in `docs/brainstorms/`. Dispatch the persona reviewers,
+        merge their findings and write the review back into the document as a
+        review section. Change no code.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "<label>", "data": {"findings": <count>}}
+        Use exactly one of these labels:
+          - "reviewed" — the document was reviewed and the findings recorded.
+          - "review_failed" — the review could not be produced at all (no
+            document, or the reviewers could not run).
+    outputs:
+      - reviewed
+      - review_failed
+    transitions:
+      reviewed: approve_scope
+      review_failed: failed
+    timeout: 30m
+    retry_policy:
+      max_attempts: 2
+      backoff: 30s
+
+  approve_scope:
+    description: >
+      HUMAN GATE — is the scope right? The requirements document is what every
+      later step is measured against; a wrong scope corrected here costs one
+      conversation, corrected after the PR it costs the whole pipeline.
+    action:
+      type: human
+      message: >
+        Read the requirements document and its review. Approve the scope, send
+        it back for another brainstorm, or stop. Your note is carried into the
+        plan.
+      inputs:
+        - name: scope_decision
+          type: select
+          required: true
+          options:
+            - approved
+            - revise
+            - abandon
+        - name: scope_notes
+          type: text
+          required: true
+          description: >
+            What the plan must respect — constraints, non-goals, or simply
+            "as written".
+    outputs:
+      - approved
+      - revise
+      - abandon
+    transitions:
+      approved: plan
+      revise: brainstorm
+      abandon: cancelled
+
+  # -------------------------------------------------------------------------
+  # HOW to build it
+  # -------------------------------------------------------------------------
+
+  plan:
+    description: >
+      ce-plan — turn the approved requirements into a durable implementation
+      plan with files, test scenarios and sequencing.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Run the `ce-plan` skill. Build from the requirements document in
+        `docs/brainstorms/` — it is the source of truth — and from the
+        reviewer's note:
+
+        {{ context.scope_notes }}
+
+        Produce a plan in `docs/plans/` with a problem frame, scope
+        boundaries, repo-relative file paths, explicit test file paths,
+        enumerated test scenarios and decisions with rationale. Decisions, not
+        code: write no implementation.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "<label>", "data": {"plan_doc": "<repo-relative path>"}}
+        Use exactly one of these labels:
+          - "plan_ready" — the plan is written and an implementer could start.
+          - "planning_blocked" — the plan cannot be written (the requirements
+            contradict the codebase, or a dependency does not exist).
+    outputs:
+      - plan_ready
+      - planning_blocked
+    transitions:
+      plan_ready: approve_plan
+      planning_blocked: failed
+    timeout: 1h
+    retry_policy:
+      max_attempts: 2
+      backoff: 1m
+
+  approve_plan:
+    description: >
+      HUMAN GATE — the last point before code exists. Everything after this is
+      an edit to the repository; a correction made here is free, and the same
+      correction made after the work is a rewrite.
+    action:
+      type: human
+      message: >
+        Read the plan. Approve it and the agent starts writing code; send it
+        back and it replans; abandon and nothing is written. This is the
+        cheapest place in the pipeline to change your mind.
+      inputs:
+        - name: plan_decision
+          type: select
+          required: true
+          options:
+            - approved
+            - revise
+            - abandon
+        - name: plan_feedback
+          type: text
+          required: false
+          description: What the plan gets wrong, if anything.
+    outputs:
+      - approved
+      - revise
+      - abandon
+    transitions:
+      approved: work
+      revise: plan
+      abandon: cancelled
+
+  # -------------------------------------------------------------------------
+  # Doing the work
+  # -------------------------------------------------------------------------
+
+  work:
+    description: >
+      ce-work — execute the approved plan, following existing patterns and
+      keeping the tests green.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Run the `ce-work` skill against the plan in `docs/plans/`. Implement
+        the plan's units in order, write the tests the plan enumerates, and
+        run the repository's own checks before you finish. Respect the plan's
+        scope boundaries.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "<label>", "data": {"units_completed": <count>}}
+        Use exactly one of these labels:
+          - "implemented" — the plan is implemented and the checks pass.
+          - "needs_human_decision" — you hit a genuine ambiguity the plan does
+            not settle. Do not guess: take this label and state the question in
+            `data.question`.
+          - "blocked" — the work cannot proceed at all (the plan is
+            unimplementable as written).
+    outputs:
+      - implemented
+      - needs_human_decision
+      - blocked
+    transitions:
+      implemented: simplify
+      needs_human_decision: resolve_ambiguity
+      blocked: failed
+    timeout: 2h
+
+  resolve_ambiguity:
+    description: >
+      HUMAN GATE — the escape hatch out of guessing. `ce-work` reached a
+      question the plan does not answer, and an agent that answers it itself
+      is inventing product behaviour halfway through an implementation.
+    action:
+      type: human
+      message: >
+        The agent stopped on an ambiguity rather than guessing. Read its
+        question in the execution's data, answer it, or send the work back to
+        planning if the plan is the thing that is wrong.
+      inputs:
+        - name: ambiguity_decision
+          type: select
+          required: true
+          options:
+            - answered
+            - replan
+            - abandon
+        - name: ambiguity_answer
+          type: text
+          required: true
+          description: The answer to the agent's question, or why you are replanning.
+    outputs:
+      - answered
+      - replan
+      - abandon
+    transitions:
+      answered: apply_clarification
+      replan: plan
+      abandon: cancelled
+
+  apply_clarification:
+    description: >
+      ce-work again, this time carrying the human's answer to the question
+      that stopped it.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Continue the `ce-work` run. The question that stopped you has been
+        answered:
+
+        {{ context.ambiguity_answer }}
+
+        Apply that answer and finish the remaining implementation units of the
+        plan in `docs/plans/`, with their tests.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "<label>", "data": {"units_completed": <count>}}
+        Use exactly one of these labels:
+          - "implemented" — the work is finished and the checks pass.
+          - "still_ambiguous" — the answer does not settle it; state what is
+            still open in `data.question`.
+          - "blocked" — the work cannot proceed at all.
+    outputs:
+      - implemented
+      - still_ambiguous
+      - blocked
+    transitions:
+      implemented: simplify
+      still_ambiguous: resolve_ambiguity
+      blocked: failed
+    timeout: 2h
+
+  simplify:
+    description: >
+      ce-simplify-code — refine what was just written for clarity, reuse and
+      efficiency, without changing behaviour.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Run the `ce-simplify-code` skill over the code changed on this branch.
+        Preserve behaviour exactly: the tests that passed before must pass
+        after. Do not add features and do not widen the diff.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "<label>", "data": {"files_touched": <count>}}
+        Use exactly one of these labels:
+          - "simplified" — simplifications were applied and the checks pass.
+          - "unchanged" — the code is already as simple as it should be.
+          - "regressed" — a simplification broke the checks and could not be
+            walked back cleanly.
+    outputs:
+      - simplified
+      - unchanged
+      - regressed
+    transitions:
+      simplified: code_review
+      unchanged: code_review
+      regressed: failed
+    timeout: 45m
+    retry_policy:
+      max_attempts: 2
+      backoff: 1m
+
+  # -------------------------------------------------------------------------
+  # Review, and going public
+  # -------------------------------------------------------------------------
+
+  code_review:
+    description: >
+      ce-code-review in report-only mode — tiered persona agents, confidence
+      gating, merged and deduplicated findings. Read-only on purpose: what to
+      do with the findings is the next gate's question.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Run the `ce-code-review` skill with `mode:report-only` over the changes
+        on this branch. Dispatch the persona reviewers, merge and deduplicate
+        their findings, and report them with severity and file:line. Change
+        nothing — no fixes, no commits.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "<label>", "data": {"findings": <count>, "blockers": <count>}}
+        Use exactly one of these labels:
+          - "clean" — no actionable findings survived the confidence gate.
+          - "findings" — there are findings for a person to triage.
+          - "review_failed" — the review could not be produced (no diff, or
+            the reviewers could not run).
+    outputs:
+      - clean
+      - findings
+      - review_failed
+    transitions:
+      clean: approve_push
+      findings: triage_findings
+      review_failed: failed
+    timeout: 1h
+    retry_policy:
+      max_attempts: 2
+      backoff: 1m
+
+  triage_findings:
+    description: >
+      HUMAN GATE — what to do with the findings. Whether a finding is a bug to
+      fix or an accepted trade-off is a judgement about this codebase and this
+      deadline, and the reviewer that raised it is not the one who gets to
+      make it.
+    action:
+      type: human
+      message: >
+        The code review produced findings. Decide: fix them, accept them and
+        move on, or stop the work here.
+      inputs:
+        - name: findings_decision
+          type: select
+          required: true
+          options:
+            - fix
+            - accept
+            - abandon
+        - name: findings_notes
+          type: text
+          required: false
+          description: Which findings to fix, and which you are accepting and why.
+    outputs:
+      - fix
+      - accept
+      - abandon
+    transitions:
+      fix: fix_findings
+      accept: approve_push
+      abandon: cancelled
+
+  fix_findings:
+    description: Address the review findings the person chose to fix.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Address the code review findings the reviewer asked to be fixed. Fix
+        the cause, not the symptom, add a regression test for each behavioural
+        finding, and re-run the repository's checks. Do not take on anything
+        the reviewer accepted.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "<label>", "data": {"fixed": <count>}}
+        Use exactly one of these labels:
+          - "fixed" — the findings are addressed and the checks pass.
+          - "blocked" — a finding cannot be fixed without a decision that is
+            not yours to make.
+    outputs:
+      - fixed
+      - blocked
+    transitions:
+      fixed: code_review
+      blocked: triage_findings
+    timeout: 1h
+
+  approve_push:
+    description: >
+      HUMAN GATE — the branch is about to leave the machine. Pushing and
+      opening a pull request is the first outward-facing, hard-to-retract act
+      in this pipeline, and it carries the author's name.
+    action:
+      type: human
+      message: >
+        The work is reviewed and ready to publish. Approving pushes the branch
+        and opens a pull request under your name; nothing has left this machine
+        yet.
+      inputs:
+        - name: publish_decision
+          type: select
+          required: true
+          options:
+            - approve
+            - revise
+            - abandon
+        - name: publish_notes
+          type: text
+          required: false
+          description: Anything the PR description must say.
+    outputs:
+      - approve
+      - revise
+      - abandon
+    transitions:
+      approve: commit_push_pr
+      revise: fix_findings
+      abandon: cancelled
+
+  commit_push_pr:
+    description: >
+      ce-commit-push-pr — commit with a value-first message, push the branch
+      and open the pull request with an adaptive description.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Run the `ce-commit-push-pr` skill. Follow the repository's commit
+        conventions, push the feature branch (never the default branch), and
+        open a pull request whose description leads with the value of the
+        change and scales in depth with its size.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "<label>", "data": {"pr_url": "<url>"}, "variables": {"pr_url": "<url>"}}
+        Use exactly one of these labels:
+          - "pr_opened" — the branch is pushed and the pull request is open.
+          - "push_failed" — the commit, the push or the PR creation failed.
+    outputs:
+      - pr_opened
+      - push_failed
+    transitions:
+      pr_opened: pr_feedback_gate
+      push_failed: failed
+    timeout: 30m
+
+  pr_feedback_gate:
+    description: >
+      HUMAN GATE — the review loop. The pull request is in other people's
+      hands now; nothing here can be decided by reading the repository, so the
+      pipeline waits for the person watching the PR to report what came back.
+    action:
+      type: human
+      message: >
+        The pull request is open. When reviewers have answered, say what came
+        back: feedback to resolve, an approval, or stop.
+      inputs:
+        - name: pr_outcome
+          type: select
+          required: true
+          options:
+            - feedback_received
+            - approved
+            - abandon
+        - name: pr_feedback_summary
+          type: text
+          required: false
+          description: What the reviewers asked for, if anything.
+    outputs:
+      - feedback_received
+      - approved
+      - abandon
+    transitions:
+      feedback_received: resolve_pr_feedback
+      approved: compound
+      abandon: cancelled
+
+  resolve_pr_feedback:
+    description: >
+      ce-resolve-pr-feedback — evaluate each review thread for validity, fix
+      what is valid, and reply on the threads.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Run the `ce-resolve-pr-feedback` skill on the open pull request.
+        Evaluate each review thread on its merits — a comment can be wrong —
+        fix the valid ones, reply to every thread saying what you did or why
+        you disagreed, and push the fixes.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "<label>", "data": {"threads_resolved": <count>}}
+        Use exactly one of these labels:
+          - "resolved" — every thread is answered and the fixes are pushed;
+            the pull request goes back for re-review.
+          - "blocked" — a thread asks for a decision you cannot make.
+    outputs:
+      - resolved
+      - blocked
+    transitions:
+      resolved: pr_feedback_gate
+      blocked: pr_feedback_gate
+    timeout: 1h
+
+  compound:
+    description: >
+      ce-compound — the step that makes the engineering compound: write down
+      what was learned so the next run starts further along.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Run the `ce-compound` skill over this piece of work. Write the durable
+        learning to `docs/solutions/` with the frontmatter the skill
+        prescribes, so a future `ce-learnings-researcher` can find it: the
+        problem, the root cause, what was tried, what worked, and the rule to
+        follow next time. If nothing here was worth keeping, say so rather
+        than padding the corpus.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "<label>", "data": {"doc": "<repo-relative path or null>"}}
+        Use exactly one of these labels:
+          - "documented" — a learning document was written.
+          - "nothing_to_document" — this run taught nothing that is not
+            already written down.
+    outputs:
+      - documented
+      - nothing_to_document
+    transitions:
+      documented: completed
+      nothing_to_document: completed
+    timeout: 30m
+    retry_policy:
+      max_attempts: 2
+      backoff: 30s
+
+  # -------------------------------------------------------------------------
+  # Terminals
+  # -------------------------------------------------------------------------
+
+  completed:
+    description: Merged-ready work, reviewed, published and its learning written down.
+
+  failed:
+    description: The pipeline could not carry the work further.
+
+  cancelled:
+    description: A person stopped the pipeline.
+
+terminal_states:
+  completed: completed
+  failed: failed
+  cancelled: cancelled

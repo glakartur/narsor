@@ -1,0 +1,641 @@
+//! Tests for the shipped workflow definitions in `workflows/`.
+//!
+//! These are the two pipelines the orchestrator ships with — the compound
+//! engineering chain and the Open Mercato SDLC — and they are user-facing
+//! artifacts, so they are held to the same bar as code: they validate with no
+//! violations, their human gates really can hand a label back to the engine,
+//! their agent prompts really name the labels their states declare, and each
+//! one runs end to end.
+//!
+//! **No real harness and no real `git`/`gh` is ever run here.** The agent
+//! states are driven by `tests/fixtures/harness/fake_harness.sh` through
+//! [`ClaudeCodeAdapter::with_program`], the way `tests/actions_agent.rs` does
+//! it, and the one script state is pointed at a two-line fixture written into
+//! a temporary directory. Nothing is ever written into the repository.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use orchestrator::domain::{
+    ActionConfig, ExecutionStatus, HumanInputType, State, TerminalStatus, WorkflowDefinition,
+    Workspace,
+};
+use orchestrator::engine::{
+    ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry, HumanInputDelivery,
+};
+use orchestrator::workflow::{load_from_file, validate_path};
+use serde_json::{json, Map, Value};
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+/// The names of the workflows this crate ships, and their files.
+const SHIPPED: [(&str, &str); 2] = [
+    ("compound-engineering", "compound-engineering.yaml"),
+    ("open-mercato-sdlc", "open-mercato-sdlc.yaml"),
+];
+
+/// The `workflows/` directory of the repository.
+fn workflows_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows")
+}
+
+/// A shipped workflow, compiled.
+fn shipped(file: &str) -> WorkflowDefinition {
+    load_from_file(workflows_dir().join(file))
+        .unwrap_or_else(|error| panic!("load shipped workflow '{file}': {error}"))
+}
+
+/// A temporary directory that deletes itself when it goes out of scope.
+///
+/// Stands in for the `tempfile` crate, which is not a dependency of this crate.
+struct TempRoot {
+    path: PathBuf,
+}
+
+impl TempRoot {
+    fn new() -> Self {
+        let path =
+            std::env::temp_dir().join(format!("orchestrator-workflows-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path).expect("create temp root");
+        Self { path }
+    }
+
+    fn dir(&self, name: &str) -> PathBuf {
+        let path = self.path.join(name);
+        fs::create_dir_all(&path).expect("create directory");
+        path
+    }
+
+    /// The workspace the actions run in.
+    fn workspace(&self) -> Workspace {
+        Workspace::local_folder(self.dir("workspace").to_string_lossy().into_owned())
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// The fake harness CLI, installed in a directory of its own and told what to
+/// answer on each call.
+struct FakeHarness {
+    program: PathBuf,
+}
+
+impl FakeHarness {
+    /// Installs the fixture script and scripts its answers, one output label
+    /// per call, in order.
+    fn installed_in(dir: PathBuf, labels: &[&str]) -> Self {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/harness/fake_harness.sh");
+        let program = dir.join("fake_harness.sh");
+        fs::copy(&source, &program).expect("copy the fake harness");
+
+        for (index, label) in labels.iter().enumerate() {
+            let answer = json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "session_id": "fake-session-1",
+                "result": json!({ "output": label, "data": {} }).to_string(),
+            })
+            .to_string();
+            fs::write(dir.join(format!("stdout.{}", index + 1)), answer)
+                .expect("write the harness answer");
+        }
+
+        Self { program }
+    }
+
+    /// An engine whose `agent` executor runs the fake harness.
+    fn engine(&self, store_root: PathBuf) -> Engine {
+        let executor = AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(
+            Arc::new(ClaudeCodeAdapter::with_program(
+                self.program.to_string_lossy().into_owned(),
+            )),
+        ));
+        Engine::new(orchestrator::persistence::ExecutionStore::new(store_root))
+            .with_executor(ActionKind::Agent, Arc::new(executor))
+    }
+}
+
+/// An answer to one human gate: the state it belongs to and the field values.
+struct Answer {
+    state: &'static str,
+    values: Vec<(&'static str, &'static str)>,
+}
+
+impl Answer {
+    fn new(state: &'static str, values: &[(&'static str, &'static str)]) -> Self {
+        Self {
+            state,
+            values: values.to_vec(),
+        }
+    }
+
+    fn delivery(&self) -> HumanInputDelivery {
+        let mut values = Map::new();
+        for (name, value) in &self.values {
+            values.insert((*name).to_string(), Value::String((*value).to_string()));
+        }
+        HumanInputDelivery::with_values(values)
+    }
+}
+
+/// Every `agent` state of a definition, by id.
+fn agent_states(definition: &WorkflowDefinition) -> Vec<(&String, &State)> {
+    definition
+        .states
+        .iter()
+        .filter(|(_, state)| matches!(state.action, Some(ActionConfig::Agent(_))))
+        .collect()
+}
+
+/// Every `human` state of a definition, by id.
+fn human_states(definition: &WorkflowDefinition) -> Vec<(&String, &State)> {
+    definition
+        .states
+        .iter()
+        .filter(|(_, state)| matches!(state.action, Some(ActionConfig::Human(_))))
+        .collect()
+}
+
+/// The declared output labels of a state.
+fn labels(state: &State) -> Vec<String> {
+    state
+        .outputs
+        .iter()
+        .map(|output| output.label.clone())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The contract every shipped workflow keeps
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_shipped_workflow_validates_without_a_single_violation() {
+    for (name, file) in SHIPPED {
+        let violations = validate_path(workflows_dir().join(file))
+            .unwrap_or_else(|error| panic!("'{file}' does not even load: {error}"));
+        assert!(
+            violations.is_empty(),
+            "'{name}' has validation violations: {violations:?}"
+        );
+    }
+}
+
+/// The trap of `WORKFLOW_SCHEMA.md` §3.3.C: a `text` field carries no output
+/// label, so a gate that only asks for prose stalls the workflow forever. A
+/// gate is only a gate if it hands a label back, and the engine derives one
+/// from a single `select` field whose value is the label.
+#[test]
+fn every_human_gate_offers_a_select_over_exactly_its_outputs() {
+    for (name, file) in SHIPPED {
+        let definition = shipped(file);
+        let gates = human_states(&definition);
+        assert!(
+            !gates.is_empty(),
+            "'{name}' has no human gate at all — an autonomous pipeline with no \
+             human gate drives straight to a merge"
+        );
+
+        for (id, state) in gates {
+            let Some(ActionConfig::Human(config)) = &state.action else {
+                unreachable!("filtered to human states");
+            };
+
+            let selects: Vec<_> = config
+                .inputs
+                .iter()
+                .filter(|field| field.field_type == HumanInputType::Select)
+                .collect();
+            assert_eq!(
+                selects.len(),
+                1,
+                "'{name}' gate '{id}' must carry exactly one select field; \
+                 none means the gate stalls, two means no label can be derived"
+            );
+
+            let select = selects[0];
+            assert!(
+                select.required,
+                "'{name}' gate '{id}': the deciding select field must be required"
+            );
+            assert_eq!(
+                select.options,
+                labels(state),
+                "'{name}' gate '{id}': the select options and the state's outputs \
+                 must be the same list, in the same order"
+            );
+        }
+    }
+}
+
+/// The executor refuses to guess a label, so every agent prompt has to name the
+/// exact labels its state declares. This keeps a prompt and its `outputs` from
+/// drifting apart in a later edit.
+#[test]
+fn every_agent_prompt_names_every_label_its_state_declares() {
+    for (name, file) in SHIPPED {
+        let definition = shipped(file);
+        for (id, state) in agent_states(&definition) {
+            let Some(ActionConfig::Agent(config)) = &state.action else {
+                unreachable!("filtered to agent states");
+            };
+            assert!(
+                config.prompt.contains("output"),
+                "'{name}' state '{id}': the prompt must state the JSON output contract"
+            );
+            for label in labels(state) {
+                assert!(
+                    config.prompt.contains(&label),
+                    "'{name}' state '{id}': the prompt never names the declared \
+                     label '{label}', so the agent cannot be expected to return it"
+                );
+            }
+        }
+    }
+}
+
+/// An agent that stalls waiting for an approval it will never get would
+/// otherwise hang the execution for good.
+#[test]
+fn every_agent_state_has_a_time_limit() {
+    for (name, file) in SHIPPED {
+        let definition = shipped(file);
+        let global = definition.globals.timeout_secs;
+        for (id, state) in agent_states(&definition) {
+            assert!(
+                state.timeout_secs.or(global).is_some(),
+                "'{name}' state '{id}' has no timeout of its own and no global one"
+            );
+        }
+    }
+}
+
+/// §3.5: the list form of `terminal_states` means `completed` for every entry,
+/// which would quietly report a failed run as a success.
+#[test]
+fn terminals_are_declared_in_the_mapping_form_with_a_real_failure() {
+    for (name, file) in SHIPPED {
+        let definition = shipped(file);
+        let terminals: Vec<(&String, &State)> = definition
+            .states
+            .iter()
+            .filter(|(_, state)| state.terminal)
+            .collect();
+        assert!(!terminals.is_empty(), "'{name}' declares no terminal state");
+
+        for (id, state) in &terminals {
+            assert!(
+                state.terminal_status.is_some(),
+                "'{name}' terminal '{id}' carries no declared status — the list \
+                 form of terminal_states would report it as completed"
+            );
+            assert!(
+                state.action.is_none(),
+                "'{name}' terminal '{id}' must carry no action"
+            );
+        }
+
+        assert!(
+            terminals
+                .iter()
+                .any(|(_, state)| state.terminal_status == Some(TerminalStatus::Failed)),
+            "'{name}' has no terminal that really reports a failure"
+        );
+    }
+}
+
+/// §5.1: no deadlocks — a terminal is reachable from every state.
+#[test]
+fn a_terminal_is_reachable_from_every_state() {
+    for (name, file) in SHIPPED {
+        let definition = shipped(file);
+
+        for (id, state) in &definition.states {
+            if state.terminal {
+                continue;
+            }
+
+            let mut seen = vec![id.clone()];
+            let mut queue = vec![id.clone()];
+            let mut reached_terminal = false;
+
+            while let Some(current) = queue.pop() {
+                let current = definition
+                    .states
+                    .get(&current)
+                    .unwrap_or_else(|| panic!("'{name}': state '{current}' is missing"));
+                if current.terminal {
+                    reached_terminal = true;
+                    break;
+                }
+                for target in current.transitions.values() {
+                    if !seen.contains(target) {
+                        seen.push(target.clone());
+                        queue.push(target.clone());
+                    }
+                }
+            }
+
+            assert!(
+                reached_terminal,
+                "'{name}': no terminal state is reachable from '{id}'"
+            );
+        }
+    }
+}
+
+/// Every state is reachable from the initial one — a state nobody can enter is
+/// a state nobody maintains.
+#[test]
+fn every_state_is_reachable_from_the_initial_state() {
+    for (name, file) in SHIPPED {
+        let definition = shipped(file);
+        let mut seen = vec![definition.initial_state.clone()];
+        let mut queue = vec![definition.initial_state.clone()];
+
+        while let Some(current) = queue.pop() {
+            let state = definition
+                .states
+                .get(&current)
+                .unwrap_or_else(|| panic!("'{name}': state '{current}' is missing"));
+            for target in state.transitions.values() {
+                if !seen.contains(target) {
+                    seen.push(target.clone());
+                    queue.push(target.clone());
+                }
+            }
+        }
+
+        for id in definition.states.keys() {
+            assert!(
+                seen.contains(id),
+                "'{name}': state '{id}' cannot be reached from '{}'",
+                definition.initial_state
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full runs
+// ---------------------------------------------------------------------------
+
+/// Drives a definition from its initial state to a terminal, answering each
+/// human gate in turn, and asserts the gates came up in the expected order.
+async fn run_to_terminal(
+    engine: &Engine,
+    definition: &WorkflowDefinition,
+    inputs: Value,
+    workspace: Workspace,
+    answers: &[Answer],
+) -> orchestrator::domain::WorkflowExecution {
+    let mut execution = engine
+        .start_and_run(definition, inputs, workspace)
+        .await
+        .expect("start the workflow");
+
+    for answer in answers {
+        assert_eq!(
+            execution.status,
+            ExecutionStatus::Paused,
+            "expected the run to pause at '{}', it is {:?} in {:?}",
+            answer.state,
+            execution.status,
+            execution.current_state
+        );
+        let pending = engine
+            .pending_input(&execution.id)
+            .expect("read the pending request")
+            .expect("a request is pending");
+        assert_eq!(
+            pending.state_id, answer.state,
+            "the pipeline paused at an unexpected gate"
+        );
+
+        execution = engine
+            .deliver_human_input(definition, &execution.id, &answer.delivery())
+            .await
+            .expect("deliver the answer to the gate");
+    }
+
+    execution
+}
+
+#[tokio::test]
+async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
+    let root = TempRoot::new();
+    // Every agent call of the path below, in order.
+    let harness = FakeHarness::installed_in(
+        root.dir("harness"),
+        &[
+            "requirements_drafted", // brainstorm
+            "reviewed",             // doc_review
+            "plan_ready",           // plan
+            "needs_human_decision", // work — refuses to guess
+            "implemented",          // apply_clarification
+            "simplified",           // simplify
+            "findings",             // code_review
+            "fixed",                // fix_findings
+            "clean",                // code_review again
+            "pr_opened",            // commit_push_pr
+            "resolved",             // resolve_pr_feedback
+            "documented",           // compound
+        ],
+    );
+    let engine = harness.engine(root.dir("store"));
+    let definition = shipped("compound-engineering.yaml");
+
+    let execution = run_to_terminal(
+        &engine,
+        &definition,
+        json!({
+            "feature_description": "let a reviewer subscribe to a workflow run",
+            "target_repo": "acme/web",
+        }),
+        root.workspace(),
+        &[
+            Answer::new(
+                "approve_scope",
+                &[
+                    ("scope_decision", "approved"),
+                    ("scope_notes", "one screen only, no notifications"),
+                ],
+            ),
+            Answer::new("approve_plan", &[("plan_decision", "approved")]),
+            Answer::new(
+                "resolve_ambiguity",
+                &[
+                    ("ambiguity_decision", "answered"),
+                    ("ambiguity_answer", "subscribe per run, not per workflow"),
+                ],
+            ),
+            Answer::new("triage_findings", &[("findings_decision", "fix")]),
+            Answer::new("approve_push", &[("publish_decision", "approve")]),
+            Answer::new("pr_feedback_gate", &[("pr_outcome", "feedback_received")]),
+            Answer::new("pr_feedback_gate", &[("pr_outcome", "approved")]),
+        ],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(execution.current_state.as_deref(), Some("completed"));
+    // The human's answers became context variables the later prompts read.
+    assert_eq!(
+        execution.context.variables.get("scope_notes"),
+        Some(&json!("one screen only, no notifications"))
+    );
+    assert_eq!(
+        execution.context.variables.get("ambiguity_answer"),
+        Some(&json!("subscribe per run, not per workflow"))
+    );
+}
+
+#[tokio::test]
+async fn the_open_mercato_pipeline_runs_through_its_review_loop_and_merge_gates() {
+    let root = TempRoot::new();
+    let harness = FakeHarness::installed_in(
+        root.dir("harness"),
+        &[
+            "routed",            // discover
+            "ready",             // intake
+            "actionable",        // triage
+            "claimed",           // claim
+            "user_facing",       // assess_surface
+            "shaped",            // shape_design
+            "implemented",       // implement
+            "pr_opened",         // open_pr
+            "changes_requested", // code_review
+            "updated",           // address_feedback
+            "approved",          // code_review again
+            "needs_qa",          // qa_routing
+            "evidence_ready",    // qa_run
+            "mergeable",         // premerge_check
+            "merged",            // merge_pr
+            "reconciled",        // housekeeping
+        ],
+    );
+    let engine = harness.engine(root.dir("store"));
+    let definition = shipped("open-mercato-sdlc.yaml");
+
+    // The validation gate runs a real script — a two-line fixture in the
+    // temporary root, never the repository's own.
+    let gate = root.dir("scripts").join("validation-gate.sh");
+    fs::write(&gate, "#!/bin/sh\nexit 0\n").expect("write the validation gate fixture");
+
+    let execution = run_to_terminal(
+        &engine,
+        &definition,
+        json!({
+            "ticket_id": "OM-417",
+            "task_brief": "the empty state of the orders list says nothing",
+            "target_repo": "open-mercato/app",
+            "validation_command": gate.to_string_lossy(),
+        }),
+        root.workspace(),
+        &[
+            Answer::new(
+                "confirm_readiness",
+                &[
+                    ("readiness_decision", "confirmed"),
+                    ("readiness_notes", "merchants with no orders yet; out of scope: filters"),
+                ],
+            ),
+            Answer::new("approve_design", &[("design_decision", "approved")]),
+            Answer::new(
+                "qa_signoff",
+                &[("qa_decision", "qa_approved"), ("qa_head", "deadbeef")],
+            ),
+            Answer::new("approve_merge", &[("merge_decision", "merge")]),
+        ],
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(execution.current_state.as_deref(), Some("completed"));
+    assert_eq!(
+        execution.context.variables.get("qa_head"),
+        Some(&json!("deadbeef")),
+        "the QA head the reviewer pinned the approval to is kept in the context"
+    );
+}
+
+/// The QA gate really does route a failure back into implementation, and the
+/// merge gate really can stop the pipeline — the two loops SDLC.md insists on.
+#[tokio::test]
+async fn a_failed_qa_goes_back_to_implementation_and_a_held_merge_can_be_abandoned() {
+    let root = TempRoot::new();
+    let harness = FakeHarness::installed_in(
+        root.dir("harness"),
+        &[
+            "routed",         // discover
+            "ready",          // intake
+            "actionable",     // triage
+            "claimed",        // claim
+            "not_user_facing",// assess_surface — the Design stage is skipped
+            "implemented",    // implement
+            "pr_opened",      // open_pr
+            "approved",       // code_review
+            "needs_qa",       // qa_routing
+            "evidence_ready", // qa_run
+            "implemented",    // implement, after QA failed
+            "pr_opened",      // open_pr again
+            "approved",       // code_review again
+            "needs_qa",       // qa_routing again
+            "evidence_ready", // qa_run again
+            "mergeable",      // premerge_check
+        ],
+    );
+    let engine = harness.engine(root.dir("store"));
+    let definition = shipped("open-mercato-sdlc.yaml");
+
+    let gate = root.dir("scripts").join("validation-gate.sh");
+    fs::write(&gate, "#!/bin/sh\nexit 0\n").expect("write the validation gate fixture");
+
+    let execution = run_to_terminal(
+        &engine,
+        &definition,
+        json!({
+            "ticket_id": "OM-418",
+            "task_brief": "orders export times out",
+            "target_repo": "open-mercato/app",
+            "validation_command": gate.to_string_lossy(),
+        }),
+        root.workspace(),
+        &[
+            Answer::new(
+                "confirm_readiness",
+                &[
+                    ("readiness_decision", "waived"),
+                    ("readiness_notes", "maintainer waives the out-of-scope section"),
+                ],
+            ),
+            Answer::new(
+                "qa_signoff",
+                &[("qa_decision", "qa_failed"), ("qa_head", "cafe1234")],
+            ),
+            Answer::new(
+                "qa_signoff",
+                &[("qa_decision", "qa_approved"), ("qa_head", "cafe5678")],
+            ),
+            Answer::new("approve_merge", &[("merge_decision", "hold")]),
+            Answer::new("blocked_gate", &[("block_decision", "abandon")]),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        execution.status,
+        ExecutionStatus::Cancelled,
+        "a human holding the merge and then abandoning cancels the run"
+    );
+    assert_eq!(execution.current_state.as_deref(), Some("cancelled"));
+}
