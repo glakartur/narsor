@@ -12,4 +12,6 @@ pub mod template;
 pub mod validator;
 
 pub use loader::{compile, load_from_file, load_from_str, LoadError};
+pub use template::{TemplateError, TemplateScope};
+pub use validator::{validate, validate_path, validate_source};
 pub use schema::{parse_duration, DurationParseError, DurationSecs, WorkflowFile};

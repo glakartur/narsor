@@ -372,7 +372,8 @@ states:
       type: agent
       harness: claude-code
       prompt: |
-        Zaimplementuj funkcję zgodnie z planem w plan.md i doprecyzowaniem od człowieka: {{ context.clarification_text }}.
+        Zaimplementuj funkcję zgodnie z planem w plan.md
+        oraz wymaganiem: {{ inputs.feature_description }}.
         Upewnij się, że kod kompiluje się.
     outputs:
       - implemented

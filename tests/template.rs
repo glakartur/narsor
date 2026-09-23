@@ -278,7 +278,10 @@ fn implement_prompt_from_the_reference_fixture_expands_fully() {
         ("feature_description", json!("logowanie przez OAuth")),
         ("target_repo", json!("acme/app")),
     ]);
-    let context = context(&[("clarification_text", json!("tylko Google jako provider"))]);
+    // Deliberately empty: `implement` is reachable from `analyze` (label `ready`)
+    // without passing through `human_clarification`, so the prompt must render
+    // on a context that carries nothing at all.
+    let context = context(&[]);
 
     let rendered = TemplateScope::new(&inputs, &context)
         .render_action(action, "state 'implement'")
@@ -293,7 +296,7 @@ fn implement_prompt_from_the_reference_fixture_expands_fully() {
         !prompt.contains("{{"),
         "the rendered prompt still contains a placeholder: {prompt}"
     );
-    assert!(prompt.contains("tylko Google jako provider"), "{prompt}");
+    assert!(prompt.contains("logowanie przez OAuth"), "{prompt}");
 }
 
 fn load_reference() -> orchestrator::domain::WorkflowDefinition {
