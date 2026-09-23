@@ -1,0 +1,55 @@
+name: tui-new-task
+version: 1
+description: >
+  Workflow fixture for starting a task from the interface. It declares one
+  input of each shape the new-task form has to respect — a required string, a
+  boolean with a default and a repository the operator picks from the registry
+  — and stops on a human state, so the test drives the whole creation path
+  without running a single external process. It deliberately declares no
+  `globals.workspace`, so nothing is ever cloned and nothing is written outside
+  the test's temporary root.
+
+inputs:
+  - name: ticket
+    type: string
+    required: true
+    description: Identifier the operator types; required, so an empty form is refused.
+  - name: is_experimental
+    type: boolean
+    required: false
+    default: false
+    description: Must reach the context as a JSON boolean, never as the string "true".
+  - name: repository
+    type: repository
+    required: false
+    description: Offered as a pick list of the registered repository ids.
+
+states:
+  review:
+    description: A person confirms the task that was just created.
+    action:
+      type: human
+      message: "Confirm the new task?"
+      inputs:
+        - name: approval_status
+          type: select
+          required: true
+          options:
+            - approved
+            - rejected
+    outputs:
+      - approved
+      - rejected
+    transitions:
+      approved: done
+      rejected: aborted
+
+  done:
+    description: The task was confirmed.
+
+  aborted:
+    description: The task was rejected.
+
+terminal_states:
+  done: completed
+  aborted: failed

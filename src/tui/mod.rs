@@ -171,6 +171,7 @@ pub async fn run(store: ExecutionStore) -> io::Result<()> {
                         Request::SubmitInput => app.submit_input().await,
                         Request::ApplyTransition => app.apply_transition().await,
                         Request::RunSelected => app.run_selected().await,
+                        Request::StartNewTask => app.start_new_task().await,
                     }
                 }
                 // A resize needs no state change: the next draw re-derives the

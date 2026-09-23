@@ -36,22 +36,52 @@
 //!   `StateExited` and `TransitionTaken`. The execution is parked `Paused` at
 //!   the target (or finished, if the target is terminal) and the operator
 //!   resumes it explicitly.
+//!
+//! # Registering a repository, and starting a task
+//!
+//! Both are modals, and both are the CLI's own operation with a form in front
+//! of it — `orchestrator repo add`/`repo list`/`repo remove` behind `R`, and
+//! `orchestrator run` behind `n`. Nothing here is a capability the CLI lacks.
+//!
+//! * The repository form builds a [`RepositoryEntry`] and calls its
+//!   [`validate`](RepositoryEntry::validate) *before* `add()`, so a refused id
+//!   or an `ext::` remote is reported next to the field rather than as a
+//!   generic storage failure.
+//! * The new-task modal validates the definition in full (every violation, the
+//!   way `orchestrator validate` prints them), then generates the input form
+//!   from the definition's `inputs`: the declared `type` decides the JSON type
+//!   the value reaches the context as, and a `repository` input is a pick list
+//!   of what the registry holds.
+//!
+//! ## What starting a task does not do yet
+//!
+//! It provisions only the empty workspace a definition without a declared
+//! `globals.workspace` runs in. Expanding the workspace templates, resolving
+//! the repository through the registry and cloning it lives in
+//! `src/cli/commands.rs` and is not reachable from here; a second copy of the
+//! rules that decide what `git` is asked to clone is exactly the drift the
+//! registry's own documentation warns about. So a workflow that declares a
+//! workspace is refused here, by name, pointing at `orchestrator run` — until
+//! that pipeline moves into a shared module both callers can use.
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::domain::{
-    Event, EventData, ExecutionStatus, HumanInputField, HumanInputType, State, WorkflowDefinition,
-    WorkflowExecution,
+    Event, EventData, ExecutionStatus, HumanInputField, HumanInputType, InputParameter, ParamType,
+    State, WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo,
 };
 use crate::engine::{
     permitted_labels, terminal_status, Engine, HumanInputDelivery, PendingHumanInput,
 };
-use crate::workflow::load_from_file;
+use crate::registry::{RepositoryEntry, RepositoryRegistry};
+use crate::workflow::{load_from_file, validate_path};
+use crate::workspace::WorkspaceProvisioner;
 
 /// Key of the CLI's scratch area in `WorkflowExecution::metadata`.
 const METADATA_CLI_KEY: &str = "cli";
@@ -78,6 +108,11 @@ pub const MANUAL_REASON: &str = "Manual transition picked by the operator.";
 
 /// The label recorded for a forced transition, which by definition has none.
 pub const OVERRIDE_LABEL: &str = "override";
+
+/// Directory name of the empty workspace a definition without a declared
+/// `globals.workspace` runs in — the same name the CLI's `run` uses, so an
+/// execution started here is laid out exactly like one started there.
+const FALLBACK_WORKSPACE_NAME: &str = "workspace";
 
 // ---------------------------------------------------------------------------
 // Small state types
@@ -218,6 +253,8 @@ pub enum Request {
     ApplyTransition,
     /// Run or resume the selected execution.
     RunSelected,
+    /// Create the execution the new-task form describes and run it.
+    StartNewTask,
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +398,358 @@ fn infers_label(fields: &[HumanInputField]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// The repository registry
+// ---------------------------------------------------------------------------
+
+/// One row of the repository form, in the order the rows are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryField {
+    /// The id a workflow writes in `globals.workspace.repository`.
+    Id,
+    /// Anything `git clone` accepts.
+    Remote,
+    /// Display name; defaults to the id.
+    Name,
+    /// Where the repository is hosted; defaults to `git`.
+    Provider,
+    /// Branch used when a workflow declares no `ref`.
+    DefaultBranch,
+    /// Free-form note.
+    Description,
+}
+
+impl RepositoryField {
+    /// Every row, in drawing order.
+    pub const ALL: [RepositoryField; 6] = [
+        RepositoryField::Id,
+        RepositoryField::Remote,
+        RepositoryField::Name,
+        RepositoryField::Provider,
+        RepositoryField::DefaultBranch,
+        RepositoryField::Description,
+    ];
+
+    /// The label drawn in front of the value.
+    pub fn label(self) -> &'static str {
+        match self {
+            RepositoryField::Id => "id",
+            RepositoryField::Remote => "remote",
+            RepositoryField::Name => "name",
+            RepositoryField::Provider => "provider",
+            RepositoryField::DefaultBranch => "default branch",
+            RepositoryField::Description => "description",
+        }
+    }
+
+    /// Whether the entry cannot be built without it.
+    pub fn required(self) -> bool {
+        matches!(self, RepositoryField::Id | RepositoryField::Remote)
+    }
+
+    /// The row's index into [`RepositoryForm::values`].
+    pub fn index(self) -> usize {
+        RepositoryField::ALL
+            .iter()
+            .position(|field| *field == self)
+            .unwrap_or(0)
+    }
+}
+
+/// The form that registers a repository — the TUI's `orchestrator repo add`.
+///
+/// Every value is a plain text line: the registry's own
+/// [`RepositoryEntry::validate`] is what judges them, so the form never invents
+/// a rule the CLI does not have.
+#[derive(Debug, Clone)]
+pub struct RepositoryForm {
+    /// The typed value of each row, by [`RepositoryField::index`].
+    pub values: Vec<String>,
+    /// The focused row.
+    pub row: usize,
+    /// The last rejection, shown in the form and keeping it open.
+    pub error: Option<String>,
+}
+
+impl Default for RepositoryForm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RepositoryForm {
+    /// An empty form.
+    pub fn new() -> Self {
+        Self {
+            values: vec![String::new(); RepositoryField::ALL.len()],
+            row: 0,
+            error: None,
+        }
+    }
+
+    /// The trimmed value of one row.
+    pub fn value(&self, field: RepositoryField) -> &str {
+        self.values
+            .get(field.index())
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim()
+    }
+
+    /// Builds the entry and runs the registry's validation on it.
+    ///
+    /// Deliberately *before* anything is stored: `add()` would reject the same
+    /// entry, but the operator would read a generic failure instead of the rule
+    /// they broke, and `ext::` remotes are exactly the case where that matters.
+    pub fn entry(&self) -> Result<RepositoryEntry, String> {
+        for field in RepositoryField::ALL {
+            if field.required() && self.value(field).is_empty() {
+                return Err(format!("Field '{}' is required.", field.label()));
+            }
+        }
+
+        let id = self.value(RepositoryField::Id);
+        let mut entry = RepositoryEntry::new(id, self.value(RepositoryField::Remote));
+
+        let name = self.value(RepositoryField::Name);
+        if !name.is_empty() {
+            entry = entry.with_name(name);
+        }
+        let provider = self.value(RepositoryField::Provider);
+        if !provider.is_empty() {
+            entry = entry.with_provider(provider);
+        }
+        let branch = self.value(RepositoryField::DefaultBranch);
+        if !branch.is_empty() {
+            entry = entry.with_default_branch(branch);
+        }
+        let description = self.value(RepositoryField::Description);
+        if !description.is_empty() {
+            entry = entry.with_description(description);
+        }
+
+        entry.validate().map_err(|error| error.to_string())?;
+        Ok(entry)
+    }
+}
+
+/// The listing of what is registered — the TUI's `orchestrator repo list`.
+///
+/// A modal rather than a fourth panel: the registry is consulted when a task is
+/// started, not while one is watched, and a permanent panel would spend screen
+/// on it every second of a session that never touches it.
+#[derive(Debug, Clone)]
+pub struct RepositoryList {
+    /// Every registered repository, in the registry's own order (by id).
+    pub entries: Vec<RepositoryEntry>,
+    /// The highlighted entry.
+    pub selected: usize,
+}
+
+impl RepositoryList {
+    /// The highlighted entry.
+    pub fn current(&self) -> Option<&RepositoryEntry> {
+        self.entries.get(self.selected)
+    }
+}
+
+/// The confirmation a removal has to pass, as an override does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryRemoveConfirm {
+    /// The repository that would be removed.
+    pub id: String,
+}
+
+// ---------------------------------------------------------------------------
+// The new-task form
+// ---------------------------------------------------------------------------
+
+/// Which half of the new-task modal is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewTaskStage {
+    /// Typing the path of the definition to run.
+    Definition,
+    /// Filling in the inputs the loaded definition declares.
+    Inputs,
+}
+
+/// How one declared input is edited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputEditor {
+    /// A free line, for `string` and `integer`.
+    Text,
+    /// A cycled list: `true`/`false` for a `boolean`, the registered ids for a
+    /// `repository`.
+    Choice(Vec<String>),
+}
+
+/// The modal that starts a workflow — the TUI's `orchestrator run`.
+///
+/// Two stages in one overlay, because they are one operation: a path is typed,
+/// the definition behind it is validated in full, and the form for its `inputs`
+/// is generated from what was loaded. Nothing is created until the second stage
+/// is submitted.
+#[derive(Debug, Clone)]
+pub struct NewTaskForm {
+    /// The stage currently shown.
+    pub stage: NewTaskStage,
+    /// The typed definition path.
+    pub path: String,
+    /// Every violation the definition failed on — all of them, as `validate`
+    /// prints them, never only the first.
+    pub violations: Vec<String>,
+    /// The last failure that is not a violation.
+    pub error: Option<String>,
+    /// The loaded definition, once the path passed.
+    pub definition: Option<WorkflowDefinition>,
+    /// The declared parameters, in declaration order.
+    pub parameters: Vec<InputParameter>,
+    /// How each parameter is edited.
+    pub editors: Vec<InputEditor>,
+    /// The current value of each parameter, as typed or picked.
+    pub values: Vec<String>,
+    /// The focused parameter.
+    pub row: usize,
+}
+
+impl Default for NewTaskForm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NewTaskForm {
+    /// An empty form, waiting for a definition path.
+    pub fn new() -> Self {
+        Self {
+            stage: NewTaskStage::Definition,
+            path: String::new(),
+            violations: Vec::new(),
+            error: None,
+            definition: None,
+            parameters: Vec::new(),
+            editors: Vec::new(),
+            values: Vec::new(),
+            row: 0,
+        }
+    }
+
+    /// The choices a parameter offers, when it is not a free line.
+    pub fn choices(&self, index: usize) -> Option<&[String]> {
+        match self.editors.get(index) {
+            Some(InputEditor::Choice(options)) => Some(options),
+            _ => None,
+        }
+    }
+
+    /// Generates the input form from a loaded definition.
+    ///
+    /// `repositories` are the registered ids: a `repository` parameter offers
+    /// them instead of asking the operator to retype an id the registry already
+    /// knows. With nothing registered it falls back to a free line, so a raw
+    /// remote — which the resolver still accepts — stays typeable.
+    fn adopt(&mut self, definition: WorkflowDefinition, repositories: &[String]) {
+        self.parameters = definition.inputs.clone();
+        self.editors = self
+            .parameters
+            .iter()
+            .map(|parameter| match parameter.param_type {
+                ParamType::Boolean => {
+                    InputEditor::Choice(vec!["true".to_string(), "false".to_string()])
+                }
+                ParamType::Repository if !repositories.is_empty() => {
+                    InputEditor::Choice(repositories.to_vec())
+                }
+                _ => InputEditor::Text,
+            })
+            .collect();
+        self.values = self
+            .parameters
+            .iter()
+            .zip(&self.editors)
+            .map(|(parameter, editor)| match (&parameter.default, editor) {
+                (Some(default), _) => default_as_text(default),
+                // A boolean is never "unset" on screen, so it starts on the
+                // value that changes nothing.
+                (None, InputEditor::Choice(options))
+                    if parameter.param_type == ParamType::Boolean =>
+                {
+                    options.last().cloned().unwrap_or_default()
+                }
+                (None, InputEditor::Choice(options)) => {
+                    options.first().cloned().unwrap_or_default()
+                }
+                (None, InputEditor::Text) => String::new(),
+            })
+            .collect();
+        self.definition = Some(definition);
+        self.stage = NewTaskStage::Inputs;
+        self.row = 0;
+        self.violations.clear();
+        self.error = None;
+    }
+
+    /// Turns the typed values into the execution's inputs.
+    ///
+    /// The declared `type` decides the JSON type, exactly as the CLI's
+    /// `--input` parsing does: `is_experimental=true` reaches the context as a
+    /// boolean, not as the string `"true"`.
+    pub fn inputs(&self) -> Result<Map<String, Value>, String> {
+        let mut values = Map::new();
+
+        for (index, parameter) in self.parameters.iter().enumerate() {
+            let raw = self
+                .values
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or("")
+                .trim();
+
+            if raw.is_empty() {
+                if let Some(default) = &parameter.default {
+                    values.insert(parameter.name.clone(), default.clone());
+                    continue;
+                }
+                if parameter.required {
+                    return Err(format!("Input '{}' is required.", parameter.name));
+                }
+                continue;
+            }
+
+            let value = match parameter.param_type {
+                ParamType::String | ParamType::Repository => Value::String(raw.to_string()),
+                ParamType::Integer => raw.parse::<i64>().map(Value::from).map_err(|_| {
+                    format!(
+                        "Input '{}' expects an integer, not '{raw}'.",
+                        parameter.name
+                    )
+                })?,
+                ParamType::Boolean => match raw.to_ascii_lowercase().as_str() {
+                    "true" => Value::Bool(true),
+                    "false" => Value::Bool(false),
+                    other => {
+                        return Err(format!(
+                            "Input '{}' expects true or false, not '{other}'.",
+                            parameter.name
+                        ))
+                    }
+                },
+            };
+            values.insert(parameter.name.clone(), value);
+        }
+
+        Ok(values)
+    }
+}
+
+/// A declared default, as the form shows it.
+fn default_as_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The manual transition menu
 // ---------------------------------------------------------------------------
 
@@ -423,6 +812,14 @@ pub enum Modal {
     Transition(TransitionMenu),
     /// The confirmation of a forced transition.
     Confirm(OverrideConfirm),
+    /// The listing of registered repositories.
+    Repositories(RepositoryList),
+    /// The form that registers a repository.
+    RepositoryForm(RepositoryForm),
+    /// The confirmation of a repository removal.
+    RepositoryRemove(RepositoryRemoveConfirm),
+    /// The form that starts a workflow.
+    NewTask(Box<NewTaskForm>),
     /// The key map.
     Help,
 }
@@ -646,6 +1043,33 @@ impl App {
                 keys
             }
             Modal::Confirm(_) => vec![("y", "confirm"), ("n/Esc", "cancel")],
+            Modal::RepositoryRemove(_) => vec![("y", "remove"), ("n/Esc", "cancel")],
+            Modal::Repositories(_) => vec![
+                ("j/k", "select"),
+                ("a", "register"),
+                ("d", "remove"),
+                ("Esc", "close"),
+            ],
+            Modal::RepositoryForm(_) => vec![
+                ("Tab/↑↓", "field"),
+                ("letters", "type"),
+                ("Enter", "register"),
+                ("Esc", "cancel"),
+            ],
+            Modal::NewTask(form) => match form.stage {
+                NewTaskStage::Definition => vec![
+                    ("letters", "type the path"),
+                    ("Enter", "load"),
+                    ("Esc", "cancel"),
+                ],
+                NewTaskStage::Inputs => vec![
+                    ("Tab/↑↓", "field"),
+                    ("←/→", "value"),
+                    ("letters", "type"),
+                    ("Enter", "start"),
+                    ("Esc", "cancel"),
+                ],
+            },
             Modal::Help => vec![("Esc/?", "close")],
             Modal::None => {
                 let mut keys = vec![("Tab", "panel"), ("r", "refresh")];
@@ -653,6 +1077,8 @@ impl App {
                     Panel::Executions => {
                         keys.push(("j/k", "select"));
                         keys.push(("g/G", "top/bottom"));
+                        keys.push(("n", "new task"));
+                        keys.push(("R", "repositories"));
                         keys.push(("s", "run/resume"));
                         keys.push(("i", "input"));
                         keys.push(("t", "transition"));
@@ -889,6 +1315,10 @@ impl App {
             Modal::Input(_) => self.on_key_form(key),
             Modal::Transition(_) => self.on_key_transition(key),
             Modal::Confirm(_) => self.on_key_confirm(key),
+            Modal::Repositories(_) => self.on_key_repositories(key),
+            Modal::RepositoryForm(_) => self.on_key_repository_form(key),
+            Modal::RepositoryRemove(_) => self.on_key_repository_remove(key),
+            Modal::NewTask(_) => self.on_key_new_task(key),
         }
     }
 
@@ -943,6 +1373,14 @@ impl App {
             }
             KeyCode::Char('t') => {
                 self.open_transition_menu();
+                Request::None
+            }
+            KeyCode::Char('n') => {
+                self.modal = Modal::NewTask(Box::default());
+                Request::None
+            }
+            KeyCode::Char('R') => {
+                self.open_repository_list();
                 Request::None
             }
             KeyCode::Char('s') => Request::RunSelected,
@@ -1125,6 +1563,140 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') => Request::ApplyTransition,
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.modal = Modal::None;
+                Request::None
+            }
+            _ => Request::None,
+        }
+    }
+
+    /// Keys inside the repository listing.
+    fn on_key_repositories(&mut self, key: KeyEvent) -> Request {
+        let Modal::Repositories(list) = &mut self.modal else {
+            return Request::None;
+        };
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.modal = Modal::None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(next) = step(list.selected, 1, list.entries.len()) {
+                    list.selected = next;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(next) = step(list.selected, -1, list.entries.len()) {
+                    list.selected = next;
+                }
+            }
+            KeyCode::Char('a') => {
+                self.modal = Modal::RepositoryForm(RepositoryForm::new());
+            }
+            KeyCode::Char('d') => match list.current() {
+                // Removal is a write, so it goes through its own confirmation,
+                // the way a forced transition does.
+                Some(entry) => {
+                    let id = entry.id.clone();
+                    self.modal = Modal::RepositoryRemove(RepositoryRemoveConfirm { id });
+                }
+                None => self.notice = Some(Notice::error("No repository is selected.")),
+            },
+            _ => {}
+        }
+        Request::None
+    }
+
+    /// Keys inside the repository form.
+    fn on_key_repository_form(&mut self, key: KeyEvent) -> Request {
+        let Modal::RepositoryForm(form) = &mut self.modal else {
+            return Request::None;
+        };
+        let rows = RepositoryField::ALL.len();
+
+        match key.code {
+            KeyCode::Esc => self.modal = Modal::None,
+            KeyCode::Enter => self.submit_repository(),
+            KeyCode::Tab | KeyCode::Down => form.row = (form.row + 1) % rows,
+            KeyCode::BackTab | KeyCode::Up => form.row = (form.row + rows - 1) % rows,
+            KeyCode::Backspace => {
+                form.values[form.row].pop();
+            }
+            KeyCode::Char(character) => form.values[form.row].push(character),
+            _ => {}
+        }
+        Request::None
+    }
+
+    /// Keys inside the repository removal confirmation.
+    fn on_key_repository_remove(&mut self, key: KeyEvent) -> Request {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.remove_repository(),
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => self.open_repository_list(),
+            _ => {}
+        }
+        Request::None
+    }
+
+    /// Keys inside the new-task form.
+    fn on_key_new_task(&mut self, key: KeyEvent) -> Request {
+        let Modal::NewTask(form) = &mut self.modal else {
+            return Request::None;
+        };
+
+        if form.stage == NewTaskStage::Definition {
+            match key.code {
+                KeyCode::Esc => self.modal = Modal::None,
+                // Loading and validating reads a file and nothing else, so it
+                // stays on this side of the `Request` seam.
+                KeyCode::Enter => self.load_new_task_definition(),
+                KeyCode::Backspace => {
+                    form.path.pop();
+                }
+                KeyCode::Char(character) => form.path.push(character),
+                _ => {}
+            }
+            return Request::None;
+        }
+
+        let rows = form.parameters.len();
+        match key.code {
+            KeyCode::Esc => {
+                self.modal = Modal::None;
+                Request::None
+            }
+            KeyCode::Enter => Request::StartNewTask,
+            KeyCode::Tab | KeyCode::Down if rows > 0 => {
+                form.row = (form.row + 1) % rows;
+                Request::None
+            }
+            KeyCode::BackTab | KeyCode::Up if rows > 0 => {
+                form.row = (form.row + rows - 1) % rows;
+                Request::None
+            }
+            KeyCode::Left => {
+                cycle_input(form, -1);
+                Request::None
+            }
+            KeyCode::Right => {
+                cycle_input(form, 1);
+                Request::None
+            }
+            KeyCode::Backspace => {
+                if form.choices(form.row).is_none() {
+                    if let Some(value) = form.values.get_mut(form.row) {
+                        value.pop();
+                    }
+                }
+                Request::None
+            }
+            KeyCode::Char(character) => {
+                if form.choices(form.row).is_some() {
+                    if character == ' ' {
+                        cycle_input(form, 1);
+                    }
+                } else if let Some(value) = form.values.get_mut(form.row) {
+                    value.push(character);
+                }
                 Request::None
             }
             _ => Request::None,
@@ -1465,6 +2037,265 @@ impl App {
         self.refresh();
     }
 
+    // -- the repository registry --------------------------------------------
+
+    /// The registry of the root this interface's store lives in.
+    fn registry(&self) -> RepositoryRegistry {
+        RepositoryRegistry::new(self.engine.store().root())
+    }
+
+    /// The registered ids, or an empty list when the registry cannot be read.
+    pub fn repository_ids(&self) -> Vec<String> {
+        self.registry()
+            .list()
+            .map(|entries| entries.into_iter().map(|entry| entry.id).collect())
+            .unwrap_or_default()
+    }
+
+    /// Opens the listing of registered repositories.
+    pub fn open_repository_list(&mut self) {
+        match self.registry().list() {
+            Ok(entries) => {
+                let selected = match &self.modal {
+                    // Coming back from a form or a confirmation keeps the
+                    // operator where they were, unless the list shrank.
+                    Modal::Repositories(list) => list.selected.min(entries.len().saturating_sub(1)),
+                    _ => 0,
+                };
+                self.modal = Modal::Repositories(RepositoryList { entries, selected });
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not read the repository registry: {error}"
+                )))
+            }
+        }
+    }
+
+    /// Opens the form that registers a repository.
+    pub fn open_repository_form(&mut self) {
+        self.modal = Modal::RepositoryForm(RepositoryForm::new());
+    }
+
+    /// Validates the open repository form and, if it passes, stores the entry.
+    ///
+    /// A rejection — a missing field, an unusable id, a refused remote, an id
+    /// that is already taken — is shown in the form and the form stays open,
+    /// exactly as the human-input form behaves. Nothing reaches the registry
+    /// that `validate()` has not already accepted.
+    pub fn submit_repository(&mut self) {
+        let Modal::RepositoryForm(form) = &self.modal else {
+            return;
+        };
+
+        let entry = match form.entry() {
+            Ok(entry) => entry,
+            Err(message) => {
+                if let Modal::RepositoryForm(form) = &mut self.modal {
+                    form.error = Some(message.clone());
+                }
+                self.notice = Some(Notice::error(message));
+                return;
+            }
+        };
+
+        let id = entry.id.clone();
+        match self.registry().add(entry) {
+            Ok(()) => {
+                self.notice = Some(Notice::info(format!("Registered repository '{id}'.")));
+                self.modal = Modal::None;
+                self.open_repository_list();
+            }
+            Err(error) => {
+                let message = format!("Could not register the repository: {error}");
+                if let Modal::RepositoryForm(form) = &mut self.modal {
+                    form.error = Some(message.clone());
+                }
+                self.notice = Some(Notice::error(message));
+            }
+        }
+    }
+
+    /// Removes the confirmed repository and returns to the listing.
+    pub fn remove_repository(&mut self) {
+        let Modal::RepositoryRemove(confirm) = &self.modal else {
+            return;
+        };
+        let id = confirm.id.clone();
+
+        match self.registry().remove(&id) {
+            Ok(entry) => {
+                self.notice = Some(Notice::info(format!(
+                    "Removed repository '{}' ({}).",
+                    entry.id, entry.remote
+                )))
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not remove the repository: {error}"
+                )))
+            }
+        }
+        self.modal = Modal::None;
+        self.open_repository_list();
+    }
+
+    // -- starting a new task ------------------------------------------------
+
+    /// Loads the definition the new-task form names and validates it in full.
+    ///
+    /// Every violation is kept, not the first one: the operator should see the
+    /// whole verdict on one screen, the way `orchestrator validate` prints it.
+    pub fn load_new_task_definition(&mut self) {
+        let repositories = self.repository_ids();
+        let Modal::NewTask(form) = &mut self.modal else {
+            return;
+        };
+
+        form.violations.clear();
+        form.error = None;
+        form.definition = None;
+
+        let path = form.path.trim().to_string();
+        if path.is_empty() {
+            form.error = Some("Type the path of a workflow definition.".to_string());
+            return;
+        }
+
+        match validate_path(&path) {
+            Ok(violations) if !violations.is_empty() => {
+                form.violations = violations.iter().map(ToString::to_string).collect();
+                form.error = Some("The definition is invalid — nothing was created.".to_string());
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                form.error = Some(format!("Could not load the definition: {error}"));
+                return;
+            }
+        }
+
+        let definition = match load_from_file(&path) {
+            Ok(definition) => definition,
+            Err(error) => {
+                form.error = Some(format!("Could not load the definition: {error}"));
+                return;
+            }
+        };
+
+        form.adopt(definition, &repositories);
+    }
+
+    /// Creates the execution the form describes and runs it.
+    ///
+    /// The steps are the CLI's, in the CLI's order: inputs first, then the
+    /// execution, then its workspace, then the run — so that a rejected input
+    /// leaves nothing on disk at all.
+    pub async fn start_new_task(&mut self) {
+        let Modal::NewTask(form) = &self.modal else {
+            return;
+        };
+        let Some(definition) = form.definition.clone() else {
+            return;
+        };
+        let file = PathBuf::from(form.path.trim());
+
+        let inputs = match form.inputs() {
+            Ok(inputs) => inputs,
+            Err(message) => {
+                if let Modal::NewTask(form) = &mut self.modal {
+                    form.error = Some(message.clone());
+                }
+                self.notice = Some(Notice::error(message));
+                return;
+            }
+        };
+
+        // See `workspace_for` — a declared `globals.workspace` is refused
+        // before anything is written, never provisioned by halves.
+        if let Err(message) = declared_workspace_is_supported(&definition) {
+            if let Modal::NewTask(form) = &mut self.modal {
+                form.error = Some(message.clone());
+            }
+            self.notice = Some(Notice::error(message));
+            return;
+        }
+
+        let root = self.engine.store().root().to_path_buf();
+        let mut execution = match self.engine.start(
+            &definition,
+            Value::Object(inputs),
+            // Replaced below, once the execution id names the task directory.
+            Workspace::local_folder(root.display().to_string()),
+        ) {
+            Ok(execution) => execution,
+            Err(error) => {
+                let message = format!("Could not create the execution: {error}");
+                if let Modal::NewTask(form) = &mut self.modal {
+                    form.error = Some(message.clone());
+                }
+                self.notice = Some(Notice::error(message));
+                return;
+            }
+        };
+
+        match empty_workspace(&root, &execution.id) {
+            Ok(workspace) => {
+                execution.context.workspace = Some(WorkspaceInfo {
+                    id: workspace.id.clone(),
+                    path: workspace.path.clone(),
+                    workspace_type: format!("{:?}", workspace.workspace_type).to_lowercase(),
+                });
+                execution.workspace = workspace;
+                record_definition_path(&mut execution, &file);
+                if let Err(error) = self.engine.store().save_execution(&execution) {
+                    self.notice = Some(Notice::error(format!(
+                        "Could not save the execution: {error}"
+                    )));
+                    return;
+                }
+            }
+            Err(message) => {
+                abandon_execution(self.engine.store(), &mut execution, &message);
+                self.notice = Some(Notice::error(message));
+                self.modal = Modal::None;
+                self.refresh();
+                self.select_execution(&execution.id);
+                return;
+            }
+        }
+
+        self.modal = Modal::None;
+        let outcome = self.engine.run(&definition, &execution.id).await;
+        self.refresh();
+        self.select_execution(&execution.id);
+
+        self.notice = Some(match outcome {
+            Ok(execution) => Notice::info(format!(
+                "Started execution {}; it is now {}.",
+                execution.id,
+                status_name(&execution.status)
+            )),
+            Err(error) => Notice::error(format!(
+                "Execution {} was created but the engine returned an error: {error}",
+                execution.id
+            )),
+        });
+    }
+
+    /// Puts the cursor on one execution, if the list holds it.
+    pub fn select_execution(&mut self, execution_id: &str) {
+        if let Some(index) = self
+            .executions
+            .iter()
+            .position(|row| row.id == execution_id)
+        {
+            self.selected = index;
+            self.focus = Panel::Executions;
+            self.reload_selection();
+        }
+    }
+
     /// Runs or resumes the selected execution.
     pub async fn run_selected(&mut self) {
         let Some(row) = self.selected().cloned() else {
@@ -1555,6 +2386,94 @@ fn cycle_choice(form: &mut InputForm, delta: isize) {
         }
         None => {}
     }
+}
+
+/// Steps the focused input's choice, when it has one.
+fn cycle_input(form: &mut NewTaskForm, delta: isize) {
+    let Some(options) = form.choices(form.row) else {
+        return;
+    };
+    if options.is_empty() {
+        return;
+    }
+    let current = options
+        .iter()
+        .position(|option| Some(option) == form.values.get(form.row))
+        .unwrap_or(0);
+    let next = wrap(current, delta, options.len());
+    let value = options[next].clone();
+    if let Some(slot) = form.values.get_mut(form.row) {
+        *slot = value;
+    }
+}
+
+/// Whether the TUI can provision the workspace this definition declares.
+///
+/// It cannot, and says so instead of guessing. Expanding the `globals.workspace`
+/// templates, resolving the repository through the registry and cloning it is
+/// implemented once, in `src/cli/commands.rs`, and it is not reachable from
+/// here; copying it would give this interface a second, drifting copy of the
+/// rules that decide what `git` is asked to clone. Until that pipeline moves
+/// into a shared module, a workflow that declares a workspace is started with
+/// `orchestrator run`, and the operator is told exactly that.
+fn declared_workspace_is_supported(definition: &WorkflowDefinition) -> Result<(), String> {
+    if definition.workspace.is_some() {
+        return Err(format!(
+            "Workflow '{}' declares globals.workspace, and provisioning a checkout \
+             is not available from the interface yet. Start it with \
+             `orchestrator run <file>`; everything else — answering, transitions, \
+             registering repositories — works here.",
+            definition.id
+        ));
+    }
+    Ok(())
+}
+
+/// Creates the empty working directory an execution without a declared
+/// workspace runs in — the same `{root}/tasks/{id}/code/workspace` the CLI
+/// falls back to, so both paths produce the same layout on disk.
+fn empty_workspace(root: &Path, execution_id: &str) -> Result<Workspace, String> {
+    let path = WorkspaceProvisioner::new(root)
+        .code_dir(execution_id)
+        .join(FALLBACK_WORKSPACE_NAME);
+    fs::create_dir_all(&path)
+        .map_err(|error| format!("Could not create the workspace directory: {error}"))?;
+    Ok(Workspace::local_folder(path.display().to_string()))
+}
+
+/// Records the definition path under the same metadata key the CLI writes, so
+/// the interface resolves an execution it started exactly as it resolves one
+/// `orchestrator run` started.
+fn record_definition_path(execution: &mut WorkflowExecution, file: &Path) {
+    let path = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    if !execution.metadata.is_object() {
+        execution.metadata = json!({});
+    }
+    if let Some(metadata) = execution.metadata.as_object_mut() {
+        metadata.insert(
+            METADATA_CLI_KEY.to_string(),
+            json!({ METADATA_DEFINITION_PATH_KEY: path.display().to_string() }),
+        );
+    }
+}
+
+/// Marks an execution that never got a workspace as failed, so it does not look
+/// resumable when nothing can ever step it.
+fn abandon_execution(
+    store: &crate::persistence::ExecutionStore,
+    execution: &mut WorkflowExecution,
+    message: &str,
+) {
+    execution.status = ExecutionStatus::Failed;
+    execution.completed_at = Some(chrono::Utc::now());
+    let _ = store.event_log(&execution.id).append_next(
+        &execution.id,
+        EventData::Error {
+            message: message.to_string(),
+            context: json!({ "stage": "workspace_provisioning" }),
+        },
+    );
+    let _ = store.save_execution(execution);
 }
 
 /// Steps an index within `length`, wrapping around.
