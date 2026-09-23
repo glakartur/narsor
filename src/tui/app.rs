@@ -631,7 +631,7 @@ impl App {
     pub fn shortcuts(&self) -> Vec<(&'static str, &'static str)> {
         match &self.modal {
             Modal::Input(_) => vec![
-                ("Tab/j/k", "field"),
+                ("Tab/↑↓", "field"),
                 ("←/→", "value"),
                 ("letters", "type"),
                 ("Enter", "submit"),

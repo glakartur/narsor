@@ -705,3 +705,32 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
     app.on_key(key(KeyCode::Char('q')));
     assert!(app.should_quit());
 }
+
+/// The form's advertised shortcuts must match what `on_key_form` actually
+/// handles. The bar and the help overlay once offered `j`/`k` for moving
+/// between fields, which never worked: on a text field those are typed as
+/// characters, and on a select row they are ignored. A hint that lies is worse
+/// than no hint, because the operator blames themselves for the key not working.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_form_never_advertises_a_key_it_does_not_handle() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    paused_at_review(&engine, root.path()).await;
+
+    let mut app = App::new(Arc::clone(&engine));
+    app.refresh();
+    app.on_key(key(KeyCode::Char('i')));
+    assert!(matches!(app.modal(), Modal::Input(_)), "the form is open");
+
+    let hints = app.shortcuts();
+    for (keys, _) in &hints {
+        assert!(
+            !keys.contains("j/k") && !keys.contains("j / k"),
+            "the form advertises {keys:?} for field movement, which on_key_form does not handle"
+        );
+    }
+    assert!(
+        hints.iter().any(|(keys, _)| keys.contains("Tab")),
+        "the form must still advertise Tab for field movement: {hints:?}"
+    );
+}

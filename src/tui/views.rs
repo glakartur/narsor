@@ -607,8 +607,10 @@ fn render_help_modal(frame: &mut Frame) {
             "Form",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from("  Tab / j / k       next field"),
+        Line::from("  Tab / ↓           next field"),
+        Line::from("  Shift+Tab / ↑     previous field"),
         Line::from("  ← / → / space     change a select value"),
+        Line::from("  letters / Backspace  edit a text field"),
         Line::from("  Enter             submit,  Esc — cancel"),
     ];
 
