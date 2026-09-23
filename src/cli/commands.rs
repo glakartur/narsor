@@ -653,10 +653,23 @@ pub async fn resume(root: &Path, execution_id: &str, definition_file: Option<&Pa
 // ---------------------------------------------------------------------------
 
 /// `orchestrator tui` — the full-screen interface, added in U10.
+///
+/// The loop is async but this entry point is not, because the subcommand
+/// dispatch calls it from inside the runtime `main` already started. So the
+/// current worker thread is handed over with `block_in_place` and the loop is
+/// driven on it: spawning a second runtime inside the first would panic, and
+/// the interface has to own a thread anyway — it blocks on keys.
+///
+/// The store is the default root: the [`Command::Tui`](crate::cli::Command::Tui)
+/// subcommand takes no arguments of its own and this function takes none
+/// either, so `--root` does not reach it. That is the one place where the TUI
+/// is less capable than the rest of the CLI.
 pub fn tui() -> Result<()> {
-    Err(CliError::failure(
-        "Interfejs TUI nie jest jeszcze dostępny w tej wersji.",
-    ))
+    let store = ExecutionStore::with_default_root();
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::block_in_place(move || handle.block_on(crate::tui::run(store))).map_err(|error| {
+        CliError::failure(format!("The terminal interface stopped with an error: {error}"))
+    })
 }
 
 // ---------------------------------------------------------------------------
