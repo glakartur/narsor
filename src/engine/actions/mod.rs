@@ -31,6 +31,7 @@
 //! request. Implementors write an `async move` block and box it; see
 //! [`ScriptExecutor::execute`] for the shape to copy.
 
+pub mod human;
 pub mod script;
 
 use std::future::Future;
@@ -39,6 +40,10 @@ use std::time::Duration;
 
 use crate::domain::{ActionConfig, ActionError, ActionResult, OutputLabel, Workspace};
 
+pub use human::{
+    HumanActionError, HumanExecutor, HumanInputDelivery, HumanInputRequest, PendingHumanInput,
+    ResumedHumanAction,
+};
 pub use script::ScriptExecutor;
 
 /// Environment variable carrying the [`crate::domain::ActionExecution`] id into
@@ -106,6 +111,21 @@ pub enum ActionOutcome {
     /// [`TimedOutAction::resolve`] with the declared labels in hand, which
     /// keeps all `outputs` knowledge in one place (U7).
     TimedOut(TimedOutAction),
+
+    /// The action neither finished nor ran out of time: it is waiting for
+    /// something outside this process, and the current pass ends here.
+    ///
+    /// Added in U6 for `HumanAction`, which suspends the moment its state is
+    /// entered (§3.3.C). It is a third outcome rather than a separate code path
+    /// beside the trait so that U7 handles every way an attempt can end in one
+    /// place, and so that `WaitAction` (§3.3.D) — which suspends for an
+    /// external event instead of a person — plugs in as another
+    /// [`SuspendedAction`] variant without touching the loop again.
+    ///
+    /// Suspending is deliberately inert on its own: an executor reports it and
+    /// does nothing else. Pausing the execution and recording the request
+    /// durably belongs to the engine — see [`human::suspend`].
+    Suspended(SuspendedAction),
 }
 
 impl ActionOutcome {
@@ -113,9 +133,27 @@ impl ActionOutcome {
     pub fn result(&self) -> Option<&ActionResult> {
         match self {
             Self::Completed(result) => Some(result),
-            Self::TimedOut(_) => None,
+            Self::TimedOut(_) | Self::Suspended(_) => None,
         }
     }
+
+    /// What the action is waiting for, if it suspended.
+    pub fn suspended(&self) -> Option<&SuspendedAction> {
+        match self {
+            Self::Suspended(suspended) => Some(suspended),
+            Self::Completed(_) | Self::TimedOut(_) => None,
+        }
+    }
+}
+
+/// What an attempt suspended on.
+///
+/// One variant per thing the orchestrator can wait for. `HumanAction` is the
+/// only one in U6; `WaitAction` adds its own later.
+#[derive(Debug, Clone)]
+pub enum SuspendedAction {
+    /// A person has to fill in the form described by the request (§3.3.C).
+    AwaitingHumanInput(HumanInputRequest),
 }
 
 /// An attempt that was stopped because it ran out of time.

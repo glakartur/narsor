@@ -10,5 +10,7 @@
 pub mod actions;
 
 pub use actions::{
-    ActionExecutor, ActionOutcome, ActionRequest, ScriptExecutor, TimedOutAction, ACTION_ID_ENV_VAR,
+    ActionExecutor, ActionOutcome, ActionRequest, HumanActionError, HumanExecutor,
+    HumanInputDelivery, HumanInputRequest, PendingHumanInput, ResumedHumanAction, ScriptExecutor,
+    SuspendedAction, TimedOutAction, ACTION_ID_ENV_VAR,
 };
