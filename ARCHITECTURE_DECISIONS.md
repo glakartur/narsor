@@ -65,6 +65,19 @@ Dokument zawiera zestawienie kluczowych decyzji architektonicznych podjętych dl
 
 ## Następne kroki
 
-1. Zatwierdzenie niniejszego dokumentu.
-2. Implementacja fazy 1 (Domain Model) zgodnie z `IMPLEMENTATION_PLAN.md`.
-3. Analiza CLI Claude Code/OpenCode (D17) przed implementacją adapterów.
+1. ~~Zatwierdzenie niniejszego dokumentu.~~ — zrobione.
+2. ~~Implementacja fazy 1 (Domain Model).~~ — zrobione; `src/domain/` zawiera
+   komplet typów z `DOMAIN_MODEL.md`.
+3. ~~Faza 2 (MVP silnika).~~ — zrobione zgodnie z
+   `docs/plans/2026-09-23-001-feat-workflow-engine-mvp-plan.md`: parser i
+   walidator YAML, persystencja plikowa, pętla silnika ze `ScriptAction` i
+   `HumanAction`, substytucja szablonów, cykl życia workspace, CLI i TUI.
+4. Analiza CLI Claude Code/OpenCode (D17) przed implementacją adapterów —
+   **to jest najbliższy kolejny krok.** Blokuje `AgentAction` (D17–D20) oraz
+   `AgentDecision`.
+5. Dalsza część fazy 3: `WaitAction` i polling zdarzeń (D26) wraz z integracją
+   GitHub (D27), REST API i SSE (D37, D38), konteneryzacja (D14, D16).
+
+> Uwaga: dokument odwoływał się wcześniej do `IMPLEMENTATION_PLAN.md`, którego
+> w repozytorium nigdy nie było. Planem obowiązującym dla fazy 2 jest ten
+> wskazany w punkcie 3.
