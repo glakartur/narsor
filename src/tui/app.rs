@@ -1,0 +1,1671 @@
+//! Application state and key handling — the half of the TUI that has no
+//! terminal in it.
+//!
+//! Everything the interface knows lives in [`App`]: the execution list, the
+//! selected execution's state, context and event stream, the health of the
+//! live channel, which panel has focus and which modal is open. Rendering reads
+//! this and adds nothing; that split is what lets `tests/tui_state.rs` drive
+//! the whole interface — including delivering human input and forcing a
+//! transition — without a tty.
+//!
+//! # Where the data comes from
+//!
+//! * The execution list and a selected execution's history come from the
+//!   [`ExecutionStore`](crate::persistence::ExecutionStore): a listing, plus a
+//!   one-off read of the event log to backfill the stream.
+//! * Everything after that comes from [`Engine::subscribe`] — see [`on_stream`]
+//!   ([`App::on_stream`]). The log is never polled for live updates.
+//! * The [`WorkflowDefinition`] is resolved the way the CLI resolves it, from
+//!   `metadata.cli.definition_path`. Without it there is no way to know a
+//!   state's `outputs` or its `allow_manual_override`, so the panels that need
+//!   those say so instead of pretending the state has none.
+//!
+//! # Manual transitions (D30)
+//!
+//! Two modes, and they are not the same operation:
+//!
+//! * **Choosing an output** — the label comes from the current state's declared
+//!   `outputs`. When the execution is waiting on a question this goes through
+//!   [`Engine::deliver_human_input`], so the engine runs the workflow on exactly
+//!   as it would for any answer.
+//! * **Override** — an arbitrary target state, offered only when the state
+//!   declares `allow_manual_override`, and only after a separate confirmation.
+//!   No engine API forces a transition, so the events are written here, and
+//!   they are written to be auditable: a `DecisionMade` naming the override
+//!   provider and carrying the reason, then `HumanTransitionSelected`,
+//!   `StateExited` and `TransitionTaken`. The execution is parked `Paused` at
+//!   the target (or finished, if the target is terminal) and the operator
+//!   resumes it explicitly.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde_json::{Map, Value};
+use tokio::sync::broadcast::error::RecvError;
+
+use crate::domain::{
+    Event, EventData, ExecutionStatus, HumanInputField, HumanInputType, State, WorkflowDefinition,
+    WorkflowExecution,
+};
+use crate::engine::{
+    permitted_labels, terminal_status, Engine, HumanInputDelivery, PendingHumanInput,
+};
+use crate::workflow::load_from_file;
+
+/// Key of the CLI's scratch area in `WorkflowExecution::metadata`.
+const METADATA_CLI_KEY: &str = "cli";
+
+/// Key of the recorded definition path inside that scratch area.
+const METADATA_DEFINITION_PATH_KEY: &str = "definition_path";
+
+/// The decision provider recorded for an operator's ordinary manual choice.
+pub const MANUAL_PROVIDER: &str = "human";
+
+/// The decision provider recorded for a forced override.
+///
+/// Deliberately distinct from [`MANUAL_PROVIDER`]: `EventData::HumanTransitionSelected`
+/// carries only the two state ids, so the fact that a transition bypassed the
+/// declared graph would otherwise be invisible in the log.
+pub const OVERRIDE_PROVIDER: &str = "human_override";
+
+/// The reason recorded on a forced transition.
+pub const OVERRIDE_REASON: &str =
+    "Forced manual transition (override): the target state was picked by the operator.";
+
+/// The reason recorded on an ordinary manual transition.
+pub const MANUAL_REASON: &str = "Manual transition picked by the operator.";
+
+/// The label recorded for a forced transition, which by definition has none.
+pub const OVERRIDE_LABEL: &str = "override";
+
+// ---------------------------------------------------------------------------
+// Small state types
+// ---------------------------------------------------------------------------
+
+/// The panel that currently has focus.
+///
+/// Cycled with `Tab`; the focused panel owns `j`/`k`/`g`/`G` and decides which
+/// shortcuts the bottom bar offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    /// Left: the execution list.
+    Executions,
+    /// Top right: current state and context variables.
+    Details,
+    /// Bottom right: the live event stream.
+    Events,
+}
+
+impl Panel {
+    /// The next panel in the cycle.
+    pub fn next(self) -> Self {
+        match self {
+            Panel::Executions => Panel::Details,
+            Panel::Details => Panel::Events,
+            Panel::Events => Panel::Executions,
+        }
+    }
+
+    /// The previous panel in the cycle.
+    pub fn previous(self) -> Self {
+        match self {
+            Panel::Executions => Panel::Events,
+            Panel::Details => Panel::Executions,
+            Panel::Events => Panel::Details,
+        }
+    }
+
+    /// The title drawn in the panel border.
+    pub fn title(self) -> &'static str {
+        match self {
+            Panel::Executions => "Executions",
+            Panel::Details => "State and context",
+            Panel::Events => "Events",
+        }
+    }
+}
+
+/// The health of the live event channel.
+///
+/// Anything other than [`StreamStatus::Live`] is drawn prominently: a view that
+/// has stopped updating must never be mistaken for a workflow that has stopped
+/// moving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamStatus {
+    /// Receiving events.
+    Live,
+    /// The receiver fell behind and the channel dropped events.
+    Lagged {
+        /// How many events were skipped by the last lag.
+        skipped: u64,
+    },
+    /// The sender is gone — no further event will ever arrive.
+    Disconnected,
+}
+
+impl StreamStatus {
+    /// Whether the stream is still delivering.
+    pub fn is_live(&self) -> bool {
+        matches!(self, StreamStatus::Live)
+    }
+
+    /// The indicator drawn in the event panel's border.
+    pub fn indicator(&self) -> String {
+        match self {
+            StreamStatus::Live => "● live".to_string(),
+            StreamStatus::Lagged { skipped } => {
+                format!("▲ {skipped} events lost — press r to reload")
+            }
+            StreamStatus::Disconnected => "✖ disconnected — the stream is closed".to_string(),
+        }
+    }
+}
+
+/// One line of the execution list.
+#[derive(Debug, Clone)]
+pub struct ExecutionRow {
+    /// The execution id.
+    pub id: String,
+    /// The workflow it runs.
+    pub workflow_id: String,
+    /// Its status, as the schema spells it.
+    pub status: ExecutionStatus,
+    /// The state it sits in, if it sits in one.
+    pub current_state: Option<String>,
+}
+
+/// A message shown in the bottom bar until the next operation replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// What the operator reads.
+    pub text: String,
+    /// Whether this reports a failure.
+    pub is_error: bool,
+}
+
+impl Notice {
+    /// A neutral confirmation.
+    pub fn info(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            is_error: false,
+        }
+    }
+
+    /// A failure the operator has to act on.
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            is_error: true,
+        }
+    }
+}
+
+/// What [`App::on_key`] asks the event loop to do afterwards.
+///
+/// Key handling is synchronous so it can be tested without a runtime; anything
+/// that talks to the engine is named here and awaited by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    /// Nothing further.
+    None,
+    /// Re-read the store.
+    Refresh,
+    /// Validate and deliver the open input form.
+    SubmitInput,
+    /// Carry out the transition the operator picked.
+    ApplyTransition,
+    /// Run or resume the selected execution.
+    RunSelected,
+}
+
+// ---------------------------------------------------------------------------
+// The human input form
+// ---------------------------------------------------------------------------
+
+/// One row of the generated form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormRow {
+    /// A declared field, by index.
+    Field(usize),
+    /// The output label picker, shown when the state recorded a menu.
+    Label,
+}
+
+/// The human-input form, generated from [`PendingHumanInput::fields`].
+///
+/// A `text` field is an editable line, a `select` field cycles its `options`.
+/// The label row exists because §4's `human_clarification` has one text field
+/// and two outputs: nothing can be inferred there, so the operator picks.
+#[derive(Debug, Clone)]
+pub struct InputForm {
+    /// The question.
+    pub instruction: String,
+    /// The declared fields, in declaration order.
+    pub fields: Vec<HumanInputField>,
+    /// The current value of each field, by index.
+    pub values: Vec<String>,
+    /// The label choices: `None` means "let the engine infer it".
+    pub label_choices: Vec<Option<String>>,
+    /// Which label choice is selected.
+    pub label_index: usize,
+    /// The focused row.
+    pub row: usize,
+    /// The last validation failure, if any.
+    pub error: Option<String>,
+}
+
+impl InputForm {
+    /// Builds the form for a pending question.
+    pub fn new(pending: &PendingHumanInput) -> Self {
+        let fields = pending.fields().to_vec();
+        let values = fields
+            .iter()
+            .map(|field| match field.field_type {
+                // A select starts on its first option, so the common case is
+                // one keystroke: Enter.
+                HumanInputType::Select => field.options.first().cloned().unwrap_or_default(),
+                HumanInputType::Text => String::new(),
+            })
+            .collect();
+
+        let mut label_choices: Vec<Option<String>> = Vec::new();
+        if !pending.outputs.is_empty() {
+            if infers_label(&fields) {
+                label_choices.push(None);
+            }
+            label_choices.extend(pending.outputs.iter().cloned().map(Some));
+        }
+
+        Self {
+            instruction: pending.instruction().to_string(),
+            fields,
+            values,
+            label_choices,
+            label_index: 0,
+            row: 0,
+            error: None,
+        }
+    }
+
+    /// The rows, in the order they are drawn and navigated.
+    pub fn rows(&self) -> Vec<FormRow> {
+        let mut rows: Vec<FormRow> = (0..self.fields.len()).map(FormRow::Field).collect();
+        if !self.label_choices.is_empty() {
+            rows.push(FormRow::Label);
+        }
+        rows
+    }
+
+    /// The focused row, if the form has any.
+    pub fn current_row(&self) -> Option<FormRow> {
+        self.rows().get(self.row).copied()
+    }
+
+    /// The label the operator picked, if they picked one.
+    pub fn chosen_label(&self) -> Option<String> {
+        self.label_choices.get(self.label_index).cloned().flatten()
+    }
+
+    /// Validates by the same rules the engine applies (U6) and builds the
+    /// delivery.
+    ///
+    /// Duplicating the rules here is on purpose: the engine would reject the
+    /// same delivery, but only after a round trip, and the operator deserves
+    /// the complaint next to the field that caused it.
+    pub fn validate(&self) -> Result<HumanInputDelivery, String> {
+        let mut values = Map::new();
+
+        for (index, field) in self.fields.iter().enumerate() {
+            let raw = self.values.get(index).map(String::as_str).unwrap_or("");
+            if raw.trim().is_empty() {
+                if field.required {
+                    return Err(format!("Field '{}' is required.", field.name));
+                }
+                continue;
+            }
+
+            if field.field_type == HumanInputType::Select
+                && !field.options.iter().any(|option| option == raw)
+            {
+                return Err(format!(
+                    "'{raw}' is not a permitted value for field '{}'; permitted values: {}.",
+                    field.name,
+                    field.options.join(", ")
+                ));
+            }
+
+            values.insert(field.name.clone(), Value::String(raw.to_string()));
+        }
+
+        let mut delivery = HumanInputDelivery::with_values(values);
+        if let Some(label) = self.chosen_label() {
+            delivery = delivery.choosing(label);
+        } else if !self.label_choices.is_empty() && !infers_label(&self.fields) {
+            return Err(
+                "Pick an output label: this state gives nothing to infer one from.".to_string(),
+            );
+        }
+        Ok(delivery)
+    }
+}
+
+/// Whether a single `select` field lets the engine infer the output label.
+fn infers_label(fields: &[HumanInputField]) -> bool {
+    fields
+        .iter()
+        .filter(|field| field.field_type == HumanInputType::Select)
+        .count()
+        == 1
+}
+
+// ---------------------------------------------------------------------------
+// The manual transition menu
+// ---------------------------------------------------------------------------
+
+/// Which set of targets the transition menu offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionMode {
+    /// The labels the current state declares — the default.
+    Outputs,
+    /// An arbitrary state, for a state that allows it.
+    Override,
+}
+
+/// The manual transition menu (D30).
+#[derive(Debug, Clone)]
+pub struct TransitionMenu {
+    /// The mode currently shown.
+    pub mode: TransitionMode,
+    /// The declared output labels of the current state.
+    pub outputs: Vec<String>,
+    /// Every other state of the workflow, for the override mode.
+    pub states: Vec<String>,
+    /// The selected entry of the current mode's list.
+    pub selected: usize,
+    /// Whether the current state declares `allow_manual_override`.
+    pub override_allowed: bool,
+}
+
+impl TransitionMenu {
+    /// The entries of the mode currently shown.
+    pub fn entries(&self) -> &[String] {
+        match self.mode {
+            TransitionMode::Outputs => &self.outputs,
+            TransitionMode::Override => &self.states,
+        }
+    }
+
+    /// The highlighted entry.
+    pub fn current(&self) -> Option<&String> {
+        self.entries().get(self.selected)
+    }
+}
+
+/// The confirmation step a forced transition has to pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverrideConfirm {
+    /// The state the execution would be moved to.
+    pub target: String,
+    /// The state it is in now.
+    pub from: String,
+}
+
+/// The overlay drawn on top of the layout, if any.
+#[derive(Debug, Clone)]
+pub enum Modal {
+    /// No overlay.
+    None,
+    /// The generated human-input form.
+    Input(InputForm),
+    /// The manual transition menu.
+    Transition(TransitionMenu),
+    /// The confirmation of a forced transition.
+    Confirm(OverrideConfirm),
+    /// The key map.
+    Help,
+}
+
+impl Modal {
+    /// Whether an overlay is open.
+    pub fn is_open(&self) -> bool {
+        !matches!(self, Modal::None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The application
+// ---------------------------------------------------------------------------
+
+/// Everything the interface knows.
+pub struct App {
+    engine: Arc<Engine>,
+
+    executions: Vec<ExecutionRow>,
+    selected: usize,
+
+    execution: Option<WorkflowExecution>,
+    definition: Option<WorkflowDefinition>,
+    definition_error: Option<String>,
+    pending: Option<PendingHumanInput>,
+    variables: Vec<(String, Value)>,
+    variable_cursor: usize,
+
+    events: Vec<Event>,
+    event_cursor: usize,
+    follow: bool,
+
+    focus: Panel,
+    modal: Modal,
+    stream: StreamStatus,
+    notice: Option<Notice>,
+    quit: bool,
+}
+
+impl App {
+    /// Builds an interface over an engine. Nothing is read until
+    /// [`App::refresh`].
+    pub fn new(engine: Arc<Engine>) -> Self {
+        Self {
+            engine,
+            executions: Vec::new(),
+            selected: 0,
+            execution: None,
+            definition: None,
+            definition_error: None,
+            pending: None,
+            variables: Vec::new(),
+            variable_cursor: 0,
+            events: Vec::new(),
+            event_cursor: 0,
+            follow: true,
+            focus: Panel::Executions,
+            modal: Modal::None,
+            stream: StreamStatus::Live,
+            notice: None,
+            quit: false,
+        }
+    }
+
+    // -- read-only accessors, for the views and the tests ------------------
+
+    /// The execution list, newest first.
+    pub fn executions(&self) -> &[ExecutionRow] {
+        &self.executions
+    }
+
+    /// The index of the highlighted execution.
+    pub fn selected_index(&self) -> usize {
+        self.selected
+    }
+
+    /// The highlighted execution's row.
+    pub fn selected(&self) -> Option<&ExecutionRow> {
+        self.executions.get(self.selected)
+    }
+
+    /// The highlighted execution, as loaded from the store.
+    pub fn execution(&self) -> Option<&WorkflowExecution> {
+        self.execution.as_ref()
+    }
+
+    /// The definition the highlighted execution runs, when it could be found.
+    pub fn definition(&self) -> Option<&WorkflowDefinition> {
+        self.definition.as_ref()
+    }
+
+    /// Why the definition could not be found, if it could not.
+    pub fn definition_error(&self) -> Option<&str> {
+        self.definition_error.as_deref()
+    }
+
+    /// The question the highlighted execution is waiting on.
+    pub fn pending(&self) -> Option<&PendingHumanInput> {
+        self.pending.as_ref()
+    }
+
+    /// The context variables, sorted by name.
+    pub fn variables(&self) -> &[(String, Value)] {
+        &self.variables
+    }
+
+    /// The highlighted context variable.
+    pub fn variable_cursor(&self) -> usize {
+        self.variable_cursor
+    }
+
+    /// The event stream of the highlighted execution, oldest first.
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
+    /// The highlighted event.
+    pub fn event_cursor(&self) -> usize {
+        self.event_cursor
+    }
+
+    /// Whether the stream view sticks to the newest entry.
+    pub fn follows_stream(&self) -> bool {
+        self.follow
+    }
+
+    /// The panel that has focus.
+    pub fn focus(&self) -> Panel {
+        self.focus
+    }
+
+    /// The overlay currently drawn on top of the layout.
+    pub fn modal(&self) -> &Modal {
+        &self.modal
+    }
+
+    /// The health of the live channel.
+    pub fn stream_status(&self) -> &StreamStatus {
+        &self.stream
+    }
+
+    /// The message in the bottom bar.
+    pub fn notice(&self) -> Option<&Notice> {
+        self.notice.as_ref()
+    }
+
+    /// Whether the loop should stop.
+    pub fn should_quit(&self) -> bool {
+        self.quit
+    }
+
+    /// Asks the loop to stop.
+    pub fn quit(&mut self) {
+        self.quit = true;
+    }
+
+    /// The current state of the highlighted execution, as the definition
+    /// declares it.
+    pub fn current_state(&self) -> Option<&State> {
+        let execution = self.execution.as_ref()?;
+        let definition = self.definition.as_ref()?;
+        definition.states.get(execution.current_state.as_deref()?)
+    }
+
+    /// The labels the current state declares — exactly its `outputs`, in
+    /// declaration order.
+    pub fn permitted_transitions(&self) -> Vec<String> {
+        self.current_state()
+            .map(permitted_labels)
+            .unwrap_or_default()
+    }
+
+    /// Whether the current state allows a forced transition.
+    pub fn override_allowed(&self) -> bool {
+        self.current_state()
+            .map(|state| state.allow_manual_override)
+            .unwrap_or(false)
+    }
+
+    /// The states a forced transition may target: every state but the current
+    /// one, and only when the current state allows an override at all.
+    pub fn override_targets(&self) -> Vec<String> {
+        if !self.override_allowed() {
+            return Vec::new();
+        }
+        let Some(definition) = self.definition.as_ref() else {
+            return Vec::new();
+        };
+        let current = self
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.current_state.clone());
+
+        let mut targets: Vec<String> = definition
+            .states
+            .keys()
+            .filter(|id| Some(id.as_str()) != current.as_deref())
+            .cloned()
+            .collect();
+        targets.sort();
+        targets
+    }
+
+    /// The shortcuts the bottom bar shows, given the focus and the modal.
+    pub fn shortcuts(&self) -> Vec<(&'static str, &'static str)> {
+        match &self.modal {
+            Modal::Input(_) => vec![
+                ("Tab/j/k", "field"),
+                ("←/→", "value"),
+                ("letters", "type"),
+                ("Enter", "submit"),
+                ("Esc", "cancel"),
+            ],
+            Modal::Transition(menu) => {
+                let mut keys = vec![("j/k", "select"), ("Enter", "apply")];
+                if menu.override_allowed {
+                    keys.push(("o", "override mode"));
+                }
+                keys.push(("Esc", "cancel"));
+                keys
+            }
+            Modal::Confirm(_) => vec![("y", "confirm"), ("n/Esc", "cancel")],
+            Modal::Help => vec![("Esc/?", "close")],
+            Modal::None => {
+                let mut keys = vec![("Tab", "panel"), ("r", "refresh")];
+                match self.focus {
+                    Panel::Executions => {
+                        keys.push(("j/k", "select"));
+                        keys.push(("g/G", "top/bottom"));
+                        keys.push(("s", "run/resume"));
+                        keys.push(("i", "input"));
+                        keys.push(("t", "transition"));
+                    }
+                    Panel::Details => {
+                        keys.push(("j/k", "variables"));
+                        keys.push(("i", "input"));
+                        keys.push(("t", "transition"));
+                    }
+                    Panel::Events => {
+                        keys.push(("j/k", "scroll"));
+                        keys.push(("g/G", "top/bottom"));
+                        keys.push(("f", "follow"));
+                    }
+                }
+                keys.push(("?", "help"));
+                keys.push(("q", "quit"));
+                keys
+            }
+        }
+    }
+
+    // -- loading ------------------------------------------------------------
+
+    /// Re-reads the execution list and the selected execution.
+    ///
+    /// The selection follows the execution id, not the index, so a new
+    /// execution appearing at the top of the list does not move the operator's
+    /// cursor onto a different workflow.
+    pub fn refresh(&mut self) {
+        let previous = self.selected().map(|row| row.id.clone());
+
+        let ids = match self.engine.store().list_execution_ids() {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not read the execution list: {error}"
+                )));
+                return;
+            }
+        };
+
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            match self.engine.store().load_execution(&id) {
+                Ok(execution) => rows.push(ExecutionRow {
+                    id: execution.id.clone(),
+                    workflow_id: execution.workflow_id.clone(),
+                    status: execution.status.clone(),
+                    current_state: execution.current_state.clone(),
+                }),
+                Err(error) => {
+                    self.notice = Some(Notice::error(format!(
+                        "Could not load execution '{id}': {error}"
+                    )));
+                }
+            }
+        }
+
+        self.executions = rows;
+        self.selected = previous
+            .and_then(|id| self.executions.iter().position(|row| row.id == id))
+            .unwrap_or(0);
+        if self.selected >= self.executions.len() {
+            self.selected = self.executions.len().saturating_sub(1);
+        }
+
+        self.reload_selection();
+    }
+
+    /// Re-reads everything that depends on which execution is selected.
+    pub fn reload_selection(&mut self) {
+        self.execution = None;
+        self.definition = None;
+        self.definition_error = None;
+        self.pending = None;
+        self.variables.clear();
+        self.variable_cursor = 0;
+        self.events.clear();
+        self.event_cursor = 0;
+
+        let Some(id) = self.selected().map(|row| row.id.clone()) else {
+            return;
+        };
+        let store = self.engine.store();
+
+        match store.load_execution(&id) {
+            Ok(execution) => self.execution = Some(execution),
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not load execution '{id}': {error}"
+                )));
+                return;
+            }
+        }
+
+        match store.load_context(&id) {
+            Ok(context) => {
+                let mut variables: Vec<(String, Value)> = context.variables.into_iter().collect();
+                variables.sort_by(|left, right| left.0.cmp(&right.0));
+                self.variables = variables;
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not read the context: {error}"
+                )));
+            }
+        }
+
+        // An execution with no events is an empty stream, not a failure: it has
+        // simply not got anywhere yet.
+        match store.event_log(&id).read_all() {
+            Ok(events) => {
+                self.events = events;
+                self.event_cursor = self.events.len().saturating_sub(1);
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not read the event log: {error}"
+                )));
+            }
+        }
+
+        match self.engine.pending_input(&id) {
+            Ok(pending) => self.pending = pending,
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not read the pending input: {error}"
+                )));
+            }
+        }
+
+        self.load_definition();
+    }
+
+    /// Resolves the definition from `metadata.cli.definition_path`.
+    fn load_definition(&mut self) {
+        let Some(execution) = self.execution.as_ref() else {
+            return;
+        };
+        let Some(path) = stored_definition_path(execution) else {
+            self.definition_error = Some(format!(
+                "Execution '{}' has no recorded definition path \
+                 (metadata.cli.definition_path): manual transitions and delivering \
+                 human input are unavailable.",
+                execution.id
+            ));
+            return;
+        };
+
+        match load_from_file(&path) {
+            Ok(definition) => self.definition = Some(definition),
+            Err(error) => {
+                self.definition_error = Some(format!(
+                    "Could not load definition '{}': {error}",
+                    path.display()
+                ))
+            }
+        }
+    }
+
+    // -- the live stream ----------------------------------------------------
+
+    /// Folds one result of `broadcast::Receiver::recv` into the state.
+    ///
+    /// A lag and a closed channel both become a visible indicator: the operator
+    /// has to be able to tell "nothing is happening" from "I am no longer being
+    /// told what happens".
+    pub fn on_stream(&mut self, received: Result<Event, RecvError>) {
+        match received {
+            Ok(event) => {
+                self.stream = StreamStatus::Live;
+                self.on_engine_event(event);
+            }
+            Err(RecvError::Lagged(skipped)) => {
+                self.stream = StreamStatus::Lagged { skipped };
+                self.notice = Some(Notice::error(format!(
+                    "The event stream fell behind: {skipped} events were lost. \
+                     Press r to reload the log."
+                )));
+            }
+            Err(RecvError::Closed) => {
+                self.stream = StreamStatus::Disconnected;
+                self.notice = Some(Notice::error(
+                    "The event stream was closed: this view no longer updates live.",
+                ));
+            }
+        }
+    }
+
+    /// Appends one live event and keeps the panels in step with it.
+    pub fn on_engine_event(&mut self, event: Event) {
+        if let Some(row) = self
+            .executions
+            .iter_mut()
+            .find(|row| row.id == event.workflow_execution_id)
+        {
+            apply_to_row(row, &event.data);
+        }
+
+        let selected = self.selected().map(|row| row.id.clone());
+        if selected.as_deref() != Some(event.workflow_execution_id.as_str()) {
+            return;
+        }
+
+        // A duplicate can arrive when a refresh backfilled the log while the
+        // same event was already in flight on the channel.
+        if self
+            .events
+            .last()
+            .is_some_and(|last| last.sequence >= event.sequence)
+        {
+            return;
+        }
+
+        self.events.push(event);
+        if self.follow {
+            self.event_cursor = self.events.len() - 1;
+        }
+    }
+
+    // -- key handling -------------------------------------------------------
+
+    /// Folds one key press into the state and names what the loop must do next.
+    pub fn on_key(&mut self, key: KeyEvent) -> Request {
+        match &mut self.modal {
+            Modal::None => self.on_key_panels(key),
+            Modal::Help => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter) {
+                    self.modal = Modal::None;
+                }
+                Request::None
+            }
+            Modal::Input(_) => self.on_key_form(key),
+            Modal::Transition(_) => self.on_key_transition(key),
+            Modal::Confirm(_) => self.on_key_confirm(key),
+        }
+    }
+
+    /// Keys when no overlay is open.
+    fn on_key_panels(&mut self, key: KeyEvent) -> Request {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.quit();
+                Request::None
+            }
+            KeyCode::Tab => {
+                self.focus = self.focus.next();
+                Request::None
+            }
+            KeyCode::BackTab => {
+                self.focus = self.focus.previous();
+                Request::None
+            }
+            KeyCode::Char('?') => {
+                self.modal = Modal::Help;
+                Request::None
+            }
+            KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Request::Refresh
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.move_cursor(1);
+                Request::None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.move_cursor(-1);
+                Request::None
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.jump_cursor(false);
+                Request::None
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                self.jump_cursor(true);
+                Request::None
+            }
+            KeyCode::Char('f') if self.focus == Panel::Events => {
+                self.follow = !self.follow;
+                if self.follow {
+                    self.event_cursor = self.events.len().saturating_sub(1);
+                }
+                Request::None
+            }
+            KeyCode::Char('i') => {
+                self.open_input_form();
+                Request::None
+            }
+            KeyCode::Char('t') => {
+                self.open_transition_menu();
+                Request::None
+            }
+            KeyCode::Char('s') => Request::RunSelected,
+            _ => Request::None,
+        }
+    }
+
+    /// Moves the focused panel's cursor by `delta`.
+    fn move_cursor(&mut self, delta: isize) {
+        match self.focus {
+            Panel::Executions => {
+                let length = self.executions.len();
+                if let Some(next) = step(self.selected, delta, length) {
+                    self.selected = next;
+                    self.reload_selection();
+                }
+            }
+            Panel::Details => {
+                if let Some(next) = step(self.variable_cursor, delta, self.variables.len()) {
+                    self.variable_cursor = next;
+                }
+            }
+            Panel::Events => {
+                if let Some(next) = step(self.event_cursor, delta, self.events.len()) {
+                    self.event_cursor = next;
+                    // Scrolling away from the newest entry means the operator
+                    // is reading, not watching.
+                    self.follow = next + 1 == self.events.len();
+                }
+            }
+        }
+    }
+
+    /// Jumps the focused panel's cursor to the first or last entry.
+    fn jump_cursor(&mut self, to_end: bool) {
+        match self.focus {
+            Panel::Executions => {
+                if self.executions.is_empty() {
+                    return;
+                }
+                self.selected = if to_end { self.executions.len() - 1 } else { 0 };
+                self.reload_selection();
+            }
+            Panel::Details => {
+                if self.variables.is_empty() {
+                    return;
+                }
+                self.variable_cursor = if to_end { self.variables.len() - 1 } else { 0 };
+            }
+            Panel::Events => {
+                if self.events.is_empty() {
+                    return;
+                }
+                self.event_cursor = if to_end { self.events.len() - 1 } else { 0 };
+                self.follow = to_end;
+            }
+        }
+    }
+
+    /// Keys inside the input form.
+    fn on_key_form(&mut self, key: KeyEvent) -> Request {
+        let Modal::Input(form) = &mut self.modal else {
+            return Request::None;
+        };
+        let rows = form.rows();
+
+        match key.code {
+            KeyCode::Esc => {
+                self.modal = Modal::None;
+                Request::None
+            }
+            KeyCode::Enter => Request::SubmitInput,
+            KeyCode::Tab | KeyCode::Down => {
+                if !rows.is_empty() {
+                    form.row = (form.row + 1) % rows.len();
+                }
+                Request::None
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                if !rows.is_empty() {
+                    form.row = (form.row + rows.len() - 1) % rows.len();
+                }
+                Request::None
+            }
+            KeyCode::Left => {
+                cycle_choice(form, -1);
+                Request::None
+            }
+            KeyCode::Right => {
+                cycle_choice(form, 1);
+                Request::None
+            }
+            KeyCode::Backspace => {
+                if let Some(FormRow::Field(index)) = form.current_row() {
+                    if form.fields[index].field_type == HumanInputType::Text {
+                        form.values[index].pop();
+                    }
+                }
+                Request::None
+            }
+            KeyCode::Char(character) => {
+                match form.current_row() {
+                    Some(FormRow::Field(index))
+                        if form.fields[index].field_type == HumanInputType::Text =>
+                    {
+                        form.values[index].push(character);
+                    }
+                    // On a select or the label row there is nothing to type, so
+                    // space steps to the next option.
+                    _ if character == ' ' => cycle_choice(form, 1),
+                    _ => {}
+                }
+                Request::None
+            }
+            _ => Request::None,
+        }
+    }
+
+    /// Keys inside the transition menu.
+    fn on_key_transition(&mut self, key: KeyEvent) -> Request {
+        let Modal::Transition(menu) = &mut self.modal else {
+            return Request::None;
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.modal = Modal::None;
+                Request::None
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(next) = step(menu.selected, 1, menu.entries().len()) {
+                    menu.selected = next;
+                }
+                Request::None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(next) = step(menu.selected, -1, menu.entries().len()) {
+                    menu.selected = next;
+                }
+                Request::None
+            }
+            KeyCode::Char('o') => {
+                if menu.override_allowed {
+                    menu.mode = match menu.mode {
+                        TransitionMode::Outputs => TransitionMode::Override,
+                        TransitionMode::Override => TransitionMode::Outputs,
+                    };
+                    menu.selected = 0;
+                } else {
+                    self.notice = Some(Notice::error(
+                        "This state does not allow a forced transition (allow_manual_override).",
+                    ));
+                }
+                Request::None
+            }
+            KeyCode::Enter => {
+                let Some(target) = menu.current().cloned() else {
+                    self.notice = Some(Notice::error("There is no transition to pick."));
+                    return Request::None;
+                };
+                if menu.mode == TransitionMode::Override {
+                    // A forced transition never happens on one keystroke.
+                    let from = self
+                        .execution
+                        .as_ref()
+                        .and_then(|execution| execution.current_state.clone())
+                        .unwrap_or_else(|| "-".to_string());
+                    self.modal = Modal::Confirm(OverrideConfirm { target, from });
+                    return Request::None;
+                }
+                Request::ApplyTransition
+            }
+            _ => Request::None,
+        }
+    }
+
+    /// Keys inside the override confirmation.
+    fn on_key_confirm(&mut self, key: KeyEvent) -> Request {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Request::ApplyTransition,
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.modal = Modal::None;
+                Request::None
+            }
+            _ => Request::None,
+        }
+    }
+
+    // -- operations ---------------------------------------------------------
+
+    /// Opens the form for the question the selected execution is waiting on.
+    pub fn open_input_form(&mut self) {
+        match self.pending.as_ref() {
+            Some(pending) => self.modal = Modal::Input(InputForm::new(pending)),
+            None => {
+                self.notice = Some(Notice::error(
+                    "The selected execution is not waiting for human input.",
+                ))
+            }
+        }
+    }
+
+    /// Opens the manual transition menu for the current state.
+    pub fn open_transition_menu(&mut self) {
+        if self.execution.is_none() {
+            self.notice = Some(Notice::error("No execution is selected."));
+            return;
+        }
+        if self.definition.is_none() {
+            self.notice = Some(Notice::error(self.definition_error.clone().unwrap_or_else(
+                || "No workflow definition for this execution.".to_string(),
+            )));
+            return;
+        }
+
+        let outputs = self.permitted_transitions();
+        let states = self.override_targets();
+        let override_allowed = self.override_allowed();
+
+        if outputs.is_empty() && !override_allowed {
+            self.notice = Some(Notice::error(
+                "The current state declares no outputs and allows no override.",
+            ));
+            return;
+        }
+
+        self.modal = Modal::Transition(TransitionMenu {
+            mode: if outputs.is_empty() {
+                TransitionMode::Override
+            } else {
+                TransitionMode::Outputs
+            },
+            outputs,
+            states,
+            selected: 0,
+            override_allowed,
+        });
+    }
+
+    /// Validates the open form and, if it passes, delivers it to the engine.
+    ///
+    /// A failed validation is reported in the form and nothing is sent: a
+    /// rejected answer must leave the execution exactly as paused as it was.
+    pub async fn submit_input(&mut self) {
+        let Modal::Input(form) = &mut self.modal else {
+            return;
+        };
+
+        let delivery = match form.validate() {
+            Ok(delivery) => delivery,
+            Err(message) => {
+                form.error = Some(message.clone());
+                self.notice = Some(Notice::error(message));
+                return;
+            }
+        };
+
+        let Some(execution_id) = self.selected().map(|row| row.id.clone()) else {
+            return;
+        };
+        let Some(definition) = self.definition.clone() else {
+            self.notice = Some(Notice::error(self.definition_error.clone().unwrap_or_else(
+                || "No workflow definition for this execution.".to_string(),
+            )));
+            return;
+        };
+
+        match self
+            .engine
+            .deliver_human_input(&definition, &execution_id, &delivery)
+            .await
+        {
+            Ok(execution) => {
+                self.modal = Modal::None;
+                self.notice = Some(Notice::info(format!(
+                    "Input delivered; execution {} is now {}.",
+                    execution.id,
+                    status_name(&execution.status)
+                )));
+                self.refresh();
+            }
+            Err(error) => {
+                let message = format!("Could not deliver the input: {error}");
+                if let Modal::Input(form) = &mut self.modal {
+                    form.error = Some(message.clone());
+                }
+                self.notice = Some(Notice::error(message));
+            }
+        }
+    }
+
+    /// Carries out the transition the operator picked.
+    pub async fn apply_transition(&mut self) {
+        let (target, forced) = match &self.modal {
+            Modal::Transition(menu) => match menu.current() {
+                Some(target) => (target.clone(), false),
+                None => return,
+            },
+            Modal::Confirm(confirm) => (confirm.target.clone(), true),
+            _ => return,
+        };
+
+        if forced {
+            self.force_transition(&target);
+            return;
+        }
+
+        // Choosing a declared label while the execution waits on a question is
+        // an ordinary answer, so the engine runs the workflow on from there.
+        if self.pending.is_some() {
+            self.deliver_label(&target).await;
+        } else {
+            self.manual_transition(&target);
+        }
+    }
+
+    /// Answers a pending question with nothing but a label.
+    async fn deliver_label(&mut self, label: &str) {
+        let Some(execution_id) = self.selected().map(|row| row.id.clone()) else {
+            return;
+        };
+        let Some(definition) = self.definition.clone() else {
+            return;
+        };
+
+        let delivery = HumanInputDelivery::label(label.to_string());
+        match self
+            .engine
+            .deliver_human_input(&definition, &execution_id, &delivery)
+            .await
+        {
+            Ok(execution) => {
+                self.modal = Modal::None;
+                self.notice = Some(Notice::info(format!(
+                    "Output '{label}' picked; the execution is now {}.",
+                    status_name(&execution.status)
+                )));
+                self.refresh();
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not pick output '{label}': {error}. \
+                     If the state declares form fields, use i instead."
+                )));
+            }
+        }
+    }
+
+    /// Takes a declared transition by hand, without the engine.
+    ///
+    /// For an execution that is not waiting on a question there is nothing to
+    /// deliver an answer to, so the transition is written here and the
+    /// execution is parked at the target for the operator to resume.
+    fn manual_transition(&mut self, label: &str) {
+        let target = self
+            .current_state()
+            .and_then(|state| state.transitions.get(label).cloned());
+
+        match target {
+            Some(target) => self.write_transition(&target, label, false),
+            None => {
+                self.notice = Some(Notice::error(format!(
+                    "The state has no transition for label '{label}'."
+                )))
+            }
+        }
+    }
+
+    /// Forces a transition to an arbitrary state (D30 override).
+    fn force_transition(&mut self, target: &str) {
+        if !self.override_allowed() {
+            self.notice = Some(Notice::error(
+                "This state does not allow a forced transition (allow_manual_override).",
+            ));
+            self.modal = Modal::None;
+            return;
+        }
+        self.write_transition(target, OVERRIDE_LABEL, true);
+    }
+
+    /// Writes the events and the new state of a transition taken by hand.
+    ///
+    /// The order mirrors the engine's own (`DOMAIN_MODEL.md` §4.2) so that
+    /// recovery reads a hand-made transition the same way it reads a generated
+    /// one. `StateEntered` is deliberately *not* written for a non-terminal
+    /// target: the engine writes it when the operator resumes, and two of them
+    /// would be a lie about how many times the state was entered.
+    fn write_transition(&mut self, target: &str, label: &str, forced: bool) {
+        let Some(execution) = self.execution.clone() else {
+            return;
+        };
+        let Some(definition) = self.definition.clone() else {
+            return;
+        };
+        let Some(target_state) = definition.states.get(target).cloned() else {
+            self.notice = Some(Notice::error(format!(
+                "The workflow has no state '{target}'."
+            )));
+            return;
+        };
+
+        let mut execution = execution;
+        let from = execution
+            .current_state
+            .clone()
+            .unwrap_or_else(|| definition.initial_state.clone());
+        let store = self.engine.store();
+        let log = store.event_log(&execution.id);
+
+        let writes: Vec<EventData> = vec![
+            EventData::DecisionMade {
+                provider: if forced {
+                    OVERRIDE_PROVIDER
+                } else {
+                    MANUAL_PROVIDER
+                }
+                .to_string(),
+                output_label: label.to_string(),
+                reasoning: Some(
+                    if forced {
+                        OVERRIDE_REASON
+                    } else {
+                        MANUAL_REASON
+                    }
+                    .to_string(),
+                ),
+            },
+            EventData::HumanTransitionSelected {
+                from_state: from.clone(),
+                to_state: target.to_string(),
+            },
+            EventData::StateExited {
+                state_id: from.clone(),
+                output_label: label.to_string(),
+            },
+            EventData::TransitionTaken {
+                from_state: from.clone(),
+                to_state: target.to_string(),
+                output_label: label.to_string(),
+            },
+        ];
+
+        for data in writes {
+            if let Err(error) = log.append_next(&execution.id, data) {
+                self.notice = Some(Notice::error(format!(
+                    "Could not append the transition event: {error}"
+                )));
+                return;
+            }
+        }
+
+        execution.current_state = Some(target.to_string());
+        execution.current_action_execution = None;
+
+        if target_state.terminal {
+            let status = terminal_status(&target_state);
+            execution.status = status.clone();
+            execution.completed_at = Some(chrono::Utc::now());
+
+            let closing = match status {
+                ExecutionStatus::Failed => EventData::WorkflowFailed {
+                    error: format!("Forced transition into terminal state '{target}'."),
+                },
+                ExecutionStatus::Cancelled => EventData::WorkflowCancelled {
+                    reason: format!("Forced transition into terminal state '{target}'."),
+                },
+                _ => EventData::WorkflowCompleted {
+                    result: Value::Object(Map::new()),
+                },
+            };
+            let entered = EventData::StateEntered {
+                state_id: target.to_string(),
+            };
+            for data in [entered, closing] {
+                if let Err(error) = log.append_next(&execution.id, data) {
+                    self.notice = Some(Notice::error(format!(
+                        "Could not append the closing event: {error}"
+                    )));
+                    return;
+                }
+            }
+        } else {
+            execution.status = ExecutionStatus::Paused;
+            if let Err(error) = log.append_next(
+                &execution.id,
+                EventData::WorkflowPaused {
+                    reason: format!(
+                        "Manual transition into state '{target}'; waiting to be resumed."
+                    ),
+                },
+            ) {
+                self.notice = Some(Notice::error(format!(
+                    "Could not append the pause event: {error}"
+                )));
+                return;
+            }
+        }
+
+        // A question asked in the state we just left can no longer be answered.
+        if let Err(error) = store.clear_pending_input(&execution.id) {
+            self.notice = Some(Notice::error(format!(
+                "Could not clear the pending input: {error}"
+            )));
+            return;
+        }
+
+        if let Err(error) = store.save_execution(&execution) {
+            self.notice = Some(Notice::error(format!(
+                "Could not save the execution: {error}"
+            )));
+            return;
+        }
+
+        self.modal = Modal::None;
+        self.notice = Some(Notice::info(if forced {
+            format!("Forced transition {from} → {target}.")
+        } else {
+            format!("Manual transition {from} → {target} ('{label}') applied.")
+        }));
+        self.refresh();
+    }
+
+    /// Runs or resumes the selected execution.
+    pub async fn run_selected(&mut self) {
+        let Some(row) = self.selected().cloned() else {
+            self.notice = Some(Notice::error("No execution is selected."));
+            return;
+        };
+        let Some(definition) = self.definition.clone() else {
+            self.notice = Some(Notice::error(self.definition_error.clone().unwrap_or_else(
+                || "No workflow definition for this execution.".to_string(),
+            )));
+            return;
+        };
+
+        if self.pending.is_some() {
+            self.notice = Some(Notice::error(
+                "The execution is waiting for an answer: use i, not s.",
+            ));
+            return;
+        }
+
+        let outcome = match row.status {
+            ExecutionStatus::Running => self.engine.run(&definition, &row.id).await,
+            ExecutionStatus::Paused => self.engine.resume(&definition, &row.id).await,
+            other => {
+                self.notice = Some(Notice::error(format!(
+                    "An execution that is {} cannot be run.",
+                    status_name(&other)
+                )));
+                return;
+            }
+        };
+
+        match outcome {
+            Ok(execution) => {
+                self.notice = Some(Notice::info(format!(
+                    "Execution {} is now {}.",
+                    execution.id,
+                    status_name(&execution.status)
+                )));
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "The engine returned an error: {error}"
+                )));
+            }
+        }
+        self.refresh();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+/// Steps a cursor within `length`, or `None` when it cannot move.
+fn step(current: usize, delta: isize, length: usize) -> Option<usize> {
+    if length == 0 {
+        return None;
+    }
+    let next = current as isize + delta;
+    if next < 0 || next as usize >= length {
+        return None;
+    }
+    Some(next as usize)
+}
+
+/// Steps the focused row's choice: a `select` field's option, or the label.
+fn cycle_choice(form: &mut InputForm, delta: isize) {
+    match form.current_row() {
+        Some(FormRow::Field(index)) => {
+            let field = &form.fields[index];
+            if field.field_type != HumanInputType::Select || field.options.is_empty() {
+                return;
+            }
+            let current = field
+                .options
+                .iter()
+                .position(|option| option == &form.values[index])
+                .unwrap_or(0);
+            let next = wrap(current, delta, field.options.len());
+            form.values[index] = field.options[next].clone();
+        }
+        Some(FormRow::Label) => {
+            if form.label_choices.is_empty() {
+                return;
+            }
+            form.label_index = wrap(form.label_index, delta, form.label_choices.len());
+        }
+        None => {}
+    }
+}
+
+/// Steps an index within `length`, wrapping around.
+fn wrap(current: usize, delta: isize, length: usize) -> usize {
+    let length = length as isize;
+    (((current as isize + delta) % length + length) % length) as usize
+}
+
+/// Keeps a list row in step with a live event, so the list does not go stale
+/// between refreshes.
+fn apply_to_row(row: &mut ExecutionRow, data: &EventData) {
+    match data {
+        EventData::StateEntered { state_id } => {
+            row.current_state = Some(state_id.clone());
+            row.status = ExecutionStatus::Running;
+        }
+        EventData::WorkflowResumed => row.status = ExecutionStatus::Running,
+        EventData::WorkflowPaused { .. } | EventData::HumanInputRequested { .. } => {
+            row.status = ExecutionStatus::Paused
+        }
+        EventData::WorkflowCompleted { .. } => row.status = ExecutionStatus::Completed,
+        EventData::WorkflowFailed { .. } => row.status = ExecutionStatus::Failed,
+        EventData::WorkflowCancelled { .. } => row.status = ExecutionStatus::Cancelled,
+        _ => {}
+    }
+}
+
+/// The definition path the CLI recorded when it created the execution.
+fn stored_definition_path(execution: &WorkflowExecution) -> Option<PathBuf> {
+    execution
+        .metadata
+        .get(METADATA_CLI_KEY)?
+        .get(METADATA_DEFINITION_PATH_KEY)?
+        .as_str()
+        .map(PathBuf::from)
+}
+
+/// The schema spelling of a status — the same words the CLI prints.
+pub fn status_name(status: &ExecutionStatus) -> &'static str {
+    match status {
+        ExecutionStatus::Running => "running",
+        ExecutionStatus::Paused => "paused",
+        ExecutionStatus::WaitingForEvent => "waiting_for_event",
+        ExecutionStatus::Completed => "completed",
+        ExecutionStatus::Failed => "failed",
+        ExecutionStatus::Cancelled => "cancelled",
+        ExecutionStatus::Unknown => "unknown",
+    }
+}
+
+/// A one-line description of an event, for the stream panel.
+pub fn event_line(event: &Event) -> String {
+    let detail = match &event.data {
+        EventData::WorkflowStarted { workflow_id, .. } => {
+            format!("workflow_started  {workflow_id}")
+        }
+        EventData::WorkflowPaused { reason } => format!("workflow_paused  {reason}"),
+        EventData::WorkflowResumed => "workflow_resumed".to_string(),
+        EventData::WorkflowCompleted { .. } => "workflow_completed".to_string(),
+        EventData::WorkflowFailed { error } => format!("workflow_failed  {error}"),
+        EventData::WorkflowCancelled { reason } => format!("workflow_cancelled  {reason}"),
+        EventData::StateEntered { state_id } => format!("state_entered  {state_id}"),
+        EventData::StateExited {
+            state_id,
+            output_label,
+        } => format!("state_exited  {state_id} → {output_label}"),
+        EventData::ActionStarted {
+            state_id,
+            action_type,
+            ..
+        } => format!("action_started  {state_id} ({action_type})"),
+        EventData::ActionCompleted { output_label, .. } => {
+            format!("action_completed  {output_label}")
+        }
+        EventData::ActionFailed { error, .. } => format!("action_failed  {error}"),
+        EventData::ActionRetrying { retry_count, .. } => {
+            format!("action_retrying  attempt {retry_count}")
+        }
+        EventData::DecisionRequested { provider } => format!("decision_requested  {provider}"),
+        EventData::DecisionMade {
+            provider,
+            output_label,
+            ..
+        } => format!("decision_made  {provider} → {output_label}"),
+        EventData::HumanInputRequested { instruction } => {
+            format!("human_input_requested  {instruction}")
+        }
+        EventData::HumanInputReceived { .. } => "human_input_received".to_string(),
+        EventData::HumanTransitionSelected {
+            from_state,
+            to_state,
+        } => format!("human_transition_selected  {from_state} → {to_state}"),
+        EventData::TransitionTaken {
+            from_state,
+            to_state,
+            output_label,
+        } => format!("transition_taken  {from_state} → {to_state} ({output_label})"),
+        EventData::ArtifactCreated { artifact_id, .. } => {
+            format!("artifact_created  {artifact_id}")
+        }
+        EventData::ExternalEventReceived { event_type, .. } => {
+            format!("external_event_received  {event_type}")
+        }
+        EventData::Error { message, .. } => format!("error  {message}"),
+        other => format!("{other:?}"),
+    };
+
+    format!(
+        "{:>4}  {}  {}",
+        event.sequence,
+        event.timestamp.format("%H:%M:%S"),
+        detail
+    )
+}

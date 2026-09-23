@@ -1,0 +1,71 @@
+name: tui-pipeline
+version: 1
+description: >
+  Workflow fixture for the TUI state tests: one script state, one human state
+  and two terminals. Deliberately declares no `globals.workspace`, so the CLI
+  path creates an empty working directory, and the script is reached through an
+  absolute path handed in as an input — the test therefore never writes into the
+  repository. The `review` state declares `allow_manual_override`, which is what
+  makes the override mode reachable; `prepare` deliberately does not.
+
+inputs:
+  - name: script_path
+    type: string
+    required: true
+    description: Absolute path to the preparing script.
+  - name: ticket
+    type: string
+    required: true
+    description: Identifier the script echoes back into the context.
+
+states:
+  prepare:
+    description: Prepares the change and records the ticket in the context.
+    action:
+      type: script
+      command: "{{ inputs.script_path }}"
+      args:
+        - "{{ inputs.ticket }}"
+      exit_codes:
+        0: prepared
+        1: broken
+    outputs:
+      - prepared
+      - broken
+    transitions:
+      prepared: review
+      broken: aborted
+
+  review:
+    description: A person approves or rejects the prepared change.
+    allow_manual_override: true
+    action:
+      type: human
+      message: "Approve the prepared change?"
+      inputs:
+        - name: approval_status
+          type: select
+          required: true
+          options:
+            - approved
+            - rejected
+        - name: comment
+          type: text
+          required: true
+          description: Note for the record; the reviewer must write one.
+    outputs:
+      - approved
+      - rejected
+    transitions:
+      approved: done
+      rejected: aborted
+
+  done:
+    description: The change was approved.
+
+  aborted:
+    description: The change was rejected or could not be prepared.
+
+terminal_states:
+  done: completed
+  aborted: failed
