@@ -31,6 +31,8 @@
 //! request. Implementors write an `async move` block and box it; see
 //! [`ScriptExecutor::execute`] for the shape to copy.
 
+pub mod agent;
+pub mod harness;
 pub mod human;
 pub mod script;
 
@@ -40,6 +42,11 @@ use std::time::Duration;
 
 use crate::domain::{ActionConfig, ActionError, ActionResult, OutputLabel, Workspace};
 
+pub use agent::{AgentEventSink, AgentExecutor, AgentOutput, LoggingEventSink};
+pub use harness::{
+    ClaudeCodeAdapter, HarnessAdapter, HarnessInvocation, HarnessRegistry, HarnessRequest,
+    HarnessRun, OpenCodeAdapter,
+};
 pub use human::{
     HumanActionError, HumanExecutor, HumanInputDelivery, HumanInputRequest, PendingHumanInput,
     ResumedHumanAction,
@@ -73,6 +80,16 @@ pub struct ActionRequest<'a> {
     /// Id of the owning [`crate::domain::ActionExecution`], passed to child
     /// processes as [`ACTION_ID_ENV_VAR`].
     pub action_execution_id: &'a str,
+
+    /// Id of the execution this attempt belongs to, where the caller knows it.
+    ///
+    /// Only an executor that records something *of its own* in the execution's
+    /// event log needs it — [`AgentExecutor`], whose harness session starts
+    /// before there is a result and can fail without one. Every other executor
+    /// says everything it has to say through its return value, and the engine
+    /// writes the log. `None` means "nobody is listening": the run is
+    /// unaffected and the events go nowhere.
+    pub execution_id: Option<&'a str>,
 }
 
 impl<'a> ActionRequest<'a> {
@@ -87,12 +104,19 @@ impl<'a> ActionRequest<'a> {
             workspace,
             timeout: None,
             action_execution_id,
+            execution_id: None,
         }
     }
 
     /// Returns the same request with a time limit applied.
     pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Returns the same request naming the execution it belongs to.
+    pub fn with_execution_id(mut self, execution_id: &'a str) -> Self {
+        self.execution_id = Some(execution_id);
         self
     }
 }

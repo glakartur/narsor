@@ -27,6 +27,10 @@ Design documentation (written in Polish, and normative):
   `~/.ssh/config` nor credential helpers nor `url.*.insteadOf` rules — which is
   exactly the configuration access to private repositories rests on. A missing
   `git` only shows up when a `git` workspace is provisioned, not at startup.
+- **An agent harness on `PATH` — `claude` or `opencode` — a runtime
+  prerequisite too**, and only for workflows that have an `agent` state. See
+  [`AgentAction`](#agentaction--running-an-ai-agent). A missing one shows up
+  when such a state is entered, not at startup.
 - A POSIX system. Read-only access to secondary repositories is enforced with
   file permission bits.
 
@@ -291,6 +295,142 @@ logging to stderr.
 
 ---
 
+## `AgentAction` — running an AI agent
+
+A state whose action is `type: agent` runs an AI coding agent in the
+execution's workspace and takes its transition from the label the agent
+returns.
+
+```yaml
+analyze:
+  action:
+    type: agent
+    harness: claude-code          # or: opencode
+    model: opus                   # optional, passed through verbatim
+    prompt: |
+      Analyse the repository for: {{ inputs.feature_description }}.
+      Write the plan to plan.md.
+    parameters:                   # optional, harness-specific
+      permission_mode: acceptEdits
+    read_only_paths:              # optional, relative to the workspace
+      - ../other-repo/src
+  outputs: [ready, ambiguous]
+  transitions:
+    ready: implement
+    ambiguous: human_clarification
+```
+
+**The harness binary is a runtime prerequisite, like `git`.** It is never
+bundled and never installed; a missing one is reported as an action error
+naming the binary and saying it must be on `PATH`, not as
+`No such file or directory`.
+
+### How each harness is invoked
+
+Both are run non-interactively, in the workspace, with
+`ORCHESTRATOR_ACTION_ID` in the environment (D24), stdin closed, and both pipes
+drained while the agent works.
+
+```text
+claude   --print --output-format json \
+         [--add-dir <read_only_paths…>] [--model <model>] [--max-turns <n>] \
+         [--append-system-prompt <text>] [--resume <session-id>] \
+         [--allow-dangerously-skip-permissions] --permission-mode <mode> \
+         <prompt>
+
+opencode run [--model <provider/model#variant>] [--agent <agent>] \
+         [--session <session-id>] [--fork] [--auto] --format json \
+         <prompt>
+```
+
+`--print` / `run` are what make the run a batch run; `json` output is what
+carries the session id as well as the text. The flag that takes exactly one
+value is always the last one before the prompt, so a prompt can never be read
+as a flag's argument.
+
+`parameters` is the per-action, harness-specific part: `permission_mode`,
+`max_turns`, `append_system_prompt`, `dangerously_skip_permissions`,
+`resume_session` for `claude-code`; `agent`, `auto_approve`, `fork`,
+`resume_session` for `opencode`. An unknown value or a wrong type is an error
+before anything is run — never a silent default.
+
+### The JSON output contract
+
+The agent is asked — the contract is appended to every prompt — to finish with
+a single JSON object:
+
+```json
+{ "output": "ready", "data": {}, "variables": { "plan": "plan.md" }, "artifacts": ["plan.md"] }
+```
+
+`output` is the only required key, and it must be one of the state's declared
+`outputs`; `variables` reach the context, `artifacts` are registered, exactly
+as for a script action.
+
+Agents do not reliably emit clean JSON, so the answer is read robustly: a bare
+object, a fenced `json` code block, or an object trailing any amount of prose all
+work, and the **last** object carrying an `output` key wins. But **when no
+usable label can be found, the action fails** — it is never guessed, and never
+defaults to `success`. In an unattended pipeline a guessed label is a silently
+wrong transition, which is worse than a failure an operator can see. The state's
+`retry_policy` gives a hallucinating agent another attempt (D20); escalating to
+a person afterwards is the state's own business.
+
+### Sessions
+
+Every run is an agent session: `AgentSessionStarted` is written to the event
+log before the harness starts, `AgentMessage` carries the agent's final text,
+and `AgentSessionCompleted` or `AgentSessionFailed` closes it. The harness's own
+session id is captured from its output and published two ways: as the context
+variable `agent_session_id`, and inside the result under
+`data.agent_session`.
+
+Resumption is **half-wired on purpose.** `parameters.resume_session: <id>`
+continues a known session (`--resume` / `--session`), but `parameters` is not
+template-expanded — only `prompt` is — so a session captured by one state
+cannot yet be chained into the next by writing
+`{{ context.variables.agent_session_id }}`. The id is captured and exposed so
+that chaining becomes a one-line change in the template scope, and nothing more.
+
+### `read_only_paths`
+
+Extra directories the agent may look at, resolved against the workspace. They
+become `--add-dir` for `claude-code`; `opencode run` has no equivalent flag, so
+they are named in the message instead. Either way this is about **visibility,
+not enforcement**: read-only access to secondary repositories is enforced by the
+workspace provisioner's permission bits (D15), and would still be enforced if
+the flag were left out.
+
+### Permissions, non-interactivity, and what that costs
+
+The orchestrator runs unattended, so a harness that stopped on a permission
+prompt would hang a workflow until its timeout. Both harnesses are therefore run
+in their batch mode, where nothing can be prompted for.
+
+The default is deliberately **not** the most permissive setting:
+
+- `claude-code` runs with `--permission-mode acceptEdits`. The agent edits files
+  in its workspace on its own; anything heavier is refused rather than waited
+  on. `parameters.permission_mode` accepts `acceptEdits`, `auto`,
+  `bypassPermissions`, `manual`, `dontAsk` and `plan`, and `bypassPermissions`
+  additionally passes the CLI's own `--allow-dangerously-skip-permissions`.
+- `opencode` runs **without** `--auto`. Set `parameters.auto_approve: true` to
+  auto-approve every permission that is not explicitly denied. Without it, a
+  tool call opencode would have asked about is simply not granted, so an action
+  that needs one either finishes without doing the work or sits until the state's
+  `timeout` — which is the reason to set a `timeout` on agent states.
+
+**The security consequence is real and is not hypothetical.** Containerisation
+(D14) is still deferred, so the only boundary around an agent is D15's
+filesystem layout and permission bits — which protects against a mistake, not
+against a determined or prompt-injected agent. An agent run with
+`bypassPermissions` or `auto_approve` has, for practical purposes, the
+orchestrator's own access to the machine: your files, your credentials, your
+network. Turn either on for a workflow you wrote, over a repository you trust,
+and never for an untrusted workflow or an untrusted prompt.
+
+---
+
 ## Exit codes
 
 The exit codes are a contract for CI:
@@ -365,10 +505,6 @@ intact.
 
 Deliberately deferred to Phase 3 — each item needs a plan of its own:
 
-- **`AgentAction`** and the harness adapters (Claude Code, OpenCode). A workflow
-  with an `agent` state will start, but that action fails with a "not available
-  in this version" error — which includes the worked example
-  `tests/fixtures/implement_feature.yaml`.
 - **`WaitAction`** and the service that polls for external events.
 - **Agent decisions** (`decision: { type: agent }`) — they return an explicit
   "not available" error instead of quietly behaving like a rule-based decision.

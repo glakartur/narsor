@@ -225,7 +225,7 @@ async fn run(
 ///
 /// Reading continues past the ceiling so a chatty child is never blocked by a
 /// full pipe; only the retained bytes are bounded.
-async fn read_capped<R>(pipe: &mut R) -> std::io::Result<Vec<u8>>
+pub(crate) async fn read_capped<R>(pipe: &mut R) -> std::io::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -309,7 +309,7 @@ fn parse_json_output(stdout: &str) -> Option<JsonOutput> {
 ///
 /// The cut lands on a character boundary, so the result stays valid UTF-8 and
 /// the marker is always visible at the end.
-fn truncate(output: &str) -> String {
+pub(crate) fn truncate(output: &str) -> String {
     if output.len() <= MAX_CAPTURED_OUTPUT_BYTES {
         return output.to_string();
     }
