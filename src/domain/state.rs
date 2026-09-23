@@ -2,4 +2,4 @@
 //! 
 //! The State type is defined in workflow_definition.rs
 
-pub use crate::domain::workflow_definition::{State, StateId};
+pub use crate::domain::workflow_definition::State;

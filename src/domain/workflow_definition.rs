@@ -8,7 +8,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use uuid::Uuid;
 
 /// Unique identifier for a workflow definition
 pub type WorkflowDefinitionId = String;

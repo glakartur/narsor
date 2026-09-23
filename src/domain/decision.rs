@@ -3,7 +3,7 @@
 //! Represents the decision-making process for workflow transitions.
 
 use serde::{Deserialize, Serialize};
-use crate::domain::{OutputLabel, StateId};
+use crate::domain::OutputLabel;
 
 /// A decision made by a decision provider
 #[derive(Debug, Clone, Serialize, Deserialize)]

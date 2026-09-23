@@ -14,8 +14,7 @@ pub mod event;
 
 pub use workflow_definition::*;
 pub use workflow_execution::*;
-pub use state::*;
-pub use action::*;
+pub use state::State;
 pub use context::*;
 pub use artifact::*;
 pub use workspace::*;
