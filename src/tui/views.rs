@@ -29,7 +29,10 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use super::app::{event_line, status_name, App, FormRow, Modal, Panel, TransitionMode};
+use super::app::{
+    event_line, status_name, App, FormRow, Modal, NewTaskStage, Panel, RepositoryField,
+    TransitionMode,
+};
 use crate::domain::{ExecutionStatus, HumanInputType};
 
 /// Height of the shortcut bar, borders included.
@@ -116,6 +119,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         Modal::Input(_) => render_input_modal(frame, app),
         Modal::Transition(_) => render_transition_modal(frame, app),
         Modal::Confirm(_) => render_confirm_modal(frame, app),
+        Modal::Repositories(_) => render_repository_list_modal(frame, app),
+        Modal::RepositoryForm(_) => render_repository_form_modal(frame, app),
+        Modal::RepositoryRemove(_) => render_repository_remove_modal(frame, app),
+        Modal::NewTask(_) => render_new_task_modal(frame, app),
         Modal::Help => render_help_modal(frame),
     }
 }
@@ -578,6 +585,277 @@ fn render_confirm_modal(frame: &mut Frame, app: &App) {
     );
 }
 
+/// The listing of registered repositories.
+fn render_repository_list_modal(frame: &mut Frame, app: &App) {
+    let Modal::Repositories(list) = app.modal() else {
+        return;
+    };
+    let area = modal_area(frame, 76, 60);
+    frame.render_widget(Clear, area);
+
+    let mut lines = Vec::new();
+    if list.entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Nothing is registered yet — press a to register a repository.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for (index, entry) in list.entries.iter().enumerate() {
+        let focused = index == list.selected;
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} {:<20} {:<10} {:<14} {}",
+                if focused { "›" } else { " " },
+                entry.id,
+                entry.provider,
+                entry.default_branch.as_deref().unwrap_or("-"),
+                entry.remote
+            ),
+            if focused {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            },
+        )));
+    }
+
+    if let Some(entry) = list.current() {
+        if let Some(description) = &entry.description {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                description.clone(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "a — register,  d — remove (needs confirmation),  Esc — close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" Repositories — {} ", list.entries.len()));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// The form that registers a repository.
+fn render_repository_form_modal(frame: &mut Frame, app: &App) {
+    let Modal::RepositoryForm(form) = app.modal() else {
+        return;
+    };
+    let area = modal_area(frame, 70, 60);
+    frame.render_widget(Clear, area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Register a repository",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    for (index, field) in RepositoryField::ALL.iter().enumerate() {
+        let focused = index == form.row;
+        let requirement = if field.required() { "*" } else { " " };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} {}{requirement}: {}",
+                if focused { "›" } else { " " },
+                field.label(),
+                form.values.get(index).cloned().unwrap_or_default()
+            ),
+            if focused {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            },
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "The id names the checkout directory; the remote is checked with the \
+         provisioner's own rules.",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    if let Some(error) = &form.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Register a repository ");
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// The confirmation a repository removal has to pass.
+fn render_repository_remove_modal(frame: &mut Frame, app: &App) {
+    let Modal::RepositoryRemove(confirm) = app.modal() else {
+        return;
+    };
+    let area = modal_area(frame, 60, 30);
+    frame.render_widget(Clear, area);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Remove a registered repository.",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("  {}", confirm.id)),
+        Line::from(""),
+        Line::from("A workflow that names this id will fall back to treating it as a raw remote."),
+        Line::from(""),
+        Line::from(Span::styled(
+            "y — remove,  n/Esc — cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Confirm removal ");
+
+    frame.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+/// The form that starts a workflow.
+fn render_new_task_modal(frame: &mut Frame, app: &App) {
+    let Modal::NewTask(form) = app.modal() else {
+        return;
+    };
+    let area = modal_area(frame, 76, 66);
+    frame.render_widget(Clear, area);
+
+    let mut lines = Vec::new();
+
+    match form.stage {
+        NewTaskStage::Definition => {
+            lines.push(Line::from(Span::styled(
+                "Path of the workflow definition to run",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("› {}", form.path),
+                Style::default().add_modifier(Modifier::REVERSED),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Enter loads and validates it; the input form is generated from \
+                 what it declares.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        NewTaskStage::Inputs => {
+            let name = form
+                .definition
+                .as_ref()
+                .map(|definition| definition.id.clone())
+                .unwrap_or_default();
+            lines.push(Line::from(Span::styled(
+                format!("Inputs of '{name}'"),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+
+            if form.parameters.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "This workflow declares no inputs — press Enter to start it.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
+            for (index, parameter) in form.parameters.iter().enumerate() {
+                let focused = index == form.row;
+                let requirement = if parameter.required { "*" } else { " " };
+                let value = form.values.get(index).cloned().unwrap_or_default();
+                let hint = match form.choices(index) {
+                    Some(options) => format!("  [{}]", options.join(" | ")),
+                    None => String::new(),
+                };
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} {}{requirement} ({:?}): {value}{hint}",
+                        if focused { "›" } else { " " },
+                        parameter.name,
+                        parameter.param_type
+                    ),
+                    if focused {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    },
+                )));
+            }
+        }
+    }
+
+    if !form.violations.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("{} violations:", form.violations.len()),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        for violation in &form.violations {
+            lines.push(Line::from(Span::styled(
+                format!("  - {violation}"),
+                Style::default().fg(Color::Red),
+            )));
+        }
+    }
+
+    if let Some(error) = &form.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" New task ");
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 /// The key map.
 fn render_help_modal(frame: &mut Frame) {
     let area = modal_area(frame, 60, 70);
@@ -598,6 +876,8 @@ fn render_help_modal(frame: &mut Frame) {
             "Operations",
             Style::default().add_modifier(Modifier::BOLD),
         )),
+        Line::from("  n                 new task (load a definition and start it)"),
+        Line::from("  R                 repositories (a — register, d — remove)"),
         Line::from("  s                 run / resume the selected execution"),
         Line::from("  i                 human input form"),
         Line::from("  t                 manual transition (o — override mode)"),

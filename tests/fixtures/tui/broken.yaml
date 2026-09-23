@@ -1,0 +1,33 @@
+name: tui-broken
+version: 1
+description: >
+  Deliberately invalid: the only state transitions into a state that does not
+  exist and its command reads an input the workflow never declares. Two
+  independent violations, which is the point — the new-task modal has to report
+  every one of them, the way `orchestrator validate` does, not just the first.
+
+inputs:
+  - name: ticket
+    type: string
+    required: true
+
+states:
+  start:
+    description: Reads an input that is not declared.
+    action:
+      type: script
+      command: "/bin/echo"
+      args:
+        - "{{ inputs.undeclared_input }}"
+      exit_codes:
+        0: done
+    outputs:
+      - done
+    transitions:
+      done: nowhere
+
+  finished:
+    description: Never reached.
+
+terminal_states:
+  finished: completed
