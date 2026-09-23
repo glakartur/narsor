@@ -1,0 +1,136 @@
+name: implement-feature
+version: 1
+description: Implementuje funkcję, testuje ją i tworzy Pull Request.
+
+inputs:
+  - name: feature_description
+    type: string
+    required: true
+  - name: target_repo
+    type: repository
+    required: true
+
+globals:
+  timeout: 2h
+  retry_policy:
+    max_attempts: 2
+    backoff: 10s
+  workspace:
+    type: git
+    repository: "{{ inputs.target_repo }}"
+    ref: main
+
+states:
+  analyze:
+    description: Analiza istniejącego kodu i wymagań.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Przeanalizuj repozytorium pod kątem implementacji: {{ inputs.feature_description }}.
+        Zidentyfikuj pliki, które trzeba zmodyfikować.
+        Zapisz plan w pliku plan.md.
+    outputs:
+      - ready
+      - ambiguous
+    transitions:
+      ready: implement
+      ambiguous: human_clarification
+    
+  human_clarification:
+    description: Człowiek wyjaśnia niejasności.
+    action:
+      type: human
+      message: "Agent ma wątpliwości. Proszę doprecyzować wymagania."
+      inputs:
+        - name: clarification_text
+          type: text
+          required: true
+    outputs:
+      - clarified
+      - abort
+    transitions:
+      clarified: implement
+      abort: failed
+
+  implement:
+    description: Implementacja funkcji.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Zaimplementuj funkcję zgodnie z planem w plan.md i doprecyzowaniem: {{ context.clarification_text | default(inputs.feature_description) }}.
+        Upewnij się, że kod kompiluje się.
+    outputs:
+      - implemented
+      - blocked
+    transitions:
+      implemented: test
+      blocked: failed
+
+  test:
+    description: Uruchomienie testów jednostkowych.
+    action:
+      type: script
+      command: ./run_tests.sh
+      exit_codes:
+        0: success
+        1: failure
+        2: partial_failure
+    outputs:
+      - success
+      - failure
+      - partial_failure
+    transitions:
+      success: create_pr
+      failure: fix_code
+      partial_failure: human_review_tests
+
+  fix_code:
+    description: Naprawa błędów wykrytych przez testy.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Testy nie przeszły. Przeanalizuj logi i napraw kod.
+    outputs:
+      - fixed
+    transitions:
+      fixed: test  # Pętla powrotu do testów
+
+  human_review_tests:
+    description: Człowiek ocenia częściowe niepowodzenie testów.
+    action:
+      type: human
+      message: "Część testów nie przeszła. Czy ignorować?"
+    outputs:
+      - ignore
+      - fix_it
+    transitions:
+      ignore: create_pr
+      fix_it: fix_code
+
+  create_pr:
+    description: Tworzenie Pull Requesta.
+    action:
+      type: script
+      command: ./create_pr.sh
+      args:
+        - "--title"
+        - "Feature: {{ inputs.feature_description }}"
+    outputs:
+      - created
+    transitions:
+      created: completed
+
+  completed:
+    description: Sukces.
+    # Brak akcji, stan terminalny
+  
+  failed:
+    description: Niepowodzenie.
+    # Brak akcji, stan terminalny
+
+terminal_states:
+  - completed
+  - failed
