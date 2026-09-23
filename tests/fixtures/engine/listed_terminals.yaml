@@ -1,0 +1,30 @@
+name: ends-in-a-listed-terminal
+version: 1
+description: >
+  The backwards-compatible list form of `terminal_states`. Every entry means
+  `completed`, including the one named `failed` — the engine no longer guesses
+  from the state's name.
+
+states:
+  check:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "broken", "variables": {"reason": "nothing compiles"}}'
+    outputs:
+      - ok
+      - broken
+    transitions:
+      ok: completed
+      broken: failed
+
+  completed:
+    description: All good.
+
+  failed:
+    description: Named like a failure, declared as nothing at all.
+
+terminal_states:
+  - completed
+  - failed

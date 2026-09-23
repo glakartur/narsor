@@ -4,8 +4,10 @@
 //! verbatim from `WORKFLOW_SCHEMA.md` §4.
 
 use orchestrator::domain::{
-    ActionConfig, HumanInputType, ParamType, State, WorkflowDefinition, WorkspaceSpec,
+    ActionConfig, ExecutionStatus, HumanInputType, ParamType, State, TerminalStatus,
+    WorkflowDefinition, WorkspaceSpec,
 };
+use orchestrator::engine::terminal_status;
 use orchestrator::workflow::{load_from_file, load_from_str};
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
@@ -556,6 +558,155 @@ states:
 terminal_states:
   - only
   - cancelled
+"#;
+
+    let definition = load_from_str(yaml).expect("loading must not fail here");
+    assert!(state(&definition, "only").terminal);
+    assert!(!definition.states.contains_key("cancelled"));
+}
+
+// ---------------------------------------------------------------------------
+// `terminal_states`: the explicit status marker of §3.5
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_reference_example_declares_its_failure_terminal_explicitly() {
+    let definition = load_reference();
+
+    assert_eq!(
+        state(&definition, "completed").terminal_status,
+        Some(TerminalStatus::Completed)
+    );
+    assert_eq!(
+        state(&definition, "failed").terminal_status,
+        Some(TerminalStatus::Failed)
+    );
+}
+
+#[test]
+fn the_mapping_form_gives_each_terminal_its_declared_status() {
+    let yaml = r#"
+name: mapped-terminals
+version: 1
+states:
+  start:
+    action:
+      type: script
+      command: /bin/true
+    outputs: [ok]
+    transitions:
+      ok: completed
+  completed:
+    description: done
+  failed:
+    description: not done
+  gave_up:
+    description: abandoned
+terminal_states:
+  completed: completed
+  failed: failed
+  gave_up: cancelled
+"#;
+
+    let definition = load_from_str(yaml).expect("the mapping form must load");
+
+    for id in ["completed", "failed", "gave_up"] {
+        assert!(state(&definition, id).terminal, "{id} must be terminal");
+    }
+    assert_eq!(
+        state(&definition, "completed").terminal_status,
+        Some(TerminalStatus::Completed)
+    );
+    assert_eq!(
+        state(&definition, "failed").terminal_status,
+        Some(TerminalStatus::Failed)
+    );
+    assert_eq!(
+        state(&definition, "gave_up").terminal_status,
+        Some(TerminalStatus::Cancelled)
+    );
+    assert!(state(&definition, "start").terminal_status.is_none());
+}
+
+#[test]
+fn the_list_form_still_loads_and_every_entry_means_completed() {
+    // Backwards compatibility: an existing file keeps working, and a state
+    // called `failed` in the list form completes the execution — the list
+    // carries no failure information and nothing guesses from the name.
+    let yaml = r#"
+name: listed-terminals
+version: 1
+states:
+  start:
+    action:
+      type: script
+      command: /bin/true
+    outputs: [ok]
+    transitions:
+      ok: completed
+  completed:
+    description: done
+  failed:
+    description: not done
+terminal_states:
+  - completed
+  - failed
+"#;
+
+    let definition = load_from_str(yaml).expect("the list form must keep working");
+
+    for id in ["completed", "failed"] {
+        let terminal = state(&definition, id);
+        assert!(terminal.terminal, "{id} must be terminal");
+        assert!(
+            terminal.terminal_status.is_none(),
+            "the list form declares no status for {id}"
+        );
+        assert_eq!(
+            terminal_status(terminal),
+            ExecutionStatus::Completed,
+            "every list entry ends the execution as completed"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_terminal_status_names_the_state_the_value_and_the_permitted_set() {
+    let yaml = r#"
+name: bad-terminal-status
+version: 1
+states:
+  only:
+    description: end
+terminal_states:
+  only: kaput
+"#;
+
+    let error = load_from_str(yaml).expect_err("an unknown status must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("only"), "names the state: {message}");
+    assert!(message.contains("kaput"), "names the bad value: {message}");
+    for permitted in ["completed", "failed", "cancelled"] {
+        assert!(
+            message.contains(permitted),
+            "names '{permitted}' among the permitted values: {message}"
+        );
+    }
+}
+
+#[test]
+fn the_mapping_form_carries_a_missing_state_through_to_the_validator() {
+    // Same contract as the list form: the loader does not reject it, the
+    // validator's `UnknownTerminalState` rule does (U2).
+    let yaml = r#"
+name: dangling-mapped-terminal
+version: 1
+states:
+  only:
+    description: end
+terminal_states:
+  only: completed
+  cancelled: cancelled
 "#;
 
     let definition = load_from_str(yaml).expect("loading must not fail here");

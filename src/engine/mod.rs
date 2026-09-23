@@ -22,7 +22,6 @@ pub use decision::{
 pub use retry::RetrySchedule;
 pub use runner::{
     terminal_status, ActionKind, Engine, EngineError, PendingStep, EVENT_CHANNEL_CAPACITY,
-    FAILURE_TERMINAL_STATE_IDS,
 };
 
 pub use actions::{

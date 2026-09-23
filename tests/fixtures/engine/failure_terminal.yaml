@@ -25,5 +25,5 @@ states:
     description: Not good.
 
 terminal_states:
-  - completed
-  - failed
+  completed: completed
+  failed: failed

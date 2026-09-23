@@ -9,6 +9,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::domain::ExecutionStatus;
+
 /// Unique identifier for a workflow definition
 pub type WorkflowDefinitionId = String;
 
@@ -123,6 +125,36 @@ pub struct InputParameter {
 /// Identifier for a state within a workflow
 pub type StateId = String;
 
+/// The execution status a terminal state produces when it is entered.
+///
+/// This is the explicit marker of `WORKFLOW_SCHEMA.md` §3.5: a workflow says
+/// what reaching a terminal means instead of leaving the engine to guess from
+/// the state's name. The variants mirror the terminal variants of
+/// [`crate::domain::ExecutionStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalStatus {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl Default for TerminalStatus {
+    fn default() -> Self {
+        TerminalStatus::Completed
+    }
+}
+
+impl From<TerminalStatus> for ExecutionStatus {
+    fn from(status: TerminalStatus) -> Self {
+        match status {
+            TerminalStatus::Completed => ExecutionStatus::Completed,
+            TerminalStatus::Failed => ExecutionStatus::Failed,
+            TerminalStatus::Cancelled => ExecutionStatus::Cancelled,
+        }
+    }
+}
+
 /// A state in the workflow graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct State {
@@ -163,6 +195,16 @@ pub struct State {
     /// Whether this is a terminal state
     #[serde(default)]
     pub terminal: bool,
+
+    /// How the execution ends when this terminal state is entered.
+    ///
+    /// Declared explicitly in the YAML contract (`WORKFLOW_SCHEMA.md` §3.5,
+    /// the mapping form of `terminal_states`). `None` means the workflow did
+    /// not declare one — the list form of `terminal_states`, or a `state.json`
+    /// written before this field existed — and the engine then treats the
+    /// terminal as a success.
+    #[serde(default)]
+    pub terminal_status: Option<TerminalStatus>,
 
     /// Whether manual transition override is allowed
     #[serde(default)]
