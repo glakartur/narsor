@@ -77,7 +77,8 @@ impl Paths {
 
     /// `{root}/executions/{execution_id}/events/{sequence:08}.json`
     pub fn event_file(&self, execution_id: &str, sequence: u64) -> PathBuf {
-        self.events_dir(execution_id).join(event_file_name(sequence))
+        self.events_dir(execution_id)
+            .join(event_file_name(sequence))
     }
 
     /// `{root}/executions/{execution_id}/artifacts`

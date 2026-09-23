@@ -1245,7 +1245,10 @@ async fn a_definition_declaring_a_workspace_starts_from_the_modal_and_is_provisi
     let notice = app.notice().expect("a notice");
     assert!(!notice.is_error, "and it started: {}", notice.text);
 
-    let selected = app.selected().expect("the new execution is selected").clone();
+    let selected = app
+        .selected()
+        .expect("the new execution is selected")
+        .clone();
     assert_eq!(selected.workflow_id, "tui-new-task-workspace");
 
     // The workspace holds the source directory's contents, under the root.

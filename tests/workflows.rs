@@ -114,11 +114,10 @@ impl FakeHarness {
 
     /// An engine whose `agent` executor runs the fake harness.
     fn engine(&self, store_root: PathBuf) -> Engine {
-        let executor = AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(
-            Arc::new(ClaudeCodeAdapter::with_program(
-                self.program.to_string_lossy().into_owned(),
-            )),
-        ));
+        let executor =
+            AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(Arc::new(
+                ClaudeCodeAdapter::with_program(self.program.to_string_lossy().into_owned()),
+            )));
         Engine::new(orchestrator::persistence::ExecutionStore::new(store_root))
             .with_executor(ActionKind::Agent, Arc::new(executor))
     }
@@ -546,7 +545,10 @@ async fn the_open_mercato_pipeline_runs_through_its_review_loop_and_merge_gates(
                 "confirm_readiness",
                 &[
                     ("readiness_decision", "confirmed"),
-                    ("readiness_notes", "merchants with no orders yet; out of scope: filters"),
+                    (
+                        "readiness_notes",
+                        "merchants with no orders yet; out of scope: filters",
+                    ),
                 ],
             ),
             Answer::new("approve_design", &[("design_decision", "approved")]),
@@ -576,22 +578,22 @@ async fn a_failed_qa_goes_back_to_implementation_and_a_held_merge_can_be_abandon
     let harness = FakeHarness::installed_in(
         root.dir("harness"),
         &[
-            "routed",         // discover
-            "ready",          // intake
-            "actionable",     // triage
-            "claimed",        // claim
-            "not_user_facing",// assess_surface — the Design stage is skipped
-            "implemented",    // implement
-            "pr_opened",      // open_pr
-            "approved",       // code_review
-            "needs_qa",       // qa_routing
-            "evidence_ready", // qa_run
-            "implemented",    // implement, after QA failed
-            "pr_opened",      // open_pr again
-            "approved",       // code_review again
-            "needs_qa",       // qa_routing again
-            "evidence_ready", // qa_run again
-            "mergeable",      // premerge_check
+            "routed",          // discover
+            "ready",           // intake
+            "actionable",      // triage
+            "claimed",         // claim
+            "not_user_facing", // assess_surface — the Design stage is skipped
+            "implemented",     // implement
+            "pr_opened",       // open_pr
+            "approved",        // code_review
+            "needs_qa",        // qa_routing
+            "evidence_ready",  // qa_run
+            "implemented",     // implement, after QA failed
+            "pr_opened",       // open_pr again
+            "approved",        // code_review again
+            "needs_qa",        // qa_routing again
+            "evidence_ready",  // qa_run again
+            "mergeable",       // premerge_check
         ],
     );
     let engine = harness.engine(root.dir("store"));
@@ -615,7 +617,10 @@ async fn a_failed_qa_goes_back_to_implementation_and_a_held_merge_can_be_abandon
                 "confirm_readiness",
                 &[
                     ("readiness_decision", "waived"),
-                    ("readiness_notes", "maintainer waives the out-of-scope section"),
+                    (
+                        "readiness_notes",
+                        "maintainer waives the out-of-scope section",
+                    ),
                 ],
             ),
             Answer::new(

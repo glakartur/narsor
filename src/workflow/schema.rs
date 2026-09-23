@@ -204,7 +204,6 @@ pub enum ParamTypeSchema {
     Repository,
 }
 
-
 /// The `globals` section (§3.2).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -571,7 +570,8 @@ impl<'de> Deserialize<'de> for DurationSecs {
             type Value = DurationSecs;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a duration such as \"10s\", \"30m\", \"2h\" or a number of seconds")
+                formatter
+                    .write_str("a duration such as \"10s\", \"30m\", \"2h\" or a number of seconds")
             }
 
             fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {

@@ -1,9 +1,9 @@
 //! Event model
-//! 
+//!
 //! Represents events in the workflow execution history.
 
-use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Unique identifier for an event
@@ -14,16 +14,16 @@ pub type EventId = String;
 pub struct Event {
     /// Unique identifier
     pub id: EventId,
-    
+
     /// ID of the workflow execution this event belongs to
     pub workflow_execution_id: String,
-    
+
     /// When the event occurred
     pub timestamp: DateTime<Utc>,
-    
+
     /// The event data
     pub data: EventData,
-    
+
     /// Sequence number (for ordering)
     pub sequence: u64,
 }
@@ -51,7 +51,7 @@ pub enum EventData {
     WorkflowCancelled {
         reason: String,
     },
-    
+
     // State events
     StateEntered {
         state_id: String,
@@ -60,7 +60,7 @@ pub enum EventData {
         state_id: String,
         output_label: String,
     },
-    
+
     // Action events
     ActionStarted {
         action_execution_id: String,
@@ -79,7 +79,7 @@ pub enum EventData {
         action_execution_id: String,
         retry_count: u32,
     },
-    
+
     // Agent events
     AgentSessionStarted {
         session_id: String,
@@ -97,7 +97,7 @@ pub enum EventData {
         content: String,
         role: String,
     },
-    
+
     // Decision events
     DecisionRequested {
         provider: String,
@@ -107,7 +107,7 @@ pub enum EventData {
         output_label: String,
         reasoning: Option<String>,
     },
-    
+
     // Human interaction events
     HumanInputRequested {
         instruction: String,
@@ -119,28 +119,28 @@ pub enum EventData {
         from_state: String,
         to_state: String,
     },
-    
+
     // External events
     ExternalEventReceived {
         event_type: String,
         source: String,
         payload: serde_json::Value,
     },
-    
+
     // Transition events
     TransitionTaken {
         from_state: String,
         to_state: String,
         output_label: String,
     },
-    
+
     // Artifact events
     ArtifactCreated {
         artifact_id: String,
         artifact_type: String,
         location: String,
     },
-    
+
     // Error events
     Error {
         message: String,
@@ -150,11 +150,7 @@ pub enum EventData {
 
 impl Event {
     /// Creates a new event
-    pub fn new(
-        workflow_execution_id: String,
-        data: EventData,
-        sequence: u64,
-    ) -> Self {
+    pub fn new(workflow_execution_id: String, data: EventData, sequence: u64) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             workflow_execution_id,
@@ -163,7 +159,7 @@ impl Event {
             sequence,
         }
     }
-    
+
     /// Returns a human-readable description of the event
     /// A one-line description of the event for an operator.
     ///
@@ -173,7 +169,11 @@ impl Event {
     /// than quietly leaking a Rust `Debug` dump into the interface.
     pub fn description(&self) -> String {
         match &self.data {
-            EventData::WorkflowStarted { workflow_id, workflow_version, .. } => {
+            EventData::WorkflowStarted {
+                workflow_id,
+                workflow_version,
+                ..
+            } => {
                 format!("Workflow '{workflow_id}' (version {workflow_version}) started")
             }
             EventData::WorkflowPaused { reason } => format!("Workflow paused: {reason}"),
@@ -183,11 +183,18 @@ impl Event {
             EventData::WorkflowCancelled { reason } => format!("Workflow cancelled: {reason}"),
 
             EventData::StateEntered { state_id } => format!("Entered state '{state_id}'"),
-            EventData::StateExited { state_id, output_label } => {
+            EventData::StateExited {
+                state_id,
+                output_label,
+            } => {
                 format!("Left state '{state_id}' with '{output_label}'")
             }
 
-            EventData::ActionStarted { action_type, state_id, .. } => {
+            EventData::ActionStarted {
+                action_type,
+                state_id,
+                ..
+            } => {
                 format!("Action '{action_type}' started in state '{state_id}'")
             }
             EventData::ActionCompleted { output_label, .. } => {
@@ -212,7 +219,11 @@ impl Event {
             EventData::DecisionRequested { provider } => {
                 format!("Decision requested from '{provider}'")
             }
-            EventData::DecisionMade { provider, output_label, .. } => {
+            EventData::DecisionMade {
+                provider,
+                output_label,
+                ..
+            } => {
                 format!("Decision '{output_label}' made by '{provider}'")
             }
 
@@ -222,19 +233,32 @@ impl Event {
             EventData::HumanInputReceived { input } => {
                 format!("Human input received: {}", summarize_input(input))
             }
-            EventData::HumanTransitionSelected { from_state, to_state } => {
+            EventData::HumanTransitionSelected {
+                from_state,
+                to_state,
+            } => {
                 format!("Human chose the transition {from_state} -> {to_state}")
             }
 
-            EventData::ExternalEventReceived { event_type, source, .. } => {
+            EventData::ExternalEventReceived {
+                event_type, source, ..
+            } => {
                 format!("External event '{event_type}' from '{source}'")
             }
 
-            EventData::TransitionTaken { from_state, to_state, output_label } => {
+            EventData::TransitionTaken {
+                from_state,
+                to_state,
+                output_label,
+            } => {
                 format!("Transition {from_state} -> {to_state} on '{output_label}'")
             }
 
-            EventData::ArtifactCreated { artifact_type, location, .. } => {
+            EventData::ArtifactCreated {
+                artifact_type,
+                location,
+                ..
+            } => {
                 format!("Artifact '{artifact_type}' created at {location}")
             }
 

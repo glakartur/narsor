@@ -5,8 +5,8 @@
 
 use chrono::Utc;
 use orchestrator::domain::{
-    Context, Event, EventData, ExecutionStatus, RepositoryInfo, Workspace, WorkspaceType,
-    WorkflowExecution,
+    Context, Event, EventData, ExecutionStatus, RepositoryInfo, WorkflowExecution, Workspace,
+    WorkspaceType,
 };
 use orchestrator::persistence::atomic::{read_json, write_json_atomic};
 use orchestrator::persistence::paths::{event_file_name, temp_path_for};
@@ -23,10 +23,8 @@ struct TempRoot {
 
 impl TempRoot {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "orchestrator-persistence-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("orchestrator-persistence-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
     }
@@ -110,10 +108,7 @@ fn saving_and_loading_an_execution_preserves_every_field() {
     assert_eq!(loaded.completed_at, None);
     assert_eq!(loaded.inputs, execution.inputs);
     assert_eq!(loaded.metadata, execution.metadata);
-    assert_eq!(
-        loaded.current_action_execution.as_deref(),
-        Some("action-7")
-    );
+    assert_eq!(loaded.current_action_execution.as_deref(), Some("action-7"));
 
     // Context survives in full.
     assert_eq!(
@@ -137,10 +132,7 @@ fn saving_and_loading_an_execution_preserves_every_field() {
     let repository = loaded.workspace.repository.expect("repository preserved");
     assert_eq!(repository.name, "orchestrator");
     assert_eq!(repository.provider, "gitlab");
-    assert_eq!(
-        repository.remote,
-        "git@example.com:team/orchestrator.git"
-    );
+    assert_eq!(repository.remote, "git@example.com:team/orchestrator.git");
 }
 
 #[test]
@@ -291,7 +283,9 @@ fn appending_an_existing_sequence_fails_and_leaves_the_file_untouched() {
     let before = fs::read_to_string(&path).expect("read existing event");
 
     let colliding = sample_event("exec-collision", 2, "SHOULD-NOT-BE-WRITTEN");
-    let error = log.append(&colliding).expect_err("collision must be an error");
+    let error = log
+        .append(&colliding)
+        .expect_err("collision must be an error");
 
     match &error {
         PersistenceError::EventAlreadyExists { sequence, path: p } => {
@@ -416,10 +410,11 @@ fn cleanup_removes_an_orphaned_temp_file_and_leaves_the_real_file_intact() {
     // Simulate a crash between the write and the rename.
     let orphan = temp_path_for(&state_path);
     fs::write(&orphan, b"{\"id\":\"half-written").expect("write orphan");
-    let event_orphan = store
-        .paths()
-        .events_dir("exec-orphan")
-        .join(format!("{}{}", event_file_name(5), ".tmp"));
+    let event_orphan =
+        store
+            .paths()
+            .events_dir("exec-orphan")
+            .join(format!("{}{}", event_file_name(5), ".tmp"));
     fs::write(&event_orphan, b"{").expect("write event orphan");
     assert!(orphan.exists() && event_orphan.exists());
 
@@ -468,7 +463,10 @@ fn two_successive_context_writes_leave_no_temp_file_behind() {
                 .is_some_and(|name| name.ends_with(".tmp"))
         })
         .collect();
-    assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "temp files left behind: {leftovers:?}"
+    );
 
     let context = store.load_context("exec-context").expect("load context");
     assert_eq!(

@@ -1,26 +1,26 @@
 //! Decision model
-//! 
+//!
 //! Represents the decision-making process for workflow transitions.
 
-use serde::{Deserialize, Serialize};
 use crate::domain::OutputLabel;
+use serde::{Deserialize, Serialize};
 
 /// A decision made by a decision provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Decision {
     /// ID of the decision
     pub id: String,
-    
+
     /// Which provider made the decision
     pub provider: DecisionProviderType,
-    
+
     /// The chosen output label
     pub selected_output: OutputLabel,
-    
+
     /// Reasoning behind the decision (optional)
     #[serde(default)]
     pub reasoning: Option<String>,
-    
+
     /// Additional data from the decision process
     #[serde(default)]
     pub metadata: serde_json::Value,
@@ -43,18 +43,18 @@ pub enum DecisionProviderType {
 pub struct DecisionResult {
     /// Whether a decision was successfully made
     pub success: bool,
-    
+
     /// The decision (if successful)
     pub decision: Option<Decision>,
-    
+
     /// Error message (if failed)
     #[serde(default)]
     pub error: Option<String>,
-    
+
     /// Whether to escalate to another provider
     #[serde(default)]
     pub escalate: bool,
-    
+
     /// Target provider for escalation
     #[serde(default)]
     pub escalate_to: Option<DecisionProviderType>,
@@ -88,7 +88,7 @@ impl DecisionResult {
             escalate_to: None,
         }
     }
-    
+
     /// Creates a failed decision result
     pub fn failure(error: String) -> Self {
         Self {
@@ -99,7 +99,7 @@ impl DecisionResult {
             escalate_to: None,
         }
     }
-    
+
     /// Creates an escalation result
     pub fn escalate(to: DecisionProviderType, reason: Option<String>) -> Self {
         Self {

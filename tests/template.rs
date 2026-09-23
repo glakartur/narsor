@@ -95,7 +95,10 @@ fn substitutes_two_occurrences_independently() {
 fn ignores_whitespace_inside_the_placeholder() {
     let inputs = inputs(&[("x", json!("value"))]);
 
-    assert_eq!(render("{{   inputs.x   }}", &inputs, &Context::new()), "value");
+    assert_eq!(
+        render("{{   inputs.x   }}", &inputs, &Context::new()),
+        "value"
+    );
     assert_eq!(render("{{inputs.x}}", &inputs, &Context::new()), "value");
 }
 
@@ -173,7 +176,11 @@ fn unknown_context_variable_is_an_error_naming_the_variable() {
 
 #[test]
 fn a_filter_expression_is_rejected_with_a_dedicated_message() {
-    let error = render_error(r#"{{ context.x | default("y") }}"#, &Map::new(), &Context::new());
+    let error = render_error(
+        r#"{{ context.x | default("y") }}"#,
+        &Map::new(),
+        &Context::new(),
+    );
 
     assert!(
         matches!(error, TemplateError::FilterUnsupported { .. }),
@@ -240,16 +247,14 @@ fn renders_a_wait_filter_recursively() {
     let no_inputs = Map::new();
     let scope = TemplateScope::new(&no_inputs, &context);
 
-    let filter = json!({ "pr_number": "{{ context.pr_number }}", "nested": ["{{ context.pr_number }}"] });
+    let filter =
+        json!({ "pr_number": "{{ context.pr_number }}", "nested": ["{{ context.pr_number }}"] });
 
     let rendered = scope
         .render_value(&filter, "state 'await_review', filter")
         .expect("the filter must render");
 
-    assert_eq!(
-        rendered,
-        json!({ "pr_number": "42", "nested": ["42"] })
-    );
+    assert_eq!(rendered, json!({ "pr_number": "42", "nested": ["42"] }));
 }
 
 #[test]

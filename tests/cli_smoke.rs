@@ -91,10 +91,7 @@ fn fixtures() -> PathBuf {
 
 /// The smoke-test workflow: one script state, one human state.
 fn greet_workflow() -> String {
-    fixtures()
-        .join("cli/greet.yaml")
-        .display()
-        .to_string()
+    fixtures().join("cli/greet.yaml").display().to_string()
 }
 
 /// The script that workflow runs, as an absolute path.
@@ -145,7 +142,11 @@ fn validate_confirms_a_correct_definition() {
 
     let invocation = cli(&root, &["validate", &file.display().to_string()]);
 
-    assert_eq!(invocation.code, EXIT_SUCCESS, "stderr: {}", invocation.stderr);
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stderr: {}",
+        invocation.stderr
+    );
     assert!(
         invocation.stdout.contains("The definition is valid"),
         "stdout was:\n{}",
@@ -160,7 +161,11 @@ fn run_creates_an_execution_and_prints_its_id() {
 
     let (invocation, id) = start_greet(&root);
 
-    assert_eq!(invocation.code, EXIT_SUCCESS, "stderr: {}", invocation.stderr);
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stderr: {}",
+        invocation.stderr
+    );
     assert!(!id.is_empty());
     // The workflow stops at its human state, so the run ends paused.
     assert!(
@@ -178,7 +183,11 @@ fn list_shows_the_created_execution_with_its_status() {
 
     let invocation = cli(&root, &["list"]);
 
-    assert_eq!(invocation.code, EXIT_SUCCESS, "stderr: {}", invocation.stderr);
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stderr: {}",
+        invocation.stderr
+    );
     let line = invocation
         .stdout
         .lines()
@@ -195,10 +204,20 @@ fn show_prints_state_status_and_context_variables() {
 
     let invocation = cli(&root, &["show", &id]);
 
-    assert_eq!(invocation.code, EXIT_SUCCESS, "stderr: {}", invocation.stderr);
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stderr: {}",
+        invocation.stderr
+    );
     let stdout = invocation.stdout;
-    assert!(stdout.contains("Status:        paused"), "stdout:\n{stdout}");
-    assert!(stdout.contains("Current state: approve"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("Status:        paused"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Current state: approve"),
+        "stdout:\n{stdout}"
+    );
     assert!(stdout.contains("Context variables:"), "stdout:\n{stdout}");
     // Set by the script through its JSON result, merged into the context by the
     // engine.
@@ -218,7 +237,11 @@ fn input_delivers_an_answer_and_resumes_the_execution() {
         &["input", &id, "--field", "approval_status=approved"],
     );
 
-    assert_eq!(invocation.code, EXIT_SUCCESS, "stderr: {}", invocation.stderr);
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stderr: {}",
+        invocation.stderr
+    );
     assert!(
         invocation.stdout.contains("Status: completed"),
         "stdout:\n{}",
@@ -237,7 +260,11 @@ fn events_lists_the_log_in_sequence_order() {
 
     let invocation = cli(&root, &["events", &id]);
 
-    assert_eq!(invocation.code, EXIT_SUCCESS, "stderr: {}", invocation.stderr);
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stderr: {}",
+        invocation.stderr
+    );
     let types: Vec<&str> = invocation
         .stdout
         .lines()
@@ -257,7 +284,11 @@ fn list_without_any_executions_prints_an_empty_list() {
 
     let invocation = cli(&root, &["list"]);
 
-    assert_eq!(invocation.code, EXIT_SUCCESS, "stderr: {}", invocation.stderr);
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stderr: {}",
+        invocation.stderr
+    );
     assert!(
         invocation.stdout.contains("No executions."),
         "stdout:\n{}",
@@ -281,8 +312,13 @@ fn a_boolean_input_reaches_the_context_as_a_boolean() {
     assert!(!invocation.stdout.contains(r#"is_experimental = "true""#));
 
     let stored: serde_json::Value = serde_json::from_slice(
-        &fs::read(root.path().join("executions").join(&id).join("context.json"))
-            .expect("read context.json"),
+        &fs::read(
+            root.path()
+                .join("executions")
+                .join(&id)
+                .join("context.json"),
+        )
+        .expect("read context.json"),
     )
     .expect("parse context.json");
     assert_eq!(
@@ -363,7 +399,10 @@ fn a_missing_command_line_argument_is_a_usage_error() {
 
     let invocation = cli(&root, &["show"]);
 
-    assert_eq!(invocation.code, EXIT_USAGE, "clap's own code must match ours");
+    assert_eq!(
+        invocation.code, EXIT_USAGE,
+        "clap's own code must match ours"
+    );
 }
 
 #[test]

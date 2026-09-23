@@ -100,7 +100,10 @@ pub fn compile(file: WorkflowFile) -> Result<WorkflowDefinition, LoadError> {
     let mut states = HashMap::with_capacity(file.states.len());
     for (id, state) in file.states {
         let terminal = file.terminal_states.contains(&id);
-        let terminal_status = file.terminal_states.status_of(&id).map(compile_terminal_status);
+        let terminal_status = file
+            .terminal_states
+            .status_of(&id)
+            .map(compile_terminal_status);
         let compiled = compile_state(
             id.clone(),
             state,
@@ -186,10 +189,7 @@ fn compile_state(
     default_timeout_secs: Option<u64>,
     default_retry_policy: Option<&RetryPolicy>,
 ) -> State {
-    let timeout_secs = state
-        .timeout
-        .map(|d| d.as_secs())
-        .or(default_timeout_secs);
+    let timeout_secs = state.timeout.map(|d| d.as_secs()).or(default_timeout_secs);
 
     let retry_policy = state
         .retry_policy

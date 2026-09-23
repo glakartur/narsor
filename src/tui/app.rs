@@ -2201,31 +2201,30 @@ impl App {
         };
 
         let root = self.engine.store().root().to_path_buf();
-        let execution =
-            match tasks::start_task(&root, &self.engine, &definition, &file, inputs) {
-                Ok(execution) => execution,
-                Err(error) => {
-                    let message = error.to_string();
-                    // An error that left an execution behind happened after it
-                    // was created: the modal has nothing left to correct, so it
-                    // closes and the list shows the failed execution instead.
-                    match error.execution_id() {
-                        Some(execution_id) => {
-                            let execution_id = execution_id.to_string();
-                            self.modal = Modal::None;
-                            self.refresh();
-                            self.select_execution(&execution_id);
-                        }
-                        None => {
-                            if let Modal::NewTask(form) = &mut self.modal {
-                                form.error = Some(message.clone());
-                            }
+        let execution = match tasks::start_task(&root, &self.engine, &definition, &file, inputs) {
+            Ok(execution) => execution,
+            Err(error) => {
+                let message = error.to_string();
+                // An error that left an execution behind happened after it
+                // was created: the modal has nothing left to correct, so it
+                // closes and the list shows the failed execution instead.
+                match error.execution_id() {
+                    Some(execution_id) => {
+                        let execution_id = execution_id.to_string();
+                        self.modal = Modal::None;
+                        self.refresh();
+                        self.select_execution(&execution_id);
+                    }
+                    None => {
+                        if let Modal::NewTask(form) = &mut self.modal {
+                            form.error = Some(message.clone());
                         }
                     }
-                    self.notice = Some(Notice::error(message));
-                    return;
                 }
-            };
+                self.notice = Some(Notice::error(message));
+                return;
+            }
+        };
 
         self.modal = Modal::None;
         let outcome = self.engine.run(&definition, &execution.id).await;

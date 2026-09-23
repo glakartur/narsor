@@ -159,10 +159,7 @@ pub async fn run(root: &Path, file: &Path, inputs: &[String]) -> Result<()> {
 
 /// Parses `--input` pairs against the declared parameters, fills in defaults and
 /// reports everything that is missing.
-fn collect_inputs(
-    definition: &WorkflowDefinition,
-    pairs: &[String],
-) -> Result<Map<String, Value>> {
+fn collect_inputs(definition: &WorkflowDefinition, pairs: &[String]) -> Result<Map<String, Value>> {
     let mut values = Map::new();
 
     for pair in pairs {
@@ -274,10 +271,7 @@ pub fn list(root: &Path) -> Result<()> {
     // are looking for.
     executions.sort_by_key(|execution| std::cmp::Reverse(execution.started_at));
 
-    println!(
-        "{:<38} {:<10} {:<22} WORKFLOW",
-        "ID", "STATUS", "STATE"
-    );
+    println!("{:<38} {:<10} {:<22} WORKFLOW", "ID", "STATUS", "STATE");
     for execution in &executions {
         println!(
             "{:<38} {:<10} {:<22} {}",
@@ -605,7 +599,9 @@ pub fn tui(root: &Path) -> Result<()> {
     let store = ExecutionStore::new(root);
     let handle = tokio::runtime::Handle::current();
     tokio::task::block_in_place(move || handle.block_on(crate::tui::run(store))).map_err(|error| {
-        CliError::failure(format!("The terminal interface stopped with an error: {error}"))
+        CliError::failure(format!(
+            "The terminal interface stopped with an error: {error}"
+        ))
     })
 }
 
@@ -623,17 +619,10 @@ fn load_execution(store: &ExecutionStore, execution_id: &str) -> Result<Workflow
 }
 
 /// The pending question of an execution, if it has one.
-fn pending_input(
-    store: &ExecutionStore,
-    execution_id: &str,
-) -> Result<Option<PendingHumanInput>> {
+fn pending_input(store: &ExecutionStore, execution_id: &str) -> Result<Option<PendingHumanInput>> {
     store
         .load_pending_input::<PendingHumanInput>(execution_id)
-        .map_err(|error| {
-            CliError::failure(format!(
-                "Could not read the pending input: {error}"
-            ))
-        })
+        .map_err(|error| CliError::failure(format!("Could not read the pending input: {error}")))
 }
 
 /// Resolves the definition an execution continues with.

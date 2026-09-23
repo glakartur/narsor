@@ -120,9 +120,9 @@ fn transition_for_an_undeclared_label_is_rejected() {
 fn unreachable_state_is_rejected() {
     let errors = errors_of("unreachable_state.yaml");
     assert!(
-        errors
-            .iter()
-            .any(|err| matches!(err, ValidationError::UnreachableState(state) if state == "orphan")),
+        errors.iter().any(
+            |err| matches!(err, ValidationError::UnreachableState(state) if state == "orphan")
+        ),
         "got: {}",
         describe(&errors)
     );
@@ -133,9 +133,9 @@ fn a_loop_without_an_exit_is_rejected_as_a_deadlock() {
     let errors = errors_of("no_path_to_terminal.yaml");
     for state_id in ["a", "b"] {
         assert!(
-            errors
-                .iter()
-                .any(|err| matches!(err, ValidationError::NoPathToTerminal(state) if state == state_id)),
+            errors.iter().any(
+                |err| matches!(err, ValidationError::NoPathToTerminal(state) if state == state_id)
+            ),
             "expected a deadlock error for '{state_id}', got: {}",
             describe(&errors)
         );
@@ -410,7 +410,10 @@ terminal_states: [finished]
 "#;
     let definition = load_from_str(yaml).unwrap();
     if let Err(errors) = definition.validate() {
-        panic!("runtime references must pass validation, got: {}", describe(&errors));
+        panic!(
+            "runtime references must pass validation, got: {}",
+            describe(&errors)
+        );
     }
 }
 
@@ -431,7 +434,10 @@ terminal_states: [only]
     let definition = load_from_str(yaml).unwrap();
     assert_eq!(definition.initial_state, "only");
     if let Err(errors) = definition.validate() {
-        panic!("a single terminal state is a valid workflow, got: {}", describe(&errors));
+        panic!(
+            "a single terminal state is a valid workflow, got: {}",
+            describe(&errors)
+        );
     }
 }
 
@@ -446,14 +452,22 @@ fn five_violations_are_reported_as_five_errors() {
     );
 
     let expected: [fn(&ValidationError) -> bool; 5] = [
-        |err| matches!(err, ValidationError::UnknownInputReference { state, variable, .. }
-            if state == "start" && variable == "missing"),
-        |err| matches!(err, ValidationError::OutputWithoutTransition { state, label }
-            if state == "start" && label == "extra"),
-        |err| matches!(err, ValidationError::MissingActionField { state, field, .. }
-            if state == "middle" && *field == "command"),
-        |err| matches!(err, ValidationError::TransitionWithoutOutput { state, label }
-            if state == "middle" && label == "failure"),
+        |err| {
+            matches!(err, ValidationError::UnknownInputReference { state, variable, .. }
+            if state == "start" && variable == "missing")
+        },
+        |err| {
+            matches!(err, ValidationError::OutputWithoutTransition { state, label }
+            if state == "start" && label == "extra")
+        },
+        |err| {
+            matches!(err, ValidationError::MissingActionField { state, field, .. }
+            if state == "middle" && *field == "command")
+        },
+        |err| {
+            matches!(err, ValidationError::TransitionWithoutOutput { state, label }
+            if state == "middle" && label == "failure")
+        },
         |err| matches!(err, ValidationError::UnreachableState(state) if state == "orphan"),
     ];
     for (index, matches_rule) in expected.iter().enumerate() {

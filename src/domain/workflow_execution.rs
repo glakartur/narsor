@@ -1,11 +1,11 @@
 //! Workflow Execution model
-//! 
+//!
 //! Represents a running or completed instance of a workflow.
 
-use crate::domain::{WorkflowDefinition, StateId, Context, Artifact, Workspace};
+use crate::domain::{Artifact, Context, StateId, WorkflowDefinition, Workspace};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
 /// Unique identifier for a workflow execution
 pub type ExecutionId = String;
@@ -35,37 +35,37 @@ pub enum ExecutionStatus {
 pub struct WorkflowExecution {
     /// Unique identifier for this execution
     pub id: ExecutionId,
-    
+
     /// ID of the workflow definition
     pub workflow_id: String,
-    
+
     /// Version of the workflow definition used
     pub workflow_version: u32,
-    
+
     /// Current status
     pub status: ExecutionStatus,
-    
+
     /// Current state (if running/paused/waiting)
     pub current_state: Option<StateId>,
-    
+
     /// When the execution was started
     pub started_at: DateTime<Utc>,
-    
+
     /// When the execution completed (if applicable)
     pub completed_at: Option<DateTime<Utc>>,
-    
+
     /// Input parameters provided at start
     pub inputs: serde_json::Value,
-    
+
     /// The workflow context (variables, artifacts references, etc.)
     pub context: Context,
-    
+
     /// Workspace configuration for this execution
     pub workspace: Workspace,
-    
+
     /// ID of the current/last action execution
     pub current_action_execution: Option<ActionExecutionId>,
-    
+
     /// Metadata
     #[serde(default)]
     pub metadata: serde_json::Value,
@@ -91,37 +91,37 @@ pub enum ActionExecutionStatus {
 pub struct ActionExecution {
     /// Unique identifier for this action execution
     pub id: ActionExecutionId,
-    
+
     /// ID of the parent workflow execution
     pub workflow_execution_id: ExecutionId,
-    
+
     /// ID of the state this action belongs to
     pub state_id: StateId,
-    
+
     /// When the action execution started
     pub started_at: DateTime<Utc>,
-    
+
     /// When the action execution completed
     pub ended_at: Option<DateTime<Utc>>,
-    
+
     /// Current status
     pub status: ActionExecutionStatus,
-    
+
     /// Input data provided to the action
     pub input: serde_json::Value,
-    
+
     /// Result data from the action (if completed)
     pub output: Option<ActionResult>,
-    
+
     /// Error information (if failed)
     pub error: Option<ActionError>,
-    
+
     /// Number of retries attempted
     pub retry_count: u32,
-    
+
     /// Associated agent session ID (if applicable)
     pub agent_session_id: Option<AgentSessionId>,
-    
+
     /// Artifacts produced by this action
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
@@ -132,22 +132,22 @@ pub struct ActionExecution {
 pub struct ActionResult {
     /// The output label (determines transition)
     pub output_label: String,
-    
+
     /// Data returned by the action
     #[serde(default)]
     pub data: serde_json::Value,
-    
+
     /// Variables to update in the workflow context
     #[serde(default)]
     pub variables: serde_json::Map<String, serde_json::Value>,
-    
+
     /// Exit code (for script actions)
     pub exit_code: Option<i32>,
-    
+
     /// Standard output (for script/agent actions)
     #[serde(default)]
     pub stdout: String,
-    
+
     /// Standard error (for script/agent actions)
     #[serde(default)]
     pub stderr: String,
@@ -158,11 +158,11 @@ pub struct ActionResult {
 pub struct ActionError {
     /// Error message
     pub message: String,
-    
+
     /// Error type/category
     #[serde(default)]
     pub error_type: Option<String>,
-    
+
     /// Stack trace or additional details
     #[serde(default)]
     pub details: Option<serde_json::Value>,
@@ -188,26 +188,26 @@ pub enum AgentSessionStatus {
 pub struct AgentSession {
     /// Unique identifier for this session
     pub id: AgentSessionId,
-    
+
     /// ID of the parent workflow execution
     pub workflow_execution_id: ExecutionId,
-    
+
     /// Which harness is being used
     pub harness: String,
-    
+
     /// When the session was started
     pub started_at: DateTime<Utc>,
-    
+
     /// When the session ended
     pub ended_at: Option<DateTime<Utc>>,
-    
+
     /// Current status
     pub status: AgentSessionStatus,
-    
+
     /// Model specification
     #[serde(default)]
     pub model: Option<String>,
-    
+
     /// Session-specific configuration
     #[serde(default)]
     pub config: serde_json::Value,
@@ -235,14 +235,12 @@ impl WorkflowExecution {
             metadata: serde_json::json!({}),
         }
     }
-    
+
     /// Checks if the execution is in a terminal state
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.status,
-            ExecutionStatus::Completed
-                | ExecutionStatus::Failed
-                | ExecutionStatus::Cancelled
+            ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
         )
     }
 }

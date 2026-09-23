@@ -38,8 +38,8 @@
 //! permission bits on the provisioned directories, for both harnesses.
 
 use super::{
-    bool_parameter, reject_option_like, resolve_read_only_path, string_parameter, tail, HarnessAdapter,
-    HarnessInvocation, HarnessRequest, HarnessRun,
+    bool_parameter, reject_option_like, resolve_read_only_path, string_parameter, tail,
+    HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun,
 };
 use crate::domain::ActionError;
 use serde_json::Value;

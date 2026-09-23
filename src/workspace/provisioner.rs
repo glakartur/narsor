@@ -755,7 +755,12 @@ fn git_run(args: &[&str]) -> io::Result<GitRun> {
 /// [`WorkspaceError::Git`] with git's own stderr attached.
 fn run_git(repository: &str, args: &[&str]) -> Result<String> {
     let run = git_run(args).map_err(|error| {
-        WorkspaceError::git(repository, args, None, format!("could not run git: {error}"))
+        WorkspaceError::git(
+            repository,
+            args,
+            None,
+            format!("could not run git: {error}"),
+        )
     })?;
     if !run.ok {
         return Err(WorkspaceError::git(repository, args, run.code, run.stderr));
@@ -913,7 +918,10 @@ fn unsaved_work_in_repository(path: &Path, name: &str) -> Result<Option<String>>
     // `--porcelain` is stable across git versions, configurations and locales,
     // and lists untracked files (but not ignored ones) by default.
     let status = run_git(name, &["-C", &dir, "status", "--porcelain"])?;
-    let changes = status.lines().filter(|line| !line.trim().is_empty()).count();
+    let changes = status
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
     if changes > 0 {
         return Ok(Some(format!(
             "repository '{name}' has {changes} uncommitted change(s)"
@@ -980,8 +988,7 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
         let entry = entry.map_err(|error| WorkspaceError::io(source, error))?;
         let from = entry.path();
         let to = target.join(entry.file_name());
-        let metadata =
-            fs::metadata(&from).map_err(|error| WorkspaceError::io(&from, error))?;
+        let metadata = fs::metadata(&from).map_err(|error| WorkspaceError::io(&from, error))?;
         if metadata.is_dir() {
             copy_dir_recursive(&from, &to)?;
         } else {
@@ -1068,8 +1075,7 @@ fn force_remove_dir_all(path: &Path) -> Result<()> {
 #[cfg(unix)]
 fn walk(path: &Path) -> Result<Vec<PathBuf>> {
     let mut collected = Vec::new();
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| WorkspaceError::io(path, error))?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| WorkspaceError::io(path, error))?;
     if metadata.is_dir() && !metadata.file_type().is_symlink() {
         let entries = fs::read_dir(path).map_err(|error| WorkspaceError::io(path, error))?;
         for entry in entries {

@@ -305,12 +305,7 @@ impl AgentExecutor {
     }
 
     /// Marks the session failed and says so in the log.
-    fn fail_session(
-        &self,
-        execution_id: Option<&str>,
-        session: &mut AgentSession,
-        error: String,
-    ) {
+    fn fail_session(&self, execution_id: Option<&str>, session: &mut AgentSession, error: String) {
         session.status = AgentSessionStatus::Failed;
         session.ended_at = Some(Utc::now());
         self.emit(
@@ -328,7 +323,10 @@ fn agent_config(action: &ActionConfig) -> Result<&AgentActionConfig, ActionError
     match action {
         ActionConfig::Agent(config) => Ok(config),
         other => Err(ActionError {
-            message: format!("AgentExecutor received a {} action", action_type_name(other)),
+            message: format!(
+                "AgentExecutor received a {} action",
+                action_type_name(other)
+            ),
             error_type: Some("wrong_action_type".to_string()),
             details: None,
         }),

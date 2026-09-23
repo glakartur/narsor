@@ -5,7 +5,7 @@
 //! permissions and actual checkouts, so nothing is mocked and nothing touches
 //! the network.
 
-use orchestrator::domain::{WorkspaceType, WorkflowExecution};
+use orchestrator::domain::{WorkflowExecution, WorkspaceType};
 use orchestrator::workspace::{
     CleanupOutcome, CleanupPolicy, RepositorySpec, WorkspaceError, WorkspaceProvisioner,
     WorkspaceRequest,
@@ -236,7 +236,9 @@ fn local_workspace_holds_the_source_contents_and_is_recorded_on_the_execution() 
 
     let provisioner = temp.provisioner();
     let request = WorkspaceRequest::new(RepositorySpec::local("app", &source));
-    let provisioned = provisioner.provision("exec-1", &request).expect("provision");
+    let provisioned = provisioner
+        .provision("exec-1", &request)
+        .expect("provision");
 
     let repo_dir = provisioner.repository_dir("exec-1", "app");
     assert_eq!(provisioned.primary().path, repo_dir);
@@ -275,7 +277,9 @@ fn git_workspace_is_cloned_at_the_requested_ref() {
         origin.display().to_string(),
         Some("feature".to_string()),
     ));
-    let provisioned = provisioner.provision("exec-1", &request).expect("provision");
+    let provisioned = provisioner
+        .provision("exec-1", &request)
+        .expect("provision");
 
     let repo_dir = provisioned.primary().path.clone();
     assert_eq!(
@@ -287,7 +291,10 @@ fn git_workspace_is_cloned_at_the_requested_ref() {
         "base\n"
     );
 
-    assert_eq!(git(&repo_dir, &["symbolic-ref", "--short", "HEAD"]), "feature");
+    assert_eq!(
+        git(&repo_dir, &["symbolic-ref", "--short", "HEAD"]),
+        "feature"
+    );
 
     assert!(matches!(
         provisioned.workspace.workspace_type,
@@ -318,7 +325,9 @@ fn secondary_repository_is_readable_but_not_writable() {
     let provisioner = temp.provisioner();
     let request = WorkspaceRequest::new(RepositorySpec::local("app", &primary))
         .with_secondary(RepositorySpec::local("docs", &reference));
-    let provisioned = provisioner.provision("exec-1", &request).expect("provision");
+    let provisioned = provisioner
+        .provision("exec-1", &request)
+        .expect("provision");
 
     let docs = provisioned.repository("docs").expect("secondary present");
     assert!(docs.read_only);
@@ -359,7 +368,10 @@ fn secondary_repository_is_readable_but_not_writable() {
 
     // The primary repository stays writable for the same script.
     let primary_repo = provisioned.primary();
-    let script = format!("echo agent > '{}'", primary_repo.path.join("out.txt").display());
+    let script = format!(
+        "echo agent > '{}'",
+        primary_repo.path.join("out.txt").display()
+    );
     let output = Command::new("sh")
         .arg("-c")
         .arg(&script)
@@ -381,7 +393,9 @@ fn cleanup_removes_the_workspace_after_the_execution_finishes() {
     let provisioner = temp.provisioner();
     let request = WorkspaceRequest::new(RepositorySpec::local("app", &source))
         .with_secondary(RepositorySpec::local("docs", &reference));
-    let provisioned = provisioner.provision("exec-1", &request).expect("provision");
+    let provisioned = provisioner
+        .provision("exec-1", &request)
+        .expect("provision");
     assert!(provisioned.task_dir.exists());
 
     let outcome = provisioner
@@ -403,7 +417,9 @@ fn preserve_leaves_the_workspace_untouched() {
 
     let provisioner = temp.provisioner();
     let request = WorkspaceRequest::new(RepositorySpec::local("app", &source));
-    let provisioned = provisioner.provision("exec-1", &request).expect("provision");
+    let provisioned = provisioner
+        .provision("exec-1", &request)
+        .expect("provision");
 
     let outcome = provisioner
         .cleanup("exec-1", CleanupPolicy::Preserve)
@@ -549,7 +565,9 @@ fn uncommitted_changes_block_cleanup_and_leave_a_warning() {
 
     let provisioner = temp.provisioner();
     let request = WorkspaceRequest::new(RepositorySpec::local("app", &source));
-    let provisioned = provisioner.provision("exec-1", &request).expect("provision");
+    let provisioned = provisioner
+        .provision("exec-1", &request)
+        .expect("provision");
 
     // Simulate an agent that produced work but never committed it.
     fs::write(provisioned.primary().path.join("agent-output.md"), "work\n")
@@ -604,7 +622,9 @@ fn unpushed_commits_block_cleanup_of_a_cloned_repository() {
         origin.display().to_string(),
         Some("feature".to_string()),
     ));
-    let provisioned = provisioner.provision("exec-1", &request).expect("provision");
+    let provisioned = provisioner
+        .provision("exec-1", &request)
+        .expect("provision");
 
     // A clone that is exactly at its upstream can be thrown away; one commit
     // ahead of it cannot.
@@ -663,8 +683,11 @@ fn a_remote_using_the_ext_transport_is_rejected_before_anything_is_written() {
 fn a_remote_that_git_would_read_as_an_option_is_rejected() {
     let root = TempRoot::new();
     let provisioner = WorkspaceProvisioner::new(root.path());
-    let request =
-        WorkspaceRequest::new(RepositorySpec::git("app", "--upload-pack=touch /tmp/x", None));
+    let request = WorkspaceRequest::new(RepositorySpec::git(
+        "app",
+        "--upload-pack=touch /tmp/x",
+        None,
+    ));
 
     assert!(matches!(
         provisioner.validate(&request),

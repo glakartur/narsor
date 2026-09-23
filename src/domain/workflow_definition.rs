@@ -101,7 +101,6 @@ pub enum ParamType {
     Repository,
 }
 
-
 /// Input parameter definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputParameter {
@@ -137,7 +136,6 @@ pub enum TerminalStatus {
     Failed,
     Cancelled,
 }
-
 
 impl From<TerminalStatus> for ExecutionStatus {
     fn from(status: TerminalStatus) -> Self {
@@ -392,9 +390,15 @@ pub struct RetryPolicy {
     pub backoff_multiplier: f64,
 }
 
-fn default_max_attempts() -> u32 { 1 }
-fn default_backoff_secs() -> u64 { 0 }
-fn default_backoff_multiplier() -> f64 { 2.0 }
+fn default_max_attempts() -> u32 {
+    1
+}
+fn default_backoff_secs() -> u64 {
+    0
+}
+fn default_backoff_multiplier() -> f64 {
+    2.0
+}
 
 impl Default for RetryPolicy {
     fn default() -> Self {
@@ -469,10 +473,7 @@ pub enum ValidationError {
 
     // --- Decision correctness (§5.3) ---
     #[error("State '{state}' uses an agent decision without the required field '{field}'")]
-    AgentDecisionMissingField {
-        state: StateId,
-        field: &'static str,
-    },
+    AgentDecisionMissingField { state: StateId, field: &'static str },
 
     // --- Variables and context (§5.4) ---
     #[error("State '{state}' references unknown input '{variable}' in field '{field}'")]

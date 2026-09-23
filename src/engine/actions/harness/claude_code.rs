@@ -44,9 +44,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::{
-    bool_parameter, integer_parameter, reject_option_like, resolve_read_only_path, string_parameter,
-    tail,
-    HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun,
+    bool_parameter, integer_parameter, reject_option_like, resolve_read_only_path,
+    string_parameter, tail, HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun,
 };
 use crate::domain::ActionError;
 
@@ -150,8 +149,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             args.push(max_turns.to_string());
         }
 
-        if let Some(system_prompt) =
-            string_parameter(config, "append_system_prompt", CLAUDE_CODE)?
+        if let Some(system_prompt) = string_parameter(config, "append_system_prompt", CLAUDE_CODE)?
         {
             reject_option_like(system_prompt, "append_system_prompt", CLAUDE_CODE)?;
             args.push("--append-system-prompt".to_string());

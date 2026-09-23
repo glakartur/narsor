@@ -93,10 +93,11 @@ pub fn validate_path<P: AsRef<Path>>(path: P) -> Result<Vec<ValidationError>, Lo
         path: path.to_path_buf(),
         source,
     })?;
-    let file: WorkflowFile = serde_yaml::from_str(&contents).map_err(|source| LoadError::Parse {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let file: WorkflowFile =
+        serde_yaml::from_str(&contents).map_err(|source| LoadError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
     validate_file(file)
 }
 
@@ -462,7 +463,11 @@ fn extract_input_references(text: &str) -> Vec<String> {
 /// anything more complicated.
 fn plain_input_reference(expression: &str) -> Option<String> {
     let name = expression.strip_prefix("inputs.")?;
-    if name.is_empty() || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
         return None;
     }
     Some(name.to_string())

@@ -86,7 +86,10 @@ fn list_is_ordered_by_id_whatever_order_entries_were_added_in() {
 
     for id in ["zeta", "alpha", "mu"] {
         registry
-            .add(RepositoryEntry::new(id, format!("https://example.com/{id}.git")))
+            .add(RepositoryEntry::new(
+                id,
+                format!("https://example.com/{id}.git"),
+            ))
             .expect("add the entry");
     }
 
@@ -106,10 +109,16 @@ fn update_replaces_an_entry_and_registers_an_unknown_one() {
 
     registry.add(full_entry()).expect("add the entry");
     registry
-        .update(RepositoryEntry::new("acme-api", "https://example.com/moved.git"))
+        .update(RepositoryEntry::new(
+            "acme-api",
+            "https://example.com/moved.git",
+        ))
         .expect("update the entry");
     registry
-        .update(RepositoryEntry::new("acme-web", "https://example.com/web.git"))
+        .update(RepositoryEntry::new(
+            "acme-web",
+            "https://example.com/web.git",
+        ))
         .expect("upsert a new entry");
 
     let stored = registry.get("acme-api").expect("read").expect("registered");
@@ -128,7 +137,10 @@ fn a_duplicate_id_is_refused_and_leaves_the_stored_entry_untouched() {
     registry.add(full_entry()).expect("add the entry");
 
     let error = registry
-        .add(RepositoryEntry::new("acme-api", "https://example.com/other.git"))
+        .add(RepositoryEntry::new(
+            "acme-api",
+            "https://example.com/other.git",
+        ))
         .expect_err("a duplicate id must be refused");
 
     assert!(
@@ -241,7 +253,10 @@ fn the_file_is_written_atomically_and_leaves_no_temporary_behind() {
 
     registry.add(full_entry()).expect("add the entry");
     registry
-        .add(RepositoryEntry::new("acme-web", "https://example.com/web.git"))
+        .add(RepositoryEntry::new(
+            "acme-web",
+            "https://example.com/web.git",
+        ))
         .expect("add a second entry");
     registry.remove("acme-web").expect("remove it again");
 

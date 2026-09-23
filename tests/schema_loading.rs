@@ -75,8 +75,14 @@ fn inputs_keep_their_declared_types() {
 fn global_workspace_becomes_a_definition_level_spec() {
     let definition = load_reference();
 
-    match definition.workspace.expect("globals.workspace must be kept") {
-        WorkspaceSpec::Git { repository, git_ref } => {
+    match definition
+        .workspace
+        .expect("globals.workspace must be kept")
+    {
+        WorkspaceSpec::Git {
+            repository,
+            git_ref,
+        } => {
             assert_eq!(repository, "{{ inputs.target_repo }}");
             assert_eq!(git_ref.as_deref(), Some("main"));
         }
@@ -341,7 +347,11 @@ terminal_states: [done]
 "#;
 
     let definition = load_from_str(yaml).unwrap();
-    let wait = match state(&definition, "wait_for_review").action.as_ref().unwrap() {
+    let wait = match state(&definition, "wait_for_review")
+        .action
+        .as_ref()
+        .unwrap()
+    {
         ActionConfig::Wait(wait) => wait,
         other => panic!("expected a wait action, got {other:?}"),
     };

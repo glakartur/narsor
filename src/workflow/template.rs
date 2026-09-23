@@ -141,11 +141,12 @@ impl<'a> TemplateScope<'a> {
             rendered.push_str(&rest[..start]);
             let after_open = &rest[start + OPEN.len()..];
 
-            let end = after_open
-                .find(CLOSE)
-                .ok_or_else(|| TemplateError::UnterminatedPlaceholder {
-                    location: location.to_string(),
-                })?;
+            let end =
+                after_open
+                    .find(CLOSE)
+                    .ok_or_else(|| TemplateError::UnterminatedPlaceholder {
+                        location: location.to_string(),
+                    })?;
 
             let expression = &after_open[..end];
             rendered.push_str(&self.resolve(expression, location)?);

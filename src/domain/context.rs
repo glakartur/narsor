@@ -1,5 +1,5 @@
 //! Context model
-//! 
+//!
 //! Represents the shared state of a workflow execution.
 
 use serde::{Deserialize, Serialize};
@@ -11,19 +11,19 @@ pub struct Context {
     /// Task-related information
     #[serde(default)]
     pub task: Option<TaskInfo>,
-    
+
     /// User-defined variables
     #[serde(default)]
     pub variables: HashMap<String, serde_json::Value>,
-    
+
     /// References to artifacts
     #[serde(default)]
     pub artifacts: HashMap<String, ArtifactReference>,
-    
+
     /// Repository references
     #[serde(default)]
     pub repositories: HashMap<String, RepositoryReference>,
-    
+
     /// Workspace reference
     #[serde(default)]
     pub workspace: Option<WorkspaceInfo>,
@@ -73,19 +73,19 @@ impl Context {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Updates variables in the context
     pub fn update_variables(&mut self, variables: serde_json::Map<String, serde_json::Value>) {
         for (key, value) in variables {
             self.variables.insert(key, value);
         }
     }
-    
+
     /// Adds an artifact reference
     pub fn add_artifact(&mut self, key: String, artifact: ArtifactReference) {
         self.artifacts.insert(key, artifact);
     }
-    
+
     /// Gets a variable by key
     pub fn get_variable(&self, key: &str) -> Option<&serde_json::Value> {
         self.variables.get(key)

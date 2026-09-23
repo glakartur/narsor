@@ -80,8 +80,8 @@ struct FakeHarness {
 impl FakeHarness {
     /// Copies the fixture script into `dir` and returns a handle to it.
     fn install(dir: PathBuf) -> Self {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/harness/fake_harness.sh");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/harness/fake_harness.sh");
         let program = dir.join("fake_harness.sh");
         fs::copy(&source, &program).expect("copy the fake harness");
         Self { dir, program }
@@ -468,7 +468,10 @@ async fn the_session_events_are_emitted_and_the_harness_session_id_is_captured()
         result.data["agent_session"]["config"]["harness_session_id"],
         json!("fake-session-1")
     );
-    assert_eq!(result.data["agent_session"]["harness"], json!("claude-code"));
+    assert_eq!(
+        result.data["agent_session"]["harness"],
+        json!("claude-code")
+    );
 }
 
 #[tokio::test]
@@ -748,9 +751,10 @@ fn process_is_alive(pid: u32) -> bool {
 async fn a_missing_harness_binary_names_it_and_says_it_must_be_on_path() {
     let root = TempRoot::new();
 
-    let executor = AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(
-        Arc::new(ClaudeCodeAdapter::with_program("claude-that-is-not-installed")),
-    ));
+    let executor =
+        AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(Arc::new(
+            ClaudeCodeAdapter::with_program("claude-that-is-not-installed"),
+        )));
 
     let error = fail(&executor, agent_action("look around"), &root.workspace()).await;
 
@@ -828,11 +832,9 @@ impl EngineFixture {
     /// session events into the same store as everything else.
     fn engine(&self) -> Engine {
         let store = self.store();
-        let executor = AgentExecutor::with_harnesses(
-            HarnessRegistry::defaults().with_adapter(Arc::new(ClaudeCodeAdapter::with_program(
-                self.fake.program(),
-            ))),
-        )
+        let executor = AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(
+            Arc::new(ClaudeCodeAdapter::with_program(self.fake.program())),
+        ))
         .with_event_sink(Arc::new(LoggingEventSink::new(store.clone(), None)));
 
         Engine::new(store).with_executor(ActionKind::Agent, Arc::new(executor))
@@ -860,9 +862,9 @@ impl EngineFixture {
 #[tokio::test]
 async fn an_agent_state_transitions_on_the_label_the_agent_returned() {
     let fixture = EngineFixture::new();
-    fixture
-        .fake
-        .answers(&envelope(r#"{"output":"ready","variables":{"plan":"plan.md"}}"#));
+    fixture.fake.answers(&envelope(
+        r#"{"output":"ready","variables":{"plan":"plan.md"}}"#,
+    ));
 
     let definition = fixture.workflow(
         r#"
@@ -911,7 +913,10 @@ inputs:
 
     // The session events are in the same log as the engine's own.
     let types = fixture.event_types(&execution.id);
-    assert!(types.contains(&"agent_session_started".to_string()), "{types:?}");
+    assert!(
+        types.contains(&"agent_session_started".to_string()),
+        "{types:?}"
+    );
     assert!(
         types.contains(&"agent_session_completed".to_string()),
         "{types:?}"
