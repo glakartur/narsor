@@ -151,74 +151,56 @@ fn capture_logs<T>(body: impl FnOnce() -> T) -> (T, String) {
 // Git fixtures
 // ---------------------------------------------------------------------------
 
-/// Creates a git repository with a deterministic identity.
-fn init_repo(path: &Path) -> git2::Repository {
+/// Runs `git` inside `path` with a deterministic identity and fails loudly.
+///
+/// The identity is passed per invocation with `-c` instead of relying on the
+/// machine's global git config: CI and fresh machines have none, and
+/// `git commit` hard-fails without one. `GIT_TERMINAL_PROMPT=0` keeps a
+/// misconfigured fixture from hanging on a prompt.
+fn git(path: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["-c", "user.name=Workspace Test"])
+        .args(["-c", "user.email=workspace@example.com"])
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Creates a git repository with a deterministic identity and default branch.
+fn init_repo(path: &Path) -> PathBuf {
     fs::create_dir_all(path).expect("create repo dir");
-    let repo = git2::Repository::init(path).expect("git init");
-    let mut config = repo.config().expect("repo config");
-    config.set_str("user.name", "Workspace Test").expect("name");
-    config
-        .set_str("user.email", "workspace@example.com")
-        .expect("email");
-    repo
+    git(path, &["-c", "init.defaultBranch=main", "init"]);
+    path.to_path_buf()
 }
 
 /// Writes a file and commits it on the current HEAD.
-fn commit_file(repo: &git2::Repository, name: &str, contents: &str, message: &str) -> git2::Oid {
-    let workdir = repo.workdir().expect("workdir").to_path_buf();
-    fs::write(workdir.join(name), contents).expect("write file");
-
-    let mut index = repo.index().expect("index");
-    index.add_path(Path::new(name)).expect("add path");
-    index.write().expect("write index");
-    let tree = repo
-        .find_tree(index.write_tree().expect("write tree"))
-        .expect("find tree");
-    let signature = repo.signature().expect("signature");
-
-    let parent = repo.head().ok().and_then(|head| head.target());
-    let parents: Vec<git2::Commit> = parent
-        .map(|oid| vec![repo.find_commit(oid).expect("find parent")])
-        .unwrap_or_default();
-    let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-
-    repo.commit(
-        Some("HEAD"),
-        &signature,
-        &signature,
-        message,
-        &tree,
-        &parent_refs,
-    )
-    .expect("commit")
+fn commit_file(repo: &Path, name: &str, contents: &str, message: &str) {
+    fs::write(repo.join(name), contents).expect("write file");
+    git(repo, &["add", "--", name]);
+    git(repo, &["commit", "--message", message]);
 }
 
 /// A repository whose default branch holds `base.txt` and whose `feature`
 /// branch additionally holds `feature.txt`.
-fn repo_with_feature_branch(path: &Path) -> git2::Repository {
+fn repo_with_feature_branch(path: &Path) -> PathBuf {
     let repo = init_repo(path);
-    let base = commit_file(&repo, "base.txt", "base\n", "base commit");
-    let default_branch = repo
-        .head()
-        .expect("head")
-        .name()
-        .expect("head name")
-        .to_string();
+    commit_file(&repo, "base.txt", "base\n", "base commit");
+    let default_branch = git(&repo, &["symbolic-ref", "--short", "HEAD"]);
 
-    {
-        let base_commit = repo.find_commit(base).expect("find base");
-        repo.branch("feature", &base_commit, false)
-            .expect("create branch");
-    }
-    repo.set_head("refs/heads/feature").expect("set head");
-    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-        .expect("checkout feature");
+    git(&repo, &["checkout", "-b", "feature"]);
     commit_file(&repo, "feature.txt", "feature\n", "feature commit");
 
-    repo.set_head(&default_branch).expect("restore head");
-    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-        .expect("checkout default");
-    let _ = fs::remove_file(path.join("feature.txt"));
+    git(&repo, &["checkout", "--force", &default_branch]);
     repo
 }
 
@@ -305,9 +287,7 @@ fn git_workspace_is_cloned_at_the_requested_ref() {
         "base\n"
     );
 
-    let clone = git2::Repository::open(&repo_dir).expect("open clone");
-    let head = clone.head().expect("head");
-    assert_eq!(head.shorthand(), Some("feature"));
+    assert_eq!(git(&repo_dir, &["symbolic-ref", "--short", "HEAD"]), "feature");
 
     assert!(matches!(
         provisioned.workspace.workspace_type,
@@ -564,8 +544,8 @@ fn an_unreachable_local_path_fails_validation_not_the_first_action() {
 fn uncommitted_changes_block_cleanup_and_leave_a_warning() {
     let temp = TempRoot::new();
     let source = temp.join("source");
-    let repo = init_repo(&source);
-    commit_file(&repo, "base.txt", "base\n", "base commit");
+    init_repo(&source);
+    commit_file(&source, "base.txt", "base\n", "base commit");
 
     let provisioner = temp.provisioner();
     let request = WorkspaceRequest::new(RepositorySpec::local("app", &source));
@@ -600,9 +580,12 @@ fn uncommitted_changes_block_cleanup_and_leave_a_warning() {
     );
 
     // Once the work is committed and there is nowhere to push it, cleanup runs.
-    let workspace_repo = git2::Repository::open(&provisioned.primary().path).expect("open clone");
-    commit_file(&workspace_repo, "agent-output.md", "work\n", "agent work");
-    drop(workspace_repo);
+    commit_file(
+        &provisioned.primary().path,
+        "agent-output.md",
+        "work\n",
+        "agent work",
+    );
     let outcome = provisioner
         .cleanup("exec-1", CleanupPolicy::Remove)
         .expect("cleanup");
@@ -623,14 +606,14 @@ fn unpushed_commits_block_cleanup_of_a_cloned_repository() {
     ));
     let provisioned = provisioner.provision("exec-1", &request).expect("provision");
 
-    // A clone that is exactly at its upstream can be thrown away.
-    let clone = git2::Repository::open(provisioned.primary().path.clone()).expect("open clone");
-    let mut config = clone.config().expect("config");
-    config.set_str("user.name", "Agent").expect("name");
-    config.set_str("user.email", "agent@example.com").expect("email");
-
-    commit_file(&clone, "agent-output.md", "work\n", "agent work");
-    drop(clone);
+    // A clone that is exactly at its upstream can be thrown away; one commit
+    // ahead of it cannot.
+    commit_file(
+        &provisioned.primary().path,
+        "agent-output.md",
+        "work\n",
+        "agent work",
+    );
 
     let (outcome, logs) = capture_logs(|| {
         provisioner
