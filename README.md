@@ -375,11 +375,42 @@ provider and carrying the reason, then `HumanTransitionSelected`, `StateExited`
 and `TransitionTaken`. The execution is parked `Paused` at the target state (or
 finished, when the target is terminal) and the operator resumes it explicitly.
 
-**What it cannot do.** It cannot *create* an execution: there is no screen for
-picking a definition file and its inputs, so use `orchestrator run` for that and
-then select the new execution in the list (`r` reloads it). Conversely the
-override — a forced transition to an arbitrary state — currently exists **only**
-in the TUI; there is no CLI equivalent for it.
+**Creating things.** Two keys create rather than inspect, and each is the CLI
+operation of the same name with a form in front of it — nothing is reachable
+here that the command line cannot do.
+
+| Key | Opens | The CLI it stands for |
+|-----|-------|------------------------|
+| `n` | New task | `orchestrator run <file> --input k=v` |
+| `R` | Repositories | `orchestrator repo list` / `add` / `remove` |
+
+`R` lists the registry in the same order `orchestrator repo list` prints. Inside
+it, `a` opens a registration form (*id* and *remote* required, plus *name*,
+*provider*, *default branch* and *description*), and `d` removes the selected
+entry behind a separate `y`/`n` confirmation — `d` alone writes nothing. The
+form is checked with the registry's own rules **before** anything is stored, so
+an unusable id, a remote starting with `-`, a remote using the `ext::` transport
+and an already-registered id are each reported next to the field with the form
+left open. Nothing invalid reaches `repositories.json`.
+
+`n` opens the new-task modal: type the path of a definition and press Enter to
+validate and load it — *every* violation is listed, the same verdict
+`orchestrator validate` gives, not just the first — then fill in the declared
+inputs and press Enter to start it. The declared `type` decides what a value
+becomes: a `boolean` is a `true`/`false` pick list and reaches the context as a
+JSON boolean rather than the string `"true"`, an `integer` is parsed, and a
+`repository` input is a pick list of the registered ids, so an id already in the
+registry is chosen instead of retyped. The execution is created, run and
+selected, so it is watched from the moment it starts.
+
+Any definition can be started this way, including one that declares
+`globals.workspace`. The interface and `orchestrator run` call the same shared
+module (`src/tasks`), so the workspace is expanded, resolved registry-first and
+cloned identically whichever started the task, and an execution started here is
+resumable from the command line and vice versa.
+
+**The one thing only the TUI can do** is the forced transition to an arbitrary
+state; there is no CLI equivalent for it yet.
 
 **Logging.** `tui` takes over the alternate screen, so a log line on stderr
 would be written over the panels. With `RUST_LOG` set, the interface's logs are
@@ -594,6 +625,56 @@ Every write of `state.json`, `context.json` and `repositories.json` is atomic
 (temporary file in the same directory, `fsync`, `rename`), and event numbering
 increases monotonically without gaps. An interrupted write leaves the previous
 version of the file intact.
+
+---
+
+## Shipped workflows
+
+Two runnable pipelines live in `workflows/`, written against `WORKFLOW_SCHEMA.md`
+and modelled on real agentic development processes rather than invented ones:
+
+| File | Process | Modelled on |
+|---|---|---|
+| `workflows/compound-engineering.yaml` | brainstorm → plan → work → code review → commit/push/PR → compound | the `ce-*` skills of the compound-engineering plugin |
+| `workflows/open-mercato-sdlc.yaml` | Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | Open Mercato's `SDLC.md` and the `om-*` skills |
+
+```sh
+orchestrator validate workflows/open-mercato-sdlc.yaml
+
+orchestrator repo add acme-web --remote git@github.com:acme/web.git   # once
+orchestrator run workflows/compound-engineering.yaml \
+  --input feature_description="let a reviewer subscribe to a run" \
+  --input target_repo=acme-web
+
+orchestrator show <execution-id>          # where it is waiting
+orchestrator input <execution-id> ...     # answer the gate and resume
+```
+
+Neither pipeline is autonomous end to end, and that is the point: both stop for a
+person wherever a decision is irreversible, outward-facing, or beyond what an
+agent can settle from the repository alone.
+
+**Compound engineering** stops seven times — when the brainstorm finds no
+direction it can take; on the scope, before planning; **on the plan, before a
+line of code exists**, which is the cheapest correction point in the process;
+when `ce-work` hits a genuine ambiguity, so it asks instead of guessing; on what
+to do with the code-review findings; before the push and PR, the first
+outward-facing act; and on the open pull request, where the review loop turns.
+
+**Open Mercato** stops five times, at the gates `SDLC.md` names itself: the
+ticket-level Definition of Ready that only a human can supply (with a
+maintainer's waiver as its own option); the design contract for a user-facing
+change, settled before the code exists and skipped entirely when the change
+touches no UI; the QA sign-off, because "manual means a person judges the result
+and owns `qa-approved`", pinned to the tested commit; the squash-merge, the point
+of no return; and a human-owned `blocked_gate` that every dead end routes to
+rather than failing silently.
+
+Both model the loops the real processes have — review → changes requested →
+re-work → re-review, and a QA failure back into implementation — and both are
+exercised end to end in `tests/workflows.rs` against a fake harness, with the
+human gates answered by script. `workflows/README.md` documents every gate and
+what a maintainer editing these files has to keep true.
 
 ---
 
