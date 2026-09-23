@@ -99,14 +99,14 @@ pub type Result<T> = std::result::Result<T, CliError>;
 // validate
 // ---------------------------------------------------------------------------
 
-/// `orchestrator validate <plik>` — static validation, all violations at once.
+/// `orchestrator validate <file>` — static validation, all violations at once.
 pub fn validate(file: &Path) -> Result<()> {
     let violations = validate_path(file)
-        .map_err(|error| CliError::failure(format!("Nie udało się wczytać definicji: {error}")))?;
+        .map_err(|error| CliError::failure(format!("Could not load the definition: {error}")))?;
 
     if !violations.is_empty() {
         let mut message = format!(
-            "Definicja '{}' jest niepoprawna — znaleziono {} {}:",
+            "Definition '{}' is invalid — {} {} found:",
             file.display(),
             violations.len(),
             violation_noun(violations.len())
@@ -118,10 +118,10 @@ pub fn validate(file: &Path) -> Result<()> {
     }
 
     let definition = load_from_file(file)
-        .map_err(|error| CliError::failure(format!("Nie udało się wczytać definicji: {error}")))?;
+        .map_err(|error| CliError::failure(format!("Could not load the definition: {error}")))?;
 
     println!(
-        "Definicja jest poprawna: {} (wersja {}), stanów: {}, stan początkowy: {}.",
+        "The definition is valid: {} (version {}), states: {}, initial state: {}.",
         definition.name,
         definition.version,
         definition.states.len(),
@@ -130,16 +130,12 @@ pub fn validate(file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Polish noun agreement for the violation count.
+/// Singular or plural, for the violation count.
 fn violation_noun(count: usize) -> &'static str {
-    let last_two = count % 100;
-    let last = count % 10;
     if count == 1 {
-        "naruszenie"
-    } else if (2..=4).contains(&last) && !(12..=14).contains(&last_two) {
-        "naruszenia"
+        "violation"
     } else {
-        "naruszeń"
+        "violations"
     }
 }
 
@@ -147,12 +143,12 @@ fn violation_noun(count: usize) -> &'static str {
 // run
 // ---------------------------------------------------------------------------
 
-/// `orchestrator run <plik> [--input k=v]…` — create an execution and run it.
+/// `orchestrator run <file> [--input k=v]…` — create an execution and run it.
 pub async fn run(root: &Path, file: &Path, inputs: &[String]) -> Result<()> {
     let violations = validate_path(file)
-        .map_err(|error| CliError::failure(format!("Nie udało się wczytać definicji: {error}")))?;
+        .map_err(|error| CliError::failure(format!("Could not load the definition: {error}")))?;
     if !violations.is_empty() {
-        let mut message = String::from("Definicja jest niepoprawna — wykonanie nie zostało utworzone:");
+        let mut message = String::from("The definition is invalid — no execution was created:");
         for violation in &violations {
             message.push_str(&format!("\n  - {violation}"));
         }
@@ -160,7 +156,7 @@ pub async fn run(root: &Path, file: &Path, inputs: &[String]) -> Result<()> {
     }
 
     let definition = load_from_file(file)
-        .map_err(|error| CliError::failure(format!("Nie udało się wczytać definicji: {error}")))?;
+        .map_err(|error| CliError::failure(format!("Could not load the definition: {error}")))?;
 
     // Inputs first: a missing required parameter must be reported before
     // anything is written to disk.
@@ -170,7 +166,7 @@ pub async fn run(root: &Path, file: &Path, inputs: &[String]) -> Result<()> {
     let request = workspace_request(&definition, &inputs)?;
     if let Some(request) = &request {
         provisioner.validate(request).map_err(|error| {
-            CliError::failure(format!("Workspace nie może zostać utworzony: {error}"))
+            CliError::failure(format!("The workspace cannot be created: {error}"))
         })?;
     }
 
@@ -182,9 +178,9 @@ pub async fn run(root: &Path, file: &Path, inputs: &[String]) -> Result<()> {
             // Replaced below, once the execution id names the task directory.
             Workspace::local_folder(root.display().to_string()),
         )
-        .map_err(|error| CliError::failure(format!("Nie udało się utworzyć wykonania: {error}")))?;
+        .map_err(|error| CliError::failure(format!("Could not create the execution: {error}")))?;
 
-    println!("Utworzono wykonanie: {}", execution.id);
+    println!("Created execution: {}", execution.id);
 
     match provision_workspace(&provisioner, &execution.id, request.as_ref()) {
         Ok(workspace) => {
@@ -196,7 +192,7 @@ pub async fn run(root: &Path, file: &Path, inputs: &[String]) -> Result<()> {
             execution.workspace = workspace;
             record_definition_path(&mut execution, file);
             engine.store().save_execution(&execution).map_err(|error| {
-                CliError::failure(format!("Nie udało się zapisać wykonania: {error}"))
+                CliError::failure(format!("Could not save the execution: {error}"))
             })?;
         }
         Err(message) => {
@@ -208,19 +204,19 @@ pub async fn run(root: &Path, file: &Path, inputs: &[String]) -> Result<()> {
     let execution = engine
         .run(&definition, &execution.id)
         .await
-        .map_err(|error| CliError::failure(format!("Błąd silnika: {error}")))?;
+        .map_err(|error| CliError::failure(format!("Engine error: {error}")))?;
 
     print_execution_summary(&execution);
     if let Some(pending) = engine
         .pending_input(&execution.id)
-        .map_err(|error| CliError::failure(format!("Błąd silnika: {error}")))?
+        .map_err(|error| CliError::failure(format!("Engine error: {error}")))?
     {
         print_pending_input(&pending);
     }
 
     if execution.status == ExecutionStatus::Failed {
         return Err(CliError::failure(format!(
-            "Wykonanie {} zakończyło się niepowodzeniem.",
+            "Execution {} failed.",
             execution.id
         )));
     }
@@ -238,7 +234,7 @@ fn collect_inputs(
     for pair in pairs {
         let (name, raw) = pair.split_once('=').ok_or_else(|| {
             CliError::usage(format!(
-                "Nieprawidłowe wejście '{pair}' — oczekiwano postaci nazwa=wartość."
+                "Invalid input '{pair}' — expected the form name=value."
             ))
         })?;
 
@@ -248,7 +244,7 @@ fn collect_inputs(
             .find(|parameter| parameter.name == name)
             .ok_or_else(|| {
                 CliError::usage(format!(
-                    "Workflow '{}' nie deklaruje wejścia '{name}'. Zadeklarowane wejścia: {}.",
+                    "Workflow '{}' declares no input named '{name}'. Declared inputs: {}.",
                     definition.name,
                     declared_input_names(definition)
                 ))
@@ -271,7 +267,7 @@ fn collect_inputs(
 
     if !missing.is_empty() {
         return Err(CliError::usage(format!(
-            "Brakuje wymaganych wejść: {}. Podaj je opcją --input nazwa=wartość.",
+            "Missing required inputs: {}. Pass them with --input name=value.",
             missing.join(", ")
         )));
     }
@@ -282,7 +278,7 @@ fn collect_inputs(
 /// The declared input names, for an error message.
 fn declared_input_names(definition: &WorkflowDefinition) -> String {
     if definition.inputs.is_empty() {
-        return "(brak)".to_string();
+        return "(none)".to_string();
     }
     definition
         .inputs
@@ -302,7 +298,7 @@ fn parse_input_value(parameter: &InputParameter, raw: &str) -> Result<Value> {
         ParamType::String | ParamType::Repository => Ok(Value::String(raw.to_string())),
         ParamType::Integer => raw.parse::<i64>().map(Value::from).map_err(|_| {
             CliError::usage(format!(
-                "Wejście '{}' jest typu integer, a '{raw}' nie jest liczbą całkowitą.",
+                "Input '{}' is of type integer, and '{raw}' is not a whole number.",
                 parameter.name
             ))
         }),
@@ -310,7 +306,7 @@ fn parse_input_value(parameter: &InputParameter, raw: &str) -> Result<Value> {
             "true" => Ok(Value::Bool(true)),
             "false" => Ok(Value::Bool(false)),
             _ => Err(CliError::usage(format!(
-                "Wejście '{}' jest typu boolean — dozwolone wartości to 'true' i 'false', podano '{raw}'.",
+                "Input '{}' is of type boolean — the allowed values are 'true' and 'false', got '{raw}'.",
                 parameter.name
             ))),
         },
@@ -335,7 +331,7 @@ fn workspace_request(
         scope
             .render(template, &format!("globals.workspace.{field}"))
             .map_err(|error| {
-                CliError::failure(format!("Nie udało się rozwinąć szablonu workspace: {error}"))
+                CliError::failure(format!("Could not expand the workspace template: {error}"))
             })
     };
 
@@ -385,13 +381,13 @@ fn provision_workspace(
         Some(request) => provisioner
             .provision(execution_id, request)
             .map(|provisioned| provisioned.workspace)
-            .map_err(|error| format!("Nie udało się utworzyć workspace: {error}")),
+            .map_err(|error| format!("Could not create the workspace: {error}")),
         None => {
             let path = provisioner
                 .code_dir(execution_id)
                 .join(FALLBACK_WORKSPACE_NAME);
             fs::create_dir_all(&path)
-                .map_err(|error| format!("Nie udało się utworzyć katalogu workspace: {error}"))?;
+                .map_err(|error| format!("Could not create the workspace directory: {error}"))?;
             Ok(Workspace::local_folder(path.display().to_string()))
         }
     }
@@ -437,10 +433,10 @@ pub fn list(root: &Path) -> Result<()> {
     let store = ExecutionStore::new(root);
     let ids = store
         .list_execution_ids()
-        .map_err(|error| CliError::failure(format!("Nie udało się odczytać wykonań: {error}")))?;
+        .map_err(|error| CliError::failure(format!("Could not read the executions: {error}")))?;
 
     if ids.is_empty() {
-        println!("Brak wykonań.");
+        println!("No executions.");
         return Ok(());
     }
 
@@ -448,14 +444,14 @@ pub fn list(root: &Path) -> Result<()> {
     for id in ids {
         match store.load_execution(&id) {
             Ok(execution) => executions.push(execution),
-            Err(error) => eprintln!("Pomijam wykonanie '{id}': {error}"),
+            Err(error) => eprintln!("Skipping execution '{id}': {error}"),
         }
     }
     executions.sort_by(|left, right| right.started_at.cmp(&left.started_at));
 
     println!(
         "{:<38} {:<10} {:<22} {}",
-        "ID", "STATUS", "STAN", "WORKFLOW"
+        "ID", "STATUS", "STATE", "WORKFLOW"
     );
     for execution in &executions {
         println!(
@@ -474,19 +470,19 @@ pub fn show(root: &Path, execution_id: &str) -> Result<()> {
     let store = ExecutionStore::new(root);
     let execution = load_execution(&store, execution_id)?;
 
-    println!("Wykonanie:     {}", execution.id);
+    println!("Execution:     {}", execution.id);
     println!(
-        "Workflow:      {} (wersja {})",
+        "Workflow:      {} (version {})",
         execution.workflow_id, execution.workflow_version
     );
     println!("Status:        {}", status_name(&execution.status));
     println!(
-        "Bieżący stan:  {}",
+        "Current state: {}",
         execution.current_state.as_deref().unwrap_or("-")
     );
-    println!("Rozpoczęto:    {}", execution.started_at.to_rfc3339());
+    println!("Started:       {}", execution.started_at.to_rfc3339());
     if let Some(completed_at) = execution.completed_at {
-        println!("Zakończono:    {}", completed_at.to_rfc3339());
+        println!("Finished:      {}", completed_at.to_rfc3339());
     }
     println!("Workspace:     {}", execution.workspace.path);
 
@@ -494,9 +490,9 @@ pub fn show(root: &Path, execution_id: &str) -> Result<()> {
         .load_context(execution_id)
         .unwrap_or_else(|_| execution.context.clone());
 
-    println!("Zmienne kontekstu:");
+    println!("Context variables:");
     if context.variables.is_empty() {
-        println!("  (brak)");
+        println!("  (none)");
     } else {
         let mut names: Vec<&String> = context.variables.keys().collect();
         names.sort();
@@ -523,7 +519,7 @@ pub async fn events(root: &Path, execution_id: &str, follow: bool) -> Result<()>
         let events = store
             .event_log(execution_id)
             .read_all()
-            .map_err(|error| CliError::failure(format!("Nie udało się odczytać zdarzeń: {error}")))?;
+            .map_err(|error| CliError::failure(format!("Could not read the events: {error}")))?;
 
         for event in events.iter().skip(printed) {
             print_event(event);
@@ -580,7 +576,7 @@ pub async fn input(
 
     let Some(pending) = pending_input(&store, execution_id)? else {
         return Err(CliError::failure(format!(
-            "Wykonanie '{execution_id}' nie czeka na wejście człowieka (status: {}).",
+            "Execution '{execution_id}' is not waiting for human input (status: {}).",
             status_name(&execution.status)
         )));
     };
@@ -589,7 +585,7 @@ pub async fn input(
     for pair in fields {
         let (name, raw) = pair.split_once('=').ok_or_else(|| {
             CliError::usage(format!(
-                "Nieprawidłowe pole '{pair}' — oczekiwano postaci nazwa=wartość."
+                "Invalid field '{pair}' — expected the form name=value."
             ))
         })?;
         values.insert(name.to_string(), Value::String(raw.to_string()));
@@ -605,20 +601,20 @@ pub async fn input(
     let execution = engine
         .deliver_human_input(&definition, &pending.execution_id, &delivery)
         .await
-        .map_err(|error| CliError::failure(format!("Nie udało się dostarczyć wejścia: {error}")))?;
+        .map_err(|error| CliError::failure(format!("Could not deliver the input: {error}")))?;
 
-    println!("Dostarczono wejście do wykonania {}.", execution.id);
+    println!("Input delivered to execution {}.", execution.id);
     print_execution_summary(&execution);
     if let Some(pending) = engine
         .pending_input(&execution.id)
-        .map_err(|error| CliError::failure(format!("Błąd silnika: {error}")))?
+        .map_err(|error| CliError::failure(format!("Engine error: {error}")))?
     {
         print_pending_input(&pending);
     }
 
     if execution.status == ExecutionStatus::Failed {
         return Err(CliError::failure(format!(
-            "Wykonanie {} zakończyło się niepowodzeniem.",
+            "Execution {} failed.",
             execution.id
         )));
     }
@@ -635,13 +631,13 @@ pub async fn resume(root: &Path, execution_id: &str, definition_file: Option<&Pa
     let execution = engine
         .resume(&definition, execution_id)
         .await
-        .map_err(|error| CliError::failure(format!("Nie udało się wznowić wykonania: {error}")))?;
+        .map_err(|error| CliError::failure(format!("Could not resume the execution: {error}")))?;
 
-    println!("Wznowiono wykonanie {}.", execution.id);
+    println!("Resumed execution {}.", execution.id);
     print_execution_summary(&execution);
     if execution.status == ExecutionStatus::Failed {
         return Err(CliError::failure(format!(
-            "Wykonanie {} zakończyło się niepowodzeniem.",
+            "Execution {} failed.",
             execution.id
         )));
     }
@@ -660,12 +656,11 @@ pub async fn resume(root: &Path, execution_id: &str, definition_file: Option<&Pa
 /// driven on it: spawning a second runtime inside the first would panic, and
 /// the interface has to own a thread anyway — it blocks on keys.
 ///
-/// The store is the default root: the [`Command::Tui`](crate::cli::Command::Tui)
-/// subcommand takes no arguments of its own and this function takes none
-/// either, so `--root` does not reach it. That is the one place where the TUI
-/// is less capable than the rest of the CLI.
-pub fn tui() -> Result<()> {
-    let store = ExecutionStore::with_default_root();
+/// The store is opened on the global `--root`, exactly like every other
+/// subcommand: the interface shows the executions of the data directory the
+/// operator asked for, not always those of the default one.
+pub fn tui(root: &Path) -> Result<()> {
+    let store = ExecutionStore::new(root);
     let handle = tokio::runtime::Handle::current();
     tokio::task::block_in_place(move || handle.block_on(crate::tui::run(store))).map_err(|error| {
         CliError::failure(format!("The terminal interface stopped with an error: {error}"))
@@ -680,7 +675,7 @@ pub fn tui() -> Result<()> {
 fn load_execution(store: &ExecutionStore, execution_id: &str) -> Result<WorkflowExecution> {
     store.load_execution(execution_id).map_err(|error| {
         CliError::failure(format!(
-            "Nie udało się wczytać wykonania '{execution_id}': {error}"
+            "Could not load execution '{execution_id}': {error}"
         ))
     })
 }
@@ -694,7 +689,7 @@ fn pending_input(
         .load_pending_input::<PendingHumanInput>(execution_id)
         .map_err(|error| {
             CliError::failure(format!(
-                "Nie udało się odczytać oczekującego wejścia: {error}"
+                "Could not read the pending input: {error}"
             ))
         })
 }
@@ -708,7 +703,7 @@ fn definition_for(
         Some(path) => path.to_path_buf(),
         None => stored_definition_path(execution).ok_or_else(|| {
             CliError::usage(format!(
-                "Wykonanie '{}' nie ma zapisanej ścieżki definicji — wskaż plik opcją --file.",
+                "Execution '{}' has no recorded definition path — point at the file with --file.",
                 execution.id
             ))
         })?,
@@ -716,7 +711,7 @@ fn definition_for(
 
     load_from_file(&path).map_err(|error| {
         CliError::failure(format!(
-            "Nie udało się wczytać definicji '{}': {error}",
+            "Could not load definition '{}': {error}",
             path.display()
         ))
     })
@@ -736,24 +731,24 @@ fn stored_definition_path(execution: &WorkflowExecution) -> Option<PathBuf> {
 fn print_execution_summary(execution: &WorkflowExecution) {
     println!("Status: {}", status_name(&execution.status));
     println!(
-        "Bieżący stan: {}",
+        "Current state: {}",
         execution.current_state.as_deref().unwrap_or("-")
     );
 }
 
 /// The question an execution is waiting on, as a form the operator can fill in.
 fn print_pending_input(pending: &PendingHumanInput) {
-    println!("Oczekiwane wejście człowieka: {}", pending.instruction());
+    println!("Human input expected: {}", pending.instruction());
     for field in pending.fields() {
         let requirement = if field.required {
-            "wymagane"
+            "required"
         } else {
-            "opcjonalne"
+            "optional"
         };
         let options = if field.options.is_empty() {
             String::new()
         } else {
-            format!(", dozwolone wartości: {}", field.options.join(", "))
+            format!(", allowed values: {}", field.options.join(", "))
         };
         println!(
             "  --field {}=…  ({:?}, {requirement}{options})",
@@ -761,7 +756,7 @@ fn print_pending_input(pending: &PendingHumanInput) {
         );
     }
     if !pending.outputs.is_empty() {
-        println!("  Etykiety wyjścia: {}", pending.outputs.join(", "));
+        println!("  Output labels: {}", pending.outputs.join(", "));
     }
 }
 

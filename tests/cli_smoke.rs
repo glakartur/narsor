@@ -113,7 +113,7 @@ fn start_greet(root: &TempRoot) -> (Invocation, String) {
             "run",
             &greet_workflow(),
             "--input",
-            "greeting=Dzień dobry",
+            "greeting=Good morning",
             "--input",
             &announce_script(),
             "--input",
@@ -128,7 +128,7 @@ fn start_greet(root: &TempRoot) -> (Invocation, String) {
 fn execution_id(stdout: &str) -> String {
     stdout
         .lines()
-        .find_map(|line| line.strip_prefix("Utworzono wykonanie: "))
+        .find_map(|line| line.strip_prefix("Created execution: "))
         .unwrap_or_else(|| panic!("`run` did not print an execution id; stdout was:\n{stdout}"))
         .trim()
         .to_string()
@@ -147,7 +147,7 @@ fn validate_confirms_a_correct_definition() {
 
     assert_eq!(invocation.code, EXIT_SUCCESS, "stderr: {}", invocation.stderr);
     assert!(
-        invocation.stdout.contains("Definicja jest poprawna"),
+        invocation.stdout.contains("The definition is valid"),
         "stdout was:\n{}",
         invocation.stdout
     );
@@ -198,12 +198,12 @@ fn show_prints_state_status_and_context_variables() {
     assert_eq!(invocation.code, EXIT_SUCCESS, "stderr: {}", invocation.stderr);
     let stdout = invocation.stdout;
     assert!(stdout.contains("Status:        paused"), "stdout:\n{stdout}");
-    assert!(stdout.contains("Bieżący stan:  approve"), "stdout:\n{stdout}");
-    assert!(stdout.contains("Zmienne kontekstu:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Current state: approve"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Context variables:"), "stdout:\n{stdout}");
     // Set by the script through its JSON result, merged into the context by the
     // engine.
     assert!(
-        stdout.contains(r#"announced = "Dzień dobry""#),
+        stdout.contains(r#"announced = "Good morning""#),
         "stdout:\n{stdout}"
     );
 }
@@ -227,7 +227,7 @@ fn input_delivers_an_answer_and_resumes_the_execution() {
 
     let shown = cli(&root, &["show", &id]);
     assert!(shown.stdout.contains("Status:        completed"));
-    assert!(shown.stdout.contains("Bieżący stan:  completed"));
+    assert!(shown.stdout.contains("Current state: completed"));
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn list_without_any_executions_prints_an_empty_list() {
 
     assert_eq!(invocation.code, EXIT_SUCCESS, "stderr: {}", invocation.stderr);
     assert!(
-        invocation.stdout.contains("Brak wykonań."),
+        invocation.stdout.contains("No executions."),
         "stdout:\n{}",
         invocation.stdout
     );
@@ -349,12 +349,12 @@ fn an_unknown_input_is_a_usage_error() {
             "--input",
             &announce_script(),
             "--input",
-            "nieznane=1",
+            "unknown_input=1",
         ],
     );
 
     assert_eq!(invocation.code, EXIT_USAGE);
-    assert!(invocation.output().contains("nieznane"));
+    assert!(invocation.output().contains("unknown_input"));
 }
 
 #[test]
@@ -370,11 +370,11 @@ fn a_missing_command_line_argument_is_a_usage_error() {
 fn show_for_an_unknown_id_is_a_readable_failure() {
     let root = TempRoot::new();
 
-    let invocation = cli(&root, &["show", "nie-ma-takiego"]);
+    let invocation = cli(&root, &["show", "no-such-execution"]);
 
     assert_eq!(invocation.code, EXIT_FAILURE);
     assert!(
-        invocation.output().contains("nie-ma-takiego"),
+        invocation.output().contains("no-such-execution"),
         "output:\n{}",
         invocation.output()
     );
@@ -417,7 +417,7 @@ fn validate_run_input_show_is_one_uninterrupted_path() {
 
     let (started, id) = start_greet(&root);
     assert_eq!(started.code, EXIT_SUCCESS, "stderr: {}", started.stderr);
-    assert!(started.stdout.contains("Oczekiwane wejście człowieka"));
+    assert!(started.stdout.contains("Human input expected"));
 
     let answered = cli(
         &root,

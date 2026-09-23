@@ -10,7 +10,10 @@
 //! # Two streams
 //!
 //! Command output goes to stdout, diagnostics and `tracing` logs to stderr.
-//! That is what makes `orchestrator list | grep paused` work.
+//! That is what makes `orchestrator list | grep paused` work. The one
+//! exception is [`Command::Tui`], which owns the whole terminal: its logs are
+//! diverted to a file under `--root` (see `src/main.rs`) so that nothing is
+//! written over the alternate screen.
 //!
 //! # Exit codes are a contract
 //!
@@ -49,20 +52,20 @@ pub const EXIT_USAGE: i32 = 2;
 #[command(
     name = "orchestrator",
     version,
-    about = "Orkiestrator workflow AI — walidacja definicji, uruchamianie i podgląd wykonań",
+    about = "AI workflow orchestrator — validate definitions, run them, and inspect executions",
     disable_help_subcommand = true
 )]
 pub struct Cli {
-    /// Katalog danych orkiestratora (wykonania i workspace'y).
+    /// Orchestrator data directory (executions and workspaces).
     #[arg(
         long,
         global = true,
-        value_name = "KATALOG",
+        value_name = "DIRECTORY",
         default_value = DEFAULT_ROOT
     )]
     pub root: PathBuf,
 
-    /// Podkomenda do wykonania.
+    /// The subcommand to run.
     #[command(subcommand)]
     pub command: Command,
 }
@@ -70,76 +73,76 @@ pub struct Cli {
 /// Everything the operator can ask for.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Sprawdza definicję workflow i wypisuje wszystkie naruszenia naraz.
+    /// Checks a workflow definition and reports every violation at once.
     Validate {
-        /// Plik YAML z definicją workflow.
-        #[arg(value_name = "PLIK")]
+        /// YAML file holding the workflow definition.
+        #[arg(value_name = "FILE")]
         file: PathBuf,
     },
 
-    /// Uruchamia workflow z podanymi wejściami.
+    /// Runs a workflow with the given inputs.
     Run {
-        /// Plik YAML z definicją workflow.
-        #[arg(value_name = "PLIK")]
+        /// YAML file holding the workflow definition.
+        #[arg(value_name = "FILE")]
         file: PathBuf,
 
-        /// Wejście workflow w postaci `nazwa=wartość` (można podać wielokrotnie).
-        #[arg(long = "input", value_name = "NAZWA=WARTOŚĆ")]
+        /// Workflow input, written `name=value` (may be given more than once).
+        #[arg(long = "input", value_name = "NAME=VALUE")]
         inputs: Vec<String>,
     },
 
-    /// Wypisuje wykonania zapisane w katalogu danych.
+    /// Lists the executions stored in the data directory.
     List,
 
-    /// Pokazuje stan, status i zmienne kontekstu jednego wykonania.
+    /// Shows the current state, the status and the context variables of one execution.
     Show {
-        /// Identyfikator wykonania.
-        #[arg(value_name = "ID_WYKONANIA")]
+        /// The execution identifier.
+        #[arg(value_name = "EXECUTION_ID")]
         execution_id: String,
     },
 
-    /// Wypisuje historię zdarzeń wykonania.
+    /// Prints the event history of an execution.
     Events {
-        /// Identyfikator wykonania.
-        #[arg(value_name = "ID_WYKONANIA")]
+        /// The execution identifier.
+        #[arg(value_name = "EXECUTION_ID")]
         execution_id: String,
 
-        /// Śledzi nowe zdarzenia, aż wykonanie się zatrzyma.
+        /// Follows new events until the execution stops.
         #[arg(long)]
         follow: bool,
     },
 
-    /// Dostarcza wejście człowieka do wstrzymanego wykonania i wznawia je.
+    /// Delivers human input to a paused execution and resumes it.
     Input {
-        /// Identyfikator wykonania.
-        #[arg(value_name = "ID_WYKONANIA")]
+        /// The execution identifier.
+        #[arg(value_name = "EXECUTION_ID")]
         execution_id: String,
 
-        /// Wartość pola formularza w postaci `nazwa=wartość` (można podać wielokrotnie).
-        #[arg(long = "field", value_name = "NAZWA=WARTOŚĆ")]
+        /// Form field value, written `name=value` (may be given more than once).
+        #[arg(long = "field", value_name = "NAME=VALUE")]
         fields: Vec<String>,
 
-        /// Etykieta wyjścia wybrana wprost (gdy akcja nie ma pól albo ma ich kilka).
-        #[arg(long, value_name = "ETYKIETA")]
+        /// Output label chosen explicitly (when the action has no fields, or several).
+        #[arg(long, value_name = "LABEL")]
         label: Option<String>,
 
-        /// Plik definicji workflow, gdy nie da się go odczytać z zapisanego wykonania.
-        #[arg(long = "file", value_name = "PLIK")]
+        /// Workflow definition file, for when it cannot be read back from the stored execution.
+        #[arg(long = "file", value_name = "FILE")]
         file: Option<PathBuf>,
     },
 
-    /// Wznawia wstrzymane wykonanie, które nie czeka na wejście człowieka.
+    /// Resumes a paused execution that is not waiting for human input.
     Resume {
-        /// Identyfikator wykonania.
-        #[arg(value_name = "ID_WYKONANIA")]
+        /// The execution identifier.
+        #[arg(value_name = "EXECUTION_ID")]
         execution_id: String,
 
-        /// Plik definicji workflow, gdy nie da się go odczytać z zapisanego wykonania.
-        #[arg(long = "file", value_name = "PLIK")]
+        /// Workflow definition file, for when it cannot be read back from the stored execution.
+        #[arg(long = "file", value_name = "FILE")]
         file: Option<PathBuf>,
     },
 
-    /// Pełnoekranowy interfejs terminalowy (jeszcze niedostępny).
+    /// Opens the full-screen terminal interface.
     Tui,
 }
 
@@ -166,7 +169,7 @@ pub async fn run(cli: Cli) -> i32 {
         Command::Resume { execution_id, file } => {
             commands::resume(&cli.root, &execution_id, file.as_deref()).await
         }
-        Command::Tui => commands::tui(),
+        Command::Tui => commands::tui(&cli.root),
     };
 
     match outcome {

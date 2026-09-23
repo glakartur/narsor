@@ -1,29 +1,30 @@
 name: cli-greet
 version: 1
 description: >
-  Workflow do testów dymnych CLI: jeden skrypt i jedno pytanie do człowieka.
-  Świadomie nie deklaruje `globals.workspace`, więc CLI tworzy pusty katalog
-  roboczy, a skrypt jest wskazywany ścieżką bezwzględną przez wejście
-  `script_path`. Dzięki temu test nigdy nie pisze do repozytorium.
+  A CLI smoke-test workflow: one script and one question for a human. It
+  deliberately declares no `globals.workspace`, so the CLI creates an empty
+  working directory, and the script is pointed at by an absolute path handed in
+  through the `script_path` input. That is what keeps the test from ever
+  writing into the repository.
 
 inputs:
   - name: greeting
     type: string
     required: true
-    description: Tekst, który skrypt ma ogłosić.
+    description: The text the script announces.
   - name: script_path
     type: string
     required: true
-    description: Ścieżka bezwzględna do skryptu ogłaszającego.
+    description: Absolute path to the announcing script.
   - name: is_experimental
     type: boolean
     required: false
     default: false
-    description: Flaga logiczna — sprawdza, czy typy wejść są zachowane.
+    description: A boolean flag — checks that input types are preserved.
 
 states:
   announce:
-    description: Ogłasza powitanie i zapisuje je w kontekście.
+    description: Announces the greeting and records it in the context.
     action:
       type: script
       command: "{{ inputs.script_path }}"
@@ -40,10 +41,10 @@ states:
       failure: failed
 
   approve:
-    description: Człowiek zatwierdza ogłoszenie.
+    description: A human approves the announcement.
     action:
       type: human
-      message: "Czy ogłoszenie jest w porządku?"
+      message: "Is the announcement all right?"
       inputs:
         - name: approval_status
           type: select
@@ -59,10 +60,10 @@ states:
       rejected: failed
 
   completed:
-    description: Gotowe.
+    description: Done.
 
   failed:
-    description: Niepowodzenie.
+    description: Failed.
 
 terminal_states:
   - completed
