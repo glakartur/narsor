@@ -628,6 +628,84 @@ version of the file intact.
 
 ---
 
+## Workflows: built in, by name, overridable
+
+The two shipped workflows — `compound-engineering` and `open-mercato-sdlc` —
+are compiled into the binary, so `cargo install --path .` is enough to run them
+from anywhere:
+
+```bash
+orchestrator run compound-engineering \
+  --input feature_description="rate-limit the public API" \
+  --input target_repo=acme-api
+```
+
+`run`, `validate` and `--file` take a *workflow reference*: a path, or a name
+with or without a `.yaml` / `.yml` suffix. It is resolved in this order, first
+hit wins:
+
+| # | Where | Source shown as |
+|---|-------|-----------------|
+| 1 | an existing file at that exact path | `file` |
+| 2 | `{root}/workflows/<name>.yaml` (then `.yml`) | `root` |
+| 3 | `$XDG_CONFIG_HOME/orchestrator/workflows/<name>.yaml`, else `$HOME/.config/orchestrator/workflows/<name>.yaml` | `user` |
+| 4 | the workflow built into the binary | `built-in` |
+
+A path always wins, so `orchestrator run ./draft.yaml` keeps meaning exactly
+that file. A copy in one of the directories **overrides** the built-in of the
+same name. When nothing matches, the error lists every place that was tried and
+names the built-ins.
+
+### Looking at what is reachable
+
+```bash
+orchestrator workflow list          # every workflow, its source, its description
+orchestrator workflow show NAME     # the YAML that would run (stdout); the source on stderr
+```
+
+`list` prints one row per name and marks an override rather than listing the
+same name twice:
+
+```
+NAME                         SOURCE     DESCRIPTION
+compound-engineering         user       The compound engineering chain, end to end: …
+                                        overrides: built-in
+                                        path: /home/you/.config/orchestrator/workflows/compound-engineering.yaml
+open-mercato-sdlc            built-in   The Open Mercato software delivery process …
+```
+
+### Making a built-in your own
+
+```bash
+orchestrator workflow eject compound-engineering        # → the user directory
+orchestrator workflow eject compound-engineering --to ./workflows
+```
+
+`eject` writes the built-in out as a file, creating the directory if needed, and
+refuses to overwrite an existing one unless you pass `--force`. The copy takes
+precedence from that moment on — edit it and every later `run` of that name uses
+your version.
+
+### Starting one from the interface
+
+`orchestrator tui`, then `n`: the modal opens on the same list, each row naming
+its source (`built-in`, `user`, `root`, and `overrides: …` where a copy shadows a
+built-in). `←` / `→` — and `space`, `j` / `k`, `↑` / `↓` — change the selection,
+`Enter` loads and validates it, and the last row, *Enter a path…*, still takes an
+arbitrary path for a definition you are writing.
+
+### Resuming what a built-in started
+
+An execution records both the definition's path (when it came from a file) and
+its workflow name, in `metadata.cli.definition_path` and
+`metadata.cli.definition_name`. A built-in has no path, so the name is what makes
+`orchestrator input` and `orchestrator resume` — and the interface — find the
+definition again in a later process. The path is used first when it is still
+there, so executions created before this existed keep resolving unchanged;
+`--file <WORKFLOW>` overrides both and accepts a name as well as a path.
+
+---
+
 ## Shipped workflows
 
 Two runnable pipelines live in `workflows/`, written against `WORKFLOW_SCHEMA.md`
@@ -639,10 +717,10 @@ and modelled on real agentic development processes rather than invented ones:
 | `workflows/open-mercato-sdlc.yaml` | Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | Open Mercato's `SDLC.md` and the `om-*` skills |
 
 ```sh
-orchestrator validate workflows/open-mercato-sdlc.yaml
+orchestrator validate open-mercato-sdlc        # by name, from anywhere
 
 orchestrator repo add acme-web --remote git@github.com:acme/web.git   # once
-orchestrator run workflows/compound-engineering.yaml \
+orchestrator run compound-engineering \
   --input feature_description="let a reviewer subscribe to a run" \
   --input target_repo=acme-web
 
