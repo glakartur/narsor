@@ -1,7 +1,7 @@
 ---
 title: "feat: Silnik workflow MVP — kontrakt YAML, persystencja plikowa, egzekucja, CLI + TUI"
 type: feat
-status: active
+status: completed
 date: 2026-09-23
 ---
 
