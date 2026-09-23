@@ -220,6 +220,38 @@ fn parameter_type_error(key: &str, harness: &str, expected: &str, got: &Value) -
     }
 }
 
+/// Rejects a value the harness CLI would read as an option rather than a value.
+///
+/// Every value below is pushed into argv in a flag-value position, so one
+/// beginning with `-` becomes another flag. That is not merely untidy: the
+/// permission mode is checked against a whitelist, which is the one field a
+/// reviewer reads before trusting a workflow, while `model` and the rest were
+/// passed through raw — so `model: "--allow-dangerously-skip-permissions"`
+/// would smuggle an escalation straight past that review. Validating only the
+/// obvious field and leaving an innocuous one open is the whole bug.
+pub(crate) fn reject_option_like(
+    value: &str,
+    field: &str,
+    harness: &str,
+) -> Result<(), ActionError> {
+    if !value.starts_with('-') {
+        return Ok(());
+    }
+
+    Err(ActionError {
+        message: format!(
+            "{harness}: {field} '{value}' starts with '-', which the harness \
+             would read as an option rather than a value"
+        ),
+        error_type: Some("unsafe_harness_argument".to_string()),
+        details: Some(serde_json::json!({
+            "harness": harness,
+            "field": field,
+            "value": value,
+        })),
+    })
+}
+
 /// Resolves a `read_only_paths` entry against the workspace.
 ///
 /// The schema calls the paths workspace-relative; an absolute one is taken as

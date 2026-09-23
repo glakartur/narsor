@@ -997,3 +997,31 @@ fn which(name: &str) -> Option<PathBuf> {
             .find(|candidate| candidate.is_file())
     })
 }
+
+// ---------------------------------------------------------------------------
+// Argument safety
+// ---------------------------------------------------------------------------
+
+/// `permission_mode` is checked against a whitelist, which is the field a
+/// reviewer reads before trusting a workflow. Every other value was pushed into
+/// a flag-value position raw, so a `model` beginning with `-` became another
+/// flag — and `--allow-dangerously-skip-permissions` smuggled through `model`
+/// would have escalated straight past that review.
+#[tokio::test]
+async fn a_model_that_would_be_read_as_a_flag_is_refused() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"output":"ready"}"#));
+
+    let mut config = agent_action("do the thing");
+    config.model = Some("--allow-dangerously-skip-permissions".to_string());
+
+    let error = fail(&executor(&fake), config, &root.workspace()).await;
+
+    assert_eq!(error.error_type.as_deref(), Some("unsafe_harness_argument"));
+    assert!(
+        error.message.contains("model"),
+        "the error must name the offending field: {}",
+        error.message
+    );
+}

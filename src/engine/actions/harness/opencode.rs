@@ -38,7 +38,7 @@
 //! permission bits on the provisioned directories, for both harnesses.
 
 use super::{
-    bool_parameter, resolve_read_only_path, string_parameter, tail, HarnessAdapter,
+    bool_parameter, reject_option_like, resolve_read_only_path, string_parameter, tail, HarnessAdapter,
     HarnessInvocation, HarnessRequest, HarnessRun,
 };
 use crate::domain::ActionError;
@@ -95,16 +95,19 @@ impl HarnessAdapter for OpenCodeAdapter {
         let mut args = vec!["run".to_string()];
 
         if let Some(model) = &config.model {
+            reject_option_like(model, "model", OPENCODE)?;
             args.push("--model".to_string());
             args.push(model.clone());
         }
 
         if let Some(agent) = string_parameter(config, "agent", OPENCODE)? {
+            reject_option_like(agent, "agent", OPENCODE)?;
             args.push("--agent".to_string());
             args.push(agent.to_string());
         }
 
         if let Some(session) = request.resume_session {
+            reject_option_like(session, "resume_session", OPENCODE)?;
             args.push("--session".to_string());
             args.push(session.to_string());
 

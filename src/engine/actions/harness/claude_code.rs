@@ -44,7 +44,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::{
-    bool_parameter, integer_parameter, resolve_read_only_path, string_parameter, tail,
+    bool_parameter, integer_parameter, reject_option_like, resolve_read_only_path, string_parameter,
+    tail,
     HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun,
 };
 use crate::domain::ActionError;
@@ -128,12 +129,18 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         // Variadic, so it must never be the last flag before the prompt.
         if !config.read_only_paths.is_empty() {
             args.push("--add-dir".to_string());
+            // No option-like guard here: resolve_read_only_path joins a
+            // relative entry onto the workspace and leaves an absolute one
+            // alone, so the result always begins with '/' and can never be
+            // read as a flag. A guard here would never fire, and a guard that
+            // cannot fire reads like protection that is not there.
             for path in &config.read_only_paths {
                 args.push(read_only_arg(request.workspace, path));
             }
         }
 
         if let Some(model) = &config.model {
+            reject_option_like(model, "model", CLAUDE_CODE)?;
             args.push("--model".to_string());
             args.push(model.clone());
         }
@@ -146,11 +153,13 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         if let Some(system_prompt) =
             string_parameter(config, "append_system_prompt", CLAUDE_CODE)?
         {
+            reject_option_like(system_prompt, "append_system_prompt", CLAUDE_CODE)?;
             args.push("--append-system-prompt".to_string());
             args.push(system_prompt.to_string());
         }
 
         if let Some(session) = request.resume_session {
+            reject_option_like(session, "resume_session", CLAUDE_CODE)?;
             args.push("--resume".to_string());
             args.push(session.to_string());
         }
