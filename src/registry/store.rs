@@ -112,15 +112,37 @@ pub struct RepositoryEntry {
     pub description: Option<String>,
 }
 
+/// Guesses the provider from the shape of a remote.
+///
+/// Only a default for an omitted provider: the field is free text and getting
+/// it wrong costs a display label, never a clone. It lives here rather than in
+/// a caller so the command line and the interface label the same remote the
+/// same way — registering one repository two ways should not describe it two
+/// ways.
+pub fn infer_provider(remote: &str) -> &'static str {
+    let lowered = remote.to_ascii_lowercase();
+    if lowered.contains("github.") {
+        "github"
+    } else if lowered.contains("gitlab.") {
+        "gitlab"
+    } else if lowered.starts_with('/') || lowered.starts_with('.') || lowered.starts_with("file://")
+    {
+        "local"
+    } else {
+        "git"
+    }
+}
+
 impl RepositoryEntry {
     /// A minimal entry: the id stands in for the name, the provider is `git`.
     pub fn new(id: impl Into<String>, remote: impl Into<String>) -> Self {
         let id = id.into();
+        let remote = remote.into();
         Self {
             name: id.clone(),
             id,
-            provider: "git".to_string(),
-            remote: remote.into(),
+            provider: infer_provider(&remote).to_string(),
+            remote,
             default_branch: None,
             description: None,
         }

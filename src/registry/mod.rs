@@ -30,4 +30,6 @@
 
 pub mod store;
 
-pub use store::{RegistryError, RepositoryEntry, RepositoryRegistry, Result, REPOSITORIES_FILE};
+pub use store::{
+    infer_provider, RegistryError, RepositoryEntry, RepositoryRegistry, Result, REPOSITORIES_FILE,
+};

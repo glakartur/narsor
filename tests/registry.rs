@@ -300,3 +300,23 @@ fn an_entry_converts_to_the_domain_types_without_a_third_shape() {
     assert_eq!(info.provider, entry.provider);
     assert_eq!(info.remote, entry.remote);
 }
+
+/// `orchestrator repo add` used to guess the provider from the remote while the
+/// TUI form left it at the default, so the same repository registered two ways
+/// described itself two ways. The guess lives beside the entry now, so both
+/// paths label a remote identically.
+#[test]
+fn the_provider_is_inferred_from_the_remote_shape() {
+    use orchestrator::registry::infer_provider;
+
+    assert_eq!(infer_provider("/home/artur/Projekty/narsor"), "local");
+    assert_eq!(infer_provider("./relative/repo"), "local");
+    assert_eq!(infer_provider("file:///srv/repo.git"), "local");
+    assert_eq!(infer_provider("git@github.com:acme/web.git"), "github");
+    assert_eq!(infer_provider("https://gitlab.com/acme/web.git"), "gitlab");
+    assert_eq!(infer_provider("git://example.invalid/web.git"), "git");
+
+    // The entry constructor applies it, which is what makes the two paths agree.
+    let entry = RepositoryEntry::new("demo", "/srv/demo");
+    assert_eq!(entry.provider, "local");
+}

@@ -26,7 +26,7 @@ use crate::domain::{
 };
 use crate::engine::{Engine, HumanInputDelivery, PendingHumanInput};
 use crate::persistence::ExecutionStore;
-use crate::registry::{RepositoryEntry, RepositoryRegistry};
+use crate::registry::{infer_provider, RepositoryEntry, RepositoryRegistry};
 use crate::tasks::{self, TaskError};
 use crate::workflow::load_from_file;
 
@@ -560,24 +560,6 @@ pub fn repo_remove(root: &Path, id: &str) -> Result<()> {
 
     println!("Removed repository '{id}'.");
     Ok(())
-}
-
-/// Guesses the provider from the shape of a remote.
-///
-/// Only a default for `--provider`: the field is free text, and getting it
-/// wrong costs a display label, never a clone.
-fn infer_provider(remote: &str) -> &'static str {
-    let lowered = remote.to_ascii_lowercase();
-    if lowered.contains("github.") {
-        "github"
-    } else if lowered.contains("gitlab.") {
-        "gitlab"
-    } else if lowered.starts_with('/') || lowered.starts_with('.') || lowered.starts_with("file://")
-    {
-        "local"
-    } else {
-        "git"
-    }
 }
 
 // ---------------------------------------------------------------------------
