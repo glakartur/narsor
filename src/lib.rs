@@ -8,6 +8,7 @@ pub mod cli;
 pub mod domain;
 pub mod engine;
 pub mod persistence;
+pub mod registry;
 pub mod tui;
 pub mod workflow;
 pub mod workspace;

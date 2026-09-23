@@ -435,3 +435,341 @@ fn validate_run_input_show_is_one_uninterrupted_path() {
         .join(".orchestrator")
         .exists());
 }
+
+// ---------------------------------------------------------------------------
+// The repository registry
+// ---------------------------------------------------------------------------
+
+/// The registry fixture workflow: one script state, a templated git workspace.
+fn clone_workflow() -> String {
+    fixtures().join("cli/clone.yaml").display().to_string()
+}
+
+/// Runs `git` inside `path` with a deterministic identity and fails loudly.
+///
+/// The identity is passed per invocation with `-c` rather than read from the
+/// machine's global config: CI has none, and `git commit` hard-fails without
+/// one. `GIT_TERMINAL_PROMPT=0` keeps a misconfigured fixture from hanging.
+fn git(path: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["-c", "user.name=CLI Test"])
+        .args(["-c", "user.email=cli@example.com"])
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Builds a real git repository under the temp root, holding one marker file.
+///
+/// Returns its absolute path: the value that is either registered as a remote
+/// or handed to the workflow raw, depending on which path is under test.
+fn source_repo(root: &TempRoot, name: &str, marker: &str) -> PathBuf {
+    let path = root.path().join("sources").join(name);
+    fs::create_dir_all(&path).expect("create the source repo dir");
+    git(&path, &["-c", "init.defaultBranch=main", "init"]);
+    fs::write(path.join("marker.txt"), marker).expect("write the marker file");
+    git(&path, &["add", "--", "marker.txt"]);
+    git(&path, &["commit", "--message", "add the marker"]);
+    path
+}
+
+#[test]
+fn repo_add_then_list_shows_the_registered_repository() {
+    let root = TempRoot::new();
+
+    let added = cli(
+        &root,
+        &[
+            "repo",
+            "add",
+            "acme-api",
+            "--remote",
+            "https://github.com/acme/api.git",
+            "--name",
+            "ACME API",
+            "--provider",
+            "github",
+            "--default-branch",
+            "main",
+            "--description",
+            "The public API service.",
+        ],
+    );
+    assert_eq!(added.code, EXIT_SUCCESS, "stderr: {}", added.stderr);
+
+    let listed = cli(&root, &["repo", "list"]);
+
+    assert_eq!(listed.code, EXIT_SUCCESS, "stderr: {}", listed.stderr);
+    let line = listed
+        .stdout
+        .lines()
+        .find(|line| line.starts_with("acme-api"))
+        .unwrap_or_else(|| panic!("`repo list` did not mention it:\n{}", listed.stdout));
+    assert!(line.contains("github"), "line was: {line}");
+    assert!(line.contains("main"), "line was: {line}");
+    assert!(
+        line.contains("https://github.com/acme/api.git"),
+        "line was: {line}"
+    );
+}
+
+#[test]
+fn repo_list_on_an_empty_registry_is_not_an_error() {
+    let root = TempRoot::new();
+
+    let listed = cli(&root, &["repo", "list"]);
+
+    assert_eq!(listed.code, EXIT_SUCCESS, "stderr: {}", listed.stderr);
+    assert!(
+        listed.stdout.contains("No repositories registered."),
+        "stdout:\n{}",
+        listed.stdout
+    );
+}
+
+#[test]
+fn repo_show_prints_every_field() {
+    let root = TempRoot::new();
+    let added = cli(
+        &root,
+        &[
+            "repo",
+            "add",
+            "acme-api",
+            "--remote",
+            "https://github.com/acme/api.git",
+            "--name",
+            "ACME API",
+            "--provider",
+            "github",
+            "--default-branch",
+            "main",
+            "--description",
+            "The public API service.",
+        ],
+    );
+    assert_eq!(added.code, EXIT_SUCCESS, "stderr: {}", added.stderr);
+
+    let shown = cli(&root, &["repo", "show", "acme-api"]);
+
+    assert_eq!(shown.code, EXIT_SUCCESS, "stderr: {}", shown.stderr);
+    let stdout = shown.stdout;
+    assert!(stdout.contains("Repository:     acme-api"), "{stdout}");
+    assert!(stdout.contains("Name:           ACME API"), "{stdout}");
+    assert!(stdout.contains("Provider:       github"), "{stdout}");
+    assert!(
+        stdout.contains("Remote:         https://github.com/acme/api.git"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Default branch: main"), "{stdout}");
+    assert!(
+        stdout.contains("Description:    The public API service."),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn repo_remove_drops_the_repository() {
+    let root = TempRoot::new();
+    let added = cli(
+        &root,
+        &["repo", "add", "acme-api", "--remote", "/srv/git/api"],
+    );
+    assert_eq!(added.code, EXIT_SUCCESS, "stderr: {}", added.stderr);
+
+    let removed = cli(&root, &["repo", "remove", "acme-api"]);
+    assert_eq!(removed.code, EXIT_SUCCESS, "stderr: {}", removed.stderr);
+
+    let listed = cli(&root, &["repo", "list"]);
+    assert!(
+        listed.stdout.contains("No repositories registered."),
+        "stdout:\n{}",
+        listed.stdout
+    );
+    assert_eq!(cli(&root, &["repo", "show", "acme-api"]).code, EXIT_FAILURE);
+}
+
+#[test]
+fn repo_show_for_an_unknown_id_is_a_readable_failure() {
+    let root = TempRoot::new();
+
+    let shown = cli(&root, &["repo", "show", "no-such-repository"]);
+
+    assert_eq!(shown.code, EXIT_FAILURE);
+    assert!(
+        shown.output().contains("no-such-repository"),
+        "output:\n{}",
+        shown.output()
+    );
+}
+
+#[test]
+fn repo_remove_of_an_unknown_id_is_a_readable_failure() {
+    let root = TempRoot::new();
+
+    let removed = cli(&root, &["repo", "remove", "no-such-repository"]);
+
+    assert_eq!(removed.code, EXIT_FAILURE);
+    assert!(
+        removed.output().contains("no-such-repository"),
+        "output:\n{}",
+        removed.output()
+    );
+}
+
+#[test]
+fn repo_add_with_a_duplicate_id_is_a_failure() {
+    let root = TempRoot::new();
+    let first = cli(
+        &root,
+        &["repo", "add", "acme-api", "--remote", "/srv/git/api"],
+    );
+    assert_eq!(first.code, EXIT_SUCCESS, "stderr: {}", first.stderr);
+
+    let second = cli(
+        &root,
+        &["repo", "add", "acme-api", "--remote", "/srv/git/other"],
+    );
+
+    assert_eq!(second.code, EXIT_FAILURE);
+    assert!(
+        second.output().contains("acme-api"),
+        "output:\n{}",
+        second.output()
+    );
+    // The first registration survived the refusal.
+    let shown = cli(&root, &["repo", "show", "acme-api"]);
+    assert!(
+        shown.stdout.contains("/srv/git/api"),
+        "stdout:\n{}",
+        shown.stdout
+    );
+}
+
+#[test]
+fn repo_add_without_the_required_remote_is_a_usage_error() {
+    let root = TempRoot::new();
+
+    let added = cli(&root, &["repo", "add", "acme-api"]);
+
+    assert_eq!(added.code, EXIT_USAGE, "clap's own code must match ours");
+}
+
+#[test]
+fn repo_add_refuses_a_remote_git_would_read_as_a_command() {
+    let root = TempRoot::new();
+
+    let added = cli(
+        &root,
+        &["repo", "add", "hostile", "--remote", "ext::sh -c whoami"],
+    );
+
+    assert_eq!(added.code, EXIT_FAILURE);
+    assert!(
+        added.output().contains("ext::"),
+        "the message must say why; output:\n{}",
+        added.output()
+    );
+}
+
+#[test]
+fn a_workflow_naming_a_registered_id_provisions_from_the_registered_remote() {
+    let root = TempRoot::new();
+    let registered = source_repo(&root, "registered", "from the registry");
+
+    let added = cli(
+        &root,
+        &[
+            "repo",
+            "add",
+            "acme-api",
+            "--remote",
+            &registered.display().to_string(),
+            "--provider",
+            "local",
+            "--default-branch",
+            "main",
+        ],
+    );
+    assert_eq!(added.code, EXIT_SUCCESS, "stderr: {}", added.stderr);
+
+    let invocation = cli(
+        &root,
+        &[
+            "run",
+            &clone_workflow(),
+            "--input",
+            "repository=acme-api",
+            "--input",
+            &announce_script(),
+        ],
+    );
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stdout: {}\nstderr: {}",
+        invocation.stdout, invocation.stderr
+    );
+    let id = execution_id(&invocation.stdout);
+
+    // The checkout is named after the registry id and holds the marker file of
+    // the registered repository — so the registry, not the raw value, decided
+    // which remote was cloned.
+    let checkout = root
+        .path()
+        .join("tasks")
+        .join(&id)
+        .join("code")
+        .join("acme-api");
+    assert!(checkout.is_dir(), "expected a checkout at {checkout:?}");
+    assert_eq!(
+        fs::read_to_string(checkout.join("marker.txt")).expect("read the marker"),
+        "from the registry"
+    );
+}
+
+#[test]
+fn a_workflow_naming_an_unregistered_raw_path_still_provisions_as_before() {
+    let root = TempRoot::new();
+    let raw = source_repo(&root, "raw-repo", "from the raw path");
+
+    let invocation = cli(
+        &root,
+        &[
+            "run",
+            &clone_workflow(),
+            "--input",
+            &format!("repository={}", raw.display()),
+            "--input",
+            &announce_script(),
+        ],
+    );
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stdout: {}\nstderr: {}",
+        invocation.stdout, invocation.stderr
+    );
+    let id = execution_id(&invocation.stdout);
+
+    // Nothing was registered, so the value was used as a raw remote and the
+    // checkout is named after the last path segment, exactly as before.
+    let checkout = root
+        .path()
+        .join("tasks")
+        .join(&id)
+        .join("code")
+        .join("raw-repo");
+    assert!(checkout.is_dir(), "expected a checkout at {checkout:?}");
+    assert_eq!(
+        fs::read_to_string(checkout.join("marker.txt")).expect("read the marker"),
+        "from the raw path"
+    );
+}

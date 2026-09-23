@@ -7,9 +7,11 @@
 //!
 //! * the definition declares `globals.workspace: { type: git, ... }` — the
 //!   `repository` field may still hold a `{{ inputs.* }}` template, so it is
-//!   expanded against the inputs first and the result is handed to
-//!   [`WorkspaceProvisioner`] as a git remote (anything `git clone` accepts,
-//!   including a local path);
+//!   expanded against the inputs first and the result is then resolved
+//!   **registry first** (see [`resolve_repository`]): a value that names an
+//!   entry of `{root}/repositories.json` provisions from that entry's `remote`,
+//!   and anything else is handed to [`WorkspaceProvisioner`] as a raw git
+//!   remote (whatever `git clone` accepts, including a local path);
 //! * the definition declares `{ type: local, path: ... }` — the path is
 //!   expanded the same way and its contents are copied into the workspace;
 //! * the definition declares no workspace at all — the CLI creates an empty
@@ -47,6 +49,7 @@ use crate::domain::{
 };
 use crate::engine::{Engine, HumanInputDelivery, PendingHumanInput};
 use crate::persistence::ExecutionStore;
+use crate::registry::{RepositoryEntry, RepositoryRegistry};
 use crate::workflow::{load_from_file, validate_path, TemplateScope};
 use crate::workspace::{RepositorySpec, WorkspaceProvisioner, WorkspaceRequest};
 
@@ -163,7 +166,7 @@ pub async fn run(root: &Path, file: &Path, inputs: &[String]) -> Result<()> {
     let inputs = collect_inputs(&definition, inputs)?;
 
     let provisioner = WorkspaceProvisioner::new(root);
-    let request = workspace_request(&definition, &inputs)?;
+    let request = workspace_request(root, &definition, &inputs)?;
     if let Some(request) = &request {
         provisioner.validate(request).map_err(|error| {
             CliError::failure(format!("The workspace cannot be created: {error}"))
@@ -318,6 +321,7 @@ fn parse_input_value(parameter: &InputParameter, raw: &str) -> Result<Value> {
 /// `None` means the definition declares no workspace and the fallback directory
 /// is used.
 fn workspace_request(
+    root: &Path,
     definition: &WorkflowDefinition,
     inputs: &Map<String, Value>,
 ) -> Result<Option<WorkspaceRequest>> {
@@ -340,12 +344,12 @@ fn workspace_request(
             repository,
             git_ref,
         } => {
-            let remote = render(repository, "repository")?;
+            let repository = render(repository, "repository")?;
             let git_ref = match git_ref {
                 Some(git_ref) => Some(render(git_ref, "ref")?),
                 None => None,
             };
-            RepositorySpec::git(repository_name(&remote), remote, git_ref)
+            resolve_repository(root, &repository, git_ref)?
         }
         WorkspaceSpec::Local { path } => {
             let path = render(path, "path")?;
@@ -354,6 +358,58 @@ fn workspace_request(
     };
 
     Ok(Some(WorkspaceRequest::new(spec)))
+}
+
+/// Turns the `repository` of a `git` workspace into a repository to provision.
+///
+/// # Precedence: registry id first, raw remote as fallback
+///
+/// `WORKFLOW_SCHEMA.md` §3.2 defines `repository` as the id of a registered
+/// repository, so the value is looked up in `{root}/repositories.json` first.
+/// A hit provisions from the entry's `remote`, checks out its `default_branch`
+/// when the workflow declares no `ref` of its own, and names the checkout
+/// directory after the entry's id — an id the registry already validated as a
+/// usable directory name.
+///
+/// A miss keeps the behaviour the CLI had before a registry existed: the value
+/// is handed to `git clone` as a raw remote, which is what makes a workflow
+/// carrying a URL or a local path — `tests/fixtures/implement_feature.yaml`
+/// among them — keep working unchanged.
+///
+/// Which branch was taken is logged at `debug`, because "it cloned something
+/// other than what I expected" is otherwise a silent difference.
+fn resolve_repository(
+    root: &Path,
+    repository: &str,
+    git_ref: Option<String>,
+) -> Result<RepositorySpec> {
+    let registered = RepositoryRegistry::new(root)
+        .get(repository)
+        .map_err(|error| CliError::failure(format!("Could not read the registry: {error}")))?;
+
+    match registered {
+        Some(entry) => {
+            let git_ref = git_ref.or_else(|| entry.default_branch.clone());
+            tracing::debug!(
+                repository = %repository,
+                remote = %entry.remote,
+                git_ref = git_ref.as_deref().unwrap_or("(clone default)"),
+                "resolved the workspace repository from the registry"
+            );
+            Ok(RepositorySpec::git(entry.id, entry.remote, git_ref))
+        }
+        None => {
+            tracing::debug!(
+                repository = %repository,
+                "no registry entry for the workspace repository — using it as a raw git remote"
+            );
+            Ok(RepositorySpec::git(
+                repository_name(repository),
+                repository,
+                git_ref,
+            ))
+        }
+    }
 }
 
 /// The directory name a remote or path is checked out into.
@@ -644,6 +700,123 @@ pub async fn resume(root: &Path, execution_id: &str, definition_file: Option<&Pa
         )));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// repo
+// ---------------------------------------------------------------------------
+
+/// `orchestrator repo add <id> --remote <url|path> …` — register a repository.
+///
+/// The remote is checked with the workspace provisioner's own rules, so a
+/// remote the registry accepts is one a workflow will be able to clone: a value
+/// starting with `-` or using the `ext::` transport is refused here rather than
+/// halfway through a run.
+pub fn repo_add(
+    root: &Path,
+    id: &str,
+    remote: &str,
+    name: Option<String>,
+    provider: Option<String>,
+    default_branch: Option<String>,
+    description: Option<String>,
+) -> Result<()> {
+    let mut entry = RepositoryEntry::new(id, remote)
+        .with_name(name.unwrap_or_else(|| id.to_string()))
+        .with_provider(provider.unwrap_or_else(|| infer_provider(remote).to_string()));
+    entry.default_branch = default_branch;
+    entry.description = description;
+
+    let registry = RepositoryRegistry::new(root);
+    registry.add(entry).map_err(|error| {
+        CliError::failure(format!("Could not register the repository: {error}"))
+    })?;
+
+    println!("Registered repository '{id}' -> {remote}");
+    Ok(())
+}
+
+/// `orchestrator repo list` — every registered repository, ordered by id.
+pub fn repo_list(root: &Path) -> Result<()> {
+    let entries = RepositoryRegistry::new(root)
+        .list()
+        .map_err(|error| CliError::failure(format!("Could not read the registry: {error}")))?;
+
+    if entries.is_empty() {
+        println!("No repositories registered.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<24} {:<10} {:<16} REMOTE",
+        "ID", "PROVIDER", "DEFAULT BRANCH"
+    );
+    for entry in &entries {
+        println!(
+            "{:<24} {:<10} {:<16} {}",
+            entry.id,
+            entry.provider,
+            entry.default_branch.as_deref().unwrap_or("-"),
+            entry.remote
+        );
+    }
+    Ok(())
+}
+
+/// `orchestrator repo show <id>` — every field of one registered repository.
+pub fn repo_show(root: &Path, id: &str) -> Result<()> {
+    let registry = RepositoryRegistry::new(root);
+    let entry = registry
+        .get(id)
+        .map_err(|error| CliError::failure(format!("Could not read the registry: {error}")))?
+        .ok_or_else(|| {
+            CliError::failure(format!(
+                "Repository '{id}' is not registered in '{}'.",
+                registry.path().display()
+            ))
+        })?;
+
+    println!("Repository:     {}", entry.id);
+    println!("Name:           {}", entry.name);
+    println!("Provider:       {}", entry.provider);
+    println!("Remote:         {}", entry.remote);
+    println!(
+        "Default branch: {}",
+        entry.default_branch.as_deref().unwrap_or("-")
+    );
+    println!(
+        "Description:    {}",
+        entry.description.as_deref().unwrap_or("-")
+    );
+    Ok(())
+}
+
+/// `orchestrator repo remove <id>` — drop a repository from the registry.
+pub fn repo_remove(root: &Path, id: &str) -> Result<()> {
+    RepositoryRegistry::new(root)
+        .remove(id)
+        .map_err(|error| CliError::failure(format!("Could not remove the repository: {error}")))?;
+
+    println!("Removed repository '{id}'.");
+    Ok(())
+}
+
+/// Guesses the provider from the shape of a remote.
+///
+/// Only a default for `--provider`: the field is free text, and getting it
+/// wrong costs a display label, never a clone.
+fn infer_provider(remote: &str) -> &'static str {
+    let lowered = remote.to_ascii_lowercase();
+    if lowered.contains("github.") {
+        "github"
+    } else if lowered.contains("gitlab.") {
+        "gitlab"
+    } else if lowered.starts_with('/') || lowered.starts_with('.') || lowered.starts_with("file://")
+    {
+        "local"
+    } else {
+        "git"
+    }
 }
 
 // ---------------------------------------------------------------------------

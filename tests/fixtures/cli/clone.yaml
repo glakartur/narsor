@@ -1,0 +1,52 @@
+name: cli-clone
+version: 1
+description: >
+  A CLI smoke-test workflow whose only point is its workspace: it declares
+  `globals.workspace` with `type: git` and a templated `repository`, so the
+  same file can be run once with a registered repository id and once with a
+  raw local path. The single script it runs is pointed at by an absolute path
+  handed in through `script_path`, exactly as `greet.yaml` does, so nothing is
+  ever written into the repository holding these fixtures.
+
+inputs:
+  - name: repository
+    type: repository
+    required: true
+    description: A registered repository id, or a raw git remote.
+  - name: script_path
+    type: string
+    required: true
+    description: Absolute path to the announcing script.
+
+globals:
+  workspace:
+    type: git
+    repository: "{{ inputs.repository }}"
+
+states:
+  announce:
+    description: Runs once, so that the execution reaches a terminal state.
+    action:
+      type: script
+      command: "{{ inputs.script_path }}"
+      args:
+        - cloned
+      exit_codes:
+        0: success
+        1: failure
+    outputs:
+      - success
+      - failure
+    transitions:
+      success: completed
+      failure: failed
+
+  completed:
+    description: Done.
+
+  failed:
+    description: Failed.
+
+terminal_states:
+  - completed
+  - failed

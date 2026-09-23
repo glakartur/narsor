@@ -142,8 +142,66 @@ pub enum Command {
         file: Option<PathBuf>,
     },
 
+    /// Manages the registry of repositories workflows name by id.
+    Repo {
+        /// What to do with the registry.
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
+
     /// Opens the full-screen terminal interface.
     Tui,
+}
+
+/// The registry half of the command line.
+///
+/// The registry lives in `{root}/repositories.json`, so every one of these
+/// honours the global `--root` exactly like the execution subcommands do.
+#[derive(Debug, Subcommand)]
+pub enum RepoCommand {
+    /// Registers a repository under an id workflows can name.
+    Add {
+        /// The identifier a workflow writes in `globals.workspace.repository`.
+        #[arg(value_name = "ID")]
+        id: String,
+
+        /// Anything `git clone` accepts: a URL or an absolute local path.
+        #[arg(long, value_name = "URL|PATH")]
+        remote: String,
+
+        /// Human-readable name. Defaults to the id.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+
+        /// Where the repository is hosted. Inferred from the remote when omitted.
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+
+        /// Branch used when a workflow declares no `ref` of its own.
+        #[arg(long = "default-branch", value_name = "BRANCH")]
+        default_branch: Option<String>,
+
+        /// Free-form note about what the repository is.
+        #[arg(long, value_name = "TEXT")]
+        description: Option<String>,
+    },
+
+    /// Lists the registered repositories, ordered by id.
+    List,
+
+    /// Shows every field of one registered repository.
+    Show {
+        /// The repository identifier.
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+
+    /// Removes a repository from the registry.
+    Remove {
+        /// The repository identifier.
+        #[arg(value_name = "ID")]
+        id: String,
+    },
 }
 
 /// Runs the parsed command line and returns the process exit code.
@@ -169,6 +227,27 @@ pub async fn run(cli: Cli) -> i32 {
         Command::Resume { execution_id, file } => {
             commands::resume(&cli.root, &execution_id, file.as_deref()).await
         }
+        Command::Repo { command } => match command {
+            RepoCommand::Add {
+                id,
+                remote,
+                name,
+                provider,
+                default_branch,
+                description,
+            } => commands::repo_add(
+                &cli.root,
+                &id,
+                &remote,
+                name,
+                provider,
+                default_branch,
+                description,
+            ),
+            RepoCommand::List => commands::repo_list(&cli.root),
+            RepoCommand::Show { id } => commands::repo_show(&cli.root, &id),
+            RepoCommand::Remove { id } => commands::repo_remove(&cli.root, &id),
+        },
         Command::Tui => commands::tui(&cli.root),
     };
 

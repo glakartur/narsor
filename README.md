@@ -125,7 +125,10 @@ Human input expected: Is the announcement all right?
 
 1. `globals.workspace: { type: git, repository: …, ref: … }` — the `repository`
    field may hold a `{{ inputs.* }}` template, which is expanded before use; the
-   result is handed to `git clone` (a URL or a local path).
+   result is then resolved **registry first** (see [`repo`](#repo)): a value
+   that names a registered repository is cloned from that entry's remote, and
+   anything else is handed to `git clone` as a raw remote (a URL or a local
+   path).
 2. `globals.workspace: { type: local, path: … }` — the contents of that
    directory are copied into the workspace.
 3. No `workspace` section — an empty directory
@@ -206,6 +209,98 @@ Resumes an execution that was paused by something **other** than a question for
 a human (a manual `pause`, for instance). An execution waiting for an answer
 needs `input`, not `resume` — that is the guard against delivering the same
 answer twice.
+
+### `repo`
+
+The registry of repositories a workflow may name by id. `WORKFLOW_SCHEMA.md`
+§3.2 defines `globals.workspace.repository` as *the id of a repository
+registered in the system* — this is that system. Registering a repository lets
+a definition say `repository: acme-api` instead of embedding a URL that changes
+whenever the hosting does.
+
+The registry is one JSON document, `{root}/repositories.json`, so it follows the
+global `--root` like everything else. Every write is atomic (temporary file in
+the same directory, `fsync`, `rename`), and a root without that file is simply
+an empty registry — not an error.
+
+#### `repo add <ID> --remote <URL|PATH> [--name …] [--provider …] [--default-branch …] [--description …]`
+
+Registers a repository. `--remote` is required; `--name` defaults to the id and
+`--provider` is inferred from the shape of the remote (`github`, `gitlab`,
+`local`, otherwise `git`). The id doubles as the directory name the checkout
+lands in, so it has to be usable as one, and the remote is checked with the
+workspace provisioner's own rules — a value starting with `-` (which `git`
+reads as an option) or using the `ext::` transport (which makes `git` run an
+arbitrary command) is refused here rather than halfway through a run.
+
+```console
+$ orchestrator repo add acme-api \
+      --remote https://github.com/acme/api.git \
+      --name "ACME API" \
+      --provider github \
+      --default-branch main \
+      --description "The public API service."
+Registered repository 'acme-api' -> https://github.com/acme/api.git
+
+$ orchestrator repo add acme-api --remote https://github.com/acme/other.git
+Could not register the repository: repository 'acme-api' is already registered in '…/repositories.json'
+```
+
+#### `repo list`
+
+Every registered repository, ordered by id. An empty registry is not an error.
+
+```console
+$ orchestrator repo list
+ID                       PROVIDER   DEFAULT BRANCH   REMOTE
+acme-api                 github     main             https://github.com/acme/api.git
+acme-web                 gitlab     -                git@gitlab.com:acme/web.git
+```
+
+#### `repo show <ID>`
+
+Every field of one entry. An unknown id is exit code `1`.
+
+```console
+$ orchestrator repo show acme-api
+Repository:     acme-api
+Name:           ACME API
+Provider:       github
+Remote:         https://github.com/acme/api.git
+Default branch: main
+Description:    The public API service.
+```
+
+#### `repo remove <ID>`
+
+Drops an entry. Removing an id that was never registered is reported, not
+silently accepted — an operator who mistypes an id would otherwise be told the
+repository is gone while it is still there.
+
+```console
+$ orchestrator repo remove acme-web
+Removed repository 'acme-web'.
+```
+
+#### Resolution precedence
+
+When `run` provisions a `type: git` workspace, the expanded `repository` value
+is resolved in this order:
+
+1. **A registered id.** The entry's `remote` is cloned, its `default_branch` is
+   checked out when the workflow declares no `ref` of its own, and the checkout
+   directory is named after the id.
+2. **A raw remote.** Anything not found in the registry is handed to `git clone`
+   unchanged — a URL or a local path — which is what the CLI did before a
+   registry existed. Every workflow that carried a URL keeps working untouched.
+
+`RUST_LOG=debug` says which of the two was taken, on stderr.
+
+```console
+$ orchestrator repo add acme-api --remote /srv/git/api --default-branch main
+$ orchestrator run pipeline.yaml --input repository=acme-api   # clones /srv/git/api
+$ orchestrator run pipeline.yaml --input repository=/srv/git/other   # raw remote
+```
 
 ### `tui`
 
@@ -341,6 +436,7 @@ Under the `--root` directory (`./.orchestrator` by default):
 
 ```text
 {root}/
+├── repositories.json               # the repository registry (`repo add` …)
 ├── executions/{execution_id}/
 │   ├── state.json                  # WorkflowExecution: status, current state, context
 │   ├── context.json                # the context projection (variables, artifacts, workspace)
@@ -354,10 +450,10 @@ Under the `--root` directory (`./.orchestrator` by default):
 └── orchestrator.log                # only written by `tui`, and only with RUST_LOG set
 ```
 
-Every write of `state.json` and `context.json` is atomic (temporary file in the
-same directory, `fsync`, `rename`), and event numbering increases monotonically
-without gaps. An interrupted write leaves the previous version of the file
-intact.
+Every write of `state.json`, `context.json` and `repositories.json` is atomic
+(temporary file in the same directory, `fsync`, `rename`), and event numbering
+increases monotonically without gaps. An interrupted write leaves the previous
+version of the file intact.
 
 ---
 

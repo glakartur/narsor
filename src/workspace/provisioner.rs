@@ -684,7 +684,7 @@ fn redact_credentials(text: &str) -> String {
 /// from a hand-written workflow by accident, but a remote can come from
 /// `{{ inputs.* }}`, which is supplied when the workflow is *run* rather than
 /// when it is authored — a lower trust level than the file itself.
-fn check_remote(repository: &str, remote: &str) -> Result<()> {
+pub(crate) fn check_remote(repository: &str, remote: &str) -> Result<()> {
     let reason = if remote.trim().is_empty() {
         Some("it is empty")
     } else if remote.starts_with('-') {
@@ -1098,7 +1098,7 @@ fn is_read_only_dir(_path: &Path) -> bool {
 }
 
 /// Rejects names that would escape `code/` or collide with path syntax.
-fn is_usable_directory_name(name: &str) -> bool {
+pub(crate) fn is_usable_directory_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
