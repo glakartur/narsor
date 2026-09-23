@@ -39,6 +39,16 @@ pub const MAX_CAPTURED_OUTPUT_BYTES: usize = 64 * 1024;
 /// Appended in place of everything that [`MAX_CAPTURED_OUTPUT_BYTES`] cut off.
 pub const TRUNCATION_MARKER: &str = "\n… [truncated by orchestrator]";
 
+/// Hard ceiling on how much of a pipe is held in memory at once, in bytes.
+///
+/// [`MAX_CAPTURED_OUTPUT_BYTES`] bounds what is *persisted*, but it is applied
+/// after the fact, so reading a pipe to its end first would let a script that
+/// prints without bound exhaust the orchestrator's memory before any cap could
+/// be applied — the captured-output limit would give a false sense of safety.
+/// Past this ceiling the pipe is still drained, so the child never blocks on a
+/// full pipe, but the surplus bytes are dropped rather than buffered.
+pub const MAX_BUFFERED_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
 /// Label for exit code 0 when `exit_codes` does not say otherwise.
 pub const DEFAULT_SUCCESS_LABEL: &str = "success";
 
@@ -153,21 +163,10 @@ async fn run(
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
 
     let wait = async {
-        let mut stdout_buffer = Vec::new();
-        let mut stderr_buffer = Vec::new();
-
-        let (stdout_read, stderr_read, status) = tokio::join!(
-            stdout_pipe.read_to_end(&mut stdout_buffer),
-            stderr_pipe.read_to_end(&mut stderr_buffer),
+        tokio::join!(
+            read_capped(&mut stdout_pipe),
+            read_capped(&mut stderr_pipe),
             child.wait(),
-        );
-
-        (
-            stdout_read,
-            stderr_read,
-            status,
-            stdout_buffer,
-            stderr_buffer,
         )
     };
 
@@ -176,7 +175,7 @@ async fn run(
         None => Ok(wait.await),
     };
 
-    let (stdout_read, stderr_read, status, stdout_buffer, stderr_buffer) = match finished {
+    let (stdout_read, stderr_read, status) = match finished {
         Ok(finished) => finished,
         Err(_elapsed) => {
             // The waiting future has been dropped, so the child is free again:
@@ -190,8 +189,8 @@ async fn run(
         }
     };
 
-    stdout_read.map_err(|error| io_error(config, "stdout", &error))?;
-    stderr_read.map_err(|error| io_error(config, "stderr", &error))?;
+    let stdout_buffer = stdout_read.map_err(|error| io_error(config, "stdout", &error))?;
+    let stderr_buffer = stderr_read.map_err(|error| io_error(config, "stderr", &error))?;
     let status = status.map_err(|error| io_error(config, "exit status", &error))?;
 
     let stdout = String::from_utf8_lossy(&stdout_buffer).into_owned();
@@ -220,6 +219,30 @@ async fn run(
     }
 
     Ok(ActionOutcome::Completed(result))
+}
+
+/// Drains `pipe` to its end, buffering at most [`MAX_BUFFERED_OUTPUT_BYTES`].
+///
+/// Reading continues past the ceiling so a chatty child is never blocked by a
+/// full pipe; only the retained bytes are bounded.
+async fn read_capped<R>(pipe: &mut R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 16 * 1024];
+
+    loop {
+        let read = pipe.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(buffer);
+        }
+
+        if buffer.len() < MAX_BUFFERED_OUTPUT_BYTES {
+            let room = MAX_BUFFERED_OUTPUT_BYTES - buffer.len();
+            buffer.extend_from_slice(&chunk[..read.min(room)]);
+        }
+    }
 }
 
 /// The label an exit code maps to: `exit_codes` first, then the documented

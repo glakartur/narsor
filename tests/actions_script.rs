@@ -424,3 +424,21 @@ async fn a_command_rendered_by_the_template_scope_runs_with_the_substituted_valu
     let lines: Vec<&str> = result.stdout.lines().collect();
     assert_eq!(lines, vec!["feature/login", "123"]);
 }
+
+#[tokio::test]
+async fn stdout_beyond_the_buffering_ceiling_does_not_grow_memory_without_bound() {
+    let root = TempRoot::new();
+
+    // 12 MiB of stdout — past MAX_BUFFERED_OUTPUT_BYTES (8 MiB), so the
+    // surplus must be dropped as it arrives rather than buffered and only
+    // then truncated. The script must still run to completion: the pipe keeps
+    // being drained past the ceiling, so the child never blocks on a full pipe.
+    let result = complete(script("print_long_line.sh", &["12288"]), &root.workspace()).await;
+
+    assert_eq!(result.output_label, "success");
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(
+        result.stdout.len(),
+        MAX_CAPTURED_OUTPUT_BYTES + TRUNCATION_MARKER.len()
+    );
+}
