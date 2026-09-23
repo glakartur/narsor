@@ -1,0 +1,21 @@
+# §5.2: a script action needs a `command`. The key itself is required by the
+# YAML layer, so the only way for the definition to reach the validator with a
+# missing command is an empty value.
+name: missing-script-command
+version: 1
+
+states:
+  start:
+    action:
+      type: script
+      command: ""
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  - done

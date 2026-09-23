@@ -1,0 +1,17 @@
+# §5.2: only a terminal state may omit its action.
+name: non-terminal-without-action
+version: 1
+
+states:
+  start:
+    description: Brak akcji, a stan nie jest terminalny.
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  - done

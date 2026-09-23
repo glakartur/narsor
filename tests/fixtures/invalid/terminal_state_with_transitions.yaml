@@ -1,0 +1,23 @@
+# §5.1: entering a terminal state ends the execution, so it cannot lead on.
+name: terminal-state-with-transitions
+version: 1
+
+states:
+  start:
+    action:
+      type: script
+      command: ./run.sh
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  done:
+    description: Koniec, ale z wyjściem.
+    outputs:
+      - again
+    transitions:
+      again: start
+
+terminal_states:
+  - done

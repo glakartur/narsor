@@ -1,0 +1,50 @@
+# Five independent violations in one file, one per rule group:
+#   1. `start` references an input that is not declared,
+#   2. `start` declares the output `extra` without a transition,
+#   3. `middle` has a script action with an empty command,
+#   4. `middle` has a transition for `failure`, which is not among its outputs,
+#   5. `orphan` is unreachable from the initial state.
+name: five-violations
+version: 1
+
+inputs:
+  - name: feature_description
+    type: string
+    required: true
+
+states:
+  start:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: Zaimplementuj {{ inputs.missing }}.
+    outputs:
+      - ok
+      - extra
+    transitions:
+      ok: middle
+
+  middle:
+    action:
+      type: script
+      command: ""
+    outputs:
+      - success
+    transitions:
+      success: done
+      failure: done
+
+  orphan:
+    action:
+      type: script
+      command: ./orphan.sh
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  - done

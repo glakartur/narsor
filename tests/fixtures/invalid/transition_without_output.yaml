@@ -1,0 +1,20 @@
+# §5.1: a transition may only be declared for a label listed in `outputs`.
+name: transition-without-output
+version: 1
+
+states:
+  start:
+    action:
+      type: script
+      command: ./run.sh
+    outputs:
+      - success
+    transitions:
+      success: done
+      failure: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  - done

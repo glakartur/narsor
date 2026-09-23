@@ -371,44 +371,22 @@ impl Default for RetryPolicy {
 }
 
 impl WorkflowDefinition {
-    /// Validates the workflow definition
-    pub fn validate(&self) -> Result<(), ValidationError> {
-        // Check that initial state exists
-        if !self.states.contains_key(&self.initial_state) {
-            return Err(ValidationError::InitialStateNotFound(self.initial_state.clone()));
-        }
-
-        // Check all transitions point to valid states
-        for (state_id, state) in &self.states {
-            for (output_label, target_state_id) in &state.transitions {
-                if !self.states.contains_key(target_state_id) {
-                    return Err(ValidationError::TransitionToUnknownState(
-                        state_id.clone(),
-                        output_label.clone(),
-                        target_state_id.clone(),
-                    ));
-                }
-            }
-
-            // Check terminal states have no transitions
-            if state.terminal && !state.transitions.is_empty() {
-                return Err(ValidationError::TerminalStateWithTransitions(state_id.clone()));
-            }
-        }
-
-        // Check for at least one terminal state
-        let has_terminal = self.states.values().any(|s| s.terminal);
-        if !has_terminal {
-            return Err(ValidationError::NoTerminalState);
-        }
-
-        Ok(())
+    /// Validates the workflow definition against `WORKFLOW_SCHEMA.md` §5.
+    ///
+    /// All violations are reported at once, so that the author of a workflow
+    /// does not have to fix them one file save at a time. The rules themselves
+    /// live in [`crate::workflow::validator`], which also offers entry points
+    /// that see the YAML layer (`terminal_states` naming a state that does not
+    /// exist disappears during compilation).
+    pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
+        crate::workflow::validator::validate(self)
     }
 }
 
 /// Errors that can occur during workflow validation
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
+    // --- Graph consistency (§5.1) ---
     #[error("Initial state '{0}' not found")]
     InitialStateNotFound(StateId),
 
@@ -420,4 +398,57 @@ pub enum ValidationError {
 
     #[error("Workflow must have at least one terminal state")]
     NoTerminalState,
+
+    #[error("State '{state}' declares output '{label}' but has no transition for it")]
+    OutputWithoutTransition { state: StateId, label: OutputLabel },
+
+    #[error("State '{state}' has a transition for label '{label}', which is not declared in its outputs")]
+    TransitionWithoutOutput { state: StateId, label: OutputLabel },
+
+    #[error("State '{0}' is not reachable from the initial state")]
+    UnreachableState(StateId),
+
+    #[error("State '{0}' has no path to any terminal state (deadlock)")]
+    NoPathToTerminal(StateId),
+
+    #[error("Non-terminal state '{0}' has no action")]
+    NonTerminalStateWithoutAction(StateId),
+
+    #[error("'terminal_states' names state '{0}', which is not defined")]
+    UnknownTerminalState(StateId),
+
+    // --- Action correctness (§5.2) ---
+    #[error("State '{state}' has a {action_type} action without the required field '{field}'")]
+    MissingActionField {
+        state: StateId,
+        action_type: &'static str,
+        field: &'static str,
+    },
+
+    #[error("State '{state}' has a {action_type} action with an empty 'outputs' list")]
+    EmptyOutputs {
+        state: StateId,
+        action_type: &'static str,
+    },
+
+    // --- Decision correctness (§5.3) ---
+    #[error("State '{state}' uses an agent decision without the required field '{field}'")]
+    AgentDecisionMissingField {
+        state: StateId,
+        field: &'static str,
+    },
+
+    // --- Variables and context (§5.4) ---
+    #[error("State '{state}' references unknown input '{variable}' in field '{field}'")]
+    UnknownInputReference {
+        state: StateId,
+        field: String,
+        variable: String,
+    },
+
+    #[error("Field '{field}' references unknown input '{variable}'")]
+    UnknownInputReferenceInGlobals {
+        field: &'static str,
+        variable: String,
+    },
 }

@@ -1,0 +1,26 @@
+# §5.2: an agent action must declare at least one output. Without one the
+# state is also a dead end, which the reachability rule reports separately.
+name: empty-agent-outputs
+version: 1
+
+states:
+  start:
+    action:
+      type: script
+      command: ./run.sh
+    outputs:
+      - success
+    transitions:
+      success: work
+
+  work:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: Zrób coś pożytecznego.
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  - done
