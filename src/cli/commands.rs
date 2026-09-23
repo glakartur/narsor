@@ -2,32 +2,11 @@
 //!
 //! # Where a `run` gets its workspace
 //!
-//! An execution needs a directory to work in before its first action starts.
-//! Three cases, in this order:
-//!
-//! * the definition declares `globals.workspace: { type: git, ... }` — the
-//!   `repository` field may still hold a `{{ inputs.* }}` template, so it is
-//!   expanded against the inputs first and the result is then resolved
-//!   **registry first** (see [`resolve_repository`]): a value that names an
-//!   entry of `{root}/repositories.json` provisions from that entry's `remote`,
-//!   and anything else is handed to [`WorkspaceProvisioner`] as a raw git
-//!   remote (whatever `git clone` accepts, including a local path);
-//! * the definition declares `{ type: local, path: ... }` — the path is
-//!   expanded the same way and its contents are copied into the workspace;
-//! * the definition declares no workspace at all — the CLI creates an empty
-//!   directory `{root}/tasks/{execution_id}/code/workspace` and uses that. A
-//!   workflow whose scripts live outside the repository (the usual shape of a
-//!   smoke test) needs nothing more, and an empty directory is a better default
-//!   than refusing to run.
-//!
-//! Provisioning is deliberately split around [`crate::engine::Engine::start`]:
-//! everything checkable without touching the disk
-//! ([`WorkspaceProvisioner::validate`]) runs *before* the execution is created,
-//! so a bad remote leaves nothing behind; the actual clone runs *after*, because
-//! the task directory is named for the execution id (`DOMAIN_MODEL.md` §2.8) and
-//! that id only exists once the execution does. The execution record is then
-//! saved again with the real workspace. If the clone fails, the freshly created
-//! execution is marked `Failed` rather than left `Running` forever.
+//! `run` owns the command line — parsing `--input name=value` pairs against the
+//! declared parameters, and printing what happened — and nothing else: creating
+//! the execution, provisioning its workspace and recording where its definition
+//! lives is [`crate::tasks::start_task`], which the interface calls too. That
+//! module documents the ordering those steps have to keep.
 //!
 //! # How `input` and `resume` find the definition
 //!
@@ -37,33 +16,21 @@
 //! later commands read it back. `--file` overrides it, for the case where the
 //! definition has moved.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
 use crate::domain::{
-    Context, Event, ExecutionStatus, InputParameter, ParamType, WorkflowDefinition,
-    WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
+    Event, ExecutionStatus, InputParameter, ParamType, WorkflowDefinition, WorkflowExecution,
 };
 use crate::engine::{Engine, HumanInputDelivery, PendingHumanInput};
 use crate::persistence::ExecutionStore;
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
-use crate::workflow::{load_from_file, validate_path, TemplateScope};
-use crate::workspace::{RepositorySpec, WorkspaceProvisioner, WorkspaceRequest};
+use crate::tasks::{self, TaskError};
+use crate::workflow::load_from_file;
 
 use super::{EXIT_FAILURE, EXIT_USAGE};
-
-/// Key of the CLI's own scratch area inside `WorkflowExecution::metadata`.
-const METADATA_CLI_KEY: &str = "cli";
-
-/// Key of the recorded definition path inside that scratch area.
-const METADATA_DEFINITION_PATH_KEY: &str = "definition_path";
-
-/// Directory name of the fallback workspace, used when the definition declares
-/// none.
-const FALLBACK_WORKSPACE_NAME: &str = "workspace";
 
 /// How often `events --follow` looks for new entries in the log.
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(250);
@@ -104,24 +71,21 @@ pub type Result<T> = std::result::Result<T, CliError>;
 
 /// `orchestrator validate <file>` — static validation, all violations at once.
 pub fn validate(file: &Path) -> Result<()> {
-    let violations = validate_path(file)
-        .map_err(|error| CliError::failure(format!("Could not load the definition: {error}")))?;
-
-    if !violations.is_empty() {
-        let mut message = format!(
-            "Definition '{}' is invalid — {} {} found:",
-            file.display(),
-            violations.len(),
-            violation_noun(violations.len())
-        );
-        for violation in &violations {
-            message.push_str(&format!("\n  - {violation}"));
+    let definition = tasks::load_definition(file).map_err(|error| match error {
+        TaskError::InvalidDefinition { violations } => {
+            let mut message = format!(
+                "Definition '{}' is invalid — {} {} found:",
+                file.display(),
+                violations.len(),
+                violation_noun(violations.len())
+            );
+            for violation in &violations {
+                message.push_str(&format!("\n  - {violation}"));
+            }
+            CliError::failure(message)
         }
-        return Err(CliError::failure(message));
-    }
-
-    let definition = load_from_file(file)
-        .map_err(|error| CliError::failure(format!("Could not load the definition: {error}")))?;
+        other => CliError::failure(other.to_string()),
+    })?;
 
     println!(
         "The definition is valid: {} (version {}), states: {}, initial state: {}.",
@@ -148,61 +112,28 @@ fn violation_noun(count: usize) -> &'static str {
 
 /// `orchestrator run <file> [--input k=v]…` — create an execution and run it.
 pub async fn run(root: &Path, file: &Path, inputs: &[String]) -> Result<()> {
-    let violations = validate_path(file)
-        .map_err(|error| CliError::failure(format!("Could not load the definition: {error}")))?;
-    if !violations.is_empty() {
-        let mut message = String::from("The definition is invalid — no execution was created:");
-        for violation in &violations {
-            message.push_str(&format!("\n  - {violation}"));
+    let definition = tasks::load_definition(file).map_err(|error| match error {
+        TaskError::InvalidDefinition { violations } => {
+            let mut message = String::from("The definition is invalid — no execution was created:");
+            for violation in &violations {
+                message.push_str(&format!("\n  - {violation}"));
+            }
+            CliError::failure(message)
         }
-        return Err(CliError::failure(message));
-    }
-
-    let definition = load_from_file(file)
-        .map_err(|error| CliError::failure(format!("Could not load the definition: {error}")))?;
+        other => CliError::failure(other.to_string()),
+    })?;
 
     // Inputs first: a missing required parameter must be reported before
     // anything is written to disk.
     let inputs = collect_inputs(&definition, inputs)?;
 
-    let provisioner = WorkspaceProvisioner::new(root);
-    let request = workspace_request(root, &definition, &inputs)?;
-    if let Some(request) = &request {
-        provisioner.validate(request).map_err(|error| {
-            CliError::failure(format!("The workspace cannot be created: {error}"))
-        })?;
-    }
-
     let engine = Engine::new(ExecutionStore::new(root));
-    let mut execution = engine
-        .start(
-            &definition,
-            Value::Object(inputs),
-            // Replaced below, once the execution id names the task directory.
-            Workspace::local_folder(root.display().to_string()),
-        )
-        .map_err(|error| CliError::failure(format!("Could not create the execution: {error}")))?;
-
-    println!("Created execution: {}", execution.id);
-
-    match provision_workspace(&provisioner, &execution.id, request.as_ref()) {
-        Ok(workspace) => {
-            execution.context.workspace = Some(WorkspaceInfo {
-                id: workspace.id.clone(),
-                path: workspace.path.clone(),
-                workspace_type: format!("{:?}", workspace.workspace_type).to_lowercase(),
-            });
-            execution.workspace = workspace;
-            record_definition_path(&mut execution, file);
-            engine.store().save_execution(&execution).map_err(|error| {
-                CliError::failure(format!("Could not save the execution: {error}"))
-            })?;
-        }
-        Err(message) => {
-            abandon_execution(engine.store(), &mut execution, &message);
-            return Err(CliError::failure(message));
-        }
-    }
+    // The new id is announced the moment it exists, so that a failing clone
+    // still tells the operator which execution to look at.
+    let execution = tasks::start_task_with(root, &engine, &definition, file, inputs, |execution| {
+        println!("Created execution: {}", execution.id);
+    })
+    .map_err(|error| CliError::failure(error.to_string()))?;
 
     let execution = engine
         .run(&definition, &execution.id)
@@ -314,170 +245,6 @@ fn parse_input_value(parameter: &InputParameter, raw: &str) -> Result<Value> {
             ))),
         },
     }
-}
-
-/// Builds the workspace request from the definition, expanding templates in it.
-///
-/// `None` means the definition declares no workspace and the fallback directory
-/// is used.
-fn workspace_request(
-    root: &Path,
-    definition: &WorkflowDefinition,
-    inputs: &Map<String, Value>,
-) -> Result<Option<WorkspaceRequest>> {
-    let Some(spec) = &definition.workspace else {
-        return Ok(None);
-    };
-
-    let context = Context::new();
-    let scope = TemplateScope::new(inputs, &context);
-    let render = |template: &str, field: &str| -> Result<String> {
-        scope
-            .render(template, &format!("globals.workspace.{field}"))
-            .map_err(|error| {
-                CliError::failure(format!("Could not expand the workspace template: {error}"))
-            })
-    };
-
-    let spec = match spec {
-        WorkspaceSpec::Git {
-            repository,
-            git_ref,
-        } => {
-            let repository = render(repository, "repository")?;
-            let git_ref = match git_ref {
-                Some(git_ref) => Some(render(git_ref, "ref")?),
-                None => None,
-            };
-            resolve_repository(root, &repository, git_ref)?
-        }
-        WorkspaceSpec::Local { path } => {
-            let path = render(path, "path")?;
-            RepositorySpec::local(repository_name(&path), PathBuf::from(path))
-        }
-    };
-
-    Ok(Some(WorkspaceRequest::new(spec)))
-}
-
-/// Turns the `repository` of a `git` workspace into a repository to provision.
-///
-/// # Precedence: registry id first, raw remote as fallback
-///
-/// `WORKFLOW_SCHEMA.md` §3.2 defines `repository` as the id of a registered
-/// repository, so the value is looked up in `{root}/repositories.json` first.
-/// A hit provisions from the entry's `remote`, checks out its `default_branch`
-/// when the workflow declares no `ref` of its own, and names the checkout
-/// directory after the entry's id — an id the registry already validated as a
-/// usable directory name.
-///
-/// A miss keeps the behaviour the CLI had before a registry existed: the value
-/// is handed to `git clone` as a raw remote, which is what makes a workflow
-/// carrying a URL or a local path — `tests/fixtures/implement_feature.yaml`
-/// among them — keep working unchanged.
-///
-/// Which branch was taken is logged at `debug`, because "it cloned something
-/// other than what I expected" is otherwise a silent difference.
-fn resolve_repository(
-    root: &Path,
-    repository: &str,
-    git_ref: Option<String>,
-) -> Result<RepositorySpec> {
-    let registered = RepositoryRegistry::new(root)
-        .get(repository)
-        .map_err(|error| CliError::failure(format!("Could not read the registry: {error}")))?;
-
-    match registered {
-        Some(entry) => {
-            let git_ref = git_ref.or_else(|| entry.default_branch.clone());
-            tracing::debug!(
-                repository = %repository,
-                remote = %entry.remote,
-                git_ref = git_ref.as_deref().unwrap_or("(clone default)"),
-                "resolved the workspace repository from the registry"
-            );
-            Ok(RepositorySpec::git(entry.id, entry.remote, git_ref))
-        }
-        None => {
-            tracing::debug!(
-                repository = %repository,
-                "no registry entry for the workspace repository — using it as a raw git remote"
-            );
-            Ok(RepositorySpec::git(
-                repository_name(repository),
-                repository,
-                git_ref,
-            ))
-        }
-    }
-}
-
-/// The directory name a remote or path is checked out into.
-fn repository_name(remote: &str) -> String {
-    let trimmed = remote.trim_end_matches('/');
-    let last = trimmed
-        .rsplit(['/', ':', '\\'])
-        .find(|segment| !segment.is_empty())
-        .unwrap_or(trimmed);
-    let name = last.strip_suffix(".git").unwrap_or(last);
-    if name.is_empty() || name == "." || name == ".." {
-        FALLBACK_WORKSPACE_NAME.to_string()
-    } else {
-        name.to_string()
-    }
-}
-
-/// Materialises the workspace of an execution, or the fallback directory.
-fn provision_workspace(
-    provisioner: &WorkspaceProvisioner,
-    execution_id: &str,
-    request: Option<&WorkspaceRequest>,
-) -> std::result::Result<Workspace, String> {
-    match request {
-        Some(request) => provisioner
-            .provision(execution_id, request)
-            .map(|provisioned| provisioned.workspace)
-            .map_err(|error| format!("Could not create the workspace: {error}")),
-        None => {
-            let path = provisioner
-                .code_dir(execution_id)
-                .join(FALLBACK_WORKSPACE_NAME);
-            fs::create_dir_all(&path)
-                .map_err(|error| format!("Could not create the workspace directory: {error}"))?;
-            Ok(Workspace::local_folder(path.display().to_string()))
-        }
-    }
-}
-
-/// Records the definition path so `input` and `resume` can find it again.
-fn record_definition_path(execution: &mut WorkflowExecution, file: &Path) {
-    let path = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
-    if !execution.metadata.is_object() {
-        execution.metadata = json!({});
-    }
-    if let Some(metadata) = execution.metadata.as_object_mut() {
-        metadata.insert(
-            METADATA_CLI_KEY.to_string(),
-            json!({ METADATA_DEFINITION_PATH_KEY: path.display().to_string() }),
-        );
-    }
-}
-
-/// Marks an execution that never got a workspace as failed.
-///
-/// Leaving it `Running` would make it look resumable when nothing can ever
-/// step it: it has no directory to run in.
-fn abandon_execution(store: &ExecutionStore, execution: &mut WorkflowExecution, message: &str) {
-    execution.status = ExecutionStatus::Failed;
-    execution.completed_at = Some(chrono::Utc::now());
-    let _ = store.event_log(&execution.id).append_next(
-        &execution.id,
-        crate::domain::EventData::Error {
-            message: message.to_string(),
-            context: json!({ "stage": "workspace_provisioning" }),
-        },
-    );
-    let _ = store.save_execution(execution);
 }
 
 // ---------------------------------------------------------------------------
@@ -876,7 +643,7 @@ fn definition_for(
 ) -> Result<WorkflowDefinition> {
     let path = match override_path {
         Some(path) => path.to_path_buf(),
-        None => stored_definition_path(execution).ok_or_else(|| {
+        None => tasks::stored_definition_path(execution).ok_or_else(|| {
             CliError::usage(format!(
                 "Execution '{}' has no recorded definition path — point at the file with --file.",
                 execution.id
@@ -890,16 +657,6 @@ fn definition_for(
             path.display()
         ))
     })
-}
-
-/// The definition path `run` recorded in the execution metadata.
-fn stored_definition_path(execution: &WorkflowExecution) -> Option<PathBuf> {
-    execution
-        .metadata
-        .get(METADATA_CLI_KEY)?
-        .get(METADATA_DEFINITION_PATH_KEY)?
-        .as_str()
-        .map(PathBuf::from)
 }
 
 /// Status, current state and — when it stopped — the outcome.

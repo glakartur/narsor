@@ -53,41 +53,32 @@
 //!   the value reaches the context as, and a `repository` input is a pick list
 //!   of what the registry holds.
 //!
-//! ## What starting a task does not do yet
+//! ## Where the workspace comes from
 //!
-//! It provisions only the empty workspace a definition without a declared
-//! `globals.workspace` runs in. Expanding the workspace templates, resolving
-//! the repository through the registry and cloning it lives in
-//! `src/cli/commands.rs` and is not reachable from here; a second copy of the
-//! rules that decide what `git` is asked to clone is exactly the drift the
-//! registry's own documentation warns about. So a workflow that declares a
-//! workspace is refused here, by name, pointing at `orchestrator run` — until
-//! that pipeline moves into a shared module both callers can use.
+//! From [`crate::tasks::start_task`], the same entry point `orchestrator run`
+//! calls: a definition declaring `globals.workspace` is expanded, resolved
+//! through the registry and cloned here exactly as it is there, and one that
+//! declares none gets the same empty `{root}/tasks/{id}/code/workspace`. There
+//! is one copy of the rules that decide what `git` is asked to clone, and this
+//! interface does not hold a second.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::domain::{
     Event, EventData, ExecutionStatus, HumanInputField, HumanInputType, InputParameter, ParamType,
-    State, WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo,
+    State, WorkflowDefinition, WorkflowExecution,
 };
 use crate::engine::{
     permitted_labels, terminal_status, Engine, HumanInputDelivery, PendingHumanInput,
 };
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
+use crate::tasks;
 use crate::workflow::{load_from_file, validate_path};
-use crate::workspace::WorkspaceProvisioner;
-
-/// Key of the CLI's scratch area in `WorkflowExecution::metadata`.
-const METADATA_CLI_KEY: &str = "cli";
-
-/// Key of the recorded definition path inside that scratch area.
-const METADATA_DEFINITION_PATH_KEY: &str = "definition_path";
 
 /// The decision provider recorded for an operator's ordinary manual choice.
 pub const MANUAL_PROVIDER: &str = "human";
@@ -108,11 +99,6 @@ pub const MANUAL_REASON: &str = "Manual transition picked by the operator.";
 
 /// The label recorded for a forced transition, which by definition has none.
 pub const OVERRIDE_LABEL: &str = "override";
-
-/// Directory name of the empty workspace a definition without a declared
-/// `globals.workspace` runs in — the same name the CLI's `run` uses, so an
-/// execution started here is laid out exactly like one started there.
-const FALLBACK_WORKSPACE_NAME: &str = "workspace";
 
 // ---------------------------------------------------------------------------
 // Small state types
@@ -1219,7 +1205,7 @@ impl App {
         let Some(execution) = self.execution.as_ref() else {
             return;
         };
-        let Some(path) = stored_definition_path(execution) else {
+        let Some(path) = tasks::stored_definition_path(execution) else {
             self.definition_error = Some(format!(
                 "Execution '{}' has no recorded definition path \
                  (metadata.cli.definition_path): manual transitions and delivering \
@@ -2188,9 +2174,12 @@ impl App {
 
     /// Creates the execution the form describes and runs it.
     ///
-    /// The steps are the CLI's, in the CLI's order: inputs first, then the
-    /// execution, then its workspace, then the run — so that a rejected input
-    /// leaves nothing on disk at all.
+    /// The form's own values are parsed first, because a rejected input must
+    /// leave nothing on disk at all; everything after that is
+    /// [`crate::tasks::start_task`], the operation `orchestrator run`
+    /// performs — the workspace a declared `globals.workspace` asks for
+    /// included. The run itself stays here, so the interface keeps rendering
+    /// while the engine works.
     pub async fn start_new_task(&mut self) {
         let Modal::NewTask(form) = &self.modal else {
             return;
@@ -2211,59 +2200,32 @@ impl App {
             }
         };
 
-        // See `workspace_for` — a declared `globals.workspace` is refused
-        // before anything is written, never provisioned by halves.
-        if let Err(message) = declared_workspace_is_supported(&definition) {
-            if let Modal::NewTask(form) = &mut self.modal {
-                form.error = Some(message.clone());
-            }
-            self.notice = Some(Notice::error(message));
-            return;
-        }
-
         let root = self.engine.store().root().to_path_buf();
-        let mut execution = match self.engine.start(
-            &definition,
-            Value::Object(inputs),
-            // Replaced below, once the execution id names the task directory.
-            Workspace::local_folder(root.display().to_string()),
-        ) {
-            Ok(execution) => execution,
-            Err(error) => {
-                let message = format!("Could not create the execution: {error}");
-                if let Modal::NewTask(form) = &mut self.modal {
-                    form.error = Some(message.clone());
-                }
-                self.notice = Some(Notice::error(message));
-                return;
-            }
-        };
-
-        match empty_workspace(&root, &execution.id) {
-            Ok(workspace) => {
-                execution.context.workspace = Some(WorkspaceInfo {
-                    id: workspace.id.clone(),
-                    path: workspace.path.clone(),
-                    workspace_type: format!("{:?}", workspace.workspace_type).to_lowercase(),
-                });
-                execution.workspace = workspace;
-                record_definition_path(&mut execution, &file);
-                if let Err(error) = self.engine.store().save_execution(&execution) {
-                    self.notice = Some(Notice::error(format!(
-                        "Could not save the execution: {error}"
-                    )));
+        let execution =
+            match tasks::start_task(&root, &self.engine, &definition, &file, inputs) {
+                Ok(execution) => execution,
+                Err(error) => {
+                    let message = error.to_string();
+                    // An error that left an execution behind happened after it
+                    // was created: the modal has nothing left to correct, so it
+                    // closes and the list shows the failed execution instead.
+                    match error.execution_id() {
+                        Some(execution_id) => {
+                            let execution_id = execution_id.to_string();
+                            self.modal = Modal::None;
+                            self.refresh();
+                            self.select_execution(&execution_id);
+                        }
+                        None => {
+                            if let Modal::NewTask(form) = &mut self.modal {
+                                form.error = Some(message.clone());
+                            }
+                        }
+                    }
+                    self.notice = Some(Notice::error(message));
                     return;
                 }
-            }
-            Err(message) => {
-                abandon_execution(self.engine.store(), &mut execution, &message);
-                self.notice = Some(Notice::error(message));
-                self.modal = Modal::None;
-                self.refresh();
-                self.select_execution(&execution.id);
-                return;
-            }
-        }
+            };
 
         self.modal = Modal::None;
         let outcome = self.engine.run(&definition, &execution.id).await;
@@ -2407,75 +2369,6 @@ fn cycle_input(form: &mut NewTaskForm, delta: isize) {
     }
 }
 
-/// Whether the TUI can provision the workspace this definition declares.
-///
-/// It cannot, and says so instead of guessing. Expanding the `globals.workspace`
-/// templates, resolving the repository through the registry and cloning it is
-/// implemented once, in `src/cli/commands.rs`, and it is not reachable from
-/// here; copying it would give this interface a second, drifting copy of the
-/// rules that decide what `git` is asked to clone. Until that pipeline moves
-/// into a shared module, a workflow that declares a workspace is started with
-/// `orchestrator run`, and the operator is told exactly that.
-fn declared_workspace_is_supported(definition: &WorkflowDefinition) -> Result<(), String> {
-    if definition.workspace.is_some() {
-        return Err(format!(
-            "Workflow '{}' declares globals.workspace, and provisioning a checkout \
-             is not available from the interface yet. Start it with \
-             `orchestrator run <file>`; everything else — answering, transitions, \
-             registering repositories — works here.",
-            definition.id
-        ));
-    }
-    Ok(())
-}
-
-/// Creates the empty working directory an execution without a declared
-/// workspace runs in — the same `{root}/tasks/{id}/code/workspace` the CLI
-/// falls back to, so both paths produce the same layout on disk.
-fn empty_workspace(root: &Path, execution_id: &str) -> Result<Workspace, String> {
-    let path = WorkspaceProvisioner::new(root)
-        .code_dir(execution_id)
-        .join(FALLBACK_WORKSPACE_NAME);
-    fs::create_dir_all(&path)
-        .map_err(|error| format!("Could not create the workspace directory: {error}"))?;
-    Ok(Workspace::local_folder(path.display().to_string()))
-}
-
-/// Records the definition path under the same metadata key the CLI writes, so
-/// the interface resolves an execution it started exactly as it resolves one
-/// `orchestrator run` started.
-fn record_definition_path(execution: &mut WorkflowExecution, file: &Path) {
-    let path = fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
-    if !execution.metadata.is_object() {
-        execution.metadata = json!({});
-    }
-    if let Some(metadata) = execution.metadata.as_object_mut() {
-        metadata.insert(
-            METADATA_CLI_KEY.to_string(),
-            json!({ METADATA_DEFINITION_PATH_KEY: path.display().to_string() }),
-        );
-    }
-}
-
-/// Marks an execution that never got a workspace as failed, so it does not look
-/// resumable when nothing can ever step it.
-fn abandon_execution(
-    store: &crate::persistence::ExecutionStore,
-    execution: &mut WorkflowExecution,
-    message: &str,
-) {
-    execution.status = ExecutionStatus::Failed;
-    execution.completed_at = Some(chrono::Utc::now());
-    let _ = store.event_log(&execution.id).append_next(
-        &execution.id,
-        EventData::Error {
-            message: message.to_string(),
-            context: json!({ "stage": "workspace_provisioning" }),
-        },
-    );
-    let _ = store.save_execution(execution);
-}
-
 /// Steps an index within `length`, wrapping around.
 fn wrap(current: usize, delta: isize, length: usize) -> usize {
     let length = length as isize;
@@ -2499,16 +2392,6 @@ fn apply_to_row(row: &mut ExecutionRow, data: &EventData) {
         EventData::WorkflowCancelled { .. } => row.status = ExecutionStatus::Cancelled,
         _ => {}
     }
-}
-
-/// The definition path the CLI recorded when it created the execution.
-fn stored_definition_path(execution: &WorkflowExecution) -> Option<PathBuf> {
-    execution
-        .metadata
-        .get(METADATA_CLI_KEY)?
-        .get(METADATA_DEFINITION_PATH_KEY)?
-        .as_str()
-        .map(PathBuf::from)
 }
 
 /// The schema spelling of a status — the same words the CLI prints.

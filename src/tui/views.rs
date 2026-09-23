@@ -181,7 +181,7 @@ fn render_executions(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.executions().is_empty() {
         let hint = Paragraph::new(
-            "No executions in the store.\n\nStart a workflow with\n`orchestrator run <file>`.",
+            "No executions in the store.\n\nPress `n` to start a workflow,\nor run `orchestrator run <file>`.",
         )
         .wrap(Wrap { trim: true })
         .block(block);

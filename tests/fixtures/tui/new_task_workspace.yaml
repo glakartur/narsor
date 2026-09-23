@@ -1,0 +1,50 @@
+name: tui-new-task-workspace
+version: 1
+description: >
+  Workflow fixture for starting a task that needs a checkout from the
+  interface. It declares `globals.workspace` — the thing the new-task modal
+  used to refuse — as a `local` directory named by an input, so the test proves
+  the workspace is provisioned without cloning anything and without touching
+  the network. The source directory is created by the test inside its own
+  temporary root, and the single human state means nothing is ever executed.
+
+inputs:
+  - name: source
+    type: string
+    required: true
+    description: Absolute path of the directory the workspace is copied from.
+
+globals:
+  workspace:
+    type: local
+    path: "{{ inputs.source }}"
+
+states:
+  review:
+    description: A person confirms the task that was just created.
+    action:
+      type: human
+      message: "Confirm the new task?"
+      inputs:
+        - name: approval_status
+          type: select
+          required: true
+          options:
+            - approved
+            - rejected
+    outputs:
+      - approved
+      - rejected
+    transitions:
+      approved: done
+      rejected: aborted
+
+  done:
+    description: The task was confirmed.
+
+  aborted:
+    description: The task was rejected.
+
+terminal_states:
+  done: completed
+  aborted: failed
