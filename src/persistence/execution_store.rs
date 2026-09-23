@@ -7,8 +7,17 @@ use crate::persistence::atomic::{
 };
 use crate::persistence::event_log::EventLog;
 use crate::persistence::paths::{Paths, DEFAULT_ROOT};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// File holding the input request an execution is currently waiting on.
+///
+/// Its presence is a hint, never the truth: the authority for "this execution
+/// is waiting" is `status` in `state.json`. See `engine::actions::human` for
+/// why the request lives in its own file rather than inside the execution.
+pub const PENDING_INPUT_FILE: &str = "pending_input.json";
 
 /// Filesystem store for workflow executions.
 ///
@@ -87,6 +96,55 @@ impl ExecutionStore {
             });
         }
         read_json(&path)
+    }
+
+    /// `{root}/executions/{execution_id}/pending_input.json`.
+    pub fn pending_input_file(&self, execution_id: &str) -> PathBuf {
+        self.paths
+            .execution_dir(execution_id)
+            .join(PENDING_INPUT_FILE)
+    }
+
+    /// Persists the request an execution is waiting on.
+    ///
+    /// Generic over the record rather than typed: the pending request is an
+    /// engine concept (`engine::actions::human::PendingHumanInput`) and this
+    /// layer sits below the engine, so naming the type here would invert the
+    /// dependency. The store's job is that the bytes land atomically.
+    pub fn save_pending_input<T: Serialize>(&self, execution_id: &str, pending: &T) -> Result<()> {
+        self.create_execution_dirs(execution_id)?;
+        write_json_atomic(&self.pending_input_file(execution_id), pending)
+    }
+
+    /// Loads the pending request, or `None` when the execution is not waiting
+    /// on one.
+    ///
+    /// An absent file is the ordinary case — most executions are not waiting —
+    /// so it is an `Ok(None)` rather than an error.
+    pub fn load_pending_input<T: DeserializeOwned>(&self, execution_id: &str) -> Result<Option<T>> {
+        let path = self.pending_input_file(execution_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(&path).map(Some)
+    }
+
+    /// True when a pending request file exists for this execution.
+    ///
+    /// Cheap enough to call while listing every execution in the store, which
+    /// is how the TUI finds the ones waiting for a person.
+    pub fn has_pending_input(&self, execution_id: &str) -> bool {
+        self.pending_input_file(execution_id).exists()
+    }
+
+    /// Removes the pending request. Returns whether there was one to remove.
+    pub fn clear_pending_input(&self, execution_id: &str) -> Result<bool> {
+        let path = self.pending_input_file(execution_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(PersistenceError::io(&path, source)),
+        }
     }
 
     /// True when an execution with this identifier is stored.

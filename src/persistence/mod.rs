@@ -7,6 +7,7 @@
 //! {root}/executions/{execution_id}/
 //!     state.json                  -- the serialized WorkflowExecution
 //!     context.json                -- projection of the execution context
+//!     pending_input.json          -- the input request a paused execution awaits
 //!     events/{sequence:08}.json   -- append-only event log
 //!     artifacts/{artifact_id}/    -- files produced by actions
 //! ```
@@ -23,7 +24,7 @@ pub mod paths;
 
 pub use atomic::{cleanup_orphaned_temp_files, read_json, write_json_atomic};
 pub use event_log::EventLog;
-pub use execution_store::ExecutionStore;
+pub use execution_store::{ExecutionStore, PENDING_INPUT_FILE};
 pub use paths::{Paths, CONTEXT_FILE, DEFAULT_ROOT, STATE_FILE, TEMP_SUFFIX};
 
 use std::io;

@@ -94,6 +94,9 @@ async fn complete(config: ScriptActionConfig, workspace: &Workspace) -> ActionRe
     match execute(config, workspace, None).await {
         Ok(ActionOutcome::Completed(result)) => result,
         Ok(ActionOutcome::TimedOut(timed_out)) => panic!("unexpected timeout: {timed_out:?}"),
+        Ok(ActionOutcome::Suspended(suspended)) => {
+            panic!("a script action never suspends: {suspended:?}")
+        }
         Err(error) => panic!("action failed: {error:?}"),
     }
 }
