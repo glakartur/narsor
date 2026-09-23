@@ -29,5 +29,5 @@ states:
     description: Rejected.
 
 terminal_states:
-  - completed
-  - failed
+  completed: completed
+  failed: failed

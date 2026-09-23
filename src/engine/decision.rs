@@ -197,6 +197,7 @@ mod tests {
             timeout_secs: None,
             retry_policy: None,
             terminal: false,
+            terminal_status: None,
             allow_manual_override: false,
         }
     }

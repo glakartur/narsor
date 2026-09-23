@@ -44,14 +44,16 @@
 //! the moment `ActionCompleted` is emitted, and the loop checks for it before
 //! entering a state: when one is there, the step resumes at the decision.
 //!
-//! # Terminal states: `Completed` or `Failed`
+//! # Terminal states say how they end
 //!
-//! The domain has no marker distinguishing a success terminal from a failure
-//! terminal — `WORKFLOW_SCHEMA.md` §4 just lists `completed` and `failed` under
-//! `terminal_states`. Until the schema grows one, the engine reads the state's
-//! **id**: the names in [`FAILURE_TERMINAL_STATE_IDS`], and anything starting
-//! with `fail`, end the execution as [`ExecutionStatus::Failed`]; every other
-//! terminal state completes it. See [`terminal_status`].
+//! Whether reaching a terminal means success or failure is **declared**, not
+//! guessed: `WORKFLOW_SCHEMA.md` §3.5 lets `terminal_states` be a mapping from
+//! state id to the resulting status, which the loader puts on the state as
+//! `terminal_status`. The engine only reads it — it never inspects the state's
+//! name, because a name-based guess reports a terminal called
+//! `rejected_by_reviewer` as a success. A terminal state with no declared
+//! status ends the execution as [`ExecutionStatus::Completed`]. See
+//! [`terminal_status`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -86,37 +88,22 @@ use crate::workflow::TemplateScope;
 /// and is told so by `RecvError::Lagged`; the engine itself never blocks on it.
 pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
-/// Terminal state ids that end an execution as [`ExecutionStatus::Failed`].
-///
-/// A stopgap for the missing schema marker — see the module documentation.
-pub const FAILURE_TERMINAL_STATE_IDS: &[&str] = &[
-    "failed",
-    "failure",
-    "fail",
-    "error",
-    "aborted",
-    "abort",
-    "rejected",
-    "cancelled",
-    "canceled",
-];
-
 /// Key of the engine's own scratch area inside `WorkflowExecution::metadata`.
 pub const METADATA_ENGINE_KEY: &str = "engine";
 
 /// Key of the persisted mid-step state inside the engine's scratch area.
 pub const METADATA_PENDING_STEP_KEY: &str = "pending_step";
 
-/// How an execution ends when it enters the terminal state `state_id`.
-pub fn terminal_status(state_id: &str) -> ExecutionStatus {
-    let name = state_id.to_ascii_lowercase();
-    let failed = FAILURE_TERMINAL_STATE_IDS.contains(&name.as_str()) || name.starts_with("fail");
-
-    if failed {
-        ExecutionStatus::Failed
-    } else {
-        ExecutionStatus::Completed
-    }
+/// How an execution ends when it enters the terminal state `state`.
+///
+/// The answer comes from the workflow's own declaration (`WORKFLOW_SCHEMA.md`
+/// §3.5) and from nowhere else; a terminal that declares nothing completes the
+/// execution.
+pub fn terminal_status(state: &State) -> ExecutionStatus {
+    state
+        .terminal_status
+        .map(ExecutionStatus::from)
+        .unwrap_or(ExecutionStatus::Completed)
 }
 
 /// The action types an executor can be registered for.
@@ -939,26 +926,23 @@ impl Engine {
 
     /// Ends the execution in a terminal state (`DOMAIN_MODEL.md` §4.4).
     fn finish(&self, execution: &mut WorkflowExecution, state: &State) -> Result<(), EngineError> {
-        let status = terminal_status(&state.id);
+        let status = terminal_status(state);
 
-        if status == ExecutionStatus::Completed {
-            self.emit(
-                &execution.id,
-                EventData::WorkflowCompleted {
-                    result: json!({
-                        "terminal_state": state.id,
-                        "variables": execution.context.variables,
-                    }),
-                },
-            )?;
-        } else {
-            self.emit(
-                &execution.id,
-                EventData::WorkflowFailed {
-                    error: format!("workflow ended in failure terminal state '{}'", state.id),
-                },
-            )?;
-        }
+        let ending = match status {
+            ExecutionStatus::Cancelled => EventData::WorkflowCancelled {
+                reason: format!("workflow ended in terminal state '{}'", state.id),
+            },
+            ExecutionStatus::Failed => EventData::WorkflowFailed {
+                error: format!("workflow ended in failure terminal state '{}'", state.id),
+            },
+            _ => EventData::WorkflowCompleted {
+                result: json!({
+                    "terminal_state": state.id,
+                    "variables": execution.context.variables,
+                }),
+            },
+        };
+        self.emit(&execution.id, ending)?;
 
         execution.status = status;
         execution.completed_at = Some(Utc::now());
@@ -1296,17 +1280,56 @@ fn status_name(status: &ExecutionStatus) -> &'static str {
 mod tests {
     use super::*;
 
-    #[test]
-    fn failure_terminals_are_recognised_by_name() {
-        assert_eq!(terminal_status("completed"), ExecutionStatus::Completed);
-        assert_eq!(terminal_status("done"), ExecutionStatus::Completed);
-        assert_eq!(terminal_status("merged"), ExecutionStatus::Completed);
+    use crate::domain::TerminalStatus;
 
-        assert_eq!(terminal_status("failed"), ExecutionStatus::Failed);
-        assert_eq!(terminal_status("Failed"), ExecutionStatus::Failed);
-        assert_eq!(terminal_status("failure"), ExecutionStatus::Failed);
-        assert_eq!(terminal_status("fail_validation"), ExecutionStatus::Failed);
-        assert_eq!(terminal_status("aborted"), ExecutionStatus::Failed);
+    fn terminal(id: &str, declared: Option<TerminalStatus>) -> State {
+        State {
+            id: id.to_string(),
+            description: None,
+            action: None,
+            outputs: Vec::new(),
+            transitions: HashMap::new(),
+            decision: None,
+            timeout_secs: None,
+            retry_policy: None,
+            terminal: true,
+            terminal_status: declared,
+            allow_manual_override: false,
+        }
+    }
+
+    #[test]
+    fn a_terminal_state_ends_the_execution_as_it_declares() {
+        assert_eq!(
+            terminal_status(&terminal("completed", Some(TerminalStatus::Completed))),
+            ExecutionStatus::Completed
+        );
+        assert_eq!(
+            terminal_status(&terminal("failed", Some(TerminalStatus::Failed))),
+            ExecutionStatus::Failed
+        );
+        assert_eq!(
+            terminal_status(&terminal("gave_up", Some(TerminalStatus::Cancelled))),
+            ExecutionStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn an_undeclared_terminal_completes_whatever_it_is_called() {
+        // The id is never consulted — this is exactly the guessing that was
+        // removed, and `failed` here is the deliberate consequence of it.
+        assert_eq!(
+            terminal_status(&terminal("done", None)),
+            ExecutionStatus::Completed
+        );
+        assert_eq!(
+            terminal_status(&terminal("failed", None)),
+            ExecutionStatus::Completed
+        );
+        assert_eq!(
+            terminal_status(&terminal("rejected_by_reviewer", None)),
+            ExecutionStatus::Completed
+        );
     }
 
     #[test]

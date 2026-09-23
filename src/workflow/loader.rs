@@ -6,6 +6,7 @@
 //! * `globals.timeout` and `globals.retry_policy` are propagated as per-state
 //!   defaults; a value declared on the state itself always wins,
 //! * `terminal_states` is turned into the `terminal` flag on each named state,
+//!   together with the `terminal_status` the entry declares (§3.5),
 //! * `initial_state` is the state flagged `initial: true`, or — with no such
 //!   flag — the first state in file order,
 //! * `globals.workspace` becomes a single `WorkspaceSpec` on the definition,
@@ -21,13 +22,14 @@ use std::path::{Path, PathBuf};
 use crate::domain::{
     ActionConfig, AgentActionConfig, AgentDecisionConfig, DecisionConfig, GlobalsConfig,
     HumanActionConfig, HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter,
-    OutputDefinition, ParamType, RetryPolicy, ScriptActionConfig, State, WaitActionConfig,
-    WorkflowDefinition, WorkspaceSpec,
+    OutputDefinition, ParamType, RetryPolicy, ScriptActionConfig, State, TerminalStatus,
+    WaitActionConfig, WorkflowDefinition, WorkspaceSpec,
 };
 
 use super::schema::{
     ActionSchema, DecisionSchema, GlobalsSchema, HumanInputTypeSchema, InputSchema,
-    ParamTypeSchema, RetryPolicySchema, StateSchema, WorkflowFile, WorkspaceSchema,
+    ParamTypeSchema, RetryPolicySchema, StateSchema, TerminalStatusSchema, WorkflowFile,
+    WorkspaceSchema,
 };
 
 /// Errors that can occur while loading a workflow definition from YAML.
@@ -98,10 +100,12 @@ pub fn compile(file: WorkflowFile) -> Result<WorkflowDefinition, LoadError> {
     let mut states = HashMap::with_capacity(file.states.len());
     for (id, state) in file.states {
         let terminal = file.terminal_states.contains(&id);
+        let terminal_status = file.terminal_states.status_of(&id).map(compile_terminal_status);
         let compiled = compile_state(
             id.clone(),
             state,
             terminal,
+            terminal_status,
             default_timeout_secs,
             default_retry_policy.as_ref(),
         );
@@ -165,10 +169,20 @@ fn compile_input(input: InputSchema) -> InputParameter {
     }
 }
 
+/// Maps a declared status from the YAML layer onto the domain enum.
+fn compile_terminal_status(status: TerminalStatusSchema) -> TerminalStatus {
+    match status {
+        TerminalStatusSchema::Completed => TerminalStatus::Completed,
+        TerminalStatusSchema::Failed => TerminalStatus::Failed,
+        TerminalStatusSchema::Cancelled => TerminalStatus::Cancelled,
+    }
+}
+
 fn compile_state(
     id: String,
     state: StateSchema,
     terminal: bool,
+    terminal_status: Option<TerminalStatus>,
     default_timeout_secs: Option<u64>,
     default_retry_policy: Option<&RetryPolicy>,
 ) -> State {
@@ -200,6 +214,7 @@ fn compile_state(
         timeout_secs,
         retry_policy,
         terminal,
+        terminal_status,
         allow_manual_override: state.allow_manual_override,
     }
 }

@@ -65,9 +65,9 @@ pub fn validate_file(file: WorkflowFile) -> Result<Vec<ValidationError>, LoadErr
     let mut errors = Vec::new();
     {
         let declared: HashSet<&str> = file.states.iter().map(|(id, _)| id.as_str()).collect();
-        for terminal in &file.terminal_states {
-            if !declared.contains(terminal.as_str()) {
-                errors.push(ValidationError::UnknownTerminalState(terminal.clone()));
+        for terminal in file.terminal_states.ids() {
+            if !declared.contains(terminal) {
+                errors.push(ValidationError::UnknownTerminalState(terminal.to_string()));
             }
         }
     }

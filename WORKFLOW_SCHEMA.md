@@ -58,9 +58,9 @@ states:                     # Graf stanów (wymagane)
     timeout: <duration>     # Timeout dla tego stanu (nadpisuje globalny)
     retry_policy:           # Polityka retry dla tej akcji (nadpisuje globalną)
 
-terminal_states:            # Lista stanów terminalnych (kończących workflow)
-  - <state_id_1>
-  - <state_id_2>
+terminal_states:            # Stany terminalne (kończące workflow) i ich status
+  <state_id_1>: completed   # completed | failed | cancelled
+  <state_id_2>: failed      # Forma listowa też działa — każdy wpis = completed
 ```
 
 ---
@@ -293,16 +293,30 @@ decision:
 
 ### 3.5. Terminal States (Stany Końcowe)
 
-Lista identyfikatorów stanów, których osiągnięcie kończy wykonanie workflow. Mogą to być stany sukcesu lub błędu.
+Deklaruje stany, których osiągnięcie kończy wykonanie workflow. Sekcja przyjmuje dwie formy.
+
+**Forma mapująca (zalecana).** Każdy stan terminalny wprost deklaruje status, jaki nadaje wykonaniu:
+
+```yaml
+terminal_states:
+  completed: completed
+  failed: failed
+  cancelled: cancelled
+```
+
+Dozwolone wartości to `completed`, `failed` i `cancelled` — odpowiadają one statusom `COMPLETED`, `FAILED` i `CANCELLED` encji `WorkflowExecution`. Inna wartość jest błędem wczytania; komunikat podaje nazwę stanu, błędną wartość i zbiór dozwolonych wartości.
+
+**Forma listowa (zgodność wsteczna).** Zwykła lista identyfikatorów stanów:
 
 ```yaml
 terminal_states:
   - completed
   - failed
-  - cancelled
 ```
 
-Osiągnięcie stanu z tej listy powoduje zmianę statusu `WorkflowExecution` na `COMPLETED`, `FAILED` lub `CANCELLED` w zależności od kontekstu.
+W tej formie **każdy** wpis oznacza `completed` — lista nie niesie żadnej informacji o niepowodzeniu. Silnik nie zgaduje po nazwie stanu: stan nazwany `failed` na liście również zakończy wykonanie statusem `COMPLETED`. Zgadywanie po nazwie dawało cichą, błędną odpowiedź dla stanów takich jak `rejected_by_reviewer` czy `timed_out`, dlatego zostało usunięte. Jeżeli stan terminalny ma oznaczać niepowodzenie lub anulowanie, użyj formy mapującej.
+
+Identyfikatory wymienione w `terminal_states` muszą odpowiadać istniejącym stanom (§5.1) — w obu formach.
 
 ---
 
@@ -446,8 +460,8 @@ states:
     # Brak akcji, stan terminalny
 
 terminal_states:
-  - completed
-  - failed
+  completed: completed
+  failed: failed
 ```
 
 ---

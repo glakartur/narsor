@@ -190,6 +190,48 @@ async fn a_failure_terminal_fails_the_execution() {
 }
 
 #[tokio::test]
+async fn a_terminal_declared_cancelled_cancels_the_execution() {
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let definition = workflow("cancelled_terminal");
+
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+
+    assert_eq!(execution.status, ExecutionStatus::Cancelled);
+    assert_eq!(
+        execution.current_state.as_deref(),
+        Some("rejected_by_reviewer")
+    );
+
+    let types = harness.event_types(&execution.id);
+    assert_eq!(types.last().map(String::as_str), Some("workflow_cancelled"));
+}
+
+#[tokio::test]
+async fn the_list_form_of_terminal_states_completes_even_a_state_called_failed() {
+    // The deliberate consequence of replacing the name heuristic with an
+    // explicit declaration: the list form declares nothing, so every terminal
+    // it names completes the execution.
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let definition = workflow("listed_terminals");
+
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(execution.current_state.as_deref(), Some("failed"));
+
+    let types = harness.event_types(&execution.id);
+    assert_eq!(types.last().map(String::as_str), Some("workflow_completed"));
+}
+
+#[tokio::test]
 async fn a_single_terminal_state_finishes_immediately() {
     let harness = Harness::new();
     let engine = harness.engine();

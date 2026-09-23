@@ -1,0 +1,29 @@
+name: ends-in-cancellation
+version: 1
+description: >
+  A script that reports the label leading to a terminal declared `cancelled`.
+  Its name says nothing about the outcome — only the declaration does.
+
+states:
+  check:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "rejected", "variables": {"reason": "reviewer said no"}}'
+    outputs:
+      - ok
+      - rejected
+    transitions:
+      ok: completed
+      rejected: rejected_by_reviewer
+
+  completed:
+    description: All good.
+
+  rejected_by_reviewer:
+    description: The reviewer turned it down.
+
+terminal_states:
+  completed: completed
+  rejected_by_reviewer: cancelled

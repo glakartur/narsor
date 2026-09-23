@@ -189,6 +189,45 @@ fn terminal_states_naming_an_unknown_state_is_rejected() {
 }
 
 #[test]
+fn the_mapping_form_of_terminal_states_is_checked_for_unknown_states_too() {
+    // The loader turns `terminal_states` into a flag on the named state, so an
+    // entry naming a state that does not exist disappears during compilation.
+    // The YAML entry points exist precisely to keep this rule alive — and they
+    // must see the mapping form as well as the list form.
+    let yaml = r#"
+name: unknown-mapped-terminal
+version: 1
+
+states:
+  start:
+    action:
+      type: script
+      command: ./run.sh
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  done:
+    description: Koniec.
+
+terminal_states:
+  done: completed
+  cancelled: cancelled
+"#;
+
+    let errors = orchestrator::workflow::validate_source(yaml).expect("the file must compile");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::UnknownTerminalState(state) if state == "cancelled"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
 fn initial_state_that_does_not_exist_is_rejected() {
     // The loader always derives `initial_state` from the file, so this rule is
     // only reachable for a definition built in code.
@@ -205,6 +244,7 @@ fn initial_state_that_does_not_exist_is_rejected() {
             timeout_secs: None,
             retry_policy: None,
             terminal: true,
+            terminal_status: None,
             allow_manual_override: false,
         },
     );

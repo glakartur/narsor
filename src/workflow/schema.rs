@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use serde::de::{self, MapAccess, Visitor};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 /// The whole workflow file (`WORKFLOW_SCHEMA.md` §2).
@@ -44,9 +44,132 @@ pub struct WorkflowFile {
     #[serde(deserialize_with = "deserialize_ordered_states")]
     pub states: Vec<(String, StateSchema)>,
 
-    /// States whose entry ends the execution.
+    /// States whose entry ends the execution, with the status each one
+    /// produces. Accepts both forms of §3.5 — see [`TerminalStatesSchema`].
     #[serde(default)]
-    pub terminal_states: Vec<String>,
+    pub terminal_states: TerminalStatesSchema,
+}
+
+/// The `terminal_states` section (§3.5), in either of its two forms.
+///
+/// The contract accepts a plain list of state ids and a mapping from state id
+/// to the resulting execution status:
+///
+/// ```yaml
+/// terminal_states:          # mapping form — explicit
+///   completed: completed
+///   failed: failed
+///
+/// terminal_states:          # list form — every entry means `completed`
+///   - completed
+///   - failed
+/// ```
+///
+/// Both compile to the same shape: an ordered list of pairs, where the list
+/// form leaves the status undeclared. Order is preserved so that error reports
+/// follow the file.
+#[derive(Debug, Clone, Default)]
+pub struct TerminalStatesSchema {
+    entries: Vec<(String, Option<TerminalStatusSchema>)>,
+}
+
+impl TerminalStatesSchema {
+    /// Builds the section from already-parsed entries.
+    pub fn new(entries: Vec<(String, Option<TerminalStatusSchema>)>) -> Self {
+        Self { entries }
+    }
+
+    /// The declared state ids, in file order.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|(id, _)| id.as_str())
+    }
+
+    /// Whether `id` is declared terminal.
+    pub fn contains(&self, id: &str) -> bool {
+        self.entries.iter().any(|(entry, _)| entry == id)
+    }
+
+    /// The status declared for `id`, if the mapping form was used.
+    pub fn status_of(&self, id: &str) -> Option<TerminalStatusSchema> {
+        self.entries
+            .iter()
+            .find(|(entry, _)| entry == id)
+            .and_then(|(_, status)| *status)
+    }
+}
+
+/// The status a terminal state produces, as written in the YAML contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalStatusSchema {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// The values `terminal_states` accepts, for error messages.
+pub const TERMINAL_STATUS_VALUES: &[&str] = &["completed", "failed", "cancelled"];
+
+impl TerminalStatusSchema {
+    /// Parses one declared status value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TerminalStatesSchema {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct TerminalStatesVisitor;
+
+        impl<'de> Visitor<'de> for TerminalStatesVisitor {
+            type Value = TerminalStatesSchema;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str(
+                    "a list of terminal state ids, or a mapping from state id to one of: completed, failed, cancelled",
+                )
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                // The list form declares no status: every entry is a plain
+                // terminal, which the engine ends as `completed`.
+                let mut entries = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(id) = seq.next_element::<String>()? {
+                    entries.push((id, None));
+                }
+                Ok(TerminalStatesSchema::new(entries))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((id, value)) = map.next_entry::<String, String>()? {
+                    let status = TerminalStatusSchema::parse(value.trim()).ok_or_else(|| {
+                        de::Error::custom(format!(
+                            "terminal state '{id}' declares unknown status '{value}'; permitted values are {}",
+                            TERMINAL_STATUS_VALUES.join(", ")
+                        ))
+                    })?;
+                    entries.push((id, Some(status)));
+                }
+                Ok(TerminalStatesSchema::new(entries))
+            }
+        }
+
+        deserializer.deserialize_any(TerminalStatesVisitor)
+    }
 }
 
 /// One entry of the `inputs` list (§3.1).
