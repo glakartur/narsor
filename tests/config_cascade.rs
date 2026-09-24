@@ -317,3 +317,38 @@ fn pathdiff_from_cwd(target: &Path) -> PathBuf {
     }
     relative
 }
+
+#[test]
+fn a_config_map_symlink_chain_is_reported_by_the_path_that_was_mounted() {
+    // A ConfigMap mounts config.yaml -> ..data/config.yaml -> ..2026_.../config.yaml,
+    // and replaces the snapshot directory on every update. Reporting the
+    // snapshot would name a path that is real for a few seconds and is not the
+    // one the operator mounted (R8).
+    let root = TempRoot::new();
+    let system = root.system_dir();
+    let snapshot = system.join("..2026_09_24_10_00_00.1234");
+    fs::create_dir_all(&snapshot).expect("create the snapshot directory");
+    fs::write(snapshot.join("config.yaml"), "log_level: info\n").expect("write the file");
+    std::os::unix::fs::symlink(&snapshot, system.join("..data")).expect("link ..data");
+    std::os::unix::fs::symlink(
+        Path::new("..data").join("config.yaml"),
+        system.join("config.yaml"),
+    )
+    .expect("link config.yaml");
+
+    let resolution = ConfigCascade::with_dirs(None, None, Some(system.clone()))
+        .resolve()
+        .expect("resolve");
+
+    let path = resolution.path().expect("a winner");
+    assert_eq!(
+        path,
+        system.join("config.yaml"),
+        "the mounted path, not the snapshot it currently points at"
+    );
+    assert!(
+        !path.to_string_lossy().contains("..2026_"),
+        "the snapshot directory is replaced on the next update: {}",
+        path.display()
+    );
+}

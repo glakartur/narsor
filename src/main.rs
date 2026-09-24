@@ -145,11 +145,16 @@ fn init_tracing(cli: &Cli, resolved: &Resolved) -> anyhow::Result<()> {
 /// The filter for the resolved directive.
 ///
 /// The directive is either a bare level from the settings or whatever
-/// `RUST_LOG` held, which may name targets. A directive that does not parse
-/// falls back to no filtering at all rather than stopping the command — the
-/// logs are never worth more than the run.
+/// `RUST_LOG` held, which may name targets.
+///
+/// Parsed *lossily*, which is what `EnvFilter::from_default_env` did before
+/// the configuration layer existed: `RUST_LOG="info,narsor=nonsense"` keeps
+/// the `info` that parsed and complains on stderr about the part that did not.
+/// Refusing the whole directive would silence a run that asked to be noisy,
+/// over a typo, with nothing said — and the logs are never worth more than
+/// the run.
 fn filter(directive: &str) -> EnvFilter {
-    EnvFilter::try_new(directive).unwrap_or_else(|_| EnvFilter::new("off"))
+    EnvFilter::builder().parse_lossy(directive)
 }
 
 /// Opens `{data_dir}/narsor.log` for appending, creating the directory if

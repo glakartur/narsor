@@ -14,6 +14,31 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Whether this machine has a real system-wide configuration file.
+///
+/// The third step of the cascade is `/etc/narsor/`, which a test cannot
+/// redirect through the environment the way it redirects `HOME` and
+/// `XDG_CONFIG_HOME`. A machine that has one — and this feature exists to
+/// encourage exactly that — would feed it into every assertion below. Skipping
+/// with a word is better than failing with a mystery.
+fn system_config_present() -> bool {
+    ["yaml", "yml"].iter().any(|extension| {
+        Path::new("/etc/narsor")
+            .join(format!("config.{extension}"))
+            .exists()
+    })
+}
+
+/// Leaves the test early, saying why, when the machine has one.
+macro_rules! needs_no_system_config {
+    () => {
+        if system_config_present() {
+            eprintln!("skipped: this machine has /etc/narsor/config.yaml, which the cascade finds");
+            return;
+        }
+    };
+}
+
 /// The exit code of a successful command.
 const EXIT_SUCCESS: i32 = 0;
 
@@ -134,6 +159,7 @@ fn source_repository(root: &TempRoot) -> String {
 
 #[test]
 fn a_broken_file_stops_every_subcommand_with_the_file_named() {
+    needs_no_system_config!();
     // AE3.
     let root = TempRoot::new();
     let config = root.config("lgo_level: info\n");
@@ -169,6 +195,7 @@ fn a_broken_file_stops_every_subcommand_with_the_file_named() {
 
 #[test]
 fn a_broken_file_reports_every_fault_at_once() {
+    needs_no_system_config!();
     let root = TempRoot::new();
     root.config("nonsense: 1\nlog_level: shouting\n");
 
@@ -189,6 +216,7 @@ fn a_broken_file_reports_every_fault_at_once() {
 
 #[test]
 fn a_config_path_that_is_not_there_is_a_usage_error() {
+    needs_no_system_config!();
     let root = TempRoot::new();
     let missing = root.path().join("nope.yaml");
 
@@ -208,6 +236,7 @@ fn a_config_path_that_is_not_there_is_a_usage_error() {
 
 #[test]
 fn the_config_flag_works_after_the_subcommand_too() {
+    needs_no_system_config!();
     let root = TempRoot::new();
     let elsewhere = root.path().join("mine.yaml");
     fs::write(&elsewhere, "log_level: warn\n").expect("write the file");
@@ -223,6 +252,7 @@ fn the_config_flag_works_after_the_subcommand_too() {
 
 #[test]
 fn a_good_file_does_not_disturb_anything() {
+    needs_no_system_config!();
     let root = TempRoot::new();
     root.config("log_level: off\nagent_harness: opencode\n");
 
@@ -234,6 +264,7 @@ fn a_good_file_does_not_disturb_anything() {
 
 #[test]
 fn the_data_directory_from_the_file_is_the_one_the_command_works_in() {
+    needs_no_system_config!();
     let root = TempRoot::new();
     let store = root.path().join("from-the-file");
     root.config(&format!("data_dir: {}\n", store.display()));
@@ -264,6 +295,7 @@ fn the_data_directory_from_the_file_is_the_one_the_command_works_in() {
 
 #[test]
 fn the_flag_still_beats_the_file_for_the_data_directory() {
+    needs_no_system_config!();
     // AE1, through the binary.
     let root = TempRoot::new();
     root.config(&format!(
@@ -294,6 +326,7 @@ fn the_flag_still_beats_the_file_for_the_data_directory() {
 
 #[test]
 fn nothing_configured_means_not_one_line_of_log() {
+    needs_no_system_config!();
     // D-N: exactly today's behaviour, and the startup order did not change it.
     let root = TempRoot::new();
 
@@ -320,6 +353,7 @@ fn nothing_configured_means_not_one_line_of_log() {
 
 #[test]
 fn a_level_in_the_file_changes_what_reaches_stderr() {
+    needs_no_system_config!();
     let root = TempRoot::new();
     root.config("log_level: debug\n");
 
@@ -350,6 +384,7 @@ fn a_level_in_the_file_changes_what_reaches_stderr() {
 
 #[test]
 fn rust_log_still_overrides_the_configured_level() {
+    needs_no_system_config!();
     // D-K, through the binary: the file says be quiet, RUST_LOG says talk.
     let root = TempRoot::new();
     root.config("log_level: off\n");
@@ -373,6 +408,7 @@ fn rust_log_still_overrides_the_configured_level() {
 
 #[test]
 fn the_tui_log_file_lands_in_the_resolved_data_directory() {
+    needs_no_system_config!();
     // The interface cannot be driven from a test, but the file it would write
     // into is opened before the terminal is touched — so the failure to start
     // still leaves the log behind, in the directory the configuration named.
@@ -398,6 +434,7 @@ fn the_tui_log_file_lands_in_the_resolved_data_directory() {
 
 #[test]
 fn an_unconfigured_tui_creates_neither_the_directory_nor_the_log() {
+    needs_no_system_config!();
     // D-N: today a `tui` run with nothing configured leaves no trace, and it
     // still must not.
     let root = TempRoot::new();
@@ -408,5 +445,34 @@ fn an_unconfigured_tui_creates_neither_the_directory_nor_the_log() {
     assert!(
         !root.path().join(".narsor").exists(),
         "no data directory may be created just to run the interface"
+    );
+}
+
+#[test]
+fn a_partly_invalid_rust_log_keeps_the_part_that_parsed() {
+    needs_no_system_config!();
+    // What EnvFilter::from_default_env did before the configuration layer
+    // existed. Refusing the whole directive would silence a run that asked to
+    // be noisy, over a typo, with nothing said.
+    let root = TempRoot::new();
+
+    let invocation = cli(
+        &root,
+        &[("RUST_LOG", "debug,narsor=nonsense=broken")],
+        &[
+            "run",
+            &clone_workflow(),
+            "--input",
+            &format!("repository={}", source_repository(&root)),
+            "--input",
+            &format!("script_path={}", announce_script()),
+        ],
+    );
+
+    assert_eq!(invocation.code, EXIT_SUCCESS, "{}", invocation.stderr);
+    assert!(
+        invocation.stderr.contains("DEBUG"),
+        "the directive that parsed still applies: {}",
+        invocation.stderr
     );
 }

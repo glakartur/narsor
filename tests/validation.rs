@@ -545,3 +545,45 @@ terminal_states:
         "'harnes' is not a field of an agent action"
     );
 }
+
+/// A harness that is present but blank is still refused.
+///
+/// Absent means "use the configured default"; empty means the author wrote
+/// something and it came to nothing. Catching it here costs nothing, where
+/// catching it at run time costs a cloned workspace and every state that ran
+/// before it.
+#[test]
+fn a_blank_harness_is_still_a_violation() {
+    for written in ["\"\"", "\"   \""] {
+        let yaml = format!(
+            r#"
+name: blank
+version: 1
+states:
+  think:
+    action:
+      type: agent
+      harness: {written}
+      prompt: Do the thing.
+    outputs:
+      - done
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states:
+  - completed
+"#
+        );
+
+        let errors = narsor::workflow::validate_source(&yaml).expect("the file must compile");
+
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                ValidationError::MissingActionField { field, .. } if *field == "harness"
+            )),
+            "harness: {written} must be reported: {errors:?}"
+        );
+    }
+}

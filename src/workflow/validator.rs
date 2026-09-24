@@ -267,10 +267,22 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
     // looking at while reading the message.
     match action {
         ActionConfig::Agent(agent) => {
-            // No check that `harness` is present: every setting has a value
-            // built into the binary, so "no harness anywhere" cannot happen
-            // and there is nothing to report (D-F). Validation stays static,
-            // and an exported workflow stays portable.
+            // An *absent* harness is fine: every setting has a value built
+            // into the binary, so "no harness anywhere" cannot happen, and
+            // that is what keeps an exported workflow portable (D-F).
+            //
+            // A harness that is present but blank is still a mistake, and
+            // still one this can catch: `Some("")` is not `None`, so it would
+            // otherwise reach the registry at run time — after the workspace
+            // has been cloned and earlier states have run — instead of failing
+            // here, for free, the way it used to.
+            if agent
+                .harness
+                .as_deref()
+                .is_some_and(|harness| harness.trim().is_empty())
+            {
+                errors.push(missing_field(state, "agent", "harness"));
+            }
             if agent.prompt.trim().is_empty() {
                 errors.push(missing_field(state, "agent", "prompt"));
             }

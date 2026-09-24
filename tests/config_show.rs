@@ -10,6 +10,31 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Whether this machine has a real system-wide configuration file.
+///
+/// The third step of the cascade is `/etc/narsor/`, which a test cannot
+/// redirect through the environment the way it redirects `HOME` and
+/// `XDG_CONFIG_HOME`. A machine that has one — and this feature exists to
+/// encourage exactly that — would feed it into every assertion below. Skipping
+/// with a word is better than failing with a mystery.
+fn system_config_present() -> bool {
+    ["yaml", "yml"].iter().any(|extension| {
+        Path::new("/etc/narsor")
+            .join(format!("config.{extension}"))
+            .exists()
+    })
+}
+
+/// Leaves the test early, saying why, when the machine has one.
+macro_rules! needs_no_system_config {
+    () => {
+        if system_config_present() {
+            eprintln!("skipped: this machine has /etc/narsor/config.yaml, which the cascade finds");
+            return;
+        }
+    };
+}
+
 /// The exit code of a successful command.
 const EXIT_SUCCESS: i32 = 0;
 
@@ -92,6 +117,7 @@ fn json(invocation: &Invocation) -> serde_json::Value {
 
 #[test]
 fn every_setting_is_listed_even_the_ones_nobody_touched() {
+    needs_no_system_config!();
     // R7: the question is "what is in force", not "what did I change".
     let root = TempRoot::new();
 
@@ -115,6 +141,7 @@ fn every_setting_is_listed_even_the_ones_nobody_touched() {
 
 #[test]
 fn a_flag_shows_as_the_flag_even_when_the_file_names_the_same_setting() {
+    needs_no_system_config!();
     // AE1.
     let root = TempRoot::new();
     root.config("data_dir: /from/the/file\n");
@@ -130,6 +157,7 @@ fn a_flag_shows_as_the_flag_even_when_the_file_names_the_same_setting() {
 
 #[test]
 fn a_value_from_the_file_shows_the_path_and_one_from_the_environment_the_variable() {
+    needs_no_system_config!();
     // R8: the concrete thing, never the category.
     let root = TempRoot::new();
     let config = root.config("data_dir: /from/the/file\n");
@@ -152,6 +180,7 @@ fn a_value_from_the_file_shows_the_path_and_one_from_the_environment_the_variabl
 
 #[test]
 fn a_shadowed_candidate_is_named_beside_the_winner() {
+    needs_no_system_config!();
     // AE5: the operator has to be able to see that the file feeding this run
     // is not the one they edited.
     let root = TempRoot::new();
@@ -180,6 +209,7 @@ fn a_shadowed_candidate_is_named_beside_the_winner() {
 
 #[test]
 fn the_json_form_carries_a_structured_source_and_a_version() {
+    needs_no_system_config!();
     // R10 and D-O: nothing downstream should have to parse "file (/etc/…)",
     // and a later change of shape should be recognisable.
     let root = TempRoot::new();
@@ -207,6 +237,7 @@ fn the_json_form_carries_a_structured_source_and_a_version() {
 
 #[test]
 fn it_works_without_a_home_and_without_the_data_directory_existing() {
+    needs_no_system_config!();
     // R9: no writable home, no writable filesystem, nothing created.
     let root = TempRoot::new();
     let absent = root.path().join("not-there");
@@ -234,6 +265,7 @@ fn it_works_without_a_home_and_without_the_data_directory_existing() {
 
 #[test]
 fn an_empty_file_is_reported_as_the_winner_with_every_value_built_in() {
+    needs_no_system_config!();
     // D-H: it looks contradictory and it is correct — the file is in force and
     // it sets nothing.
     let root = TempRoot::new();
@@ -255,6 +287,7 @@ fn an_empty_file_is_reported_as_the_winner_with_every_value_built_in() {
 
 #[test]
 fn a_broken_key_is_marked_while_the_rest_of_the_table_still_prints() {
+    needs_no_system_config!();
     // D-D: the one command that survives what it exists to diagnose.
     let root = TempRoot::new();
     let config = root.config("data_dir: /from/the/file\nagent_timeout: tomorrow\n");
@@ -285,6 +318,7 @@ fn a_broken_key_is_marked_while_the_rest_of_the_table_still_prints() {
 
 #[test]
 fn an_unknown_key_is_reported_while_list_in_the_same_directory_refuses_outright() {
+    needs_no_system_config!();
     // AE3, and the contrast that makes D-D worth having.
     let root = TempRoot::new();
     root.config("lgo_level: info\n");
@@ -321,6 +355,7 @@ fn an_unknown_key_is_reported_while_list_in_the_same_directory_refuses_outright(
 
 #[test]
 fn two_broken_keys_are_both_marked() {
+    needs_no_system_config!();
     let root = TempRoot::new();
     root.config("agent_timeout: tomorrow\nlog_level: shouting\n");
 
@@ -337,6 +372,7 @@ fn two_broken_keys_are_both_marked() {
 
 #[test]
 fn the_json_form_stays_valid_json_when_the_file_is_broken() {
+    needs_no_system_config!();
     // D-D applies to both formats identically.
     let root = TempRoot::new();
     root.config("lgo_level: info\nagent_timeout: tomorrow\n");
@@ -361,6 +397,7 @@ fn the_json_form_stays_valid_json_when_the_file_is_broken() {
 
 #[test]
 fn a_directory_under_the_candidate_path_still_prints_a_table() {
+    needs_no_system_config!();
     // D-G through the command: the failure a ConfigMap produces is exactly the
     // one an operator reaches for this tool to understand.
     let root = TempRoot::new();
@@ -386,6 +423,7 @@ fn a_directory_under_the_candidate_path_still_prints_a_table() {
 
 #[test]
 fn a_config_path_that_is_not_there_is_a_usage_error_with_no_table() {
+    needs_no_system_config!();
     // The exception to the exception: the operator named a file that does not
     // exist, and there is nothing to diagnose.
     let root = TempRoot::new();
@@ -404,6 +442,7 @@ fn a_config_path_that_is_not_there_is_a_usage_error_with_no_table() {
 
 #[test]
 fn the_json_on_stdout_is_not_polluted_by_logging() {
+    needs_no_system_config!();
     // The two-stream rule, under the condition that breaks it most easily.
     let root = TempRoot::new();
     root.config("log_level: info\n");
@@ -434,6 +473,7 @@ fn data_dir_row(output: &str) -> &str {
 
 #[test]
 fn a_bad_value_in_the_environment_marks_its_row_too() {
+    needs_no_system_config!();
     // The same treatment a bad value in the file gets: an operator should not
     // have to know which layer produced a fault to find the row it belongs to.
     let root = TempRoot::new();
@@ -447,5 +487,95 @@ fn a_bad_value_in_the_environment_marks_its_row_too() {
         invocation.stdout.contains("NARSOR_AGENT_TIMEOUT"),
         "and the variable is named: {}",
         invocation.stdout
+    );
+}
+
+#[test]
+fn a_long_path_is_printed_whole_rather_than_clipped_to_the_column() {
+    needs_no_system_config!();
+    // The one question this command answers is "what is in force"; a path cut
+    // at the column width is a wrong answer to it (R8).
+    let root = TempRoot::new();
+    let long = "/srv/a/deliberately/long/path/to/the/narsor/data/directory";
+
+    let invocation = show(&root, &[], &["--root", long]);
+
+    assert_eq!(invocation.code, EXIT_SUCCESS, "{}", invocation.stderr);
+    assert!(
+        invocation.stdout.contains(long),
+        "the whole path must be there: {}",
+        invocation.stdout
+    );
+    assert!(
+        !invocation.stdout.contains('…'),
+        "and nothing may be elided: {}",
+        invocation.stdout
+    );
+}
+
+#[test]
+fn a_fault_in_a_layer_that_lost_does_not_mask_the_value_in_force() {
+    needs_no_system_config!();
+    // R2 is per setting and per layer: a bad harness in the file is still a
+    // fault worth reporting, but the environment outranked it, so the row has
+    // to show what will actually run.
+    let root = TempRoot::new();
+    root.config("agent_harness: bogus\n");
+
+    let invocation = show(&root, &[("NARSOR_AGENT_HARNESS", "opencode")], &[]);
+
+    assert_eq!(invocation.code, EXIT_FAILURE, "the fault is still reported");
+    let row = row_for(&invocation.stdout, "agent_harness");
+    assert!(
+        row.contains("opencode") && row.contains("NARSOR_AGENT_HARNESS"),
+        "the row shows the value in force and where it came from: {row}"
+    );
+    assert!(
+        !row.contains("(error)"),
+        "nothing was lost to the fault, so nothing is masked: {row}"
+    );
+    assert!(
+        invocation.stdout.contains("bogus"),
+        "and the complaint is still printed: {}",
+        invocation.stdout
+    );
+}
+
+#[test]
+fn a_fault_that_cost_the_value_does_mask_the_row() {
+    needs_no_system_config!();
+    // The other half: with nothing to outrank it, the fault is why the
+    // built-in is in force, and the row says so.
+    let root = TempRoot::new();
+    root.config("agent_harness: bogus\n");
+
+    let invocation = show(&root, &[], &[]);
+
+    assert_eq!(invocation.code, EXIT_FAILURE);
+    let row = row_for(&invocation.stdout, "agent_harness");
+    assert!(row.contains("(error)"), "{row}");
+}
+
+#[test]
+fn the_closing_message_does_not_promise_a_marker_that_is_not_there() {
+    needs_no_system_config!();
+    // A cascade failure marks no row at all; sending the operator hunting for
+    // one is worse than saying nothing.
+    let root = TempRoot::new();
+    fs::create_dir_all(root.path().join("config/narsor/config.yaml"))
+        .expect("mount a directory over the file path");
+
+    let invocation = show(&root, &[], &[]);
+
+    assert_eq!(invocation.code, EXIT_FAILURE);
+    assert!(
+        !invocation.stdout.contains("(error)"),
+        "no row is marked here: {}",
+        invocation.stdout
+    );
+    assert!(
+        !invocation.stderr.contains("marked"),
+        "so the message must not point at a marker: {}",
+        invocation.stderr
     );
 }

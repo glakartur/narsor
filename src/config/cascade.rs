@@ -30,7 +30,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use crate::workflows::{absolute, user_config_dir};
+use crate::workflows::user_config_dir;
 
 /// The directory a system-wide configuration file is read from.
 ///
@@ -252,7 +252,7 @@ impl ConfigCascade {
                         None => {
                             winner = Some(Candidate {
                                 kind: candidate.kind,
-                                path: absolute(&candidate.path),
+                                path: absolutize(&candidate.path),
                             })
                         }
                         Some(_) => shadowed.push(candidate),
@@ -273,6 +273,19 @@ enum Presence {
     Readable,
     /// Something is there and cannot be read, with the reason.
     Broken(CascadeError),
+}
+
+/// The path made absolute, without following symbolic links.
+///
+/// Deliberately not `canonicalize`, which
+/// [`WorkflowOrigin::File`](crate::workflows::WorkflowOrigin) uses: a
+/// ConfigMap mounts `/etc/narsor/config.yaml` as a link to `..data/…`, itself
+/// a link to a timestamped snapshot directory that is replaced on the next
+/// update. Resolving that chain would report a path which is real for a few
+/// seconds and is not the one the operator mounted or would edit — the
+/// opposite of what naming the source is for (R8).
+fn absolutize(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Whether anything is there at all, without asking whether it can be read.
