@@ -57,13 +57,14 @@ pub const EXIT_USAGE: i32 = 2;
 )]
 pub struct Cli {
     /// Narsor data directory (executions and workspaces).
-    #[arg(
-        long,
-        global = true,
-        value_name = "DIRECTORY",
-        default_value = DEFAULT_ROOT
-    )]
-    pub root: PathBuf,
+    ///
+    /// Deliberately without a clap `default_value`: with one, an unset flag and
+    /// a flag set to the default value are indistinguishable, and answering
+    /// "where did this value come from" (R8) needs them told apart. The
+    /// built-in value lives in the settings registry instead
+    /// ([`crate::config::SettingKey::built_in`]).
+    #[arg(long, global = true, value_name = "DIRECTORY")]
+    pub root: Option<PathBuf>,
 
     /// The subcommand to run.
     #[command(subcommand)]
@@ -248,29 +249,33 @@ pub enum RepoCommand {
 /// Nothing here panics on an operator mistake: every failure becomes a message
 /// on stderr plus one of the three documented codes.
 pub async fn run(cli: Cli) -> i32 {
+    let root = cli
+        .root
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
     let outcome = match cli.command {
-        Command::Validate { workflow } => commands::validate(&cli.root, &workflow),
-        Command::Run { workflow, inputs } => commands::run(&cli.root, &workflow, &inputs).await,
-        Command::List => commands::list(&cli.root),
-        Command::Show { execution_id } => commands::show(&cli.root, &execution_id),
+        Command::Validate { workflow } => commands::validate(&root, &workflow),
+        Command::Run { workflow, inputs } => commands::run(&root, &workflow, &inputs).await,
+        Command::List => commands::list(&root),
+        Command::Show { execution_id } => commands::show(&root, &execution_id),
         Command::Events {
             execution_id,
             follow,
-        } => commands::events(&cli.root, &execution_id, follow).await,
+        } => commands::events(&root, &execution_id, follow).await,
         Command::Input {
             execution_id,
             fields,
             label,
             file,
-        } => commands::input(&cli.root, &execution_id, &fields, label, file.as_deref()).await,
+        } => commands::input(&root, &execution_id, &fields, label, file.as_deref()).await,
         Command::Resume { execution_id, file } => {
-            commands::resume(&cli.root, &execution_id, file.as_deref()).await
+            commands::resume(&root, &execution_id, file.as_deref()).await
         }
         Command::Workflow { command } => match command {
-            WorkflowCommand::List => commands::workflow_list(&cli.root),
-            WorkflowCommand::Show { workflow } => commands::workflow_show(&cli.root, &workflow),
+            WorkflowCommand::List => commands::workflow_list(&root),
+            WorkflowCommand::Show { workflow } => commands::workflow_show(&root, &workflow),
             WorkflowCommand::Eject { name, to, force } => {
-                commands::workflow_eject(&cli.root, &name, to.as_deref(), force)
+                commands::workflow_eject(&root, &name, to.as_deref(), force)
             }
         },
         Command::Repo { command } => match command {
@@ -282,7 +287,7 @@ pub async fn run(cli: Cli) -> i32 {
                 default_branch,
                 description,
             } => commands::repo_add(
-                &cli.root,
+                &root,
                 &id,
                 &remote,
                 name,
@@ -290,11 +295,11 @@ pub async fn run(cli: Cli) -> i32 {
                 default_branch,
                 description,
             ),
-            RepoCommand::List => commands::repo_list(&cli.root),
-            RepoCommand::Show { id } => commands::repo_show(&cli.root, &id),
-            RepoCommand::Remove { id } => commands::repo_remove(&cli.root, &id),
+            RepoCommand::List => commands::repo_list(&root),
+            RepoCommand::Show { id } => commands::repo_show(&root, &id),
+            RepoCommand::Remove { id } => commands::repo_remove(&root, &id),
         },
-        Command::Tui => commands::tui(&cli.root),
+        Command::Tui => commands::tui(&root),
     };
 
     match outcome {

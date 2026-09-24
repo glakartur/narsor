@@ -46,7 +46,11 @@ fn init_tracing(cli: &Cli) -> anyhow::Result<()> {
         if !filter_is_configured() {
             return Ok(());
         }
-        let Some(file) = open_log_file(&cli.root) else {
+        let root = cli
+            .root
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(narsor::persistence::DEFAULT_ROOT));
+        let Some(file) = open_log_file(&root) else {
             // The directory is not writable. The interface still runs; the
             // logs are the thing given up, never the screen.
             return Ok(());
