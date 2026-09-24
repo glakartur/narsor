@@ -36,7 +36,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::persistence::DEFAULT_ROOT;
+use crate::config::Resolved;
 
 /// The command did what it was asked.
 pub const EXIT_SUCCESS: i32 = 0;
@@ -65,6 +65,14 @@ pub struct Cli {
     /// ([`crate::config::SettingKey::built_in`]).
     #[arg(long, global = true, value_name = "DIRECTORY")]
     pub root: Option<PathBuf>,
+
+    /// Configuration file to read instead of searching for one.
+    ///
+    /// Global, like `--root`, so that it also works after the subcommand. A
+    /// path that is not there is a usage error rather than a fall-through to
+    /// the next step of the cascade: the operator named this file.
+    #[arg(long, global = true, value_name = "FILE")]
+    pub config: Option<PathBuf>,
 
     /// The subcommand to run.
     #[command(subcommand)]
@@ -248,11 +256,10 @@ pub enum RepoCommand {
 ///
 /// Nothing here panics on an operator mistake: every failure becomes a message
 /// on stderr plus one of the three documented codes.
-pub async fn run(cli: Cli) -> i32 {
-    let root = cli
-        .root
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
+pub async fn run(cli: Cli, config: Resolved) -> i32 {
+    // The resolved value, never the raw flag: the data directory is a setting
+    // now, and a file or an environment variable may be the thing that set it.
+    let root = config.data_dir().to_path_buf();
     let outcome = match cli.command {
         Command::Validate { workflow } => commands::validate(&root, &workflow),
         Command::Run { workflow, inputs } => commands::run(&root, &workflow, &inputs).await,

@@ -317,9 +317,29 @@ fn known_keys() -> Vec<String> {
 /// The `Err` is the sentence that goes after "key 'x': ", so it names what was
 /// expected rather than only what was found.
 fn value_of(setting: SettingKey, raw: &serde_yaml::Value) -> Result<SettingValue, String> {
+    // The shapes YAML offers that text does not: an explicit null and a bare
+    // integer, both of which a duration accepts.
+    if setting == SettingKey::AgentTimeout {
+        if raw.is_null() {
+            return Ok(SettingValue::Duration(None));
+        }
+        if let Some(seconds) = raw.as_u64() {
+            return Ok(SettingValue::Duration(Some(seconds)));
+        }
+    }
+
+    value_from_text(setting, &text_of(raw)?)
+}
+
+/// Validates one value written as text.
+///
+/// Shared with [`super::resolve`], so that a setting given in the environment
+/// is held to exactly the same contract as the same setting given in the file
+/// — R6 asks for the two to be interchangeable, and they are only
+/// interchangeable if they are validated alike.
+pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, String> {
     match setting {
         SettingKey::DataDir => {
-            let text = text_of(raw)?;
             if text.trim().is_empty() {
                 return Err("a directory path was expected, but the value is empty".to_string());
             }
@@ -327,14 +347,13 @@ fn value_of(setting: SettingKey, raw: &serde_yaml::Value) -> Result<SettingValue
         }
 
         SettingKey::AgentHarness => {
-            let text = text_of(raw)?;
             let supported = HarnessRegistry::defaults()
                 .supported()
                 .into_iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
-            if supported.iter().any(|name| name == &text) {
-                Ok(SettingValue::Text(text))
+            if supported.iter().any(|name| name == text) {
+                Ok(SettingValue::Text(text.to_string()))
             } else {
                 Err(format!(
                     "unknown agent harness '{text}'; supported harnesses are: {}",
@@ -344,25 +363,17 @@ fn value_of(setting: SettingKey, raw: &serde_yaml::Value) -> Result<SettingValue
         }
 
         SettingKey::AgentTimeout => {
-            // Null and the spelled-out word both mean "no limit", so a value
-            // inherited from /etc/narsor/ can be revoked and not only replaced.
-            if raw.is_null() {
-                return Ok(SettingValue::Duration(None));
-            }
-            if let Some(seconds) = raw.as_u64() {
-                return Ok(SettingValue::Duration(Some(seconds)));
-            }
-            let text = text_of(raw)?;
+            // The spelled-out word means "no limit", so a value inherited from
+            // /etc/narsor/ can be revoked and not only replaced.
             if text.trim().eq_ignore_ascii_case(NO_LIMIT) {
                 return Ok(SettingValue::Duration(None));
             }
-            parse_duration(&text)
+            parse_duration(text)
                 .map(|seconds| SettingValue::Duration(Some(seconds)))
                 .map_err(|error| format!("{error}; or '{NO_LIMIT}' for no limit at all"))
         }
 
         SettingKey::LogLevel => {
-            let text = text_of(raw)?;
             let level = text.trim().to_lowercase();
             if LOG_LEVELS.contains(&level.as_str()) {
                 Ok(SettingValue::Text(level))
