@@ -30,7 +30,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use crate::workflows::user_config_dir;
+use crate::workflows::{absolute, user_config_dir};
 
 /// The directory a system-wide configuration file is read from.
 ///
@@ -250,10 +250,20 @@ impl ConfigCascade {
                     }
                     shadowed.push(candidate);
                 }
-                Presence::Readable => match winner {
-                    None => winner = Some(candidate),
-                    Some(_) => shadowed.push(candidate),
-                },
+                Presence::Readable => {
+                    // Absolutized, the way `WorkflowOrigin::File` already is: a
+                    // relative `XDG_CONFIG_HOME` is accepted by the code around
+                    // it, and printing "config.yaml" as the answer to "which
+                    // file did this come from" would only half answer it (R8).
+                    let candidate = Candidate {
+                        kind: candidate.kind,
+                        path: absolute(&candidate.path),
+                    };
+                    match winner {
+                        None => winner = Some(candidate),
+                        Some(_) => shadowed.push(candidate),
+                    }
+                }
             }
         }
 

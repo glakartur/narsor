@@ -506,6 +506,6 @@ fn file_name(path: &Path) -> String {
 }
 
 /// The absolute form of a path, when the filesystem can give one.
-fn absolute(path: &Path) -> PathBuf {
+pub(crate) fn absolute(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }

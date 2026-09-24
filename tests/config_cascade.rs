@@ -282,3 +282,38 @@ fn resolving_creates_nothing_at_all() {
     assert!(!user.exists(), "the user directory must not be created");
     assert!(!system.exists(), "the system directory must not be created");
 }
+
+#[test]
+fn the_winning_path_is_absolute_even_when_the_directory_was_relative() {
+    // R8: "which file did this come from" is only half answered by
+    // "config.yaml". A relative XDG_CONFIG_HOME is against the spec but is
+    // accepted by the code around this, so it has to be handled here.
+    let root = TempRoot::new();
+    root.write("user/config.yaml", "log_level: info\n");
+
+    let relative = pathdiff_from_cwd(&root.user_dir());
+    let resolution = ConfigCascade::with_dirs(None, Some(relative), None)
+        .resolve()
+        .expect("resolve");
+
+    let path = resolution.path().expect("a winner");
+    assert!(
+        path.is_absolute(),
+        "the reported path must be absolute: {}",
+        path.display()
+    );
+    assert!(path.ends_with("user/config.yaml"));
+}
+
+/// The path of `target` written relative to the current directory.
+fn pathdiff_from_cwd(target: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().expect("a working directory");
+    let mut relative = PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        relative.push("..");
+    }
+    for component in target.components().skip(1) {
+        relative.push(component);
+    }
+    relative
+}
