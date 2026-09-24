@@ -23,6 +23,8 @@
 //! (D-D). So resolution hands back values *and* errors together, and the
 //! caller decides whether to refuse to start or to print what it has.
 
+pub mod cascade;
 pub mod settings;
 
+pub use cascade::{CascadeError, ConfigCascade, Resolution};
 pub use settings::{render_value, SettingKey, SettingValue, Source, ENV_PREFIX, MASK, NO_LIMIT};

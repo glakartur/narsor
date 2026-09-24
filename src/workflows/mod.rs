@@ -430,13 +430,23 @@ impl WorkflowResolver {
     }
 }
 
-/// `$XDG_CONFIG_HOME/narsor/workflows`, or `$HOME/.config/…`.
-pub fn user_workflows_dir() -> Option<PathBuf> {
+/// `$XDG_CONFIG_HOME/narsor`, or `$HOME/.config/narsor`.
+///
+/// `None` when neither variable is set, which is a normal state in a
+/// container: the step that would have used it is skipped rather than guessed
+/// at (R9). An empty `XDG_CONFIG_HOME` counts as unset, because that is how
+/// an unset key of a ConfigMap renders.
+pub fn user_config_dir() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(value) if !value.is_empty() => PathBuf::from(value),
         _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
     };
-    Some(base.join(USER_CONFIG_DIR).join(WORKFLOWS_DIR))
+    Some(base.join(USER_CONFIG_DIR))
+}
+
+/// `$XDG_CONFIG_HOME/narsor/workflows`, or `$HOME/.config/…`.
+pub fn user_workflows_dir() -> Option<PathBuf> {
+    Some(user_config_dir()?.join(WORKFLOWS_DIR))
 }
 
 /// Whether a reference can be looked up as a bare name in a directory.
