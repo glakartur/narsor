@@ -909,10 +909,9 @@ fn print_config_table(config: &Resolved) {
         match config_error_for(config, setting.key()) {
             Some(message) => {
                 println!(
-                    "{:<16} {:<28} {}",
+                    "{:<16} {:<28} -",
                     setting.key(),
-                    format!("({CONFIG_ERROR_MARKER})"),
-                    "-"
+                    format!("({CONFIG_ERROR_MARKER})")
                 );
                 println!("{:<16} {:<28} {}", "", "", message);
             }
