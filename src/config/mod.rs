@@ -24,7 +24,9 @@
 //! caller decides whether to refuse to start or to print what it has.
 
 pub mod cascade;
+pub mod file;
 pub mod settings;
 
 pub use cascade::{CascadeError, ConfigCascade, Resolution};
+pub use file::{FileError, FileValues};
 pub use settings::{render_value, SettingKey, SettingValue, Source, ENV_PREFIX, MASK, NO_LIMIT};

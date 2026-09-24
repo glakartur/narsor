@@ -29,6 +29,12 @@ pub const ENV_PREFIX: &str = "NARSOR_";
 /// What is printed instead of the value of a sensitive setting.
 pub const MASK: &str = "********";
 
+/// The logging levels a setting may name, in increasing verbosity.
+///
+/// A closed set rather than a full `EnvFilter` directive: `RUST_LOG` is the
+/// tool for directives, and it wins over this setting anyway (D-K).
+pub const LOG_LEVELS: [&str; 6] = ["off", "error", "warn", "info", "debug", "trace"];
+
 /// How a duration setting spells "no limit at all".
 ///
 /// Writable in the file so that a value inherited from `/etc/narsor/` can be
