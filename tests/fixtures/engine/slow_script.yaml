@@ -1,0 +1,28 @@
+name: slow-script
+version: 1
+description: >
+  One script state that takes a moment and declares no time limit of its own,
+  and no `globals.timeout` either. It exists to pin down what a state like this
+  gets: no limit at all. A configured default agent timeout must not reach it
+  (D-C) — every script state written before that setting existed relies on
+  this, and a limit arriving from the environment would turn them into retried
+  action failures.
+
+states:
+  slow:
+    action:
+      type: script
+      command: ./sleep_then_emit.sh
+      args:
+        - '2'
+        - '{"output": "done"}'
+    outputs:
+      - done
+    transitions:
+      done: completed
+
+  completed:
+    description: The script finished on its own time.
+
+terminal_states:
+  - completed

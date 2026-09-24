@@ -322,7 +322,13 @@ pub enum ActionSchema {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentActionSchema {
-    pub harness: String,
+    /// Optional: an action that names no harness uses the configured default,
+    /// and failing that the built-in one (D-F).
+    ///
+    /// `deny_unknown_fields` still catches a misspelled `harnes:`; what
+    /// changes is only the status of the field being absent.
+    #[serde(default)]
+    pub harness: Option<String>,
 
     #[serde(default)]
     pub model: Option<String>,

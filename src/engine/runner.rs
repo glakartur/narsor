@@ -107,6 +107,18 @@ pub fn terminal_status(state: &State) -> ExecutionStatus {
         .unwrap_or(ExecutionStatus::Completed)
 }
 
+/// What the configuration contributes to an `agent` action.
+///
+/// A small value rather than the whole resolved configuration, so the engine
+/// stays independent of how those two values were arrived at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDefaults {
+    /// The harness for an action that names none.
+    pub harness: String,
+    /// The time limit for an action that declares none, `None` for no limit.
+    pub timeout_secs: Option<u64>,
+}
+
 /// The action types an executor can be registered for.
 ///
 /// A typed key rather than a string, so that registering an executor for a
@@ -315,6 +327,7 @@ impl AttemptFailure {
 pub struct Engine {
     store: ExecutionStore,
     executors: HashMap<ActionKind, Arc<dyn ActionExecutor>>,
+    agent_timeout_secs: Option<u64>,
     events: broadcast::Sender<Event>,
     pause_requests: Mutex<HashSet<ExecutionId>>,
 }
@@ -346,9 +359,41 @@ impl Engine {
         Self {
             store,
             executors,
+            agent_timeout_secs: None,
             events,
             pause_requests: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Returns the engine with the configured defaults for `agent` actions.
+    ///
+    /// Rebuilds the agent executor, because the default harness belongs to it:
+    /// a workflow that names no harness gets this one, and the session event
+    /// then records the harness that actually ran (D-F).
+    pub fn with_agent_defaults(mut self, defaults: AgentDefaults) -> Self {
+        self.agent_timeout_secs = defaults.timeout_secs;
+        let agent = AgentExecutor::new()
+            .with_default_harness(defaults.harness)
+            .with_event_sink(Arc::new(LoggingEventSink::new(
+                self.store.clone(),
+                Some(self.events.clone()),
+            )));
+        self.executors.insert(ActionKind::Agent, Arc::new(agent));
+        self
+    }
+
+    /// Returns the engine with a default time limit for `agent` actions.
+    ///
+    /// Deliberately only for `agent` actions (D-C). The engine has one timeout
+    /// chain shared by every kind of action, in which `None` means "no limit";
+    /// feeding a configured default into that chain would give every existing
+    /// script state a limit it never had, and a script that outran it would
+    /// become a retryable action failure, then an exhausted retry budget, then
+    /// a failed action. Script and human actions therefore keep exactly the
+    /// chain they have always had.
+    pub fn with_agent_timeout(mut self, seconds: Option<u64>) -> Self {
+        self.agent_timeout_secs = seconds;
+        self
     }
 
     /// Registers (or replaces) the executor for one action type.
@@ -664,6 +709,27 @@ impl Engine {
         }
     }
 
+    /// The time limit of one attempt.
+    ///
+    /// The state's own value wins, then the workflow's global one — which is
+    /// what R13 asks for: a setting is a default, never an instruction the
+    /// workflow cannot override. Only when neither declares anything does the
+    /// configured default apply, and only to an `agent` action (D-C).
+    fn timeout_for(
+        &self,
+        kind: ActionKind,
+        state: &State,
+        definition: &WorkflowDefinition,
+    ) -> Option<u64> {
+        let declared = state.timeout_secs.or(definition.globals.timeout_secs);
+        match kind {
+            ActionKind::Agent => declared.or(self.agent_timeout_secs),
+            // Unchanged, bit for bit: a script or human state that declares no
+            // limit still has none.
+            _ => declared,
+        }
+    }
+
     /// Runs the action of a state, retrying it as the policy allows (D21).
     ///
     /// A failure that survived every attempt is already recorded as
@@ -678,9 +744,8 @@ impl Engine {
     ) -> Result<ActionUpshot, EngineError> {
         let schedule = RetrySchedule::resolve(state, &definition.globals);
         let kind = ActionKind::of(action);
-        let timeout = state
-            .timeout_secs
-            .or(definition.globals.timeout_secs)
+        let timeout = self
+            .timeout_for(kind, state, definition)
             .map(Duration::from_secs);
 
         let mut attempt = 1_u32;

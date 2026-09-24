@@ -396,7 +396,7 @@ terminal_states: [done]
         other => panic!("expected an agent action, got {other:?}"),
     };
 
-    assert_eq!(agent.harness, "claude-code");
+    assert_eq!(agent.harness.as_deref(), Some("claude-code"));
     assert_eq!(agent.model.as_deref(), Some("sonnet-3.5"));
     assert_eq!(agent.read_only_paths, vec!["../other-repo/src"]);
     assert_eq!(agent.parameters["max_tokens"], serde_json::json!(4096));

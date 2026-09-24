@@ -26,6 +26,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::engine::AgentDefaults;
+
 use super::cascade::{CascadeError, ConfigCascade, Resolution};
 use super::file::{self, FileError, FileValues};
 use super::settings::{SettingKey, SettingValue, Source};
@@ -183,6 +185,14 @@ impl Resolved {
         self.value(SettingKey::AgentTimeout)
             .as_duration()
             .expect("the timeout is a duration")
+    }
+
+    /// What the engine needs from the configuration for an `agent` action.
+    pub fn agent_defaults(&self) -> AgentDefaults {
+        AgentDefaults {
+            harness: self.agent_harness().to_string(),
+            timeout_secs: self.agent_timeout(),
+        }
     }
 
     /// The `tracing` filter to install, or `None` for "install nothing".

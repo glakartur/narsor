@@ -1,0 +1,23 @@
+name: agent-declared-timeout
+version: 1
+description: >
+  One agent state that declares its own time limit. The configured default
+  must not overrule it: a setting is a default, never an instruction the
+  workflow cannot override (R13).
+
+states:
+  think:
+    timeout: 5s
+    action:
+      type: agent
+      prompt: Do the thing.
+    outputs:
+      - done
+    transitions:
+      done: completed
+
+  completed:
+    description: The agent answered.
+
+terminal_states:
+  - completed

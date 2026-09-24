@@ -216,3 +216,51 @@ impl ActionExecutor for StubAgentExecutor {
         })
     }
 }
+
+/// An executor that records the time limit it was handed and then answers.
+///
+/// What it exists for is the *value*: the engine resolves a limit per action
+/// kind, and the only way to see which chain produced it is to look at what
+/// reached the executor.
+pub struct TimeoutRecorder {
+    label: String,
+    timeouts: Mutex<Vec<Option<std::time::Duration>>>,
+}
+
+impl TimeoutRecorder {
+    /// A recorder that always answers with `label`.
+    pub fn answering(label: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            timeouts: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The limits handed over, in order.
+    pub fn timeouts(&self) -> Vec<Option<std::time::Duration>> {
+        self.timeouts.lock().expect("timeouts").clone()
+    }
+}
+
+impl ActionExecutor for TimeoutRecorder {
+    fn execute<'a>(
+        &'a self,
+        request: ActionRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
+        self.timeouts
+            .lock()
+            .expect("timeouts")
+            .push(request.timeout);
+        let label = self.label.clone();
+        Box::pin(async move {
+            Ok(ActionOutcome::Completed(ActionResult {
+                output_label: label,
+                data: json!({}),
+                variables: Map::new(),
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            }))
+        })
+    }
+}

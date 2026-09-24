@@ -130,7 +130,8 @@ fn violation_noun(count: usize) -> &'static str {
 
 /// `narsor run <workflow> [--input k=v]…` — create an execution and run
 /// it.
-pub async fn run(root: &Path, reference: &str, inputs: &[String]) -> Result<()> {
+pub async fn run(config: &Resolved, reference: &str, inputs: &[String]) -> Result<()> {
+    let root = config.data_dir();
     let resolved = resolve_workflow(root, reference)?;
     eprintln!("Workflow '{}' — {}.", resolved.name, resolved.origin);
     let definition = tasks::load_resolved(&resolved).map_err(|error| match error {
@@ -148,7 +149,8 @@ pub async fn run(root: &Path, reference: &str, inputs: &[String]) -> Result<()> 
     // anything is written to disk.
     let inputs = collect_inputs(&definition, inputs)?;
 
-    let engine = Engine::new(ExecutionStore::new(root));
+    let engine =
+        Engine::new(ExecutionStore::new(root)).with_agent_defaults(config.agent_defaults());
     // The new id is announced the moment it exists, so that a failing clone
     // still tells the operator which execution to look at.
     let execution =
@@ -406,12 +408,13 @@ fn event_type(event: &Event) -> String {
 
 /// `narsor input <id> [--field k=v]… [--label l]` — answer a question.
 pub async fn input(
-    root: &Path,
+    config: &Resolved,
     execution_id: &str,
     fields: &[String],
     label: Option<String>,
     definition_file: Option<&str>,
 ) -> Result<()> {
+    let root = config.data_dir();
     let store = ExecutionStore::new(root);
     let execution = load_execution(&store, execution_id)?;
 
@@ -438,7 +441,7 @@ pub async fn input(
     }
 
     let definition = definition_for(root, &execution, definition_file)?;
-    let engine = Engine::new(store);
+    let engine = Engine::new(store).with_agent_defaults(config.agent_defaults());
     let execution = engine
         .deliver_human_input(&definition, &pending.execution_id, &delivery)
         .await
@@ -463,12 +466,17 @@ pub async fn input(
 }
 
 /// `narsor resume <id>` — continue a paused execution.
-pub async fn resume(root: &Path, execution_id: &str, definition_file: Option<&str>) -> Result<()> {
+pub async fn resume(
+    config: &Resolved,
+    execution_id: &str,
+    definition_file: Option<&str>,
+) -> Result<()> {
+    let root = config.data_dir();
     let store = ExecutionStore::new(root);
     let execution = load_execution(&store, execution_id)?;
     let definition = definition_for(root, &execution, definition_file)?;
 
-    let engine = Engine::new(store);
+    let engine = Engine::new(store).with_agent_defaults(config.agent_defaults());
     let execution = engine
         .resume(&definition, execution_id)
         .await
@@ -726,14 +734,17 @@ fn truncate(text: &str, limit: usize) -> String {
 /// The store is opened on the global `--root`, exactly like every other
 /// subcommand: the interface shows the executions of the data directory the
 /// operator asked for, not always those of the default one.
-pub fn tui(root: &Path) -> Result<()> {
-    let store = ExecutionStore::new(root);
+pub fn tui(config: &Resolved) -> Result<()> {
+    let store = ExecutionStore::new(config.data_dir());
+    let defaults = config.agent_defaults();
     let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(move || handle.block_on(crate::tui::run(store))).map_err(|error| {
-        CliError::failure(format!(
-            "The terminal interface stopped with an error: {error}"
-        ))
-    })
+    tokio::task::block_in_place(move || handle.block_on(crate::tui::run(store, defaults))).map_err(
+        |error| {
+            CliError::failure(format!(
+                "The terminal interface stopped with an error: {error}"
+            ))
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

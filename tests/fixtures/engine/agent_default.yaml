@@ -1,0 +1,22 @@
+name: agent-default
+version: 1
+description: >
+  One agent state that names neither a harness nor a time limit. Both are
+  supposed to come from the configuration, and in its absence from the values
+  built into the binary — so this file is the portable case D-F describes.
+
+states:
+  think:
+    action:
+      type: agent
+      prompt: Do the thing.
+    outputs:
+      - done
+    transitions:
+      done: completed
+
+  completed:
+    description: The agent answered.
+
+terminal_states:
+  - completed

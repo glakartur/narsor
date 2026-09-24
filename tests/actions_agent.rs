@@ -174,7 +174,7 @@ fn envelope(text: &str) -> String {
 /// An agent action on the `claude-code` harness.
 fn agent_action(prompt: &str) -> AgentActionConfig {
     AgentActionConfig {
-        harness: "claude-code".to_string(),
+        harness: Some("claude-code".to_string()),
         model: None,
         prompt: prompt.to_string(),
         workspace: None,
@@ -619,7 +619,7 @@ async fn the_opencode_adapter_builds_its_own_command_line() {
     );
 
     let mut config = agent_action("look around");
-    config.harness = "opencode".to_string();
+    config.harness = Some("opencode".to_string());
     config.model = Some("anthropic/claude-sonnet-4".to_string());
     config
         .parameters
@@ -771,7 +771,7 @@ async fn an_unknown_harness_names_the_supported_ones() {
     let root = TempRoot::new();
 
     let mut config = agent_action("look around");
-    config.harness = "aider".to_string();
+    config.harness = Some("aider".to_string());
 
     let error = fail(&AgentExecutor::new(), config, &root.workspace()).await;
 
@@ -1027,5 +1027,111 @@ async fn a_model_that_would_be_read_as_a_flag_is_refused() {
         error.message.contains("model"),
         "the error must name the offending field: {}",
         error.message
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The configured defaults (U7)
+// ---------------------------------------------------------------------------
+
+/// An action that names no harness uses the configured default.
+#[tokio::test]
+async fn an_action_without_a_harness_uses_the_configured_default() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope("{\"output\": \"done\"}"));
+
+    // The default points at `opencode`, and that adapter is the one wired to
+    // the fake harness — so a run proves which name was chosen.
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(OpenCodeAdapter::with_program(fake.program()))),
+    )
+    .with_default_harness("opencode");
+
+    let mut config = agent_action("do the thing");
+    config.harness = None;
+
+    let outcome = execute(&executor, config, &root.workspace(), None)
+        .await
+        .expect("the action runs on the configured harness");
+
+    assert!(matches!(outcome, ActionOutcome::Completed(_)));
+    assert_eq!(fake.calls(), 1);
+}
+
+/// With nothing configured, an action that names no harness gets the built-in.
+#[tokio::test]
+async fn an_action_without_a_harness_falls_back_to_the_built_in_one() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope("{\"output\": \"done\"}"));
+
+    // `claude-code` is the built-in default and the adapter wired to the fake.
+    let executor = executor(&fake);
+    assert_eq!(executor.default_harness(), "claude-code");
+
+    let mut config = agent_action("do the thing");
+    config.harness = None;
+
+    let outcome = execute(&executor, config, &root.workspace(), None)
+        .await
+        .expect("the action runs on the built-in harness");
+
+    assert!(matches!(outcome, ActionOutcome::Completed(_)));
+}
+
+/// An action that names a harness keeps it, whatever the configuration says.
+#[tokio::test]
+async fn the_workflow_wins_over_the_configured_harness() {
+    // AE4 / R13: a setting is a default, never an instruction the workflow
+    // cannot override.
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope("{\"output\": \"done\"}"));
+
+    let executor = executor(&fake).with_default_harness("opencode");
+
+    // The action says claude-code, which is the adapter pointed at the fake;
+    // the configured opencode adapter is the stock one and would not answer.
+    let config = agent_action("do the thing");
+
+    let outcome = execute(&executor, config, &root.workspace(), None)
+        .await
+        .expect("the harness the workflow named is the one that ran");
+
+    assert!(matches!(outcome, ActionOutcome::Completed(_)));
+    assert_eq!(fake.calls(), 1);
+}
+
+/// The session event records the harness that actually ran.
+#[tokio::test]
+async fn the_session_event_records_the_harness_that_ran_not_the_absence_of_one() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope("{\"output\": \"done\"}"));
+
+    let sink = Arc::new(RecordingSink::default());
+    let executor = executor(&fake).with_event_sink(Arc::clone(&sink) as Arc<dyn AgentEventSink>);
+
+    let mut config = agent_action("do the thing");
+    config.harness = None;
+
+    execute(&executor, config, &root.workspace(), None)
+        .await
+        .expect("the action runs");
+
+    let started: Vec<String> = sink
+        .events()
+        .into_iter()
+        .filter_map(|(_, data)| match data {
+            EventData::AgentSessionStarted { harness, .. } => Some(harness),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started,
+        vec!["claude-code".to_string()],
+        "the event carries the harness that ran, not 'unspecified'"
     );
 }

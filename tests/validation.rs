@@ -479,3 +479,69 @@ fn five_violations_are_reported_as_five_errors() {
         );
     }
 }
+
+/// An agent state that names no harness is valid (D-F).
+///
+/// Every setting has a value built into the binary, so "no harness anywhere"
+/// cannot happen and there is nothing for a static check to report. Validation
+/// stays a pure function of the source: it does not consult the environment,
+/// and it gives the same verdict wherever it is run.
+#[test]
+fn an_agent_state_without_a_harness_is_valid() {
+    let yaml = r#"
+name: portable
+version: 1
+states:
+  think:
+    action:
+      type: agent
+      prompt: Do the thing.
+    outputs:
+      - done
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states:
+  - completed
+"#;
+
+    let errors = narsor::workflow::validate_source(yaml).expect("the file must compile");
+
+    assert!(
+        errors.is_empty(),
+        "a workflow without a harness is portable, not invalid: {errors:?}"
+    );
+}
+
+/// A misspelled field is still caught.
+///
+/// What changed is the status of `harness` being *absent*; an unknown key is
+/// still a deserialization error, because the workflow schema keeps
+/// `deny_unknown_fields`.
+#[test]
+fn a_misspelled_harness_field_is_still_refused() {
+    let yaml = r#"
+name: typo
+version: 1
+states:
+  think:
+    action:
+      type: agent
+      harnes: claude-code
+      prompt: Do the thing.
+    outputs:
+      - done
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states:
+  - completed
+"#;
+
+    assert!(
+        narsor::workflow::validate_source(yaml).is_err(),
+        "'harnes' is not a field of an agent action"
+    );
+}

@@ -10,9 +10,13 @@ mod engine_support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use engine_support::{event_type, workflow, workflow_file, Harness, StubAgentExecutor};
+use engine_support::{
+    event_type, workflow, workflow_file, Harness, StubAgentExecutor, TimeoutRecorder,
+};
 use narsor::domain::{EventData, ExecutionStatus};
-use narsor::engine::{ActionKind, Engine, EngineError, HumanInputDelivery};
+use narsor::engine::{
+    ActionExecutor, ActionKind, AgentDefaults, Engine, EngineError, HumanInputDelivery,
+};
 use serde_json::{json, Map, Value};
 
 // ---------------------------------------------------------------------------
@@ -797,4 +801,151 @@ async fn an_answer_cannot_be_delivered_twice() {
         .await
         .expect_err("the second delivery is refused");
     assert!(matches!(error, EngineError::HumanInput(_)), "{error:?}");
+}
+
+/// A script state that declares no limit gets none — the behaviour every
+/// script workflow written before the configuration layer existed relies on.
+///
+/// Characterization: written before the timeout chains were split, so that the
+/// split could be shown not to move it (D-C). The script sleeps for longer
+/// than the default agent timeout the next test configures.
+#[tokio::test]
+async fn a_script_state_without_a_declared_limit_runs_without_one() {
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let definition = workflow("slow_script");
+
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+
+    assert_eq!(
+        execution.status,
+        ExecutionStatus::Completed,
+        "a script with no declared limit is not interrupted"
+    );
+}
+
+/// A configured agent timeout does not reach a script state (D-C).
+///
+/// The counterpart of [`a_script_state_without_a_declared_limit_runs_without_one`]:
+/// the same workflow, now with a default agent timeout configured. What is
+/// asserted is the limit the script executor is actually handed — `None`, the
+/// same as before. A shared chain would have handed it one second here, and a
+/// script that outran it would have become a timeout, then a retryable action
+/// failure, then a failed action.
+#[tokio::test]
+async fn a_configured_agent_timeout_leaves_script_states_alone() {
+    let harness = Harness::new();
+    let recorder = Arc::new(TimeoutRecorder::answering("done"));
+    let engine = harness
+        .engine()
+        .with_agent_defaults(AgentDefaults {
+            harness: "claude-code".to_string(),
+            timeout_secs: Some(1),
+        })
+        .with_executor(
+            ActionKind::Script,
+            Arc::clone(&recorder) as Arc<dyn ActionExecutor>,
+        );
+    let definition = workflow("slow_script");
+
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(
+        recorder.timeouts(),
+        vec![None],
+        "a script state that declares no limit still has none"
+    );
+}
+
+/// An agent state that declares no limit gets the configured one.
+#[tokio::test]
+async fn a_configured_agent_timeout_reaches_an_agent_state_without_one() {
+    let harness = Harness::new();
+    let recorder = Arc::new(TimeoutRecorder::answering("done"));
+    let engine = harness
+        .engine()
+        .with_agent_defaults(AgentDefaults {
+            harness: "claude-code".to_string(),
+            timeout_secs: Some(90),
+        })
+        .with_executor(
+            ActionKind::Agent,
+            Arc::clone(&recorder) as Arc<dyn ActionExecutor>,
+        );
+    let definition = workflow("agent_default");
+
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(recorder.timeouts(), vec![Some(Duration::from_secs(90))]);
+}
+
+/// A limit declared by the workflow wins over the configured one.
+#[tokio::test]
+async fn the_workflow_timeout_wins_over_the_configured_one() {
+    // R13 / AE4: the setting is a default, never an instruction the workflow
+    // cannot override.
+    let harness = Harness::new();
+    let recorder = Arc::new(TimeoutRecorder::answering("done"));
+    let engine = harness
+        .engine()
+        .with_agent_defaults(AgentDefaults {
+            harness: "claude-code".to_string(),
+            timeout_secs: Some(90),
+        })
+        .with_executor(
+            ActionKind::Agent,
+            Arc::clone(&recorder) as Arc<dyn ActionExecutor>,
+        );
+    let definition = workflow("agent_declared_timeout");
+
+    engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+
+    assert_eq!(
+        recorder.timeouts(),
+        vec![Some(Duration::from_secs(5))],
+        "the workflow declared five seconds; the configuration does not overrule it"
+    );
+}
+
+/// No configured limit leaves an agent state without one, exactly as before.
+#[tokio::test]
+async fn no_configured_timeout_leaves_an_agent_state_unlimited() {
+    let harness = Harness::new();
+    let recorder = Arc::new(TimeoutRecorder::answering("done"));
+    let engine = harness
+        .engine()
+        .with_agent_defaults(AgentDefaults {
+            harness: "claude-code".to_string(),
+            timeout_secs: None,
+        })
+        .with_executor(
+            ActionKind::Agent,
+            Arc::clone(&recorder) as Arc<dyn ActionExecutor>,
+        );
+    let definition = workflow("agent_default");
+
+    engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+
+    assert_eq!(
+        recorder.timeouts(),
+        vec![None],
+        "a configuration that revokes the limit leaves the action running as it does today"
+    );
 }

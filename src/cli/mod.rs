@@ -293,7 +293,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
     let root = config.data_dir().to_path_buf();
     let outcome = match cli.command {
         Command::Validate { workflow } => commands::validate(&root, &workflow),
-        Command::Run { workflow, inputs } => commands::run(&root, &workflow, &inputs).await,
+        Command::Run { workflow, inputs } => commands::run(&config, &workflow, &inputs).await,
         Command::List => commands::list(&root),
         Command::Show { execution_id } => commands::show(&root, &execution_id),
         Command::Events {
@@ -305,9 +305,9 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             fields,
             label,
             file,
-        } => commands::input(&root, &execution_id, &fields, label, file.as_deref()).await,
+        } => commands::input(&config, &execution_id, &fields, label, file.as_deref()).await,
         Command::Resume { execution_id, file } => {
-            commands::resume(&root, &execution_id, file.as_deref()).await
+            commands::resume(&config, &execution_id, file.as_deref()).await
         }
         Command::Workflow { command } => match command {
             WorkflowCommand::List => commands::workflow_list(&root),
@@ -340,7 +340,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Config { command } => match command {
             ConfigCommand::Show { format } => commands::config_show(&config, format),
         },
-        Command::Tui => commands::tui(&root),
+        Command::Tui => commands::tui(&config),
     };
 
     match outcome {

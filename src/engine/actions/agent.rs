@@ -71,6 +71,12 @@ if none were listed, the label the task asks for). `data`, `variables` and \
 `artifacts` are optional. Do not omit the JSON object: without it the workflow \
 cannot continue.";
 
+/// The harness used when neither the action nor the configuration names one.
+///
+/// The same value the settings registry carries as the built-in; kept here so
+/// that an executor built without a configuration behaves identically.
+pub const BUILT_IN_HARNESS: &str = "claude-code";
+
 /// The `parameters` key that continues an existing harness session (D18).
 pub const RESUME_SESSION_PARAMETER: &str = "resume_session";
 
@@ -138,6 +144,7 @@ impl AgentEventSink for LoggingEventSink {
 #[derive(Debug, Clone)]
 pub struct AgentExecutor {
     harnesses: HarnessRegistry,
+    default_harness: String,
     events: Option<Arc<dyn AgentEventSink>>,
 }
 
@@ -146,6 +153,7 @@ impl AgentExecutor {
     pub fn new() -> Self {
         Self {
             harnesses: HarnessRegistry::defaults(),
+            default_harness: BUILT_IN_HARNESS.to_string(),
             events: None,
         }
     }
@@ -154,8 +162,25 @@ impl AgentExecutor {
     pub fn with_harnesses(harnesses: HarnessRegistry) -> Self {
         Self {
             harnesses,
+            default_harness: BUILT_IN_HARNESS.to_string(),
             events: None,
         }
+    }
+
+    /// Returns the executor with another default harness.
+    ///
+    /// The harness an action that names none falls back to. Applied here
+    /// rather than in the loader so that compiling a definition stays a pure
+    /// function of its source, and so that `AgentSessionStarted` records the
+    /// harness that actually ran rather than "unspecified" (D-F).
+    pub fn with_default_harness(mut self, harness: impl Into<String>) -> Self {
+        self.default_harness = harness.into();
+        self
+    }
+
+    /// The harness used by an action that names none.
+    pub fn default_harness(&self) -> &str {
+        &self.default_harness
     }
 
     /// Returns the executor with the session events routed to `sink`.
@@ -196,9 +221,12 @@ impl AgentExecutor {
     /// One agent run, from the session record to the output label.
     async fn run(&self, request: ActionRequest<'_>) -> Result<ActionOutcome, ActionError> {
         let config = agent_config(request.action)?;
-        let adapter = self.harnesses.get(&config.harness)?;
+        // The action's own harness, or the configured default; an unknown name
+        // is still reported here, naming the ones that exist.
+        let harness = config.harness.as_deref().unwrap_or(&self.default_harness);
+        let adapter = self.harnesses.get(harness)?;
 
-        let mut session = new_session(config, request.execution_id);
+        let mut session = new_session(config, harness, request.execution_id);
         let resume = resume_session(config)?;
 
         let prompt = format!("{}{AGENT_OUTPUT_CONTRACT}", config.prompt);
@@ -215,7 +243,8 @@ impl AgentExecutor {
             request.execution_id,
             EventData::AgentSessionStarted {
                 session_id: session.id.clone(),
-                harness: config.harness.clone(),
+                // The harness that actually ran, never "unspecified".
+                harness: harness.to_string(),
             },
         );
         session.status = AgentSessionStatus::Running;
@@ -344,11 +373,15 @@ fn action_type_name(action: &ActionConfig) -> &'static str {
 }
 
 /// The session record of a run, before the harness has said anything.
-fn new_session(config: &AgentActionConfig, execution_id: Option<&str>) -> AgentSession {
+fn new_session(
+    config: &AgentActionConfig,
+    harness: &str,
+    execution_id: Option<&str>,
+) -> AgentSession {
     AgentSession {
         id: Uuid::new_v4().to_string(),
         workflow_execution_id: execution_id.unwrap_or_default().to_string(),
-        harness: config.harness.clone(),
+        harness: harness.to_string(),
         started_at: Utc::now(),
         ended_at: None,
         status: AgentSessionStatus::Starting,

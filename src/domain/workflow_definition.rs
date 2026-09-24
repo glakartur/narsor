@@ -216,8 +216,14 @@ pub enum ActionConfig {
 /// Agent action configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentActionConfig {
-    /// Which harness to use (e.g., "claude-code", "opencode")
-    pub harness: String,
+    /// Which harness to use (e.g., "claude-code", "opencode").
+    ///
+    /// `None` means "whatever the configuration says", resolved by the
+    /// executor rather than the loader so that compiling a definition stays a
+    /// pure function of its source (D-F). `serde(default)` reads an execution
+    /// stored before the field became optional, where it was always present.
+    #[serde(default)]
+    pub harness: Option<String>,
 
     /// Model specification (optional)
     #[serde(default)]

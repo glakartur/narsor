@@ -267,9 +267,10 @@ fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
     // looking at while reading the message.
     match action {
         ActionConfig::Agent(agent) => {
-            if agent.harness.trim().is_empty() {
-                errors.push(missing_field(state, "agent", "harness"));
-            }
+            // No check that `harness` is present: every setting has a value
+            // built into the binary, so "no harness anywhere" cannot happen
+            // and there is nothing to report (D-F). Validation stays static,
+            // and an exported workflow stays portable.
             if agent.prompt.trim().is_empty() {
                 errors.push(missing_field(state, "agent", "prompt"));
             }
@@ -352,7 +353,10 @@ fn validate_state_templates(
 
     match &state.action {
         Some(ActionConfig::Agent(agent)) => {
-            templated.push(("action.harness".to_string(), agent.harness.as_str()));
+            // The same shape the decision branch below already has.
+            if let Some(harness) = &agent.harness {
+                templated.push(("action.harness".to_string(), harness.as_str()));
+            }
             templated.push(("action.prompt".to_string(), agent.prompt.as_str()));
             if let Some(model) = &agent.model {
                 templated.push(("action.model".to_string(), model.as_str()));
