@@ -9,15 +9,13 @@
 mod engine_support;
 
 use engine_support::{workflow, Harness};
-use orchestrator::domain::{EventData, ExecutionStatus, WorkflowExecution};
-use orchestrator::engine::{EngineError, PendingStep};
-use orchestrator::persistence::{
+use narsor::domain::{EventData, ExecutionStatus, WorkflowExecution};
+use narsor::engine::{EngineError, PendingStep};
+use narsor::persistence::{
     reconcile, reconcile_all, recover, sweep_orphaned_workspaces, OrphanReason,
     ReconciliationOutcome,
 };
-use orchestrator::workspace::{
-    CleanupPolicy, RepositorySpec, WorkspaceProvisioner, WorkspaceRequest,
-};
+use narsor::workspace::{CleanupPolicy, RepositorySpec, WorkspaceProvisioner, WorkspaceRequest};
 use serde_json::json;
 
 /// Writes the log of an execution that died while its first action ran.

@@ -1,8 +1,8 @@
-# Orchestrator
+# Narsor
 
 A workflow engine for tasks carried out by AI agents and by people. A process is
 described in YAML (a graph of states, actions and transitions) and the
-orchestrator runs it step by step, persisting every state and every event to
+narsor runs it step by step, persisting every state and every event to
 disk — so that an interrupted execution can be recovered and the whole run can
 be audited afterwards.
 
@@ -21,7 +21,7 @@ Design documentation (written in Polish, and normative):
 ## Prerequisites
 
 - **Rust** (2021 edition) with `cargo`.
-- **`git` on `PATH` — a runtime prerequisite.** The orchestrator clones
+- **`git` on `PATH` — a runtime prerequisite.** The narsor clones
   repositories by shelling out to the `git` command as a child process.
   `libgit2` was deliberately rejected, because it honours neither
   `~/.ssh/config` nor credential helpers nor `url.*.insteadOf` rules — which is
@@ -37,7 +37,7 @@ Design documentation (written in Polish, and normative):
 ### Building and testing
 
 ```bash
-cargo build              # builds target/debug/orchestrator
+cargo build              # builds target/debug/narsor
 cargo test               # the whole suite (unit + integration)
 cargo build --release    # release build
 ```
@@ -51,22 +51,22 @@ processes — always in temporary directories, never inside the repository.
 
 ```bash
 # 1. Check the definition
-orchestrator validate tests/fixtures/cli/greet.yaml
+narsor validate tests/fixtures/cli/greet.yaml
 
 # 2. Run the workflow
-orchestrator run tests/fixtures/cli/greet.yaml \
+narsor run tests/fixtures/cli/greet.yaml \
     --input "greeting=Good morning" \
     --input "script_path=$PWD/tests/fixtures/cli/announce.sh"
 
 # 3. See what is going on
-orchestrator list
-orchestrator show <EXECUTION_ID>
+narsor list
+narsor show <EXECUTION_ID>
 
 # 4. Answer the question the workflow asked
-orchestrator input <EXECUTION_ID> --field approval_status=approved
+narsor input <EXECUTION_ID> --field approval_status=approved
 
 # …or drive all of that from the full-screen interface
-orchestrator tui
+narsor tui
 ```
 
 ---
@@ -75,11 +75,11 @@ orchestrator tui
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--root <DIRECTORY>` | `./.orchestrator` | The data directory: executions and workspaces. Applies to every subcommand, `tui` included. |
+| `--root <DIRECTORY>` | `./.narsor` | The data directory: executions and workspaces. Applies to every subcommand, `tui` included. |
 | `--help`, `--version` | — | Help and version. |
 
 `tracing` logs go to **stderr** and the output of the command to **stdout**, so
-that `orchestrator list | grep paused` keeps working with `RUST_LOG=debug` set.
+that `narsor list | grep paused` keeps working with `RUST_LOG=debug` set.
 The exception is `tui`, which owns the whole terminal: see
 [`tui`](#tui) below.
 
@@ -94,10 +94,10 @@ consistency, well-formed actions and decisions, references to variables. It
 reports **every** violation at once, not just the first one it meets.
 
 ```console
-$ orchestrator validate tests/fixtures/implement_feature.yaml
+$ narsor validate tests/fixtures/implement_feature.yaml
 The definition is valid: implement-feature (version 1), states: 9, initial state: analyze.
 
-$ orchestrator validate tests/fixtures/invalid/five_violations.yaml
+$ narsor validate tests/fixtures/invalid/five_violations.yaml
 Definition 'tests/fixtures/invalid/five_violations.yaml' is invalid — 5 violations found:
   - ...
 ```
@@ -114,7 +114,7 @@ the context as a boolean and not as a string. Missing required inputs are
 reported **before** anything is written to disk.
 
 ```console
-$ orchestrator run tests/fixtures/cli/greet.yaml \
+$ narsor run tests/fixtures/cli/greet.yaml \
       --input "greeting=Good morning" \
       --input "script_path=$PWD/tests/fixtures/cli/announce.sh" \
       --input is_experimental=true
@@ -155,7 +155,7 @@ Lists the executions in the data directory, newest first. An empty store is not
 an error.
 
 ```console
-$ orchestrator list
+$ narsor list
 ID                                     STATUS     STATE                  WORKFLOW
 4f1c8f0e-...-9b21                      paused     approve                cli-greet
 ```
@@ -166,7 +166,7 @@ The status, the current state, the workspace and the context variables; plus the
 question and its form fields, when the execution is waiting on a human.
 
 ```console
-$ orchestrator show 4f1c8f0e-...-9b21
+$ narsor show 4f1c8f0e-...-9b21
 Execution:     4f1c8f0e-...-9b21
 Workflow:      cli-greet (version 1)
 Status:        paused
@@ -186,7 +186,7 @@ The event history in sequence order: number, timestamp, type, description.
 state.
 
 ```console
-$ orchestrator events 4f1c8f0e-...-9b21
+$ narsor events 4f1c8f0e-...-9b21
     1  2026-09-23T19:43:49+00:00  workflow_started       Workflow 'cli-greet' started
     2  2026-09-23T19:43:49+00:00  state_entered          Entered state 'announce'
     3  2026-09-23T19:43:49+00:00  action_started         Action 'script' started
@@ -201,7 +201,7 @@ the label cannot be derived from a single `select` field. `--file` points at the
 definition when the file has moved.
 
 ```console
-$ orchestrator input 4f1c8f0e-...-9b21 --field approval_status=approved
+$ narsor input 4f1c8f0e-...-9b21 --field approval_status=approved
 Input delivered to execution 4f1c8f0e-...-9b21.
 Status: completed
 Current state: completed
@@ -238,7 +238,7 @@ reads as an option) or using the `ext::` transport (which makes `git` run an
 arbitrary command) is refused here rather than halfway through a run.
 
 ```console
-$ orchestrator repo add acme-api \
+$ narsor repo add acme-api \
       --remote https://github.com/acme/api.git \
       --name "ACME API" \
       --provider github \
@@ -246,7 +246,7 @@ $ orchestrator repo add acme-api \
       --description "The public API service."
 Registered repository 'acme-api' -> https://github.com/acme/api.git
 
-$ orchestrator repo add acme-api --remote https://github.com/acme/other.git
+$ narsor repo add acme-api --remote https://github.com/acme/other.git
 Could not register the repository: repository 'acme-api' is already registered in '…/repositories.json'
 ```
 
@@ -255,7 +255,7 @@ Could not register the repository: repository 'acme-api' is already registered i
 Every registered repository, ordered by id. An empty registry is not an error.
 
 ```console
-$ orchestrator repo list
+$ narsor repo list
 ID                       PROVIDER   DEFAULT BRANCH   REMOTE
 acme-api                 github     main             https://github.com/acme/api.git
 acme-web                 gitlab     -                git@gitlab.com:acme/web.git
@@ -266,7 +266,7 @@ acme-web                 gitlab     -                git@gitlab.com:acme/web.git
 Every field of one entry. An unknown id is exit code `1`.
 
 ```console
-$ orchestrator repo show acme-api
+$ narsor repo show acme-api
 Repository:     acme-api
 Name:           ACME API
 Provider:       github
@@ -282,7 +282,7 @@ silently accepted — an operator who mistypes an id would otherwise be told the
 repository is gone while it is still there.
 
 ```console
-$ orchestrator repo remove acme-web
+$ narsor repo remove acme-web
 Removed repository 'acme-web'.
 ```
 
@@ -301,16 +301,16 @@ is resolved in this order:
 `RUST_LOG=debug` says which of the two was taken, on stderr.
 
 ```console
-$ orchestrator repo add acme-api --remote /srv/git/api --default-branch main
-$ orchestrator run pipeline.yaml --input repository=acme-api   # clones /srv/git/api
-$ orchestrator run pipeline.yaml --input repository=/srv/git/other   # raw remote
+$ narsor repo add acme-api --remote /srv/git/api --default-branch main
+$ narsor run pipeline.yaml --input repository=acme-api   # clones /srv/git/api
+$ narsor run pipeline.yaml --input repository=/srv/git/other   # raw remote
 ```
 
 ### `tui`
 
 The full-screen terminal interface: a `lazygit`-shaped console over the same
 engine the CLI drives. It honours the global `--root`, so
-`orchestrator --root /srv/data tui` shows that data directory.
+`narsor --root /srv/data tui` shows that data directory.
 
 ```text
 ┌ Executions ────────┬ State and context ─────────┐
@@ -366,7 +366,7 @@ Events panel title rather than a view that silently stops moving.
 **What it can do.** Browse every execution in the data directory and its
 context; watch the live event stream; run a `running` execution on or resume a
 `paused` one (`s`); fill in and submit a human-input form (`i`), which goes
-through `Engine::deliver_human_input` exactly as `orchestrator input` does;
+through `Engine::deliver_human_input` exactly as `narsor input` does;
 choose a declared output of the current state, or — with `o`, and only where the
 state declares `allow_manual_override` — **force a transition to an arbitrary
 state** after a separate `y`/`n` confirmation. A forced transition is written to
@@ -381,10 +381,10 @@ here that the command line cannot do.
 
 | Key | Opens | The CLI it stands for |
 |-----|-------|------------------------|
-| `n` | New task | `orchestrator run <file> --input k=v` |
-| `R` | Repositories | `orchestrator repo list` / `add` / `remove` |
+| `n` | New task | `narsor run <file> --input k=v` |
+| `R` | Repositories | `narsor repo list` / `add` / `remove` |
 
-`R` lists the registry in the same order `orchestrator repo list` prints. Inside
+`R` lists the registry in the same order `narsor repo list` prints. Inside
 it, `a` opens a registration form (*id* and *remote* required, plus *name*,
 *provider*, *default branch* and *description*), and `d` removes the selected
 entry behind a separate `y`/`n` confirmation — `d` alone writes nothing. The
@@ -395,7 +395,7 @@ left open. Nothing invalid reaches `repositories.json`.
 
 `n` opens the new-task modal: type the path of a definition and press Enter to
 validate and load it — *every* violation is listed, the same verdict
-`orchestrator validate` gives, not just the first — then fill in the declared
+`narsor validate` gives, not just the first — then fill in the declared
 inputs and press Enter to start it. The declared `type` decides what a value
 becomes: a `boolean` is a `true`/`false` pick list and reaches the context as a
 JSON boolean rather than the string `"true"`, an `integer` is parsed, and a
@@ -404,7 +404,7 @@ registry is chosen instead of retyped. The execution is created, run and
 selected, so it is watched from the moment it starts.
 
 Any definition can be started this way, including one that declares
-`globals.workspace`. The interface and `orchestrator run` call the same shared
+`globals.workspace`. The interface and `narsor run` call the same shared
 module (`src/tasks`), so the workspace is expanded, resolved registry-first and
 cloned identically whichever started the task, and an execution started here is
 resumable from the command line and vice versa.
@@ -414,7 +414,7 @@ state; there is no CLI equivalent for it yet.
 
 **Logging.** `tui` takes over the alternate screen, so a log line on stderr
 would be written over the panels. With `RUST_LOG` set, the interface's logs are
-appended to `{root}/orchestrator.log` instead; with `RUST_LOG` unset no
+appended to `{root}/narsor.log` instead; with `RUST_LOG` unset no
 subscriber is installed at all and the records are dropped. Either way nothing
 reaches the terminal while the interface is up. Every other subcommand keeps
 logging to stderr.
@@ -529,7 +529,7 @@ the flag were left out.
 
 ### Permissions, non-interactivity, and what that costs
 
-The orchestrator runs unattended, so a harness that stopped on a permission
+The narsor runs unattended, so a harness that stopped on a permission
 prompt would hang a workflow until its timeout. Both harnesses are therefore run
 in their batch mode, where nothing can be prompted for.
 
@@ -551,7 +551,7 @@ The default is deliberately **not** the most permissive setting:
 filesystem layout and permission bits — which protects against a mistake, not
 against a determined or prompt-injected agent. An agent run with
 `bypassPermissions` or `auto_approve` has, for practical purposes, the
-orchestrator's own access to the machine: your files, your credentials, your
+narsor's own access to the machine: your files, your credentials, your
 network. Turn either on for a workflow you wrote, over a repository you trust,
 and never for an untrusted workflow or an untrusted prompt.
 
@@ -603,7 +603,7 @@ state is supposed to end the run as a failure or a cancellation.
 
 ## The on-disk layout
 
-Under the `--root` directory (`./.orchestrator` by default):
+Under the `--root` directory (`./.narsor` by default):
 
 ```text
 {root}/
@@ -618,7 +618,7 @@ Under the `--root` directory (`./.orchestrator` by default):
 │   └── code/
 │       ├── {primary_repository}/   # writable
 │       └── {secondary_repository}/ # read-only
-└── orchestrator.log                # only written by `tui`, and only with RUST_LOG set
+└── narsor.log                # only written by `tui`, and only with RUST_LOG set
 ```
 
 Every write of `state.json`, `context.json` and `repositories.json` is atomic
@@ -635,7 +635,7 @@ are compiled into the binary, so `cargo install --path .` is enough to run them
 from anywhere:
 
 ```bash
-orchestrator run compound-engineering \
+narsor run compound-engineering \
   --input feature_description="rate-limit the public API" \
   --input target_repo=acme-api
 ```
@@ -648,10 +648,10 @@ hit wins:
 |---|-------|-----------------|
 | 1 | an existing file at that exact path | `file` |
 | 2 | `{root}/workflows/<name>.yaml` (then `.yml`) | `root` |
-| 3 | `$XDG_CONFIG_HOME/orchestrator/workflows/<name>.yaml`, else `$HOME/.config/orchestrator/workflows/<name>.yaml` | `user` |
+| 3 | `$XDG_CONFIG_HOME/narsor/workflows/<name>.yaml`, else `$HOME/.config/narsor/workflows/<name>.yaml` | `user` |
 | 4 | the workflow built into the binary | `built-in` |
 
-A path always wins, so `orchestrator run ./draft.yaml` keeps meaning exactly
+A path always wins, so `narsor run ./draft.yaml` keeps meaning exactly
 that file. A copy in one of the directories **overrides** the built-in of the
 same name. When nothing matches, the error lists every place that was tried and
 names the built-ins.
@@ -659,8 +659,8 @@ names the built-ins.
 ### Looking at what is reachable
 
 ```bash
-orchestrator workflow list          # every workflow, its source, its description
-orchestrator workflow show NAME     # the YAML that would run (stdout); the source on stderr
+narsor workflow list          # every workflow, its source, its description
+narsor workflow show NAME     # the YAML that would run (stdout); the source on stderr
 ```
 
 `list` prints one row per name and marks an override rather than listing the
@@ -670,15 +670,15 @@ same name twice:
 NAME                         SOURCE     DESCRIPTION
 compound-engineering         user       The compound engineering chain, end to end: …
                                         overrides: built-in
-                                        path: /home/you/.config/orchestrator/workflows/compound-engineering.yaml
+                                        path: /home/you/.config/narsor/workflows/compound-engineering.yaml
 open-mercato-sdlc            built-in   The Open Mercato software delivery process …
 ```
 
 ### Making a built-in your own
 
 ```bash
-orchestrator workflow eject compound-engineering        # → the user directory
-orchestrator workflow eject compound-engineering --to ./workflows
+narsor workflow eject compound-engineering        # → the user directory
+narsor workflow eject compound-engineering --to ./workflows
 ```
 
 `eject` writes the built-in out as a file, creating the directory if needed, and
@@ -688,7 +688,7 @@ your version.
 
 ### Starting one from the interface
 
-`orchestrator tui`, then `n`: the modal opens on the same list, each row naming
+`narsor tui`, then `n`: the modal opens on the same list, each row naming
 its source (`built-in`, `user`, `root`, and `overrides: …` where a copy shadows a
 built-in). `←` / `→` — and `space`, `j` / `k`, `↑` / `↓` — change the selection,
 `Enter` loads and validates it, and the last row, *Enter a path…*, still takes an
@@ -699,7 +699,7 @@ arbitrary path for a definition you are writing.
 An execution records both the definition's path (when it came from a file) and
 its workflow name, in `metadata.cli.definition_path` and
 `metadata.cli.definition_name`. A built-in has no path, so the name is what makes
-`orchestrator input` and `orchestrator resume` — and the interface — find the
+`narsor input` and `narsor resume` — and the interface — find the
 definition again in a later process. The path is used first when it is still
 there, so executions created before this existed keep resolving unchanged;
 `--file <WORKFLOW>` overrides both and accepts a name as well as a path.
@@ -717,15 +717,15 @@ and modelled on real agentic development processes rather than invented ones:
 | `workflows/open-mercato-sdlc.yaml` | Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | Open Mercato's `SDLC.md` and the `om-*` skills |
 
 ```sh
-orchestrator validate open-mercato-sdlc        # by name, from anywhere
+narsor validate open-mercato-sdlc        # by name, from anywhere
 
-orchestrator repo add acme-web --remote git@github.com:acme/web.git   # once
-orchestrator run compound-engineering \
+narsor repo add acme-web --remote git@github.com:acme/web.git   # once
+narsor run compound-engineering \
   --input feature_description="let a reviewer subscribe to a run" \
   --input target_repo=acme-web
 
-orchestrator show <execution-id>          # where it is waiting
-orchestrator input <execution-id> ...     # answer the gate and resume
+narsor show <execution-id>          # where it is waiting
+narsor input <execution-id> ...     # answer the gate and resume
 ```
 
 Neither pipeline is autonomous end to end, and that is the point: both stop for a

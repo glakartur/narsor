@@ -2,7 +2,7 @@ name: agent-decision
 version: 1
 description: >
   A state that delegates the choice of transition to an agent, which this
-  version of the orchestrator cannot do.
+  version of narsor cannot do.
 
 states:
   check:

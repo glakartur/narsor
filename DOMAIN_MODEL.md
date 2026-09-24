@@ -1,6 +1,6 @@
 # Domain Model
 
-Niniejszy dokument opisuje model domenowy systemu **AI Workflow Orchestrator**. Model został zaprojektowany zgodnie z zasadą **deterministycznego rdzenia**, gdzie AI jest jedynie wykonawcą akcji, a nie właścicielem procesu decyzyjnego.
+Niniejszy dokument opisuje model domenowy systemu **AI Workflow Narsor**. Model został zaprojektowany zgodnie z zasadą **deterministycznego rdzenia**, gdzie AI jest jedynie wykonawcą akcji, a nie właścicielem procesu decyzyjnego.
 
 ## 1. Przegląd encji
 

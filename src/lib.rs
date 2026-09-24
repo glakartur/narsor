@@ -1,7 +1,7 @@
-//! AI Workflow Orchestrator
+//! Narsor — an AI workflow orchestrator
 //!
 //! Library crate exposing the domain model and the engine subsystems.
-//! The `orchestrator` binary is a thin wrapper over this crate; integration
+//! The `narsor` binary is a thin wrapper over this crate; integration
 //! tests under `tests/` link against it.
 
 pub mod cli;

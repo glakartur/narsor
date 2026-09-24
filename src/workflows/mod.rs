@@ -1,6 +1,6 @@
 //! Where a workflow definition comes from.
 //!
-//! `orchestrator run compound-engineering` has to work from an installed
+//! `narsor run compound-engineering` has to work from an installed
 //! binary, and `cargo install --path .` installs the binary and nothing else.
 //! So the two shipped definitions are **embedded** with `include_str!`
 //! ([`BUILTIN_WORKFLOWS`]): they travel with the binary that runs them and can
@@ -13,11 +13,11 @@
 //!
 //! 1. **a file that exists** at that exact path, relative or absolute — the
 //!    behaviour the CLI has always had, and the one that must keep winning so
-//!    that `orchestrator run ./draft.yaml` never resolves to something else;
+//!    that `narsor run ./draft.yaml` never resolves to something else;
 //! 2. `{root}/workflows/<name>.yaml` (then `.yml`) — the checkout's own copies,
 //!    and a directory `workflow eject --to` can target;
-//! 3. the user directory — `$XDG_CONFIG_HOME/orchestrator/workflows/<name>.yaml`,
-//!    or `$HOME/.config/orchestrator/workflows/<name>.yaml` when
+//! 3. the user directory — `$XDG_CONFIG_HOME/narsor/workflows/<name>.yaml`,
+//!    or `$HOME/.config/narsor/workflows/<name>.yaml` when
 //!    `XDG_CONFIG_HOME` is unset;
 //! 4. the **built-in** of that name.
 //!
@@ -47,7 +47,7 @@ use crate::workflow::{load_from_str, validate_source, LoadError};
 pub const WORKFLOWS_DIR: &str = "workflows";
 
 /// Directory of this application inside the user's config directory.
-pub const USER_CONFIG_DIR: &str = "orchestrator";
+pub const USER_CONFIG_DIR: &str = "narsor";
 
 /// The file extensions a workflow definition may use, in lookup order.
 pub const EXTENSIONS: [&str; 2] = ["yaml", "yml"];
@@ -63,7 +63,7 @@ pub struct BuiltinWorkflow {
 
 /// Every workflow shipped inside the binary.
 ///
-/// `include_str!` rather than a file read: an installed `orchestrator` has no
+/// `include_str!` rather than a file read: an installed `narsor` has no
 /// checkout to read from, and an embedded copy cannot fall out of step with
 /// the binary. `tests/builtin_workflows.rs` asserts these strings are
 /// byte-identical to the files under `workflows/`.
@@ -174,7 +174,7 @@ impl ResolvedWorkflow {
     }
 }
 
-/// One entry of the listing behind `orchestrator workflow list`.
+/// One entry of the listing behind `narsor workflow list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowEntry {
     /// The name it is reached by.
@@ -430,7 +430,7 @@ impl WorkflowResolver {
     }
 }
 
-/// `$XDG_CONFIG_HOME/orchestrator/workflows`, or `$HOME/.config/…`.
+/// `$XDG_CONFIG_HOME/narsor/workflows`, or `$HOME/.config/…`.
 pub fn user_workflows_dir() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(value) if !value.is_empty() => PathBuf::from(value),

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engine_support::{event_type, workflow, workflow_file, Harness, StubAgentExecutor};
-use orchestrator::domain::{EventData, ExecutionStatus};
-use orchestrator::engine::{ActionKind, Engine, EngineError, HumanInputDelivery};
+use narsor::domain::{EventData, ExecutionStatus};
+use narsor::engine::{ActionKind, Engine, EngineError, HumanInputDelivery};
 use serde_json::{json, Map, Value};
 
 // ---------------------------------------------------------------------------

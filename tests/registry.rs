@@ -4,7 +4,7 @@
 //! layer is what actually lands on disk: one JSON document, written through the
 //! atomic writer, that a missing file reads back as empty.
 
-use orchestrator::registry::{RegistryError, RepositoryEntry, RepositoryRegistry};
+use narsor::registry::{RegistryError, RepositoryEntry, RepositoryRegistry};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -21,8 +21,7 @@ struct TempRoot {
 
 impl TempRoot {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("orchestrator-registry-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("narsor-registry-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
     }
@@ -301,13 +300,13 @@ fn an_entry_converts_to_the_domain_types_without_a_third_shape() {
     assert_eq!(info.remote, entry.remote);
 }
 
-/// `orchestrator repo add` used to guess the provider from the remote while the
+/// `narsor repo add` used to guess the provider from the remote while the
 /// TUI form left it at the default, so the same repository registered two ways
 /// described itself two ways. The guess lives beside the entry now, so both
 /// paths label a remote identically.
 #[test]
 fn the_provider_is_inferred_from_the_remote_shape() {
-    use orchestrator::registry::infer_provider;
+    use narsor::registry::infer_provider;
 
     assert_eq!(infer_provider("/home/artur/Projekty/narsor"), "local");
     assert_eq!(infer_provider("./relative/repo"), "local");

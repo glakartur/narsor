@@ -728,7 +728,7 @@ fn check_ref(repository: &str, git_ref: &str) -> Result<()> {
 /// Runs the `git` command-line tool and captures both of its streams.
 ///
 /// `git` is looked up by name, so the `PATH` of the running process decides
-/// which installation is used — never a path hardcoded here. The orchestrator
+/// which installation is used — never a path hardcoded here. The narsor
 /// therefore requires `git` to be installed and on `PATH` at runtime; see the
 /// module documentation.
 ///

@@ -1,9 +1,9 @@
 #!/bin/sh
-# Appends the idempotency key the orchestrator passed in the environment to the
+# Appends the idempotency key narsor passed in the environment to the
 # file named by the first argument, twice per invocation, so a test can see both
 # that the key is stable within one attempt and that it changes between retries.
 # The first N invocations (N = the second argument) then die by signal, which
-# makes the orchestrator retry them.
+# makes narsor retry them.
 printf '%s\n' "$ORCHESTRATOR_ACTION_ID" >> "$1"
 printf '%s\n' "$ORCHESTRATOR_ACTION_ID" >> "$1"
 

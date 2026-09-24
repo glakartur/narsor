@@ -2,7 +2,7 @@
 
 ## 1. Przegląd
 
-Ten dokument definiuje deklaratywny format plików YAML używanych do opisywania workflow w AI Workflow Orchestrator. Format został zaprojektowany tak, aby był czytelny dla ludzi, łatwy do walidacji maszynowej i wspierał kluczowe funkcje systemu: deterministyczne przejścia stanów, izolację workspace'ów, integrację z agentami AI oraz human-in-the-loop.
+Ten dokument definiuje deklaratywny format plików YAML używanych do opisywania workflow w AI Workflow Narsor. Format został zaprojektowany tak, aby był czytelny dla ludzi, łatwy do walidacji maszynowej i wspierał kluczowe funkcje systemu: deterministyczne przejścia stanów, izolację workspace'ów, integrację z agentami AI oraz human-in-the-loop.
 
 ### 1.1. Zasady projektowe
 
@@ -198,7 +198,7 @@ action:
     124: timeout                      # Specjalny kod dla timeoutu procesu
 ```
 
-**Uwaga:** Skrypt powinien wypisać valid JSON na stdout (lub do wskazanego pliku), jeśli wymaga się przekazu zmiennych/artefaktów. Jeśli skrypt nie zwraca JSON, orchestrator polega wyłącznie na kodzie wyjścia do podjęcia decyzji.
+**Uwaga:** Skrypt powinien wypisać valid JSON na stdout (lub do wskazanego pliku), jeśli wymaga się przekazu zmiennych/artefaktów. Jeśli skrypt nie zwraca JSON, narsor polega wyłącznie na kodzie wyjścia do podjęcia decyzji.
 
 ##### C. HumanAction
 
@@ -242,7 +242,7 @@ Szablony są podstawiane tuż przed wykonaniem akcji — w promptach, komendach,
 - `{{ inputs.NAZWA }}` — wejście workflow zadeklarowane w sekcji `inputs`,
 - `{{ context.variables.NAZWA }}` — zmienna kontekstu, wraz ze skrótem `{{ context.NAZWA }}`, który znaczy dokładnie to samo.
 
-Białe znaki wewnątrz `{{ }}` są ignorowane. Nie ma filtrów (`| default(...)`), wyrażeń, warunków ani pętli — to świadomie prosty mechanizm podstawiania, a nie silnik szablonów. Odwołanie do nieistniejącego wejścia lub nieistniejącej zmiennej jest **błędem**, który przerywa akcję; orchestrator nigdy nie podstawia po cichu pustego stringa. Podstawianie jest jednoprzebiegowe: jeśli wartość zmiennej sama zawiera `{{ ... }}`, nie jest rozwijana ponownie.
+Białe znaki wewnątrz `{{ }}` są ignorowane. Nie ma filtrów (`| default(...)`), wyrażeń, warunków ani pętli — to świadomie prosty mechanizm podstawiania, a nie silnik szablonów. Odwołanie do nieistniejącego wejścia lub nieistniejącej zmiennej jest **błędem**, który przerywa akcję; narsor nigdy nie podstawia po cichu pustego stringa. Podstawianie jest jednoprzebiegowe: jeśli wartość zmiennej sama zawiera `{{ ... }}`, nie jest rozwijana ponownie.
 
 Wartości nie-stringowe renderują się jako JSON: liczba i wartość logiczna bez cudzysłowów (`123`, `true`), lista i obiekt w postaci kompaktowej (`["a","b"]`).
 
@@ -500,4 +500,4 @@ Schema została zaprojektowana z myślą o przyszłych rozszerzeniach:
 *   **Parallel States:** W przyszłości można dodać pole `parallel: true` do stanu, które pozwoliłoby na równoległe wykonanie pod-stanów, ale wymaga to znaczącej zmiany w silniku (obecnie sekwencyjnym).
 *   **Dynamiczne Workspace'y:** Obecnie workspace jest stały dla wykonania. W przyszłości można dodać pole `workspace_override` w stanie, aby zmieniać środowisko pracy między krokami (wymaga obsługi migracji kontekstu).
 
-Dokument ten stanowi kontrakt między użytkownikiem (twórcą workflow) a silnikiem orchestratora. Zmiany w schemacie powinny być wersjonowane (pole `version` w pliku YAML).
+Dokument ten stanowi kontrakt między użytkownikiem (twórcą workflow) a silnikiem narsora. Zmiany w schemacie powinny być wersjonowane (pole `version` w pliku YAML).

@@ -1,13 +1,13 @@
-# Architecture Decisions - AI Workflow Orchestrator
+# Architecture Decisions - AI Workflow Narsor
 
-Dokument zawiera zestawienie kluczowych decyzji architektonicznych podjętych dla projektu AI Workflow Orchestrator w fazie MVP.
+Dokument zawiera zestawienie kluczowych decyzji architektonicznych podjętych dla projektu AI Workflow Narsor w fazie MVP.
 
 ## Tabela decyzji
 
 | ID  | Obszar | Decyzja | Alternatywa | Status | Konsekwencje |
 |-----|--------|---------|-------------|--------|--------------|
 | D1  | Język implementacji | **Rust** (z frameworkiem Axum) | Go, TypeScript, Python | ✅ ZATWIERDZONA | Bezpieczeństwo pamięci, wydajność, pojedynczy plik binarny, łatwe TUI i API. |
-| D2  | Architektura procesu | **Single Process** (jeden proces orchestratora) | Mikroserwisy | ✅ ZATWIERDZONA | Prostszy deployment, brak opóźnień sieciowych, wszystkie komponenty w jednej binarynce. |
+| D2  | Architektura procesu | **Single Process** (jeden proces narsora) | Mikroserwisy | ✅ ZATWIERDZONA | Prostszy deployment, brak opóźnień sieciowych, wszystkie komponenty w jednej binarynce. |
 | D3  | Persistence | **Filesystem-based storage** (pliki JSON + foldery) | SQLite, PostgreSQL | ✅ ZATWIERDZONA | Zero zależności DB, łatwy backup (kopia folderu), struktura: `/tasks/{id}/{state,context,events/,artifacts/}`. |
 | D4  | Event History | **Hybryda**: Bieżący stan (`state.json`) + Append-only log (`events/`) | Pełny Event Sourcing | ✅ ZATWIERDZONA | Szybki odczyt stanu, pełna historia do debugowania, możliwość migracji do ES w przyszłości. |
 | D5  | Workflow DSL | **YAML** + walidacja JSON Schema | JSON, TOML, własny DSL | ✅ ZATWIERDZONA | Czytelność dla ludzi, łatwa walidacja, brak potrzeby parsera własnego języka. |
@@ -33,7 +33,7 @@ Dokument zawiera zestawienie kluczowych decyzji architektonicznych podjętych dl
 | D25 | Delivery Eventów | **At-least-once** + deduplikacja po event_id. | Exactly-once | ✅ ZATWIERDZONA | Gwarancja dostarczenia przy restarcie. Odbiorca musi obsługiwać duplikaty. |
 | D26 | External Events | **Polling Service** (odpytywanie zewnętrznych API) | Webhooki / Nasłuchiwanie | ✅ ZATWIERDZONA | Workflow rejestruje oczekiwanie (np. na PR). Usługa pyta GitHub i wstrzykuje event do workflow. Brak serwera webhooków w MVP. |
 | D27 | GitHub Integration | **Minimalna**: PR create/merge, status CI. | Pełna integracja | ⚠️ CAN DEFER | Tylko niezbędne operacje dla MVP. Reszta jako rozszerzenie. |
-| D28 | Orchestrator Assistant | **Brak w MVP**. Tylko Human-in-the-loop. | Agent-asystent | ✅ ZATWIERDZONA | Fokus na silniku workflow. Asystent jako klient API w przyszłości. |
+| D28 | Narsor Assistant | **Brak w MVP**. Tylko Human-in-the-loop. | Agent-asystent | ✅ ZATWIERDZONA | Fokus na silniku workflow. Asystent jako klient API w przyszłości. |
 | D29 | Permissions Asystenta | N/A (brak asystenta w MVP). | - | ⚠️ CAN DEFER | Do określenia przy dodawaniu asystenta. |
 | D30 | Manual Transition | **Tryb mieszany**: 1) Wybór z listy (standard), 2) Override (dowolny stan, wymagany flag). | Tylko z listy / Dowolny | ✅ ZATWIERDZONA | Bezpieczeństwo domyślne, elastyczność w sytuacjach awaryjnych (override). |
 | D31 | Mutacja Workflow | **Zabroniona** podczas execution. | Dynamiczna zmiana definicji | ✅ ZATWIERDZONA | Stabilność wykonania. Zmiana wymaga nowego execution. |

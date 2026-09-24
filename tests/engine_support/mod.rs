@@ -14,12 +14,12 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex;
 
-use orchestrator::domain::{
+use narsor::domain::{
     ActionConfig, ActionError, ActionResult, Event, ExecutionStatus, WorkflowDefinition, Workspace,
 };
-use orchestrator::engine::{ActionExecutor, ActionOutcome, ActionRequest, Engine};
-use orchestrator::persistence::ExecutionStore;
-use orchestrator::workflow::load_from_file;
+use narsor::engine::{ActionExecutor, ActionOutcome, ActionRequest, Engine};
+use narsor::persistence::ExecutionStore;
+use narsor::workflow::load_from_file;
 use serde_json::{json, Map, Value};
 
 /// A temporary root with a store and a workspace, removed when it goes away.
@@ -33,8 +33,7 @@ impl Harness {
     /// Creates the root, the store directory and a workspace holding every
     /// fixture script.
     pub fn new() -> Self {
-        let root =
-            std::env::temp_dir().join(format!("orchestrator-engine-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("narsor-engine-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(root.join("store")).expect("create store root");
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).expect("create workspace");

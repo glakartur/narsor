@@ -768,7 +768,7 @@ impl Engine {
         let executor = self.executors.get(&kind).ok_or_else(|| {
             AttemptFailure::permanent(format!(
                 "state '{}' uses a {} action, which is not available in this version \
-                 of the orchestrator",
+                 of narsor",
                 state.id,
                 kind.name()
             ))

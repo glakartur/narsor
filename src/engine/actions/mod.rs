@@ -172,7 +172,7 @@ impl ActionOutcome {
 
 /// What an attempt suspended on.
 ///
-/// One variant per thing the orchestrator can wait for. `HumanAction` is the
+/// One variant per thing narsor can wait for. `HumanAction` is the
 /// only one in U6; `WaitAction` adds its own later.
 #[derive(Debug, Clone)]
 pub enum SuspendedAction {

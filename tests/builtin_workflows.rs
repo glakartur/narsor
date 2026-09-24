@@ -4,7 +4,7 @@
 //!
 //! * the resolver itself, driven through the library, where the user directory
 //!   is handed in explicitly
-//!   ([`WorkflowResolver::with_user_dir`](orchestrator::workflows::WorkflowResolver::with_user_dir));
+//!   ([`WorkflowResolver::with_user_dir`](narsor::workflows::WorkflowResolver::with_user_dir));
 //! * the binary, driven through `std::process::Command`, where
 //!   `XDG_CONFIG_HOME` points at a temporary directory.
 //!
@@ -28,7 +28,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use orchestrator::workflows::{
+use narsor::workflows::{
     builtin, builtin_names, WorkflowOrigin, WorkflowResolver, BUILTIN_WORKFLOWS,
 };
 
@@ -54,8 +54,7 @@ struct TempRoot {
 
 impl TempRoot {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("orchestrator-workflows-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("narsor-workflows-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
     }
@@ -88,7 +87,7 @@ impl TempRoot {
 
     /// The user's workflow directory inside the stand-in config directory.
     fn user_workflows(&self) -> PathBuf {
-        self.dir("config/orchestrator/workflows")
+        self.dir("config/narsor/workflows")
     }
 }
 
@@ -154,7 +153,7 @@ fn cli(root: &TempRoot, args: &[&str]) -> Invocation {
 
 /// The same, with a directory prepended to `PATH` — for the fake `claude`.
 fn cli_with_path(root: &TempRoot, args: &[&str], bin: Option<&Path>) -> Invocation {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_orchestrator"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_narsor"));
     command
         .current_dir(root.path())
         .env("XDG_CONFIG_HOME", root.config())
@@ -168,7 +167,7 @@ fn cli_with_path(root: &TempRoot, args: &[&str], bin: Option<&Path>) -> Invocati
         command.env("PATH", format!("{}:{inherited}", bin.display()));
     }
 
-    let output = command.output().expect("run the orchestrator binary");
+    let output = command.output().expect("run the narsor binary");
     Invocation {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -222,7 +221,7 @@ fn every_builtin_is_embedded_and_validates_without_a_single_violation() {
             entry.name
         );
 
-        let violations = orchestrator::workflow::validate_source(entry.source)
+        let violations = narsor::workflow::validate_source(entry.source)
             .unwrap_or_else(|error| panic!("the embedded '{}' compiles: {error}", entry.name));
         assert!(
             violations.is_empty(),
@@ -231,7 +230,7 @@ fn every_builtin_is_embedded_and_validates_without_a_single_violation() {
             violations
         );
 
-        let definition = orchestrator::workflow::load_from_str(entry.source)
+        let definition = narsor::workflow::load_from_str(entry.source)
             .unwrap_or_else(|error| panic!("the embedded '{}' loads: {error}", entry.name));
         assert_eq!(
             definition.name, entry.name,
@@ -521,7 +520,7 @@ fn workflow_eject_writes_refuses_a_second_time_and_then_takes_precedence() {
 
     let target = root
         .config()
-        .join("orchestrator/workflows/compound-engineering.yaml");
+        .join("narsor/workflows/compound-engineering.yaml");
     assert!(
         target.is_file(),
         "the file was written to {}",
@@ -726,7 +725,7 @@ fn make_executable(path: &Path) {
 ///
 /// A built-in has no file, so nothing can be recorded in
 /// `metadata.cli.definition_path`; the workflow *name* is recorded instead, and
-/// `orchestrator input` re-resolves from it. Both shipped workflows are full of
+/// `narsor input` re-resolves from it. Both shipped workflows are full of
 /// human gates, so an execution that could not be answered would be useless.
 #[test]
 fn an_execution_started_from_a_builtin_by_name_is_resumable_in_a_fresh_process() {

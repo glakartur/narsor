@@ -46,7 +46,7 @@ impl ExecutionStore {
         }
     }
 
-    /// Creates a store at the default root (`./.orchestrator`).
+    /// Creates a store at the default root (`./.narsor`).
     pub fn with_default_root() -> Self {
         Self::new(DEFAULT_ROOT)
     }

@@ -1,6 +1,6 @@
 //! Command-line interface.
 //!
-//! The operator-facing half of the orchestrator: validate a definition, start a
+//! The operator-facing half of narsor: validate a definition, start a
 //! workflow, look at what is on disk, and answer a question a workflow asked.
 //! Everything here is a thin shell around the library — argument parsing,
 //! resolving the workflow definition, and formatting — so that every operation
@@ -10,7 +10,7 @@
 //! # Two streams
 //!
 //! Command output goes to stdout, diagnostics and `tracing` logs to stderr.
-//! That is what makes `orchestrator list | grep paused` work. The one
+//! That is what makes `narsor list | grep paused` work. The one
 //! exception is [`Command::Tui`], which owns the whole terminal: its logs are
 //! diverted to a file under `--root` (see `src/main.rs`) so that nothing is
 //! written over the alternate screen.
@@ -47,16 +47,16 @@ pub const EXIT_FAILURE: i32 = 1;
 /// The invocation itself was wrong.
 pub const EXIT_USAGE: i32 = 2;
 
-/// The `orchestrator` command line.
+/// The `narsor` command line.
 #[derive(Debug, Parser)]
 #[command(
-    name = "orchestrator",
+    name = "narsor",
     version,
-    about = "AI workflow orchestrator — validate definitions, run them, and inspect executions",
+    about = "Narsor — an AI workflow orchestrator: validate definitions, run them, and inspect executions",
     disable_help_subcommand = true
 )]
 pub struct Cli {
-    /// Orchestrator data directory (executions and workspaces).
+    /// Narsor data directory (executions and workspaces).
     #[arg(
         long,
         global = true,

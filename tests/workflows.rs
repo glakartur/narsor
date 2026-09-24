@@ -1,6 +1,6 @@
 //! Tests for the shipped workflow definitions in `workflows/`.
 //!
-//! These are the two pipelines the orchestrator ships with — the compound
+//! These are the two pipelines narsor ships with — the compound
 //! engineering chain and the Open Mercato SDLC — and they are user-facing
 //! artifacts, so they are held to the same bar as code: they validate with no
 //! violations, their human gates really can hand a label back to the engine,
@@ -17,14 +17,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use orchestrator::domain::{
+use narsor::domain::{
     ActionConfig, ExecutionStatus, HumanInputType, State, TerminalStatus, WorkflowDefinition,
     Workspace,
 };
-use orchestrator::engine::{
+use narsor::engine::{
     ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry, HumanInputDelivery,
 };
-use orchestrator::workflow::{load_from_file, validate_path};
+use narsor::workflow::{load_from_file, validate_path};
 use serde_json::{json, Map, Value};
 
 // ---------------------------------------------------------------------------
@@ -57,8 +57,7 @@ struct TempRoot {
 
 impl TempRoot {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("orchestrator-workflows-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("narsor-workflows-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
     }
@@ -118,7 +117,7 @@ impl FakeHarness {
             AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(Arc::new(
                 ClaudeCodeAdapter::with_program(self.program.to_string_lossy().into_owned()),
             )));
-        Engine::new(orchestrator::persistence::ExecutionStore::new(store_root))
+        Engine::new(narsor::persistence::ExecutionStore::new(store_root))
             .with_executor(ActionKind::Agent, Arc::new(executor))
     }
 }
@@ -396,7 +395,7 @@ async fn run_to_terminal(
     inputs: Value,
     workspace: Workspace,
     answers: &[Answer],
-) -> orchestrator::domain::WorkflowExecution {
+) -> narsor::domain::WorkflowExecution {
     let mut execution = engine
         .start_and_run(definition, inputs, workspace)
         .await

@@ -11,13 +11,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use orchestrator::domain::{
+use narsor::domain::{
     ActionConfig, ActionError, ActionResult, Context, ScriptActionConfig, Workspace,
 };
-use orchestrator::engine::actions::script::{MAX_CAPTURED_OUTPUT_BYTES, TRUNCATION_MARKER};
-use orchestrator::engine::actions::TIMEOUT_LABEL;
-use orchestrator::engine::{ActionExecutor, ActionOutcome, ActionRequest, ScriptExecutor};
-use orchestrator::workflow::TemplateScope;
+use narsor::engine::actions::script::{MAX_CAPTURED_OUTPUT_BYTES, TRUNCATION_MARKER};
+use narsor::engine::actions::TIMEOUT_LABEL;
+use narsor::engine::{ActionExecutor, ActionOutcome, ActionRequest, ScriptExecutor};
+use narsor::workflow::TemplateScope;
 use serde_json::{json, Map, Value};
 
 // ---------------------------------------------------------------------------
@@ -33,8 +33,7 @@ struct TempRoot {
 
 impl TempRoot {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("orchestrator-script-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("narsor-script-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
     }
@@ -340,7 +339,7 @@ fn process_is_alive(pid: u32) -> bool {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_process_runs_in_the_workspace_not_in_the_orchestrator_directory() {
+async fn the_process_runs_in_the_workspace_not_in_the_narsor_directory() {
     let root = TempRoot::new();
 
     let result = complete(script("print_cwd.sh", &[]), &root.workspace()).await;
@@ -386,7 +385,7 @@ async fn a_script_writing_a_file_creates_it_inside_the_workspace() {
         !Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("report.txt")
             .exists(),
-        "the file must not be written into the orchestrator repository"
+        "the file must not be written into the narsor repository"
     );
 }
 

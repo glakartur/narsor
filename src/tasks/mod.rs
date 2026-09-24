@@ -1,7 +1,7 @@
 //! Starting a task: one workflow definition plus its inputs, turned into an
 //! execution that owns a directory to work in.
 //!
-//! This is the operation behind `orchestrator run` and behind the TUI's `n`,
+//! This is the operation behind `narsor run` and behind the TUI's `n`,
 //! and it lives here rather than in either of them because both need it and
 //! because one of its steps — [`resolve_repository`] — decides what `git` is
 //! asked to clone. A second, drifting copy of that rule is a
@@ -63,7 +63,7 @@
 //! * `metadata.cli.definition_name` — the workflow's *name* in the search path
 //!   ([`crate::workflows`]). This is the key a built-in needs, because a
 //!   built-in is compiled into the binary and has no path at all: without it an
-//!   execution started as `orchestrator run compound-engineering` could never
+//!   execution started as `narsor run compound-engineering` could never
 //!   be resumed, and both shipped workflows are full of human gates.
 //!
 //! [`resolve_definition`] reads them back, **path first**: an execution written

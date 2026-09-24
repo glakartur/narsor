@@ -10,18 +10,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use orchestrator::domain::{
+use narsor::domain::{
     ActionConfig, Event, EventData, ExecutionStatus, HumanActionConfig, HumanInputField,
     HumanInputType, WorkflowExecution, Workspace,
 };
-use orchestrator::engine::actions::human::{
+use narsor::engine::actions::human::{
     self, HumanActionError, PendingHumanInput, ResumedHumanAction,
 };
-use orchestrator::engine::{
+use narsor::engine::{
     ActionExecutor, ActionOutcome, ActionRequest, HumanExecutor, HumanInputDelivery,
     SuspendedAction,
 };
-use orchestrator::persistence::ExecutionStore;
+use narsor::persistence::ExecutionStore;
 use serde_json::{json, Map, Value};
 
 // ---------------------------------------------------------------------------
@@ -37,8 +37,7 @@ struct TempRoot {
 
 impl TempRoot {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("orchestrator-human-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("narsor-human-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
     }
@@ -130,7 +129,7 @@ fn start_execution(store: &ExecutionStore, workspace_path: &Path) -> WorkflowExe
         started_at: chrono::Utc::now(),
         completed_at: None,
         inputs: json!({}),
-        context: orchestrator::domain::Context::new(),
+        context: narsor::domain::Context::new(),
         workspace: Workspace::local_folder(workspace_path.to_string_lossy().into_owned()),
         current_action_execution: None,
         metadata: json!({}),
@@ -222,7 +221,7 @@ async fn executor_suspends_instead_of_running_anything() {
 
 #[tokio::test]
 async fn executor_rejects_an_action_of_another_type() {
-    let action = ActionConfig::Script(orchestrator::domain::ScriptActionConfig {
+    let action = ActionConfig::Script(narsor::domain::ScriptActionConfig {
         command: "true".to_string(),
         args: Vec::new(),
         working_dir: None,

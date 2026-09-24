@@ -1,16 +1,16 @@
-//! The `orchestrator` binary: logging plus the command-line interface.
+//! The `narsor` binary: logging plus the command-line interface.
 //!
 //! # Where the logs go, and why it depends on the subcommand
 //!
 //! For every subcommand but `tui` the logger writes to stderr, so that stdout
-//! carries nothing but the output of the command — `orchestrator list | grep
+//! carries nothing but the output of the command — `narsor list | grep
 //! paused` has to keep working with `RUST_LOG=debug` set.
 //!
 //! `tui` is the exception, because it owns the whole terminal: it switches to
 //! the alternate screen, and a log line written to stderr lands on top of the
 //! panels, corrupting a display that nothing redraws from scratch. So the
 //! interface's logs go to a file under the data directory
-//! (`{root}/orchestrator.log`, opened for appending), and if no filter is
+//! (`{root}/narsor.log`, opened for appending), and if no filter is
 //! configured — `RUST_LOG` unset or empty — no subscriber is installed at all
 //! and the records are dropped where they are made. Either way nothing reaches
 //! the terminal while the alternate screen is up.
@@ -20,11 +20,11 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use clap::Parser;
-use orchestrator::cli::{self, Cli, Command};
+use narsor::cli::{self, Cli, Command};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 /// Name of the log file the terminal interface writes into, under `--root`.
-const TUI_LOG_FILE: &str = "orchestrator.log";
+const TUI_LOG_FILE: &str = "narsor.log";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -82,7 +82,7 @@ fn filter_is_configured() -> bool {
         .unwrap_or(false)
 }
 
-/// Opens `{root}/orchestrator.log` for appending, creating the root if needed.
+/// Opens `{root}/narsor.log` for appending, creating the root if needed.
 ///
 /// `None` when the file cannot be opened; the caller then runs without logs.
 fn open_log_file(root: &Path) -> Option<File> {

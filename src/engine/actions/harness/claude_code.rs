@@ -14,11 +14,11 @@
 //! # Why that shape
 //!
 //! * `--print` is what makes the run batch: the CLI answers and exits instead
-//!   of opening a session on a terminal the orchestrator does not have.
+//!   of opening a session on a terminal narsor does not have.
 //! * `--output-format json` gives one result object with the final text *and*
 //!   the session id in it. `text` would give the text alone and leave the
 //!   session unresumable; `stream-json` would have to be reassembled for no
-//!   gain, since the orchestrator does not forward tokens anywhere yet.
+//!   gain, since narsor does not forward tokens anywhere yet.
 //! * `--permission-mode` is **last** before the prompt on purpose. It takes
 //!   exactly one value, so the prompt after it can never be mistaken for a flag
 //!   argument — unlike `--add-dir`, which is variadic and would swallow the

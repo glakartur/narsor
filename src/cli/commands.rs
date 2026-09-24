@@ -13,7 +13,7 @@
 //! `validate`, `run` and `--file` all take a *workflow reference*, not a path:
 //! an existing file wins, then `{root}/workflows/<name>.yaml`, then the user
 //! directory, then the built-in of that name ([`crate::workflows`]). That is
-//! what makes `orchestrator run compound-engineering` work from an installed
+//! what makes `narsor run compound-engineering` work from an installed
 //! binary, which has no checkout to read from.
 //!
 //! # How `input` and `resume` find the definition
@@ -79,7 +79,7 @@ pub type Result<T> = std::result::Result<T, CliError>;
 // validate
 // ---------------------------------------------------------------------------
 
-/// `orchestrator validate <workflow>` — static validation, all violations at
+/// `narsor validate <workflow>` — static validation, all violations at
 /// once.
 ///
 /// The argument is a workflow reference: a file, a name in the search path, or
@@ -126,7 +126,7 @@ fn violation_noun(count: usize) -> &'static str {
 // run
 // ---------------------------------------------------------------------------
 
-/// `orchestrator run <workflow> [--input k=v]…` — create an execution and run
+/// `narsor run <workflow> [--input k=v]…` — create an execution and run
 /// it.
 pub async fn run(root: &Path, reference: &str, inputs: &[String]) -> Result<()> {
     let resolved = resolve_workflow(root, reference)?;
@@ -268,7 +268,7 @@ fn parse_input_value(parameter: &InputParameter, raw: &str) -> Result<Value> {
 // list / show / events
 // ---------------------------------------------------------------------------
 
-/// `orchestrator list` — every execution in the store, newest first.
+/// `narsor list` — every execution in the store, newest first.
 pub fn list(root: &Path) -> Result<()> {
     let store = ExecutionStore::new(root);
     let ids = store
@@ -304,7 +304,7 @@ pub fn list(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `orchestrator show <id>` — the current state, the status and the context.
+/// `narsor show <id>` — the current state, the status and the context.
 pub fn show(root: &Path, execution_id: &str) -> Result<()> {
     let store = ExecutionStore::new(root);
     let execution = load_execution(&store, execution_id)?;
@@ -347,7 +347,7 @@ pub fn show(root: &Path, execution_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// `orchestrator events <id> [--follow]` — the event log, in sequence order.
+/// `narsor events <id> [--follow]` — the event log, in sequence order.
 pub async fn events(root: &Path, execution_id: &str, follow: bool) -> Result<()> {
     let store = ExecutionStore::new(root);
     // Fails early and readably when the id is unknown.
@@ -402,7 +402,7 @@ fn event_type(event: &Event) -> String {
 // input / resume
 // ---------------------------------------------------------------------------
 
-/// `orchestrator input <id> [--field k=v]… [--label l]` — answer a question.
+/// `narsor input <id> [--field k=v]… [--label l]` — answer a question.
 pub async fn input(
     root: &Path,
     execution_id: &str,
@@ -460,7 +460,7 @@ pub async fn input(
     Ok(())
 }
 
-/// `orchestrator resume <id>` — continue a paused execution.
+/// `narsor resume <id>` — continue a paused execution.
 pub async fn resume(root: &Path, execution_id: &str, definition_file: Option<&str>) -> Result<()> {
     let store = ExecutionStore::new(root);
     let execution = load_execution(&store, execution_id)?;
@@ -487,7 +487,7 @@ pub async fn resume(root: &Path, execution_id: &str, definition_file: Option<&st
 // repo
 // ---------------------------------------------------------------------------
 
-/// `orchestrator repo add <id> --remote <url|path> …` — register a repository.
+/// `narsor repo add <id> --remote <url|path> …` — register a repository.
 ///
 /// The remote is checked with the workspace provisioner's own rules, so a
 /// remote the registry accepts is one a workflow will be able to clone: a value
@@ -517,7 +517,7 @@ pub fn repo_add(
     Ok(())
 }
 
-/// `orchestrator repo list` — every registered repository, ordered by id.
+/// `narsor repo list` — every registered repository, ordered by id.
 pub fn repo_list(root: &Path) -> Result<()> {
     let entries = RepositoryRegistry::new(root)
         .list()
@@ -544,7 +544,7 @@ pub fn repo_list(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `orchestrator repo show <id>` — every field of one registered repository.
+/// `narsor repo show <id>` — every field of one registered repository.
 pub fn repo_show(root: &Path, id: &str) -> Result<()> {
     let registry = RepositoryRegistry::new(root);
     let entry = registry
@@ -572,7 +572,7 @@ pub fn repo_show(root: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// `orchestrator repo remove <id>` — drop a repository from the registry.
+/// `narsor repo remove <id>` — drop a repository from the registry.
 pub fn repo_remove(root: &Path, id: &str) -> Result<()> {
     RepositoryRegistry::new(root)
         .remove(id)
@@ -586,7 +586,7 @@ pub fn repo_remove(root: &Path, id: &str) -> Result<()> {
 // workflow
 // ---------------------------------------------------------------------------
 
-/// `orchestrator workflow list` — every workflow reachable right now.
+/// `narsor workflow list` — every workflow reachable right now.
 ///
 /// One line per *name*: where the copy that wins comes from, what it overrides
 /// when it overrides something, and its `description`. A user copy shadowing a
@@ -620,10 +620,10 @@ pub fn workflow_list(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `orchestrator workflow show <name>` — the YAML that would run.
+/// `narsor workflow show <name>` — the YAML that would run.
 ///
 /// The definition goes to stdout and nothing else does, so
-/// `orchestrator workflow show compound-engineering > mine.yaml` is a copy;
+/// `narsor workflow show compound-engineering > mine.yaml` is a copy;
 /// where it came from is said on stderr.
 pub fn workflow_show(root: &Path, reference: &str) -> Result<()> {
     let resolved = resolve_workflow(root, reference)?;
@@ -635,7 +635,7 @@ pub fn workflow_show(root: &Path, reference: &str) -> Result<()> {
     Ok(())
 }
 
-/// `orchestrator workflow eject <name> [--to <dir>] [--force]` — write a
+/// `narsor workflow eject <name> [--to <dir>] [--force]` — write a
 /// built-in out as a file.
 ///
 /// The default target is the user directory, which the resolver searches ahead
@@ -713,7 +713,7 @@ fn truncate(text: &str, limit: usize) -> String {
 // tui (U10)
 // ---------------------------------------------------------------------------
 
-/// `orchestrator tui` — the full-screen interface, added in U10.
+/// `narsor tui` — the full-screen interface, added in U10.
 ///
 /// The loop is async but this entry point is not, because the subcommand
 /// dispatch calls it from inside the runtime `main` already started. So the

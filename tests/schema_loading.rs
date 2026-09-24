@@ -3,12 +3,12 @@
 //! The reference fixture is `tests/fixtures/implement_feature.yaml`, copied
 //! verbatim from `WORKFLOW_SCHEMA.md` §4.
 
-use orchestrator::domain::{
+use narsor::domain::{
     ActionConfig, ExecutionStatus, HumanInputType, ParamType, State, TerminalStatus,
     WorkflowDefinition, WorkspaceSpec,
 };
-use orchestrator::engine::terminal_status;
-use orchestrator::workflow::{load_from_file, load_from_str};
+use narsor::engine::terminal_status;
+use narsor::workflow::{load_from_file, load_from_str};
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -404,7 +404,7 @@ terminal_states: [done]
 
 #[test]
 fn human_decision_message_is_not_lost() {
-    use orchestrator::domain::DecisionConfig;
+    use narsor::domain::DecisionConfig;
 
     let yaml = r#"
 name: decision-demo
@@ -437,7 +437,7 @@ terminal_states: [done]
 
 #[test]
 fn rules_and_agent_decisions_load() {
-    use orchestrator::domain::DecisionConfig;
+    use narsor::domain::DecisionConfig;
 
     let yaml = r#"
 name: decisions

@@ -43,8 +43,8 @@
 //! # Registering a repository, and starting a task
 //!
 //! Both are modals, and both are the CLI's own operation with a form in front
-//! of it — `orchestrator repo add`/`repo list`/`repo remove` behind `R`, and
-//! `orchestrator run` behind `n`. Nothing here is a capability the CLI lacks.
+//! of it — `narsor repo add`/`repo list`/`repo remove` behind `R`, and
+//! `narsor run` behind `n`. Nothing here is a capability the CLI lacks.
 //!
 //! * The repository form builds a [`RepositoryEntry`] and calls its
 //!   [`validate`](RepositoryEntry::validate) *before* `add()`, so a refused id
@@ -53,18 +53,18 @@
 //! * The new-task modal opens on a **pick list** of every workflow the
 //!   resolver can reach — built-ins, the user's own copies and
 //!   `{root}/workflows`, each row naming its source and marking an override,
-//!   exactly as `orchestrator workflow list` does. `←`/`→` (and `space`,
+//!   exactly as `narsor workflow list` does. `←`/`→` (and `space`,
 //!   `j`/`k`, `↑`/`↓`) change the selection; the last row, "Enter a path…",
 //!   switches to a text line so that a definition being developed — which is
 //!   in no search location yet — can still be run. The pick is then validated
-//!   in full (every violation, the way `orchestrator validate` prints them)
+//!   in full (every violation, the way `narsor validate` prints them)
 //!   and the input form is generated from the definition's `inputs`: the
 //!   declared `type` decides the JSON type the value reaches the context as,
 //!   and a `repository` input is a pick list of what the registry holds.
 //!
 //! ## Where the workspace comes from
 //!
-//! From [`crate::tasks::start_task`], the same entry point `orchestrator run`
+//! From [`crate::tasks::start_task`], the same entry point `narsor run`
 //! calls: a definition declaring `globals.workspace` is expanded, resolved
 //! through the registry and cloned here exactly as it is there, and one that
 //! declares none gets the same empty `{root}/tasks/{id}/code/workspace`. There
@@ -450,7 +450,7 @@ impl RepositoryField {
     }
 }
 
-/// The form that registers a repository — the TUI's `orchestrator repo add`.
+/// The form that registers a repository — the TUI's `narsor repo add`.
 ///
 /// Every value is a plain text line: the registry's own
 /// [`RepositoryEntry::validate`] is what judges them, so the form never invents
@@ -527,7 +527,7 @@ impl RepositoryForm {
     }
 }
 
-/// The listing of what is registered — the TUI's `orchestrator repo list`.
+/// The listing of what is registered — the TUI's `narsor repo list`.
 ///
 /// A modal rather than a fourth panel: the registry is consulted when a task is
 /// started, not while one is watched, and a permanent panel would spend screen
@@ -620,7 +620,7 @@ pub enum InputEditor {
     Choice(Vec<String>),
 }
 
-/// The modal that starts a workflow — the TUI's `orchestrator run`.
+/// The modal that starts a workflow — the TUI's `narsor run`.
 ///
 /// Two stages in one overlay, because they are one operation: a path is typed,
 /// the definition behind it is validated in full, and the form for its `inputs`
@@ -2266,7 +2266,7 @@ impl App {
     /// Loads the definition the new-task form names and validates it in full.
     ///
     /// Every violation is kept, not the first one: the operator should see the
-    /// whole verdict on one screen, the way `orchestrator validate` prints it.
+    /// whole verdict on one screen, the way `narsor validate` prints it.
     pub fn load_new_task_definition(&mut self) {
         let repositories = self.repository_ids();
         let reference = match &self.modal {
@@ -2299,7 +2299,7 @@ impl App {
     /// Opens the new-task modal on the list of everything that can be run.
     ///
     /// The list is the resolver's own — the same enumeration
-    /// `orchestrator workflow list` prints, overrides marked — plus the row
+    /// `narsor workflow list` prints, overrides marked — plus the row
     /// that switches to a typed path, because a definition being written is in
     /// no search location yet.
     pub fn open_new_task(&mut self) {
@@ -2374,7 +2374,7 @@ impl App {
     /// Validates a resolved workflow in full and builds its input form.
     ///
     /// Every violation is kept, not the first one: the operator should see the
-    /// whole verdict on one screen, the way `orchestrator validate` prints it.
+    /// whole verdict on one screen, the way `narsor validate` prints it.
     fn adopt_new_task_workflow(&mut self, resolved: ResolvedWorkflow, repositories: &[String]) {
         let Modal::NewTask(form) = &mut self.modal else {
             return;
@@ -2413,7 +2413,7 @@ impl App {
     ///
     /// The form's own values are parsed first, because a rejected input must
     /// leave nothing on disk at all; everything after that is
-    /// [`crate::tasks::start_task`], the operation `orchestrator run`
+    /// [`crate::tasks::start_task`], the operation `narsor run`
     /// performs — the workspace a declared `globals.workspace` asks for
     /// included. The run itself stays here, so the interface keeps rendering
     /// while the engine works.

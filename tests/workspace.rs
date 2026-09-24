@@ -5,8 +5,8 @@
 //! permissions and actual checkouts, so nothing is mocked and nothing touches
 //! the network.
 
-use orchestrator::domain::{WorkflowExecution, WorkspaceType};
-use orchestrator::workspace::{
+use narsor::domain::{WorkflowExecution, WorkspaceType};
+use narsor::workspace::{
     CleanupOutcome, CleanupPolicy, RepositorySpec, WorkspaceError, WorkspaceProvisioner,
     WorkspaceRequest,
 };
@@ -29,8 +29,7 @@ struct TempRoot {
 
 impl TempRoot {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("orchestrator-workspace-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("narsor-workspace-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
     }
@@ -205,17 +204,17 @@ fn repo_with_feature_branch(path: &Path) -> PathBuf {
 }
 
 /// Builds a throwaway execution record carrying a provisioned workspace.
-fn execution_with(workspace: orchestrator::domain::Workspace) -> WorkflowExecution {
+fn execution_with(workspace: narsor::domain::Workspace) -> WorkflowExecution {
     WorkflowExecution {
         id: "exec-1".to_string(),
         workflow_id: "implement-feature".to_string(),
         workflow_version: 1,
-        status: orchestrator::domain::ExecutionStatus::Running,
+        status: narsor::domain::ExecutionStatus::Running,
         current_state: None,
         started_at: chrono::Utc::now(),
         completed_at: None,
         inputs: serde_json::Value::Null,
-        context: orchestrator::domain::Context::new(),
+        context: narsor::domain::Context::new(),
         workspace,
         current_action_execution: None,
         metadata: serde_json::Value::Null,

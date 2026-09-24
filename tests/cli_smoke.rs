@@ -40,7 +40,7 @@ struct TempRoot {
 
 impl TempRoot {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("orchestrator-cli-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("narsor-cli-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
     }
@@ -73,7 +73,7 @@ impl Invocation {
 
 /// Runs the built binary against `root`, with `root` as its working directory.
 fn cli(root: &TempRoot, args: &[&str]) -> Invocation {
-    let output = Command::new(env!("CARGO_BIN_EXE_orchestrator"))
+    let output = Command::new(env!("CARGO_BIN_EXE_narsor"))
         .current_dir(root.path())
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .env("HOME", root.path())
@@ -81,7 +81,7 @@ fn cli(root: &TempRoot, args: &[&str]) -> Invocation {
         .arg(root.path())
         .args(args)
         .output()
-        .expect("run the orchestrator binary");
+        .expect("run the narsor binary");
 
     Invocation {
         code: output.status.code().expect("the process exited normally"),
@@ -477,7 +477,7 @@ fn validate_run_input_show_is_one_uninterrupted_path() {
     // The whole run happened under the temporary root and nowhere else.
     assert!(root.path().join("tasks").join(&id).join("code").is_dir());
     assert!(!Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".orchestrator")
+        .join(".narsor")
         .exists());
 }
 

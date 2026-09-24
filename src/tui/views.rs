@@ -181,7 +181,7 @@ fn render_executions(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.executions().is_empty() {
         let hint = Paragraph::new(
-            "No executions in the store.\n\nPress `n` to start a workflow,\nor run `orchestrator run <file>`.",
+            "No executions in the store.\n\nPress `n` to start a workflow,\nor run `narsor run <file>`.",
         )
         .wrap(Wrap { trim: true })
         .block(block);
@@ -395,7 +395,7 @@ fn render_shortcuts(frame: &mut Frame, app: &App, area: Rect) {
                 Color::Green
             }),
         ),
-        None => Span::styled(" Orchestrator ", Style::default().fg(Color::DarkGray)),
+        None => Span::styled(" Narsor ", Style::default().fg(Color::DarkGray)),
     };
 
     let block = Block::default()

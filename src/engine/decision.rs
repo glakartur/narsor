@@ -78,7 +78,7 @@ pub enum DecisionError {
     /// The workflow asks for an agent decision, which this version cannot make.
     #[error(
         "state '{state}' uses an agent decision provider, which is not available \
-         in this version of the orchestrator; use 'rules' or 'human' instead"
+         in this version of narsor; use 'rules' or 'human' instead"
     )]
     AgentProviderUnavailable {
         /// The state that asked for it.

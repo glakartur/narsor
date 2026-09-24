@@ -17,7 +17,7 @@ use crate::domain::{RepositoryInfo, RepositoryReference};
 use crate::persistence::{read_json, write_json_atomic, PersistenceError};
 use crate::workspace::provisioner::{check_remote, is_usable_directory_name};
 
-/// Name of the registry file, directly under the orchestrator root.
+/// Name of the registry file, directly under the narsor root.
 pub const REPOSITORIES_FILE: &str = "repositories.json";
 
 /// Result alias for every fallible registry operation.

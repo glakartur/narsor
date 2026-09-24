@@ -4,13 +4,13 @@
 //! layer lies in real file operations, so nothing here is mocked.
 
 use chrono::Utc;
-use orchestrator::domain::{
+use narsor::domain::{
     Context, Event, EventData, ExecutionStatus, RepositoryInfo, WorkflowExecution, Workspace,
     WorkspaceType,
 };
-use orchestrator::persistence::atomic::{read_json, write_json_atomic};
-use orchestrator::persistence::paths::{event_file_name, temp_path_for};
-use orchestrator::persistence::{EventLog, ExecutionStore, PersistenceError};
+use narsor::persistence::atomic::{read_json, write_json_atomic};
+use narsor::persistence::paths::{event_file_name, temp_path_for};
+use narsor::persistence::{EventLog, ExecutionStore, PersistenceError};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -24,7 +24,7 @@ struct TempRoot {
 impl TempRoot {
     fn new() -> Self {
         let path =
-            std::env::temp_dir().join(format!("orchestrator-persistence-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("narsor-persistence-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
     }
@@ -67,9 +67,9 @@ fn sample_execution(id: &str) -> WorkflowExecution {
             "/tmp/workspace-42".to_string(),
             RepositoryInfo {
                 id: "repo-1".to_string(),
-                name: "orchestrator".to_string(),
+                name: "narsor".to_string(),
                 provider: "gitlab".to_string(),
-                remote: "git@example.com:team/orchestrator.git".to_string(),
+                remote: "git@example.com:team/narsor.git".to_string(),
             },
             Some("main".to_string()),
         ),
@@ -130,9 +130,9 @@ fn saving_and_loading_an_execution_preserves_every_field() {
     assert_eq!(loaded.workspace.git_ref.as_deref(), Some("main"));
     assert!(!loaded.workspace.read_only);
     let repository = loaded.workspace.repository.expect("repository preserved");
-    assert_eq!(repository.name, "orchestrator");
+    assert_eq!(repository.name, "narsor");
     assert_eq!(repository.provider, "gitlab");
-    assert_eq!(repository.remote, "git@example.com:team/orchestrator.git");
+    assert_eq!(repository.remote, "git@example.com:team/narsor.git");
 }
 
 #[test]

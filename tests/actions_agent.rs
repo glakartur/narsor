@@ -17,16 +17,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use orchestrator::domain::{
+use narsor::domain::{
     ActionConfig, ActionError, AgentActionConfig, Context, EventData, ExecutionStatus, Workspace,
 };
-use orchestrator::engine::actions::agent::{AgentEventSink, SESSION_ID_VARIABLE};
-use orchestrator::engine::{
+use narsor::engine::actions::agent::{AgentEventSink, SESSION_ID_VARIABLE};
+use narsor::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
     Engine, HarnessRegistry, LoggingEventSink, OpenCodeAdapter,
 };
-use orchestrator::persistence::ExecutionStore;
-use orchestrator::workflow::{load_from_file, TemplateScope};
+use narsor::persistence::ExecutionStore;
+use narsor::workflow::{load_from_file, TemplateScope};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -42,8 +42,7 @@ struct TempRoot {
 
 impl TempRoot {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("orchestrator-agent-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("narsor-agent-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
     }
@@ -215,7 +214,7 @@ async fn complete(
     executor: &AgentExecutor,
     config: AgentActionConfig,
     workspace: &Workspace,
-) -> orchestrator::domain::ActionResult {
+) -> narsor::domain::ActionResult {
     match execute(executor, config, workspace, None).await {
         Ok(ActionOutcome::Completed(result)) => result,
         Ok(other) => panic!("expected a completed action, got {other:?}"),
@@ -852,7 +851,7 @@ impl EngineFixture {
     }
 
     /// Writes a workflow definition into the root and loads it.
-    fn workflow(&self, yaml: &str) -> orchestrator::domain::WorkflowDefinition {
+    fn workflow(&self, yaml: &str) -> narsor::domain::WorkflowDefinition {
         let path = self.root.path().join("workflow.yaml");
         fs::write(&path, yaml).expect("write the workflow");
         load_from_file(&path).expect("load the workflow")

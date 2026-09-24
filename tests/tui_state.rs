@@ -25,20 +25,20 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifi
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 
-use orchestrator::domain::{
+use narsor::domain::{
     Event, EventData, ExecutionStatus, HumanInputType, WorkflowDefinition, WorkflowExecution,
     Workspace,
 };
-use orchestrator::engine::{ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry};
-use orchestrator::persistence::ExecutionStore;
-use orchestrator::registry::{RepositoryEntry, RepositoryRegistry};
-use orchestrator::tui::app::{
+use narsor::engine::{ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry};
+use narsor::persistence::ExecutionStore;
+use narsor::registry::{RepositoryEntry, RepositoryRegistry};
+use narsor::tui::app::{
     App, FormRow, Modal, NewTaskChoice, NewTaskStage, Panel, RepositoryField, Request,
     StreamStatus, TransitionMode, OVERRIDE_PROVIDER, OVERRIDE_REASON,
 };
-use orchestrator::tui::views;
-use orchestrator::workflow::load_from_file;
-use orchestrator::workflows::{builtin, WorkflowResolver};
+use narsor::tui::views;
+use narsor::workflow::load_from_file;
+use narsor::workflows::{builtin, WorkflowResolver};
 
 // ---------------------------------------------------------------------------
 // harness
@@ -54,7 +54,7 @@ struct TempRoot {
 
 impl TempRoot {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("orchestrator-tui-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("narsor-tui-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
     }
@@ -93,7 +93,7 @@ fn inputs() -> Value {
     })
 }
 
-/// Creates an execution the way `orchestrator run` does, definition path
+/// Creates an execution the way `narsor run` does, definition path
 /// included, without running it.
 fn start(engine: &Engine, root: &Path) -> WorkflowExecution {
     let workspace_path = root.join("workspace");
@@ -683,33 +683,33 @@ async fn an_override_requires_confirmation_and_is_recorded_as_forced() {
 /// can confirm.
 #[test]
 fn the_terminal_is_restored_on_exit_and_on_panic() {
-    let before = orchestrator::tui::restore_count();
-    orchestrator::tui::restore_terminal();
+    let before = narsor::tui::restore_count();
+    narsor::tui::restore_terminal();
     assert_eq!(
-        orchestrator::tui::restore_count(),
+        narsor::tui::restore_count(),
         before + 1,
         "the ordinary exit path restores the terminal"
     );
 
-    orchestrator::tui::install_panic_hook();
-    let before_panic = orchestrator::tui::restore_count();
+    narsor::tui::install_panic_hook();
+    let before_panic = narsor::tui::restore_count();
 
     let result = panic::catch_unwind(|| panic!("a crash inside the interface"));
     assert!(result.is_err(), "the panic really happened");
 
     assert!(
-        orchestrator::tui::restore_count() > before_panic,
+        narsor::tui::restore_count() > before_panic,
         "the panic hook restored the terminal before unwinding"
     );
 }
 
 /// The whole journey, driven through the state layer only.
 ///
-/// From an execution the way `orchestrator run` creates one, every step after
+/// From an execution the way `narsor run` creates one, every step after
 /// that is a key press or the operation a key press asks for: run the script
 /// state, open the generated form, fill it in, submit, and land in a terminal
 /// state. Starting a *new* workflow is not part of the TUI — that stays with
-/// `orchestrator run` — so this begins where the interface begins.
+/// `narsor run` — so this begins where the interface begins.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface() {
     let root = TempRoot::new();
@@ -840,7 +840,7 @@ async fn the_repository_form_stores_an_entry_that_the_listing_then_shows() {
         .expect("the entry was stored");
     assert_eq!(stored.remote, "https://example.test/acme.git");
     assert_eq!(stored.default_branch.as_deref(), Some("main"));
-    // The id stands in for the name, exactly as `orchestrator repo add` does.
+    // The id stands in for the name, exactly as `narsor repo add` does.
     assert_eq!(stored.name, "acme-api");
 
     let Modal::Repositories(list) = app.modal() else {
@@ -988,7 +988,7 @@ async fn removing_a_repository_needs_a_confirmation() {
 /// developer's own `~/.config` is out of reach: every `App` built here is given
 /// a resolver pointed at this directory.
 fn user_workflows(root: &Path) -> PathBuf {
-    let path = root.join("config/orchestrator/workflows");
+    let path = root.join("config/narsor/workflows");
     fs::create_dir_all(&path).expect("create the user workflow directory");
     path
 }
@@ -1286,7 +1286,7 @@ async fn the_path_route_starts_a_definition_that_is_in_no_search_location() {
         .store()
         .load_execution(&ids[0])
         .expect("load the execution");
-    let resolved = orchestrator::tasks::resolve_definition(root.path(), &execution)
+    let resolved = narsor::tasks::resolve_definition(root.path(), &execution)
         .expect("the definition resolves again");
     assert_eq!(resolved.origin.label(), "file");
 }
@@ -1644,7 +1644,7 @@ async fn starting_a_valid_new_task_creates_an_execution_that_is_listed_and_selec
 
 /// A definition declaring `globals.workspace` starts from the modal, and its
 /// workspace is provisioned — the interface no longer sends the operator to
-/// `orchestrator run` for it.
+/// `narsor run` for it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_definition_declaring_a_workspace_starts_from_the_modal_and_is_provisioned() {
     let root = TempRoot::new();
@@ -1690,7 +1690,7 @@ async fn a_definition_declaring_a_workspace_starts_from_the_modal_and_is_provisi
             .join(&selected.id)
             .join("code")
             .join("source"),
-        "the checkout is the one `orchestrator run` would have made"
+        "the checkout is the one `narsor run` would have made"
     );
     assert_eq!(
         fs::read_to_string(workspace.join("README.md")).expect("read the copy"),

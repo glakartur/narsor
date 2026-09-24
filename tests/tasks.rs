@@ -1,6 +1,6 @@
 //! Tests for the shared "start a task" module (`src/tasks`).
 //!
-//! This is the operation both `orchestrator run` and the TUI's new-task modal
+//! This is the operation both `narsor run` and the TUI's new-task modal
 //! perform, so it is tested once, here, directly — the two callers' own tests
 //! then only have to prove that they call it.
 //!
@@ -19,13 +19,13 @@ use std::process::Command;
 
 use serde_json::{json, Map, Value};
 
-use orchestrator::domain::{EventData, ExecutionStatus, WorkflowDefinition};
-use orchestrator::engine::Engine;
-use orchestrator::persistence::ExecutionStore;
-use orchestrator::registry::{RepositoryEntry, RepositoryRegistry};
-use orchestrator::tasks::{self, TaskError};
-use orchestrator::workflow::load_from_file;
-use orchestrator::workspace::{RepositorySource, RepositorySpec};
+use narsor::domain::{EventData, ExecutionStatus, WorkflowDefinition};
+use narsor::engine::Engine;
+use narsor::persistence::ExecutionStore;
+use narsor::registry::{RepositoryEntry, RepositoryRegistry};
+use narsor::tasks::{self, TaskError};
+use narsor::workflow::load_from_file;
+use narsor::workspace::{RepositorySource, RepositorySpec};
 
 // ---------------------------------------------------------------------------
 // harness
@@ -40,8 +40,7 @@ struct TempRoot {
 
 impl TempRoot {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("orchestrator-tasks-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("narsor-tasks-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
     }

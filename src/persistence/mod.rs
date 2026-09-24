@@ -1,7 +1,7 @@
 //! Filesystem persistence layer.
 //!
 //! Execution state, context and the append-only event history live on the
-//! filesystem under a configurable root (default `./.orchestrator`):
+//! filesystem under a configurable root (default `./.narsor`):
 //!
 //! ```text
 //! {root}/executions/{execution_id}/

@@ -5,9 +5,9 @@
 
 use std::collections::HashMap;
 
-use orchestrator::domain::{ActionConfig, Context};
-use orchestrator::workflow::load_from_file;
-use orchestrator::workflow::template::{TemplateError, TemplateScope};
+use narsor::domain::{ActionConfig, Context};
+use narsor::workflow::load_from_file;
+use narsor::workflow::template::{TemplateError, TemplateScope};
 use serde_json::{json, Map, Value};
 
 const WHERE: &str = "state 'implement', prompt";
@@ -304,7 +304,7 @@ fn implement_prompt_from_the_reference_fixture_expands_fully() {
     assert!(prompt.contains("logowanie przez OAuth"), "{prompt}");
 }
 
-fn load_reference() -> orchestrator::domain::WorkflowDefinition {
+fn load_reference() -> narsor::domain::WorkflowDefinition {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/implement_feature.yaml");
     load_from_file(path).expect("the §4 example must load without modification")

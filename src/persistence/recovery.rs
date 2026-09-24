@@ -13,7 +13,7 @@
 //! * anything else means the step boundary was reached and `state.json` is
 //!   trustworthy.
 //!
-//! An in-flight action is **not replayed**. The orchestrator cannot know
+//! An in-flight action is **not replayed**. The narsor cannot know
 //! whether the child process got as far as its side effect — pushing a branch,
 //! opening a pull request, deploying — and a duplicate of that is worse than a
 //! stall. The execution becomes [`ExecutionStatus::Unknown`], an `Error` event
@@ -180,7 +180,7 @@ pub fn reconcile(store: &ExecutionStore, execution_id: &str) -> Result<Reconcili
 
     let message = format!(
         "action '{action_execution_id}' of state '{state_id}' was still running when the \
-         orchestrator stopped; its effect is unknown and it will not be replayed \
+         narsor stopped; its effect is unknown and it will not be replayed \
          automatically"
     );
 

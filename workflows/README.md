@@ -15,15 +15,15 @@ ever run by the tests.
 ## Running one
 
 ```sh
-orchestrator validate workflows/compound-engineering.yaml
+narsor validate workflows/compound-engineering.yaml
 
-orchestrator repo add acme-web --remote git@github.com:acme/web.git   # once
-orchestrator run workflows/compound-engineering.yaml \
+narsor repo add acme-web --remote git@github.com:acme/web.git   # once
+narsor run workflows/compound-engineering.yaml \
   --input feature_description="let a reviewer subscribe to a run" \
   --input target_repo=acme-web
 
-orchestrator show <execution-id>          # where it is waiting
-orchestrator input <execution-id> ...     # answer the gate and resume
+narsor show <execution-id>          # where it is waiting
+narsor input <execution-id> ...     # answer the gate and resume
 ```
 
 `target_repo` resolves through the repository registry and falls back to a raw

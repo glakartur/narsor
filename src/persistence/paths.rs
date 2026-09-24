@@ -7,7 +7,7 @@ use crate::domain::ExecutionId;
 use std::path::{Path, PathBuf};
 
 /// Default persistence root, relative to the process working directory.
-pub const DEFAULT_ROOT: &str = "./.orchestrator";
+pub const DEFAULT_ROOT: &str = "./.narsor";
 
 /// Directory holding every execution, directly under the root.
 pub const EXECUTIONS_DIR: &str = "executions";

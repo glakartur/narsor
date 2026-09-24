@@ -37,13 +37,13 @@ use crate::domain::{ActionConfig, ActionError, ActionResult, ScriptActionConfig}
 pub const MAX_CAPTURED_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Appended in place of everything that [`MAX_CAPTURED_OUTPUT_BYTES`] cut off.
-pub const TRUNCATION_MARKER: &str = "\n… [truncated by orchestrator]";
+pub const TRUNCATION_MARKER: &str = "\n… [truncated by narsor]";
 
 /// Hard ceiling on how much of a pipe is held in memory at once, in bytes.
 ///
 /// [`MAX_CAPTURED_OUTPUT_BYTES`] bounds what is *persisted*, but it is applied
 /// after the fact, so reading a pipe to its end first would let a script that
-/// prints without bound exhaust the orchestrator's memory before any cap could
+/// prints without bound exhaust narsor's memory before any cap could
 /// be applied — the captured-output limit would give a false sense of safety.
 /// Past this ceiling the pipe is still drained, so the child never blocks on a
 /// full pipe, but the surplus bytes are dropped rather than buffered.

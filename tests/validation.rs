@@ -8,9 +8,9 @@
 
 use std::collections::HashMap;
 
-use orchestrator::domain::{State, ValidationError, WorkflowDefinition};
-use orchestrator::workflow::validator::validate_path;
-use orchestrator::workflow::{load_from_file, load_from_str};
+use narsor::domain::{State, ValidationError, WorkflowDefinition};
+use narsor::workflow::validator::validate_path;
+use narsor::workflow::{load_from_file, load_from_str};
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -216,7 +216,7 @@ terminal_states:
   cancelled: cancelled
 "#;
 
-    let errors = orchestrator::workflow::validate_source(yaml).expect("the file must compile");
+    let errors = narsor::workflow::validate_source(yaml).expect("the file must compile");
     assert!(
         errors.iter().any(|err| matches!(
             err,
