@@ -92,20 +92,12 @@ fn refuse_broken_configuration(cli: &Cli, resolved: &Resolved) -> Option<i32> {
         return Some(EXIT_USAGE);
     }
 
-    if survives_a_broken_file(cli) {
+    if cli.command.runs_on_broken_config() {
         return None;
     }
 
     report(resolved);
     Some(EXIT_FAILURE)
-}
-
-/// Whether this invocation runs on a configuration it could not use.
-///
-/// Only `config show`, and only because it is the instrument for diagnosing
-/// exactly this (D-D). It prints what it has and exits 1 itself.
-fn survives_a_broken_file(cli: &Cli) -> bool {
-    matches!(cli.command, Command::Config { .. })
 }
 
 /// Prints every configuration failure on stderr, one per line.

@@ -30,18 +30,10 @@ use crate::engine::AgentDefaults;
 
 use super::cascade::{CascadeError, ConfigCascade, Resolution};
 use super::file::{self, FileError, FileValues};
-use super::settings::{SettingKey, SettingValue, Source};
+use super::settings::{SettingKey, SettingValue, Source, ENV_PREFIX, LOG_OFF, RUST_LOG};
 
 /// The environment, as a map read once rather than consulted repeatedly.
 pub type Environment = BTreeMap<String, String>;
-
-/// The variable that carries a full `tracing` filter directive.
-///
-/// It beats `NARSOR_LOG_LEVEL` because it is the more precise instrument: it
-/// takes per-target directives such as `narsor::engine=debug`, where the
-/// setting takes a bare level. There is no sense in the sharper tool losing
-/// (D-K).
-pub const RUST_LOG: &str = "RUST_LOG";
 
 /// The environment of this process, as a map.
 ///
@@ -49,8 +41,13 @@ pub const RUST_LOG: &str = "RUST_LOG";
 /// unset key of a ConfigMap — and how `XDG_CONFIG_HOME` is already treated
 /// elsewhere in this crate (D-J).
 pub fn environment_from_process() -> Environment {
+    // Only the variables that can carry a setting: a container's environment
+    // runs to hundreds of entries, and copying all of them to answer five
+    // lookups is work done on the start of every single subcommand.
     std::env::vars()
-        .filter(|(_, value)| !value.is_empty())
+        .filter(|(name, value)| {
+            !value.is_empty() && (name == RUST_LOG || name.starts_with(ENV_PREFIX))
+        })
         .collect()
 }
 
@@ -64,10 +61,18 @@ pub struct Flags {
 }
 
 impl Flags {
-    /// The value this setting was given on the command line, if any.
-    fn value(&self, setting: SettingKey) -> Option<SettingValue> {
+    /// The value this setting was given on the command line, and the flag that
+    /// gave it.
+    ///
+    /// Both together, from one match: a flag's name and its value are one
+    /// fact, and stating them in two places would need a runtime check that
+    /// they agree.
+    fn value(&self, setting: SettingKey) -> Option<(SettingValue, &'static str)> {
         match setting {
-            SettingKey::DataDir => self.root.clone().map(SettingValue::Path),
+            SettingKey::DataDir => self
+                .root
+                .clone()
+                .map(|root| (SettingValue::Path(root), "--root")),
             SettingKey::AgentHarness | SettingKey::AgentTimeout | SettingKey::LogLevel => None,
         }
     }
@@ -208,7 +213,7 @@ impl Resolved {
             .value(SettingKey::LogLevel)
             .as_text()
             .expect("the level is text");
-        if directive == "off" {
+        if directive == LOG_OFF {
             None
         } else {
             Some(directive.to_string())
@@ -278,8 +283,7 @@ fn resolve_one(
     file_path: Option<&Path>,
     errors: &mut Vec<ConfigError>,
 ) -> (SettingValue, Source) {
-    if let Some(value) = flags.value(setting) {
-        let flag = setting.flag().expect("a flag value implies a flag");
+    if let Some((value, flag)) = flags.value(setting) {
         return (value, Source::Flag(flag));
     }
 

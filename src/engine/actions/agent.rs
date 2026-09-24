@@ -73,9 +73,10 @@ cannot continue.";
 
 /// The harness used when neither the action nor the configuration names one.
 ///
-/// The same value the settings registry carries as the built-in; kept here so
-/// that an executor built without a configuration behaves identically.
-pub const BUILT_IN_HARNESS: &str = "claude-code";
+/// The name the adapter itself registers under, not a second spelling of it:
+/// a default that `HarnessRegistry::get` does not know would fail at run time
+/// rather than at compile time.
+pub const BUILT_IN_HARNESS: &str = super::harness::claude_code::CLAUDE_CODE;
 
 /// The `parameters` key that continues an existing harness session (D18).
 pub const RESUME_SESSION_PARAMETER: &str = "resume_session";

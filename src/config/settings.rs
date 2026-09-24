@@ -33,7 +33,23 @@ pub const MASK: &str = "********";
 ///
 /// A closed set rather than a full `EnvFilter` directive: `RUST_LOG` is the
 /// tool for directives, and it wins over this setting anyway (D-K).
-pub const LOG_LEVELS: [&str; 6] = ["off", "error", "warn", "info", "debug", "trace"];
+pub const LOG_LEVELS: [&str; 6] = [LOG_OFF, "error", "warn", "info", "debug", "trace"];
+
+/// The level that turns logging off entirely.
+///
+/// Load-bearing rather than cosmetic: it is the value that decides whether a
+/// subscriber is installed at all, which is what keeps an unconfigured run
+/// silent (D-N).
+pub const LOG_OFF: &str = "off";
+
+/// The variable that carries a full `tracing` filter directive.
+///
+/// It belongs to the registry rather than to the resolver because this module
+/// is where the names of the variables live. It beats `NARSOR_LOG_LEVEL`
+/// because it is the more precise instrument: it takes per-target directives
+/// such as `narsor::engine=debug`, where the setting takes a bare level. There
+/// is no sense in the sharper tool losing (D-K).
+pub const RUST_LOG: &str = "RUST_LOG";
 
 /// How a duration setting spells "no limit at all".
 ///
@@ -94,14 +110,6 @@ impl SettingKey {
         format!("{ENV_PREFIX}{}", self.key().to_uppercase())
     }
 
-    /// The command-line flag that carries it, for the settings that have one.
-    pub fn flag(self) -> Option<&'static str> {
-        match self {
-            SettingKey::DataDir => Some("--root"),
-            SettingKey::AgentHarness | SettingKey::AgentTimeout | SettingKey::LogLevel => None,
-        }
-    }
-
     /// Whether the value is masked when printed.
     ///
     /// No setting is sensitive in this version; the flag exists because
@@ -128,23 +136,11 @@ impl SettingKey {
             SettingKey::DataDir => {
                 SettingValue::Path(PathBuf::from(crate::persistence::paths::DEFAULT_ROOT))
             }
-            SettingKey::AgentHarness => SettingValue::Text("claude-code".to_string()),
-            SettingKey::AgentTimeout => SettingValue::Duration(None),
-            SettingKey::LogLevel => SettingValue::Text("off".to_string()),
-        }
-    }
-
-    /// One line describing the setting, for documentation and `--help`.
-    pub fn description(self) -> &'static str {
-        match self {
-            SettingKey::DataDir => {
-                "Directory holding executions, workspaces and the repository registry"
-            }
             SettingKey::AgentHarness => {
-                "Agent harness used by an agent action that names none itself"
+                SettingValue::Text(crate::engine::actions::agent::BUILT_IN_HARNESS.to_string())
             }
-            SettingKey::AgentTimeout => "Time limit of an agent action that declares none itself",
-            SettingKey::LogLevel => "Logging level, unless RUST_LOG says otherwise",
+            SettingKey::AgentTimeout => SettingValue::Duration(None),
+            SettingKey::LogLevel => SettingValue::Text(LOG_OFF.to_string()),
         }
     }
 }
@@ -263,14 +259,6 @@ impl Source {
             Source::Env(name) => Some(name.clone()),
             Source::File(path) => Some(path.display().to_string()),
             Source::BuiltIn => None,
-        }
-    }
-
-    /// The file it was read from, when it was a file.
-    pub fn path(&self) -> Option<&Path> {
-        match self {
-            Source::File(path) => Some(path),
-            _ => None,
         }
     }
 }

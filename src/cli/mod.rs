@@ -259,6 +259,41 @@ pub enum RepoCommand {
     },
 }
 
+impl Command {
+    /// Whether this command runs on a configuration that did not hold up.
+    ///
+    /// Only `config show`, and only because it is the instrument for
+    /// diagnosing exactly that: a diagnostic tool that stops working in the
+    /// situation it exists for is no tool at all (D-D). It prints what it has,
+    /// marks the settings that did not hold up, and still exits 1.
+    ///
+    /// Spelled out per variant rather than caught by `_`, so that a new
+    /// subcommand has to decide rather than inherit — and so that the policy
+    /// lives beside the commands it is about, where it can be tested without
+    /// spawning the binary.
+    ///
+    /// It does not extend to a `--config` path that is not there: that is a
+    /// usage error for every command including this one, because there is
+    /// nothing to diagnose.
+    pub fn runs_on_broken_config(&self) -> bool {
+        match self {
+            Command::Config { command } => match command {
+                ConfigCommand::Show { .. } => true,
+            },
+            Command::Validate { .. }
+            | Command::Run { .. }
+            | Command::List
+            | Command::Show { .. }
+            | Command::Events { .. }
+            | Command::Input { .. }
+            | Command::Resume { .. }
+            | Command::Workflow { .. }
+            | Command::Repo { .. }
+            | Command::Tui => false,
+        }
+    }
+}
+
 /// What `config` can be asked for.
 ///
 /// A group with a single verb, like [`Command::Workflow`] and
@@ -348,6 +383,40 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Err(error) => {
             eprintln!("{}", error.message);
             error.exit_code
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_show_is_the_only_command_that_runs_on_a_broken_configuration() {
+        // D-D. Asserted here rather than by spawning the binary, which is the
+        // point of the policy living beside the commands.
+        assert!(Command::Config {
+            command: ConfigCommand::Show {
+                format: ConfigFormat::Table
+            }
+        }
+        .runs_on_broken_config());
+
+        for command in [
+            Command::List,
+            Command::Tui,
+            Command::Validate {
+                workflow: "any".to_string(),
+            },
+            Command::Run {
+                workflow: "any".to_string(),
+                inputs: Vec::new(),
+            },
+        ] {
+            assert!(
+                !command.runs_on_broken_config(),
+                "{command:?} must refuse to start on a configuration it cannot use"
+            );
         }
     }
 }

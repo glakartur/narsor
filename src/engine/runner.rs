@@ -71,6 +71,7 @@ use crate::domain::{
     EventData, ExecutionId, ExecutionStatus, OutputLabel, State, StateId, WorkflowDefinition,
     WorkflowExecution, Workspace, WorkspaceInfo,
 };
+use crate::engine::actions::agent::BUILT_IN_HARNESS;
 use crate::engine::actions::human::{
     self, HumanActionError, HumanInputDelivery, HumanInputRequest, PendingHumanInput,
 };
@@ -105,6 +106,24 @@ pub fn terminal_status(state: &State) -> ExecutionStatus {
         .terminal_status
         .map(ExecutionStatus::from)
         .unwrap_or(ExecutionStatus::Completed)
+}
+
+/// The agent executor this engine runs, wired to its own store and channel.
+///
+/// One constructor rather than two, so that anything added here — a second
+/// sink, a different registry — cannot be silently lost by whichever of
+/// [`Engine::new`] and [`Engine::with_agent_defaults`] ran last.
+fn agent_executor(
+    store: &ExecutionStore,
+    events: &broadcast::Sender<Event>,
+    default_harness: &str,
+) -> AgentExecutor {
+    AgentExecutor::new()
+        .with_default_harness(default_harness)
+        .with_event_sink(Arc::new(LoggingEventSink::new(
+            store.clone(),
+            Some(events.clone()),
+        )))
 }
 
 /// What the configuration contributes to an `agent` action.
@@ -346,10 +365,7 @@ impl Engine {
     pub fn new(store: ExecutionStore) -> Self {
         let events = broadcast::channel(EVENT_CHANNEL_CAPACITY).0;
 
-        let agent = AgentExecutor::new().with_event_sink(Arc::new(LoggingEventSink::new(
-            store.clone(),
-            Some(events.clone()),
-        )));
+        let agent = agent_executor(&store, &events, BUILT_IN_HARNESS);
 
         let mut executors: HashMap<ActionKind, Arc<dyn ActionExecutor>> = HashMap::new();
         executors.insert(ActionKind::Script, Arc::new(ScriptExecutor::new()));
@@ -367,32 +383,14 @@ impl Engine {
 
     /// Returns the engine with the configured defaults for `agent` actions.
     ///
-    /// Rebuilds the agent executor, because the default harness belongs to it:
-    /// a workflow that names no harness gets this one, and the session event
-    /// then records the harness that actually ran (D-F).
+    /// The default harness belongs to the agent executor, so this replaces it —
+    /// which means it must come **before** any
+    /// [`with_executor`](Engine::with_executor) registering an agent executor
+    /// of your own, or that one is overwritten.
     pub fn with_agent_defaults(mut self, defaults: AgentDefaults) -> Self {
         self.agent_timeout_secs = defaults.timeout_secs;
-        let agent = AgentExecutor::new()
-            .with_default_harness(defaults.harness)
-            .with_event_sink(Arc::new(LoggingEventSink::new(
-                self.store.clone(),
-                Some(self.events.clone()),
-            )));
+        let agent = agent_executor(&self.store, &self.events, &defaults.harness);
         self.executors.insert(ActionKind::Agent, Arc::new(agent));
-        self
-    }
-
-    /// Returns the engine with a default time limit for `agent` actions.
-    ///
-    /// Deliberately only for `agent` actions (D-C). The engine has one timeout
-    /// chain shared by every kind of action, in which `None` means "no limit";
-    /// feeding a configured default into that chain would give every existing
-    /// script state a limit it never had, and a script that outran it would
-    /// become a retryable action failure, then an exhausted retry budget, then
-    /// a failed action. Script and human actions therefore keep exactly the
-    /// chain they have always had.
-    pub fn with_agent_timeout(mut self, seconds: Option<u64>) -> Self {
-        self.agent_timeout_secs = seconds;
         self
     }
 
@@ -725,8 +723,9 @@ impl Engine {
         match kind {
             ActionKind::Agent => declared.or(self.agent_timeout_secs),
             // Unchanged, bit for bit: a script or human state that declares no
-            // limit still has none.
-            _ => declared,
+            // limit still has none. Spelled out rather than caught by `_`, so
+            // that a fifth action kind has to decide rather than inherit.
+            ActionKind::Script | ActionKind::Human | ActionKind::Wait => declared,
         }
     }
 

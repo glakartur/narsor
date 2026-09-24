@@ -57,17 +57,6 @@ pub enum CandidateKind {
     System,
 }
 
-impl CandidateKind {
-    /// The word printed beside a shadowed candidate.
-    pub fn label(self) -> &'static str {
-        match self {
-            CandidateKind::Flag => "flag",
-            CandidateKind::User => "user",
-            CandidateKind::System => "system",
-        }
-    }
-}
-
 /// One place the cascade looked at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -232,7 +221,14 @@ impl ConfigCascade {
         let mut shadowed = Vec::new();
 
         for candidate in candidates {
-            match inspect(&candidate.path) {
+            // Past the winner, a candidate only has to be known to exist: its
+            // readability is never used, and checking it would open and
+            // canonicalize a file nothing will read.
+            let found = match &winner {
+                Some(_) => presence_of(&candidate.path),
+                None => inspect(&candidate.path),
+            };
+            match found {
                 Presence::Absent => {
                     // A file that is not there is not a problem (R4).
                     if candidate.kind == CandidateKind::Flag {
@@ -242,25 +238,23 @@ impl ConfigCascade {
                     }
                 }
                 Presence::Broken(error) => {
-                    // Only the candidates up to the winner are inspected, so a
-                    // broken file further down the cascade cannot stop a run
-                    // that was never going to read it.
-                    if winner.is_none() {
-                        return Err(error);
-                    }
-                    shadowed.push(candidate);
+                    // A candidate is only inspected closely while there is no
+                    // winner, so a broken file below the winner cannot stop a
+                    // run that was never going to read it.
+                    return Err(error);
                 }
                 Presence::Readable => {
                     // Absolutized, the way `WorkflowOrigin::File` already is: a
                     // relative `XDG_CONFIG_HOME` is accepted by the code around
                     // it, and printing "config.yaml" as the answer to "which
                     // file did this come from" would only half answer it (R8).
-                    let candidate = Candidate {
-                        kind: candidate.kind,
-                        path: absolute(&candidate.path),
-                    };
                     match winner {
-                        None => winner = Some(candidate),
+                        None => {
+                            winner = Some(Candidate {
+                                kind: candidate.kind,
+                                path: absolute(&candidate.path),
+                            })
+                        }
                         Some(_) => shadowed.push(candidate),
                     }
                 }
@@ -279,6 +273,18 @@ enum Presence {
     Readable,
     /// Something is there and cannot be read, with the reason.
     Broken(CascadeError),
+}
+
+/// Whether anything is there at all, without asking whether it can be read.
+///
+/// What a candidate below the winner needs: it is reported as shadowed, and
+/// nothing will ever open it.
+fn presence_of(path: &Path) -> Presence {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Presence::Readable,
+        Err(error) if error.kind() == ErrorKind::NotFound => Presence::Absent,
+        Err(_) => Presence::Absent,
+    }
 }
 
 /// Classifies one candidate path.

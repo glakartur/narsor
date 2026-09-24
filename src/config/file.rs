@@ -29,6 +29,7 @@
 //! this refuses rather than letting the expansion happen.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::engine::HarnessRegistry;
@@ -129,14 +130,20 @@ pub enum FileError {
     },
 
     /// A key no setting answers to.
-    #[error("Configuration file '{path}' sets unknown key '{key}'; known keys are: {}.", known.join(", "))]
+    ///
+    /// The list of keys that *would* have been accepted is derived from the
+    /// registry when the message is rendered, rather than carried: it is the
+    /// same list every time, and carrying it would allocate it once per
+    /// offending key.
+    #[error(
+        "Configuration file '{path}' sets unknown key '{key}'; known keys are: {}.",
+        known_keys()
+    )]
     UnknownKey {
         /// The file.
         path: PathBuf,
         /// The key as written.
         key: String,
-        /// Every key that would have been accepted.
-        known: Vec<String>,
     },
 
     /// A known key whose value does not fit.
@@ -216,8 +223,12 @@ impl ParsedFile {
 
 /// Reads and parses one configuration file.
 pub fn load(path: &Path) -> ParsedFile {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
+    // Opened once and then asked its own size: the check has to come before
+    // the read — using the length of what was read would mean holding an
+    // oversized file in memory to discover it was oversized — but the size of
+    // an open handle costs no second lookup of the path.
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(source) => {
             return ParsedFile::failed(FileError::Read {
                 path: path.to_path_buf(),
@@ -226,25 +237,30 @@ pub fn load(path: &Path) -> ParsedFile {
         }
     };
 
-    // Checked before the read, so that an oversized file is never held in
-    // memory even once.
-    if metadata.len() > MAX_FILE_BYTES {
-        return ParsedFile::failed(FileError::TooLarge {
-            path: path.to_path_buf(),
-            bytes: metadata.len(),
-            limit: MAX_FILE_BYTES,
-        });
+    match file.metadata() {
+        Ok(metadata) if metadata.len() > MAX_FILE_BYTES => {
+            return ParsedFile::failed(FileError::TooLarge {
+                path: path.to_path_buf(),
+                bytes: metadata.len(),
+                limit: MAX_FILE_BYTES,
+            })
+        }
+        Ok(_) => {}
+        Err(source) => {
+            return ParsedFile::failed(FileError::Read {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
     }
 
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(source) => {
-            return ParsedFile::failed(FileError::Read {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
-    };
+    let mut bytes = Vec::new();
+    if let Err(source) = file.read_to_end(&mut bytes) {
+        return ParsedFile::failed(FileError::Read {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
 
     let contents = match String::from_utf8(bytes) {
         Ok(contents) => contents,
@@ -301,7 +317,6 @@ pub fn parse(path: &Path, contents: &str) -> ParsedFile {
             errors.push(FileError::UnknownKey {
                 path: path.to_path_buf(),
                 key: describe(&raw_key),
-                known: known_keys(),
             });
             continue;
         };
@@ -310,7 +325,6 @@ pub fn parse(path: &Path, contents: &str) -> ParsedFile {
             errors.push(FileError::UnknownKey {
                 path: path.to_path_buf(),
                 key,
-                known: known_keys(),
             });
             continue;
         };
@@ -341,12 +355,13 @@ pub fn parse(path: &Path, contents: &str) -> ParsedFile {
     }
 }
 
-/// Every key the file may set, in registry order.
-fn known_keys() -> Vec<String> {
+/// Every key the file may set, in registry order, ready to print.
+fn known_keys() -> String {
     SettingKey::ALL
         .iter()
-        .map(|key| key.key().to_string())
-        .collect()
+        .map(|key| key.key())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Validates one value against the setting it was written under.

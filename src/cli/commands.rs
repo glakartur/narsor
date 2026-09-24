@@ -897,30 +897,42 @@ pub fn config_show(config: &Resolved, format: ConfigFormat) -> Result<()> {
 /// What stands in the value column of a setting whose value did not hold up.
 const CONFIG_ERROR_MARKER: &str = "error";
 
+/// Width of the setting-name column.
+const SETTING_WIDTH: usize = 16;
+
+/// Width of the value column, and the length values are truncated to.
+///
+/// One constant for both, so the two cannot disagree and produce a table whose
+/// columns do not line up.
+const VALUE_WIDTH: usize = 28;
+
 /// The table `config show` prints by default.
 ///
 /// The same fixed-width shape as `workflow list`, continuation lines and all,
 /// because it is the same idea: one row per thing, with what is behind it on
 /// the lines below.
 fn print_config_table(config: &Resolved) {
-    println!("{:<16} {:<28} SOURCE", "SETTING", "VALUE");
+    println!(
+        "{:<SETTING_WIDTH$} {:<VALUE_WIDTH$} SOURCE",
+        "SETTING", "VALUE"
+    );
 
     for setting in SettingKey::ALL {
         match config_error_for(config, setting.key()) {
             Some(message) => {
                 println!(
-                    "{:<16} {:<28} -",
+                    "{:<SETTING_WIDTH$} {:<VALUE_WIDTH$} -",
                     setting.key(),
                     format!("({CONFIG_ERROR_MARKER})")
                 );
-                println!("{:<16} {:<28} {}", "", "", message);
+                println!("{:<SETTING_WIDTH$} {:<VALUE_WIDTH$} {}", "", "", message);
             }
             None => {
                 let value = render_value(config.value(setting), setting.is_sensitive());
                 println!(
-                    "{:<16} {:<28} {}",
+                    "{:<SETTING_WIDTH$} {:<VALUE_WIDTH$} {}",
                     setting.key(),
-                    truncate(&value, 28),
+                    truncate(&value, VALUE_WIDTH),
                     config.source(setting)
                 );
             }
@@ -928,11 +940,16 @@ fn print_config_table(config: &Resolved) {
     }
 
     if let Some(path) = config.file().path() {
-        println!("{:<16} {:<28} file: {}", "", "", path.display());
+        println!(
+            "{:<SETTING_WIDTH$} {:<VALUE_WIDTH$} file: {}",
+            "",
+            "",
+            path.display()
+        );
     }
     for shadowed in &config.file().shadowed {
         println!(
-            "{:<16} {:<28} shadowed: {}",
+            "{:<SETTING_WIDTH$} {:<VALUE_WIDTH$} shadowed: {}",
             "",
             "",
             shadowed.path.display()
@@ -946,7 +963,10 @@ fn print_config_table(config: &Resolved) {
             .key()
             .is_none_or(|key| SettingKey::from_key(key).is_none())
         {
-            println!("{:<16} {:<28} {CONFIG_ERROR_MARKER}: {error}", "", "");
+            println!(
+                "{:<SETTING_WIDTH$} {:<VALUE_WIDTH$} {CONFIG_ERROR_MARKER}: {error}",
+                "", ""
+            );
         }
     }
 }
