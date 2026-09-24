@@ -216,13 +216,14 @@ pub fn resolve_with(flags: &Flags, environment: &Environment, cascade: &ConfigCa
 
     let (file_resolution, file_values) = match cascade.resolve() {
         Ok(resolution) => match resolution.path() {
-            Some(path) => match file::load(path) {
-                Ok(values) => (resolution.clone(), values),
-                Err(problems) => {
-                    errors.extend(problems.into_iter().map(ConfigError::File));
-                    (resolution.clone(), FileValues::default())
-                }
-            },
+            Some(path) => {
+                let parsed = file::load(path);
+                // The keys that held up stay in force even when others did
+                // not: `config show` prints the good rows beside the bad ones,
+                // and dropping them would make the table lie (D-D).
+                errors.extend(parsed.errors.into_iter().map(ConfigError::File));
+                (resolution.clone(), parsed.values)
+            }
             // No file anywhere is a normal, silent state (R4).
             None => (resolution, FileValues::default()),
         },

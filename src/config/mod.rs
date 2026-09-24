@@ -29,6 +29,6 @@ pub mod resolve;
 pub mod settings;
 
 pub use cascade::{CascadeError, ConfigCascade, Resolution};
-pub use file::{FileError, FileValues};
+pub use file::{FileError, FileValues, ParsedFile};
 pub use resolve::{resolve, ConfigError, Environment, Flags, Resolved};
 pub use settings::{render_value, SettingKey, SettingValue, Source, ENV_PREFIX, MASK, NO_LIMIT};

@@ -165,6 +165,13 @@ pub enum Command {
         command: RepoCommand,
     },
 
+    /// Shows the configuration in force.
+    Config {
+        /// What to do with the configuration.
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+
     /// Opens the full-screen terminal interface.
     Tui,
 }
@@ -252,6 +259,30 @@ pub enum RepoCommand {
     },
 }
 
+/// What `config` can be asked for.
+///
+/// A group with a single verb, like [`Command::Workflow`] and
+/// [`Command::Repo`], so that a later `config path` has somewhere to go.
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Prints every setting, its effective value and where that value came
+    /// from.
+    Show {
+        /// How to print it.
+        #[arg(long, value_name = "FORMAT", default_value = "table")]
+        format: ConfigFormat,
+    },
+}
+
+/// The shapes `config show` prints in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ConfigFormat {
+    /// Fixed-width columns, for pasting into a report.
+    Table,
+    /// A JSON document on stdout, for a script to read.
+    Json,
+}
+
 /// Runs the parsed command line and returns the process exit code.
 ///
 /// Nothing here panics on an operator mistake: every failure becomes a message
@@ -305,6 +336,9 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             RepoCommand::List => commands::repo_list(&root),
             RepoCommand::Show { id } => commands::repo_show(&root, &id),
             RepoCommand::Remove { id } => commands::repo_remove(&root, &id),
+        },
+        Command::Config { command } => match command {
+            ConfigCommand::Show { format } => commands::config_show(&config, format),
         },
         Command::Tui => commands::tui(&root),
     };

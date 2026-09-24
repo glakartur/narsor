@@ -177,44 +177,81 @@ impl FileError {
     }
 }
 
+/// What one file yielded: the values that held up, and every complaint.
+///
+/// Both, rather than one or the other, because `config show` prints the rows
+/// that are fine beside the rows that are not (D-D) — a key the operator got
+/// right is still in force, and hiding it would make the table lie.
+#[derive(Debug, Default)]
+pub struct ParsedFile {
+    /// Every value that held up.
+    pub values: FileValues,
+    /// Every complaint, sorted by key.
+    pub errors: Vec<FileError>,
+}
+
+impl ParsedFile {
+    /// Nothing wrong with it.
+    pub fn is_ok(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    /// The values, if there is nothing to complain about.
+    pub fn into_result(self) -> Result<FileValues, Vec<FileError>> {
+        if self.errors.is_empty() {
+            Ok(self.values)
+        } else {
+            Err(self.errors)
+        }
+    }
+
+    /// A whole-file failure: nothing could be read at all.
+    fn failed(error: FileError) -> Self {
+        Self {
+            values: FileValues::default(),
+            errors: vec![error],
+        }
+    }
+}
+
 /// Reads and parses one configuration file.
-pub fn load(path: &Path) -> Result<FileValues, Vec<FileError>> {
+pub fn load(path: &Path) -> ParsedFile {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(source) => {
-            return Err(vec![FileError::Read {
+            return ParsedFile::failed(FileError::Read {
                 path: path.to_path_buf(),
                 source,
-            }])
+            })
         }
     };
 
     // Checked before the read, so that an oversized file is never held in
     // memory even once.
     if metadata.len() > MAX_FILE_BYTES {
-        return Err(vec![FileError::TooLarge {
+        return ParsedFile::failed(FileError::TooLarge {
             path: path.to_path_buf(),
             bytes: metadata.len(),
             limit: MAX_FILE_BYTES,
-        }]);
+        });
     }
 
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(source) => {
-            return Err(vec![FileError::Read {
+            return ParsedFile::failed(FileError::Read {
                 path: path.to_path_buf(),
                 source,
-            }])
+            })
         }
     };
 
     let contents = match String::from_utf8(bytes) {
         Ok(contents) => contents,
         Err(_) => {
-            return Err(vec![FileError::NotUtf8 {
+            return ParsedFile::failed(FileError::NotUtf8 {
                 path: path.to_path_buf(),
-            }])
+            })
         }
     };
 
@@ -225,17 +262,17 @@ pub fn load(path: &Path) -> Result<FileValues, Vec<FileError>> {
 ///
 /// Separate from [`load`] so that the two phases can be exercised without a
 /// filesystem; `path` is carried only to name the file in the messages.
-pub fn parse(path: &Path, contents: &str) -> Result<FileValues, Vec<FileError>> {
+pub fn parse(path: &Path, contents: &str) -> ParsedFile {
     let contents = contents.strip_prefix(BOM).unwrap_or(contents);
 
     // Phase one: no types, no rejections — just the document.
     let document: serde_yaml::Value = match serde_yaml::from_str(contents) {
         Ok(document) => document,
         Err(source) => {
-            return Err(vec![FileError::Syntax {
+            return ParsedFile::failed(FileError::Syntax {
                 path: path.to_path_buf(),
                 source,
-            }])
+            })
         }
     };
 
@@ -247,10 +284,10 @@ pub fn parse(path: &Path, contents: &str) -> Result<FileValues, Vec<FileError>> 
         serde_yaml::Value::Null => serde_yaml::Mapping::new(),
         serde_yaml::Value::Mapping(mapping) => mapping,
         other => {
-            return Err(vec![FileError::NotAMapping {
+            return ParsedFile::failed(FileError::NotAMapping {
                 path: path.to_path_buf(),
                 found: describe(&other),
-            }])
+            })
         }
     };
 
@@ -290,17 +327,17 @@ pub fn parse(path: &Path, contents: &str) -> Result<FileValues, Vec<FileError>> 
         }
     }
 
-    if errors.is_empty() {
-        Ok(FileValues { values })
-    } else {
-        // Sorted by key so that the same file always produces the same report,
-        // whatever order the document happened to use.
-        errors.sort_by(|left, right| {
-            left.key()
-                .unwrap_or_default()
-                .cmp(right.key().unwrap_or_default())
-        });
-        Err(errors)
+    // Sorted by key so that the same file always produces the same report,
+    // whatever order the document happened to use.
+    errors.sort_by(|left, right| {
+        left.key()
+            .unwrap_or_default()
+            .cmp(right.key().unwrap_or_default())
+    });
+
+    ParsedFile {
+        values: FileValues { values },
+        errors,
     }
 }
 

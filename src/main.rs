@@ -30,12 +30,17 @@
 //! level is `off`, so a `tui` run still creates neither a data directory nor a
 //! log file unless logging was actually asked for (D-N).
 //!
-//! # A broken configuration stops the run
+//! # The one command that survives a broken configuration
 //!
 //! A configuration file that exists but does not hold up stops the subcommand
-//! with exit code 1, naming every fault at once. A `--config` path that is not
-//! there is exit code 2 instead: the operator named a file that does not
-//! exist, so nothing was run and nothing could be.
+//! with exit code 1, naming every fault at once — except `config show`, which
+//! is the only instrument there is for diagnosing exactly that (D-D). It
+//! prints what it has, marks the rows that did not hold up, and exits 1
+//! itself.
+//!
+//! The exception does not extend to a `--config` path that is not there: that
+//! is exit code 2 for every command including this one, because the operator
+//! named a file that does not exist and there is nothing to diagnose.
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -87,9 +92,20 @@ fn refuse_broken_configuration(cli: &Cli, resolved: &Resolved) -> Option<i32> {
         return Some(EXIT_USAGE);
     }
 
-    let _ = cli;
+    if survives_a_broken_file(cli) {
+        return None;
+    }
+
     report(resolved);
     Some(EXIT_FAILURE)
+}
+
+/// Whether this invocation runs on a configuration it could not use.
+///
+/// Only `config show`, and only because it is the instrument for diagnosing
+/// exactly this (D-D). It prints what it has and exits 1 itself.
+fn survives_a_broken_file(cli: &Cli) -> bool {
+    matches!(cli.command, Command::Config { .. })
 }
 
 /// Prints every configuration failure on stderr, one per line.

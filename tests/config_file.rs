@@ -46,8 +46,12 @@ impl Drop for TempRoot {
 }
 
 /// Parses text without touching the filesystem.
+///
+/// Returns the same `Result` shape the assertions are written against; the
+/// parser itself hands back values and errors together, because `config show`
+/// prints the rows that held up beside the rows that did not.
 fn parse(contents: &str) -> Result<narsor::config::FileValues, Vec<FileError>> {
-    file::parse(Path::new("/etc/narsor/config.yaml"), contents)
+    file::parse(Path::new("/etc/narsor/config.yaml"), contents).into_result()
 }
 
 /// The errors of a parse that was supposed to fail, as their messages.
@@ -267,7 +271,7 @@ fn a_file_over_the_size_limit_is_refused_without_being_parsed() {
     contents.push_str(&"padding ".repeat(((MAX_FILE_BYTES as usize) / 8) + 16));
     let path = root.file(&contents);
 
-    let errors = file::load(&path).expect_err("over the limit");
+    let errors = file::load(&path).into_result().expect_err("over the limit");
 
     assert!(matches!(errors.as_slice(), [FileError::TooLarge { .. }]));
     let message = messages(&errors)[0].clone();
@@ -279,7 +283,7 @@ fn bytes_that_are_not_text_say_so_rather_than_sounding_like_a_permission_problem
     let root = TempRoot::new();
     let path = root.bytes(&[0xff, 0xfe, 0x00, 0x41]);
 
-    let errors = file::load(&path).expect_err("not UTF-8");
+    let errors = file::load(&path).into_result().expect_err("not UTF-8");
 
     assert!(matches!(errors.as_slice(), [FileError::NotUtf8 { .. }]));
     let message = messages(&errors)[0].clone();
@@ -292,7 +296,7 @@ fn every_message_names_the_file() {
     let root = TempRoot::new();
     let path = root.file("nonsense: 1\nlog_level: shouting\n");
 
-    let errors = file::load(&path).expect_err("two faults");
+    let errors = file::load(&path).into_result().expect_err("two faults");
 
     for error in &errors {
         assert_eq!(error.path(), path.as_path());
@@ -308,8 +312,28 @@ fn a_file_that_is_not_there_is_a_read_error_naming_it() {
     let root = TempRoot::new();
     let path = root.path.join("absent.yaml");
 
-    let errors = file::load(&path).expect_err("nothing to read");
+    let errors = file::load(&path)
+        .into_result()
+        .expect_err("nothing to read");
 
     assert!(matches!(errors.as_slice(), [FileError::Read { .. }]));
     assert!(messages(&errors)[0].contains("absent.yaml"));
+}
+
+#[test]
+fn the_keys_that_held_up_survive_beside_the_ones_that_did_not() {
+    // `config show` prints the good rows beside the bad ones, so a file with
+    // one mistake still has to yield the values of every other key (D-D).
+    let parsed = file::parse(
+        Path::new("/etc/narsor/config.yaml"),
+        "data_dir: /srv/narsor\nagent_timeout: tomorrow\n",
+    );
+
+    assert_eq!(parsed.errors.len(), 1, "only the timeout is wrong");
+    assert_eq!(
+        parsed.values.get(SettingKey::DataDir),
+        Some(&SettingValue::Path(PathBuf::from("/srv/narsor"))),
+        "the key the operator got right is still in force"
+    );
+    assert!(!parsed.is_ok());
 }
