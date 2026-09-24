@@ -431,3 +431,21 @@ fn row_for<'a>(output: &'a str, setting: &str) -> &'a str {
 fn data_dir_row(output: &str) -> &str {
     row_for(output, "data_dir")
 }
+
+#[test]
+fn a_bad_value_in_the_environment_marks_its_row_too() {
+    // The same treatment a bad value in the file gets: an operator should not
+    // have to know which layer produced a fault to find the row it belongs to.
+    let root = TempRoot::new();
+
+    let invocation = show(&root, &[("NARSOR_AGENT_TIMEOUT", "tomorrow")], &[]);
+
+    assert_eq!(invocation.code, EXIT_FAILURE);
+    let row = row_for(&invocation.stdout, "agent_timeout");
+    assert!(row.contains("(error)"), "{row}");
+    assert!(
+        invocation.stdout.contains("NARSOR_AGENT_TIMEOUT"),
+        "and the variable is named: {}",
+        invocation.stdout
+    );
+}

@@ -87,6 +87,9 @@ pub enum ConfigError {
     /// A setting given in the environment does not hold up.
     #[error("Environment variable {variable}: {message}")]
     Env {
+        /// The setting it was meant to set, so the row can be marked the same
+        /// way a bad value in the file is.
+        key: &'static str,
         /// The variable.
         variable: String,
         /// What is wrong with its value.
@@ -99,7 +102,8 @@ impl ConfigError {
     pub fn key(&self) -> Option<&str> {
         match self {
             ConfigError::File(error) => error.key(),
-            ConfigError::Cascade(_) | ConfigError::Env { .. } => None,
+            ConfigError::Env { key, .. } => Some(key),
+            ConfigError::Cascade(_) => None,
         }
     }
 
@@ -294,7 +298,11 @@ fn resolve_one(
     if let Some(text) = environment.get(&variable) {
         match file::value_from_text(setting, text) {
             Ok(value) => return (value, Source::Env(variable)),
-            Err(message) => errors.push(ConfigError::Env { variable, message }),
+            Err(message) => errors.push(ConfigError::Env {
+                key: setting.key(),
+                variable,
+                message,
+            }),
         }
     }
 
