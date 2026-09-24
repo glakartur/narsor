@@ -142,7 +142,9 @@ Uruchamia agenta AI (np. Claude Code, OpenCode).
 ```yaml
 action:
   type: agent
-  harness: <claude-code|opencode>     # Wybór narzędzia
+  harness: <claude-code|opencode>     # Opcjonalne — domyślnie z konfiguracji
+                                      # (`agent_harness`, patrz README → Configuration),
+                                      # a w jej braku `claude-code`.
   model: <string>                     # Model AI (opcjonalne, np. "sonnet-3.5")
   prompt: |                           # Instrukcja dla agenta
     Analizuj kod w bieżącym katalogu.
@@ -479,6 +481,9 @@ Przed uruchomieniem workflow, definicja musi przejść walidację:
 2.  **Poprawność Akcji:**
     *   Typ akcji musi być obsługiwany (`agent`, `script`, `human`, `wait`).
     *   Wymagane pola dla danego typu akcji muszą być obecne (np. `prompt` dla agenta, `command` dla skryptu).
+        `harness` **nie** jest wymagany: każde ustawienie ma wartość wbudowaną,
+        więc „brak harnessu gdziekolwiek" nie może zaistnieć, a walidacja
+        pozostaje funkcją samego źródła.
     *   Dla `AgentAction` i `ScriptAction` lista `outputs` nie może być pusta.
 
 3.  **Poprawność Decyzji:**
