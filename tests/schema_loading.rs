@@ -723,3 +723,27 @@ terminal_states:
     assert!(state(&definition, "only").terminal);
     assert!(!definition.states.contains_key("cancelled"));
 }
+
+/// An execution stored before `harness` became optional still reads.
+///
+/// `AgentActionConfig` is serialized into `state.json`, so making the field
+/// optional changed the shape of records already on disk. The field was never
+/// empty in those, so `Option` with `serde(default)` reads them unchanged —
+/// and a record written since, without the field, reads as "use the default".
+#[test]
+fn an_agent_action_stored_before_the_harness_became_optional_still_reads() {
+    use narsor::domain::AgentActionConfig;
+
+    let old = serde_json::json!({
+        "harness": "claude-code",
+        "prompt": "Do the thing.",
+    });
+    let config: AgentActionConfig =
+        serde_json::from_value(old).expect("a record written before the change must still read");
+    assert_eq!(config.harness.as_deref(), Some("claude-code"));
+
+    let new = serde_json::json!({ "prompt": "Do the thing." });
+    let config: AgentActionConfig =
+        serde_json::from_value(new).expect("a record written since must read too");
+    assert_eq!(config.harness, None);
+}
