@@ -74,7 +74,9 @@ Thumbs.db
 node_modules/
 .next/
 
-# Orchestrator runtime state
+# Narsor runtime state
+.narsor/
+# The pre-rename name, so a checkout mid-migration stays quiet
 .orchestrator/
 
 # Agent worktrees
