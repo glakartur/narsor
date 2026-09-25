@@ -601,3 +601,34 @@ fn all_three_roots_default_to_the_same_directory() {
     assert_eq!(WorkPaths::default().root(), Path::new(DEFAULT_ROOT));
     assert_eq!(DEFAULT_ROOT, "./.narsor");
 }
+
+#[test]
+fn workspace_without_a_base_commit_still_reads() {
+    // A state.json written before this field existed must keep loading:
+    // an execution in flight when the binary is upgraded is the normal case.
+    let json = serde_json::json!({
+        "id": "ws-1",
+        "workspace_type": "local_folder",
+        "path": "/tmp/ws",
+    });
+
+    let workspace: narsor::domain::Workspace =
+        serde_json::from_value(json).expect("deserialize legacy workspace");
+
+    assert_eq!(workspace.base_commit, None);
+}
+
+#[test]
+fn workspace_round_trips_its_base_commit() {
+    let mut workspace = narsor::domain::Workspace::local_folder("/tmp/ws".to_string());
+    workspace.base_commit = Some("0123456789abcdef0123456789abcdef01234567".to_string());
+
+    let encoded = serde_json::to_value(&workspace).expect("serialize");
+    let decoded: narsor::domain::Workspace =
+        serde_json::from_value(encoded).expect("deserialize");
+
+    assert_eq!(
+        decoded.base_commit.as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567")
+    );
+}

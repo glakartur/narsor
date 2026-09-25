@@ -27,6 +27,17 @@ pub struct Workspace {
     #[serde(default)]
     pub git_ref: Option<String>,
 
+    /// The commit the workspace was materialised at, recorded once when the
+    /// execution started.
+    ///
+    /// This is the base a checkpoint delta is measured against, and it is
+    /// deliberately *not* re-read from the checkout: a checkout that has moved
+    /// on would silently change what "the delta" means. `None` for a workspace
+    /// that is not a git work tree, and for executions written before this
+    /// field existed.
+    #[serde(default)]
+    pub base_commit: Option<String>,
+
     /// Whether this workspace is read-only
     #[serde(default)]
     pub read_only: bool,
@@ -71,6 +82,7 @@ impl Workspace {
             path,
             repository: None,
             git_ref: None,
+            base_commit: None,
             read_only: false,
         }
     }
@@ -83,6 +95,7 @@ impl Workspace {
             path,
             repository: Some(repository),
             git_ref,
+            base_commit: None,
             read_only: false,
         }
     }
@@ -95,6 +108,7 @@ impl Workspace {
             path,
             repository: Some(repository),
             git_ref: Some(git_ref),
+            base_commit: None,
             read_only: false,
         }
     }
