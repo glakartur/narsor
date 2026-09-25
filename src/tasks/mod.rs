@@ -87,7 +87,10 @@ use crate::persistence::{write_atomic, ExecutionStore, PersistenceError, StatePa
 use crate::registry::{RegistryError, RepositoryRegistry};
 use crate::workflow::{load_from_file, validate_path, LoadError, TemplateError, TemplateScope};
 use crate::workflows::{ResolveError, ResolvedWorkflow, WorkflowOrigin, WorkflowResolver};
-use crate::workspace::{RepositorySpec, WorkspaceError, WorkspaceProvisioner, WorkspaceRequest};
+use crate::workspace::{
+    materialise, Base, CheckpointError, MaterialiseRequest, RepositorySpec, WorkspaceError,
+    WorkspaceProvisioner, WorkspaceRequest,
+};
 
 /// Key of the scratch area inside [`WorkflowExecution::metadata`] that holds
 /// the definition path.
@@ -630,6 +633,150 @@ pub fn resolve_definition(
             execution_id: execution.id.clone(),
             source,
         })
+}
+
+/// Everything that can stop an execution from being taken over.
+#[derive(Debug, thiserror::Error)]
+pub enum TakeoverError {
+    /// The store could not be read or written.
+    #[error("{0}")]
+    Persistence(#[from] PersistenceError),
+
+    /// The workspace could not be provisioned.
+    #[error("{0}")]
+    Workspace(#[from] WorkspaceError),
+
+    /// The checkpoint could not be restored.
+    #[error("{0}")]
+    Checkpoint(#[from] CheckpointError),
+
+    /// The execution never wrote a checkpoint, so there is nothing to restore.
+    #[error("execution {execution_id} has no checkpoint to take over from")]
+    NoCheckpoint {
+        /// The execution that was asked for.
+        execution_id: String,
+    },
+}
+
+/// Takes an execution over: reconcile, then rebuild the workspace from its
+/// checkpoint.
+///
+/// This is the counterpart of [`start_task`] and the one path by which an
+/// execution resumes in a process that did not start it — whether because the
+/// previous one crashed, because its worker was killed, or because the work is
+/// being handed to somebody else. There is deliberately no second path: the
+/// work tree left behind by the previous process is **never** reused, because a
+/// path that only works when the directory survived is a path a handover cannot
+/// take (R26).
+///
+/// Running the execution on is the caller's business, as it is for
+/// [`start_task`]: an execution the reconciliation found mid-action comes back
+/// [`ExecutionStatus::Unknown`] and will not run until somebody looks at it.
+pub fn takeover(
+    store: &ExecutionStore,
+    provisioner: &WorkspaceProvisioner,
+    execution_id: &str,
+) -> std::result::Result<WorkflowExecution, TakeoverError> {
+    // D23, unchanged: an action in flight is not replayed, it is reported.
+    crate::persistence::reconcile(store, execution_id)?;
+
+    let mut execution = store.load_execution(execution_id)?;
+
+    let bundle = store.paths().checkpoint_file(execution_id);
+    if !bundle.is_file() {
+        return Err(TakeoverError::NoCheckpoint {
+            execution_id: execution_id.to_string(),
+        });
+    }
+
+    // The work tree the previous process left behind is discarded, not reused
+    // (R26). It is scratch: everything durable is in the checkpoint, and work
+    // done after the last step boundary is the loss window this design already
+    // accepts. Removing it is also what lets `provision` run at all, since it
+    // refuses to write into a task directory that already exists.
+    let task_dir = provisioner.paths().task_dir(execution_id);
+    if task_dir.exists() {
+        fs::remove_dir_all(&task_dir).map_err(|error| PersistenceError::io(&task_dir, error))?;
+    }
+
+    // Rebuild the checkout from the recorded descriptor, with this worker's own
+    // credentials, then lay the delta over it.
+    let request = takeover_request(&execution);
+    let work_tree = match provision_workspace(provisioner, execution_id, request.as_ref()) {
+        Ok(workspace) => PathBuf::from(workspace.path),
+        Err(ProvisionFailure::Workspace(error)) => return Err(error.into()),
+        Err(ProvisionFailure::Directory(error)) => {
+            return Err(PersistenceError::io(provisioner.code_dir(execution_id), error).into())
+        }
+    };
+
+    let base = match &execution.workspace.base_commit {
+        Some(commit) => {
+            checkout_commit(&work_tree, commit)?;
+            Base::Commit(commit.clone())
+        }
+        None => Base::None,
+    };
+
+    materialise(MaterialiseRequest {
+        work_tree: &work_tree,
+        base,
+        scratch: &store.paths().checkpoint_scratch(execution_id),
+        bundle: &bundle,
+    })?;
+
+    // The record keeps its identity — id, repository, base commit — and only
+    // learns where the work tree now lives.
+    let path = work_tree.display().to_string();
+    if let Some(info) = execution.context.workspace.as_mut() {
+        info.path = path.clone();
+    }
+    execution.workspace.path = path;
+    store.save_execution(&execution)?;
+
+    Ok(execution)
+}
+
+/// The workspace to rebuild for a takeover, from the execution's own record.
+///
+/// A git checkout is cloned again from its recorded remote and ref. Anything
+/// else — a copied local folder, or the fallback directory of a workflow with
+/// no workspace — becomes the same empty fallback directory [`start_task`]
+/// creates: there is no base to fetch for those, and the checkpoint
+/// ([`Base::None`]) carries their whole content. Re-copying a local source
+/// would not even be possible in general, since the folder it was copied from
+/// lives on the machine that started the execution.
+fn takeover_request(execution: &WorkflowExecution) -> Option<WorkspaceRequest> {
+    let repository = execution.workspace.repository.as_ref()?;
+    if repository.provider == "local" {
+        return None;
+    }
+    Some(WorkspaceRequest::new(RepositorySpec::git(
+        repository.name.clone(),
+        repository.remote.clone(),
+        execution.workspace.git_ref.clone(),
+    )))
+}
+
+/// Checks the pinned base commit out in a fresh clone.
+///
+/// `provision` leaves the clone on a branch, which may have moved on since the
+/// execution started, while the checkpoint delta is measured from the commit.
+fn checkout_commit(work_tree: &Path, commit: &str) -> std::result::Result<(), TakeoverError> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(work_tree)
+        .args(["checkout", "--quiet", "--detach", commit, "--"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(CheckpointError::Io)?;
+    if !output.status.success() {
+        return Err(CheckpointError::MissingBase {
+            commit: commit.to_string(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// What provisioning can fail with, before it knows which execution it belongs

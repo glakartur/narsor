@@ -20,6 +20,7 @@ use narsor::domain::{
 use narsor::engine::{ActionExecutor, ActionOutcome, ActionRequest, Engine};
 use narsor::persistence::ExecutionStore;
 use narsor::workflow::load_from_file;
+use narsor::workspace::WorkspaceProvisioner;
 use serde_json::{json, Map, Value};
 
 /// A temporary root with a store and a workspace, removed when it goes away.
@@ -70,6 +71,46 @@ impl Harness {
     /// An engine with the stock executors.
     pub fn engine(&self) -> Engine {
         Engine::new(self.store())
+    }
+
+    /// A provisioner over the work tree root, as a fresh process would build
+    /// one.
+    pub fn provisioner(&self) -> WorkspaceProvisioner {
+        WorkspaceProvisioner::new(self.root.join("work"))
+    }
+
+    /// The git repository a fixture may use as its product repository.
+    pub fn origin_dir(&self) -> PathBuf {
+        self.root.join("origin")
+    }
+
+    /// Every ref name the product repository holds, as `git ls-remote` lists
+    /// them.
+    ///
+    /// Empty when the fixture uses no git repository at all — which is itself
+    /// the answer to "did anything get pushed to it".
+    pub fn origin_refs(&self) -> Vec<String> {
+        let origin = self.origin_dir();
+        if !origin.is_dir() {
+            return Vec::new();
+        }
+        let output = std::process::Command::new("git")
+            .arg("ls-remote")
+            .arg(&origin)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("run git ls-remote");
+        assert!(
+            output.status.success(),
+            "git ls-remote {} failed: {}",
+            origin.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .map(ToString::to_string)
+            .collect()
     }
 
     /// A file inside the workspace.

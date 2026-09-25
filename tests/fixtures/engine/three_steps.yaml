@@ -1,0 +1,48 @@
+name: three-steps
+version: 1
+description: >
+  Three script states in a row, then a success terminal. Each state leaves one
+  file in the workspace and reports, as its own variable, every step file the
+  workspace holds — so the context only matches a clean run when the files of
+  the earlier steps were carried across. Used to prove that a run interrupted at
+  any step boundary and taken over ends where an uninterrupted one does.
+
+states:
+  first:
+    action:
+      type: script
+      command: ./record_step.sh
+      args:
+        - first
+    outputs:
+      - done
+    transitions:
+      done: second
+
+  second:
+    action:
+      type: script
+      command: ./record_step.sh
+      args:
+        - second
+    outputs:
+      - done
+    transitions:
+      done: third
+
+  third:
+    action:
+      type: script
+      command: ./record_step.sh
+      args:
+        - third
+    outputs:
+      - done
+    transitions:
+      done: completed
+
+  completed:
+    description: Every step went through.
+
+terminal_states:
+  - completed

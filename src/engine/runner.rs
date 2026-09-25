@@ -506,6 +506,27 @@ impl Engine {
         self.run_loop(definition, execution).await
     }
 
+    /// Runs a stored execution like [`Engine::run`], but stops after `steps`
+    /// step boundaries — each one a transition taken and persisted — even if
+    /// the workflow could go on.
+    ///
+    /// The execution is left `Running` at a clean boundary, exactly as a
+    /// process that died right after that step would leave it, which is what
+    /// makes it the seam for proving that a takeover resumes correctly from any
+    /// point.
+    pub async fn run_steps(
+        &self,
+        definition: &WorkflowDefinition,
+        execution_id: &str,
+        steps: usize,
+    ) -> Result<WorkflowExecution, EngineError> {
+        let execution = self.store.load_execution(execution_id)?;
+        if execution.status != ExecutionStatus::Running {
+            return Err(self.not_runnable(&execution, "run"));
+        }
+        self.step_loop(definition, execution, Some(steps)).await
+    }
+
     /// Asks the pass currently running this execution to stop before its next
     /// action (D34).
     ///
@@ -639,10 +660,25 @@ impl Engine {
     async fn run_loop(
         &self,
         definition: &WorkflowDefinition,
-        mut execution: WorkflowExecution,
+        execution: WorkflowExecution,
     ) -> Result<WorkflowExecution, EngineError> {
+        self.step_loop(definition, execution, None).await
+    }
+
+    /// Steps until the execution stops being runnable or, when `limit` is
+    /// given, until that many step boundaries have been crossed.
+    async fn step_loop(
+        &self,
+        definition: &WorkflowDefinition,
+        mut execution: WorkflowExecution,
+        limit: Option<usize>,
+    ) -> Result<WorkflowExecution, EngineError> {
+        let mut crossed = 0;
         loop {
             if execution.status != ExecutionStatus::Running {
+                break;
+            }
+            if limit.is_some_and(|limit| crossed >= limit) {
                 break;
             }
 
@@ -662,6 +698,7 @@ impl Engine {
             if flow == Flow::Stop {
                 break;
             }
+            crossed += 1;
         }
 
         Ok(execution)
