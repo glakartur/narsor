@@ -76,6 +76,15 @@ pub const EVENTS_DIR: &str = "events";
 /// Directory holding artifact files of one execution.
 pub const ARTIFACTS_DIR: &str = "artifacts";
 
+/// The one checkpoint kept for an execution (R25).
+pub const CHECKPOINT_FILE: &str = "checkpoint.bundle";
+
+/// Git's own scratch area for producing and applying a checkpoint.
+///
+/// Deliberately outside the work tree, so that a workspace which is not a git
+/// repository does not acquire a `.git` directory it never asked for.
+pub const CHECKPOINT_SCRATCH_DIR: &str = "checkpoint.git";
+
 /// Suffix of a not-yet-renamed atomic write. Never a file to read from.
 pub const TEMP_SUFFIX: &str = ".tmp";
 
@@ -131,6 +140,16 @@ impl StatePaths {
     /// `{root}/executions/{execution_id}/context.json`
     pub fn context_file(&self, execution_id: &str) -> PathBuf {
         self.execution_dir(execution_id).join(CONTEXT_FILE)
+    }
+
+    /// `{state}/executions/{id}/checkpoint.bundle`.
+    pub fn checkpoint_file(&self, execution_id: &str) -> PathBuf {
+        self.execution_dir(execution_id).join(CHECKPOINT_FILE)
+    }
+
+    /// `{state}/executions/{id}/checkpoint.git`.
+    pub fn checkpoint_scratch(&self, execution_id: &str) -> PathBuf {
+        self.execution_dir(execution_id).join(CHECKPOINT_SCRATCH_DIR)
     }
 
     /// `{state}/executions/{id}/definition.yaml`.
