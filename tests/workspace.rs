@@ -257,6 +257,10 @@ fn local_workspace_holds_the_source_contents_and_is_recorded_on_the_execution() 
         WorkspaceType::LocalFolder
     ));
     assert_eq!(execution.workspace.path, repo_dir.display().to_string());
+    assert_eq!(
+        execution.workspace.base_commit, None,
+        "a copied folder has no base commit"
+    );
 
     // The source must not be touched: the workspace is a copy, not a link.
     assert!(!source.join("src").join("written-by-agent").exists());
@@ -300,6 +304,11 @@ fn git_workspace_is_cloned_at_the_requested_ref() {
         WorkspaceType::GitCheckout
     ));
     assert_eq!(provisioned.workspace.git_ref.as_deref(), Some("feature"));
+    // The commit the clone landed on is pinned as the checkpoint base.
+    assert_eq!(
+        provisioned.workspace.base_commit.as_deref(),
+        Some(git(&repo_dir, &["rev-parse", "HEAD"]).as_str())
+    );
     assert_eq!(
         provisioned
             .workspace

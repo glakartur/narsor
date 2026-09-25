@@ -36,8 +36,8 @@
 //! work, and lets every failure be reported in git's own words.
 
 use crate::domain::{RepositoryInfo, Workspace};
-use std::fs;
 use crate::persistence::paths::WorkPaths;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -537,13 +537,18 @@ impl WorkspaceProvisioner {
             });
         }
 
-        let primary_path = repositories[0].path.display().to_string();
+        let primary = &repositories[0].path;
+        let primary_path = primary.display().to_string();
         let workspace = match &request.primary.source {
-            RepositorySource::Git { .. } => Workspace::git_checkout(
-                primary_path,
-                request.primary.repository_info(),
-                request.primary.git_ref(),
-            ),
+            RepositorySource::Git { .. } => {
+                let mut workspace = Workspace::git_checkout(
+                    primary_path,
+                    request.primary.repository_info(),
+                    request.primary.git_ref(),
+                );
+                workspace.base_commit = Some(head_commit(primary, &request.primary.name)?);
+                workspace
+            }
             RepositorySource::Local { .. } => Workspace::local_folder(primary_path),
         };
 
@@ -802,6 +807,19 @@ fn clone_repository(
         return Ok(());
     };
     checkout_ref(target, git_ref, repository)
+}
+
+/// The commit a freshly provisioned checkout sits at.
+///
+/// Recorded once, as the workspace's base commit: every checkpoint delta is
+/// measured against it, and a takeover checks exactly this commit out again —
+/// not whatever the branch has moved on to since.
+fn head_commit(path: &Path, repository: &str) -> Result<String> {
+    let dir = path.to_string_lossy().into_owned();
+    run_git(
+        repository,
+        &["-C", &dir, "rev-parse", "--verify", "HEAD^{commit}"],
+    )
 }
 
 /// Checks `git_ref` out in an already cloned repository.
