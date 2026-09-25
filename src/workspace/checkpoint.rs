@@ -234,3 +234,83 @@ pub fn capture(request: CaptureRequest<'_>) -> Result<Capture, CheckpointError> 
 
     Ok(Capture { commit, bytes })
 }
+
+/// Everything [`materialise`] needs.
+#[derive(Debug)]
+pub struct MaterialiseRequest<'a> {
+    /// The directory the checkpoint is restored into. For [`Base::Commit`] it
+    /// must already be a checkout holding that commit.
+    pub work_tree: &'a Path,
+    /// The base the delta was measured from.
+    pub base: Base,
+    /// Git's scratch area, as in [`CaptureRequest`].
+    pub scratch: &'a Path,
+    /// The bundle to restore.
+    pub bundle: &'a Path,
+}
+
+/// Restores a checkpoint into `work_tree`.
+///
+/// The work tree ends up holding exactly what it held when the checkpoint was
+/// taken, and `git status` reports the same dirty state: the checkpoint commit
+/// is checked out hard, then the index is reset back to the base, which turns
+/// its content back into unstaged modifications and untracked files.
+pub fn materialise(request: MaterialiseRequest<'_>) -> Result<(), CheckpointError> {
+    fs::create_dir_all(request.scratch)?;
+
+    let git_dir = match &request.base {
+        Base::Commit(_) => None,
+        Base::None => {
+            let dir = request.scratch.join("repo.git");
+            if !dir.exists() {
+                fs::create_dir_all(&dir)?;
+                run(request.work_tree, Some(&dir), None, &["init", "--quiet"])?;
+            }
+            Some(dir)
+        }
+    };
+    let git_dir = git_dir.as_deref();
+
+    if let Base::Commit(commit) = &request.base {
+        run(
+            request.work_tree,
+            git_dir,
+            None,
+            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+        )
+        .map_err(|_| CheckpointError::MissingBase {
+            commit: commit.clone(),
+        })?;
+    }
+
+    let refspec = format!("{CHECKPOINT_REF}:{CHECKPOINT_REF}");
+    run(
+        request.work_tree,
+        git_dir,
+        None,
+        &[
+            "fetch",
+            "--quiet",
+            &request.bundle.display().to_string(),
+            &refspec,
+        ],
+    )?;
+
+    run(
+        request.work_tree,
+        git_dir,
+        None,
+        &["reset", "--quiet", "--hard", CHECKPOINT_REF],
+    )?;
+
+    if let Base::Commit(base) = &request.base {
+        run(
+            request.work_tree,
+            git_dir,
+            None,
+            &["reset", "--quiet", "--mixed", base],
+        )?;
+    }
+
+    Ok(())
+}

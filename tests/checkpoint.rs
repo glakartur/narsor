@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use narsor::workspace::{capture, Base, CaptureRequest};
+use narsor::workspace::{capture, materialise, Base, CaptureRequest, MaterialiseRequest};
 
 /// A temporary directory removed when it goes away.
 struct TempRoot {
@@ -186,5 +186,165 @@ fn a_failed_capture_leaves_the_previous_bundle_intact() {
         fs::read(&bundle).expect("read bundle after the failure"),
         good,
         "a failed capture must leave the previous checkpoint byte-identical"
+    );
+}
+
+/// Clones `origin` into `into` and checks `base` out, the way a takeover does.
+fn clone_at(origin: &Path, into: &Path, base: &str) {
+    let parent = into.parent().expect("clone target has a parent");
+    fs::create_dir_all(parent).expect("create clone parent");
+    let output = Command::new("git")
+        .arg("clone")
+        .arg("--quiet")
+        .arg(origin)
+        .arg(into)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("run git clone");
+    assert!(output.status.success(), "git clone failed");
+    git(into, &["checkout", "--quiet", base]);
+}
+
+#[test]
+fn a_dirty_tree_survives_a_round_trip() {
+    // Success criterion 3: the restored tree is identical to the captured one,
+    // and `git status` reports the same dirty state, not a pile of staged work.
+    let temp = TempRoot::new();
+    let origin = temp.join("origin");
+    let base = repo_with_base(&origin);
+
+    let work = temp.join("work");
+    clone_at(&origin, &work, &base);
+
+    fs::write(work.join("tracked.txt"), "base\nmodified\n").expect("modify tracked");
+    fs::write(work.join("untracked.txt"), "brand new\n").expect("add untracked");
+    fs::write(work.join("binary.dat"), [0u8, 1, 2, 255]).expect("add binary");
+    fs::remove_file(work.join(".gitignore")).expect("delete a tracked file");
+    let expected_status = git(&work, &["status", "--porcelain"]);
+
+    let bundle = temp.join("cp.bundle");
+    capture(CaptureRequest {
+        work_tree: &work,
+        base: Base::Commit(base.clone()),
+        scratch: &temp.join("scratch"),
+        bundle: &bundle,
+        preserve: &[],
+    })
+    .expect("capture");
+
+    let fresh = temp.join("fresh");
+    clone_at(&origin, &fresh, &base);
+    materialise(MaterialiseRequest {
+        work_tree: &fresh,
+        base: Base::Commit(base),
+        scratch: &temp.join("fresh-scratch"),
+        bundle: &bundle,
+    })
+    .expect("materialise");
+
+    assert_eq!(
+        git(&fresh, &["status", "--porcelain"]),
+        expected_status,
+        "the restored tree must show the same dirty state"
+    );
+    assert_eq!(
+        fs::read_to_string(fresh.join("tracked.txt")).expect("read tracked"),
+        "base\nmodified\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fresh.join("untracked.txt")).expect("read untracked"),
+        "brand new\n"
+    );
+    assert_eq!(
+        fs::read(fresh.join("binary.dat")).expect("read binary"),
+        vec![0u8, 1, 2, 255]
+    );
+    assert!(!fresh.join(".gitignore").exists(), "the deletion must travel");
+}
+
+#[test]
+fn materialising_without_the_base_is_a_named_error() {
+    // Review Focus 3: a force-pushed or garbage-collected base must produce a
+    // sentence an operator can act on, not a wall of git stderr.
+    let temp = TempRoot::new();
+    let origin = temp.join("origin");
+    let base = repo_with_base(&origin);
+
+    let work = temp.join("work");
+    clone_at(&origin, &work, &base);
+    fs::write(work.join("tracked.txt"), "base\nmodified\n").expect("modify");
+
+    let bundle = temp.join("cp.bundle");
+    capture(CaptureRequest {
+        work_tree: &work,
+        base: Base::Commit(base.clone()),
+        scratch: &temp.join("scratch"),
+        bundle: &bundle,
+        preserve: &[],
+    })
+    .expect("capture");
+
+    // A fresh repository that has never heard of the base.
+    let stranger = temp.join("stranger");
+    fs::create_dir_all(&stranger).expect("create stranger");
+    git(&stranger, &["-c", "init.defaultBranch=main", "init"]);
+
+    let error = materialise(MaterialiseRequest {
+        work_tree: &stranger,
+        base: Base::Commit(base.clone()),
+        scratch: &temp.join("stranger-scratch"),
+        bundle: &bundle,
+    })
+    .expect_err("materialising without the base must fail");
+
+    let message = error.to_string();
+    assert!(
+        message.contains(&base) && message.contains("force-pushed"),
+        "expected a named MissingBase error, got: {message}"
+    );
+}
+
+#[test]
+fn a_nested_repository_restores_as_an_empty_directory() {
+    // Review Focus 5. `git add -A` records a nested repository as a gitlink, so
+    // the restore leaves the directory empty. Pinned here so the behaviour is
+    // known rather than discovered in production.
+    let temp = TempRoot::new();
+    let origin = temp.join("origin");
+    let base = repo_with_base(&origin);
+
+    let work = temp.join("work");
+    clone_at(&origin, &work, &base);
+
+    let nested = work.join("vendor");
+    fs::create_dir_all(&nested).expect("create nested");
+    git(&nested, &["-c", "init.defaultBranch=main", "init"]);
+    fs::write(nested.join("inner.txt"), "inner\n").expect("write inner");
+    git(&nested, &["add", "-A"]);
+    git(&nested, &["commit", "--message", "inner"]);
+
+    let bundle = temp.join("cp.bundle");
+    capture(CaptureRequest {
+        work_tree: &work,
+        base: Base::Commit(base.clone()),
+        scratch: &temp.join("scratch"),
+        bundle: &bundle,
+        preserve: &[],
+    })
+    .expect("capture");
+
+    let fresh = temp.join("fresh");
+    clone_at(&origin, &fresh, &base);
+    materialise(MaterialiseRequest {
+        work_tree: &fresh,
+        base: Base::Commit(base),
+        scratch: &temp.join("fresh-scratch"),
+        bundle: &bundle,
+    })
+    .expect("materialise");
+
+    assert!(
+        !fresh.join("vendor").join("inner.txt").exists(),
+        "a nested repository's contents do not travel in the checkpoint"
     );
 }

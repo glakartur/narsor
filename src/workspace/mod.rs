@@ -20,7 +20,10 @@
 pub mod checkpoint;
 pub mod provisioner;
 
-pub use checkpoint::{capture, Base, Capture, CaptureRequest, CheckpointError, CHECKPOINT_REF};
+pub use checkpoint::{
+    capture, materialise, Base, Capture, CaptureRequest, CheckpointError, MaterialiseRequest,
+    CHECKPOINT_REF,
+};
 pub use provisioner::{
     CleanupOutcome, CleanupPolicy, ProvisionedRepository, ProvisionedWorkspace, RepositorySource,
     RepositorySpec, WorkspaceError, WorkspaceProvisioner, WorkspaceRequest, CODE_DIR, TASKS_DIR,
