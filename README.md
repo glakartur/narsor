@@ -769,6 +769,9 @@ Under the `--root` directory (`./.narsor` by default):
 │   ├── state.json                  # WorkflowExecution: status, current state, context
 │   ├── context.json                # the context projection (variables, artifacts, workspace)
 │   ├── pending_input.json          # the question a paused execution is waiting on
+│   ├── definition.yaml             # pinned copy of the workflow definition for this execution
+│   ├── checkpoint.bundle           # git bundle of the workspace delta against base_commit
+│   ├── checkpoint.git/             # scratch area for materialising the checkpoint
 │   ├── events/{sequence:08}.json   # append-only event log
 │   └── artifacts/{artifact_id}/    # files produced by actions
 ├── tasks/{execution_id}/

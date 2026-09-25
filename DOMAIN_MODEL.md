@@ -154,6 +154,9 @@ Reprezentuje środowisko filesystemowe, w którym działają akcje.
 - Izolacja realizowana przez uprawnienia filesystemu i montowanie RO/RW.
 - Workspace jest tworzony przy starcie execution i czyszczony po zakończeniu (zgodnie z polityką).
 
+**Checkpoint i materializacja:**
+Workspace jest samodzielnie odtwarzalny za sprawą checkpointu — git bundle'a zawierającego deltę zmian względem pinned base commit (zarejestrowanego w `base_commit` na WorkflowExecution). Checkpoint przechowuje tylko różnicę między stanem początkowym a stanem workspace'u po wykonaniu, nie całą historię. Materializacja (przywrócenie workspace'u w innym miejscu lub na innej maszynie) zawsze odbywa się wyłącznie z checkpointu, ignorując ocalałe katalogi na ścieżce — zapewnia to powtarzalność i bezpieczeństwo.
+
 ### 2.9 Event
 
 Niezmienny rekord faktu, który wydarzył się w systemie. Podstawa obserwowalności i recovery.
