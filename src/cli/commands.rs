@@ -86,8 +86,8 @@ pub type Result<T> = std::result::Result<T, CliError>;
 ///
 /// The argument is a workflow reference: a file, a name in the search path, or
 /// a built-in.
-pub fn validate(root: &Path, reference: &str) -> Result<()> {
-    let resolved = resolve_workflow(root, reference)?;
+pub fn validate(catalog: &Path, reference: &str) -> Result<()> {
+    let resolved = resolve_workflow(catalog, reference)?;
     let definition = tasks::load_resolved(&resolved).map_err(|error| match error {
         TaskError::InvalidDefinition { violations } => {
             let mut message = format!(
@@ -131,8 +131,11 @@ fn violation_noun(count: usize) -> &'static str {
 /// `narsor run <workflow> [--input k=v]…` — create an execution and run
 /// it.
 pub async fn run(config: &Resolved, reference: &str, inputs: &[String]) -> Result<()> {
-    let root = config.data_dir();
-    let resolved = resolve_workflow(root, reference)?;
+    // The one command that needs all three, and it takes them one by one: the
+    // definition and the registry come from the catalogue, the execution is
+    // written to the state root, and the checkout lands in the work tree.
+    let catalog = config.catalog_dir();
+    let resolved = resolve_workflow(catalog, reference)?;
     eprintln!("Workflow '{}' — {}.", resolved.name, resolved.origin);
     let definition = tasks::load_resolved(&resolved).map_err(|error| match error {
         TaskError::InvalidDefinition { violations } => {
@@ -149,14 +152,22 @@ pub async fn run(config: &Resolved, reference: &str, inputs: &[String]) -> Resul
     // anything is written to disk.
     let inputs = collect_inputs(&definition, inputs)?;
 
-    let engine =
-        Engine::new(ExecutionStore::new(root)).with_agent_defaults(config.agent_defaults());
+    let engine = Engine::new(ExecutionStore::new(config.state_dir()))
+        .with_agent_defaults(config.agent_defaults());
     // The new id is announced the moment it exists, so that a failing clone
     // still tells the operator which execution to look at.
     let execution =
-        tasks::start_task_with(root, &engine, &definition, &resolved, inputs, |execution| {
-            println!("Created execution: {}", execution.id);
-        })
+        tasks::start_task_with(
+            catalog,
+            config.work_dir(),
+            &engine,
+            &definition,
+            &resolved,
+            inputs,
+            |execution| {
+                println!("Created execution: {}", execution.id);
+            },
+        )
         .map_err(|error| CliError::failure(error.to_string()))?;
 
     let execution = engine
@@ -273,8 +284,8 @@ fn parse_input_value(parameter: &InputParameter, raw: &str) -> Result<Value> {
 // ---------------------------------------------------------------------------
 
 /// `narsor list` — every execution in the store, newest first.
-pub fn list(root: &Path) -> Result<()> {
-    let store = ExecutionStore::new(root);
+pub fn list(state: &Path) -> Result<()> {
+    let store = ExecutionStore::new(state);
     let ids = store
         .list_execution_ids()
         .map_err(|error| CliError::failure(format!("Could not read the executions: {error}")))?;
@@ -309,8 +320,8 @@ pub fn list(root: &Path) -> Result<()> {
 }
 
 /// `narsor show <id>` — the current state, the status and the context.
-pub fn show(root: &Path, execution_id: &str) -> Result<()> {
-    let store = ExecutionStore::new(root);
+pub fn show(state: &Path, execution_id: &str) -> Result<()> {
+    let store = ExecutionStore::new(state);
     let execution = load_execution(&store, execution_id)?;
 
     println!("Execution:     {}", execution.id);
@@ -352,8 +363,8 @@ pub fn show(root: &Path, execution_id: &str) -> Result<()> {
 }
 
 /// `narsor events <id> [--follow]` — the event log, in sequence order.
-pub async fn events(root: &Path, execution_id: &str, follow: bool) -> Result<()> {
-    let store = ExecutionStore::new(root);
+pub async fn events(state: &Path, execution_id: &str, follow: bool) -> Result<()> {
+    let store = ExecutionStore::new(state);
     // Fails early and readably when the id is unknown.
     let mut execution = load_execution(&store, execution_id)?;
 
@@ -414,8 +425,7 @@ pub async fn input(
     label: Option<String>,
     definition_file: Option<&str>,
 ) -> Result<()> {
-    let root = config.data_dir();
-    let store = ExecutionStore::new(root);
+    let store = ExecutionStore::new(config.state_dir());
     let execution = load_execution(&store, execution_id)?;
 
     let Some(pending) = pending_input(&store, execution_id)? else {
@@ -440,7 +450,7 @@ pub async fn input(
         delivery = delivery.choosing(label);
     }
 
-    let definition = definition_for(root, &execution, definition_file)?;
+    let definition = definition_for(config.catalog_dir(), &execution, definition_file)?;
     let engine = Engine::new(store).with_agent_defaults(config.agent_defaults());
     let execution = engine
         .deliver_human_input(&definition, &pending.execution_id, &delivery)
@@ -471,10 +481,9 @@ pub async fn resume(
     execution_id: &str,
     definition_file: Option<&str>,
 ) -> Result<()> {
-    let root = config.data_dir();
-    let store = ExecutionStore::new(root);
+    let store = ExecutionStore::new(config.state_dir());
     let execution = load_execution(&store, execution_id)?;
-    let definition = definition_for(root, &execution, definition_file)?;
+    let definition = definition_for(config.catalog_dir(), &execution, definition_file)?;
 
     let engine = Engine::new(store).with_agent_defaults(config.agent_defaults());
     let execution = engine
@@ -504,7 +513,7 @@ pub async fn resume(
 /// starting with `-` or using the `ext::` transport is refused here rather than
 /// halfway through a run.
 pub fn repo_add(
-    root: &Path,
+    catalog: &Path,
     id: &str,
     remote: &str,
     name: Option<String>,
@@ -518,7 +527,7 @@ pub fn repo_add(
     entry.default_branch = default_branch;
     entry.description = description;
 
-    let registry = RepositoryRegistry::new(root);
+    let registry = RepositoryRegistry::new(catalog);
     registry.add(entry).map_err(|error| {
         CliError::failure(format!("Could not register the repository: {error}"))
     })?;
@@ -534,8 +543,8 @@ pub fn repo_add(
 /// pattern is `config show`'s — a diagnostic that goes silent in the situation
 /// it exists for is no diagnostic — and the exit code is what keeps a script
 /// branching on it from being misled.
-pub fn repo_list(root: &Path) -> Result<()> {
-    let listing = RepositoryRegistry::new(root)
+pub fn repo_list(catalog: &Path) -> Result<()> {
+    let listing = RepositoryRegistry::new(catalog)
         .list()
         .map_err(|error| CliError::failure(format!("Could not read the registry: {error}")))?;
 
@@ -574,8 +583,8 @@ pub fn repo_list(root: &Path) -> Result<()> {
 }
 
 /// `narsor repo show <id>` — every field of one registered repository.
-pub fn repo_show(root: &Path, id: &str) -> Result<()> {
-    let registry = RepositoryRegistry::new(root);
+pub fn repo_show(catalog: &Path, id: &str) -> Result<()> {
+    let registry = RepositoryRegistry::new(catalog);
     let entry = registry
         .get(id)
         .map_err(|error| CliError::failure(format!("Could not read the registry: {error}")))?
@@ -602,8 +611,8 @@ pub fn repo_show(root: &Path, id: &str) -> Result<()> {
 }
 
 /// `narsor repo remove <id>` — drop a repository from the registry.
-pub fn repo_remove(root: &Path, id: &str) -> Result<()> {
-    RepositoryRegistry::new(root)
+pub fn repo_remove(catalog: &Path, id: &str) -> Result<()> {
+    RepositoryRegistry::new(catalog)
         .remove(id)
         .map_err(|error| CliError::failure(format!("Could not remove the repository: {error}")))?;
 
@@ -621,8 +630,8 @@ pub fn repo_remove(root: &Path, id: &str) -> Result<()> {
 /// when it overrides something, and its `description`. A user copy shadowing a
 /// built-in is one row marked as an override, never two rows that leave the
 /// operator guessing which one would run.
-pub fn workflow_list(root: &Path) -> Result<()> {
-    let resolver = WorkflowResolver::new(root);
+pub fn workflow_list(catalog: &Path) -> Result<()> {
+    let resolver = WorkflowResolver::new(catalog);
     let entries = resolver.list();
 
     if entries.is_empty() {
@@ -654,8 +663,8 @@ pub fn workflow_list(root: &Path) -> Result<()> {
 /// The definition goes to stdout and nothing else does, so
 /// `narsor workflow show compound-engineering > mine.yaml` is a copy;
 /// where it came from is said on stderr.
-pub fn workflow_show(root: &Path, reference: &str) -> Result<()> {
-    let resolved = resolve_workflow(root, reference)?;
+pub fn workflow_show(catalog: &Path, reference: &str) -> Result<()> {
+    let resolved = resolve_workflow(catalog, reference)?;
     eprintln!("Workflow '{}' — {}.", resolved.name, resolved.origin);
     print!("{}", resolved.source);
     if !resolved.source.ends_with('\n') {
@@ -670,7 +679,7 @@ pub fn workflow_show(root: &Path, reference: &str) -> Result<()> {
 /// The default target is the user directory, which the resolver searches ahead
 /// of the built-ins: the ejected copy takes precedence the moment it is
 /// written, which is the whole point of ejecting one.
-pub fn workflow_eject(root: &Path, name: &str, to: Option<&Path>, force: bool) -> Result<()> {
+pub fn workflow_eject(catalog: &Path, name: &str, to: Option<&Path>, force: bool) -> Result<()> {
     let builtin = builtin(name).ok_or_else(|| {
         CliError::usage(format!(
             "There is no built-in workflow named '{}'. Available built-in workflows: {}.",
@@ -679,7 +688,7 @@ pub fn workflow_eject(root: &Path, name: &str, to: Option<&Path>, force: bool) -
         ))
     })?;
 
-    let resolver = WorkflowResolver::new(root);
+    let resolver = WorkflowResolver::new(catalog);
     let directory = match to {
         Some(directory) => directory.to_path_buf(),
         None => resolver.user_dir().map(Path::to_path_buf).ok_or_else(|| {
@@ -750,14 +759,20 @@ fn truncate(text: &str, limit: usize) -> String {
 /// driven on it: spawning a second runtime inside the first would panic, and
 /// the interface has to own a thread anyway — it blocks on keys.
 ///
-/// The store is opened on the global `--root`, exactly like every other
-/// subcommand: the interface shows the executions of the data directory the
-/// operator asked for, not always those of the default one.
+/// The three roots are opened exactly as every other subcommand opens the ones
+/// it needs, and handed to the interface separately: it shows the executions of
+/// the state directory the operator asked for, reads workflows and the registry
+/// from the catalogue, and puts checkouts in the work tree.
 pub fn tui(config: &Resolved) -> Result<()> {
-    let store = ExecutionStore::new(config.data_dir());
+    let store = ExecutionStore::new(config.state_dir());
     let defaults = config.agent_defaults();
     let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(move || handle.block_on(crate::tui::run(store, defaults))).map_err(
+    let catalog = config.catalog_paths();
+    let work = config.work_paths();
+    tokio::task::block_in_place(move || {
+        handle.block_on(crate::tui::run(store, catalog, work, defaults))
+    })
+    .map_err(
         |error| {
             CliError::failure(format!(
                 "The terminal interface stopped with an error: {error}"
@@ -792,13 +807,13 @@ fn pending_input(store: &ExecutionStore, execution_id: &str) -> Result<Option<Pe
 /// was started from while that file is still there, and the workflow name
 /// otherwise, which is the only thing a built-in leaves behind.
 fn definition_for(
-    root: &Path,
+    catalog: &Path,
     execution: &WorkflowExecution,
     override_reference: Option<&str>,
 ) -> Result<WorkflowDefinition> {
     let resolved = match override_reference {
-        Some(reference) => resolve_workflow(root, reference)?,
-        None => tasks::resolve_definition(root, execution)
+        Some(reference) => resolve_workflow(catalog, reference)?,
+        None => tasks::resolve_definition(catalog, execution)
             .map_err(|error| CliError::failure(error.to_string()))?,
     };
 
@@ -812,8 +827,8 @@ fn definition_for(
 
 /// Resolves a workflow reference, turning a miss into the message that names
 /// every place that was tried.
-fn resolve_workflow(root: &Path, reference: &str) -> Result<ResolvedWorkflow> {
-    WorkflowResolver::new(root)
+fn resolve_workflow(catalog: &Path, reference: &str) -> Result<ResolvedWorkflow> {
+    WorkflowResolver::new(catalog)
         .resolve(reference)
         .map_err(|error| CliError::usage(error.to_string()))
 }

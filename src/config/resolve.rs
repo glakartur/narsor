@@ -27,10 +27,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::engine::AgentDefaults;
+use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
 
 use super::cascade::{CascadeError, ConfigCascade, Resolution};
 use super::file::{self, FileError, FileValues};
-use super::settings::{SettingKey, SettingValue, Source, ENV_PREFIX, LOG_OFF, RUST_LOG};
+use super::settings::{
+    self, SettingKey, SettingValue, Source, ENV_PREFIX, LOG_OFF, RUST_LOG,
+};
 
 /// The environment, as a map read once rather than consulted repeatedly.
 pub type Environment = BTreeMap<String, String>;
@@ -69,7 +72,13 @@ impl Flags {
     /// they agree.
     fn value(&self, setting: SettingKey) -> Option<(SettingValue, &'static str)> {
         match setting {
-            SettingKey::DataDir => self
+            // One flag, three settings. `--root` stays the single knob for
+            // local work and for tests, and it stays a *flag* rather than a
+            // fourth setting the three derive from: a derived value would need
+            // a source variant of its own ("derived from data_dir") and break
+            // the one-setting-one-key-one-source model the whole preview
+            // stands on (D-B).
+            SettingKey::CatalogDir | SettingKey::StateDir | SettingKey::WorkDir => self
                 .root
                 .clone()
                 .map(|root| (SettingValue::Path(root), "--root")),
@@ -89,6 +98,21 @@ pub enum ConfigError {
     #[error(transparent)]
     File(#[from] FileError),
 
+    /// A variable that carried a setting in an earlier version.
+    ///
+    /// Its own variant because it cannot be reported by the loop that asks for
+    /// one variable per known setting: that loop never looks the name up, so
+    /// the variable would be ignored in silence — the one outcome R6 forbids.
+    #[error("{message}")]
+    RetiredEnv {
+        /// The key it used to set, so the row can be marked.
+        key: &'static str,
+        /// The variable.
+        variable: String,
+        /// What happened to it, and what to set instead.
+        message: String,
+    },
+
     /// A setting given in the environment does not hold up.
     #[error("Environment variable {variable}: {message}")]
     Env {
@@ -107,7 +131,7 @@ impl ConfigError {
     pub fn key(&self) -> Option<&str> {
         match self {
             ConfigError::File(error) => error.key(),
-            ConfigError::Env { key, .. } => Some(key),
+            ConfigError::Env { key, .. } | ConfigError::RetiredEnv { key, .. } => Some(key),
             ConfigError::Cascade(_) => None,
         }
     }
@@ -118,7 +142,12 @@ impl ConfigError {
     pub fn is_usage(&self) -> bool {
         match self {
             ConfigError::Cascade(error) => error.is_usage(),
-            ConfigError::File(_) | ConfigError::Env { .. } => false,
+            // Not a usage error: it stops every subcommand, but `config show`
+            // has to survive it and print the table, because that is the one
+            // tool for diagnosing a configuration (D-D, D-J).
+            ConfigError::File(_) | ConfigError::Env { .. } | ConfigError::RetiredEnv { .. } => {
+                false
+            }
         }
     }
 }
@@ -173,11 +202,39 @@ impl Resolved {
         self.errors.iter().any(ConfigError::is_usage)
     }
 
-    /// The data directory in force.
-    pub fn data_dir(&self) -> &Path {
-        self.value(SettingKey::DataDir)
-            .as_path()
-            .expect("the data directory is a path")
+    /// Where workflow definitions and the repository registry are read from.
+    pub fn catalog_dir(&self) -> &Path {
+        self.root_of(SettingKey::CatalogDir)
+    }
+
+    /// Where executions are kept.
+    pub fn state_dir(&self) -> &Path {
+        self.root_of(SettingKey::StateDir)
+    }
+
+    /// Where task workspaces are created.
+    pub fn work_dir(&self) -> &Path {
+        self.root_of(SettingKey::WorkDir)
+    }
+
+    /// The catalogue layout in force.
+    pub fn catalog_paths(&self) -> CatalogPaths {
+        CatalogPaths::new(self.catalog_dir())
+    }
+
+    /// The state layout in force.
+    pub fn state_paths(&self) -> StatePaths {
+        StatePaths::new(self.state_dir())
+    }
+
+    /// The work layout in force.
+    pub fn work_paths(&self) -> WorkPaths {
+        WorkPaths::new(self.work_dir())
+    }
+
+    /// One of the three roots, which are all paths.
+    fn root_of(&self, setting: SettingKey) -> &Path {
+        self.value(setting).as_path().expect("a root is a path")
     }
 
     /// The agent harness an action that names none falls back to.
@@ -253,6 +310,20 @@ pub fn resolve_with(flags: &Flags, environment: &Environment, cascade: &ConfigCa
     };
 
     let file_path = file_resolution.path().map(Path::to_path_buf);
+
+    // Swept separately, and before the settings: the loop below asks for one
+    // variable per *known* setting, so a retired one is never looked up there
+    // and would pass unnoticed (D-I).
+    for withdrawn in settings::RETIRED_KEYS {
+        let variable = withdrawn.env_var();
+        if environment.contains_key(&variable) {
+            errors.push(ConfigError::RetiredEnv {
+                key: withdrawn.key,
+                variable,
+                message: withdrawn.env_message(),
+            });
+        }
+    }
 
     let mut values = BTreeMap::new();
     for setting in SettingKey::ALL {

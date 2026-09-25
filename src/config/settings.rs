@@ -68,8 +68,13 @@ pub const NO_LIMIT: &str = "none";
 /// the set grows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SettingKey {
-    /// Where executions, workspaces and the registry are kept.
-    DataDir,
+    /// Where the workflow definitions and the repository registry are read
+    /// from. Shareable between processes, and mountable read-only.
+    CatalogDir,
+    /// Where executions are kept. Separable for mounting, not for sharing.
+    StateDir,
+    /// Where task workspaces — the git checkouts — are created. Local scratch.
+    WorkDir,
     /// The agent harness used by an `agent` action that names none itself.
     AgentHarness,
     /// The time limit of an `agent` action that declares none itself.
@@ -80,17 +85,28 @@ pub enum SettingKey {
 
 impl SettingKey {
     /// Every setting, in the order `config show` prints them.
-    pub const ALL: [SettingKey; 4] = [
-        SettingKey::DataDir,
+    pub const ALL: [SettingKey; 6] = [
+        SettingKey::CatalogDir,
+        SettingKey::StateDir,
+        SettingKey::WorkDir,
         SettingKey::AgentHarness,
         SettingKey::AgentTimeout,
         SettingKey::LogLevel,
     ];
 
+    /// The three roots, in the order `config show` prints them.
+    pub const ROOTS: [SettingKey; 3] = [
+        SettingKey::CatalogDir,
+        SettingKey::StateDir,
+        SettingKey::WorkDir,
+    ];
+
     /// The key as it is written in the configuration file.
     pub fn key(self) -> &'static str {
         match self {
-            SettingKey::DataDir => "data_dir",
+            SettingKey::CatalogDir => "catalog_dir",
+            SettingKey::StateDir => "state_dir",
+            SettingKey::WorkDir => "work_dir",
             SettingKey::AgentHarness => "agent_harness",
             SettingKey::AgentTimeout => "agent_timeout",
             SettingKey::LogLevel => "log_level",
@@ -117,7 +133,9 @@ impl SettingKey {
     /// guessed from the key's name (R11).
     pub fn is_sensitive(self) -> bool {
         match self {
-            SettingKey::DataDir
+            SettingKey::CatalogDir
+            | SettingKey::StateDir
+            | SettingKey::WorkDir
             | SettingKey::AgentHarness
             | SettingKey::AgentTimeout
             | SettingKey::LogLevel => false,
@@ -133,7 +151,7 @@ impl SettingKey {
     /// a log file on every run — a change of behaviour no requirement asks for.
     pub fn built_in(self) -> SettingValue {
         match self {
-            SettingKey::DataDir => {
+            SettingKey::CatalogDir | SettingKey::StateDir | SettingKey::WorkDir => {
                 SettingValue::Path(PathBuf::from(crate::persistence::paths::DEFAULT_ROOT))
             }
             SettingKey::AgentHarness => {
@@ -149,6 +167,74 @@ impl fmt::Display for SettingKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.key())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Settings that used to exist
+// ---------------------------------------------------------------------------
+
+/// A key that was a setting once and is not one now.
+///
+/// Its own table rather than a variant of [`SettingKey`], because it is not a
+/// setting: it has no value, no source and no row in `config show`. What it
+/// has is a name that an operator may still have in a file or a deployment,
+/// and one job — to say what happened instead of being mistaken for a typo.
+///
+/// Both places that could see the name have to consult this. The file parser
+/// would otherwise answer with the generic "unknown key, known keys are …",
+/// which lists the successors without saying that they *are* successors. The
+/// environment is worse: resolution asks for one variable per known setting,
+/// so a retired variable is not looked up at all and would be ignored in
+/// complete silence — which is exactly the failure this table exists to
+/// prevent.
+pub const RETIRED_KEYS: &[RetiredKey] = &[RetiredKey {
+    key: "data_dir",
+    replacement: "It was split into 'catalog_dir' (workflow definitions and the repository \
+                  registry), 'state_dir' (executions) and 'work_dir' (task workspaces). Set \
+                  the ones you need, or pass --root to point all three at one directory.",
+}];
+
+/// One withdrawn setting and the sentence that explains it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredKey {
+    /// The key as it was written in the file.
+    pub key: &'static str,
+    /// What to do instead, as one sentence for an operator.
+    pub replacement: &'static str,
+}
+
+impl RetiredKey {
+    /// The environment variable that used to carry it.
+    pub fn env_var(&self) -> String {
+        format!("{ENV_PREFIX}{}", self.key.to_uppercase())
+    }
+
+    /// The whole message, for a key written in a file.
+    pub fn message(&self) -> String {
+        format!("Setting '{}' no longer exists. {}", self.key, self.replacement)
+    }
+
+    /// The whole message, for a variable found in the environment.
+    pub fn env_message(&self) -> String {
+        format!(
+            "Environment variable {} sets '{}', which no longer exists. {}",
+            self.env_var(),
+            self.key,
+            self.replacement
+        )
+    }
+}
+
+/// The retired setting written under this key, if there is one.
+pub fn retired(key: &str) -> Option<&'static RetiredKey> {
+    RETIRED_KEYS.iter().find(|entry| entry.key == key)
+}
+
+/// The retired setting this environment variable used to carry, if any.
+pub fn retired_env_var(variable: &str) -> Option<&'static RetiredKey> {
+    RETIRED_KEYS
+        .iter()
+        .find(|entry| entry.env_var() == variable)
 }
 
 // ---------------------------------------------------------------------------
@@ -281,9 +367,57 @@ mod tests {
         let keys: Vec<&str> = SettingKey::ALL.iter().map(|key| key.key()).collect();
         assert_eq!(
             keys,
-            vec!["data_dir", "agent_harness", "agent_timeout", "log_level"],
-            "R12 names four settings; the registry is the one place they live"
+            vec![
+                "catalog_dir",
+                "state_dir",
+                "work_dir",
+                "agent_harness",
+                "agent_timeout",
+                "log_level"
+            ],
+            "the registry is the one place the settings live, and the three \
+             roots lead because that is the order `config show` prints"
         );
+    }
+
+    #[test]
+    fn data_dir_is_retired_rather_than_forgotten() {
+        // It must not come back as a setting: a key that both exists and is
+        // withdrawn would be reported twice and resolved once.
+        assert_eq!(SettingKey::from_key("data_dir"), None);
+
+        let withdrawn = retired("data_dir").expect("data_dir is a retired key");
+        assert_eq!(withdrawn.env_var(), "NARSOR_DATA_DIR");
+        assert_eq!(
+            retired_env_var("NARSOR_DATA_DIR").map(|entry| entry.key),
+            Some("data_dir")
+        );
+
+        // The message names all three successors, which is the whole job.
+        for successor in ["catalog_dir", "state_dir", "work_dir"] {
+            assert!(
+                withdrawn.message().contains(successor),
+                "the message must name {successor}: {}",
+                withdrawn.message()
+            );
+            assert!(
+                withdrawn.env_message().contains(successor),
+                "the variable's message must name {successor} too"
+            );
+        }
+        assert!(withdrawn.env_message().contains("NARSOR_DATA_DIR"));
+    }
+
+    #[test]
+    fn no_retired_key_is_also_a_live_setting() {
+        for withdrawn in RETIRED_KEYS {
+            assert_eq!(
+                SettingKey::from_key(withdrawn.key),
+                None,
+                "'{}' cannot be both withdrawn and in force",
+                withdrawn.key
+            );
+        }
     }
 
     #[test]
@@ -335,10 +469,14 @@ mod tests {
 
     #[test]
     fn the_built_in_values_are_the_ones_the_plan_names() {
-        assert_eq!(
-            SettingKey::DataDir.built_in(),
-            SettingValue::Path(PathBuf::from("./.narsor"))
-        );
+        for root in SettingKey::ROOTS {
+            assert_eq!(
+                root.built_in(),
+                SettingValue::Path(PathBuf::from("./.narsor")),
+                "{root} shares the one built-in root, so an unconfigured run \
+                 writes where it always did"
+            );
+        }
         assert_eq!(
             SettingKey::AgentHarness.built_in(),
             SettingValue::Text("claude-code".to_string())
@@ -357,8 +495,8 @@ mod tests {
         assert_eq!(Source::BuiltIn.to_string(), "built-in");
         assert_eq!(Source::Flag("--root").to_string(), "flag (--root)");
         assert_eq!(
-            Source::Env("NARSOR_DATA_DIR".to_string()).to_string(),
-            "env (NARSOR_DATA_DIR)"
+            Source::Env("NARSOR_STATE_DIR".to_string()).to_string(),
+            "env (NARSOR_STATE_DIR)"
         );
     }
 

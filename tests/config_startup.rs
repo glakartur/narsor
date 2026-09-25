@@ -1,7 +1,7 @@
 //! The order of the first three steps, through the real binary (U5).
 //!
 //! These are the things a unit test cannot prove: that a broken file actually
-//! stops a subcommand, that the data directory a command works in is the
+//! stops a subcommand, that the roots a command works in are the
 //! resolved one rather than the raw flag, and that the silence of an
 //! unconfigured run survived the change of startup order (D-N).
 //!
@@ -263,11 +263,16 @@ fn a_good_file_does_not_disturb_anything() {
 }
 
 #[test]
-fn the_data_directory_from_the_file_is_the_one_the_command_works_in() {
+fn the_state_directory_from_the_file_is_the_one_the_command_works_in() {
     needs_no_system_config!();
     let root = TempRoot::new();
     let store = root.path().join("from-the-file");
-    root.config(&format!("data_dir: {}\n", store.display()));
+    // All three, because they are independent now: setting one and expecting
+    // the other two to follow is exactly the assumption the split removes.
+    root.config(&format!(
+        "catalog_dir: {0}\nstate_dir: {0}\nwork_dir: {0}\n",
+        store.display()
+    ));
 
     let invocation = cli(
         &root,
@@ -294,12 +299,12 @@ fn the_data_directory_from_the_file_is_the_one_the_command_works_in() {
 }
 
 #[test]
-fn the_flag_still_beats_the_file_for_the_data_directory() {
+fn the_flag_still_beats_the_file_for_the_state_directory() {
     needs_no_system_config!();
     // AE1, through the binary.
     let root = TempRoot::new();
     root.config(&format!(
-        "data_dir: {}\n",
+        "state_dir: {}\n",
         root.path().join("from-the-file").display()
     ));
     let from_the_flag = root.path().join("from-the-flag");
@@ -407,7 +412,7 @@ fn rust_log_still_overrides_the_configured_level() {
 }
 
 #[test]
-fn the_tui_log_file_lands_in_the_resolved_data_directory() {
+fn the_tui_log_file_lands_in_the_resolved_state_directory() {
     needs_no_system_config!();
     // The interface cannot be driven from a test, but the file it would write
     // into is opened before the terminal is touched — so the failure to start
@@ -415,7 +420,7 @@ fn the_tui_log_file_lands_in_the_resolved_data_directory() {
     let root = TempRoot::new();
     let store = root.path().join("from-the-file");
     root.config(&format!(
-        "data_dir: {}\nlog_level: debug\n",
+        "state_dir: {}\nlog_level: debug\n",
         store.display()
     ));
 
@@ -428,7 +433,7 @@ fn the_tui_log_file_lands_in_the_resolved_data_directory() {
     );
     assert!(
         store.join("narsor.log").exists(),
-        "the log belongs under the configured data directory, not under the raw flag"
+        "the log belongs under the configured state directory, not under the raw flag"
     );
 }
 
@@ -444,7 +449,7 @@ fn an_unconfigured_tui_creates_neither_the_directory_nor_the_log() {
     assert_ne!(invocation.code, EXIT_USAGE, "{}", invocation.stderr);
     assert!(
         !root.path().join(".narsor").exists(),
-        "no data directory may be created just to run the interface"
+        "no state directory may be created just to run the interface"
     );
 }
 
@@ -475,4 +480,180 @@ fn a_partly_invalid_rust_log_keeps_the_part_that_parsed() {
         "the directive that parsed still applies: {}",
         invocation.stderr
     );
+}
+
+/// AE1 — three roots pointed at three places, and each holds only its own.
+///
+/// The assertion that matters is about what is *absent*: a consumer handed all
+/// three roots and still using one would pass every "the file is where I
+/// expect" check and fail here. Listing each directory is the only way to see
+/// it.
+#[test]
+fn three_roots_pointed_apart_each_hold_only_what_belongs_to_them() {
+    needs_no_system_config!();
+    let root = TempRoot::new();
+    let catalog = root.path().join("catalog");
+    let state = root.path().join("state");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&catalog).expect("create the catalogue");
+    root.config(&format!(
+        "catalog_dir: {}\nstate_dir: {}\nwork_dir: {}\n",
+        catalog.display(),
+        state.display(),
+        work.display()
+    ));
+
+    let invocation = cli(
+        &root,
+        &[],
+        &[
+            "run",
+            &clone_workflow(),
+            "--input",
+            &format!("repository={}", source_repository(&root)),
+            "--input",
+            &format!("script_path={}", announce_script()),
+        ],
+    );
+    assert_eq!(invocation.code, EXIT_SUCCESS, "{}", invocation.stderr);
+
+    // The catalogue is declaration only: the run puts nothing into it at all.
+    assert_eq!(
+        entries_of(&catalog),
+        Vec::<String>::new(),
+        "a run must write nothing into the catalogue — that is what lets it be \
+         mounted read-only and shared between pods"
+    );
+
+    // The state root holds executions and nothing else.
+    assert_eq!(entries_of(&state), vec!["executions".to_string()]);
+
+    // The work root holds checkouts and nothing else.
+    assert_eq!(entries_of(&work), vec!["tasks".to_string()]);
+
+    // And the built-in root is never touched when all three are configured.
+    assert!(!root.path().join(".narsor").exists());
+}
+
+/// The names directly inside a directory, sorted; empty when it does not exist.
+fn entries_of(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+// ---------------------------------------------------------------------------
+// The setting that used to exist
+// ---------------------------------------------------------------------------
+
+/// AE4 — `data_dir` in the file stops the command and names its successors.
+#[test]
+fn data_dir_in_the_file_stops_the_command_and_names_what_replaced_it() {
+    needs_no_system_config!();
+    let root = TempRoot::new();
+    root.config("data_dir: /srv/narsor\n");
+
+    let invocation = cli(&root, &[], &["list"]);
+
+    assert_eq!(invocation.code, EXIT_FAILURE, "{}", invocation.stdout);
+    for successor in ["catalog_dir", "state_dir", "work_dir"] {
+        assert!(
+            invocation.stderr.contains(successor),
+            "the message must name {successor}: {}",
+            invocation.stderr
+        );
+    }
+    assert!(
+        !invocation.stderr.contains("known keys are"),
+        "a withdrawn setting is not a typo, and must not be answered like one: {}",
+        invocation.stderr
+    );
+}
+
+/// AE4 — and the same for the variable, which used to be ignored in silence.
+///
+/// This is the half that could not work before: resolution asks for one
+/// variable per *known* setting, so a withdrawn one was never looked up. A run
+/// carrying `NARSOR_DATA_DIR` would have quietly used `./.narsor` instead —
+/// writing an operator's executions somewhere they never asked for.
+#[test]
+fn the_data_dir_variable_cannot_be_ignored_in_silence() {
+    needs_no_system_config!();
+    let root = TempRoot::new();
+
+    let invocation = cli(&root, &[("NARSOR_DATA_DIR", "/srv/narsor")], &["list"]);
+
+    assert_eq!(invocation.code, EXIT_FAILURE, "{}", invocation.stdout);
+    assert!(
+        invocation.stderr.contains("NARSOR_DATA_DIR"),
+        "the message must name the variable: {}",
+        invocation.stderr
+    );
+    for successor in ["catalog_dir", "state_dir", "work_dir"] {
+        assert!(invocation.stderr.contains(successor), "{}", invocation.stderr);
+    }
+}
+
+/// D-J — it stops every subcommand, but not the one that diagnoses them.
+#[test]
+fn config_show_survives_a_withdrawn_setting_and_still_prints_the_table() {
+    needs_no_system_config!();
+    let root = TempRoot::new();
+    root.config("data_dir: /srv/narsor\n");
+
+    let invocation = cli(&root, &[], &["config", "show"]);
+
+    assert_eq!(
+        invocation.code, EXIT_FAILURE,
+        "it still fails, so a script branching on the code is not misled"
+    );
+    for setting in ["catalog_dir", "state_dir", "work_dir", "log_level"] {
+        assert!(
+            invocation.stdout.contains(setting),
+            "the table must still print {setting}: {}",
+            invocation.stdout
+        );
+    }
+    assert!(
+        !invocation.stdout.contains("data_dir "),
+        "but the withdrawn key is not a row — it has no value and no source: {}",
+        invocation.stdout
+    );
+}
+
+/// AE3 — `--root` is one knob that sets all three, and says so.
+#[test]
+fn the_root_flag_sets_all_three_and_every_row_names_it() {
+    needs_no_system_config!();
+    let root = TempRoot::new();
+    let target = root.path().join("everything");
+
+    let invocation = cli(
+        &root,
+        &[],
+        &["--root", target.to_str().expect("utf-8"), "config", "show"],
+    );
+
+    assert_eq!(invocation.code, EXIT_SUCCESS, "{}", invocation.stderr);
+    for setting in ["catalog_dir", "state_dir", "work_dir"] {
+        let row = invocation
+            .stdout
+            .lines()
+            .find(|line| line.starts_with(setting))
+            .unwrap_or_else(|| panic!("no row for {setting}:\n{}", invocation.stdout));
+        assert!(
+            row.contains(target.to_str().expect("utf-8")),
+            "{setting} must carry the flag's value: {row}"
+        );
+        assert!(
+            row.contains("flag (--root)"),
+            "{setting} must name the flag as its source: {row}"
+        );
+    }
 }

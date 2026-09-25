@@ -30,7 +30,7 @@ use narsor::domain::{
     Workspace,
 };
 use narsor::engine::{ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry};
-use narsor::persistence::ExecutionStore;
+use narsor::persistence::{CatalogPaths, ExecutionStore, WorkPaths};
 use narsor::registry::{RepositoryEntry, RepositoryRegistry};
 use narsor::tui::app::{
     App, FormRow, Modal, NewTaskChoice, NewTaskStage, Panel, RepositoryField, Request,
@@ -119,6 +119,19 @@ fn start(engine: &Engine, root: &Path) -> WorkflowExecution {
 }
 
 /// An engine over a fresh store in `root`.
+/// An interface whose three roots are all the one temporary directory.
+///
+/// Which is the default an unconfigured run gets, and the arrangement these
+/// tests care about: they are about what the interface does, not about where
+/// the three directories are. A test that needs them apart says so.
+fn app_over(engine: &Arc<Engine>, root: &Path) -> App {
+    App::new(
+        Arc::clone(engine),
+        CatalogPaths::new(root),
+        WorkPaths::new(root),
+    )
+}
+
 fn engine_for(root: &Path) -> Arc<Engine> {
     Arc::new(Engine::new(ExecutionStore::new(root)))
 }
@@ -254,7 +267,7 @@ async fn execution_list_reflects_the_store_with_its_statuses() {
     finished.current_state = Some("done".to_string());
     engine.store().save_execution(&finished).expect("save");
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     assert_eq!(app.executions().len(), 2);
@@ -284,7 +297,7 @@ async fn a_live_event_appends_to_the_stream_and_moves_the_view() {
     let engine = engine_for(root.path());
     let execution_id = paused_at_review(&engine, root.path()).await;
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     let backfilled = app.events().len();
@@ -313,7 +326,7 @@ async fn selecting_a_paused_execution_exposes_the_input_form() {
     let engine = engine_for(root.path());
     paused_at_review(&engine, root.path()).await;
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     assert!(app.pending().is_some(), "the question is visible");
@@ -348,7 +361,7 @@ async fn submitting_a_valid_form_resumes_the_execution() {
     let engine = engine_for(root.path());
     let execution_id = paused_at_review(&engine, root.path()).await;
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
     app.on_key(key(KeyCode::Char('i')));
 
@@ -376,7 +389,7 @@ async fn permitted_transitions_are_exactly_the_declared_outputs() {
     let engine = engine_for(root.path());
     paused_at_review(&engine, root.path()).await;
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     assert_eq!(app.permitted_transitions(), vec!["approved", "rejected"]);
@@ -416,7 +429,7 @@ async fn an_execution_without_events_shows_an_empty_stream() {
         .save_context(&execution.id, &execution.context)
         .expect("save the context");
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     assert_eq!(app.executions().len(), 1);
@@ -440,7 +453,7 @@ async fn a_state_without_allow_manual_override_offers_no_override_mode() {
     execution.current_state = Some("prepare".to_string());
     engine.store().save_execution(&execution).expect("save");
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     assert!(!app.override_allowed());
@@ -515,7 +528,7 @@ async fn a_form_missing_a_required_field_reports_an_error_and_sends_nothing() {
     let execution_id = paused_at_review(&engine, root.path()).await;
     let before = events_of(&engine, &execution_id).len();
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
     app.on_key(key(KeyCode::Char('i')));
 
@@ -553,7 +566,7 @@ async fn losing_the_event_channel_shows_a_disconnection_indicator() {
     let engine = engine_for(root.path());
     paused_at_review(&engine, root.path()).await;
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
     assert_eq!(app.stream_status(), &StreamStatus::Live);
 
@@ -585,7 +598,7 @@ async fn an_override_requires_confirmation_and_is_recorded_as_forced() {
     let execution_id = paused_at_review(&engine, root.path()).await;
     let before = events_of(&engine, &execution_id).len();
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
     assert!(app.override_allowed(), "`review` declares the flag");
 
@@ -716,7 +729,7 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
     let engine = engine_for(root.path());
     let execution = start(&engine, root.path());
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     assert_eq!(app.focus(), Panel::Executions);
@@ -793,7 +806,7 @@ async fn the_form_never_advertises_a_key_it_does_not_handle() {
     let engine = engine_for(root.path());
     paused_at_review(&engine, root.path()).await;
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
     app.on_key(key(KeyCode::Char('i')));
     assert!(matches!(app.modal(), Modal::Input(_)), "the form is open");
@@ -821,7 +834,7 @@ async fn the_repository_form_stores_an_entry_that_the_listing_then_shows() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     open_repository_form(&mut app);
@@ -863,7 +876,7 @@ async fn a_duplicate_repository_id_keeps_the_form_open_and_changes_nothing() {
         ))
         .expect("register the original");
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     open_repository_form(&mut app);
@@ -903,7 +916,7 @@ async fn an_ext_remote_is_refused_in_the_form_and_never_reaches_the_registry() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     open_repository_form(&mut app);
@@ -946,7 +959,7 @@ async fn removing_a_repository_needs_a_confirmation() {
         ))
         .expect("register");
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     app.on_key(key(KeyCode::Char('R')));
@@ -1003,7 +1016,12 @@ fn root_workflows(root: &Path) -> PathBuf {
 /// An interface whose workflow search path is entirely inside `root`.
 fn app_for(engine: &Arc<Engine>, root: &Path) -> App {
     let resolver = WorkflowResolver::with_user_dir(root.to_path_buf(), Some(user_workflows(root)));
-    let mut app = App::with_resolver(Arc::clone(engine), resolver);
+    let mut app = App::with_resolver(
+        Arc::clone(engine),
+        resolver,
+        CatalogPaths::new(root),
+        WorkPaths::new(root),
+    );
     app.refresh();
     app
 }
@@ -1405,7 +1423,7 @@ async fn an_invalid_definition_is_refused_with_every_violation() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     open_new_task(&mut app, &broken_definition_path());
@@ -1455,7 +1473,7 @@ async fn the_input_form_is_built_from_the_definition_and_enforces_required_input
     let root = TempRoot::new();
     let engine = engine_for(root.path());
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     open_new_task(&mut app, &new_task_definition_path());
@@ -1512,7 +1530,7 @@ async fn a_repository_input_offers_the_registered_ids() {
         ))
         .expect("register acme");
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     open_new_task(&mut app, &new_task_definition_path());
@@ -1534,7 +1552,7 @@ async fn a_boolean_input_reaches_the_context_as_a_json_boolean() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     open_new_task(&mut app, &new_task_definition_path());
@@ -1587,7 +1605,7 @@ async fn starting_a_valid_new_task_creates_an_execution_that_is_listed_and_selec
     // An unrelated execution, so "selected" means something.
     let existing = start(&engine, root.path());
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
     assert_eq!(app.executions().len(), 1);
 
@@ -1655,7 +1673,7 @@ async fn a_definition_declaring_a_workspace_starts_from_the_modal_and_is_provisi
     fs::create_dir_all(&source).expect("create the source tree");
     fs::write(source.join("README.md"), "hello\n").expect("write readme");
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     open_new_task(&mut app, &fixtures().join("new_task_workspace.yaml"));
@@ -1704,7 +1722,7 @@ async fn esc_cancels_every_modal_without_writing_anything() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
 
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = app_over(&engine, root.path());
     app.refresh();
 
     // The repository form, half filled in.

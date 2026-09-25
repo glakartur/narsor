@@ -195,7 +195,7 @@ fn a_definition_without_a_workspace_gets_the_empty_working_directory() {
     let engine = engine_for(root.path());
     let (definition, file) = definition_with(&root, "tasks-no-workspace", "", "");
 
-    let execution = tasks::start_task(root.path(), &engine, &definition, &file, Map::new())
+    let execution = tasks::start_task(root.path(), root.path(), &engine, &definition, &file, Map::new())
         .expect("start the task");
 
     let workspace = PathBuf::from(&execution.workspace.path);
@@ -261,6 +261,7 @@ fn a_local_workspace_is_copied_into_the_task_directory() {
 
     let execution = tasks::start_task(
         root.path(),
+        root.path(),
         &engine,
         &definition,
         &file,
@@ -317,6 +318,7 @@ fn a_registered_repository_is_cloned_from_its_remote_at_its_default_branch() {
 
     let execution = tasks::start_task(
         root.path(),
+        root.path(),
         &engine,
         &definition,
         &file,
@@ -360,6 +362,7 @@ fn an_unregistered_repository_is_still_cloned_as_a_raw_remote() {
     );
 
     let execution = tasks::start_task(
+        root.path(),
         root.path(),
         &engine,
         &definition,
@@ -407,6 +410,7 @@ fn a_rejected_input_leaves_nothing_on_disk() {
 
     let error = tasks::start_task(
         root.path(),
+        root.path(),
         &engine,
         &definition,
         &file,
@@ -443,6 +447,7 @@ fn a_workspace_that_cannot_be_created_is_refused_before_the_execution_exists() {
 
     let error = tasks::start_task(
         root.path(),
+        root.path(),
         &engine,
         &definition,
         &file,
@@ -476,6 +481,7 @@ fn a_failed_provisioning_leaves_the_execution_failed_with_an_error_event() {
     );
 
     let error = tasks::start_task(
+        root.path(),
         root.path(),
         &engine,
         &definition,

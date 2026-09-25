@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use crate::engine::HarnessRegistry;
 use crate::workflow::schema::parse_duration;
 
-use super::settings::{SettingKey, SettingValue, LOG_LEVELS, NO_LIMIT};
+use super::settings::{self, SettingKey, SettingValue, LOG_LEVELS, NO_LIMIT};
 
 /// The largest configuration file that will be parsed.
 pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
@@ -146,6 +146,23 @@ pub enum FileError {
         key: String,
     },
 
+    /// A key that was a setting in an earlier version and is not one now.
+    ///
+    /// Separate from [`FileError::UnknownKey`] because the two call for
+    /// different sentences: an unknown key is answered with the list of keys
+    /// that would have worked, while a retired one is answered by naming what
+    /// replaced it. Falling through to the generic message would print the
+    /// successors without ever saying they *are* the successors.
+    #[error("Configuration file '{path}': {message}")]
+    RetiredKey {
+        /// The file.
+        path: PathBuf,
+        /// The key as written.
+        key: String,
+        /// What happened to it, and what to set instead.
+        message: String,
+    },
+
     /// A known key whose value does not fit.
     #[error("Configuration file '{path}', key '{key}': {message}")]
     BadValue {
@@ -168,6 +185,7 @@ impl FileError {
             | FileError::Syntax { path, .. }
             | FileError::NotAMapping { path, .. }
             | FileError::UnknownKey { path, .. }
+            | FileError::RetiredKey { path, .. }
             | FileError::BadValue { path, .. } => path,
         }
     }
@@ -178,7 +196,9 @@ impl FileError {
     /// printing the complaint beside the table.
     pub fn key(&self) -> Option<&str> {
         match self {
-            FileError::UnknownKey { key, .. } | FileError::BadValue { key, .. } => Some(key),
+            FileError::UnknownKey { key, .. }
+            | FileError::RetiredKey { key, .. }
+            | FileError::BadValue { key, .. } => Some(key),
             _ => None,
         }
     }
@@ -322,10 +342,20 @@ pub fn parse(path: &Path, contents: &str) -> ParsedFile {
         };
 
         let Some(setting) = SettingKey::from_key(&key) else {
-            errors.push(FileError::UnknownKey {
-                path: path.to_path_buf(),
-                key,
-            });
+            // Checked before the generic complaint, so a key that used to work
+            // is told what replaced it rather than being read as a typo.
+            if let Some(withdrawn) = settings::retired(&key) {
+                errors.push(FileError::RetiredKey {
+                    path: path.to_path_buf(),
+                    key,
+                    message: withdrawn.message(),
+                });
+            } else {
+                errors.push(FileError::UnknownKey {
+                    path: path.to_path_buf(),
+                    key,
+                });
+            }
             continue;
         };
 
@@ -391,7 +421,7 @@ fn value_of(setting: SettingKey, raw: &serde_yaml::Value) -> Result<SettingValue
 /// interchangeable if they are validated alike.
 pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, String> {
     match setting {
-        SettingKey::DataDir => {
+        SettingKey::CatalogDir | SettingKey::StateDir | SettingKey::WorkDir => {
             if text.trim().is_empty() {
                 return Err("a directory path was expected, but the value is empty".to_string());
             }

@@ -178,7 +178,7 @@ pub enum Command {
 
 /// The workflow half of the command line.
 ///
-/// Every one of these honours the global `--root`, because `{root}/workflows`
+/// Every one of these honours `catalog_dir`, because `{catalog}/workflows`
 /// is one of the directories the resolver searches.
 #[derive(Debug, Subcommand)]
 pub enum WorkflowCommand {
@@ -210,8 +210,8 @@ pub enum WorkflowCommand {
 
 /// The registry half of the command line.
 ///
-/// The registry lives in `{root}/repositories.json`, so every one of these
-/// honours the global `--root` exactly like the execution subcommands do.
+/// The registry lives in `{catalog}/repositories/`, so every one of these
+/// honours `catalog_dir` — and the global `--root`, which sets it.
 #[derive(Debug, Subcommand)]
 pub enum RepoCommand {
     /// Registers a repository under an id workflows can name.
@@ -323,18 +323,23 @@ pub enum ConfigFormat {
 /// Nothing here panics on an operator mistake: every failure becomes a message
 /// on stderr plus one of the three documented codes.
 pub async fn run(cli: Cli, config: Resolved) -> i32 {
-    // The resolved value, never the raw flag: the data directory is a setting
-    // now, and a file or an environment variable may be the thing that set it.
-    let root = config.data_dir().to_path_buf();
+    // The resolved values, never the raw flag: each root is a setting now, and
+    // a file or an environment variable may be the thing that set it.
+    //
+    // Handed out one at a time rather than as one root, because that is the
+    // whole point: a subcommand that is given a root it does not use is a
+    // subcommand that can write somewhere it has no business writing.
+    let catalog = config.catalog_dir().to_path_buf();
+    let state = config.state_dir().to_path_buf();
     let outcome = match cli.command {
-        Command::Validate { workflow } => commands::validate(&root, &workflow),
+        Command::Validate { workflow } => commands::validate(&catalog, &workflow),
         Command::Run { workflow, inputs } => commands::run(&config, &workflow, &inputs).await,
-        Command::List => commands::list(&root),
-        Command::Show { execution_id } => commands::show(&root, &execution_id),
+        Command::List => commands::list(&state),
+        Command::Show { execution_id } => commands::show(&state, &execution_id),
         Command::Events {
             execution_id,
             follow,
-        } => commands::events(&root, &execution_id, follow).await,
+        } => commands::events(&state, &execution_id, follow).await,
         Command::Input {
             execution_id,
             fields,
@@ -345,10 +350,10 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             commands::resume(&config, &execution_id, file.as_deref()).await
         }
         Command::Workflow { command } => match command {
-            WorkflowCommand::List => commands::workflow_list(&root),
-            WorkflowCommand::Show { workflow } => commands::workflow_show(&root, &workflow),
+            WorkflowCommand::List => commands::workflow_list(&catalog),
+            WorkflowCommand::Show { workflow } => commands::workflow_show(&catalog, &workflow),
             WorkflowCommand::Eject { name, to, force } => {
-                commands::workflow_eject(&root, &name, to.as_deref(), force)
+                commands::workflow_eject(&catalog, &name, to.as_deref(), force)
             }
         },
         Command::Repo { command } => match command {
@@ -360,7 +365,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
                 default_branch,
                 description,
             } => commands::repo_add(
-                &root,
+                &catalog,
                 &id,
                 &remote,
                 name,
@@ -368,9 +373,9 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
                 default_branch,
                 description,
             ),
-            RepoCommand::List => commands::repo_list(&root),
-            RepoCommand::Show { id } => commands::repo_show(&root, &id),
-            RepoCommand::Remove { id } => commands::repo_remove(&root, &id),
+            RepoCommand::List => commands::repo_list(&catalog),
+            RepoCommand::Show { id } => commands::repo_show(&catalog, &id),
+            RepoCommand::Remove { id } => commands::repo_remove(&catalog, &id),
         },
         Command::Config { command } => match command {
             ConfigCommand::Show { format } => commands::config_show(&config, format),

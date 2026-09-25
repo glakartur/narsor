@@ -10,7 +10,7 @@ use crate::persistence::paths::{StatePaths, DEFAULT_ROOT};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// File holding the input request an execution is currently waiting on.
 ///
@@ -225,10 +225,7 @@ impl ExecutionStore {
         self.paths.execution_dir(execution_id)
     }
 
-    /// The persistence root.
-    pub fn root(&self) -> &Path {
-        self.paths.root()
-    }
+
 }
 
 impl Default for ExecutionStore {

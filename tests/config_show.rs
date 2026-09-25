@@ -45,7 +45,14 @@ const EXIT_FAILURE: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 
 /// Every setting the command must account for (R7).
-const EVERY_SETTING: [&str; 4] = ["data_dir", "agent_harness", "agent_timeout", "log_level"];
+const EVERY_SETTING: [&str; 6] = [
+    "catalog_dir",
+    "state_dir",
+    "work_dir",
+    "agent_harness",
+    "agent_timeout",
+    "log_level",
+];
 
 /// A temporary directory that deletes itself when it goes out of scope.
 struct TempRoot {
@@ -144,12 +151,12 @@ fn a_flag_shows_as_the_flag_even_when_the_file_names_the_same_setting() {
     needs_no_system_config!();
     // AE1.
     let root = TempRoot::new();
-    root.config("data_dir: /from/the/file\n");
+    root.config("state_dir: /from/the/file\n");
 
     let invocation = show(&root, &[], &["--root", "/from/the/flag"]);
 
     assert_eq!(invocation.code, EXIT_SUCCESS, "{}", invocation.stderr);
-    let row = data_dir_row(&invocation.stdout);
+    let row = state_dir_row(&invocation.stdout);
     assert!(row.contains("/from/the/flag"), "{row}");
     assert!(row.contains("--root"), "the source names the flag: {row}");
     assert!(!row.contains("/from/the/file"), "{row}");
@@ -160,10 +167,10 @@ fn a_value_from_the_file_shows_the_path_and_one_from_the_environment_the_variabl
     needs_no_system_config!();
     // R8: the concrete thing, never the category.
     let root = TempRoot::new();
-    let config = root.config("data_dir: /from/the/file\n");
+    let config = root.config("state_dir: /from/the/file\n");
 
     let invocation = show(&root, &[], &[]);
-    let row = data_dir_row(&invocation.stdout);
+    let row = state_dir_row(&invocation.stdout);
     assert!(
         row.contains(&config.display().to_string()),
         "the path of the file that was actually read: {row}"
@@ -213,7 +220,7 @@ fn the_json_form_carries_a_structured_source_and_a_version() {
     // R10 and D-O: nothing downstream should have to parse "file (/etc/…)",
     // and a later change of shape should be recognisable.
     let root = TempRoot::new();
-    let config = root.config("data_dir: /from/the/file\n");
+    let config = root.config("state_dir: /from/the/file\n");
 
     let invocation = show(&root, &[], &["--format", "json"]);
 
@@ -222,10 +229,10 @@ fn the_json_form_carries_a_structured_source_and_a_version() {
     assert_eq!(document["version"], 1);
     assert_eq!(document["file"], config.display().to_string());
 
-    let source = &document["settings"]["data_dir"]["source"];
+    let source = &document["settings"]["state_dir"]["source"];
     assert_eq!(source["kind"], "file");
     assert_eq!(source["detail"], config.display().to_string());
-    assert_eq!(document["settings"]["data_dir"]["value"], "/from/the/file");
+    assert_eq!(document["settings"]["state_dir"]["value"], "/from/the/file");
 
     for setting in EVERY_SETTING {
         assert!(
@@ -236,7 +243,7 @@ fn the_json_form_carries_a_structured_source_and_a_version() {
 }
 
 #[test]
-fn it_works_without_a_home_and_without_the_data_directory_existing() {
+fn it_works_without_a_home_and_without_the_state_directory_existing() {
     needs_no_system_config!();
     // R9: no writable home, no writable filesystem, nothing created.
     let root = TempRoot::new();
@@ -290,7 +297,7 @@ fn a_broken_key_is_marked_while_the_rest_of_the_table_still_prints() {
     needs_no_system_config!();
     // D-D: the one command that survives what it exists to diagnose.
     let root = TempRoot::new();
-    let config = root.config("data_dir: /from/the/file\nagent_timeout: tomorrow\n");
+    let config = root.config("state_dir: /from/the/file\nagent_timeout: tomorrow\n");
 
     let invocation = show(&root, &[], &[]);
 
@@ -309,7 +316,7 @@ fn a_broken_key_is_marked_while_the_rest_of_the_table_still_prints() {
         invocation.stdout
     );
     assert!(
-        data_dir_row(&invocation.stdout).contains("/from/the/file"),
+        state_dir_row(&invocation.stdout).contains("/from/the/file"),
         "the key the operator got right is still shown as in force: {}",
         invocation.stdout
     );
@@ -326,7 +333,7 @@ fn an_unknown_key_is_reported_while_list_in_the_same_directory_refuses_outright(
     let invocation = show(&root, &[], &[]);
     assert_eq!(invocation.code, EXIT_FAILURE);
     assert!(
-        invocation.stdout.contains("data_dir"),
+        invocation.stdout.contains("state_dir"),
         "the table is printed: {}",
         invocation.stdout
     );
@@ -467,8 +474,8 @@ fn row_for<'a>(output: &'a str, setting: &str) -> &'a str {
 }
 
 /// The table row for the data directory.
-fn data_dir_row(output: &str) -> &str {
-    row_for(output, "data_dir")
+fn state_dir_row(output: &str) -> &str {
+    row_for(output, "state_dir")
 }
 
 #[test]

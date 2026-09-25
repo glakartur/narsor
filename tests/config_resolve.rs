@@ -70,7 +70,7 @@ fn a_flag_beats_the_file_and_says_so() {
     // AE1: the operator passed --root, so the answer to "where did this come
     // from" is the flag, not the file that also mentions it.
     let root = TempRoot::new();
-    root.user_config("data_dir: /from/the/file\n");
+    root.user_config("state_dir: /from/the/file\n");
 
     let flags = Flags {
         root: Some(PathBuf::from("/from/the/flag")),
@@ -79,9 +79,9 @@ fn a_flag_beats_the_file_and_says_so() {
     let resolved = resolve_with(&flags, &environment(&[]), &cascade(&root));
 
     assert!(resolved.is_ok());
-    assert_eq!(resolved.data_dir(), Path::new("/from/the/flag"));
+    assert_eq!(resolved.state_dir(), Path::new("/from/the/flag"));
     assert_eq!(
-        resolved.source(SettingKey::DataDir),
+        resolved.source(SettingKey::StateDir),
         &Source::Flag("--root")
     );
 }
@@ -89,14 +89,14 @@ fn a_flag_beats_the_file_and_says_so() {
 #[test]
 fn the_environment_beats_the_file_and_loses_to_the_flag() {
     let root = TempRoot::new();
-    root.user_config("data_dir: /from/the/file\n");
-    let env = environment(&[("NARSOR_DATA_DIR", "/from/the/environment")]);
+    root.user_config("state_dir: /from/the/file\n");
+    let env = environment(&[("NARSOR_STATE_DIR", "/from/the/environment")]);
 
     let resolved = resolve_with(&Flags::default(), &env, &cascade(&root));
-    assert_eq!(resolved.data_dir(), Path::new("/from/the/environment"));
+    assert_eq!(resolved.state_dir(), Path::new("/from/the/environment"));
     assert_eq!(
-        resolved.source(SettingKey::DataDir),
-        &Source::Env("NARSOR_DATA_DIR".to_string()),
+        resolved.source(SettingKey::StateDir),
+        &Source::Env("NARSOR_STATE_DIR".to_string()),
         "the source names the variable, not the word 'environment'"
     );
 
@@ -105,19 +105,19 @@ fn the_environment_beats_the_file_and_loses_to_the_flag() {
         config: None,
     };
     let resolved = resolve_with(&flags, &env, &cascade(&root));
-    assert_eq!(resolved.data_dir(), Path::new("/from/the/flag"));
+    assert_eq!(resolved.state_dir(), Path::new("/from/the/flag"));
 }
 
 #[test]
 fn the_file_beats_the_built_in_and_names_its_own_path() {
     // R8: the path of the file that was actually read.
     let root = TempRoot::new();
-    let path = root.user_config("data_dir: /from/the/file\n");
+    let path = root.user_config("state_dir: /from/the/file\n");
 
     let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
 
-    assert_eq!(resolved.data_dir(), Path::new("/from/the/file"));
-    assert_eq!(resolved.source(SettingKey::DataDir), &Source::File(path));
+    assert_eq!(resolved.state_dir(), Path::new("/from/the/file"));
+    assert_eq!(resolved.source(SettingKey::StateDir), &Source::File(path));
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn with_nothing_anywhere_every_setting_is_built_in_and_nothing_fails() {
         );
         assert_eq!(resolved.value(setting), &setting.built_in());
     }
-    assert_eq!(resolved.data_dir(), Path::new("./.narsor"));
+    assert_eq!(resolved.state_dir(), Path::new("./.narsor"));
     assert_eq!(resolved.agent_harness(), "claude-code");
     assert_eq!(resolved.agent_timeout(), None);
 }
@@ -147,13 +147,13 @@ fn with_nothing_anywhere_every_setting_is_built_in_and_nothing_fails() {
 fn an_empty_environment_variable_counts_as_unset() {
     // D-J: that is how Kubernetes renders an unset key of a ConfigMap.
     let root = TempRoot::new();
-    let path = root.user_config("data_dir: /from/the/file\n");
+    let path = root.user_config("state_dir: /from/the/file\n");
     let env = environment(&[("NARSOR_DATA_DIR", "")]);
 
     let resolved = resolve_with(&Flags::default(), &env, &cascade(&root));
 
-    assert_eq!(resolved.data_dir(), Path::new("/from/the/file"));
-    assert_eq!(resolved.source(SettingKey::DataDir), &Source::File(path));
+    assert_eq!(resolved.state_dir(), Path::new("/from/the/file"));
+    assert_eq!(resolved.source(SettingKey::StateDir), &Source::File(path));
 }
 
 #[test]
@@ -229,7 +229,7 @@ fn a_level_from_the_file_turns_logging_on() {
 fn settings_are_resolved_one_by_one_not_file_by_file() {
     // R2: a file that sets one key does not displace a flag that sets another.
     let root = TempRoot::new();
-    let path = root.user_config("data_dir: /from/the/file\nagent_harness: opencode\n");
+    let path = root.user_config("state_dir: /from/the/file\nagent_harness: opencode\n");
 
     let flags = Flags {
         root: Some(PathBuf::from("/from/the/flag")),
@@ -238,7 +238,7 @@ fn settings_are_resolved_one_by_one_not_file_by_file() {
     let resolved = resolve_with(&flags, &environment(&[]), &cascade(&root));
 
     assert_eq!(
-        resolved.source(SettingKey::DataDir),
+        resolved.source(SettingKey::StateDir),
         &Source::Flag("--root")
     );
     assert_eq!(
@@ -255,11 +255,11 @@ fn settings_are_resolved_one_by_one_not_file_by_file() {
 }
 
 #[test]
-fn the_cascade_looks_for_the_file_regardless_of_the_data_directory() {
+fn the_cascade_looks_for_the_file_regardless_of_the_three_roots() {
     // D-A: the data directory is an ordinary setting. Pointing it somewhere
     // else does not move the file, and the file is still what sets it.
     let root = TempRoot::new();
-    let path = root.user_config("data_dir: /somewhere/else\n");
+    let path = root.user_config("state_dir: /somewhere/else\n");
 
     let flags = Flags {
         root: None,
@@ -267,7 +267,7 @@ fn the_cascade_looks_for_the_file_regardless_of_the_data_directory() {
     };
     let resolved = resolve_with(&flags, &environment(&[]), &cascade(&root));
 
-    assert_eq!(resolved.data_dir(), Path::new("/somewhere/else"));
+    assert_eq!(resolved.state_dir(), Path::new("/somewhere/else"));
     assert_eq!(resolved.file().path(), Some(path.as_path()));
 }
 
@@ -288,8 +288,8 @@ fn a_broken_file_yields_errors_and_still_yields_every_value() {
     }
 
     // Everything the file did not break is still answerable.
-    assert_eq!(resolved.data_dir(), Path::new("./.narsor"));
-    assert_eq!(resolved.source(SettingKey::DataDir), &Source::BuiltIn);
+    assert_eq!(resolved.state_dir(), Path::new("./.narsor"));
+    assert_eq!(resolved.source(SettingKey::StateDir), &Source::BuiltIn);
 }
 
 #[test]

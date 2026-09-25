@@ -15,13 +15,13 @@
 //!   `repository` field may still hold a `{{ inputs.* }}` template, so it is
 //!   expanded against the inputs first and the result is then resolved
 //!   **registry first** (see [`resolve_repository`]): a value that names an
-//!   entry of `{root}/repositories.json` provisions from that entry's `remote`,
+//!   entry of `{catalog}/repositories/` provisions from that entry's `remote`,
 //!   and anything else is handed to [`WorkspaceProvisioner`] as a raw git
 //!   remote (whatever `git clone` accepts, including a local path);
 //! * the definition declares `{ type: local, path: ... }` — the path is
 //!   expanded the same way and its contents are copied into the workspace;
 //! * the definition declares no workspace at all — an empty directory
-//!   `{root}/tasks/{execution_id}/code/workspace` is created and used. A
+//!   `{work}/tasks/{execution_id}/code/workspace` is created and used. A
 //!   workflow whose scripts live outside the repository (the usual shape of a
 //!   smoke test) needs nothing more, and an empty directory is a better default
 //!   than refusing to run.
@@ -130,7 +130,7 @@ pub enum TaskError {
     #[error("Could not expand the workspace template: {0}")]
     Template(#[from] TemplateError),
 
-    /// `{root}/repositories.json` could not be read.
+    /// The repository registry could not be read.
     #[error("Could not read the registry: {0}")]
     Registry(#[from] RegistryError),
 
@@ -229,13 +229,14 @@ pub fn load_resolved(resolved: &ResolvedWorkflow) -> Result<WorkflowDefinition> 
 /// documentation for why. The returned execution is saved and ready to be
 /// handed to [`Engine::run`](crate::engine::Engine::run) by the caller.
 pub fn start_task(
-    root: &Path,
+    catalog: &Path,
+    work: &Path,
     engine: &Engine,
     definition: &WorkflowDefinition,
     source: impl Into<DefinitionSource>,
     inputs: Map<String, Value>,
 ) -> Result<WorkflowExecution> {
-    start_task_with(root, engine, definition, source, inputs, |_| {})
+    start_task_with(catalog, work, engine, definition, source, inputs, |_| {})
 }
 
 /// [`start_task`], with a hook that observes the execution the moment it exists.
@@ -244,7 +245,8 @@ pub fn start_task(
 /// failing clone still tells the operator which execution to look at; that
 /// announcement is the only reason this variant exists.
 pub fn start_task_with(
-    root: &Path,
+    catalog: &Path,
+    work: &Path,
     engine: &Engine,
     definition: &WorkflowDefinition,
     source: impl Into<DefinitionSource>,
@@ -252,8 +254,12 @@ pub fn start_task_with(
     on_created: impl FnOnce(&WorkflowExecution),
 ) -> Result<WorkflowExecution> {
     let source = source.into();
-    let provisioner = WorkspaceProvisioner::new(root);
-    let request = workspace_request(root, definition, &inputs)?;
+    // The two roots this needs, taken separately rather than as one: the
+    // registry is read from the catalogue, which a deployment may mount
+    // read-only, while the checkout lands in the work tree, which is local
+    // scratch. Passing one root for both is what made them one volume.
+    let provisioner = WorkspaceProvisioner::new(work);
+    let request = workspace_request(catalog, definition, &inputs)?;
     if let Some(request) = &request {
         provisioner
             .validate(request)
@@ -265,7 +271,7 @@ pub fn start_task_with(
             definition,
             Value::Object(inputs),
             // Replaced below, once the execution id names the task directory.
-            Workspace::local_folder(root.display().to_string()),
+            Workspace::local_folder(work.display().to_string()),
         )
         .map_err(TaskError::Start)?;
 
@@ -303,7 +309,7 @@ pub fn start_task_with(
 /// `None` means the definition declares no workspace and the fallback directory
 /// is used.
 pub fn workspace_request(
-    root: &Path,
+    catalog: &Path,
     definition: &WorkflowDefinition,
     inputs: &Map<String, Value>,
 ) -> Result<Option<WorkspaceRequest>> {
@@ -327,7 +333,7 @@ pub fn workspace_request(
                 Some(git_ref) => Some(render(git_ref, "ref")?),
                 None => None,
             };
-            resolve_repository(root, &repository, git_ref.as_deref())?
+            resolve_repository(catalog, &repository, git_ref.as_deref())?
         }
         WorkspaceSpec::Local { path } => {
             let path = render(path, "path")?;
@@ -343,7 +349,7 @@ pub fn workspace_request(
 /// # Precedence: registry id first, raw remote as fallback
 ///
 /// `WORKFLOW_SCHEMA.md` §3.2 defines `repository` as the id of a registered
-/// repository, so the value is looked up in `{root}/repositories.json` first.
+/// repository, so the value is looked up in `{catalog}/repositories/` first.
 /// A hit provisions from the entry's `remote`, checks out its `default_branch`
 /// when the workflow declares no `ref` of its own, and names the checkout
 /// directory after the entry's id — an id the registry already validated as a
@@ -357,11 +363,11 @@ pub fn workspace_request(
 /// Which branch was taken is logged at `debug`, because "it cloned something
 /// other than what I expected" is otherwise a silent difference.
 pub fn resolve_repository(
-    root: &Path,
+    catalog: &Path,
     repository: &str,
     git_ref: Option<&str>,
 ) -> Result<RepositorySpec> {
-    let registered = RepositoryRegistry::new(root).get(repository)?;
+    let registered = RepositoryRegistry::new(catalog).get(repository)?;
 
     match registered {
         Some(entry) => {
@@ -554,7 +560,7 @@ pub enum DefinitionLookupError {
 /// Path first, name second — see the module documentation for why that order
 /// is the one that keeps executions already on disk working.
 pub fn resolve_definition(
-    root: &Path,
+    catalog: &Path,
     execution: &WorkflowExecution,
 ) -> std::result::Result<ResolvedWorkflow, DefinitionLookupError> {
     let path = stored_definition_path(execution);
@@ -581,7 +587,7 @@ pub fn resolve_definition(
         });
     };
 
-    WorkflowResolver::new(root)
+    WorkflowResolver::new(catalog)
         .resolve_name(&name)
         .map_err(|source| DefinitionLookupError::Unresolved {
             execution_id: execution.id.clone(),

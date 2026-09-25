@@ -52,7 +52,7 @@
 //!   generic storage failure.
 //! * The new-task modal opens on a **pick list** of every workflow the
 //!   resolver can reach — built-ins, the user's own copies and
-//!   `{root}/workflows`, each row naming its source and marking an override,
+//!   `{catalog}/workflows`, each row naming its source and marking an override,
 //!   exactly as `narsor workflow list` does. `←`/`→` (and `space`,
 //!   `j`/`k`, `↑`/`↓`) change the selection; the last row, "Enter a path…",
 //!   switches to a text line so that a definition being developed — which is
@@ -67,7 +67,7 @@
 //! From [`crate::tasks::start_task`], the same entry point `narsor run`
 //! calls: a definition declaring `globals.workspace` is expanded, resolved
 //! through the registry and cloned here exactly as it is there, and one that
-//! declares none gets the same empty `{root}/tasks/{id}/code/workspace`. There
+//! declares none gets the same empty `{work}/tasks/{id}/code/workspace`. There
 //! is one copy of the rules that decide what `git` is asked to clone, and this
 //! interface does not hold a second.
 
@@ -87,6 +87,7 @@ use crate::engine::{
 };
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
 use crate::tasks::{self, DefinitionSource};
+use crate::persistence::{CatalogPaths, WorkPaths};
 use crate::workflows::{ResolvedWorkflow, WorkflowEntry, WorkflowResolver};
 
 /// The decision provider recorded for an operator's ordinary manual choice.
@@ -936,25 +937,36 @@ pub struct App {
     stream: StreamStatus,
     notice: Option<Notice>,
     quit: bool,
+    catalog: CatalogPaths,
+    work: WorkPaths,
 }
 
 impl App {
     /// Builds an interface over an engine. Nothing is read until
     /// [`App::refresh`].
-    pub fn new(engine: Arc<Engine>) -> Self {
-        let resolver = WorkflowResolver::new(engine.store().root().to_path_buf());
-        Self::with_resolver(engine, resolver)
+    ///
+    /// The catalogue and the work tree are handed in rather than recovered
+    /// from the engine's store. They used to be: the store carried the one
+    /// root, and this is where the registry and the workflow search path were
+    /// rebuilt out of it. That shortcut is what made the three directories one
+    /// directory in practice, whatever the configuration said.
+    pub fn new(engine: Arc<Engine>, catalog: CatalogPaths, work: WorkPaths) -> Self {
+        let resolver = WorkflowResolver::new(catalog.root().to_path_buf());
+        Self::with_resolver(engine, resolver, catalog, work)
     }
 
     /// The same, with the workflow search path given explicitly.
-    ///
-    /// The interface itself always builds the resolver from the environment;
-    /// this exists so a test can point the user directory somewhere harmless
-    /// instead of reading — or writing — the developer's own `~/.config`.
-    pub fn with_resolver(engine: Arc<Engine>, resolver: WorkflowResolver) -> Self {
+    pub fn with_resolver(
+        engine: Arc<Engine>,
+        resolver: WorkflowResolver,
+        catalog: CatalogPaths,
+        work: WorkPaths,
+    ) -> Self {
         Self {
             engine,
             resolver,
+            catalog,
+            work,
             executions: Vec::new(),
             selected: 0,
             execution: None,
@@ -1319,8 +1331,7 @@ impl App {
             return;
         };
 
-        let root = self.engine.store().root().to_path_buf();
-        let resolved = match tasks::resolve_definition(&root, execution) {
+        let resolved = match tasks::resolve_definition(self.catalog.root(), execution) {
             Ok(resolved) => resolved,
             Err(error) => {
                 self.definition_error = Some(format!(
@@ -2160,9 +2171,9 @@ impl App {
 
     // -- the repository registry --------------------------------------------
 
-    /// The registry of the root this interface's store lives in.
+    /// The registry of the catalogue this interface was given.
     fn registry(&self) -> RepositoryRegistry {
-        RepositoryRegistry::new(self.engine.store().root())
+        RepositoryRegistry::new(self.catalog.root())
     }
 
     /// The registered ids, or an empty list when the registry cannot be read.
@@ -2471,8 +2482,14 @@ impl App {
             }
         };
 
-        let root = self.engine.store().root().to_path_buf();
-        let execution = match tasks::start_task(&root, &self.engine, &definition, source, inputs) {
+        let execution = match tasks::start_task(
+            self.catalog.root(),
+            self.work.root(),
+            &self.engine,
+            &definition,
+            source,
+            inputs,
+        ) {
             Ok(execution) => execution,
             Err(error) => {
                 let message = error.to_string();

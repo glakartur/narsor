@@ -49,6 +49,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use crate::persistence::{CatalogPaths, WorkPaths};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -144,12 +145,17 @@ impl Drop for TerminalGuard {
 /// Keys are read on a dedicated thread because `crossterm` reads block, and are
 /// forwarded over a channel so the loop can wait on keys and engine events at
 /// once. The engine is owned here and shared with [`App`] behind an [`Arc`].
-pub async fn run(store: ExecutionStore, defaults: AgentDefaults) -> io::Result<()> {
+pub async fn run(
+    store: ExecutionStore,
+    catalog: CatalogPaths,
+    work: WorkPaths,
+    defaults: AgentDefaults,
+) -> io::Result<()> {
     install_panic_hook();
 
     let engine = Arc::new(Engine::new(store).with_agent_defaults(defaults));
     let mut events = engine.subscribe();
-    let mut app = App::new(Arc::clone(&engine));
+    let mut app = App::new(Arc::clone(&engine), catalog, work);
     app.refresh();
 
     let mut guard = TerminalGuard::enter()?;

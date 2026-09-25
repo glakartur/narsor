@@ -22,7 +22,7 @@
 //! the alternate screen, and a log line written to stderr lands on top of the
 //! panels, corrupting a display that nothing redraws from scratch. So the
 //! interface's logs go to a file under the resolved data directory
-//! (`{data_dir}/narsor.log`, opened for appending).
+//! (`{state_dir}/narsor.log`, opened for appending).
 //!
 //! When nothing turns logging on — no `RUST_LOG`, no configured level — no
 //! subscriber is installed at all and the records are dropped where they are
@@ -43,17 +43,13 @@
 //! named a file that does not exist and there is nothing to diagnose.
 
 use std::fs::{File, OpenOptions};
-use std::path::Path;
 use std::sync::Mutex;
 
 use clap::Parser;
 use narsor::cli::{self, Cli, Command, EXIT_FAILURE, EXIT_USAGE};
 use narsor::config::{self, Flags, Resolved};
+use narsor::persistence::StatePaths;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-/// Name of the log file the terminal interface writes into, under the data
-/// directory.
-const TUI_LOG_FILE: &str = "narsor.log";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -116,7 +112,7 @@ fn init_tracing(cli: &Cli, resolved: &Resolved) -> anyhow::Result<()> {
     };
 
     if matches!(cli.command, Command::Tui) {
-        let Some(file) = open_log_file(resolved.data_dir()) else {
+        let Some(file) = open_log_file(&resolved.state_paths()) else {
             // The directory is not writable. The interface still runs; the
             // logs are the thing given up, never the screen.
             return Ok(());
@@ -157,15 +153,20 @@ fn filter(directive: &str) -> EnvFilter {
     EnvFilter::builder().parse_lossy(directive)
 }
 
-/// Opens `{data_dir}/narsor.log` for appending, creating the directory if
+/// Opens `{state_dir}/narsor.log` for appending, creating the directory if
 /// needed.
 ///
+/// The state root and not the catalogue: a log is something this process
+/// produced, not something a deployment declared, and the catalogue may be
+/// mounted read-only — which this function, which creates a directory, would
+/// not survive.
+///
 /// `None` when the file cannot be opened; the caller then runs without logs.
-fn open_log_file(data_dir: &Path) -> Option<File> {
-    std::fs::create_dir_all(data_dir).ok()?;
+fn open_log_file(paths: &StatePaths) -> Option<File> {
+    std::fs::create_dir_all(paths.root()).ok()?;
     OpenOptions::new()
         .create(true)
         .append(true)
-        .open(data_dir.join(TUI_LOG_FILE))
+        .open(paths.log_file())
         .ok()
 }

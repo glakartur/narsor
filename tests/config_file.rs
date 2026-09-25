@@ -79,13 +79,22 @@ fn two_unknown_keys_produce_two_errors_not_one() {
 #[test]
 fn a_file_setting_everything_yields_every_value_and_no_errors() {
     let values = parse(
-        "data_dir: /srv/narsor\nagent_harness: opencode\nagent_timeout: 30m\nlog_level: debug\n",
+        "catalog_dir: /srv/catalog\nstate_dir: /srv/state\nwork_dir: /scratch\n\
+         agent_harness: opencode\nagent_timeout: 30m\nlog_level: debug\n",
     )
     .expect("a complete, correct file");
 
     assert_eq!(
-        values.get(SettingKey::DataDir),
-        Some(&SettingValue::Path(PathBuf::from("/srv/narsor")))
+        values.get(SettingKey::CatalogDir),
+        Some(&SettingValue::Path(PathBuf::from("/srv/catalog")))
+    );
+    assert_eq!(
+        values.get(SettingKey::StateDir),
+        Some(&SettingValue::Path(PathBuf::from("/srv/state")))
+    );
+    assert_eq!(
+        values.get(SettingKey::WorkDir),
+        Some(&SettingValue::Path(PathBuf::from("/scratch")))
     );
     assert_eq!(
         values.get(SettingKey::AgentHarness),
@@ -111,7 +120,9 @@ fn a_key_the_file_does_not_mention_is_absent_not_defaulted() {
         values.get(SettingKey::LogLevel),
         Some(&SettingValue::Text("warn".to_string()))
     );
-    assert_eq!(values.get(SettingKey::DataDir), None);
+    assert_eq!(values.get(SettingKey::CatalogDir), None);
+    assert_eq!(values.get(SettingKey::StateDir), None);
+    assert_eq!(values.get(SettingKey::WorkDir), None);
     assert_eq!(values.get(SettingKey::AgentHarness), None);
     assert_eq!(values.get(SettingKey::AgentTimeout), None);
 }
@@ -326,12 +337,12 @@ fn the_keys_that_held_up_survive_beside_the_ones_that_did_not() {
     // one mistake still has to yield the values of every other key (D-D).
     let parsed = file::parse(
         Path::new("/etc/narsor/config.yaml"),
-        "data_dir: /srv/narsor\nagent_timeout: tomorrow\n",
+        "state_dir: /srv/narsor\nagent_timeout: tomorrow\n",
     );
 
     assert_eq!(parsed.errors.len(), 1, "only the timeout is wrong");
     assert_eq!(
-        parsed.values.get(SettingKey::DataDir),
+        parsed.values.get(SettingKey::StateDir),
         Some(&SettingValue::Path(PathBuf::from("/srv/narsor"))),
         "the key the operator got right is still in force"
     );
