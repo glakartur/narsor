@@ -347,6 +347,7 @@ pub fn workspace_request(
         WorkspaceSpec::Git {
             repository,
             git_ref,
+            ..
         } => {
             let repository = render(repository, "repository")?;
             let git_ref = match git_ref {

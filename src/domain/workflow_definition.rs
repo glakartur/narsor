@@ -81,6 +81,10 @@ pub enum WorkspaceSpec {
         /// Branch, tag or commit
         #[serde(default, rename = "ref")]
         git_ref: Option<String>,
+        /// Paths captured into a checkpoint even though the repository
+        /// ignores them (`preserve_paths` in YAML).
+        #[serde(default)]
+        preserve_paths: Vec<String>,
     },
     /// Plain local folder, relative to the task directory
     Local {

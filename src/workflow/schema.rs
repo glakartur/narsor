@@ -258,6 +258,15 @@ pub struct GitWorkspaceSchema {
     /// Branch, tag or commit.
     #[serde(default, rename = "ref")]
     pub git_ref: Option<String>,
+
+    /// Paths captured into a checkpoint even though the repository ignores them.
+    ///
+    /// The one exception to "ignored files do not travel": a file a step
+    /// generates, the repository ignores, and a later step needs — a `.env`
+    /// being the usual one. Everything else is rebuilt by the worker that takes
+    /// the execution over.
+    #[serde(default)]
+    pub preserve_paths: Vec<String>,
 }
 
 /// `globals.workspace` with `type: local`.

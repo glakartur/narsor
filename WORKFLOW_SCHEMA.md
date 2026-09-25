@@ -39,7 +39,7 @@ globals:                    # Ustawienia globalne dla całego workflow (opcjonal
     repository: <string>    # ID repozytorium z registry (dla typu git)
     ref: <string>           # Branch/tag/commit (dla typu git)
     path: <string>          # Ścieżka względna w folderze taska
-    preserve_paths:         # Ścieżki ignorowane przez repo, które mimo to mają przetrwać do checkpointu (dla typu local)
+    preserve_paths:         # Ścieżki ignorowane przez repo, które mimo to mają przetrwać do checkpointu (git i local)
       - <string>
 
 states:                     # Graf stanów (wymagane)
@@ -105,11 +105,14 @@ Opcjonalna sekcja określająca domyślne zachowanie dla całego workflow.
     *   `repository`: ID repozytorium zarejestrowanego w systemie.
     *   `ref`: Gałąź, tag lub commit.
     *   `path`: Ścieżka do folderu lokalnego (dla typu `local`).
-    *   `preserve_paths` (dla typu `local`): Lista ścieżek, które mają trafić do checkpointu mimo
-        że `.gitignore` repozytorium je ignoruje — jedyny wyjątek od zasady "pliki ignorowane nie
-        podróżują". Typowy przypadek to plik wygenerowany przez jeden krok i potrzebny kolejnemu,
-        np. `.env` zapisany przez krok instalacyjny: `preserve_paths: [".env"]`. Wszystko inne
-        worker, który przejmuje wykonanie, odtwarza sam.
+    *   `preserve_paths` (dla obu typów, `git` i `local`): Lista ścieżek, które mają trafić do
+        checkpointu mimo że `.gitignore` repozytorium je ignoruje — jedyny wyjątek od zasady
+        "pliki ignorowane nie podróżują". Typowy przypadek to plik wygenerowany przez jeden krok
+        i potrzebny kolejnemu, np. `.env` zapisany przez krok instalacyjny:
+        `preserve_paths: [".env"]`. Dotyczy to zarówno repozytorium sklonowanego przez `git`, jak
+        i zwykłego folderu lokalnego — mechanizm checkpointu (`CaptureRequest::preserve`) działa
+        identycznie w obu przypadkach. Wszystko inne worker, który przejmuje wykonanie, odtwarza
+        sam.
 
 ### 3.3. States (Stany)
 

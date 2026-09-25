@@ -82,9 +82,11 @@ fn global_workspace_becomes_a_definition_level_spec() {
         WorkspaceSpec::Git {
             repository,
             git_ref,
+            preserve_paths,
         } => {
             assert_eq!(repository, "{{ inputs.target_repo }}");
             assert_eq!(git_ref.as_deref(), Some("main"));
+            assert!(preserve_paths.is_empty());
         }
         other => panic!("expected a git workspace, got {other:?}"),
     }
@@ -162,6 +164,84 @@ terminal_states: [done]
             assert!(preserve_paths.is_empty());
         }
         other => panic!("expected a local workspace, got {other:?}"),
+    }
+}
+
+#[test]
+fn git_workspace_preserve_paths_reaches_the_domain_model() {
+    let yaml = r#"
+name: preserve-paths-git-demo
+version: 1
+globals:
+  workspace:
+    type: git
+    repository: some-repo
+    ref: main
+    preserve_paths: [".env"]
+states:
+  only:
+    action:
+      type: script
+      command: ./a.sh
+    outputs: [success]
+    transitions:
+      success: done
+  done:
+    description: end
+terminal_states: [done]
+"#;
+
+    let definition = load_from_str(yaml).unwrap();
+
+    match definition
+        .workspace
+        .expect("globals.workspace must be kept")
+    {
+        WorkspaceSpec::Git {
+            repository,
+            preserve_paths,
+            ..
+        } => {
+            assert_eq!(repository, "some-repo");
+            assert_eq!(preserve_paths, vec![".env".to_string()]);
+        }
+        other => panic!("expected a git workspace, got {other:?}"),
+    }
+}
+
+#[test]
+fn git_workspace_without_preserve_paths_has_an_empty_list() {
+    let yaml = r#"
+name: preserve-paths-git-default
+version: 1
+globals:
+  workspace:
+    type: git
+    repository: some-repo
+    ref: main
+states:
+  only:
+    action:
+      type: script
+      command: ./a.sh
+    outputs: [success]
+    transitions:
+      success: done
+  done:
+    description: end
+terminal_states: [done]
+"#;
+
+    let definition = load_from_str(yaml).unwrap();
+
+    match definition
+        .workspace
+        .expect("globals.workspace must be kept")
+    {
+        WorkspaceSpec::Git { preserve_paths, .. } => {
+            assert!(preserve_paths.is_empty());
+        }
+        other => panic!("expected a git workspace, got {other:?}"),
     }
 }
 

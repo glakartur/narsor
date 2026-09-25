@@ -142,6 +142,7 @@ fn compile_workspace(workspace: &WorkspaceSchema) -> WorkspaceSpec {
         WorkspaceSchema::Git(git) => WorkspaceSpec::Git {
             repository: git.repository.clone(),
             git_ref: git.git_ref.clone(),
+            preserve_paths: git.preserve_paths.clone(),
         },
         WorkspaceSchema::Local(local) => WorkspaceSpec::Local {
             path: local.path.clone(),
