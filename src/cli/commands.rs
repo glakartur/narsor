@@ -35,7 +35,7 @@ use crate::domain::{
     Event, ExecutionStatus, InputParameter, ParamType, WorkflowDefinition, WorkflowExecution,
 };
 use crate::engine::{Engine, HumanInputDelivery, PendingHumanInput};
-use crate::persistence::ExecutionStore;
+use crate::persistence::{ExecutionStore, StatePaths};
 use crate::registry::{infer_provider, RepositoryEntry, RepositoryRegistry};
 use crate::tasks::{self, TaskError};
 use crate::workflows::{builtin, builtin_names, ResolvedWorkflow, WorkflowResolver};
@@ -450,7 +450,12 @@ pub async fn input(
         delivery = delivery.choosing(label);
     }
 
-    let definition = definition_for(config.catalog_dir(), &execution, definition_file)?;
+    let definition = definition_for(
+        config.catalog_dir(),
+        store.paths(),
+        &execution,
+        definition_file,
+    )?;
     let engine = Engine::new(store).with_agent_defaults(config.agent_defaults());
     let execution = engine
         .deliver_human_input(&definition, &pending.execution_id, &delivery)
@@ -483,7 +488,12 @@ pub async fn resume(
 ) -> Result<()> {
     let store = ExecutionStore::new(config.state_dir());
     let execution = load_execution(&store, execution_id)?;
-    let definition = definition_for(config.catalog_dir(), &execution, definition_file)?;
+    let definition = definition_for(
+        config.catalog_dir(),
+        store.paths(),
+        &execution,
+        definition_file,
+    )?;
 
     let engine = Engine::new(store).with_agent_defaults(config.agent_defaults());
     let execution = engine
@@ -808,12 +818,13 @@ fn pending_input(store: &ExecutionStore, execution_id: &str) -> Result<Option<Pe
 /// otherwise, which is the only thing a built-in leaves behind.
 fn definition_for(
     catalog: &Path,
+    store_paths: &StatePaths,
     execution: &WorkflowExecution,
     override_reference: Option<&str>,
 ) -> Result<WorkflowDefinition> {
     let resolved = match override_reference {
         Some(reference) => resolve_workflow(catalog, reference)?,
-        None => tasks::resolve_definition(catalog, execution)
+        None => tasks::resolve_definition(catalog, store_paths, execution)
             .map_err(|error| CliError::failure(error.to_string()))?,
     };
 

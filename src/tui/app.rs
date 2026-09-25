@@ -1331,7 +1331,11 @@ impl App {
             return;
         };
 
-        let resolved = match tasks::resolve_definition(self.catalog.root(), execution) {
+        let resolved = match tasks::resolve_definition(
+            self.catalog.root(),
+            self.engine.store().paths(),
+            execution,
+        ) {
             Ok(resolved) => resolved,
             Err(error) => {
                 self.definition_error = Some(format!(

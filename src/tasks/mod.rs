@@ -83,7 +83,7 @@ use crate::domain::{
     WorkspaceInfo, WorkspaceSpec,
 };
 use crate::engine::{Engine, EngineError};
-use crate::persistence::{ExecutionStore, PersistenceError};
+use crate::persistence::{write_atomic, ExecutionStore, PersistenceError, StatePaths};
 use crate::registry::{RegistryError, RepositoryRegistry};
 use crate::workflow::{load_from_file, validate_path, LoadError, TemplateError, TemplateScope};
 use crate::workflows::{ResolveError, ResolvedWorkflow, WorkflowOrigin, WorkflowResolver};
@@ -276,6 +276,26 @@ pub fn start_task_with(
         .map_err(TaskError::Start)?;
 
     on_created(&execution);
+
+    // The execution carries its own definition from here on (R2): resuming it
+    // must not depend on a catalogue that may have changed, or on a worker that
+    // may not have the catalogue at all. Only a file-sourced definition has raw
+    // YAML to pin; a built-in resolves by name from the binary itself and is
+    // never subject to catalogue drift.
+    if let Some(path) = &source.path {
+        let text = fs::read_to_string(path).map_err(|error| TaskError::Save {
+            execution_id: execution.id.clone(),
+            source: PersistenceError::io(path, error),
+        })?;
+        write_atomic(
+            &engine.store().paths().definition_file(&execution.id),
+            text.as_bytes(),
+        )
+        .map_err(|source| TaskError::Save {
+            execution_id: execution.id.clone(),
+            source,
+        })?;
+    }
 
     let workspace = match provision_workspace(&provisioner, &execution.id, request.as_ref()) {
         Ok(workspace) => workspace,
@@ -561,8 +581,24 @@ pub enum DefinitionLookupError {
 /// is the one that keeps executions already on disk working.
 pub fn resolve_definition(
     catalog: &Path,
+    store_paths: &StatePaths,
     execution: &WorkflowExecution,
 ) -> std::result::Result<ResolvedWorkflow, DefinitionLookupError> {
+    // The pinned copy wins over everything else: it is the definition this
+    // execution actually started with.
+    let pinned = store_paths.definition_file(&execution.id);
+    if pinned.is_file() {
+        let source = fs::read_to_string(&pinned).map_err(|source| DefinitionLookupError::Read {
+            path: pinned.clone(),
+            source,
+        })?;
+        return Ok(ResolvedWorkflow {
+            name: stored_definition_name(execution).unwrap_or_else(|| execution.workflow_id.clone()),
+            origin: WorkflowOrigin::File(pinned),
+            source,
+        });
+    }
+
     let path = stored_definition_path(execution);
     if let Some(path) = path.as_ref().filter(|path| path.is_file()) {
         let source = fs::read_to_string(path).map_err(|source| DefinitionLookupError::Read {

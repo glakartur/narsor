@@ -604,3 +604,127 @@ fn git_source(spec: &RepositorySpec) -> (String, Option<String>) {
         other => panic!("expected a git repository, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// the pinned definition (R2, AE7)
+// ---------------------------------------------------------------------------
+
+/// A minimal valid workflow, marked so a test can tell which copy was read.
+const ORIGINAL_DEFINITION: &str = r#"
+name: greet
+version: 1
+description: original-marker
+
+states:
+  review:
+    description: A person confirms the task that was just created.
+    action:
+      type: human
+      message: "Confirm?"
+      inputs:
+        - name: approval_status
+          type: select
+          required: true
+          options:
+            - approved
+            - rejected
+    outputs:
+      - approved
+      - rejected
+    transitions:
+      approved: done
+      rejected: done
+
+  done:
+    description: The task was confirmed.
+
+terminal_states:
+  done: completed
+"#;
+
+/// The same shape as [`ORIGINAL_DEFINITION`], as if the catalogue had drifted.
+const DRIFTED_DEFINITION: &str = r#"
+name: greet
+version: 1
+description: drifted-marker
+
+states:
+  review:
+    description: A person confirms the task that was just created.
+    action:
+      type: human
+      message: "Confirm?"
+      inputs:
+        - name: approval_status
+          type: select
+          required: true
+          options:
+            - approved
+            - rejected
+    outputs:
+      - approved
+      - rejected
+    transitions:
+      approved: done
+      rejected: done
+
+  done:
+    description: The task was confirmed.
+
+terminal_states:
+  done: completed
+"#;
+
+/// Starts an execution of the `greet.yaml` at `definition_path`, with no
+/// inputs — `definition_path` is expected to live under `{catalog}/workflows`.
+fn start_greet_task(store: &ExecutionStore, definition_path: &Path) -> narsor::domain::WorkflowExecution {
+    let catalog = definition_path
+        .parent()
+        .and_then(Path::parent)
+        .expect("the definition lives under {catalog}/workflows");
+    let work = store
+        .paths()
+        .root()
+        .parent()
+        .expect("the state root has a parent")
+        .join("work");
+
+    let engine = Engine::new(store.clone());
+    let definition = tasks::load_definition(definition_path).expect("load the definition");
+    tasks::start_task(
+        catalog,
+        &work,
+        &engine,
+        &definition,
+        definition_path,
+        Map::new(),
+    )
+    .expect("start the task")
+}
+
+/// AE7: the catalogue may later hold a different definition under the same
+/// name. The execution must go on running the one it started with (D31).
+#[test]
+fn a_started_execution_keeps_its_own_definition() {
+    let temp = TempRoot::new();
+    let catalog = temp.join("catalog");
+    fs::create_dir_all(catalog.join("workflows")).expect("create workflows dir");
+
+    let definition = catalog.join("workflows").join("greet.yaml");
+    fs::write(&definition, ORIGINAL_DEFINITION).expect("write definition");
+
+    let store = ExecutionStore::new(temp.join("state"));
+    let execution = start_greet_task(&store, &definition);
+
+    // The catalogue drifts underneath the running execution.
+    fs::write(&definition, DRIFTED_DEFINITION).expect("overwrite definition");
+
+    let resolved = tasks::resolve_definition(&catalog, store.paths(), &execution)
+        .expect("resolve the pinned definition");
+
+    assert!(
+        resolved.source.contains("original-marker"),
+        "expected the pinned definition, got: {}",
+        resolved.source
+    );
+}

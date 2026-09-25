@@ -63,6 +63,13 @@ pub const STATE_FILE: &str = "state.json";
 /// File holding the serialized `Context`.
 pub const CONTEXT_FILE: &str = "context.json";
 
+/// The definition an execution was started from, pinned inside its directory.
+///
+/// An execution is resumable from its own record alone, so the definition
+/// travels with it rather than being looked up by name in a catalogue that may
+/// have moved on (D31).
+pub const DEFINITION_FILE: &str = "definition.yaml";
+
 /// Directory holding the append-only event log of one execution.
 pub const EVENTS_DIR: &str = "events";
 
@@ -124,6 +131,11 @@ impl StatePaths {
     /// `{root}/executions/{execution_id}/context.json`
     pub fn context_file(&self, execution_id: &str) -> PathBuf {
         self.execution_dir(execution_id).join(CONTEXT_FILE)
+    }
+
+    /// `{state}/executions/{id}/definition.yaml`.
+    pub fn definition_file(&self, execution_id: &str) -> PathBuf {
+        self.execution_dir(execution_id).join(DEFINITION_FILE)
     }
 
     /// `{root}/executions/{execution_id}/events`

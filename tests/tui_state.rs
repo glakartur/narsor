@@ -1304,8 +1304,9 @@ async fn the_path_route_starts_a_definition_that_is_in_no_search_location() {
         .store()
         .load_execution(&ids[0])
         .expect("load the execution");
-    let resolved = narsor::tasks::resolve_definition(root.path(), &execution)
-        .expect("the definition resolves again");
+    let resolved =
+        narsor::tasks::resolve_definition(root.path(), engine.store().paths(), &execution)
+            .expect("the definition resolves again");
     assert_eq!(resolved.origin.label(), "file");
 }
 
