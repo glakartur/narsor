@@ -54,8 +54,27 @@ Dokument zawiera zestawienie kluczowych decyzji architektonicznych podjętych dl
 | D46 | Observability | **Structured Logs + Event History**. | Distributed Tracing, Metrics | ✅ ZATWIERDZONA | Wystarczające do debugowania i audytu w MVP. |
 | D47 | Konfiguracja aplikacji | **Jeden plik YAML znajdowany kaskadą** (`--config` → `~/.config/narsor/` → `/etc/narsor/`, pierwszy trafiony wygrywa, bez scalania) plus **rozwiązywanie per ustawienie** (flaga → zmienna `NARSOR_*` → plik → wartość wbudowana). Niepoprawny plik zatrzymuje start; `config show` jest jedynym wyjątkiem i pokazuje źródło każdej wartości. | Scalanie kilku plików; katalog danych jako krok kaskady; konfiguracja per projekt | ✅ ZATWIERDZONA | Kontener w Kubernetesie: `/etc/narsor/` jest punktem montowania ConfigMapy, katalog domowy może nie istnieć, a system plików bywa RO (D14, D15). Katalog danych jest zwykłym ustawieniem — gdyby był krokiem kaskady, plik leżałby w katalogu, który sam konfiguruje. Sekrety pozostają poza tym plikiem (D16). Domyślny harness i limit czasu agenta są wartościami domyślnymi, nie przymusem: definicja workflow wygrywa (D22). Szczegóły: `docs/plans/2026-09-24-001-feat-konfiguracja-aplikacji-plan.md`. |
 | D48 | Wykonanie jest samowystarczalne | **Wykonanie niesie przypiętą definicję i pinned base commit**. Definicja `definition.yaml` i bazowy commit są przechowywane per-execution, a definicja jest preferowana nad wyszukiwaniem po nazwie w katalogu. | Wyszukiwanie po nazwie w katalogu, katalog centralny definicji | ✅ ZATWIERDZONA | Samowystarczalność: wykonanie można wznowić lub przywrócić bez dostępu do katalogu definicji. Pinned base pozwala na dokładne odtworzenie Delta checkpointu (D49). Konsekwencje i uzasadnienie: `docs/brainstorms/2026-09-25-rozproszony-narsor-requirements.md`. |
-| D49 | Checkpoint workspace'u jako git bundle | **Checkpoint workspace'u to git bundle delty względem pinned base commit**, przechowywany jako plik `checkpoint.bundle` z área roboczą w `checkpoint.git/`. Alternatywą są gałęzie WIP na repozytorium produktowym (CI noise, problemy z uprawnieniami, brak obsługi workflow bez gita) lub dedykowane repozytorium stanu (zależność od forge'a). | Gałęzie WIP na repozytorium produktowym, dedykowane repozytorium stanu | ✅ ZATWIERDZONA | Bundle jest niezależny od platformy i hosta, zawiera dokładną deltę zmian (nie całą historię), nie wymaga forka repozytorium. Bezpieczna restauracja: przejęcie zawsze materializuje z checkpointu (D50), niezależnie od ocalałych plików. Konsekwencje i uzasadnienie: `docs/brainstorms/2026-09-25-rozproszony-narsor-requirements.md`. |
+| D49 | Checkpoint workspace'u jako git bundle | **Checkpoint workspace'u to git bundle delty względem pinned base commit**, przechowywany jako plik `checkpoint.bundle` z obszarem roboczym w `checkpoint.git/`. Alternatywą są gałęzie WIP na repozytorium produktowym (CI noise, problemy z uprawnieniami, brak obsługi workflow bez gita) lub dedykowane repozytorium stanu (zależność od forge'a). | Gałęzie WIP na repozytorium produktowym, dedykowane repozytorium stanu | ✅ ZATWIERDZONA | Bundle jest niezależny od platformy i hosta, zawiera dokładną deltę zmian (nie całą historię), nie wymaga forka repozytorium. Bezpieczna restauracja: przejęcie zawsze materializuje z checkpointu (D50), niezależnie od ocalałych plików. Konsekwencje i uzasadnienie: `docs/brainstorms/2026-09-25-rozproszony-narsor-requirements.md`. |
 | D50 | Materializacja wyłącznie z checkpointu | **Przywracanie workspace'u (takeover) materializuje wyłącznie z checkpointu, ignorując ocalałe katalogi na ścieżce**. Ścieżka workspace'u jest czyszczona bezwarunkowo (brak recovery istniejącego katalogu). | Odzyskiwanie ocalałego katalogu, połączenie istniejących plików z bundle'm | ✅ ZATWIERDZONA | Prostota: jedno źródło prawdy (checkpoint). Bezpieczeństwo: eliminuje ścieżkę recovery, która byłaby zależna od maszyny i mogłaby mieć niespójny stan. Wymaga pinned base (D48) aby restore'a była powtarzalna. Konsekwencje i uzasadnienie: `docs/brainstorms/2026-09-25-rozproszony-narsor-requirements.md`. |
+
+**Znane ograniczenia M1 (D48–D50), odłożone do kolejnej iteracji:**
+
+* **Przejęcie nie zachowuje lokalnych commitów w workspace'u.** Przejęcie (takeover) zostawia
+  workspace z odpiętym (`detached`) HEAD-em przypiętym na pinned base commit; wszelkie lokalne
+  commity albo gałąź, które sam przebieg wykonania utworzył wewnątrz workspace'u (np. workflow
+  otwierający PR), nie są zachowane jako realne commity — wracają jako niescommitowane zmiany na
+  odpiętym HEAD-zie, a nie jako gałąź z prawdziwą historią commitów. Równoważność, którą ten plan
+  dowodzi (AE1), zachodzi dla workflow'ów, których kroki nie commitują wewnątrz workspace'u;
+  workflow, który to robi, jest znaną luką M1 — do adresowania w kolejnej iteracji przez
+  spakowanie lokalnej gałęzi do checkpointu i odtworzenie HEAD-a przy przejęciu.
+* **Checkpoint nie jest powiązany z konkretnym przejściem/zdarzeniem.** Capture checkpointu jest
+  best-effort i nie jest przypięty do konkretnego przejścia (transition) czy zdarzenia, po którym
+  został wykonany — jeśli capture się nie powiedzie (logowane, nie fatalne, zgodnie z założeniem
+  tego planu) albo proces padnie między zapisaniem stanu wykonania a wykonaniem checkpointu,
+  późniejsze przejęcie nie potrafi wykryć, że checkpoint jest o jeden lub więcej kroków w tyle za
+  rekordem wykonania — i przywraca bez ostrzeżenia. Powiązanie każdego checkpointu z konkretnym
+  przejściem/zdarzeniem, do którego należy, i ostrzeganie przez przejęcie przy niezgodności, jest
+  odłożone do kolejnej iteracji.
 
 ## Podsumowanie strategii MVP
 

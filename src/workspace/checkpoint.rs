@@ -189,6 +189,15 @@ pub fn capture(request: CaptureRequest<'_>) -> Result<Capture, CheckpointError> 
         &["add", "--all", "--", "."],
     )?;
     for path in request.preserve {
+        // A preserved path that does not currently exist in the work tree is
+        // routine (e.g. a file an earlier step has not written yet, or one
+        // that never appears in some runs), not a capture failure: `git add`
+        // on a pathspec that matches nothing exits non-zero, and letting that
+        // propagate would abort the whole checkpoint. Every path that does
+        // exist is still force-added and travels into the bundle as before.
+        if !request.work_tree.join(path).exists() {
+            continue;
+        }
         run(
             request.work_tree,
             git_dir,

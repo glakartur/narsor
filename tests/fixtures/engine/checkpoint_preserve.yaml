@@ -1,0 +1,32 @@
+name: checkpoint-preserve
+version: 1
+description: >
+  One script state, run over a workspace whose workflow declares
+  preserve_paths. Used to prove that preserve_paths reaches a real checkpoint
+  capture through the engine's own write_checkpoint hook, not just capture()
+  called directly.
+
+globals:
+  workspace:
+    type: local
+    path: .
+    preserve_paths:
+      - secret.local
+
+states:
+  first:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "done"}'
+    outputs:
+      - done
+    transitions:
+      done: completed
+
+  completed:
+    description: Done.
+
+terminal_states:
+  - completed

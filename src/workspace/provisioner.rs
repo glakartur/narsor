@@ -546,7 +546,7 @@ impl WorkspaceProvisioner {
                     request.primary.repository_info(),
                     request.primary.git_ref(),
                 );
-                workspace.base_commit = Some(head_commit(primary, &request.primary.name)?);
+                workspace.base_commit = head_commit(primary, &request.primary.name)?;
                 workspace
             }
             RepositorySource::Local { .. } => Workspace::local_folder(primary_path),
@@ -809,17 +809,51 @@ fn clone_repository(
     checkout_ref(target, git_ref, repository)
 }
 
-/// The commit a freshly provisioned checkout sits at.
+/// The commit a freshly provisioned checkout sits at, or `None` when the
+/// checkout has no commits yet (an unborn `HEAD` — e.g. a brand new
+/// repository whose branch tip does not exist).
 ///
 /// Recorded once, as the workspace's base commit: every checkpoint delta is
 /// measured against it, and a takeover checks exactly this commit out again —
-/// not whatever the branch has moved on to since.
-fn head_commit(path: &Path, repository: &str) -> Result<String> {
+/// not whatever the branch has moved on to since. An empty repository simply
+/// has no base commit to pin; that is not an error, so it must not fail
+/// provisioning for everyone else just because checkpointing might one day
+/// want a base to diff against.
+fn head_commit(path: &Path, repository: &str) -> Result<Option<String>> {
     let dir = path.to_string_lossy().into_owned();
-    run_git(
-        repository,
-        &["-C", &dir, "rev-parse", "--verify", "HEAD^{commit}"],
-    )
+    let args = ["-C", dir.as_str(), "rev-parse", "--verify", "HEAD^{commit}"];
+    let run = git_run(&args).map_err(|error| {
+        WorkspaceError::git(
+            repository,
+            &args,
+            None,
+            format!("could not run git: {error}"),
+        )
+    })?;
+    if run.ok {
+        return Ok(Some(run.stdout));
+    }
+
+    // `rev-parse` failed. That is expected on an unborn HEAD (a checkout with
+    // zero commits), and a real error otherwise. `rev-list --all` distin-
+    // guishes the two: it lists every commit reachable from any ref, so an
+    // empty, successful result means the repository genuinely has no
+    // commits at all — the failure above can only be the unborn-HEAD case.
+    // Any other outcome (a non-empty history, or `rev-list` itself failing)
+    // means the original failure was a genuine, unexpected git error, which
+    // must still propagate.
+    let history = git_run(&["-C", &dir, "rev-list", "--all", "-n", "1"]).map_err(|error| {
+        WorkspaceError::git(
+            repository,
+            &args,
+            None,
+            format!("could not run git: {error}"),
+        )
+    })?;
+    if history.ok && history.stdout.is_empty() {
+        return Ok(None);
+    }
+    Err(WorkspaceError::git(repository, &args, run.code, run.stderr))
 }
 
 /// Checks `git_ref` out in an already cloned repository.

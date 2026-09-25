@@ -147,6 +147,42 @@ fn preserve_paths_carries_an_ignored_file() {
 }
 
 #[test]
+fn preserve_paths_skips_an_entry_that_does_not_exist() {
+    // A preserve entry naming a path that has not been written yet (e.g. a
+    // `.env` an earlier step has not created) must not abort the whole
+    // capture: `git add --force` on a pathspec matching nothing exits
+    // non-zero, and that must be swallowed for exactly that entry while every
+    // other preserved path still travels.
+    let temp = TempRoot::new();
+    let work = temp.join("work");
+    let base = repo_with_base(&work);
+
+    fs::write(work.join("ignored.log"), "needed\n").expect("write ignored");
+
+    let capture_result = capture(CaptureRequest {
+        work_tree: &work,
+        base: Base::Commit(base),
+        scratch: &temp.join("scratch"),
+        bundle: &temp.join("cp.bundle"),
+        preserve: &["ignored.log".to_string(), "missing.env".to_string()],
+    })
+    .expect("capture must succeed even though one preserve path is missing");
+
+    let listing = git(
+        &work,
+        &["ls-tree", "-r", "--name-only", &capture_result.commit],
+    );
+    assert!(
+        listing.contains("ignored.log"),
+        "the existing preserved path must still travel, got: {listing}"
+    );
+    assert!(
+        !listing.contains("missing.env"),
+        "the missing preserved path cannot appear, got: {listing}"
+    );
+}
+
+#[test]
 fn capture_keeps_a_tracked_file_that_became_ignored() {
     // Review Focus 1. `.gitignore` governs files that are new, not files that
     // are already tracked. Seeding the temporary index from the base is what

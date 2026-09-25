@@ -262,9 +262,14 @@ pub struct GitWorkspaceSchema {
     /// Paths captured into a checkpoint even though the repository ignores them.
     ///
     /// The one exception to "ignored files do not travel": a file a step
-    /// generates, the repository ignores, and a later step needs — a `.env`
-    /// being the usual one. Everything else is rebuilt by the worker that takes
-    /// the execution over.
+    /// generates, the repository ignores, and a later step needs — a
+    /// generated lockfile being the usual one. Everything else is rebuilt by
+    /// the worker that takes the execution over.
+    ///
+    /// A preserved path travels into the checkpoint bundle un-encrypted, so it
+    /// must never name a file carrying secrets or credentials (e.g. `.env`) —
+    /// R33 requires that nothing in the record or checkpoint carries
+    /// credentials.
     #[serde(default)]
     pub preserve_paths: Vec<String>,
 }
@@ -279,9 +284,14 @@ pub struct LocalWorkspaceSchema {
     /// Paths captured into a checkpoint even though the repository ignores them.
     ///
     /// The one exception to "ignored files do not travel": a file a step
-    /// generates, the repository ignores, and a later step needs — a `.env`
-    /// being the usual one. Everything else is rebuilt by the worker that takes
-    /// the execution over.
+    /// generates, the repository ignores, and a later step needs — a
+    /// generated lockfile being the usual one. Everything else is rebuilt by
+    /// the worker that takes the execution over.
+    ///
+    /// A preserved path travels into the checkpoint bundle un-encrypted, so it
+    /// must never name a file carrying secrets or credentials (e.g. `.env`) —
+    /// R33 requires that nothing in the record or checkpoint carries
+    /// credentials.
     #[serde(default)]
     pub preserve_paths: Vec<String>,
 }

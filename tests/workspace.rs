@@ -321,6 +321,34 @@ fn git_workspace_is_cloned_at_the_requested_ref() {
 }
 
 #[test]
+fn git_workspace_cloned_from_an_empty_repository_provisions_with_no_base_commit() {
+    // An "unborn HEAD" repository (freshly `git init`'d, zero commits) must
+    // not fail provisioning: it simply has nothing to pin as a base commit.
+    let temp = TempRoot::new();
+    let origin = temp.join("origin");
+    init_repo(&origin);
+
+    let provisioner = temp.provisioner();
+    let request = WorkspaceRequest::new(RepositorySpec::git(
+        "app",
+        origin.display().to_string(),
+        None,
+    ));
+    let provisioned = provisioner
+        .provision("exec-1", &request)
+        .expect("provisioning an empty repository must succeed");
+
+    assert!(matches!(
+        provisioned.workspace.workspace_type,
+        WorkspaceType::GitCheckout
+    ));
+    assert_eq!(
+        provisioned.workspace.base_commit, None,
+        "an empty clone has no commit to pin as its base"
+    );
+}
+
+#[test]
 fn secondary_repository_is_readable_but_not_writable() {
     let temp = TempRoot::new();
     let reference = temp.join("reference");

@@ -974,6 +974,70 @@ async fn checkpoints_are_written_at_every_step_boundary() {
     );
 }
 
+/// A `preserve_paths` entry the workflow declares must reach a real
+/// checkpoint bundle through the engine's own `write_checkpoint` hook — not
+/// just through `capture()` called directly (`tests/checkpoint.rs` proves the
+/// mechanism in isolation; this proves it is actually wired in).
+#[tokio::test]
+async fn preserve_paths_declared_on_the_workflow_reaches_the_checkpoint() {
+    let harness = Harness::new();
+    let definition = workflow("checkpoint_preserve");
+    let engine = harness.engine().with_checkpoints();
+
+    // A file the workspace ignores, but the workflow asks to preserve.
+    std::fs::write(harness.workspace_file(".gitignore"), "secret.local\n")
+        .expect("write .gitignore");
+    std::fs::write(harness.workspace_file("secret.local"), "keep-me\n")
+        .expect("write the preserved file");
+
+    let execution = engine
+        .start_and_run(&definition, serde_json::json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+
+    let bundle = harness.store().paths().checkpoint_file(&execution.id);
+    assert!(bundle.is_file(), "a checkpoint must have been written");
+
+    // Read the checkpoint commit back out of the bundle, the same way
+    // `materialise` does: fetch its ref into a scratch repository, then look
+    // at the tree directly, without touching the workspace itself.
+    let scratch = harness.root().join("bundle-scratch");
+    std::fs::create_dir_all(&scratch).expect("create scratch dir");
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&scratch)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap_or_else(|error| panic!("run git {args:?}: {error}"))
+    };
+    let init = run_git(&["init", "--quiet"]);
+    assert!(init.status.success(), "git init failed");
+    let fetch = run_git(&[
+        "fetch",
+        "--quiet",
+        &bundle.display().to_string(),
+        "refs/narsor/checkpoint:refs/narsor/checkpoint",
+    ]);
+    assert!(
+        fetch.status.success(),
+        "fetching the checkpoint bundle failed: {}",
+        String::from_utf8_lossy(&fetch.stderr)
+    );
+    let show = run_git(&["show", "refs/narsor/checkpoint:secret.local"]);
+    assert!(
+        show.status.success(),
+        "the checkpoint commit does not contain secret.local: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&show.stdout),
+        "keep-me\n",
+        "preserve_paths declared on the workflow must have travelled into the real checkpoint"
+    );
+}
+
 #[tokio::test]
 async fn an_engine_without_checkpoints_writes_none() {
     // The default stays off in M1, so no existing test starts shelling out to
