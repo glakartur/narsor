@@ -134,6 +134,29 @@ fn run(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Sets up `GIT_DIR` for `base`, creating and initialising the scratch
+/// repository beside `work_tree` the first time [`Base::None`] is seen.
+///
+/// Shared by [`capture`] and [`materialise`], which otherwise repeat this
+/// bootstrap identically.
+fn git_dir_for(
+    base: &Base,
+    work_tree: &Path,
+    scratch: &Path,
+) -> Result<Option<PathBuf>, CheckpointError> {
+    match base {
+        Base::Commit(_) => Ok(None),
+        Base::None => {
+            let dir = scratch.join("repo.git");
+            if !dir.exists() {
+                fs::create_dir_all(&dir)?;
+                run(work_tree, Some(&dir), None, &["init", "--quiet"])?;
+            }
+            Ok(Some(dir))
+        }
+    }
+}
+
 /// Writes the checkpoint of `work_tree` to `bundle`, replacing any previous one.
 ///
 /// The bundle is written to a unique temporary name in the same directory and
@@ -144,17 +167,7 @@ pub fn capture(request: CaptureRequest<'_>) -> Result<Capture, CheckpointError> 
     let index = request.scratch.join("index");
     let _ = fs::remove_file(&index);
 
-    let git_dir = match &request.base {
-        Base::Commit(_) => None,
-        Base::None => {
-            let dir = request.scratch.join("repo.git");
-            if !dir.exists() {
-                fs::create_dir_all(&dir)?;
-                run(request.work_tree, Some(&dir), None, &["init", "--quiet"])?;
-            }
-            Some(dir)
-        }
-    };
+    let git_dir = git_dir_for(&request.base, request.work_tree, request.scratch)?;
     let git_dir = git_dir.as_deref();
 
     if let Base::Commit(commit) = &request.base {
@@ -258,17 +271,7 @@ pub struct MaterialiseRequest<'a> {
 pub fn materialise(request: MaterialiseRequest<'_>) -> Result<(), CheckpointError> {
     fs::create_dir_all(request.scratch)?;
 
-    let git_dir = match &request.base {
-        Base::Commit(_) => None,
-        Base::None => {
-            let dir = request.scratch.join("repo.git");
-            if !dir.exists() {
-                fs::create_dir_all(&dir)?;
-                run(request.work_tree, Some(&dir), None, &["init", "--quiet"])?;
-            }
-            Some(dir)
-        }
-    };
+    let git_dir = git_dir_for(&request.base, request.work_tree, request.scratch)?;
     let git_dir = git_dir.as_deref();
 
     if let Base::Commit(commit) = &request.base {

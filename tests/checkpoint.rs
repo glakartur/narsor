@@ -347,4 +347,17 @@ fn a_nested_repository_restores_as_an_empty_directory() {
         !fresh.join("vendor").join("inner.txt").exists(),
         "a nested repository's contents do not travel in the checkpoint"
     );
+
+    let vendor = fresh.join("vendor");
+    assert!(
+        vendor.exists() && vendor.is_dir(),
+        "the gitlink still recreates the directory on restore"
+    );
+    assert!(
+        fs::read_dir(&vendor)
+            .expect("read vendor")
+            .next()
+            .is_none(),
+        "the recreated directory is empty"
+    );
 }
