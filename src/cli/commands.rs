@@ -528,30 +528,49 @@ pub fn repo_add(
 }
 
 /// `narsor repo list` — every registered repository, ordered by id.
+///
+/// A file that cannot be read as an entry does not hide the ones that can: the
+/// listing prints what loaded, names what did not, and *then* fails. The
+/// pattern is `config show`'s — a diagnostic that goes silent in the situation
+/// it exists for is no diagnostic — and the exit code is what keeps a script
+/// branching on it from being misled.
 pub fn repo_list(root: &Path) -> Result<()> {
-    let entries = RepositoryRegistry::new(root)
+    let listing = RepositoryRegistry::new(root)
         .list()
         .map_err(|error| CliError::failure(format!("Could not read the registry: {error}")))?;
 
-    if entries.is_empty() {
+    if listing.is_empty() {
         println!("No repositories registered.");
         return Ok(());
     }
 
-    println!(
-        "{:<24} {:<10} {:<16} REMOTE",
-        "ID", "PROVIDER", "DEFAULT BRANCH"
-    );
-    for entry in &entries {
+    if !listing.entries.is_empty() {
         println!(
-            "{:<24} {:<10} {:<16} {}",
-            entry.id,
-            entry.provider,
-            entry.default_branch.as_deref().unwrap_or("-"),
-            entry.remote
+            "{:<24} {:<10} {:<16} REMOTE",
+            "ID", "PROVIDER", "DEFAULT BRANCH"
         );
+        for entry in &listing.entries {
+            println!(
+                "{:<24} {:<10} {:<16} {}",
+                entry.id,
+                entry.provider,
+                entry.default_branch.as_deref().unwrap_or("-"),
+                entry.remote
+            );
+        }
     }
-    Ok(())
+
+    if listing.is_ok() {
+        return Ok(());
+    }
+
+    for failure in &listing.failures {
+        eprintln!("{}: {}", failure.path.display(), failure.reason);
+    }
+    Err(CliError::failure(format!(
+        "{} registry entr(y/ies) could not be read; they are named above.",
+        listing.failures.len()
+    )))
 }
 
 /// `narsor repo show <id>` — every field of one registered repository.
@@ -563,7 +582,7 @@ pub fn repo_show(root: &Path, id: &str) -> Result<()> {
         .ok_or_else(|| {
             CliError::failure(format!(
                 "Repository '{id}' is not registered in '{}'.",
-                registry.path().display()
+                registry.dir().display()
             ))
         })?;
 

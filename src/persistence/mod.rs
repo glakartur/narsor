@@ -23,7 +23,9 @@ pub mod execution_store;
 pub mod paths;
 pub mod recovery;
 
-pub use atomic::{cleanup_orphaned_temp_files, read_json, write_json_atomic};
+pub use atomic::{
+    cleanup_orphaned_temp_files, read_json, write_atomic, write_atomic_exclusive, write_json_atomic,
+};
 pub use event_log::EventLog;
 pub use execution_store::{ExecutionStore, PENDING_INPUT_FILE};
 pub use paths::{Paths, CONTEXT_FILE, DEFAULT_ROOT, STATE_FILE, TEMP_SUFFIX};

@@ -126,11 +126,40 @@ pub fn is_temp_file(path: &Path) -> bool {
 ///
 /// The temporary file sits in the same directory as its target, which is what
 /// makes the subsequent `rename` atomic.
+///
+/// This is the *shape* of an interrupted write, used to recognise and to
+/// fabricate one. A writer picks its own name with [`unique_temp_path_for`];
+/// the two agree on the suffix, which is all [`is_temp_file`] and the sweeper
+/// care about.
 pub fn temp_path_for(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
         .map(|name| name.to_os_string())
         .unwrap_or_default();
+    name.push(TEMP_SUFFIX);
+    match path.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// Returns a temporary file that no concurrent write of `path` will pick too.
+///
+/// Deriving the temporary name from the target alone — which is what
+/// [`temp_path_for`] does — is safe for one writer and unsafe for several: two
+/// processes writing the same target open the *same* temporary file, so one
+/// overwrites the other's bytes and one renames a file the other already moved
+/// away. The first splices two documents into one, the second fails a write
+/// that had every right to succeed.
+///
+/// The random component removes both. The suffix is unchanged, so an orphan
+/// left by a crash is still recognised by [`is_temp_file`] and still swept.
+pub fn unique_temp_path_for(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{}", uuid::Uuid::new_v4()));
     name.push(TEMP_SUFFIX);
     match path.parent() {
         Some(parent) => parent.join(name),

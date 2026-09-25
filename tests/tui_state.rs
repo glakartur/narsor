@@ -891,7 +891,7 @@ async fn a_duplicate_repository_id_keeps_the_form_open_and_changes_nothing() {
         .expect("the original is still there");
     assert_eq!(stored.remote, "https://example.test/original.git");
     assert_eq!(
-        registry_of(root.path()).list().expect("list").len(),
+        registry_of(root.path()).list().expect("list").entries.len(),
         1,
         "nothing was appended"
     );
@@ -929,8 +929,8 @@ async fn an_ext_remote_is_refused_in_the_form_and_never_reaches_the_registry() {
         "nothing was written to the registry"
     );
     assert!(
-        !registry_of(root.path()).path().exists(),
-        "the registry file was not even created"
+        !registry_of(root.path()).dir().exists(),
+        "the registry directory was not even created"
     );
 }
 
@@ -956,7 +956,7 @@ async fn removing_a_repository_needs_a_confirmation() {
     };
     assert_eq!(confirm.id, "acme-api");
     assert_eq!(
-        registry_of(root.path()).list().expect("list").len(),
+        registry_of(root.path()).list().expect("list").entries.len(),
         1,
         "nothing is removed before the confirmation"
     );
@@ -964,7 +964,7 @@ async fn removing_a_repository_needs_a_confirmation() {
     // Declining puts the listing back and leaves the entry alone.
     app.on_key(key(KeyCode::Char('n')));
     assert!(matches!(app.modal(), Modal::Repositories(_)));
-    assert_eq!(registry_of(root.path()).list().expect("list").len(), 1);
+    assert_eq!(registry_of(root.path()).list().expect("list").entries.len(), 1);
 
     app.on_key(key(KeyCode::Char('d')));
     app.on_key(key(KeyCode::Char('y')));
@@ -1743,7 +1743,7 @@ async fn esc_cancels_every_modal_without_writing_anything() {
     assert!(matches!(app.modal(), Modal::RepositoryRemove(_)));
     app.on_key(key(KeyCode::Esc));
     assert_eq!(
-        registry_of(root.path()).list().expect("list").len(),
+        registry_of(root.path()).list().expect("list").entries.len(),
         1,
         "the cancelled removal kept the entry"
     );

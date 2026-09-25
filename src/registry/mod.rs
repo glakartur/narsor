@@ -7,8 +7,15 @@
 //! changes when the hosting does.
 //!
 //! ```text
-//! {root}/repositories.json   -- the whole registry, one JSON document
+//! {catalog}/repositories/{id}.yaml   -- one file per repository
 //! ```
+//!
+//! The file name is the identifier. A directory rather than one document
+//! because entries do not depend on each other: uniqueness becomes `EEXIST`,
+//! isolation becomes two paths, and a corrupt file costs one repository
+//! instead of the catalogue. YAML rather than JSON because the catalogue is
+//! meant to be written by a person and by a deployment, beside the workflow
+//! definitions it sits next to.
 //!
 //! # Resolution precedence
 //!
@@ -31,5 +38,6 @@
 pub mod store;
 
 pub use store::{
-    infer_provider, RegistryError, RepositoryEntry, RepositoryRegistry, Result, REPOSITORIES_FILE,
+    infer_provider, RegistryError, RegistryFailure, RegistryListing, RepositoryEntry,
+    RepositoryRegistry, Result, REPOSITORIES_DIR,
 };

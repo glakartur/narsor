@@ -3,9 +3,16 @@
 //! A rename within a single directory is atomic on POSIX, so a concurrent
 //! reader sees either the previous file or the new one, never a mixture, and a
 //! process killed mid-write leaves the previous version complete on disk.
+//!
+//! The temporary file carries a random component
+//! ([`unique_temp_path_for`](crate::persistence::paths::unique_temp_path_for))
+//! rather than being derived from the target alone. Concurrent *writers* are
+//! the reason: two of them sharing one temporary file interleave their bytes
+//! into it, and the loser of the rename fails a write that should have
+//! succeeded. Atomicity for the reader was never the part that was missing.
 
 use super::{PersistenceError, Result};
-use crate::persistence::paths::{is_temp_file, temp_path_for};
+use crate::persistence::paths::{is_temp_file, unique_temp_path_for};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
@@ -23,7 +30,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         ensure_dir(parent)?;
     }
 
-    let temp = temp_path_for(path);
+    let temp = unique_temp_path_for(path);
     write_and_sync(&temp, bytes)?;
 
     fs::rename(&temp, path).map_err(|source| {
@@ -52,13 +59,15 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// atomicity and `O_EXCL` semantics without a check-then-write race.
 ///
 /// Returns `Ok(false)` when the target already existed, in which case the
-/// existing file is left completely untouched.
+/// existing file is left completely untouched — including when the caller
+/// racing it is another process, because the temporary file is named uniquely
+/// per write (see [`unique_temp_path_for`]).
 pub fn write_atomic_exclusive(path: &Path, bytes: &[u8]) -> Result<bool> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
 
-    let temp = temp_path_for(path);
+    let temp = unique_temp_path_for(path);
     write_and_sync(&temp, bytes)?;
 
     let linked = match fs::hard_link(&temp, path) {

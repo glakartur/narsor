@@ -2169,21 +2169,49 @@ impl App {
     pub fn repository_ids(&self) -> Vec<String> {
         self.registry()
             .list()
-            .map(|entries| entries.into_iter().map(|entry| entry.id).collect())
+            .map(|listing| {
+                listing
+                    .entries
+                    .into_iter()
+                    .map(|entry| entry.id)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
     /// Opens the listing of registered repositories.
+    ///
+    /// An entry that could not be read is named in a notice rather than
+    /// dropped. Showing the remaining repositories and saying nothing about
+    /// the missing one is the failure `repo list` is built to avoid, and the
+    /// interface has no more right to it.
     pub fn open_repository_list(&mut self) {
         match self.registry().list() {
-            Ok(entries) => {
+            Ok(listing) => {
                 let selected = match &self.modal {
                     // Coming back from a form or a confirmation keeps the
                     // operator where they were, unless the list shrank.
-                    Modal::Repositories(list) => list.selected.min(entries.len().saturating_sub(1)),
+                    Modal::Repositories(list) => list
+                        .selected
+                        .min(listing.entries.len().saturating_sub(1)),
                     _ => 0,
                 };
-                self.modal = Modal::Repositories(RepositoryList { entries, selected });
+                let unreadable: Vec<String> = listing
+                    .failures
+                    .iter()
+                    .map(|failure| failure.path.display().to_string())
+                    .collect();
+                self.modal = Modal::Repositories(RepositoryList {
+                    entries: listing.entries,
+                    selected,
+                });
+                if !unreadable.is_empty() {
+                    self.notice = Some(Notice::error(format!(
+                        "{} registry entr(y/ies) could not be read: {}",
+                        unreadable.len(),
+                        unreadable.join(", ")
+                    )));
+                }
             }
             Err(error) => {
                 self.notice = Some(Notice::error(format!(
