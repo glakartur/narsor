@@ -145,6 +145,7 @@ fn compile_workspace(workspace: &WorkspaceSchema) -> WorkspaceSpec {
         },
         WorkspaceSchema::Local(local) => WorkspaceSpec::Local {
             path: local.path.clone(),
+            preserve_paths: local.preserve_paths.clone(),
         },
     }
 }

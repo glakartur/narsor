@@ -437,7 +437,7 @@ fn validate_workflow_templates(definition: &WorkflowDefinition, errors: &mut Vec
         WorkspaceSpec::Git { repository, .. } => {
             ("globals.workspace.repository", repository.as_str())
         }
-        WorkspaceSpec::Local { path } => ("globals.workspace.path", path.as_str()),
+        WorkspaceSpec::Local { path, .. } => ("globals.workspace.path", path.as_str()),
     };
 
     for variable in extract_input_references(text) {

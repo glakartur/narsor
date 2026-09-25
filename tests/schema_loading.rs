@@ -91,6 +91,81 @@ fn global_workspace_becomes_a_definition_level_spec() {
 }
 
 #[test]
+fn local_workspace_preserve_paths_reaches_the_domain_model() {
+    let yaml = r#"
+name: preserve-paths-demo
+version: 1
+globals:
+  workspace:
+    type: local
+    path: "."
+    preserve_paths: [".env"]
+states:
+  only:
+    action:
+      type: script
+      command: ./a.sh
+    outputs: [success]
+    transitions:
+      success: done
+  done:
+    description: end
+terminal_states: [done]
+"#;
+
+    let definition = load_from_str(yaml).unwrap();
+
+    match definition
+        .workspace
+        .expect("globals.workspace must be kept")
+    {
+        WorkspaceSpec::Local {
+            path,
+            preserve_paths,
+        } => {
+            assert_eq!(path, ".");
+            assert_eq!(preserve_paths, vec![".env".to_string()]);
+        }
+        other => panic!("expected a local workspace, got {other:?}"),
+    }
+}
+
+#[test]
+fn local_workspace_without_preserve_paths_has_an_empty_list() {
+    let yaml = r#"
+name: preserve-paths-default
+version: 1
+globals:
+  workspace:
+    type: local
+    path: "."
+states:
+  only:
+    action:
+      type: script
+      command: ./a.sh
+    outputs: [success]
+    transitions:
+      success: done
+  done:
+    description: end
+terminal_states: [done]
+"#;
+
+    let definition = load_from_str(yaml).unwrap();
+
+    match definition
+        .workspace
+        .expect("globals.workspace must be kept")
+    {
+        WorkspaceSpec::Local { preserve_paths, .. } => {
+            assert!(preserve_paths.is_empty());
+        }
+        other => panic!("expected a local workspace, got {other:?}"),
+    }
+}
+
+#[test]
 fn global_retry_policy_is_propagated_and_can_be_overridden() {
     let yaml = r#"
 name: retry-demo

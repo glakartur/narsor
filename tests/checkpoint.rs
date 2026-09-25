@@ -118,6 +118,35 @@ fn capture_excludes_ignored_files() {
 }
 
 #[test]
+fn preserve_paths_carries_an_ignored_file() {
+    // R24's only exception: a generated file that the repository ignores but
+    // the workflow needs — the classic case being a `.env` written by a step.
+    let temp = TempRoot::new();
+    let work = temp.join("work");
+    let base = repo_with_base(&work);
+
+    fs::write(work.join("ignored.log"), "needed\n").expect("write ignored");
+
+    let capture_result = capture(CaptureRequest {
+        work_tree: &work,
+        base: Base::Commit(base),
+        scratch: &temp.join("scratch"),
+        bundle: &temp.join("cp.bundle"),
+        preserve: &["ignored.log".to_string()],
+    })
+    .expect("capture");
+
+    let listing = git(
+        &work,
+        &["ls-tree", "-r", "--name-only", &capture_result.commit],
+    );
+    assert!(
+        listing.contains("ignored.log"),
+        "a preserved path must travel despite .gitignore, got: {listing}"
+    );
+}
+
+#[test]
 fn capture_keeps_a_tracked_file_that_became_ignored() {
     // Review Focus 1. `.gitignore` governs files that are new, not files that
     // are already tracked. Seeding the temporary index from the base is what

@@ -266,6 +266,15 @@ pub struct GitWorkspaceSchema {
 pub struct LocalWorkspaceSchema {
     /// Path to the folder, relative to the task directory.
     pub path: String,
+
+    /// Paths captured into a checkpoint even though the repository ignores them.
+    ///
+    /// The one exception to "ignored files do not travel": a file a step
+    /// generates, the repository ignores, and a later step needs — a `.env`
+    /// being the usual one. Everything else is rebuilt by the worker that takes
+    /// the execution over.
+    #[serde(default)]
+    pub preserve_paths: Vec<String>,
 }
 
 /// A single state of the graph (§3.3).

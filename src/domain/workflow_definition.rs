@@ -86,6 +86,10 @@ pub enum WorkspaceSpec {
     Local {
         /// Path to the folder
         path: String,
+        /// Paths captured into a checkpoint even though the repository
+        /// ignores them (`preserve_paths` in YAML).
+        #[serde(default)]
+        preserve_paths: Vec<String>,
     },
 }
 

@@ -355,7 +355,7 @@ pub fn workspace_request(
             };
             resolve_repository(catalog, &repository, git_ref.as_deref())?
         }
-        WorkspaceSpec::Local { path } => {
+        WorkspaceSpec::Local { path, .. } => {
             let path = render(path, "path")?;
             RepositorySpec::local(repository_name(&path), PathBuf::from(path))
         }
