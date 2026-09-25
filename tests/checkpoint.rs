@@ -361,3 +361,50 @@ fn a_nested_repository_restores_as_an_empty_directory() {
         "the recreated directory is empty"
     );
 }
+
+#[test]
+fn a_plain_directory_round_trips_without_becoming_a_repository() {
+    // AE8 / Review Focus 4: a workflow that declares no workspace gets an empty
+    // directory (DOMAIN_MODEL.md §2.8). It must checkpoint through the very same
+    // code — and must not grow a `.git` of its own.
+    let temp = TempRoot::new();
+    let work = temp.join("plain");
+    fs::create_dir_all(work.join("sub")).expect("create plain workspace");
+    fs::write(work.join("a.txt"), "hello\n").expect("write a");
+    fs::write(work.join("sub").join("b.dat"), [0u8, 9, 9]).expect("write b");
+
+    let bundle = temp.join("cp.bundle");
+    capture(CaptureRequest {
+        work_tree: &work,
+        base: Base::None,
+        scratch: &temp.join("scratch"),
+        bundle: &bundle,
+        preserve: &[],
+    })
+    .expect("capture a plain directory");
+
+    assert!(
+        !work.join(".git").exists(),
+        "checkpointing must not turn the workspace into a repository"
+    );
+
+    let fresh = temp.join("fresh-plain");
+    fs::create_dir_all(&fresh).expect("create fresh");
+    materialise(MaterialiseRequest {
+        work_tree: &fresh,
+        base: Base::None,
+        scratch: &temp.join("fresh-scratch"),
+        bundle: &bundle,
+    })
+    .expect("materialise a plain directory");
+
+    assert_eq!(
+        fs::read_to_string(fresh.join("a.txt")).expect("read a"),
+        "hello\n"
+    );
+    assert_eq!(
+        fs::read(fresh.join("sub").join("b.dat")).expect("read b"),
+        vec![0u8, 9, 9]
+    );
+    assert!(!fresh.join(".git").exists(), "no .git in the restored tree");
+}
