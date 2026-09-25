@@ -528,3 +528,76 @@ fn a_temp_file_in_the_events_directory_is_not_read_as_an_event() {
     assert_eq!(events.len(), 1);
     assert_eq!(log.next_sequence().expect("next sequence"), 2);
 }
+
+// ---------------------------------------------------------------------------
+// The three roots
+// ---------------------------------------------------------------------------
+
+/// AE2 — splitting one root into three moves nothing.
+///
+/// The whole layout, asserted against the literal paths the code produced
+/// before the split. This is the test that makes "the change is invisible
+/// until someone separates the roots deliberately" a fact rather than an
+/// intention, so it is written against string literals on purpose: deriving
+/// the expectation from the same constants the implementation uses would
+/// assert nothing at all.
+#[test]
+fn the_three_roots_on_one_directory_reproduce_the_previous_layout() {
+    use narsor::persistence::{CatalogPaths, StatePaths, WorkPaths};
+
+    let root = Path::new("/srv/narsor");
+    let state = StatePaths::new(root);
+    let catalog = CatalogPaths::new(root);
+    let work = WorkPaths::new(root);
+
+    assert_eq!(state.executions_dir(), Path::new("/srv/narsor/executions"));
+    assert_eq!(
+        state.state_file("exec-1"),
+        Path::new("/srv/narsor/executions/exec-1/state.json")
+    );
+    assert_eq!(
+        state.context_file("exec-1"),
+        Path::new("/srv/narsor/executions/exec-1/context.json")
+    );
+    assert_eq!(
+        state.events_dir("exec-1"),
+        Path::new("/srv/narsor/executions/exec-1/events")
+    );
+    assert_eq!(
+        state.event_file("exec-1", 7),
+        Path::new("/srv/narsor/executions/exec-1/events/00000007.json")
+    );
+    assert_eq!(
+        state.artifacts_dir("exec-1"),
+        Path::new("/srv/narsor/executions/exec-1/artifacts")
+    );
+    assert_eq!(state.log_file(), Path::new("/srv/narsor/narsor.log"));
+
+    assert_eq!(catalog.workflows_dir(), Path::new("/srv/narsor/workflows"));
+    assert_eq!(
+        catalog.repositories_dir(),
+        Path::new("/srv/narsor/repositories")
+    );
+
+    assert_eq!(work.tasks_dir(), Path::new("/srv/narsor/tasks"));
+    assert_eq!(work.task_dir("exec-1"), Path::new("/srv/narsor/tasks/exec-1"));
+    assert_eq!(
+        work.code_dir("exec-1"),
+        Path::new("/srv/narsor/tasks/exec-1/code")
+    );
+    assert_eq!(
+        work.checkout_dir("exec-1", "acme-api"),
+        Path::new("/srv/narsor/tasks/exec-1/code/acme-api")
+    );
+}
+
+/// R2 — all three share one built-in value, so an unconfigured run is unmoved.
+#[test]
+fn all_three_roots_default_to_the_same_directory() {
+    use narsor::persistence::{CatalogPaths, StatePaths, WorkPaths, DEFAULT_ROOT};
+
+    assert_eq!(StatePaths::default().root(), Path::new(DEFAULT_ROOT));
+    assert_eq!(CatalogPaths::default().root(), Path::new(DEFAULT_ROOT));
+    assert_eq!(WorkPaths::default().root(), Path::new(DEFAULT_ROOT));
+    assert_eq!(DEFAULT_ROOT, "./.narsor");
+}

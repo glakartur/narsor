@@ -1,13 +1,58 @@
-//! Directory layout of the persistence root.
+//! Directory layout of the three roots.
 //!
 //! All path construction lives here so that the layout described in
-//! `DOMAIN_MODEL.md` §2.7 is defined exactly once.
+//! `DOMAIN_MODEL.md` §2.7 is defined exactly once — which is why splitting one
+//! root into three did not scatter it into three modules.
+//!
+//! The three are separate *types* rather than three fields of one, because the
+//! guarantee wanted is about what a consumer can reach: an [`ExecutionStore`]
+//! holding [`StatePaths`] has no method that yields a workflow directory, and
+//! no raw root to join one out of. Sharing would make the split a convention
+//! that holds until someone writes `.join("..")`.
+//!
+//! ```text
+//! {catalog}/repositories/{id}.yaml   -- CatalogPaths: declared, shareable,
+//! {catalog}/workflows/{name}.yaml                     mountable read-only
+//!
+//! {state}/executions/{id}/…          -- StatePaths: owned by one process
+//! {state}/narsor.log
+//!
+//! {work}/tasks/{id}/code/…           -- WorkPaths: local scratch, disposable
+//! ```
+//!
+//! All three default to the same `./.narsor`, so a run that configures nothing
+//! puts every file exactly where it was before the split. The layout only
+//! comes apart when someone deliberately takes it apart.
+//!
+//! [`ExecutionStore`]: crate::persistence::ExecutionStore
 
 use crate::domain::ExecutionId;
 use std::path::{Path, PathBuf};
 
-/// Default persistence root, relative to the process working directory.
+/// Default root, relative to the process working directory.
+///
+/// One value shared by all three roots: the split is meant to be invisible
+/// until an operator separates them on purpose.
 pub const DEFAULT_ROOT: &str = "./.narsor";
+
+/// Directory holding workflow definitions, under the catalogue root.
+pub const WORKFLOWS_DIR: &str = "workflows";
+
+/// Directory holding registry entries, under the catalogue root.
+pub const REPOSITORIES_DIR: &str = "repositories";
+
+/// Directory holding every execution workspace, under the work root.
+pub const TASKS_DIR: &str = "tasks";
+
+/// Directory inside a task that holds the checkouts.
+pub const CODE_DIR: &str = "code";
+
+/// File the terminal interface appends its log to, under the state root.
+///
+/// State rather than declaration, so it belongs here and not beside the
+/// workflows — and the catalogue may be mounted read-only, which a log file
+/// would not survive.
+pub const LOG_FILE: &str = "narsor.log";
 
 /// Directory holding every execution, directly under the root.
 pub const EXECUTIONS_DIR: &str = "executions";
@@ -30,24 +75,35 @@ pub const TEMP_SUFFIX: &str = ".tmp";
 /// Number of digits in an event file name (`00000001.json`).
 const SEQUENCE_WIDTH: usize = 8;
 
-/// Resolves every path of the persistence layout below a configurable root.
+/// Resolves every path of the *state* layout below a configurable root.
+///
+/// Execution state and the log: everything one process writes while it runs a
+/// task. Splitting the roots does not make this directory safe to share — the
+/// event log's sequence counter is cached in the process and pauses live in a
+/// mutex, so two processes on one state root still overwrite each other's
+/// events. It is separable for mounting, not for sharing.
 ///
 /// The root is configurable precisely so that tests can point it at a
 /// temporary directory; nothing in this layer ever reads a global location.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Paths {
+pub struct StatePaths {
     root: PathBuf,
 }
 
-impl Paths {
+impl StatePaths {
     /// Creates a layout rooted at `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
 
-    /// The persistence root itself.
+    /// The state root itself.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// `{root}/narsor.log`
+    pub fn log_file(&self) -> PathBuf {
+        self.root.join(LOG_FILE)
     }
 
     /// `{root}/executions`
@@ -92,7 +148,102 @@ impl Paths {
     }
 }
 
-impl Default for Paths {
+impl Default for StatePaths {
+    fn default() -> Self {
+        Self::new(DEFAULT_ROOT)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The catalogue
+// ---------------------------------------------------------------------------
+
+/// Resolves every path of the *catalogue* below a configurable root.
+///
+/// What a deployment declares: the workflow definitions and the repository
+/// registry. Written rarely and from outside, read by every process, and the
+/// one root that is meant to be shared between them — mounted read-only if the
+/// deployment wishes, because nothing here is written while a task runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogPaths {
+    root: PathBuf,
+}
+
+impl CatalogPaths {
+    /// Creates a layout rooted at `root`.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// The catalogue root itself.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// `{root}/workflows`
+    pub fn workflows_dir(&self) -> PathBuf {
+        self.root.join(WORKFLOWS_DIR)
+    }
+
+    /// `{root}/repositories`
+    pub fn repositories_dir(&self) -> PathBuf {
+        self.root.join(REPOSITORIES_DIR)
+    }
+}
+
+impl Default for CatalogPaths {
+    fn default() -> Self {
+        Self::new(DEFAULT_ROOT)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The work directory
+// ---------------------------------------------------------------------------
+
+/// Resolves every path of the per-task *work* tree below a configurable root.
+///
+/// Git checkouts and whatever an action writes beside them: heavy, rewritable,
+/// and interesting to nobody but the process that made it. This is the root a
+/// deployment gives an `emptyDir` rather than a shared volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkPaths {
+    root: PathBuf,
+}
+
+impl WorkPaths {
+    /// Creates a layout rooted at `root`.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// The work root itself.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// `{root}/tasks`
+    pub fn tasks_dir(&self) -> PathBuf {
+        self.root.join(TASKS_DIR)
+    }
+
+    /// `{root}/tasks/{execution_id}` — the whole tree owned by the execution.
+    pub fn task_dir(&self, execution_id: &str) -> PathBuf {
+        self.tasks_dir().join(execution_id)
+    }
+
+    /// `{root}/tasks/{execution_id}/code`
+    pub fn code_dir(&self, execution_id: &str) -> PathBuf {
+        self.task_dir(execution_id).join(CODE_DIR)
+    }
+
+    /// `{root}/tasks/{execution_id}/code/{repository_name}`
+    pub fn checkout_dir(&self, execution_id: &str, repository_name: &str) -> PathBuf {
+        self.code_dir(execution_id).join(repository_name)
+    }
+}
+
+impl Default for WorkPaths {
     fn default() -> Self {
         Self::new(DEFAULT_ROOT)
     }

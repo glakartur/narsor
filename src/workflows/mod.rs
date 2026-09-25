@@ -42,9 +42,7 @@ use serde::Deserialize;
 use crate::domain::{ValidationError, WorkflowDefinition};
 use crate::workflow::{load_from_str, validate_source, LoadError};
 
-/// Directory, under `--root` and under the user config directory, that holds
-/// workflow definitions.
-pub const WORKFLOWS_DIR: &str = "workflows";
+pub use crate::persistence::paths::WORKFLOWS_DIR;
 
 /// Directory of this application inside the user's config directory.
 pub const USER_CONFIG_DIR: &str = "narsor";

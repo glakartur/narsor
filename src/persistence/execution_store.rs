@@ -6,7 +6,7 @@ use crate::persistence::atomic::{
     cleanup_orphaned_temp_files, ensure_dir, read_json, write_json_atomic,
 };
 use crate::persistence::event_log::EventLog;
-use crate::persistence::paths::{Paths, DEFAULT_ROOT};
+use crate::persistence::paths::{StatePaths, DEFAULT_ROOT};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fs;
@@ -35,14 +35,14 @@ pub const PENDING_INPUT_FILE: &str = "pending_input.json";
 /// only the context changed.
 #[derive(Debug, Clone)]
 pub struct ExecutionStore {
-    paths: Paths,
+    paths: StatePaths,
 }
 
 impl ExecutionStore {
     /// Creates a store rooted at `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
-            paths: Paths::new(root),
+            paths: StatePaths::new(root),
         }
     }
 
@@ -52,7 +52,7 @@ impl ExecutionStore {
     }
 
     /// The path layout this store uses.
-    pub fn paths(&self) -> &Paths {
+    pub fn paths(&self) -> &StatePaths {
         &self.paths
     }
 

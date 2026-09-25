@@ -33,8 +33,7 @@ use crate::domain::{RepositoryInfo, RepositoryReference};
 use crate::persistence::{write_atomic, write_atomic_exclusive, PersistenceError};
 use crate::workspace::provisioner::{check_remote, is_usable_directory_name};
 
-/// Directory holding the registry, under the catalogue root.
-pub const REPOSITORIES_DIR: &str = "repositories";
+pub use crate::persistence::paths::REPOSITORIES_DIR;
 
 /// The file extensions a registry entry may use, in lookup order.
 ///

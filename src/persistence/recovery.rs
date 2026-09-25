@@ -41,7 +41,6 @@ use serde_json::json;
 
 use crate::domain::{EventData, ExecutionId, ExecutionStatus};
 use crate::persistence::{ExecutionStore, PersistenceError, Result};
-use crate::workspace::provisioner::TASKS_DIR;
 use crate::workspace::{CleanupOutcome, CleanupPolicy, WorkspaceProvisioner};
 
 /// What reconciling one execution concluded.
@@ -263,7 +262,7 @@ pub fn sweep_orphaned_workspaces(
     provisioner: &WorkspaceProvisioner,
     policy: CleanupPolicy,
 ) -> Result<Vec<OrphanedWorkspace>> {
-    let tasks_dir = provisioner.root().join(TASKS_DIR);
+    let tasks_dir = provisioner.paths().tasks_dir();
     let mut orphans = Vec::new();
 
     for execution_id in task_directories(&tasks_dir)? {

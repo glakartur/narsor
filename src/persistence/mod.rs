@@ -28,7 +28,9 @@ pub use atomic::{
 };
 pub use event_log::EventLog;
 pub use execution_store::{ExecutionStore, PENDING_INPUT_FILE};
-pub use paths::{Paths, CONTEXT_FILE, DEFAULT_ROOT, STATE_FILE, TEMP_SUFFIX};
+pub use paths::{
+    CatalogPaths, StatePaths, WorkPaths, CONTEXT_FILE, DEFAULT_ROOT, STATE_FILE, TEMP_SUFFIX,
+};
 pub use recovery::{
     reconcile, reconcile_all, recover, sweep_orphaned_workspaces, OrphanReason, OrphanedWorkspace,
     Reconciliation, ReconciliationOutcome, RecoveryReport,

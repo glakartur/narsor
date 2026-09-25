@@ -37,16 +37,13 @@
 
 use crate::domain::{RepositoryInfo, Workspace};
 use std::fs;
+use crate::persistence::paths::WorkPaths;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
 
-/// Directory holding every execution workspace, directly under the root.
-pub const TASKS_DIR: &str = "tasks";
-
-/// Directory holding the checked-out repositories of one execution.
-pub const CODE_DIR: &str = "code";
+pub use crate::persistence::paths::{CODE_DIR, TASKS_DIR};
 
 /// Result alias for every fallible workspace operation.
 pub type Result<T> = std::result::Result<T, WorkspaceError>;
@@ -383,36 +380,46 @@ pub enum CleanupPolicy {
 /// Creates and removes the per-execution workspaces below a configurable root.
 ///
 /// The root is configurable so that tests point it at a temporary directory;
-/// nothing here ever reaches for a global location.
+/// nothing here ever reaches for a global location. It is a [`WorkPaths`] and
+/// not a bare path so that this layer can name the directories it owns and no
+/// others: there is no way from here to a workflow definition or to an
+/// execution's state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceProvisioner {
-    root: PathBuf,
+    paths: WorkPaths,
 }
 
 impl WorkspaceProvisioner {
     /// Creates a provisioner rooted at `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            paths: WorkPaths::new(root),
+        }
+    }
+
+    /// The layout this provisioner writes into.
+    pub fn paths(&self) -> &WorkPaths {
+        &self.paths
     }
 
     /// The workspace root itself.
     pub fn root(&self) -> &Path {
-        &self.root
+        self.paths.root()
     }
 
     /// `{root}/tasks/{execution_id}`
     pub fn task_dir(&self, execution_id: &str) -> PathBuf {
-        self.root.join(TASKS_DIR).join(execution_id)
+        self.paths.task_dir(execution_id)
     }
 
     /// `{root}/tasks/{execution_id}/code`
     pub fn code_dir(&self, execution_id: &str) -> PathBuf {
-        self.task_dir(execution_id).join(CODE_DIR)
+        self.paths.code_dir(execution_id)
     }
 
     /// `{root}/tasks/{execution_id}/code/{repository_name}`
     pub fn repository_dir(&self, execution_id: &str, repository_name: &str) -> PathBuf {
-        self.code_dir(execution_id).join(repository_name)
+        self.paths.checkout_dir(execution_id, repository_name)
     }
 
     /// Checks everything that can be checked without touching the workspace.
