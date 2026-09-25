@@ -69,7 +69,7 @@ use uuid::Uuid;
 use crate::domain::{
     ActionConfig, ActionResult, Artifact, ArtifactReference, DecisionProviderType, Event,
     EventData, ExecutionId, ExecutionStatus, OutputLabel, State, StateId, WorkflowDefinition,
-    WorkflowExecution, Workspace, WorkspaceInfo,
+    WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
 };
 use crate::engine::actions::agent::BUILT_IN_HARNESS;
 use crate::engine::actions::human::{
@@ -349,6 +349,7 @@ pub struct Engine {
     agent_timeout_secs: Option<u64>,
     events: broadcast::Sender<Event>,
     pause_requests: Mutex<HashSet<ExecutionId>>,
+    checkpoints: bool,
 }
 
 impl Engine {
@@ -378,6 +379,7 @@ impl Engine {
             agent_timeout_secs: None,
             events,
             pause_requests: Mutex::new(HashSet::new()),
+            checkpoints: false,
         }
     }
 
@@ -391,6 +393,16 @@ impl Engine {
         self.agent_timeout_secs = defaults.timeout_secs;
         let agent = agent_executor(&self.store, &self.events, &defaults.harness);
         self.executors.insert(ActionKind::Agent, Arc::new(agent));
+        self
+    }
+
+    /// Writes a checkpoint of the workspace at every step boundary (R4).
+    ///
+    /// Opt-in while there is no hub to replicate to: turning it on for every
+    /// engine would make each step of every existing test shell out to `git`
+    /// for no gain. From M2 on, the hub's worker turns it on unconditionally.
+    pub fn with_checkpoints(mut self) -> Self {
+        self.checkpoints = true;
         self
     }
 
@@ -599,11 +611,12 @@ impl Engine {
                     provider: DecisionProviderType::Human,
                     reasoning: None,
                 };
-                self.apply_decision(&mut execution, state, pending, outcome)?
+                self.apply_decision(definition, &mut execution, state, pending, outcome)?
             }
             None => {
                 // The answer is the human action's own result.
                 self.record_completion(
+                    definition,
                     &mut execution,
                     state,
                     resumed.pending.action_execution_id().to_string(),
@@ -642,7 +655,7 @@ impl Engine {
             let state = self.state_of(definition, &execution, &state_id)?;
 
             let flow = match self.pending_step(&execution, &state_id)? {
-                Some(pending) => self.complete_step(&mut execution, state, pending)?,
+                Some(pending) => self.complete_step(definition, &mut execution, state, pending)?,
                 None => self.enter_state(definition, &mut execution, state).await?,
             };
 
@@ -703,7 +716,7 @@ impl Engine {
             ActionUpshot::Completed {
                 action_execution_id,
                 result,
-            } => self.record_completion(execution, state, action_execution_id, result),
+            } => self.record_completion(definition, execution, state, action_execution_id, result),
         }
     }
 
@@ -864,6 +877,7 @@ impl Engine {
     /// and the mid-step state that makes the rest of the step resumable.
     fn record_completion(
         &self,
+        definition: &WorkflowDefinition,
         execution: &mut WorkflowExecution,
         state: &State,
         action_execution_id: String,
@@ -895,12 +909,13 @@ impl Engine {
         self.write_pending_step(execution, &pending)?;
         self.store.save_execution(execution)?;
 
-        self.complete_step(execution, state, pending)
+        self.complete_step(definition, execution, state, pending)
     }
 
     /// The second half of a step: decide, write the context, transition.
     fn complete_step(
         &self,
+        definition: &WorkflowDefinition,
         execution: &mut WorkflowExecution,
         state: &State,
         pending: PendingStep,
@@ -933,12 +948,13 @@ impl Engine {
             }
         };
 
-        self.apply_decision(execution, state, pending, outcome)
+        self.apply_decision(definition, execution, state, pending, outcome)
     }
 
     /// `DecisionMade` → context (D10) → `TransitionTaken` → `state.json`.
     fn apply_decision(
         &self,
+        definition: &WorkflowDefinition,
         execution: &mut WorkflowExecution,
         state: &State,
         pending: PendingStep,
@@ -995,7 +1011,55 @@ impl Engine {
         execution.current_action_execution = Some(pending.action_execution_id);
         self.store.save_execution(execution)?;
 
+        self.write_checkpoint(definition, execution);
+
         Ok(Flow::Continue)
+    }
+
+    /// Captures the workspace at a step boundary, if checkpointing is on.
+    ///
+    /// A failing checkpoint does not fail the step: the execution's own record
+    /// is already durable, and refusing to go on because a *copy* could not be
+    /// made would turn a recoverable situation into a stopped workflow. The
+    /// failure is logged, and the previous checkpoint is left intact (R25).
+    ///
+    /// `preserve` comes from the workflow's own workspace declaration
+    /// (`globals.workspace.preserve_paths`) — the definition, not the
+    /// provisioned `Workspace` record, because the latter does not carry it
+    /// (it only exists to describe *where* the workspace lives, not how it was
+    /// declared).
+    fn write_checkpoint(&self, definition: &WorkflowDefinition, execution: &WorkflowExecution) {
+        if !self.checkpoints {
+            return;
+        }
+
+        let base = match &execution.workspace.base_commit {
+            Some(commit) => crate::workspace::Base::Commit(commit.clone()),
+            None => crate::workspace::Base::None,
+        };
+
+        let preserve: &[String] = match &definition.workspace {
+            Some(WorkspaceSpec::Git { preserve_paths, .. }) => preserve_paths,
+            Some(WorkspaceSpec::Local { preserve_paths, .. }) => preserve_paths,
+            None => &[],
+        };
+
+        let paths = self.store.paths();
+        let request = crate::workspace::CaptureRequest {
+            work_tree: std::path::Path::new(&execution.workspace.path),
+            base,
+            scratch: &paths.checkpoint_scratch(&execution.id),
+            bundle: &paths.checkpoint_file(&execution.id),
+            preserve,
+        };
+
+        if let Err(error) = crate::workspace::capture(request) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                %error,
+                "could not checkpoint the workspace; the previous checkpoint is kept"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

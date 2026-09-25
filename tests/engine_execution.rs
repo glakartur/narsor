@@ -949,3 +949,50 @@ async fn no_configured_timeout_leaves_an_agent_state_unlimited() {
         "a configuration that revokes the limit leaves the action running as it does today"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Checkpointing (R4)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn checkpoints_are_written_at_every_step_boundary() {
+    let harness = Harness::new();
+    let definition = workflow("two_steps");
+    let engine = harness.engine().with_checkpoints();
+
+    let execution = engine
+        .start_and_run(&definition, serde_json::json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+
+    let bundle = harness.store().paths().checkpoint_file(&execution.id);
+
+    assert!(
+        bundle.is_file(),
+        "a finished execution must have left a checkpoint at {}",
+        bundle.display()
+    );
+}
+
+#[tokio::test]
+async fn an_engine_without_checkpoints_writes_none() {
+    // The default stays off in M1, so no existing test starts shelling out to
+    // git on every step.
+    let harness = Harness::new();
+    let definition = workflow("two_steps");
+
+    let execution = harness
+        .engine()
+        .start_and_run(&definition, serde_json::json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+
+    assert!(
+        !harness
+            .store()
+            .paths()
+            .checkpoint_file(&execution.id)
+            .exists(),
+        "checkpointing is opt-in in M1"
+    );
+}
