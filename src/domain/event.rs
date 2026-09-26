@@ -75,27 +75,77 @@ pub enum EventData {
         action_execution_id: String,
         error: String,
     },
+    /// A failed attempt that still has retries left (R4, R7, R11).
+    ///
+    /// Emitted right after the failed attempt and before the backoff sleep, so
+    /// an operator watching the log sees the failure the moment it happens
+    /// rather than only after the delay. The attempt that exhausts the retry
+    /// budget does **not** get one of these — it goes straight to
+    /// [`EventData::ActionFailed`], since there is no retry to announce.
+    ActionAttemptFailed {
+        /// The attempt that failed.
+        action_execution_id: String,
+        /// The state whose action failed.
+        state_id: String,
+        /// The error message, same as `ActionFailed` would carry if this were
+        /// the last attempt.
+        error: String,
+        /// How long the engine will wait before the next attempt starts.
+        retry_in_ms: u64,
+    },
     ActionRetrying {
         action_execution_id: String,
         retry_count: u32,
+        /// The state whose action is being retried.
+        ///
+        /// `#[serde(default)]` so an event log written before this field
+        /// existed still deserializes, with `None` standing for "unknown".
+        #[serde(default)]
+        state_id: Option<String>,
     },
 
     // Agent events
     AgentSessionStarted {
         session_id: String,
         harness: String,
+        /// The action attempt this session belongs to.
+        ///
+        /// `#[serde(default)]` so an event log written before this field
+        /// existed still deserializes, with `None` standing for "unknown".
+        #[serde(default)]
+        action_execution_id: Option<String>,
+        /// The harness session this run resumed, if `resume_session` named one
+        /// (D18).
+        #[serde(default)]
+        resumed_session: Option<String>,
     },
     AgentSessionCompleted {
         session_id: String,
+        /// The action attempt this session belongs to.
+        #[serde(default)]
+        action_execution_id: Option<String>,
+        /// The harness's own session id, captured from its output.
+        #[serde(default)]
+        harness_session_id: Option<String>,
     },
     AgentSessionFailed {
         session_id: String,
         error: String,
+        /// The action attempt this session belongs to.
+        #[serde(default)]
+        action_execution_id: Option<String>,
+        /// The harness's own session id, when the harness reported one before
+        /// failing.
+        #[serde(default)]
+        harness_session_id: Option<String>,
     },
     AgentMessage {
         session_id: String,
         content: String,
         role: String,
+        /// The action attempt this message belongs to.
+        #[serde(default)]
+        action_execution_id: Option<String>,
     },
 
     // Decision events
@@ -201,6 +251,11 @@ impl Event {
                 format!("Action completed with '{output_label}'")
             }
             EventData::ActionFailed { error, .. } => format!("Action failed: {error}"),
+            EventData::ActionAttemptFailed {
+                error, retry_in_ms, ..
+            } => {
+                format!("Attempt failed: {error} (retrying in {retry_in_ms}ms)")
+            }
             EventData::ActionRetrying { retry_count, .. } => {
                 format!("Retrying the action (attempt {})", retry_count + 1)
             }

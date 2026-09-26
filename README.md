@@ -193,6 +193,53 @@ $ narsor events 4f1c8f0e-...-9b21
     3  2026-09-23T19:43:49+00:00  action_started         Action 'script' started
 ```
 
+### `steps <EXECUTION_ID>`
+
+The step timeline: one line per action attempt, computed from the event log
+alone (not stored separately) — the CLI counterpart of the TUI's task view
+axis. A state visited twice, or retried once, produces two or three lines,
+never one line mutated in place: `<state> #n` counts attempts of that state
+across the whole execution, so a retried step shows up as `plan #1` (failed)
+followed by `plan #2` (succeeded), and a loop's second visit continues the
+count rather than restarting it.
+
+Each line names the label, the status (`succeeded`, `failed`, `interrupted`,
+`in_progress`, `awaiting_decision`), the action type, and when the attempt
+started and ended; below it, only when they apply: the error, a note that a
+retry is still pending, that the harness session was interrupted even though
+the attempt still produced a label, which harness session it resumed, and —
+for an agent step — whether its conversation was recorded, never created (with
+why), or is unavailable because the log predates conversation records.
+
+```console
+$ narsor steps 4f1c8f0e-...-9b21
+plan #1        failed             agent      2026-09-26T10:00:00+00:00  ->  2026-09-26T10:00:01+00:00
+    error: harness exited without a result
+plan #2        succeeded          agent      2026-09-26T10:00:02+00:00  ->  2026-09-26T10:00:20+00:00
+```
+
+### `conversation <EXECUTION_ID> <ATTEMPT_ID>`
+
+One agent attempt's conversation, in order, in full — nothing is truncated
+(unlike the `AgentMessage` event, which is). `ATTEMPT_ID` is the attempt's
+`action_execution_id`, as printed by `steps` or `events`. Every entry is
+classified the same way the TUI's task view classifies it (user, assistant,
+thinking, tool call, tool result, the harness's final result, system,
+`stderr`, or a narsor-written line — the prompt sent, or the attempt's
+outcome) and printed with its full decoded content; an entry this module does
+not recognize the shape of still prints in full, tagged `raw`. An attempt with
+no conversation record — a script step, an agent step whose conversation
+never started, or a step from a log written before this feature existed — is
+a readable failure, not silent empty output.
+
+```console
+$ narsor conversation 4f1c8f0e-...-9b21 3f9c2e10-...-77aa
+    1  2026-09-26T10:00:02+00:00  narsor     prompt: implement the feature…
+    2  2026-09-26T10:00:03+00:00  assistant  I'll start by reading the existing tests.
+    3  2026-09-26T10:00:04+00:00  tool call  {"name":"bash","input":{"command":"cargo test"}}
+    4  2026-09-26T10:00:05+00:00  result     {"subtype":"success","result":"done"}
+```
+
 ### `input <EXECUTION_ID> [--field NAME=VALUE]… [--label LABEL]`
 
 Delivers a human answer to a paused execution and resumes it. `--field` fills in
@@ -364,9 +411,21 @@ Events panel title rather than a view that silently stops moving.
 | Panels | `s` | run or resume the selected execution |
 | Panels | `i` | open the human-input form |
 | Panels | `t` | open the manual transition menu |
+| Executions panel | `Enter` | open the task view for the selected execution |
 | Events panel | `f` | toggle following the stream |
+| Events panel | `Enter` | open the event detail window |
+| Events panel, detail window | `c` | jump to the conversation of the event's attempt (a message on the status bar if it has none) |
 | Panels | `?` | open the key map |
 | Panels | `q`, `Esc` | quit |
+| Task view | `Tab` | switch focus between the step axis and the step's content |
+| Task view | `j` / `↓`, `k` / `↑` | move the focused pane's cursor |
+| Task view | `PgUp` / `PgDn` | page the focused pane |
+| Task view | `g` / `Home`, `G` / `End` | first / last entry of the focused pane |
+| Task view | `r` | reload the step axis and re-read the selected step's content |
+| Task view | `Enter`, `space` (content pane) | expand or collapse a conversation entry |
+| Task view | `Esc` | back to where the task view was opened from, selection preserved |
+| Event detail window | `j` / `↓`, `k` / `↑`, `PgUp` / `PgDn`, `g` / `G` | scroll |
+| Event detail window | `Esc` | close |
 | Input form | `Tab` / `↓`, `Shift+Tab` / `↑` | next / previous field |
 | Input form | `←` / `→` | cycle a `select` value or the output label |
 | Input form | `space` | same, on a `select` row or the label row |
@@ -390,6 +449,43 @@ the log so it can be audited: a `DecisionMade` naming the `human_override`
 provider and carrying the reason, then `HumanTransitionSelected`, `StateExited`
 and `TransitionTaken`. The execution is parked `Paused` at the target state (or
 finished, when the target is terminal) and the operator resumes it explicitly.
+
+**Event detail window.** `Enter` on the Events panel opens every field of the
+selected event, wrapped and scrollable, with structural values (`inputs`,
+`payload`, `input`, `context`, `result`) shown as indented JSON — nothing is
+squeezed onto the one line the Events panel shows. An `AgentMessage`'s content
+is truncated in the log itself (it is not a place for megabytes of harness
+chatter); the window says so and points at `c`. Control characters and ANSI
+escapes in any event's content are replaced with visible substitutes before
+rendering, the same as everywhere else text reaches the terminal.
+
+**Task view.** `Enter` on an execution, or `c` on an event (from the Events
+panel or from its detail window) tied to an agent attempt, opens a full-screen
+view: a step axis on the left (one line per action attempt, the same fold
+`narsor steps` prints — a retried or revisited state shows every attempt
+separately, never one line mutated in place) and, on the right, that step's
+content — the attempt's conversation record for an agent step, or its raw
+events for anything else. Selecting a step by `c` jumps straight to it; `Enter`
+on an execution selects the step currently running, or the last one when
+nothing is. Conversation entries are shown by kind (user, assistant, thinking,
+tool call, tool result, the harness's final result, system, `stderr`, narsor)
+and long ones are collapsed to a few lines by default — `Enter`/`space`
+expands or collapses the one under the content cursor. Nothing here
+auto-refreshes: `r` re-reads the step axis and the selected step's content
+from the embedded API (below), on demand, including a step that is still
+running. `Esc` returns to wherever the task view was opened from — the
+execution list, the Events panel, or the detail window — with that view's
+selection exactly as it was, even if new events arrived while the task view
+was open.
+
+The task view, and only the task view, reads through a small embedded,
+read-only HTTP API the TUI process starts on `127.0.0.1` at a random port,
+guarded by a bearer token generated fresh per process (D52) — the same
+boundary a later standalone `narsor serve` (M2) will sit behind, without the
+task view changing how it asks for a step axis or a conversation. `narsor
+steps` and `narsor conversation` are its CLI equivalents (parity principle):
+they read the same underlying functions directly against the store, without
+going through that API or needing a TUI running at all.
 
 **Creating things.** Two keys create rather than inspect, and each is the CLI
 operation of the same name with a form in front of it — nothing is reachable
@@ -533,11 +629,28 @@ a person afterwards is the state's own business.
 ### Sessions
 
 Every run is an agent session: `AgentSessionStarted` is written to the event
-log before the harness starts, `AgentMessage` carries the agent's final text,
-and `AgentSessionCompleted` or `AgentSessionFailed` closes it. The harness's own
-session id is captured from its output and published two ways: as the context
-variable `agent_session_id`, and inside the result under
-`data.agent_session`.
+log before the harness starts, `AgentMessage` carries the agent's final text
+(truncated — see below), and `AgentSessionCompleted` or `AgentSessionFailed`
+closes it. The harness's own session id is captured from its output and
+published two ways: as the context variable `agent_session_id`, and inside the
+result under `data.agent_session`.
+
+Both harnesses are run in streaming mode by default (`--output-format
+stream-json --verbose` for Claude Code, `--format json` for opencode, which
+already streams NDJSON incrementally) — measured live against Claude Code
+2.1.283 and opencode 2.0.15. Every line the harness process writes, to either
+stream, is appended immediately to that attempt's own conversation record:
+`{root}/executions/{id}/conversations/{action_execution_id}.jsonl` while the
+attempt is open, compressed to `.jsonl.zst` once it closes. `AgentMessage`
+still carries only the harness's final text — the event log is not a place
+for megabytes of tool chatter — but nothing said over the stream is lost: the
+conversation record is the byte-for-byte source of truth for what the harness
+actually said, in order, prompt included. `narsor conversation <id> <attempt>`
+(and the TUI's task view) read it; nothing else in narsor reads it. A conversation
+record's key is the attempt's `action_execution_id` — the same idempotency key
+D24 already assigns fresh on every attempt — so a retried step never shares
+one record between its attempts, and the record survives a local takeover
+untouched, in the same directory the checkpoint bundle lives beside.
 
 Resumption is **half-wired on purpose.** `parameters.resume_session: <id>`
 continues a known session (`--resume` / `--session`), but `parameters` is not
@@ -773,6 +886,7 @@ Under the `--root` directory (`./.narsor` by default):
 │   ├── checkpoint.bundle           # git bundle of the workspace delta against base_commit
 │   ├── checkpoint.git/             # scratch area for materialising the checkpoint
 │   ├── events/{sequence:08}.json   # append-only event log
+│   ├── conversations/{action_execution_id}.jsonl(.zst)  # per-attempt agent conversation record
 │   └── artifacts/{artifact_id}/    # files produced by actions
 ├── tasks/{execution_id}/
 │   └── code/
@@ -923,7 +1037,12 @@ Deliberately deferred to Phase 3 — each item needs a plan of its own:
 - **`WaitAction`** and the service that polls for external events.
 - **Agent decisions** (`decision: { type: agent }`) — they return an explicit
   "not available" error instead of quietly behaving like a rule-based decision.
-- **A REST API and SSE** — the TUI and the CLI talk to the engine in-process.
+- **A REST API and SSE for driving executions** (run, input, transitions, a
+  live event stream) — the TUI and the CLI still talk to the engine
+  in-process for all of that. What exists today is narrower: a read-only HTTP
+  API embedded in the TUI process, loopback-only and token-protected (D52),
+  serving only the step timeline and conversation reads the task view needs —
+  the first step toward D36–D38, not the whole of it.
 - **Containerisation (Docker)** — isolation rests today on filesystem
   permissions, which protects against a mistake and not against a malicious
   agent. Do not run untrusted workflows.

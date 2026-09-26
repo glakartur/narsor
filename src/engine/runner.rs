@@ -893,11 +893,28 @@ impl Engine {
                 return Ok(ActionUpshot::Stopped);
             }
 
-            attempt += 1;
-            let delay = schedule.delay_before(attempt);
+            let next_attempt = attempt + 1;
+            let delay = schedule.delay_before(next_attempt);
+
+            // Announced before the backoff sleep (R4, R7, R11): an operator
+            // watching the log sees the failure the moment it happens, not
+            // only once the delay has elapsed. The last attempt never reaches
+            // here — it fails through the branch above, as `ActionFailed`.
+            self.emit(
+                &execution.id,
+                EventData::ActionAttemptFailed {
+                    action_execution_id: action_execution_id.clone(),
+                    state_id: state.id.clone(),
+                    error: failure.message,
+                    retry_in_ms: delay.as_millis() as u64,
+                },
+            )?;
+
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
+
+            attempt = next_attempt;
 
             // A fresh idempotency key per attempt (D24), announced in the event.
             action_execution_id = Uuid::new_v4().to_string();
@@ -907,6 +924,7 @@ impl Engine {
                 EventData::ActionRetrying {
                     action_execution_id: action_execution_id.clone(),
                     retry_count: RetrySchedule::retry_count(attempt),
+                    state_id: Some(state.id.clone()),
                 },
             )?;
         }
@@ -942,11 +960,31 @@ impl Engine {
             ))
         })?;
 
+        let conversation_store = self.store.conversation_store(&execution.id);
         let request = ActionRequest::new(&rendered, &execution.workspace, action_execution_id)
             .with_timeout(timeout)
-            .with_execution_id(&execution.id);
+            .with_execution_id(&execution.id)
+            .with_conversation_store(&conversation_store);
 
-        match executor.execute(request).await {
+        let outcome = executor.execute(request).await;
+
+        // The attempt is over, one way or another (completed, suspended,
+        // timed out, or failed outright): whatever it wrote to the
+        // conversation store is final, so this is where it is closed and
+        // compressed (R15). A script or human action never opened a writer,
+        // so this is a harmless no-op for them. Closing must never fail the
+        // attempt itself — same principle as `LoggingEventSink` recording an
+        // event: the durable record of what happened is already safe, and a
+        // compression failure is not a reason to also fail the workflow.
+        if let Err(error) = conversation_store.close_attempt(action_execution_id) {
+            tracing::warn!(
+                action_execution_id,
+                %error,
+                "could not close/compress this attempt's conversation file"
+            );
+        }
+
+        match outcome {
             Ok(ActionOutcome::Completed(result)) => Ok(AttemptOutcome::Completed(result)),
 
             Ok(ActionOutcome::TimedOut(timed_out)) => {

@@ -38,10 +38,10 @@ for arg in "$@"; do
     printf '%s\n--%%ARG%%--\n' "$arg" >> "$dir/args.$count"
 done
 
-if [ -f "$dir/sleep" ]; then
-    sleep "$(cat "$dir/sleep")"
-fi
-
+# Output is printed *before* the sleep, and flushed line-by-line (`cat` does
+# not buffer), so a streaming reader on the other end of the pipe really does
+# see each line arrive before the process is made to hang past a timeout —
+# the whole point of the "two lines, then sleep past the timeout" tests.
 if [ -f "$dir/stdout.$count" ]; then
     cat "$dir/stdout.$count"
 elif [ -f "$dir/stdout" ]; then
@@ -50,6 +50,10 @@ fi
 
 if [ -f "$dir/stderr" ]; then
     cat "$dir/stderr" >&2
+fi
+
+if [ -f "$dir/sleep" ]; then
+    sleep "$(cat "$dir/sleep")"
 fi
 
 if [ -f "$dir/exit" ]; then

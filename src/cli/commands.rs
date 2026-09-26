@@ -34,10 +34,14 @@ use serde_json::{Map, Value};
 use crate::domain::{
     Event, ExecutionStatus, InputParameter, ParamType, WorkflowDefinition, WorkflowExecution,
 };
-use crate::engine::{Engine, HumanInputDelivery, PendingHumanInput};
-use crate::persistence::{ExecutionStore, StatePaths};
+use crate::engine::{
+    build_timeline, ConversationState, Engine, HumanInputDelivery, PendingHumanInput, Position,
+    PositionStatus,
+};
+use crate::persistence::{ConversationEntry, ExecutionStore, StatePaths};
 use crate::registry::{infer_provider, RepositoryEntry, RepositoryRegistry};
 use crate::tasks::{self, TaskError};
+use crate::tui::conversation::classify;
 use crate::workflows::{builtin, builtin_names, ResolvedWorkflow, WorkflowResolver};
 
 use crate::config::{render_value, Resolved, SettingKey, Source};
@@ -411,6 +415,162 @@ fn event_type(event: &Event) -> String {
                 .map(ToString::to_string)
         })
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// steps / conversation (U8)
+// ---------------------------------------------------------------------------
+
+/// `narsor steps <id>` — the step timeline, one line per attempt.
+///
+/// Reads through exactly the same function the embedded API's `/timeline`
+/// endpoint calls ([`build_timeline`]), directly against the store — the same
+/// way `events` already reads the log directly rather than over HTTP. The CLI
+/// never talks to the embedded API: that server exists for the TUI's task
+/// view (U5/U7), and the parity principle this unit implements means every
+/// read it offers must also be reachable without a running TUI process.
+pub fn steps(state: &Path, execution_id: &str) -> Result<()> {
+    let store = ExecutionStore::new(state);
+    let execution = load_execution(&store, execution_id)?;
+    let events = store
+        .event_log(execution_id)
+        .read_all()
+        .map_err(|error| CliError::failure(format!("Could not read the events: {error}")))?;
+    let presence = conversation_presence(&store, execution_id)?;
+    let timeline = build_timeline(&events, execution.status, &presence);
+
+    if timeline.positions.is_empty() {
+        println!("No steps.");
+        return Ok(());
+    }
+
+    for position in &timeline.positions {
+        print_position(position);
+    }
+    Ok(())
+}
+
+/// One position: label, status, action type, start/end, and — when they
+/// apply — the error, the retry-pending and harness-interrupted flags, and
+/// why the conversation cannot be read.
+fn print_position(position: &Position) {
+    println!(
+        "{:<14} {:<18} {:<10} {}  ->  {}",
+        position.label,
+        position_status_name(position.status),
+        position.action_type.as_deref().unwrap_or("-"),
+        position
+            .started_at
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_else(|| "-".to_string()),
+        position
+            .ended_at
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_else(|| "-".to_string()),
+    );
+    if let Some(error) = &position.error {
+        println!("    error: {error}");
+    }
+    if position.retry_pending {
+        println!("    waiting to retry");
+    }
+    if position.harness_session_interrupted {
+        println!("    harness session interrupted");
+    }
+    if let Some(resumed) = &position.resumed_harness_session {
+        println!("    resumed harness session: {resumed}");
+    }
+    match &position.conversation {
+        ConversationState::Recorded => {
+            if let Some(attempt_id) = &position.action_execution_id {
+                println!("    attempt id: {attempt_id}");
+            }
+        }
+        ConversationState::NotCreated { reason } => {
+            println!("    conversation not created: {reason}")
+        }
+        ConversationState::NoRecord => println!("    no conversation record (old log)"),
+    }
+}
+
+/// The schema spelling of a position's status.
+fn position_status_name(status: PositionStatus) -> &'static str {
+    match status {
+        PositionStatus::Succeeded => "succeeded",
+        PositionStatus::Failed => "failed",
+        PositionStatus::Interrupted => "interrupted",
+        PositionStatus::InProgress => "in_progress",
+        PositionStatus::AwaitingDecision => "awaiting_decision",
+    }
+}
+
+/// Every attempt id with a conversation record on disk, open or closed.
+///
+/// The same question [`crate::api::routes`]'s `get_timeline` handler answers
+/// for [`build_timeline`]'s `conversation_presence` argument — both delegate
+/// to [`crate::persistence::ConversationStore::recorded_attempt_ids`] so the
+/// two can never compute a different answer for the same execution.
+fn conversation_presence(
+    store: &ExecutionStore,
+    execution_id: &str,
+) -> Result<std::collections::HashSet<String>> {
+    store
+        .conversation_store(execution_id)
+        .recorded_attempt_ids()
+        .map_err(|error| CliError::failure(format!("Could not read conversation records: {error}")))
+}
+
+/// `narsor conversation <id> <attempt>` — one attempt's conversation, in
+/// order, in full (R9: nothing is truncated).
+///
+/// Reads through [`crate::persistence::ConversationStore::read`] directly, the
+/// same store the embedded API's `/conversation` endpoint wraps — again, no
+/// HTTP involved. Every entry is printed classified ([`classify`], reused
+/// as-is from the TUI's task view, U7) for readability, but the classified
+/// text is always the entry's full decoded content, never a summary — the
+/// raw-and-complete requirement holds regardless of the kind sniffed from it.
+pub fn conversation(state: &Path, execution_id: &str, attempt_id: &str) -> Result<()> {
+    let store = ExecutionStore::new(state);
+    load_execution(&store, execution_id)?;
+
+    let conversations = store.conversation_store(execution_id);
+    let snapshot = conversations
+        .read(attempt_id, 1, usize::MAX)
+        .map_err(|error| CliError::failure(format!("Could not read the conversation: {error}")))?
+        .ok_or_else(|| {
+            CliError::failure(format!(
+                "No conversation record for attempt '{attempt_id}' in execution '{execution_id}'."
+            ))
+        })?;
+
+    for entry in &snapshot.entries {
+        print_conversation_entry(entry);
+    }
+    if snapshot.truncated_tail {
+        println!("(the last line on disk was incomplete — the attempt was interrupted mid-write)");
+    }
+    Ok(())
+}
+
+/// One conversation entry: number, timestamp, source/kind, decoded content.
+fn print_conversation_entry(entry: &ConversationEntry) {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+
+    let dto = crate::api::ConversationEntryDto {
+        entry_number: entry.entry_number,
+        timestamp: entry.timestamp,
+        source: entry.source,
+        raw_base64: BASE64.encode(&entry.raw),
+    };
+    let classified = classify(&dto);
+    println!(
+        "{:>5}  {}  {:<10} {}",
+        classified.entry_number,
+        classified.timestamp.to_rfc3339(),
+        classified.kind.label(),
+        classified.text
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -41,6 +41,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::domain::{ActionConfig, ActionError, ActionResult, OutputLabel, Workspace};
+use crate::persistence::ConversationStore;
 
 pub use agent::{AgentEventSink, AgentExecutor, AgentOutput, LoggingEventSink};
 pub use harness::{
@@ -90,6 +91,15 @@ pub struct ActionRequest<'a> {
     /// writes the log. `None` means "nobody is listening": the run is
     /// unaffected and the events go nowhere.
     pub execution_id: Option<&'a str>,
+
+    /// Where this attempt's conversation is recorded (U3), when there is one
+    /// to write to.
+    ///
+    /// Only [`AgentExecutor`] writes to it; every other executor ignores it.
+    /// `None` means the same as it does for `execution_id`: a direct unit
+    /// test with nothing wired up, where writing a conversation would have
+    /// nowhere meaningful to land.
+    pub conversation_store: Option<&'a ConversationStore>,
 }
 
 impl<'a> ActionRequest<'a> {
@@ -105,6 +115,7 @@ impl<'a> ActionRequest<'a> {
             timeout: None,
             action_execution_id,
             execution_id: None,
+            conversation_store: None,
         }
     }
 
@@ -117,6 +128,12 @@ impl<'a> ActionRequest<'a> {
     /// Returns the same request naming the execution it belongs to.
     pub fn with_execution_id(mut self, execution_id: &'a str) -> Self {
         self.execution_id = Some(execution_id);
+        self
+    }
+
+    /// Returns the same request naming where its conversation is recorded.
+    pub fn with_conversation_store(mut self, store: &'a ConversationStore) -> Self {
+        self.conversation_store = Some(store);
         self
     }
 }

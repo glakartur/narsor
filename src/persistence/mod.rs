@@ -10,6 +10,8 @@
 //!     pending_input.json          -- the input request a paused execution awaits
 //!     events/{sequence:08}.json   -- append-only event log
 //!     artifacts/{artifact_id}/    -- files produced by actions
+//!     conversations/{attempt_id}.jsonl        -- open attempt, see conversation
+//!     conversations/{attempt_id}.jsonl.zst    -- closed attempt, compressed
 //! ```
 //!
 //! Every write goes through [`atomic`]: a temporary file in the *same*
@@ -18,6 +20,7 @@
 //! write leaves the previous version intact.
 
 pub mod atomic;
+pub mod conversation;
 pub mod event_log;
 pub mod execution_store;
 pub mod paths;
@@ -26,14 +29,18 @@ pub mod recovery;
 pub use atomic::{
     cleanup_orphaned_temp_files, read_json, write_atomic, write_atomic_exclusive, write_json_atomic,
 };
+pub use conversation::{
+    ConversationEntry, ConversationSnapshot, ConversationSource, ConversationStore,
+    ConversationWriter,
+};
 pub use event_log::EventLog;
 pub use execution_store::{ExecutionStore, PENDING_INPUT_FILE};
 pub use paths::{
     CatalogPaths, StatePaths, WorkPaths, CONTEXT_FILE, DEFAULT_ROOT, STATE_FILE, TEMP_SUFFIX,
 };
 pub use recovery::{
-    reconcile, reconcile_all, recover, sweep_orphaned_workspaces, OrphanReason, OrphanedWorkspace,
-    Reconciliation, ReconciliationOutcome, RecoveryReport,
+    compress_closed_conversations, reconcile, reconcile_all, recover, sweep_orphaned_workspaces,
+    OrphanReason, OrphanedWorkspace, Reconciliation, ReconciliationOutcome, RecoveryReport,
 };
 
 use std::io;

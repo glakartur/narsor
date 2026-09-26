@@ -1,6 +1,6 @@
 //! The `opencode` harness — the `opencode run` batch entry point.
 //!
-//! Measured against `opencode` v2.0.14:
+//! Measured against `opencode` v2.0.15:
 //!
 //! ```text
 //! opencode run [--model <provider/model#variant>] [--agent <agent>] \
@@ -12,9 +12,13 @@
 //! # Why that shape
 //!
 //! * `run` is the non-interactive entry point; the bare `opencode` opens a TUI.
-//! * `--format json` gives the session id alongside the text. It is placed
-//!   **last** before the message because it takes exactly one value, so the
-//!   message after it cannot be read as a flag argument.
+//! * `--format json` gives NDJSON emitted incrementally as the agent works,
+//!   with the session id on every line's envelope (`sessionID`) and the
+//!   answer's text on the last `text`-typed line — no argv change was needed
+//!   for U3's streaming capture, since this harness already streamed (R13's
+//!   "opencode: yes" open question). It is placed **last** before the message
+//!   because it takes exactly one value, so the message after it cannot be
+//!   read as a flag argument.
 //! * `--session <id>` continues a session (D18); `--fork` is exposed through
 //!   `parameters.fork` for the case where the continuation must not disturb the
 //!   original.
@@ -39,7 +43,7 @@
 
 use super::{
     bool_parameter, reject_option_like, resolve_read_only_path, string_parameter, tail,
-    HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun,
+    HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
 };
 use crate::domain::ActionError;
 use serde_json::Value;
@@ -132,26 +136,86 @@ impl HarnessAdapter for OpenCodeAdapter {
         })
     }
 
-    fn parse(&self, stdout: &str, stderr: &str, exit_code: i32) -> HarnessRun {
-        let envelope: Option<Value> = serde_json::from_str(stdout.trim()).ok();
+    fn stream_parser(&self) -> Box<dyn HarnessStreamParser> {
+        Box::new(OpenCodeStreamParser::default())
+    }
+}
 
-        let text = envelope
-            .as_ref()
-            .and_then(extract_text)
-            .unwrap_or_else(|| stdout.to_string());
+/// Accumulates the `--format json` NDJSON lines of one run into a
+/// [`HarnessRun`].
+///
+/// opencode has no envelope that marks the end of the run — the process
+/// exiting *is* the end — so unlike Claude Code's `result` line there is
+/// nothing to wait for here: the last `text`-typed line seen wins, whichever
+/// line that turns out to be.
+#[derive(Debug, Default)]
+struct OpenCodeStreamParser {
+    /// The text of the last `text`-typed line seen.
+    text: Option<String>,
+    /// The most recent session id seen, from any line's envelope.
+    session_id: Option<String>,
+    /// The most recent `error`-typed line seen, as readable text.
+    error: Option<String>,
+}
 
-        let session_id = envelope.as_ref().and_then(extract_session_id);
+impl HarnessStreamParser for OpenCodeStreamParser {
+    fn on_stdout_line(&mut self, line: &[u8]) {
+        let Ok(text) = std::str::from_utf8(line) else {
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
+            return;
+        };
 
-        let failure = (exit_code != 0).then(|| {
-            format!(
+        if let Some(session_id) = extract_session_id(&value) {
+            self.session_id = Some(session_id);
+        }
+
+        let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        match line_type {
+            // A line with no `type` at all, or one tagged `result`, is the
+            // pre-streaming single-object shape some fixtures (and possibly
+            // an older CLI) still produce; treated the same as an explicit
+            // `text` line, since it carries the answer the same way.
+            "" | "text" | "result" => {
+                if let Some(text) = extract_text(&value) {
+                    self.text = Some(text);
+                }
+            }
+            "error" => {
+                self.error = Some(
+                    extract_text(&value)
+                        .or_else(|| {
+                            value
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| value.to_string()),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(self: Box<Self>, exit_code: i32, stderr_tail: &str) -> HarnessRun {
+        let failure = if exit_code != 0 {
+            Some(format!(
                 "opencode exited with code {exit_code}: {}",
-                tail(stderr, FAILURE_DETAIL_BYTES)
-            )
-        });
+                tail(stderr_tail, FAILURE_DETAIL_BYTES)
+            ))
+        } else {
+            self.error.as_ref().map(|error| {
+                format!(
+                    "opencode reported an error: {}",
+                    tail(error, FAILURE_DETAIL_BYTES)
+                )
+            })
+        };
 
         HarnessRun {
-            text,
-            session_id,
+            text: self.text.unwrap_or_default(),
+            session_id: self.session_id,
             failure,
         }
     }

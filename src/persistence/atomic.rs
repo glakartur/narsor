@@ -134,7 +134,12 @@ pub fn cleanup_orphaned_temp_files(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Writes `bytes` to a fresh file and flushes it all the way to the device.
-fn write_and_sync(path: &Path, bytes: &[u8]) -> Result<()> {
+///
+/// `pub(crate)` rather than private: [`crate::persistence::conversation`]
+/// reuses it for the compression step, which is the same temp+fsync+rename
+/// shape as every other atomic write in this module, just for bytes that
+/// were not serialized from a `Serialize` value.
+pub(crate) fn write_and_sync(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -152,7 +157,9 @@ fn write_and_sync(path: &Path, bytes: &[u8]) -> Result<()> {
 ///
 /// Best effort: some filesystems refuse to open a directory for sync, and a
 /// failure here never invalidates the data that was already written.
-fn sync_parent_dir(path: &Path) {
+///
+/// `pub(crate)` for the same reason as [`write_and_sync`].
+pub(crate) fn sync_parent_dir(path: &Path) {
     if let Some(parent) = path.parent() {
         if let Ok(dir) = File::open(parent) {
             let _ = dir.sync_all();

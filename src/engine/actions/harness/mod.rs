@@ -76,6 +76,32 @@ pub struct HarnessRun {
     pub failure: Option<String>,
 }
 
+/// A stateful parser fed one stdout line at a time as the harness streams,
+/// which distills a [`HarnessRun`] once the process has ended.
+///
+/// Streaming means no single buffer ever holds the whole run: the executor
+/// writes every line to the conversation store as it arrives and hands only
+/// that line to the parser, so this trait's job is to remember exactly what
+/// building a [`HarnessRun`] needs (the final text, the session id, a
+/// reported failure) and nothing more. A harness line is fed here only when
+/// it is at most [`super::agent::PARSE_LINE_LIMIT`] bytes; a longer line is
+/// still written to the conversation in full (R14) but is skipped for parsing
+/// — in every observed harness the final result never arrives on an
+/// oversized line, only bulky tool output does.
+pub trait HarnessStreamParser: Send {
+    /// Feeds one stdout line, exactly as the harness printed it (no trailing
+    /// newline). Not necessarily valid UTF-8 or valid JSON — an adapter that
+    /// cannot make sense of a line simply ignores it.
+    fn on_stdout_line(&mut self, line: &[u8]);
+
+    /// Distills the run once the process has exited.
+    ///
+    /// `exit_code` is a failure for every harness regardless of what the
+    /// stream said, so it is passed in rather than re-derived; `stderr_tail`
+    /// is quoted into a failure message the same way it always was.
+    fn finish(self: Box<Self>, exit_code: i32, stderr_tail: &str) -> HarnessRun;
+}
+
 /// Runs an [`AgentActionConfig`] on one particular harness CLI.
 ///
 /// Implementors are stateless value types and are shared behind an [`Arc`].
@@ -89,12 +115,12 @@ pub trait HarnessAdapter: Send + Sync + std::fmt::Debug {
     /// Builds the command line for one run.
     fn invocation(&self, request: &HarnessRequest<'_>) -> Result<HarnessInvocation, ActionError>;
 
-    /// Reads the harness's output into the agent's final text, its session id
-    /// and whether the harness considers the run a failure.
+    /// Creates a fresh parser for one run's stdout stream.
     ///
-    /// A non-zero exit code is a failure for every harness, so it is passed in
-    /// rather than re-derived; an adapter may add detail to it.
-    fn parse(&self, stdout: &str, stderr: &str, exit_code: i32) -> HarnessRun;
+    /// A new one per run: the parser accumulates state (a session id seen so
+    /// far, whether a `result` line has appeared) that must never leak
+    /// between two attempts.
+    fn stream_parser(&self) -> Box<dyn HarnessStreamParser>;
 }
 
 /// The harnesses an [`AgentExecutor`](super::agent::AgentExecutor) knows.

@@ -121,6 +121,33 @@ pub enum Command {
         follow: bool,
     },
 
+    /// Prints the step timeline of an execution: one line per attempt.
+    ///
+    /// The CLI counterpart of the TUI's task view axis (U7) — same
+    /// [`crate::engine::build_timeline`] fold over the same event log, read
+    /// directly from the store rather than through the embedded API, exactly
+    /// like `events` already does (parity principle, not a shortcut).
+    Steps {
+        /// The execution identifier.
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: String,
+    },
+
+    /// Prints one attempt's conversation record, in order, in full.
+    ///
+    /// The CLI counterpart of the TUI's task view content pane when it shows
+    /// a conversation (U7). `ATTEMPT_ID` is the attempt's
+    /// `action_execution_id`, as printed by `steps` or `events`.
+    Conversation {
+        /// The execution identifier.
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: String,
+
+        /// The attempt identifier (`action_execution_id`).
+        #[arg(value_name = "ATTEMPT_ID")]
+        attempt_id: String,
+    },
+
     /// Delivers human input to a paused execution and resumes it.
     Input {
         /// The execution identifier.
@@ -285,6 +312,8 @@ impl Command {
             | Command::List
             | Command::Show { .. }
             | Command::Events { .. }
+            | Command::Steps { .. }
+            | Command::Conversation { .. }
             | Command::Input { .. }
             | Command::Resume { .. }
             | Command::Workflow { .. }
@@ -340,6 +369,11 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             execution_id,
             follow,
         } => commands::events(&state, &execution_id, follow).await,
+        Command::Steps { execution_id } => commands::steps(&state, &execution_id),
+        Command::Conversation {
+            execution_id,
+            attempt_id,
+        } => commands::conversation(&state, &execution_id, &attempt_id),
         Command::Input {
             execution_id,
             fields,
