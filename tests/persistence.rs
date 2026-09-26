@@ -187,6 +187,44 @@ fn append_next_allocates_consecutive_sequence_numbers() {
     assert_eq!(log.read_all().expect("read log").len(), 2);
 }
 
+/// A second, independent `EventLog` handle on the same directory — which now
+/// legitimately happens when a background TUI run's own error is emitted
+/// concurrently with the pass it was rejected in favour of still writing its
+/// own events — starts its own next-sequence cache from its own directory
+/// listing, so both handles can compute the same "next" number. The retry in
+/// `append_next` claims the next free slot instead of failing outright.
+#[test]
+fn append_next_retries_past_a_sequence_a_second_handle_already_claimed() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let execution_id = "exec-append-next-collision".to_string();
+
+    // Two handles on the same log, exactly as two different `Engine` method
+    // calls each get their own via `ExecutionStore::event_log`.
+    let first_handle = store.event_log(&execution_id);
+    let second_handle = store.event_log(&execution_id);
+
+    let first = first_handle
+        .append_next(&execution_id, EventData::WorkflowResumed)
+        .expect("append via the first handle");
+    assert_eq!(first.sequence, 1);
+
+    // The second handle's cache still thinks 1 is free: it has never
+    // written through this handle before.
+    let second = second_handle
+        .append_next(
+            &execution_id,
+            EventData::WorkflowPaused {
+                reason: "human input".to_string(),
+            },
+        )
+        .expect("append via the second handle, past the collision");
+    assert_eq!(second.sequence, 2, "it claimed the next free slot instead");
+
+    let events = first_handle.read_all().expect("read the log");
+    assert_eq!(events.len(), 2, "both events landed, none silently lost");
+}
+
 #[test]
 fn directory_structure_is_created_on_first_write() {
     let root = TempRoot::new();

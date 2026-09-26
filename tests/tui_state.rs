@@ -136,6 +136,99 @@ fn engine_for(root: &Path) -> Arc<Engine> {
     Arc::new(Engine::new(ExecutionStore::new(root)))
 }
 
+/// Reloads `execution_id`, retrying briefly until its status matches
+/// `expected`.
+///
+/// Inside the engine, the terminal/failure event is emitted a step before the
+/// store save that records the same status (`Engine::finish`,
+/// `Engine::fail_execution`) — an internal ordering this plan does not touch.
+/// A reader on another task can therefore observe the event
+/// (`drive_until_settled` returns) a hair before that save lands, which a
+/// single immediate read would flake on under the real thread interleaving a
+/// `multi_thread` runtime allows.
+fn reload_until(
+    engine: &Engine,
+    execution_id: &str,
+    expected: ExecutionStatus,
+) -> WorkflowExecution {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        let execution = engine
+            .store()
+            .load_execution(execution_id)
+            .expect("reload the execution");
+        if execution.status == expected || std::time::Instant::now() >= deadline {
+            return execution;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Feeds `app` from `events` — exactly as the real event loop feeds it from
+/// [`Engine::subscribe`] — until one event names a terminal or error outcome
+/// for `execution_id`.
+///
+/// Dispatching one of the four engine-driving requests now only spawns the
+/// engine call in the background (R1): the request handler itself returns
+/// before that call finishes. A test that wants to see its outcome — on the
+/// execution's own record, or on `app`'s row/notice state — has to actually
+/// pump the same event stream production does, instead of asserting the
+/// instant the handler returns. The subscription must be taken before the
+/// dispatch that starts the background call, or an event emitted in the gap
+/// is missed.
+async fn drive_until_settled(
+    app: &mut App,
+    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    execution_id: &str,
+) {
+    drive_until_all_settled(app, events, &[execution_id]).await;
+}
+
+/// Like [`drive_until_settled`], for more than one execution id at once:
+/// waits until every one of `execution_ids` has had its own settling event
+/// observed, rather than stopping at the first match.
+///
+/// This is not the same as calling [`drive_until_settled`] once per id in
+/// sequence: there is one shared receiver, and a `recv()` that returns an
+/// event removes it from that receiver's view for good. Waiting for id A in
+/// full before starting to wait for id B would silently discard B's own
+/// settling event if it happened to arrive first — exactly the interleaving
+/// two backgrounded executions produce.
+async fn drive_until_all_settled(
+    app: &mut App,
+    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    execution_ids: &[&str],
+) {
+    let mut pending: std::collections::HashSet<&str> = execution_ids.iter().copied().collect();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !pending.is_empty() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for {pending:?} to settle"
+        );
+        let received = tokio::time::timeout(remaining, events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {pending:?} to settle"));
+        if let Ok(event) = &received {
+            let settled = pending.contains(event.workflow_execution_id.as_str())
+                && matches!(
+                    event.data,
+                    EventData::WorkflowCompleted { .. }
+                        | EventData::WorkflowFailed { .. }
+                        | EventData::WorkflowCancelled { .. }
+                        | EventData::WorkflowPaused { .. }
+                        | EventData::HumanInputRequested { .. }
+                        | EventData::Error { .. }
+                );
+            if settled {
+                pending.remove(event.workflow_execution_id.as_str());
+            }
+        }
+        app.on_stream(received);
+    }
+}
+
 /// Starts an execution and runs it until it stops on the `review` question.
 async fn paused_at_review(engine: &Engine, root: &Path) -> String {
     let execution = start(engine, root);
@@ -369,16 +462,16 @@ async fn submitting_a_valid_form_resumes_the_execution() {
     app.on_key(key(KeyCode::Tab));
     type_text(&mut app, "looks good");
 
+    let mut events = engine.subscribe();
     assert_eq!(app.on_key(key(KeyCode::Enter)), Request::SubmitInput);
     app.submit_input().await;
+    assert!(!matches!(app.modal(), Modal::Input(_)), "the form closed");
 
-    let execution = engine
-        .store()
-        .load_execution(&execution_id)
-        .expect("reload the execution");
+    drive_until_settled(&mut app, &mut events, &execution_id).await;
+
+    let execution = reload_until(&engine, &execution_id, ExecutionStatus::Completed);
     assert_eq!(execution.status, ExecutionStatus::Completed);
     assert_eq!(execution.current_state.as_deref(), Some("done"));
-    assert!(!matches!(app.modal(), Modal::Input(_)), "the form closed");
     assert!(!app.notice().expect("a notice").is_error);
 }
 
@@ -740,8 +833,14 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
     );
 
     // `s` — run the script state; the workflow stops on the question.
+    let mut events = engine.subscribe();
     assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
     app.run_selected().await;
+    drive_until_settled(&mut app, &mut events, &execution.id).await;
+    // Only the row's own status comes live off the stream (`apply_to_row`);
+    // `pending()`/`variables()` are read on selection, so the test refreshes
+    // them the way pressing `r` would.
+    app.refresh();
 
     assert_eq!(
         app.selected().expect("a selection").status,
@@ -767,20 +866,19 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
     app.on_key(key(KeyCode::Tab));
     type_text(&mut app, "approved after review");
     app.on_key(key(KeyCode::Enter));
+    let mut events = engine.subscribe();
     app.submit_input().await;
+    drive_until_settled(&mut app, &mut events, &execution.id).await;
 
-    let execution = engine
-        .store()
-        .load_execution(&execution.id)
-        .expect("reload the execution");
+    let execution = reload_until(&engine, &execution.id, ExecutionStatus::Completed);
     assert_eq!(execution.status, ExecutionStatus::Completed);
     assert_eq!(execution.current_state.as_deref(), Some("done"));
 
-    let events = events_of(&engine, &execution.id);
-    assert!(events
+    let recorded = events_of(&engine, &execution.id);
+    assert!(recorded
         .iter()
         .any(|event| matches!(&event.data, EventData::HumanInputReceived { .. })));
-    assert!(events
+    assert!(recorded
         .iter()
         .any(|event| matches!(&event.data, EventData::WorkflowCompleted { .. })));
 
@@ -793,6 +891,318 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
     // `q` ends the session.
     app.on_key(key(KeyCode::Char('q')));
     assert!(app.should_quit());
+}
+
+/// Writes a workflow with one deliberately slow `script` step (`sleep 0.3`),
+/// so a test has a real window to dispatch into while it is still running.
+fn write_slow_definition(root: &TempRoot, name: &str) -> (WorkflowDefinition, PathBuf) {
+    let script_path = root.path().join(format!("{name}.sh"));
+    fs::write(
+        &script_path,
+        "#!/bin/sh\nsleep 0.3\nprintf '{\"output\": \"done\"}\\n'\nexit 0\n",
+    )
+    .expect("write the slow script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script_path)
+            .expect("stat the script")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("make it executable");
+    }
+
+    let yaml = format!(
+        r#"
+name: {name}
+version: 1
+description: Fixture with one deliberately slow step.
+
+states:
+  prepare:
+    description: A deliberately slow step.
+    allow_manual_override: true
+    action:
+      type: script
+      command: "{}"
+      args: []
+      exit_codes:
+        0: done
+    outputs:
+      - done
+    transitions:
+      done: finished
+
+  finished:
+    description: Terminal.
+
+terminal_states:
+  finished: completed
+"#,
+        script_path.display()
+    );
+    let path = root.path().join(format!("{name}.yaml"));
+    fs::write(&path, yaml).expect("write the definition");
+    let definition = load_from_file(&path).expect("load the definition");
+    (definition, path)
+}
+
+/// Starts an execution of `write_slow_definition`'s workflow, without running
+/// it, recording the definition path the way the TUI's new-task modal does.
+fn start_slow(engine: &Engine, root: &TempRoot, name: &str) -> WorkflowExecution {
+    let (definition, definition_path) = write_slow_definition(root, name);
+    let workspace_path = root.path().join(format!("{name}-workspace"));
+    fs::create_dir_all(&workspace_path).expect("create the workspace");
+    let mut execution = engine
+        .start(
+            &definition,
+            json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start the execution");
+    execution.metadata = json!({
+        "cli": { "definition_path": definition_path.display().to_string() }
+    });
+    engine
+        .store()
+        .save_execution(&execution)
+        .expect("record the definition path");
+    execution
+}
+
+/// R1/R2: dispatching a request whose first step is deliberately slow returns
+/// control long before that step finishes — the point of spawning it (U3)
+/// instead of awaiting it inline in the event loop's own `tokio::select!`.
+#[tokio::test(flavor = "multi_thread")]
+async fn dispatching_a_slow_first_step_does_not_block_the_caller() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let execution = start_slow(&engine, &root, "tui-slow");
+
+    let mut app = app_over(&engine, root.path());
+    app.refresh();
+    app.select_execution(&execution.id);
+    let mut events = engine.subscribe();
+
+    let started = std::time::Instant::now();
+    assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
+    app.run_selected().await;
+    let dispatch_elapsed = started.elapsed();
+
+    assert!(
+        dispatch_elapsed < std::time::Duration::from_millis(150),
+        "dispatching returned in {dispatch_elapsed:?}, so it did not wait \
+         on the 300ms step"
+    );
+
+    drive_until_settled(&mut app, &mut events, &execution.id).await;
+    let stored = reload_until(&engine, &execution.id, ExecutionStatus::Completed);
+    assert_eq!(stored.status, ExecutionStatus::Completed);
+}
+
+/// R3: two different executions can be driven in the background from the
+/// same TUI session at once, neither blocking on the other.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_different_executions_run_in_the_background_at_once() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let first = start_slow(&engine, &root, "tui-slow-a");
+    let second = start_slow(&engine, &root, "tui-slow-b");
+
+    let mut app = app_over(&engine, root.path());
+    app.refresh();
+    let mut events = engine.subscribe();
+
+    app.select_execution(&first.id);
+    assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
+    app.run_selected().await;
+
+    app.select_execution(&second.id);
+    assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
+    app.run_selected().await;
+
+    drive_until_all_settled(&mut app, &mut events, &[&first.id, &second.id]).await;
+
+    assert_eq!(
+        reload_until(&engine, &first.id, ExecutionStatus::Completed).status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(
+        reload_until(&engine, &second.id, ExecutionStatus::Completed).status,
+        ExecutionStatus::Completed
+    );
+}
+
+/// R6, R7: a second `s` on the same execution while the first pass is still
+/// running is rejected by the engine's guard (U1), and that rejection reaches
+/// the operator as a notice naming the execution (U2, U4) — instead of
+/// racing a second driver against the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_drive_of_the_same_execution_is_rejected_with_a_notice() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let execution = start_slow(&engine, &root, "tui-slow-guard");
+
+    let mut app = app_over(&engine, root.path());
+    app.refresh();
+    app.select_execution(&execution.id);
+    let mut events = engine.subscribe();
+
+    assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
+    app.run_selected().await;
+    // The second drive races the first's slow step, not a finished execution.
+    assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
+    app.run_selected().await;
+
+    // Both dispatches only *schedule* a background task — neither is awaited
+    // here — so the test waits for both outcomes on the stream rather than
+    // stopping at whichever lands first: the rejection is expected to be
+    // near-instant, but nothing guarantees it is scheduled before the winner's
+    // completion.
+    let mut saw_completed = false;
+    let mut saw_rejection = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !(saw_completed && saw_rejection) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for both the completion and the rejection \
+             (completed: {saw_completed}, rejected: {saw_rejection})"
+        );
+        let received = tokio::time::timeout(remaining, events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for both outcomes"));
+        if let Ok(event) = &received {
+            if event.workflow_execution_id == execution.id {
+                match &event.data {
+                    EventData::WorkflowCompleted { .. } => saw_completed = true,
+                    EventData::Error { message, .. }
+                        if message.contains("already being driven") =>
+                    {
+                        saw_rejection = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        app.on_stream(received);
+    }
+
+    let stored = reload_until(&engine, &execution.id, ExecutionStatus::Completed);
+    assert_eq!(
+        stored.status,
+        ExecutionStatus::Completed,
+        "exactly one driver actually advanced the execution"
+    );
+}
+
+/// R6: a terminal event for an execution that is not the one currently
+/// selected still sets a notice naming it — the mechanism is not gated on
+/// selection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_event_for_an_unselected_execution_still_sets_a_notice() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let watched = start_slow(&engine, &root, "tui-slow-unselected");
+    let other = start(&engine, root.path());
+
+    let mut app = app_over(&engine, root.path());
+    app.refresh();
+    app.select_execution(&watched.id);
+    let mut events = engine.subscribe();
+
+    assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
+    app.run_selected().await;
+
+    // Selection moves elsewhere before the background run finishes.
+    app.select_execution(&other.id);
+    assert_ne!(app.selected().expect("a selection").id, watched.id);
+
+    drive_until_settled(&mut app, &mut events, &watched.id).await;
+
+    let notice = app.notice().expect("a notice");
+    assert!(
+        notice.text.contains(&watched.id),
+        "the notice names the execution that actually finished: {notice:?}"
+    );
+}
+
+/// A manual/forced transition writes the store directly, bypassing
+/// `Engine::run`/`resume`/`deliver_human_input` and therefore U1's guard —
+/// so it needs its own check against a background pass already driving the
+/// same execution, or its direct writes would race that pass's own appends
+/// and its own `save_execution` with no coordination at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forced_transition_is_refused_while_a_background_pass_is_driving_the_same_execution() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let execution = start_slow(&engine, &root, "tui-slow-override");
+
+    let mut app = app_over(&engine, root.path());
+    app.refresh();
+    app.select_execution(&execution.id);
+
+    // Start the slow background pass; it now holds the guard for the whole
+    // 300ms of the script.
+    assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
+    app.run_selected().await;
+
+    // Wait for the spawned background task to actually acquire the guard —
+    // dispatch only schedules it, so nothing guarantees it has run yet.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !engine.is_active(&execution.id) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background pass never acquired the guard"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    // Without refreshing, the cached selection still shows `prepare`, which
+    // is exactly the state the background pass is stepping right now.
+    app.on_key(key(KeyCode::Char('t')));
+    app.on_key(key(KeyCode::Char('o')));
+    let Modal::Transition(menu) = app.modal() else {
+        panic!("the transition menu is open");
+    };
+    assert_eq!(menu.mode, TransitionMode::Override);
+    let target = menu
+        .entries()
+        .iter()
+        .position(|entry| entry == "finished")
+        .expect("`finished` is offered as an override target");
+    for _ in 0..target {
+        app.on_key(key(KeyCode::Char('j')));
+    }
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.on_key(key(KeyCode::Char('y'))),
+        Request::ApplyTransition
+    );
+    app.apply_transition().await;
+
+    assert!(
+        app.notice().expect("a notice").is_error,
+        "the forced transition is refused while the pass is live"
+    );
+    // The background pass is legitimately still writing its own events
+    // concurrently, so a plain event count would be racy; what the refused
+    // transition itself must never have written is a `HumanTransitionSelected`.
+    assert!(
+        !events_of(&engine, &execution.id)
+            .iter()
+            .any(|event| matches!(&event.data, EventData::HumanTransitionSelected { .. })),
+        "the refused forced transition wrote no HumanTransitionSelected"
+    );
+
+    let mut events = engine.subscribe();
+    drive_until_settled(&mut app, &mut events, &execution.id).await;
+    let stored = reload_until(&engine, &execution.id, ExecutionStatus::Completed);
+    assert_eq!(
+        stored.status,
+        ExecutionStatus::Completed,
+        "the background pass finished on its own, undisturbed"
+    );
 }
 
 /// The form's advertised shortcuts must match what `on_key_form` actually
@@ -1368,6 +1778,7 @@ async fn starting_a_picked_builtin_leaves_an_execution_that_resolves_its_definit
     focus_input(&mut app, "target_repo");
     type_text(&mut app, &repository.display().to_string());
     assert_eq!(app.on_key(key(KeyCode::Enter)), Request::StartNewTask);
+    let mut events = engine.subscribe();
     app.start_new_task().await;
 
     let selected = app
@@ -1375,6 +1786,8 @@ async fn starting_a_picked_builtin_leaves_an_execution_that_resolves_its_definit
         .expect("the new execution is selected")
         .clone();
     assert_eq!(selected.workflow_id, "compound-engineering");
+
+    drive_until_settled(&mut app, &mut events, &selected.id).await;
 
     let execution = engine
         .store()
@@ -1614,6 +2027,7 @@ async fn starting_a_valid_new_task_creates_an_execution_that_is_listed_and_selec
     focus_input(&mut app, "ticket");
     type_text(&mut app, "ORC-11");
     app.on_key(key(KeyCode::Enter));
+    let mut events = engine.subscribe();
     app.start_new_task().await;
 
     assert!(
@@ -1629,6 +2043,10 @@ async fn starting_a_valid_new_task_creates_an_execution_that_is_listed_and_selec
     );
     assert_eq!(selected.workflow_id, "tui-new-task");
     assert_eq!(app.focus(), Panel::Executions);
+
+    drive_until_settled(&mut app, &mut events, &selected.id).await;
+    app.refresh();
+    let selected = app.selected().expect("a selection").clone();
 
     // It ran: the workflow stopped on its human state, and the question is
     // answerable from the interface straight away.
