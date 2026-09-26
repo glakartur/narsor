@@ -41,18 +41,25 @@
 //! only ever returns a bare status code.
 
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::{Stream, StreamExt};
 
 use crate::api::dto::{
     AcceptedResponse, ExecutionListResponse, ExecutionSummary, StartTaskRequest, StartTaskResponse,
@@ -145,6 +152,11 @@ pub fn router(
             get(get_conversation),
         )
         .route("/executions", get(get_executions))
+        .route(
+            "/executions/:execution_id/stream",
+            get(get_execution_stream),
+        )
+        .route("/events/stream", get(get_global_stream))
         .route("/tasks", post(post_start_task))
         .route("/executions/:execution_id/resume", post(post_resume))
         .route("/executions/:execution_id/input", post(post_input))
@@ -743,4 +755,170 @@ async fn get_executions(
         executions.push(ExecutionSummary::from(&execution));
     }
     Ok(Json(ExecutionListResponse { executions }))
+}
+
+// ---------------------------------------------------------------------------
+// SSE endpoints (U4)
+// ---------------------------------------------------------------------------
+
+/// How often the connection sends a keep-alive comment frame while no real
+/// event fires — long enough not to spam an idle connection, short enough
+/// that a client (or an intermediary proxy) never mistakes a quiet execution
+/// for a dead one.
+const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+fn sse_keep_alive() -> KeepAlive {
+    KeepAlive::new()
+        .interval(SSE_KEEP_ALIVE_INTERVAL)
+        .text("keep-alive")
+}
+
+/// Adapts [`Engine::subscribe`]'s broadcast receiver into the stream an axum
+/// [`Sse`] response wants: `Result<sse::Event, Infallible>`.
+///
+/// This is the one seam both SSE endpoints share — the only difference
+/// between "one execution's events" and "every execution's events"
+/// (`filter_execution_id`) is whether a `None` filter lets everything
+/// through.
+///
+/// Two failure-shaped inputs are deliberately swallowed as `None` (skip this
+/// item, keep the stream open) rather than turned into a stream `Err`,
+/// because `Sse`'s item type here is `Infallible` — surfacing either as an
+/// `Err` would have no representable value to construct and, more to the
+/// point, would end the whole SSE stream for one bad event, which is exactly
+/// what the plan says must not happen:
+///
+/// * [`BroadcastStreamRecvError::Lagged`] — this receiver fell behind the
+///   engine's broadcast buffer and missed `n` events irretrievably (the
+///   comment on [`Engine::subscribe`] already documents that a slow reader
+///   never blocks or fails the engine). Logged as a warning so the operator
+///   can see it happened, then the stream simply continues from the next
+///   event the buffer still holds.
+/// * A `json_data` serialization failure — [`Event`] always serializes in
+///   practice (every field is a plain, already-`Serialize` domain type), so
+///   this is defense in depth, not a path any test expects to exercise.
+fn sse_event_stream(
+    rx: broadcast::Receiver<Event>,
+    filter_execution_id: Option<String>,
+) -> impl Stream<Item = Result<SseEvent, Infallible>> {
+    BroadcastStream::new(rx).filter_map(move |item| {
+        let event = match item {
+            Ok(event) => event,
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    skipped,
+                    execution_id = filter_execution_id.as_deref().unwrap_or("*"),
+                    "api: SSE client lagged behind the engine's event broadcast; \
+                     some events were not delivered to it"
+                );
+                return None;
+            }
+        };
+
+        if let Some(wanted) = &filter_execution_id {
+            if &event.workflow_execution_id != wanted {
+                return None;
+            }
+        }
+
+        match SseEvent::default().event("engine").json_data(&event) {
+            Ok(sse_event) => Some(Ok(sse_event)),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    execution_id = %event.workflow_execution_id,
+                    "api: failed to encode an engine event as SSE data; dropping it"
+                );
+                None
+            }
+        }
+    })
+}
+
+/// `GET /executions/:execution_id/stream` — an SSE stream of every event the
+/// engine publishes for this one execution (AE5), filtered from the same
+/// broadcast every other subscriber (including the global stream below) also
+/// reads from.
+async fn get_execution_stream(
+    State(state): State<AppState>,
+    Path(execution_id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    require_execution(&state, &execution_id)?;
+    let rx = state.engine.subscribe();
+    let stream = sse_event_stream(rx, Some(execution_id));
+    Ok(Sse::new(stream).keep_alive(sse_keep_alive()))
+}
+
+/// `GET /events/stream` — an SSE stream of every event from every execution
+/// the engine runs, unfiltered.
+async fn get_global_stream(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+    let rx = state.engine.subscribe();
+    let stream = sse_event_stream(rx, None);
+    Sse::new(stream).keep_alive(sse_keep_alive())
+}
+
+#[cfg(test)]
+mod sse_stream_tests {
+    //! Unit-level coverage of [`sse_event_stream`]'s `Lagged` handling.
+    //!
+    //! This is deliberately not an HTTP-level test (unlike the rest of U4's
+    //! test list, in `tests/sse.rs`): reproducing a real `Lagged` over an
+    //! actual loopback connection would mean overrunning
+    //! [`crate::engine::runner::EVENT_CHANNEL_CAPACITY`] (1024) faster than
+    //! the kernel's socket buffers and axum's own body-polling ever drain
+    //! it — which depends on OS buffer sizing and scheduling, not on
+    //! anything this code controls, and would make the test flaky. Building
+    //! a small broadcast channel directly and driving
+    //! [`sse_event_stream`] — the exact function both SSE handlers call —
+    //! exercises the same `Err(Lagged(_))` branch deterministically.
+    use super::*;
+
+    #[tokio::test]
+    async fn lagged_receiver_skips_missed_events_but_keeps_streaming() {
+        // Capacity 2: sending 5 events before anyone reads guarantees the
+        // receiver is behind by more than the buffer holds.
+        let (tx, rx) = broadcast::channel(2);
+        let stream = sse_event_stream(rx, None);
+        tokio::pin!(stream);
+
+        for sequence in 1..=5u64 {
+            let _ = tx.send(sample_event("exec-1", sequence));
+        }
+        drop(tx);
+
+        let mut received = Vec::new();
+        while let Some(item) = stream.next().await {
+            // The stream's item type is `Result<SseEvent, Infallible>` —
+            // asserting it is always `Ok` is the point: a lagged receiver
+            // must never surface as a stream error.
+            let event = item.expect("a lagged receiver must not close the stream with an error");
+            received.push(event);
+        }
+
+        // Only the last two of the five sends still fit in a
+        // capacity-2 channel; the rest were overwritten before this
+        // receiver ever read them. What matters here is not exactly which
+        // sequence numbers survive (that's the broadcast channel's own
+        // contract) but that the stream degraded gracefully: it kept
+        // producing well-formed events after the loss instead of ending.
+        assert_eq!(
+            received.len(),
+            2,
+            "the receiver should see exactly the events still held in the buffer"
+        );
+    }
+
+    fn sample_event(execution_id: &str, sequence: u64) -> Event {
+        Event {
+            id: format!("event-{sequence}"),
+            workflow_execution_id: execution_id.to_string(),
+            timestamp: Utc::now(),
+            data: EventData::StateEntered {
+                state_id: "plan".to_string(),
+            },
+            sequence,
+        }
+    }
 }

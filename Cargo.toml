@@ -43,6 +43,7 @@ validator = { version = "0.16", features = ["derive"] }
 # SSE support
 axum-extra = { version = "0.9", features = ["typed-header"] }
 futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
 clap = { version = "4.6.7", features = ["derive"] }
 ratatui = "0.30.2"
 crossterm = "0.29.0"
@@ -56,4 +57,8 @@ base64 = "0.22"
 # HTTP client for the embedded API (src/api/client.rs). No TLS and no default
 # middleware: the server is loopback-only (see src/api/mod.rs), so the extra
 # default features would be dead weight.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# "stream" adds `Response::bytes_stream`/`chunk`, needed by the SSE
+# integration tests (tests/sse.rs) to read a streaming response body; the
+# embedded client itself (src/api/client.rs) only ever reads whole bodies and
+# does not use it.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
