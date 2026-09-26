@@ -443,20 +443,38 @@ async fn the_session_events_are_emitted_and_the_harness_session_id_is_captured()
     let EventData::AgentSessionStarted {
         session_id,
         harness,
+        action_execution_id,
+        resumed_session,
     } = started
     else {
         panic!("the first event is the session start: {started:?}");
     };
     assert_eq!(harness, "claude-code");
+    assert_eq!(action_execution_id.as_deref(), Some("action-exec-1"));
+    assert_eq!(resumed_session, &None);
+
+    // Every event of this attempt carries the same `action_execution_id`.
+    let EventData::AgentMessage {
+        action_execution_id: message_action_id,
+        ..
+    } = &events[1].1
+    else {
+        panic!("the middle event is the agent message");
+    };
+    assert_eq!(message_action_id.as_deref(), Some("action-exec-1"));
 
     // The session is the same one throughout.
     let EventData::AgentSessionCompleted {
         session_id: completed,
+        action_execution_id: completed_action_id,
+        harness_session_id,
     } = &events[2].1
     else {
         panic!("the last event is the session completion");
     };
     assert_eq!(completed, session_id);
+    assert_eq!(completed_action_id.as_deref(), Some("action-exec-1"));
+    assert_eq!(harness_session_id.as_deref(), Some("fake-session-1"));
 
     // The harness's own session id is captured, and reachable for a later state.
     assert_eq!(
@@ -505,7 +523,10 @@ async fn a_session_to_resume_reaches_the_argv() {
         .parameters
         .insert("resume_session".to_string(), json!("session-42"));
 
-    complete(&executor(&fake), config, &root.workspace()).await;
+    let sink = Arc::new(RecordingSink::default());
+    let executor = executor(&fake).with_event_sink(sink.clone());
+
+    complete(&executor, config, &root.workspace()).await;
 
     let args = fake.args(1);
     assert!(
@@ -513,6 +534,15 @@ async fn a_session_to_resume_reaches_the_argv() {
             .any(|pair| pair[0] == "--resume" && pair[1] == "session-42"),
         "{args:?}"
     );
+
+    let (_, started) = &sink.events()[0];
+    let EventData::AgentSessionStarted {
+        resumed_session, ..
+    } = started
+    else {
+        panic!("the first event is the session start: {started:?}");
+    };
+    assert_eq!(resumed_session.as_deref(), Some("session-42"));
 }
 
 // ---------------------------------------------------------------------------

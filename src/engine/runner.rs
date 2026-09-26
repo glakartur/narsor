@@ -893,11 +893,28 @@ impl Engine {
                 return Ok(ActionUpshot::Stopped);
             }
 
-            attempt += 1;
-            let delay = schedule.delay_before(attempt);
+            let next_attempt = attempt + 1;
+            let delay = schedule.delay_before(next_attempt);
+
+            // Announced before the backoff sleep (R4, R7, R11): an operator
+            // watching the log sees the failure the moment it happens, not
+            // only once the delay has elapsed. The last attempt never reaches
+            // here — it fails through the branch above, as `ActionFailed`.
+            self.emit(
+                &execution.id,
+                EventData::ActionAttemptFailed {
+                    action_execution_id: action_execution_id.clone(),
+                    state_id: state.id.clone(),
+                    error: failure.message,
+                    retry_in_ms: delay.as_millis() as u64,
+                },
+            )?;
+
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
+
+            attempt = next_attempt;
 
             // A fresh idempotency key per attempt (D24), announced in the event.
             action_execution_id = Uuid::new_v4().to_string();
@@ -907,6 +924,7 @@ impl Engine {
                 EventData::ActionRetrying {
                     action_execution_id: action_execution_id.clone(),
                     retry_count: RetrySchedule::retry_count(attempt),
+                    state_id: Some(state.id.clone()),
                 },
             )?;
         }

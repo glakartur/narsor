@@ -2774,6 +2774,11 @@ pub fn event_line(event: &Event) -> String {
             format!("action_completed  {output_label}")
         }
         EventData::ActionFailed { error, .. } => format!("action_failed  {error}"),
+        EventData::ActionAttemptFailed {
+            error, retry_in_ms, ..
+        } => {
+            format!("action_attempt_failed  {error} (retrying in {retry_in_ms}ms)")
+        }
         EventData::ActionRetrying { retry_count, .. } => {
             format!("action_retrying  attempt {retry_count}")
         }

@@ -86,6 +86,88 @@ async fn an_action_that_never_finished_leaves_the_execution_unknown() {
     assert_eq!(stored.status, ExecutionStatus::Unknown);
 }
 
+/// Writes the log of an execution that died during the backoff sleep between
+/// two attempts: the failed attempt got its `ActionAttemptFailed`, but the
+/// process died before `ActionRetrying` was appended.
+fn interrupt_during_backoff(harness: &Harness, execution: &WorkflowExecution) -> String {
+    let log = harness.store().event_log(&execution.id);
+    log.append_next(
+        &execution.id,
+        EventData::StateEntered {
+            state_id: "first".to_string(),
+        },
+    )
+    .expect("append StateEntered");
+
+    let action_execution_id = "action-under-way".to_string();
+    log.append_next(
+        &execution.id,
+        EventData::ActionStarted {
+            action_execution_id: action_execution_id.clone(),
+            state_id: "first".to_string(),
+            action_type: "script".to_string(),
+        },
+    )
+    .expect("append ActionStarted");
+
+    log.append_next(
+        &execution.id,
+        EventData::ActionAttemptFailed {
+            action_execution_id: action_execution_id.clone(),
+            state_id: "first".to_string(),
+            error: "the script exited nonzero".to_string(),
+            retry_in_ms: 1000,
+        },
+    )
+    .expect("append ActionAttemptFailed");
+
+    action_execution_id
+}
+
+#[tokio::test]
+async fn a_crash_during_backoff_still_leaves_the_execution_unknown() {
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let definition = workflow("two_steps");
+
+    let execution = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    let action_execution_id = interrupt_during_backoff(&harness, &execution);
+
+    let reconciliation = reconcile(&harness.store(), &execution.id).expect("reconcile");
+
+    // `ActionAttemptFailed` is not a closure: the attempt it names is still
+    // open, exactly as if it had only just started, so the outcome is
+    // identical to a crash right after `ActionStarted` (D23).
+    assert_eq!(reconciliation.status, ExecutionStatus::Unknown);
+    assert_eq!(
+        reconciliation.outcome,
+        ReconciliationOutcome::InterruptedAction {
+            state_id: "first".to_string(),
+            action_execution_id: action_execution_id.clone(),
+        }
+    );
+    assert!(reconciliation.outcome.needs_attention());
+
+    let message = harness
+        .events(&execution.id)
+        .into_iter()
+        .find_map(|event| match event.data {
+            EventData::Error { message, .. } => Some(message),
+            _ => None,
+        })
+        .expect("an Error event");
+    assert!(message.contains(&action_execution_id), "{message}");
+    assert!(message.contains("will not be replayed"), "{message}");
+
+    let stored = harness
+        .store()
+        .load_execution(&execution.id)
+        .expect("load the execution");
+    assert_eq!(stored.status, ExecutionStatus::Unknown);
+}
+
 #[tokio::test]
 async fn the_engine_does_not_replay_an_interrupted_action_by_itself() {
     let harness = Harness::new();

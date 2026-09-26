@@ -242,6 +242,12 @@ fn unfinished_action(events: &[crate::domain::Event]) -> Option<(String, String)
             EventData::HumanInputReceived { .. } => {
                 open = None;
             }
+            // Deliberately *not* a closure: an attempt that will be retried is
+            // not the end of the action, only of one attempt at it. The action
+            // stays open — a crash right after this event and before the next
+            // `ActionRetrying` is still an interrupted action (D23), exactly as
+            // if this event did not exist.
+            EventData::ActionAttemptFailed { .. } => {}
             _ => {}
         }
     }

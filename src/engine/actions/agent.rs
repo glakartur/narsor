@@ -246,6 +246,8 @@ impl AgentExecutor {
                 session_id: session.id.clone(),
                 // The harness that actually ran, never "unspecified".
                 harness: harness.to_string(),
+                action_execution_id: Some(request.action_execution_id.to_string()),
+                resumed_session: resume.map(ToString::to_string),
             },
         );
         session.status = AgentSessionStatus::Running;
@@ -265,7 +267,9 @@ impl AgentExecutor {
                 let limit = request.timeout.unwrap_or_default();
                 self.fail_session(
                     request.execution_id,
+                    request.action_execution_id,
                     &mut session,
+                    None,
                     format!(
                         "the harness was still running after {}s and was killed",
                         limit.as_secs_f64()
@@ -278,7 +282,13 @@ impl AgentExecutor {
                 }));
             }
             Err(error) => {
-                self.fail_session(request.execution_id, &mut session, error.message.clone());
+                self.fail_session(
+                    request.execution_id,
+                    request.action_execution_id,
+                    &mut session,
+                    None,
+                    error.message.clone(),
+                );
                 return Err(error);
             }
         };
@@ -303,19 +313,32 @@ impl AgentExecutor {
                     session_id: session.id.clone(),
                     content: truncate(&run.text),
                     role: "assistant".to_string(),
+                    action_execution_id: Some(request.action_execution_id.to_string()),
                 },
             );
         }
 
         if let Some(failure) = &run.failure {
-            self.fail_session(request.execution_id, &mut session, failure.clone());
+            self.fail_session(
+                request.execution_id,
+                request.action_execution_id,
+                &mut session,
+                run.session_id.clone(),
+                failure.clone(),
+            );
             return Err(harness_error(adapter.as_ref(), failure, &finished, &run));
         }
 
         let output = match extract_output(&run.text) {
             Ok(output) => output,
             Err(error) => {
-                self.fail_session(request.execution_id, &mut session, error.message.clone());
+                self.fail_session(
+                    request.execution_id,
+                    request.action_execution_id,
+                    &mut session,
+                    run.session_id.clone(),
+                    error.message.clone(),
+                );
                 return Err(error);
             }
         };
@@ -326,6 +349,8 @@ impl AgentExecutor {
             request.execution_id,
             EventData::AgentSessionCompleted {
                 session_id: session.id.clone(),
+                action_execution_id: Some(request.action_execution_id.to_string()),
+                harness_session_id: run.session_id.clone(),
             },
         );
 
@@ -335,7 +360,14 @@ impl AgentExecutor {
     }
 
     /// Marks the session failed and says so in the log.
-    fn fail_session(&self, execution_id: Option<&str>, session: &mut AgentSession, error: String) {
+    fn fail_session(
+        &self,
+        execution_id: Option<&str>,
+        action_execution_id: &str,
+        session: &mut AgentSession,
+        harness_session_id: Option<String>,
+        error: String,
+    ) {
         session.status = AgentSessionStatus::Failed;
         session.ended_at = Some(Utc::now());
         self.emit(
@@ -343,6 +375,8 @@ impl AgentExecutor {
             EventData::AgentSessionFailed {
                 session_id: session.id.clone(),
                 error,
+                action_execution_id: Some(action_execution_id.to_string()),
+                harness_session_id,
             },
         );
     }

@@ -187,6 +187,71 @@ fn append_next_allocates_consecutive_sequence_numbers() {
     assert_eq!(log.read_all().expect("read log").len(), 2);
 }
 
+/// An event written before `action_execution_id`, `state_id`,
+/// `harness_session_id` and `resumed_session` existed on the agent/retry
+/// events still deserializes, with every new field defaulting to `None`
+/// (U1): old logs on disk must keep working after an upgrade.
+#[test]
+fn an_old_format_agent_session_event_deserializes_with_the_new_fields_absent() {
+    let old_format = serde_json::json!({
+        "id": "event-1",
+        "workflow_execution_id": "exec-old-format",
+        "timestamp": Utc::now().to_rfc3339(),
+        "sequence": 1,
+        "data": {
+            "type": "agent_session_started",
+            "session_id": "session-1",
+            "harness": "claude-code"
+        }
+    });
+
+    let event: Event = serde_json::from_value(old_format).expect("deserialize the old event");
+    match event.data {
+        EventData::AgentSessionStarted {
+            session_id,
+            harness,
+            action_execution_id,
+            resumed_session,
+        } => {
+            assert_eq!(session_id, "session-1");
+            assert_eq!(harness, "claude-code");
+            assert_eq!(action_execution_id, None);
+            assert_eq!(resumed_session, None);
+        }
+        other => panic!("unexpected event data: {other:?}"),
+    }
+}
+
+/// Same guarantee for `ActionRetrying`, whose `state_id` is new in U1.
+#[test]
+fn an_old_format_action_retrying_event_deserializes_with_no_state_id() {
+    let old_format = serde_json::json!({
+        "id": "event-2",
+        "workflow_execution_id": "exec-old-format",
+        "timestamp": Utc::now().to_rfc3339(),
+        "sequence": 2,
+        "data": {
+            "type": "action_retrying",
+            "action_execution_id": "action-1",
+            "retry_count": 1
+        }
+    });
+
+    let event: Event = serde_json::from_value(old_format).expect("deserialize the old event");
+    match event.data {
+        EventData::ActionRetrying {
+            action_execution_id,
+            retry_count,
+            state_id,
+        } => {
+            assert_eq!(action_execution_id, "action-1");
+            assert_eq!(retry_count, 1);
+            assert_eq!(state_id, None);
+        }
+        other => panic!("unexpected event data: {other:?}"),
+    }
+}
+
 /// A second, independent `EventLog` handle on the same directory — which now
 /// legitimately happens when a background TUI run's own error is emitted
 /// concurrently with the pass it was rejected in favour of still writing its

@@ -277,7 +277,9 @@ async fn three_attempts_mean_two_retries() {
             "workflow_started",
             "state_entered",
             "action_started",
+            "action_attempt_failed",
             "action_retrying",
+            "action_attempt_failed",
             "action_retrying",
             "action_completed",
             "decision_made",
@@ -297,6 +299,45 @@ async fn three_attempts_mean_two_retries() {
         .collect();
     assert_eq!(retry_counts, vec![1, 2]);
     assert_eq!(execution.context.variables.get("attempts"), Some(&json!(3)));
+
+    // Every `ActionAttemptFailed` names the attempt that failed and the state
+    // it belongs to, and carries the retry delay that follows it.
+    let attempt_failures: Vec<(String, String)> = harness
+        .events(&execution.id)
+        .into_iter()
+        .filter_map(|event| match event.data {
+            EventData::ActionAttemptFailed {
+                action_execution_id,
+                state_id,
+                ..
+            } => Some((action_execution_id, state_id)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attempt_failures.len(), 2);
+    for (_, state_id) in &attempt_failures {
+        assert_eq!(state_id, "build");
+    }
+
+    // Each attempt's own id is announced, once as the failing attempt and once
+    // as the retry that follows it.
+    let started_and_retried: Vec<String> = harness
+        .events(&execution.id)
+        .into_iter()
+        .filter_map(|event| match event.data {
+            EventData::ActionStarted {
+                action_execution_id,
+                ..
+            }
+            | EventData::ActionRetrying {
+                action_execution_id,
+                ..
+            } => Some(action_execution_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started_and_retried[0], attempt_failures[0].0);
+    assert_eq!(started_and_retried[1], attempt_failures[1].0);
 }
 
 #[tokio::test]
@@ -319,12 +360,22 @@ async fn exhausted_retries_fail_the_execution_without_a_transition() {
             "workflow_started",
             "state_entered",
             "action_started",
+            "action_attempt_failed",
             "action_retrying",
             "action_failed",
             "workflow_failed",
         ]
     );
     assert!(!types.contains(&"transition_taken".to_string()));
+
+    // The exhausting, final attempt gets no `ActionAttemptFailed` of its own —
+    // only `ActionFailed`, since there is no retry left to announce.
+    let attempt_failures = harness
+        .events(&execution.id)
+        .into_iter()
+        .filter(|event| matches!(event.data, EventData::ActionAttemptFailed { .. }))
+        .count();
+    assert_eq!(attempt_failures, 1);
 }
 
 #[tokio::test]
@@ -368,6 +419,17 @@ async fn the_backoff_grows_between_attempts() {
         second_wait >= first_wait + Duration::from_millis(700),
         "waits were {first_wait:?} then {second_wait:?}"
     );
+
+    // `ActionAttemptFailed.retry_in_ms` announces the same delay ahead of time,
+    // before the sleep, matching the growing backoff (1s, then 2s).
+    let retry_in_ms: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match &event.data {
+            EventData::ActionAttemptFailed { retry_in_ms, .. } => Some(*retry_in_ms),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retry_in_ms, vec![1000, 2000]);
 }
 
 #[tokio::test]
