@@ -16,11 +16,15 @@ pub mod actions;
 pub mod decision;
 pub mod retry;
 pub mod runner;
+pub mod timeline;
 
 pub use decision::{
     check_label, decide, permitted_labels, DecisionError, DecisionOutcome, DecisionRequest,
 };
 pub use retry::RetrySchedule;
+pub use timeline::{
+    build_timeline, ConversationState, EventLink, Position, PositionStatus, Timeline,
+};
 pub use runner::{
     terminal_status, ActionKind, AgentDefaults, Engine, EngineError, PendingStep,
     EVENT_CHANNEL_CAPACITY,
