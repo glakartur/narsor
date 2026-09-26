@@ -76,6 +76,15 @@ pub const EVENTS_DIR: &str = "events";
 /// Directory holding artifact files of one execution.
 pub const ARTIFACTS_DIR: &str = "artifacts";
 
+/// Directory holding one conversation file per action attempt (U2).
+pub const CONVERSATIONS_DIR: &str = "conversations";
+
+/// Suffix of a conversation file still being written by a live attempt.
+pub const CONVERSATION_JSONL_SUFFIX: &str = ".jsonl";
+
+/// Suffix of a conversation file whose attempt has closed.
+pub const CONVERSATION_ZST_SUFFIX: &str = ".jsonl.zst";
+
 /// The one checkpoint kept for an execution (R25).
 pub const CHECKPOINT_FILE: &str = "checkpoint.bundle";
 
@@ -176,6 +185,31 @@ impl StatePaths {
     /// `{root}/executions/{execution_id}/artifacts/{artifact_id}`
     pub fn artifact_dir(&self, execution_id: &ExecutionId, artifact_id: &str) -> PathBuf {
         self.artifacts_dir(execution_id).join(artifact_id)
+    }
+
+    /// `{root}/executions/{execution_id}/conversations`
+    ///
+    /// One file per action attempt, keyed by `action_execution_id` (D24), so
+    /// every attempt and every re-entry gets its own record (R4, R7).
+    pub fn conversations_dir(&self, execution_id: &str) -> PathBuf {
+        self.execution_dir(execution_id).join(CONVERSATIONS_DIR)
+    }
+
+    /// `{root}/executions/{execution_id}/conversations/{attempt_id}.jsonl`
+    ///
+    /// The plain, append-only form written while the attempt is still in
+    /// flight.
+    pub fn conversation_file(&self, execution_id: &str, attempt_id: &str) -> PathBuf {
+        self.conversations_dir(execution_id)
+            .join(conversation_jsonl_name(attempt_id))
+    }
+
+    /// `{root}/executions/{execution_id}/conversations/{attempt_id}.jsonl.zst`
+    ///
+    /// The compressed form a closed attempt is rewritten to (R15).
+    pub fn conversation_compressed_file(&self, execution_id: &str, attempt_id: &str) -> PathBuf {
+        self.conversations_dir(execution_id)
+            .join(conversation_zst_name(attempt_id))
     }
 }
 
@@ -295,6 +329,25 @@ pub fn parse_event_file_name(file_name: &str) -> Option<u64> {
         return None;
     }
     stem.parse().ok()
+}
+
+/// Renders the plain conversation file name for one attempt.
+pub fn conversation_jsonl_name(attempt_id: &str) -> String {
+    format!("{attempt_id}{CONVERSATION_JSONL_SUFFIX}")
+}
+
+/// Renders the compressed conversation file name for one attempt.
+pub fn conversation_zst_name(attempt_id: &str) -> String {
+    format!("{attempt_id}{CONVERSATION_ZST_SUFFIX}")
+}
+
+/// Parses the attempt id back out of a plain conversation file name.
+///
+/// Returns `None` for anything that is not a well-formed plain conversation
+/// file, notably a `.jsonl.zst` file or a leftover `.tmp`/`.zst.tmp` one, so
+/// callers can simply skip foreign entries.
+pub fn parse_conversation_jsonl_name(file_name: &str) -> Option<&str> {
+    file_name.strip_suffix(CONVERSATION_JSONL_SUFFIX)
 }
 
 /// Returns true when the path is a temporary file of an interrupted write.

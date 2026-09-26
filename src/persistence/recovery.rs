@@ -34,12 +34,13 @@
 //! removes it — through the provisioner, which refuses to delete a repository
 //! holding uncommitted or unpushed work.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::domain::{EventData, ExecutionId, ExecutionStatus};
+use crate::domain::{Event, EventData, ExecutionId, ExecutionStatus};
 use crate::persistence::{ExecutionStore, PersistenceError, Result};
 use crate::workspace::{CleanupOutcome, CleanupPolicy, WorkspaceProvisioner};
 
@@ -114,6 +115,9 @@ pub struct RecoveryReport {
     pub removed_temp_files: Vec<PathBuf>,
     /// One verdict per stored execution.
     pub reconciled: Vec<Reconciliation>,
+    /// Attempts (`(execution_id, action_execution_id)`) whose conversation
+    /// file was compressed because they were found closed (U2, R15).
+    pub compressed_conversations: Vec<(ExecutionId, String)>,
 }
 
 impl RecoveryReport {
@@ -125,16 +129,102 @@ impl RecoveryReport {
     }
 }
 
-/// Clears interrupted writes and reconciles every stored execution.
+/// Clears interrupted writes, reconciles every stored execution, and
+/// compresses the conversation files of attempts found closed.
 ///
 /// Call once at startup, before running anything.
 pub fn recover(store: &ExecutionStore) -> Result<RecoveryReport> {
     let removed_temp_files = store.cleanup_orphaned_temp_files()?;
     let reconciled = reconcile_all(store)?;
+    let compressed_conversations = compress_closed_conversations(store)?;
     Ok(RecoveryReport {
         removed_temp_files,
         reconciled,
+        compressed_conversations,
     })
+}
+
+/// Compresses the plain conversation file of every attempt found closed
+/// (U2, R15).
+///
+/// "Closed" means either of two independent things, either being enough:
+/// the owning execution is no longer `Running` (nothing will ever append to
+/// this attempt's file again, whatever the event log says about the attempt
+/// itself — a `Paused`/`Completed`/`Cancelled`/`Unknown` execution has no live
+/// writer left), or the event log records the attempt itself as finished
+/// (`ActionCompleted`, `ActionFailed`, or `ActionAttemptFailed` for that
+/// `action_execution_id`) while the execution keeps running its next state.
+///
+/// An attempt that is neither is presumed still open in another process and
+/// is left completely untouched — compressing out from under a live writer
+/// would corrupt its next append.
+pub fn compress_closed_conversations(
+    store: &ExecutionStore,
+) -> Result<Vec<(ExecutionId, String)>> {
+    let mut compressed = Vec::new();
+
+    for execution_id in store.list_execution_ids()? {
+        if !store.exists(&execution_id) {
+            continue;
+        }
+        let execution = store.load_execution(&execution_id)?;
+        let conversations = store.conversation_store(&execution_id);
+        let open_attempts = conversations.open_attempt_ids()?;
+        if open_attempts.is_empty() {
+            continue;
+        }
+
+        let closed_in_log = if execution.status == ExecutionStatus::Running {
+            let log = store.event_log(&execution_id);
+            Some(closed_attempt_ids(&log.read_all()?))
+        } else {
+            // Nothing will ever write to this execution's attempts again,
+            // regardless of what the log says about any individual one.
+            None
+        };
+
+        for attempt_id in open_attempts {
+            let should_close = match &closed_in_log {
+                Some(closed) => closed.contains(&attempt_id),
+                None => true,
+            };
+            if !should_close {
+                continue;
+            }
+            conversations.close_attempt(&attempt_id)?;
+            compressed.push((execution_id.clone(), attempt_id));
+        }
+    }
+
+    Ok(compressed)
+}
+
+/// The `action_execution_id`s the event log records as finished, one way or
+/// another: a completed attempt, a final failure, or a failed attempt that
+/// will be retried under a *different* `action_execution_id` (D24) — either
+/// way, nothing more is ever written to *this* attempt's conversation file.
+fn closed_attempt_ids(events: &[Event]) -> HashSet<String> {
+    let mut closed = HashSet::new();
+    for event in events {
+        match &event.data {
+            EventData::ActionCompleted {
+                action_execution_id,
+                ..
+            }
+            | EventData::ActionFailed {
+                action_execution_id,
+                ..
+            }
+            | EventData::ActionAttemptFailed {
+                action_execution_id,
+                ..
+            } => {
+                closed.insert(action_execution_id.clone());
+            }
+            _ => {}
+        }
+    }
+    closed
 }
 
 /// Reconciles every stored execution.

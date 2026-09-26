@@ -5,6 +5,7 @@ use crate::domain::{Context, ExecutionId, WorkflowExecution};
 use crate::persistence::atomic::{
     cleanup_orphaned_temp_files, ensure_dir, read_json, write_json_atomic,
 };
+use crate::persistence::conversation::ConversationStore;
 use crate::persistence::event_log::EventLog;
 use crate::persistence::paths::{StatePaths, DEFAULT_ROOT};
 use serde::de::DeserializeOwned;
@@ -182,6 +183,12 @@ impl ExecutionStore {
         EventLog::new(self.paths.events_dir(execution_id))
     }
 
+    /// The conversation store of one execution (U2): one file per action
+    /// attempt, keyed by `action_execution_id`.
+    pub fn conversation_store(&self, execution_id: &str) -> ConversationStore {
+        ConversationStore::new(self.paths.clone(), execution_id)
+    }
+
     /// Creates and returns the directory for one artifact of an execution.
     pub fn artifact_dir(&self, execution_id: &ExecutionId, artifact_id: &str) -> Result<PathBuf> {
         let dir = self.paths.artifact_dir(execution_id, artifact_id);
@@ -215,6 +222,14 @@ impl ExecutionStore {
             )?);
             removed.extend(cleanup_orphaned_temp_files(
                 &self.paths.artifacts_dir(&execution_id),
+            )?);
+            // A `.jsonl.zst.tmp` compression temp file ends in the same
+            // generic `.tmp` suffix (its name never collides with a real
+            // target, so the generic sweep is exactly right for it too), so
+            // no separate rule is needed here — only the directory itself
+            // has to be included in the sweep.
+            removed.extend(cleanup_orphaned_temp_files(
+                &self.paths.conversations_dir(&execution_id),
             )?);
         }
         Ok(removed)
