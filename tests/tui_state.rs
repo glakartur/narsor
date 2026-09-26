@@ -29,11 +29,11 @@ use narsor::domain::{
     Event, EventData, ExecutionStatus, HumanInputType, WorkflowDefinition, WorkflowExecution,
     Workspace,
 };
+use narsor::engine::actions::script::TRUNCATION_MARKER;
 use narsor::engine::{ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry};
 use narsor::persistence::conversation::ConversationSource;
 use narsor::persistence::{CatalogPaths, ExecutionStore, WorkPaths};
 use narsor::registry::{RepositoryEntry, RepositoryRegistry};
-use narsor::engine::actions::script::TRUNCATION_MARKER;
 use narsor::tui::app::{
     event_detail_lines, event_line, task_position_line, App, FormRow, Modal, NewTaskChoice,
     NewTaskStage, Panel, RepositoryField, Request, Screen, StreamStatus, TaskContent,
@@ -132,17 +132,18 @@ async fn app_over(engine: &Arc<Engine>, root: &Path) -> App {
         Arc::clone(engine),
         CatalogPaths::new(root),
         WorkPaths::new(root),
-        api_client_for(engine).await,
+        api_client_for(engine, root).await,
     )
 }
 
-/// Starts the embedded API server (U5) over the same store `engine` drives —
-/// the task view's (U7) only read path for the timeline and conversations —
-/// and leaks the handle so it keeps serving for the rest of this (short-lived
-/// test) process. Every test gets its own server, on its own random loopback
-/// port, exactly as production does per `App`.
-async fn api_client_for(engine: &Engine) -> narsor::api::ApiClient {
-    let handle = narsor::api::start(engine.store().clone())
+/// Starts the embedded API server (U5, now also carrying U3's mutating
+/// endpoints) over the same engine `App` drives — the task view's (U7) only
+/// read path for the timeline and conversations — and leaks the handle so it
+/// keeps serving for the rest of this (short-lived test) process. Every test
+/// gets its own server, on its own random loopback port, exactly as
+/// production does per `App`.
+async fn api_client_for(engine: &Arc<Engine>, root: &Path) -> narsor::api::ApiClient {
+    let handle = narsor::api::start(Arc::clone(engine), root.to_path_buf(), root.to_path_buf())
         .await
         .expect("start the embedded api server");
     let client = handle.client();
@@ -1405,7 +1406,10 @@ async fn removing_a_repository_needs_a_confirmation() {
     // Declining puts the listing back and leaves the entry alone.
     app.on_key(key(KeyCode::Char('n')));
     assert!(matches!(app.modal(), Modal::Repositories(_)));
-    assert_eq!(registry_of(root.path()).list().expect("list").entries.len(), 1);
+    assert_eq!(
+        registry_of(root.path()).list().expect("list").entries.len(),
+        1
+    );
 
     app.on_key(key(KeyCode::Char('d')));
     app.on_key(key(KeyCode::Char('y')));
@@ -1449,7 +1453,7 @@ async fn app_for(engine: &Arc<Engine>, root: &Path) -> App {
         resolver,
         CatalogPaths::new(root),
         WorkPaths::new(root),
-        api_client_for(engine).await,
+        api_client_for(engine, root).await,
     );
     app.refresh();
     app
@@ -2520,7 +2524,9 @@ async fn c_on_an_unlinked_event_names_the_reason_and_opens_nothing() {
     let notice = app.notice().expect("a notice");
     assert!(notice.is_error);
     assert!(
-        notice.text.contains("does not belong to an agent conversation"),
+        notice
+            .text
+            .contains("does not belong to an agent conversation"),
         "got: {}",
         notice.text
     );
@@ -2724,12 +2730,20 @@ async fn c_on_a_second_attempt_event_opens_its_position_and_conversation() {
         .sequence;
     // The default cursor after a refresh is the newest event, which here is
     // exactly attempt-2's `ActionCompleted` — the last event appended.
-    assert_eq!(app.events()[app.event_cursor()].sequence, completed_sequence);
+    assert_eq!(
+        app.events()[app.event_cursor()].sequence,
+        completed_sequence
+    );
 
     app.on_key(key(KeyCode::Tab));
     app.on_key(key(KeyCode::Tab));
     let request = app.on_key(key(KeyCode::Char('c')));
-    assert_eq!(request, Request::OpenConversation { sequence: completed_sequence });
+    assert_eq!(
+        request,
+        Request::OpenConversation {
+            sequence: completed_sequence
+        }
+    );
     app.open_conversation_for_event(completed_sequence).await;
 
     let view = task_view(&app);
@@ -2766,7 +2780,10 @@ async fn expanding_a_conversation_entry_toggles_and_collapses_again() {
 
     let entry_number = match &task_view(&app).content {
         TaskContent::Conversation { entries, .. } => {
-            entries.first().expect("attempt-2 has at least one entry").entry_number
+            entries
+                .first()
+                .expect("attempt-2 has at least one entry")
+                .entry_number
         }
         other => panic!("expected a loaded conversation, got {other:?}"),
     };
@@ -2861,7 +2878,10 @@ async fn a_continued_harness_session_is_named_in_the_position_header() {
         .iter()
         .find(|position| position.label == "plan #1")
         .expect("plan #1 position");
-    assert_eq!(position.resumed_harness_session.as_deref(), Some("sess-old"));
+    assert_eq!(
+        position.resumed_harness_session.as_deref(),
+        Some("sess-old")
+    );
     assert!(
         task_position_line(position).contains("resumes"),
         "the position header should name the continued session: {}",
@@ -2936,7 +2956,9 @@ async fn c_on_a_script_step_event_opens_nothing() {
     let notice = app.notice().expect("a notice");
     assert!(notice.is_error);
     assert!(
-        notice.text.contains("does not belong to an agent conversation"),
+        notice
+            .text
+            .contains("does not belong to an agent conversation"),
         "got: {}",
         notice.text
     );
@@ -2958,10 +2980,17 @@ async fn enter_on_an_execution_opens_the_task_view_and_esc_returns() {
     app.open_task_for_execution().await;
 
     let view = task_view(&app);
-    assert_eq!(view.selected.as_deref(), Some("plan #2"), "the last position is the default");
+    assert_eq!(
+        view.selected.as_deref(),
+        Some("plan #2"),
+        "the last position is the default"
+    );
 
     app.on_key(key(KeyCode::Esc));
-    assert!(matches!(app.screen(), Screen::Main), "Esc returns to the main screen");
+    assert!(
+        matches!(app.screen(), Screen::Main),
+        "Esc returns to the main screen"
+    );
 }
 
 /// Covers AE6: an execution whose agent session events predate
@@ -3032,7 +3061,10 @@ async fn an_old_format_log_shows_no_conversation_record() {
     match &view.content {
         TaskContent::Events { message, events } => {
             assert_eq!(message, "no conversation record");
-            assert!(!events.is_empty(), "the position's own events are still shown");
+            assert!(
+                !events.is_empty(),
+                "the position's own events are still shown"
+            );
         }
         other => panic!("expected the events fallback, got {other:?}"),
     }

@@ -364,8 +364,8 @@ async fn drain_active_runs_pauses_the_active_run_and_waits_for_it_to_finish() {
     let root = TempRoot::new();
     let work = root.path().join("work");
     fs::create_dir_all(&work).expect("create a work dir");
-    for entry in fs::read_dir(engine_support::fixtures().join("scripts"))
-        .expect("read fixture scripts")
+    for entry in
+        fs::read_dir(engine_support::fixtures().join("scripts")).expect("read fixture scripts")
     {
         let entry = entry.expect("fixture script");
         fs::copy(entry.path(), work.join(entry.file_name())).expect("copy fixture script");
@@ -397,8 +397,7 @@ async fn drain_active_runs_pauses_the_active_run_and_waits_for_it_to_finish() {
         "the run must still be in flight for this test to mean anything"
     );
 
-    let drained =
-        narsor::cli::daemon::drain_active_runs(&engine, Duration::from_secs(5)).await;
+    let drained = narsor::cli::daemon::drain_active_runs(&engine, Duration::from_secs(5)).await;
 
     assert!(
         drained,

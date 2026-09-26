@@ -41,19 +41,56 @@
 //! only ever returns a bare status code.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
-use crate::domain::Event;
-use crate::engine::{build_timeline, Timeline};
+use crate::api::dto::{
+    AcceptedResponse, ExecutionListResponse, ExecutionSummary, StartTaskRequest, StartTaskResponse,
+    TransitionRequest,
+};
+use crate::domain::{Event, EventData, ExecutionStatus};
+use crate::engine::{
+    build_timeline, terminal_status, Engine, EngineError, HumanInputDelivery, Timeline,
+};
 use crate::persistence::{ConversationSource, ExecutionStore, PersistenceError};
+use crate::tasks::{self, TaskError};
+use crate::workflows::WorkflowResolver;
+
+/// The decision provider recorded for an operator's ordinary manual choice.
+///
+/// Deliberately the same literal `src/tui/app.rs`'s `MANUAL_PROVIDER` writes:
+/// both are alternative front doors to the same append-only event log, and an
+/// operator reading it later must not be able to tell which one wrote a given
+/// manual transition from the provider string alone.
+const MANUAL_PROVIDER: &str = "human";
+
+/// The decision provider recorded for a forced override (D30). See
+/// `src/tui/app.rs`'s `OVERRIDE_PROVIDER` for why it is deliberately distinct
+/// from [`MANUAL_PROVIDER`].
+const OVERRIDE_PROVIDER: &str = "human_override";
+
+/// The reason recorded on a forced transition — same text as
+/// `src/tui/app.rs`'s `OVERRIDE_REASON`.
+const OVERRIDE_REASON: &str =
+    "Forced manual transition (override): the target state was picked by the operator.";
+
+/// The reason recorded on an ordinary manual transition — same text as
+/// `src/tui/app.rs`'s `MANUAL_REASON`.
+const MANUAL_REASON: &str = "Manual transition picked by the operator.";
+
+/// The label recorded for a forced transition, which by definition has none
+/// — same value as `src/tui/app.rs`'s `OVERRIDE_LABEL`.
+const OVERRIDE_LABEL: &str = "override";
 
 /// Default byte budget for a conversation read when the caller does not ask
 /// for a specific one.
@@ -68,19 +105,52 @@ const DEFAULT_BYTE_BUDGET: usize = 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
+    engine: Arc<Engine>,
     store: ExecutionStore,
     token: String,
+    catalog_dir: PathBuf,
+    work_dir: PathBuf,
 }
 
-/// Builds the router: three GET endpoints behind the bearer-token gate.
-pub fn router(store: ExecutionStore, token: String) -> Router {
-    let state = AppState { store, token };
+/// Builds the router: the three original read-only endpoints (U5/U2) plus
+/// the mutating surface U3 adds — `POST /tasks`, `POST
+/// /executions/:id/resume`, `POST /executions/:id/input`, `POST
+/// /executions/:id/transition` and `GET /executions` — all behind the same
+/// bearer-token gate.
+///
+/// `catalog_dir`/`work_dir` are what [`crate::tasks::start_task`] and
+/// workflow-reference resolution ([`WorkflowResolver`]) need — the daemon's
+/// own catalogue and work roots (`config::Resolved::catalog_dir`/
+/// `work_dir`), now read by the server that runs a task instead of by a CLI
+/// process that used to hold them directly.
+pub fn router(
+    engine: Arc<Engine>,
+    store: ExecutionStore,
+    token: String,
+    catalog_dir: PathBuf,
+    work_dir: PathBuf,
+) -> Router {
+    let state = AppState {
+        engine,
+        store,
+        token,
+        catalog_dir,
+        work_dir,
+    };
     Router::new()
         .route("/executions/:execution_id/events", get(get_events))
         .route("/executions/:execution_id/timeline", get(get_timeline))
         .route(
             "/executions/:execution_id/attempts/:attempt_id/conversation",
             get(get_conversation),
+        )
+        .route("/executions", get(get_executions))
+        .route("/tasks", post(post_start_task))
+        .route("/executions/:execution_id/resume", post(post_resume))
+        .route("/executions/:execution_id/input", post(post_input))
+        .route(
+            "/executions/:execution_id/transition",
+            post(post_transition),
         )
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state)
@@ -124,15 +194,39 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// same trust boundary and there is nothing a body would add.
 enum ApiError {
     ExecutionNotFound,
+    /// The request itself is malformed or asks for something the workflow
+    /// definition does not allow (an unknown workflow reference, an illegal
+    /// transition target). `400`.
+    BadRequest(String),
+    /// The request is well-formed but conflicts with the execution's current
+    /// state (already being driven, or being transitioned by hand while
+    /// active). `409`.
+    Conflict(String),
     Storage(PersistenceError),
+    /// Anything else that stops a handler from completing — mirrors
+    /// `Storage`'s `500`, kept distinct only so the log line names the right
+    /// source.
+    Internal(String),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
             ApiError::ExecutionNotFound => StatusCode::NOT_FOUND.into_response(),
+            ApiError::BadRequest(message) => {
+                tracing::debug!(message, "api: bad request");
+                StatusCode::BAD_REQUEST.into_response()
+            }
+            ApiError::Conflict(message) => {
+                tracing::debug!(message, "api: conflict");
+                StatusCode::CONFLICT.into_response()
+            }
             ApiError::Storage(error) => {
                 tracing::warn!(error = %error, "api: storage error serving request");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+            ApiError::Internal(message) => {
+                tracing::warn!(message, "api: internal error serving request");
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         }
@@ -142,6 +236,41 @@ impl IntoResponse for ApiError {
 impl From<PersistenceError> for ApiError {
     fn from(error: PersistenceError) -> Self {
         ApiError::Storage(error)
+    }
+}
+
+/// Maps an [`EngineError`] the way the plan's U3 Approach specifies:
+/// [`EngineError::AlreadyRunning`] → `409`, "the execution does not exist" →
+/// `404`, everything else → `500`. Every other variant (`NotRunnable`,
+/// `AwaitingHumanInput`, `Decision`, `InvalidDefinition`, ...) is an engine or
+/// workflow-author problem the plan does not ask this endpoint surface to
+/// distinguish further — it lands on `Internal`, same as a storage failure.
+impl From<EngineError> for ApiError {
+    fn from(error: EngineError) -> Self {
+        match error {
+            EngineError::AlreadyRunning { .. } => ApiError::Conflict(error.to_string()),
+            EngineError::Persistence(PersistenceError::ExecutionNotFound { .. }) => {
+                ApiError::ExecutionNotFound
+            }
+            other => {
+                tracing::warn!(error = %other, "api: engine error serving request");
+                ApiError::Internal(other.to_string())
+            }
+        }
+    }
+}
+
+/// Maps a [`TaskError`] (starting a task, `POST /tasks`): a definition that
+/// fails static validation is the caller's fault (`400`); everything else
+/// (a rejected workspace, a failed clone, a storage error) is `500`.
+impl From<TaskError> for ApiError {
+    fn from(error: TaskError) -> Self {
+        match error {
+            TaskError::InvalidDefinition { violations } => {
+                ApiError::BadRequest(violations.join("; "))
+            }
+            other => ApiError::Internal(other.to_string()),
+        }
     }
 }
 
@@ -325,4 +454,293 @@ fn base64_encode(raw: &[u8]) -> String {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
     STANDARD.encode(raw)
+}
+
+// ---------------------------------------------------------------------------
+// Mutating endpoints (U3)
+// ---------------------------------------------------------------------------
+
+/// The definition an execution was started from, re-resolved the way `narsor
+/// resume`/`input` already do it ([`tasks::resolve_definition`]): from the
+/// path or workflow name pinned in the execution's own metadata, never from a
+/// caller-supplied override — there is no REST equivalent of the CLI's
+/// `--file` here, since a client of this API has no local filesystem
+/// relationship to the daemon's catalogue to point at.
+fn load_definition_for(
+    state: &AppState,
+    execution: &crate::domain::WorkflowExecution,
+) -> Result<crate::domain::WorkflowDefinition, ApiError> {
+    let resolved = tasks::resolve_definition(&state.catalog_dir, state.store.paths(), execution)
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    resolved
+        .load()
+        .map_err(|error| ApiError::Internal(error.to_string()))
+}
+
+/// `POST /tasks` — starts a new execution and drives it in the background.
+///
+/// Mirrors `narsor run`'s own two steps
+/// ([`tasks::start_task`] then [`Engine::run`]), except the run itself is
+/// hop-spawned rather than awaited: the plan calls for `202 Accepted` with
+/// the new `execution_id` the moment the execution exists, not once it
+/// finishes — a workflow can run for as long as its longest human gate.
+async fn post_start_task(
+    State(state): State<AppState>,
+    Json(body): Json<StartTaskRequest>,
+) -> Result<(StatusCode, Json<StartTaskResponse>), ApiError> {
+    let resolved = WorkflowResolver::new(state.catalog_dir.clone())
+        .resolve(&body.workflow)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let definition = tasks::load_resolved(&resolved)?;
+
+    let execution = tasks::start_task(
+        &state.catalog_dir,
+        &state.work_dir,
+        &state.engine,
+        &definition,
+        &resolved,
+        body.inputs,
+    )?;
+
+    let execution_id = execution.id.clone();
+    let engine = Arc::clone(&state.engine);
+    tokio::spawn(async move {
+        let _ = engine.run(&definition, &execution_id).await;
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(StartTaskResponse {
+            execution_id: execution.id,
+        }),
+    ))
+}
+
+/// `POST /executions/:execution_id/resume` — resumes a paused execution.
+///
+/// Phase 1 ([`Engine::try_begin_resume`]) runs synchronously: if another pass
+/// already holds this execution, this returns `409` immediately, with
+/// nothing spawned. On success, phase 2
+/// ([`crate::engine::RunHandle::run_to_completion`]) is handed to
+/// `tokio::spawn` and the handler answers `202` right away.
+async fn post_resume(
+    State(state): State<AppState>,
+    Path(execution_id): Path<String>,
+) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
+    require_execution(&state, &execution_id)?;
+    let execution = state.store.load_execution(&execution_id)?;
+    let definition = load_definition_for(&state, &execution)?;
+
+    let handle = state.engine.try_begin_resume(&execution_id)?;
+    tokio::spawn(async move {
+        let _ = handle.run_to_completion(&definition).await;
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(AcceptedResponse { execution_id }),
+    ))
+}
+
+/// `POST /executions/:execution_id/input` — delivers a person's answer to a
+/// paused execution.
+///
+/// The body is a [`HumanInputDelivery`] verbatim — it already derives
+/// `Serialize`/`Deserialize` for exactly this reason, so no separate DTO
+/// duplicates its shape. Same two-phase split as [`post_resume`].
+async fn post_input(
+    State(state): State<AppState>,
+    Path(execution_id): Path<String>,
+    Json(delivery): Json<HumanInputDelivery>,
+) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
+    require_execution(&state, &execution_id)?;
+    let execution = state.store.load_execution(&execution_id)?;
+    let definition = load_definition_for(&state, &execution)?;
+
+    let handle =
+        state
+            .engine
+            .try_begin_deliver_human_input(&definition, &execution_id, &delivery)?;
+    tokio::spawn(async move {
+        let _ = handle.run_to_completion(&definition).await;
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(AcceptedResponse { execution_id }),
+    ))
+}
+
+/// `POST /executions/:execution_id/transition` — a manual or forced
+/// transition, server-side.
+///
+/// Reimplements `src/tui/app.rs`'s `write_transition` (reached today only
+/// through `manual_transition`/`force_transition`, both fed from a menu the
+/// TUI already built out of *legal* choices): `engine.is_active` refuses a
+/// concurrently-driven execution first (`409`), and — the one check the TUI
+/// never needed, because its menu could not offer an illegal choice in the
+/// first place — the requested transition is validated against the
+/// workflow's own declared transitions before anything is written:
+///
+/// * ordinary (`force: false`): `label` must be one of the current state's
+///   declared `transitions`; anything else is `400`.
+/// * forced (`force: true`, D30): the current state must declare
+///   `allow_manual_override: true`, and `target` must name a state the
+///   workflow actually has; either failing is `400`.
+///
+/// Once validated, the event sequence and status update are byte-for-byte
+/// the ones `write_transition` writes, in the same order.
+async fn post_transition(
+    State(state): State<AppState>,
+    Path(execution_id): Path<String>,
+    Json(body): Json<TransitionRequest>,
+) -> Result<Json<ExecutionSummary>, ApiError> {
+    require_execution(&state, &execution_id)?;
+
+    // A background pass may be advancing this execution right now — this
+    // check is what keeps a hand-written transition from racing that pass's
+    // own appends and its own `save_execution` (see `write_transition`'s own
+    // comment on the same check).
+    if state.engine.is_active(&execution_id) {
+        return Err(ApiError::Conflict(format!(
+            "execution '{execution_id}' is being driven in the background right now"
+        )));
+    }
+
+    let mut execution = state.store.load_execution(&execution_id)?;
+    let definition = load_definition_for(&state, &execution)?;
+
+    let from_state_id = execution
+        .current_state
+        .clone()
+        .unwrap_or_else(|| definition.initial_state.clone());
+    let from_state = definition.states.get(&from_state_id).ok_or_else(|| {
+        ApiError::Internal(format!(
+            "execution '{execution_id}' is at state '{from_state_id}', which its workflow does \
+             not define"
+        ))
+    })?;
+
+    let (target, label, provider, reason) = if body.force {
+        if !from_state.allow_manual_override {
+            return Err(ApiError::BadRequest(format!(
+                "state '{from_state_id}' does not allow a forced transition \
+                 (allow_manual_override)"
+            )));
+        }
+        let target = body.target.clone().ok_or_else(|| {
+            ApiError::BadRequest("a forced transition requires a target state".to_string())
+        })?;
+        if !definition.states.contains_key(&target) {
+            return Err(ApiError::BadRequest(format!(
+                "the workflow has no state '{target}'"
+            )));
+        }
+        (
+            target,
+            OVERRIDE_LABEL.to_string(),
+            OVERRIDE_PROVIDER,
+            OVERRIDE_REASON,
+        )
+    } else {
+        let label = body.label.clone().ok_or_else(|| {
+            ApiError::BadRequest("label is required unless force is set".to_string())
+        })?;
+        let target = from_state.transitions.get(&label).cloned().ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "state '{from_state_id}' has no transition for label '{label}' — this is not a \
+                 legal transition from the current state"
+            ))
+        })?;
+        (target, label, MANUAL_PROVIDER, MANUAL_REASON)
+    };
+
+    // Guaranteed to exist: the forced branch checked it above, and the
+    // ordinary branch's target came from the current state's own
+    // `transitions` map, which the loader already validates points at a
+    // declared state (`WORKFLOW_SCHEMA.md` §5).
+    let target_state = definition
+        .states
+        .get(&target)
+        .cloned()
+        .ok_or_else(|| ApiError::Internal(format!("the workflow has no state '{target}'")))?;
+
+    let log = state.store.event_log(&execution_id);
+    let writes: Vec<EventData> = vec![
+        EventData::DecisionMade {
+            provider: provider.to_string(),
+            output_label: label.clone(),
+            reasoning: Some(reason.to_string()),
+        },
+        EventData::HumanTransitionSelected {
+            from_state: from_state_id.clone(),
+            to_state: target.clone(),
+        },
+        EventData::StateExited {
+            state_id: from_state_id.clone(),
+            output_label: label.clone(),
+        },
+        EventData::TransitionTaken {
+            from_state: from_state_id.clone(),
+            to_state: target.clone(),
+            output_label: label.clone(),
+        },
+    ];
+    for data in writes {
+        log.append_next(&execution_id, data)?;
+    }
+
+    execution.current_state = Some(target.clone());
+    execution.current_action_execution = None;
+
+    if target_state.terminal {
+        let status = terminal_status(&target_state);
+        execution.status = status.clone();
+        execution.completed_at = Some(Utc::now());
+
+        let closing = match status {
+            ExecutionStatus::Failed => EventData::WorkflowFailed {
+                error: format!("Forced transition into terminal state '{target}'."),
+            },
+            ExecutionStatus::Cancelled => EventData::WorkflowCancelled {
+                reason: format!("Forced transition into terminal state '{target}'."),
+            },
+            _ => EventData::WorkflowCompleted {
+                result: Value::Object(Map::new()),
+            },
+        };
+        let entered = EventData::StateEntered {
+            state_id: target.clone(),
+        };
+        for data in [entered, closing] {
+            log.append_next(&execution_id, data)?;
+        }
+    } else {
+        execution.status = ExecutionStatus::Paused;
+        log.append_next(
+            &execution_id,
+            EventData::WorkflowPaused {
+                reason: format!("Manual transition into state '{target}'; waiting to be resumed."),
+            },
+        )?;
+    }
+
+    // A question asked in the state just left can no longer be answered.
+    state.store.clear_pending_input(&execution_id)?;
+    state.store.save_execution(&execution)?;
+
+    Ok(Json(ExecutionSummary::from(&execution)))
+}
+
+/// `GET /executions` — every stored execution, summarised.
+async fn get_executions(
+    State(state): State<AppState>,
+) -> Result<Json<ExecutionListResponse>, ApiError> {
+    let ids = state.store.list_execution_ids()?;
+    let mut executions = Vec::with_capacity(ids.len());
+    for id in ids {
+        let execution = state.store.load_execution(&id)?;
+        executions.push(ExecutionSummary::from(&execution));
+    }
+    Ok(Json(ExecutionListResponse { executions }))
 }

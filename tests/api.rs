@@ -4,17 +4,22 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use narsor::api;
-use narsor::api::ClientError;
+use narsor::api::{ClientError, ExecutionListResponse, ExecutionSummary, StartTaskResponse};
 use narsor::domain::{
-    Context, Event, EventData, ExecutionStatus, RepositoryInfo, WorkflowExecution, Workspace,
+    Context, Event, EventData, ExecutionStatus, RepositoryInfo, WorkflowDefinition,
+    WorkflowExecution, Workspace,
 };
-use narsor::engine::{ConversationState, PositionStatus};
+use narsor::engine::{ConversationState, Engine, HumanInputDelivery, PositionStatus};
 use narsor::persistence::conversation::ConversationSource;
 use narsor::persistence::ExecutionStore;
+use narsor::workflow::load_from_file;
 
 /// A temporary directory that deletes itself when it goes out of scope.
 ///
@@ -29,6 +34,14 @@ impl TempRoot {
         let path = std::env::temp_dir().join(format!("narsor-api-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn join(&self, name: &str) -> PathBuf {
+        self.path.join(name)
     }
 
     fn store(&self) -> ExecutionStore {
@@ -131,7 +144,9 @@ fn seed_execution_with_retry(store: &ExecutionStore, execution_id: &str) {
 
     let conversations = store.conversation_store(execution_id);
     let mut first = conversations.writer("attempt-1").expect("open writer 1");
-    first.append_narsor("prompt: try the thing").expect("append prompt 1");
+    first
+        .append_narsor("prompt: try the thing")
+        .expect("append prompt 1");
     first
         .append(ConversationSource::Stdout, br#"{"type":"error"}"#)
         .expect("append stdout 1");
@@ -153,8 +168,177 @@ fn seed_execution_with_retry(store: &ExecutionStore, execution_id: &str) {
         .expect("close attempt 2");
 }
 
+/// Starts the server over a fresh, otherwise unused engine — for the
+/// original read-only endpoint tests, which never drive anything and so
+/// don't care what the catalog/work roots are.
 async fn start_server(store: ExecutionStore) -> api::ApiHandle {
-    api::start(store).await.expect("server starts")
+    let root = std::env::temp_dir();
+    start_server_with_engine(Arc::new(Engine::new(store)), root.clone(), root).await
+}
+
+/// Starts the server over a caller-supplied, already-`Arc`-wrapped engine —
+/// for the mutating endpoint tests (U3), which need to keep driving that
+/// same engine directly (to seed a paused execution, or to hold the
+/// "already running" claim while asserting a conflict) alongside what goes
+/// over HTTP.
+async fn start_server_with_engine(
+    engine: Arc<Engine>,
+    catalog_dir: PathBuf,
+    work_dir: PathBuf,
+) -> api::ApiHandle {
+    api::start(engine, catalog_dir, work_dir)
+        .await
+        .expect("server starts")
+}
+
+/// The directory the TUI's own fixtures live in — reused here rather than
+/// duplicated, since `pipeline.yaml` (one script state, one human state, two
+/// terminals) is exactly the shape these tests need too.
+fn fixtures() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tui")
+}
+
+fn pipeline_definition_path() -> PathBuf {
+    fixtures().join("pipeline.yaml")
+}
+
+fn prepare_script_path() -> PathBuf {
+    fixtures().join("prepare.sh")
+}
+
+/// Writes (and loads) the smallest workflow that validates: one script state
+/// that always succeeds, straight into a terminal. For tests that need an
+/// execution to run to completion without any human gate in the way.
+fn write_script_to_done_workflow(root: &TempRoot) -> (WorkflowDefinition, PathBuf) {
+    let script_path = root.join("succeed.sh");
+    fs::write(&script_path, "#!/bin/sh\nexit 0\n").expect("write script");
+    let mut permissions = fs::metadata(&script_path)
+        .expect("stat script")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("chmod script");
+
+    let yaml = format!(
+        r#"
+name: api-resume-fixture
+version: 1
+description: Minimal script-to-terminal fixture for the resume endpoint test.
+
+states:
+  start:
+    description: Runs a script that always succeeds.
+    action:
+      type: script
+      command: "{command}"
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  done:
+    description: Terminal.
+
+terminal_states:
+  done: completed
+"#,
+        command = script_path.display()
+    );
+
+    let path = root.join("api-resume-fixture.yaml");
+    fs::write(&path, yaml).expect("write definition");
+    let definition = load_from_file(&path).expect("load definition");
+    (definition, path)
+}
+
+/// Writes (and loads) a workflow with a non-terminal `waiting` state whose
+/// declared transitions are exactly `approve -> done` and `reject ->
+/// aborted` — for the transition endpoint tests, which need a state with a
+/// real transition graph to validate a label against but never actually run
+/// the state's own action.
+fn write_transition_fixture(root: &TempRoot) -> (WorkflowDefinition, PathBuf) {
+    let yaml = r#"
+name: api-transition-fixture
+version: 1
+description: Fixture with a declared transition graph, for the transition endpoint tests.
+
+states:
+  waiting:
+    description: A person decides, by hand, whether to approve or reject.
+    allow_manual_override: true
+    action:
+      type: human
+      message: "Approve?"
+      inputs:
+        - name: approval_status
+          type: select
+          required: true
+          options:
+            - approved
+            - rejected
+    outputs:
+      - approve
+      - reject
+    transitions:
+      approve: done
+      reject: aborted
+
+  done:
+    description: Approved.
+
+  aborted:
+    description: Rejected.
+
+terminal_states:
+  done: completed
+  aborted: failed
+"#;
+
+    let path = root.join("api-transition-fixture.yaml");
+    fs::write(&path, yaml).expect("write definition");
+    let definition = load_from_file(&path).expect("load definition");
+    (definition, path)
+}
+
+/// Records where `definition_path` lives in `execution`'s own metadata, the
+/// way `tasks::start_task` does — so the server's own
+/// `tasks::resolve_definition` can find the workflow again for
+/// resume/input/transition, exactly as `narsor resume`/`input` already rely
+/// on it to.
+fn pin_definition_path(store: &ExecutionStore, execution_id: &str, definition_path: &Path) {
+    let mut execution = store
+        .load_execution(execution_id)
+        .expect("reload execution");
+    execution.metadata = serde_json::json!({
+        "cli": { "definition_path": definition_path.display().to_string() }
+    });
+    store
+        .save_execution(&execution)
+        .expect("save execution with pinned definition path");
+}
+
+/// Polls the store until `execution_id` reaches `expected`, or panics once
+/// `timeout` elapses.
+async fn wait_for_status(
+    store: &ExecutionStore,
+    execution_id: &str,
+    expected: ExecutionStatus,
+    timeout: Duration,
+) -> WorkflowExecution {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let execution = store.load_execution(execution_id).expect("load execution");
+        if execution.status == expected {
+            return execution;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "execution '{execution_id}' did not reach {expected:?} within {timeout:?} \
+                 (last status: {:?})",
+                execution.status
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 // --- Happy paths -------------------------------------------------------
@@ -175,8 +359,14 @@ async fn timeline_endpoint_reports_two_positions_after_a_retry() {
     assert_eq!(timeline.positions[0].status, PositionStatus::Failed);
     assert_eq!(timeline.positions[1].label, "plan #2");
     assert_eq!(timeline.positions[1].status, PositionStatus::Succeeded);
-    assert_eq!(timeline.positions[0].conversation, ConversationState::Recorded);
-    assert_eq!(timeline.positions[1].conversation, ConversationState::Recorded);
+    assert_eq!(
+        timeline.positions[0].conversation,
+        ConversationState::Recorded
+    );
+    assert_eq!(
+        timeline.positions[1].conversation,
+        ConversationState::Recorded
+    );
 }
 
 #[tokio::test]
@@ -355,10 +545,7 @@ async fn missing_or_wrong_token_is_refused() {
     let handle = start_server(store).await;
     let raw = reqwest::Client::new();
 
-    let url = format!(
-        "http://{}/executions/exec-1/timeline",
-        handle.addr()
-    );
+    let url = format!("http://{}/executions/exec-1/timeline", handle.addr());
 
     let no_token = raw.get(&url).send().await.expect("request without token");
     assert_eq!(no_token.status(), reqwest::StatusCode::UNAUTHORIZED);
@@ -444,4 +631,676 @@ async fn client_walks_event_to_timeline_to_conversation() {
         }
         narsor::api::ConversationResponse::NoRecord => panic!("expected a record"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// U3: mutating endpoints
+// ---------------------------------------------------------------------------
+
+fn raw_client() -> reqwest::Client {
+    reqwest::Client::new()
+}
+
+fn url(handle: &api::ApiHandle, path: &str) -> String {
+    format!("http://{}{path}", handle.addr())
+}
+
+#[tokio::test]
+async fn post_tasks_creates_an_execution_and_it_appears_in_the_list() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let raw = raw_client();
+
+    let body = serde_json::json!({
+        "workflow": pipeline_definition_path().display().to_string(),
+        "inputs": {
+            "script_path": prepare_script_path().display().to_string(),
+            "ticket": "ORC-1",
+        }
+    });
+
+    let response = raw
+        .post(url(&handle, "/tasks"))
+        .bearer_auth(handle.token())
+        .json(&body)
+        .send()
+        .await
+        .expect("post /tasks");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let parsed: StartTaskResponse = response.json().await.expect("parse start-task response");
+    let execution_id = parsed.execution_id;
+    assert!(store.exists(&execution_id));
+
+    let listing = raw
+        .get(url(&handle, "/executions"))
+        .bearer_auth(handle.token())
+        .send()
+        .await
+        .expect("get /executions");
+    assert_eq!(listing.status(), reqwest::StatusCode::OK);
+    let listing: ExecutionListResponse = listing.json().await.expect("parse listing");
+    assert!(listing
+        .executions
+        .iter()
+        .any(|execution| execution.id == execution_id));
+
+    // The workflow's script state always succeeds, so the run reaches the
+    // human gate at `review` and stops there — proof the background
+    // `tokio::spawn(engine.run(...))` actually ran.
+    wait_for_status(
+        &store,
+        &execution_id,
+        ExecutionStatus::Paused,
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn post_resume_drives_a_paused_execution_to_a_terminal_state() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+
+    let (definition, definition_path) = write_script_to_done_workflow(&root);
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let execution = engine
+        .start(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start execution");
+    engine
+        .pause_now(&execution.id, "paused for the resume test")
+        .expect("pause the execution");
+    pin_definition_path(&store, &execution.id, &definition_path);
+
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let raw = raw_client();
+
+    let response = raw
+        .post(url(
+            &handle,
+            &format!("/executions/{}/resume", execution.id),
+        ))
+        .bearer_auth(handle.token())
+        .send()
+        .await
+        .expect("post resume");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+
+    wait_for_status(
+        &store,
+        &execution.id,
+        ExecutionStatus::Completed,
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn post_input_delivers_an_answer_to_a_waiting_execution() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+
+    let definition = load_from_file(pipeline_definition_path()).expect("load pipeline fixture");
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let execution = engine
+        .start(
+            &definition,
+            serde_json::json!({
+                "script_path": prepare_script_path().display().to_string(),
+                "ticket": "ORC-2",
+            }),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start execution");
+    pin_definition_path(&store, &execution.id, &pipeline_definition_path());
+
+    // Drives the execution to the human gate directly through the engine —
+    // exactly what `POST /tasks` does in the background — before the server
+    // (and its own claim on the execution) is even started.
+    engine
+        .run(&definition, &execution.id)
+        .await
+        .expect("run to the human gate");
+    assert_eq!(
+        store.load_execution(&execution.id).expect("reload").status,
+        ExecutionStatus::Paused
+    );
+    assert!(store.has_pending_input(&execution.id));
+
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let raw = raw_client();
+
+    let delivery = HumanInputDelivery::with_values(
+        serde_json::json!({
+            "approval_status": "approved",
+            "comment": "looks good",
+        })
+        .as_object()
+        .cloned()
+        .expect("object"),
+    );
+
+    let response = raw
+        .post(url(&handle, &format!("/executions/{}/input", execution.id)))
+        .bearer_auth(handle.token())
+        .json(&delivery)
+        .send()
+        .await
+        .expect("post input");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+
+    wait_for_status(
+        &store,
+        &execution.id,
+        ExecutionStatus::Completed,
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn post_transition_happy_path_writes_the_expected_events_and_state() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+
+    let (definition, definition_path) = write_transition_fixture(&root);
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let mut execution = engine
+        .start(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start execution");
+    execution.current_state = Some("waiting".to_string());
+    execution.status = ExecutionStatus::Paused;
+    store.save_execution(&execution).expect("save execution");
+    pin_definition_path(&store, &execution.id, &definition_path);
+
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let raw = raw_client();
+
+    let body = TransitionRequestBody {
+        label: Some("approve".to_string()),
+        target: None,
+        force: false,
+    };
+
+    let response = raw
+        .post(url(
+            &handle,
+            &format!("/executions/{}/transition", execution.id),
+        ))
+        .bearer_auth(handle.token())
+        .json(&body)
+        .send()
+        .await
+        .expect("post transition");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let summary: ExecutionSummary = response.json().await.expect("parse summary");
+    assert_eq!(summary.current_state.as_deref(), Some("done"));
+    assert_eq!(summary.status, ExecutionStatus::Completed);
+
+    let events = store
+        .event_log(&execution.id)
+        .read_all()
+        .expect("read events");
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|event| match &event.data {
+            EventData::WorkflowStarted { .. } => "workflow_started",
+            EventData::DecisionMade { .. } => "decision_made",
+            EventData::HumanTransitionSelected { .. } => "human_transition_selected",
+            EventData::StateExited { .. } => "state_exited",
+            EventData::TransitionTaken { .. } => "transition_taken",
+            EventData::StateEntered { .. } => "state_entered",
+            EventData::WorkflowCompleted { .. } => "workflow_completed",
+            other => panic!("unexpected event in this fixture's log: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "workflow_started",
+            "decision_made",
+            "human_transition_selected",
+            "state_exited",
+            "transition_taken",
+            "state_entered",
+            "workflow_completed",
+        ]
+    );
+
+    let reloaded = store.load_execution(&execution.id).expect("reload");
+    assert_eq!(reloaded.status, ExecutionStatus::Completed);
+    assert_eq!(reloaded.current_state.as_deref(), Some("done"));
+}
+
+#[tokio::test]
+async fn post_transition_to_an_illegal_label_is_rejected_with_no_write() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+
+    let (definition, definition_path) = write_transition_fixture(&root);
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let mut execution = engine
+        .start(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start execution");
+    execution.current_state = Some("waiting".to_string());
+    execution.status = ExecutionStatus::Paused;
+    store.save_execution(&execution).expect("save execution");
+    pin_definition_path(&store, &execution.id, &definition_path);
+
+    let events_before = store
+        .event_log(&execution.id)
+        .read_all()
+        .expect("read events");
+
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let raw = raw_client();
+
+    let body = TransitionRequestBody {
+        label: Some("not-a-declared-label".to_string()),
+        target: None,
+        force: false,
+    };
+
+    let response = raw
+        .post(url(
+            &handle,
+            &format!("/executions/{}/transition", execution.id),
+        ))
+        .bearer_auth(handle.token())
+        .json(&body)
+        .send()
+        .await
+        .expect("post transition");
+    assert!(
+        response.status() == reqwest::StatusCode::BAD_REQUEST
+            || response.status() == reqwest::StatusCode::CONFLICT
+    );
+
+    let events_after = store
+        .event_log(&execution.id)
+        .read_all()
+        .expect("read events");
+    assert_eq!(
+        events_before.len(),
+        events_after.len(),
+        "no event was written"
+    );
+    let reloaded = store.load_execution(&execution.id).expect("reload");
+    assert_eq!(reloaded.status, ExecutionStatus::Paused, "no status change");
+    assert_eq!(reloaded.current_state.as_deref(), Some("waiting"));
+}
+
+#[tokio::test]
+async fn post_transition_on_an_active_execution_is_a_conflict_with_no_write() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+
+    // A script that sleeps briefly, so the execution is observably "active"
+    // (`Engine::is_active`) for long enough to race the transition against.
+    let script_path = root.join("slow.sh");
+    fs::write(&script_path, "#!/bin/sh\nsleep 1\nexit 0\n").expect("write script");
+    let mut permissions = fs::metadata(&script_path).expect("stat").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("chmod");
+
+    let yaml = format!(
+        r#"
+name: api-active-conflict-fixture
+version: 1
+description: A slow script state, for the "active execution" conflict test.
+
+states:
+  start:
+    action:
+      type: script
+      command: "{command}"
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  done:
+    description: Terminal.
+
+terminal_states:
+  done: completed
+"#,
+        command = script_path.display()
+    );
+    let definition_path = root.join("api-active-conflict-fixture.yaml");
+    fs::write(&definition_path, yaml).expect("write definition");
+    let definition = load_from_file(&definition_path).expect("load definition");
+
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let execution = engine
+        .start(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start execution");
+    pin_definition_path(&store, &execution.id, &definition_path);
+
+    // Drives the execution directly through the engine (not through the
+    // server) — a background pass exactly like `POST /tasks`'s
+    // `tokio::spawn(engine.run(...))` would leave running.
+    let running_engine = Arc::clone(&engine);
+    let running_definition = definition.clone();
+    let execution_id = execution.id.clone();
+    let run_task = tokio::spawn(async move {
+        let _ = running_engine.run(&running_definition, &execution_id).await;
+    });
+
+    // Wait until the engine actually claims the execution before racing the
+    // transition against it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !engine.is_active(&execution.id) {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("the background run never became active");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let raw = raw_client();
+
+    let body = TransitionRequestBody {
+        label: Some("success".to_string()),
+        target: None,
+        force: false,
+    };
+    let response = raw
+        .post(url(
+            &handle,
+            &format!("/executions/{}/transition", execution.id),
+        ))
+        .bearer_auth(handle.token())
+        .json(&body)
+        .send()
+        .await
+        .expect("post transition");
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+
+    run_task.await.expect("background run task");
+    wait_for_status(
+        &store,
+        &execution.id,
+        ExecutionStatus::Completed,
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+/// Covers AE4: two concurrent `POST /executions/:id/resume` for the same id
+/// — exactly one `202`, the other `409`.
+#[tokio::test]
+async fn concurrent_resume_yields_exactly_one_accepted_and_one_conflict() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+
+    let script_path = root.join("slow.sh");
+    fs::write(&script_path, "#!/bin/sh\nsleep 1\nexit 0\n").expect("write script");
+    let mut permissions = fs::metadata(&script_path).expect("stat").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("chmod");
+
+    let yaml = format!(
+        r#"
+name: api-concurrent-resume-fixture
+version: 1
+description: A slow script state, for the concurrent-resume (AE4) test.
+
+states:
+  start:
+    action:
+      type: script
+      command: "{command}"
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  done:
+    description: Terminal.
+
+terminal_states:
+  done: completed
+"#,
+        command = script_path.display()
+    );
+    let definition_path = root.join("api-concurrent-resume-fixture.yaml");
+    fs::write(&definition_path, yaml).expect("write definition");
+    let definition = load_from_file(&definition_path).expect("load definition");
+
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let execution = engine
+        .start(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start execution");
+    engine
+        .pause_now(&execution.id, "paused for the concurrent-resume test")
+        .expect("pause");
+    pin_definition_path(&store, &execution.id, &definition_path);
+
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let raw = raw_client();
+
+    let request = || {
+        raw.post(url(
+            &handle,
+            &format!("/executions/{}/resume", execution.id),
+        ))
+        .bearer_auth(handle.token())
+        .send()
+    };
+
+    let (first, second) = tokio::join!(request(), request());
+    let statuses = [
+        first.expect("first resume request").status(),
+        second.expect("second resume request").status(),
+    ];
+
+    let accepted = statuses
+        .iter()
+        .filter(|status| **status == reqwest::StatusCode::ACCEPTED)
+        .count();
+    let conflicts = statuses
+        .iter()
+        .filter(|status| **status == reqwest::StatusCode::CONFLICT)
+        .count();
+    assert_eq!(
+        accepted, 1,
+        "exactly one request must be accepted: {statuses:?}"
+    );
+    assert_eq!(
+        conflicts, 1,
+        "exactly one request must conflict: {statuses:?}"
+    );
+
+    wait_for_status(
+        &store,
+        &execution.id,
+        ExecutionStatus::Completed,
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn unknown_execution_id_is_not_found_on_every_mutating_endpoint() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let raw = raw_client();
+
+    let resume = raw
+        .post(url(&handle, "/executions/does-not-exist/resume"))
+        .bearer_auth(handle.token())
+        .send()
+        .await
+        .expect("post resume");
+    assert_eq!(resume.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let input = raw
+        .post(url(&handle, "/executions/does-not-exist/input"))
+        .bearer_auth(handle.token())
+        .json(&HumanInputDelivery::label("approved"))
+        .send()
+        .await
+        .expect("post input");
+    assert_eq!(input.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let transition = raw
+        .post(url(&handle, "/executions/does-not-exist/transition"))
+        .bearer_auth(handle.token())
+        .json(&TransitionRequestBody {
+            label: Some("approve".to_string()),
+            target: None,
+            force: false,
+        })
+        .send()
+        .await
+        .expect("post transition");
+    assert_eq!(transition.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn mutating_endpoints_refuse_a_missing_or_wrong_token() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let raw = raw_client();
+
+    let no_token = raw
+        .post(url(&handle, "/tasks"))
+        .json(&serde_json::json!({ "workflow": "does-not-matter", "inputs": {} }))
+        .send()
+        .await
+        .expect("post tasks without a token");
+    assert_eq!(no_token.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body = no_token.text().await.expect("read body");
+    assert!(body.is_empty(), "refusal must carry no body content");
+
+    let wrong_token = raw
+        .get(url(&handle, "/executions"))
+        .bearer_auth("not-the-real-token")
+        .send()
+        .await
+        .expect("get executions with the wrong token");
+    assert_eq!(wrong_token.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn an_unsafe_execution_id_on_transition_is_rejected_like_not_found() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let raw = raw_client();
+
+    // `../../etc` URL-encoded, so it survives as a single path segment
+    // rather than being collapsed by the HTTP client before it ever reaches
+    // the server; `is_safe_id` must still reject it.
+    let response = raw
+        .post(url(&handle, "/executions/..%2F..%2Fetc/transition"))
+        .bearer_auth(handle.token())
+        .json(&TransitionRequestBody {
+            label: Some("approve".to_string()),
+            target: None,
+            force: false,
+        })
+        .send()
+        .await
+        .expect("post transition with an unsafe id");
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+/// A local stand-in for [`TransitionRequest`], since that DTO only derives
+/// `Deserialize` (a handler only ever reads one) and these tests need to
+/// serialize a request body to send over the wire.
+#[derive(serde::Serialize)]
+struct TransitionRequestBody {
+    label: Option<String>,
+    target: Option<String>,
+    force: bool,
 }

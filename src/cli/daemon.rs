@@ -61,12 +61,18 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
 
     let engine = Arc::new(Engine::new(store.clone()).with_agent_defaults(config.agent_defaults()));
 
-    // The router today is the minimal, pre-existing read-only surface
-    // (`src/api/routes.rs`) — mutating endpoints and SSE are U3/U4, out of
-    // scope here. Binding and owning this server is the daemon's job now
-    // (R1); a failure to bind is fatal and must leave no discovery file
-    // behind (checked by `tests/daemon_lifecycle.rs`).
-    let api_handle = crate::api::start(store).await.map_err(|error| {
+    // The router now also carries the mutating endpoints U3 adds (SSE is
+    // still U4, out of scope here); it drives on `engine` directly, sharing
+    // the one `Arc<Engine>` this daemon owns. Binding and owning this server
+    // is the daemon's job (R1); a failure to bind is fatal and must leave no
+    // discovery file behind (checked by `tests/daemon_lifecycle.rs`).
+    let api_handle = crate::api::start(
+        Arc::clone(&engine),
+        config.catalog_dir().to_path_buf(),
+        config.work_dir().to_path_buf(),
+    )
+    .await
+    .map_err(|error| {
         CliError::failure(format!("could not start the daemon's API server: {error}"))
     })?;
 

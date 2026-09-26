@@ -63,14 +63,21 @@
 //! returns an error the caller is expected to treat as fatal.
 
 mod client;
+pub mod dto;
 mod routes;
 
 pub use client::{ApiClient, ClientError};
+pub use dto::{
+    AcceptedResponse, ExecutionListResponse, ExecutionSummary, StartTaskRequest, StartTaskResponse,
+    TransitionRequest,
+};
 pub use routes::{ConversationEntryDto, ConversationResponse};
 
-use crate::persistence::ExecutionStore;
+use crate::engine::Engine;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -139,18 +146,27 @@ impl ApiHandle {
     }
 }
 
-/// Starts the embedded API server over `store`, on a random loopback port.
+/// Starts the embedded API server over `engine`, on a random loopback port.
+///
+/// `catalog_dir`/`work_dir` are the daemon's own catalogue and work roots
+/// (U3): `POST /tasks` needs them to resolve a workflow reference and
+/// provision a workspace exactly as `narsor run` does, now server-side.
 ///
 /// The returned [`ApiHandle`] carries the bound address and the token every
 /// request must present as `Authorization: Bearer <token>`.
-pub async fn start(store: ExecutionStore) -> Result<ApiHandle, ApiStartError> {
+pub async fn start(
+    engine: Arc<Engine>,
+    catalog_dir: PathBuf,
+    work_dir: PathBuf,
+) -> Result<ApiHandle, ApiStartError> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(ApiStartError)?;
     let addr = listener.local_addr().map_err(ApiStartError)?;
     let token = Uuid::new_v4().to_string();
 
-    let app = routes::router(store, token.clone());
+    let store = engine.store().clone();
+    let app = routes::router(engine, store, token.clone(), catalog_dir, work_dir);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         let _ = axum::serve(listener, app)

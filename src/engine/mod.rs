@@ -22,12 +22,12 @@ pub use decision::{
     check_label, decide, permitted_labels, DecisionError, DecisionOutcome, DecisionRequest,
 };
 pub use retry::RetrySchedule;
+pub use runner::{
+    terminal_status, ActionKind, AgentDefaults, Engine, EngineError, PendingStep, RunHandle,
+    EVENT_CHANNEL_CAPACITY,
+};
 pub use timeline::{
     build_timeline, ConversationState, EventLink, Position, PositionStatus, Timeline,
-};
-pub use runner::{
-    terminal_status, ActionKind, AgentDefaults, Engine, EngineError, PendingStep,
-    EVENT_CHANNEL_CAPACITY,
 };
 
 pub use actions::{

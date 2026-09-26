@@ -378,6 +378,102 @@ impl Drop for RunGuard<'_> {
     }
 }
 
+/// An owned equivalent of [`RunGuard`]: holds the same "already running"
+/// claim, over the same `active_runs` set, but through an [`Arc<Engine>`]
+/// rather than a borrow — which is what lets it live inside a
+/// `tokio::spawn`-ed task instead of a stack frame that ends when an HTTP
+/// handler returns (U3). [`Engine::begin_run`] and this claim both operate on
+/// the one `active_runs` set, so a plain [`Engine::run`]/[`Engine::resume`]
+/// and a [`RunHandle`]-driven resume can never both succeed on the same
+/// execution.
+struct ActiveRunClaim {
+    engine: Arc<Engine>,
+    execution_id: ExecutionId,
+}
+
+impl Drop for ActiveRunClaim {
+    fn drop(&mut self) {
+        self.engine.lock_active_runs().remove(&self.execution_id);
+    }
+}
+
+/// What a prepared (but not yet driven to completion) resume/delivery ended
+/// up at, synchronously.
+enum HandleState {
+    /// The execution still has to be stepped (`run_loop`).
+    Ready(WorkflowExecution),
+    /// The synchronous phase already reached a stop (e.g. a `human` action's
+    /// answer completed the step but the workflow suspended again right
+    /// away) — nothing left to run.
+    Done(WorkflowExecution),
+}
+
+/// The claim on one execution, held between the synchronous "try to begin"
+/// phase and the asynchronous "run to completion" phase (U3's two-phase
+/// split of [`Engine::resume`]/[`Engine::deliver_human_input`]).
+///
+/// Returned by [`Engine::try_begin_resume`] and
+/// [`Engine::try_begin_deliver_human_input`] — both fail synchronously, with
+/// no `.await`, if another pass already holds the execution
+/// ([`EngineError::AlreadyRunning`]), which is what lets an HTTP handler
+/// answer `409` immediately without spawning anything. On success, the
+/// handle carries everything [`RunHandle::run_to_completion`] needs to
+/// finish the job; that method is the only way to consume it, and is exactly
+/// the thing a caller hands to `tokio::spawn`.
+///
+/// The exact shape here (an owned handle over `Arc<Engine>`, rather than the
+/// plan's own sketch of `ResumeHandle<'_>` borrowing `&Engine`) is this
+/// unit's implementation decision (see the plan's U3 Approach and Open
+/// Questions): a borrowed handle cannot outlive the stack frame that created
+/// it, which is exactly the frame an HTTP handler returns from before phase
+/// 2 finishes.
+pub struct RunHandle {
+    engine: Arc<Engine>,
+    execution_id: ExecutionId,
+    claim: ActiveRunClaim,
+    state: HandleState,
+}
+
+impl RunHandle {
+    /// The execution this handle is driving.
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
+    }
+
+    /// Runs the prepared execution to completion (or, if the synchronous
+    /// phase already stopped it, simply returns it) — the asynchronous half
+    /// of the two-phase split, safe to hand to `tokio::spawn` because it owns
+    /// everything it touches.
+    ///
+    /// Any error is recorded as an [`EventData::Error`] against the
+    /// execution before it is returned, exactly as
+    /// [`Engine::resume`]/[`Engine::deliver_human_input`] already do via
+    /// `observed` — a caller that spawns this and discards the `JoinHandle`
+    /// still gets the failure onto the event stream.
+    pub async fn run_to_completion(
+        self,
+        definition: &WorkflowDefinition,
+    ) -> Result<WorkflowExecution, EngineError> {
+        let RunHandle {
+            engine,
+            execution_id,
+            claim,
+            state,
+        } = self;
+
+        let outcome = match state {
+            HandleState::Done(execution) => Ok(execution),
+            HandleState::Ready(execution) => engine.run_loop(definition, execution).await,
+        };
+
+        if let Err(error) = &outcome {
+            engine.note_engine_error(&execution_id, error);
+        }
+        drop(claim);
+        outcome
+    }
+}
+
 impl Engine {
     /// Creates an engine with the executors of this version: `script`, `human`
     /// and `agent`.
@@ -623,6 +719,12 @@ impl Engine {
     ///
     /// Refuses an execution that is paused on a question: that one needs an
     /// answer, not a nudge.
+    ///
+    /// A thin wrapper, unchanged in contract, over the two-phase split U3
+    /// introduced for the REST endpoint: [`Engine::try_begin_resume`] claims
+    /// the run and does the synchronous half, then
+    /// [`RunHandle::run_to_completion`] does the rest — sequentially, in one
+    /// `.await`, exactly as this used to be written as a single block.
     pub async fn resume(
         &self,
         definition: &WorkflowDefinition,
@@ -630,27 +732,68 @@ impl Engine {
     ) -> Result<WorkflowExecution, EngineError> {
         self.observed(execution_id, async {
             let _guard = self.begin_run(execution_id)?;
-            let mut execution = self.store.load_execution(execution_id)?;
-
-            match execution.status {
-                ExecutionStatus::Running => {}
-                ExecutionStatus::Paused => {
-                    if self.store.has_pending_input(execution_id) {
-                        return Err(EngineError::AwaitingHumanInput {
-                            execution_id: execution_id.to_string(),
-                        });
-                    }
-                    self.lock_pause_requests().remove(execution_id);
-                    execution.status = ExecutionStatus::Running;
-                    self.store.save_execution(&execution)?;
-                    self.emit(execution_id, EventData::WorkflowResumed)?;
-                }
-                _ => return Err(self.not_runnable(&execution, "resumed")),
-            }
-
+            let execution = self.prepare_resume(execution_id)?;
             self.run_loop(definition, execution).await
         })
         .await
+    }
+
+    /// The synchronous half of [`Engine::resume`]: validates the execution's
+    /// status and, for a `Paused` one, flips it back to `Running` and emits
+    /// `WorkflowResumed` — everything [`Engine::resume`] did before it
+    /// reached `run_loop`. Shared, not duplicated, between the borrowed
+    /// (`resume`) and owned ([`Engine::try_begin_resume`]) entry points.
+    fn prepare_resume(&self, execution_id: &str) -> Result<WorkflowExecution, EngineError> {
+        let mut execution = self.store.load_execution(execution_id)?;
+
+        match execution.status {
+            ExecutionStatus::Running => {}
+            ExecutionStatus::Paused => {
+                if self.store.has_pending_input(execution_id) {
+                    return Err(EngineError::AwaitingHumanInput {
+                        execution_id: execution_id.to_string(),
+                    });
+                }
+                self.lock_pause_requests().remove(execution_id);
+                execution.status = ExecutionStatus::Running;
+                self.store.save_execution(&execution)?;
+                self.emit(execution_id, EventData::WorkflowResumed)?;
+            }
+            _ => return Err(self.not_runnable(&execution, "resumed")),
+        }
+
+        Ok(execution)
+    }
+
+    /// Phase 1 of the two-phase `resume` (U3): claims the execution
+    /// synchronously — returning [`EngineError::AlreadyRunning`] immediately,
+    /// with no `.await`, if another pass already holds it — and does the
+    /// same synchronous validation [`Engine::resume`] does. On success, hand
+    /// the returned [`RunHandle`] to [`RunHandle::run_to_completion`],
+    /// typically via `tokio::spawn`, to actually drive the workflow on.
+    ///
+    /// Takes `self: &Arc<Self>` (rather than `&self`) because the handle it
+    /// returns must be able to outlive this call's stack frame — the whole
+    /// point of splitting this out of [`Engine::resume`] is to let an HTTP
+    /// handler return `202 Accepted` right after this succeeds, while phase
+    /// 2 keeps running after the response is sent.
+    pub fn try_begin_resume(
+        self: &Arc<Self>,
+        execution_id: &str,
+    ) -> Result<RunHandle, EngineError> {
+        let claim = self.claim_active_run(execution_id)?;
+        match self.prepare_resume(execution_id) {
+            Ok(execution) => Ok(RunHandle {
+                engine: Arc::clone(self),
+                execution_id: execution_id.to_string(),
+                claim,
+                state: HandleState::Ready(execution),
+            }),
+            Err(error) => {
+                self.note_engine_error(execution_id, &error);
+                Err(error)
+            }
+        }
     }
 
     /// The question an execution is waiting on, if it is waiting on one.
@@ -676,45 +819,90 @@ impl Engine {
     ) -> Result<WorkflowExecution, EngineError> {
         self.observed(execution_id, async {
             let _guard = self.begin_run(execution_id)?;
-
-            let from = self.store.event_log(execution_id).next_sequence()?;
-            let resumed = human::resume(&self.store, execution_id, delivery)?;
-            self.publish_from(execution_id, from)?;
-
-            let mut execution = resumed.execution;
-            self.lock_pause_requests().remove(execution_id);
-
-            let state_id = self.current_state_id(&execution)?;
-            let state = self.state_of(definition, &execution, &state_id)?;
-
-            let flow = match self.pending_step(&execution, &state_id)? {
-                Some(pending) => {
-                    // The action had already finished: this answer is the decision.
-                    let outcome = DecisionOutcome {
-                        label: resumed.result.output_label.clone(),
-                        provider: DecisionProviderType::Human,
-                        reasoning: None,
-                    };
-                    self.apply_decision(definition, &mut execution, state, pending, outcome)?
-                }
-                None => {
-                    // The answer is the human action's own result.
-                    self.record_completion(
-                        definition,
-                        &mut execution,
-                        state,
-                        resumed.pending.action_execution_id().to_string(),
-                        resumed.result,
-                    )?
-                }
-            };
-
-            if flow == Flow::Stop {
-                return Ok(execution);
+            match self.prepare_deliver_human_input(definition, execution_id, delivery)? {
+                HandleState::Done(execution) => Ok(execution),
+                HandleState::Ready(execution) => self.run_loop(definition, execution).await,
             }
-            self.run_loop(definition, execution).await
         })
         .await
+    }
+
+    /// The synchronous half of [`Engine::deliver_human_input`]: records the
+    /// answer, applies it (as a decision or as an action's own result,
+    /// depending on what was pending), and reports whether the step already
+    /// stopped or still needs `run_loop`. Shared between the borrowed
+    /// (`deliver_human_input`) and owned
+    /// ([`Engine::try_begin_deliver_human_input`]) entry points.
+    fn prepare_deliver_human_input(
+        &self,
+        definition: &WorkflowDefinition,
+        execution_id: &str,
+        delivery: &HumanInputDelivery,
+    ) -> Result<HandleState, EngineError> {
+        let from = self.store.event_log(execution_id).next_sequence()?;
+        let resumed = human::resume(&self.store, execution_id, delivery)?;
+        self.publish_from(execution_id, from)?;
+
+        let mut execution = resumed.execution;
+        self.lock_pause_requests().remove(execution_id);
+
+        let state_id = self.current_state_id(&execution)?;
+        let state = self.state_of(definition, &execution, &state_id)?;
+
+        let flow = match self.pending_step(&execution, &state_id)? {
+            Some(pending) => {
+                // The action had already finished: this answer is the decision.
+                let outcome = DecisionOutcome {
+                    label: resumed.result.output_label.clone(),
+                    provider: DecisionProviderType::Human,
+                    reasoning: None,
+                };
+                self.apply_decision(definition, &mut execution, state, pending, outcome)?
+            }
+            None => {
+                // The answer is the human action's own result.
+                self.record_completion(
+                    definition,
+                    &mut execution,
+                    state,
+                    resumed.pending.action_execution_id().to_string(),
+                    resumed.result,
+                )?
+            }
+        };
+
+        Ok(match flow {
+            Flow::Stop => HandleState::Done(execution),
+            Flow::Continue => HandleState::Ready(execution),
+        })
+    }
+
+    /// Phase 1 of the two-phase `deliver_human_input` (U3): claims the
+    /// execution synchronously — returning [`EngineError::AlreadyRunning`]
+    /// immediately, with no `.await`, if another pass already holds it — and
+    /// does the same synchronous recording/decision work
+    /// [`Engine::deliver_human_input`] does. On success, hand the returned
+    /// [`RunHandle`] to [`RunHandle::run_to_completion`], typically via
+    /// `tokio::spawn`, to drive the workflow the rest of the way.
+    pub fn try_begin_deliver_human_input(
+        self: &Arc<Self>,
+        definition: &WorkflowDefinition,
+        execution_id: &str,
+        delivery: &HumanInputDelivery,
+    ) -> Result<RunHandle, EngineError> {
+        let claim = self.claim_active_run(execution_id)?;
+        match self.prepare_deliver_human_input(definition, execution_id, delivery) {
+            Ok(state) => Ok(RunHandle {
+                engine: Arc::clone(self),
+                execution_id: execution_id.to_string(),
+                claim,
+                state,
+            }),
+            Err(error) => {
+                self.note_engine_error(execution_id, &error);
+                Err(error)
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1506,6 +1694,27 @@ impl Engine {
         }
         Ok(RunGuard {
             engine: self,
+            execution_id: execution_id.to_string(),
+        })
+    }
+
+    /// The owned equivalent of [`Engine::begin_run`]: claims the right to
+    /// drive `execution_id` through an [`ActiveRunClaim`] that lives inside
+    /// an [`Arc<Engine>`] rather than borrowing `&self`, so it can be moved
+    /// into a `tokio::spawn`-ed task. Operates on the exact same
+    /// `active_runs` set as [`Engine::begin_run`], so the two can never both
+    /// succeed for the same execution.
+    fn claim_active_run(
+        self: &Arc<Self>,
+        execution_id: &str,
+    ) -> Result<ActiveRunClaim, EngineError> {
+        if !self.lock_active_runs().insert(execution_id.to_string()) {
+            return Err(EngineError::AlreadyRunning {
+                execution_id: execution_id.to_string(),
+            });
+        }
+        Ok(ActiveRunClaim {
+            engine: Arc::clone(self),
             execution_id: execution_id.to_string(),
         })
     }

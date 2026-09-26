@@ -45,13 +45,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
+use crate::persistence::{CatalogPaths, WorkPaths};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event as TerminalEvent, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use crate::persistence::{CatalogPaths, WorkPaths};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -165,18 +165,27 @@ pub async fn run(
     // a REST client) removes; until then, leaving this recovery-free is
     // deliberately narrow in scope to what U2 asks for.
 
-    // The embedded, read-only API (U5) is the only path the task view (U7)
-    // reads the step timeline and conversations through — see
-    // `crate::api` for why it is loopback-only and token-protected. A
-    // failure to bind it is treated as fatal, per the plan: this TUI must
-    // not start silently degraded.
-    let api_store = store.clone();
-    let api_handle = api::start(api_store)
-        .await
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    let client = api_handle.client();
-
     let engine = Arc::new(Engine::new(store).with_agent_defaults(defaults));
+
+    // The embedded API (U5, now also carrying U3's mutating endpoints) is
+    // the only path the task view (U7) reads the step timeline and
+    // conversations through — see `crate::api` for why it is loopback-only
+    // and token-protected. A failure to bind it is treated as fatal, per the
+    // plan: this TUI must not start silently degraded.
+    //
+    // This TUI still drives the engine directly (`Arc::clone(&engine)`
+    // below) rather than through this same client's mutating endpoints —
+    // that dual ownership is exactly what U7 (full TUI migration to a REST
+    // client) removes; until then this is deliberately narrow in scope to
+    // what U3 asks for.
+    let api_handle = api::start(
+        Arc::clone(&engine),
+        catalog.root().to_path_buf(),
+        work.root().to_path_buf(),
+    )
+    .await
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    let client = api_handle.client();
     let mut events = engine.subscribe();
     let mut app = App::new(Arc::clone(&engine), catalog, work, client);
     app.refresh();
