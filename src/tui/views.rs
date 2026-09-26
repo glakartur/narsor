@@ -30,9 +30,10 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use super::app::{
-    event_line, status_name, App, FormRow, Modal, NewTaskStage, Panel, RepositoryField,
-    TransitionMode,
+    event_detail_lines, event_line, status_name, App, FormRow, Modal, NewTaskStage, Panel,
+    RepositoryField, TransitionMode,
 };
+use super::scroll::wrap_visible;
 use crate::domain::{ExecutionStatus, HumanInputType};
 
 /// Height of the shortcut bar, borders included.
@@ -117,6 +118,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     match app.modal() {
         Modal::None => {}
         Modal::Input(_) => render_input_modal(frame, app),
+        Modal::EventDetail(_) => render_event_detail_modal(frame, app),
         Modal::Transition(_) => render_transition_modal(frame, app),
         Modal::Confirm(_) => render_confirm_modal(frame, app),
         Modal::Repositories(_) => render_repository_list_modal(frame, app),
@@ -493,6 +495,43 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// The scrollable window with every field of one event (R1, R2, R3).
+fn render_event_detail_modal(frame: &mut Frame, app: &App) {
+    let Modal::EventDetail(detail) = app.modal() else {
+        return;
+    };
+    let area = modal_area(frame, 86, 80);
+    frame.render_widget(Clear, area);
+
+    let lines = event_detail_lines(&detail.event);
+    let inner_width = area.width.saturating_sub(2).max(1) as usize;
+    let inner_height = area.height.saturating_sub(2).max(1) as usize;
+    let offset = detail.scroll.offset().min(lines.len());
+
+    // Wraps only the rows this frame is about to draw (`scroll::wrap_visible`)
+    // rather than the whole buffer — the point that matters once this
+    // window's sibling, the conversation view (U7), can hold megabytes of raw
+    // harness output.
+    let visible: Vec<Line> = wrap_visible(&lines, inner_width, offset, inner_height)
+        .into_iter()
+        .map(Line::from)
+        .collect();
+
+    let position = if lines.is_empty() {
+        "empty".to_string()
+    } else {
+        format!("{}/{}", offset + 1, lines.len())
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" Event #{} — {position} ", detail.event.sequence));
+
+    frame.render_widget(Paragraph::new(visible).block(block), area);
 }
 
 /// The manual transition menu.
@@ -920,6 +959,15 @@ fn render_help_modal(frame: &mut Frame) {
         Line::from("  i                 human input form"),
         Line::from("  t                 manual transition (o — override mode)"),
         Line::from("  f                 follow the event stream"),
+        Line::from("  Enter             (Events panel) open the event's detail window"),
+        Line::from("  c                 (Events panel / detail window) open its conversation"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Event detail window",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  j / k, PgUp/PgDn  scroll,  g / G  top / bottom"),
+        Line::from("  c                 open the conversation,  Esc — close"),
         Line::from(""),
         Line::from(Span::styled(
             "Form",

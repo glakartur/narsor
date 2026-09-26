@@ -32,9 +32,10 @@ use narsor::domain::{
 use narsor::engine::{ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry};
 use narsor::persistence::{CatalogPaths, ExecutionStore, WorkPaths};
 use narsor::registry::{RepositoryEntry, RepositoryRegistry};
+use narsor::engine::actions::script::TRUNCATION_MARKER;
 use narsor::tui::app::{
-    App, FormRow, Modal, NewTaskChoice, NewTaskStage, Panel, RepositoryField, Request,
-    StreamStatus, TransitionMode, OVERRIDE_PROVIDER, OVERRIDE_REASON,
+    event_detail_lines, event_line, App, FormRow, Modal, NewTaskChoice, NewTaskStage, Panel,
+    RepositoryField, Request, StreamStatus, TransitionMode, OVERRIDE_PROVIDER, OVERRIDE_REASON,
 };
 use narsor::tui::views;
 use narsor::workflow::load_from_file;
@@ -2199,5 +2200,365 @@ async fn esc_cancels_every_modal_without_writing_anything() {
             .expect("list the store")
             .is_empty(),
         "the abandoned form created no execution"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// U6: readable events and the event detail window
+// ---------------------------------------------------------------------------
+
+/// One instance of every [`EventData`] variant, with plausible field values.
+///
+/// Used to prove `event_line` has no leftover catch-all: a variant added here
+/// without a matching hand-written arm would fail to compile, and this list
+/// is the thing that would need updating to prove it — see
+/// `event_line_has_no_debug_style_dump_for_any_variant`.
+fn every_event_data_variant() -> Vec<EventData> {
+    vec![
+        EventData::WorkflowStarted {
+            workflow_id: "wf".to_string(),
+            workflow_version: 1,
+            inputs: json!({"ticket": "ORC-7"}),
+        },
+        EventData::WorkflowPaused {
+            reason: "waiting on a human".to_string(),
+        },
+        EventData::WorkflowResumed,
+        EventData::WorkflowCompleted { result: json!({}) },
+        EventData::WorkflowFailed {
+            error: "boom".to_string(),
+        },
+        EventData::WorkflowCancelled {
+            reason: "operator".to_string(),
+        },
+        EventData::StateEntered {
+            state_id: "prepare".to_string(),
+        },
+        EventData::StateExited {
+            state_id: "prepare".to_string(),
+            output_label: "success".to_string(),
+        },
+        EventData::ActionStarted {
+            action_execution_id: "a1".to_string(),
+            state_id: "prepare".to_string(),
+            action_type: "agent".to_string(),
+        },
+        EventData::ActionCompleted {
+            action_execution_id: "a1".to_string(),
+            output_label: "success".to_string(),
+        },
+        EventData::ActionFailed {
+            action_execution_id: "a1".to_string(),
+            error: "boom".to_string(),
+        },
+        EventData::ActionAttemptFailed {
+            action_execution_id: "a1".to_string(),
+            state_id: "prepare".to_string(),
+            error: "boom".to_string(),
+            retry_in_ms: 500,
+        },
+        EventData::ActionRetrying {
+            action_execution_id: "a2".to_string(),
+            retry_count: 1,
+            state_id: Some("prepare".to_string()),
+        },
+        EventData::AgentSessionStarted {
+            session_id: "sess".to_string(),
+            harness: "claude_code".to_string(),
+            action_execution_id: Some("a1".to_string()),
+            resumed_session: None,
+        },
+        EventData::AgentSessionCompleted {
+            session_id: "sess".to_string(),
+            action_execution_id: Some("a1".to_string()),
+            harness_session_id: Some("hs1".to_string()),
+        },
+        EventData::AgentSessionFailed {
+            session_id: "sess".to_string(),
+            error: "boom".to_string(),
+            action_execution_id: Some("a1".to_string()),
+            harness_session_id: None,
+        },
+        EventData::AgentMessage {
+            session_id: "sess".to_string(),
+            content: "hello there".to_string(),
+            role: "assistant".to_string(),
+            action_execution_id: Some("a1".to_string()),
+        },
+        EventData::DecisionRequested {
+            provider: "claude".to_string(),
+        },
+        EventData::DecisionMade {
+            provider: "claude".to_string(),
+            output_label: "success".to_string(),
+            reasoning: None,
+        },
+        EventData::HumanInputRequested {
+            instruction: "approve?".to_string(),
+        },
+        EventData::HumanInputReceived {
+            input: json!({"approval_status": "approved"}),
+        },
+        EventData::HumanTransitionSelected {
+            from_state: "review".to_string(),
+            to_state: "done".to_string(),
+        },
+        EventData::ExternalEventReceived {
+            event_type: "hook".to_string(),
+            source: "github".to_string(),
+            payload: json!({}),
+        },
+        EventData::TransitionTaken {
+            from_state: "review".to_string(),
+            to_state: "done".to_string(),
+            output_label: "success".to_string(),
+        },
+        EventData::ArtifactCreated {
+            artifact_id: "art1".to_string(),
+            artifact_type: "file".to_string(),
+            location: "artifacts/art1".to_string(),
+        },
+        EventData::Error {
+            message: "boom".to_string(),
+            context: json!({}),
+        },
+    ]
+}
+
+/// AE1: a `workflow_started` event with a dozen-plus inputs stays a single
+/// line in the stream, and each input gets its own line of indented JSON in
+/// the detail window.
+#[test]
+fn workflow_started_line_is_single_line_and_detail_expands_every_input() {
+    let mut inputs = serde_json::Map::new();
+    for index in 0..14 {
+        inputs.insert(format!("field_{index}"), json!(format!("value-{index}")));
+    }
+
+    let event = Event::new(
+        "exec-1".to_string(),
+        EventData::WorkflowStarted {
+            workflow_id: "demo".to_string(),
+            workflow_version: 1,
+            inputs: Value::Object(inputs),
+        },
+        1,
+    );
+
+    let line = event_line(&event);
+    assert!(
+        !line.contains('\n'),
+        "the stream line is exactly one line: {line:?}"
+    );
+
+    let detail = event_detail_lines(&event);
+    for index in 0..14 {
+        let needle = format!("\"field_{index}\":");
+        assert!(
+            detail.iter().any(|l| l.trim_start().starts_with(&needle)),
+            "input {index} is on its own line of indented JSON: {detail:?}"
+        );
+    }
+}
+
+/// Edge case: `event_line` never leaks a Rust `Debug` dump, for any variant —
+/// every hand-written arm in the function stays free of `{`, which a derived
+/// `Debug` for a struct-like variant always contains (e.g. `AgentMessage {`).
+#[test]
+fn event_line_has_no_debug_style_dump_for_any_variant() {
+    for (index, data) in every_event_data_variant().into_iter().enumerate() {
+        let event = Event::new("exec-1".to_string(), data, index as u64);
+        let line = event_line(&event);
+        assert!(
+            !line.contains('{'),
+            "event_line leaked a Debug-style dump: {line:?}"
+        );
+    }
+}
+
+/// `Enter` in the Events panel opens the detail window on the selected
+/// event, and `Esc` closes it with the selection preserved.
+#[tokio::test(flavor = "multi_thread")]
+async fn enter_opens_event_detail_and_esc_preserves_selection() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    paused_at_review(&engine, root.path()).await;
+
+    let mut app = app_over(&engine, root.path());
+    app.refresh();
+    assert!(!app.events().is_empty(), "the backfill read some events");
+
+    app.on_key(key(KeyCode::Tab));
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(app.focus(), Panel::Events);
+
+    let cursor_before = app.event_cursor();
+    app.on_key(key(KeyCode::Enter));
+    assert!(
+        matches!(app.modal(), Modal::EventDetail(_)),
+        "Enter opened the detail window"
+    );
+
+    app.on_key(key(KeyCode::Esc));
+    assert!(matches!(app.modal(), Modal::None), "Esc closed it");
+    assert_eq!(
+        app.event_cursor(),
+        cursor_before,
+        "the selection survived the round trip"
+    );
+}
+
+/// Scrolling in the detail window (`j`/`k`/`PgDn`/`G`) moves the offset and
+/// never past the content's own bounds.
+#[tokio::test(flavor = "multi_thread")]
+async fn scrolling_the_event_detail_window_stays_within_content_bounds() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let execution_id = paused_at_review(&engine, root.path()).await;
+
+    let mut app = app_over(&engine, root.path());
+    app.refresh();
+
+    // A payload large enough that the pretty-printed detail window has many
+    // lines to scroll through.
+    let mut context = serde_json::Map::new();
+    for index in 0..200 {
+        context.insert(format!("k{index}"), json!(index));
+    }
+    let last_sequence = app.events().last().expect("an event").sequence;
+    let event = Event::new(
+        execution_id,
+        EventData::Error {
+            message: "boom".to_string(),
+            context: Value::Object(context),
+        },
+        last_sequence + 1,
+    );
+    app.on_stream(Ok(event));
+
+    app.on_key(key(KeyCode::Tab));
+    app.on_key(key(KeyCode::Tab));
+    app.on_key(key(KeyCode::Enter));
+
+    let offset_of = |app: &App| match app.modal() {
+        Modal::EventDetail(detail) => detail.scroll.offset(),
+        other => panic!("expected the detail window to be open, got {other:?}"),
+    };
+
+    assert_eq!(offset_of(&app), 0);
+
+    app.on_key(key(KeyCode::Char('j')));
+    assert_eq!(offset_of(&app), 1, "one line down");
+
+    app.on_key(key(KeyCode::PageDown));
+    let after_page = offset_of(&app);
+    assert!(after_page > 1, "a page moves further than a line");
+
+    app.on_key(key(KeyCode::Char('G')));
+    let bottom = offset_of(&app);
+    assert!(bottom >= after_page);
+
+    app.on_key(key(KeyCode::Char('j')));
+    assert_eq!(offset_of(&app), bottom, "clamped at the last line");
+
+    app.on_key(key(KeyCode::Char('g')));
+    assert_eq!(offset_of(&app), 0, "g jumps back to the top");
+}
+
+/// Covers AE3: `c` on an event outside an agent conversation (here,
+/// `human_input_received`) changes nothing on screen and names the reason in
+/// the message bar.
+#[tokio::test(flavor = "multi_thread")]
+async fn c_on_an_unlinked_event_names_the_reason_and_opens_nothing() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let execution_id = paused_at_review(&engine, root.path()).await;
+
+    let mut app = app_over(&engine, root.path());
+    app.refresh();
+
+    let last_sequence = app.events().last().expect("an event").sequence;
+    let event = Event::new(
+        execution_id,
+        EventData::HumanInputReceived {
+            input: json!({"approval_status": "approved"}),
+        },
+        last_sequence + 1,
+    );
+    app.on_stream(Ok(event));
+
+    app.on_key(key(KeyCode::Tab));
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(app.focus(), Panel::Events);
+    assert!(matches!(
+        &app.events().last().expect("an event").data,
+        EventData::HumanInputReceived { .. }
+    ));
+
+    let request = app.on_key(key(KeyCode::Char('c')));
+    assert_eq!(request, Request::None);
+    assert!(matches!(app.modal(), Modal::None), "no screen change");
+
+    let notice = app.notice().expect("a notice");
+    assert!(notice.is_error);
+    assert!(
+        notice.text.contains("does not belong to an agent conversation"),
+        "got: {}",
+        notice.text
+    );
+}
+
+/// Edge case: content with ANSI escapes and control characters reaches the
+/// detail window with no raw control bytes left in it.
+#[test]
+fn event_detail_lines_strip_ansi_and_control_characters() {
+    let event = Event::new(
+        "exec-1".to_string(),
+        EventData::Error {
+            message: "boom\u{1b}[31mRED\u{1b}[0m\u{7}".to_string(),
+            context: json!({"raw": "col1\tcol2\u{7}tail"}),
+        },
+        1,
+    );
+
+    let detail = event_detail_lines(&event);
+    for line in &detail {
+        assert!(
+            !line.chars().any(|c| c.is_control() && c != '\n'),
+            "a raw control byte survived sanitization: {line:?}"
+        );
+    }
+    assert!(
+        detail.iter().any(|line| line.contains("RED")),
+        "the visible text around the escape codes is still there"
+    );
+}
+
+/// Edge case: an `AgentMessage` whose content the executor truncated is
+/// flagged in the detail window.
+#[test]
+fn truncated_agent_message_is_flagged_in_the_detail_window() {
+    let content = format!("partial output{TRUNCATION_MARKER}");
+    let event = Event::new(
+        "exec-1".to_string(),
+        EventData::AgentMessage {
+            session_id: "sess".to_string(),
+            content,
+            role: "assistant".to_string(),
+            action_execution_id: Some("a1".to_string()),
+        },
+        1,
+    );
+
+    let detail = event_detail_lines(&event);
+    assert!(
+        detail
+            .iter()
+            .any(|line| line.to_lowercase().contains("truncated")),
+        "the truncation is flagged: {detail:?}"
+    );
+    assert!(
+        detail.iter().any(|line| line.contains("press c")),
+        "the window points at the c key: {detail:?}"
     );
 }

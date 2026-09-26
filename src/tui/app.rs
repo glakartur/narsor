@@ -82,6 +82,7 @@ use crate::domain::{
     Event, EventData, ExecutionStatus, HumanInputField, HumanInputType, InputParameter, ParamType,
     State, WorkflowDefinition, WorkflowExecution,
 };
+use crate::engine::actions::script::TRUNCATION_MARKER;
 use crate::engine::{
     permitted_labels, terminal_status, Engine, EngineError, HumanInputDelivery, PendingHumanInput,
 };
@@ -89,6 +90,7 @@ use futures::FutureExt;
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
 use crate::tasks::{self, DefinitionSource};
 use crate::persistence::{CatalogPaths, WorkPaths};
+use crate::tui::scroll::{sanitize, ScrollState};
 use crate::workflows::{ResolvedWorkflow, WorkflowEntry, WorkflowResolver};
 
 /// The decision provider recorded for an operator's ordinary manual choice.
@@ -238,7 +240,7 @@ impl Notice {
 ///
 /// Key handling is synchronous so it can be tested without a runtime; anything
 /// that talks to the engine is named here and awaited by the caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     /// Nothing further.
     None,
@@ -252,6 +254,17 @@ pub enum Request {
     RunSelected,
     /// Create the execution the new-task form describes and run it.
     StartNewTask,
+    /// Open the attempt's agent conversation (R5).
+    ///
+    /// Emitted by `c` on an event that carries an `action_execution_id`, from
+    /// either the Events panel or [`Modal::EventDetail`]. The full-screen task
+    /// view that actually reads it is U7's job — here the request only proves
+    /// the id reached this far; the event loop currently does nothing with it
+    /// (see `src/tui/mod.rs`).
+    OpenConversation {
+        /// The attempt whose conversation to open.
+        action_execution_id: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -880,6 +893,20 @@ pub struct OverrideConfirm {
     pub from: String,
 }
 
+/// The scrollable window opened by `Enter` on an event (R1).
+#[derive(Debug, Clone)]
+pub struct EventDetail {
+    /// The event the window was opened for.
+    ///
+    /// A private copy rather than an index into [`App::events`]: a live event
+    /// arriving on the stream while the window is open must not shift what it
+    /// shows out from under the operator (R3's "stable while open" is implicit
+    /// in every other modal here, and this one is no different).
+    pub event: Event,
+    /// The window's own scroll cursor.
+    pub scroll: ScrollState,
+}
+
 /// The overlay drawn on top of the layout, if any.
 #[derive(Debug, Clone)]
 pub enum Modal {
@@ -887,6 +914,8 @@ pub enum Modal {
     None,
     /// The generated human-input form.
     Input(InputForm),
+    /// The full content of one event (R1, R2, R3).
+    EventDetail(EventDetail),
     /// The manual transition menu.
     Transition(TransitionMenu),
     /// The confirmation of a forced transition.
@@ -1144,6 +1173,13 @@ impl App {
                 keys.push(("Esc", "cancel"));
                 keys
             }
+            Modal::EventDetail(_) => vec![
+                ("j/k", "scroll"),
+                ("PgUp/PgDn", "page"),
+                ("g/G", "top/bottom"),
+                ("c", "conversation"),
+                ("Esc", "close"),
+            ],
             Modal::Confirm(_) => vec![("y", "confirm"), ("n/Esc", "cancel")],
             Modal::RepositoryRemove(_) => vec![("y", "remove"), ("n/Esc", "cancel")],
             Modal::Repositories(_) => vec![
@@ -1200,6 +1236,8 @@ impl App {
                         keys.push(("j/k", "scroll"));
                         keys.push(("g/G", "top/bottom"));
                         keys.push(("f", "follow"));
+                        keys.push(("Enter", "details"));
+                        keys.push(("c", "conversation"));
                     }
                 }
                 keys.push(("?", "help"));
@@ -1437,6 +1475,7 @@ impl App {
                 Request::None
             }
             Modal::Input(_) => self.on_key_form(key),
+            Modal::EventDetail(_) => self.on_key_event_detail(key),
             Modal::Transition(_) => self.on_key_transition(key),
             Modal::Confirm(_) => self.on_key_confirm(key),
             Modal::Repositories(_) => self.on_key_repositories(key),
@@ -1490,6 +1529,16 @@ impl App {
                     self.event_cursor = self.events.len().saturating_sub(1);
                 }
                 Request::None
+            }
+            KeyCode::Enter if self.focus == Panel::Events => {
+                self.open_event_detail();
+                Request::None
+            }
+            KeyCode::Char('c') if self.focus == Panel::Events => {
+                let Some(event) = self.events.get(self.event_cursor).cloned() else {
+                    return Request::None;
+                };
+                self.request_conversation(&event)
             }
             KeyCode::Char('i') => {
                 self.open_input_form();
@@ -1561,6 +1610,85 @@ impl App {
                 self.event_cursor = if to_end { self.events.len() - 1 } else { 0 };
                 self.follow = to_end;
             }
+        }
+    }
+
+    /// Opens the detail window on the highlighted event, if there is one.
+    fn open_event_detail(&mut self) {
+        let Some(event) = self.events.get(self.event_cursor).cloned() else {
+            return;
+        };
+        self.modal = Modal::EventDetail(EventDetail {
+            event,
+            scroll: ScrollState::new(),
+        });
+    }
+
+    /// The `c` key (R5): a [`Request::OpenConversation`] for an event that
+    /// carries an attempt id, or a notice explaining why not (AE3).
+    fn request_conversation(&mut self, event: &Event) -> Request {
+        match conversation_attempt(&event.data) {
+            Some(id) => Request::OpenConversation {
+                action_execution_id: id.to_string(),
+            },
+            None => {
+                self.notice = Some(Notice::error(NO_CONVERSATION_LINK_MESSAGE));
+                Request::None
+            }
+        }
+    }
+
+    /// Keys inside the event detail window.
+    fn on_key_event_detail(&mut self, key: KeyEvent) -> Request {
+        let Modal::EventDetail(detail) = &self.modal else {
+            return Request::None;
+        };
+        let total_lines = event_detail_lines(&detail.event).len();
+        let event = detail.event.clone();
+
+        match key.code {
+            KeyCode::Esc => {
+                self.modal = Modal::None;
+                Request::None
+            }
+            KeyCode::Char('c') => self.request_conversation(&event),
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.event_detail_scroll_mut().line_down(total_lines);
+                Request::None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.event_detail_scroll_mut().line_up(total_lines);
+                Request::None
+            }
+            KeyCode::PageDown => {
+                self.event_detail_scroll_mut().page_down(total_lines);
+                Request::None
+            }
+            KeyCode::PageUp => {
+                self.event_detail_scroll_mut().page_up(total_lines);
+                Request::None
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.event_detail_scroll_mut().to_top();
+                Request::None
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                self.event_detail_scroll_mut().to_bottom(total_lines);
+                Request::None
+            }
+            _ => Request::None,
+        }
+    }
+
+    /// The event detail window's scroll cursor.
+    ///
+    /// Panics if the modal is not [`Modal::EventDetail`]: every caller only
+    /// reaches this from within [`App::on_key_event_detail`], which already
+    /// holds that modal open.
+    fn event_detail_scroll_mut(&mut self) -> &mut ScrollState {
+        match &mut self.modal {
+            Modal::EventDetail(detail) => &mut detail.scroll,
+            _ => unreachable!("on_key_event_detail only runs while the event detail modal is open"),
         }
     }
 
@@ -2808,7 +2936,49 @@ pub fn event_line(event: &Event) -> String {
             format!("external_event_received  {event_type}")
         }
         EventData::Error { message, .. } => format!("error  {message}"),
-        other => format!("{other:?}"),
+        EventData::AgentSessionStarted {
+            harness,
+            action_execution_id,
+            resumed_session,
+            ..
+        } => match resumed_session {
+            Some(session) => format!(
+                "agent_session_started  {harness} (attempt {}, resuming {})",
+                short_id(action_execution_id.as_deref()),
+                short_id(Some(session))
+            ),
+            None => format!(
+                "agent_session_started  {harness} (attempt {})",
+                short_id(action_execution_id.as_deref())
+            ),
+        },
+        EventData::AgentSessionCompleted {
+            action_execution_id,
+            harness_session_id,
+            ..
+        } => format!(
+            "agent_session_completed  attempt {} (session {})",
+            short_id(action_execution_id.as_deref()),
+            short_id(harness_session_id.as_deref())
+        ),
+        EventData::AgentSessionFailed {
+            error,
+            action_execution_id,
+            ..
+        } => format!(
+            "agent_session_failed  {error} (attempt {})",
+            short_id(action_execution_id.as_deref())
+        ),
+        EventData::AgentMessage {
+            role,
+            content,
+            action_execution_id,
+            ..
+        } => format!(
+            "agent_message  ({role}) attempt {}: {}",
+            short_id(action_execution_id.as_deref()),
+            first_line(content)
+        ),
     };
 
     format!(
@@ -2817,4 +2987,112 @@ pub fn event_line(event: &Event) -> String {
         event.timestamp.format("%H:%M:%S"),
         detail
     )
+}
+
+/// The first line of a multi-line string, trimmed and elided, so a long
+/// agent message cannot break the one-line-per-event stream panel.
+fn first_line(text: &str) -> String {
+    const LIMIT: usize = 80;
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= LIMIT {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(LIMIT).collect();
+    format!("{cut}…")
+}
+
+/// A short fragment of an id, for a one-line summary where the full UUID
+/// would swamp everything else on the line. The full value is always in the
+/// detail window ([`event_detail_lines`]).
+fn short_id(id: Option<&str>) -> String {
+    match id {
+        Some(id) => id.chars().take(8).collect(),
+        None => "unknown".to_string(),
+    }
+}
+
+/// The message shown in the bottom bar for `c` on an event with no
+/// conversation link (AE3).
+///
+/// The phrase "does not belong to an agent conversation" matches the reason
+/// [`crate::engine::timeline`] records for the same situation, so an operator
+/// sees the same wording once U7 wires the task view up to it.
+const NO_CONVERSATION_LINK_MESSAGE: &str = "This event does not belong to an agent conversation.";
+
+/// The attempt an event is linked to, if it carries one at all (R5).
+///
+/// This only reads the field the event itself carries. It deliberately does
+/// not attempt the fuller association [`crate::engine::timeline::build_timeline`]
+/// computes — a state/transition event's link to "the last attempt of the
+/// current visit", or whether an `action_execution_id` actually belongs to an
+/// agent action rather than a script one — because that needs the whole event
+/// log, which is timeline/API territory (U4/U7), not this window's job. An
+/// event outside that reach simply has no link here yet.
+fn conversation_attempt(data: &EventData) -> Option<&str> {
+    match data {
+        EventData::ActionStarted {
+            action_execution_id,
+            ..
+        }
+        | EventData::ActionCompleted {
+            action_execution_id,
+            ..
+        }
+        | EventData::ActionFailed {
+            action_execution_id,
+            ..
+        }
+        | EventData::ActionAttemptFailed {
+            action_execution_id,
+            ..
+        }
+        | EventData::ActionRetrying {
+            action_execution_id,
+            ..
+        } => Some(action_execution_id.as_str()),
+        EventData::AgentSessionStarted {
+            action_execution_id,
+            ..
+        }
+        | EventData::AgentSessionCompleted {
+            action_execution_id,
+            ..
+        }
+        | EventData::AgentSessionFailed {
+            action_execution_id,
+            ..
+        }
+        | EventData::AgentMessage {
+            action_execution_id,
+            ..
+        } => action_execution_id.as_deref(),
+        _ => None,
+    }
+}
+
+/// Every field of an event, for the detail window (R1).
+///
+/// Structured values are shown as indented JSON: the whole event is
+/// serialized once and pretty-printed, which covers every current and future
+/// [`EventData`] variant without a second exhaustive match to keep in step
+/// with [`event_line`] — that one stays hand-written because its whole point
+/// is a compiler-enforced one-liner per variant (R2), which a generic dump
+/// cannot give.
+pub fn event_detail_lines(event: &Event) -> Vec<String> {
+    let mut lines = vec![sanitize(&event_line(event)), String::new()];
+
+    if let EventData::AgentMessage { content, .. } = &event.data {
+        if content.ends_with(TRUNCATION_MARKER) {
+            lines.push(sanitize(
+                "This message was truncated by the executor — press c to open the full conversation.",
+            ));
+            lines.push(String::new());
+        }
+    }
+
+    let value = serde_json::to_value(event).unwrap_or(Value::Null);
+    let pretty = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+    lines.extend(pretty.lines().map(sanitize));
+
+    lines
 }

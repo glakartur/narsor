@@ -36,6 +36,7 @@
 //! indicator rather than as a view that quietly stops updating.
 
 pub mod app;
+pub mod scroll;
 pub mod views;
 
 use std::io::{self, Stdout};
@@ -178,6 +179,9 @@ pub async fn run(
                         Request::ApplyTransition => app.apply_transition().await,
                         Request::RunSelected => app.run_selected().await,
                         Request::StartNewTask => app.start_new_task().await,
+                        // The task view that reads this (U7) does not exist
+                        // yet; for now the id is only proven reachable.
+                        Request::OpenConversation { .. } => {}
                     }
                 }
                 // A resize needs no state change: the next draw re-derives the
