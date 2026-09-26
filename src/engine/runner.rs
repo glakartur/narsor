@@ -960,11 +960,31 @@ impl Engine {
             ))
         })?;
 
+        let conversation_store = self.store.conversation_store(&execution.id);
         let request = ActionRequest::new(&rendered, &execution.workspace, action_execution_id)
             .with_timeout(timeout)
-            .with_execution_id(&execution.id);
+            .with_execution_id(&execution.id)
+            .with_conversation_store(&conversation_store);
 
-        match executor.execute(request).await {
+        let outcome = executor.execute(request).await;
+
+        // The attempt is over, one way or another (completed, suspended,
+        // timed out, or failed outright): whatever it wrote to the
+        // conversation store is final, so this is where it is closed and
+        // compressed (R15). A script or human action never opened a writer,
+        // so this is a harmless no-op for them. Closing must never fail the
+        // attempt itself — same principle as `LoggingEventSink` recording an
+        // event: the durable record of what happened is already safe, and a
+        // compression failure is not a reason to also fail the workflow.
+        if let Err(error) = conversation_store.close_attempt(action_execution_id) {
+            tracing::warn!(
+                action_execution_id,
+                %error,
+                "could not close/compress this attempt's conversation file"
+            );
+        }
+
+        match outcome {
             Ok(ActionOutcome::Completed(result)) => Ok(AttemptOutcome::Completed(result)),
 
             Ok(ActionOutcome::TimedOut(timed_out)) => {

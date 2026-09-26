@@ -25,7 +25,9 @@ use narsor::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
     Engine, HarnessRegistry, LoggingEventSink, OpenCodeAdapter,
 };
-use narsor::persistence::ExecutionStore;
+use narsor::persistence::{
+    ConversationEntry, ConversationSource, ConversationStore, ExecutionStore,
+};
 use narsor::workflow::{load_from_file, TemplateScope};
 use serde_json::{json, Value};
 
@@ -78,11 +80,26 @@ struct FakeHarness {
 
 impl FakeHarness {
     /// Copies the fixture script into `dir` and returns a handle to it.
+    ///
+    /// Copies to a temporary name in the same directory and renames it into
+    /// place, rather than `fs::copy`-ing straight to `program`: writing
+    /// directly to the final name and then, moments later, `execve`-ing it
+    /// (once this test's harness runs) has been an intermittent ETXTBSY
+    /// flake under `cargo test`'s parallel test threads — many threads
+    /// copying and exec'ing fake-harness binaries at once occasionally hits
+    /// the kernel's "text file busy" window before a fresh file's write
+    /// handle is fully torn down. The temp-name-then-rename here is the same
+    /// atomic-swap idiom `src/persistence/atomic.rs` uses for durability: the
+    /// final path is only ever created by a single `rename`, never opened for
+    /// writing itself, so there is nothing left for a concurrent `execve` to
+    /// collide with.
     fn install(dir: PathBuf) -> Self {
         let source =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/harness/fake_harness.sh");
         let program = dir.join("fake_harness.sh");
-        fs::copy(&source, &program).expect("copy the fake harness");
+        let temp = dir.join(format!(".fake_harness.sh.{}.tmp", uuid::Uuid::new_v4()));
+        fs::copy(&source, &temp).expect("copy the fake harness");
+        fs::rename(&temp, &program).expect("move the fake harness into place");
         Self { dir, program }
     }
 
@@ -159,7 +176,11 @@ fn read_line(path: &Path) -> String {
         .to_string()
 }
 
-/// A `claude --output-format json` result envelope carrying `text`.
+/// A single `stream-json` `result` line carrying `text`.
+///
+/// A single line is still a well-formed (if minimal) NDJSON stream, so this
+/// keeps working as the stand-in for "the harness answered" in every test
+/// that does not care about the lines leading up to it.
 fn envelope(text: &str) -> String {
     json!({
         "type": "result",
@@ -169,6 +190,125 @@ fn envelope(text: &str) -> String {
         "result": text,
     })
     .to_string()
+}
+
+/// Joins NDJSON lines the way a streaming harness actually prints them: one
+/// JSON value per line, each one terminated by `\n` — including the last
+/// one, which is what a real harness does (it flushes each line as it is
+/// produced, well before it has anything else to say, let alone before it
+/// exits) and which matters for a line that arrives right before the process
+/// is killed: only a `\n`-terminated line is guaranteed to be read as a whole
+/// line rather than lost as an incomplete trailing chunk.
+fn ndjson(lines: &[Value]) -> String {
+    lines
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>()
+}
+
+/// A full `claude --output-format stream-json` run: `system`/`init`, an
+/// `assistant` message using a tool, the `user` tool result, and the final
+/// `result` line.
+fn claude_stream(session_id: &str, output_json: &str) -> String {
+    ndjson(&[
+        json!({ "type": "system", "subtype": "init", "session_id": session_id }),
+        json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-1",
+                "content": [{ "type": "tool_use", "name": "Read", "input": { "file_path": "a.txt" } }],
+            },
+        }),
+        json!({
+            "type": "user",
+            "message": { "content": [{ "type": "tool_result", "content": "file contents" }] },
+        }),
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "session_id": session_id,
+            "result": output_json,
+        }),
+    ])
+}
+
+/// A full `opencode run --format json` run: `step_start`, a `tool_use`, the
+/// final `text`, then `step_finish`.
+fn opencode_stream(session_id: &str, text: &str) -> String {
+    ndjson(&[
+        json!({ "type": "step_start", "sessionID": session_id }),
+        json!({
+            "type": "tool_use",
+            "sessionID": session_id,
+            "state": { "input": {}, "output": "ok" },
+        }),
+        json!({ "type": "text", "sessionID": session_id, "text": text }),
+        json!({ "type": "step_finish", "sessionID": session_id }),
+    ])
+}
+
+/// A store, scoped to one execution, that a test can wire into an
+/// [`ActionRequest`] and later read the conversation back from.
+struct ConversationFixture {
+    store: ConversationStore,
+}
+
+impl ConversationFixture {
+    /// A fresh store under `root`, scoped to `EXECUTION_ID`.
+    fn new(root: &TempRoot) -> Self {
+        let execution_store = ExecutionStore::new(root.dir("conversations"));
+        Self {
+            store: execution_store.conversation_store(EXECUTION_ID),
+        }
+    }
+
+    /// Every entry of `attempt_id`'s conversation, from the beginning.
+    fn entries(&self, attempt_id: &str) -> Vec<ConversationEntry> {
+        self.store
+            .read(attempt_id, 1, usize::MAX)
+            .expect("read the conversation")
+            .unwrap_or_else(|| panic!("attempt '{attempt_id}' has no conversation file"))
+            .entries
+    }
+
+    /// Whether the attempt was closed (compressed).
+    fn is_closed(&self, attempt_id: &str) -> bool {
+        self.store
+            .read(attempt_id, 1, usize::MAX)
+            .expect("read the conversation")
+            .map(|snapshot| snapshot.closed)
+            .unwrap_or(false)
+    }
+}
+
+/// The raw bytes of an entry, decoded as UTF-8 (lossily — tests that care
+/// about exact bytes compare `entry.raw` directly instead).
+fn entry_text(entry: &ConversationEntry) -> String {
+    String::from_utf8_lossy(&entry.raw).into_owned()
+}
+
+/// The fixed ids every test in this file runs its agent action under.
+const EXECUTION_ID: &str = "execution-1";
+const ACTION_EXECUTION_ID: &str = "action-exec-1";
+
+/// Runs an agent action with a conversation store wired in.
+async fn execute_with_conversation(
+    executor: &AgentExecutor,
+    config: AgentActionConfig,
+    workspace: &Workspace,
+    conversation: &ConversationFixture,
+    timeout: Option<Duration>,
+) -> Result<ActionOutcome, ActionError> {
+    let action = ActionConfig::Agent(config);
+    executor
+        .execute(
+            ActionRequest::new(&action, workspace, ACTION_EXECUTION_ID)
+                .with_timeout(timeout)
+                .with_execution_id(EXECUTION_ID)
+                .with_conversation_store(&conversation.store),
+        )
+        .await
 }
 
 /// An agent action on the `claude-code` harness.
@@ -566,9 +706,10 @@ async fn the_model_and_the_read_only_paths_reach_the_argv() {
     assert!(args.contains(&"--print".to_string()), "{args:?}");
     assert!(
         args.windows(2)
-            .any(|pair| pair[0] == "--output-format" && pair[1] == "json"),
+            .any(|pair| pair[0] == "--output-format" && pair[1] == "stream-json"),
         "{args:?}"
     );
+    assert!(args.contains(&"--verbose".to_string()), "{args:?}");
     assert!(
         args.windows(2)
             .any(|pair| pair[0] == "--model" && pair[1] == "opus"),
@@ -988,6 +1129,516 @@ async fn the_reference_workflow_runs_end_to_end_on_the_fake_harness() {
     assert_eq!(
         execution.context.variables.get("pr_number"),
         Some(&json!(123))
+    );
+}
+
+/// Every `action_execution_id` an `ActionStarted`/`ActionRetrying` event of
+/// `execution_id` introduced, in order — one per attempt.
+fn attempt_ids(fixture: &EngineFixture, execution_id: &str) -> Vec<String> {
+    fixture
+        .store()
+        .event_log(execution_id)
+        .read_all()
+        .expect("read the event log")
+        .into_iter()
+        .filter_map(|event| match event.data {
+            EventData::ActionStarted {
+                action_execution_id,
+                ..
+            } => Some(action_execution_id),
+            EventData::ActionRetrying {
+                action_execution_id,
+                ..
+            } => Some(action_execution_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Integration: a retried agent state gets one conversation file per attempt,
+/// and both are compressed once the run is over.
+#[tokio::test]
+async fn a_retried_agent_state_gets_one_compressed_conversation_file_per_attempt() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &envelope("no JSON here at all"))
+        .answers_on_call(2, &envelope(r#"{"output":"ready"}"#));
+
+    let definition = fixture.workflow(
+        r#"
+name: agent-retry
+version: 1
+states:
+  analyze:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: "Analyse {{ inputs.subject }}"
+    outputs: [ready]
+    retry_policy:
+      max_attempts: 2
+      backoff: 0
+    transitions:
+      ready: done
+  done:
+    description: Success.
+terminal_states:
+  done: completed
+inputs:
+  - name: subject
+    type: string
+    required: true
+"#,
+    );
+
+    let execution = fixture
+        .engine()
+        .start_and_run(
+            &definition,
+            json!({ "subject": "the login module" }),
+            fixture.workspace(),
+        )
+        .await
+        .expect("run the workflow");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(
+        fixture.fake.calls(),
+        2,
+        "the first attempt failed and was retried"
+    );
+
+    let attempts = attempt_ids(&fixture, &execution.id);
+    assert_eq!(attempts.len(), 2, "one id per attempt: {attempts:?}");
+    assert_ne!(
+        attempts[0], attempts[1],
+        "each attempt has its own id (D24)"
+    );
+
+    let conversation_store = fixture.store().conversation_store(&execution.id);
+    for attempt in &attempts {
+        let snapshot = conversation_store
+            .read(attempt, 1, usize::MAX)
+            .expect("read the conversation")
+            .unwrap_or_else(|| panic!("attempt '{attempt}' has a conversation file"));
+        assert!(
+            snapshot.closed,
+            "attempt '{attempt}' was compressed once its run ended"
+        );
+        assert!(
+            !snapshot.entries.is_empty(),
+            "attempt '{attempt}' has at least the prompt and the completion entry"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming capture (U3): every line reaches the conversation file
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_claude_code_stream_is_captured_in_order_with_the_prompt_and_a_completion_entry() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&claude_stream("fake-session-1", r#"{"output":"ready"}"#));
+
+    let result = execute_with_conversation(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await
+    .expect("the run completes");
+
+    let ActionOutcome::Completed(result) = result else {
+        panic!("expected a completed action");
+    };
+    assert_eq!(result.output_label, "ready");
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    // Prompt, four stdout lines, one completion entry.
+    assert_eq!(entries.len(), 6, "{entries:?}");
+    assert_eq!(entries[0].source, ConversationSource::Narsor);
+    assert!(entry_text(&entries[0]).contains("look around"));
+
+    for entry in &entries[1..5] {
+        assert_eq!(entry.source, ConversationSource::Stdout);
+    }
+    assert!(
+        entry_text(&entries[1]).contains("\"init\""),
+        "the first stdout line is the system/init line: {}",
+        entry_text(&entries[1])
+    );
+    assert!(
+        entry_text(&entries[4]).contains("\"result\""),
+        "the last stdout line is the result line: {}",
+        entry_text(&entries[4])
+    );
+
+    let last = entries.last().expect("a completion entry");
+    assert_eq!(last.source, ConversationSource::Narsor);
+    assert!(
+        entry_text(last).contains("exited with code 0"),
+        "{}",
+        entry_text(last)
+    );
+
+    // Closing (and compressing) the attempt is the runner's job, done once
+    // the whole attempt — executor included — is over (U3's Approach); a
+    // bare executor call like this one never closes it itself. See
+    // `a_retried_agent_state_gets_one_compressed_conversation_file_per_attempt`
+    // for the runner actually doing it.
+    assert!(!conversation.is_closed(ACTION_EXECUTION_ID));
+}
+
+#[tokio::test]
+async fn an_opencode_stream_is_captured_and_the_label_comes_from_its_text_line() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&opencode_stream("ses_7", r#"{"output":"ready"}"#));
+
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(OpenCodeAdapter::with_program(fake.program()))),
+    );
+
+    let mut config = agent_action("look around");
+    config.harness = Some("opencode".to_string());
+
+    let result =
+        execute_with_conversation(&executor, config, &root.workspace(), &conversation, None)
+            .await
+            .expect("the run completes");
+
+    let ActionOutcome::Completed(result) = result else {
+        panic!("expected a completed action");
+    };
+    assert_eq!(result.output_label, "ready");
+    assert_eq!(
+        result.variables.get(SESSION_ID_VARIABLE),
+        Some(&json!("ses_7"))
+    );
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    // Prompt, four stdout lines, one completion entry.
+    assert_eq!(entries.len(), 6, "{entries:?}");
+    assert!(!conversation.is_closed(ACTION_EXECUTION_ID));
+}
+
+#[tokio::test]
+async fn covers_ae5_two_lines_then_a_timeout_are_both_captured_plus_a_timeout_entry() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&ndjson(&[
+        json!({ "type": "system", "subtype": "init", "session_id": "s1" }),
+        json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "thinking" }] } }),
+    ]))
+    .sleeps(30);
+
+    let sink = Arc::new(RecordingSink::default());
+    let executor = executor(&fake).with_event_sink(sink.clone());
+
+    let outcome = execute_with_conversation(
+        &executor,
+        agent_action("think for a long time"),
+        &root.workspace(),
+        &conversation,
+        Some(Duration::from_millis(300)),
+    )
+    .await
+    .expect("a timeout is an outcome, not a failure");
+
+    assert!(matches!(outcome, ActionOutcome::TimedOut(_)));
+
+    let failed = sink
+        .events()
+        .into_iter()
+        .find_map(|(_, data)| match data {
+            EventData::AgentSessionFailed {
+                action_execution_id,
+                ..
+            } => Some(action_execution_id),
+            _ => None,
+        })
+        .expect("a session failure was recorded");
+    assert_eq!(failed.as_deref(), Some(ACTION_EXECUTION_ID));
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    // Prompt, two stdout lines, one "timed out" completion entry.
+    assert_eq!(entries.len(), 4, "{entries:?}");
+    assert!(entry_text(&entries[1]).contains("\"init\""));
+    assert!(entry_text(&entries[2]).contains("thinking"));
+    assert!(
+        entry_text(entries.last().expect("a completion entry")).contains("timed out"),
+        "{}",
+        entry_text(entries.last().unwrap())
+    );
+}
+
+#[tokio::test]
+async fn a_stream_with_no_result_line_is_an_error() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&ndjson(&[
+        json!({ "type": "system", "subtype": "init", "session_id": "s1" }),
+        json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "done, I think" }] } }),
+    ]));
+
+    let error = fail(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+    )
+    .await;
+
+    assert_eq!(error.error_type.as_deref(), Some("harness_failed"));
+    assert!(
+        error.message.contains("finished without a result"),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn an_is_error_result_at_subtype_success_is_a_session_error() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(
+        &json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "session_id": "s1",
+            "result": "something went wrong internally",
+        })
+        .to_string(),
+    );
+
+    let error = fail(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+    )
+    .await;
+
+    assert_eq!(error.error_type.as_deref(), Some("harness_failed"));
+    assert!(
+        error.message.contains("something went wrong internally"),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn error_max_turns_builds_its_message_from_the_errors_array() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(
+        &json!({
+            "type": "result",
+            "subtype": "error_max_turns",
+            "session_id": "s1",
+            "errors": [{ "message": "exceeded the maximum number of turns" }],
+        })
+        .to_string(),
+    );
+
+    let error = fail(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+    )
+    .await;
+
+    assert_eq!(error.error_type.as_deref(), Some("harness_failed"));
+    assert!(
+        error
+            .message
+            .contains("exceeded the maximum number of turns"),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn a_missing_binary_still_leaves_a_conversation_file_with_the_prompt() {
+    let root = TempRoot::new();
+    let conversation = ConversationFixture::new(&root);
+
+    let executor =
+        AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(Arc::new(
+            ClaudeCodeAdapter::with_program("claude-that-is-not-installed"),
+        )));
+
+    let outcome = execute_with_conversation(
+        &executor,
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await;
+    assert!(outcome.is_err());
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert!(entry_text(&entries[0]).contains("look around"));
+    assert!(
+        entry_text(&entries[1]).contains("harness did not start"),
+        "{}",
+        entry_text(&entries[1])
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_tool_result_line_does_not_truncate_the_capture_or_break_the_label() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+
+    // Comfortably past the 8 MiB the old whole-buffer capture used to cap at.
+    let huge_content = "x".repeat(9 * 1024 * 1024);
+    let huge_line = json!({
+        "type": "user",
+        "message": { "content": [{ "type": "tool_result", "content": huge_content }] },
+    })
+    .to_string();
+    let result_line = envelope(r#"{"output":"ready"}"#);
+    fake.answers(&format!("{huge_line}\n{result_line}"));
+
+    let result = execute_with_conversation(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await
+    .expect("the run completes");
+
+    let ActionOutcome::Completed(result) = result else {
+        panic!("expected a completed action");
+    };
+    assert_eq!(result.output_label, "ready");
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    let big_entry = entries
+        .iter()
+        .find(|entry| entry.raw.len() > 9 * 1024 * 1024)
+        .expect("the oversized line was captured in full");
+    assert_eq!(big_entry.raw.len(), huge_line.len());
+}
+
+#[tokio::test]
+async fn a_non_json_line_is_captured_raw_and_does_not_abort_parsing() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&format!(
+        "this is not JSON at all\n{}",
+        envelope(r#"{"output":"ready"}"#)
+    ));
+
+    let result = execute_with_conversation(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await
+    .expect("the run completes");
+
+    let ActionOutcome::Completed(result) = result else {
+        panic!("expected a completed action");
+    };
+    assert_eq!(result.output_label, "ready");
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry_text(entry) == "this is not JSON at all"),
+        "{entries:?}"
+    );
+}
+
+#[tokio::test]
+async fn stderr_on_a_successful_run_is_captured_without_affecting_the_result() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&envelope(r#"{"output":"ready"}"#))
+        .fails(0, "a warning the harness printed on stderr\n");
+
+    let result = execute_with_conversation(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await
+    .expect("the run completes");
+
+    let ActionOutcome::Completed(result) = result else {
+        panic!("expected a completed action");
+    };
+    assert_eq!(result.output_label, "ready");
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    let stderr_entry = entries
+        .iter()
+        .find(|entry| entry.source == ConversationSource::Stderr)
+        .expect("a stderr entry was captured");
+    assert!(
+        entry_text(stderr_entry).contains("a warning the harness printed"),
+        "{}",
+        entry_text(stderr_entry)
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_session_reaches_the_argv_and_the_prompt_entry() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&envelope(r#"{"output":"ready"}"#));
+
+    let mut config = agent_action("carry on");
+    config
+        .parameters
+        .insert("resume_session".to_string(), json!("session-42"));
+
+    let result = execute_with_conversation(
+        &executor(&fake),
+        config,
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await
+    .expect("the run completes");
+    assert!(matches!(result, ActionOutcome::Completed(_)));
+
+    let args = fake.args(1);
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "--resume" && pair[1] == "session-42"),
+        "{args:?}"
+    );
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    assert!(
+        entry_text(&entries[0]).contains("session-42"),
+        "the prompt entry names the resumed session: {}",
+        entry_text(&entries[0])
     );
 }
 

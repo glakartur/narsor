@@ -36,26 +36,32 @@
 //! unchanged and the events simply go nowhere.
 
 use std::future::Future;
+use std::io;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::{Map, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use super::harness::{HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun};
-use super::script::{read_capped, truncate};
+use super::harness::{
+    HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun, HarnessStreamParser,
+};
+use super::script::{truncate, MAX_BUFFERED_OUTPUT_BYTES};
 use super::{ActionExecutor, ActionOutcome, ActionRequest, TimedOutAction, ACTION_ID_ENV_VAR};
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, AgentActionConfig, AgentSession, AgentSessionStatus,
     Event, EventData, Workspace,
 };
-use crate::persistence::ExecutionStore;
+use crate::persistence::{
+    ConversationSource, ConversationStore, ConversationWriter, ExecutionStore,
+};
 
 /// Appended to every prompt, so the agent is told the contract it has to meet.
 ///
@@ -86,6 +92,16 @@ pub const SESSION_ID_VARIABLE: &str = "agent_session_id";
 
 /// The `data` key carrying the session record of the run.
 pub const SESSION_DATA_KEY: &str = "agent_session";
+
+/// The most a single stdout line is handed to the harness's stream parser.
+///
+/// Every line reaches the conversation file in full regardless (R14) — this
+/// only bounds what is fed to [`HarnessStreamParser::on_stdout_line`]. Tens of
+/// megabytes is well past anything a harness's own JSON envelope needs (a
+/// multi-megabyte `tool_result` line is ordinary; the final `result`/`text`
+/// line is not), so a line past this limit is bulky tool output, not the
+/// answer, and is safely skipped for parsing.
+pub const PARSE_LINE_LIMIT: usize = 32 * 1024 * 1024;
 
 /// Receives the agent-session events of a run.
 ///
@@ -131,6 +147,85 @@ impl AgentEventSink for LoggingEventSink {
                     execution_id,
                     %error,
                     "an agent session event could not be appended to the log"
+                );
+            }
+        }
+    }
+}
+
+/// Best-effort access to one attempt's conversation file (U3).
+///
+/// Wraps the writer in `Arc<Mutex<_>>` because stdout and stderr are drained
+/// concurrently (see [`stream_lines`]) and both append to the same file; the
+/// lock is held only for the duration of one `write_all`, never across an
+/// `.await`. `None` stands for "there is nowhere to write" — no store was
+/// given, or opening the file failed — and every method is then a no-op,
+/// following the same "recording must never fail a run" rule as
+/// [`AgentEventSink`].
+#[derive(Clone)]
+struct ConversationSink(Option<Arc<Mutex<ConversationWriter>>>);
+
+impl ConversationSink {
+    /// No file to write to.
+    fn none() -> Self {
+        Self(None)
+    }
+
+    /// Opens `attempt_id`'s conversation file in `store`, or answers `none()`
+    /// and logs why when that fails.
+    fn open(store: &ConversationStore, attempt_id: &str) -> Self {
+        match store.writer(attempt_id) {
+            Ok(writer) => Self(Some(Arc::new(Mutex::new(writer)))),
+            Err(error) => {
+                tracing::warn!(
+                    attempt_id,
+                    %error,
+                    "could not open this attempt's conversation file; the run \
+                     continues without one"
+                );
+                Self::none()
+            }
+        }
+    }
+
+    /// Appends one entry, logging (and otherwise ignoring) a failure to.
+    fn append(&self, source: ConversationSource, raw: &[u8]) {
+        let Some(writer) = &self.0 else { return };
+        let mut writer = writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(error) = writer.append(source, raw) {
+            tracing::warn!(%error, "could not append a conversation entry");
+        }
+    }
+
+    /// Convenience for a narsor-authored entry (the prompt, the outcome).
+    fn append_narsor(&self, text: &str) {
+        self.append(ConversationSource::Narsor, text.as_bytes());
+    }
+
+    /// Flushes the writer to disk, once, at the very end of the attempt.
+    ///
+    /// Consumes the sink: nothing appends after an attempt has finished.
+    /// Silently does nothing if another clone of this sink is still alive
+    /// when this is called — which never happens in practice, since every
+    /// reader task has already joined by the time [`AgentExecutor::run`]
+    /// calls this.
+    fn finish(self) {
+        let Some(writer) = self.0 else { return };
+        match Arc::try_unwrap(writer) {
+            Ok(mutex) => {
+                let writer = mutex
+                    .into_inner()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Err(error) = writer.finish() {
+                    tracing::warn!(%error, "could not sync this attempt's conversation file");
+                }
+            }
+            Err(_still_shared) => {
+                tracing::warn!(
+                    "the conversation writer still had outstanding references at the \
+                     end of the attempt; it was not synced explicitly"
                 );
             }
         }
@@ -219,6 +314,32 @@ impl ActionExecutor for AgentExecutor {
 }
 
 impl AgentExecutor {
+    /// Opens this attempt's conversation file, if there is a store to open it
+    /// in, and writes the prompt entry — the first line any conversation ever
+    /// has: the prompt sent, the harness, and the session it continues, if
+    /// any.
+    fn open_conversation(
+        &self,
+        request: &ActionRequest<'_>,
+        harness: &str,
+        resume: Option<&str>,
+        prompt: &str,
+    ) -> ConversationSink {
+        let Some(store) = request.conversation_store else {
+            return ConversationSink::none();
+        };
+        let sink = ConversationSink::open(store, request.action_execution_id);
+        let entry = serde_json::json!({
+            "event": "prompt",
+            "harness": harness,
+            "resumed_session": resume,
+            "prompt": prompt,
+        })
+        .to_string();
+        sink.append_narsor(&entry);
+        sink
+    }
+
     /// One agent run, from the session record to the output label.
     async fn run(&self, request: ActionRequest<'_>) -> Result<ActionOutcome, ActionError> {
         let config = agent_config(request.action)?;
@@ -233,12 +354,25 @@ impl AgentExecutor {
         let prompt = format!("{}{AGENT_OUTPUT_CONTRACT}", config.prompt);
         let workspace = Path::new(&request.workspace.path);
 
-        let invocation = adapter.invocation(&HarnessRequest {
+        // Opened before `invocation` (Key Technical Decisions): even an
+        // invocation that never runs (a bad parameter, a missing binary)
+        // leaves a conversation file behind, with the prompt and why the
+        // harness never started.
+        let conversation = self.open_conversation(&request, harness, resume, &prompt);
+
+        let invocation = match adapter.invocation(&HarnessRequest {
             config,
             prompt: &prompt,
             workspace,
             resume_session: resume,
-        })?;
+        }) {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                conversation.append_narsor(&format!("harness did not start: {}", error.message));
+                conversation.finish();
+                return Err(error);
+            }
+        };
 
         self.emit(
             request.execution_id,
@@ -252,19 +386,31 @@ impl AgentExecutor {
         );
         session.status = AgentSessionStatus::Running;
 
-        let outcome = spawn_and_wait(
+        let ending = spawn_and_wait(
             &invocation.program,
             &invocation.args,
             request.workspace,
             request.action_execution_id,
             request.timeout,
+            adapter.stream_parser(),
+            &conversation,
         )
         .await;
 
-        let finished = match outcome {
-            Ok(Some(finished)) => finished,
-            Ok(None) => {
+        let finished = match ending {
+            Ok(SpawnEnding::Finished(finished)) => {
+                conversation
+                    .append_narsor(&format!("harness exited with code {}", finished.exit_code));
+                finished
+            }
+            Ok(SpawnEnding::TimedOut) => {
                 let limit = request.timeout.unwrap_or_default();
+                conversation.append_narsor(&format!(
+                    "harness timed out after {}s and was killed",
+                    limit.as_secs_f64()
+                ));
+                conversation.finish();
+
                 self.fail_session(
                     request.execution_id,
                     request.action_execution_id,
@@ -282,6 +428,17 @@ impl AgentExecutor {
                 }));
             }
             Err(error) => {
+                let started = !matches!(
+                    error.error_type.as_deref(),
+                    Some("harness_not_found") | Some("spawn_failed")
+                );
+                conversation.append_narsor(&if started {
+                    format!("harness run failed: {}", error.message)
+                } else {
+                    format!("harness did not start: {}", error.message)
+                });
+                conversation.finish();
+
                 self.fail_session(
                     request.execution_id,
                     request.action_execution_id,
@@ -293,7 +450,9 @@ impl AgentExecutor {
             }
         };
 
-        let run = adapter.parse(&finished.stdout, &finished.stderr, finished.exit_code);
+        conversation.finish();
+
+        let run = finished.run.clone();
 
         if let Some(session_id) = &run.session_id {
             session
@@ -451,26 +610,44 @@ fn resume_session(config: &AgentActionConfig) -> Result<Option<&str>, ActionErro
     }
 }
 
-/// A harness process that ran to completion.
-struct FinishedProcess {
-    stdout: String,
-    stderr: String,
+/// A harness process that ran to completion, already parsed.
+struct FinishedRun {
+    /// What the adapter's stream parser distilled from the stdout stream.
+    run: HarnessRun,
+    /// The process's exit code.
     exit_code: i32,
+    /// A bounded capture of stderr, for error messages only — the full text,
+    /// unbounded, is what the conversation file holds (R14).
+    stderr: String,
 }
 
-/// Runs the harness, draining both pipes while it goes.
+/// How the harness process ended, from [`spawn_and_wait`]'s point of view.
+enum SpawnEnding {
+    /// It ran to completion (successfully or not — that is `run.failure`'s
+    /// business, not this type's).
+    Finished(FinishedRun),
+    /// The time limit ran out and the process was killed.
+    TimedOut,
+}
+
+/// Runs the harness, draining both pipes while it goes and feeding every
+/// stdout line to the conversation store and to `parser`.
 ///
-/// `Ok(None)` means the time limit ran out and the process was killed. The
-/// draining is [`read_capped`], shared with the script executor: a chatty agent
-/// — and every agent is chatty — would otherwise block on a full pipe and look
-/// exactly like a hang.
+/// Reading is a line loop ([`stream_lines`]) rather than `read_capped` (used
+/// by the script executor, which has no per-line structure to preserve): a
+/// chatty agent — and every agent is chatty — would otherwise block on a full
+/// pipe and look exactly like a hang, so both pipes are still drained
+/// concurrently with the wait, only now line by line instead of as one
+/// unbounded blob.
 async fn spawn_and_wait(
     program: &str,
     args: &[String],
     workspace: &Workspace,
     action_execution_id: &str,
     limit: Option<Duration>,
-) -> Result<Option<FinishedProcess>, ActionError> {
+    parser: Box<dyn HarnessStreamParser>,
+    conversation: &ConversationSink,
+) -> Result<SpawnEnding, ActionError> {
     let working_dir = Path::new(&workspace.path);
 
     let mut command = Command::new(program);
@@ -483,41 +660,57 @@ async fn spawn_and_wait(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = command
-        .spawn()
+    let mut child = spawn_retrying_text_busy(&mut command)
+        .await
         .map_err(|error| spawn_error(program, working_dir, &error))?;
 
     let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
 
-    let wait = async {
-        tokio::join!(
-            read_capped(&mut stdout_pipe),
-            read_capped(&mut stderr_pipe),
-            child.wait(),
-        )
+    let stdout_task = async {
+        let mut parser = parser;
+        let result = stream_lines(&mut stdout_pipe, |line| {
+            conversation.append(ConversationSource::Stdout, line);
+            if line.len() <= PARSE_LINE_LIMIT {
+                parser.on_stdout_line(line);
+            }
+        })
+        .await;
+        (result, parser)
     };
+
+    let stderr_task = async {
+        let mut stderr_capture: Vec<u8> = Vec::new();
+        let result = stream_lines(&mut stderr_pipe, |line| {
+            conversation.append(ConversationSource::Stderr, line);
+            accumulate_capped(&mut stderr_capture, line, MAX_BUFFERED_OUTPUT_BYTES);
+            accumulate_capped(&mut stderr_capture, b"\n", MAX_BUFFERED_OUTPUT_BYTES);
+        })
+        .await;
+        (result, stderr_capture)
+    };
+
+    let wait = async { tokio::join!(stdout_task, stderr_task, child.wait()) };
 
     let finished = match limit {
         Some(limit) => tokio::time::timeout(limit, wait).await,
         None => Ok(wait.await),
     };
 
-    let (stdout_read, stderr_read, status) = match finished {
+    let ((stdout_result, parser), (stderr_result, stderr_capture), status) = match finished {
         Ok(finished) => finished,
         Err(_elapsed) => {
             // The waiting future is gone, so the child can be reaped for good.
             let _ = child.kill().await;
-            return Ok(None);
+            return Ok(SpawnEnding::TimedOut);
         }
     };
 
-    let stdout = stdout_read.map_err(|error| io_error(program, "stdout", &error))?;
-    let stderr = stderr_read.map_err(|error| io_error(program, "stderr", &error))?;
+    stdout_result.map_err(|error| io_error(program, "stdout", &error))?;
+    stderr_result.map_err(|error| io_error(program, "stderr", &error))?;
     let status = status.map_err(|error| io_error(program, "exit status", &error))?;
 
-    let stdout = String::from_utf8_lossy(&stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_capture).into_owned();
 
     let Some(exit_code) = status.code() else {
         return Err(ActionError {
@@ -527,11 +720,105 @@ async fn spawn_and_wait(
         });
     };
 
-    Ok(Some(FinishedProcess {
-        stdout,
-        stderr,
+    let run = parser.finish(exit_code, &stderr);
+
+    Ok(SpawnEnding::Finished(FinishedRun {
+        run,
         exit_code,
+        stderr,
     }))
+}
+
+/// Reads `pipe` line by line, calling `on_line` with the raw bytes of each
+/// complete line — the trailing `\n` stripped and nothing else touched, not
+/// even a trailing `\r`, not even invalid UTF-8. The final, unterminated
+/// chunk left at EOF (the trace of a harness that never printed a last
+/// newline) is delivered the same way as any other line.
+///
+/// Deliberately not `tokio::io::AsyncBufReadExt::lines()` (requires valid
+/// UTF-8, and has no size limit of its own) and not
+/// `tokio_util::codec::LinesCodec` (silently drops anything past its
+/// configured length): this is the `fill_buf`/`consume` loop the two would
+/// otherwise hide, kept explicit so that a line of any size still reaches
+/// `on_line` in full (R14) — only *parsing* it is ever capped, by the caller,
+/// never this function's own reading.
+async fn stream_lines<R>(pipe: &mut R, mut on_line: impl FnMut(&[u8])) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::with_capacity(64 * 1024, pipe);
+    let mut line: Vec<u8> = Vec::new();
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            break;
+        }
+
+        match available.iter().position(|&byte| byte == b'\n') {
+            Some(pos) => {
+                line.extend_from_slice(&available[..pos]);
+                reader.consume(pos + 1);
+                on_line(&line);
+                line.clear();
+            }
+            None => {
+                let consumed = available.len();
+                line.extend_from_slice(available);
+                reader.consume(consumed);
+            }
+        }
+    }
+
+    if !line.is_empty() {
+        on_line(&line);
+    }
+    Ok(())
+}
+
+/// Appends as much of `chunk` as fits within `cap` total bytes, silently
+/// dropping the rest once the cap is reached — a smaller, line-oriented
+/// cousin of `read_capped`'s "keep draining, stop retaining" rule, used
+/// here only for the bounded stderr text quoted in error messages. The
+/// conversation file holds the unbounded original regardless.
+fn accumulate_capped(buffer: &mut Vec<u8>, chunk: &[u8], cap: usize) {
+    if buffer.len() >= cap {
+        return;
+    }
+    let room = cap - buffer.len();
+    buffer.extend_from_slice(&chunk[..chunk.len().min(room)]);
+}
+
+/// How many times a fresh `ETXTBSY` is retried before it is given up on as a
+/// real error.
+const SPAWN_TEXT_BUSY_RETRIES: u32 = 20;
+
+/// Spawns `command`, retrying briefly on `ExecutableFileBusy`.
+///
+/// Linux (and other Unixes) refuse to `execve` a file that some other open
+/// file description still has open for writing — ordinarily this means a
+/// build is genuinely in flight, but it is also a real, if brief, race for a
+/// binary that was just written and closed a moment ago and is executed
+/// again immediately after (a harness deployed by a rolling update; the test
+/// suite's own fixture, copied and renamed into place right before this same
+/// process runs it — see `tests/actions_agent.rs`'s `FakeHarness::install`).
+/// The window is a matter of microseconds, so a handful of immediate retries
+/// clears it without ever masking a binary that is actually, persistently
+/// busy — those keep failing past the retry budget exactly as before.
+async fn spawn_retrying_text_busy(command: &mut Command) -> std::io::Result<tokio::process::Child> {
+    for attempt in 0..SPAWN_TEXT_BUSY_RETRIES {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error)
+                if attempt + 1 < SPAWN_TEXT_BUSY_RETRIES
+                    && error.kind() == io::ErrorKind::ExecutableFileBusy =>
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the loop above always returns before exhausting its retries")
 }
 
 /// The harness could not be started.
@@ -581,7 +868,7 @@ fn io_error(program: &str, what: &str, error: &std::io::Error) -> ActionError {
 fn harness_error(
     adapter: &dyn HarnessAdapter,
     failure: &str,
-    finished: &FinishedProcess,
+    finished: &FinishedRun,
     run: &HarnessRun,
 ) -> ActionError {
     ActionError {
@@ -752,7 +1039,7 @@ fn build_result(
     output: AgentOutput,
     session: &AgentSession,
     run: &HarnessRun,
-    finished: &FinishedProcess,
+    finished: &FinishedRun,
 ) -> ActionResult {
     let mut data = output.data;
     let session_record = serde_json::to_value(session).unwrap_or(Value::Null);

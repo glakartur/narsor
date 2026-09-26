@@ -89,11 +89,18 @@ struct FakeHarness {
 impl FakeHarness {
     /// Installs the fixture script and scripts its answers, one output label
     /// per call, in order.
+    ///
+    /// Copies to a temporary name and renames it into place — see the
+    /// comment on `FakeHarness::install` in `tests/actions_agent.rs` for why
+    /// a straight `fs::copy` onto the final name is an intermittent ETXTBSY
+    /// flake under parallel test threads.
     fn installed_in(dir: PathBuf, labels: &[&str]) -> Self {
         let source =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/harness/fake_harness.sh");
         let program = dir.join("fake_harness.sh");
-        fs::copy(&source, &program).expect("copy the fake harness");
+        let temp = dir.join(format!(".fake_harness.sh.{}.tmp", uuid::Uuid::new_v4()));
+        fs::copy(&source, &temp).expect("copy the fake harness");
+        fs::rename(&temp, &program).expect("move the fake harness into place");
 
         for (index, label) in labels.iter().enumerate() {
             let answer = json!({
