@@ -274,6 +274,13 @@ pub enum EngineError {
         /// What went wrong.
         message: String,
     },
+
+    /// Another pass is already driving this execution.
+    #[error("execution '{execution_id}' is already being driven by another pass")]
+    AlreadyRunning {
+        /// The execution a second driver tried to advance.
+        execution_id: ExecutionId,
+    },
 }
 
 /// Whether the loop keeps stepping.
@@ -349,7 +356,26 @@ pub struct Engine {
     agent_timeout_secs: Option<u64>,
     events: broadcast::Sender<Event>,
     pause_requests: Mutex<HashSet<ExecutionId>>,
+    active_runs: Mutex<HashSet<ExecutionId>>,
     checkpoints: bool,
+}
+
+/// Holds the "already running" claim on one execution for as long as a pass is
+/// driving it.
+///
+/// Acquired by [`Engine::begin_run`], which does the check-and-insert under one
+/// lock so two attempts can never both succeed; released on `Drop`, so every
+/// exit path — a normal return, an early `?`, or a panic unwinding through it —
+/// frees the execution the same way.
+struct RunGuard<'a> {
+    engine: &'a Engine,
+    execution_id: ExecutionId,
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.engine.lock_active_runs().remove(&self.execution_id);
+    }
 }
 
 impl Engine {
@@ -379,6 +405,7 @@ impl Engine {
             agent_timeout_secs: None,
             events,
             pause_requests: Mutex::new(HashSet::new()),
+            active_runs: Mutex::new(HashSet::new()),
             checkpoints: false,
         }
     }
@@ -499,11 +526,15 @@ impl Engine {
         definition: &WorkflowDefinition,
         execution_id: &str,
     ) -> Result<WorkflowExecution, EngineError> {
-        let execution = self.store.load_execution(execution_id)?;
-        if execution.status != ExecutionStatus::Running {
-            return Err(self.not_runnable(&execution, "run"));
-        }
-        self.run_loop(definition, execution).await
+        self.observed(execution_id, async {
+            let _guard = self.begin_run(execution_id)?;
+            let execution = self.store.load_execution(execution_id)?;
+            if execution.status != ExecutionStatus::Running {
+                return Err(self.not_runnable(&execution, "run"));
+            }
+            self.run_loop(definition, execution).await
+        })
+        .await
     }
 
     /// Runs a stored execution like [`Engine::run`], but stops after `steps`
@@ -572,25 +603,29 @@ impl Engine {
         definition: &WorkflowDefinition,
         execution_id: &str,
     ) -> Result<WorkflowExecution, EngineError> {
-        let mut execution = self.store.load_execution(execution_id)?;
+        self.observed(execution_id, async {
+            let _guard = self.begin_run(execution_id)?;
+            let mut execution = self.store.load_execution(execution_id)?;
 
-        match execution.status {
-            ExecutionStatus::Running => {}
-            ExecutionStatus::Paused => {
-                if self.store.has_pending_input(execution_id) {
-                    return Err(EngineError::AwaitingHumanInput {
-                        execution_id: execution_id.to_string(),
-                    });
+            match execution.status {
+                ExecutionStatus::Running => {}
+                ExecutionStatus::Paused => {
+                    if self.store.has_pending_input(execution_id) {
+                        return Err(EngineError::AwaitingHumanInput {
+                            execution_id: execution_id.to_string(),
+                        });
+                    }
+                    self.lock_pause_requests().remove(execution_id);
+                    execution.status = ExecutionStatus::Running;
+                    self.store.save_execution(&execution)?;
+                    self.emit(execution_id, EventData::WorkflowResumed)?;
                 }
-                self.lock_pause_requests().remove(execution_id);
-                execution.status = ExecutionStatus::Running;
-                self.store.save_execution(&execution)?;
-                self.emit(execution_id, EventData::WorkflowResumed)?;
+                _ => return Err(self.not_runnable(&execution, "resumed")),
             }
-            _ => return Err(self.not_runnable(&execution, "resumed")),
-        }
 
-        self.run_loop(definition, execution).await
+            self.run_loop(definition, execution).await
+        })
+        .await
     }
 
     /// The question an execution is waiting on, if it is waiting on one.
@@ -614,42 +649,47 @@ impl Engine {
         execution_id: &str,
         delivery: &HumanInputDelivery,
     ) -> Result<WorkflowExecution, EngineError> {
-        let from = self.store.event_log(execution_id).next_sequence()?;
-        let resumed = human::resume(&self.store, execution_id, delivery)?;
-        self.publish_from(execution_id, from)?;
+        self.observed(execution_id, async {
+            let _guard = self.begin_run(execution_id)?;
 
-        let mut execution = resumed.execution;
-        self.lock_pause_requests().remove(execution_id);
+            let from = self.store.event_log(execution_id).next_sequence()?;
+            let resumed = human::resume(&self.store, execution_id, delivery)?;
+            self.publish_from(execution_id, from)?;
 
-        let state_id = self.current_state_id(&execution)?;
-        let state = self.state_of(definition, &execution, &state_id)?;
+            let mut execution = resumed.execution;
+            self.lock_pause_requests().remove(execution_id);
 
-        let flow = match self.pending_step(&execution, &state_id)? {
-            Some(pending) => {
-                // The action had already finished: this answer is the decision.
-                let outcome = DecisionOutcome {
-                    label: resumed.result.output_label.clone(),
-                    provider: DecisionProviderType::Human,
-                    reasoning: None,
-                };
-                self.apply_decision(definition, &mut execution, state, pending, outcome)?
+            let state_id = self.current_state_id(&execution)?;
+            let state = self.state_of(definition, &execution, &state_id)?;
+
+            let flow = match self.pending_step(&execution, &state_id)? {
+                Some(pending) => {
+                    // The action had already finished: this answer is the decision.
+                    let outcome = DecisionOutcome {
+                        label: resumed.result.output_label.clone(),
+                        provider: DecisionProviderType::Human,
+                        reasoning: None,
+                    };
+                    self.apply_decision(definition, &mut execution, state, pending, outcome)?
+                }
+                None => {
+                    // The answer is the human action's own result.
+                    self.record_completion(
+                        definition,
+                        &mut execution,
+                        state,
+                        resumed.pending.action_execution_id().to_string(),
+                        resumed.result,
+                    )?
+                }
+            };
+
+            if flow == Flow::Stop {
+                return Ok(execution);
             }
-            None => {
-                // The answer is the human action's own result.
-                self.record_completion(
-                    definition,
-                    &mut execution,
-                    state,
-                    resumed.pending.action_execution_id().to_string(),
-                    resumed.result,
-                )?
-            }
-        };
-
-        if flow == Flow::Stop {
-            return Ok(execution);
-        }
-        self.run_loop(definition, execution).await
+            self.run_loop(definition, execution).await
+        })
+        .await
     }
 
     // -----------------------------------------------------------------------
@@ -1386,6 +1426,84 @@ impl Engine {
         self.pause_requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Claims the right to drive `execution_id`, or refuses if another pass
+    /// already holds it.
+    ///
+    /// The check and the insert happen under the one lock this returns from
+    /// holding, which is what makes two concurrent callers unable to both
+    /// succeed (R7): a separate check-then-insert would leave a gap between
+    /// the two a second caller could land in.
+    fn begin_run(&self, execution_id: &str) -> Result<RunGuard<'_>, EngineError> {
+        if !self.lock_active_runs().insert(execution_id.to_string()) {
+            return Err(EngineError::AlreadyRunning {
+                execution_id: execution_id.to_string(),
+            });
+        }
+        Ok(RunGuard {
+            engine: self,
+            execution_id: execution_id.to_string(),
+        })
+    }
+
+    /// Locks the active-run set, recovering from a poisoned mutex: a panic
+    /// elsewhere is no reason to make every future run impossible.
+    fn lock_active_runs(&self) -> std::sync::MutexGuard<'_, HashSet<ExecutionId>> {
+        self.active_runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Runs `future`, one of the three public entry points, and makes sure any
+    /// `Err` it returns is also noted as an event (R5) before it reaches the
+    /// caller — which is what makes the failure observable to a caller that,
+    /// like the TUI's background spawns, discards the `Result` itself.
+    async fn observed<F>(
+        &self,
+        execution_id: &str,
+        future: F,
+    ) -> Result<WorkflowExecution, EngineError>
+    where
+        F: std::future::Future<Output = Result<WorkflowExecution, EngineError>>,
+    {
+        let outcome = future.await;
+        if let Err(error) = &outcome {
+            self.note_engine_error(execution_id, error);
+        }
+        outcome
+    }
+
+    /// Emits an [`EventData::Error`] against `execution_id`, best-effort.
+    ///
+    /// Used to make an [`EngineError`] that would otherwise only reach the
+    /// caller's `Result` observable through the event stream as well (R5), for
+    /// callers — background TUI spawns — that discard the `Result`. Skips
+    /// emitting for the one case where `execution_id` never resolved to
+    /// anything on disk (there is no log to identify), rather than inventing
+    /// one; otherwise, a failure to emit never masks or replaces the original
+    /// error — it is only ever logged, not returned.
+    fn note_engine_error(&self, execution_id: &str, error: &EngineError) {
+        if matches!(
+            error,
+            EngineError::Persistence(PersistenceError::ExecutionNotFound { .. })
+        ) {
+            return;
+        }
+        if let Err(emit_error) = self.emit(
+            execution_id,
+            EventData::Error {
+                message: error.to_string(),
+                context: json!({}),
+            },
+        ) {
+            tracing::warn!(
+                execution_id,
+                %error,
+                %emit_error,
+                "could not record an engine-level error as an event"
+            );
+        }
     }
 
     /// The error for an operation the execution's status does not allow.

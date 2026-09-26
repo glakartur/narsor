@@ -728,3 +728,146 @@ fn a_started_execution_keeps_its_own_definition() {
         resolved.source
     );
 }
+
+// ---------------------------------------------------------------------------
+// the "already running" guard (U1, R7)
+// ---------------------------------------------------------------------------
+
+/// A definition with one deliberately slow `script` step, so a concurrent
+/// second call has a real window to land while the first is mid-flight.
+fn slow_definition(root: &TempRoot) -> (WorkflowDefinition, PathBuf) {
+    let script_path = root.join("slow.sh");
+    fs::write(
+        &script_path,
+        "#!/bin/sh\nsleep 0.3\nprintf '{\"output\": \"done\"}\\n'\nexit 0\n",
+    )
+    .expect("write the slow script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script_path)
+            .expect("stat the script")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("make it executable");
+    }
+
+    let yaml = format!(
+        r#"
+name: tasks-guard
+version: 1
+description: >
+  Fixture for the "already running" guard: one slow step, so two concurrent
+  drivers have a real window to race in.
+
+states:
+  prepare:
+    description: A deliberately slow step.
+    action:
+      type: script
+      command: "{}"
+      args: []
+      exit_codes:
+        0: done
+    outputs:
+      - done
+    transitions:
+      done: finished
+
+  finished:
+    description: Terminal.
+
+terminal_states:
+  finished: completed
+"#,
+        script_path.display()
+    );
+
+    let path = root.join("guard.yaml");
+    fs::write(&path, yaml).expect("write the definition");
+    let definition = load_from_file(&path).expect("load the definition");
+    (definition, path)
+}
+
+/// Two concurrent `run`s for the same execution: the loser gets the new
+/// error immediately, and the winner drives the execution to completion
+/// exactly as if the loser had never called at all (U1's verification).
+#[tokio::test]
+async fn a_second_driver_for_the_same_execution_is_rejected_while_the_first_runs() {
+    let root = TempRoot::new();
+    let engine = std::sync::Arc::new(engine_for(root.path()));
+    let (definition, file) = slow_definition(&root);
+
+    let execution =
+        tasks::start_task(root.path(), root.path(), &engine, &definition, &file, Map::new())
+            .expect("start the task");
+    let execution_id = execution.id.clone();
+
+    let first = tokio::spawn({
+        let engine = std::sync::Arc::clone(&engine);
+        let definition = definition.clone();
+        let execution_id = execution_id.clone();
+        async move { engine.run(&definition, &execution_id).await }
+    });
+
+    // Give the first call time to acquire the guard and enter the slow step.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let second = engine.run(&definition, &execution_id).await;
+    let first = first.await.expect("the first pass did not panic");
+
+    assert!(first.is_ok(), "the first driver completes the run: {first:?}");
+    assert!(
+        matches!(second, Err(narsor::engine::EngineError::AlreadyRunning { .. })),
+        "the second driver is rejected instead of racing the first: {second:?}"
+    );
+
+    let stored = engine
+        .store()
+        .load_execution(&execution_id)
+        .expect("reload the execution");
+    assert_eq!(stored.status, ExecutionStatus::Completed);
+
+    // R5: the rejection that only reached the loser's `Result` is also on the
+    // execution's own event log, for a caller that discards it.
+    let log = engine
+        .store()
+        .event_log(&execution_id)
+        .read_all()
+        .expect("read the log");
+    assert!(
+        log.iter().any(|event| matches!(
+            &event.data,
+            EventData::Error { message, .. } if message.contains("already being driven")
+        )),
+        "the rejection is also observable as an event"
+    );
+}
+
+/// Once the first pass's guard has dropped, a later `run` for the same
+/// execution id is free to proceed (it is simply `NotRunnable` by then,
+/// because the execution already finished — not `AlreadyRunning`).
+#[tokio::test]
+async fn the_execution_id_is_free_again_once_the_first_pass_drops_its_guard() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let (definition, file) = slow_definition(&root);
+
+    let execution =
+        tasks::start_task(root.path(), root.path(), &engine, &definition, &file, Map::new())
+            .expect("start the task");
+
+    engine
+        .run(&definition, &execution.id)
+        .await
+        .expect("the run completes");
+
+    let second = engine.run(&definition, &execution.id).await;
+    assert!(
+        matches!(
+            second,
+            Err(narsor::engine::EngineError::NotRunnable { .. })
+        ),
+        "a completed execution is rejected as not runnable, not as still running: {second:?}"
+    );
+}
