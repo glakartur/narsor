@@ -53,7 +53,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::Event;
 use crate::engine::{build_timeline, Timeline};
-use crate::persistence::paths::{parse_conversation_jsonl_name, CONVERSATION_ZST_SUFFIX};
 use crate::persistence::{ConversationSource, ExecutionStore, PersistenceError};
 
 /// Default byte budget for a conversation read when the caller does not ask
@@ -61,10 +60,10 @@ use crate::persistence::{ConversationSource, ExecutionStore, PersistenceError};
 ///
 /// Sized to comfortably hold a normal run of harness lines in one response
 /// while still bounding it — the plan defers the exact number to
-/// implementation ("dobrać przy implementacji na podstawie realnych
-/// rozmiarów"); 1 MiB is a generous starting point a caller can override per
-/// request via `byte_budget`, and it is only ever a *soft* cap (the first
-/// entry is always returned whole, per `ConversationStore::read`).
+/// implementation time, to be picked from real observed sizes; 1 MiB is a
+/// generous starting point a caller can override per request via
+/// `byte_budget`, and it is only ever a *soft* cap (the first entry is
+/// always returned whole, per `ConversationStore::read`).
 const DEFAULT_BYTE_BUDGET: usize = 1024 * 1024;
 
 #[derive(Clone)]
@@ -99,9 +98,22 @@ async fn require_token(State(state): State<AppState>, request: Request, next: Ne
         .and_then(|value| value.to_str().ok());
 
     match presented {
-        Some(value) if value == expected => next.run(request).await,
+        Some(value) if constant_time_eq(value.as_bytes(), expected.as_bytes()) => {
+            next.run(request).await
+        }
         _ => StatusCode::UNAUTHORIZED.into_response(),
     }
+}
+
+/// Compares two byte strings in time that depends only on their lengths, not
+/// their contents — the token is a bearer secret, so a length-leaking or
+/// early-exit comparison would give a caller on the same loopback interface
+/// a timing side channel to brute-force it byte by byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// An error a handler can return; every variant maps to a status code with
@@ -117,7 +129,8 @@ impl IntoResponse for ApiError {
         match self {
             ApiError::ExecutionNotFound => StatusCode::NOT_FOUND.into_response(),
             ApiError::Storage(error) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                tracing::warn!(error = %error, "api: storage error serving request");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         }
     }
@@ -180,33 +193,18 @@ async fn get_timeline(
 
 /// Every attempt id with a conversation record on disk, open or closed —
 /// exactly what [`crate::engine::build_timeline`] needs as its
-/// `conversation_presence` set, and nothing [`crate::persistence::conversation`]
-/// exposes ready-made (its own `open_attempt_ids` deliberately only covers
-/// the recovery sweep's narrower question, "which attempts are still
-/// plain").
+/// `conversation_presence` set. Delegates to
+/// [`crate::persistence::ConversationStore::recorded_attempt_ids`] so this
+/// handler and the `steps` CLI command can never compute a different answer
+/// for the same execution.
 fn conversation_presence(
     store: &ExecutionStore,
     execution_id: &str,
 ) -> Result<HashSet<String>, ApiError> {
-    let dir = store.conversation_store(execution_id).dir();
-    let mut ids = HashSet::new();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
-        Err(source) => return Err(ApiError::Storage(PersistenceError::io(&dir, source))),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|source| PersistenceError::io(&dir, source))?;
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if let Some(id) = name.strip_suffix(CONVERSATION_ZST_SUFFIX) {
-            ids.insert(id.to_string());
-        } else if let Some(id) = parse_conversation_jsonl_name(&name) {
-            ids.insert(id.to_string());
-        }
-    }
-    Ok(ids)
+    store
+        .conversation_store(execution_id)
+        .recorded_attempt_ids()
+        .map_err(ApiError::Storage)
 }
 
 #[derive(Debug, Deserialize)]

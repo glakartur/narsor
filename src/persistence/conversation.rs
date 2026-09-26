@@ -143,6 +143,7 @@ impl ConversationWriter {
             .append(true)
             .open(&path)
             .map_err(|source| PersistenceError::io(&path, source))?;
+        restrict_to_owner(&path);
         Ok(Self {
             file,
             path,
@@ -252,13 +253,24 @@ impl ConversationStore {
 
         let temp = unique_temp_path_for(&zst_path);
         write_and_sync(&temp, &compressed)?;
+        restrict_to_owner(&temp);
         fs::rename(&temp, &zst_path).map_err(|source| {
             let _ = fs::remove_file(&temp);
             PersistenceError::io(&zst_path, source)
         })?;
         sync_parent_dir(&zst_path);
 
-        fs::remove_file(&jsonl_path).map_err(|source| PersistenceError::io(&jsonl_path, source))?;
+        // Tolerate a concurrent racer (another process reconciling the same
+        // execution) having already removed the plain file after its own
+        // rename landed first: the rename above already succeeded either way
+        // (a second rename onto the same target is a harmless no-op on
+        // POSIX), so the only thing left to be racy about is this delete,
+        // and "it's already gone" is exactly the outcome we wanted.
+        if let Err(source) = fs::remove_file(&jsonl_path) {
+            if source.kind() != io::ErrorKind::NotFound {
+                return Err(PersistenceError::io(&jsonl_path, source));
+            }
+        }
         Ok(())
     }
 
@@ -282,17 +294,18 @@ impl ConversationStore {
         let zst_path = self.zst_path(attempt_id);
         let jsonl_path = self.jsonl_path(attempt_id);
 
-        let (bytes, closed) = if zst_path.exists() {
-            let file = File::open(&zst_path).map_err(|source| PersistenceError::io(&zst_path, source))?;
-            let bytes = zstd::stream::decode_all(file)
-                .map_err(|source| PersistenceError::io(&zst_path, source))?;
-            (bytes, true)
-        } else if jsonl_path.exists() {
-            let bytes =
-                fs::read(&jsonl_path).map_err(|source| PersistenceError::io(&jsonl_path, source))?;
-            (bytes, false)
-        } else {
-            return Ok(None);
+        // `close_attempt` renames the plain file to `.zst` and only then
+        // deletes it, so there is a narrow window in which neither `exists()`
+        // check below observes a file: this check ran before the rename, and
+        // the next one ran after the delete. Retrying once, rather than
+        // reporting "no record", is what makes that window invisible to a
+        // reader instead of surfacing as a spurious gap in the conversation.
+        let (bytes, closed) = match Self::read_whichever_exists(&zst_path, &jsonl_path)? {
+            Some(found) => found,
+            None => match Self::read_whichever_exists(&zst_path, &jsonl_path)? {
+                Some(found) => found,
+                None => return Ok(None),
+            },
         };
 
         let source_path = if closed { &zst_path } else { &jsonl_path };
@@ -345,6 +358,29 @@ impl ConversationStore {
         }))
     }
 
+    /// Reads whichever file currently exists (`.zst` preferred), returning
+    /// the raw bytes and whether they came from the closed (compressed)
+    /// form. `Ok(None)` means neither file was present at the moment of the
+    /// check — the caller decides whether that is final or worth a retry.
+    fn read_whichever_exists(
+        zst_path: &Path,
+        jsonl_path: &Path,
+    ) -> Result<Option<(Vec<u8>, bool)>> {
+        if zst_path.exists() {
+            let file =
+                File::open(zst_path).map_err(|source| PersistenceError::io(zst_path, source))?;
+            let bytes = zstd::stream::decode_all(file)
+                .map_err(|source| PersistenceError::io(zst_path, source))?;
+            Ok(Some((bytes, true)))
+        } else if jsonl_path.exists() {
+            let bytes =
+                fs::read(jsonl_path).map_err(|source| PersistenceError::io(jsonl_path, source))?;
+            Ok(Some((bytes, false)))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Attempt ids with a plain (not yet compressed) conversation file.
     ///
     /// Used by [`super::recovery`] to find candidates for the startup
@@ -368,7 +404,65 @@ impl ConversationStore {
         }
         Ok(ids)
     }
+
+    /// Every attempt id with a conversation record on disk, open or closed —
+    /// exactly the `conversation_presence` set [`crate::engine::build_timeline`]
+    /// needs, and broader than [`Self::open_attempt_ids`], which deliberately
+    /// only covers the startup compression sweep's narrower "still plain"
+    /// question. Shared by the axum API's timeline handler and the `steps`
+    /// CLI command so the two can never compute a different answer for the
+    /// same execution.
+    pub fn recorded_attempt_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let dir = self.dir();
+        let mut ids = std::collections::HashSet::new();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(ids),
+            Err(source) => return Err(PersistenceError::io(&dir, source)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|source| PersistenceError::io(&dir, source))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if let Some(id) = name.strip_suffix(super::paths::CONVERSATION_ZST_SUFFIX) {
+                ids.insert(id.to_string());
+            } else if let Some(id) = parse_conversation_jsonl_name(&name) {
+                ids.insert(id.to_string());
+            }
+        }
+        Ok(ids)
+    }
 }
+
+/// Restricts `path` to owner-only read/write (`0600`).
+///
+/// A conversation record is raw harness stdout/stderr — the same
+/// sensitivity class as the workspace, per the plan, and can carry secrets
+/// a tool call touched. `ConversationWriter::create` and
+/// [`ConversationStore::close_attempt`] both call this on every file they
+/// produce, mirroring the permission-tightening pattern already used for
+/// read-only workspaces (`src/workspace/provisioner.rs`).
+///
+/// Best-effort only, like every other write in this module: a failure here
+/// is logged, never propagated, so a permissions quirk on an unusual
+/// filesystem cannot fail the run.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    if let Err(error) = fs::set_permissions(path, permissions) {
+        tracing::warn!(path = %path.display(), error = %error, "conversation: could not restrict file permissions");
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) {}
 
 /// Splits `bytes` on `\n` into complete lines and an optional trailing
 /// incomplete chunk (present only when `bytes` does not end with `\n` and

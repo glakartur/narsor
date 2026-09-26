@@ -38,7 +38,6 @@ use crate::engine::{
     build_timeline, ConversationState, Engine, HumanInputDelivery, PendingHumanInput, Position,
     PositionStatus,
 };
-use crate::persistence::paths::{parse_conversation_jsonl_name, CONVERSATION_ZST_SUFFIX};
 use crate::persistence::{ConversationEntry, ExecutionStore, StatePaths};
 use crate::registry::{infer_provider, RepositoryEntry, RepositoryRegistry};
 use crate::tasks::{self, TaskError};
@@ -482,7 +481,11 @@ fn print_position(position: &Position) {
         println!("    resumed harness session: {resumed}");
     }
     match &position.conversation {
-        ConversationState::Recorded => {}
+        ConversationState::Recorded => {
+            if let Some(attempt_id) = &position.action_execution_id {
+                println!("    attempt id: {attempt_id}");
+            }
+        }
         ConversationState::NotCreated { reason } => {
             println!("    conversation not created: {reason}")
         }
@@ -504,42 +507,17 @@ fn position_status_name(status: PositionStatus) -> &'static str {
 /// Every attempt id with a conversation record on disk, open or closed.
 ///
 /// The same question [`crate::api::routes`]'s `get_timeline` handler answers
-/// for [`build_timeline`]'s `conversation_presence` argument, computed the
-/// same way (a directory listing, not [`crate::persistence::ConversationStore::open_attempt_ids`],
-/// which deliberately only covers the narrower "still plain" question the
-/// startup compression sweep asks). Duplicated rather than shared because the
-/// API module is reasonably private about its handler internals and this is
-/// a handful of lines, not a seam worth exporting for one caller.
+/// for [`build_timeline`]'s `conversation_presence` argument — both delegate
+/// to [`crate::persistence::ConversationStore::recorded_attempt_ids`] so the
+/// two can never compute a different answer for the same execution.
 fn conversation_presence(
     store: &ExecutionStore,
     execution_id: &str,
 ) -> Result<std::collections::HashSet<String>> {
-    let dir = store.conversation_store(execution_id).dir();
-    let mut ids = std::collections::HashSet::new();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
-        Err(source) => {
-            return Err(CliError::failure(format!(
-                "Could not read '{}': {source}",
-                dir.display()
-            )))
-        }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            CliError::failure(format!("Could not read '{}': {error}", dir.display()))
-        })?;
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if let Some(id) = name.strip_suffix(CONVERSATION_ZST_SUFFIX) {
-            ids.insert(id.to_string());
-        } else if let Some(id) = parse_conversation_jsonl_name(&name) {
-            ids.insert(id.to_string());
-        }
-    }
-    Ok(ids)
+    store
+        .conversation_store(execution_id)
+        .recorded_attempt_ids()
+        .map_err(|error| CliError::failure(format!("Could not read conversation records: {error}")))
 }
 
 /// `narsor conversation <id> <attempt>` — one attempt's conversation, in
