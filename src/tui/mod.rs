@@ -36,6 +36,7 @@
 //! indicator rather than as a view that quietly stops updating.
 
 pub mod app;
+pub mod conversation;
 pub mod scroll;
 pub mod views;
 
@@ -55,6 +56,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
+use crate::api;
 use crate::engine::{AgentDefaults, Engine};
 use crate::persistence::ExecutionStore;
 
@@ -154,9 +156,20 @@ pub async fn run(
 ) -> io::Result<()> {
     install_panic_hook();
 
+    // The embedded, read-only API (U5) is the only path the task view (U7)
+    // reads the step timeline and conversations through — see
+    // `crate::api` for why it is loopback-only and token-protected. A
+    // failure to bind it is treated as fatal, per the plan: this TUI must
+    // not start silently degraded.
+    let api_store = store.clone();
+    let api_handle = api::start(api_store)
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let client = api_handle.client();
+
     let engine = Arc::new(Engine::new(store).with_agent_defaults(defaults));
     let mut events = engine.subscribe();
-    let mut app = App::new(Arc::clone(&engine), catalog, work);
+    let mut app = App::new(Arc::clone(&engine), catalog, work, client);
     app.refresh();
 
     let mut guard = TerminalGuard::enter()?;
@@ -179,9 +192,12 @@ pub async fn run(
                         Request::ApplyTransition => app.apply_transition().await,
                         Request::RunSelected => app.run_selected().await,
                         Request::StartNewTask => app.start_new_task().await,
-                        // The task view that reads this (U7) does not exist
-                        // yet; for now the id is only proven reachable.
-                        Request::OpenConversation { .. } => {}
+                        Request::OpenConversation { sequence } => {
+                            app.open_conversation_for_event(sequence).await
+                        }
+                        Request::OpenTaskView => app.open_task_for_execution().await,
+                        Request::TaskRefresh => app.refresh_task().await,
+                        Request::TaskLoadSelected => app.load_task_position().await,
                     }
                 }
                 // A resize needs no state change: the next draw re-derives the

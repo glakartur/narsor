@@ -30,12 +30,14 @@ use narsor::domain::{
     Workspace,
 };
 use narsor::engine::{ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry};
+use narsor::persistence::conversation::ConversationSource;
 use narsor::persistence::{CatalogPaths, ExecutionStore, WorkPaths};
 use narsor::registry::{RepositoryEntry, RepositoryRegistry};
 use narsor::engine::actions::script::TRUNCATION_MARKER;
 use narsor::tui::app::{
     event_detail_lines, event_line, App, FormRow, Modal, NewTaskChoice, NewTaskStage, Panel,
-    RepositoryField, Request, StreamStatus, TransitionMode, OVERRIDE_PROVIDER, OVERRIDE_REASON,
+    RepositoryField, Request, Screen, StreamStatus, TaskContent, TransitionMode,
+    OVERRIDE_PROVIDER, OVERRIDE_REASON,
 };
 use narsor::tui::views;
 use narsor::workflow::load_from_file;
@@ -125,12 +127,27 @@ fn start(engine: &Engine, root: &Path) -> WorkflowExecution {
 /// Which is the default an unconfigured run gets, and the arrangement these
 /// tests care about: they are about what the interface does, not about where
 /// the three directories are. A test that needs them apart says so.
-fn app_over(engine: &Arc<Engine>, root: &Path) -> App {
+async fn app_over(engine: &Arc<Engine>, root: &Path) -> App {
     App::new(
         Arc::clone(engine),
         CatalogPaths::new(root),
         WorkPaths::new(root),
+        api_client_for(engine).await,
     )
+}
+
+/// Starts the embedded API server (U5) over the same store `engine` drives —
+/// the task view's (U7) only read path for the timeline and conversations —
+/// and leaks the handle so it keeps serving for the rest of this (short-lived
+/// test) process. Every test gets its own server, on its own random loopback
+/// port, exactly as production does per `App`.
+async fn api_client_for(engine: &Engine) -> narsor::api::ApiClient {
+    let handle = narsor::api::start(engine.store().clone())
+        .await
+        .expect("start the embedded api server");
+    let client = handle.client();
+    Box::leak(Box::new(handle));
+    client
 }
 
 fn engine_for(root: &Path) -> Arc<Engine> {
@@ -361,7 +378,7 @@ async fn execution_list_reflects_the_store_with_its_statuses() {
     finished.current_state = Some("done".to_string());
     engine.store().save_execution(&finished).expect("save");
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     assert_eq!(app.executions().len(), 2);
@@ -391,7 +408,7 @@ async fn a_live_event_appends_to_the_stream_and_moves_the_view() {
     let engine = engine_for(root.path());
     let execution_id = paused_at_review(&engine, root.path()).await;
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     let backfilled = app.events().len();
@@ -420,7 +437,7 @@ async fn selecting_a_paused_execution_exposes_the_input_form() {
     let engine = engine_for(root.path());
     paused_at_review(&engine, root.path()).await;
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     assert!(app.pending().is_some(), "the question is visible");
@@ -455,7 +472,7 @@ async fn submitting_a_valid_form_resumes_the_execution() {
     let engine = engine_for(root.path());
     let execution_id = paused_at_review(&engine, root.path()).await;
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
     app.on_key(key(KeyCode::Char('i')));
 
@@ -483,7 +500,7 @@ async fn permitted_transitions_are_exactly_the_declared_outputs() {
     let engine = engine_for(root.path());
     paused_at_review(&engine, root.path()).await;
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     assert_eq!(app.permitted_transitions(), vec!["approved", "rejected"]);
@@ -523,7 +540,7 @@ async fn an_execution_without_events_shows_an_empty_stream() {
         .save_context(&execution.id, &execution.context)
         .expect("save the context");
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     assert_eq!(app.executions().len(), 1);
@@ -547,7 +564,7 @@ async fn a_state_without_allow_manual_override_offers_no_override_mode() {
     execution.current_state = Some("prepare".to_string());
     engine.store().save_execution(&execution).expect("save");
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     assert!(!app.override_allowed());
@@ -622,7 +639,7 @@ async fn a_form_missing_a_required_field_reports_an_error_and_sends_nothing() {
     let execution_id = paused_at_review(&engine, root.path()).await;
     let before = events_of(&engine, &execution_id).len();
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
     app.on_key(key(KeyCode::Char('i')));
 
@@ -660,7 +677,7 @@ async fn losing_the_event_channel_shows_a_disconnection_indicator() {
     let engine = engine_for(root.path());
     paused_at_review(&engine, root.path()).await;
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
     assert_eq!(app.stream_status(), &StreamStatus::Live);
 
@@ -692,7 +709,7 @@ async fn an_override_requires_confirmation_and_is_recorded_as_forced() {
     let execution_id = paused_at_review(&engine, root.path()).await;
     let before = events_of(&engine, &execution_id).len();
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
     assert!(app.override_allowed(), "`review` declares the flag");
 
@@ -823,7 +840,7 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
     let engine = engine_for(root.path());
     let execution = start(&engine, root.path());
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     assert_eq!(app.focus(), Panel::Executions);
@@ -980,7 +997,7 @@ async fn dispatching_a_slow_first_step_does_not_block_the_caller() {
     let engine = engine_for(root.path());
     let execution = start_slow(&engine, &root, "tui-slow");
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
     app.select_execution(&execution.id);
     let mut events = engine.subscribe();
@@ -1010,7 +1027,7 @@ async fn two_different_executions_run_in_the_background_at_once() {
     let first = start_slow(&engine, &root, "tui-slow-a");
     let second = start_slow(&engine, &root, "tui-slow-b");
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
     let mut events = engine.subscribe();
 
@@ -1044,7 +1061,7 @@ async fn a_second_drive_of_the_same_execution_is_rejected_with_a_notice() {
     let engine = engine_for(root.path());
     let execution = start_slow(&engine, &root, "tui-slow-guard");
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
     app.select_execution(&execution.id);
     let mut events = engine.subscribe();
@@ -1107,7 +1124,7 @@ async fn a_terminal_event_for_an_unselected_execution_still_sets_a_notice() {
     let watched = start_slow(&engine, &root, "tui-slow-unselected");
     let other = start(&engine, root.path());
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
     app.select_execution(&watched.id);
     let mut events = engine.subscribe();
@@ -1139,7 +1156,7 @@ async fn a_forced_transition_is_refused_while_a_background_pass_is_driving_the_s
     let engine = engine_for(root.path());
     let execution = start_slow(&engine, &root, "tui-slow-override");
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
     app.select_execution(&execution.id);
 
@@ -1217,7 +1234,7 @@ async fn the_form_never_advertises_a_key_it_does_not_handle() {
     let engine = engine_for(root.path());
     paused_at_review(&engine, root.path()).await;
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
     app.on_key(key(KeyCode::Char('i')));
     assert!(matches!(app.modal(), Modal::Input(_)), "the form is open");
@@ -1245,7 +1262,7 @@ async fn the_repository_form_stores_an_entry_that_the_listing_then_shows() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     open_repository_form(&mut app);
@@ -1287,7 +1304,7 @@ async fn a_duplicate_repository_id_keeps_the_form_open_and_changes_nothing() {
         ))
         .expect("register the original");
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     open_repository_form(&mut app);
@@ -1327,7 +1344,7 @@ async fn an_ext_remote_is_refused_in_the_form_and_never_reaches_the_registry() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     open_repository_form(&mut app);
@@ -1370,7 +1387,7 @@ async fn removing_a_repository_needs_a_confirmation() {
         ))
         .expect("register");
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     app.on_key(key(KeyCode::Char('R')));
@@ -1425,13 +1442,14 @@ fn root_workflows(root: &Path) -> PathBuf {
 }
 
 /// An interface whose workflow search path is entirely inside `root`.
-fn app_for(engine: &Arc<Engine>, root: &Path) -> App {
+async fn app_for(engine: &Arc<Engine>, root: &Path) -> App {
     let resolver = WorkflowResolver::with_user_dir(root.to_path_buf(), Some(user_workflows(root)));
     let mut app = App::with_resolver(
         Arc::clone(engine),
         resolver,
         CatalogPaths::new(root),
         WorkPaths::new(root),
+        api_client_for(engine).await,
     );
     app.refresh();
     app
@@ -1529,7 +1547,7 @@ fn git(path: &Path, args: &[&str]) {
 async fn the_new_task_list_is_built_from_the_resolver_and_names_each_source() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
-    let mut app = app_for(&engine, root.path());
+    let mut app = app_for(&engine, root.path()).await;
 
     app.on_key(key(KeyCode::Char('n')));
 
@@ -1569,7 +1587,7 @@ async fn the_new_task_list_is_built_from_the_resolver_and_names_each_source() {
 async fn left_and_right_move_the_selection_and_the_selection_is_what_is_loaded() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
-    let mut app = app_for(&engine, root.path());
+    let mut app = app_for(&engine, root.path()).await;
 
     app.on_key(key(KeyCode::Char('n')));
     let Modal::NewTask(form) = app.modal() else {
@@ -1642,7 +1660,7 @@ async fn an_override_appears_once_and_says_what_it_overrides() {
     )
     .expect("install a copy that shadows the built-in");
 
-    let mut app = app_for(&engine, root.path());
+    let mut app = app_for(&engine, root.path()).await;
     app.on_key(key(KeyCode::Char('n')));
 
     let labels = pick_labels(&app);
@@ -1679,7 +1697,7 @@ async fn an_override_appears_once_and_says_what_it_overrides() {
 async fn the_path_route_starts_a_definition_that_is_in_no_search_location() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
-    let mut app = app_for(&engine, root.path());
+    let mut app = app_for(&engine, root.path()).await;
 
     app.on_key(key(KeyCode::Char('n')));
     // The last row: ← wraps straight onto it.
@@ -1726,7 +1744,7 @@ async fn the_path_route_starts_a_definition_that_is_in_no_search_location() {
 async fn esc_on_the_path_line_returns_to_the_list() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
-    let mut app = app_for(&engine, root.path());
+    let mut app = app_for(&engine, root.path()).await;
 
     app.on_key(key(KeyCode::Char('n')));
     app.on_key(key(KeyCode::Left));
@@ -1769,7 +1787,7 @@ async fn starting_a_picked_builtin_leaves_an_execution_that_resolves_its_definit
     );
     let repository = source_repository(root.path());
 
-    let mut app = app_for(&engine, root.path());
+    let mut app = app_for(&engine, root.path()).await;
     app.on_key(key(KeyCode::Char('n')));
     pick_workflow(&mut app, "compound-engineering");
     app.on_key(key(KeyCode::Enter));
@@ -1812,7 +1830,7 @@ async fn starting_a_picked_builtin_leaves_an_execution_that_resolves_its_definit
 
     // A second interface over the same store: it has to resolve the definition
     // from the recorded name alone.
-    let mut reopened = app_for(&engine, root.path());
+    let mut reopened = app_for(&engine, root.path()).await;
     reopened.select_execution(&selected.id);
     assert!(
         reopened.definition_error().is_none(),
@@ -1838,7 +1856,7 @@ async fn an_invalid_definition_is_refused_with_every_violation() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     open_new_task(&mut app, &broken_definition_path());
@@ -1888,7 +1906,7 @@ async fn the_input_form_is_built_from_the_definition_and_enforces_required_input
     let root = TempRoot::new();
     let engine = engine_for(root.path());
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     open_new_task(&mut app, &new_task_definition_path());
@@ -1945,7 +1963,7 @@ async fn a_repository_input_offers_the_registered_ids() {
         ))
         .expect("register acme");
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     open_new_task(&mut app, &new_task_definition_path());
@@ -1967,7 +1985,7 @@ async fn a_boolean_input_reaches_the_context_as_a_json_boolean() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     open_new_task(&mut app, &new_task_definition_path());
@@ -2020,7 +2038,7 @@ async fn starting_a_valid_new_task_creates_an_execution_that_is_listed_and_selec
     // An unrelated execution, so "selected" means something.
     let existing = start(&engine, root.path());
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
     assert_eq!(app.executions().len(), 1);
 
@@ -2093,7 +2111,7 @@ async fn a_definition_declaring_a_workspace_starts_from_the_modal_and_is_provisi
     fs::create_dir_all(&source).expect("create the source tree");
     fs::write(source.join("README.md"), "hello\n").expect("write readme");
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     open_new_task(&mut app, &fixtures().join("new_task_workspace.yaml"));
@@ -2142,7 +2160,7 @@ async fn esc_cancels_every_modal_without_writing_anything() {
     let root = TempRoot::new();
     let engine = engine_for(root.path());
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     // The repository form, half filled in.
@@ -2384,7 +2402,7 @@ async fn enter_opens_event_detail_and_esc_preserves_selection() {
     let engine = engine_for(root.path());
     paused_at_review(&engine, root.path()).await;
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
     assert!(!app.events().is_empty(), "the backfill read some events");
 
@@ -2416,7 +2434,7 @@ async fn scrolling_the_event_detail_window_stays_within_content_bounds() {
     let engine = engine_for(root.path());
     let execution_id = paused_at_review(&engine, root.path()).await;
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     // A payload large enough that the pretty-printed detail window has many
@@ -2474,7 +2492,7 @@ async fn c_on_an_unlinked_event_names_the_reason_and_opens_nothing() {
     let engine = engine_for(root.path());
     let execution_id = paused_at_review(&engine, root.path()).await;
 
-    let mut app = app_over(&engine, root.path());
+    let mut app = app_over(&engine, root.path()).await;
     app.refresh();
 
     let last_sequence = app.events().last().expect("an event").sequence;
@@ -2561,4 +2579,337 @@ fn truncated_agent_message_is_flagged_in_the_detail_window() {
         detail.iter().any(|line| line.contains("press c")),
         "the window points at the c key: {detail:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// the full-screen task view (U7)
+// ---------------------------------------------------------------------------
+
+/// A minimal, directly-saved execution — the same shortcut `tests/api.rs`
+/// takes, reused here so the task view has something real to open without
+/// spawning an actual harness process.
+fn seeded_execution(id: &str, status: ExecutionStatus) -> WorkflowExecution {
+    WorkflowExecution {
+        id: id.to_string(),
+        workflow_id: "implement-feature".to_string(),
+        workflow_version: 1,
+        status,
+        current_state: Some("plan".to_string()),
+        started_at: chrono::Utc::now(),
+        completed_at: None,
+        inputs: json!({}),
+        context: narsor::domain::Context::new(),
+        workspace: Workspace::local_folder("/tmp/workspace".to_string()),
+        current_action_execution: None,
+        metadata: json!({}),
+    }
+}
+
+/// Seeds `store` with an execution whose `plan` step failed once and
+/// succeeded on retry, each attempt with its own conversation record —
+/// mirrors `tests/api.rs`'s fixture (AE2/AE7/F1/F3).
+fn seed_retried_agent_execution(store: &ExecutionStore, execution_id: &str) {
+    store
+        .save_execution(&seeded_execution(execution_id, ExecutionStatus::Completed))
+        .expect("save execution");
+
+    let log = store.event_log(execution_id);
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::WorkflowStarted {
+            workflow_id: "implement-feature".to_string(),
+            workflow_version: 1,
+            inputs: json!({}),
+        },
+    )
+    .expect("append WorkflowStarted");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::StateEntered {
+            state_id: "plan".to_string(),
+        },
+    )
+    .expect("append StateEntered");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::ActionStarted {
+            action_execution_id: "attempt-1".to_string(),
+            state_id: "plan".to_string(),
+            action_type: "agent".to_string(),
+        },
+    )
+    .expect("append ActionStarted 1");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::ActionAttemptFailed {
+            action_execution_id: "attempt-1".to_string(),
+            state_id: "plan".to_string(),
+            error: "boom".to_string(),
+            retry_in_ms: 100,
+        },
+    )
+    .expect("append ActionAttemptFailed");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::ActionRetrying {
+            action_execution_id: "attempt-2".to_string(),
+            retry_count: 1,
+            state_id: Some("plan".to_string()),
+        },
+    )
+    .expect("append ActionRetrying");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::ActionCompleted {
+            action_execution_id: "attempt-2".to_string(),
+            output_label: "success".to_string(),
+        },
+    )
+    .expect("append ActionCompleted");
+
+    let conversations = store.conversation_store(execution_id);
+    let mut first = conversations.writer("attempt-1").expect("open writer 1");
+    first
+        .append_narsor("prompt: try the thing")
+        .expect("append prompt 1");
+    first
+        .append(ConversationSource::Stdout, br#"{"type":"error"}"#)
+        .expect("append stdout 1");
+    first.finish().expect("finish writer 1");
+    conversations
+        .close_attempt("attempt-1")
+        .expect("close attempt 1");
+
+    let mut second = conversations.writer("attempt-2").expect("open writer 2");
+    second
+        .append_narsor("prompt: try again")
+        .expect("append prompt 2");
+    second
+        .append(
+            ConversationSource::Stdout,
+            br#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"done"}]}}"#,
+        )
+        .expect("append stdout 2");
+    second.finish().expect("finish writer 2");
+    conversations
+        .close_attempt("attempt-2")
+        .expect("close attempt 2");
+}
+
+/// The `Screen::Task` view, or a panic naming what was open instead.
+fn task_view(app: &App) -> &narsor::tui::app::TaskView {
+    match app.screen() {
+        Screen::Task(view) => view,
+        Screen::Main => panic!("expected the task view to be open"),
+    }
+}
+
+/// Covers AE2/F1: selecting the second attempt's `action_failed`-adjacent
+/// event and pressing `c` opens the task view on `plan #2`, with that
+/// attempt's own conversation.
+#[tokio::test(flavor = "multi_thread")]
+async fn c_on_a_second_attempt_event_opens_its_position_and_conversation() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    seed_retried_agent_execution(engine.store(), "exec-1");
+
+    let mut app = app_over(&engine, root.path()).await;
+    app.refresh();
+
+    let completed_sequence = app
+        .events()
+        .iter()
+        .find(|event| matches!(event.data, EventData::ActionCompleted { .. }))
+        .expect("the second attempt's ActionCompleted event")
+        .sequence;
+    // The default cursor after a refresh is the newest event, which here is
+    // exactly attempt-2's `ActionCompleted` — the last event appended.
+    assert_eq!(app.events()[app.event_cursor()].sequence, completed_sequence);
+
+    app.on_key(key(KeyCode::Tab));
+    app.on_key(key(KeyCode::Tab));
+    let request = app.on_key(key(KeyCode::Char('c')));
+    assert_eq!(request, Request::OpenConversation { sequence: completed_sequence });
+    app.open_conversation_for_event(completed_sequence).await;
+
+    let view = task_view(&app);
+    assert_eq!(view.selected.as_deref(), Some("plan #2"));
+    match &view.content {
+        TaskContent::Conversation { entries, .. } => {
+            assert!(
+                entries.iter().any(|entry| entry.text.contains("done")),
+                "attempt-2's own conversation was loaded: {entries:?}"
+            );
+        }
+        other => panic!("expected a loaded conversation, got {other:?}"),
+    }
+}
+
+/// The over-linking U6 flagged: a script step's own `ActionStarted` carries
+/// an `action_execution_id` (so the fast, event-only check lets it through),
+/// but the real timeline says it is not an agent action, so `c` still opens
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn c_on_a_script_step_event_opens_nothing() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let execution_id = "exec-script";
+    engine
+        .store()
+        .save_execution(&seeded_execution(execution_id, ExecutionStatus::Completed))
+        .expect("save execution");
+    let log = engine.store().event_log(execution_id);
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::WorkflowStarted {
+            workflow_id: "implement-feature".to_string(),
+            workflow_version: 1,
+            inputs: json!({}),
+        },
+    )
+    .expect("append WorkflowStarted");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::StateEntered {
+            state_id: "prepare".to_string(),
+        },
+    )
+    .expect("append StateEntered");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::ActionStarted {
+            action_execution_id: "script-1".to_string(),
+            state_id: "prepare".to_string(),
+            action_type: "script".to_string(),
+        },
+    )
+    .expect("append ActionStarted");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::ActionCompleted {
+            action_execution_id: "script-1".to_string(),
+            output_label: "success".to_string(),
+        },
+    )
+    .expect("append ActionCompleted");
+
+    let mut app = app_over(&engine, root.path()).await;
+    app.refresh();
+
+    let started_sequence = app
+        .events()
+        .iter()
+        .find(|event| matches!(event.data, EventData::ActionStarted { .. }))
+        .expect("the script step's ActionStarted event")
+        .sequence;
+
+    app.open_conversation_for_event(started_sequence).await;
+
+    assert!(
+        matches!(app.screen(), Screen::Main),
+        "a script step never opens the task view via c"
+    );
+    let notice = app.notice().expect("a notice");
+    assert!(notice.is_error);
+    assert!(
+        notice.text.contains("does not belong to an agent conversation"),
+        "got: {}",
+        notice.text
+    );
+}
+
+/// `Enter` on the execution list opens the task view at the timeline's
+/// default position, and `Esc` returns to the execution list.
+#[tokio::test(flavor = "multi_thread")]
+async fn enter_on_an_execution_opens_the_task_view_and_esc_returns() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    seed_retried_agent_execution(engine.store(), "exec-1");
+
+    let mut app = app_over(&engine, root.path()).await;
+    app.refresh();
+    assert_eq!(app.focus(), Panel::Executions);
+
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::OpenTaskView);
+    app.open_task_for_execution().await;
+
+    let view = task_view(&app);
+    assert_eq!(view.selected.as_deref(), Some("plan #2"), "the last position is the default");
+
+    app.on_key(key(KeyCode::Esc));
+    assert!(matches!(app.screen(), Screen::Main), "Esc returns to the main screen");
+}
+
+/// Covers AE6: an execution whose agent session events predate
+/// `action_execution_id` (an old-format log) shows "no conversation record"
+/// plus the position's own events, not an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_format_log_shows_no_conversation_record() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let execution_id = "exec-old";
+    engine
+        .store()
+        .save_execution(&seeded_execution(execution_id, ExecutionStatus::Completed))
+        .expect("save execution");
+    let log = engine.store().event_log(execution_id);
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::WorkflowStarted {
+            workflow_id: "implement-feature".to_string(),
+            workflow_version: 1,
+            inputs: json!({}),
+        },
+    )
+    .expect("append WorkflowStarted");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::StateEntered {
+            state_id: "plan".to_string(),
+        },
+    )
+    .expect("append StateEntered");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::ActionStarted {
+            action_execution_id: "attempt-1".to_string(),
+            state_id: "plan".to_string(),
+            action_type: "agent".to_string(),
+        },
+    )
+    .expect("append ActionStarted");
+    // An old-format log: the agent session events carry no
+    // `action_execution_id` at all (`#[serde(default)]` from U1 means these
+    // deserialize as `None`, which is what a pre-U1 log on disk would give).
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::AgentSessionStarted {
+            session_id: "sess-1".to_string(),
+            harness: "claude_code".to_string(),
+            action_execution_id: None,
+            resumed_session: None,
+        },
+    )
+    .expect("append AgentSessionStarted");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::ActionCompleted {
+            action_execution_id: "attempt-1".to_string(),
+            output_label: "success".to_string(),
+        },
+    )
+    .expect("append ActionCompleted");
+
+    let mut app = app_over(&engine, root.path()).await;
+    app.refresh();
+
+    app.open_task_for_execution().await;
+    let view = task_view(&app);
+    match &view.content {
+        TaskContent::Events { message, events } => {
+            assert_eq!(message, "no conversation record");
+            assert!(!events.is_empty(), "the position's own events are still shown");
+        }
+        other => panic!("expected the events fallback, got {other:?}"),
+    }
 }

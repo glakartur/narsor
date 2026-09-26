@@ -30,8 +30,9 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use super::app::{
-    event_detail_lines, event_line, status_name, App, FormRow, Modal, NewTaskStage, Panel,
-    RepositoryField, TransitionMode,
+    event_detail_lines, event_line, status_name, task_conversation_lines, task_events_lines,
+    task_position_line, App, FormRow, Modal, NewTaskStage, Panel, RepositoryField, Screen,
+    TaskContent, TaskFocus, TaskView, TransitionMode,
 };
 use super::scroll::wrap_visible;
 use crate::domain::{ExecutionStatus, HumanInputType};
@@ -108,6 +109,11 @@ pub fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
 
 /// Draws the whole interface.
 pub fn render(frame: &mut Frame, app: &App) {
+    if let Screen::Task(view) = app.screen() {
+        render_task_view(frame, app, view);
+        return;
+    }
+
     let areas = layout(frame.area());
 
     render_executions(frame, app, areas.executions);
@@ -127,6 +133,119 @@ pub fn render(frame: &mut Frame, app: &App) {
         Modal::NewTask(_) => render_new_task_modal(frame, app),
         Modal::Help => render_help_modal(frame),
     }
+}
+
+/// The full-screen task view (U7): the step timeline on the left, the
+/// selected step's content on the right.
+fn render_task_view(frame: &mut Frame, app: &App, view: &TaskView) {
+    let [body, shortcuts] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(SHORTCUT_BAR_HEIGHT)])
+            .areas(frame.area());
+    let [axis_area, content_area] =
+        Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(body);
+
+    render_task_axis(frame, view, axis_area);
+    render_task_content(frame, view, content_area);
+    render_shortcuts(frame, app, shortcuts);
+}
+
+/// The task view's left pane: every position, in timeline order (R7).
+fn render_task_axis(frame: &mut Frame, view: &TaskView, area: Rect) {
+    let focused = view.focus == TaskFocus::Axis;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if focused {
+            BorderType::Thick
+        } else {
+            BorderType::Plain
+        })
+        .border_style(Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray }))
+        .title(format!(" Steps — {} ", view.execution_id));
+
+    if view.timeline.positions.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No positions on this timeline yet.").block(block),
+            area,
+        );
+        return;
+    }
+
+    let cursor = view.axis_scroll.offset();
+    let inner_height = area.height.saturating_sub(2).max(1) as usize;
+    let lines: Vec<Line> = view
+        .timeline
+        .positions
+        .iter()
+        .enumerate()
+        .skip(cursor.saturating_sub(inner_height.saturating_sub(1)))
+        .map(|(index, position)| {
+            let text = task_position_line(position);
+            let style = if index == cursor && focused {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else if index == cursor {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(text, style))
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+}
+
+/// The task view's right pane: the selected position's conversation, or a
+/// fallback event list (R11).
+fn render_task_content(frame: &mut Frame, view: &TaskView, area: Rect) {
+    let focused = view.focus == TaskFocus::Content;
+    let title = match &view.content {
+        TaskContent::Conversation { closed, .. } => {
+            if *closed {
+                " Conversation ".to_string()
+            } else {
+                " Conversation — attempt in progress ".to_string()
+            }
+        }
+        TaskContent::Events { .. } => " Events ".to_string(),
+        TaskContent::Empty => " Loading… ".to_string(),
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if focused {
+            BorderType::Thick
+        } else {
+            BorderType::Plain
+        })
+        .border_style(Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray }))
+        .title(title);
+
+    // The content pane always renders starting at the selected entry, so a
+    // variable-height entry (a collapsed vs. an expanded tool result) never
+    // has to be measured in advance to keep the cursor on screen — the same
+    // reasoning `render_task_axis` applies to positions, adapted for
+    // entries whose rendered height is not uniform.
+    let cursor = view.content_scroll.offset();
+    let lines: Vec<String> = match &view.content {
+        TaskContent::Conversation { entries, .. } => {
+            let start = cursor.min(entries.len());
+            task_conversation_lines(&entries[start..], 0, &view.expanded)
+        }
+        TaskContent::Events { message, events } => {
+            let start = cursor.min(events.len());
+            task_events_lines(message, &events[start..], 0)
+        }
+        TaskContent::Empty => vec!["Loading…".to_string()],
+    };
+
+    let inner_width = area.width.saturating_sub(2).max(1) as usize;
+    let inner_height = area.height.saturating_sub(2).max(1) as usize;
+    let visible: Vec<Line> = wrap_visible(&lines, inner_width, 0, inner_height)
+        .into_iter()
+        .map(Line::from)
+        .collect();
+
+    frame.render_widget(Paragraph::new(visible).block(block), area);
 }
 
 /// The bordered block of a panel, highlighted when it has focus.

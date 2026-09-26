@@ -66,7 +66,7 @@ mod client;
 mod routes;
 
 pub use client::{ApiClient, ClientError};
-pub use routes::ConversationResponse;
+pub use routes::{ConversationEntryDto, ConversationResponse};
 
 use crate::persistence::ExecutionStore;
 use std::fmt;

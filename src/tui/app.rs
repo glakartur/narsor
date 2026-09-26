@@ -71,6 +71,7 @@
 //! is one copy of the rules that decide what `git` is asked to clone, and this
 //! interface does not hold a second.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -78,14 +79,17 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Map, Value};
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::api::{ApiClient, ConversationResponse};
 use crate::domain::{
     Event, EventData, ExecutionStatus, HumanInputField, HumanInputType, InputParameter, ParamType,
     State, WorkflowDefinition, WorkflowExecution,
 };
 use crate::engine::actions::script::TRUNCATION_MARKER;
 use crate::engine::{
-    permitted_labels, terminal_status, Engine, EngineError, HumanInputDelivery, PendingHumanInput,
+    permitted_labels, terminal_status, ConversationState as PositionConversationState, Engine,
+    EngineError, EventLink, HumanInputDelivery, PendingHumanInput, Timeline,
 };
+use crate::tui::conversation::{classify, ClassifiedEntry};
 use futures::FutureExt;
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
 use crate::tasks::{self, DefinitionSource};
@@ -254,17 +258,30 @@ pub enum Request {
     RunSelected,
     /// Create the execution the new-task form describes and run it.
     StartNewTask,
-    /// Open the attempt's agent conversation (R5).
+    /// Open the task view at the position `sequence`'s event resolves to,
+    /// via the real timeline link map (R5).
     ///
-    /// Emitted by `c` on an event that carries an `action_execution_id`, from
-    /// either the Events panel or [`Modal::EventDetail`]. The full-screen task
-    /// view that actually reads it is U7's job — here the request only proves
-    /// the id reached this far; the event loop currently does nothing with it
-    /// (see `src/tui/mod.rs`).
+    /// Emitted by `c` on an event the local, event-only check
+    /// ([`conversation_attempt`]) says *might* carry a conversation, from
+    /// either the Events panel or [`Modal::EventDetail`]. The event loop
+    /// awaits [`App::open_conversation_for_event`], which fetches the
+    /// timeline and makes the real decision — including refusing a
+    /// script-step event even though it carries an `action_execution_id`
+    /// (the over-linking U6 flagged).
     OpenConversation {
-        /// The attempt whose conversation to open.
-        action_execution_id: String,
+        /// The event whose link to resolve.
+        sequence: u64,
     },
+    /// Open the task view on the selected execution's default position
+    /// (R6). Emitted by `Enter` on the execution list.
+    OpenTaskView,
+    /// Re-read the task view's timeline and continue its selected
+    /// position's conversation from its cursor (R8). Emitted by `r` while
+    /// the task view is open.
+    TaskRefresh,
+    /// Load the freshly selected position's content from scratch. Emitted
+    /// whenever the axis' selection changes.
+    TaskLoadSelected,
 }
 
 // ---------------------------------------------------------------------------
@@ -940,6 +957,122 @@ impl Modal {
 }
 
 // ---------------------------------------------------------------------------
+// The full-screen task view (U7)
+// ---------------------------------------------------------------------------
+
+/// How many logical lines a collapsed conversation entry shows before it is
+/// elided, until the operator expands it (R10). Deferred to implementation
+/// by the plan; six lines is enough to recognize most entries at a glance
+/// without letting one drown the rest of the pane.
+pub const TASK_ENTRY_COLLAPSE_LINES: usize = 6;
+
+/// The byte budget passed on every conversation read the task view makes.
+/// Matches the API's own default (`src/api/routes.rs`) — a generous soft cap
+/// a single very large entry always overrides (R14 applies to a read the same
+/// as to a write).
+const CONVERSATION_BYTE_BUDGET: usize = 1024 * 1024;
+
+/// Which full-screen view is showing.
+#[derive(Debug, Clone)]
+pub enum Screen {
+    /// The four-panel main interface, with whatever [`Modal`] is open.
+    Main,
+    /// The full-screen task view: step timeline and step content (R6).
+    ///
+    /// Boxed: [`TaskView`] carries a whole [`Timeline`], and [`Screen::Main`]
+    /// carries nothing, so an unboxed variant would size every `Screen`
+    /// (most of which are `Main`, while the task view is open) to the
+    /// larger one for no benefit.
+    Task(Box<TaskView>),
+}
+
+/// Where the task view was entered from.
+///
+/// Keyed by the event's own `sequence` rather than its index in
+/// [`App::events`], so growth of that list while the task view is open (a
+/// live event arriving) cannot invalidate the selection `Esc` restores (R6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskOrigin {
+    /// Entered with `Enter` on the execution list. Nothing about the
+    /// Executions panel's own selection changes while the task view is
+    /// open, so there is nothing further to remember here.
+    Executions,
+    /// Entered with `c`, either from the Events panel or from
+    /// [`Modal::EventDetail`] (both dispatch through the same
+    /// [`App::request_conversation`]). `was_following` is the Events panel's
+    /// `follow` flag at the moment of entry: it is paused for the duration
+    /// of the task view (a live event arriving must not silently move the
+    /// selection `Esc` is about to restore) and reinstated on the way out.
+    Event { sequence: u64, was_following: bool },
+}
+
+/// Which pane of the task view has focus (`Tab` cycles between them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskFocus {
+    /// The step timeline.
+    Axis,
+    /// The selected step's content (a conversation, or a fallback event
+    /// list).
+    Content,
+}
+
+/// The selected step's content, once loaded.
+#[derive(Debug, Clone)]
+pub enum TaskContent {
+    /// Nothing loaded yet (a fresh entry into the task view, before the
+    /// first read completes).
+    Empty,
+    /// A conversation record, decoded and classified (U7's `conversation`
+    /// module).
+    Conversation {
+        /// Entries read so far, oldest first.
+        entries: Vec<ClassifiedEntry>,
+        /// The cursor to continue from on the next manual refresh (R8).
+        next_entry: u64,
+        /// Whether the attempt's conversation is closed (compressed).
+        closed: bool,
+        /// Whether the on-disk file's last line was incomplete when read.
+        truncated_tail: bool,
+    },
+    /// No conversation to show — a script step, an agent step whose
+    /// conversation never started, or an old-format log (R11) — so the
+    /// step's own events are shown instead, with `message` explaining why
+    /// there is no conversation.
+    Events {
+        /// "no conversation record" / "conversation not created: …".
+        message: String,
+        /// This position's own events, in order.
+        events: Vec<Event>,
+    },
+}
+
+/// The full-screen task view's own state (R6).
+#[derive(Debug, Clone)]
+pub struct TaskView {
+    /// The execution this task view is over.
+    pub execution_id: String,
+    /// Where it was entered from, for `Esc` (R6).
+    pub origin: TaskOrigin,
+    /// The step timeline, as last read from the API.
+    pub timeline: Timeline,
+    /// The selected position's label, if any position exists.
+    pub selected: Option<String>,
+    /// The axis' scroll cursor: one logical line per position, in timeline
+    /// order (the shared widget from U6, `src/tui/scroll.rs`).
+    pub axis_scroll: ScrollState,
+    /// The content pane's scroll cursor: one logical line per entry (a
+    /// conversation entry, or a fallback event).
+    pub content_scroll: ScrollState,
+    /// Which pane has focus.
+    pub focus: TaskFocus,
+    /// The selected position's content.
+    pub content: TaskContent,
+    /// Which conversation entries (by `entry_number`) are expanded past
+    /// [`TASK_ENTRY_COLLAPSE_LINES`] (R10).
+    pub expanded: HashSet<u64>,
+}
+
+// ---------------------------------------------------------------------------
 // The application
 // ---------------------------------------------------------------------------
 
@@ -964,11 +1097,13 @@ pub struct App {
 
     focus: Panel,
     modal: Modal,
+    screen: Screen,
     stream: StreamStatus,
     notice: Option<Notice>,
     quit: bool,
     catalog: CatalogPaths,
     work: WorkPaths,
+    client: ApiClient,
 }
 
 impl App {
@@ -980,9 +1115,14 @@ impl App {
     /// root, and this is where the registry and the workflow search path were
     /// rebuilt out of it. That shortcut is what made the three directories one
     /// directory in practice, whatever the configuration said.
-    pub fn new(engine: Arc<Engine>, catalog: CatalogPaths, work: WorkPaths) -> Self {
+    ///
+    /// `client` is the interface's only path to the step timeline and to
+    /// conversations (U7): it is a client of the embedded API server
+    /// (`crate::api`), which `src/tui/mod.rs::run` starts before building
+    /// this `App`.
+    pub fn new(engine: Arc<Engine>, catalog: CatalogPaths, work: WorkPaths, client: ApiClient) -> Self {
         let resolver = WorkflowResolver::new(catalog.root().to_path_buf());
-        Self::with_resolver(engine, resolver, catalog, work)
+        Self::with_resolver(engine, resolver, catalog, work, client)
     }
 
     /// The same, with the workflow search path given explicitly.
@@ -991,12 +1131,14 @@ impl App {
         resolver: WorkflowResolver,
         catalog: CatalogPaths,
         work: WorkPaths,
+        client: ApiClient,
     ) -> Self {
         Self {
             engine,
             resolver,
             catalog,
             work,
+            client,
             executions: Vec::new(),
             selected: 0,
             execution: None,
@@ -1010,6 +1152,7 @@ impl App {
             follow: true,
             focus: Panel::Executions,
             modal: Modal::None,
+            screen: Screen::Main,
             stream: StreamStatus::Live,
             notice: None,
             quit: false,
@@ -1088,6 +1231,12 @@ impl App {
         &self.modal
     }
 
+    /// Which full-screen view is showing: the main interface, or the task
+    /// view (U7).
+    pub fn screen(&self) -> &Screen {
+        &self.screen
+    }
+
     /// The health of the live channel.
     pub fn stream_status(&self) -> &StreamStatus {
         &self.stream
@@ -1157,6 +1306,20 @@ impl App {
 
     /// The shortcuts the bottom bar shows, given the focus and the modal.
     pub fn shortcuts(&self) -> Vec<(&'static str, &'static str)> {
+        if let Screen::Task(view) = &self.screen {
+            let mut keys = vec![
+                ("Tab", "axis/content"),
+                ("j/k", "select"),
+                ("PgUp/PgDn", "page"),
+                ("g/G", "top/bottom"),
+                ("r", "refresh"),
+            ];
+            if view.focus == TaskFocus::Content {
+                keys.push(("Enter/space", "expand/collapse"));
+            }
+            keys.push(("Esc", "back"));
+            return keys;
+        }
         match &self.modal {
             Modal::Input(_) => vec![
                 ("Tab/↑↓", "field"),
@@ -1221,6 +1384,7 @@ impl App {
                     Panel::Executions => {
                         keys.push(("j/k", "select"));
                         keys.push(("g/G", "top/bottom"));
+                        keys.push(("Enter", "task view"));
                         keys.push(("n", "new task"));
                         keys.push(("R", "repositories"));
                         keys.push(("s", "run/resume"));
@@ -1466,6 +1630,9 @@ impl App {
 
     /// Folds one key press into the state and names what the loop must do next.
     pub fn on_key(&mut self, key: KeyEvent) -> Request {
+        if matches!(self.screen, Screen::Task(_)) {
+            return self.on_key_task(key);
+        }
         match &mut self.modal {
             Modal::None => self.on_key_panels(key),
             Modal::Help => {
@@ -1533,6 +1700,13 @@ impl App {
             KeyCode::Enter if self.focus == Panel::Events => {
                 self.open_event_detail();
                 Request::None
+            }
+            KeyCode::Enter if self.focus == Panel::Executions => {
+                if self.selected().is_some() {
+                    Request::OpenTaskView
+                } else {
+                    Request::None
+                }
             }
             KeyCode::Char('c') if self.focus == Panel::Events => {
                 let Some(event) = self.events.get(self.event_cursor).cloned() else {
@@ -1626,10 +1800,19 @@ impl App {
 
     /// The `c` key (R5): a [`Request::OpenConversation`] for an event that
     /// carries an attempt id, or a notice explaining why not (AE3).
+    ///
+    /// This local check only rules out the events that can *never* carry a
+    /// conversation (they do not even carry an `action_execution_id` field)
+    /// — the same fast, network-free path U6 had. Whatever passes it still
+    /// goes through the real timeline link map in
+    /// [`App::open_conversation_for_event`], which is what actually decides
+    /// (and is what fixes U6's over-linking: a script step's `ActionStarted`
+    /// passes this check too, but the timeline's `action_type` then refuses
+    /// it).
     fn request_conversation(&mut self, event: &Event) -> Request {
         match conversation_attempt(&event.data) {
-            Some(id) => Request::OpenConversation {
-                action_execution_id: id.to_string(),
+            Some(_) => Request::OpenConversation {
+                sequence: event.sequence,
             },
             None => {
                 self.notice = Some(Notice::error(NO_CONVERSATION_LINK_MESSAGE));
@@ -1689,6 +1872,428 @@ impl App {
         match &mut self.modal {
             Modal::EventDetail(detail) => &mut detail.scroll,
             _ => unreachable!("on_key_event_detail only runs while the event detail modal is open"),
+        }
+    }
+
+    // -- the full-screen task view (U7) --------------------------------
+
+    /// `Enter` on the execution list: opens the task view at the timeline's
+    /// default position (R6).
+    pub async fn open_task_for_execution(&mut self) {
+        let Some(execution_id) = self.selected().map(|row| row.id.clone()) else {
+            return;
+        };
+
+        let timeline = match self.client.timeline(&execution_id).await {
+            Ok(timeline) => timeline,
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not open the task view: {error}"
+                )));
+                return;
+            }
+        };
+
+        let selected = timeline.default_position.clone();
+        self.enter_task_view(execution_id, TaskOrigin::Executions, timeline, selected);
+        self.load_selected_task_position(false).await;
+    }
+
+    /// `c` on an event, resolved through the real timeline link map (R5) —
+    /// this is what fixes U6's over-linking: a script step's own
+    /// `ActionStarted`/`ActionCompleted`/... passes the local
+    /// [`conversation_attempt`] check (it does carry an
+    /// `action_execution_id`), but the timeline's `action_type` on the
+    /// position it resolves to says it is not an agent step, so it is
+    /// refused here exactly as an event with no link at all is.
+    pub async fn open_conversation_for_event(&mut self, sequence: u64) {
+        let Some(execution_id) = self.selected().map(|row| row.id.clone()) else {
+            return;
+        };
+
+        let timeline = match self.client.timeline(&execution_id).await {
+            Ok(timeline) => timeline,
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not open the conversation: {error}"
+                )));
+                return;
+            }
+        };
+
+        let (selected, info) = match timeline.link(sequence) {
+            Some(EventLink::Position(label)) => match timeline.position(label) {
+                Some(position) if position.action_type.as_deref() == Some("agent") => {
+                    (Some(label.clone()), None)
+                }
+                _ => {
+                    self.notice = Some(Notice::error(NO_CONVERSATION_LINK_MESSAGE));
+                    return;
+                }
+            },
+            Some(EventLink::NoLink { reason }) => {
+                self.notice = Some(Notice::error(reason.clone()));
+                return;
+            }
+            None => (
+                timeline.default_position.clone(),
+                Some("No attempt found for that event; showing the latest.".to_string()),
+            ),
+        };
+
+        let was_following = self.follow;
+        self.follow = false;
+        self.enter_task_view(
+            execution_id,
+            TaskOrigin::Event {
+                sequence,
+                was_following,
+            },
+            timeline,
+            selected,
+        );
+        if let Some(message) = info {
+            self.notice = Some(Notice::info(message));
+        }
+        self.load_selected_task_position(false).await;
+    }
+
+    /// Builds a fresh [`TaskView`] and switches [`Screen`] to it.
+    fn enter_task_view(
+        &mut self,
+        execution_id: String,
+        origin: TaskOrigin,
+        timeline: Timeline,
+        selected: Option<String>,
+    ) {
+        let axis_index = selected
+            .as_ref()
+            .and_then(|label| timeline.positions.iter().position(|p| &p.label == label))
+            .unwrap_or(0);
+        let mut axis_scroll = ScrollState::new();
+        for _ in 0..axis_index {
+            axis_scroll.line_down(timeline.positions.len());
+        }
+
+        self.screen = Screen::Task(Box::new(TaskView {
+            execution_id,
+            origin,
+            timeline,
+            selected,
+            axis_scroll,
+            content_scroll: ScrollState::new(),
+            focus: TaskFocus::Axis,
+            content: TaskContent::Empty,
+            expanded: HashSet::new(),
+        }));
+    }
+
+    /// `r` in the task view (R8): re-reads the timeline, then continues the
+    /// selected position's conversation from its cursor. Nothing refreshes
+    /// on its own; this is the only path that does.
+    pub async fn refresh_task(&mut self) {
+        let Screen::Task(view) = &self.screen else {
+            return;
+        };
+        let execution_id = view.execution_id.clone();
+
+        match self.client.timeline(&execution_id).await {
+            Ok(timeline) => {
+                if let Screen::Task(view) = &mut self.screen {
+                    view.timeline = timeline;
+                    if view
+                        .selected
+                        .as_deref()
+                        .is_none_or(|label| view.timeline.position(label).is_none())
+                    {
+                        view.selected = view.timeline.default_position.clone();
+                    }
+                }
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not refresh the task view: {error}"
+                )));
+                return;
+            }
+        }
+
+        self.load_selected_task_position(true).await;
+    }
+
+    /// Loads the currently selected position's content from scratch —
+    /// called whenever the axis' selection changes.
+    pub async fn load_task_position(&mut self) {
+        self.load_selected_task_position(false).await;
+    }
+
+    /// The label the task view's axis currently has selected, if any.
+    fn current_task_label(&self) -> Option<String> {
+        match &self.screen {
+            Screen::Task(view) => view.selected.clone(),
+            Screen::Main => None,
+        }
+    }
+
+    /// Loads the selected position's content: a conversation (from entry 1,
+    /// or continuing from the pane's own cursor when `append`), or the
+    /// position's own events when it has none.
+    async fn load_selected_task_position(&mut self, append: bool) {
+        let Some(label) = self.current_task_label() else {
+            return;
+        };
+        let Screen::Task(view) = &self.screen else {
+            return;
+        };
+        let execution_id = view.execution_id.clone();
+        let Some(position) = view.timeline.position(&label).cloned() else {
+            return;
+        };
+
+        match &position.conversation {
+            PositionConversationState::Recorded => {
+                let Some(attempt_id) = position.action_execution_id.clone() else {
+                    return;
+                };
+                let from = if append {
+                    match &view.content {
+                        TaskContent::Conversation { next_entry, .. } => *next_entry,
+                        _ => 1,
+                    }
+                } else {
+                    1
+                };
+
+                match self
+                    .client
+                    .conversation(&execution_id, &attempt_id, from, CONVERSATION_BYTE_BUDGET)
+                    .await
+                {
+                    Ok(ConversationResponse::Recorded {
+                        entries,
+                        next_entry,
+                        closed,
+                        truncated_tail,
+                    }) => {
+                        let fresh: Vec<ClassifiedEntry> = entries.iter().map(classify).collect();
+                        if let Screen::Task(view) = &mut self.screen {
+                            let existing = if append {
+                                match std::mem::replace(&mut view.content, TaskContent::Empty) {
+                                    TaskContent::Conversation { entries, .. } => entries,
+                                    _ => Vec::new(),
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            let mut entries = existing;
+                            entries.extend(fresh);
+                            view.content = TaskContent::Conversation {
+                                entries,
+                                next_entry,
+                                closed,
+                                truncated_tail,
+                            };
+                        }
+                    }
+                    Ok(ConversationResponse::NoRecord) => {
+                        self.set_task_events_fallback(&label, "no conversation record".to_string());
+                    }
+                    Err(error) => {
+                        self.notice = Some(Notice::error(format!(
+                            "Could not load the conversation: {error}"
+                        )));
+                    }
+                }
+            }
+            PositionConversationState::NotCreated { reason } => {
+                self.set_task_events_fallback(&label, format!("conversation not created: {reason}"));
+            }
+            PositionConversationState::NoRecord => {
+                self.set_task_events_fallback(&label, "no conversation record".to_string());
+            }
+        }
+    }
+
+    /// Fills the content pane with this position's own events (R11): a
+    /// script step, an agent step whose conversation never started, or an
+    /// old-format log.
+    fn set_task_events_fallback(&mut self, label: &str, message: String) {
+        let events: Vec<Event> = match &self.screen {
+            Screen::Task(view) => self
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        view.timeline.link(event.sequence),
+                        Some(EventLink::Position(position_label)) if position_label == label
+                    )
+                })
+                .cloned()
+                .collect(),
+            Screen::Main => Vec::new(),
+        };
+
+        if let Screen::Task(view) = &mut self.screen {
+            view.content = TaskContent::Events { message, events };
+        }
+    }
+
+    /// Keys while the task view is open.
+    fn on_key_task(&mut self, key: KeyEvent) -> Request {
+        match key.code {
+            KeyCode::Esc => {
+                self.leave_task_view();
+                Request::None
+            }
+            KeyCode::Tab => {
+                if let Screen::Task(view) = &mut self.screen {
+                    view.focus = match view.focus {
+                        TaskFocus::Axis => TaskFocus::Content,
+                        TaskFocus::Content => TaskFocus::Axis,
+                    };
+                }
+                Request::None
+            }
+            KeyCode::Char('r') => Request::TaskRefresh,
+            KeyCode::Char('j') | KeyCode::Down => self.move_task_cursor(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_task_cursor(-1),
+            KeyCode::PageDown => self.page_task_cursor(1),
+            KeyCode::PageUp => self.page_task_cursor(-1),
+            KeyCode::Char('g') | KeyCode::Home => self.jump_task_cursor(false),
+            KeyCode::Char('G') | KeyCode::End => self.jump_task_cursor(true),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.toggle_task_entry_expanded();
+                Request::None
+            }
+            _ => Request::None,
+        }
+    }
+
+    /// The number of logical lines the focused pane currently has.
+    fn task_pane_len(view: &TaskView) -> usize {
+        match view.focus {
+            TaskFocus::Axis => view.timeline.positions.len(),
+            TaskFocus::Content => match &view.content {
+                TaskContent::Conversation { entries, .. } => entries.len(),
+                TaskContent::Events { events, .. } => events.len(),
+                TaskContent::Empty => 0,
+            },
+        }
+    }
+
+    /// Applies `delta` (one line, `+1`/`-1`) to the focused pane's cursor,
+    /// re-syncing the selected label when the axis moved.
+    fn move_task_cursor(&mut self, delta: isize) -> Request {
+        let Screen::Task(view) = &mut self.screen else {
+            return Request::None;
+        };
+        let total = Self::task_pane_len(view);
+        let scroll = match view.focus {
+            TaskFocus::Axis => &mut view.axis_scroll,
+            TaskFocus::Content => &mut view.content_scroll,
+        };
+        if delta >= 0 {
+            scroll.line_down(total);
+        } else {
+            scroll.line_up(total);
+        }
+        self.after_task_cursor_move()
+    }
+
+    /// Like [`App::move_task_cursor`], a page at a time.
+    fn page_task_cursor(&mut self, direction: isize) -> Request {
+        let Screen::Task(view) = &mut self.screen else {
+            return Request::None;
+        };
+        let total = Self::task_pane_len(view);
+        let scroll = match view.focus {
+            TaskFocus::Axis => &mut view.axis_scroll,
+            TaskFocus::Content => &mut view.content_scroll,
+        };
+        if direction >= 0 {
+            scroll.page_down(total);
+        } else {
+            scroll.page_up(total);
+        }
+        self.after_task_cursor_move()
+    }
+
+    /// Jumps the focused pane's cursor to its first or last entry.
+    fn jump_task_cursor(&mut self, to_end: bool) -> Request {
+        let Screen::Task(view) = &mut self.screen else {
+            return Request::None;
+        };
+        let total = Self::task_pane_len(view);
+        let scroll = match view.focus {
+            TaskFocus::Axis => &mut view.axis_scroll,
+            TaskFocus::Content => &mut view.content_scroll,
+        };
+        if to_end {
+            scroll.to_bottom(total);
+        } else {
+            scroll.to_top();
+        }
+        self.after_task_cursor_move()
+    }
+
+    /// After the focused pane's cursor moved: re-syncs the selected label
+    /// from the axis' cursor, and asks for a fresh load when the axis is
+    /// what moved (moving inside the content pane needs no new read).
+    fn after_task_cursor_move(&mut self) -> Request {
+        let Screen::Task(view) = &mut self.screen else {
+            return Request::None;
+        };
+        if view.focus != TaskFocus::Axis {
+            return Request::None;
+        }
+        let index = view.axis_scroll.offset();
+        let label = view.timeline.positions.get(index).map(|p| p.label.clone());
+        if label == view.selected {
+            return Request::None;
+        }
+        view.selected = label;
+        view.content = TaskContent::Empty;
+        view.content_scroll = ScrollState::new();
+        Request::TaskLoadSelected
+    }
+
+    /// `Enter`/space on the content pane (R10): expands or collapses the
+    /// entry under the pane's cursor.
+    fn toggle_task_entry_expanded(&mut self) {
+        let Screen::Task(view) = &mut self.screen else {
+            return;
+        };
+        if view.focus != TaskFocus::Content {
+            return;
+        }
+        let TaskContent::Conversation { entries, .. } = &view.content else {
+            return;
+        };
+        let Some(entry) = entries.get(view.content_scroll.offset()) else {
+            return;
+        };
+        let number = entry.entry_number;
+        if !view.expanded.insert(number) {
+            view.expanded.remove(&number);
+        }
+    }
+
+    /// `Esc` in the task view (R6): returns to the entry point, restoring
+    /// the selection an event's origin remembers even if new events arrived
+    /// (with `follow` paused for exactly this reason) while it was open.
+    fn leave_task_view(&mut self) {
+        let Screen::Task(view) = std::mem::replace(&mut self.screen, Screen::Main) else {
+            return;
+        };
+        if let TaskOrigin::Event {
+            sequence,
+            was_following,
+        } = view.origin
+        {
+            self.follow = was_following;
+            if let Some(index) = self.events.iter().position(|event| event.sequence == sequence) {
+                self.event_cursor = index;
+            }
         }
     }
 
@@ -3094,5 +3699,90 @@ pub fn event_detail_lines(event: &Event) -> Vec<String> {
     let pretty = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     lines.extend(pretty.lines().map(sanitize));
 
+    lines
+}
+
+/// One line of the task view's axis (R7): the position's label, status and
+/// what it started at, plus the markers the status precedence rule leaves
+/// (`harness_session_interrupted`, `retry_pending`).
+pub fn task_position_line(position: &crate::engine::Position) -> String {
+    let status = match position.status {
+        crate::engine::PositionStatus::Succeeded => "succeeded",
+        crate::engine::PositionStatus::Failed => "failed",
+        crate::engine::PositionStatus::Interrupted => "interrupted",
+        crate::engine::PositionStatus::InProgress => "in progress",
+        crate::engine::PositionStatus::AwaitingDecision => "awaiting decision",
+    };
+
+    let mut suffixes = Vec::new();
+    if position.harness_session_interrupted {
+        suffixes.push("harness session interrupted".to_string());
+    }
+    if position.retry_pending {
+        suffixes.push("retry pending".to_string());
+    }
+    if let Some(session) = &position.resumed_harness_session {
+        suffixes.push(format!("resumes {}", short_id(Some(session))));
+    }
+
+    let suffix = if suffixes.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})", suffixes.join(", "))
+    };
+
+    match &position.error {
+        Some(error) => format!("{}  {status}  {error}{suffix}", position.label),
+        None => format!("{}  {status}{suffix}", position.label),
+    }
+}
+
+/// The task view content pane's logical lines: a header per entry (or
+/// event) and, when expanded (or short enough already), its full sanitized
+/// body — collapsed otherwise to [`TASK_ENTRY_COLLAPSE_LINES`] with a hint
+/// that `Enter`/space expands it (R10).
+pub fn task_conversation_lines(
+    entries: &[ClassifiedEntry],
+    cursor: usize,
+    expanded: &HashSet<u64>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let marker = if index == cursor { "›" } else { " " };
+        lines.push(format!(
+            "{marker} [{}] {}  {}  ({:?})",
+            entry.entry_number,
+            entry.timestamp.format("%H:%M:%S"),
+            entry.kind.label(),
+            entry.source
+        ));
+
+        let body: Vec<String> = sanitize(&entry.text).lines().map(str::to_string).collect();
+        let is_expanded = expanded.contains(&entry.entry_number);
+        if is_expanded || body.len() <= TASK_ENTRY_COLLAPSE_LINES {
+            for line in &body {
+                lines.push(format!("    {line}"));
+            }
+        } else {
+            for line in &body[..TASK_ENTRY_COLLAPSE_LINES] {
+                lines.push(format!("    {line}"));
+            }
+            lines.push(format!(
+                "    … {} more lines — Enter/space to expand",
+                body.len() - TASK_ENTRY_COLLAPSE_LINES
+            ));
+        }
+    }
+    lines
+}
+
+/// The task view's content pane, for a step with no conversation (R11): its
+/// own events, one line each, in the same style as the Events panel.
+pub fn task_events_lines(message: &str, events: &[Event], cursor: usize) -> Vec<String> {
+    let mut lines = vec![sanitize(message), String::new()];
+    for (index, event) in events.iter().enumerate() {
+        let marker = if index == cursor { "›" } else { " " };
+        lines.push(format!("{marker} {}", event_line(event)));
+    }
     lines
 }
