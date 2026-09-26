@@ -575,6 +575,20 @@ impl Engine {
         self.lock_pause_requests().contains(execution_id)
     }
 
+    /// Whether a pass is currently driving this execution through
+    /// [`Engine::run`], [`Engine::resume`] or [`Engine::deliver_human_input`]
+    /// (R7).
+    ///
+    /// For a caller deciding whether it is safe to touch the execution's
+    /// record by some *other* means (the TUI's manual/forced transition,
+    /// which writes the store directly rather than going through one of
+    /// those three) — not for retrying the call itself, since a failed
+    /// acquisition already reports [`EngineError::AlreadyRunning`] atomically
+    /// at the point that matters.
+    pub fn is_active(&self, execution_id: &str) -> bool {
+        self.lock_active_runs().contains(execution_id)
+    }
+
     /// Parks a running execution immediately: status `Paused`, `WorkflowPaused`
     /// in the log.
     ///

@@ -921,6 +921,7 @@ description: Fixture with one deliberately slow step.
 states:
   prepare:
     description: A deliberately slow step.
+    allow_manual_override: true
     action:
       type: script
       command: "{}"
@@ -1123,6 +1124,84 @@ async fn a_terminal_event_for_an_unselected_execution_still_sets_a_notice() {
     assert!(
         notice.text.contains(&watched.id),
         "the notice names the execution that actually finished: {notice:?}"
+    );
+}
+
+/// A manual/forced transition writes the store directly, bypassing
+/// `Engine::run`/`resume`/`deliver_human_input` and therefore U1's guard —
+/// so it needs its own check against a background pass already driving the
+/// same execution, or its direct writes would race that pass's own appends
+/// and its own `save_execution` with no coordination at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forced_transition_is_refused_while_a_background_pass_is_driving_the_same_execution() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let execution = start_slow(&engine, &root, "tui-slow-override");
+
+    let mut app = app_over(&engine, root.path());
+    app.refresh();
+    app.select_execution(&execution.id);
+
+    // Start the slow background pass; it now holds the guard for the whole
+    // 300ms of the script.
+    assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
+    app.run_selected().await;
+
+    // Wait for the spawned background task to actually acquire the guard —
+    // dispatch only schedules it, so nothing guarantees it has run yet.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !engine.is_active(&execution.id) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background pass never acquired the guard"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    // Without refreshing, the cached selection still shows `prepare`, which
+    // is exactly the state the background pass is stepping right now.
+    app.on_key(key(KeyCode::Char('t')));
+    app.on_key(key(KeyCode::Char('o')));
+    let Modal::Transition(menu) = app.modal() else {
+        panic!("the transition menu is open");
+    };
+    assert_eq!(menu.mode, TransitionMode::Override);
+    let target = menu
+        .entries()
+        .iter()
+        .position(|entry| entry == "finished")
+        .expect("`finished` is offered as an override target");
+    for _ in 0..target {
+        app.on_key(key(KeyCode::Char('j')));
+    }
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.on_key(key(KeyCode::Char('y'))),
+        Request::ApplyTransition
+    );
+    app.apply_transition().await;
+
+    assert!(
+        app.notice().expect("a notice").is_error,
+        "the forced transition is refused while the pass is live"
+    );
+    // The background pass is legitimately still writing its own events
+    // concurrently, so a plain event count would be racy; what the refused
+    // transition itself must never have written is a `HumanTransitionSelected`.
+    assert!(
+        !events_of(&engine, &execution.id)
+            .iter()
+            .any(|event| matches!(&event.data, EventData::HumanTransitionSelected { .. })),
+        "the refused forced transition wrote no HumanTransitionSelected"
+    );
+
+    let mut events = engine.subscribe();
+    drive_until_settled(&mut app, &mut events, &execution.id).await;
+    let stored = reload_until(&engine, &execution.id, ExecutionStatus::Completed);
+    assert_eq!(
+        stored.status,
+        ExecutionStatus::Completed,
+        "the background pass finished on its own, undisturbed"
     );
 }
 

@@ -816,8 +816,18 @@ async fn a_second_driver_for_the_same_execution_is_rejected_while_the_first_runs
         async move { engine.run(&definition, &execution_id).await }
     });
 
-    // Give the first call time to acquire the guard and enter the slow step.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Wait for the first call to actually acquire the guard, rather than
+    // guessing a delay: a fixed sleep here would be a flake risk under a
+    // loaded CI runner where scheduling the first call could plausibly take
+    // longer than a short guess.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !engine.is_active(&execution_id) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first call never acquired the guard"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
 
     let second = engine.run(&definition, &execution_id).await;
     let first = first.await.expect("the first pass did not panic");
@@ -839,6 +849,10 @@ async fn a_second_driver_for_the_same_execution_is_rejected_while_the_first_runs
         .load_execution(&execution_id)
         .expect("reload the execution");
     assert_eq!(stored.status, ExecutionStatus::Completed);
+    assert!(
+        !engine.is_active(&execution_id),
+        "the guard is released once the winning pass finishes"
+    );
 
     // R5: the rejection that only reached the loser's `Result` is also on the
     // execution's own event log, for a caller that discards it.

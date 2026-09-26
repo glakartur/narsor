@@ -83,8 +83,9 @@ use crate::domain::{
     State, WorkflowDefinition, WorkflowExecution,
 };
 use crate::engine::{
-    permitted_labels, terminal_status, Engine, HumanInputDelivery, PendingHumanInput,
+    permitted_labels, terminal_status, Engine, EngineError, HumanInputDelivery, PendingHumanInput,
 };
+use futures::FutureExt;
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
 use crate::tasks::{self, DefinitionSource};
 use crate::persistence::{CatalogPaths, WorkPaths};
@@ -1897,6 +1898,37 @@ impl App {
         });
     }
 
+    /// Spawns one of the four engine-driving calls in the background (R1,
+    /// R2, R3): the caller returns immediately, and the outcome — success or
+    /// failure — reaches the interface only through the event stream (R4),
+    /// never through this call's own return value, which is why `future`'s
+    /// `Result` is otherwise discarded here.
+    ///
+    /// A panic inside `future` (an executor bug, say) is still caught rather
+    /// than left to vanish with it: `tokio::spawn` already stops it from
+    /// taking down the whole process, but the discarded `JoinHandle` would
+    /// otherwise mean nobody ever learns the pass panicked at all.
+    fn spawn_background(
+        &self,
+        future: impl std::future::Future<Output = Result<WorkflowExecution, EngineError>>
+            + Send
+            + 'static,
+    ) {
+        tokio::spawn(async move {
+            if let Err(payload) = std::panic::AssertUnwindSafe(future).catch_unwind().await {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|message| message.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                tracing::error!(
+                    %message,
+                    "a backgrounded engine call panicked; its execution's outcome is unknown"
+                );
+            }
+        });
+    }
+
     /// Validates the open form and, if it passes, dispatches it to the engine
     /// in the background.
     ///
@@ -1932,10 +1964,10 @@ impl App {
 
         self.modal = Modal::None;
         let engine = Arc::clone(&self.engine);
-        tokio::spawn(async move {
-            let _ = engine
+        self.spawn_background(async move {
+            engine
                 .deliver_human_input(&definition, &execution_id, &delivery)
-                .await;
+                .await
         });
     }
 
@@ -1978,10 +2010,10 @@ impl App {
         self.modal = Modal::None;
         let delivery = HumanInputDelivery::label(label.to_string());
         let engine = Arc::clone(&self.engine);
-        tokio::spawn(async move {
-            let _ = engine
+        self.spawn_background(async move {
+            engine
                 .deliver_human_input(&definition, &execution_id, &delivery)
-                .await;
+                .await
         });
     }
 
@@ -2028,6 +2060,20 @@ impl App {
         let Some(execution) = self.execution.clone() else {
             return;
         };
+        // A background pass may be advancing this same execution right now
+        // (R7's guard covers `Engine::run`/`resume`/`deliver_human_input`,
+        // but a manual/forced transition writes the store directly, so it
+        // needs its own check): writing here concurrently with that pass
+        // would race its own appends and its own `save_execution`, exactly
+        // the corruption the guard exists to prevent one layer up.
+        if self.engine.is_active(&execution.id) {
+            self.notice = Some(Notice::error(
+                "This execution is being driven in the background right now; \
+                 wait for it to settle before transitioning it by hand.",
+            ));
+            self.modal = Modal::None;
+            return;
+        }
         let Some(definition) = self.definition.clone() else {
             return;
         };
@@ -2514,9 +2560,7 @@ impl App {
 
         let engine = Arc::clone(&self.engine);
         let execution_id = execution.id.clone();
-        tokio::spawn(async move {
-            let _ = engine.run(&definition, &execution_id).await;
-        });
+        self.spawn_background(async move { engine.run(&definition, &execution_id).await });
     }
 
     /// Puts the cursor on one execution, if the list holds it.
@@ -2558,14 +2602,12 @@ impl App {
         let execution_id = row.id.clone();
         match row.status {
             ExecutionStatus::Running => {
-                tokio::spawn(async move {
-                    let _ = engine.run(&definition, &execution_id).await;
-                });
+                self.spawn_background(async move { engine.run(&definition, &execution_id).await });
             }
             ExecutionStatus::Paused => {
-                tokio::spawn(async move {
-                    let _ = engine.resume(&definition, &execution_id).await;
-                });
+                self.spawn_background(
+                    async move { engine.resume(&definition, &execution_id).await },
+                );
             }
             other => {
                 self.notice = Some(Notice::error(format!(
