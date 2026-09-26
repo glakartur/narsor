@@ -81,11 +81,16 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::domain::{Event, EventData, ExecutionStatus};
 
 /// One action attempt on the timeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` are derived here, not bolted on in `src/api`,
+/// because this is the API's actual response shape (U5): the contract is
+/// "the same fold this module already computes", not a second copy of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
     /// `"<state> #n"`, stable identity of this position (see module docs).
     pub label: String,
@@ -127,7 +132,8 @@ pub struct Position {
 
 /// The status of one [`Position`], per the precedence rule in the module
 /// docs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PositionStatus {
     /// `ActionCompleted` fired for this attempt.
     Succeeded,
@@ -145,7 +151,8 @@ pub enum PositionStatus {
 
 /// Whether a position's conversation can be read, and why not when it
 /// cannot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum ConversationState {
     /// The attempt has a conversation record.
     Recorded,
@@ -163,7 +170,8 @@ pub enum ConversationState {
 }
 
 /// Where one event belongs on the timeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "link", content = "value", rename_all = "snake_case")]
 pub enum EventLink {
     /// The event belongs to this position, named by its label.
     Position(String),
@@ -176,7 +184,7 @@ pub enum EventLink {
 
 /// The result of [`build_timeline`]: every position, in order, plus the
 /// event → position map and the position to select by default (R6).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Timeline {
     /// Every position, in the order their attempts started.
     pub positions: Vec<Position>,

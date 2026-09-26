@@ -4,6 +4,7 @@
 //! The `narsor` binary is a thin wrapper over this crate; integration
 //! tests under `tests/` link against it.
 
+pub mod api;
 pub mod cli;
 pub mod config;
 pub mod domain;
