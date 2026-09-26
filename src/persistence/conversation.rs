@@ -369,7 +369,7 @@ impl ConversationStore {
         if zst_path.exists() {
             let file =
                 File::open(zst_path).map_err(|source| PersistenceError::io(zst_path, source))?;
-            let bytes = zstd::stream::decode_all(file)
+            let bytes = decode_capped(file, MAX_DECOMPRESSED_BYTES)
                 .map_err(|source| PersistenceError::io(zst_path, source))?;
             Ok(Some((bytes, true)))
         } else if jsonl_path.exists() {
@@ -463,6 +463,37 @@ fn restrict_to_owner(path: &Path) {
 
 #[cfg(not(unix))]
 fn restrict_to_owner(_path: &Path) {}
+
+/// The largest a compressed attempt is ever allowed to decompress to.
+///
+/// A conversation file this store wrote itself is bounded by how much a
+/// harness can plausibly say in one attempt's timeout window — nowhere near
+/// this. The cap exists for the file zstd was never asked to guarantee
+/// anything about: one substituted, corrupted, or hand-crafted by another
+/// local account before this store's own [`restrict_to_owner`] took effect,
+/// where a small `.jsonl.zst` on disk could otherwise expand to gigabytes in
+/// memory. 4 GiB is generous headroom above any real attempt while still
+/// being a bound.
+const MAX_DECOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Decompresses `file` (a zstd stream), refusing to grow the output past
+/// `cap` bytes rather than trusting the frame's own claimed size — a
+/// corrupted or adversarial frame can claim anything.
+fn decode_capped(file: File, cap: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let decoder = zstd::stream::read::Decoder::new(file)?;
+    let mut limited = decoder.take(cap + 1);
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decompressed conversation record exceeded {cap} bytes"),
+        ));
+    }
+    Ok(bytes)
+}
 
 /// Splits `bytes` on `\n` into complete lines and an optional trailing
 /// incomplete chunk (present only when `bytes` does not end with `\n` and

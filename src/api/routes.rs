@@ -143,11 +143,28 @@ impl From<PersistenceError> for ApiError {
 }
 
 fn require_execution(state: &AppState, execution_id: &str) -> Result<(), ApiError> {
-    if state.store.exists(execution_id) {
+    if is_safe_id(execution_id) && state.store.exists(execution_id) {
         Ok(())
     } else {
         Err(ApiError::ExecutionNotFound)
     }
+}
+
+/// Whether `id` is safe to join onto a filesystem path: every id this API
+/// ever hands out (execution ids, attempt ids) is one of narsor's own
+/// generated identifiers, never a path fragment, so this rejects anything a
+/// caller could use to escape the intended directory (`..`, `/`, a bare
+/// `.`) before it ever reaches [`crate::persistence::paths::StatePaths`]'s
+/// path-joining. A request with an id that fails this check is treated the
+/// same as one for an id that simply does not exist — there is nothing an
+/// attacker should learn from the distinction.
+fn is_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,6 +290,9 @@ async fn get_conversation(
     Query(query): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, ApiError> {
     require_execution(&state, &execution_id)?;
+    if !is_safe_id(&attempt_id) {
+        return Ok(Json(ConversationResponse::NoRecord));
+    }
     let store = state.store.conversation_store(&execution_id);
     let snapshot = store.read(&attempt_id, query.from, query.byte_budget)?;
 

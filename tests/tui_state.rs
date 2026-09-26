@@ -35,9 +35,9 @@ use narsor::persistence::{CatalogPaths, ExecutionStore, WorkPaths};
 use narsor::registry::{RepositoryEntry, RepositoryRegistry};
 use narsor::engine::actions::script::TRUNCATION_MARKER;
 use narsor::tui::app::{
-    event_detail_lines, event_line, App, FormRow, Modal, NewTaskChoice, NewTaskStage, Panel,
-    RepositoryField, Request, Screen, StreamStatus, TaskContent, TransitionMode,
-    OVERRIDE_PROVIDER, OVERRIDE_REASON,
+    event_detail_lines, event_line, task_position_line, App, FormRow, Modal, NewTaskChoice,
+    NewTaskStage, Panel, RepositoryField, Request, Screen, StreamStatus, TaskContent,
+    TransitionMode, OVERRIDE_PROVIDER, OVERRIDE_REASON,
 };
 use narsor::tui::views;
 use narsor::workflow::load_from_file;
@@ -2743,6 +2743,130 @@ async fn c_on_a_second_attempt_event_opens_its_position_and_conversation() {
         }
         other => panic!("expected a loaded conversation, got {other:?}"),
     }
+}
+
+/// `Enter`/space on the content pane (R10): the entry under the cursor
+/// expands, and pressing it again on the same entry collapses it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn expanding_a_conversation_entry_toggles_and_collapses_again() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    seed_retried_agent_execution(engine.store(), "exec-expand");
+
+    let mut app = app_over(&engine, root.path()).await;
+    app.refresh();
+
+    let completed_sequence = app
+        .events()
+        .iter()
+        .find(|event| matches!(event.data, EventData::ActionCompleted { .. }))
+        .expect("the second attempt's ActionCompleted event")
+        .sequence;
+    app.open_conversation_for_event(completed_sequence).await;
+
+    let entry_number = match &task_view(&app).content {
+        TaskContent::Conversation { entries, .. } => {
+            entries.first().expect("attempt-2 has at least one entry").entry_number
+        }
+        other => panic!("expected a loaded conversation, got {other:?}"),
+    };
+    assert!(
+        !task_view(&app).expanded.contains(&entry_number),
+        "entry should start collapsed"
+    );
+
+    // One `Tab` moves focus from the axis (where `c` leaves it selected) to
+    // the content pane; `Enter` there toggles the entry under the cursor.
+    app.on_key(key(KeyCode::Tab));
+    app.on_key(key(KeyCode::Enter));
+    assert!(
+        task_view(&app).expanded.contains(&entry_number),
+        "first Enter should expand the entry: {:?}",
+        task_view(&app).expanded
+    );
+
+    app.on_key(key(KeyCode::Enter));
+    assert!(
+        !task_view(&app).expanded.contains(&entry_number),
+        "second Enter should collapse the entry again: {:?}",
+        task_view(&app).expanded
+    );
+}
+
+/// A continued harness session (D18) is named in the axis line, not just
+/// carried silently on the `Position`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continued_harness_session_is_named_in_the_position_header() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    let execution_id = "exec-resume";
+    engine
+        .store()
+        .save_execution(&seeded_execution(execution_id, ExecutionStatus::Completed))
+        .expect("save execution");
+
+    let log = engine.store().event_log(execution_id);
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::WorkflowStarted {
+            workflow_id: "implement-feature".to_string(),
+            workflow_version: 1,
+            inputs: json!({}),
+        },
+    )
+    .expect("append WorkflowStarted");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::StateEntered {
+            state_id: "plan".to_string(),
+        },
+    )
+    .expect("append StateEntered");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::ActionStarted {
+            action_execution_id: "attempt-1".to_string(),
+            state_id: "plan".to_string(),
+            action_type: "agent".to_string(),
+        },
+    )
+    .expect("append ActionStarted");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::AgentSessionStarted {
+            session_id: "sess-new".to_string(),
+            harness: "claude_code".to_string(),
+            action_execution_id: Some("attempt-1".to_string()),
+            resumed_session: Some("sess-old".to_string()),
+        },
+    )
+    .expect("append AgentSessionStarted");
+    log.append_next(
+        &execution_id.to_string(),
+        EventData::ActionCompleted {
+            action_execution_id: "attempt-1".to_string(),
+            output_label: "success".to_string(),
+        },
+    )
+    .expect("append ActionCompleted");
+
+    let mut app = app_over(&engine, root.path()).await;
+    app.refresh();
+    app.open_task_for_execution().await;
+
+    let view = task_view(&app);
+    let position = view
+        .timeline
+        .positions
+        .iter()
+        .find(|position| position.label == "plan #1")
+        .expect("plan #1 position");
+    assert_eq!(position.resumed_harness_session.as_deref(), Some("sess-old"));
+    assert!(
+        task_position_line(position).contains("resumes"),
+        "the position header should name the continued session: {}",
+        task_position_line(position)
+    );
 }
 
 /// The over-linking U6 flagged: a script step's own `ActionStarted` carries

@@ -156,6 +156,17 @@ pub async fn run(
 ) -> io::Result<()> {
     install_panic_hook();
 
+    // Compress any conversation attempt the event log already shows as
+    // closed before anything reads through the store: this is the "at
+    // startup" half of R15's compression contract (the runner handles the
+    // other half, closing an attempt the moment its own action finishes).
+    // Best-effort like every other conversation-store write — a failure
+    // here must not block the interface from starting, since worst case a
+    // reader just sees an uncompressed `.jsonl` a little longer.
+    if let Err(error) = crate::persistence::recovery::compress_closed_conversations(&store) {
+        tracing::warn!(error = %error, "tui: startup conversation compression sweep failed");
+    }
+
     // The embedded, read-only API (U5) is the only path the task view (U7)
     // reads the step timeline and conversations through — see
     // `crate::api` for why it is loopback-only and token-protected. A

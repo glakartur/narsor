@@ -20,6 +20,15 @@
 //! means "give it more time" — it means the process is gone, wedged, or the
 //! wrong port. A bounded timeout turns that into a prompt, readable
 //! [`ClientError::Unavailable`] instead of a TUI that appears to hang.
+//!
+//! The bound is short (not the generous timeout a client talking to a real
+//! network service would want) because every call this client makes is
+//! awaited directly inside the TUI's key-handling loop
+//! (`crate::tui::run`'s `select!`), so the timeout is also the worst-case
+//! delay before the interface redraws or responds to another key — including
+//! quit. A loopback, same-process, read-only server has no legitimate reason
+//! to take seconds to answer; if it ever does, failing fast matters more
+//! here than it would for a client with no such coupling to input latency.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -33,8 +42,11 @@ use crate::engine::Timeline;
 use super::routes::ConversationResponse;
 
 /// How long a single request may take before it is treated as the server
-/// being unavailable.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// being unavailable — and, since every call is awaited on the TUI's
+/// key-handling path, the worst-case stall an operator can see from a single
+/// slow request. See the module doc for why this is short rather than
+/// generous.
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// A distinguishable failure of a client call.
 #[derive(Debug)]

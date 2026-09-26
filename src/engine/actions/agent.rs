@@ -729,6 +729,20 @@ async fn spawn_and_wait(
     }))
 }
 
+/// The hard ceiling on one unterminated line's accumulated size, independent
+/// of [`PARSE_LINE_LIMIT`] (which only bounds what the *parser* sees, not
+/// what [`stream_lines`] holds while waiting for the next `\n`).
+///
+/// A real tool-result line runs to single-digit megabytes at most (R14's own
+/// justification cites "wielomegabajtowe linie wyników narzędzi" — a few
+/// tens of MiB); a harness that streams for an entire timeout window with no
+/// newline at all is not a line at any size R14 was written for, and letting
+/// this accumulator grow without bound turns a misbehaving subprocess into
+/// an OOM instead of the ordinary "this action failed" outcome every other
+/// harness failure produces. 256 MiB is generous headroom above any
+/// realistic single line while still being a bound.
+const MAX_LINE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Reads `pipe` line by line, calling `on_line` with the raw bytes of each
 /// complete line — the trailing `\n` stripped and nothing else touched, not
 /// even a trailing `\r`, not even invalid UTF-8. The final, unterminated
@@ -741,7 +755,9 @@ async fn spawn_and_wait(
 /// configured length): this is the `fill_buf`/`consume` loop the two would
 /// otherwise hide, kept explicit so that a line of any size still reaches
 /// `on_line` in full (R14) — only *parsing* it is ever capped, by the caller,
-/// never this function's own reading.
+/// never this function's own reading. The one exception is
+/// [`MAX_LINE_BYTES`]: past that, this stops treating the stream as
+/// well-formed and reports an error instead of accumulating forever.
 async fn stream_lines<R>(pipe: &mut R, mut on_line: impl FnMut(&[u8])) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -766,6 +782,14 @@ where
                 let consumed = available.len();
                 line.extend_from_slice(available);
                 reader.consume(consumed);
+                if line.len() > MAX_LINE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "a single line exceeded {MAX_LINE_BYTES} bytes with no newline"
+                        ),
+                    ));
+                }
             }
         }
     }
