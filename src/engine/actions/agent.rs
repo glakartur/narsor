@@ -830,6 +830,8 @@ const SPAWN_TEXT_BUSY_RETRIES: u32 = 20;
 /// clears it without ever masking a binary that is actually, persistently
 /// busy — those keep failing past the retry budget exactly as before.
 async fn spawn_retrying_text_busy(command: &mut Command) -> std::io::Result<tokio::process::Child> {
+    const RETRY_DELAY_MS: u64 = 5;
+
     for attempt in 0..SPAWN_TEXT_BUSY_RETRIES {
         match command.spawn() {
             Ok(child) => return Ok(child),
@@ -837,7 +839,22 @@ async fn spawn_retrying_text_busy(command: &mut Command) -> std::io::Result<toki
                 if attempt + 1 < SPAWN_TEXT_BUSY_RETRIES
                     && error.kind() == io::ErrorKind::ExecutableFileBusy =>
             {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+            }
+            // On the last attempt, an `ExecutableFileBusy` gets a message
+            // naming the retry budget already spent, so this is
+            // distinguishable from a first-attempt failure with the same
+            // raw OS error — otherwise both look identical to an operator,
+            // even though one means "genuinely, persistently busy" and the
+            // other never should have reached this branch at all.
+            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "still busy after {SPAWN_TEXT_BUSY_RETRIES} attempts over ~{}ms: {error}",
+                        u64::from(SPAWN_TEXT_BUSY_RETRIES - 1) * RETRY_DELAY_MS
+                    ),
+                ));
             }
             Err(error) => return Err(error),
         }
