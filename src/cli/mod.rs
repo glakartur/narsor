@@ -31,6 +31,7 @@
 //! which is also the code clap itself returns for a malformed command line.
 
 pub mod commands;
+pub mod daemon;
 
 use std::path::PathBuf;
 
@@ -201,6 +202,28 @@ pub enum Command {
 
     /// Opens the full-screen terminal interface.
     Tui,
+
+    /// Runs the daemon that owns `Engine`/`ExecutionStore` for as long as the
+    /// machine stays up (U2), or sends the running one a graceful stop
+    /// signal.
+    ///
+    /// Bare `narsor daemon` runs in the foreground until it receives
+    /// `SIGTERM` — it does not detach itself; that is the job of the client
+    /// that discovers no daemon is running and spawns one
+    /// (`src/daemon/launch.rs`, wired in by U5). `narsor daemon stop` is the
+    /// other half: it never runs a daemon, only signals one.
+    Daemon {
+        /// What to do about the daemon: nothing (run it) or `stop` it.
+        #[command(subcommand)]
+        command: Option<DaemonCommand>,
+    },
+}
+
+/// The daemon half of the command line.
+#[derive(Debug, Subcommand)]
+pub enum DaemonCommand {
+    /// Sends a graceful stop signal (`SIGTERM`) to the running daemon.
+    Stop,
 }
 
 /// The workflow half of the command line.
@@ -318,7 +341,8 @@ impl Command {
             | Command::Resume { .. }
             | Command::Workflow { .. }
             | Command::Repo { .. }
-            | Command::Tui => false,
+            | Command::Tui
+            | Command::Daemon { .. } => false,
         }
     }
 }
@@ -415,6 +439,10 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             ConfigCommand::Show { format } => commands::config_show(&config, format),
         },
         Command::Tui => commands::tui(&config),
+        Command::Daemon { command } => match command {
+            None => daemon::run_daemon(&config).await,
+            Some(DaemonCommand::Stop) => daemon::stop_daemon(&config),
+        },
     };
 
     match outcome {

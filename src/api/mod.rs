@@ -72,6 +72,7 @@ use crate::persistence::ExecutionStore;
 use std::fmt;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -93,16 +94,19 @@ impl std::error::Error for ApiStartError {
 
 /// A running embedded API server.
 ///
-/// Holds the [`JoinHandle`] of the task serving requests: dropping this
-/// handle aborts that task, so the server's lifetime is exactly the
-/// lifetime of whatever holds the handle (the TUI's `App`, in U7). There is
-/// no separate `stop` method because there is no graceful shutdown to speak
-/// of — every request is a read, so aborting mid-request loses nothing but
-/// that one in-flight response.
+/// Holds the [`JoinHandle`] of the task serving requests and a channel to
+/// signal it to stop. Unlike the earlier, embedded-in-the-TUI shape (U5),
+/// this server is now owned by the daemon process (U2) and may outlive any
+/// one client — so it is no longer torn down implicitly when a handle is
+/// dropped (R10). Callers that want the server to stop must call
+/// [`ApiHandle::shutdown`] explicitly; simply dropping the handle leaves the
+/// server running, exactly like every other resource that isn't RAII-scoped
+/// to one client's lifetime.
 pub struct ApiHandle {
     addr: SocketAddr,
     token: String,
     task: JoinHandle<()>,
+    shutdown_tx: oneshot::Sender<()>,
 }
 
 impl ApiHandle {
@@ -120,11 +124,18 @@ impl ApiHandle {
     pub fn client(&self) -> ApiClient {
         ApiClient::new(self.addr, self.token.clone())
     }
-}
 
-impl Drop for ApiHandle {
-    fn drop(&mut self) {
-        self.task.abort();
+    /// Gracefully stops the server: in-flight requests are allowed to finish
+    /// ([`axum::serve`]'s `with_graceful_shutdown`), then this returns once
+    /// the serving task has actually ended.
+    ///
+    /// The send can fail if the serving task already ended on its own (for
+    /// instance the listener errored); that is not a failure to report here,
+    /// since the outcome — the task is no longer running — is exactly what
+    /// was asked for.
+    pub async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(());
+        let _ = self.task.await;
     }
 }
 
@@ -140,12 +151,19 @@ pub async fn start(store: ExecutionStore) -> Result<ApiHandle, ApiStartError> {
     let token = Uuid::new_v4().to_string();
 
     let app = routes::router(store, token.clone());
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
-        // A read-only server has no state to save on the way out; letting
-        // the future simply end (on abort, or if `axum::serve` itself ever
-        // returns) needs no handling beyond dropping the listener.
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
     });
 
-    Ok(ApiHandle { addr, token, task })
+    Ok(ApiHandle {
+        addr,
+        token,
+        task,
+        shutdown_tx,
+    })
 }

@@ -589,6 +589,17 @@ impl Engine {
         self.lock_active_runs().contains(execution_id)
     }
 
+    /// A snapshot of every execution a pass is currently driving.
+    ///
+    /// For the daemon's graceful shutdown (U2): on `SIGTERM` it asks each of
+    /// these to [`Engine::pause`] and then polls this same getter until it is
+    /// empty (or a timeout elapses). A snapshot under the lock, not a live
+    /// view — the set can change the instant after this returns, which is
+    /// fine for a poll loop that simply calls it again.
+    pub fn active_run_ids(&self) -> Vec<ExecutionId> {
+        self.lock_active_runs().iter().cloned().collect()
+    }
+
     /// Parks a running execution immediately: status `Paused`, `WorkflowPaused`
     /// in the log.
     ///
