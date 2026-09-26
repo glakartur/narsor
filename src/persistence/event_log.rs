@@ -65,10 +65,28 @@ impl EventLog {
     }
 
     /// Builds and appends an event with the next free sequence number.
+    ///
+    /// Retries on a collision instead of failing outright: a second
+    /// `EventLog` handle on the same directory — a second concurrent caller
+    /// of [`crate::engine::Engine::run`]/`resume`/`deliver_human_input` now
+    /// legitimately exists, guarded against advancing the same execution
+    /// twice but not against *this* — starts its own next-sequence cache from
+    /// an independent directory listing, so two handles can compute the same
+    /// "next" number. The cache is only ever a hint the filesystem can
+    /// rebuild (see [`EventLog`]'s own doc comment), so losing the race for
+    /// one slot just means resyncing and claiming the next free one, rather
+    /// than an event silently never reaching the log.
     pub fn append_next(&self, execution_id: &ExecutionId, data: EventData) -> Result<Event> {
-        let event = Event::new(execution_id.clone(), data, self.next_sequence()?);
-        self.append(&event)?;
-        Ok(event)
+        loop {
+            let event = Event::new(execution_id.clone(), data.clone(), self.next_sequence()?);
+            match self.append(&event) {
+                Ok(()) => return Ok(event),
+                Err(PersistenceError::EventAlreadyExists { .. }) => {
+                    *self.lock_next_sequence() = None;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Reads the whole log, ordered by sequence number.

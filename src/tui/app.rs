@@ -1395,6 +1395,13 @@ impl App {
             apply_to_row(row, &event.data);
         }
 
+        // A background run's outcome is set as a notice by execution id, not
+        // only for whichever execution happens to be selected (R6) — this is
+        // in addition to the row update above, not a replacement for it.
+        if let Some(notice) = notice_for(&event) {
+            self.notice = Some(notice);
+        }
+
         let selected = self.selected().map(|row| row.id.clone());
         if selected.as_deref() != Some(event.workflow_execution_id.as_str()) {
             return;
@@ -1890,10 +1897,15 @@ impl App {
         });
     }
 
-    /// Validates the open form and, if it passes, delivers it to the engine.
+    /// Validates the open form and, if it passes, dispatches it to the engine
+    /// in the background.
     ///
     /// A failed validation is reported in the form and nothing is sent: a
     /// rejected answer must leave the execution exactly as paused as it was.
+    /// A validated delivery's engine-level outcome — success or failure — no
+    /// longer reopens this form; it surfaces later as a notice (R6), because
+    /// the engine call itself runs in the background and this handler does
+    /// not wait for it (R1).
     pub async fn submit_input(&mut self) {
         let Modal::Input(form) = &mut self.modal else {
             return;
@@ -1918,28 +1930,13 @@ impl App {
             return;
         };
 
-        match self
-            .engine
-            .deliver_human_input(&definition, &execution_id, &delivery)
-            .await
-        {
-            Ok(execution) => {
-                self.modal = Modal::None;
-                self.notice = Some(Notice::info(format!(
-                    "Input delivered; execution {} is now {}.",
-                    execution.id,
-                    status_name(&execution.status)
-                )));
-                self.refresh();
-            }
-            Err(error) => {
-                let message = format!("Could not deliver the input: {error}");
-                if let Modal::Input(form) = &mut self.modal {
-                    form.error = Some(message.clone());
-                }
-                self.notice = Some(Notice::error(message));
-            }
-        }
+        self.modal = Modal::None;
+        let engine = Arc::clone(&self.engine);
+        tokio::spawn(async move {
+            let _ = engine
+                .deliver_human_input(&definition, &execution_id, &delivery)
+                .await;
+        });
     }
 
     /// Carries out the transition the operator picked.
@@ -1967,7 +1964,9 @@ impl App {
         }
     }
 
-    /// Answers a pending question with nothing but a label.
+    /// Answers a pending question with nothing but a label, in the
+    /// background — see [`App::submit_input`] for why this no longer waits
+    /// on the engine call either.
     async fn deliver_label(&mut self, label: &str) {
         let Some(execution_id) = self.selected().map(|row| row.id.clone()) else {
             return;
@@ -1976,27 +1975,14 @@ impl App {
             return;
         };
 
+        self.modal = Modal::None;
         let delivery = HumanInputDelivery::label(label.to_string());
-        match self
-            .engine
-            .deliver_human_input(&definition, &execution_id, &delivery)
-            .await
-        {
-            Ok(execution) => {
-                self.modal = Modal::None;
-                self.notice = Some(Notice::info(format!(
-                    "Output '{label}' picked; the execution is now {}.",
-                    status_name(&execution.status)
-                )));
-                self.refresh();
-            }
-            Err(error) => {
-                self.notice = Some(Notice::error(format!(
-                    "Could not pick output '{label}': {error}. \
-                     If the state declares form fields, use i instead."
-                )));
-            }
-        }
+        let engine = Arc::clone(&self.engine);
+        tokio::spawn(async move {
+            let _ = engine
+                .deliver_human_input(&definition, &execution_id, &delivery)
+                .await;
+        });
     }
 
     /// Takes a declared transition by hand, without the engine.
@@ -2519,20 +2505,17 @@ impl App {
         };
 
         self.modal = Modal::None;
-        let outcome = self.engine.run(&definition, &execution.id).await;
+        self.notice = Some(Notice::info(format!(
+            "Started execution {}; running in the background.",
+            execution.id
+        )));
         self.refresh();
         self.select_execution(&execution.id);
 
-        self.notice = Some(match outcome {
-            Ok(execution) => Notice::info(format!(
-                "Started execution {}; it is now {}.",
-                execution.id,
-                status_name(&execution.status)
-            )),
-            Err(error) => Notice::error(format!(
-                "Execution {} was created but the engine returned an error: {error}",
-                execution.id
-            )),
+        let engine = Arc::clone(&self.engine);
+        let execution_id = execution.id.clone();
+        tokio::spawn(async move {
+            let _ = engine.run(&definition, &execution_id).await;
         });
     }
 
@@ -2549,7 +2532,9 @@ impl App {
         }
     }
 
-    /// Runs or resumes the selected execution.
+    /// Runs or resumes the selected execution, in the background (R1, R2):
+    /// this returns as soon as the engine call is dispatched, and its outcome
+    /// — success or failure — reaches the interface later as an event (R4).
     pub async fn run_selected(&mut self) {
         let Some(row) = self.selected().cloned() else {
             self.notice = Some(Notice::error("No execution is selected."));
@@ -2569,9 +2554,19 @@ impl App {
             return;
         }
 
-        let outcome = match row.status {
-            ExecutionStatus::Running => self.engine.run(&definition, &row.id).await,
-            ExecutionStatus::Paused => self.engine.resume(&definition, &row.id).await,
+        let engine = Arc::clone(&self.engine);
+        let execution_id = row.id.clone();
+        match row.status {
+            ExecutionStatus::Running => {
+                tokio::spawn(async move {
+                    let _ = engine.run(&definition, &execution_id).await;
+                });
+            }
+            ExecutionStatus::Paused => {
+                tokio::spawn(async move {
+                    let _ = engine.resume(&definition, &execution_id).await;
+                });
+            }
             other => {
                 self.notice = Some(Notice::error(format!(
                     "An execution that is {} cannot be run.",
@@ -2579,23 +2574,12 @@ impl App {
                 )));
                 return;
             }
-        };
-
-        match outcome {
-            Ok(execution) => {
-                self.notice = Some(Notice::info(format!(
-                    "Execution {} is now {}.",
-                    execution.id,
-                    status_name(&execution.status)
-                )));
-            }
-            Err(error) => {
-                self.notice = Some(Notice::error(format!(
-                    "The engine returned an error: {error}"
-                )));
-            }
         }
-        self.refresh();
+
+        self.notice = Some(Notice::info(format!(
+            "Execution {} is running in the background.",
+            row.id
+        )));
     }
 }
 
@@ -2682,6 +2666,31 @@ fn apply_to_row(row: &mut ExecutionRow, data: &EventData) {
         EventData::WorkflowFailed { .. } => row.status = ExecutionStatus::Failed,
         EventData::WorkflowCancelled { .. } => row.status = ExecutionStatus::Cancelled,
         _ => {}
+    }
+}
+
+/// The bottom-bar notice a background run's outcome produces, if any (R4, R6).
+///
+/// Only a terminal or error event names an outcome worth interrupting the
+/// operator for; reaching a human checkpoint (`WorkflowPaused`,
+/// `HumanInputRequested`) is an ordinary part of a run, not one, so it
+/// produces no notice here.
+fn notice_for(event: &Event) -> Option<Notice> {
+    let execution_id = &event.workflow_execution_id;
+    match &event.data {
+        EventData::WorkflowCompleted { .. } => {
+            Some(Notice::info(format!("Execution {execution_id} completed.")))
+        }
+        EventData::WorkflowFailed { error } => Some(Notice::error(format!(
+            "Execution {execution_id} failed: {error}"
+        ))),
+        EventData::WorkflowCancelled { reason } => Some(Notice::error(format!(
+            "Execution {execution_id} was cancelled: {reason}"
+        ))),
+        EventData::Error { message, .. } => Some(Notice::error(format!(
+            "Execution {execution_id}: {message}"
+        ))),
+        _ => None,
     }
 }
 

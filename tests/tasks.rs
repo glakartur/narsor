@@ -798,9 +798,15 @@ async fn a_second_driver_for_the_same_execution_is_rejected_while_the_first_runs
     let engine = std::sync::Arc::new(engine_for(root.path()));
     let (definition, file) = slow_definition(&root);
 
-    let execution =
-        tasks::start_task(root.path(), root.path(), &engine, &definition, &file, Map::new())
-            .expect("start the task");
+    let execution = tasks::start_task(
+        root.path(),
+        root.path(),
+        &engine,
+        &definition,
+        &file,
+        Map::new(),
+    )
+    .expect("start the task");
     let execution_id = execution.id.clone();
 
     let first = tokio::spawn({
@@ -816,9 +822,15 @@ async fn a_second_driver_for_the_same_execution_is_rejected_while_the_first_runs
     let second = engine.run(&definition, &execution_id).await;
     let first = first.await.expect("the first pass did not panic");
 
-    assert!(first.is_ok(), "the first driver completes the run: {first:?}");
     assert!(
-        matches!(second, Err(narsor::engine::EngineError::AlreadyRunning { .. })),
+        first.is_ok(),
+        "the first driver completes the run: {first:?}"
+    );
+    assert!(
+        matches!(
+            second,
+            Err(narsor::engine::EngineError::AlreadyRunning { .. })
+        ),
         "the second driver is rejected instead of racing the first: {second:?}"
     );
 
@@ -853,9 +865,15 @@ async fn the_execution_id_is_free_again_once_the_first_pass_drops_its_guard() {
     let engine = engine_for(root.path());
     let (definition, file) = slow_definition(&root);
 
-    let execution =
-        tasks::start_task(root.path(), root.path(), &engine, &definition, &file, Map::new())
-            .expect("start the task");
+    let execution = tasks::start_task(
+        root.path(),
+        root.path(),
+        &engine,
+        &definition,
+        &file,
+        Map::new(),
+    )
+    .expect("start the task");
 
     engine
         .run(&definition, &execution.id)
@@ -864,10 +882,7 @@ async fn the_execution_id_is_free_again_once_the_first_pass_drops_its_guard() {
 
     let second = engine.run(&definition, &execution.id).await;
     assert!(
-        matches!(
-            second,
-            Err(narsor::engine::EngineError::NotRunnable { .. })
-        ),
+        matches!(second, Err(narsor::engine::EngineError::NotRunnable { .. })),
         "a completed execution is rejected as not runnable, not as still running: {second:?}"
     );
 }
