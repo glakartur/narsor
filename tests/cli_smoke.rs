@@ -22,6 +22,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use narsor::persistence::{ConversationSource, ExecutionStore};
+
 /// The exit code of a successful command.
 const EXIT_SUCCESS: i32 = 0;
 
@@ -911,5 +913,148 @@ fn run_with_an_unknown_workflow_name_is_a_usage_error() {
             && invocation.stderr.contains("open-mercato-sdlc"),
         "the message names the built-ins: {}",
         invocation.stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
+// steps / conversation (U8)
+// ---------------------------------------------------------------------------
+
+/// The `cli-flaky` fixture: a script action killed by signal on its first
+/// attempt, succeeding on its second, under a fast (`backoff: 0s`) retry
+/// policy — exactly the shape `narsor steps` needs to show more than one
+/// attempt of the same state.
+fn flaky_workflow() -> String {
+    fixtures().join("cli/flaky.yaml").display().to_string()
+}
+
+/// Starts the flaky workflow and returns the invocation and the new id.
+fn start_flaky(root: &TempRoot) -> (Invocation, String) {
+    let script = fixtures().join("scripts/flaky_crash.sh");
+    let counter = root.path().join("attempts.txt");
+    let invocation = cli(
+        root,
+        &[
+            "run",
+            &flaky_workflow(),
+            "--input",
+            &format!("script_path={}", script.display()),
+            "--input",
+            &format!("counter_path={}", counter.display()),
+        ],
+    );
+    let id = execution_id(&invocation.stdout);
+    (invocation, id)
+}
+
+#[test]
+fn steps_shows_one_line_per_attempt_with_its_status() {
+    let root = TempRoot::new();
+    let (invocation, id) = start_flaky(&root);
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stderr: {}",
+        invocation.stderr
+    );
+    assert!(
+        invocation.stdout.contains("Status: completed"),
+        "stdout:\n{}",
+        invocation.stdout
+    );
+
+    let steps = cli(&root, &["steps", &id]);
+
+    assert_eq!(steps.code, EXIT_SUCCESS, "stderr: {}", steps.stderr);
+    let first = steps
+        .stdout
+        .lines()
+        .find(|line| line.starts_with("build #1"))
+        .unwrap_or_else(|| panic!("no 'build #1' line:\n{}", steps.stdout));
+    assert!(first.contains("failed"), "line was: {first}");
+    let second = steps
+        .stdout
+        .lines()
+        .find(|line| line.starts_with("build #2"))
+        .unwrap_or_else(|| panic!("no 'build #2' line:\n{}", steps.stdout));
+    assert!(second.contains("succeeded"), "line was: {second}");
+}
+
+#[test]
+fn steps_for_an_unknown_execution_is_a_readable_failure() {
+    let root = TempRoot::new();
+
+    let invocation = cli(&root, &["steps", "no-such-execution"]);
+
+    assert_eq!(invocation.code, EXIT_FAILURE);
+    assert!(
+        invocation.output().contains("no-such-execution"),
+        "output:\n{}",
+        invocation.output()
+    );
+}
+
+/// `narsor conversation <id> <attempt>` reads through
+/// [`narsor::persistence::ConversationStore`] the same way the embedded API's
+/// handler does — directly against the store, without an HTTP round trip.
+/// This test writes a conversation record by hand for an arbitrary attempt id
+/// alongside a real execution (nothing ties a conversation file's name to any
+/// event; it is looked up purely by the id given on the command line), then
+/// checks every entry that was written comes back, in order, in full.
+#[test]
+fn conversation_prints_every_entry_in_order() {
+    let root = TempRoot::new();
+    let (_, id) = start_greet(&root);
+
+    let store = ExecutionStore::new(root.path());
+    let conversations = store.conversation_store(&id);
+    let mut writer = conversations.writer("attempt-1").expect("open the writer");
+    writer
+        .append_narsor("prompt: do the thing")
+        .expect("write the prompt entry");
+    writer
+        .append(
+            ConversationSource::Stdout,
+            br#"{"type":"result","subtype":"success","result":"done"}"#,
+        )
+        .expect("write the stdout entry");
+    writer
+        .append(ConversationSource::Stderr, b"a warning on stderr")
+        .expect("write the stderr entry");
+    writer.finish().expect("flush the writer");
+
+    let invocation = cli(&root, &["conversation", &id, "attempt-1"]);
+
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stderr: {}",
+        invocation.stderr
+    );
+    let lines: Vec<&str> = invocation.stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "stdout:\n{}", invocation.stdout);
+    assert!(
+        lines[0].contains("prompt: do the thing"),
+        "line was: {}",
+        lines[0]
+    );
+    assert!(lines[1].contains("done"), "line was: {}", lines[1]);
+    assert!(
+        lines[2].contains("a warning on stderr"),
+        "line was: {}",
+        lines[2]
+    );
+}
+
+#[test]
+fn conversation_for_an_unknown_attempt_is_a_readable_failure() {
+    let root = TempRoot::new();
+    let (_, id) = start_greet(&root);
+
+    let invocation = cli(&root, &["conversation", &id, "no-such-attempt"]);
+
+    assert_eq!(invocation.code, EXIT_FAILURE);
+    assert!(
+        invocation.output().contains("no-such-attempt"),
+        "output:\n{}",
+        invocation.output()
     );
 }

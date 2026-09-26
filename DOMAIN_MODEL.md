@@ -165,6 +165,11 @@ Niezmienny rekord faktu, który wydarzył się w systemie. Podstawa obserwowalno
 - `WorkflowStarted`
 - `StateEntered`
 - `ActionStarted`
+- `ActionAttemptFailed` (U1, `docs/plans/2026-09-26-002-*.md`): nieudana próba, po której
+  nastąpi retry — `action_execution_id`, `state_id`, `error`, `retry_in_ms`. Emitowane zaraz po
+  próbie, przed uśpieniem backoffu; ostatnia, wyczerpująca próba wciąż emituje tylko
+  `ActionFailed`, bez tego zdarzenia. Neutralne dla `reconcile` (D23): akcja pozostaje
+  niedomknięta do `ActionFailed` albo `ActionCompleted`.
 - `ActionCompleted` (z payloadem result)
 - `ActionFailed`
 - `DecisionMade` (z wybraną transition)
@@ -173,6 +178,13 @@ Niezmienny rekord faktu, który wydarzył się w systemie. Podstawa obserwowalno
 - `WorkflowCompleted` / `WorkflowFailed`
 - `HumanInputRequested` / `HumanInputProvided`
 - `ExternalEventReceived`
+
+U1 dodał też opcjonalne pola `#[serde(default)]` do zdarzeń istniejących, bez zmiany ich
+znaczenia: `action_execution_id` na `AgentSessionStarted`/`AgentSessionCompleted`/
+`AgentSessionFailed`/`AgentMessage` (jawne powiązanie próby z jej zdarzeniami agenta, zamiast
+wywodzenia go pozycyjnie z logu), `state_id` na `ActionRetrying`, `harness_session_id` na
+`AgentSessionCompleted`/`AgentSessionFailed`, i `resumed_session` na `AgentSessionStarted`. Stary
+log bez tych pól wczytuje się nadal — deserializują się jako `None`.
 
 **Struktura:**
 - `id`: Unikalny ID (UUID lub ULID).
@@ -206,12 +218,23 @@ Reprezentuje połączenie z zewnętrznym harnessem AI.
 - `harness_type`: `claude-code`, `opencode`.
 - `status`: `ACTIVE`, `COMPLETED`, `TERMINATED`, `FAILED`.
 - `working_directory`: Ścieżka, w której działa agent.
-- `log_path`: Ścieżka do logu surowej sesji.
-- `resume_token`: Token umożliwiający wznowienie (jeśli harness obsługuje).
+- ~~`log_path`: Ścieżka do logu surowej sesji.~~ — zastąpione **zapisem rozmowy per
+  `action_execution_id`** (U2/U3 z `docs/plans/2026-09-26-002-*.md`, D51): każda próba akcji
+  agenta ma własny, przyrostowo dopisywany plik JSONL w
+  `{state}/executions/{id}/conversations/{action_execution_id}.jsonl`, kompresowany do
+  `.jsonl.zst` po zamknięciu próby. `AgentSession` nie ma jednego logu na sesję, bo sesja
+  harnessu (`--resume`) i próba akcji nie są tym samym pojęciem — próba dostaje zawsze nowy
+  zapis, sesja harnessu bywa kontynuowana (`resumed_session` w `AgentSessionStarted`). Klucz
+  zapisu jest ten sam, co klucz idempotencji próby (D24), więc nie ma osobnego identyfikatora do
+  zarządzania.
+- `resume_token`: Token umożliwiający wznowienie (jeśli harness obsługuje) — odpowiada polu
+  `harness_session_id`/`resumed_session` na zdarzeniach `AgentSession*` (U1).
 
 **Relacja:**
 - Jedno `ActionExecution` typu `AgentAction` może mieć jedną aktywną `AgentSession`.
 - Po restarcie systemu stara sesja może być nieważna; tworzona jest nowa sesja z kontekstem poprzedniej.
+- Każda próba (`retry`) tej samej `ActionExecution` dostaje własny zapis rozmowy, tak jak dostaje
+  własny `action_execution_id` — dwie próby tego samego stanu nigdy nie dzielą jednego pliku.
 
 ---
 

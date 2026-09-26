@@ -1,0 +1,42 @@
+name: cli-flaky
+version: 1
+description: >
+  A CLI smoke-test workflow: one script action that is killed by signal on its
+  first attempt and succeeds on its second, under a fast retry policy — used
+  to exercise `narsor steps` against an execution with more than one attempt
+  of the same state (U8). Absolute paths handed in through inputs, exactly
+  like `cli-greet`, keep the test from touching the repository or the
+  checkout.
+
+inputs:
+  - name: script_path
+    type: string
+    required: true
+    description: Absolute path to tests/fixtures/scripts/flaky_crash.sh.
+  - name: counter_path
+    type: string
+    required: true
+    description: Absolute path to the counter file the script maintains.
+
+states:
+  build:
+    description: Fails once (by signal), then succeeds.
+    action:
+      type: script
+      command: "{{ inputs.script_path }}"
+      args:
+        - "{{ inputs.counter_path }}"
+        - "1"
+    retry_policy:
+      max_attempts: 2
+      backoff: 0s
+    outputs:
+      - success
+    transitions:
+      success: completed
+
+  completed:
+    description: Done.
+
+terminal_states:
+  - completed

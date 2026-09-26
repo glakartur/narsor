@@ -342,3 +342,19 @@ najbliższy jest M1.
   z M0.
 - **Czy zatwierdzenie kroku jest jednym wywołaniem API, czy dwoma** (metadane osobno od delty),
   co ma znaczenie dla wznawiania przerwanego zatwierdzenia.
+- **Wyjątek od D-B: zapis rozmowy trwającej próby.** `docs/plans/2026-09-26-002-*.md` (U2/U3,
+  ADR D51) wprowadził zapis rozmowy agenta jako plik JSONL dopisywany przyrostowo w trakcie
+  trwania próby, w katalogu stanu (`{state}/executions/{id}/conversations/`), a nie na granicy
+  kroku. To już dziś rozjeżdża się z D-B, o ile centrala ma widzieć podgląd *trwającej* próby, a
+  nie tylko jej stan po zamknięciu: replikacja na granicy kroku (D-B) replikowałaby zapis dopiero
+  po zamknięciu próby i jej kompresji do `.jsonl.zst`, więc worker odcięty w trakcie długiej
+  próby nie miałby jak pokazać centrali, co się dzieje, dopóki próba się nie skończy. M1 tego nie
+  rozstrzyga: serwer odczytu (D52) jest wbudowany w proces TUI i czyta lokalny plik zwykły w
+  trakcie zapisu, co działa tylko wtedy, gdy czytelnik i pisarz są tym samym procesem albo mają
+  współdzielony dostęp do tego samego systemu plików — założenie, które M2 (worker zdalny) łamie.
+  Do uzgodnienia w M2: albo zapis rozmowy trwającej próby dostaje własną, częstszą granicę
+  replikacji niż krok (osobny niezmiennik obok D-B, z dodatkowym kosztem sieciowym uzasadnionym
+  tym, że to dane diagnostyczne, nie stan silnika), albo podgląd trwającej próby na zdalnym
+  workerze idzie przez bezpośrednie połączenie do workera (nowa powierzchnia, poza REST+SSE
+  D37/D38), albo M2 świadomie akceptuje, że podgląd trwającej próby jest niedostępny z centrali
+  dopóki próba się nie zamknie (degradacja R8 w konfiguracji rozproszonej, nie lokalnej).
