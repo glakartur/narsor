@@ -1972,7 +1972,7 @@ impl App {
             .unwrap_or(0);
         let mut axis_scroll = ScrollState::new();
         for _ in 0..axis_index {
-            axis_scroll.line_down(timeline.positions.len());
+            axis_scroll.select_down(timeline.positions.len());
         }
 
         self.screen = Screen::Task(Box::new(TaskView {
@@ -2192,10 +2192,14 @@ impl App {
             TaskFocus::Axis => &mut view.axis_scroll,
             TaskFocus::Content => &mut view.content_scroll,
         };
+        // A selection cursor over the pane's discrete items (positions or
+        // entries), not a scroll viewport — `select_down`/`select_up`, never
+        // `line_down`/`line_up`, which would freeze at index 0 the moment
+        // the list is shorter than the viewport (see `ScrollState`'s doc).
         if delta >= 0 {
-            scroll.line_down(total);
+            scroll.select_down(total);
         } else {
-            scroll.line_up(total);
+            scroll.select_up(total);
         }
         self.after_task_cursor_move()
     }
@@ -2211,9 +2215,9 @@ impl App {
             TaskFocus::Content => &mut view.content_scroll,
         };
         if direction >= 0 {
-            scroll.page_down(total);
+            scroll.select_page_down(total);
         } else {
-            scroll.page_up(total);
+            scroll.select_page_up(total);
         }
         self.after_task_cursor_move()
     }
@@ -2229,9 +2233,9 @@ impl App {
             TaskFocus::Content => &mut view.content_scroll,
         };
         if to_end {
-            scroll.to_bottom(total);
+            scroll.select_last(total);
         } else {
-            scroll.to_top();
+            scroll.select_first();
         }
         self.after_task_cursor_move()
     }

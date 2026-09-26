@@ -3037,3 +3037,45 @@ async fn an_old_format_log_shows_no_conversation_record() {
         other => panic!("expected the events fallback, got {other:?}"),
     }
 }
+/// The bug this test is named after: with only a handful of positions (far
+/// fewer than the axis pane's height), `j`/`k` used to freeze the selection
+/// at the first position forever, because the axis cursor reused
+/// `ScrollState`'s scroll-viewport clamp (`total.saturating_sub(viewport)`,
+/// which collapses to `0` here) instead of a selection cursor's
+/// (`total - 1`). This drives the cursor across every position, in both
+/// directions, and checks it actually lands on each one.
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_the_axis_cursor_visits_every_position() {
+    let root = TempRoot::new();
+    let engine = engine_for(root.path());
+    seed_retried_agent_execution(engine.store(), "exec-axis-cursor");
+
+    let mut app = app_over(&engine, root.path()).await;
+    app.refresh();
+    app.open_task_for_execution().await;
+
+    // The default selection is the last position.
+    assert_eq!(task_view(&app).selected.as_deref(), Some("plan #2"));
+
+    app.on_key(key(KeyCode::Char('k')));
+    app.load_task_position().await;
+    assert_eq!(task_view(&app).selected.as_deref(), Some("plan #1"));
+
+    // Moving up again must not move past the first position.
+    app.on_key(key(KeyCode::Char('k')));
+    app.load_task_position().await;
+    assert_eq!(task_view(&app).selected.as_deref(), Some("plan #1"));
+
+    app.on_key(key(KeyCode::Char('j')));
+    app.load_task_position().await;
+    assert_eq!(task_view(&app).selected.as_deref(), Some("plan #2"));
+
+    // `g`/`G` jump to the first/last position directly.
+    app.on_key(key(KeyCode::Char('g')));
+    app.load_task_position().await;
+    assert_eq!(task_view(&app).selected.as_deref(), Some("plan #1"));
+
+    app.on_key(key(KeyCode::Char('G')));
+    app.load_task_position().await;
+    assert_eq!(task_view(&app).selected.as_deref(), Some("plan #2"));
+}
