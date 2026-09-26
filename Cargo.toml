@@ -28,6 +28,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # UUID generation
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Unix syscalls (PID liveness check, process detach in the daemon)
+libc = "0.2"
+
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
 

@@ -4,6 +4,8 @@
 //! filesystem under a configurable root (default `./.narsor`):
 //!
 //! ```text
+//! {root}/daemon.json                  -- discovery file of a running daemon
+//! {root}/daemon.lock                  -- exclusive lock guarding daemon spawn
 //! {root}/executions/{execution_id}/
 //!     state.json                  -- the serialized WorkflowExecution
 //!     context.json                -- projection of the execution context
@@ -21,18 +23,21 @@
 
 pub mod atomic;
 pub mod conversation;
+pub mod daemon_info;
 pub mod event_log;
 pub mod execution_store;
 pub mod paths;
 pub mod recovery;
 
 pub use atomic::{
-    cleanup_orphaned_temp_files, read_json, write_atomic, write_atomic_exclusive, write_json_atomic,
+    cleanup_orphaned_temp_files, read_json, write_atomic, write_atomic_exclusive,
+    write_atomic_with_mode, write_json_atomic, write_json_atomic_with_mode,
 };
 pub use conversation::{
     ConversationEntry, ConversationSnapshot, ConversationSource, ConversationStore,
     ConversationWriter,
 };
+pub use daemon_info::DaemonInfo;
 pub use event_log::EventLog;
 pub use execution_store::{ExecutionStore, PENDING_INPUT_FILE};
 pub use paths::{

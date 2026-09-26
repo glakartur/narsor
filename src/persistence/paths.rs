@@ -54,6 +54,17 @@ pub const CODE_DIR: &str = "code";
 /// would not survive.
 pub const LOG_FILE: &str = "narsor.log";
 
+/// File the daemon writes so other processes can discover it (`DaemonInfo`).
+///
+/// State rather than declaration, for the same reason as [`LOG_FILE`]: it is
+/// written by exactly one running process and would not survive a read-only
+/// mount of the catalogue.
+pub const DAEMON_FILE: &str = "daemon.json";
+
+/// Exclusive lock used to serialize daemon spawn against a race between
+/// several clients discovering no daemon at once.
+pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
+
 /// Directory holding every execution, directly under the root.
 pub const EXECUTIONS_DIR: &str = "executions";
 
@@ -129,6 +140,16 @@ impl StatePaths {
     /// `{root}/narsor.log`
     pub fn log_file(&self) -> PathBuf {
         self.root.join(LOG_FILE)
+    }
+
+    /// `{root}/daemon.json`
+    pub fn daemon_file(&self) -> PathBuf {
+        self.root.join(DAEMON_FILE)
+    }
+
+    /// `{root}/daemon.lock`
+    pub fn daemon_lock_file(&self) -> PathBuf {
+        self.root.join(DAEMON_LOCK_FILE)
     }
 
     /// `{root}/executions`

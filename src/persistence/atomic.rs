@@ -52,6 +52,51 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_atomic(path, &bytes)
 }
 
+/// Writes `bytes` to `path` atomically, with the temporary file created under
+/// `mode` from the moment it is opened — before a single byte is written to
+/// it, not merely tightened afterwards.
+///
+/// [`write_atomic`] cannot be reused for secrets: it opens its temporary file
+/// under the process umask and only the completed, renamed file would ever
+/// get different permissions, which leaves a window where a temporary file
+/// carrying the sensitive bytes exists world- or group-readable. Anything
+/// written here (a daemon discovery file carrying a bearer token, say) needs
+/// the restricted mode to apply to the very first byte on disk.
+///
+/// Unix-only, like the rest of this crate's permission handling
+/// (`src/persistence/conversation.rs`, `src/workspace/provisioner.rs`); on
+/// other platforms this falls back to [`write_atomic`] and ignores `mode`.
+pub fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+
+    let temp = unique_temp_path_for(path);
+    write_and_sync_with_mode(&temp, bytes, mode)?;
+
+    fs::rename(&temp, path).map_err(|source| {
+        let _ = fs::remove_file(&temp);
+        PersistenceError::io(path, source)
+    })?;
+
+    sync_parent_dir(path);
+    Ok(())
+}
+
+/// Serializes `value` as pretty JSON and writes it to `path` atomically under
+/// `mode`. See [`write_atomic_with_mode`].
+pub fn write_json_atomic_with_mode<T: Serialize>(
+    path: &Path,
+    value: &T,
+    mode: u32,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|source| PersistenceError::Serialize {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    write_atomic_with_mode(path, &bytes, mode)
+}
+
 /// Writes `bytes` to `path` atomically, but fails if `path` already exists.
 ///
 /// The content is written to a temporary file and then hard-linked into place:
@@ -151,6 +196,35 @@ pub(crate) fn write_and_sync(path: &Path, bytes: &[u8]) -> Result<()> {
     file.sync_all()
         .map_err(|source| PersistenceError::io(path, source))?;
     Ok(())
+}
+
+/// Writes `bytes` to a fresh file created under `mode`, flushed to the device.
+///
+/// Unix-only: opens the file with the mode already applied via
+/// `OpenOptionsExt::mode`, so there is no window between file creation and
+/// permission tightening. See [`write_atomic_with_mode`].
+#[cfg(unix)]
+pub(crate) fn write_and_sync_with_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(path)
+        .map_err(|source| PersistenceError::io(path, source))?;
+    file.write_all(bytes)
+        .map_err(|source| PersistenceError::io(path, source))?;
+    file.sync_all()
+        .map_err(|source| PersistenceError::io(path, source))?;
+    Ok(())
+}
+
+/// Non-Unix fallback: `mode` is ignored, matching the process umask.
+#[cfg(not(unix))]
+pub(crate) fn write_and_sync_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> Result<()> {
+    write_and_sync(path, bytes)
 }
 
 /// Fsyncs the directory holding `path` so the rename itself is durable.
