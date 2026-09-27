@@ -19,10 +19,14 @@
 //! developer's own `~/.config`.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use narsor::domain::Workspace;
+use narsor::engine::Engine;
 use narsor::persistence::{ConversationSource, ExecutionStore};
+use narsor::workflow::load_from_file;
 
 /// The exit code of a successful command.
 const EXIT_SUCCESS: i32 = 0;
@@ -59,6 +63,7 @@ impl Drop for TempRoot {
 }
 
 /// What one invocation of the binary produced.
+#[derive(Debug)]
 struct Invocation {
     code: i32,
     stdout: String,
@@ -75,12 +80,20 @@ impl Invocation {
 
 /// Runs the built binary against `root`, with `root` as its working directory.
 fn cli(root: &TempRoot, args: &[&str]) -> Invocation {
+    cli_at(root.path(), args)
+}
+
+/// [`cli`], taking a bare path instead of a [`TempRoot`] — for a test that
+/// has to run two invocations concurrently (from separate threads) against
+/// the same root, which cannot each borrow the same `&TempRoot` across a
+/// `thread::spawn`'s `'static` bound.
+fn cli_at(root: &Path, args: &[&str]) -> Invocation {
     let output = Command::new(env!("CARGO_BIN_EXE_narsor"))
-        .current_dir(root.path())
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("HOME", root.path())
+        .current_dir(root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("HOME", root)
         .arg("--root")
-        .arg(root.path())
+        .arg(root)
         .args(args)
         .output()
         .expect("run the narsor binary");
@@ -1057,4 +1070,192 @@ fn conversation_for_an_unknown_attempt_is_a_readable_failure() {
         "output:\n{}",
         invocation.output()
     );
+}
+
+// ---------------------------------------------------------------------------
+// resume (U6): now a REST client of a daemon, not a direct `Engine` call
+// ---------------------------------------------------------------------------
+
+/// Writes a script-to-terminal workflow, starts it directly against the
+/// store (mirroring `tests/api.rs`'s own `write_script_to_done_workflow` /
+/// `post_resume_drives_a_paused_execution_to_a_terminal_state` fixtures —
+/// there is no CLI-reachable way to pause an execution that is not waiting
+/// on a human answer, since nothing exposes `Engine::pause_now` on the
+/// command line), then parks it with `pause_now` and pins its definition
+/// path the way `tasks::start_task` records it — exactly what `resume`
+/// needs to find the definition again. No daemon exists yet at this point:
+/// the CLI's own `resume` invocation is what discovers none running and
+/// launches one (AE2), against the very same store this just wrote into.
+///
+/// The script sleeps briefly rather than exiting immediately, so that a test
+/// racing two `resume` calls against this execution has a wide, reliable
+/// window in which the execution is genuinely `Running` (and so the second
+/// caller reliably observes `EngineError::AlreadyRunning`/`409`, not merely
+/// "already completed").
+fn pause_a_fresh_execution(root: &TempRoot) -> String {
+    let script_path = root.path().join("succeed-slowly.sh");
+    fs::write(&script_path, "#!/bin/sh\nsleep 0.3\nexit 0\n").expect("write script");
+    let mut permissions = fs::metadata(&script_path)
+        .expect("stat script")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("chmod script");
+
+    let yaml = format!(
+        r#"
+name: cli-resume-fixture
+version: 1
+description: Minimal script-to-terminal fixture for the CLI's resume test.
+
+states:
+  start:
+    description: Runs a script that always succeeds, slowly.
+    action:
+      type: script
+      command: "{command}"
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  done:
+    description: Terminal.
+
+terminal_states:
+  done: completed
+"#,
+        command = script_path.display()
+    );
+    let definition_path = root.path().join("cli-resume-fixture.yaml");
+    fs::write(&definition_path, yaml).expect("write definition");
+    let definition = load_from_file(&definition_path).expect("load definition");
+
+    let store = ExecutionStore::new(root.path());
+    let engine = Engine::new(store.clone());
+    let workspace_path = root.path().join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let execution = engine
+        .start(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start execution");
+    engine
+        .pause_now(&execution.id, "paused for the CLI resume test")
+        .expect("pause the execution");
+
+    let mut reloaded = store
+        .load_execution(&execution.id)
+        .expect("reload execution");
+    reloaded.metadata = serde_json::json!({
+        "cli": { "definition_path": definition_path.display().to_string() }
+    });
+    store
+        .save_execution(&reloaded)
+        .expect("pin the definition path");
+
+    execution.id
+}
+
+#[test]
+fn resume_drives_a_paused_execution_to_a_terminal_state() {
+    let root = TempRoot::new();
+    let id = pause_a_fresh_execution(&root);
+
+    let invocation = cli(&root, &["resume", &id]);
+
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stderr: {}",
+        invocation.stderr
+    );
+    assert!(
+        invocation
+            .stdout
+            .contains(&format!("Resumed execution {id}")),
+        "stdout:\n{}",
+        invocation.stdout
+    );
+    assert!(
+        invocation.stdout.contains("Status: completed"),
+        "stdout:\n{}",
+        invocation.stdout
+    );
+
+    let shown = cli(&root, &["show", &id]);
+    assert!(shown.stdout.contains("Status:        completed"));
+}
+
+/// `--file` on `resume` is refused, not silently ignored — the daemon has no
+/// way to honour a local override path (see `resume`'s own doc comment).
+#[test]
+fn resume_with_file_override_is_a_usage_error() {
+    let root = TempRoot::new();
+    let id = pause_a_fresh_execution(&root);
+
+    let invocation = cli(&root, &["resume", &id, "--file", "some-workflow"]);
+
+    assert_eq!(invocation.code, EXIT_USAGE, "stdout: {}", invocation.stdout);
+    assert!(
+        invocation.output().contains("--file"),
+        "output:\n{}",
+        invocation.output()
+    );
+}
+
+/// AE4-shaped: two drivers race to resume the same execution — here, two
+/// `narsor resume` invocations from separate processes instead of `run`
+/// from one and the TUI from another (the TUI itself is not migrated until
+/// U7), which exercises exactly the same underlying guard
+/// (`Engine::begin_run`/`active_runs`, R11) through the same REST path.
+/// Exactly one must succeed; the other must fail readably — the daemon's
+/// `409` must not reach the operator as a raw HTTP/JSON dump.
+#[test]
+fn two_concurrent_resumes_of_the_same_execution_exactly_one_succeeds() {
+    let root = TempRoot::new();
+    let id = pause_a_fresh_execution(&root);
+    let root_path = root.path().to_path_buf();
+
+    let path_a = root_path.clone();
+    let id_a = id.clone();
+    let thread_a = std::thread::spawn(move || cli_at(&path_a, &["resume", &id_a]));
+
+    let path_b = root_path.clone();
+    let id_b = id.clone();
+    let thread_b = std::thread::spawn(move || cli_at(&path_b, &["resume", &id_b]));
+
+    let result_a = thread_a.join().expect("resume thread a");
+    let result_b = thread_b.join().expect("resume thread b");
+
+    let successes = [&result_a, &result_b]
+        .into_iter()
+        .filter(|invocation| invocation.code == EXIT_SUCCESS)
+        .count();
+    assert_eq!(
+        successes, 1,
+        "exactly one resume must succeed: a={result_a:?} b={result_b:?}"
+    );
+
+    let failure = if result_a.code != EXIT_SUCCESS {
+        &result_a
+    } else {
+        &result_b
+    };
+    assert_eq!(failure.code, EXIT_FAILURE, "a={result_a:?} b={result_b:?}");
+    assert!(
+        !failure.output().contains('{'),
+        "must be a readable sentence, not a raw JSON/HTTP body: {}",
+        failure.output()
+    );
+    assert!(
+        failure.output().to_lowercase().contains("already"),
+        "must explain the conflict in words: {}",
+        failure.output()
+    );
+
+    // Whichever one drove it, the execution still reaches its terminal
+    // state — the race decided who drove it, not whether it finished.
+    let shown = cli(&root, &["show", &id]);
+    assert!(shown.stdout.contains("Status:        completed"));
 }

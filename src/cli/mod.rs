@@ -37,7 +37,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::Resolved;
+use crate::config::{Flags, Resolved};
 
 /// The command did what it was asked.
 pub const EXIT_SUCCESS: i32 = 0;
@@ -382,22 +382,34 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
     // Handed out one at a time rather than as one root, because that is the
     // whole point: a subcommand that is given a root it does not use is a
     // subcommand that can write somewhere it has no business writing.
+    // Built once, from the same raw flags `main` resolved `config` from
+    // (`--root`/`--config`), for every command below that has to hand a
+    // daemon it discovers-or-launches the same roots this process itself
+    // resolved (`ensure_daemon_running`'s contract) — see `cli.root`/
+    // `cli.config`'s own doc comments on why the raw flag, not the resolved
+    // path, is what a spawned daemon's argv needs.
+    let flags = Flags {
+        root: cli.root.clone(),
+        config: cli.config.clone(),
+    };
     let catalog = config.catalog_dir().to_path_buf();
     let state = config.state_dir().to_path_buf();
     let outcome = match cli.command {
         Command::Validate { workflow } => commands::validate(&catalog, &workflow),
-        Command::Run { workflow, inputs } => commands::run(&config, &workflow, &inputs).await,
+        Command::Run { workflow, inputs } => {
+            commands::run(&config, &flags, &workflow, &inputs).await
+        }
         Command::List => commands::list(&state),
         Command::Show { execution_id } => commands::show(&state, &execution_id),
         Command::Events {
             execution_id,
             follow,
-        } => commands::events(&state, &execution_id, follow).await,
-        Command::Steps { execution_id } => commands::steps(&state, &execution_id),
+        } => commands::events(&state, &flags, &execution_id, follow).await,
+        Command::Steps { execution_id } => commands::steps(&state, &flags, &execution_id).await,
         Command::Conversation {
             execution_id,
             attempt_id,
-        } => commands::conversation(&state, &execution_id, &attempt_id),
+        } => commands::conversation(&state, &flags, &execution_id, &attempt_id).await,
         Command::Input {
             execution_id,
             fields,
@@ -405,7 +417,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             file,
         } => commands::input(&config, &execution_id, &fields, label, file.as_deref()).await,
         Command::Resume { execution_id, file } => {
-            commands::resume(&config, &execution_id, file.as_deref()).await
+            commands::resume(&config, &flags, &execution_id, file.as_deref()).await
         }
         Command::Workflow { command } => match command {
             WorkflowCommand::List => commands::workflow_list(&catalog),

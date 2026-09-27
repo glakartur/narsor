@@ -525,8 +525,17 @@ fn three_roots_pointed_apart_each_hold_only_what_belongs_to_them() {
          mounted read-only and shared between pods"
     );
 
-    // The state root holds executions and nothing else.
-    assert_eq!(entries_of(&state), vec!["executions".to_string()]);
+    // The state root holds executions, and — since U6 — the daemon `run`
+    // transparently discovered-or-launched (AE2) also left its discovery
+    // file and its detached log there; nothing else.
+    assert_eq!(
+        entries_of(&state),
+        vec![
+            "daemon.json".to_string(),
+            "executions".to_string(),
+            "narsor.log".to_string(),
+        ]
+    );
 
     // The work root holds checkouts and nothing else.
     assert_eq!(entries_of(&work), vec!["tasks".to_string()]);
@@ -596,7 +605,11 @@ fn the_data_dir_variable_cannot_be_ignored_in_silence() {
         invocation.stderr
     );
     for successor in ["catalog_dir", "state_dir", "work_dir"] {
-        assert!(invocation.stderr.contains(successor), "{}", invocation.stderr);
+        assert!(
+            invocation.stderr.contains(successor),
+            "{}",
+            invocation.stderr
+        );
     }
 }
 

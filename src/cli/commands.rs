@@ -29,22 +29,24 @@
 use std::path::Path;
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use serde_json::{Map, Value};
 
+use crate::api::{ApiClient, ClientError, ConversationResponse, ExecutionSummary};
 use crate::domain::{
-    Event, ExecutionStatus, InputParameter, ParamType, WorkflowDefinition, WorkflowExecution,
+    Event, EventData, ExecutionStatus, InputParameter, ParamType, WorkflowDefinition,
+    WorkflowExecution,
 };
 use crate::engine::{
-    build_timeline, ConversationState, Engine, HumanInputDelivery, PendingHumanInput, Position,
-    PositionStatus,
+    ConversationState, Engine, HumanInputDelivery, PendingHumanInput, Position, PositionStatus,
 };
-use crate::persistence::{ConversationEntry, ExecutionStore, StatePaths};
+use crate::persistence::{ExecutionStore, StatePaths};
 use crate::registry::{infer_provider, RepositoryEntry, RepositoryRegistry};
 use crate::tasks::{self, TaskError};
 use crate::tui::conversation::classify;
 use crate::workflows::{builtin, builtin_names, ResolvedWorkflow, WorkflowResolver};
 
-use crate::config::{render_value, Resolved, SettingKey, Source};
+use crate::config::{render_value, Flags, Resolved, SettingKey, Source};
 
 use super::{ConfigFormat, EXIT_FAILURE, EXIT_USAGE};
 
@@ -134,10 +136,28 @@ fn violation_noun(count: usize) -> &'static str {
 
 /// `narsor run <workflow> [--input k=v]…` — create an execution and run
 /// it.
-pub async fn run(config: &Resolved, reference: &str, inputs: &[String]) -> Result<()> {
-    // The one command that needs all three, and it takes them one by one: the
-    // definition and the registry come from the catalogue, the execution is
-    // written to the state root, and the checkout lands in the work tree.
+///
+/// No longer constructs `Engine`/`ExecutionStore` itself (R4/D52): it
+/// discovers or transparently launches a daemon
+/// ([`crate::api::ensure_daemon_running`], AE2) and drives the rest of this
+/// command entirely as that daemon's REST client — `POST /tasks`, then
+/// blocking until the execution stops needing a driver
+/// ([`wait_until_stopped`]).
+///
+/// The workflow reference is still resolved and its definition still loaded
+/// locally first, exactly as before: that is what lets a missing/invalid
+/// definition or a missing required input be reported before anything talks
+/// to the daemon at all (unchanged from the pre-daemon behaviour). The
+/// *reference string itself* — not the locally resolved name — is what goes
+/// over the wire, so the daemon repeats exactly the same resolution
+/// (`WorkflowResolver::resolve`) this process just did, including the
+/// "an existing file wins" case for a bespoke local path.
+pub async fn run(
+    config: &Resolved,
+    flags: &Flags,
+    reference: &str,
+    inputs: &[String],
+) -> Result<()> {
     let catalog = config.catalog_dir();
     let resolved = resolve_workflow(catalog, reference)?;
     eprintln!("Workflow '{}' — {}.", resolved.name, resolved.origin);
@@ -156,41 +176,24 @@ pub async fn run(config: &Resolved, reference: &str, inputs: &[String]) -> Resul
     // anything is written to disk.
     let inputs = collect_inputs(&definition, inputs)?;
 
-    let engine = Engine::new(ExecutionStore::new(config.state_dir()))
-        .with_agent_defaults(config.agent_defaults());
+    let client = daemon_client(config.state_dir(), flags).await?;
+
+    let started = client
+        .start_task(reference, inputs)
+        .await
+        .map_err(|error| CliError::failure(format!("Could not start the workflow: {error}")))?;
     // The new id is announced the moment it exists, so that a failing clone
     // still tells the operator which execution to look at.
-    let execution =
-        tasks::start_task_with(
-            catalog,
-            config.work_dir(),
-            &engine,
-            &definition,
-            &resolved,
-            inputs,
-            |execution| {
-                println!("Created execution: {}", execution.id);
-            },
-        )
-        .map_err(|error| CliError::failure(error.to_string()))?;
+    println!("Created execution: {}", started.execution_id);
 
-    let execution = engine
-        .run(&definition, &execution.id)
-        .await
-        .map_err(|error| CliError::failure(format!("Engine error: {error}")))?;
+    let summary = wait_until_stopped(&client, &started.execution_id).await?;
+    print_summary(&summary);
+    print_pending_input_if_any(&client, &started.execution_id, &summary).await?;
 
-    print_execution_summary(&execution);
-    if let Some(pending) = engine
-        .pending_input(&execution.id)
-        .map_err(|error| CliError::failure(format!("Engine error: {error}")))?
-    {
-        print_pending_input(&pending);
-    }
-
-    if execution.status == ExecutionStatus::Failed {
+    if summary.status == ExecutionStatus::Failed {
         return Err(CliError::failure(format!(
             "Execution {} failed.",
-            execution.id
+            summary.id
         )));
     }
     Ok(())
@@ -367,28 +370,35 @@ pub fn show(state: &Path, execution_id: &str) -> Result<()> {
 }
 
 /// `narsor events <id> [--follow]` — the event log, in sequence order.
-pub async fn events(state: &Path, execution_id: &str, follow: bool) -> Result<()> {
-    let store = ExecutionStore::new(state);
+///
+/// Reads through `ApiClient` (R4/D52) instead of `ExecutionStore` directly —
+/// the same `GET /executions/:id/events` endpoint the TUI's task view uses —
+/// so `after` is the highest sequence number already printed, not a count to
+/// skip.
+pub async fn events(state: &Path, flags: &Flags, execution_id: &str, follow: bool) -> Result<()> {
+    let client = daemon_client(state, flags).await?;
     // Fails early and readably when the id is unknown.
-    let mut execution = load_execution(&store, execution_id)?;
+    let mut summary = load_execution_summary(&client, execution_id).await?;
 
-    let mut printed = 0usize;
+    let mut after = 0u64;
     loop {
-        let events = store
-            .event_log(execution_id)
-            .read_all()
-            .map_err(|error| CliError::failure(format!("Could not read the events: {error}")))?;
+        let events = client
+            .events(execution_id, after)
+            .await
+            .map_err(|error| client_error(execution_id, error))?;
 
-        for event in events.iter().skip(printed) {
+        for event in &events {
             print_event(event);
         }
-        printed = events.len();
+        if let Some(last) = events.last() {
+            after = last.sequence;
+        }
 
-        if !follow || is_final(&execution.status) {
+        if !follow || is_final(&summary.status) {
             break;
         }
         tokio::time::sleep(FOLLOW_INTERVAL).await;
-        execution = load_execution(&store, execution_id)?;
+        summary = load_execution_summary(&client, execution_id).await?;
     }
     Ok(())
 }
@@ -423,21 +433,17 @@ fn event_type(event: &Event) -> String {
 
 /// `narsor steps <id>` — the step timeline, one line per attempt.
 ///
-/// Reads through exactly the same function the embedded API's `/timeline`
-/// endpoint calls ([`build_timeline`]), directly against the store — the same
-/// way `events` already reads the log directly rather than over HTTP. The CLI
-/// never talks to the embedded API: that server exists for the TUI's task
-/// view (U5/U7), and the parity principle this unit implements means every
-/// read it offers must also be reachable without a running TUI process.
-pub fn steps(state: &Path, execution_id: &str) -> Result<()> {
-    let store = ExecutionStore::new(state);
-    let execution = load_execution(&store, execution_id)?;
-    let events = store
-        .event_log(execution_id)
-        .read_all()
-        .map_err(|error| CliError::failure(format!("Could not read the events: {error}")))?;
-    let presence = conversation_presence(&store, execution_id)?;
-    let timeline = build_timeline(&events, execution.status, &presence);
+/// Reads through `ApiClient` (R4/D52) — `GET /executions/:id/timeline`,
+/// which computes the same [`crate::engine::build_timeline`] fold server-side. The CLI and
+/// the TUI's task view (U7) can therefore never compute a different answer
+/// for the same execution: both are just callers of the one server-side
+/// computation now.
+pub async fn steps(state: &Path, flags: &Flags, execution_id: &str) -> Result<()> {
+    let client = daemon_client(state, flags).await?;
+    let timeline = client
+        .timeline(execution_id)
+        .await
+        .map_err(|error| client_error(execution_id, error))?;
 
     if timeline.positions.is_empty() {
         println!("No steps.");
@@ -504,66 +510,57 @@ fn position_status_name(status: PositionStatus) -> &'static str {
     }
 }
 
-/// Every attempt id with a conversation record on disk, open or closed.
-///
-/// The same question [`crate::api::routes`]'s `get_timeline` handler answers
-/// for [`build_timeline`]'s `conversation_presence` argument — both delegate
-/// to [`crate::persistence::ConversationStore::recorded_attempt_ids`] so the
-/// two can never compute a different answer for the same execution.
-fn conversation_presence(
-    store: &ExecutionStore,
-    execution_id: &str,
-) -> Result<std::collections::HashSet<String>> {
-    store
-        .conversation_store(execution_id)
-        .recorded_attempt_ids()
-        .map_err(|error| CliError::failure(format!("Could not read conversation records: {error}")))
-}
-
 /// `narsor conversation <id> <attempt>` — one attempt's conversation, in
 /// order, in full (R9: nothing is truncated).
 ///
-/// Reads through [`crate::persistence::ConversationStore::read`] directly, the
-/// same store the embedded API's `/conversation` endpoint wraps — again, no
-/// HTTP involved. Every entry is printed classified ([`classify`], reused
+/// Reads through `ApiClient` (R4/D52) — `GET
+/// /executions/:id/attempts/:attempt/conversation` — with `byte_budget:
+/// usize::MAX`, which the server-side read never actually reaches (an
+/// attempt's conversation is nowhere near [`usize::MAX`] bytes), so this is
+/// one request, not a paginated loop, exactly as the direct store read used
+/// to be one call. Every entry is printed classified ([`classify`], reused
 /// as-is from the TUI's task view, U7) for readability, but the classified
 /// text is always the entry's full decoded content, never a summary — the
 /// raw-and-complete requirement holds regardless of the kind sniffed from it.
-pub fn conversation(state: &Path, execution_id: &str, attempt_id: &str) -> Result<()> {
-    let store = ExecutionStore::new(state);
-    load_execution(&store, execution_id)?;
+pub async fn conversation(
+    state: &Path,
+    flags: &Flags,
+    execution_id: &str,
+    attempt_id: &str,
+) -> Result<()> {
+    let client = daemon_client(state, flags).await?;
+    load_execution_summary(&client, execution_id).await?;
 
-    let conversations = store.conversation_store(execution_id);
-    let snapshot = conversations
-        .read(attempt_id, 1, usize::MAX)
-        .map_err(|error| CliError::failure(format!("Could not read the conversation: {error}")))?
-        .ok_or_else(|| {
-            CliError::failure(format!(
-                "No conversation record for attempt '{attempt_id}' in execution '{execution_id}'."
-            ))
-        })?;
+    let response = client
+        .conversation(execution_id, attempt_id, 1, usize::MAX)
+        .await
+        .map_err(|error| client_error(execution_id, error))?;
 
-    for entry in &snapshot.entries {
-        print_conversation_entry(entry);
+    match response {
+        ConversationResponse::Recorded {
+            entries,
+            truncated_tail,
+            ..
+        } => {
+            for entry in &entries {
+                print_conversation_entry(entry);
+            }
+            if truncated_tail {
+                println!(
+                    "(the last line on disk was incomplete — the attempt was interrupted mid-write)"
+                );
+            }
+            Ok(())
+        }
+        ConversationResponse::NoRecord => Err(CliError::failure(format!(
+            "No conversation record for attempt '{attempt_id}' in execution '{execution_id}'."
+        ))),
     }
-    if snapshot.truncated_tail {
-        println!("(the last line on disk was incomplete — the attempt was interrupted mid-write)");
-    }
-    Ok(())
 }
 
 /// One conversation entry: number, timestamp, source/kind, decoded content.
-fn print_conversation_entry(entry: &ConversationEntry) {
-    use base64::engine::general_purpose::STANDARD as BASE64;
-    use base64::Engine as _;
-
-    let dto = crate::api::ConversationEntryDto {
-        entry_number: entry.entry_number,
-        timestamp: entry.timestamp,
-        source: entry.source,
-        raw_base64: BASE64.encode(&entry.raw),
-    };
-    let classified = classify(&dto);
+fn print_conversation_entry(entry: &crate::api::ConversationEntryDto) {
+    let classified = classify(entry);
     println!(
         "{:>5}  {}  {:<10} {}",
         classified.entry_number,
@@ -641,32 +638,52 @@ pub async fn input(
 }
 
 /// `narsor resume <id>` — continue a paused execution.
+///
+/// Goes through `ApiClient` (R4/D52): `POST /executions/:id/resume`, then
+/// [`wait_until_stopped`], exactly like [`run`]'s own tail end. A `409` from
+/// the daemon — another driver (the TUI, another `resume`/`run`) already
+/// holds this execution (R11/AE4) — is reported as a readable sentence via
+/// [`client_error`], never a raw HTTP status.
+///
+/// `--file` has no REST equivalent: the daemon always resolves the workflow
+/// from the execution's own recorded metadata
+/// (`tasks::resolve_definition`), the same way `resume` without `--file`
+/// already did — there is no way for a REST caller to point the daemon at a
+/// local override path it has no filesystem relationship to (see
+/// `src/api/routes.rs`'s `load_definition_for`). Passing `--file` is
+/// refused with a usage error rather than silently ignored, so an operator
+/// relying on it to work around a moved definition is told plainly, not left
+/// wondering why it had no effect.
 pub async fn resume(
     config: &Resolved,
+    flags: &Flags,
     execution_id: &str,
     definition_file: Option<&str>,
 ) -> Result<()> {
-    let store = ExecutionStore::new(config.state_dir());
-    let execution = load_execution(&store, execution_id)?;
-    let definition = definition_for(
-        config.catalog_dir(),
-        store.paths(),
-        &execution,
-        definition_file,
-    )?;
+    if let Some(file) = definition_file {
+        return Err(CliError::usage(format!(
+            "'--file {file}' is not supported for 'resume': the daemon always resolves the \
+             workflow from the execution's own record, with no way for a REST call to point it \
+             at a local override path."
+        )));
+    }
 
-    let engine = Engine::new(store).with_agent_defaults(config.agent_defaults());
-    let execution = engine
-        .resume(&definition, execution_id)
+    let client = daemon_client(config.state_dir(), flags).await?;
+
+    client
+        .resume(execution_id)
         .await
-        .map_err(|error| CliError::failure(format!("Could not resume the execution: {error}")))?;
+        .map_err(|error| client_error(execution_id, error))?;
 
-    println!("Resumed execution {}.", execution.id);
-    print_execution_summary(&execution);
-    if execution.status == ExecutionStatus::Failed {
+    let summary = wait_until_stopped(&client, execution_id).await?;
+
+    println!("Resumed execution {}.", summary.id);
+    print_summary(&summary);
+    print_pending_input_if_any(&client, execution_id, &summary).await?;
+    if summary.status == ExecutionStatus::Failed {
         return Err(CliError::failure(format!(
             "Execution {} failed.",
-            execution.id
+            summary.id
         )));
     }
     Ok(())
@@ -942,13 +959,11 @@ pub fn tui(config: &Resolved) -> Result<()> {
     tokio::task::block_in_place(move || {
         handle.block_on(crate::tui::run(store, catalog, work, defaults))
     })
-    .map_err(
-        |error| {
-            CliError::failure(format!(
-                "The terminal interface stopped with an error: {error}"
-            ))
-        },
-    )
+    .map_err(|error| {
+        CliError::failure(format!(
+            "The terminal interface stopped with an error: {error}"
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,11 +1021,198 @@ fn resolve_workflow(catalog: &Path, reference: &str) -> Result<ResolvedWorkflow>
 
 /// Status, current state and — when it stopped — the outcome.
 fn print_execution_summary(execution: &WorkflowExecution) {
-    println!("Status: {}", status_name(&execution.status));
-    println!(
-        "Current state: {}",
-        execution.current_state.as_deref().unwrap_or("-")
-    );
+    print_status_line(&execution.status, execution.current_state.as_deref());
+}
+
+/// The REST counterpart of [`print_execution_summary`]: same two lines, from
+/// an [`ExecutionSummary`] the daemon answered with instead of a
+/// [`WorkflowExecution`] read straight off the store.
+fn print_summary(summary: &ExecutionSummary) {
+    print_status_line(&summary.status, summary.current_state.as_deref());
+}
+
+/// The two lines both of the above print, factored out so `run`/`resume`
+/// print byte-for-byte what they always did regardless of which of the two
+/// shapes above they are holding.
+fn print_status_line(status: &ExecutionStatus, current_state: Option<&str>) {
+    println!("Status: {}", status_name(status));
+    println!("Current state: {}", current_state.unwrap_or("-"));
+}
+
+// ---------------------------------------------------------------------------
+// daemon client (U6)
+// ---------------------------------------------------------------------------
+
+/// Discovers a running daemon for `state`'s state root, or transparently
+/// launches one (AE2) — the one entry point every command above goes
+/// through instead of constructing `Engine`/`ExecutionStore` itself (R4).
+async fn daemon_client(state: &Path, flags: &Flags) -> Result<ApiClient> {
+    let paths = StatePaths::new(state);
+    crate::api::ensure_daemon_running(&paths, flags)
+        .await
+        .map_err(|error| CliError::failure(format!("Could not reach the narsor daemon: {error}")))
+}
+
+/// Turns a [`ClientError`] into the message an operator sees, naming the
+/// execution the call was about.
+///
+/// [`ClientError::Conflict`] (a `409`) is the one case this unit's test
+/// scenarios call out by name: another driver — another `resume`/`run`, or
+/// the TUI once U7 migrates it — already holds this execution (R11/AE4).
+/// Reported as a plain sentence, never the raw `409` or a JSON body, exactly
+/// as every other variant below already is.
+fn client_error(execution_id: &str, error: ClientError) -> CliError {
+    match error {
+        ClientError::Conflict => CliError::failure(format!(
+            "Execution '{execution_id}' is already being driven by another process right now \
+             (another 'run'/'resume', or the TUI) — try again once it settles."
+        )),
+        ClientError::NotFound => CliError::failure(format!(
+            "Could not load execution '{execution_id}': not found"
+        )),
+        ClientError::Unauthorized => {
+            CliError::failure("The narsor daemon rejected the request: bad token".to_string())
+        }
+        ClientError::Unavailable(detail) => {
+            CliError::failure(format!("Could not reach the narsor daemon: {detail}"))
+        }
+        ClientError::Server(detail) => {
+            CliError::failure(format!("The narsor daemon reported an error: {detail}"))
+        }
+    }
+}
+
+/// `execution_id`'s summary, or `None` if the daemon does not know it —
+/// `GET /executions`, filtered client-side (there is no single-execution GET
+/// endpoint; every existing caller of that list is small enough that this is
+/// not worth adding one for).
+async fn find_execution(
+    client: &ApiClient,
+    execution_id: &str,
+) -> Result<Option<ExecutionSummary>> {
+    let listing = client
+        .list_executions()
+        .await
+        .map_err(|error| client_error(execution_id, error))?;
+    Ok(listing
+        .executions
+        .into_iter()
+        .find(|execution| execution.id == execution_id))
+}
+
+/// [`find_execution`], turning "not found" into the same readable message
+/// [`load_execution`] (the direct-store version, still used by
+/// `list`/`show`/`input`) reports — the REST counterpart of that helper.
+async fn load_execution_summary(
+    client: &ApiClient,
+    execution_id: &str,
+) -> Result<ExecutionSummary> {
+    find_execution(client, execution_id).await?.ok_or_else(|| {
+        CliError::failure(format!(
+            "Could not load execution '{execution_id}': not found"
+        ))
+    })
+}
+
+/// How often [`wait_until_stopped`] asks the daemon directly whether
+/// `execution_id` is still `Running`, as a bound on how long it can ever be
+/// waiting on an SSE event that will never come — see that function's doc
+/// comment for why that bound is needed at all, not just an optimisation.
+const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Blocks until `execution_id` is no longer `Running`, returning its final
+/// summary. This is the shared tail of [`run`] and [`resume`]: both start a
+/// pass driving an execution over REST and then need to wait, exactly as
+/// they always blocked on `Engine::run`/`Engine::resume` directly before
+/// this unit.
+///
+/// # Why this polls `GET /executions` at all, rather than only watching SSE
+///
+/// The obvious shape — drain `client.stream_execution(execution_id)` until
+/// it ends itself on a terminal event — has a real race this command cannot
+/// let an operator hit: `POST /tasks`/`POST /executions/:id/resume` both
+/// answer `202` the instant the execution is created/claimed and hand the
+/// actual run to a background `tokio::spawn`, which can start — and, for a
+/// trivial workflow, finish — before this call's *next* HTTP request (the
+/// SSE connection) ever reaches the daemon. `Engine::subscribe()`'s
+/// broadcast channel has no replay: a subscriber only ever sees events
+/// published after it connects, so a stream that connects after the
+/// execution already settled would wait forever for an event that was
+/// already sent. Also, the two ways a workflow parks (an operator pause —
+/// `WorkflowPaused` — or a question raised — `HumanInputRequested`, from
+/// `human::suspend`) are not among the three events
+/// [`ApiClient::stream_execution`] treats as terminal, since that contract
+/// was written for the workflow-*finishes* case (AE5) alone.
+///
+/// So the SSE stream here is only ever a low-latency wake-up: every loop
+/// iteration checks the authoritative status directly first and returns the
+/// moment it is not `Running`, and only *then* waits (bounded by
+/// [`STATUS_POLL_INTERVAL`]) for the stream to say something, so as not to
+/// busy-poll. Once the stream ends — on its own terminal event, or because
+/// the connection dropped — this falls back to a plain, bounded sleep for
+/// the rest of the wait. Either way, the wait can never exceed
+/// [`STATUS_POLL_INTERVAL`] past the moment the execution actually stopped.
+async fn wait_until_stopped(client: &ApiClient, execution_id: &str) -> Result<ExecutionSummary> {
+    let mut stream = Some(Box::pin(client.stream_execution(execution_id)));
+    loop {
+        if let Some(summary) = find_execution(client, execution_id).await? {
+            if summary.status != ExecutionStatus::Running {
+                return Ok(summary);
+            }
+        }
+
+        match &mut stream {
+            // Wait for the stream to say *something* — any event at all, not
+            // only a stopping one — or for the bound to elapse; either way,
+            // loop back around to the authoritative status check above.
+            // `Ok(None)` means the stream ended on its own (its terminal
+            // event, or the connection dropping): stop polling it, a
+            // finished stream would otherwise just return `None` forever.
+            Some(active) => match tokio::time::timeout(STATUS_POLL_INTERVAL, active.next()).await {
+                Ok(None) => stream = None,
+                Ok(Some(_)) | Err(_) => {}
+            },
+            None => tokio::time::sleep(STATUS_POLL_INTERVAL).await,
+        }
+    }
+}
+
+/// Prints the "Human input expected: …" line [`run`]/[`resume`] always
+/// printed when a pass stops on a question, if `summary` says the
+/// execution is `Paused` right now.
+///
+/// There is no REST endpoint that hands back the full form a question
+/// declares (fields, types, allowed values, output labels) — only
+/// [`crate::engine::human::pending_input`], reachable through
+/// `ExecutionStore` directly, has that (see `input`, still unmigrated).
+/// Reading the event log instead ([`ClientError`]-mapped, same as every
+/// other call here) recovers the one piece every operator actually needs
+/// immediately — the instruction text — from the `HumanInputRequested`
+/// event `human::suspend` appends right before parking the execution: that
+/// event is the log's very last entry exactly when this applies, since
+/// nothing else is appended between it and the question being answered.
+/// An operator-requested pause (`WorkflowPaused`, `Engine::pause_now`) has
+/// no such event and prints nothing here, matching
+/// `engine.pending_input()` returning `None` for that case before this
+/// unit.
+async fn print_pending_input_if_any(
+    client: &ApiClient,
+    execution_id: &str,
+    summary: &ExecutionSummary,
+) -> Result<()> {
+    if summary.status != ExecutionStatus::Paused {
+        return Ok(());
+    }
+    let events = client
+        .events(execution_id, 0)
+        .await
+        .map_err(|error| client_error(execution_id, error))?;
+    if let Some(EventData::HumanInputRequested { instruction }) =
+        events.last().map(|event| &event.data)
+    {
+        println!("Human input expected: {instruction}");
+    }
+    Ok(())
 }
 
 /// The question an execution is waiting on, as a form the operator can fill in.
