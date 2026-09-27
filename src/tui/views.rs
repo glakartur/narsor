@@ -131,6 +131,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Modal::RepositoryForm(_) => render_repository_form_modal(frame, app),
         Modal::RepositoryRemove(_) => render_repository_remove_modal(frame, app),
         Modal::NewTask(_) => render_new_task_modal(frame, app),
+        Modal::HarnessSelection(_) => render_harness_selection_modal(frame, app),
         Modal::Help => render_help_modal(frame),
     }
 }
@@ -884,6 +885,97 @@ fn render_repository_form_modal(frame: &mut Frame, app: &App) {
 }
 
 /// The confirmation a repository removal has to pass.
+/// The daemon-backed default harness picker.
+fn render_harness_selection_modal(frame: &mut Frame, app: &App) {
+    let Modal::HarnessSelection(picker) = app.modal() else {
+        return;
+    };
+    let area = modal_area(frame, 64, 54);
+    frame.render_widget(Clear, area);
+
+    let mut lines = Vec::new();
+    match &picker.snapshot {
+        None if picker.error.is_none() => {
+            lines.push(Line::from(Span::styled(
+                "Loading the daemon's harness selection…",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        None => {}
+        Some(snapshot) => {
+            lines.push(Line::from(format!("Configured: {}", snapshot.configured)));
+            lines.push(Line::from(format!(
+                "Persistent override: {}",
+                snapshot.override_harness.as_deref().unwrap_or("none")
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("Effective default: {}", snapshot.effective),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            for (index, harness) in snapshot.supported.iter().enumerate() {
+                let active = harness == &snapshot.effective;
+                let selected = index == picker.selected;
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} {}{}",
+                        if selected { "›" } else { " " },
+                        harness,
+                        if active { " (effective)" } else { "" }
+                    ),
+                    if selected {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    },
+                )));
+            }
+            let reset_selected = picker.selected == snapshot.supported.len();
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} Use configured value{}",
+                    if reset_selected { "›" } else { " " },
+                    if snapshot.override_harness.is_none() {
+                        " (already active)"
+                    } else {
+                        ""
+                    }
+                ),
+                if reset_selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                },
+            )));
+        }
+    }
+
+    if let Some(error) = &picker.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            error,
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter applies the highlighted choice; Esc closes without changing it.",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Default agent harness ");
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn render_repository_remove_modal(frame: &mut Frame, app: &App) {
     let Modal::RepositoryRemove(confirm) = app.modal() else {
         return;

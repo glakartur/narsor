@@ -3228,3 +3228,67 @@ async fn two_tuis_connected_to_the_same_daemon_see_the_same_live_events() {
     wait_until_settled(&client_a, &[&execution.id]).await;
     drop(daemon);
 }
+
+// ---------------------------------------------------------------------------
+// U5: daemon-backed default harness picker
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn harness_picker_uses_confirmed_snapshots_for_set_reset_and_errors() {
+    let root = TempRoot::new();
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+
+    assert_eq!(
+        app.on_key(key(KeyCode::Char('h'))),
+        Request::LoadHarnessSelection
+    );
+    app.load_harness_selection().await;
+
+    let initial = match app.modal() {
+        Modal::HarnessSelection(picker) => picker.snapshot.clone().expect("loaded snapshot"),
+        other => panic!("expected harness picker, got {other:?}"),
+    };
+    assert!(initial.supported.iter().any(|harness| harness == "codex"));
+
+    app.set_harness_selection("codex".to_string()).await;
+    match app.modal() {
+        Modal::HarnessSelection(picker) => {
+            let snapshot = picker.snapshot.as_ref().expect("set snapshot");
+            assert_eq!(snapshot.effective, "codex");
+            assert_eq!(snapshot.override_harness.as_deref(), Some("codex"));
+        }
+        other => panic!("expected harness picker, got {other:?}"),
+    }
+
+    app.reset_harness_selection().await;
+    let confirmed_reset = match app.modal() {
+        Modal::HarnessSelection(picker) => {
+            let snapshot = picker.snapshot.clone().expect("reset snapshot");
+            assert_eq!(snapshot.override_harness, None);
+            assert_eq!(snapshot.effective, snapshot.configured);
+            snapshot
+        }
+        other => panic!("expected harness picker, got {other:?}"),
+    };
+
+    app.set_harness_selection("not-a-harness".to_string()).await;
+    match app.modal() {
+        Modal::HarnessSelection(picker) => {
+            assert_eq!(picker.snapshot.as_ref(), Some(&confirmed_reset));
+            assert!(picker
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("rejected")));
+        }
+        other => panic!("failed mutation must leave picker open, got {other:?}"),
+    }
+
+    // Esc is read-only; reopening later will make a fresh daemon request.
+    assert_eq!(app.on_key(key(KeyCode::Esc)), Request::None);
+    assert!(matches!(app.modal(), Modal::None));
+    assert_eq!(
+        client.harness_selection().await.expect("snapshot"),
+        confirmed_reset
+    );
+}

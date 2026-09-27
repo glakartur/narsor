@@ -151,7 +151,36 @@ fn classify_stdout_line(text: &str) -> EntryKind {
         "tool_use" => EntryKind::ToolCall,
         "step_start" | "step_finish" | "error" => EntryKind::System,
 
+        // Codex `exec --json`: lifecycle envelopes have dotted event names;
+        // item envelopes carry their conversational kind one level down.
+        "thread.started" | "turn.started" => EntryKind::System,
+        "turn.completed" => EntryKind::Result,
+        "turn.failed" => EntryKind::System,
+        "item.started" | "item.updated" | "item.completed" => {
+            classify_codex_item(&value, type_field).unwrap_or(EntryKind::Raw)
+        }
+
         _ => EntryKind::Raw,
+    }
+}
+
+/// Classifies Codex's nested `item` payload without altering the raw JSON
+/// shown by the conversation view. Completed tool items are results; all
+/// other appearances are calls in progress.
+fn classify_codex_item(value: &Value, event_type: &str) -> Option<EntryKind> {
+    let item_type = value.pointer("/item/type")?.as_str()?;
+    match item_type {
+        "agent_message" => Some(EntryKind::Assistant),
+        "reasoning" => Some(EntryKind::Thinking),
+        "command_execution" | "mcp_tool_call" | "web_search" | "file_change" => {
+            Some(if event_type == "item.completed" {
+                EntryKind::ToolResult
+            } else {
+                EntryKind::ToolCall
+            })
+        }
+        "error" => Some(EntryKind::System),
+        _ => None,
     }
 }
 

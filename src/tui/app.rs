@@ -78,7 +78,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Map, Value};
 
 use crate::api::{
-    ApiClient, ClientError, ConversationResponse, ExecutionSummary, TransitionRequest,
+    ApiClient, ClientError, ConversationResponse, ExecutionSummary, HarnessSelectionSnapshot,
+    TransitionRequest,
 };
 use crate::domain::{
     Context, Event, EventData, ExecutionStatus, HumanInputField, HumanInputType, InputParameter,
@@ -289,6 +290,13 @@ pub enum Request {
     /// Load the freshly selected position's content from scratch. Emitted
     /// whenever the axis' selection changes.
     TaskLoadSelected,
+    /// Fetch the daemon's authoritative default-harness snapshot for the
+    /// picker that was just opened.
+    LoadHarnessSelection,
+    /// Persist one picker entry as the daemon's default harness.
+    SetHarnessSelection { harness: String },
+    /// Remove the durable override and return to the configured default.
+    ResetHarnessSelection,
 }
 
 // ---------------------------------------------------------------------------
@@ -944,6 +952,50 @@ pub struct EventDetail {
     pub scroll: ScrollState,
 }
 
+/// The daemon-backed default-harness picker.
+///
+/// `snapshot` is deliberately absent while an open is loading: nothing in the
+/// TUI guesses the configured, overridden, or effective value.  A failed
+/// request leaves the modal open, so its error can be read and the operator
+/// can retry by closing and reopening it.
+#[derive(Debug, Clone)]
+pub struct HarnessSelectionModal {
+    /// The last server-confirmed selection, if a read or mutation succeeded.
+    pub snapshot: Option<HarnessSelectionSnapshot>,
+    /// Supported-harness row currently highlighted; `supported.len()` is the
+    /// final "use configured value" reset row.
+    pub selected: usize,
+    /// The most recent request failure, kept visible in the modal.
+    pub error: Option<String>,
+}
+
+impl HarnessSelectionModal {
+    fn loading() -> Self {
+        Self {
+            snapshot: None,
+            selected: 0,
+            error: None,
+        }
+    }
+
+    fn accept_snapshot(&mut self, snapshot: HarnessSelectionSnapshot) {
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|current| snapshot.revision < current.revision)
+        {
+            return;
+        }
+        self.selected = snapshot
+            .supported
+            .iter()
+            .position(|harness| harness == &snapshot.effective)
+            .unwrap_or(0);
+        self.snapshot = Some(snapshot);
+        self.error = None;
+    }
+}
+
 /// The overlay drawn on top of the layout, if any.
 #[derive(Debug, Clone)]
 pub enum Modal {
@@ -965,6 +1017,8 @@ pub enum Modal {
     RepositoryRemove(RepositoryRemoveConfirm),
     /// The form that starts a workflow.
     NewTask(Box<NewTaskForm>),
+    /// The daemon-backed default harness picker.
+    HarnessSelection(HarnessSelectionModal),
     /// The key map.
     Help,
 }
@@ -1417,6 +1471,9 @@ impl App {
                     ("Esc", "cancel"),
                 ],
             },
+            Modal::HarnessSelection(_) => {
+                vec![("j/k", "select"), ("Enter", "apply"), ("Esc", "close")]
+            }
             Modal::Help => vec![("Esc/?", "close")],
             Modal::None => {
                 let mut keys = vec![("Tab", "panel"), ("r", "refresh")];
@@ -1445,6 +1502,7 @@ impl App {
                     }
                 }
                 keys.push(("?", "help"));
+                keys.push(("h", "harness"));
                 keys.push(("q", "quit"));
                 keys
             }
@@ -1690,6 +1748,7 @@ impl App {
             Modal::RepositoryForm(_) => self.on_key_repository_form(key),
             Modal::RepositoryRemove(_) => self.on_key_repository_remove(key),
             Modal::NewTask(_) => self.on_key_new_task(key),
+            Modal::HarnessSelection(_) => self.on_key_harness_selection(key),
         }
     }
 
@@ -1758,6 +1817,10 @@ impl App {
             KeyCode::Char('R') => {
                 self.open_repository_list();
                 Request::None
+            }
+            KeyCode::Char('h') => {
+                self.modal = Modal::HarnessSelection(HarnessSelectionModal::loading());
+                Request::LoadHarnessSelection
             }
             KeyCode::Char('s') => Request::RunSelected,
             _ => Request::None,
@@ -2480,6 +2543,51 @@ impl App {
         }
     }
 
+    /// Keys inside the default harness picker.
+    fn on_key_harness_selection(&mut self, key: KeyEvent) -> Request {
+        let Modal::HarnessSelection(picker) = &mut self.modal else {
+            return Request::None;
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.modal = Modal::None;
+                Request::None
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let Some(snapshot) = &picker.snapshot else {
+                    return Request::None;
+                };
+                picker.selected = (picker.selected + 1) % (snapshot.supported.len() + 1);
+                Request::None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let Some(snapshot) = &picker.snapshot else {
+                    return Request::None;
+                };
+                let rows = snapshot.supported.len() + 1;
+                picker.selected = (picker.selected + rows - 1) % rows;
+                Request::None
+            }
+            KeyCode::Enter => {
+                let Some(snapshot) = &picker.snapshot else {
+                    return Request::None;
+                };
+                if picker.selected == snapshot.supported.len() {
+                    Request::ResetHarnessSelection
+                } else {
+                    snapshot
+                        .supported
+                        .get(picker.selected)
+                        .cloned()
+                        .map(|harness| Request::SetHarnessSelection { harness })
+                        .unwrap_or(Request::None)
+                }
+            }
+            _ => Request::None,
+        }
+    }
+
     /// Keys inside the repository listing.
     fn on_key_repositories(&mut self, key: KeyEvent) -> Request {
         let Modal::Repositories(list) = &mut self.modal else {
@@ -3197,6 +3305,45 @@ impl App {
                 self.notice = Some(Notice::error(message));
             }
         }
+    }
+
+    /// Loads the default-harness snapshot for an open picker.
+    pub async fn load_harness_selection(&mut self) {
+        match self.client.harness_selection().await {
+            Ok(snapshot) => self.accept_harness_snapshot(snapshot),
+            Err(error) => self.harness_selection_error(error),
+        }
+    }
+
+    /// Persists the selected harness and displays only the daemon's returned
+    /// snapshot — never the requested value optimistically.
+    pub async fn set_harness_selection(&mut self, harness: String) {
+        match self.client.set_harness_selection(&harness).await {
+            Ok(snapshot) => self.accept_harness_snapshot(snapshot),
+            Err(error) => self.harness_selection_error(error),
+        }
+    }
+
+    /// Removes the persistent override and displays the returned fallback.
+    pub async fn reset_harness_selection(&mut self) {
+        match self.client.reset_harness_selection().await {
+            Ok(snapshot) => self.accept_harness_snapshot(snapshot),
+            Err(error) => self.harness_selection_error(error),
+        }
+    }
+
+    fn accept_harness_snapshot(&mut self, snapshot: HarnessSelectionSnapshot) {
+        if let Modal::HarnessSelection(picker) = &mut self.modal {
+            picker.accept_snapshot(snapshot);
+        }
+    }
+
+    fn harness_selection_error(&mut self, error: ClientError) {
+        let message = format!("Could not update the default harness: {error}");
+        if let Modal::HarnessSelection(picker) = &mut self.modal {
+            picker.error = Some(message.clone());
+        }
+        self.notice = Some(Notice::error(message));
     }
 
     /// Puts the cursor on one execution, if the list holds it.

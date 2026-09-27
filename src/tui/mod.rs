@@ -245,6 +245,11 @@ pub async fn run(
                         Request::OpenTaskView => app.open_task_for_execution().await,
                         Request::TaskRefresh => app.refresh_task().await,
                         Request::TaskLoadSelected => app.load_task_position().await,
+                        Request::LoadHarnessSelection => app.load_harness_selection().await,
+                        Request::SetHarnessSelection { harness } => {
+                            app.set_harness_selection(harness).await
+                        }
+                        Request::ResetHarnessSelection => app.reset_harness_selection().await,
                     }
                 }
                 // A resize needs no state change: the next draw re-derives the

@@ -145,6 +145,42 @@ fn opencode_error_is_system() {
     );
 }
 
+// --- Codex JSONL shapes -----------------------------------------------------
+
+#[test]
+fn codex_messages_reasoning_tools_results_and_errors_are_distinguished() {
+    let cases = [
+        (
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}"#,
+            EntryKind::Assistant,
+        ),
+        (
+            r#"{"type":"item.updated","item":{"type":"reasoning","text":"because"}}"#,
+            EntryKind::Thinking,
+        ),
+        (
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"git status"}}"#,
+            EntryKind::ToolCall,
+        ),
+        (
+            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","status":"completed"}}"#,
+            EntryKind::ToolResult,
+        ),
+        (r#"{"type":"turn.completed","usage":{}}"#, EntryKind::Result),
+        (
+            r#"{"type":"turn.failed","error":"boom"}"#,
+            EntryKind::System,
+        ),
+    ];
+
+    for (raw, expected) in cases {
+        assert_eq!(
+            classify(&entry(ConversationSource::Stdout, raw)).kind,
+            expected
+        );
+    }
+}
+
 // --- fallback ----------------------------------------------------------------
 
 #[test]
