@@ -1,4 +1,4 @@
-//! Typed HTTP client for the embedded API (U5), the one thing U7's task view
+//! Typed HTTP client for the daemon API, the one thing U7's task view
 //! is meant to depend on for events, the timeline and conversations.
 //!
 //! # Why a distinct "API unavailable" error

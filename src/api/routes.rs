@@ -1,5 +1,4 @@
-//! Handlers for the three read-only endpoints, and the bearer-token gate in
-//! front of all of them.
+//! Handlers for the daemon API and its bearer-token gate.
 //!
 //! # Why these three shapes, and only these
 //!

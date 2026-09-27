@@ -1,4 +1,9 @@
-//! The embedded, read-only API server (U5).
+//! The daemon-owned local HTTP API.
+//!
+//! The daemon is the sole owner of [`crate::engine::Engine`] and its writable
+//! store. TUI and CLI clients use this API for reads, execution control, and
+//! the default-agent-harness setting. The historical rationale below predates
+//! the daemon migration; the current ownership contract is D53.
 //!
 //! # Why an API at all, when the TUI already has the store on disk
 //!
@@ -15,7 +20,7 @@
 //! serve` (M2) without the TUI or CLI changing how they ask for a timeline or
 //! a conversation — only where the answer comes from changes.
 //!
-//! # Why embedded in the TUI process for now, not `narsor serve`
+//! # Historical embedded-server rationale
 //!
 //! A standalone server process, a Unix socket, and caller identity (R29 in
 //! the distributed-narsor brainstorm) are all M2 concerns this plan
@@ -37,7 +42,7 @@
 //! process never writes the token to disk, and nothing to guess since it is
 //! a random UUID valid only for this process's lifetime.
 //!
-//! # Why read-only, and why that means no `Engine::is_active` check
+//! # Historical read-only rationale
 //!
 //! `docs/plans/2026-09-26-001-fix-tui-background-engine-runs-plan.md`
 //! established that anything which *drives* an execution — runs it, resumes
@@ -87,13 +92,13 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-/// Failure to start the embedded API server.
+/// Failure to start the local API server.
 #[derive(Debug)]
 pub struct ApiStartError(std::io::Error);
 
 impl fmt::Display for ApiStartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "could not start the embedded API server: {}", self.0)
+        write!(f, "could not start the local API server: {}", self.0)
     }
 }
 
@@ -103,7 +108,7 @@ impl std::error::Error for ApiStartError {
     }
 }
 
-/// A running embedded API server.
+/// A running local API server.
 ///
 /// Holds the [`JoinHandle`] of the task serving requests and a channel to
 /// signal it to stop. Unlike the earlier, embedded-in-the-TUI shape (U5),
@@ -187,7 +192,7 @@ impl ApiHandle {
     }
 }
 
-/// Starts the embedded API server over `engine`, on a random loopback port.
+/// Starts the local API server over `engine`, on a random loopback port.
 ///
 /// `catalog_dir`/`work_dir` are the daemon's own catalogue and work roots
 /// (U3): `POST /tasks` needs them to resolve a workflow reference and
