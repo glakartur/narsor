@@ -1,0 +1,277 @@
+//! "Discover a running daemon, or launch one" (U5): the client-side half of
+//! the sequence documented in the plan's "High-Level Technical Design"
+//! (AE2/AE3/AE4).
+//!
+//! [`ensure_daemon_running`] is the one entry point every client (CLI, TUI —
+//! U6/U7, not built yet) is meant to call before it ever talks to the API:
+//! it hands back a working [`ApiClient`], spawning a fresh daemon behind the
+//! scenes if (and only if) none was already running.
+//!
+//! # Why liveness alone ([`DaemonInfo::is_alive`]) is not enough
+//!
+//! A PID existing only means *some* process holds it — not that it is the
+//! daemon this crate started, still less that its HTTP server is actually
+//! answering. A PID can be reused by an unrelated process after the daemon
+//! that owned it died (AE3's "dead PID" is the easy case; the harder one,
+//! also covered here, is a *live* PID that answers to nothing narsor
+//! understands). So every branch below that is about to hand back a client
+//! for an *existing* discovery file first does a real, authenticated
+//! request — [`health_check`] — and only trusts the file if that succeeds
+//! too. A stale or wrong entry is treated exactly like no daemon at all:
+//! cleaned up, then handled by the spawn/lock path below.
+//!
+//! # Why a lock file, not just "check-then-spawn"
+//!
+//! Two clients discovering no daemon at (almost) the same moment must not
+//! both spawn one — two daemons would open the same on-disk store for write
+//! at once, exactly the hazard this whole plan exists to close off (see
+//! `src/persistence/daemon_info.rs`'s module doc and U1's Approach).
+//! `{state}/daemon.lock`, acquired via
+//! [`crate::persistence::write_atomic_exclusive`]'s `O_EXCL`-like semantics,
+//! makes "decide who spawns" atomic: exactly one caller ever observes
+//! `Ok(true)` for a given lock file. The loser does not spawn its own
+//! daemon — it polls [`paths.daemon_file()`](crate::persistence::StatePaths::daemon_file)
+//! the same way it would if it had found a live daemon on its very first
+//! read, on the theory that "someone else is already spawning" and "someone
+//! else has already spawned" are the same wait from this caller's point of
+//! view.
+
+use std::time::{Duration, Instant};
+
+use crate::config::Flags;
+use crate::daemon::launch::spawn_detached;
+use crate::persistence::{write_atomic_exclusive, DaemonInfo, PersistenceError, StatePaths};
+
+use super::client::ApiClient;
+
+/// How often the discovery poll (waiting for `daemon.json` to appear and
+/// answer) re-checks.
+///
+/// Short enough that a caller waiting on a daemon that starts in well under
+/// a second (the common case: bind a loopback socket, construct an
+/// in-memory `Engine`) does not feel it, long enough not to spin a busy
+/// loop against the filesystem.
+const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long [`ensure_daemon_running`] waits, in total, for a daemon (its own
+/// spawn, or one another racing caller is spawning) to become discoverable
+/// and answer a health check before giving up.
+///
+/// Generous relative to how long a daemon actually takes to start (well
+/// under a second in every observed run) because the plan's Verification
+/// asks for this to hold even under a concurrent-spawn race
+/// ([`ensure_daemon_running`]'s AE4-shaped scenario), where the losing
+/// caller is waiting on a whole extra process's worth of startup — `exec`,
+/// recovery sweep, socket bind — that its own path never pays for.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Content written to `daemon.lock`. Never read back — only its *existence*
+/// (via `write_atomic_exclusive`'s `O_EXCL` semantics) matters — but a lock
+/// file with recognisable content is friendlier to an operator who stumbles
+/// on it with `cat` while a spawn is in flight.
+const LOCK_FILE_CONTENTS: &[u8] = b"narsor daemon spawn in progress\n";
+
+/// A failure of the discover-or-launch protocol.
+#[derive(Debug)]
+pub enum DiscoveryError {
+    /// A filesystem operation (reading, writing, or removing one of the
+    /// discovery/lock files) failed for a reason other than the file simply
+    /// not being there yet.
+    Persistence(PersistenceError),
+    /// Detach-spawning a fresh daemon process failed at the OS level (e.g.
+    /// `current_exe()`, opening the log file, or the `fork`/`exec` itself).
+    Spawn(std::io::Error),
+    /// Waited [`DISCOVERY_TIMEOUT`] without ever seeing a discovery file
+    /// that both names a live PID and answers an authenticated health
+    /// check — whether this caller was the one spawning or was waiting on
+    /// another caller's spawn.
+    Timeout,
+}
+
+impl std::fmt::Display for DiscoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiscoveryError::Persistence(error) => {
+                write!(f, "could not read/write daemon discovery state: {error}")
+            }
+            DiscoveryError::Spawn(error) => {
+                write!(f, "could not launch the narsor daemon: {error}")
+            }
+            DiscoveryError::Timeout => write!(
+                f,
+                "timed out waiting for the narsor daemon to start and answer"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DiscoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DiscoveryError::Persistence(error) => Some(error),
+            DiscoveryError::Spawn(error) => Some(error),
+            DiscoveryError::Timeout => None,
+        }
+    }
+}
+
+impl From<PersistenceError> for DiscoveryError {
+    fn from(error: PersistenceError) -> Self {
+        DiscoveryError::Persistence(error)
+    }
+}
+
+/// Ensures a daemon is running against `paths`' state root and returns a
+/// client already configured to talk to it — discovering an existing one,
+/// or launching a fresh one, per the plan's sequence diagram.
+///
+/// `flags` supplies the `--root`/`--config` this process was itself invoked
+/// with, re-appended verbatim to the spawned daemon's own argv: a detached
+/// re-exec of the current binary does not lose the parent's environment,
+/// but relying on inherited environment alone here would be fragile, since
+/// the whole point of this call is that the spawned daemon must resolve
+/// exactly the same state root this caller did — not whatever a bare
+/// `narsor daemon` would default to.
+pub async fn ensure_daemon_running(
+    paths: &StatePaths,
+    flags: &Flags,
+) -> Result<ApiClient, DiscoveryError> {
+    let daemon_file = paths.daemon_file();
+
+    if let Ok(info) = DaemonInfo::read(&daemon_file) {
+        if info.is_alive() && health_check(&info).await {
+            return Ok(client_for(&info));
+        }
+        // Stale entry (dead PID — AE3) or a PID that answers to nothing
+        // narsor understands (a reused PID, or some unrelated process):
+        // clean it up and fall through to the spawn/lock path below, same
+        // as if no discovery file had ever existed.
+        let _ = std::fs::remove_file(&daemon_file);
+    }
+
+    let lock_file = paths.daemon_lock_file();
+    let won_the_lock = write_atomic_exclusive(&lock_file, LOCK_FILE_CONTENTS)?;
+
+    if won_the_lock {
+        let outcome = spawn_and_wait(paths, flags, &daemon_file).await;
+        // Cleaned up on every path out of this branch — success and
+        // failure alike — so a spawn that times out never leaves a
+        // permanent deadlock behind for the next caller (see U1's Approach
+        // on this same point).
+        let _ = std::fs::remove_file(&lock_file);
+        Ok(client_for(&outcome?))
+    } else {
+        // Someone else already won the lock and is spawning (or has just
+        // spawned) — this caller must not spawn its own daemon (the
+        // AE4-shaped race the plan calls out). Wait for their daemon
+        // exactly as it would wait for its own.
+        let info = poll_until_ready(&daemon_file, DISCOVERY_TIMEOUT).await?;
+        Ok(client_for(&info))
+    }
+}
+
+/// Builds the client [`ensure_daemon_running`] hands back, from a
+/// discovery record already proven live by [`health_check`].
+fn client_for(info: &DaemonInfo) -> ApiClient {
+    ApiClient::new(info.addr, info.token.clone())
+}
+
+/// The winning branch: launch a detached daemon, then wait for it to
+/// publish a discovery file that also answers a health check.
+async fn spawn_and_wait(
+    paths: &StatePaths,
+    flags: &Flags,
+    daemon_file: &std::path::Path,
+) -> Result<DaemonInfo, DiscoveryError> {
+    let args = daemon_launch_args(flags);
+    spawn_detached(args, &paths.log_file()).map_err(DiscoveryError::Spawn)?;
+    poll_until_ready(daemon_file, DISCOVERY_TIMEOUT).await
+}
+
+/// Builds the argv a spawned `narsor daemon` needs to resolve the same
+/// configuration as this process — see [`ensure_daemon_running`]'s doc on
+/// why this is spelled out explicitly rather than left to inherited
+/// environment.
+fn daemon_launch_args(flags: &Flags) -> Vec<String> {
+    let mut args = vec!["daemon".to_string()];
+    if let Some(root) = &flags.root {
+        args.push("--root".to_string());
+        args.push(path_to_arg(root));
+    }
+    if let Some(config) = &flags.config {
+        args.push("--config".to_string());
+        args.push(path_to_arg(config));
+    }
+    args
+}
+
+fn path_to_arg(path: &std::path::Path) -> String {
+    path.display().to_string()
+}
+
+/// Polls `daemon_file` until it both exists and names a daemon that answers
+/// an authenticated health check, or `timeout` elapses.
+///
+/// Used identically by the lock-winning branch (waiting on its own spawn)
+/// and the lock-losing branch (waiting on someone else's) — from this
+/// caller's point of view "I am waiting for a daemon to become ready" is
+/// the same operation either way.
+async fn poll_until_ready(
+    daemon_file: &std::path::Path,
+    timeout: Duration,
+) -> Result<DaemonInfo, DiscoveryError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(info) = DaemonInfo::read(daemon_file) {
+            if health_check(&info).await {
+                return Ok(info);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(DiscoveryError::Timeout);
+        }
+        tokio::time::sleep(DISCOVERY_POLL_INTERVAL).await;
+    }
+}
+
+/// A real, authenticated request against the address/token a discovery
+/// record names — the only way to tell "a live process happens to hold
+/// this PID" from "the narsor daemon is actually listening and accepting
+/// this token" (see the module doc). There is no unauthenticated `/health`
+/// endpoint (every route in this plan sits behind `require_token`), so this
+/// reuses an ordinary read endpoint, `GET /executions`, exactly as an
+/// ordinary [`ApiClient`] caller would.
+async fn health_check(info: &DaemonInfo) -> bool {
+    let client = client_for(info);
+    client.list_executions().await.is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn daemon_launch_args_reappends_root_and_config_flags() {
+        let flags = Flags {
+            root: Some(PathBuf::from("/tmp/some-root")),
+            config: Some(PathBuf::from("/tmp/some.toml")),
+        };
+        assert_eq!(
+            daemon_launch_args(&flags),
+            vec![
+                "daemon",
+                "--root",
+                "/tmp/some-root",
+                "--config",
+                "/tmp/some.toml",
+            ]
+        );
+    }
+
+    #[test]
+    fn daemon_launch_args_omits_flags_that_were_not_given() {
+        let flags = Flags::default();
+        assert_eq!(daemon_launch_args(&flags), vec!["daemon"]);
+    }
+}

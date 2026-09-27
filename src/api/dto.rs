@@ -19,7 +19,7 @@ use crate::domain::{ExecutionStatus, WorkflowExecution};
 /// — an existing file, `{catalog}/workflows/<name>.yaml`, the user directory,
 /// or a built-in name ([`crate::workflows::WorkflowResolver`]) — not a path
 /// the caller is expected to already have resolved.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartTaskRequest {
     /// The workflow to start.
     pub workflow: String,
@@ -62,7 +62,7 @@ pub struct AcceptedResponse {
 /// * `force: true` — `target` names the state to jump to directly, bypassing
 ///   the declared transition graph; the current state must declare
 ///   `allow_manual_override: true` (D30) or the request is rejected.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionRequest {
     /// The declared output label to take. Required (and validated against
     /// the current state's transitions) unless `force` is set.

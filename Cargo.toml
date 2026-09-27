@@ -62,3 +62,9 @@ base64 = "0.22"
 # embedded client itself (src/api/client.rs) only ever reads whole bodies and
 # does not use it.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+
+# Named explicitly so `src/api/client.rs`'s hand-rolled SSE parser can name
+# `bytes::Bytes` (the item type of `reqwest::Response::bytes_stream()`)
+# without going through reqwest's own re-export surface, which does not
+# expose it. Already pulled in transitively by reqwest/hyper.
+bytes = "1"

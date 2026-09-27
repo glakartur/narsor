@@ -1295,12 +1295,392 @@ async fn an_unsafe_execution_id_on_transition_is_rejected_like_not_found() {
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
-/// A local stand-in for [`TransitionRequest`], since that DTO only derives
-/// `Deserialize` (a handler only ever reads one) and these tests need to
-/// serialize a request body to send over the wire.
+/// A local stand-in for [`TransitionRequest`].
+///
+/// `TransitionRequest` itself gained `Serialize` in U5 (the client's own
+/// `transition` method needs it to send a request body), but these tests
+/// predate that and are left using their own copy rather than churning every
+/// call site.
 #[derive(serde::Serialize)]
 struct TransitionRequestBody {
     label: Option<String>,
     target: Option<String>,
     force: bool,
+}
+
+// ---------------------------------------------------------------------------
+// U5: `ApiClient`'s own mutating methods and SSE streaming
+// ---------------------------------------------------------------------------
+
+use futures::StreamExt as _;
+use narsor::api::TransitionRequest;
+
+#[tokio::test]
+async fn client_start_task_creates_an_execution_that_reaches_the_human_gate() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let client = handle.client();
+
+    let inputs = serde_json::json!({
+        "script_path": prepare_script_path().display().to_string(),
+        "ticket": "ORC-CLIENT-1",
+    })
+    .as_object()
+    .cloned()
+    .expect("object");
+
+    let response = client
+        .start_task(&pipeline_definition_path().display().to_string(), inputs)
+        .await
+        .expect("start_task");
+    assert!(store.exists(&response.execution_id));
+
+    wait_for_status(
+        &store,
+        &response.execution_id,
+        ExecutionStatus::Paused,
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn client_resume_drives_a_paused_execution_to_completion() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+
+    let (definition, definition_path) = write_script_to_done_workflow(&root);
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let execution = engine
+        .start(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start execution");
+    engine
+        .pause_now(&execution.id, "paused for the client resume test")
+        .expect("pause the execution");
+    pin_definition_path(&store, &execution.id, &definition_path);
+
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let client = handle.client();
+
+    let response = client.resume(&execution.id).await.expect("client resume");
+    assert_eq!(response.execution_id, execution.id);
+
+    wait_for_status(
+        &store,
+        &execution.id,
+        ExecutionStatus::Completed,
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn client_deliver_input_answers_a_waiting_execution() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+
+    let definition = load_from_file(pipeline_definition_path()).expect("load pipeline fixture");
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let execution = engine
+        .start(
+            &definition,
+            serde_json::json!({
+                "script_path": prepare_script_path().display().to_string(),
+                "ticket": "ORC-CLIENT-2",
+            }),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start execution");
+    pin_definition_path(&store, &execution.id, &pipeline_definition_path());
+
+    engine
+        .run(&definition, &execution.id)
+        .await
+        .expect("run to the human gate");
+    assert!(store.has_pending_input(&execution.id));
+
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let client = handle.client();
+
+    let delivery = HumanInputDelivery::with_values(
+        serde_json::json!({
+            "approval_status": "approved",
+            "comment": "looks good",
+        })
+        .as_object()
+        .cloned()
+        .expect("object"),
+    );
+
+    let response = client
+        .deliver_input(&execution.id, delivery)
+        .await
+        .expect("client deliver_input");
+    assert_eq!(response.execution_id, execution.id);
+
+    wait_for_status(
+        &store,
+        &execution.id,
+        ExecutionStatus::Completed,
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn client_transition_moves_a_waiting_execution_to_the_declared_target() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+
+    let (definition, definition_path) = write_transition_fixture(&root);
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let mut execution = engine
+        .start(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start execution");
+    execution.current_state = Some("waiting".to_string());
+    execution.status = ExecutionStatus::Paused;
+    store.save_execution(&execution).expect("save execution");
+    pin_definition_path(&store, &execution.id, &definition_path);
+
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let client = handle.client();
+
+    let summary = client
+        .transition(
+            &execution.id,
+            TransitionRequest {
+                label: Some("approve".to_string()),
+                target: None,
+                force: false,
+            },
+        )
+        .await
+        .expect("client transition");
+    assert_eq!(summary.current_state.as_deref(), Some("done"));
+    assert_eq!(summary.status, ExecutionStatus::Completed);
+}
+
+#[tokio::test]
+async fn client_list_executions_reports_every_stored_execution() {
+    let root = TempRoot::new();
+    let store = root.store();
+    seed_execution_with_retry(&store, "exec-list-1");
+    let execution_two = sample_execution("exec-list-2", ExecutionStatus::Paused);
+    store
+        .save_execution(&execution_two)
+        .expect("save execution two");
+
+    let handle = start_server(store).await;
+    let client = handle.client();
+
+    let listing = client.list_executions().await.expect("list_executions");
+    let ids: Vec<&str> = listing
+        .executions
+        .iter()
+        .map(|execution| execution.id.as_str())
+        .collect();
+    assert!(ids.contains(&"exec-list-1"));
+    assert!(ids.contains(&"exec-list-2"));
+}
+
+/// A `409` from a mutating endpoint maps to [`ClientError::Conflict`], not a
+/// generic [`ClientError::Server`] — covers the plan's explicit "not a
+/// generic Server error" test scenario, driven this time through the client
+/// method itself rather than a raw request.
+#[tokio::test]
+async fn client_resume_on_an_already_running_execution_maps_to_conflict() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+
+    let script_path = root.join("slow.sh");
+    fs::write(&script_path, "#!/bin/sh\nsleep 1\nexit 0\n").expect("write script");
+    let mut permissions = fs::metadata(&script_path).expect("stat").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("chmod");
+
+    let yaml = format!(
+        r#"
+name: api-client-conflict-fixture
+version: 1
+description: A slow script state, for the client-side 409-mapping test.
+
+states:
+  start:
+    action:
+      type: script
+      command: "{command}"
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  done:
+    description: Terminal.
+
+terminal_states:
+  done: completed
+"#,
+        command = script_path.display()
+    );
+    let definition_path = root.join("api-client-conflict-fixture.yaml");
+    fs::write(&definition_path, yaml).expect("write definition");
+    let definition = load_from_file(&definition_path).expect("load definition");
+
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let execution = engine
+        .start(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start execution");
+    engine
+        .pause_now(&execution.id, "paused for the client 409 test")
+        .expect("pause");
+    pin_definition_path(&store, &execution.id, &definition_path);
+
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let client = handle.client();
+
+    let (first, second) = tokio::join!(client.resume(&execution.id), client.resume(&execution.id));
+    let results = [first, second];
+
+    let accepted = results.iter().filter(|result| result.is_ok()).count();
+    let conflicts = results
+        .iter()
+        .filter(|result| matches!(result, Err(ClientError::Conflict)))
+        .count();
+    assert_eq!(
+        accepted, 1,
+        "exactly one resume must be accepted: {results:?}"
+    );
+    assert_eq!(
+        conflicts, 1,
+        "exactly one resume must map to ClientError::Conflict: {results:?}"
+    );
+
+    wait_for_status(
+        &store,
+        &execution.id,
+        ExecutionStatus::Completed,
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+/// AE5 from the client's own `stream_execution`: it yields every event up to
+/// and including the terminal one, and then ends on its own — `.next()`
+/// returns `None` — without the caller having to inspect events itself to
+/// know when to stop.
+#[tokio::test]
+async fn client_stream_execution_ends_itself_after_the_terminal_event() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+
+    let (definition, _definition_path) = write_script_to_done_workflow(&root);
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let execution = engine
+        .start(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start execution");
+
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let client = handle.client();
+
+    let stream = client.stream_execution(&execution.id);
+    tokio::pin!(stream);
+
+    // Give the stream a moment to actually connect and start polling before
+    // the run happens, mirroring `tests/sse.rs`'s own pattern.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let engine_for_run = Arc::clone(&engine);
+    let definition_for_run = definition.clone();
+    let execution_id = execution.id.clone();
+    let run_task = tokio::spawn(async move {
+        engine_for_run
+            .run(&definition_for_run, &execution_id)
+            .await
+            .expect("run to completion")
+    });
+
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("stream_execution did not end within the deadline: {events:?}");
+        }
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(item)) => events.push(item.expect("stream item must not be an error")),
+            Ok(None) => break,
+            Err(_) => panic!("timed out waiting for the next stream item: {events:?}"),
+        }
+    }
+
+    run_task.await.expect("background run task");
+
+    assert!(
+        !events.is_empty(),
+        "the stream must have yielded at least the terminal event"
+    );
+    assert!(matches!(
+        events.last().expect("at least one event").data,
+        narsor::domain::EventData::WorkflowCompleted { .. }
+    ));
+    assert!(events
+        .iter()
+        .all(|event| event.workflow_execution_id == execution.id));
 }

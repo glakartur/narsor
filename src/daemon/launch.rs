@@ -63,7 +63,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let current_exe = std::env::current_exe()?;
+    let current_exe = resolve_exe()?;
     let log_out = open_log_file(log_file)?;
     let log_err = log_out.try_clone()?;
 
@@ -94,6 +94,61 @@ where
     let pid = child.id();
     drop(child);
     Ok(pid)
+}
+
+/// Environment variable [`set_exe_override_for_tests`] writes to, and
+/// [`resolve_exe`] checks before falling back to `current_exe()`.
+///
+/// Only ever read in a `debug_assertions` build (see [`resolve_exe`]): a
+/// release binary must never let *any* environment variable redirect which
+/// executable a daemon spawn re-execs, since that would hand anyone able to
+/// set env vars for this process a way to make it launch an arbitrary
+/// binary in its place — a strictly worse position than "no override
+/// exists at all" that a shipped build should never carry.
+#[cfg(debug_assertions)]
+const EXE_OVERRIDE_ENV: &str = "NARSOR_TEST_DAEMON_EXE";
+
+/// Resolves the executable [`spawn_detached`] re-execs: in a
+/// `debug_assertions` build, the override set by
+/// [`set_exe_override_for_tests`] if one was set, otherwise
+/// `current_exe()`. A release build only ever calls `current_exe()` — the
+/// override does not exist in that build at all (see [`EXE_OVERRIDE_ENV`]).
+fn resolve_exe() -> io::Result<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Ok(path) = std::env::var(EXE_OVERRIDE_ENV) {
+        return Ok(std::path::PathBuf::from(path));
+    }
+    std::env::current_exe()
+}
+
+/// Test-only seam: makes [`spawn_detached`] re-exec `path` instead of
+/// `current_exe()`.
+///
+/// `cargo test`'s own harness binary is not the `narsor` binary — `current_exe()`
+/// inside a test process resolves to the compiled test binary, not to
+/// `narsor` itself (see this module's doc comment on why a raw re-exec of
+/// `current_exe()` cannot be exercised directly from this crate's own unit
+/// tests). An integration test that wants `ensure_daemon_running`
+/// (`src/api/discovery.rs`, U5) to actually spawn the real daemon calls this
+/// once, with `env!("CARGO_BIN_EXE_narsor")`, before any test in the binary
+/// calls through to [`spawn_detached`].
+///
+/// `#[cfg(debug_assertions)]`, not `#[cfg(test)]`: an integration test under
+/// `tests/` is compiled as a separate crate that only sees this crate's
+/// public API, never its `cfg(test)` items, so this has to be a plain,
+/// exported function to be reachable from there at all — but it must still
+/// not exist in a release build (see [`EXE_OVERRIDE_ENV`]), and every
+/// ordinary `cargo test` run already builds in a `debug_assertions`
+/// profile, so gating on that rather than `cfg(test)` costs nothing here.
+///
+/// Sets a process-wide environment variable, so a test binary that calls
+/// this must do so once, before spawning any threads that call
+/// [`spawn_detached`] concurrently — never from inside a `#[tokio::test]`
+/// itself, where `cargo test`'s own test runner may already be running
+/// other tests on other threads in the same process.
+#[cfg(debug_assertions)]
+pub fn set_exe_override_for_tests(path: &Path) {
+    std::env::set_var(EXE_OVERRIDE_ENV, path);
 }
 
 /// Opens `path` for appending, ensuring `0600` permissions whether the file
