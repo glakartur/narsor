@@ -399,8 +399,8 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Run { workflow, inputs } => {
             commands::run(&config, &flags, &workflow, &inputs).await
         }
-        Command::List => commands::list(&state),
-        Command::Show { execution_id } => commands::show(&state, &execution_id),
+        Command::List => commands::list(&state, &flags).await,
+        Command::Show { execution_id } => commands::show(&state, &flags, &execution_id).await,
         Command::Events {
             execution_id,
             follow,
@@ -415,7 +415,17 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             fields,
             label,
             file,
-        } => commands::input(&config, &execution_id, &fields, label, file.as_deref()).await,
+        } => {
+            commands::input(
+                &config,
+                &flags,
+                &execution_id,
+                &fields,
+                label,
+                file.as_deref(),
+            )
+            .await
+        }
         Command::Resume { execution_id, file } => {
             commands::resume(&config, &flags, &execution_id, file.as_deref()).await
         }

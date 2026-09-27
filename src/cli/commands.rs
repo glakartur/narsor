@@ -21,10 +21,13 @@
 //! The engine needs the [`WorkflowDefinition`] to continue an execution, but
 //! `state.json` stores only the workflow *id*. So `run` records both the
 //! absolute path of the file it read (when there was one) and the workflow's
-//! name, and the later commands re-resolve from that —
-//! [`crate::tasks::resolve_definition`]. A built-in has no path at all, so
-//! without the name an execution started from one could never be resumed.
-//! `--file` overrides both, for the case where the definition has moved.
+//! name, and re-resolves from that — [`crate::tasks::resolve_definition`]. A
+//! built-in has no path at all, so without the name an execution started
+//! from one could never be resumed. This resolution happens daemon-side
+//! (R4/D52): `input` and `resume` are pure `ApiClient` callers, so neither
+//! reaches for `tasks::resolve_definition` itself any more, and neither
+//! accepts `--file` — there is no way for a REST call to point the daemon at
+//! a local override path it has no filesystem relationship to.
 
 use std::path::Path;
 use std::time::Duration;
@@ -35,12 +38,11 @@ use serde_json::{Map, Value};
 use crate::api::{ApiClient, ClientError, ConversationResponse, ExecutionSummary};
 use crate::domain::{
     Event, EventData, ExecutionStatus, InputParameter, ParamType, WorkflowDefinition,
-    WorkflowExecution,
 };
 use crate::engine::{
-    ConversationState, Engine, HumanInputDelivery, PendingHumanInput, Position, PositionStatus,
+    ConversationState, HumanInputDelivery, PendingHumanInput, Position, PositionStatus,
 };
-use crate::persistence::{ExecutionStore, StatePaths};
+use crate::persistence::StatePaths;
 use crate::registry::{infer_provider, RepositoryEntry, RepositoryRegistry};
 use crate::tasks::{self, TaskError};
 use crate::tui::conversation::classify;
@@ -290,27 +292,28 @@ fn parse_input_value(parameter: &InputParameter, raw: &str) -> Result<Value> {
 // list / show / events
 // ---------------------------------------------------------------------------
 
-/// `narsor list` — every execution in the store, newest first.
-pub fn list(state: &Path) -> Result<()> {
-    let store = ExecutionStore::new(state);
-    let ids = store
-        .list_execution_ids()
+/// `narsor list` — every execution, newest first.
+///
+/// Goes through `ApiClient` (R4/D52): `GET /executions`, the same request
+/// `ApiClient::list_executions` already makes for `find_execution`/the TUI's
+/// own listing. Used to read `ExecutionStore` directly — the very
+/// construction the daemon migration exists to keep out of this file (R1) —
+/// left over from before this unit's own migration ever reached it.
+pub async fn list(state: &Path, flags: &Flags) -> Result<()> {
+    let client = daemon_client(state, flags).await?;
+    let listing = client
+        .list_executions()
+        .await
         .map_err(|error| CliError::failure(format!("Could not read the executions: {error}")))?;
 
-    if ids.is_empty() {
+    if listing.executions.is_empty() {
         println!("No executions.");
         return Ok(());
     }
 
-    let mut executions = Vec::new();
-    for id in ids {
-        match store.load_execution(&id) {
-            Ok(execution) => executions.push(execution),
-            Err(error) => eprintln!("Skipping execution '{id}': {error}"),
-        }
-    }
     // Newest first: the execution an operator just started is the one they
     // are looking for.
+    let mut executions = listing.executions;
     executions.sort_by_key(|execution| std::cmp::Reverse(execution.started_at));
 
     println!("{:<38} {:<10} {:<22} WORKFLOW", "ID", "STATUS", "STATE");
@@ -327,9 +330,18 @@ pub fn list(state: &Path) -> Result<()> {
 }
 
 /// `narsor show <id>` — the current state, the status and the context.
-pub fn show(state: &Path, execution_id: &str) -> Result<()> {
-    let store = ExecutionStore::new(state);
-    let execution = load_execution(&store, execution_id)?;
+///
+/// Goes through `ApiClient` (R4/D52), the same as [`list`] above: `GET
+/// /executions` plus [`find_execution`] to pick out the one execution asked
+/// for. There is no per-execution `GET`, only the listing — the same one the
+/// TUI's own task view already relies on for exactly this (state, status,
+/// context variables, pending question). One thing this can no longer show
+/// that the old, direct-store version did: the workspace path, which
+/// [`ExecutionSummary`] deliberately leaves out of the wire contract
+/// (internal engine bookkeeping, not something a REST client needs).
+pub async fn show(state: &Path, flags: &Flags, execution_id: &str) -> Result<()> {
+    let client = daemon_client(state, flags).await?;
+    let execution = load_execution_summary(&client, execution_id).await?;
 
     println!("Execution:     {}", execution.id);
     println!(
@@ -345,26 +357,21 @@ pub fn show(state: &Path, execution_id: &str) -> Result<()> {
     if let Some(completed_at) = execution.completed_at {
         println!("Finished:      {}", completed_at.to_rfc3339());
     }
-    println!("Workspace:     {}", execution.workspace.path);
-
-    let context = store
-        .load_context(execution_id)
-        .unwrap_or_else(|_| execution.context.clone());
 
     println!("Context variables:");
-    if context.variables.is_empty() {
+    if execution.variables.is_empty() {
         println!("  (none)");
     } else {
-        let mut names: Vec<&String> = context.variables.keys().collect();
+        let mut names: Vec<&String> = execution.variables.keys().collect();
         names.sort();
         for name in names {
-            let value = &context.variables[name];
+            let value = &execution.variables[name];
             println!("  {name} = {value}");
         }
     }
 
-    if let Some(pending) = pending_input(&store, execution_id)? {
-        print_pending_input(&pending);
+    if let Some(pending) = &execution.pending_input {
+        print_pending_input(pending);
     }
     Ok(())
 }
@@ -575,22 +582,33 @@ fn print_conversation_entry(entry: &crate::api::ConversationEntryDto) {
 // ---------------------------------------------------------------------------
 
 /// `narsor input <id> [--field k=v]… [--label l]` — answer a question.
+///
+/// Goes through `ApiClient` (R4/D52), exactly like [`resume`]: `POST
+/// /executions/:id/input`, then [`wait_until_stopped`]. Used to construct its
+/// own `Engine`/`ExecutionStore` and call `Engine::deliver_human_input`
+/// directly in this process — a leftover from before the daemon migration
+/// that raced the daemon's own writes to the same store files exactly the
+/// way every other command here was rewritten specifically to avoid (R1).
+///
+/// `--file` has no REST equivalent, for the identical reason [`resume`]'s own
+/// doc comment gives: the daemon always resolves the workflow from the
+/// execution's own recorded metadata, with no way for a REST call to point
+/// it at a local override path.
 pub async fn input(
     config: &Resolved,
+    flags: &Flags,
     execution_id: &str,
     fields: &[String],
     label: Option<String>,
     definition_file: Option<&str>,
 ) -> Result<()> {
-    let store = ExecutionStore::new(config.state_dir());
-    let execution = load_execution(&store, execution_id)?;
-
-    let Some(pending) = pending_input(&store, execution_id)? else {
-        return Err(CliError::failure(format!(
-            "Execution '{execution_id}' is not waiting for human input (status: {}).",
-            status_name(&execution.status)
+    if let Some(file) = definition_file {
+        return Err(CliError::usage(format!(
+            "'--file {file}' is not supported for 'input': the daemon always resolves the \
+             workflow from the execution's own record, with no way for a REST call to point it \
+             at a local override path."
         )));
-    };
+    }
 
     let mut values = Map::new();
     for pair in fields {
@@ -607,31 +625,37 @@ pub async fn input(
         delivery = delivery.choosing(label);
     }
 
-    let definition = definition_for(
-        config.catalog_dir(),
-        store.paths(),
-        &execution,
-        definition_file,
-    )?;
-    let engine = Engine::new(store).with_agent_defaults(config.agent_defaults());
-    let execution = engine
-        .deliver_human_input(&definition, &pending.execution_id, &delivery)
-        .await
-        .map_err(|error| CliError::failure(format!("Could not deliver the input: {error}")))?;
+    let client = daemon_client(config.state_dir(), flags).await?;
 
-    println!("Input delivered to execution {}.", execution.id);
-    print_execution_summary(&execution);
-    if let Some(pending) = engine
-        .pending_input(&execution.id)
-        .map_err(|error| CliError::failure(format!("Engine error: {error}")))?
-    {
-        print_pending_input(&pending);
+    // Checked here, not left to the server: an execution that is not
+    // awaiting human input is a caller mistake, not an engine failure, and
+    // deserves the same readable "not waiting (status: X)" message this
+    // command always gave — `EngineError`'s mapping to `ApiError` (U3) does
+    // not single this case out from every other "engine can't proceed"
+    // reason, so relying on the REST error alone would only report a bare
+    // `500`.
+    let current = load_execution_summary(&client, execution_id).await?;
+    if current.pending_input.is_none() {
+        return Err(CliError::failure(format!(
+            "Execution '{execution_id}' is not waiting for human input (status: {}).",
+            status_name(&current.status)
+        )));
     }
 
-    if execution.status == ExecutionStatus::Failed {
+    client
+        .deliver_input(execution_id, delivery)
+        .await
+        .map_err(|error| client_error(execution_id, error))?;
+
+    let summary = wait_until_stopped(&client, execution_id).await?;
+
+    println!("Input delivered to execution {}.", summary.id);
+    print_summary(&summary);
+    print_pending_input_if_any(&client, execution_id, &summary).await?;
+    if summary.status == ExecutionStatus::Failed {
         return Err(CliError::failure(format!(
             "Execution {} failed.",
-            execution.id
+            summary.id
         )));
     }
     Ok(())
@@ -975,47 +999,6 @@ pub fn tui(config: &Resolved, flags: &Flags) -> Result<()> {
 // shared helpers
 // ---------------------------------------------------------------------------
 
-/// Loads an execution, turning "not found" into a readable message.
-fn load_execution(store: &ExecutionStore, execution_id: &str) -> Result<WorkflowExecution> {
-    store.load_execution(execution_id).map_err(|error| {
-        CliError::failure(format!(
-            "Could not load execution '{execution_id}': {error}"
-        ))
-    })
-}
-
-/// The pending question of an execution, if it has one.
-fn pending_input(store: &ExecutionStore, execution_id: &str) -> Result<Option<PendingHumanInput>> {
-    store
-        .load_pending_input::<PendingHumanInput>(execution_id)
-        .map_err(|error| CliError::failure(format!("Could not read the pending input: {error}")))
-}
-
-/// Resolves the definition an execution continues with.
-///
-/// `--file` wins; otherwise the execution's own record decides — the path it
-/// was started from while that file is still there, and the workflow name
-/// otherwise, which is the only thing a built-in leaves behind.
-fn definition_for(
-    catalog: &Path,
-    store_paths: &StatePaths,
-    execution: &WorkflowExecution,
-    override_reference: Option<&str>,
-) -> Result<WorkflowDefinition> {
-    let resolved = match override_reference {
-        Some(reference) => resolve_workflow(catalog, reference)?,
-        None => tasks::resolve_definition(catalog, store_paths, execution)
-            .map_err(|error| CliError::failure(error.to_string()))?,
-    };
-
-    resolved.load().map_err(|error| {
-        CliError::failure(format!(
-            "Could not load definition '{}' ({}): {error}",
-            resolved.name, resolved.origin
-        ))
-    })
-}
-
 /// Resolves a workflow reference, turning a miss into the message that names
 /// every place that was tried.
 fn resolve_workflow(catalog: &Path, reference: &str) -> Result<ResolvedWorkflow> {
@@ -1024,12 +1007,8 @@ fn resolve_workflow(catalog: &Path, reference: &str) -> Result<ResolvedWorkflow>
         .map_err(|error| CliError::usage(error.to_string()))
 }
 
-/// Status, current state and — when it stopped — the outcome.
-fn print_execution_summary(execution: &WorkflowExecution) {
-    print_status_line(&execution.status, execution.current_state.as_deref());
-}
-
-/// The REST counterpart of [`print_execution_summary`]: same two lines, from
+/// The REST counterpart of the old, in-process
+/// `print_execution_summary(&WorkflowExecution)`: same two lines, from
 /// an [`ExecutionSummary`] the daemon answered with instead of a
 /// [`WorkflowExecution`] read straight off the store.
 fn print_summary(summary: &ExecutionSummary) {
@@ -1105,9 +1084,7 @@ async fn find_execution(
         .find(|execution| execution.id == execution_id))
 }
 
-/// [`find_execution`], turning "not found" into the same readable message
-/// [`load_execution`] (the direct-store version, still used by
-/// `list`/`show`/`input`) reports — the REST counterpart of that helper.
+/// [`find_execution`], turning "not found" into a readable message.
 async fn load_execution_summary(
     client: &ApiClient,
     execution_id: &str,

@@ -703,6 +703,96 @@ async fn post_tasks_creates_an_execution_and_it_appears_in_the_list() {
     .await;
 }
 
+/// U8: proves `POST /tasks` is not a divergent reimplementation of
+/// `tasks::start_task` but a thin wrapper calling the very same function.
+///
+/// The handler's source shows a single call to `tasks::start_task` (see
+/// `src/api/routes.rs::post_start_task`), but that alone would not catch a
+/// future edit that swapped in a lookalike. This test instead proves it
+/// behaviourally, by relying on a side effect only the real `start_task`
+/// performs and that no other test in this file lets happen on its own:
+/// recording `metadata.cli.definition_path` (`record_definition_source`).
+/// Every other paused-execution test here calls the `pin_definition_path`
+/// test helper to fake that recording by hand; this test never does, and
+/// instead lets `POST /tasks` alone create the execution, then drives it
+/// straight through the human gate (`POST /input`) to completion. If the
+/// handler ever stopped calling the real `start_task` — or called a
+/// reimplementation that skipped pinning the definition source — resolving
+/// the definition for `/input` would fail with `DefinitionLookupError` and
+/// this test would fail closed.
+#[tokio::test]
+async fn post_tasks_calls_the_real_start_task_and_records_a_resolvable_definition() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let raw = raw_client();
+
+    let body = serde_json::json!({
+        "workflow": pipeline_definition_path().display().to_string(),
+        "inputs": {
+            "script_path": prepare_script_path().display().to_string(),
+            "ticket": "ORC-3",
+        }
+    });
+
+    let response = raw
+        .post(url(&handle, "/tasks"))
+        .bearer_auth(handle.token())
+        .json(&body)
+        .send()
+        .await
+        .expect("post /tasks");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let execution_id = response
+        .json::<StartTaskResponse>()
+        .await
+        .expect("parse start-task response")
+        .execution_id;
+
+    wait_for_status(
+        &store,
+        &execution_id,
+        ExecutionStatus::Paused,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // No `pin_definition_path` call anywhere above: the definition path this
+    // resolves through below can only have come from `start_task` itself.
+    let delivery = HumanInputDelivery::with_values(
+        serde_json::json!({
+            "approval_status": "approved",
+            "comment": "confirms start_task recorded the definition source",
+        })
+        .as_object()
+        .cloned()
+        .expect("object"),
+    );
+
+    let response = raw
+        .post(url(&handle, &format!("/executions/{execution_id}/input")))
+        .bearer_auth(handle.token())
+        .json(&delivery)
+        .send()
+        .await
+        .expect("post input");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+
+    wait_for_status(
+        &store,
+        &execution_id,
+        ExecutionStatus::Completed,
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn post_resume_drives_a_paused_execution_to_a_terminal_state() {
     let root = TempRoot::new();
