@@ -16,6 +16,7 @@
 //!
 //! {state}/executions/{id}/…          -- StatePaths: owned by one process
 //! {state}/narsor.log
+//! {state}/agent-harness.json          -- operator-selected default harness
 //!
 //! {work}/tasks/{id}/code/…           -- WorkPaths: local scratch, disposable
 //! ```
@@ -64,6 +65,13 @@ pub const DAEMON_FILE: &str = "daemon.json";
 /// Exclusive lock used to serialize daemon spawn against a race between
 /// several clients discovering no daemon at once.
 pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
+
+/// Versioned durable override for the daemon's default agent harness.
+///
+/// This is state owned by the daemon, rather than configuration: deployments
+/// may mount the configuration catalogue read-only while still allowing an
+/// operator to change the live default through the API.
+pub const AGENT_HARNESS_SELECTION_FILE: &str = "agent-harness.json";
 
 /// Directory holding every execution, directly under the root.
 pub const EXECUTIONS_DIR: &str = "executions";
@@ -150,6 +158,11 @@ impl StatePaths {
     /// `{root}/daemon.lock`
     pub fn daemon_lock_file(&self) -> PathBuf {
         self.root.join(DAEMON_LOCK_FILE)
+    }
+
+    /// `{root}/agent-harness.json`
+    pub fn agent_harness_selection_file(&self) -> PathBuf {
+        self.root.join(AGENT_HARNESS_SELECTION_FILE)
     }
 
     /// `{root}/executions`

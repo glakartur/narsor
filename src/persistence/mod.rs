@@ -6,6 +6,7 @@
 //! ```text
 //! {root}/daemon.json                  -- discovery file of a running daemon
 //! {root}/daemon.lock                  -- exclusive lock guarding daemon spawn
+//! {root}/agent-harness.json            -- durable default-harness override
 //! {root}/executions/{execution_id}/
 //!     state.json                  -- the serialized WorkflowExecution
 //!     context.json                -- projection of the execution context
@@ -21,6 +22,7 @@
 //! POSIX, so a reader never observes a half-written file and an interrupted
 //! write leaves the previous version intact.
 
+pub mod agent_harness;
 pub mod atomic;
 pub mod conversation;
 pub mod daemon_info;
@@ -29,6 +31,7 @@ pub mod execution_store;
 pub mod paths;
 pub mod recovery;
 
+pub use agent_harness::{DefaultHarnessSelector, HarnessSelectionError, HarnessSelectionSnapshot};
 pub use atomic::{
     cleanup_orphaned_temp_files, read_json, write_atomic, write_atomic_exclusive,
     write_atomic_with_mode, write_json_atomic, write_json_atomic_with_mode,
@@ -41,7 +44,8 @@ pub use daemon_info::{pid_is_alive, DaemonInfo};
 pub use event_log::EventLog;
 pub use execution_store::{ExecutionStore, PENDING_INPUT_FILE};
 pub use paths::{
-    CatalogPaths, StatePaths, WorkPaths, CONTEXT_FILE, DEFAULT_ROOT, STATE_FILE, TEMP_SUFFIX,
+    CatalogPaths, StatePaths, WorkPaths, AGENT_HARNESS_SELECTION_FILE, CONTEXT_FILE, DEFAULT_ROOT,
+    STATE_FILE, TEMP_SUFFIX,
 };
 pub use recovery::{
     compress_closed_conversations, reconcile, reconcile_all, recover, sweep_orphaned_workspaces,
