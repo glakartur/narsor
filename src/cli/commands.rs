@@ -1058,6 +1058,7 @@ fn client_error(execution_id: &str, error: ClientError) -> CliError {
         ClientError::Unavailable(detail) => {
             CliError::failure(format!("Could not reach the narsor daemon: {detail}"))
         }
+        ClientError::Request { message, .. } => CliError::failure(message),
         ClientError::Server(detail) => {
             CliError::failure(format!("The narsor daemon reported an error: {detail}"))
         }

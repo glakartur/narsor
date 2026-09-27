@@ -47,7 +47,8 @@ use crate::domain::{Event, EventData};
 use crate::engine::{HumanInputDelivery, Timeline};
 
 use super::dto::{
-    AcceptedResponse, ExecutionListResponse, ExecutionSummary, StartTaskRequest, StartTaskResponse,
+    AcceptedResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
+    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
     TransitionRequest,
 };
 use super::routes::ConversationResponse;
@@ -79,6 +80,9 @@ pub enum ClientError {
     /// so a caller (the CLI, the TUI) can tell "try again, something else is
     /// driving this" from "the server broke".
     Conflict,
+    /// The server rejected a validly decoded request and supplied a safe,
+    /// typed reason suitable for an operator-facing UI.
+    Request { code: String, message: String },
     /// The server answered with an unexpected status or a body this client
     /// could not parse.
     Server(String),
@@ -91,6 +95,9 @@ impl std::fmt::Display for ClientError {
             ClientError::Unauthorized => write!(f, "API rejected the request: bad token"),
             ClientError::NotFound => write!(f, "API: not found"),
             ClientError::Conflict => write!(f, "API: conflict (409)"),
+            ClientError::Request { code, message } => {
+                write!(f, "API request rejected ({code}): {message}")
+            }
             ClientError::Server(detail) => write!(f, "API error: {detail}"),
         }
     }
@@ -218,6 +225,34 @@ impl ApiClient {
         self.get_json(&url).await
     }
 
+    /// Reads supported harnesses and the daemon's current default selection.
+    pub async fn harness_selection(&self) -> Result<HarnessSelectionSnapshot, ClientError> {
+        let url = format!("{}/settings/agent-harness", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// Persists `harness` as the daemon's default and returns its confirmed
+    /// post-commit snapshot.
+    pub async fn set_harness_selection(
+        &self,
+        harness: &str,
+    ) -> Result<HarnessSelectionSnapshot, ClientError> {
+        let url = format!("{}/settings/agent-harness", self.base_url);
+        self.put_json(
+            &url,
+            &SetHarnessSelectionRequest {
+                harness: harness.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Removes the durable override and returns the configured fallback.
+    pub async fn reset_harness_selection(&self) -> Result<HarnessSelectionSnapshot, ClientError> {
+        let url = format!("{}/settings/agent-harness", self.base_url);
+        self.delete_json(&url).await
+    }
+
     // -----------------------------------------------------------------
     // SSE (U5)
     // -----------------------------------------------------------------
@@ -338,6 +373,33 @@ impl ApiClient {
             .map_err(|error| ClientError::Unavailable(error.to_string()))?;
         handle_json_response(response).await
     }
+
+    async fn put_json<B: Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<T, ClientError> {
+        let response = self
+            .http
+            .put(url)
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| ClientError::Unavailable(error.to_string()))?;
+        handle_json_response(response).await
+    }
+
+    async fn delete_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ClientError> {
+        let response = self
+            .http
+            .delete(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|error| ClientError::Unavailable(error.to_string()))?;
+        handle_json_response(response).await
+    }
 }
 
 /// Maps a response's status to a [`ClientError`] the same way for every
@@ -364,6 +426,18 @@ async fn handle_json_response<T: DeserializeOwned>(
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ClientError::Unauthorized),
         StatusCode::NOT_FOUND => Err(ClientError::NotFound),
         StatusCode::CONFLICT => Err(ClientError::Conflict),
+        StatusCode::BAD_REQUEST => {
+            let error = response
+                .json::<RequestErrorResponse>()
+                .await
+                .map_err(|error| {
+                    ClientError::Server(format!("invalid bad-request response: {error}"))
+                })?;
+            Err(ClientError::Request {
+                code: error.code,
+                message: error.message,
+            })
+        }
         status => Err(ClientError::Server(format!("unexpected status {status}"))),
     }
 }

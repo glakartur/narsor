@@ -70,12 +70,14 @@ mod routes;
 pub use client::{ApiClient, ClientError};
 pub use discovery::{ensure_daemon_running, DiscoveryError};
 pub use dto::{
-    AcceptedResponse, ExecutionListResponse, ExecutionSummary, StartTaskRequest, StartTaskResponse,
+    AcceptedResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
+    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
     TransitionRequest,
 };
 pub use routes::{ConversationEntryDto, ConversationResponse};
 
 use crate::engine::Engine;
+use crate::persistence::DefaultHarnessSelector;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -198,6 +200,20 @@ pub async fn start(
     catalog_dir: PathBuf,
     work_dir: PathBuf,
 ) -> Result<ApiHandle, ApiStartError> {
+    start_with_harness_selector(engine, catalog_dir, work_dir, None).await
+}
+
+/// Starts the API server with the daemon's shared default-harness selector.
+///
+/// The compatibility [`start`] entry point remains useful to older embedded
+/// API tests that do not compose an agent selector. Daemons must call this
+/// function so the settings resource and executor observe the same `Arc`.
+pub async fn start_with_harness_selector(
+    engine: Arc<Engine>,
+    catalog_dir: PathBuf,
+    work_dir: PathBuf,
+    harness_selector: Option<Arc<DefaultHarnessSelector>>,
+) -> Result<ApiHandle, ApiStartError> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(ApiStartError)?;
@@ -205,7 +221,14 @@ pub async fn start(
     let token = Uuid::new_v4().to_string();
 
     let store = engine.store().clone();
-    let app = routes::router(engine, store, token.clone(), catalog_dir, work_dir);
+    let app = routes::router(
+        engine,
+        store,
+        token.clone(),
+        catalog_dir,
+        work_dir,
+        harness_selector,
+    );
     let shutdown = Arc::new(Notify::new());
     let shutdown_wait = Arc::clone(&shutdown);
     let task = tokio::spawn(async move {

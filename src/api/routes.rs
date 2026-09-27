@@ -62,7 +62,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::api::dto::{
-    AcceptedResponse, ExecutionListResponse, ExecutionSummary, StartTaskRequest, StartTaskResponse,
+    AcceptedResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
+    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
     TransitionRequest,
 };
 use crate::domain::{Event, EventData, ExecutionStatus};
@@ -70,7 +71,10 @@ use crate::engine::{
     build_timeline, terminal_status, Engine, EngineError, HumanActionError, HumanInputDelivery,
     Timeline,
 };
-use crate::persistence::{ConversationSource, ExecutionStore, PersistenceError};
+use crate::persistence::{
+    ConversationSource, DefaultHarnessSelector, ExecutionStore, HarnessSelectionError,
+    HarnessSelectionSnapshot as PersistenceHarnessSelectionSnapshot, PersistenceError,
+};
 use crate::tasks::{self, TaskError};
 use crate::workflows::WorkflowResolver;
 
@@ -118,6 +122,7 @@ struct AppState {
     token: String,
     catalog_dir: PathBuf,
     work_dir: PathBuf,
+    harness_selector: Option<Arc<DefaultHarnessSelector>>,
 }
 
 /// Builds the router: the three original read-only endpoints (U5/U2) plus
@@ -137,6 +142,7 @@ pub fn router(
     token: String,
     catalog_dir: PathBuf,
     work_dir: PathBuf,
+    harness_selector: Option<Arc<DefaultHarnessSelector>>,
 ) -> Router {
     let state = AppState {
         engine,
@@ -144,6 +150,7 @@ pub fn router(
         token,
         catalog_dir,
         work_dir,
+        harness_selector,
     };
     Router::new()
         .route("/executions/:execution_id/events", get(get_events))
@@ -153,6 +160,12 @@ pub fn router(
             get(get_conversation),
         )
         .route("/executions", get(get_executions))
+        .route(
+            "/settings/agent-harness",
+            get(get_harness_selection)
+                .put(put_harness_selection)
+                .delete(delete_harness_selection),
+        )
         .route(
             "/executions/:execution_id/stream",
             get(get_execution_stream),
@@ -188,6 +201,37 @@ async fn require_token(State(state): State<AppState>, request: Request, next: Ne
     }
 }
 
+/// Reads the daemon's authoritative default-harness setting.
+async fn get_harness_selection(
+    State(state): State<AppState>,
+) -> Result<Json<HarnessSelectionSnapshot>, ApiError> {
+    let selector = require_harness_selector(&state)?;
+    Ok(Json(selector.snapshot().await.into()))
+}
+
+/// Persists a new default-harness override and returns the post-commit view.
+async fn put_harness_selection(
+    State(state): State<AppState>,
+    Json(request): Json<SetHarnessSelectionRequest>,
+) -> Result<Json<HarnessSelectionSnapshot>, ApiError> {
+    let selector = require_harness_selector(&state)?;
+    Ok(Json(selector.set(request.harness).await?.into()))
+}
+
+/// Removes the durable override and returns the configured fallback view.
+async fn delete_harness_selection(
+    State(state): State<AppState>,
+) -> Result<Json<HarnessSelectionSnapshot>, ApiError> {
+    let selector = require_harness_selector(&state)?;
+    Ok(Json(selector.reset().await?.into()))
+}
+
+fn require_harness_selector(state: &AppState) -> Result<Arc<DefaultHarnessSelector>, ApiError> {
+    state.harness_selector.clone().ok_or_else(|| {
+        ApiError::Internal("default harness selector was not configured for this API server".into())
+    })
+}
+
 /// Compares two byte strings in time that depends only on their lengths, not
 /// their contents — the token is a bearer secret, so a length-leaking or
 /// early-exit comparison would give a caller on the same loopback interface
@@ -211,6 +255,11 @@ enum ApiError {
     /// definition does not allow (an unknown workflow reference, an illegal
     /// transition target). `400`.
     BadRequest(String),
+    /// A request error safe to return to a local authenticated client.
+    Request {
+        code: &'static str,
+        message: String,
+    },
     /// The request is well-formed but conflicts with the execution's current
     /// state (already being driven, or being transitioned by hand while
     /// active). `409`.
@@ -230,6 +279,14 @@ impl IntoResponse for ApiError {
                 tracing::debug!(message, "api: bad request");
                 StatusCode::BAD_REQUEST.into_response()
             }
+            ApiError::Request { code, message } => (
+                StatusCode::BAD_REQUEST,
+                Json(RequestErrorResponse {
+                    code: code.to_owned(),
+                    message,
+                }),
+            )
+                .into_response(),
             ApiError::Conflict(message) => {
                 tracing::debug!(message, "api: conflict");
                 StatusCode::CONFLICT.into_response()
@@ -242,6 +299,30 @@ impl IntoResponse for ApiError {
                 tracing::warn!(message, "api: internal error serving request");
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
+        }
+    }
+}
+
+impl From<HarnessSelectionError> for ApiError {
+    fn from(error: HarnessSelectionError) -> Self {
+        match error {
+            HarnessSelectionError::UnsupportedHarness { .. } => ApiError::Request {
+                code: "unsupported_harness",
+                message: error.to_string(),
+            },
+            other => ApiError::Internal(other.to_string()),
+        }
+    }
+}
+
+impl From<PersistenceHarnessSelectionSnapshot> for HarnessSelectionSnapshot {
+    fn from(snapshot: PersistenceHarnessSelectionSnapshot) -> Self {
+        Self {
+            supported: snapshot.supported,
+            configured: snapshot.configured,
+            override_harness: snapshot.override_harness,
+            effective: snapshot.effective,
+            revision: snapshot.revision,
         }
     }
 }

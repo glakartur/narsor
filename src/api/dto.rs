@@ -16,6 +16,39 @@ use serde_json::{Map, Value};
 use crate::domain::{ExecutionStatus, WorkflowExecution};
 use crate::engine::PendingHumanInput;
 
+/// Authoritative default-harness selection returned by `GET`, `PUT`, and
+/// `DELETE /settings/agent-harness`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessSelectionSnapshot {
+    /// Harness adapters registered by this daemon, in registry order.
+    pub supported: Vec<String>,
+    /// The startup configuration value used when there is no override.
+    pub configured: String,
+    /// The durable operator override, if one is active.
+    #[serde(rename = "override")]
+    pub override_harness: Option<String>,
+    /// The harness new agent attempts will use by default.
+    pub effective: String,
+    /// Monotonically increasing durable mutation revision.
+    pub revision: u64,
+}
+
+/// `PUT /settings/agent-harness` request body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetHarnessSelectionRequest {
+    /// A name from [`HarnessSelectionSnapshot::supported`].
+    pub harness: String,
+}
+
+/// A safe, user-displayable invalid-request response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestErrorResponse {
+    /// Stable machine-readable reason, such as `unsupported_harness`.
+    pub code: String,
+    /// Human-readable explanation that contains no credentials.
+    pub message: String,
+}
+
 /// `POST /tasks` request body.
 ///
 /// `workflow` is a reference exactly as `narsor run <reference>` accepts one

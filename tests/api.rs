@@ -18,7 +18,7 @@ use narsor::domain::{
 };
 use narsor::engine::{ConversationState, Engine, HumanInputDelivery, PositionStatus};
 use narsor::persistence::conversation::ConversationSource;
-use narsor::persistence::ExecutionStore;
+use narsor::persistence::{DefaultHarnessSelector, ExecutionStore, StatePaths};
 use narsor::workflow::load_from_file;
 
 /// A temporary directory that deletes itself when it goes out of scope.
@@ -189,6 +189,97 @@ async fn start_server_with_engine(
     api::start(engine, catalog_dir, work_dir)
         .await
         .expect("server starts")
+}
+
+async fn start_server_with_harness_selector(
+    root: &TempRoot,
+    selector: Arc<DefaultHarnessSelector>,
+) -> api::ApiHandle {
+    api::start_with_harness_selector(
+        Arc::new(Engine::new(root.store())),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+        Some(selector),
+    )
+    .await
+    .expect("server starts with selector")
+}
+
+#[tokio::test]
+async fn harness_settings_are_authenticated_and_return_authoritative_snapshots() {
+    let root = TempRoot::new();
+    let selector = Arc::new(
+        DefaultHarnessSelector::load(
+            StatePaths::new(root.path()),
+            vec!["claude-code".into(), "codex".into(), "opencode".into()],
+            "claude-code",
+        )
+        .await
+        .expect("load selector"),
+    );
+    let server = start_server_with_harness_selector(&root, Arc::clone(&selector)).await;
+    let client = server.client();
+
+    let initial = client.harness_selection().await.expect("authenticated GET");
+    assert_eq!(initial.effective, "claude-code");
+    assert_eq!(initial.override_harness, None);
+    assert_eq!(initial.revision, 0);
+
+    let changed = client
+        .set_harness_selection("codex")
+        .await
+        .expect("authenticated PUT");
+    assert_eq!(changed.override_harness.as_deref(), Some("codex"));
+    assert_eq!(changed.effective, "codex");
+    assert_eq!(changed.revision, 1);
+
+    let reset = client
+        .reset_harness_selection()
+        .await
+        .expect("authenticated DELETE");
+    assert_eq!(reset.override_harness, None);
+    assert_eq!(reset.effective, "claude-code");
+    assert_eq!(reset.revision, 2);
+
+    let unauthenticated = api::ApiClient::new(server.addr(), "wrong-token");
+    assert!(matches!(
+        unauthenticated.harness_selection().await,
+        Err(ClientError::Unauthorized)
+    ));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_harness_setting_is_typed_and_does_not_change_the_snapshot() {
+    let root = TempRoot::new();
+    let selector = Arc::new(
+        DefaultHarnessSelector::load(
+            StatePaths::new(root.path()),
+            vec!["claude-code".into(), "codex".into(), "opencode".into()],
+            "claude-code",
+        )
+        .await
+        .expect("load selector"),
+    );
+    let server = start_server_with_harness_selector(&root, selector).await;
+    let client = server.client();
+
+    let error = client
+        .set_harness_selection("missing")
+        .await
+        .expect_err("unknown harness is rejected");
+    assert!(matches!(
+        error,
+        ClientError::Request { ref code, .. } if code == "unsupported_harness"
+    ));
+    let current = client
+        .harness_selection()
+        .await
+        .expect("state is unchanged");
+    assert_eq!(current.effective, "claude-code");
+    assert_eq!(current.override_harness, None);
+    assert_eq!(current.revision, 0);
+    server.shutdown().await;
 }
 
 /// The directory the TUI's own fixtures live in — reused here rather than
