@@ -327,3 +327,53 @@ async fn a_pid_that_is_alive_but_not_a_daemon_is_treated_as_dead() {
     let _ = unrelated.kill();
     let _ = unrelated.wait();
 }
+
+// ---------------------------------------------------------------------------
+// Regression: a stale `daemon.lock` left by a spawner that died must not
+// permanently deadlock every future caller (found in code review, U8
+// follow-up)
+// ---------------------------------------------------------------------------
+
+/// Before this fix, `daemon.lock`'s content was a fixed, unparseable string
+/// — only its existence (`write_atomic_exclusive`'s `O_EXCL` semantics)
+/// mattered, and nothing but the winning caller's own cleanup ever removed
+/// it. A caller killed between winning the lock and removing it (a closing
+/// terminal, `SIGKILL`, an OOM) would leave the lock behind forever: every
+/// future `ensure_daemon_running` against this state root would lose the
+/// race, wait the full `DISCOVERY_TIMEOUT`, and fail — with no path back to
+/// working short of an operator manually deleting the file.
+///
+/// This seeds exactly that scenario by hand (a lock file naming a PID that
+/// is provably dead) and asserts `ensure_daemon_running` reaps it and spawns
+/// a fresh daemon instead of timing out.
+#[tokio::test]
+async fn a_stale_lock_file_naming_a_dead_pid_is_reaped_instead_of_deadlocking() {
+    init_exe_override();
+    let root = TempRoot::new();
+    let paths = state_paths(&root);
+    let flags = flags_for(&root);
+
+    fs::write(paths.daemon_lock_file(), dead_pid().to_string())
+        .expect("seed a stale lock file naming a dead pid");
+
+    let started = Instant::now();
+    let client = ensure_daemon_running(&paths, &flags)
+        .await
+        .expect("a stale lock must be reaped, not leave the caller stuck until timeout");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "reaping a stale lock must not fall back to waiting out the discovery timeout"
+    );
+
+    client
+        .list_executions()
+        .await
+        .expect("the freshly spawned daemon must actually work");
+    assert!(
+        !paths.daemon_lock_file().exists(),
+        "the lock file must not be left behind after a successful spawn"
+    );
+
+    let info = DaemonInfo::read(&paths.daemon_file()).expect("daemon.json exists");
+    stop_and_reap(info.pid);
+}

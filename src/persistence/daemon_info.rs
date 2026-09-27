@@ -57,25 +57,37 @@ impl DaemonInfo {
 
     /// Whether the process this record names is still alive.
     ///
-    /// Checks the PID only — `kill(pid, 0)` on Unix, which sends no signal
-    /// and just asks the kernel whether the process exists and is visible to
-    /// this user. It says nothing about whether the HTTP server behind that
-    /// PID is actually answering; that requires a network round trip and is
-    /// the client's job (U6), not this module's.
-    #[cfg(unix)]
+    /// Checks the PID only — see [`pid_is_alive`]. It says nothing about
+    /// whether the HTTP server behind that PID is actually answering; that
+    /// requires a network round trip and is the client's job (U6), not this
+    /// module's.
     pub fn is_alive(&self) -> bool {
-        // SAFETY: `kill` with signal 0 sends no signal; it only validates
-        // that a process with this PID exists and is signalable by us. Not
-        // representable as safe Rust because it is a raw syscall.
-        let result = unsafe { libc::kill(self.pid as libc::pid_t, 0) };
-        result == 0
+        pid_is_alive(self.pid)
     }
+}
 
-    /// Non-Unix fallback: liveness cannot be checked, so assume it is not.
-    #[cfg(not(unix))]
-    pub fn is_alive(&self) -> bool {
-        false
-    }
+/// Whether a process with this PID exists and is visible to this user —
+/// `kill(pid, 0)` on Unix, which sends no signal and just asks the kernel.
+///
+/// Shared between [`DaemonInfo::is_alive`] (is the daemon named by
+/// `daemon.json` still around) and the spawn-lock staleness check in
+/// `src/api/discovery.rs` (is the process that acquired `daemon.lock` still
+/// around, or did it die — killed, OOM, `SIGKILL` from a closing terminal —
+/// after winning the lock but before releasing it, which would otherwise
+/// wedge every future caller against a lock nothing will ever remove).
+#[cfg(unix)]
+pub fn pid_is_alive(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 sends no signal; it only validates that a
+    // process with this PID exists and is signalable by us. Not
+    // representable as safe Rust because it is a raw syscall.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0
+}
+
+/// Non-Unix fallback: liveness cannot be checked, so assume it is not.
+#[cfg(not(unix))]
+pub fn pid_is_alive(_pid: u32) -> bool {
+    false
 }
 
 #[cfg(test)]

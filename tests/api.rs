@@ -1774,3 +1774,193 @@ async fn client_stream_execution_ends_itself_after_the_terminal_event() {
         .iter()
         .all(|event| event.workflow_execution_id == execution.id));
 }
+
+/// A script-to-terminal fixture whose one action sleeps for a bit before
+/// succeeding — long enough that a test can observe it still `Running` while
+/// a sibling execution using [`write_script_to_done_workflow`] has already
+/// reached a terminal state.
+fn write_slow_script_workflow(
+    root: &TempRoot,
+    sleep_seconds: u64,
+) -> (WorkflowDefinition, PathBuf) {
+    let script_path = root.join(&format!("slow-{sleep_seconds}.sh"));
+    fs::write(
+        &script_path,
+        format!("#!/bin/sh\nsleep {sleep_seconds}\nexit 0\n"),
+    )
+    .expect("write script");
+    let mut permissions = fs::metadata(&script_path)
+        .expect("stat script")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("chmod script");
+
+    let yaml = format!(
+        r#"
+name: api-slow-fixture
+version: 1
+description: A single script action that sleeps before succeeding.
+
+states:
+  start:
+    description: Runs a script that sleeps, then succeeds.
+    action:
+      type: script
+      command: "{command}"
+    outputs:
+      - success
+    transitions:
+      success: done
+
+  done:
+    description: Terminal.
+
+terminal_states:
+  done: completed
+"#,
+        command = script_path.display()
+    );
+
+    let path = root.join(&format!("api-slow-fixture-{sleep_seconds}.yaml"));
+    fs::write(&path, yaml).expect("write definition");
+    let definition = load_from_file(&path).expect("load definition");
+    (definition, path)
+}
+
+/// Regression test for a real bug found in code review (U8 follow-up): the
+/// SSE parser both [`ApiClient::stream_execution`] and
+/// [`ApiClient::stream_all`] share used to set `done = true` on *any*
+/// terminal event, with no check that it belonged to the execution the
+/// stream cared about. `stream_execution` never noticed, since it only ever
+/// watches one execution — but `stream_all`, which by contract "keeps
+/// running until the connection itself ends," would silently end the moment
+/// the *first* of several concurrently running executions finished. A TUI
+/// relying on `stream_all` for its whole live-update lifetime would then
+/// falsely report the connection as dropped the first time any workflow
+/// completed while another was still in flight.
+///
+/// This drives two executions concurrently — one that finishes almost
+/// immediately, one that is still sleeping — and asserts `stream_all` keeps
+/// yielding events (in particular, the *second* execution's own terminal
+/// event) well after the first execution's terminal event has already gone
+/// by.
+#[tokio::test]
+async fn client_stream_all_does_not_end_when_only_one_of_several_executions_finishes() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine = Arc::new(Engine::new(store.clone()));
+
+    let (fast_definition, _fast_path) = write_script_to_done_workflow(&root);
+    let (slow_definition, _slow_path) = write_slow_script_workflow(&root, 2);
+    let fast_workspace_path = root.join("workspace-fast");
+    let slow_workspace_path = root.join("workspace-slow");
+    fs::create_dir_all(&fast_workspace_path).expect("create fast workspace dir");
+    fs::create_dir_all(&slow_workspace_path).expect("create slow workspace dir");
+
+    let fast_execution = engine
+        .start(
+            &fast_definition,
+            serde_json::json!({}),
+            Workspace::local_folder(fast_workspace_path.display().to_string()),
+        )
+        .expect("start fast execution");
+    let slow_execution = engine
+        .start(
+            &slow_definition,
+            serde_json::json!({}),
+            Workspace::local_folder(slow_workspace_path.display().to_string()),
+        )
+        .expect("start slow execution");
+
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let client = handle.client();
+
+    // `stream_all()`'s connection is lazy — it only opens on the first
+    // `.next()` poll (see `src/tui/mod.rs`'s module doc on this same gap for
+    // `App`'s own event loop). Polling it once, in its own task, before
+    // either run is spawned is what actually opens the SSE connection early
+    // enough to see the fast execution's own terminal event; the sleep
+    // afterwards is a generous margin for the connection to be fully
+    // established server-side, not a race the test depends on being exact.
+    let stream = client.stream_all();
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stream_task = tokio::spawn(async move {
+        tokio::pin!(stream);
+        while let Some(item) = stream.next().await {
+            if events_tx.send(item).is_err() {
+                break;
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let engine_for_fast = Arc::clone(&engine);
+    let fast_definition_for_run = fast_definition.clone();
+    let fast_id = fast_execution.id.clone();
+    let fast_task = tokio::spawn(async move {
+        engine_for_fast
+            .run(&fast_definition_for_run, &fast_id)
+            .await
+            .expect("fast run to completion")
+    });
+
+    let engine_for_slow = Arc::clone(&engine);
+    let slow_definition_for_run = slow_definition.clone();
+    let slow_id = slow_execution.id.clone();
+    let slow_task = tokio::spawn(async move {
+        engine_for_slow
+            .run(&slow_definition_for_run, &slow_id)
+            .await
+            .expect("slow run to completion")
+    });
+
+    let mut saw_fast_terminal = false;
+    let mut saw_slow_terminal = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !saw_slow_terminal {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "stream_all ended or stalled before the slow execution's terminal event \
+             (saw_fast_terminal={saw_fast_terminal})"
+        );
+        let item = match tokio::time::timeout(remaining, events_rx.recv()).await {
+            Ok(Some(item)) => item.expect("stream item must not be an error"),
+            Ok(None) => panic!(
+                "stream_all ended after the fast execution finished, before the slow one did \
+                 (saw_fast_terminal={saw_fast_terminal}) — this is exactly the bug this test \
+                 guards against"
+            ),
+            Err(_) => panic!("timed out waiting for the next stream_all item"),
+        };
+        if item.workflow_execution_id == fast_execution.id
+            && matches!(
+                item.data,
+                narsor::domain::EventData::WorkflowCompleted { .. }
+            )
+        {
+            saw_fast_terminal = true;
+        }
+        if item.workflow_execution_id == slow_execution.id
+            && matches!(
+                item.data,
+                narsor::domain::EventData::WorkflowCompleted { .. }
+            )
+        {
+            saw_slow_terminal = true;
+        }
+    }
+
+    fast_task.await.expect("fast run task");
+    slow_task.await.expect("slow run task");
+    stream_task.abort();
+    assert!(
+        saw_fast_terminal,
+        "must have observed the fast execution's terminal event too"
+    );
+}

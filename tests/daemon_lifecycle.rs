@@ -412,3 +412,122 @@ async fn drain_active_runs_pauses_the_active_run_and_waits_for_it_to_finish() {
         "Engine::pause was honoured at the next step boundary (D34)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression: the HTTP server must stop accepting new mutating requests
+// before the active-run drain, not after (found in code review, U8 follow-up)
+// ---------------------------------------------------------------------------
+
+/// Writes a workflow with one script action that sleeps `sleep_seconds`
+/// before succeeding, and returns its absolute path — passed straight to
+/// `POST /tasks` as the `workflow` field, exactly as `narsor run
+/// <path-to-file>` would (`WorkflowResolver::resolve` accepts an existing
+/// file path directly, regardless of the daemon's own catalog directory).
+fn write_sleeping_workflow(root: &Path, sleep_seconds: u64) -> PathBuf {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scripts/sleep_then_emit.sh");
+    let yaml = format!(
+        r#"
+name: daemon-shutdown-race-fixture
+version: 1
+description: One script action that sleeps before succeeding.
+
+states:
+  slow:
+    action:
+      type: script
+      command: "{command}"
+      args:
+        - "{seconds}"
+        - '{{"output": "done"}}'
+    outputs:
+      - done
+    transitions:
+      done: completed
+
+  completed:
+    description: Terminal.
+
+terminal_states:
+  - completed
+"#,
+        command = script.display(),
+        seconds = sleep_seconds,
+    );
+    let path = root.join(format!("sleeping-{sleep_seconds}.yaml"));
+    fs::write(&path, yaml).expect("write the workflow definition");
+    path
+}
+
+/// Regression test for a real bug found in code review: `run_daemon` used to
+/// call `drain_active_runs` — which can legitimately take up to
+/// `SHUTDOWN_DRAIN_TIMEOUT` (several seconds) — *before* telling the HTTP
+/// server to stop accepting new connections. Every mutating endpoint stayed
+/// reachable throughout that whole window, so a fresh `POST /tasks` landing
+/// mid-drain would start a background run that the drain's own snapshot
+/// (already taken) never asked to pause — silently defeating the point of
+/// draining at all.
+///
+/// This starts one long-running action (to give the drain real time to
+/// work with), sends `SIGTERM`, and — comfortably after the near-instant
+/// `stop_accepting()` call but comfortably before the multi-second drain
+/// finishes — asserts a second `POST /tasks` is refused at the connection
+/// level, not accepted.
+#[tokio::test]
+async fn new_mutating_requests_are_refused_once_shutdown_begins_not_only_after_the_drain() {
+    let root = TempRoot::new();
+    let mut child = spawn_daemon(root.path());
+    let info = wait_for_daemon_info(root.path(), Duration::from_secs(10));
+
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+
+    let long_workflow = write_sleeping_workflow(root.path(), 5);
+    let start = http
+        .post(format!("http://{}/tasks", info.addr))
+        .bearer_auth(&info.token)
+        .json(&serde_json::json!({ "workflow": long_workflow.display().to_string(), "inputs": {} }))
+        .send()
+        .await
+        .expect("start the long-running task");
+    assert_eq!(start.status(), reqwest::StatusCode::ACCEPTED);
+
+    // Let the action actually begin before shutting down, so
+    // `drain_active_runs` has a real, multi-second wait ahead of it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    send_sigterm(child.id());
+
+    // Comfortably longer than the near-instant `stop_accepting()` call this
+    // signal triggers, comfortably shorter than the 5-second action the
+    // drain is waiting on — squarely inside the window the bug this test
+    // guards against would have kept accepting new connections in.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let short_workflow = write_sleeping_workflow(root.path(), 0);
+    let second = http
+        .post(format!("http://{}/tasks", info.addr))
+        .bearer_auth(&info.token)
+        .json(
+            &serde_json::json!({ "workflow": short_workflow.display().to_string(), "inputs": {} }),
+        )
+        .send()
+        .await;
+
+    match second {
+        Err(error) => assert!(
+            error.is_connect() || error.is_request() || error.is_timeout(),
+            "expected a connection-level refusal, got a different reqwest error: {error}"
+        ),
+        Ok(response) => panic!(
+            "a new mutating request must be refused once shutdown has begun \
+             (drain_active_runs took its snapshot already) — instead got {}",
+            response.status()
+        ),
+    }
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(15));
+    assert!(status.success(), "daemon should still exit cleanly");
+}

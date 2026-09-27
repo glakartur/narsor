@@ -37,7 +37,7 @@ pub use conversation::{
     ConversationEntry, ConversationSnapshot, ConversationSource, ConversationStore,
     ConversationWriter,
 };
-pub use daemon_info::DaemonInfo;
+pub use daemon_info::{pid_is_alive, DaemonInfo};
 pub use event_log::EventLog;
 pub use execution_store::{ExecutionStore, PENDING_INPUT_FILE};
 pub use paths::{

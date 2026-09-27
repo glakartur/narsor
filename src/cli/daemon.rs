@@ -121,6 +121,18 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     terminate.recv().await;
     tracing::info!("daemon: received SIGTERM, shutting down");
 
+    // Stop accepting new connections *before* draining active runs, not
+    // after: `Engine::active_run_ids()` is a snapshot the instant
+    // `drain_active_runs` takes it, and a fresh `POST /tasks`/`/resume`/
+    // `/input` landing anywhere in the drain window would start a new
+    // background run this snapshot never asked to pause — silently
+    // defeating the whole point of draining. An in-flight request that
+    // arrived a moment before this call still completes normally
+    // (`stop_accepting` only refuses *new* connections); everything after
+    // this point is refused at the TCP level before it ever reaches a
+    // handler.
+    api_handle.stop_accepting();
+
     if !drain_active_runs(&engine, SHUTDOWN_DRAIN_TIMEOUT).await {
         tracing::warn!(
             "daemon: active runs did not drain within the shutdown timeout; exiting anyway \
@@ -128,7 +140,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         );
     }
 
-    if tokio::time::timeout(HTTP_SHUTDOWN_TIMEOUT, api_handle.shutdown())
+    if tokio::time::timeout(HTTP_SHUTDOWN_TIMEOUT, api_handle.wait_drained())
         .await
         .is_err()
     {

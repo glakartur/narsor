@@ -67,7 +67,8 @@ use crate::api::dto::{
 };
 use crate::domain::{Event, EventData, ExecutionStatus};
 use crate::engine::{
-    build_timeline, terminal_status, Engine, EngineError, HumanInputDelivery, Timeline,
+    build_timeline, terminal_status, Engine, EngineError, HumanActionError, HumanInputDelivery,
+    Timeline,
 };
 use crate::persistence::{ConversationSource, ExecutionStore, PersistenceError};
 use crate::tasks::{self, TaskError};
@@ -260,7 +261,12 @@ impl From<PersistenceError> for ApiError {
 impl From<EngineError> for ApiError {
     fn from(error: EngineError) -> Self {
         match error {
-            EngineError::AlreadyRunning { .. } => ApiError::Conflict(error.to_string()),
+            EngineError::AlreadyRunning { .. }
+            | EngineError::NotRunnable { .. }
+            | EngineError::AwaitingHumanInput { .. }
+            | EngineError::HumanInput(
+                HumanActionError::NotPaused { .. } | HumanActionError::NoPendingRequest { .. },
+            ) => ApiError::Conflict(error.to_string()),
             EngineError::Persistence(PersistenceError::ExecutionNotFound { .. }) => {
                 ApiError::ExecutionNotFound
             }

@@ -81,7 +81,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -115,7 +115,7 @@ pub struct ApiHandle {
     addr: SocketAddr,
     token: String,
     task: JoinHandle<()>,
-    shutdown_tx: oneshot::Sender<()>,
+    shutdown: Arc<Notify>,
 }
 
 impl ApiHandle {
@@ -138,12 +138,49 @@ impl ApiHandle {
     /// ([`axum::serve`]'s `with_graceful_shutdown`), then this returns once
     /// the serving task has actually ended.
     ///
-    /// The send can fail if the serving task already ended on its own (for
-    /// instance the listener errored); that is not a failure to report here,
-    /// since the outcome — the task is no longer running — is exactly what
-    /// was asked for.
+    /// This is [`ApiHandle::stop_accepting`] followed by
+    /// [`ApiHandle::wait_drained`] — kept as one call for a caller that
+    /// doesn't need anything to happen *between* the two (every caller
+    /// before the daemon's own shutdown sequence needed only this). A
+    /// caller that needs new connections to stop being accepted before some
+    /// other work runs (like `narsor daemon`'s own active-run drain — see
+    /// `src/cli/daemon.rs::run_daemon`) should call the two steps
+    /// separately instead of this one.
     pub async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(());
+        self.stop_accepting();
+        self.wait_drained().await;
+    }
+
+    /// Stops the server from accepting any *new* connection, immediately —
+    /// wakes [`axum::serve`]'s `with_graceful_shutdown` future without
+    /// waiting for anything.
+    ///
+    /// A [`tokio::sync::Notify`], not a `oneshot`: the signal has to be
+    /// sendable through `&self` (this method takes a borrow, not `self` by
+    /// value), since the caller still needs the handle afterwards to call
+    /// [`ApiHandle::wait_drained`] — `oneshot::Sender::send` consumes the
+    /// sender and cannot be cloned, so it cannot fire from a shared
+    /// reference. `notify_one` is a no-op if the graceful-shutdown future is
+    /// not yet awaiting it (a permit is stored and consumed on its next
+    /// `.notified().await` instead), so calling this exactly once, before
+    /// anything else, is sufficient regardless of scheduling.
+    ///
+    /// Existing connections (in-flight requests, open SSE streams) are left
+    /// running; [`ApiHandle::wait_drained`] is what waits for those. Calling
+    /// this *before* any other shutdown-time work — rather than only at the
+    /// end, as the pre-U8 single [`ApiHandle::shutdown`] call did — is what
+    /// closes the window where a fresh mutating request (`POST /tasks`,
+    /// `/resume`, `/input`) could still land and start a new background run
+    /// after the daemon has already decided it is shutting down and started
+    /// waiting for [`crate::engine::Engine::active_run_ids`] to drain.
+    pub fn stop_accepting(&self) {
+        self.shutdown.notify_one();
+    }
+
+    /// Waits for the serving task to actually end — every connection has
+    /// either finished on its own or [`ApiHandle::stop_accepting`] already
+    /// asked it to stop accepting new ones.
+    pub async fn wait_drained(self) {
         let _ = self.task.await;
     }
 }
@@ -169,11 +206,12 @@ pub async fn start(
 
     let store = engine.store().clone();
     let app = routes::router(engine, store, token.clone(), catalog_dir, work_dir);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_wait = Arc::clone(&shutdown);
     let task = tokio::spawn(async move {
         let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
+            .with_graceful_shutdown(async move {
+                shutdown_wait.notified().await;
             })
             .await;
     });
@@ -182,6 +220,6 @@ pub async fn start(
         addr,
         token,
         task,
-        shutdown_tx,
+        shutdown,
     })
 }

@@ -236,7 +236,7 @@ impl ApiClient {
         execution_id: &str,
     ) -> impl Stream<Item = Result<Event, ClientError>> {
         let url = format!("{}/executions/{execution_id}/stream", self.base_url);
-        self.sse_stream(url)
+        self.sse_stream(url, Some(execution_id.to_string()))
     }
 
     /// An SSE stream of every event from every execution the daemon runs.
@@ -244,10 +244,13 @@ impl ApiClient {
     /// Unlike [`ApiClient::stream_execution`], there is no single execution
     /// whose terminal event would end this stream — it keeps running until
     /// the connection itself ends (the server stops, or the caller drops
-    /// it).
+    /// it). This is enforced by passing no `terminal_scope` to
+    /// [`ApiClient::sse_stream`]: `extract_sse_events` only ever treats a
+    /// terminal event as stream-ending when it is scoped to a specific
+    /// execution id, which this call does not have.
     pub fn stream_all(&self) -> impl Stream<Item = Result<Event, ClientError>> {
         let url = format!("{}/events/stream", self.base_url);
-        self.sse_stream(url)
+        self.sse_stream(url, None)
     }
 
     /// Connects to `url` over [`ApiClient::stream_http`] (no request
@@ -255,7 +258,18 @@ impl ApiClient {
     /// of parsed [`Event`]s, or a single [`ClientError`] item when the
     /// connection itself could not be established or the server refused it
     /// before ever opening the stream.
-    fn sse_stream(&self, url: String) -> impl Stream<Item = Result<Event, ClientError>> {
+    ///
+    /// `terminal_scope` is the execution id whose terminal event should end
+    /// the stream, or `None` for a stream — [`ApiClient::stream_all`] — that
+    /// must never self-terminate on content: passed straight through to
+    /// [`sse_events`]/[`extract_sse_events`], which is the single parsing
+    /// pipeline both [`ApiClient::stream_execution`] and
+    /// [`ApiClient::stream_all`] share.
+    fn sse_stream(
+        &self,
+        url: String,
+        terminal_scope: Option<String>,
+    ) -> impl Stream<Item = Result<Event, ClientError>> {
         let http = self.stream_http.clone();
         let token = self.token.clone();
 
@@ -268,7 +282,7 @@ impl ApiClient {
             };
 
             match response.status() {
-                StatusCode::OK => sse_events(response).boxed(),
+                StatusCode::OK => sse_events(response, terminal_scope).boxed(),
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                     single_error_stream(ClientError::Unauthorized)
                 }
@@ -392,16 +406,25 @@ struct SseState<S> {
     /// Set once a terminal event has been queued, or the underlying stream
     /// ended/errored — once `true` and `queue` is empty, the stream is over.
     done: bool,
+    /// The execution id whose terminal event ends this stream, or `None` for
+    /// a stream that must never self-terminate on content
+    /// ([`ApiClient::stream_all`]). See [`extract_sse_events`].
+    terminal_scope: Option<String>,
 }
 
 /// Turns a successful (`200 OK`) SSE response into a stream of parsed
-/// [`Event`]s, ending after a terminal event — see [`SseState`].
-fn sse_events(response: reqwest::Response) -> impl Stream<Item = Result<Event, ClientError>> {
+/// [`Event`]s, ending after `terminal_scope`'s terminal event (or never
+/// self-terminating, when `terminal_scope` is `None`) — see [`SseState`].
+fn sse_events(
+    response: reqwest::Response,
+    terminal_scope: Option<String>,
+) -> impl Stream<Item = Result<Event, ClientError>> {
     let state = SseState {
         inner: response.bytes_stream(),
         buffer: String::new(),
         queue: VecDeque::new(),
         done: false,
+        terminal_scope,
     };
     stream::unfold(state, |state| sse_unfold_step(state))
 }
@@ -426,7 +449,12 @@ where
         match state.inner.next().await {
             Some(Ok(bytes)) => {
                 state.buffer.push_str(&String::from_utf8_lossy(&bytes));
-                extract_sse_events(&mut state.buffer, &mut state.queue, &mut state.done);
+                extract_sse_events(
+                    &mut state.buffer,
+                    &mut state.queue,
+                    &mut state.done,
+                    state.terminal_scope.as_deref(),
+                );
             }
             Some(Err(error)) => {
                 state
@@ -445,13 +473,23 @@ where
 /// parses each one's `data: ` line as an [`Event`], and appends it to
 /// `queue` — silently skipping a frame that has no `data: ` line (axum's
 /// `KeepAlive` comment frames) or whose `data: ` line does not parse as an
-/// `Event` (defence in depth; every real frame this server sends does). Sets
-/// `*done = true` the moment a terminal event is queued, per
-/// [`ApiClient::stream_execution`]'s contract.
+/// `Event` (defence in depth; every real frame this server sends does).
+///
+/// Sets `*done = true` the moment a terminal event *belonging to
+/// `terminal_scope`* is queued — per [`ApiClient::stream_execution`]'s
+/// contract when `terminal_scope` is `Some(execution_id)`. When
+/// `terminal_scope` is `None` ([`ApiClient::stream_all`]), a terminal event
+/// never sets `done`: this is the one piece of state that makes the two
+/// streams' contracts different despite sharing this parser. Getting this
+/// scoping wrong is not hypothetical — an earlier version of this function
+/// ended on *any* terminal event regardless of whose it was, which silently
+/// killed the global stream the moment the first of several concurrently
+/// running executions finished.
 fn extract_sse_events(
     buffer: &mut String,
     queue: &mut VecDeque<Result<Event, ClientError>>,
     done: &mut bool,
+    terminal_scope: Option<&str>,
 ) {
     while let Some(idx) = buffer.find("\n\n") {
         let frame = buffer[..idx].to_string();
@@ -464,7 +502,8 @@ fn extract_sse_events(
             let Ok(event) = serde_json::from_str::<Event>(data) else {
                 continue;
             };
-            let terminal = is_terminal_event(&event.data);
+            let terminal = is_terminal_event(&event.data)
+                && terminal_scope == Some(event.workflow_execution_id.as_str());
             queue.push_back(Ok(event));
             if terminal {
                 *done = true;

@@ -36,11 +36,14 @@
 //! else has already spawned" are the same wait from this caller's point of
 //! view.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::config::Flags;
 use crate::daemon::launch::spawn_detached;
-use crate::persistence::{write_atomic_exclusive, DaemonInfo, PersistenceError, StatePaths};
+use crate::persistence::{
+    pid_is_alive, write_atomic_exclusive, DaemonInfo, PersistenceError, StatePaths,
+};
 
 use super::client::ApiClient;
 
@@ -65,11 +68,15 @@ const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// recovery sweep, socket bind — that its own path never pays for.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Content written to `daemon.lock`. Never read back — only its *existence*
-/// (via `write_atomic_exclusive`'s `O_EXCL` semantics) matters — but a lock
-/// file with recognisable content is friendlier to an operator who stumbles
-/// on it with `cat` while a spawn is in flight.
-const LOCK_FILE_CONTENTS: &[u8] = b"narsor daemon spawn in progress\n";
+/// How many times [`try_acquire_lock`] will reap a stale lock and retry
+/// before giving up and treating the lock as held by a live racer.
+///
+/// One reap is normally enough (the lock's owner is either dead, in which
+/// case removing it once clears the way, or alive, in which case the very
+/// next attempt observes that and stops immediately) — a small bound beyond
+/// one only guards against pathological back-to-back staleness, not a
+/// realistic steady state.
+const MAX_LOCK_REAP_ATTEMPTS: u32 = 5;
 
 /// A failure of the discover-or-launch protocol.
 #[derive(Debug)]
@@ -150,7 +157,7 @@ pub async fn ensure_daemon_running(
     }
 
     let lock_file = paths.daemon_lock_file();
-    let won_the_lock = write_atomic_exclusive(&lock_file, LOCK_FILE_CONTENTS)?;
+    let won_the_lock = try_acquire_lock(&lock_file)?;
 
     if won_the_lock {
         let outcome = spawn_and_wait(paths, flags, &daemon_file).await;
@@ -174,6 +181,62 @@ pub async fn ensure_daemon_running(
 /// discovery record already proven live by [`health_check`].
 fn client_for(info: &DaemonInfo) -> ApiClient {
     ApiClient::new(info.addr, info.token.clone())
+}
+
+/// Attempts to acquire `lock_file`, reaping it first if it names a PID that
+/// is no longer alive.
+///
+/// A plain `write_atomic_exclusive` call would deadlock every future caller
+/// forever behind a lock whose winner died — killed, OOM, a closing
+/// terminal — after acquiring it but before its own `remove_file` ran (see
+/// [`ensure_daemon_running`]'s cleanup comment: that cleanup only runs on the
+/// winner's own path, so it never runs at all if that path is cut short).
+/// The lock file's content is the winner's own PID for exactly this reason —
+/// [`LOCK_FILE_CONTENTS`] used to be a fixed, unparseable string; recording
+/// the PID is what makes staleness checkable at all, the same way
+/// `daemon.json` already lets [`DaemonInfo::is_alive`] tell a dead entry from
+/// a live one.
+///
+/// Bounded by [`MAX_LOCK_REAP_ATTEMPTS`]: each attempt either wins outright,
+/// or finds a live owner (a genuine, not stale, racing caller) and stops
+/// immediately — the bound only guards against back-to-back staleness, which
+/// should not happen in steady state.
+fn try_acquire_lock(lock_file: &Path) -> Result<bool, DiscoveryError> {
+    for _ in 0..MAX_LOCK_REAP_ATTEMPTS {
+        if write_atomic_exclusive(lock_file, current_pid_bytes().as_bytes())? {
+            return Ok(true);
+        }
+        match read_lock_owner(lock_file) {
+            Some(pid) if !pid_is_alive(pid) => {
+                // The lock's owner is dead: reap the stale lock and try
+                // again. A concurrent racer could win the re-acquire
+                // instead of us — that is not a bug, just this caller
+                // losing the race to a live one, exactly as an ordinary
+                // `write_atomic_exclusive` failure would be handled below.
+                let _ = std::fs::remove_file(lock_file);
+            }
+            // A live owner, or the lock file could not be read/parsed
+            // (already removed by whoever reaped it, or mid-write by its
+            // creator) — either way, not stale from this caller's point of
+            // view. Fall through to the poll-for-someone-else's-daemon path,
+            // same as an ordinary lost race.
+            _ => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+/// The current process's PID, as the exact bytes [`try_acquire_lock`] writes
+/// into a freshly acquired `daemon.lock`.
+fn current_pid_bytes() -> String {
+    std::process::id().to_string()
+}
+
+/// Reads `lock_file`'s content back as the PID that acquired it, or `None`
+/// if the file is gone, unreadable, or does not parse as one — any of which
+/// means "not a lock this caller can judge the staleness of," not "stale."
+fn read_lock_owner(lock_file: &Path) -> Option<u32> {
+    std::fs::read_to_string(lock_file).ok()?.trim().parse().ok()
 }
 
 /// The winning branch: launch a detached daemon, then wait for it to
