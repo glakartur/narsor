@@ -28,8 +28,8 @@ use chrono::Utc;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::config::Resolved;
-use crate::engine::Engine;
-use crate::persistence::{DaemonInfo, ExecutionStore};
+use crate::engine::{Engine, HarnessRegistry};
+use crate::persistence::{DaemonInfo, DefaultHarnessSelector, ExecutionStore};
 
 use super::commands::{CliError, Result};
 
@@ -86,7 +86,21 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
 
     recover_at_startup(&store);
 
-    let engine = Arc::new(Engine::new(store.clone()).with_agent_defaults(config.agent_defaults()));
+    let defaults = config.agent_defaults();
+    let supported = HarnessRegistry::defaults()
+        .supported()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let selector = Arc::new(
+        DefaultHarnessSelector::load(paths.clone(), supported, defaults.harness.clone())
+            .await
+            .map_err(|error| {
+                CliError::failure(format!("could not load default harness selection: {error}"))
+            })?,
+    );
+    let engine =
+        Arc::new(Engine::new(store.clone()).with_agent_defaults_and_selector(defaults, selector));
 
     // The router now also carries the mutating endpoints U3 adds (SSE is
     // still U4, out of scope here); it drives on `engine` directly, sharing

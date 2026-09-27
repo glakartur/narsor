@@ -81,7 +81,7 @@ use crate::engine::actions::{
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
-use crate::persistence::{read_json, ExecutionStore, PersistenceError};
+use crate::persistence::{read_json, DefaultHarnessSelector, ExecutionStore, PersistenceError};
 use crate::workflow::TemplateScope;
 
 /// How many events the in-process broadcast channel buffers per receiver.
@@ -117,13 +117,17 @@ fn agent_executor(
     store: &ExecutionStore,
     events: &broadcast::Sender<Event>,
     default_harness: &str,
+    default_harness_selector: Option<Arc<DefaultHarnessSelector>>,
 ) -> AgentExecutor {
-    AgentExecutor::new()
-        .with_default_harness(default_harness)
-        .with_event_sink(Arc::new(LoggingEventSink::new(
-            store.clone(),
-            Some(events.clone()),
-        )))
+    let executor = AgentExecutor::new().with_default_harness(default_harness);
+    let executor = match default_harness_selector {
+        Some(selector) => executor.with_default_harness_selector(selector),
+        None => executor,
+    };
+    executor.with_event_sink(Arc::new(LoggingEventSink::new(
+        store.clone(),
+        Some(events.clone()),
+    )))
 }
 
 /// What the configuration contributes to an `agent` action.
@@ -488,7 +492,7 @@ impl Engine {
     pub fn new(store: ExecutionStore) -> Self {
         let events = broadcast::channel(EVENT_CHANNEL_CAPACITY).0;
 
-        let agent = agent_executor(&store, &events, BUILT_IN_HARNESS);
+        let agent = agent_executor(&store, &events, BUILT_IN_HARNESS, None);
 
         let mut executors: HashMap<ActionKind, Arc<dyn ActionExecutor>> = HashMap::new();
         executors.insert(ActionKind::Script, Arc::new(ScriptExecutor::new()));
@@ -514,7 +518,21 @@ impl Engine {
     /// of your own, or that one is overwritten.
     pub fn with_agent_defaults(mut self, defaults: AgentDefaults) -> Self {
         self.agent_timeout_secs = defaults.timeout_secs;
-        let agent = agent_executor(&self.store, &self.events, &defaults.harness);
+        let agent = agent_executor(&self.store, &self.events, &defaults.harness, None);
+        self.executors.insert(ActionKind::Agent, Arc::new(agent));
+        self
+    }
+
+    /// Returns the engine with configured agent defaults and a shared live
+    /// selector for harnessless attempts. Custom executors registered with
+    /// [`with_executor`](Engine::with_executor) remain untouched.
+    pub fn with_agent_defaults_and_selector(
+        mut self,
+        defaults: AgentDefaults,
+        selector: Arc<DefaultHarnessSelector>,
+    ) -> Self {
+        self.agent_timeout_secs = defaults.timeout_secs;
+        let agent = agent_executor(&self.store, &self.events, &defaults.harness, Some(selector));
         self.executors.insert(ActionKind::Agent, Arc::new(agent));
         self
     }

@@ -60,7 +60,8 @@ use crate::domain::{
     Event, EventData, Workspace,
 };
 use crate::persistence::{
-    ConversationSource, ConversationStore, ConversationWriter, ExecutionStore,
+    ConversationSource, ConversationStore, ConversationWriter, DefaultHarnessSelector,
+    ExecutionStore,
 };
 
 /// Appended to every prompt, so the agent is told the contract it has to meet.
@@ -241,6 +242,7 @@ impl ConversationSink {
 pub struct AgentExecutor {
     harnesses: HarnessRegistry,
     default_harness: String,
+    default_harness_selector: Option<Arc<DefaultHarnessSelector>>,
     events: Option<Arc<dyn AgentEventSink>>,
 }
 
@@ -250,6 +252,7 @@ impl AgentExecutor {
         Self {
             harnesses: HarnessRegistry::defaults(),
             default_harness: BUILT_IN_HARNESS.to_string(),
+            default_harness_selector: None,
             events: None,
         }
     }
@@ -259,6 +262,7 @@ impl AgentExecutor {
         Self {
             harnesses,
             default_harness: BUILT_IN_HARNESS.to_string(),
+            default_harness_selector: None,
             events: None,
         }
     }
@@ -271,6 +275,13 @@ impl AgentExecutor {
     /// harness that actually ran rather than "unspecified" (D-F).
     pub fn with_default_harness(mut self, harness: impl Into<String>) -> Self {
         self.default_harness = harness.into();
+        self
+    }
+
+    /// Returns the executor with a live, shared source for harnessless
+    /// actions. Each attempt snapshots it once before creating its session.
+    pub fn with_default_harness_selector(mut self, selector: Arc<DefaultHarnessSelector>) -> Self {
+        self.default_harness_selector = Some(selector);
         self
     }
 
@@ -343,13 +354,34 @@ impl AgentExecutor {
     /// One agent run, from the session record to the output label.
     async fn run(&self, request: ActionRequest<'_>) -> Result<ActionOutcome, ActionError> {
         let config = agent_config(request.action)?;
-        // The action's own harness, or the configured default; an unknown name
-        // is still reported here, naming the ones that exist.
-        let harness = config.harness.as_deref().unwrap_or(&self.default_harness);
+        let resume = resume_session(config)?;
+        if resume.is_some() && config.harness.is_none() {
+            return Err(ActionError {
+                message: format!(
+                    "parameter '{RESUME_SESSION_PARAMETER}' requires an explicit 'harness'"
+                ),
+                error_type: Some("invalid_parameter".to_string()),
+                details: None,
+            });
+        }
+
+        // An explicit action choice always wins. Otherwise snapshot the shared
+        // selector exactly once before the session, conversation, or process
+        // exists, so a later mutation can only affect a future attempt.
+        let selected_default;
+        let harness = match config.harness.as_deref() {
+            Some(harness) => harness,
+            None => {
+                selected_default = match &self.default_harness_selector {
+                    Some(selector) => selector.snapshot().await.effective,
+                    None => self.default_harness.clone(),
+                };
+                &selected_default
+            }
+        };
         let adapter = self.harnesses.get(harness)?;
 
         let mut session = new_session(config, harness, request.execution_id);
-        let resume = resume_session(config)?;
 
         let prompt = format!("{}{AGENT_OUTPUT_CONTRACT}", config.prompt);
         let workspace = Path::new(&request.workspace.path);

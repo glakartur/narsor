@@ -26,7 +26,8 @@ use narsor::engine::{
     CodexAdapter, Engine, HarnessRegistry, LoggingEventSink, OpenCodeAdapter,
 };
 use narsor::persistence::{
-    ConversationEntry, ConversationSource, ConversationStore, ExecutionStore,
+    ConversationEntry, ConversationSource, ConversationStore, DefaultHarnessSelector,
+    ExecutionStore, StatePaths,
 };
 use narsor::workflow::{load_from_file, TemplateScope};
 use serde_json::{json, Value};
@@ -1948,6 +1949,115 @@ async fn the_workflow_wins_over_the_configured_harness() {
 
     assert!(matches!(outcome, ActionOutcome::Completed(_)));
     assert_eq!(fake.calls(), 1);
+}
+
+/// An explicit action harness remains authoritative when the daemon default is
+/// changed live.
+#[tokio::test]
+async fn an_explicit_harness_wins_over_the_live_default_selector() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope("{\"output\": \"done\"}"));
+    let selector = Arc::new(
+        DefaultHarnessSelector::load(
+            StatePaths::new(root.path()),
+            vec!["claude-code".into(), "opencode".into()],
+            "opencode",
+        )
+        .await
+        .expect("load selector"),
+    );
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(ClaudeCodeAdapter::with_program(fake.program()))),
+    )
+    .with_default_harness_selector(selector);
+
+    let outcome = execute(
+        &executor,
+        agent_action("do the thing"),
+        &root.workspace(),
+        None,
+    )
+    .await
+    .expect("the explicit Claude harness runs");
+
+    assert!(matches!(outcome, ActionOutcome::Completed(_)));
+    assert!(fake.args(1).iter().any(|argument| argument == "--print"));
+}
+
+/// A selector is read once as an attempt starts: a later mutation affects the
+/// next action, never an action already launched with its previous snapshot.
+#[tokio::test]
+async fn live_default_changes_apply_to_the_next_harnessless_attempt() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope("{\"output\": \"done\"}")).sleeps(1);
+    let selector = Arc::new(
+        DefaultHarnessSelector::load(
+            StatePaths::new(root.path()),
+            vec!["claude-code".into(), "opencode".into()],
+            "claude-code",
+        )
+        .await
+        .expect("load selector"),
+    );
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(ClaudeCodeAdapter::with_program(fake.program())))
+            .with_adapter(Arc::new(OpenCodeAdapter::with_program(fake.program()))),
+    )
+    .with_default_harness_selector(Arc::clone(&selector));
+    let mut config = agent_action("do the thing");
+    config.harness = None;
+
+    let first_executor = executor.clone();
+    let first_workspace = root.workspace();
+    let first_config = config.clone();
+    let first = tokio::spawn(async move {
+        execute(&first_executor, first_config, &first_workspace, None).await
+    });
+    for _ in 0..100 {
+        if fake.calls() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(fake.calls(), 1, "the first harness process started");
+    selector.set("opencode").await.expect("change default");
+    first
+        .await
+        .expect("the first task joins")
+        .expect("the old default attempt completes");
+    execute(&executor, config, &root.workspace(), None)
+        .await
+        .expect("the new default runs");
+
+    assert!(fake.args(1).iter().any(|argument| argument == "--print"));
+    assert!(fake.args(2).iter().any(|argument| argument == "run"));
+}
+
+/// A bare resume id cannot be safely associated with a provider after the
+/// default has changed.
+#[tokio::test]
+async fn resuming_a_session_requires_an_explicit_harness() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let mut config = agent_action("continue");
+    config.harness = None;
+    config
+        .parameters
+        .insert("resume_session".to_string(), json!("thread-42"));
+
+    let error = fail(&executor(&fake), config, &root.workspace()).await;
+
+    assert_eq!(error.error_type.as_deref(), Some("invalid_parameter"));
+    assert!(
+        error.message.contains("explicit 'harness'"),
+        "{}",
+        error.message
+    );
+    assert_eq!(fake.calls(), 0);
 }
 
 /// The session event records the harness that actually ran.
