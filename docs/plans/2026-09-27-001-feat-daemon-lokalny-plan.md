@@ -1,7 +1,7 @@
 ---
 title: Lokalny daemon jako jedyny właściciel Engine/ExecutionStore
 type: feat
-status: active
+status: completed
 date: 2026-09-27
 origin: docs/brainstorms/2026-09-26-narsor-daemon-lokalny-requirements.md
 ---
