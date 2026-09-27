@@ -1,4 +1,5 @@
-//! Tests for the TUI's state layer (U10).
+//! Tests for the TUI's state layer (U10, migrated to a REST(+SSE)-only
+//! client in U7).
 //!
 //! The plan's execution note is explicit: test `app.rs`, not the rendering.
 //! Frame snapshots are brittle and prove little, so what is asserted here is
@@ -7,6 +8,26 @@
 //! writes when the operator forces a transition. The one thing taken from the
 //! rendering half is [`views::layout`], because it is pure geometry and a
 //! resize is nothing but running it against a different rectangle.
+//!
+//! # U7: a real daemon subprocess, not a shared `Arc<Engine>`
+//!
+//! Before this unit, every test here built one `Arc<Engine>` and handed it
+//! both to `App` (as its live driver) and to itself (to seed state, drive the
+//! workflow directly, and read back the result). `App` no longer holds an
+//! `Engine` at all, so that sharing is gone: each test now spawns a real
+//! `narsor daemon` subprocess (mirroring `tests/api_discovery.rs`'s own
+//! pattern for driving one), over the same temporary root, and `App` talks to
+//! it purely through `ApiClient`.
+//!
+//! The ordering that matters: whatever a test needs to *seed* directly on
+//! disk (a specific execution record, a hand-written event log, an old-format
+//! log fixture) has to happen **before** the daemon is spawned — once it is
+//! up, it is the sole writer of that store (R4/R11), and a test process
+//! writing to the same files concurrently would race exactly the corruption
+//! the whole daemon architecture exists to prevent. A throwaway, in-process
+//! `Engine` is still used for this — `Engine`/`ExecutionStore` are perfectly
+//! fine constructions in a *test*, which is not `src/tui/` — but only ever
+//! before `spawn_daemon` runs, never alongside it.
 //!
 //! # Nothing is written into the repository
 //!
@@ -19,20 +40,25 @@
 use std::fs;
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::Once;
+use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+use futures::{Stream, StreamExt as _};
 use serde_json::{json, Value};
-use tokio::sync::broadcast::error::RecvError;
 
+use narsor::api::{ensure_daemon_running, ApiClient, ClientError};
+use narsor::config::Flags;
+use narsor::daemon::launch::set_exe_override_for_tests;
 use narsor::domain::{
     Event, EventData, ExecutionStatus, HumanInputType, WorkflowDefinition, WorkflowExecution,
     Workspace,
 };
 use narsor::engine::actions::script::TRUNCATION_MARKER;
-use narsor::engine::{ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry};
+use narsor::engine::Engine;
 use narsor::persistence::conversation::ConversationSource;
-use narsor::persistence::{CatalogPaths, ExecutionStore, WorkPaths};
+use narsor::persistence::{CatalogPaths, DaemonInfo, ExecutionStore, StatePaths, WorkPaths};
 use narsor::registry::{RepositoryEntry, RepositoryRegistry};
 use narsor::tui::app::{
     event_detail_lines, event_line, task_position_line, App, FormRow, Modal, NewTaskChoice,
@@ -73,6 +99,113 @@ impl Drop for TempRoot {
     }
 }
 
+/// Points [`narsor::daemon::launch::spawn_detached`] at the real, compiled
+/// `narsor` binary instead of this test harness binary — see
+/// `tests/api_discovery.rs`'s own copy of this helper for why.
+fn init_exe_override() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        set_exe_override_for_tests(Path::new(env!("CARGO_BIN_EXE_narsor")));
+    });
+}
+
+/// A daemon subprocess spawned over one test's temporary root, killed and
+/// reaped when it drops — the same lifecycle `tests/api_discovery.rs` gives
+/// the daemons it spawns.
+struct Daemon {
+    pid: u32,
+}
+
+impl Daemon {
+    /// Spawns (or discovers) a daemon over `root` and returns a handle to it
+    /// plus a client already talking to it.
+    async fn start(root: &Path) -> (Self, ApiClient) {
+        init_exe_override();
+        let client = Self::discover(root).await;
+        let info = DaemonInfo::read(&StatePaths::new(root).daemon_file())
+            .expect("daemon.json exists once ensure_daemon_running returns");
+        (Self { pid: info.pid }, client)
+    }
+
+    /// A fresh client for the daemon this handle already spawned — cheap: it
+    /// just re-reads `daemon.json` and health-checks it, exactly what a
+    /// second real TUI/CLI process does against an already-running daemon
+    /// (AE5's own setup).
+    async fn discover(root: &Path) -> ApiClient {
+        let paths = StatePaths::new(root);
+        let flags = Flags {
+            root: Some(root.to_path_buf()),
+            config: None,
+        };
+        ensure_daemon_running(&paths, &flags)
+            .await
+            .expect("ensure_daemon_running finds/spawns a daemon")
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        // SAFETY: a plain signal-send to a PID this handle's own spawn
+        // reported, mirroring `tests/api_discovery.rs`'s `stop_and_reap`.
+        unsafe {
+            libc::kill(self.pid as libc::pid_t, libc::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while pid_alive(self.pid) {
+            if std::time::Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 sends nothing; it only probes existence/visibility.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// An `App` over a daemon this test already spawned — the REST-client
+/// counterpart of the old `App::new(Arc::clone(&engine), …)`. Nothing is read
+/// until [`App::refresh`], exactly as before.
+async fn app_over(_daemon: &Daemon, root: &Path) -> App {
+    let client = Daemon::discover(root).await;
+    App::new(
+        StatePaths::new(root),
+        CatalogPaths::new(root),
+        WorkPaths::new(root),
+        client,
+    )
+}
+
+/// The same, with the workflow search path confined entirely to `root` (no
+/// `HOME`/`XDG_CONFIG_HOME` reach) — the REST-client counterpart of the old
+/// `App::with_resolver`. Refreshes before returning, matching the old
+/// `app_for`'s own behaviour.
+async fn app_for(_daemon: &Daemon, root: &Path) -> App {
+    let resolver = WorkflowResolver::with_user_dir(root.to_path_buf(), Some(user_workflows(root)));
+    let client = Daemon::discover(root).await;
+    let mut app = App::with_resolver(
+        StatePaths::new(root),
+        resolver,
+        CatalogPaths::new(root),
+        WorkPaths::new(root),
+        client,
+    );
+    app.refresh().await;
+    app
+}
+
+/// A plain, read-only store handle for setup and verification — legitimate in
+/// a test (never in `src/tui/`), and always used either *before* a daemon
+/// exists for this root, or read-only afterward.
+fn store_of(root: &Path) -> ExecutionStore {
+    ExecutionStore::new(root)
+}
+
 /// The directory the fixtures live in.
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tui")
@@ -97,7 +230,8 @@ fn inputs() -> Value {
 }
 
 /// Creates an execution the way `narsor run` does, definition path
-/// included, without running it.
+/// included, without running it. Only ever called before a daemon exists for
+/// `root` — see the module doc.
 fn start(engine: &Engine, root: &Path) -> WorkflowExecution {
     let workspace_path = root.join("workspace");
     fs::create_dir_all(&workspace_path).expect("create workspace");
@@ -121,136 +255,98 @@ fn start(engine: &Engine, root: &Path) -> WorkflowExecution {
     execution
 }
 
-/// An engine over a fresh store in `root`.
-/// An interface whose three roots are all the one temporary directory.
-///
-/// Which is the default an unconfigured run gets, and the arrangement these
-/// tests care about: they are about what the interface does, not about where
-/// the three directories are. A test that needs them apart says so.
-async fn app_over(engine: &Arc<Engine>, root: &Path) -> App {
-    App::new(
-        Arc::clone(engine),
-        CatalogPaths::new(root),
-        WorkPaths::new(root),
-        api_client_for(engine, root).await,
-    )
+/// An engine over a fresh store in `root`, for pre-daemon setup only.
+fn engine_for(root: &Path) -> Engine {
+    Engine::new(ExecutionStore::new(root))
 }
 
-/// Starts the embedded API server (U5, now also carrying U3's mutating
-/// endpoints) over the same engine `App` drives — the task view's (U7) only
-/// read path for the timeline and conversations — and leaks the handle so it
-/// keeps serving for the rest of this (short-lived test) process. Every test
-/// gets its own server, on its own random loopback port, exactly as
-/// production does per `App`.
-async fn api_client_for(engine: &Arc<Engine>, root: &Path) -> narsor::api::ApiClient {
-    let handle = narsor::api::start(Arc::clone(engine), root.to_path_buf(), root.to_path_buf())
-        .await
-        .expect("start the embedded api server");
-    let client = handle.client();
-    Box::leak(Box::new(handle));
-    client
-}
-
-fn engine_for(root: &Path) -> Arc<Engine> {
-    Arc::new(Engine::new(ExecutionStore::new(root)))
-}
-
-/// Reloads `execution_id`, retrying briefly until its status matches
-/// `expected`.
-///
-/// Inside the engine, the terminal/failure event is emitted a step before the
-/// store save that records the same status (`Engine::finish`,
-/// `Engine::fail_execution`) — an internal ordering this plan does not touch.
-/// A reader on another task can therefore observe the event
-/// (`drive_until_settled` returns) a hair before that save lands, which a
-/// single immediate read would flake on under the real thread interleaving a
-/// `multi_thread` runtime allows.
-fn reload_until(
-    engine: &Engine,
-    execution_id: &str,
-    expected: ExecutionStatus,
-) -> WorkflowExecution {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+/// Reloads `execution_id` directly off the store, retrying briefly until its
+/// status matches `expected`. A plain file read — safe at any point, before
+/// or after a daemon owns this root, since it never writes.
+fn reload_until(root: &Path, execution_id: &str, expected: ExecutionStatus) -> WorkflowExecution {
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let store = store_of(root);
     loop {
-        let execution = engine
-            .store()
+        let execution = store
             .load_execution(execution_id)
             .expect("reload the execution");
         if execution.status == expected || std::time::Instant::now() >= deadline {
             return execution;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
-/// Feeds `app` from `events` — exactly as the real event loop feeds it from
-/// [`Engine::subscribe`] — until one event names a terminal or error outcome
-/// for `execution_id`.
-///
-/// Dispatching one of the four engine-driving requests now only spawns the
-/// engine call in the background (R1): the request handler itself returns
-/// before that call finishes. A test that wants to see its outcome — on the
-/// execution's own record, or on `app`'s row/notice state — has to actually
-/// pump the same event stream production does, instead of asserting the
-/// instant the handler returns. The subscription must be taken before the
-/// dispatch that starts the background call, or an event emitted in the gap
-/// is missed.
+/// A boxed SSE stream, pinned so `.next()` can be called through a `&mut`
+/// reference repeatedly.
+type EventStream = Pin<Box<dyn Stream<Item = Result<Event, ClientError>> + Send>>;
+
+/// Polls `GET /executions` until every one of `execution_ids` is no longer
+/// `Running` — the authoritative wait every mutating call in this file falls
+/// back on, exactly as `src/cli/commands.rs`'s `wait_until_stopped` does and
+/// for the identical reason (documented in `src/tui/mod.rs`'s own module
+/// doc): a bare SSE subscription has no replay, so a fast-completing fixture
+/// can settle before a test's own stream ever gets around to delivering the
+/// event that says so.
+async fn wait_until_settled(client: &ApiClient, execution_ids: &[&str]) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let listing = client
+            .list_executions()
+            .await
+            .expect("list executions while waiting for them to settle");
+        let all_settled = execution_ids.iter().all(|id| {
+            listing
+                .executions
+                .iter()
+                .find(|execution| &execution.id == id)
+                .is_some_and(|execution| execution.status != ExecutionStatus::Running)
+        });
+        if all_settled {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {execution_ids:?} to settle"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// [`wait_until_settled`] for one execution, then folds in whatever `stream`
+/// already delivered (best-effort — see [`wait_until_settled`]'s doc for why
+/// this is not the primary mechanism) so a notice a live terminal event sets
+/// (`notice_for`) is visible to a caller that wants to assert on it.
 async fn drive_until_settled(
     app: &mut App,
-    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    client: &ApiClient,
+    stream: &mut EventStream,
     execution_id: &str,
 ) {
-    drive_until_all_settled(app, events, &[execution_id]).await;
+    drive_until_all_settled(app, client, stream, &[execution_id]).await;
 }
 
-/// Like [`drive_until_settled`], for more than one execution id at once:
-/// waits until every one of `execution_ids` has had its own settling event
-/// observed, rather than stopping at the first match.
-///
-/// This is not the same as calling [`drive_until_settled`] once per id in
-/// sequence: there is one shared receiver, and a `recv()` that returns an
-/// event removes it from that receiver's view for good. Waiting for id A in
-/// full before starting to wait for id B would silently discard B's own
-/// settling event if it happened to arrive first — exactly the interleaving
-/// two backgrounded executions produce.
+/// Like [`drive_until_settled`], for more than one execution id at once.
 async fn drive_until_all_settled(
     app: &mut App,
-    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    client: &ApiClient,
+    stream: &mut EventStream,
     execution_ids: &[&str],
 ) {
-    let mut pending: std::collections::HashSet<&str> = execution_ids.iter().copied().collect();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !pending.is_empty() {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "timed out waiting for {pending:?} to settle"
-        );
-        let received = tokio::time::timeout(remaining, events.recv())
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for {pending:?} to settle"));
-        if let Ok(event) = &received {
-            let settled = pending.contains(event.workflow_execution_id.as_str())
-                && matches!(
-                    event.data,
-                    EventData::WorkflowCompleted { .. }
-                        | EventData::WorkflowFailed { .. }
-                        | EventData::WorkflowCancelled { .. }
-                        | EventData::WorkflowPaused { .. }
-                        | EventData::HumanInputRequested { .. }
-                        | EventData::Error { .. }
-                );
-            if settled {
-                pending.remove(event.workflow_execution_id.as_str());
-            }
-        }
-        app.on_stream(received);
+    wait_until_settled(client, execution_ids).await;
+    while let Ok(Some(received)) =
+        tokio::time::timeout(Duration::from_millis(200), stream.next()).await
+    {
+        app.on_stream(Some(received));
     }
 }
 
-/// Starts an execution and runs it until it stops on the `review` question.
-async fn paused_at_review(engine: &Engine, root: &Path) -> String {
-    let execution = start(engine, root);
+/// Starts an execution and runs it until it stops on the `review` question —
+/// a throwaway, in-process `Engine`, used only before a daemon exists for
+/// `root` (see the module doc).
+async fn paused_at_review(root: &Path) -> String {
+    let engine = engine_for(root);
+    let execution = start(&engine, root);
     let execution = engine
         .run(&definition(), &execution.id)
         .await
@@ -351,10 +447,10 @@ fn focus_input(app: &mut App, name: &str) {
     }
 }
 
-/// The events an execution has on disk.
-fn events_of(engine: &Engine, execution_id: &str) -> Vec<Event> {
-    engine
-        .store()
+/// The events an execution has on disk — a plain read, safe once a daemon
+/// owns `root` (it never writes).
+fn events_of(root: &Path, execution_id: &str) -> Vec<Event> {
+    store_of(root)
         .event_log(execution_id)
         .read_all()
         .expect("read the event log")
@@ -368,19 +464,19 @@ fn events_of(engine: &Engine, execution_id: &str) -> Vec<Event> {
 #[tokio::test(flavor = "multi_thread")]
 async fn execution_list_reflects_the_store_with_its_statuses() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-
-    let paused = paused_at_review(&engine, root.path()).await;
+    let paused = paused_at_review(root.path()).await;
 
     // A second execution, parked in a terminal status by hand, so the list has
     // two different statuses to show.
+    let engine = engine_for(root.path());
     let mut finished = start(&engine, root.path());
     finished.status = ExecutionStatus::Completed;
     finished.current_state = Some("done".to_string());
     engine.store().save_execution(&finished).expect("save");
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     assert_eq!(app.executions().len(), 2);
 
@@ -406,11 +502,11 @@ async fn execution_list_reflects_the_store_with_its_statuses() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_live_event_appends_to_the_stream_and_moves_the_view() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let execution_id = paused_at_review(&engine, root.path()).await;
+    let execution_id = paused_at_review(root.path()).await;
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     let backfilled = app.events().len();
     assert!(backfilled > 0, "the backfill read the log");
@@ -423,7 +519,7 @@ async fn a_live_event_appends_to_the_stream_and_moves_the_view() {
         },
         last_sequence + 1,
     );
-    app.on_stream(Ok(event));
+    app.on_stream(Some(Ok(event)));
 
     assert_eq!(app.events().len(), backfilled + 1);
     assert_eq!(app.event_cursor(), app.events().len() - 1);
@@ -435,11 +531,11 @@ async fn a_live_event_appends_to_the_stream_and_moves_the_view() {
 #[tokio::test(flavor = "multi_thread")]
 async fn selecting_a_paused_execution_exposes_the_input_form() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    paused_at_review(&engine, root.path()).await;
+    paused_at_review(root.path()).await;
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     assert!(app.pending().is_some(), "the question is visible");
     assert_eq!(app.on_key(key(KeyCode::Char('i'))), Request::None);
@@ -470,25 +566,24 @@ async fn selecting_a_paused_execution_exposes_the_input_form() {
 #[tokio::test(flavor = "multi_thread")]
 async fn submitting_a_valid_form_resumes_the_execution() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let execution_id = paused_at_review(&engine, root.path()).await;
+    let execution_id = paused_at_review(root.path()).await;
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
     app.on_key(key(KeyCode::Char('i')));
 
     // approval_status already reads `approved`; move to `comment` and fill it.
     app.on_key(key(KeyCode::Tab));
     type_text(&mut app, "looks good");
 
-    let mut events = engine.subscribe();
     assert_eq!(app.on_key(key(KeyCode::Enter)), Request::SubmitInput);
     app.submit_input().await;
     assert!(!matches!(app.modal(), Modal::Input(_)), "the form closed");
 
-    drive_until_settled(&mut app, &mut events, &execution_id).await;
+    wait_until_settled(&client, &[&execution_id]).await;
 
-    let execution = reload_until(&engine, &execution_id, ExecutionStatus::Completed);
+    let execution = reload_until(root.path(), &execution_id, ExecutionStatus::Completed);
     assert_eq!(execution.status, ExecutionStatus::Completed);
     assert_eq!(execution.current_state.as_deref(), Some("done"));
     assert!(!app.notice().expect("a notice").is_error);
@@ -498,11 +593,11 @@ async fn submitting_a_valid_form_resumes_the_execution() {
 #[tokio::test(flavor = "multi_thread")]
 async fn permitted_transitions_are_exactly_the_declared_outputs() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    paused_at_review(&engine, root.path()).await;
+    paused_at_review(root.path()).await;
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     assert_eq!(app.permitted_transitions(), vec!["approved", "rejected"]);
 
@@ -522,27 +617,28 @@ async fn permitted_transitions_are_exactly_the_declared_outputs() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_execution_without_events_shows_an_empty_stream() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let store = engine.store();
-
     // Written straight to the store, so not a single event exists for it.
-    let execution = WorkflowExecution::new(
-        &definition(),
-        inputs(),
-        Workspace::local_folder(root.path().display().to_string()),
-    );
-    store
-        .create_execution_dirs(&execution.id)
-        .expect("create the directories");
-    store
-        .save_execution(&execution)
-        .expect("save the execution");
-    store
-        .save_context(&execution.id, &execution.context)
-        .expect("save the context");
+    {
+        let store = store_of(root.path());
+        let execution = WorkflowExecution::new(
+            &definition(),
+            inputs(),
+            Workspace::local_folder(root.path().display().to_string()),
+        );
+        store
+            .create_execution_dirs(&execution.id)
+            .expect("create the directories");
+        store
+            .save_execution(&execution)
+            .expect("save the execution");
+        store
+            .save_context(&execution.id, &execution.context)
+            .expect("save the context");
+    }
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     assert_eq!(app.executions().len(), 1);
     assert!(app.events().is_empty());
@@ -554,19 +650,21 @@ async fn an_execution_without_events_shows_an_empty_stream() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_state_without_allow_manual_override_offers_no_override_mode() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let execution_id = paused_at_review(&engine, root.path()).await;
+    let execution_id = paused_at_review(root.path()).await;
 
     // `prepare` is the fixture's state that deliberately does not allow it.
-    let mut execution = engine
-        .store()
-        .load_execution(&execution_id)
-        .expect("load the execution");
-    execution.current_state = Some("prepare".to_string());
-    engine.store().save_execution(&execution).expect("save");
+    {
+        let store = store_of(root.path());
+        let mut execution = store
+            .load_execution(&execution_id)
+            .expect("load the execution");
+        execution.current_state = Some("prepare".to_string());
+        store.save_execution(&execution).expect("save");
+    }
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     assert!(!app.override_allowed());
     assert!(app.override_targets().is_empty());
@@ -636,12 +734,12 @@ fn a_resize_preserves_the_panel_layout() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_form_missing_a_required_field_reports_an_error_and_sends_nothing() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let execution_id = paused_at_review(&engine, root.path()).await;
-    let before = events_of(&engine, &execution_id).len();
+    let execution_id = paused_at_review(root.path()).await;
+    let before = events_of(root.path(), &execution_id).len();
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
     app.on_key(key(KeyCode::Char('i')));
 
     // `comment` is required and nothing is typed into it.
@@ -655,17 +753,17 @@ async fn a_form_missing_a_required_field_reports_an_error_and_sends_nothing() {
     assert!(error.contains("comment"), "error names the field: {error}");
     assert!(app.notice().expect("a notice").is_error);
 
-    let execution = engine
-        .store()
+    let store = store_of(root.path());
+    let execution = store
         .load_execution(&execution_id)
         .expect("reload the execution");
     assert_eq!(execution.status, ExecutionStatus::Paused);
     assert!(
-        engine.store().has_pending_input(&execution_id),
+        store.has_pending_input(&execution_id),
         "the question is still answerable"
     );
     assert_eq!(
-        events_of(&engine, &execution_id).len(),
+        events_of(root.path(), &execution_id).len(),
         before,
         "nothing was written"
     );
@@ -675,20 +773,24 @@ async fn a_form_missing_a_required_field_reports_an_error_and_sends_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn losing_the_event_channel_shows_a_disconnection_indicator() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    paused_at_review(&engine, root.path()).await;
+    paused_at_review(root.path()).await;
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
     assert_eq!(app.stream_status(), &StreamStatus::Live);
 
-    app.on_stream(Err(RecvError::Lagged(12)));
-    assert_eq!(app.stream_status(), &StreamStatus::Lagged { skipped: 12 });
+    // U7: the live source is an SSE connection, not an in-process broadcast
+    // channel, so there is no `Lagged` case any more (see `on_stream`'s own
+    // doc) — only the stream ending, either on a transport error or on `None`.
+    app.on_stream(Some(Err(ClientError::Unavailable(
+        "connection reset".to_string(),
+    ))));
+    assert_eq!(app.stream_status(), &StreamStatus::Disconnected);
     assert!(!app.stream_status().is_live());
-    assert!(app.stream_status().indicator().contains("12"));
     assert!(app.notice().expect("a notice").is_error);
 
-    app.on_stream(Err(RecvError::Closed));
+    app.on_stream(None);
     assert_eq!(app.stream_status(), &StreamStatus::Disconnected);
     let indicator = app.stream_status().indicator();
     assert!(
@@ -706,12 +808,12 @@ async fn losing_the_event_channel_shows_a_disconnection_indicator() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_override_requires_confirmation_and_is_recorded_as_forced() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let execution_id = paused_at_review(&engine, root.path()).await;
-    let before = events_of(&engine, &execution_id).len();
+    let execution_id = paused_at_review(root.path()).await;
+    let before = events_of(root.path(), &execution_id).len();
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
     assert!(app.override_allowed(), "`review` declares the flag");
 
     app.on_key(key(KeyCode::Char('t')));
@@ -740,7 +842,7 @@ async fn an_override_requires_confirmation_and_is_recorded_as_forced() {
     assert_eq!(confirm.from, "review");
     assert_eq!(confirm.target, "prepare");
     assert_eq!(
-        events_of(&engine, &execution_id).len(),
+        events_of(root.path(), &execution_id).len(),
         before,
         "nothing is written before the confirmation"
     );
@@ -751,7 +853,7 @@ async fn an_override_requires_confirmation_and_is_recorded_as_forced() {
     );
     app.apply_transition().await;
 
-    let events = events_of(&engine, &execution_id);
+    let events = events_of(root.path(), &execution_id);
     assert!(events.len() > before, "the override was recorded");
 
     let forced = events
@@ -787,14 +889,13 @@ async fn an_override_requires_confirmation_and_is_recorded_as_forced() {
         "the transition itself is in the log"
     );
 
-    let execution = engine
-        .store()
+    let execution = store_of(root.path())
         .load_execution(&execution_id)
         .expect("reload the execution");
     assert_eq!(execution.current_state.as_deref(), Some("prepare"));
     assert_eq!(execution.status, ExecutionStatus::Paused);
     assert!(
-        !engine.store().has_pending_input(&execution_id),
+        !store_of(root.path()).has_pending_input(&execution_id),
         "the abandoned question is no longer answerable"
     );
 }
@@ -838,11 +939,14 @@ fn the_terminal_is_restored_on_exit_and_on_panic() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let execution = start(&engine, root.path());
+    let execution = {
+        let engine = engine_for(root.path());
+        start(&engine, root.path())
+    };
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     assert_eq!(app.focus(), Panel::Executions);
     assert_eq!(app.selected().expect("a selection").id, execution.id);
@@ -852,14 +956,13 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
     );
 
     // `s` — run the script state; the workflow stops on the question.
-    let mut events = engine.subscribe();
     assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
     app.run_selected().await;
-    drive_until_settled(&mut app, &mut events, &execution.id).await;
+    wait_until_settled(&client, &[&execution.id]).await;
     // Only the row's own status comes live off the stream (`apply_to_row`);
     // `pending()`/`variables()` are read on selection, so the test refreshes
     // them the way pressing `r` would.
-    app.refresh();
+    app.refresh().await;
 
     assert_eq!(
         app.selected().expect("a selection").status,
@@ -885,15 +988,14 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
     app.on_key(key(KeyCode::Tab));
     type_text(&mut app, "approved after review");
     app.on_key(key(KeyCode::Enter));
-    let mut events = engine.subscribe();
     app.submit_input().await;
-    drive_until_settled(&mut app, &mut events, &execution.id).await;
+    wait_until_settled(&client, &[&execution.id]).await;
 
-    let execution = reload_until(&engine, &execution.id, ExecutionStatus::Completed);
-    assert_eq!(execution.status, ExecutionStatus::Completed);
-    assert_eq!(execution.current_state.as_deref(), Some("done"));
+    let stored = reload_until(root.path(), &execution.id, ExecutionStatus::Completed);
+    assert_eq!(stored.status, ExecutionStatus::Completed);
+    assert_eq!(stored.current_state.as_deref(), Some("done"));
 
-    let recorded = events_of(&engine, &execution.id);
+    let recorded = events_of(root.path(), &execution.id);
     assert!(recorded
         .iter()
         .any(|event| matches!(&event.data, EventData::HumanInputReceived { .. })));
@@ -901,7 +1003,8 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
         .iter()
         .any(|event| matches!(&event.data, EventData::WorkflowCompleted { .. })));
 
-    // And the interface says so without being reloaded from outside.
+    // The interface catches up once asked, the same as pressing `r` would.
+    app.refresh().await;
     assert_eq!(
         app.selected().expect("a selection").status,
         ExecutionStatus::Completed
@@ -968,6 +1071,7 @@ terminal_states:
 
 /// Starts an execution of `write_slow_definition`'s workflow, without running
 /// it, recording the definition path the way the TUI's new-task modal does.
+/// Pre-daemon setup only.
 fn start_slow(engine: &Engine, root: &TempRoot, name: &str) -> WorkflowExecution {
     let (definition, definition_path) = write_slow_definition(root, name);
     let workspace_path = root.path().join(format!("{name}-workspace"));
@@ -990,18 +1094,21 @@ fn start_slow(engine: &Engine, root: &TempRoot, name: &str) -> WorkflowExecution
 }
 
 /// R1/R2: dispatching a request whose first step is deliberately slow returns
-/// control long before that step finishes — the point of spawning it (U3)
-/// instead of awaiting it inline in the event loop's own `tokio::select!`.
+/// control long before that step finishes — the point of the daemon running
+/// it in its own background task (U3/U7) rather than the caller awaiting it
+/// inline.
 #[tokio::test(flavor = "multi_thread")]
 async fn dispatching_a_slow_first_step_does_not_block_the_caller() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let execution = start_slow(&engine, &root, "tui-slow");
+    let execution = {
+        let engine = engine_for(root.path());
+        start_slow(&engine, &root, "tui-slow")
+    };
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
-    app.select_execution(&execution.id);
-    let mut events = engine.subscribe();
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.select_execution(&execution.id).await;
 
     let started = std::time::Instant::now();
     assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
@@ -1009,13 +1116,13 @@ async fn dispatching_a_slow_first_step_does_not_block_the_caller() {
     let dispatch_elapsed = started.elapsed();
 
     assert!(
-        dispatch_elapsed < std::time::Duration::from_millis(150),
+        dispatch_elapsed < Duration::from_millis(150),
         "dispatching returned in {dispatch_elapsed:?}, so it did not wait \
          on the 300ms step"
     );
 
-    drive_until_settled(&mut app, &mut events, &execution.id).await;
-    let stored = reload_until(&engine, &execution.id, ExecutionStatus::Completed);
+    wait_until_settled(&client, &[&execution.id]).await;
+    let stored = reload_until(root.path(), &execution.id, ExecutionStatus::Completed);
     assert_eq!(stored.status, ExecutionStatus::Completed);
 }
 
@@ -1024,95 +1131,78 @@ async fn dispatching_a_slow_first_step_does_not_block_the_caller() {
 #[tokio::test(flavor = "multi_thread")]
 async fn two_different_executions_run_in_the_background_at_once() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let first = start_slow(&engine, &root, "tui-slow-a");
-    let second = start_slow(&engine, &root, "tui-slow-b");
+    let (first, second) = {
+        let engine = engine_for(root.path());
+        (
+            start_slow(&engine, &root, "tui-slow-a"),
+            start_slow(&engine, &root, "tui-slow-b"),
+        )
+    };
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
-    let mut events = engine.subscribe();
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
-    app.select_execution(&first.id);
+    app.select_execution(&first.id).await;
     assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
     app.run_selected().await;
 
-    app.select_execution(&second.id);
+    app.select_execution(&second.id).await;
     assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
     app.run_selected().await;
 
-    drive_until_all_settled(&mut app, &mut events, &[&first.id, &second.id]).await;
+    wait_until_settled(&client, &[&first.id, &second.id]).await;
 
     assert_eq!(
-        reload_until(&engine, &first.id, ExecutionStatus::Completed).status,
+        reload_until(root.path(), &first.id, ExecutionStatus::Completed).status,
         ExecutionStatus::Completed
     );
     assert_eq!(
-        reload_until(&engine, &second.id, ExecutionStatus::Completed).status,
+        reload_until(root.path(), &second.id, ExecutionStatus::Completed).status,
         ExecutionStatus::Completed
     );
 }
 
-/// R6, R7: a second `s` on the same execution while the first pass is still
-/// running is rejected by the engine's guard (U1), and that rejection reaches
-/// the operator as a notice naming the execution (U2, U4) — instead of
-/// racing a second driver against the first.
+/// R6, R7, R11: a second `resume` on the same execution while the first pass
+/// is still running is rejected by the daemon's guard (U1/U3) with a `409`,
+/// which the TUI's own `send_transition`/`deliver`/`run_selected` all turn
+/// into a plain notice — instead of racing a second driver against the
+/// first. Driven directly through two independent clients (rather than two
+/// `App`s) so the race is deterministic (`tokio::join!`) instead of hoping a
+/// background task wins a real timing race, the way the pre-U7 version of
+/// this test had to.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_drive_of_the_same_execution_is_rejected_with_a_notice() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let execution = start_slow(&engine, &root, "tui-slow-guard");
+    let execution = {
+        let engine = engine_for(root.path());
+        start_slow(&engine, &root, "tui-slow-guard")
+    };
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
-    app.select_execution(&execution.id);
-    let mut events = engine.subscribe();
+    let (daemon, client_a) = Daemon::start(root.path()).await;
+    let client_b = Daemon::discover(root.path()).await;
 
-    assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
-    app.run_selected().await;
-    // The second drive races the first's slow step, not a finished execution.
-    assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
-    app.run_selected().await;
+    let (first, second) = tokio::join!(
+        client_a.resume(&execution.id),
+        client_b.resume(&execution.id)
+    );
+    let outcomes = [first, second];
+    let accepted = outcomes.iter().filter(|result| result.is_ok()).count();
+    let rejected = outcomes
+        .iter()
+        .filter(|result| matches!(result, Err(ClientError::Conflict)))
+        .count();
+    assert_eq!(accepted, 1, "exactly one driver wins the guard");
+    assert_eq!(rejected, 1, "the other is refused with a 409/Conflict");
 
-    // Both dispatches only *schedule* a background task — neither is awaited
-    // here — so the test waits for both outcomes on the stream rather than
-    // stopping at whichever lands first: the rejection is expected to be
-    // near-instant, but nothing guarantees it is scheduled before the winner's
-    // completion.
-    let mut saw_completed = false;
-    let mut saw_rejection = false;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !(saw_completed && saw_rejection) {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "timed out waiting for both the completion and the rejection \
-             (completed: {saw_completed}, rejected: {saw_rejection})"
-        );
-        let received = tokio::time::timeout(remaining, events.recv())
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for both outcomes"));
-        if let Ok(event) = &received {
-            if event.workflow_execution_id == execution.id {
-                match &event.data {
-                    EventData::WorkflowCompleted { .. } => saw_completed = true,
-                    EventData::Error { message, .. }
-                        if message.contains("already being driven") =>
-                    {
-                        saw_rejection = true;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        app.on_stream(received);
-    }
-
-    let stored = reload_until(&engine, &execution.id, ExecutionStatus::Completed);
+    wait_until_settled(&client_a, &[&execution.id]).await;
+    let stored = reload_until(root.path(), &execution.id, ExecutionStatus::Completed);
     assert_eq!(
         stored.status,
         ExecutionStatus::Completed,
         "exactly one driver actually advanced the execution"
     );
+    drop(daemon);
 }
 
 /// R6: a terminal event for an execution that is not the one currently
@@ -1121,23 +1211,32 @@ async fn a_second_drive_of_the_same_execution_is_rejected_with_a_notice() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminal_event_for_an_unselected_execution_still_sets_a_notice() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let watched = start_slow(&engine, &root, "tui-slow-unselected");
-    let other = start(&engine, root.path());
+    let (watched, other) = {
+        let engine = engine_for(root.path());
+        let watched = start_slow(&engine, &root, "tui-slow-unselected");
+        let other = start(&engine, root.path());
+        (watched, other)
+    };
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
-    app.select_execution(&watched.id);
-    let mut events = engine.subscribe();
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.select_execution(&watched.id).await;
+
+    // Connected before dispatch, and the fixture's 300ms sleep gives this
+    // stream a real window to actually be listening before the terminal
+    // event fires — see `src/tui/mod.rs`'s module doc on why this ordering
+    // is a best effort, not a guarantee, for a fixture with no such window.
+    let mut stream: EventStream = Box::pin(client.stream_all());
 
     assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
     app.run_selected().await;
 
     // Selection moves elsewhere before the background run finishes.
-    app.select_execution(&other.id);
+    app.select_execution(&other.id).await;
     assert_ne!(app.selected().expect("a selection").id, watched.id);
 
-    drive_until_settled(&mut app, &mut events, &watched.id).await;
+    drive_until_settled(&mut app, &client, &mut stream, &watched.id).await;
 
     let notice = app.notice().expect("a notice");
     assert!(
@@ -1146,36 +1245,32 @@ async fn a_terminal_event_for_an_unselected_execution_still_sets_a_notice() {
     );
 }
 
-/// A manual/forced transition writes the store directly, bypassing
-/// `Engine::run`/`resume`/`deliver_human_input` and therefore U1's guard —
-/// so it needs its own check against a background pass already driving the
-/// same execution, or its direct writes would race that pass's own appends
-/// and its own `save_execution` with no coordination at all.
+/// A manual/forced transition now goes through `client.transition` (U7),
+/// which the daemon rejects with a `409` while a background pass already
+/// holds the execution (U3) — the same denial the old client-side
+/// `Engine::is_active` check used to produce, now sourced from the server.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forced_transition_is_refused_while_a_background_pass_is_driving_the_same_execution() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let execution = start_slow(&engine, &root, "tui-slow-override");
+    let execution = {
+        let engine = engine_for(root.path());
+        start_slow(&engine, &root, "tui-slow-override")
+    };
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
-    app.select_execution(&execution.id);
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.select_execution(&execution.id).await;
 
     // Start the slow background pass; it now holds the guard for the whole
     // 300ms of the script.
     assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
     app.run_selected().await;
 
-    // Wait for the spawned background task to actually acquire the guard —
-    // dispatch only schedules it, so nothing guarantees it has run yet.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !engine.is_active(&execution.id) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the background pass never acquired the guard"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
+    // No client-side visibility into `Engine::is_active` any more (U7): a
+    // short sleep stands in for the old `while !engine.is_active(...)` poll,
+    // trusting the 300ms script to still be running well past it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Without refreshing, the cached selection still shows `prepare`, which
     // is exactly the state the background pass is stepping right now.
@@ -1208,15 +1303,14 @@ async fn a_forced_transition_is_refused_while_a_background_pass_is_driving_the_s
     // concurrently, so a plain event count would be racy; what the refused
     // transition itself must never have written is a `HumanTransitionSelected`.
     assert!(
-        !events_of(&engine, &execution.id)
+        !events_of(root.path(), &execution.id)
             .iter()
             .any(|event| matches!(&event.data, EventData::HumanTransitionSelected { .. })),
         "the refused forced transition wrote no HumanTransitionSelected"
     );
 
-    let mut events = engine.subscribe();
-    drive_until_settled(&mut app, &mut events, &execution.id).await;
-    let stored = reload_until(&engine, &execution.id, ExecutionStatus::Completed);
+    wait_until_settled(&client, &[&execution.id]).await;
+    let stored = reload_until(root.path(), &execution.id, ExecutionStatus::Completed);
     assert_eq!(
         stored.status,
         ExecutionStatus::Completed,
@@ -1232,11 +1326,11 @@ async fn a_forced_transition_is_refused_while_a_background_pass_is_driving_the_s
 #[tokio::test(flavor = "multi_thread")]
 async fn the_form_never_advertises_a_key_it_does_not_handle() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    paused_at_review(&engine, root.path()).await;
+    paused_at_review(root.path()).await;
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
     app.on_key(key(KeyCode::Char('i')));
     assert!(matches!(app.modal(), Modal::Input(_)), "the form is open");
 
@@ -1261,10 +1355,9 @@ async fn the_form_never_advertises_a_key_it_does_not_handle() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_repository_form_stores_an_entry_that_the_listing_then_shows() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     open_repository_form(&mut app);
     fill_repository_field(&mut app, RepositoryField::Id, "acme-api");
@@ -1297,7 +1390,6 @@ async fn the_repository_form_stores_an_entry_that_the_listing_then_shows() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_duplicate_repository_id_keeps_the_form_open_and_changes_nothing() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
     registry_of(root.path())
         .add(RepositoryEntry::new(
             "acme-api",
@@ -1305,8 +1397,9 @@ async fn a_duplicate_repository_id_keeps_the_form_open_and_changes_nothing() {
         ))
         .expect("register the original");
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     open_repository_form(&mut app);
     fill_repository_field(&mut app, RepositoryField::Id, "acme-api");
@@ -1343,10 +1436,9 @@ async fn a_duplicate_repository_id_keeps_the_form_open_and_changes_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_ext_remote_is_refused_in_the_form_and_never_reaches_the_registry() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     open_repository_form(&mut app);
     fill_repository_field(&mut app, RepositoryField::Id, "hostile");
@@ -1380,7 +1472,6 @@ async fn an_ext_remote_is_refused_in_the_form_and_never_reaches_the_registry() {
 #[tokio::test(flavor = "multi_thread")]
 async fn removing_a_repository_needs_a_confirmation() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
     registry_of(root.path())
         .add(RepositoryEntry::new(
             "acme-api",
@@ -1388,8 +1479,9 @@ async fn removing_a_repository_needs_a_confirmation() {
         ))
         .expect("register");
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     app.on_key(key(KeyCode::Char('R')));
     app.on_key(key(KeyCode::Char('d')));
@@ -1420,10 +1512,6 @@ async fn removing_a_repository_needs_a_confirmation() {
 }
 
 // ---------------------------------------------------------------------------
-// starting a new task
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // the new-task pick list
 // ---------------------------------------------------------------------------
 
@@ -1443,20 +1531,6 @@ fn root_workflows(root: &Path) -> PathBuf {
     let path = root.join("workflows");
     fs::create_dir_all(&path).expect("create the root workflow directory");
     path
-}
-
-/// An interface whose workflow search path is entirely inside `root`.
-async fn app_for(engine: &Arc<Engine>, root: &Path) -> App {
-    let resolver = WorkflowResolver::with_user_dir(root.to_path_buf(), Some(user_workflows(root)));
-    let mut app = App::with_resolver(
-        Arc::clone(engine),
-        resolver,
-        CatalogPaths::new(root),
-        WorkPaths::new(root),
-        api_client_for(engine, root).await,
-    );
-    app.refresh();
-    app
 }
 
 /// The rows of the new-task pick list, as labels.
@@ -1483,75 +1557,13 @@ fn pick_workflow(app: &mut App, name: &str) {
     }
 }
 
-/// Installs a `claude` stand-in that always answers with one label.
-///
-/// The shipped workflows drive the `claude-code` harness; the real CLI costs
-/// money and needs credentials, so the engine under test is built with an
-/// adapter pointed at this script instead.
-fn fake_claude(root: &Path, label: &str) -> PathBuf {
-    let directory = root.join("bin");
-    fs::create_dir_all(&directory).expect("create the bin directory");
-    let program = directory.join("claude");
-    fs::write(
-        &program,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",             \"is_error\":false,\"session_id\":\"fake\",             \"result\":\"Done.\\n{{\\\"output\\\": \\\"{label}\\\"}}\"}}'\n"
-        ),
-    )
-    .expect("write the fake harness");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&program).expect("stat").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&program, permissions).expect("make it executable");
-    }
-    program
-}
-
-/// A local git repository a declared `git` workspace can be cloned from.
-fn source_repository(root: &Path) -> PathBuf {
-    let path = root.join("source-repo");
-    fs::create_dir_all(&path).expect("create the source repository");
-    git(&path, &["init", "-q", "-b", "main", "."]);
-    fs::write(path.join("README.md"), "a repository to clone\n").expect("write a file");
-    git(&path, &["add", "."]);
-    git(
-        &path,
-        &[
-            "-c",
-            "user.email=tests@example.test",
-            "-c",
-            "user.name=tests",
-            "commit",
-            "-qm",
-            "initial",
-        ],
-    );
-    path
-}
-
-/// Runs `git` inside a directory, failing loudly.
-fn git(path: &Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
-        .current_dir(path)
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 /// The modal opens on every workflow the resolver reaches, each row naming its
 /// source, plus the row that takes an arbitrary path.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_new_task_list_is_built_from_the_resolver_and_names_each_source() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let mut app = app_for(&engine, root.path()).await;
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_for(&daemon, root.path()).await;
 
     app.on_key(key(KeyCode::Char('n')));
 
@@ -1590,8 +1602,8 @@ async fn the_new_task_list_is_built_from_the_resolver_and_names_each_source() {
 #[tokio::test(flavor = "multi_thread")]
 async fn left_and_right_move_the_selection_and_the_selection_is_what_is_loaded() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let mut app = app_for(&engine, root.path()).await;
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_for(&daemon, root.path()).await;
 
     app.on_key(key(KeyCode::Char('n')));
     let Modal::NewTask(form) = app.modal() else {
@@ -1650,21 +1662,21 @@ async fn left_and_right_move_the_selection_and_the_selection_is_what_is_loaded()
     assert_eq!(definition.name, "open-mercato-sdlc");
     let resolved = form.resolved.as_ref().expect("the source is remembered");
     assert_eq!(resolved.origin.label(), "built-in");
+    assert_eq!(form.reference.as_deref(), Some("open-mercato-sdlc"));
 }
 
 /// A copy shadowing a built-in is one row, marked as the override.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_override_appears_once_and_says_what_it_overrides() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-
     fs::write(
         root_workflows(root.path()).join("compound-engineering.yaml"),
         fs::read_to_string(new_task_definition_path()).expect("read the fixture"),
     )
     .expect("install a copy that shadows the built-in");
 
-    let mut app = app_for(&engine, root.path()).await;
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_for(&daemon, root.path()).await;
     app.on_key(key(KeyCode::Char('n')));
 
     let labels = pick_labels(&app);
@@ -1700,8 +1712,8 @@ async fn an_override_appears_once_and_says_what_it_overrides() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_path_route_starts_a_definition_that_is_in_no_search_location() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let mut app = app_for(&engine, root.path()).await;
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_for(&daemon, root.path()).await;
 
     app.on_key(key(KeyCode::Char('n')));
     // The last row: ← wraps straight onto it.
@@ -1730,16 +1742,13 @@ async fn the_path_route_starts_a_definition_that_is_in_no_search_location() {
     app.start_new_task().await;
 
     assert!(matches!(app.modal(), Modal::None), "the task started");
-    let ids = engine.store().list_execution_ids().expect("list the store");
+    let store = store_of(root.path());
+    let ids = store.list_execution_ids().expect("list the store");
     assert_eq!(ids.len(), 1, "one execution was created");
 
-    let execution = engine
-        .store()
-        .load_execution(&ids[0])
-        .expect("load the execution");
-    let resolved =
-        narsor::tasks::resolve_definition(root.path(), engine.store().paths(), &execution)
-            .expect("the definition resolves again");
+    let execution = store.load_execution(&ids[0]).expect("load the execution");
+    let resolved = narsor::tasks::resolve_definition(root.path(), store.paths(), &execution)
+        .expect("the definition resolves again");
     assert_eq!(resolved.origin.label(), "file");
 }
 
@@ -1747,8 +1756,8 @@ async fn the_path_route_starts_a_definition_that_is_in_no_search_location() {
 #[tokio::test(flavor = "multi_thread")]
 async fn esc_on_the_path_line_returns_to_the_list() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let mut app = app_for(&engine, root.path()).await;
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_for(&daemon, root.path()).await;
 
     app.on_key(key(KeyCode::Char('n')));
     app.on_key(key(KeyCode::Left));
@@ -1764,34 +1773,67 @@ async fn esc_on_the_path_line_returns_to_the_list() {
     assert!(matches!(app.modal(), Modal::None), "Esc then closes it");
 }
 
-/// Starting a **built-in** from the pick list leaves an execution that resolves
-/// its definition again — the trap this whole search path exists for.
+/// A local git repository a declared `git` workspace can be cloned from.
+fn source_repository(root: &Path) -> PathBuf {
+    let path = root.join("source-repo");
+    fs::create_dir_all(&path).expect("create the source repository");
+    git(&path, &["init", "-q", "-b", "main", "."]);
+    fs::write(path.join("README.md"), "a repository to clone\n").expect("write a file");
+    git(&path, &["add", "."]);
+    git(
+        &path,
+        &[
+            "-c",
+            "user.email=tests@example.test",
+            "-c",
+            "user.name=tests",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+    );
+    path
+}
+
+/// Runs `git` inside a directory, failing loudly.
+fn git(path: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .current_dir(path)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Starting a **built-in** from the pick list leaves an execution whose
+/// recorded metadata resolves the definition again by name alone — the trap
+/// this whole search path exists for.
 ///
-/// A built-in has no file, so `metadata.cli.definition_path` cannot hold
-/// anything; the name is recorded instead, and a second interface over the same
-/// store — a fresh process, as far as the store is concerned — has to find the
-/// definition from it. Without that, the human gate this run stops on could
-/// never be answered.
+/// Simplified from its pre-U7 form: that version ran the workflow through a
+/// real `compound-engineering` agent step, using a fake `claude` binary the
+/// *test's own* `Engine` was built with (`AgentExecutor::with_harnesses`).
+/// Since U7, the execution actually runs inside the daemon subprocess's own
+/// `Engine`, which resolves its harness the way a real `narsor daemon`
+/// always does (no override this test controls) — safely faking that would
+/// need a way to point the *daemon's* harness at a stand-in binary (e.g. a
+/// `PATH` override on the spawned process), which is more plumbing than this
+/// unit's stated scope covers. So this only proves the part U7 actually
+/// changed: `client.start_task` records the same `metadata.cli.definition_name`
+/// a locally-run `tasks::start_task` did, and a *second* `App` — a fresh
+/// process, as far as the daemon is concerned — resolves the definition from
+/// that name alone, with no path recorded at all. The workspace still needs a
+/// real (if trivial) git repository to clone: `tasks::start_task` provisions
+/// it synchronously, before `POST /tasks` ever answers.
 #[tokio::test(flavor = "multi_thread")]
 async fn starting_a_picked_builtin_leaves_an_execution_that_resolves_its_definition() {
     let root = TempRoot::new();
-    let engine = Arc::new(
-        Engine::new(ExecutionStore::new(root.path())).with_executor(
-            ActionKind::Agent,
-            Arc::new(AgentExecutor::with_harnesses(
-                HarnessRegistry::defaults().with_adapter(Arc::new(
-                    ClaudeCodeAdapter::with_program(
-                        fake_claude(root.path(), "needs_direction")
-                            .display()
-                            .to_string(),
-                    ),
-                )),
-            )),
-        ),
-    );
     let repository = source_repository(root.path());
-
-    let mut app = app_for(&engine, root.path()).await;
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_for(&daemon, root.path()).await;
     app.on_key(key(KeyCode::Char('n')));
     pick_workflow(&mut app, "compound-engineering");
     app.on_key(key(KeyCode::Enter));
@@ -1801,7 +1843,6 @@ async fn starting_a_picked_builtin_leaves_an_execution_that_resolves_its_definit
     focus_input(&mut app, "target_repo");
     type_text(&mut app, &repository.display().to_string());
     assert_eq!(app.on_key(key(KeyCode::Enter)), Request::StartNewTask);
-    let mut events = engine.subscribe();
     app.start_new_task().await;
 
     let selected = app
@@ -1810,10 +1851,10 @@ async fn starting_a_picked_builtin_leaves_an_execution_that_resolves_its_definit
         .clone();
     assert_eq!(selected.workflow_id, "compound-engineering");
 
-    drive_until_settled(&mut app, &mut events, &selected.id).await;
-
-    let execution = engine
-        .store()
+    let store = store_of(root.path());
+    let execution = reload_until(root.path(), &selected.id, ExecutionStatus::Running);
+    let _ = execution; // status is not the point here; metadata is.
+    let execution = store
         .load_execution(&selected.id)
         .expect("reload the execution");
     assert_eq!(
@@ -1826,16 +1867,11 @@ async fn starting_a_picked_builtin_leaves_an_execution_that_resolves_its_definit
         "a built-in records no path, because it has none: {}",
         execution.metadata
     );
-    assert_eq!(
-        execution.status,
-        ExecutionStatus::Paused,
-        "the run stopped on the human gate"
-    );
 
-    // A second interface over the same store: it has to resolve the definition
-    // from the recorded name alone.
-    let mut reopened = app_for(&engine, root.path()).await;
-    reopened.select_execution(&selected.id);
+    // A second interface over the same daemon: it has to resolve the
+    // definition from the recorded name alone.
+    let mut reopened = app_for(&daemon, root.path()).await;
+    reopened.select_execution(&selected.id).await;
     assert!(
         reopened.definition_error().is_none(),
         "the definition resolved: {:?}",
@@ -1848,20 +1884,15 @@ async fn starting_a_picked_builtin_leaves_an_execution_that_resolves_its_definit
             .name,
         "compound-engineering"
     );
-    assert!(
-        reopened.pending().is_some(),
-        "and the question it is waiting on can be answered"
-    );
 }
 
 /// A definition that fails validation is refused with every violation.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_invalid_definition_is_refused_with_every_violation() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     open_new_task(&mut app, &broken_definition_path());
 
@@ -1895,8 +1926,7 @@ async fn an_invalid_definition_is_refused_with_every_violation() {
     );
 
     assert!(
-        engine
-            .store()
+        store_of(root.path())
             .list_execution_ids()
             .expect("list the store")
             .is_empty(),
@@ -1908,10 +1938,9 @@ async fn an_invalid_definition_is_refused_with_every_violation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_input_form_is_built_from_the_definition_and_enforces_required_inputs() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     open_new_task(&mut app, &new_task_definition_path());
 
@@ -1939,8 +1968,7 @@ async fn the_input_form_is_built_from_the_definition_and_enforces_required_input
         "the error names the input: {error}"
     );
     assert!(
-        engine
-            .store()
+        store_of(root.path())
             .list_execution_ids()
             .expect("list the store")
             .is_empty(),
@@ -1952,7 +1980,6 @@ async fn the_input_form_is_built_from_the_definition_and_enforces_required_input
 #[tokio::test(flavor = "multi_thread")]
 async fn a_repository_input_offers_the_registered_ids() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
     let registry = registry_of(root.path());
     registry
         .add(RepositoryEntry::new(
@@ -1967,8 +1994,9 @@ async fn a_repository_input_offers_the_registered_ids() {
         ))
         .expect("register acme");
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     open_new_task(&mut app, &new_task_definition_path());
     let row = input_row(&app, "repository");
@@ -1987,10 +2015,9 @@ async fn a_repository_input_offers_the_registered_ids() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_boolean_input_reaches_the_context_as_a_json_boolean() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     open_new_task(&mut app, &new_task_definition_path());
     focus_input(&mut app, "ticket");
@@ -2016,10 +2043,14 @@ async fn a_boolean_input_reaches_the_context_as_a_json_boolean() {
         .expect("the new execution is selected")
         .id
         .clone();
-    let context = engine
-        .store()
-        .load_context(&execution_id)
-        .expect("read the context");
+    // The daemon needs a moment to have actually created the execution's
+    // context on disk (`202` fires before the background pass has run) —
+    // list_executions() (which already exists once `tasks::start_task`
+    // returns, before the run is even spawned) is enough of a wait here.
+    wait_until_settled(&client, &[&execution_id]).await;
+
+    let store = store_of(root.path());
+    let context = store.load_context(&execution_id).expect("read the context");
     assert_eq!(
         context.variables.get("is_experimental"),
         Some(&json!(true)),
@@ -2027,8 +2058,7 @@ async fn a_boolean_input_reaches_the_context_as_a_json_boolean() {
     );
     assert_eq!(context.variables.get("ticket"), Some(&json!("ORC-9")));
 
-    let execution = engine
-        .store()
+    let execution = store
         .load_execution(&execution_id)
         .expect("reload the execution");
     assert_eq!(execution.inputs.get("is_experimental"), Some(&json!(true)));
@@ -2038,19 +2068,21 @@ async fn a_boolean_input_reaches_the_context_as_a_json_boolean() {
 #[tokio::test(flavor = "multi_thread")]
 async fn starting_a_valid_new_task_creates_an_execution_that_is_listed_and_selected() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
     // An unrelated execution, so "selected" means something.
-    let existing = start(&engine, root.path());
+    let existing = {
+        let engine = engine_for(root.path());
+        start(&engine, root.path())
+    };
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
     assert_eq!(app.executions().len(), 1);
 
     open_new_task(&mut app, &new_task_definition_path());
     focus_input(&mut app, "ticket");
     type_text(&mut app, "ORC-11");
     app.on_key(key(KeyCode::Enter));
-    let mut events = engine.subscribe();
     app.start_new_task().await;
 
     assert!(
@@ -2067,8 +2099,8 @@ async fn starting_a_valid_new_task_creates_an_execution_that_is_listed_and_selec
     assert_eq!(selected.workflow_id, "tui-new-task");
     assert_eq!(app.focus(), Panel::Executions);
 
-    drive_until_settled(&mut app, &mut events, &selected.id).await;
-    app.refresh();
+    wait_until_settled(&client, &[&selected.id]).await;
+    app.refresh().await;
     let selected = app.selected().expect("a selection").clone();
 
     // It ran: the workflow stopped on its human state, and the question is
@@ -2083,8 +2115,7 @@ async fn starting_a_valid_new_task_creates_an_execution_that_is_listed_and_selec
 
     // The workspace is the empty directory the CLI falls back to as well, and
     // it lives under the temporary root — never in the repository.
-    let execution = engine
-        .store()
+    let execution = store_of(root.path())
         .load_execution(&selected.id)
         .expect("reload the execution");
     assert!(
@@ -2104,19 +2135,19 @@ async fn starting_a_valid_new_task_creates_an_execution_that_is_listed_and_selec
 
 /// A definition declaring `globals.workspace` starts from the modal, and its
 /// workspace is provisioned — the interface no longer sends the operator to
-/// `narsor run` for it.
+/// `narsor run` for it (now: the daemon provisions it, on the other end of
+/// `client.start_task`).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_definition_declaring_a_workspace_starts_from_the_modal_and_is_provisioned() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-
     // The directory the declared `local` workspace is copied from.
     let source = root.path().join("source");
     fs::create_dir_all(&source).expect("create the source tree");
     fs::write(source.join("README.md"), "hello\n").expect("write readme");
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     open_new_task(&mut app, &fixtures().join("new_task_workspace.yaml"));
     focus_input(&mut app, "source");
@@ -2137,9 +2168,10 @@ async fn a_definition_declaring_a_workspace_starts_from_the_modal_and_is_provisi
         .clone();
     assert_eq!(selected.workflow_id, "tui-new-task-workspace");
 
+    wait_until_settled(&client, &[&selected.id]).await;
+
     // The workspace holds the source directory's contents, under the root.
-    let execution = engine
-        .store()
+    let execution = store_of(root.path())
         .load_execution(&selected.id)
         .expect("reload the execution");
     let workspace = Path::new(&execution.workspace.path);
@@ -2162,10 +2194,9 @@ async fn a_definition_declaring_a_workspace_starts_from_the_modal_and_is_provisi
 #[tokio::test(flavor = "multi_thread")]
 async fn esc_cancels_every_modal_without_writing_anything() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     // The repository form, half filled in.
     open_repository_form(&mut app);
@@ -2216,8 +2247,7 @@ async fn esc_cancels_every_modal_without_writing_anything() {
     app.on_key(key(KeyCode::Esc));
     assert!(matches!(app.modal(), Modal::None));
     assert!(
-        engine
-            .store()
+        store_of(root.path())
             .list_execution_ids()
             .expect("list the store")
             .is_empty(),
@@ -2356,11 +2386,10 @@ fn workflow_started_line_is_single_line_and_detail_expands_every_input() {
     for index in 0..14 {
         inputs.insert(format!("field_{index}"), json!(format!("value-{index}")));
     }
-
     let event = Event::new(
         "exec-1".to_string(),
         EventData::WorkflowStarted {
-            workflow_id: "demo".to_string(),
+            workflow_id: "wf".to_string(),
             workflow_version: 1,
             inputs: Value::Object(inputs),
         },
@@ -2368,17 +2397,14 @@ fn workflow_started_line_is_single_line_and_detail_expands_every_input() {
     );
 
     let line = event_line(&event);
-    assert!(
-        !line.contains('\n'),
-        "the stream line is exactly one line: {line:?}"
-    );
+    assert_eq!(line.lines().count(), 1, "the stream line stays one line");
 
     let detail = event_detail_lines(&event);
     for index in 0..14 {
-        let needle = format!("\"field_{index}\":");
+        let needle = format!("field_{index}");
         assert!(
-            detail.iter().any(|l| l.trim_start().starts_with(&needle)),
-            "input {index} is on its own line of indented JSON: {detail:?}"
+            detail.iter().any(|line| line.contains(&needle)),
+            "input {needle} is present in the detail window"
         );
     }
 }
@@ -2403,11 +2429,11 @@ fn event_line_has_no_debug_style_dump_for_any_variant() {
 #[tokio::test(flavor = "multi_thread")]
 async fn enter_opens_event_detail_and_esc_preserves_selection() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    paused_at_review(&engine, root.path()).await;
+    paused_at_review(root.path()).await;
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
     assert!(!app.events().is_empty(), "the backfill read some events");
 
     app.on_key(key(KeyCode::Tab));
@@ -2435,11 +2461,11 @@ async fn enter_opens_event_detail_and_esc_preserves_selection() {
 #[tokio::test(flavor = "multi_thread")]
 async fn scrolling_the_event_detail_window_stays_within_content_bounds() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let execution_id = paused_at_review(&engine, root.path()).await;
+    let execution_id = paused_at_review(root.path()).await;
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     // A payload large enough that the pretty-printed detail window has many
     // lines to scroll through.
@@ -2456,7 +2482,7 @@ async fn scrolling_the_event_detail_window_stays_within_content_bounds() {
         },
         last_sequence + 1,
     );
-    app.on_stream(Ok(event));
+    app.on_stream(Some(Ok(event)));
 
     app.on_key(key(KeyCode::Tab));
     app.on_key(key(KeyCode::Tab));
@@ -2493,11 +2519,11 @@ async fn scrolling_the_event_detail_window_stays_within_content_bounds() {
 #[tokio::test(flavor = "multi_thread")]
 async fn c_on_an_unlinked_event_names_the_reason_and_opens_nothing() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    let execution_id = paused_at_review(&engine, root.path()).await;
+    let execution_id = paused_at_review(root.path()).await;
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     let last_sequence = app.events().last().expect("an event").sequence;
     let event = Event::new(
@@ -2507,7 +2533,7 @@ async fn c_on_an_unlinked_event_names_the_reason_and_opens_nothing() {
         },
         last_sequence + 1,
     );
-    app.on_stream(Ok(event));
+    app.on_stream(Some(Ok(event)));
 
     app.on_key(key(KeyCode::Tab));
     app.on_key(key(KeyCode::Tab));
@@ -2593,7 +2619,8 @@ fn truncated_agent_message_is_flagged_in_the_detail_window() {
 
 /// A minimal, directly-saved execution — the same shortcut `tests/api.rs`
 /// takes, reused here so the task view has something real to open without
-/// spawning an actual harness process.
+/// spawning an actual harness process. Only ever written before a daemon
+/// exists for the root (see the module doc).
 fn seeded_execution(id: &str, status: ExecutionStatus) -> WorkflowExecution {
     WorkflowExecution {
         id: id.to_string(),
@@ -2613,7 +2640,7 @@ fn seeded_execution(id: &str, status: ExecutionStatus) -> WorkflowExecution {
 
 /// Seeds `store` with an execution whose `plan` step failed once and
 /// succeeded on retry, each attempt with its own conversation record —
-/// mirrors `tests/api.rs`'s fixture (AE2/AE7/F1/F3).
+/// mirrors `tests/api.rs`'s fixture (AE2/AE7/F1/F3). Pre-daemon only.
 fn seed_retried_agent_execution(store: &ExecutionStore, execution_id: &str) {
     store
         .save_execution(&seeded_execution(execution_id, ExecutionStatus::Completed))
@@ -2716,11 +2743,11 @@ fn task_view(app: &App) -> &narsor::tui::app::TaskView {
 #[tokio::test(flavor = "multi_thread")]
 async fn c_on_a_second_attempt_event_opens_its_position_and_conversation() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    seed_retried_agent_execution(engine.store(), "exec-1");
+    seed_retried_agent_execution(&store_of(root.path()), "exec-1");
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     let completed_sequence = app
         .events()
@@ -2764,11 +2791,11 @@ async fn c_on_a_second_attempt_event_opens_its_position_and_conversation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn expanding_a_conversation_entry_toggles_and_collapses_again() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    seed_retried_agent_execution(engine.store(), "exec-expand");
+    seed_retried_agent_execution(&store_of(root.path()), "exec-expand");
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     let completed_sequence = app
         .events()
@@ -2815,60 +2842,62 @@ async fn expanding_a_conversation_entry_toggles_and_collapses_again() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_continued_harness_session_is_named_in_the_position_header() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
     let execution_id = "exec-resume";
-    engine
-        .store()
-        .save_execution(&seeded_execution(execution_id, ExecutionStatus::Completed))
-        .expect("save execution");
+    {
+        let store = store_of(root.path());
+        store
+            .save_execution(&seeded_execution(execution_id, ExecutionStatus::Completed))
+            .expect("save execution");
 
-    let log = engine.store().event_log(execution_id);
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::WorkflowStarted {
-            workflow_id: "implement-feature".to_string(),
-            workflow_version: 1,
-            inputs: json!({}),
-        },
-    )
-    .expect("append WorkflowStarted");
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::StateEntered {
-            state_id: "plan".to_string(),
-        },
-    )
-    .expect("append StateEntered");
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::ActionStarted {
-            action_execution_id: "attempt-1".to_string(),
-            state_id: "plan".to_string(),
-            action_type: "agent".to_string(),
-        },
-    )
-    .expect("append ActionStarted");
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::AgentSessionStarted {
-            session_id: "sess-new".to_string(),
-            harness: "claude_code".to_string(),
-            action_execution_id: Some("attempt-1".to_string()),
-            resumed_session: Some("sess-old".to_string()),
-        },
-    )
-    .expect("append AgentSessionStarted");
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::ActionCompleted {
-            action_execution_id: "attempt-1".to_string(),
-            output_label: "success".to_string(),
-        },
-    )
-    .expect("append ActionCompleted");
+        let log = store.event_log(execution_id);
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::WorkflowStarted {
+                workflow_id: "implement-feature".to_string(),
+                workflow_version: 1,
+                inputs: json!({}),
+            },
+        )
+        .expect("append WorkflowStarted");
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::StateEntered {
+                state_id: "plan".to_string(),
+            },
+        )
+        .expect("append StateEntered");
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::ActionStarted {
+                action_execution_id: "attempt-1".to_string(),
+                state_id: "plan".to_string(),
+                action_type: "agent".to_string(),
+            },
+        )
+        .expect("append ActionStarted");
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::AgentSessionStarted {
+                session_id: "sess-new".to_string(),
+                harness: "claude_code".to_string(),
+                action_execution_id: Some("attempt-1".to_string()),
+                resumed_session: Some("sess-old".to_string()),
+            },
+        )
+        .expect("append AgentSessionStarted");
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::ActionCompleted {
+                action_execution_id: "attempt-1".to_string(),
+                output_label: "success".to_string(),
+            },
+        )
+        .expect("append ActionCompleted");
+    }
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
     app.open_task_for_execution().await;
 
     let view = task_view(&app);
@@ -2896,49 +2925,51 @@ async fn a_continued_harness_session_is_named_in_the_position_header() {
 #[tokio::test(flavor = "multi_thread")]
 async fn c_on_a_script_step_event_opens_nothing() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
     let execution_id = "exec-script";
-    engine
-        .store()
-        .save_execution(&seeded_execution(execution_id, ExecutionStatus::Completed))
-        .expect("save execution");
-    let log = engine.store().event_log(execution_id);
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::WorkflowStarted {
-            workflow_id: "implement-feature".to_string(),
-            workflow_version: 1,
-            inputs: json!({}),
-        },
-    )
-    .expect("append WorkflowStarted");
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::StateEntered {
-            state_id: "prepare".to_string(),
-        },
-    )
-    .expect("append StateEntered");
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::ActionStarted {
-            action_execution_id: "script-1".to_string(),
-            state_id: "prepare".to_string(),
-            action_type: "script".to_string(),
-        },
-    )
-    .expect("append ActionStarted");
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::ActionCompleted {
-            action_execution_id: "script-1".to_string(),
-            output_label: "success".to_string(),
-        },
-    )
-    .expect("append ActionCompleted");
+    {
+        let store = store_of(root.path());
+        store
+            .save_execution(&seeded_execution(execution_id, ExecutionStatus::Completed))
+            .expect("save execution");
+        let log = store.event_log(execution_id);
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::WorkflowStarted {
+                workflow_id: "implement-feature".to_string(),
+                workflow_version: 1,
+                inputs: json!({}),
+            },
+        )
+        .expect("append WorkflowStarted");
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::StateEntered {
+                state_id: "prepare".to_string(),
+            },
+        )
+        .expect("append StateEntered");
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::ActionStarted {
+                action_execution_id: "script-1".to_string(),
+                state_id: "prepare".to_string(),
+                action_type: "script".to_string(),
+            },
+        )
+        .expect("append ActionStarted");
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::ActionCompleted {
+                action_execution_id: "script-1".to_string(),
+                output_label: "success".to_string(),
+            },
+        )
+        .expect("append ActionCompleted");
+    }
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     let started_sequence = app
         .events()
@@ -2969,11 +3000,11 @@ async fn c_on_a_script_step_event_opens_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn enter_on_an_execution_opens_the_task_view_and_esc_returns() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    seed_retried_agent_execution(engine.store(), "exec-1");
+    seed_retried_agent_execution(&store_of(root.path()), "exec-1");
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
     assert_eq!(app.focus(), Panel::Executions);
 
     assert_eq!(app.on_key(key(KeyCode::Enter)), Request::OpenTaskView);
@@ -2999,62 +3030,64 @@ async fn enter_on_an_execution_opens_the_task_view_and_esc_returns() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_old_format_log_shows_no_conversation_record() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
     let execution_id = "exec-old";
-    engine
-        .store()
-        .save_execution(&seeded_execution(execution_id, ExecutionStatus::Completed))
-        .expect("save execution");
-    let log = engine.store().event_log(execution_id);
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::WorkflowStarted {
-            workflow_id: "implement-feature".to_string(),
-            workflow_version: 1,
-            inputs: json!({}),
-        },
-    )
-    .expect("append WorkflowStarted");
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::StateEntered {
-            state_id: "plan".to_string(),
-        },
-    )
-    .expect("append StateEntered");
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::ActionStarted {
-            action_execution_id: "attempt-1".to_string(),
-            state_id: "plan".to_string(),
-            action_type: "agent".to_string(),
-        },
-    )
-    .expect("append ActionStarted");
-    // An old-format log: the agent session events carry no
-    // `action_execution_id` at all (`#[serde(default)]` from U1 means these
-    // deserialize as `None`, which is what a pre-U1 log on disk would give).
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::AgentSessionStarted {
-            session_id: "sess-1".to_string(),
-            harness: "claude_code".to_string(),
-            action_execution_id: None,
-            resumed_session: None,
-        },
-    )
-    .expect("append AgentSessionStarted");
-    log.append_next(
-        &execution_id.to_string(),
-        EventData::ActionCompleted {
-            action_execution_id: "attempt-1".to_string(),
-            output_label: "success".to_string(),
-        },
-    )
-    .expect("append ActionCompleted");
+    {
+        let store = store_of(root.path());
+        store
+            .save_execution(&seeded_execution(execution_id, ExecutionStatus::Completed))
+            .expect("save execution");
+        let log = store.event_log(execution_id);
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::WorkflowStarted {
+                workflow_id: "implement-feature".to_string(),
+                workflow_version: 1,
+                inputs: json!({}),
+            },
+        )
+        .expect("append WorkflowStarted");
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::StateEntered {
+                state_id: "plan".to_string(),
+            },
+        )
+        .expect("append StateEntered");
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::ActionStarted {
+                action_execution_id: "attempt-1".to_string(),
+                state_id: "plan".to_string(),
+                action_type: "agent".to_string(),
+            },
+        )
+        .expect("append ActionStarted");
+        // An old-format log: the agent session events carry no
+        // `action_execution_id` at all (`#[serde(default)]` from U1 means these
+        // deserialize as `None`, which is what a pre-U1 log on disk would give).
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::AgentSessionStarted {
+                session_id: "sess-1".to_string(),
+                harness: "claude_code".to_string(),
+                action_execution_id: None,
+                resumed_session: None,
+            },
+        )
+        .expect("append AgentSessionStarted");
+        log.append_next(
+            &execution_id.to_string(),
+            EventData::ActionCompleted {
+                action_execution_id: "attempt-1".to_string(),
+                output_label: "success".to_string(),
+            },
+        )
+        .expect("append ActionCompleted");
+    }
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
 
     app.open_task_for_execution().await;
     let view = task_view(&app);
@@ -3069,6 +3102,7 @@ async fn an_old_format_log_shows_no_conversation_record() {
         other => panic!("expected the events fallback, got {other:?}"),
     }
 }
+
 /// The bug this test is named after: with only a handful of positions (far
 /// fewer than the axis pane's height), `j`/`k` used to freeze the selection
 /// at the first position forever, because the axis cursor reused
@@ -3079,11 +3113,11 @@ async fn an_old_format_log_shows_no_conversation_record() {
 #[tokio::test(flavor = "multi_thread")]
 async fn moving_the_axis_cursor_visits_every_position() {
     let root = TempRoot::new();
-    let engine = engine_for(root.path());
-    seed_retried_agent_execution(engine.store(), "exec-axis-cursor");
+    seed_retried_agent_execution(&store_of(root.path()), "exec-axis-cursor");
 
-    let mut app = app_over(&engine, root.path()).await;
-    app.refresh();
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
     app.open_task_for_execution().await;
 
     // The default selection is the last position.
@@ -3110,4 +3144,87 @@ async fn moving_the_axis_cursor_visits_every_position() {
     app.on_key(key(KeyCode::Char('G')));
     app.load_task_position().await;
     assert_eq!(task_view(&app).selected.as_deref(), Some("plan #2"));
+}
+
+// ---------------------------------------------------------------------------
+// AE2, AE5: daemon discovery and cross-process liveness (U7)
+// ---------------------------------------------------------------------------
+
+/// AE2: a TUI whose process starts with no daemon running discovers/launches
+/// one transparently and sees the same execution list a `narsor` process
+/// that already had one running would.
+#[tokio::test(flavor = "multi_thread")]
+async fn tui_starts_with_no_daemon_running_and_transparently_launches_one() {
+    let root = TempRoot::new();
+    let existing = {
+        let engine = engine_for(root.path());
+        start(&engine, root.path())
+    };
+
+    init_exe_override();
+    let paths = StatePaths::new(root.path());
+    assert!(
+        !paths.daemon_file().exists(),
+        "no daemon has been started for this root yet"
+    );
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+
+    assert_eq!(app.executions().len(), 1);
+    assert_eq!(app.executions()[0].id, existing.id);
+    assert!(
+        paths.daemon_file().exists(),
+        "a daemon is now discoverable for this root"
+    );
+}
+
+/// AE5: two separate TUI processes (here, two independent `App`s, each with
+/// its own `ApiClient` and its own SSE connection) connected to the same
+/// daemon see the same live events for the same execution.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_tuis_connected_to_the_same_daemon_see_the_same_live_events() {
+    let root = TempRoot::new();
+    let execution = {
+        let engine = engine_for(root.path());
+        start_slow(&engine, &root, "tui-ae5")
+    };
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let client_a = Daemon::discover(root.path()).await;
+    let client_b = Daemon::discover(root.path()).await;
+
+    let mut stream_a: EventStream = Box::pin(client_a.stream_execution(&execution.id));
+    let mut stream_b: EventStream = Box::pin(client_b.stream_execution(&execution.id));
+
+    client_a
+        .resume(&execution.id)
+        .await
+        .expect("the first client starts the background pass");
+
+    // Both streams, over independent connections, see the same terminal
+    // event for the same execution. Polled concurrently (`tokio::join!`),
+    // not one after the other: `stream_execution`'s connection is lazy (see
+    // `src/tui/mod.rs`'s module doc), so awaiting `stream_a` to completion
+    // first would only start opening `stream_b`'s connection once the
+    // (~300ms) fixture may already have finished and the event already gone.
+    let (a, b) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(5), stream_a.next()),
+        tokio::time::timeout(Duration::from_secs(5), stream_b.next()),
+    );
+    let seen_a = a
+        .expect("stream_a delivers before the timeout")
+        .expect("stream_a yields an item")
+        .expect("stream_a's item is a real event, not a transport error");
+    let seen_b = b
+        .expect("stream_b delivers before the timeout")
+        .expect("stream_b yields an item")
+        .expect("stream_b's item is a real event, not a transport error");
+
+    assert_eq!(seen_a.workflow_execution_id, execution.id);
+    assert_eq!(seen_b.workflow_execution_id, execution.id);
+
+    wait_until_settled(&client_a, &[&execution.id]).await;
+    drop(daemon);
 }

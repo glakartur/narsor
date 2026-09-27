@@ -7,11 +7,14 @@
 //! makes the wire contract easy to review without wading through handler
 //! bodies.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::domain::{ExecutionStatus, WorkflowExecution};
+use crate::engine::PendingHumanInput;
 
 /// `POST /tasks` request body.
 ///
@@ -81,14 +84,31 @@ pub struct TransitionRequest {
 /// `POST /executions/:id/transition` response body, and one row of
 /// `GET /executions`: enough of an execution's state for a caller to decide
 /// what to do next, without handing over the whole [`WorkflowExecution`]
-/// (its `context`/`workspace`/`metadata` are internal engine bookkeeping, not
-/// wire contract).
+/// (its `workspace` is internal engine bookkeeping, not wire contract).
+///
+/// # `variables`/`metadata`/`pending_input` (U7)
+///
+/// These three were not part of the original U3/U5 wire shape — they were
+/// added while migrating the TUI off `Arc<Engine>` (U7), once it became clear
+/// the existing endpoints (`events`/`timeline`/`conversation`/the mutating
+/// calls) leave no way for a client that holds neither an `Engine` nor an
+/// `ExecutionStore` to render the "state and context" panel, resolve the
+/// workflow definition an execution runs (`tasks::resolve_definition` needs
+/// `metadata`), or build the human-input form (`PendingHumanInput` carries
+/// the declared fields/types/options, not just the instruction text the
+/// event log already exposes). Reusing this one summary type for all three
+/// keeps `GET /executions` the only read the TUI's list-and-select path
+/// needs, rather than adding three more round trips per execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionSummary {
     /// The execution's id.
     pub id: String,
     /// The workflow it is an execution of.
     pub workflow_id: String,
+    /// The version of that workflow's definition this execution was started
+    /// with.
+    #[serde(default)]
+    pub workflow_version: u32,
     /// Its current status.
     pub status: ExecutionStatus,
     /// The state it is currently at, if any.
@@ -97,17 +117,45 @@ pub struct ExecutionSummary {
     pub started_at: DateTime<Utc>,
     /// When it finished, if it has.
     pub completed_at: Option<DateTime<Utc>>,
+    /// The context's user-defined variables — the freshest copy the store
+    /// holds (`ExecutionStore::load_context`), not necessarily the one
+    /// embedded in the execution record itself.
+    #[serde(default)]
+    pub variables: HashMap<String, Value>,
+    /// The raw `metadata` an execution recorded (`metadata.cli.*`), exactly
+    /// as `tasks::resolve_definition` reads it — kept opaque here so the one
+    /// place that interprets it stays that function, not this DTO.
+    #[serde(default)]
+    pub metadata: Value,
+    /// The question this execution is waiting on, if it is `Paused` on one
+    /// raised by `human::suspend` (an operator-requested `WorkflowPaused`
+    /// has none, exactly as `Engine::pending_input` already returns `None`
+    /// for it).
+    #[serde(default)]
+    pub pending_input: Option<PendingHumanInput>,
 }
 
 impl From<&WorkflowExecution> for ExecutionSummary {
+    /// A summary built from the execution record alone, with `variables`
+    /// taken from `execution.context` (its own, possibly-stale copy — see
+    /// [`ExecutionSummary`]'s doc) and `pending_input` left `None`.
+    /// `src/api/routes.rs`'s `build_summary` is what fills in the fresher
+    /// context and the real pending-input record; this impl exists for
+    /// [`super::TransitionRequest`]'s response, where there never is a
+    /// pending input by construction (a transition just took the execution
+    /// past whatever question it may have had).
     fn from(execution: &WorkflowExecution) -> Self {
         Self {
             id: execution.id.clone(),
             workflow_id: execution.workflow_id.clone(),
+            workflow_version: execution.workflow_version,
             status: execution.status.clone(),
             current_state: execution.current_state.clone(),
             started_at: execution.started_at,
             completed_at: execution.completed_at,
+            variables: execution.context.variables.clone(),
+            metadata: execution.metadata.clone(),
+            pending_input: None,
         }
     }
 }

@@ -745,6 +745,13 @@ async fn post_transition(
 }
 
 /// `GET /executions` — every stored execution, summarised.
+///
+/// Builds each row with [`build_summary`] rather than the plain
+/// `ExecutionSummary::from(&execution)` `post_transition` uses: this is the
+/// one read the TUI's list-and-select path (U7) relies on for everything it
+/// used to read off `Arc<Engine>`/`ExecutionStore` directly, so it is also
+/// the one place `variables`/`pending_input` have to be their freshest,
+/// authoritative selves.
 async fn get_executions(
     State(state): State<AppState>,
 ) -> Result<Json<ExecutionListResponse>, ApiError> {
@@ -752,9 +759,34 @@ async fn get_executions(
     let mut executions = Vec::with_capacity(ids.len());
     for id in ids {
         let execution = state.store.load_execution(&id)?;
-        executions.push(ExecutionSummary::from(&execution));
+        executions.push(build_summary(&state.store, &execution)?);
     }
     Ok(Json(ExecutionListResponse { executions }))
+}
+
+/// An [`ExecutionSummary`] carrying the freshest context variables
+/// ([`ExecutionStore::load_context`], falling back to the execution's own
+/// embedded copy exactly as `narsor show` does) and the real pending-input
+/// record ([`Engine::pending_input`]'s own store read,
+/// `ExecutionStore::load_pending_input`), rather than the bare
+/// `ExecutionSummary::from(&execution)` conversion. See
+/// [`ExecutionSummary`]'s own doc for why a client with neither an `Engine`
+/// nor an `ExecutionStore` (the TUI, since U7) needs both of these on every
+/// row of `GET /executions` and not just the fields the wire shape started
+/// with.
+fn build_summary(
+    store: &ExecutionStore,
+    execution: &crate::domain::WorkflowExecution,
+) -> Result<ExecutionSummary, ApiError> {
+    let mut summary = ExecutionSummary::from(execution);
+    summary.variables = store
+        .load_context(&execution.id)
+        .map(|context| context.variables)
+        .unwrap_or_else(|_| execution.context.variables.clone());
+    summary.pending_input = store
+        .load_pending_input::<crate::engine::PendingHumanInput>(&execution.id)
+        .unwrap_or(None);
+    Ok(summary)
 }
 
 // ---------------------------------------------------------------------------

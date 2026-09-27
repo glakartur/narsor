@@ -946,18 +946,23 @@ fn truncate(text: &str, limit: usize) -> String {
 /// driven on it: spawning a second runtime inside the first would panic, and
 /// the interface has to own a thread anyway — it blocks on keys.
 ///
-/// The three roots are opened exactly as every other subcommand opens the ones
-/// it needs, and handed to the interface separately: it shows the executions of
-/// the state directory the operator asked for, reads workflows and the registry
-/// from the catalogue, and puts checkouts in the work tree.
-pub fn tui(config: &Resolved) -> Result<()> {
-    let store = ExecutionStore::new(config.state_dir());
-    let defaults = config.agent_defaults();
+/// No longer constructs `Engine`/`ExecutionStore` itself (R4/U7): like every
+/// other command in this module, it discovers or transparently launches a
+/// daemon (`crate::tui::run`'s own `ensure_daemon_running` call, AE2) and
+/// drives the whole interface as that daemon's REST(+SSE) client. The three
+/// roots are still opened and handed to the interface separately — the state
+/// root (now just `StatePaths`, path arithmetic only — no store is opened
+/// here) decides which daemon this discovers/launches, the catalogue is
+/// where workflows and the registry are read from, and the work tree is
+/// where the interface's own reads (`resolve_definition`) look for a pinned
+/// definition copy.
+pub fn tui(config: &Resolved, flags: &Flags) -> Result<()> {
+    let state = StatePaths::new(config.state_dir());
     let handle = tokio::runtime::Handle::current();
     let catalog = config.catalog_paths();
     let work = config.work_paths();
     tokio::task::block_in_place(move || {
-        handle.block_on(crate::tui::run(store, catalog, work, defaults))
+        handle.block_on(crate::tui::run(state, flags.clone(), catalog, work))
     })
     .map_err(|error| {
         CliError::failure(format!(

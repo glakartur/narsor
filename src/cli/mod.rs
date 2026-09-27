@@ -450,7 +450,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Config { command } => match command {
             ConfigCommand::Show { format } => commands::config_show(&config, format),
         },
-        Command::Tui => commands::tui(&config),
+        Command::Tui => commands::tui(&config, &flags),
         Command::Daemon { command } => match command {
             None => daemon::run_daemon(&config).await,
             Some(DaemonCommand::Stop) => daemon::stop_daemon(&config),

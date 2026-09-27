@@ -438,19 +438,48 @@ fn the_tui_log_file_lands_in_the_resolved_state_directory() {
 }
 
 #[test]
-fn an_unconfigured_tui_creates_neither_the_directory_nor_the_log() {
+fn an_unconfigured_tui_discovers_or_launches_a_daemon_under_the_built_in_directory() {
     needs_no_system_config!();
-    // D-N: today a `tui` run with nothing configured leaves no trace, and it
-    // still must not.
+    // D-N used to read "a `tui` run with nothing configured leaves no trace".
+    // Since U7, `tui` is a REST(+SSE) client exactly like every other
+    // subcommand (R4): it discovers-or-launches a daemon (AE2) before it ever
+    // tries the terminal, the same way `three_roots_pointed_apart_each_hold_only_what_belongs_to_them`
+    // already accepts for `run`/`resume` since U6. So the built-in directory
+    // is used, not avoided — what still must not happen is a *second*,
+    // unrelated directory or a silently different one.
     let root = TempRoot::new();
 
     let invocation = cli(&root, &[], &["tui"]);
 
     assert_ne!(invocation.code, EXIT_USAGE, "{}", invocation.stderr);
+    let state_dir = root.path().join(".narsor");
     assert!(
-        !root.path().join(".narsor").exists(),
-        "no state directory may be created just to run the interface"
+        state_dir.join("daemon.json").exists(),
+        "the interface discovers/launches a daemon under the built-in directory"
     );
+
+    // The spawned daemon is detached and outlives this test's own process —
+    // clean it up so it does not keep running against a `TempRoot` this test
+    // is about to delete.
+    if let Ok(info) = narsor::persistence::DaemonInfo::read(
+        &narsor::persistence::StatePaths::new(&state_dir).daemon_file(),
+    ) {
+        // SAFETY: a plain signal-send to the PID this test's own invocation
+        // just spawned, mirroring `tests/api_discovery.rs`'s `stop_and_reap`.
+        unsafe {
+            libc::kill(info.pid as libc::pid_t, libc::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while unsafe { libc::kill(info.pid as libc::pid_t, 0) == 0 } {
+            if std::time::Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(info.pid as libc::pid_t, libc::SIGKILL);
+                }
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 }
 
 #[test]

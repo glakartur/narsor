@@ -27,13 +27,50 @@
 //! go through [`restore_terminal`], which is idempotent and counts its calls so
 //! that a test can prove the path actually ran.
 //!
-//! # Events come from the engine, not from the disk
+//! # Events come from the daemon, not from an in-process engine (U7)
 //!
-//! The live stream is [`crate::engine::Engine::subscribe`] — the same seam an
-//! SSE endpoint takes over later (D38). The event log is read only to backfill
-//! the history of a newly selected execution. A `broadcast` receiver can fall
-//! behind or be closed, and both show up in the interface as an explicit
-//! indicator rather than as a view that quietly stops updating.
+//! The live stream used to be [`crate::engine::Engine::subscribe`] — an
+//! in-process broadcast channel shared with an `Arc<Engine>` this module
+//! constructed itself. U7 removes that construction entirely (R4): the only
+//! engine this process ever touches now is the daemon's, reached over
+//! [`crate::api::ApiClient`], discovered or transparently launched by
+//! [`crate::api::ensure_daemon_running`] (AE2) exactly as every CLI command
+//! already does (U6). The live stream is [`ApiClient::stream_all`] — a global
+//! SSE connection — mixed into the same `tokio::select!` a broadcast receiver
+//! used to occupy; the loop's shape does not change, only where its events
+//! come from.
+//!
+//! # The SSE replay gap, and why this loop does not try to close it
+//!
+//! `stream_all()`'s underlying connection is lazy — building the stream value
+//! does nothing over the wire; only the first `.next().await` actually opens
+//! it — so there is no way to *guarantee* the connection is live before
+//! [`App::refresh`] runs its own first `GET /executions` a few lines below.
+//! This mirrors the exact gap `src/cli/commands.rs`'s `wait_until_stopped`
+//! documents for `stream_execution`: a broadcast/SSE subscription has no
+//! replay, so a subscriber that connects a moment too late silently misses
+//! whatever already happened.
+//!
+//! This loop does not attempt to close that gap by synchronizing the SSE
+//! handshake (there is no explicit "subscribed" acknowledgement to wait on,
+//! short of racily waiting for the first keep-alive comment frame). Instead
+//! it leans on the same fallback the CLI settled on: every mutating call this
+//! interface makes ([`App::start_new_task`], [`App::run_selected`],
+//! [`App::submit_input`], [`App::apply_transition`]) already re-reads the
+//! authoritative state itself (`App::refresh`) right after the call returns,
+//! rather than waiting on the stream to tell it what happened. So the one
+//! window this gap can actually bite is the sliver between process startup
+//! and the very first `refresh()` a few lines down — before the operator has
+//! had a chance to select or act on anything — which is why the stream is
+//! still built *before* that first `refresh()` call: whatever ordering
+//! guarantee is available is taken, even though it is not a complete one.
+//! Losing the connection later (the daemon restarting, the connection
+//! dropping) is treated exactly as a closed broadcast channel used to be: a
+//! permanent, visible "disconnected" indicator ([`app::StreamStatus`]) for
+//! the rest of this process's life, not a silent reconnect-and-hope. Adding
+//! an actual reconnect loop is a reasonable follow-up, but nothing in this
+//! unit's test scenarios (AE5: two TUIs already up, watching the same
+//! already-running execution) requires it.
 
 pub mod app;
 pub mod conversation;
@@ -45,20 +82,20 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
-use crate::persistence::{CatalogPaths, WorkPaths};
+use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event as TerminalEvent, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use futures::StreamExt as _;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use crate::api;
-use crate::engine::{AgentDefaults, Engine};
-use crate::persistence::ExecutionStore;
+use crate::api::ensure_daemon_running;
+use crate::config::Flags;
 
 use app::{App, Request};
 
@@ -145,50 +182,41 @@ impl Drop for TerminalGuard {
 
 /// Runs the interface until the operator quits.
 ///
-/// Keys are read on a dedicated thread because `crossterm` reads block, and are
-/// forwarded over a channel so the loop can wait on keys and engine events at
-/// once. The engine is owned here and shared with [`App`] behind an [`Arc`].
+/// Keys are read on a dedicated thread because `crossterm` reads block, and
+/// are forwarded over a channel so the loop can wait on keys and daemon
+/// events at once. `state`/`flags` are exactly what
+/// [`ensure_daemon_running`] needs to discover — or transparently launch
+/// (AE2) — a daemon over the same state root this process was invoked
+/// against; `App` then holds nothing but the [`crate::api::ApiClient`] that
+/// call hands back (R4): no `Engine`, no `ExecutionStore`, constructed here
+/// or anywhere else in this module.
 pub async fn run(
-    store: ExecutionStore,
+    state: StatePaths,
+    flags: Flags,
     catalog: CatalogPaths,
     work: WorkPaths,
-    defaults: AgentDefaults,
 ) -> io::Result<()> {
     install_panic_hook();
 
-    // D23 startup reconciliation used to run here — it moved to the daemon
-    // (`crate::cli::daemon::run_daemon`) in U2, per R8: the daemon is now the
+    // D23 startup reconciliation ran here before U2, then moved to
+    // `crate::cli::daemon::run_daemon` in U2 (R8): the daemon is the one
     // process that opens the store for write, so it is the one responsible
     // for reconciling whatever a previous, differently-killed holder left
-    // behind. This TUI still constructs its own `Engine`/`ExecutionStore`
-    // below — that dual ownership is exactly what U7 (full TUI migration to
-    // a REST client) removes; until then, leaving this recovery-free is
-    // deliberately narrow in scope to what U2 asks for.
+    // behind. Until U7 this TUI still constructed its own
+    // `Engine`/`ExecutionStore` regardless (dual ownership U2 deliberately
+    // left in place, narrow in scope to what it asked for) — that
+    // construction is what this unit removes for good.
+    let client = ensure_daemon_running(&state, &flags)
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
 
-    let engine = Arc::new(Engine::new(store).with_agent_defaults(defaults));
+    // Built before `app.refresh()`'s first read, not after — see the module
+    // doc's "SSE replay gap" section for what this ordering does and does
+    // not guarantee.
+    let mut events = Box::pin(client.stream_all());
 
-    // The embedded API (U5, now also carrying U3's mutating endpoints) is
-    // the only path the task view (U7) reads the step timeline and
-    // conversations through — see `crate::api` for why it is loopback-only
-    // and token-protected. A failure to bind it is treated as fatal, per the
-    // plan: this TUI must not start silently degraded.
-    //
-    // This TUI still drives the engine directly (`Arc::clone(&engine)`
-    // below) rather than through this same client's mutating endpoints —
-    // that dual ownership is exactly what U7 (full TUI migration to a REST
-    // client) removes; until then this is deliberately narrow in scope to
-    // what U3 asks for.
-    let api_handle = api::start(
-        Arc::clone(&engine),
-        catalog.root().to_path_buf(),
-        work.root().to_path_buf(),
-    )
-    .await
-    .map_err(|error| io::Error::other(error.to_string()))?;
-    let client = api_handle.client();
-    let mut events = engine.subscribe();
-    let mut app = App::new(Arc::clone(&engine), catalog, work, client);
-    app.refresh();
+    let mut app = App::new(state, catalog, work, client);
+    app.refresh().await;
 
     let mut guard = TerminalGuard::enter()?;
 
@@ -205,7 +233,8 @@ pub async fn run(
                 Some(TerminalEvent::Key(key)) if key.kind == KeyEventKind::Press => {
                     match app.on_key(key) {
                         Request::None => {}
-                        Request::Refresh => app.refresh(),
+                        Request::Refresh => app.refresh().await,
+                        Request::SelectExecution => app.reload_selection().await,
                         Request::SubmitInput => app.submit_input().await,
                         Request::ApplyTransition => app.apply_transition().await,
                         Request::RunSelected => app.run_selected().await,
@@ -223,7 +252,7 @@ pub async fn run(
                 Some(_) => {}
                 None => app.quit(),
             },
-            received = events.recv() => app.on_stream(received),
+            received = events.next() => app.on_stream(received),
             _ = tokio::time::sleep(TICK) => {}
         }
     }

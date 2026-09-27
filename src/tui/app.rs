@@ -72,28 +72,27 @@
 //! interface does not hold a second.
 
 use std::collections::HashSet;
-use std::path::Path;
-use std::sync::Arc;
 
+use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Map, Value};
-use tokio::sync::broadcast::error::RecvError;
 
-use crate::api::{ApiClient, ConversationResponse};
+use crate::api::{
+    ApiClient, ClientError, ConversationResponse, ExecutionSummary, TransitionRequest,
+};
 use crate::domain::{
-    Event, EventData, ExecutionStatus, HumanInputField, HumanInputType, InputParameter, ParamType,
-    State, WorkflowDefinition, WorkflowExecution,
+    Context, Event, EventData, ExecutionStatus, HumanInputField, HumanInputType, InputParameter,
+    ParamType, State, WorkflowDefinition, WorkflowExecution, Workspace,
 };
 use crate::engine::actions::script::TRUNCATION_MARKER;
 use crate::engine::{
-    permitted_labels, terminal_status, ConversationState as PositionConversationState, Engine,
-    EngineError, EventLink, HumanInputDelivery, PendingHumanInput, Timeline,
+    permitted_labels, ConversationState as PositionConversationState, EventLink,
+    HumanInputDelivery, PendingHumanInput, Timeline,
 };
-use crate::tui::conversation::{classify, ClassifiedEntry};
-use futures::FutureExt;
+use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
-use crate::tasks::{self, DefinitionSource};
-use crate::persistence::{CatalogPaths, WorkPaths};
+use crate::tasks;
+use crate::tui::conversation::{classify, ClassifiedEntry};
 use crate::tui::scroll::{sanitize, ScrollState};
 use crate::workflows::{ResolvedWorkflow, WorkflowEntry, WorkflowResolver};
 
@@ -248,8 +247,16 @@ impl Notice {
 pub enum Request {
     /// Nothing further.
     None,
-    /// Re-read the store.
+    /// Re-read the whole execution list, then the selection (U7: both are
+    /// now `GET /executions` calls through the client).
     Refresh,
+    /// Re-read just the selected execution's detail — emitted when the
+    /// cursor moves onto a different row of the Executions panel (U7: this
+    /// used to be a synchronous, free store read; it is a client call now,
+    /// so [`App::move_cursor`]/[`App::jump_cursor`] can no longer do it
+    /// inline the way [`App::after_task_cursor_move`] still does for the
+    /// task view's own, purely local cursor).
+    SelectExecution,
     /// Validate and deliver the open input form.
     SubmitInput,
     /// Carry out the transition the operator picked.
@@ -675,9 +682,19 @@ pub struct NewTaskForm {
     pub error: Option<String>,
     /// The loaded definition, once the pick passed.
     pub definition: Option<WorkflowDefinition>,
-    /// Where that definition came from — recorded on the execution, so an
-    /// execution started from a built-in can be resumed later.
+    /// Where that definition came from — shown to the operator (the source
+    /// label in the pick list) and, since U7, kept only for display: the
+    /// daemon re-resolves from [`NewTaskForm::reference`] itself
+    /// (`WorkflowResolver::resolve`, exactly as `narsor run <reference>`
+    /// does), so this is no longer read to decide what gets sent over the
+    /// wire.
     pub resolved: Option<ResolvedWorkflow>,
+    /// The exact reference string this form resolved — a workflow name (from
+    /// the pick list) or a typed path — passed to `client.start_task`
+    /// verbatim (U7) so the daemon repeats the identical resolution this
+    /// form already validated, rather than the form guessing a name back out
+    /// of [`NewTaskForm::resolved`].
+    pub reference: Option<String>,
     /// The declared parameters, in declaration order.
     pub parameters: Vec<InputParameter>,
     /// How each parameter is edited.
@@ -706,6 +723,7 @@ impl NewTaskForm {
             error: None,
             definition: None,
             resolved: None,
+            reference: None,
             parameters: Vec::new(),
             editors: Vec::new(),
             values: Vec::new(),
@@ -752,10 +770,12 @@ impl NewTaskForm {
     /// remote — which the resolver still accepts — stays typeable.
     fn adopt(
         &mut self,
+        reference: String,
         definition: WorkflowDefinition,
         resolved: ResolvedWorkflow,
         repositories: &[String],
     ) {
+        self.reference = Some(reference);
         self.resolved = Some(resolved);
         self.parameters = definition.inputs.clone();
         self.editors = self
@@ -1078,13 +1098,18 @@ pub struct TaskView {
 
 /// Everything the interface knows.
 pub struct App {
-    engine: Arc<Engine>,
+    /// Path arithmetic only (U7): used solely to find an execution's pinned
+    /// definition copy ([`tasks::resolve_definition`]). Never opened as an
+    /// [`crate::persistence::ExecutionStore`] — that would put this process
+    /// back in the business of reading the store's on-disk layout directly,
+    /// which is exactly what this unit removes (R4).
+    state: StatePaths,
     resolver: WorkflowResolver,
 
     executions: Vec<ExecutionRow>,
     selected: usize,
 
-    execution: Option<WorkflowExecution>,
+    execution: Option<ExecutionSummary>,
     definition: Option<WorkflowDefinition>,
     definition_error: Option<String>,
     pending: Option<PendingHumanInput>,
@@ -1102,39 +1127,53 @@ pub struct App {
     notice: Option<Notice>,
     quit: bool,
     catalog: CatalogPaths,
+    /// Kept for constructor symmetry with the CLI's own "three roots" and
+    /// for any future feature that needs it — nothing currently reads it:
+    /// U7 moved workspace provisioning (the one thing this used to be read
+    /// for, in `start_new_task`) behind `client.start_task`, entirely onto
+    /// the daemon.
+    #[allow(dead_code)]
     work: WorkPaths,
     client: ApiClient,
 }
 
 impl App {
-    /// Builds an interface over an engine. Nothing is read until
+    /// Builds an interface over a daemon client. Nothing is read until
     /// [`App::refresh`].
     ///
     /// The catalogue and the work tree are handed in rather than recovered
-    /// from the engine's store. They used to be: the store carried the one
-    /// root, and this is where the registry and the workflow search path were
-    /// rebuilt out of it. That shortcut is what made the three directories one
-    /// directory in practice, whatever the configuration said.
+    /// from a store this process opened itself — U7 removed the last such
+    /// store, so there is nothing left to recover them from; they are read
+    /// directly off the configuration exactly as every CLI command reads
+    /// them.
     ///
-    /// `client` is the interface's only path to the step timeline and to
-    /// conversations (U7): it is a client of the embedded API server
-    /// (`crate::api`), which `src/tui/mod.rs::run` starts before building
-    /// this `App`.
-    pub fn new(engine: Arc<Engine>, catalog: CatalogPaths, work: WorkPaths, client: ApiClient) -> Self {
+    /// `client` is the interface's only path to the daemon (U7: the *only*
+    /// engine this process ever touches is the daemon's) — reads (the
+    /// execution list, the step timeline, conversations), the live SSE
+    /// stream, and every write (starting a task, resuming, delivering human
+    /// input, a manual/forced transition) all go through it. `state` is
+    /// path arithmetic only, used solely to find an execution's pinned
+    /// definition copy (see [`App`]'s own field doc).
+    pub fn new(
+        state: StatePaths,
+        catalog: CatalogPaths,
+        work: WorkPaths,
+        client: ApiClient,
+    ) -> Self {
         let resolver = WorkflowResolver::new(catalog.root().to_path_buf());
-        Self::with_resolver(engine, resolver, catalog, work, client)
+        Self::with_resolver(state, resolver, catalog, work, client)
     }
 
     /// The same, with the workflow search path given explicitly.
     pub fn with_resolver(
-        engine: Arc<Engine>,
+        state: StatePaths,
         resolver: WorkflowResolver,
         catalog: CatalogPaths,
         work: WorkPaths,
         client: ApiClient,
     ) -> Self {
         Self {
-            engine,
+            state,
             resolver,
             catalog,
             work,
@@ -1176,8 +1215,9 @@ impl App {
         self.executions.get(self.selected)
     }
 
-    /// The highlighted execution, as loaded from the store.
-    pub fn execution(&self) -> Option<&WorkflowExecution> {
+    /// The highlighted execution's summary, as the daemon last reported it
+    /// (`GET /executions`, U7 — no longer a store read).
+    pub fn execution(&self) -> Option<&ExecutionSummary> {
         self.execution.as_ref()
     }
 
@@ -1411,18 +1451,25 @@ impl App {
         }
     }
 
-    // -- loading ------------------------------------------------------------
+    // -- loading (U7: every read below is a client call, never a store read) --
 
     /// Re-reads the execution list and the selected execution.
     ///
     /// The selection follows the execution id, not the index, so a new
     /// execution appearing at the top of the list does not move the operator's
     /// cursor onto a different workflow.
-    pub fn refresh(&mut self) {
+    ///
+    /// `GET /executions` is the one read the whole interface now needs: the
+    /// list (this method) and a selection's detail
+    /// ([`App::reload_selection`]) are both just filters over the same
+    /// response — see [`ExecutionSummary`]'s own doc for why that response
+    /// carries `variables`/`metadata`/`pending_input` on top of the shape
+    /// U3/U5 originally gave it.
+    pub async fn refresh(&mut self) {
         let previous = self.selected().map(|row| row.id.clone());
 
-        let ids = match self.engine.store().list_execution_ids() {
-            Ok(ids) => ids,
+        let listing = match self.client.list_executions().await {
+            Ok(listing) => listing,
             Err(error) => {
                 self.notice = Some(Notice::error(format!(
                     "Could not read the execution list: {error}"
@@ -1431,24 +1478,17 @@ impl App {
             }
         };
 
-        let mut rows = Vec::with_capacity(ids.len());
-        for id in ids {
-            match self.engine.store().load_execution(&id) {
-                Ok(execution) => rows.push(ExecutionRow {
-                    id: execution.id.clone(),
-                    workflow_id: execution.workflow_id.clone(),
-                    status: execution.status.clone(),
-                    current_state: execution.current_state.clone(),
-                }),
-                Err(error) => {
-                    self.notice = Some(Notice::error(format!(
-                        "Could not load execution '{id}': {error}"
-                    )));
-                }
-            }
-        }
+        self.executions = listing
+            .executions
+            .into_iter()
+            .map(|summary| ExecutionRow {
+                id: summary.id,
+                workflow_id: summary.workflow_id,
+                status: summary.status,
+                current_state: summary.current_state,
+            })
+            .collect();
 
-        self.executions = rows;
         self.selected = previous
             .and_then(|id| self.executions.iter().position(|row| row.id == id))
             .unwrap_or(0);
@@ -1456,11 +1496,16 @@ impl App {
             self.selected = self.executions.len().saturating_sub(1);
         }
 
-        self.reload_selection();
+        self.reload_selection().await;
     }
 
-    /// Re-reads everything that depends on which execution is selected.
-    pub fn reload_selection(&mut self) {
+    /// Re-reads everything that depends on which execution is selected — a
+    /// second `GET /executions`, filtered down to the one row this needs,
+    /// rather than threading the listing [`App::refresh`] already has
+    /// through every caller of this method (cursor movement, `select_execution`,
+    /// a mutation's own follow-up reload): simplicity over saving one small
+    /// request on a loopback connection.
+    pub async fn reload_selection(&mut self) {
         self.execution = None;
         self.definition = None;
         self.definition_error = None;
@@ -1473,34 +1518,31 @@ impl App {
         let Some(id) = self.selected().map(|row| row.id.clone()) else {
             return;
         };
-        let store = self.engine.store();
 
-        match store.load_execution(&id) {
-            Ok(execution) => self.execution = Some(execution),
+        let summary = match self.client.list_executions().await {
+            Ok(listing) => listing.executions.into_iter().find(|row| row.id == id),
             Err(error) => {
                 self.notice = Some(Notice::error(format!(
                     "Could not load execution '{id}': {error}"
                 )));
                 return;
             }
-        }
+        };
+        let Some(summary) = summary else {
+            self.notice = Some(Notice::error(format!(
+                "Could not load execution '{id}': not found"
+            )));
+            return;
+        };
 
-        match store.load_context(&id) {
-            Ok(context) => {
-                let mut variables: Vec<(String, Value)> = context.variables.into_iter().collect();
-                variables.sort_by(|left, right| left.0.cmp(&right.0));
-                self.variables = variables;
-            }
-            Err(error) => {
-                self.notice = Some(Notice::error(format!(
-                    "Could not read the context: {error}"
-                )));
-            }
-        }
+        let mut variables: Vec<(String, Value)> = summary.variables.clone().into_iter().collect();
+        variables.sort_by(|left, right| left.0.cmp(&right.0));
+        self.variables = variables;
+        self.pending = summary.pending_input.clone();
 
         // An execution with no events is an empty stream, not a failure: it has
         // simply not got anywhere yet.
-        match store.event_log(&id).read_all() {
+        match self.client.events(&id, 0).await {
             Ok(events) => {
                 self.events = events;
                 self.event_cursor = self.events.len().saturating_sub(1);
@@ -1512,16 +1554,8 @@ impl App {
             }
         }
 
-        match self.engine.pending_input(&id) {
-            Ok(pending) => self.pending = pending,
-            Err(error) => {
-                self.notice = Some(Notice::error(format!(
-                    "Could not read the pending input: {error}"
-                )));
-            }
-        }
-
-        self.load_definition();
+        self.load_definition(&summary);
+        self.execution = Some(summary);
     }
 
     /// Resolves the definition the selected execution runs.
@@ -1529,16 +1563,14 @@ impl App {
     /// The same rule the CLI uses, through the same resolver: the recorded
     /// path while that file is there, and otherwise the recorded workflow
     /// name — which is all an execution started from a built-in has.
-    fn load_definition(&mut self) {
-        let Some(execution) = self.execution.as_ref() else {
-            return;
-        };
+    /// `tasks::resolve_definition` takes a whole [`WorkflowExecution`], which
+    /// this `App` no longer holds (only [`ExecutionSummary`]) — so this
+    /// builds the minimal stand-in [`execution_stub`] carries the two fields
+    /// that function actually reads (`id`, `metadata`).
+    fn load_definition(&mut self, summary: &ExecutionSummary) {
+        let stub = execution_stub(&summary.id, &summary.workflow_id, summary.metadata.clone());
 
-        let resolved = match tasks::resolve_definition(
-            self.catalog.root(),
-            self.engine.store().paths(),
-            execution,
-        ) {
+        let resolved = match tasks::resolve_definition(self.catalog.root(), &self.state, &stub) {
             Ok(resolved) => resolved,
             Err(error) => {
                 self.definition_error = Some(format!(
@@ -1561,25 +1593,34 @@ impl App {
 
     // -- the live stream ----------------------------------------------------
 
-    /// Folds one result of `broadcast::Receiver::recv` into the state.
+    /// Folds one item off `client.stream_all()`'s SSE stream into the state
+    /// (U7: this used to fold a `broadcast::Receiver::recv` result instead —
+    /// see `src/tui/mod.rs`'s module doc for why the source changed but this
+    /// method's job did not).
     ///
-    /// A lag and a closed channel both become a visible indicator: the operator
-    /// has to be able to tell "nothing is happening" from "I am no longer being
-    /// told what happens".
-    pub fn on_stream(&mut self, received: Result<Event, RecvError>) {
+    /// `None` (the stream ended — the connection dropped, or the daemon
+    /// stopped) and `Some(Err(_))` (a transport-level failure reported as one
+    /// last item, per [`ApiClient::sse_stream`]) both become the same
+    /// visible, permanent indicator a closed broadcast channel used to
+    /// produce: the operator has to be able to tell "nothing is happening"
+    /// from "I am no longer being told what happens". There is no
+    /// [`StreamStatus::Lagged`] equivalent here — SSE over a kept-open HTTP
+    /// connection has no bounded ring buffer to fall behind in the way an
+    /// in-process `broadcast` channel did; either the connection is up and
+    /// delivering everything it is asked to relay, or it is not up at all.
+    pub fn on_stream(&mut self, received: Option<Result<Event, ClientError>>) {
         match received {
-            Ok(event) => {
+            Some(Ok(event)) => {
                 self.stream = StreamStatus::Live;
                 self.on_engine_event(event);
             }
-            Err(RecvError::Lagged(skipped)) => {
-                self.stream = StreamStatus::Lagged { skipped };
+            Some(Err(error)) => {
+                self.stream = StreamStatus::Disconnected;
                 self.notice = Some(Notice::error(format!(
-                    "The event stream fell behind: {skipped} events were lost. \
-                     Press r to reload the log."
+                    "The event stream was closed: {error}. This view no longer updates live."
                 )));
             }
-            Err(RecvError::Closed) => {
+            None => {
                 self.stream = StreamStatus::Disconnected;
                 self.notice = Some(Notice::error(
                     "The event stream was closed: this view no longer updates live.",
@@ -1674,22 +1715,10 @@ impl App {
             KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Request::Refresh
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.move_cursor(1);
-                Request::None
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.move_cursor(-1);
-                Request::None
-            }
-            KeyCode::Char('g') | KeyCode::Home => {
-                self.jump_cursor(false);
-                Request::None
-            }
-            KeyCode::Char('G') | KeyCode::End => {
-                self.jump_cursor(true);
-                Request::None
-            }
+            KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
+            KeyCode::Char('g') | KeyCode::Home => self.jump_cursor(false),
+            KeyCode::Char('G') | KeyCode::End => self.jump_cursor(true),
             KeyCode::Char('f') if self.focus == Panel::Events => {
                 self.follow = !self.follow;
                 if self.follow {
@@ -1736,19 +1765,28 @@ impl App {
     }
 
     /// Moves the focused panel's cursor by `delta`.
-    fn move_cursor(&mut self, delta: isize) {
+    ///
+    /// Returns [`Request::SelectExecution`] when the Executions panel's
+    /// cursor actually moved (U7): unlike the other two panels, moving onto a
+    /// different execution needs a fresh client read
+    /// ([`App::reload_selection`]), which this synchronous method cannot
+    /// await itself — the same seam [`App::after_task_cursor_move`] already
+    /// uses for the task view's axis.
+    fn move_cursor(&mut self, delta: isize) -> Request {
         match self.focus {
             Panel::Executions => {
                 let length = self.executions.len();
                 if let Some(next) = step(self.selected, delta, length) {
                     self.selected = next;
-                    self.reload_selection();
+                    return Request::SelectExecution;
                 }
+                Request::None
             }
             Panel::Details => {
                 if let Some(next) = step(self.variable_cursor, delta, self.variables.len()) {
                     self.variable_cursor = next;
                 }
+                Request::None
             }
             Panel::Events => {
                 if let Some(next) = step(self.event_cursor, delta, self.events.len()) {
@@ -1757,32 +1795,37 @@ impl App {
                     // is reading, not watching.
                     self.follow = next + 1 == self.events.len();
                 }
+                Request::None
             }
         }
     }
 
-    /// Jumps the focused panel's cursor to the first or last entry.
-    fn jump_cursor(&mut self, to_end: bool) {
+    /// Jumps the focused panel's cursor to the first or last entry. See
+    /// [`App::move_cursor`] for why the Executions branch returns a
+    /// [`Request`] instead of reloading inline.
+    fn jump_cursor(&mut self, to_end: bool) -> Request {
         match self.focus {
             Panel::Executions => {
                 if self.executions.is_empty() {
-                    return;
+                    return Request::None;
                 }
                 self.selected = if to_end { self.executions.len() - 1 } else { 0 };
-                self.reload_selection();
+                Request::SelectExecution
             }
             Panel::Details => {
                 if self.variables.is_empty() {
-                    return;
+                    return Request::None;
                 }
                 self.variable_cursor = if to_end { self.variables.len() - 1 } else { 0 };
+                Request::None
             }
             Panel::Events => {
                 if self.events.is_empty() {
-                    return;
+                    return Request::None;
                 }
                 self.event_cursor = if to_end { self.events.len() - 1 } else { 0 };
                 self.follow = to_end;
+                Request::None
             }
         }
     }
@@ -2106,7 +2149,10 @@ impl App {
                 }
             }
             PositionConversationState::NotCreated { reason } => {
-                self.set_task_events_fallback(&label, format!("conversation not created: {reason}"));
+                self.set_task_events_fallback(
+                    &label,
+                    format!("conversation not created: {reason}"),
+                );
             }
             PositionConversationState::NoRecord => {
                 self.set_task_events_fallback(&label, "no conversation record".to_string());
@@ -2295,7 +2341,11 @@ impl App {
         } = view.origin
         {
             self.follow = was_following;
-            if let Some(index) = self.events.iter().position(|event| event.sequence == sequence) {
+            if let Some(index) = self
+                .events
+                .iter()
+                .position(|event| event.sequence == sequence)
+            {
                 self.event_cursor = index;
             }
         }
@@ -2635,46 +2685,16 @@ impl App {
         });
     }
 
-    /// Spawns one of the four engine-driving calls in the background (R1,
-    /// R2, R3): the caller returns immediately, and the outcome — success or
-    /// failure — reaches the interface only through the event stream (R4),
-    /// never through this call's own return value, which is why `future`'s
-    /// `Result` is otherwise discarded here.
-    ///
-    /// A panic inside `future` (an executor bug, say) is still caught rather
-    /// than left to vanish with it: `tokio::spawn` already stops it from
-    /// taking down the whole process, but the discarded `JoinHandle` would
-    /// otherwise mean nobody ever learns the pass panicked at all.
-    fn spawn_background(
-        &self,
-        future: impl std::future::Future<Output = Result<WorkflowExecution, EngineError>>
-            + Send
-            + 'static,
-    ) {
-        tokio::spawn(async move {
-            if let Err(payload) = std::panic::AssertUnwindSafe(future).catch_unwind().await {
-                let message = payload
-                    .downcast_ref::<&str>()
-                    .map(|message| message.to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "non-string panic payload".to_string());
-                tracing::error!(
-                    %message,
-                    "a backgrounded engine call panicked; its execution's outcome is unknown"
-                );
-            }
-        });
-    }
-
-    /// Validates the open form and, if it passes, dispatches it to the engine
-    /// in the background.
+    /// Validates the open form and, if it passes, delivers it — `POST
+    /// /executions/:id/input` (U7: used to dispatch `Engine::deliver_human_input`
+    /// in the background via [`App::spawn_background`]; the daemon now runs
+    /// the actual pass in its own background task, so this call is a short,
+    /// directly-awaited `202`, per the plan's Approach for this unit).
     ///
     /// A failed validation is reported in the form and nothing is sent: a
     /// rejected answer must leave the execution exactly as paused as it was.
-    /// A validated delivery's engine-level outcome — success or failure — no
-    /// longer reopens this form; it surfaces later as a notice (R6), because
-    /// the engine call itself runs in the background and this handler does
-    /// not wait for it (R1).
+    /// A validated delivery's outcome, once accepted, no longer reopens this
+    /// form; it surfaces later as a notice from the live stream (R6).
     pub async fn submit_input(&mut self) {
         let Modal::Input(form) = &mut self.modal else {
             return;
@@ -2692,20 +2712,9 @@ impl App {
         let Some(execution_id) = self.selected().map(|row| row.id.clone()) else {
             return;
         };
-        let Some(definition) = self.definition.clone() else {
-            self.notice = Some(Notice::error(self.definition_error.clone().unwrap_or_else(
-                || "No workflow definition for this execution.".to_string(),
-            )));
-            return;
-        };
 
         self.modal = Modal::None;
-        let engine = Arc::clone(&self.engine);
-        self.spawn_background(async move {
-            engine
-                .deliver_human_input(&definition, &execution_id, &delivery)
-                .await
-        });
+        self.deliver(&execution_id, delivery).await;
     }
 
     /// Carries out the transition the operator picked.
@@ -2720,62 +2729,78 @@ impl App {
         };
 
         if forced {
-            self.force_transition(&target);
+            self.force_transition(&target).await;
             return;
         }
 
         // Choosing a declared label while the execution waits on a question is
-        // an ordinary answer, so the engine runs the workflow on from there.
+        // an ordinary answer, so it goes through `deliver_input`, not
+        // `transition` — exactly as before.
         if self.pending.is_some() {
             self.deliver_label(&target).await;
         } else {
-            self.manual_transition(&target);
+            self.manual_transition(&target).await;
         }
     }
 
-    /// Answers a pending question with nothing but a label, in the
-    /// background — see [`App::submit_input`] for why this no longer waits
-    /// on the engine call either.
+    /// Answers a pending question with nothing but a label — `POST
+    /// /executions/:id/input` with [`HumanInputDelivery::label`]. See
+    /// [`App::submit_input`] for why this is now a short, directly-awaited
+    /// call rather than a backgrounded one.
     async fn deliver_label(&mut self, label: &str) {
         let Some(execution_id) = self.selected().map(|row| row.id.clone()) else {
-            return;
-        };
-        let Some(definition) = self.definition.clone() else {
             return;
         };
 
         self.modal = Modal::None;
         let delivery = HumanInputDelivery::label(label.to_string());
-        let engine = Arc::clone(&self.engine);
-        self.spawn_background(async move {
-            engine
-                .deliver_human_input(&definition, &execution_id, &delivery)
-                .await
-        });
+        self.deliver(&execution_id, delivery).await;
     }
 
-    /// Takes a declared transition by hand, without the engine.
-    ///
-    /// For an execution that is not waiting on a question there is nothing to
-    /// deliver an answer to, so the transition is written here and the
-    /// execution is parked at the target for the operator to resume.
-    fn manual_transition(&mut self, label: &str) {
-        let target = self
-            .current_state()
-            .and_then(|state| state.transitions.get(label).cloned());
-
-        match target {
-            Some(target) => self.write_transition(&target, label, false),
-            None => {
-                self.notice = Some(Notice::error(format!(
-                    "The state has no transition for label '{label}'."
-                )))
+    /// The shared tail of [`App::submit_input`]/[`App::deliver_label`]:
+    /// `client.deliver_input`, then a notice — success or failure — in the
+    /// same wording an operator already reads for every other mutating call
+    /// here.
+    async fn deliver(&mut self, execution_id: &str, delivery: HumanInputDelivery) {
+        match self.client.deliver_input(execution_id, delivery).await {
+            Ok(_) => {
+                self.notice = Some(Notice::info(format!(
+                    "Delivered input to execution {execution_id}; running in the background."
+                )));
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(client_error_message(execution_id, error)));
             }
         }
     }
 
-    /// Forces a transition to an arbitrary state (D30 override).
-    fn force_transition(&mut self, target: &str) {
+    /// Takes a declared transition by hand — `POST /executions/:id/transition`
+    /// with `label` (U7: used to write the transition's events directly to
+    /// the store here, guarded only by a client-side `Engine::is_active`
+    /// check; the server now does the identical legality/activity check
+    /// authoritatively, U3, and this just displays whatever it answers).
+    async fn manual_transition(&mut self, label: &str) {
+        let Some(execution_id) = self.selected().map(|row| row.id.clone()) else {
+            return;
+        };
+        let request = TransitionRequest {
+            label: Some(label.to_string()),
+            target: None,
+            force: false,
+        };
+        self.send_transition(&execution_id, request, false).await;
+    }
+
+    /// Forces a transition to an arbitrary state (D30 override) — `POST
+    /// /executions/:id/transition` with `force: true`.
+    ///
+    /// The `allow_manual_override` check stays here too, even though the
+    /// server repeats it authoritatively (`400` if bypassed): this is the
+    /// menu's own construction-time guard ([`App::open_transition_menu`]
+    /// never offers override mode otherwise), kept as a fast, round-trip-free
+    /// refusal for whatever narrow path might still reach this with it
+    /// disallowed.
+    async fn force_transition(&mut self, target: &str) {
         if !self.override_allowed() {
             self.notice = Some(Notice::error(
                 "This state does not allow a forced transition (allow_manual_override).",
@@ -2783,163 +2808,62 @@ impl App {
             self.modal = Modal::None;
             return;
         }
-        self.write_transition(target, OVERRIDE_LABEL, true);
+        let Some(execution_id) = self.selected().map(|row| row.id.clone()) else {
+            return;
+        };
+        let request = TransitionRequest {
+            label: None,
+            target: Some(target.to_string()),
+            force: true,
+        };
+        self.send_transition(&execution_id, request, true).await;
     }
 
-    /// Writes the events and the new state of a transition taken by hand.
-    ///
-    /// The order mirrors the engine's own (`DOMAIN_MODEL.md` §4.2) so that
-    /// recovery reads a hand-made transition the same way it reads a generated
-    /// one. `StateEntered` is deliberately *not* written for a non-terminal
-    /// target: the engine writes it when the operator resumes, and two of them
-    /// would be a lie about how many times the state was entered.
-    fn write_transition(&mut self, target: &str, label: &str, forced: bool) {
-        let Some(execution) = self.execution.clone() else {
-            return;
-        };
-        // A background pass may be advancing this same execution right now
-        // (R7's guard covers `Engine::run`/`resume`/`deliver_human_input`,
-        // but a manual/forced transition writes the store directly, so it
-        // needs its own check): writing here concurrently with that pass
-        // would race its own appends and its own `save_execution`, exactly
-        // the corruption the guard exists to prevent one layer up.
-        if self.engine.is_active(&execution.id) {
-            self.notice = Some(Notice::error(
-                "This execution is being driven in the background right now; \
-                 wait for it to settle before transitioning it by hand.",
-            ));
-            self.modal = Modal::None;
-            return;
-        }
-        let Some(definition) = self.definition.clone() else {
-            return;
-        };
-        let Some(target_state) = definition.states.get(target).cloned() else {
-            self.notice = Some(Notice::error(format!(
-                "The workflow has no state '{target}'."
-            )));
-            return;
-        };
+    /// The shared tail of [`App::manual_transition`]/[`App::force_transition`]:
+    /// `client.transition`, then the same success/error wording the old
+    /// client-side `write_transition` produced — including, for
+    /// [`ClientError::Conflict`], the exact denial text the old client-side
+    /// `Engine::is_active` guard used to produce, since the server now makes
+    /// the identical check (U3) and this is the one call site that phrases
+    /// it for an operator.
+    async fn send_transition(
+        &mut self,
+        execution_id: &str,
+        request: TransitionRequest,
+        forced: bool,
+    ) {
+        let from = self
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.current_state.clone())
+            .unwrap_or_else(|| "-".to_string());
+        let label = request.label.clone();
 
-        let mut execution = execution;
-        let from = execution
-            .current_state
-            .clone()
-            .unwrap_or_else(|| definition.initial_state.clone());
-        let store = self.engine.store();
-        let log = store.event_log(&execution.id);
-
-        let writes: Vec<EventData> = vec![
-            EventData::DecisionMade {
-                provider: if forced {
-                    OVERRIDE_PROVIDER
+        match self.client.transition(execution_id, request).await {
+            Ok(summary) => {
+                let target = summary.current_state.clone().unwrap_or_default();
+                self.modal = Modal::None;
+                self.notice = Some(Notice::info(if forced {
+                    format!("Forced transition {from} → {target}.")
                 } else {
-                    MANUAL_PROVIDER
-                }
-                .to_string(),
-                output_label: label.to_string(),
-                reasoning: Some(
-                    if forced {
-                        OVERRIDE_REASON
-                    } else {
-                        MANUAL_REASON
-                    }
-                    .to_string(),
-                ),
-            },
-            EventData::HumanTransitionSelected {
-                from_state: from.clone(),
-                to_state: target.to_string(),
-            },
-            EventData::StateExited {
-                state_id: from.clone(),
-                output_label: label.to_string(),
-            },
-            EventData::TransitionTaken {
-                from_state: from.clone(),
-                to_state: target.to_string(),
-                output_label: label.to_string(),
-            },
-        ];
-
-        for data in writes {
-            if let Err(error) = log.append_next(&execution.id, data) {
-                self.notice = Some(Notice::error(format!(
-                    "Could not append the transition event: {error}"
-                )));
-                return;
+                    format!(
+                        "Manual transition {from} → {target} ('{}') applied.",
+                        label.unwrap_or_default()
+                    )
+                }));
+                self.refresh().await;
+            }
+            Err(ClientError::Conflict) => {
+                self.notice = Some(Notice::error(
+                    "This execution is being driven in the background right now; \
+                     wait for it to settle before transitioning it by hand.",
+                ));
+                self.modal = Modal::None;
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(client_error_message(execution_id, error)));
             }
         }
-
-        execution.current_state = Some(target.to_string());
-        execution.current_action_execution = None;
-
-        if target_state.terminal {
-            let status = terminal_status(&target_state);
-            execution.status = status.clone();
-            execution.completed_at = Some(chrono::Utc::now());
-
-            let closing = match status {
-                ExecutionStatus::Failed => EventData::WorkflowFailed {
-                    error: format!("Forced transition into terminal state '{target}'."),
-                },
-                ExecutionStatus::Cancelled => EventData::WorkflowCancelled {
-                    reason: format!("Forced transition into terminal state '{target}'."),
-                },
-                _ => EventData::WorkflowCompleted {
-                    result: Value::Object(Map::new()),
-                },
-            };
-            let entered = EventData::StateEntered {
-                state_id: target.to_string(),
-            };
-            for data in [entered, closing] {
-                if let Err(error) = log.append_next(&execution.id, data) {
-                    self.notice = Some(Notice::error(format!(
-                        "Could not append the closing event: {error}"
-                    )));
-                    return;
-                }
-            }
-        } else {
-            execution.status = ExecutionStatus::Paused;
-            if let Err(error) = log.append_next(
-                &execution.id,
-                EventData::WorkflowPaused {
-                    reason: format!(
-                        "Manual transition into state '{target}'; waiting to be resumed."
-                    ),
-                },
-            ) {
-                self.notice = Some(Notice::error(format!(
-                    "Could not append the pause event: {error}"
-                )));
-                return;
-            }
-        }
-
-        // A question asked in the state we just left can no longer be answered.
-        if let Err(error) = store.clear_pending_input(&execution.id) {
-            self.notice = Some(Notice::error(format!(
-                "Could not clear the pending input: {error}"
-            )));
-            return;
-        }
-
-        if let Err(error) = store.save_execution(&execution) {
-            self.notice = Some(Notice::error(format!(
-                "Could not save the execution: {error}"
-            )));
-            return;
-        }
-
-        self.modal = Modal::None;
-        self.notice = Some(Notice::info(if forced {
-            format!("Forced transition {from} → {target}.")
-        } else {
-            format!("Manual transition {from} → {target} ('{label}') applied.")
-        }));
-        self.refresh();
     }
 
     // -- the repository registry --------------------------------------------
@@ -2953,13 +2877,7 @@ impl App {
     pub fn repository_ids(&self) -> Vec<String> {
         self.registry()
             .list()
-            .map(|listing| {
-                listing
-                    .entries
-                    .into_iter()
-                    .map(|entry| entry.id)
-                    .collect()
-            })
+            .map(|listing| listing.entries.into_iter().map(|entry| entry.id).collect())
             .unwrap_or_default()
     }
 
@@ -2975,9 +2893,9 @@ impl App {
                 let selected = match &self.modal {
                     // Coming back from a form or a confirmation keeps the
                     // operator where they were, unless the list shrank.
-                    Modal::Repositories(list) => list
-                        .selected
-                        .min(listing.entries.len().saturating_sub(1)),
+                    Modal::Repositories(list) => {
+                        list.selected.min(listing.entries.len().saturating_sub(1))
+                    }
                     _ => 0,
                 };
                 let unreadable: Vec<String> = listing
@@ -3105,7 +3023,7 @@ impl App {
             }
         };
 
-        self.adopt_new_task_workflow(resolved, &repositories);
+        self.adopt_new_task_workflow(reference, resolved, &repositories);
     }
 
     /// Opens the new-task modal on the list of everything that can be run.
@@ -3180,14 +3098,24 @@ impl App {
             }
         };
 
-        self.adopt_new_task_workflow(resolved, &repositories);
+        self.adopt_new_task_workflow(name, resolved, &repositories);
     }
 
     /// Validates a resolved workflow in full and builds its input form.
     ///
     /// Every violation is kept, not the first one: the operator should see the
     /// whole verdict on one screen, the way `narsor validate` prints it.
-    fn adopt_new_task_workflow(&mut self, resolved: ResolvedWorkflow, repositories: &[String]) {
+    ///
+    /// `reference` is the exact string that resolved to `resolved` — a
+    /// workflow name or a typed path — remembered on the form
+    /// ([`NewTaskForm::reference`]) so [`App::start_new_task`] can send the
+    /// identical reference to `client.start_task` (U7).
+    fn adopt_new_task_workflow(
+        &mut self,
+        reference: String,
+        resolved: ResolvedWorkflow,
+        repositories: &[String],
+    ) {
         let Modal::NewTask(form) = &mut self.modal else {
             return;
         };
@@ -3196,6 +3124,7 @@ impl App {
         form.error = None;
         form.definition = None;
         form.resolved = None;
+        form.reference = None;
 
         match resolved.validate() {
             Ok(violations) if !violations.is_empty() => {
@@ -3218,30 +3147,25 @@ impl App {
             }
         };
 
-        form.adopt(definition, resolved, repositories);
+        form.adopt(reference, definition, resolved, repositories);
     }
 
-    /// Creates the execution the form describes and runs it.
+    /// Creates the execution the form describes and starts it — `POST /tasks`
+    /// (U7: used to call [`crate::tasks::start_task`] directly against
+    /// `self.engine`, provisioning the workspace and everything else
+    /// in-process; the daemon does all of that now, on the other end of this
+    /// one request, exactly as `narsor run` already worked through U6).
     ///
-    /// The form's own values are parsed first, because a rejected input must
-    /// leave nothing on disk at all; everything after that is
-    /// [`crate::tasks::start_task`], the operation `narsor run`
-    /// performs — the workspace a declared `globals.workspace` asks for
-    /// included. The run itself stays here, so the interface keeps rendering
-    /// while the engine works.
+    /// `form.reference` — the exact workflow name or typed path this form
+    /// resolved locally, to validate it and build the inputs form — is sent
+    /// verbatim, so the daemon repeats the identical resolution
+    /// (`WorkflowResolver::resolve`) this form already ran.
     pub async fn start_new_task(&mut self) {
         let Modal::NewTask(form) = &self.modal else {
             return;
         };
-        let Some(definition) = form.definition.clone() else {
+        let Some(reference) = form.reference.clone() else {
             return;
-        };
-        // What the execution records about where its definition came from: a
-        // path when there is one, and always the name — a built-in has no path
-        // at all, and without the name it could never be resumed.
-        let source = match &form.resolved {
-            Some(resolved) => DefinitionSource::from_resolved(resolved),
-            None => DefinitionSource::from_path(Path::new(form.path.trim())),
         };
 
         let inputs = match form.inputs() {
@@ -3255,53 +3179,28 @@ impl App {
             }
         };
 
-        let execution = match tasks::start_task(
-            self.catalog.root(),
-            self.work.root(),
-            &self.engine,
-            &definition,
-            source,
-            inputs,
-        ) {
-            Ok(execution) => execution,
+        match self.client.start_task(&reference, inputs).await {
+            Ok(started) => {
+                self.modal = Modal::None;
+                self.notice = Some(Notice::info(format!(
+                    "Started execution {}; running in the background.",
+                    started.execution_id
+                )));
+                self.refresh().await;
+                self.select_execution(&started.execution_id).await;
+            }
             Err(error) => {
-                let message = error.to_string();
-                // An error that left an execution behind happened after it
-                // was created: the modal has nothing left to correct, so it
-                // closes and the list shows the failed execution instead.
-                match error.execution_id() {
-                    Some(execution_id) => {
-                        let execution_id = execution_id.to_string();
-                        self.modal = Modal::None;
-                        self.refresh();
-                        self.select_execution(&execution_id);
-                    }
-                    None => {
-                        if let Modal::NewTask(form) = &mut self.modal {
-                            form.error = Some(message.clone());
-                        }
-                    }
+                let message = client_error_message(&reference, error);
+                if let Modal::NewTask(form) = &mut self.modal {
+                    form.error = Some(message.clone());
                 }
                 self.notice = Some(Notice::error(message));
-                return;
             }
-        };
-
-        self.modal = Modal::None;
-        self.notice = Some(Notice::info(format!(
-            "Started execution {}; running in the background.",
-            execution.id
-        )));
-        self.refresh();
-        self.select_execution(&execution.id);
-
-        let engine = Arc::clone(&self.engine);
-        let execution_id = execution.id.clone();
-        self.spawn_background(async move { engine.run(&definition, &execution_id).await });
+        }
     }
 
     /// Puts the cursor on one execution, if the list holds it.
-    pub fn select_execution(&mut self, execution_id: &str) {
+    pub async fn select_execution(&mut self, execution_id: &str) {
         if let Some(index) = self
             .executions
             .iter()
@@ -3309,22 +3208,20 @@ impl App {
         {
             self.selected = index;
             self.focus = Panel::Executions;
-            self.reload_selection();
+            self.reload_selection().await;
         }
     }
 
-    /// Runs or resumes the selected execution, in the background (R1, R2):
-    /// this returns as soon as the engine call is dispatched, and its outcome
-    /// — success or failure — reaches the interface later as an event (R4).
+    /// Runs or resumes the selected execution — `POST
+    /// /executions/:id/resume` (U7: used to dispatch `Engine::run`/`resume`
+    /// in the background via [`App::spawn_background`], picking one of the
+    /// two based on the row's own status; the server's `Engine::prepare_resume`
+    /// already accepts a `Running` execution as a no-op passthrough exactly
+    /// as `Engine::run` did, so `resume` alone now covers both cases the old
+    /// `Running`/`Paused` match used to split between).
     pub async fn run_selected(&mut self) {
         let Some(row) = self.selected().cloned() else {
             self.notice = Some(Notice::error("No execution is selected."));
-            return;
-        };
-        let Some(definition) = self.definition.clone() else {
-            self.notice = Some(Notice::error(self.definition_error.clone().unwrap_or_else(
-                || "No workflow definition for this execution.".to_string(),
-            )));
             return;
         };
 
@@ -3335,16 +3232,12 @@ impl App {
             return;
         }
 
-        let engine = Arc::clone(&self.engine);
-        let execution_id = row.id.clone();
         match row.status {
-            ExecutionStatus::Running => {
-                self.spawn_background(async move { engine.run(&definition, &execution_id).await });
-            }
-            ExecutionStatus::Paused => {
-                self.spawn_background(
-                    async move { engine.resume(&definition, &execution_id).await },
-                );
+            ExecutionStatus::Running | ExecutionStatus::Paused => {
+                if let Err(error) = self.client.resume(&row.id).await {
+                    self.notice = Some(Notice::error(client_error_message(&row.id, error)));
+                    return;
+                }
             }
             other => {
                 self.notice = Some(Notice::error(format!(
@@ -3365,6 +3258,55 @@ impl App {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// Turns a [`ClientError`] into the notice text an operator reads — the
+/// TUI's counterpart of `src/cli/commands.rs`'s `client_error`, which does
+/// the same mapping for the CLI. `execution_id` (or, for `start_new_task`,
+/// the workflow reference) is folded into the message so a notice never
+/// reads as a bare, unattributed "not found"/"conflict".
+fn client_error_message(execution_id: &str, error: ClientError) -> String {
+    match error {
+        ClientError::Conflict => format!(
+            "Execution '{execution_id}' is already being driven by another process right now \
+             (another operation, or a second TUI/CLI) — try again once it settles."
+        ),
+        ClientError::NotFound => format!("Could not load execution '{execution_id}': not found"),
+        ClientError::Unauthorized => {
+            "The narsor daemon rejected the request: bad token".to_string()
+        }
+        ClientError::Unavailable(detail) => {
+            format!("Could not reach the narsor daemon: {detail}")
+        }
+        ClientError::Server(detail) => {
+            format!("The narsor daemon reported an error: {detail}")
+        }
+    }
+}
+
+/// A minimal stand-in [`WorkflowExecution`] carrying only what
+/// `tasks::resolve_definition` actually reads (`metadata`, for
+/// `metadata.cli.*`, plus `id`/`workflow_id` for its error messages) —
+/// needed because [`App`] now holds an [`ExecutionSummary`], not the whole
+/// record `resolve_definition`'s signature (shared with the CLI and the
+/// daemon's own routes, both of which do have the whole thing) still takes.
+/// Every other field is a harmless placeholder: nothing else in
+/// `resolve_definition`'s call graph reads them.
+fn execution_stub(id: &str, workflow_id: &str, metadata: Value) -> WorkflowExecution {
+    WorkflowExecution {
+        id: id.to_string(),
+        workflow_id: workflow_id.to_string(),
+        workflow_version: 0,
+        status: ExecutionStatus::Unknown,
+        current_state: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        inputs: Value::Null,
+        context: Context::default(),
+        workspace: Workspace::local_folder(String::new()),
+        current_action_execution: None,
+        metadata,
+    }
+}
 
 /// Steps a cursor within `length`, or `None` when it cannot move.
 fn step(current: usize, delta: isize, length: usize) -> Option<usize> {
