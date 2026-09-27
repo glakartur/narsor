@@ -38,7 +38,6 @@ states:
       right-sized requirements document.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `ce-brainstorm` skill for this request:
 
@@ -97,7 +96,6 @@ states:
       and surface role-specific issues before anyone plans against it.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `ce-doc-review` skill over the requirements document written by
         `ce-brainstorm` in `docs/brainstorms/`. Dispatch the persona reviewers,
@@ -165,7 +163,6 @@ states:
       plan with files, test scenarios and sequencing.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `ce-plan` skill. Build from the requirements document in
         `docs/brainstorms/` — it is the source of truth — and from the
@@ -237,7 +234,6 @@ states:
       keeping the tests green.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `ce-work` skill against the plan in `docs/plans/`. Implement
         the plan's units in order, write the tests the plan enumerates, and
@@ -301,7 +297,6 @@ states:
       that stopped it.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Continue the `ce-work` run. The question that stopped you has been
         answered:
@@ -334,7 +329,6 @@ states:
       efficiency, without changing behaviour.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `ce-simplify-code` skill over the code changed on this branch.
         Preserve behaviour exactly: the tests that passed before must pass
@@ -371,7 +365,6 @@ states:
       do with the findings is the next gate's question.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `ce-code-review` skill with `mode:report-only` over the changes
         on this branch. Dispatch the persona reviewers, merge and deduplicate
@@ -434,7 +427,6 @@ states:
     description: Address the review findings the person chose to fix.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Address the code review findings the reviewer asked to be fixed. Fix
         the cause, not the symptom, add a regression test for each behavioural
@@ -493,7 +485,6 @@ states:
       and open the pull request with an adaptive description.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `ce-commit-push-pr` skill. Follow the repository's commit
         conventions, push the feature branch (never the default branch), and
@@ -550,7 +541,6 @@ states:
       what is valid, and reply on the threads.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `ce-resolve-pr-feedback` skill on the open pull request.
         Evaluate each review thread on its merits — a comment can be wrong —
@@ -577,7 +567,6 @@ states:
       what was learned so the next run starts further along.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `ce-compound` skill over this piece of work. Write the durable
         learning to `docs/solutions/` with the frontmatter the skill

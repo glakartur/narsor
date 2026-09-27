@@ -862,7 +862,7 @@ async fn the_codex_adapter_builds_a_safe_fresh_command_line_and_records_its_thre
     );
     assert!(
         args.windows(2)
-            .any(|pair| pair == ["--sandbox", "workspace-write"]),
+            .any(|pair| pair == ["--sandbox", "read-only"]),
         "{args:?}"
     );
     assert!(

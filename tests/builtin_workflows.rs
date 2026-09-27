@@ -28,6 +28,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use narsor::domain::ActionConfig;
 use narsor::workflows::{
     builtin, builtin_names, WorkflowOrigin, WorkflowResolver, BUILTIN_WORKFLOWS,
 };
@@ -241,6 +242,27 @@ fn every_builtin_is_embedded_and_validates_without_a_single_violation() {
             "the embedded '{}' declares states",
             entry.name
         );
+    }
+}
+
+/// Shipped workflows deliberately inherit the daemon's chosen default rather
+/// than pinning every agent action to Claude Code.  That keeps the workflows
+/// portable while explicit `harness:` in a user workflow remains an override.
+#[test]
+fn builtin_agent_actions_inherit_the_operator_default_harness() {
+    for entry in BUILTIN_WORKFLOWS {
+        let definition = narsor::workflow::load_from_str(entry.source)
+            .unwrap_or_else(|error| panic!("the embedded '{}' loads: {error}", entry.name));
+        for (state_id, state) in definition.states {
+            let Some(ActionConfig::Agent(action)) = state.action else {
+                continue;
+            };
+            assert!(
+                action.harness.is_none(),
+                "built-in '{}' state '{state_id}' must inherit the operator default",
+                entry.name
+            );
+        }
     }
 }
 

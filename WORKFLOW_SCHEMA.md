@@ -157,7 +157,8 @@ action:
   type: agent
   harness: <claude-code|codex|opencode> # Opcjonalne — domyślnie z konfiguracji
                                       # (`agent_harness`, patrz README → Configuration),
-                                      # a w jej braku `claude-code`.
+                                      # a w jej braku `claude-code`. Codex bez
+                                      # `parameters.sandbox` używa `read-only`.
   model: <string>                     # Model AI (opcjonalne, np. "sonnet-3.5")
   prompt: |                           # Instrukcja dla agenta
     Analizuj kod w bieżącym katalogu.

@@ -49,7 +49,6 @@ states:
       turns the idea into a routing decision and a brief.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `om-discover` and `om-brainstorm` skills for ticket
         {{ inputs.ticket_id }}:
@@ -84,7 +83,6 @@ states:
       still lacks.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run `om-prepare-issue` for ticket {{ inputs.ticket_id }}, or
         `om-auto-manage-issues` if the ticket already exists. File or update it
@@ -159,7 +157,6 @@ states:
       main, and not already claimed or covered by an open PR. Read-only.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `om-verify-in-repo` skill for ticket {{ inputs.ticket_id }}.
         Reproduce the problem against `main`, check no open PR already covers
@@ -193,7 +190,6 @@ states:
       Claim — the three-signal claim protocol, so concurrent agents back off.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Claim ticket {{ inputs.ticket_id }} with all three signals the claim
         protocol requires: assign yourself, add the `in-progress` label, and
@@ -223,7 +219,6 @@ states:
       skips this stage".
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Decide whether this change is user-facing. Read the ticket and the
         code it will touch: does it change a screen, a flow, or anything a
@@ -251,7 +246,6 @@ states:
       exists.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `om-ux-shape` skill for ticket {{ inputs.ticket_id }}. Settle
         the flow and every state of it before any code exists: what the screen
@@ -320,7 +314,6 @@ states:
       om-auto-create-pr) makes the change with regression tests.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run `om-root-cause` read-only to locate the minimal change surface for
         ticket {{ inputs.ticket_id }}, then implement the change with
@@ -374,7 +367,6 @@ states:
       request against main.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `om-open-pr` skill. Open a ready (non-draft) pull request
         against `main` for ticket {{ inputs.ticket_id }}, carrying exactly one
@@ -405,7 +397,6 @@ states:
       full review, never instead of it.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `om-auto-review-pr` skill over the open pull request, against
         the `om-code-review` checklist. Report every finding in one cycle,
@@ -441,7 +432,6 @@ states:
       and addresses the requested changes, then it goes back for re-review.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `om-auto-continue-pr` skill on the open pull request. Address
         every requested change, re-run the validation gate, push, reply on the
@@ -471,7 +461,6 @@ states:
       explicit opt-out for docs-, dependency-, CI- and test-only changes.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Read the pull request's QA meta label and confirm it against the
         change. `needs-qa` applies to UI changes, new features and other
@@ -503,7 +492,6 @@ states:
       report. It touches no labels: automation never grants qa-approved.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run `om-prepare-test-env` to boot the app, then `om-auto-qa-pr` to walk
         the change in a real browser. Cover the whole state matrix — default,
@@ -581,7 +569,6 @@ states:
       or is close but blocked.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `om-merge-buddy` skill for this pull request. Read-only:
         report, do not merge. A `needs-qa` PR without `qa-approved` is blocked;
@@ -644,7 +631,6 @@ states:
       squash-merges.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run the `om-approve-merge-pr` skill. Re-check every gate yourself
         before touching the merge button — `needs-qa` without `qa-approved`,
@@ -673,7 +659,6 @@ states:
       issues. Merge is where this process ends.
     action:
       type: agent
-      harness: claude-code
       prompt: |
         Run `om-close-fixed-issues` and `om-followup-issue-from-pr` for the
         merged pull request. Close what it fixes — never an issue labelled

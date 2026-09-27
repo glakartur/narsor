@@ -12,6 +12,21 @@ Both validate with zero violations and both are exercised end to end in
 `tests/workflows.rs` against a fake harness — no real `claude`, `git` or `gh` is
 ever run by the tests.
 
+## Harness and skills prerequisites
+
+The shipped workflows deliberately omit `harness:` on every agent action. A
+new attempt uses the daemon's effective default: the durable operator override
+when present, otherwise `agent_harness` from configuration, otherwise
+`claude-code`. An explicit `harness:` in a user workflow still wins. Inspect or
+change the daemon selection in the TUI with `h`, or through
+`GET`/`PUT`/`DELETE /settings/agent-harness` on its authenticated local API.
+
+These are prompts for external skill packages, not bundled implementations:
+the compound-engineering workflow needs the referenced `ce-*` skills and the
+Open Mercato workflow needs the referenced `om-*` skills available to the
+selected harness. Narsor does not install, translate, or migrate those skills;
+an operator should install compatible packages before running the workflow.
+
 ## Running one
 
 ```sh
@@ -93,3 +108,5 @@ clean stop, not a failure), `failed` and `cancelled`.
   as a success.
 * Every agent state carries a timeout; a stalled agent would otherwise hang the
   run for good.
+* The built-ins must keep `harness` absent. `tests/builtin_workflows.rs` guards
+  that contract against an accidental reintroduction of a Claude-only default.

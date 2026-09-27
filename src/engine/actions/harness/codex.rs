@@ -20,7 +20,8 @@ pub const DEFAULT_PROGRAM: &str = "codex";
 
 const FAILURE_DETAIL_BYTES: usize = 2 * 1024;
 const APPROVAL_POLICY: &str = "never";
-const DEFAULT_SANDBOX: &str = "workspace-write";
+/// A workflow must explicitly opt into a writable Codex sandbox.
+const DEFAULT_SANDBOX: &str = "read-only";
 
 /// Adapter for the Codex CLI.
 #[derive(Debug, Clone)]

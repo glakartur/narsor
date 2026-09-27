@@ -694,9 +694,11 @@ The default is deliberately **not** the most permissive setting:
   that needs one either finishes without doing the work or sits until the state's
   `timeout` — which is the reason to set a `timeout` on agent states.
 - `codex` always passes `approval_policy=never` and permits only the native
-  `read-only` and `workspace-write` sandboxes. `danger-full-access` and bypass
-  requests fail before the process starts; its operator-provided environment
-  and profile are otherwise preserved for authentication and skills.
+  `read-only` and `workspace-write` sandboxes; the default is `read-only`, and
+  a workflow must explicitly request `workspace-write`. `danger-full-access`
+  and bypass requests fail before the process starts; its operator-provided
+  environment and profile are otherwise preserved for authentication and
+  skills.
 
 **The security consequence is real and is not hypothetical.** Containerisation
 (D14) is still deferred, so the only boundary around an agent is D15's
