@@ -104,11 +104,8 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
             .with_agent_defaults_and_selector(defaults, Arc::clone(&selector)),
     );
 
-    // The router now also carries the mutating endpoints U3 adds (SSE is
-    // still U4, out of scope here); it drives on `engine` directly, sharing
-    // the one `Arc<Engine>` this daemon owns. Binding and owning this server
-    // is the daemon's job (R1); a failure to bind is fatal and must leave no
-    // discovery file behind (checked by `tests/daemon_lifecycle.rs`).
+    // The engine and API share one selector, so a confirmed setting affects
+    // later harnessless attempts without restarting the daemon.
     let api_handle = crate::api::start_with_harness_selector(
         Arc::clone(&engine),
         config.catalog_dir().to_path_buf(),

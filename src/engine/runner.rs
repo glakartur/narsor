@@ -516,23 +516,28 @@ impl Engine {
     /// which means it must come **before** any
     /// [`with_executor`](Engine::with_executor) registering an agent executor
     /// of your own, or that one is overwritten.
-    pub fn with_agent_defaults(mut self, defaults: AgentDefaults) -> Self {
-        self.agent_timeout_secs = defaults.timeout_secs;
-        let agent = agent_executor(&self.store, &self.events, &defaults.harness, None);
-        self.executors.insert(ActionKind::Agent, Arc::new(agent));
-        self
+    pub fn with_agent_defaults(self, defaults: AgentDefaults) -> Self {
+        self.with_agent_defaults_inner(defaults, None)
     }
 
     /// Returns the engine with configured agent defaults and a shared live
     /// selector for harnessless attempts. Custom executors registered with
     /// [`with_executor`](Engine::with_executor) remain untouched.
     pub fn with_agent_defaults_and_selector(
-        mut self,
+        self,
         defaults: AgentDefaults,
         selector: Arc<DefaultHarnessSelector>,
     ) -> Self {
+        self.with_agent_defaults_inner(defaults, Some(selector))
+    }
+
+    fn with_agent_defaults_inner(
+        mut self,
+        defaults: AgentDefaults,
+        selector: Option<Arc<DefaultHarnessSelector>>,
+    ) -> Self {
         self.agent_timeout_secs = defaults.timeout_secs;
-        let agent = agent_executor(&self.store, &self.events, &defaults.harness, Some(selector));
+        let agent = agent_executor(&self.store, &self.events, &defaults.harness, selector);
         self.executors.insert(ActionKind::Agent, Arc::new(agent));
         self
     }

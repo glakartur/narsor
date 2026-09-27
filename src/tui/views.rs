@@ -884,7 +884,6 @@ fn render_repository_form_modal(frame: &mut Frame, app: &App) {
     );
 }
 
-/// The confirmation a repository removal has to pass.
 /// The daemon-backed default harness picker.
 fn render_harness_selection_modal(frame: &mut Frame, app: &App) {
     let Modal::HarnessSelection(picker) = app.modal() else {
