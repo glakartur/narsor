@@ -179,7 +179,8 @@ impl StatePaths {
 
     /// `{state}/executions/{id}/checkpoint.git`.
     pub fn checkpoint_scratch(&self, execution_id: &str) -> PathBuf {
-        self.execution_dir(execution_id).join(CHECKPOINT_SCRATCH_DIR)
+        self.execution_dir(execution_id)
+            .join(CHECKPOINT_SCRATCH_DIR)
     }
 
     /// `{state}/executions/{id}/definition.yaml`.

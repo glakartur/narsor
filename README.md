@@ -543,7 +543,7 @@ returns.
 analyze:
   action:
     type: agent
-    harness: claude-code          # optional; or: opencode
+    harness: claude-code          # optional; or: codex, opencode
     model: opus                   # optional, passed through verbatim
     prompt: |
       Analyse the repository for: {{ inputs.feature_description }}.
@@ -577,7 +577,7 @@ naming the binary and saying it must be on `PATH`, not as
 
 ### How each harness is invoked
 
-Both are run non-interactively, in the workspace, with
+All three are run non-interactively, in the workspace, with
 `ORCHESTRATOR_ACTION_ID` in the environment (D24), stdin closed, and both pipes
 drained while the agent works.
 
@@ -591,6 +591,9 @@ claude   --print --output-format json \
 opencode run [--model <provider/model#variant>] [--agent <agent>] \
          [--session <session-id>] [--fork] [--auto] --format json \
          <prompt>
+
+codex exec [--model <model>] --sandbox <read-only|workspace-write> \
+          --config approval_policy=never --json [resume <thread-id>] <prompt>
 ```
 
 `--print` / `run` are what make the run a batch run; `json` output is what
@@ -601,7 +604,9 @@ as a flag's argument.
 `parameters` is the per-action, harness-specific part: `permission_mode`,
 `max_turns`, `append_system_prompt`, `dangerously_skip_permissions`,
 `resume_session` for `claude-code`; `agent`, `auto_approve`, `fork`,
-`resume_session` for `opencode`. An unknown value or a wrong type is an error
+`resume_session` for `opencode`; `sandbox` (`read-only` or `workspace-write`),
+`approval_policy` (only `never`) and `resume_session` for `codex`. An unknown
+value or a wrong type is an error
 before anything is run — never a silent default.
 
 ### The JSON output contract
@@ -635,10 +640,12 @@ closes it. The harness's own session id is captured from its output and
 published two ways: as the context variable `agent_session_id`, and inside the
 result under `data.agent_session`.
 
-Both harnesses are run in streaming mode by default (`--output-format
+All harnesses are run in streaming mode by default (`--output-format
 stream-json --verbose` for Claude Code, `--format json` for opencode, which
-already streams NDJSON incrementally) — measured live against Claude Code
-2.1.283 and opencode 2.0.15. Every line the harness process writes, to either
+already streams NDJSON incrementally, and `exec --json` for Codex). Codex
+accepts a result only after `thread.started`, a completed `agent_message`, and
+a later `turn.completed`; `turn.failed` and top-level `error` remain failures.
+Every line the harness process writes, to either
 stream, is appended immediately to that attempt's own conversation record:
 `{root}/executions/{id}/conversations/{action_execution_id}.jsonl` while the
 attempt is open, compressed to `.jsonl.zst` once it closes. `AgentMessage`
@@ -662,8 +669,8 @@ that chaining becomes a one-line change in the template scope, and nothing more.
 ### `read_only_paths`
 
 Extra directories the agent may look at, resolved against the workspace. They
-become `--add-dir` for `claude-code`; `opencode run` has no equivalent flag, so
-they are named in the message instead. Either way this is about **visibility,
+become `--add-dir` for `claude-code`; `opencode run` and Codex have no safe
+read-only equivalent, so they are named in the message instead. Either way this is about **visibility,
 not enforcement**: read-only access to secondary repositories is enforced by the
 workspace provisioner's permission bits (D15), and would still be enforced if
 the flag were left out.
@@ -686,6 +693,10 @@ The default is deliberately **not** the most permissive setting:
   tool call opencode would have asked about is simply not granted, so an action
   that needs one either finishes without doing the work or sits until the state's
   `timeout` — which is the reason to set a `timeout` on agent states.
+- `codex` always passes `approval_policy=never` and permits only the native
+  `read-only` and `workspace-write` sandboxes. `danger-full-access` and bypass
+  requests fail before the process starts; its operator-provided environment
+  and profile are otherwise preserved for authentication and skills.
 
 **The security consequence is real and is not hypothetical.** Containerisation
 (D14) is still deferred, so the only boundary around an agent is D15's

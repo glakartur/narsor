@@ -168,8 +168,7 @@ fn a_loop_numbers_attempts_globally_and_labels_stay_stable() {
     log.push(decision_made("retry"));
     let after_first_visit = log.push(transition_taken("plan", "plan", "retry"));
 
-    let partial_timeline =
-        build_timeline(&log.events, ExecutionStatus::Running, &HashSet::new());
+    let partial_timeline = build_timeline(&log.events, ExecutionStatus::Running, &HashSet::new());
     assert_eq!(
         partial_timeline
             .positions
@@ -203,7 +202,10 @@ fn a_loop_numbers_attempts_globally_and_labels_stay_stable() {
     assert_eq!(visits, vec![1, 2, 2]);
 
     // Appending more events did not change the first position's label.
-    assert_eq!(full_timeline.positions[0].label, partial_timeline.positions[0].label);
+    assert_eq!(
+        full_timeline.positions[0].label,
+        partial_timeline.positions[0].label
+    );
 }
 
 /// Happy path: default selection picks the currently-running attempt.
@@ -375,7 +377,10 @@ fn an_old_format_log_still_attributes_events_but_has_no_conversation() {
     // id needed to look it up was never recorded.
     let timeline = build_timeline(&log.events, ExecutionStatus::Completed, &presence(&["a1"]));
 
-    assert_eq!(timeline.positions[0].conversation, ConversationState::NoRecord);
+    assert_eq!(
+        timeline.positions[0].conversation,
+        ConversationState::NoRecord
+    );
     assert_eq!(
         timeline.link(agent_started_seq),
         Some(&EventLink::Position("plan #1".to_string()))
@@ -442,7 +447,9 @@ fn workflow_and_human_events_have_no_link_and_script_steps_have_no_conversation(
         Some(EventLink::NoLink { .. })
     ));
 
-    let script_position = timeline.position("build #1").expect("the script position exists");
+    let script_position = timeline
+        .position("build #1")
+        .expect("the script position exists");
     assert!(matches!(
         script_position.conversation,
         ConversationState::NotCreated { .. }
@@ -481,5 +488,8 @@ fn a_present_conversation_reads_as_recorded() {
 
     let timeline = build_timeline(&log.events, ExecutionStatus::Running, &presence(&["a1"]));
 
-    assert_eq!(timeline.positions[0].conversation, ConversationState::Recorded);
+    assert_eq!(
+        timeline.positions[0].conversation,
+        ConversationState::Recorded
+    );
 }

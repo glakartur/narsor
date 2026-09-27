@@ -229,7 +229,17 @@ fn an_unsupported_harness_lists_the_supported_ones() {
     let message = messages(&errors).join("\n");
     assert!(message.contains("gpt-pilot"), "{message}");
     assert!(message.contains("claude-code"), "{message}");
+    assert!(message.contains("codex"), "{message}");
     assert!(message.contains("opencode"), "{message}");
+}
+
+#[test]
+fn codex_is_an_accepted_configured_harness() {
+    let values = parse("agent_harness: codex\n").expect("codex is registered");
+    assert_eq!(
+        values.get(SettingKey::AgentHarness),
+        Some(&SettingValue::Text("codex".to_string()))
+    );
 }
 
 #[test]

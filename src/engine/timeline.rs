@@ -199,7 +199,9 @@ pub struct Timeline {
 impl Timeline {
     /// The position with this label, if any.
     pub fn position(&self, label: &str) -> Option<&Position> {
-        self.positions.iter().find(|position| position.label == label)
+        self.positions
+            .iter()
+            .find(|position| position.label == label)
     }
 
     /// Where the event with this `sequence` belongs, if it was in the log
@@ -346,8 +348,8 @@ pub fn build_timeline(
                     );
                     continue;
                 };
-                let inherited_action_type = current_visit_last_position
-                    .and_then(|idx| drafts[idx].action_type.clone());
+                let inherited_action_type =
+                    current_visit_last_position.and_then(|idx| drafts[idx].action_type.clone());
                 let idx = push_attempt(
                     &mut drafts,
                     &mut state_attempt_counts,

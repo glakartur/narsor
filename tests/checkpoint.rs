@@ -324,7 +324,10 @@ fn a_dirty_tree_survives_a_round_trip() {
         fs::read(fresh.join("binary.dat")).expect("read binary"),
         vec![0u8, 1, 2, 255]
     );
-    assert!(!fresh.join(".gitignore").exists(), "the deletion must travel");
+    assert!(
+        !fresh.join(".gitignore").exists(),
+        "the deletion must travel"
+    );
 }
 
 #[test]
@@ -419,10 +422,7 @@ fn a_nested_repository_restores_as_an_empty_directory() {
         "the gitlink still recreates the directory on restore"
     );
     assert!(
-        fs::read_dir(&vendor)
-            .expect("read vendor")
-            .next()
-            .is_none(),
+        fs::read_dir(&vendor).expect("read vendor").next().is_none(),
         "the recreated directory is empty"
     );
 }

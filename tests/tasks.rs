@@ -195,8 +195,15 @@ fn a_definition_without_a_workspace_gets_the_empty_working_directory() {
     let engine = engine_for(root.path());
     let (definition, file) = definition_with(&root, "tasks-no-workspace", "", "");
 
-    let execution = tasks::start_task(root.path(), root.path(), &engine, &definition, &file, Map::new())
-        .expect("start the task");
+    let execution = tasks::start_task(
+        root.path(),
+        root.path(),
+        &engine,
+        &definition,
+        &file,
+        Map::new(),
+    )
+    .expect("start the task");
 
     let workspace = PathBuf::from(&execution.workspace.path);
     assert_eq!(
@@ -677,7 +684,10 @@ terminal_states:
 
 /// Starts an execution of the `greet.yaml` at `definition_path`, with no
 /// inputs — `definition_path` is expected to live under `{catalog}/workflows`.
-fn start_greet_task(store: &ExecutionStore, definition_path: &Path) -> narsor::domain::WorkflowExecution {
+fn start_greet_task(
+    store: &ExecutionStore,
+    definition_path: &Path,
+) -> narsor::domain::WorkflowExecution {
     let catalog = definition_path
         .parent()
         .and_then(Path::parent)

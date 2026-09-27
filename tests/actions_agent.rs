@@ -23,7 +23,7 @@ use narsor::domain::{
 use narsor::engine::actions::agent::{AgentEventSink, SESSION_ID_VARIABLE};
 use narsor::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
-    Engine, HarnessRegistry, LoggingEventSink, OpenCodeAdapter,
+    CodexAdapter, Engine, HarnessRegistry, LoggingEventSink, OpenCodeAdapter,
 };
 use narsor::persistence::{
     ConversationEntry, ConversationSource, ConversationStore, ExecutionStore,
@@ -245,6 +245,20 @@ fn opencode_stream(session_id: &str, text: &str) -> String {
         }),
         json!({ "type": "text", "sessionID": session_id, "text": text }),
         json!({ "type": "step_finish", "sessionID": session_id }),
+    ])
+}
+
+/// A complete successful `codex exec --json` stream.  Codex's success is more
+/// than an assistant message: it must identify the thread and subsequently
+/// complete the turn.
+fn codex_stream(thread_id: &str, text: &str) -> String {
+    ndjson(&[
+        json!({ "type": "thread.started", "thread_id": thread_id }),
+        json!({
+            "type": "item.completed",
+            "item": { "type": "agent_message", "text": text },
+        }),
+        json!({ "type": "turn.completed" }),
     ])
 }
 
@@ -814,6 +828,157 @@ async fn the_opencode_adapter_builds_its_own_command_line() {
     assert!(args.contains(&"--auto".to_string()), "{args:?}");
     assert_eq!(args[args.len() - 3], "--format");
     assert_eq!(args[args.len() - 2], "json");
+}
+
+#[tokio::test]
+async fn the_codex_adapter_builds_a_safe_fresh_command_line_and_records_its_thread() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&codex_stream("thread-7", r#"{"output":"ready"}"#));
+
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
+    );
+    let mut config = agent_action("look around");
+    config.harness = Some("codex".to_string());
+    config.model = Some("gpt-5-codex".to_string());
+    config.read_only_paths = vec!["../reference".to_string()];
+
+    let result = complete(&executor, config, &root.workspace()).await;
+
+    assert_eq!(result.output_label, "ready");
+    assert_eq!(
+        result.variables.get(SESSION_ID_VARIABLE),
+        Some(&json!("thread-7"))
+    );
+    let args = fake.args(1);
+    assert_eq!(args[0], "exec");
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--model", "gpt-5-codex"]),
+        "{args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--sandbox", "workspace-write"]),
+        "{args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--config", "approval_policy=never"]),
+        "{args:?}"
+    );
+    assert!(args.contains(&"--json".to_string()), "{args:?}");
+    assert!(!args.contains(&"--add-dir".to_string()), "{args:?}");
+    assert!(
+        args.last()
+            .is_some_and(|prompt| prompt.contains("readable but must not be modified")),
+        "{args:?}"
+    );
+}
+
+#[tokio::test]
+async fn codex_resume_uses_the_exec_resume_grammar() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&codex_stream("thread-42", r#"{"output":"ready"}"#));
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
+    );
+    let mut config = agent_action("continue");
+    config.harness = Some("codex".to_string());
+    config
+        .parameters
+        .insert("resume_session".to_string(), json!("thread-42"));
+
+    let result = complete(&executor, config, &root.workspace()).await;
+
+    assert_eq!(
+        result.variables.get(SESSION_ID_VARIABLE),
+        Some(&json!("thread-42"))
+    );
+    let args = fake.args(1);
+    assert_eq!(args[0], "exec");
+    let resume = args
+        .iter()
+        .position(|arg| arg == "resume")
+        .expect("resume subcommand");
+    assert_eq!(args[resume + 1], "thread-42");
+    assert!(
+        args.last()
+            .is_some_and(|prompt| prompt.starts_with("continue")),
+        "{args:?}"
+    );
+}
+
+#[tokio::test]
+async fn codex_rejects_unsafe_sandbox_before_spawn() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
+    );
+    let mut config = agent_action("do the thing");
+    config.harness = Some("codex".to_string());
+    config
+        .parameters
+        .insert("sandbox".to_string(), json!("danger-full-access"));
+
+    let error = fail(&executor, config, &root.workspace()).await;
+    assert_eq!(error.error_type.as_deref(), Some("unsafe_harness_argument"));
+    assert_eq!(fake.calls(), 0);
+}
+
+#[tokio::test]
+async fn codex_requires_a_completed_turn_after_its_agent_message() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&ndjson(&[
+        json!({ "type": "thread.started", "thread_id": "thread-7" }),
+        json!({ "type": "item.completed", "item": { "type": "agent_message", "text": "{\\\"output\\\":\\\"ready\\\"}" } }),
+    ]));
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
+    );
+    let mut config = agent_action("do the thing");
+    config.harness = Some("codex".to_string());
+
+    let error = fail(&executor, config, &root.workspace()).await;
+    assert_eq!(error.error_type.as_deref(), Some("harness_failed"));
+    assert!(
+        error.message.contains("turn.completed"),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn codex_terminal_failure_dominates_an_earlier_agent_message() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&ndjson(&[
+        json!({ "type": "thread.started", "thread_id": "thread-7" }),
+        json!({ "type": "item.completed", "item": { "type": "agent_message", "text": "{\\\"output\\\":\\\"ready\\\"}" } }),
+        json!({ "type": "turn.failed", "error": { "message": "permission denied" } }),
+    ]));
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
+    );
+    let mut config = agent_action("do the thing");
+    config.harness = Some("codex".to_string());
+
+    let error = fail(&executor, config, &root.workspace()).await;
+    assert_eq!(error.error_type.as_deref(), Some("harness_failed"));
+    assert!(
+        error.message.contains("permission denied"),
+        "{}",
+        error.message
+    );
 }
 
 // ---------------------------------------------------------------------------

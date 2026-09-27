@@ -785,9 +785,7 @@ where
                 if line.len() > MAX_LINE_BYTES {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!(
-                            "a single line exceeded {MAX_LINE_BYTES} bytes with no newline"
-                        ),
+                        format!("a single line exceeded {MAX_LINE_BYTES} bytes with no newline"),
                     ));
                 }
             }

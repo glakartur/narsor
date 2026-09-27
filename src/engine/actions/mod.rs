@@ -45,8 +45,8 @@ use crate::persistence::ConversationStore;
 
 pub use agent::{AgentEventSink, AgentExecutor, AgentOutput, LoggingEventSink};
 pub use harness::{
-    ClaudeCodeAdapter, HarnessAdapter, HarnessInvocation, HarnessRegistry, HarnessRequest,
-    HarnessRun, OpenCodeAdapter,
+    ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, HarnessInvocation, HarnessRegistry,
+    HarnessRequest, HarnessRun, OpenCodeAdapter,
 };
 pub use human::{
     HumanActionError, HumanExecutor, HumanInputDelivery, HumanInputRequest, PendingHumanInput,

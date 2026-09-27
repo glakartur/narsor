@@ -437,10 +437,7 @@ impl RepositoryRegistry {
         if written {
             Ok(())
         } else {
-            Err(RegistryError::DuplicateId {
-                id: entry.id,
-                path,
-            })
+            Err(RegistryError::DuplicateId { id: entry.id, path })
         }
     }
 
@@ -460,12 +457,10 @@ impl RepositoryRegistry {
     /// it is still registered.
     pub fn remove(&self, id: &str) -> Result<RepositoryEntry> {
         validate_id(id)?;
-        let removed = self
-            .get(id)?
-            .ok_or_else(|| RegistryError::NotFound {
-                id: id.to_string(),
-                path: self.dir.clone(),
-            })?;
+        let removed = self.get(id)?.ok_or_else(|| RegistryError::NotFound {
+            id: id.to_string(),
+            path: self.dir.clone(),
+        })?;
 
         for extension in EXTENSIONS {
             let path = self.dir.join(format!("{id}.{extension}"));

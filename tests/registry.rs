@@ -287,7 +287,10 @@ fn each_repository_is_one_yaml_file_named_for_its_id() {
     assert!(path.is_file(), "the entry is its own file");
 
     let raw = fs::read_to_string(&path).expect("read the entry");
-    assert!(raw.contains("remote: https://github.com/acme/api.git"), "{raw}");
+    assert!(
+        raw.contains("remote: https://github.com/acme/api.git"),
+        "{raw}"
+    );
     assert!(raw.contains("name: ACME API"), "{raw}");
 }
 
@@ -482,7 +485,9 @@ fn concurrent_registration_of_different_repositories_keeps_every_entry() {
             .into_iter()
             .map(|entry| entry.id)
             .collect();
-        let expected: Vec<String> = (0..WRITERS).map(|writer| format!("repo-{writer}")).collect();
+        let expected: Vec<String> = (0..WRITERS)
+            .map(|writer| format!("repo-{writer}"))
+            .collect();
 
         assert_eq!(
             stored, expected,
@@ -510,7 +515,10 @@ fn eight_sequential_registrations_keep_every_entry() {
             .expect("register a repository");
     }
 
-    assert_eq!(registry.list().expect("list the registry").entries.len(), WRITERS);
+    assert_eq!(
+        registry.list().expect("list the registry").entries.len(),
+        WRITERS
+    );
 }
 
 /// AE6 — two writers racing for the *same* id: one wins, the other is told.
@@ -551,7 +559,11 @@ fn concurrent_registration_of_one_id_leaves_exactly_the_winner_on_disk() {
                 .collect()
         });
 
-        let winners: Vec<usize> = outcomes.iter().filter_map(|o| o.as_ref().ok()).copied().collect();
+        let winners: Vec<usize> = outcomes
+            .iter()
+            .filter_map(|o| o.as_ref().ok())
+            .copied()
+            .collect();
         assert_eq!(
             winners.len(),
             1,
@@ -596,7 +608,10 @@ fn a_corrupt_entry_is_named_by_the_listing_and_the_rest_still_load() {
     let registry = root.registry();
     registry.add(full_entry()).expect("add a good entry");
     registry
-        .add(RepositoryEntry::new("acme-web", "https://example.com/web.git"))
+        .add(RepositoryEntry::new(
+            "acme-web",
+            "https://example.com/web.git",
+        ))
         .expect("add a second good entry");
     let broken = plant(&registry, "broken.yaml", "this: is: not: valid: yaml:\n");
 
@@ -604,7 +619,12 @@ fn a_corrupt_entry_is_named_by_the_listing_and_the_rest_still_load() {
 
     let ids: Vec<&str> = listing.entries.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(ids, ["acme-api", "acme-web"], "the good entries still load");
-    assert_eq!(listing.failures.len(), 1, "failures: {:?}", listing.failures);
+    assert_eq!(
+        listing.failures.len(),
+        1,
+        "failures: {:?}",
+        listing.failures
+    );
     assert_eq!(listing.failures[0].path, broken);
     assert!(!listing.is_ok(), "a listing with a failure is not ok");
 }
@@ -663,7 +683,11 @@ fn a_file_whose_name_is_not_a_usable_id_is_a_failure_not_an_entry() {
     let root = TempRoot::new();
     let registry = root.registry();
     registry.add(full_entry()).expect("add a good entry");
-    let hostile = plant(&registry, " padded .yaml", "name: X\nprovider: git\nremote: /srv/x\n");
+    let hostile = plant(
+        &registry,
+        " padded .yaml",
+        "name: X\nprovider: git\nremote: /srv/x\n",
+    );
 
     let listing = registry.list().expect("list the registry");
 
@@ -699,14 +723,20 @@ fn updating_one_entry_does_not_touch_any_other_file() {
     let registry = root.registry();
     registry.add(full_entry()).expect("add the entry");
     registry
-        .add(RepositoryEntry::new("acme-web", "https://example.com/web.git"))
+        .add(RepositoryEntry::new(
+            "acme-web",
+            "https://example.com/web.git",
+        ))
         .expect("add a second entry");
 
     let untouched = registry.entry_path("acme-web");
     let before = fs::read(&untouched).expect("read the neighbour");
 
     registry
-        .update(RepositoryEntry::new("acme-api", "https://example.com/moved.git"))
+        .update(RepositoryEntry::new(
+            "acme-api",
+            "https://example.com/moved.git",
+        ))
         .expect("update the first entry");
 
     assert_eq!(

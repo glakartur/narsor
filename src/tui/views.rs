@@ -159,7 +159,11 @@ fn render_task_axis(frame: &mut Frame, view: &TaskView, area: Rect) {
         } else {
             BorderType::Plain
         })
-        .border_style(Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray }))
+        .border_style(Style::default().fg(if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }))
         .title(format!(" Steps — {} ", view.execution_id));
 
     if view.timeline.positions.is_empty() {
@@ -191,7 +195,12 @@ fn render_task_axis(frame: &mut Frame, view: &TaskView, area: Rect) {
         })
         .collect();
 
-    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// The task view's right pane: the selected position's conversation, or a
@@ -217,7 +226,11 @@ fn render_task_content(frame: &mut Frame, view: &TaskView, area: Rect) {
         } else {
             BorderType::Plain
         })
-        .border_style(Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray }))
+        .border_style(Style::default().fg(if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }))
         .title(title);
 
     // The content pane always renders starting at the selected entry, so a

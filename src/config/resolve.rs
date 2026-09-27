@@ -31,9 +31,7 @@ use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
 
 use super::cascade::{CascadeError, ConfigCascade, Resolution};
 use super::file::{self, FileError, FileValues};
-use super::settings::{
-    self, SettingKey, SettingValue, Source, ENV_PREFIX, LOG_OFF, RUST_LOG,
-};
+use super::settings::{self, SettingKey, SettingValue, Source, ENV_PREFIX, LOG_OFF, RUST_LOG};
 
 /// The environment, as a map read once rather than consulted repeatedly.
 pub type Environment = BTreeMap<String, String>;

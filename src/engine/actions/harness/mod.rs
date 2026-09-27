@@ -23,6 +23,7 @@
 //! suite never spends money and never needs credentials.
 
 pub mod claude_code;
+pub mod codex;
 pub mod opencode;
 
 use std::path::{Path, PathBuf};
@@ -33,6 +34,7 @@ use serde_json::Value;
 use crate::domain::{ActionError, AgentActionConfig};
 
 pub use claude_code::{ClaudeCodeAdapter, CLAUDE_CODE};
+pub use codex::{CodexAdapter, CODEX};
 pub use opencode::{OpenCodeAdapter, OPENCODE};
 
 /// Everything an adapter needs to build one invocation.
@@ -133,12 +135,13 @@ pub struct HarnessRegistry {
 }
 
 impl HarnessRegistry {
-    /// The harnesses of this version: `claude-code` and `opencode`, each on its
+    /// The harnesses of this version: `claude-code`, `codex`, and `opencode`, each on its
     /// default binary.
     pub fn defaults() -> Self {
         Self {
             adapters: vec![
                 Arc::new(ClaudeCodeAdapter::new()),
+                Arc::new(CodexAdapter::new()),
                 Arc::new(OpenCodeAdapter::new()),
             ],
         }

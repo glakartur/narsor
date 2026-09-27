@@ -597,7 +597,8 @@ pub fn resolve_definition(
             source,
         })?;
         return Ok(ResolvedWorkflow {
-            name: stored_definition_name(execution).unwrap_or_else(|| execution.workflow_id.clone()),
+            name: stored_definition_name(execution)
+                .unwrap_or_else(|| execution.workflow_id.clone()),
             origin: WorkflowOrigin::File(pinned),
             source,
         });

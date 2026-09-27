@@ -211,7 +211,10 @@ impl RetiredKey {
 
     /// The whole message, for a key written in a file.
     pub fn message(&self) -> String {
-        format!("Setting '{}' no longer exists. {}", self.key, self.replacement)
+        format!(
+            "Setting '{}' no longer exists. {}",
+            self.key, self.replacement
+        )
     }
 
     /// The whole message, for a variable found in the environment.

@@ -683,7 +683,10 @@ fn the_three_roots_on_one_directory_reproduce_the_previous_layout() {
     );
 
     assert_eq!(work.tasks_dir(), Path::new("/srv/narsor/tasks"));
-    assert_eq!(work.task_dir("exec-1"), Path::new("/srv/narsor/tasks/exec-1"));
+    assert_eq!(
+        work.task_dir("exec-1"),
+        Path::new("/srv/narsor/tasks/exec-1")
+    );
     assert_eq!(
         work.code_dir("exec-1"),
         Path::new("/srv/narsor/tasks/exec-1/code")
@@ -727,8 +730,7 @@ fn workspace_round_trips_its_base_commit() {
     workspace.base_commit = Some("0123456789abcdef0123456789abcdef01234567".to_string());
 
     let encoded = serde_json::to_value(&workspace).expect("serialize");
-    let decoded: narsor::domain::Workspace =
-        serde_json::from_value(encoded).expect("deserialize");
+    let decoded: narsor::domain::Workspace = serde_json::from_value(encoded).expect("deserialize");
 
     assert_eq!(
         decoded.base_commit.as_deref(),

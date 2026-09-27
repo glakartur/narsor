@@ -32,8 +32,8 @@ pub use timeline::{
 
 pub use actions::{
     ActionExecutor, ActionOutcome, ActionRequest, AgentEventSink, AgentExecutor, AgentOutput,
-    ClaudeCodeAdapter, HarnessAdapter, HarnessInvocation, HarnessRegistry, HarnessRequest,
-    HarnessRun, HumanActionError, HumanExecutor, HumanInputDelivery, HumanInputRequest,
-    LoggingEventSink, OpenCodeAdapter, PendingHumanInput, ResumedHumanAction, ScriptExecutor,
-    SuspendedAction, TimedOutAction, ACTION_ID_ENV_VAR,
+    ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, HarnessInvocation, HarnessRegistry,
+    HarnessRequest, HarnessRun, HumanActionError, HumanExecutor, HumanInputDelivery,
+    HumanInputRequest, LoggingEventSink, OpenCodeAdapter, PendingHumanInput, ResumedHumanAction,
+    ScriptExecutor, SuspendedAction, TimedOutAction, ACTION_ID_ENV_VAR,
 };

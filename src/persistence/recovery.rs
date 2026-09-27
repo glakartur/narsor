@@ -158,9 +158,7 @@ pub fn recover(store: &ExecutionStore) -> Result<RecoveryReport> {
 /// An attempt that is neither is presumed still open in another process and
 /// is left completely untouched — compressing out from under a live writer
 /// would corrupt its next append.
-pub fn compress_closed_conversations(
-    store: &ExecutionStore,
-) -> Result<Vec<(ExecutionId, String)>> {
+pub fn compress_closed_conversations(store: &ExecutionStore) -> Result<Vec<(ExecutionId, String)>> {
     let mut compressed = Vec::new();
 
     for execution_id in store.list_execution_ids()? {

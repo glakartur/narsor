@@ -27,7 +27,10 @@ fn entry(source: ConversationSource, raw: &str) -> ConversationEntryDto {
 
 #[test]
 fn a_narsor_line_is_the_narsor_kind_even_if_it_looks_like_json() {
-    let classified = classify(&entry(ConversationSource::Narsor, r#"{"type":"assistant"}"#));
+    let classified = classify(&entry(
+        ConversationSource::Narsor,
+        r#"{"type":"assistant"}"#,
+    ));
     assert_eq!(classified.kind, EntryKind::Narsor);
 }
 
@@ -41,7 +44,8 @@ fn a_stderr_line_is_the_stderr_kind_even_if_it_looks_like_json() {
 
 #[test]
 fn claude_assistant_text_is_assistant() {
-    let raw = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}"#;
+    let raw =
+        r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}"#;
     assert_eq!(
         classify(&entry(ConversationSource::Stdout, raw)).kind,
         EntryKind::Assistant
@@ -115,7 +119,8 @@ fn opencode_reasoning_is_thinking() {
 
 #[test]
 fn opencode_tool_use_is_tool_call() {
-    let raw = r#"{"type":"tool_use","timestamp":0,"sessionID":"s1","state":{"input":{},"output":"ok"}}"#;
+    let raw =
+        r#"{"type":"tool_use","timestamp":0,"sessionID":"s1","state":{"input":{},"output":"ok"}}"#;
     assert_eq!(
         classify(&entry(ConversationSource::Stdout, raw)).kind,
         EntryKind::ToolCall
@@ -147,7 +152,10 @@ fn an_unrecognized_type_is_raw_with_full_content_preserved() {
     let raw = r#"{"type":"api_retry","detail":"backing off"}"#;
     let classified = classify(&entry(ConversationSource::Stdout, raw));
     assert_eq!(classified.kind, EntryKind::Raw);
-    assert_eq!(classified.text, raw, "R9: nothing is dropped, even unrecognized");
+    assert_eq!(
+        classified.text, raw,
+        "R9: nothing is dropped, even unrecognized"
+    );
 }
 
 #[test]

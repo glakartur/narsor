@@ -114,11 +114,19 @@ fn writing_three_entries_and_closing_leaves_only_the_compressed_file() {
     let jsonl_path = conversations.dir().join("attempt-1.jsonl");
     assert!(jsonl_path.exists(), "plain file must exist before closing");
 
-    conversations.close_attempt("attempt-1").expect("close attempt");
+    conversations
+        .close_attempt("attempt-1")
+        .expect("close attempt");
 
     let zst_path = conversations.dir().join("attempt-1.jsonl.zst");
-    assert!(zst_path.exists(), "compressed file must exist after closing");
-    assert!(!jsonl_path.exists(), "plain file must be gone after closing");
+    assert!(
+        zst_path.exists(),
+        "compressed file must exist after closing"
+    );
+    assert!(
+        !jsonl_path.exists(),
+        "plain file must be gone after closing"
+    );
 
     let snapshot = conversations
         .read("attempt-1", 0, 1 << 20)
@@ -203,7 +211,9 @@ fn a_truncated_last_line_is_omitted_while_open_and_reported_incomplete_once_clos
     assert!(while_open.truncated_tail);
     assert!(!while_open.closed);
 
-    conversations.close_attempt("attempt-1").expect("close attempt");
+    conversations
+        .close_attempt("attempt-1")
+        .expect("close attempt");
 
     let after_close = conversations
         .read("attempt-1", 0, 1 << 20)
@@ -240,7 +250,9 @@ fn compression_between_two_reads_gives_a_correct_continuation() {
 
     writer.append_narsor("three").expect("append 3");
     writer.finish().expect("finish writer");
-    conversations.close_attempt("attempt-1").expect("close attempt");
+    conversations
+        .close_attempt("attempt-1")
+        .expect("close attempt");
 
     let second_read = conversations
         .read("attempt-1", cursor, 1 << 20)
@@ -262,12 +274,15 @@ fn both_files_present_prefers_the_compressed_one_and_startup_deletes_the_plain_o
     let mut writer = conversations.writer("attempt-1").expect("open writer");
     writer.append_narsor("hello").expect("append");
     writer.finish().expect("finish writer");
-    conversations.close_attempt("attempt-1").expect("close attempt");
+    conversations
+        .close_attempt("attempt-1")
+        .expect("close attempt");
 
     // Simulate a crash between rename and delete: recreate the plain file
     // with different (stale) content next to the already-compressed one.
     let jsonl_path = conversations.dir().join("attempt-1.jsonl");
-    fs::write(&jsonl_path, b"stale garbage, must never be read\n").expect("recreate stale plain file");
+    fs::write(&jsonl_path, b"stale garbage, must never be read\n")
+        .expect("recreate stale plain file");
     assert!(conversations.dir().join("attempt-1.jsonl.zst").exists());
 
     let snapshot = conversations
@@ -319,9 +334,7 @@ fn a_single_ten_mebibyte_entry_is_written_and_read_back_in_full() {
     let store = root.store();
     let conversations = store.conversation_store("exec-7");
 
-    let big: Vec<u8> = (0..10 * 1024 * 1024)
-        .map(|i| (i % 251) as u8)
-        .collect();
+    let big: Vec<u8> = (0..10 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
 
     let mut writer = conversations.writer("attempt-1").expect("open writer");
     writer
@@ -379,14 +392,15 @@ fn startup_leaves_a_running_executions_open_attempt_untouched_and_compresses_a_c
     open_writer.append_narsor("still running").expect("append");
     open_writer.finish().expect("finish writer");
 
-    let mut closed_writer = conversations
-        .writer("attempt-closed")
-        .expect("open writer");
+    let mut closed_writer = conversations.writer("attempt-closed").expect("open writer");
     closed_writer.append_narsor("done").expect("append");
     closed_writer.finish().expect("finish writer");
 
     let compressed = compress_closed_conversations(&store).expect("compression sweep");
-    assert_eq!(compressed, vec![("exec-9".to_string(), "attempt-closed".to_string())]);
+    assert_eq!(
+        compressed,
+        vec![("exec-9".to_string(), "attempt-closed".to_string())]
+    );
 
     assert!(
         conversations.dir().join("attempt-open.jsonl").exists(),
@@ -395,7 +409,10 @@ fn startup_leaves_a_running_executions_open_attempt_untouched_and_compresses_a_c
     assert!(!conversations.dir().join("attempt-open.jsonl.zst").exists());
 
     assert!(
-        conversations.dir().join("attempt-closed.jsonl.zst").exists(),
+        conversations
+            .dir()
+            .join("attempt-closed.jsonl.zst")
+            .exists(),
         "an attempt closed in the log must be compressed"
     );
     assert!(!conversations.dir().join("attempt-closed.jsonl").exists());

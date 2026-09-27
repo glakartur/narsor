@@ -85,11 +85,7 @@ pub fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()
 
 /// Serializes `value` as pretty JSON and writes it to `path` atomically under
 /// `mode`. See [`write_atomic_with_mode`].
-pub fn write_json_atomic_with_mode<T: Serialize>(
-    path: &Path,
-    value: &T,
-    mode: u32,
-) -> Result<()> {
+pub fn write_json_atomic_with_mode<T: Serialize>(path: &Path, value: &T, mode: u32) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|source| PersistenceError::Serialize {
         path: path.to_path_buf(),
         source,

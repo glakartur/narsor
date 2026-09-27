@@ -239,8 +239,6 @@ impl ExecutionStore {
     pub fn execution_dir(&self, execution_id: &str) -> PathBuf {
         self.paths.execution_dir(execution_id)
     }
-
-
 }
 
 impl Default for ExecutionStore {

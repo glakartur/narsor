@@ -247,7 +247,8 @@ impl ConversationStore {
         }
 
         let zst_path = self.zst_path(attempt_id);
-        let plain = fs::read(&jsonl_path).map_err(|source| PersistenceError::io(&jsonl_path, source))?;
+        let plain =
+            fs::read(&jsonl_path).map_err(|source| PersistenceError::io(&jsonl_path, source))?;
         let compressed = zstd::stream::encode_all(plain.as_slice(), 0)
             .map_err(|source| PersistenceError::io(&zst_path, source))?;
 
@@ -317,12 +318,11 @@ impl ConversationStore {
         let mut next_entry = from_entry;
 
         for line in lines {
-            let envelope: Envelope = serde_json::from_slice(line).map_err(|source| {
-                PersistenceError::Deserialize {
+            let envelope: Envelope =
+                serde_json::from_slice(line).map_err(|source| PersistenceError::Deserialize {
                     path: source_path.clone(),
                     source,
-                }
-            })?;
+                })?;
             if envelope.n < from_entry {
                 continue;
             }
@@ -330,15 +330,17 @@ impl ConversationStore {
                 break;
             }
 
-            let raw = BASE64.decode(envelope.raw_b64.as_bytes()).map_err(|error| {
-                PersistenceError::io(
-                    source_path,
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("entry {} has invalid base64 payload: {error}", envelope.n),
-                    ),
-                )
-            })?;
+            let raw = BASE64
+                .decode(envelope.raw_b64.as_bytes())
+                .map_err(|error| {
+                    PersistenceError::io(
+                        source_path,
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("entry {} has invalid base64 payload: {error}", envelope.n),
+                        ),
+                    )
+                })?;
 
             budget_used += raw.len();
             next_entry = envelope.n + 1;

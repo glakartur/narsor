@@ -292,7 +292,10 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
         return vec![String::new()];
     }
     let chars: Vec<char> = line.chars().collect();
-    chars.chunks(width).map(|chunk| chunk.iter().collect()).collect()
+    chars
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect())
+        .collect()
 }
 
 #[cfg(test)]

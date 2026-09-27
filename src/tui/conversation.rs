@@ -201,7 +201,8 @@ mod tests {
 
     #[test]
     fn claude_assistant_text_block_is_the_assistant_kind() {
-        let raw = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}"#;
+        let raw =
+            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}"#;
         let classified = classify(&entry(ConversationSource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::Assistant);
     }
@@ -222,7 +223,8 @@ mod tests {
 
     #[test]
     fn claude_user_tool_result_block_is_the_tool_result_kind() {
-        let raw = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#;
+        let raw =
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#;
         let classified = classify(&entry(ConversationSource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::ToolResult);
     }

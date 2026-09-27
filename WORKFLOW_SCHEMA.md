@@ -150,12 +150,12 @@ Serce definicji workflow. Każdy klucz w sekcji `states` to unikalny identyfikat
 
 ##### A. AgentAction
 
-Uruchamia agenta AI (np. Claude Code, OpenCode).
+Uruchamia agenta AI (np. Claude Code, Codex, OpenCode).
 
 ```yaml
 action:
   type: agent
-  harness: <claude-code|opencode>     # Opcjonalne — domyślnie z konfiguracji
+  harness: <claude-code|codex|opencode> # Opcjonalne — domyślnie z konfiguracji
                                       # (`agent_harness`, patrz README → Configuration),
                                       # a w jej braku `claude-code`.
   model: <string>                     # Model AI (opcjonalne, np. "sonnet-3.5")
