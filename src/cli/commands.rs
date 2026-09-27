@@ -36,9 +36,7 @@ use futures::StreamExt as _;
 use serde_json::{Map, Value};
 
 use crate::api::{ApiClient, ClientError, ConversationResponse, ExecutionSummary};
-use crate::domain::{
-    Event, EventData, ExecutionStatus, InputParameter, ParamType, WorkflowDefinition,
-};
+use crate::domain::{Event, ExecutionStatus, InputParameter, ParamType, WorkflowDefinition};
 use crate::engine::{
     ConversationState, HumanInputDelivery, PendingHumanInput, Position, PositionStatus,
 };
@@ -190,7 +188,7 @@ pub async fn run(
 
     let summary = wait_until_stopped(&client, &started.execution_id).await?;
     print_summary(&summary);
-    print_pending_input_if_any(&client, &started.execution_id, &summary).await?;
+    print_pending_input_if_any(&summary);
 
     if summary.status == ExecutionStatus::Failed {
         return Err(CliError::failure(format!(
@@ -651,7 +649,7 @@ pub async fn input(
 
     println!("Input delivered to execution {}.", summary.id);
     print_summary(&summary);
-    print_pending_input_if_any(&client, execution_id, &summary).await?;
+    print_pending_input_if_any(&summary);
     if summary.status == ExecutionStatus::Failed {
         return Err(CliError::failure(format!(
             "Execution {} failed.",
@@ -703,7 +701,7 @@ pub async fn resume(
 
     println!("Resumed execution {}.", summary.id);
     print_summary(&summary);
-    print_pending_input_if_any(&client, execution_id, &summary).await?;
+    print_pending_input_if_any(&summary);
     if summary.status == ExecutionStatus::Failed {
         return Err(CliError::failure(format!(
             "Execution {} failed.",
@@ -1159,42 +1157,30 @@ async fn wait_until_stopped(client: &ApiClient, execution_id: &str) -> Result<Ex
     }
 }
 
-/// Prints the "Human input expected: …" line [`run`]/[`resume`] always
-/// printed when a pass stops on a question, if `summary` says the
-/// execution is `Paused` right now.
+/// Prints the pending question's full form ([`print_pending_input`]) —
+/// fields, types, allowed values, output labels, not just its instruction
+/// text — that [`run`]/[`resume`]/[`input`] always printed when a pass
+/// stops on a question, if `summary` says the execution is `Paused` right
+/// now.
 ///
-/// There is no REST endpoint that hands back the full form a question
-/// declares (fields, types, allowed values, output labels) — only
-/// [`crate::engine::human::pending_input`], reachable through
-/// `ExecutionStore` directly, has that (see `input`, still unmigrated).
-/// Reading the event log instead ([`ClientError`]-mapped, same as every
-/// other call here) recovers the one piece every operator actually needs
-/// immediately — the instruction text — from the `HumanInputRequested`
-/// event `human::suspend` appends right before parking the execution: that
-/// event is the log's very last entry exactly when this applies, since
-/// nothing else is appended between it and the question being answered.
-/// An operator-requested pause (`WorkflowPaused`, `Engine::pause_now`) has
-/// no such event and prints nothing here, matching
+/// `ExecutionSummary::pending_input` (added to `GET /executions` while
+/// migrating the TUI off `Arc<Engine>`, U7) already carries this whole form
+/// — an earlier version of this function predated that field and had to
+/// settle for re-reading the event log just to recover the bare instruction
+/// text from `HumanInputRequested`, the one piece it could get any other
+/// way. Callers already fetch `summary` from `GET /executions` before
+/// calling this, so reusing it here costs nothing further. An
+/// operator-requested pause (`WorkflowPaused`, `Engine::pause_now`) has no
+/// pending question and `pending_input` is `None` for it, matching
 /// `engine.pending_input()` returning `None` for that case before this
 /// unit.
-async fn print_pending_input_if_any(
-    client: &ApiClient,
-    execution_id: &str,
-    summary: &ExecutionSummary,
-) -> Result<()> {
+fn print_pending_input_if_any(summary: &ExecutionSummary) {
     if summary.status != ExecutionStatus::Paused {
-        return Ok(());
+        return;
     }
-    let events = client
-        .events(execution_id, 0)
-        .await
-        .map_err(|error| client_error(execution_id, error))?;
-    if let Some(EventData::HumanInputRequested { instruction }) =
-        events.last().map(|event| &event.data)
-    {
-        println!("Human input expected: {instruction}");
+    if let Some(pending) = &summary.pending_input {
+        print_pending_input(pending);
     }
-    Ok(())
 }
 
 /// The question an execution is waiting on, as a form the operator can fill in.

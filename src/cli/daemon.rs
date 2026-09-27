@@ -46,9 +46,9 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the drain loop re-checks [`Engine::active_run_ids`].
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// How long the daemon waits for [`crate::api::ApiHandle::shutdown`]'s own
-/// graceful drain (`axum::serve`'s `with_graceful_shutdown`) to finish before
-/// giving up on it and exiting anyway.
+/// How long the daemon waits for [`crate::api::ApiHandle::wait_drained`]
+/// (`axum::serve`'s `with_graceful_shutdown`, its connections-close half) to
+/// finish before giving up on it and exiting anyway.
 ///
 /// `axum::serve`'s graceful shutdown waits for every open connection to
 /// close on its own — normally near-instant, since an HTTP response ends the
@@ -58,10 +58,15 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// that client's *process* dies without the kernel getting a chance to send
 /// a clean TCP close (killed by `SIGKILL`, the machine loses network, ...),
 /// the connection can sit half-open from this side indefinitely and
-/// `with_graceful_shutdown` never resolves — found by `tests/daemon_e2e.rs`'s
-/// AE1 scenario, which kills exactly such a client. Bounding this the same
-/// way [`drain_active_runs`] bounds its own wait keeps `SIGTERM`/`daemon
-/// stop` reliably responsive regardless of what any given client does; the
+/// `wait_drained` never resolves on its own. No test exercises this specific
+/// branch end to end — doing so would need a client that opens an SSE stream
+/// and is then killed without a clean close, which none of this crate's
+/// current SSE tests do (they all disconnect cleanly); the timeout below is
+/// reasoned about, not proven by a failing-then-passing test the way the
+/// shutdown-ordering fix a few lines down (`api_handle.stop_accepting()`
+/// before the drain, not after) is. Bounding this the same way
+/// [`drain_active_runs`] bounds its own wait keeps `SIGTERM`/`daemon stop`
+/// reliably responsive regardless of what any given client does; the
 /// process exiting closes every remaining connection anyway; the *engine's*
 /// own runs are already safely drained by [`drain_active_runs`] before this
 /// ever runs, so nothing about workflow correctness depends on this
