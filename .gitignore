@@ -1,4 +1,5 @@
-node_modules/
+# Documentation
+ARCHITECTURE_DECISIONS.mdnode_modules/
 .next/
 dist/
 build/
