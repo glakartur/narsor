@@ -1,6 +1,5 @@
-DOMAIN_MODEL.mdnode_modules/
+Nothing needs to be added to .gitignore since only a markdown file (WORKFLOW_SCHEMA.md) was added, which is a source/config file and not a build artifact, dependency, or temporary file.node_modules/
 .next/
 dist/
 build/
 *.log
-node_modules/

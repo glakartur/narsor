@@ -1,0 +1,477 @@
+# Workflow Schema Specification
+
+## 1. Przegląd
+
+Ten dokument definiuje deklaratywny format plików YAML używanych do opisywania workflow w AI Workflow Orchestrator. Format został zaprojektowany tak, aby był czytelny dla ludzi, łatwy do walidacji maszynowej i wspierał kluczowe funkcje systemu: deterministyczne przejścia stanów, izolację workspace'ów, integrację z agentami AI oraz human-in-the-loop.
+
+### 1.1. Zasady projektowe
+
+*   **Statyczny Graf:** Definicja workflow jest niezmienna podczas wykonania. Nie można dynamicznie dodawać stanów ani przejść.
+*   **Jeden Stan = Jedna Akcja:** Każdy stan wykonuje dokładnie jedną akcję (`AgentAction`, `ScriptAction`, `HumanAction`, `WaitAction`).
+*   **Deterministyczne Przejścia:** Przejścia między stanami są określane przez statyczne mapowanie etykiet wyjścia (`output labels`) do stanów docelowych. Nie ma dynamicznych wyrażeń warunkowych (np. `when: x > 5`).
+*   **Strukturyzowane Wyjście:** Akcje zwracają ustrukturyzowany wynik JSON zawierający etykietę wyjścia (`output`), opcjonalne dane (`data`), zmienne do aktualizacji kontekstu (`variables`) oraz referencje do artefaktów (`artifacts`).
+*   **Bezpieczeństwo przez Izolację:** Workspace jest definiowany na poziomie wykonania (execution) lub zadania (task), a nie zmieniany dynamicznie wewnątrz workflow. Dostęp do plików kontrolowany jest przez uprawnienia systemu plików i montowania.
+
+---
+
+## 2. Struktura Pliku Workflow
+
+Plik workflow składa się z następujących sekcji:
+
+```yaml
+name: <string>              # Unikalna nazwa workflow (np. "code-review")
+version: <integer>          # Wersja definicji (np. 1)
+description: <string>       # Opis celu workflow (opcjonalne)
+
+inputs:                     # Definica wejść wymaganych do uruchomienia (opcjonalne)
+  - name: <string>
+    type: <string>          # string, integer, boolean, repository
+    required: <boolean>
+    default: <any>          # Wartość domyślna (opcjonalne)
+
+globals:                    # Ustawienia globalne dla całego workflow (opcjonalne)
+  timeout: <duration>       # Np. "1h", "30m"
+  retry_policy:             # Domyślna polityka retry dla akcji
+    max_attempts: <int>
+    backoff: <duration>
+  workspace:                # Domyślna konfiguracja workspace
+    type: <git|local>
+    repository: <string>    # ID repozytorium z registry (dla typu git)
+    ref: <string>           # Branch/tag/commit (dla typu git)
+    path: <string>          # Ścieżka względna w folderze taska
+
+states:                     # Graf stanów (wymagane)
+  <state_id>:
+    description: <string>   # Opis stanu (opcjonalne)
+    action:                 # Definicja akcji do wykonania
+      type: <agent|script|human|wait>
+      # ... konfiguracja specyficzna dla typu akcji
+    outputs:                # Lista możliwych etykiet wyjścia (wymagane dla agent/script)
+      - <label_1>
+      - <label_2>
+    transitions:            # Mapowanie etykiet na stany docelowe (wymagane)
+      <label_1>: <next_state_id_1>
+      <label_2>: <next_state_id_2>
+    decision:               # Konfiguracja dostawcy decyzji (opcjonalne, domyślnie rules)
+      type: <rules|agent|human>
+      # ... konfiguracja specyficzna dla typu decyzji
+    timeout: <duration>     # Timeout dla tego stanu (nadpisuje globalny)
+    retry_policy:           # Polityka retry dla tej akcji (nadpisuje globalną)
+
+terminal_states:            # Lista stanów terminalnych (kończących workflow)
+  - <state_id_1>
+  - <state_id_2>
+```
+
+---
+
+## 3. Szczegółowa Specyfikacja Sekcji
+
+### 3.1. Inputs (Wejścia)
+
+Definiuje parametry, które muszą zostać dostarczone przy uruchamianiu wykonania (`WorkflowExecution`). Są one dostępne w kontekście workflow jako `inputs.<name>`.
+
+**Przykład:**
+```yaml
+inputs:
+  - name: task_description
+    type: string
+    required: true
+    description: "Opis zadania do wykonania przez agenta"
+  
+  - name: target_repository
+    type: repository
+    required: true
+    description: "Repozytorium, w którym mają być wprowadzone zmiany"
+  
+  - name: is_experimental
+    type: boolean
+    required: false
+    default: false
+```
+
+### 3.2. Globals (Ustawienia Globalne)
+
+Opcjonalna sekcja określająca domyślne zachowanie dla całego workflow.
+
+*   `timeout`: Maksymalny czas życia pojedynczego wykonania.
+*   `retry_policy`: Domyślne zasady ponawiania nieudanych akcji.
+    *   `max_attempts`: Liczba prób (domyślnie 1).
+    *   `backoff`: Czas oczekiwania między próbami (np. "10s").
+*   `workspace`: Domyślna konfiguracja środowiska pracy.
+    *   `type`: `git` (wymaga `repository` i `ref`) lub `local` (wymaga `path`).
+    *   `repository`: ID repozytorium zarejestrowanego w systemie.
+    *   `ref`: Gałąź, tag lub commit.
+    *   `path`: Ścieżka do folderu lokalnego (dla typu `local`).
+
+### 3.3. States (Stany)
+
+Serce definicji workflow. Każdy klucz w sekcji `states` to unikalny identyfikator stanu.
+
+#### Struktura Stanu:
+
+```yaml
+<state_id>:
+  description: <string>               # Opisowy tekst
+  action:                             # Konfiguracja akcji
+    type: <agent|script|human|wait>
+    # ... szczegóły akcji
+  outputs:                            # Lista dopuszczalnych etykiet wyjścia
+    - success
+    - failure
+    - needs_human
+  transitions:                        # Mapowanie: etykieta -> następny stan
+    success: next_state
+    failure: error_handler
+    needs_human: human_review
+  decision:                           # Sposób wyboru przejścia (opcjonalne)
+    type: <rules|agent|human>
+    # ... szczegóły decyzji
+  timeout: <duration>                 # Nadpisanie globalnego timeoutu
+  retry_policy:                       # Nadpisanie globalnej polityki retry
+    max_attempts: 3
+    backoff: 5s
+```
+
+#### Typy Akcji (Action Types):
+
+##### A. AgentAction
+
+Uruchamia agenta AI (np. Claude Code, OpenCode).
+
+```yaml
+action:
+  type: agent
+  harness: <claude-code|opencode>     # Wybór narzędzia
+  model: <string>                     # Model AI (opcjonalne, np. "sonnet-3.5")
+  prompt: |                           # Instrukcja dla agenta
+    Analizuj kod w bieżącym katalogu.
+    Znajdź potencjalne błędy bezpieczeństwa.
+    Zapisz raport do pliku security_report.md.
+  
+  # Opcjonalne ustawienia specyficzne dla harnessa
+  parameters:
+    max_tokens: 4096
+    temperature: 0.7
+  
+  # Foldery dodatkowe (tylko do odczytu)
+  read_only_paths:
+    - ../other-repo/src               # Ścieżki względem workspace
+```
+
+**Wymagane wyjścia (outputs):**
+Agent musi zwrócić JSON z kluczem `output` odpowiadającym jednej z zadeklarowanych etykiet.
+Przykładowy wynik agenta:
+```json
+{
+  "output": "success",
+  "data": {
+    "findings_count": 3
+  },
+  "variables": {
+    "security_level": "high"
+  },
+  "artifacts": ["security_report.md"]
+}
+```
+
+##### B. ScriptAction
+
+Uruchamia skrypt powłoki lub binarkę.
+
+```yaml
+action:
+  type: script
+  command: ./run-tests.sh             # Polecenie do wykonania
+  args:                               # Argumenty (opcjonalne)
+    - "--verbose"
+    - "--coverage"
+  env:                                # Zmienne środowiskowe (opcjonalne)
+    CI: "true"
+    DB_HOST: "localhost"
+  
+  # Mapowanie kodów wyjścia na etykiety (opcjonalne, domyślnie 0=success, !=0=failure)
+  exit_codes:
+    0: success
+    1: failure
+    10: needs_human                   # Niestandardowy kod wyjścia
+    124: timeout                      # Specjalny kod dla timeoutu procesu
+```
+
+**Uwaga:** Skrypt powinien wypisać valid JSON na stdout (lub do wskazanego pliku), jeśli wymaga się przekazu zmiennych/artefaktów. Jeśli skrypt nie zwraca JSON, orchestrator polega wyłącznie na kodzie wyjścia do podjęcia decyzji.
+
+##### C. HumanAction
+
+Wstrzymuje workflow i czeka na interakcję użytkownika.
+
+```yaml
+action:
+  type: human
+  message: "Proszę o review zmian."   # Komunikat wyświetlany w UI
+  inputs:                             # Pola do wypełnienia przez użytkownika (opcjonalne)
+    - name: approval_status
+      type: select
+      options: [approved, changes_requested, rejected]
+      required: true
+    - name: comments
+      type: text
+      required: false
+```
+
+**Wyjścia:** Etykiety wyjścia odpowiadają wartościom wybranym przez użytkownika (np. `approved`, `changes_requested`).
+
+##### D. WaitAction
+
+Wstrzymuje workflow do czasu wystąpienia zdarzenia zewnętrznego.
+
+```yaml
+action:
+  type: wait
+  event_type: github.pull_request.reviewed  # Typ zdarzenia
+  filter:                                   # Filtr zdarzeń (opcjonalne)
+    pr_number: "{{ context.pr_number }}"    # Template zmiennej kontekstowej
+  timeout: 24h                              # Maksymalny czas oczekiwania
+```
+
+**Wyjścia:** Zazwyczaj `received` (gdy zdarzenie nastąpiło) lub `timeout` (gdy upłynął czas).
+
+---
+
+### 3.4. Decision Providers (Dostawcy Decyzji)
+
+Określa mechanizm wybierania przejścia na podstawie wyniku akcji. Domyślnie `rules`.
+
+#### A. Rules (Reguły Statyczne)
+
+Najprostszy i domyślny mechanizm. Przejście jest wybierane bezpośrednio na podstawie etykiety `output` zwróconej przez akcję.
+
+```yaml
+decision:
+  type: rules
+  # Brak dodatkowej konfiguracji. 
+  # Przejście jest deterministycznie mapowane w sekcji 'transitions'.
+```
+
+#### B. Agent (Decyzja przez AI)
+
+Uruchamia drugą sesję agenta AI, który analizuje wynik poprzedniej akcji i wybiera przejście. Przydatne w sytuacjach niejednoznacznych.
+
+```yaml
+decision:
+  type: agent
+  harness: claude-code
+  prompt: |
+    Przeanalizuj wynik poprzedniego kroku.
+    Czy zmiany są bezpieczne do wdrożenia?
+    Wybierz przejście: 'safe_to_merge', 'needs_more_tests', 'rollback'.
+  
+  # Agent decyzyjny MUSI wybrać jedną z etykiet zdefiniowanych w 'outputs' stanu.
+```
+
+#### C. Human (Decyzja przez Człowieka)
+
+Wymusza ręczny wybór przejścia przez użytkownika w UI, nawet jeśli akcja zwróciła wynik.
+
+```yaml
+decision:
+  type: human
+  message: "Wybierz kolejny krok na podstawie wyników testów."
+```
+
+---
+
+### 3.5. Terminal States (Stany Końcowe)
+
+Lista identyfikatorów stanów, których osiągnięcie kończy wykonanie workflow. Mogą to być stany sukcesu lub błędu.
+
+```yaml
+terminal_states:
+  - completed
+  - failed
+  - cancelled
+```
+
+Osiągnięcie stanu z tej listy powoduje zmianę statusu `WorkflowExecution` na `COMPLETED`, `FAILED` lub `CANCELLED` w zależności od kontekstu.
+
+---
+
+## 4. Przykładowe Workflow
+
+Poniżej kompletny przykład workflow realizującego prosty proces implementacji funkcji, testowania i tworzenia PR.
+
+```yaml
+name: implement-feature
+version: 1
+description: Implementuje funkcję, testuje ją i tworzy Pull Request.
+
+inputs:
+  - name: feature_description
+    type: string
+    required: true
+  - name: target_repo
+    type: repository
+    required: true
+
+globals:
+  timeout: 2h
+  retry_policy:
+    max_attempts: 2
+    backoff: 10s
+  workspace:
+    type: git
+    repository: "{{ inputs.target_repo }}"
+    ref: main
+
+states:
+  analyze:
+    description: Analiza istniejącego kodu i wymagań.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Przeanalizuj repozytorium pod kątem implementacji: {{ inputs.feature_description }}.
+        Zidentyfikuj pliki, które trzeba zmodyfikować.
+        Zapisz plan w pliku plan.md.
+    outputs:
+      - ready
+      - ambiguous
+    transitions:
+      ready: implement
+      ambiguous: human_clarification
+    
+  human_clarification:
+    description: Człowiek wyjaśnia niejasności.
+    action:
+      type: human
+      message: "Agent ma wątpliwości. Proszę doprecyzować wymagania."
+      inputs:
+        - name: clarification_text
+          type: text
+          required: true
+    outputs:
+      - clarified
+      - abort
+    transitions:
+      clarified: implement
+      abort: failed
+
+  implement:
+    description: Implementacja funkcji.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Zaimplementuj funkcję zgodnie z planem w plan.md i doprecyzowaniem: {{ context.clarification_text | default(inputs.feature_description) }}.
+        Upewnij się, że kod kompiluje się.
+    outputs:
+      - implemented
+      - blocked
+    transitions:
+      implemented: test
+      blocked: failed
+
+  test:
+    description: Uruchomienie testów jednostkowych.
+    action:
+      type: script
+      command: ./run_tests.sh
+      exit_codes:
+        0: success
+        1: failure
+        2: partial_failure
+    outputs:
+      - success
+      - failure
+      - partial_failure
+    transitions:
+      success: create_pr
+      failure: fix_code
+      partial_failure: human_review_tests
+
+  fix_code:
+    description: Naprawa błędów wykrytych przez testy.
+    action:
+      type: agent
+      harness: claude-code
+      prompt: |
+        Testy nie przeszły. Przeanalizuj logi i napraw kod.
+    outputs:
+      - fixed
+    transitions:
+      fixed: test  # Pętla powrotu do testów
+
+  human_review_tests:
+    description: Człowiek ocenia częściowe niepowodzenie testów.
+    action:
+      type: human
+      message: "Część testów nie przeszła. Czy ignorować?"
+    outputs:
+      - ignore
+      - fix_it
+    transitions:
+      ignore: create_pr
+      fix_it: fix_code
+
+  create_pr:
+    description: Tworzenie Pull Requesta.
+    action:
+      type: script
+      command: ./create_pr.sh
+      args:
+        - "--title"
+        - "Feature: {{ inputs.feature_description }}"
+    outputs:
+      - created
+    transitions:
+      created: completed
+
+  completed:
+    description: Sukces.
+    # Brak akcji, stan terminalny
+  
+  failed:
+    description: Niepowodzenie.
+    # Brak akcji, stan terminalny
+
+terminal_states:
+  - completed
+  - failed
+```
+
+---
+
+## 5. Walidacja Schematu
+
+Przed uruchomieniem workflow, definicja musi przejść walidację:
+
+1.  **Spójność Grafu:**
+    *   Wszystkie stany wskazane w `transitions` muszą istnieć w sekcji `states`.
+    *   Każda etykieta w `outputs` musi mieć odpowiadające jej przejście w `transitions` (chyba że stan jest terminalny).
+    *   Musi istnieć co najmniej jeden stan początkowy (pierwszy zdefiniowany lub oznaczony flagą `initial: true`).
+    *   Muszą istnieć stany terminalne osiągalne z każdego innego stanu (brak deadlocków).
+
+2.  **Poprawność Akcji:**
+    *   Typ akcji musi być obsługiwany (`agent`, `script`, `human`, `wait`).
+    *   Wymagane pola dla danego typu akcji muszą być obecne (np. `prompt` dla agenta, `command` dla skryptu).
+    *   Dla `AgentAction` i `ScriptAction` lista `outputs` nie może być pusta.
+
+3.  **Poprawność Decyzji:**
+    *   Typ dostawcy decyzji musi być poprawny.
+    *   Jeśli wybrano `AgentDecision`, muszą być dostarczone odpowiednie parametry (harness, prompt).
+
+4.  **Zmienne i Kontekst:**
+    *   Odwołania do zmiennych (np. `{{ inputs.xxx }}`) muszą dotyczyć zdefiniowanych wejść lub pól kontekstu.
+
+Walidacja odbywa się statycznie przed utworzeniem `WorkflowExecution`. Błędy walidacji uniemożliwiają start workflow.
+
+---
+
+## 6. Rozszerzalność
+
+Schema została zaprojektowana z myślą o przyszłych rozszerzeniach:
+
+*   **Nowe typy akcji:** Dodanie nowego typu (np. `http`, `docker`) wymaga jedynie rozszerzenia enum `type` w definicji akcji i dodania odpowiedniego parsera/handlera w silniku.
+*   **Parallel States:** W przyszłości można dodać pole `parallel: true` do stanu, które pozwoliłoby na równoległe wykonanie pod-stanów, ale wymaga to znaczącej zmiany w silniku (obecnie sekwencyjnym).
+*   **Dynamiczne Workspace'y:** Obecnie workspace jest stały dla wykonania. W przyszłości można dodać pole `workspace_override` w stanie, aby zmieniać środowisko pracy między krokami (wymaga obsługi migracji kontekstu).
+
+Dokument ten stanowi kontrakt między użytkownikiem (twórcą workflow) a silnikiem orchestratora. Zmiany w schemacie powinny być wersjonowane (pole `version` w pliku YAML).
