@@ -3,3 +3,4 @@ DOMAIN_MODEL.mdnode_modules/
 dist/
 build/
 *.log
+node_modules/
