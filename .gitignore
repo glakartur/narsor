@@ -3,3 +3,4 @@ Nothing needs to be added to .gitignore since only a markdown file (WORKFLOW_SCH
 dist/
 build/
 *.log
+node_modules/
