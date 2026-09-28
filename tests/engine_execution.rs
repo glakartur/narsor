@@ -707,6 +707,62 @@ async fn running_a_paused_execution_is_refused() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn explicit_recovery_retries_an_interrupted_agent_step_and_passes_the_operator_note() {
+    let harness = Harness::new();
+    let agent = Arc::new(StubAgentExecutor::new(&[
+        "unexpected",
+        "ready",
+        "implemented",
+    ]));
+    let engine =
+        Arc::new(Engine::new(harness.store()).with_executor(ActionKind::Agent, agent.clone()));
+    let definition = workflow_file("implement_feature.yaml");
+
+    let failed = engine
+        .start_and_run(
+            &definition,
+            json!({ "feature_description": "add login", "target_repo": "acme/web" }),
+            harness.workspace(),
+        )
+        .await
+        .expect("the failed run is recorded, not an engine error");
+    assert_eq!(failed.status, ExecutionStatus::Failed);
+
+    // Recovery marks an action interrupted by a stopped daemon as `unknown`.
+    // The explicit recovery path must accept that state just as it accepts a
+    // regular failed attempt.
+    let mut interrupted = harness
+        .store()
+        .load_execution(&failed.id)
+        .expect("reload failed execution");
+    interrupted.status = ExecutionStatus::Unknown;
+    harness
+        .store()
+        .save_execution(&interrupted)
+        .expect("mark action interrupted");
+
+    engine
+        .try_begin_recover(
+            &failed.id,
+            Some("Return the required output JSON.".to_string()),
+        )
+        .expect("operator can explicitly recover a failed run")
+        .run_to_completion(&definition)
+        .await
+        .expect("recovered run completes");
+
+    let recovered = harness
+        .store()
+        .load_execution(&failed.id)
+        .expect("load recovered execution");
+    assert_eq!(recovered.status, ExecutionStatus::Completed);
+    assert!(
+        agent.prompts()[1].contains("Operator recovery note:\nReturn the required output JSON."),
+        "the fresh agent attempt receives the operator's note"
+    );
+}
+
+#[tokio::test]
 async fn the_reference_workflow_runs_end_to_end_on_stubs() {
     let harness = Harness::new();
     let agent = Arc::new(StubAgentExecutor::new(&["ready", "implemented"]));

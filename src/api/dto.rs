@@ -71,7 +71,7 @@ pub struct StartTaskResponse {
     pub execution_id: String,
 }
 
-/// `POST /executions/:id/resume` and `POST /executions/:id/input` response
+/// `POST /executions/:id/resume`, `/input`, and `/recover` response
 /// body: `202 Accepted`.
 ///
 /// Carries no execution state — by the time the response is sent, phase 2
@@ -84,6 +84,16 @@ pub struct StartTaskResponse {
 pub struct AcceptedResponse {
     /// The execution the request was accepted for.
     pub execution_id: String,
+}
+
+/// An explicit operator recovery of a failed or interrupted execution.
+///
+/// When present, `comment` is shown to the agent as an operator note in the
+/// newly started attempt; it is never used for an automatic retry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryRequest {
+    #[serde(default)]
+    pub comment: Option<String>,
 }
 
 /// `POST /executions/:id/transition` request body.

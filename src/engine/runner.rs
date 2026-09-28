@@ -96,6 +96,9 @@ pub const METADATA_ENGINE_KEY: &str = "engine";
 /// Key of the persisted mid-step state inside the engine's scratch area.
 pub const METADATA_PENDING_STEP_KEY: &str = "pending_step";
 
+/// A one-shot operator note to attach to the next recovered agent attempt.
+const METADATA_OPERATOR_RECOVERY_NOTE_KEY: &str = "operator_recovery_note";
+
 /// How an execution ends when it enters the terminal state `state`.
 ///
 /// The answer comes from the workflow's own declaration (`WORKFLOW_SCHEMA.md`
@@ -788,6 +791,35 @@ impl Engine {
         Ok(execution)
     }
 
+    /// The synchronous half of an explicit operator recovery. Recovery is
+    /// deliberately limited to terminal failure or interruption states, so it
+    /// cannot turn daemon startup into an automatic replay.
+    fn prepare_recover(
+        &self,
+        execution_id: &str,
+        comment: Option<String>,
+    ) -> Result<WorkflowExecution, EngineError> {
+        let mut execution = self.store.load_execution(execution_id)?;
+        match execution.status {
+            ExecutionStatus::Failed | ExecutionStatus::Unknown => {}
+            _ => return Err(self.not_runnable(&execution, "recovered")),
+        }
+
+        if let Some(comment) = comment.filter(|comment| !comment.trim().is_empty()) {
+            engine_metadata_mut(&mut execution).insert(
+                METADATA_OPERATOR_RECOVERY_NOTE_KEY.to_string(),
+                Value::String(comment),
+            );
+        }
+
+        self.lock_pause_requests().remove(execution_id);
+        execution.status = ExecutionStatus::Running;
+        execution.completed_at = None;
+        self.store.save_execution(&execution)?;
+        self.emit(execution_id, EventData::WorkflowResumed)?;
+        Ok(execution)
+    }
+
     /// Phase 1 of the two-phase `resume` (U3): claims the execution
     /// synchronously — returning [`EngineError::AlreadyRunning`] immediately,
     /// with no `.await`, if another pass already holds it — and does the
@@ -806,6 +838,29 @@ impl Engine {
     ) -> Result<RunHandle, EngineError> {
         let claim = self.claim_active_run(execution_id)?;
         match self.prepare_resume(execution_id) {
+            Ok(execution) => Ok(RunHandle {
+                engine: Arc::clone(self),
+                execution_id: execution_id.to_string(),
+                claim,
+                state: HandleState::Ready(execution),
+            }),
+            Err(error) => {
+                self.note_engine_error(execution_id, &error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Claims a failed or crash-interrupted execution and starts one new
+    /// attempt. The caller must invoke this explicitly; recovery is never
+    /// performed while reconciling a stopped daemon.
+    pub fn try_begin_recover(
+        self: &Arc<Self>,
+        execution_id: &str,
+        comment: Option<String>,
+    ) -> Result<RunHandle, EngineError> {
+        let claim = self.claim_active_run(execution_id)?;
+        match self.prepare_recover(execution_id, comment) {
             Ok(execution) => Ok(RunHandle {
                 engine: Arc::clone(self),
                 execution_id: execution_id.to_string(),
@@ -1156,7 +1211,7 @@ impl Engine {
     /// translate what comes back.
     async fn attempt_action(
         &self,
-        execution: &WorkflowExecution,
+        execution: &mut WorkflowExecution,
         state: &State,
         action: &ActionConfig,
         action_execution_id: &str,
@@ -1168,9 +1223,19 @@ impl Engine {
         // picks up the value current at this moment (D31).
         let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
-        let rendered = scope
+        let mut rendered = scope
             .render_action(action, &location)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
+
+        // A comment is consumed only by the first agent attempt following an
+        // explicit recovery. It remains durable until this point, so a daemon
+        // restart before the attempt begins cannot silently discard it.
+        if let ActionConfig::Agent(config) = &mut rendered {
+            if let Some(note) = self.take_operator_recovery_note(execution)? {
+                config.prompt.push_str("\n\nOperator recovery note:\n");
+                config.prompt.push_str(&note);
+            }
+        }
 
         let kind = ActionKind::of(action);
         let executor = self.executors.get(&kind).ok_or_else(|| {
@@ -1658,23 +1723,7 @@ impl Engine {
                 message: error.to_string(),
             })?;
 
-        if !execution.metadata.is_object() {
-            execution.metadata = json!({});
-        }
-        let metadata = execution
-            .metadata
-            .as_object_mut()
-            .expect("metadata was just made an object");
-        let engine = metadata
-            .entry(METADATA_ENGINE_KEY.to_string())
-            .or_insert_with(|| json!({}));
-        if !engine.is_object() {
-            *engine = json!({});
-        }
-        engine
-            .as_object_mut()
-            .expect("engine metadata was just made an object")
-            .insert(METADATA_PENDING_STEP_KEY.to_string(), value);
+        engine_metadata_mut(execution).insert(METADATA_PENDING_STEP_KEY.to_string(), value);
         Ok(())
     }
 
@@ -1687,6 +1736,29 @@ impl Engine {
         {
             engine.remove(METADATA_PENDING_STEP_KEY);
         }
+    }
+
+    /// Removes and persists the note destined for the next agent attempt.
+    fn take_operator_recovery_note(
+        &self,
+        execution: &mut WorkflowExecution,
+    ) -> Result<Option<String>, AttemptFailure> {
+        let Some(engine) = execution
+            .metadata
+            .get_mut(METADATA_ENGINE_KEY)
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(None);
+        };
+        let note = engine
+            .remove(METADATA_OPERATOR_RECOVERY_NOTE_KEY)
+            .and_then(|value| value.as_str().map(ToString::to_string));
+        if note.is_some() {
+            self.store
+                .save_execution(execution)
+                .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
+        }
+        Ok(note)
     }
 
     /// Consumes a pending pause request, if there is one.
@@ -1866,6 +1938,27 @@ fn status_name(status: &ExecutionStatus) -> &'static str {
         ExecutionStatus::Cancelled => "cancelled",
         ExecutionStatus::Unknown => "unknown",
     }
+}
+
+/// Returns the engine-owned metadata object, normalizing records written
+/// before `metadata` or its engine subobject were guaranteed to be objects.
+fn engine_metadata_mut(execution: &mut WorkflowExecution) -> &mut serde_json::Map<String, Value> {
+    if !execution.metadata.is_object() {
+        execution.metadata = json!({});
+    }
+    let metadata = execution
+        .metadata
+        .as_object_mut()
+        .expect("metadata was just made an object");
+    let engine = metadata
+        .entry(METADATA_ENGINE_KEY.to_string())
+        .or_insert_with(|| json!({}));
+    if !engine.is_object() {
+        *engine = json!({});
+    }
+    engine
+        .as_object_mut()
+        .expect("engine metadata was just made an object")
 }
 
 #[cfg(test)]

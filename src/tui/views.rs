@@ -124,6 +124,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     match app.modal() {
         Modal::None => {}
         Modal::Input(_) => render_input_modal(frame, app),
+        Modal::RecoveryComment(_) => render_recovery_comment_modal(frame, app),
         Modal::EventDetail(_) => render_event_detail_modal(frame, app),
         Modal::Transition(_) => render_transition_modal(frame, app),
         Modal::Confirm(_) => render_confirm_modal(frame, app),
@@ -622,6 +623,35 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Yellow))
         .title(" Human input ");
 
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// The short free-form note sent with an explicit recovery attempt.
+fn render_recovery_comment_modal(frame: &mut Frame, app: &App) {
+    let Modal::RecoveryComment(form) = app.modal() else {
+        return;
+    };
+    let area = modal_area(frame, 70, 30);
+    frame.render_widget(Clear, area);
+    let lines = vec![
+        Line::from(Span::styled(
+            "Operator note for the new agent attempt",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("The execution will restart from its current state only after Enter."),
+        Line::from(""),
+        Line::from(format!("› {}", form.value)),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Recover with note ");
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)

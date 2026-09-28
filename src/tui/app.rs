@@ -264,6 +264,9 @@ pub enum Request {
     ApplyTransition,
     /// Run or resume the selected execution.
     RunSelected,
+    /// Recover a failed or interrupted execution, optionally with an operator
+    /// note for the next agent attempt.
+    RecoverSelected { comment: Option<String> },
     /// Create the execution the new-task form describes and run it.
     StartNewTask,
     /// Open the task view at the position `sequence`'s event resolves to,
@@ -333,6 +336,13 @@ pub struct InputForm {
     pub row: usize,
     /// The last validation failure, if any.
     pub error: Option<String>,
+}
+
+/// A free-form note sent with an explicit recovery of an agent step.
+#[derive(Debug, Clone, Default)]
+pub struct RecoveryCommentForm {
+    /// The text to append to the next agent prompt.
+    pub value: String,
 }
 
 impl InputForm {
@@ -1003,6 +1013,8 @@ pub enum Modal {
     None,
     /// The generated human-input form.
     Input(InputForm),
+    /// Operator note for a recovered agent attempt.
+    RecoveryComment(RecoveryCommentForm),
     /// The full content of one event (R1, R2, R3).
     EventDetail(EventDetail),
     /// The manual transition menu.
@@ -1422,6 +1434,11 @@ impl App {
                 ("Enter", "submit"),
                 ("Esc", "cancel"),
             ],
+            Modal::RecoveryComment(_) => vec![
+                ("letters", "type operator note"),
+                ("Enter", "recover with note"),
+                ("Esc", "cancel"),
+            ],
             Modal::Transition(menu) => {
                 let mut keys = vec![("j/k", "select"), ("Enter", "apply")];
                 if menu.override_allowed {
@@ -1741,6 +1758,7 @@ impl App {
                 Request::None
             }
             Modal::Input(_) => self.on_key_form(key),
+            Modal::RecoveryComment(_) => self.on_key_recovery_comment(key),
             Modal::EventDetail(_) => self.on_key_event_detail(key),
             Modal::Transition(_) => self.on_key_transition(key),
             Modal::Confirm(_) => self.on_key_confirm(key),
@@ -1803,7 +1821,7 @@ impl App {
                 self.request_conversation(&event)
             }
             KeyCode::Char('i') => {
-                self.open_input_form();
+                self.open_input_or_recovery_comment();
                 Request::None
             }
             KeyCode::Char('t') => {
@@ -2473,6 +2491,31 @@ impl App {
         }
     }
 
+    /// Keys inside the free-form recovery-note editor.
+    fn on_key_recovery_comment(&mut self, key: KeyEvent) -> Request {
+        let Modal::RecoveryComment(form) = &mut self.modal else {
+            return Request::None;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.modal = Modal::None;
+                Request::None
+            }
+            KeyCode::Enter => Request::RecoverSelected {
+                comment: Some(std::mem::take(&mut form.value)),
+            },
+            KeyCode::Backspace => {
+                form.value.pop();
+                Request::None
+            }
+            KeyCode::Char(character) => {
+                form.value.push(character);
+                Request::None
+            }
+            _ => Request::None,
+        }
+    }
+
     /// Keys inside the transition menu.
     fn on_key_transition(&mut self, key: KeyEvent) -> Request {
         let Modal::Transition(menu) = &mut self.modal else {
@@ -2753,6 +2796,21 @@ impl App {
                     "The selected execution is not waiting for human input.",
                 ))
             }
+        }
+    }
+
+    /// `i` answers a pending human question, or supplies an operator note for
+    /// a deliberate recovery. It is never an implicit retry for a live task.
+    pub fn open_input_or_recovery_comment(&mut self) {
+        if self.pending.is_some() {
+            self.open_input_form();
+            return;
+        }
+        match self.selected().map(|row| &row.status) {
+            Some(ExecutionStatus::Failed | ExecutionStatus::Unknown) => {
+                self.modal = Modal::RecoveryComment(RecoveryCommentForm::default());
+            }
+            _ => self.open_input_form(),
         }
     }
 
@@ -3386,6 +3444,10 @@ impl App {
                     return;
                 }
             }
+            ExecutionStatus::Failed | ExecutionStatus::Unknown => {
+                self.recover_selected(None).await;
+                return;
+            }
             other => {
                 self.notice = Some(Notice::error(format!(
                     "An execution that is {} cannot be run.",
@@ -3399,6 +3461,27 @@ impl App {
             "Execution {} is running in the background.",
             row.id
         )));
+    }
+
+    /// Starts a fresh, explicit recovery attempt from a failed or interrupted
+    /// state. A supplied note becomes part of the new agent prompt.
+    pub async fn recover_selected(&mut self, comment: Option<String>) {
+        let Some(row) = self.selected().cloned() else {
+            self.notice = Some(Notice::error("No execution is selected."));
+            return;
+        };
+        self.modal = Modal::None;
+        match self.client.recover(&row.id, comment).await {
+            Ok(_) => {
+                self.notice = Some(Notice::info(format!(
+                    "Execution {} is recovering in the background.",
+                    row.id
+                )))
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(client_error_message(&row.id, error)));
+            }
+        }
     }
 }
 

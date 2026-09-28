@@ -48,8 +48,8 @@ use crate::engine::{HumanInputDelivery, Timeline};
 
 use super::dto::{
     AcceptedResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
-    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
-    TransitionRequest,
+    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
+    StartTaskResponse, TransitionRequest,
 };
 use super::routes::ConversationResponse;
 
@@ -196,6 +196,16 @@ impl ApiClient {
     pub async fn resume(&self, execution_id: &str) -> Result<AcceptedResponse, ClientError> {
         let url = format!("{}/executions/{execution_id}/resume", self.base_url);
         self.post_empty(&url).await
+    }
+
+    /// Explicitly starts a fresh attempt after a failed or interrupted run.
+    pub async fn recover(
+        &self,
+        execution_id: &str,
+        comment: Option<String>,
+    ) -> Result<AcceptedResponse, ClientError> {
+        let url = format!("{}/executions/{execution_id}/recover", self.base_url);
+        self.post_json(&url, &RecoveryRequest { comment }).await
     }
 
     /// Delivers a person's answer to a paused execution — `POST

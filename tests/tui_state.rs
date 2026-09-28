@@ -1097,6 +1097,68 @@ fn start_slow(engine: &Engine, root: &TempRoot, name: &str) -> WorkflowExecution
 /// control long before that step finishes — the point of the daemon running
 /// it in its own background task (U3/U7) rather than the caller awaiting it
 /// inline.
+/// `s` is an explicit recovery for a failed execution, not merely a synonym
+/// for `/resume` (which only accepts running or paused executions).
+#[tokio::test(flavor = "multi_thread")]
+async fn s_recovers_a_failed_execution_with_a_fresh_attempt() {
+    let root = TempRoot::new();
+    let execution = {
+        let engine = engine_for(root.path());
+        start(&engine, root.path())
+    };
+
+    let store = store_of(root.path());
+    let mut failed = store.load_execution(&execution.id).expect("load execution");
+    failed.status = ExecutionStatus::Failed;
+    store.save_execution(&failed).expect("mark failed");
+
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    assert_eq!(
+        app.selected().expect("selection").status,
+        ExecutionStatus::Failed
+    );
+
+    assert_eq!(app.on_key(key(KeyCode::Char('s'))), Request::RunSelected);
+    app.run_selected().await;
+    wait_until_settled(&client, &[&execution.id]).await;
+    app.refresh().await;
+
+    assert_eq!(
+        app.selected().expect("selection").status,
+        ExecutionStatus::Paused,
+        "the new script attempt reached the workflow's human checkpoint"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn i_opens_a_recovery_note_editor_for_a_failed_execution() {
+    let root = TempRoot::new();
+    let execution = {
+        let engine = engine_for(root.path());
+        start(&engine, root.path())
+    };
+    let store = store_of(root.path());
+    let mut failed = store.load_execution(&execution.id).expect("load execution");
+    failed.status = ExecutionStatus::Failed;
+    store.save_execution(&failed).expect("mark failed");
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+
+    assert_eq!(app.on_key(key(KeyCode::Char('i'))), Request::None);
+    assert!(matches!(app.modal(), Modal::RecoveryComment(_)));
+    app.on_key(key(KeyCode::Char('r')));
+    assert_eq!(
+        app.on_key(key(KeyCode::Enter)),
+        Request::RecoverSelected {
+            comment: Some("r".to_string())
+        }
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dispatching_a_slow_first_step_does_not_block_the_caller() {
     let root = TempRoot::new();

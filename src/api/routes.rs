@@ -62,8 +62,8 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::api::dto::{
     AcceptedResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
-    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
-    TransitionRequest,
+    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
+    StartTaskResponse, TransitionRequest,
 };
 use crate::domain::{Event, EventData, ExecutionStatus};
 use crate::engine::{
@@ -172,6 +172,7 @@ pub fn router(
         .route("/events/stream", get(get_global_stream))
         .route("/tasks", post(post_start_task))
         .route("/executions/:execution_id/resume", post(post_resume))
+        .route("/executions/:execution_id/recover", post(post_recover))
         .route("/executions/:execution_id/input", post(post_input))
         .route(
             "/executions/:execution_id/transition",
@@ -630,6 +631,31 @@ async fn post_resume(
     let definition = load_definition_for(&state, &execution)?;
 
     let handle = state.engine.try_begin_resume(&execution_id)?;
+    tokio::spawn(async move {
+        let _ = handle.run_to_completion(&definition).await;
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(AcceptedResponse { execution_id }),
+    ))
+}
+
+/// `POST /executions/:execution_id/recover` — explicitly starts a new attempt
+/// from the failed or interrupted state. This is separate from `/resume` so a
+/// crash is never replayed merely because the daemon restarted.
+async fn post_recover(
+    State(state): State<AppState>,
+    Path(execution_id): Path<String>,
+    Json(request): Json<RecoveryRequest>,
+) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
+    require_execution(&state, &execution_id)?;
+    let execution = state.store.load_execution(&execution_id)?;
+    let definition = load_definition_for(&state, &execution)?;
+
+    let handle = state
+        .engine
+        .try_begin_recover(&execution_id, request.comment)?;
     tokio::spawn(async move {
         let _ = handle.run_to_completion(&definition).await;
     });

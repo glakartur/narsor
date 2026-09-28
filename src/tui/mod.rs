@@ -238,6 +238,7 @@ pub async fn run(
                         Request::SubmitInput => app.submit_input().await,
                         Request::ApplyTransition => app.apply_transition().await,
                         Request::RunSelected => app.run_selected().await,
+                        Request::RecoverSelected { comment } => app.recover_selected(comment).await,
                         Request::StartNewTask => app.start_new_task().await,
                         Request::OpenConversation { sequence } => {
                             app.open_conversation_for_event(sequence).await
