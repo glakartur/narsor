@@ -1,7 +1,5 @@
-# Documentation
-ARCHITECTURE_DECISIONS.mdnode_modules/
+DOMAIN_MODEL.mdnode_modules/
 .next/
 dist/
 build/
 *.log
-node_modules/
