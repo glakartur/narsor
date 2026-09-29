@@ -163,6 +163,22 @@ pub enum Command {
         #[arg(long, value_name = "LABEL")]
         label: Option<String>,
 
+        /// A key of the step's `data`, written `name=value`, when resolving a
+        /// problem (may be given more than once). A value that reads as JSON
+        /// (`3`, `true`, `["a"]`) is taken as that; anything else is text.
+        #[arg(long = "data", value_name = "NAME=VALUE")]
+        data: Vec<String>,
+
+        /// A context variable of the step's result, written `name=value`, when
+        /// resolving a problem (may be given more than once). Values read as
+        /// for `--data`.
+        #[arg(long = "variable", value_name = "NAME=VALUE")]
+        variables: Vec<String>,
+
+        /// A remark kept in the event log with the answer.
+        #[arg(long, value_name = "TEXT")]
+        comment: Option<String>,
+
         /// Workflow file or name, for when it cannot be read back from the stored execution.
         #[arg(long = "file", value_name = "WORKFLOW")]
         file: Option<String>,
@@ -414,17 +430,19 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             execution_id,
             fields,
             label,
+            data,
+            variables,
+            comment,
             file,
         } => {
-            commands::input(
-                &config,
-                &flags,
-                &execution_id,
-                &fields,
+            let answer = commands::InputAnswer {
+                fields,
                 label,
-                file.as_deref(),
-            )
-            .await
+                data,
+                variables,
+                comment,
+            };
+            commands::input(&config, &flags, &execution_id, answer, file.as_deref()).await
         }
         Command::Resume { execution_id, file } => {
             commands::resume(&config, &flags, &execution_id, file.as_deref()).await

@@ -67,10 +67,11 @@ use crate::api::dto::{
     OperatorNoteRequest, RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest,
     StartTaskRequest, StartTaskResponse, TransitionRequest,
 };
-use crate::domain::{Event, EventData, ExecutionStatus};
+use crate::domain::{AnsweredBy, Event, EventData, ExecutionStatus, InputCloseReason};
+use crate::engine::actions::human;
 use crate::engine::{
     build_timeline, record_manual_transition, terminal_status, Engine, EngineError,
-    HumanActionError, HumanInputDelivery, PendingHumanInput, Timeline,
+    HumanInputDelivery, PendingHumanInput, Timeline,
 };
 use crate::persistence::{
     ConversationSource, DefaultHarnessSelector, ExecutionStore, HarnessSelectionError,
@@ -344,7 +345,8 @@ impl From<PersistenceError> for ApiError {
 
 /// Maps an [`EngineError`] the way the plan's U3 Approach specifies:
 /// [`EngineError::AlreadyRunning`] → `409`, "the execution does not exist" →
-/// `404`, everything else → `500`. Every other variant (`NotRunnable`,
+/// `404`, everything else → `500` — refined for human input (U5): an answer
+/// that came too late is `409`, one that is invalid is `400` with the reason. Every other variant (`NotRunnable`,
 /// `AwaitingHumanInput`, `Decision`, `InvalidDefinition`, ...) is an engine or
 /// workflow-author problem the plan does not ask this endpoint surface to
 /// distinguish further — it lands on `Internal`, same as a storage failure.
@@ -353,10 +355,19 @@ impl From<EngineError> for ApiError {
         match error {
             EngineError::AlreadyRunning { .. }
             | EngineError::NotRunnable { .. }
-            | EngineError::AwaitingHumanInput { .. }
-            | EngineError::HumanInput(
-                HumanActionError::NotPaused { .. } | HumanActionError::NoPendingRequest { .. },
-            ) => ApiError::Conflict(error.to_string()),
+            | EngineError::AwaitingHumanInput { .. } => ApiError::Conflict(error.to_string()),
+            // Too late: the request was answered or closed meanwhile (KTD9).
+            EngineError::HumanInput(ref human) if human.is_stale() => {
+                ApiError::Conflict(error.to_string())
+            }
+            // The answer itself is wrong, and the person who sent it can fix
+            // it: said with the reason, e.g. the key a label still needs.
+            EngineError::HumanInput(ref human) if human.is_invalid_delivery() => {
+                ApiError::Request {
+                    code: "invalid_input",
+                    message: error.to_string(),
+                }
+            }
             EngineError::Persistence(PersistenceError::ExecutionNotFound { .. }) => {
                 ApiError::ExecutionNotFound
             }
@@ -757,6 +768,12 @@ where
 /// The body is a [`HumanInputDelivery`] verbatim — it already derives
 /// `Serialize`/`Deserialize` for exactly this reason, so no separate DTO
 /// duplicates its shape. Same two-phase split as [`post_resume`].
+///
+/// Whoever calls this is the operator: `answered_by` is not on the wire.
+/// A delivery naming the `episode` of a request that is no longer pending
+/// is `409`, checked by `human::resume` on the same read it answers from, so
+/// of two concurrent answers to one request exactly one is accepted. An
+/// invalid answer is `400` with the reason.
 async fn post_input(
     State(state): State<AppState>,
     Path(execution_id): Path<String>,
@@ -880,6 +897,14 @@ async fn post_transition(
     record_manual_transition(&mut execution, from_state, &target, pending_input.as_ref())?;
 
     let log = state.store.event_log(&execution_id);
+    // A request still open is closed by this transition, first, so a form
+    // left open on it can say what closed it (R5).
+    if let Some(pending) = &pending_input {
+        log.append_next(
+            &execution_id,
+            human::closing_event(pending, InputCloseReason::Transition, AnsweredBy::Operator),
+        )?;
+    }
     let writes: Vec<EventData> = vec![
         EventData::DecisionMade {
             provider: provider.to_string(),

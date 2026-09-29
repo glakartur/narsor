@@ -24,8 +24,9 @@ use narsor::domain::{
 use narsor::engine::actions::agent::{output_contract, AgentEventSink, SESSION_ID_VARIABLE};
 use narsor::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
-    CodexAdapter, Engine, HarnessRegistry, LoggingEventSink, OpenCodeAdapter, OutputRejection,
-    METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY,
+    CodexAdapter, Engine, HarnessRegistry, InputContinuation, LoggingEventSink, OpenCodeAdapter,
+    OutputProblem, OutputRejection, PendingHumanInput, METADATA_ENGINE_KEY,
+    METADATA_OUTPUT_REJECTION_KEY,
 };
 use narsor::persistence::{
     recover, ConversationEntry, ConversationSource, ConversationStore, DefaultHarnessSelector,
@@ -1816,15 +1817,26 @@ async fn run_reprompt_workflow(fixture: &EngineFixture) -> narsor::domain::Workf
         .expect("run the workflow")
 }
 
-/// The error of the execution's `ActionFailed`.
-fn action_failure(fixture: &EngineFixture, execution_id: &str) -> String {
-    events_of(fixture, execution_id)
-        .into_iter()
-        .find_map(|data| match data {
-            EventData::ActionFailed { error, .. } => Some(error),
-            _ => None,
-        })
-        .expect("an ActionFailed event")
+/// The problem the execution waits on (U5): it is `InputNeeded` on a
+/// `ResolveOutput` request, announced by `ProblemRaised`, and did not fail.
+fn output_problem(
+    fixture: &EngineFixture,
+    execution: &narsor::domain::WorkflowExecution,
+) -> (PendingHumanInput, OutputProblem) {
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    let pending: PendingHumanInput = fixture
+        .store()
+        .load_pending_input(&execution.id)
+        .expect("read the pending input")
+        .expect("a pending input");
+    assert_eq!(pending.continuation, InputContinuation::ResolveOutput);
+    let types = fixture.event_types(&execution.id);
+    assert!(types.contains(&"problem_raised".to_string()), "{types:?}");
+    for absent in ["action_failed", "workflow_failed"] {
+        assert!(!types.contains(&absent.to_string()), "{types:?}");
+    }
+    let problem = pending.problem.clone().expect("the problem record");
+    (pending, problem)
 }
 
 /// A label the state does not declare is a format error too: asked again,
@@ -1879,7 +1891,6 @@ async fn without_a_harness_session_there_is_no_reprompt() {
 
     let execution = run_reprompt_workflow(&fixture).await;
 
-    assert_eq!(execution.status, ExecutionStatus::Failed);
     assert_eq!(fixture.fake.calls(), 1, "no reprompt and no retry");
     let types = fixture.event_types(&execution.id);
     assert!(
@@ -1889,22 +1900,33 @@ async fn without_a_harness_session_there_is_no_reprompt() {
     for absent in ["output_reprompted", "action_retrying"] {
         assert!(!types.contains(&absent.to_string()), "{types:?}");
     }
-    let error = action_failure(&fixture, &execution.id);
-    assert!(error.contains("no session to resume"), "{error}");
+    // Phase 2: straight to a problem, with the one answer there was.
+    let (_, problem) = output_problem(&fixture, &execution);
+    assert!(
+        problem.reason.contains("no session to resume"),
+        "{}",
+        problem.reason
+    );
+    assert_eq!(problem.answers.len(), 1);
+    assert_eq!(
+        problem.answers[0].answer_tail.as_deref(),
+        Some("All done, nothing to report.")
+    );
+    assert!(problem.analysis.is_none());
 }
 
-/// A reprompt that again yields no label ends the step with a clear error —
-/// and still no `retry_policy` retry.
+/// A reprompt that again yields no label makes the step a problem for the
+/// operator (U5) — with both answers — and still no `retry_policy` retry.
 #[tokio::test]
-async fn a_reprompt_without_a_label_fails_with_a_clear_error() {
+async fn a_reprompt_without_a_label_becomes_a_problem_with_both_answers() {
     let fixture = EngineFixture::new();
     fixture
         .fake
-        .answers(&envelope("I already told you, it is done."));
+        .answers_on_call(1, &envelope("Done, no JSON."))
+        .answers_on_call(2, &envelope("I already told you, it is done."));
 
     let execution = run_reprompt_workflow(&fixture).await;
 
-    assert_eq!(execution.status, ExecutionStatus::Failed);
     assert_eq!(
         fixture.fake.calls(),
         2,
@@ -1920,8 +1942,90 @@ async fn a_reprompt_without_a_label_fails_with_a_clear_error() {
         "{types:?}"
     );
     assert!(!types.contains(&"action_retrying".to_string()), "{types:?}");
-    let error = action_failure(&fixture, &execution.id);
-    assert!(error.contains("even when asked again"), "{error}");
+    let (pending, problem) = output_problem(&fixture, &execution);
+    assert!(
+        problem.reason.contains("even when asked again"),
+        "{}",
+        problem.reason
+    );
+    let tails: Vec<Option<&str>> = problem
+        .answers
+        .iter()
+        .map(|answer| answer.answer_tail.as_deref())
+        .collect();
+    assert_eq!(
+        tails,
+        vec![
+            Some("Done, no JSON."),
+            Some("I already told you, it is done.")
+        ]
+    );
+    // The request suspends on the reprompt, the last attempt.
+    assert_eq!(
+        pending.action_execution_id(),
+        problem.answers[1].action_execution_id
+    );
+    assert_eq!(
+        pending.request.answer_tail.as_deref(),
+        Some("I already told you, it is done.")
+    );
+    // Both labels are offered with their descriptions.
+    let offered: Vec<(&str, Option<&str>)> = pending
+        .outputs
+        .iter()
+        .map(|output| (output.label.as_str(), output.description.as_deref()))
+        .collect();
+    assert_eq!(
+        offered,
+        vec![
+            ("implemented", Some("The feature is implemented.")),
+            (
+                "needs_human_decision",
+                Some("A person has to decide first.")
+            ),
+        ]
+    );
+    let raised = events_of(&fixture, &execution.id)
+        .into_iter()
+        .find_map(|data| match data {
+            EventData::ProblemRaised {
+                episode,
+                action_execution_id,
+                ..
+            } => Some((episode, action_execution_id)),
+            _ => None,
+        })
+        .expect("ProblemRaised");
+    assert_eq!(raised.0.as_deref(), Some(pending.episode_key()));
+    assert_eq!(raised.1, pending.action_execution_id());
+}
+
+/// A reprompt whose run itself fails is a failed reprompt too: its attempt
+/// is closed and the step becomes a problem, not an action failure.
+#[tokio::test]
+async fn a_reprompt_that_fails_outright_is_a_problem_too() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &envelope("Done, no JSON."))
+        .answers_on_call(2, &failed_envelope("the model is overloaded"));
+
+    let execution = run_reprompt_workflow(&fixture).await;
+
+    assert_eq!(fixture.fake.calls(), 2, "no retry of the reprompt");
+    let (_, problem) = output_problem(&fixture, &execution);
+    assert!(
+        problem.reason.contains("asking the agent again"),
+        "{}",
+        problem.reason
+    );
+    assert_eq!(problem.answers.len(), 2);
+    let rejected = fixture
+        .event_types(&execution.id)
+        .iter()
+        .filter(|kind| *kind == "action_output_rejected")
+        .count();
+    assert_eq!(rejected, 2, "the reprompt attempt is closed as well");
 }
 
 /// KTD7: a question in reply to a reprompt is a failed reprompt, not a
@@ -1939,10 +2043,13 @@ async fn a_question_in_reply_to_a_reprompt_is_a_failed_reprompt() {
 
     let execution = run_reprompt_workflow(&fixture).await;
 
-    assert_eq!(execution.status, ExecutionStatus::Failed);
-    assert!(!fixture.store().has_pending_input(&execution.id));
-    let error = action_failure(&fixture, &execution.id);
-    assert!(error.contains("Which label do you mean?"), "{error}");
+    // Not an agent question (`ResumeAgent`) but a problem about the output.
+    let (_, problem) = output_problem(&fixture, &execution);
+    assert!(
+        problem.reason.contains("Which label do you mean?"),
+        "{}",
+        problem.reason
+    );
 }
 
 /// A timeout is an action failure, not a format error: it goes through the

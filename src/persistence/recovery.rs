@@ -359,6 +359,11 @@ fn unfinished_action(events: &[crate::domain::Event]) -> Option<(String, String)
             // `ActionRetrying` is still an interrupted action (D23), exactly as
             // if this event did not exist.
             EventData::ActionAttemptFailed { .. } => {}
+            // Neither opens nor closes an attempt: a problem about a step's
+            // output follows the rejection that closed its attempt and
+            // leaves the execution `InputNeeded`, which is never reconciled;
+            // one about a failure follows `ActionFailed`.
+            EventData::ProblemRaised { .. } => {}
             _ => {}
         }
     }

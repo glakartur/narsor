@@ -1,0 +1,49 @@
+name: agent-problem
+version: 1
+description: >
+  An agent whose answer may carry no output label, so its step becomes a
+  problem. Each label leads to a state that needs something of the answer:
+  a script reading `context.summary`, and a human gate showing the agent's
+  question.
+
+states:
+  work:
+    action:
+      type: agent
+      prompt: Implement the feature.
+    outputs:
+      - label: implemented
+        description: The feature is implemented.
+      - label: needs_human_decision
+        description: A person has to decide first.
+    transitions:
+      implemented: report
+      needs_human_decision: resolve_ambiguity
+
+  report:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "ok"}'
+      env:
+        SUMMARY: "{{ context.summary }}"
+    outputs:
+      - ok
+    transitions:
+      ok: finished
+
+  resolve_ambiguity:
+    action:
+      type: human
+      message: The agent needs a decision.
+    outputs:
+      - accept
+    transitions:
+      accept: finished
+
+  finished:
+    description: Done.
+
+terminal_states:
+  finished: completed

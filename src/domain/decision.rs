@@ -36,6 +36,8 @@ pub enum DecisionProviderType {
     Agent,
     /// Human-based decision
     Human,
+    /// The conductor settled it on the operator's behalf (KTD6).
+    Conductor,
 }
 
 /// Result of a decision process

@@ -72,9 +72,10 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::domain::{
-    ActionConfig, ActionError, ActionResult, Artifact, ArtifactReference, DecisionProviderType,
-    Event, EventData, ExecutionId, ExecutionStatus, OutputDefinition, RepromptedBy, State, StateId,
-    WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
+    ActionConfig, ActionError, ActionResult, AnsweredBy, Artifact, ArtifactReference,
+    DecisionProviderType, Event, EventData, ExecutionId, ExecutionStatus, InputCloseReason,
+    OutputDefinition, ProblemKind, RepromptedBy, State, StateId, WorkflowDefinition,
+    WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
 };
 use crate::engine::actions::agent::{
     self, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL, SESSION_DATA_KEY,
@@ -82,7 +83,7 @@ use crate::engine::actions::agent::{
 use crate::engine::actions::harness;
 use crate::engine::actions::human::{
     self, HumanActionError, HumanInputDelivery, HumanInputRequest, InputContinuation,
-    PendingHumanInput,
+    OutputProblem, OutputRequirement, PendingHumanInput, RejectedAnswer,
 };
 use crate::engine::actions::{
     ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
@@ -91,7 +92,7 @@ use crate::engine::actions::{
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
 use crate::persistence::{read_json, DefaultHarnessSelector, ExecutionStore, PersistenceError};
-use crate::workflow::TemplateScope;
+use crate::workflow::{action_context_references, TemplateScope};
 
 /// How many events the in-process broadcast channel buffers per receiver.
 ///
@@ -370,6 +371,16 @@ impl OutputRejection {
             answer_tail: None,
             harness: None,
             harness_session_id: None,
+        }
+    }
+}
+
+impl From<&OutputRejection> for RejectedAnswer {
+    fn from(rejection: &OutputRejection) -> Self {
+        Self {
+            action_execution_id: rejection.action_execution_id.clone(),
+            reason: rejection.reason.clone(),
+            answer_tail: rejection.answer_tail.clone(),
         }
     }
 }
@@ -985,8 +996,18 @@ impl Engine {
         }
 
         // A recovery starts the state's action afresh. A rejected output left
-        // behind by an interrupted reprompt must not turn it into another one.
+        // behind by an interrupted reprompt must not turn it into another one,
+        // and a request left behind must say it was closed by the recovery
+        // rather than linger as if it could still be answered.
         clear_engine_metadata(&mut execution, METADATA_OUTPUT_REJECTION_KEY);
+        let from = self.store.event_log(execution_id).next_sequence()?;
+        human::close_pending(
+            &self.store,
+            execution_id,
+            InputCloseReason::Recover,
+            AnsweredBy::Operator,
+        )?;
+        self.publish_from(execution_id, from)?;
 
         if let Some(comment) = comment.filter(|comment| !comment.trim().is_empty()) {
             engine_metadata_mut(&mut execution).insert(
@@ -1118,6 +1139,56 @@ impl Engine {
             })?;
             self.store_agent_input(&mut execution, &state_id, &answer)?;
             return Ok(HandleState::Ready(execution));
+        }
+
+        if resumed.pending.continuation == InputContinuation::ResolveOutput {
+            // The answer is the output the agent did not give: recorded as
+            // the step's result, and the label it names is the decision,
+            // made by whoever answered rather than by the state's provider.
+            let outcome = DecisionOutcome {
+                label: resumed.result.output_label.clone(),
+                provider: match delivery.answered_by {
+                    AnsweredBy::Operator => DecisionProviderType::Human,
+                    AnsweredBy::Conductor => DecisionProviderType::Conductor,
+                },
+                reasoning: delivery
+                    .comment
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|comment| !comment.is_empty())
+                    .map(ToString::to_string),
+            };
+            let mut result = resumed.result;
+            // What the agent last said, for a gate the label may lead to: it
+            // is the answer the operator settled, and the gate shows it
+            // beside the question the operator supplied (KTD8).
+            result.stdout = resumed
+                .pending
+                .problem
+                .as_ref()
+                .and_then(|problem| {
+                    problem
+                        .answers
+                        .iter()
+                        .rev()
+                        .find_map(|answer| answer.answer_tail.clone())
+                })
+                .unwrap_or_default();
+            let flow = match self.record_result(
+                &mut execution,
+                state,
+                resumed.pending.action_execution_id().to_string(),
+                result,
+            )? {
+                Some(pending) => {
+                    self.apply_decision(definition, &mut execution, state, pending, outcome)?
+                }
+                None => Flow::Stop,
+            };
+            return Ok(match flow {
+                Flow::Stop => HandleState::Done(execution),
+                Flow::Continue => HandleState::Ready(execution),
+            });
         }
 
         let flow = match self.pending_step(&execution, &state_id)? {
@@ -1371,7 +1442,7 @@ impl Engine {
                     // error is repaired in the same session, not re-run.
                     self.reject_output(execution, &rejection)?;
                     return self
-                        .reprompt(execution, state, action, rejection, timeout)
+                        .reprompt(definition, execution, state, action, rejection, timeout)
                         .await;
                 }
                 Ok(AttemptOutcome::Completed(result)) => {
@@ -1614,7 +1685,7 @@ impl Engine {
             .map(Duration::from_secs);
 
         match self
-            .reprompt(execution, state, action, rejection, timeout)
+            .reprompt(definition, execution, state, action, rejection, timeout)
             .await?
         {
             ActionUpshot::Stopped => Ok(Flow::Stop),
@@ -1632,15 +1703,19 @@ impl Engine {
     /// Not a `retry_policy` retry (R15): it is announced by `OutputReprompted`,
     /// never `ActionRetrying`, and whatever it ends with — a label, another
     /// format error, a question, a failure — is final for the step. Until the
-    /// conductor exists (U10), everything but a label fails the action.
+    /// conductor exists (U10), everything but a label — and a rejected
+    /// attempt with no session to resume — becomes a problem for the
+    /// operator ([`Engine::raise_output_problem`]).
     async fn reprompt(
         &self,
+        definition: &WorkflowDefinition,
         execution: &mut WorkflowExecution,
         state: &State,
         action: &ActionConfig,
         rejection: OutputRejection,
         timeout: Option<Duration>,
     ) -> Result<ActionUpshot, EngineError> {
+        let first = RejectedAnswer::from(&rejection);
         let resumable = match (action, &rejection.harness, &rejection.harness_session_id) {
             (ActionConfig::Agent(config), Some(harness), Some(session)) => Some(
                 agent::reprompt_config(config, harness, session, &rejection.reason),
@@ -1648,10 +1723,11 @@ impl Engine {
             _ => None,
         };
         let Some(config) = resumable else {
-            clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
-            self.fail_action(
+            self.raise_output_problem(
+                definition,
                 execution,
-                &rejection.action_execution_id,
+                state,
+                vec![first],
                 format!(
                     "{} The agent could not be asked again for its output label: its \
                      harness reported no session to resume.",
@@ -1727,37 +1803,109 @@ impl Engine {
             },
         };
 
-        match failure {
-            // Another format error: closed like the first one, then final.
+        // Either way the reprompt attempt is over without a label: closed
+        // like the first one, and the step becomes a problem. A reprompt that
+        // failed outright is closed the same way — it is a failed reprompt,
+        // not an action failure, and `retry_policy` does not apply to it.
+        let (second, reason) = match failure {
             RepromptFailure::Rejected(rejection) => {
-                self.emit(
-                    &execution.id,
-                    EventData::ActionOutputRejected {
-                        action_execution_id: action_execution_id.clone(),
-                        state_id: state.id.clone(),
-                        reason: rejection.reason.clone(),
-                        answer_tail: rejection.answer_tail.clone(),
-                    },
-                )?;
-                self.fail_action(
-                    execution,
-                    &action_execution_id,
-                    format!(
-                        "the agent did not give a usable output label even when asked again: {}",
-                        rejection.reason
-                    ),
-                )?;
+                let reason = format!(
+                    "the agent did not give a usable output label even when asked again: {}",
+                    rejection.reason
+                );
+                (RejectedAnswer::from(&rejection), reason)
             }
-            // The reprompt itself failed; `retry_policy` does not apply to it.
             RepromptFailure::Failed(message) => {
-                self.fail_action(
-                    execution,
-                    &action_execution_id,
-                    format!("asking the agent again for its output label failed: {message}"),
-                )?;
+                let reason =
+                    format!("asking the agent again for its output label failed: {message}");
+                (
+                    RejectedAnswer {
+                        action_execution_id: action_execution_id.clone(),
+                        reason: reason.clone(),
+                        answer_tail: None,
+                    },
+                    reason,
+                )
             }
-        }
+        };
+        self.emit(
+            &execution.id,
+            EventData::ActionOutputRejected {
+                action_execution_id: action_execution_id.clone(),
+                state_id: state.id.clone(),
+                reason: second.reason.clone(),
+                answer_tail: second.answer_tail.clone(),
+            },
+        )?;
+        self.raise_output_problem(definition, execution, state, vec![first, second], reason)?;
         Ok(ActionUpshot::Stopped)
+    }
+
+    /// Suspends a step whose agent gave no usable output label as a problem
+    /// (KTD3): `InputNeeded` on a [`InputContinuation::ResolveOutput`]
+    /// request carrying the agent's `answers`, then `ProblemRaised`.
+    ///
+    /// The last answer's attempt is the one the request suspends on; an
+    /// answer to the request completes the step under that attempt.
+    fn raise_output_problem(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        answers: Vec<RejectedAnswer>,
+        reason: String,
+    ) -> Result<(), EngineError> {
+        clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
+
+        let action_execution_id = answers
+            .last()
+            .map(|answer| answer.action_execution_id.clone())
+            .or_else(|| execution.current_action_execution.clone())
+            .unwrap_or_default();
+        let answer_tail = answers
+            .iter()
+            .rev()
+            .find_map(|answer| answer.answer_tail.clone());
+        let problem = OutputProblem {
+            reason: reason.clone(),
+            answers,
+            requirements: output_requirements(definition, execution, state),
+            analysis: None,
+        };
+        let request = HumanInputRequest {
+            action_execution_id: action_execution_id.clone(),
+            instruction: format!(
+                "The agent of state '{}' did not give a usable output label. Choose the \
+                 label its step ends with, and the data and variables it would have given.",
+                state.id
+            ),
+            fields: Vec::new(),
+            question: None,
+            answer_tail,
+        };
+        let pending = PendingHumanInput::for_problem(
+            execution.id.clone(),
+            state.id.clone(),
+            request,
+            decision::permitted_outputs(state),
+            problem,
+        );
+
+        let from = self.store.event_log(&execution.id).next_sequence()?;
+        human::suspend(&self.store, execution, &pending)?;
+        self.publish_from(&execution.id, from)?;
+
+        self.emit(
+            &execution.id,
+            EventData::ProblemRaised {
+                state_id: state.id.clone(),
+                action_execution_id,
+                kind: ProblemKind::Output,
+                reason,
+                episode: Some(pending.episode_key().to_string()),
+            },
+        )?;
+        Ok(())
     }
 
     /// Records a finished action: label check, `ActionCompleted`, artifacts,
@@ -1770,11 +1918,27 @@ impl Engine {
         action_execution_id: String,
         result: ActionResult,
     ) -> Result<Flow, EngineError> {
+        match self.record_result(execution, state, action_execution_id, result)? {
+            Some(pending) => self.complete_step(definition, execution, state, pending),
+            None => Ok(Flow::Stop),
+        }
+    }
+
+    /// The first half of [`Engine::record_completion`], up to the decision:
+    /// returns the persisted mid-step state, or `None` when the label failed
+    /// the action.
+    fn record_result(
+        &self,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        action_execution_id: String,
+        result: ActionResult,
+    ) -> Result<Option<PendingStep>, EngineError> {
         // A label the state does not declare is the engine's call, never the
         // executor's — this is the message the operator sees.
         if let Err(error) = decision::check_label(state, &result.output_label) {
             self.fail_action(execution, &action_execution_id, error.to_string())?;
-            return Ok(Flow::Stop);
+            return Ok(None);
         }
 
         self.emit(
@@ -1796,7 +1960,7 @@ impl Engine {
         self.write_pending_step(execution, &pending)?;
         self.store.save_execution(execution)?;
 
-        self.complete_step(definition, execution, state, pending)
+        Ok(Some(pending))
     }
 
     /// The second half of a step: decide, write the context, transition.
@@ -2569,6 +2733,52 @@ fn clear_engine_metadata(execution: &mut WorkflowExecution, key: &str) {
     }
 }
 
+/// What choosing each label of `state` requires of an answer to a problem
+/// (KTD15, R18), worked out from the state each label leads to.
+///
+/// A `human` gate shows the question the agent left open, so it needs
+/// `data.question`. Every `context.NAME` the target's templates use needs a
+/// value — unless the context already holds one, since the target then
+/// renders as it is.
+fn output_requirements(
+    definition: &WorkflowDefinition,
+    execution: &WorkflowExecution,
+    state: &State,
+) -> Vec<OutputRequirement> {
+    state
+        .outputs
+        .iter()
+        .map(|output| {
+            let target = state
+                .transitions
+                .get(&output.label)
+                .and_then(|target| definition.states.get(target));
+            let action = target.and_then(|target| target.action.as_ref());
+            let data = match action {
+                Some(ActionConfig::Human(_)) => vec!["question".to_string()],
+                _ => Vec::new(),
+            };
+            let variables = action
+                .map(action_context_references)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|name| {
+                    !execution
+                        .context
+                        .variables
+                        .get(name)
+                        .is_some_and(|value| !human::is_blank(value))
+                })
+                .collect();
+            OutputRequirement {
+                label: output.label.clone(),
+                data,
+                variables,
+            }
+        })
+        .collect()
+}
+
 /// Whether `state` runs an agent.
 fn is_agent(state: &State) -> bool {
     matches!(state.action, Some(ActionConfig::Agent(_)))
@@ -2651,7 +2861,8 @@ fn preceding_agent_step(execution: &WorkflowExecution, state: &State) -> Option<
 /// A manual transition takes no decision, so the agent's answer is wherever
 /// the state left it: in `pending_step` when the agent finished and waited
 /// for a decision, or in `pending_input` when it asked a question of its own
-/// (then there is a question but no answer to quote). Leaving any other
+/// (then there is a question but no answer to quote) or when its step is a
+/// problem (then there is an answer but no question). Leaving any other
 /// state drops the record.
 pub fn record_manual_transition(
     execution: &mut WorkflowExecution,
@@ -2669,16 +2880,25 @@ pub fn record_manual_transition(
             ))
         } else {
             pending_input
-                .filter(|input| {
-                    input.state_id == from.id
-                        && input.continuation == InputContinuation::ResumeAgent
-                })
-                .map(|input| LastAgentStep {
-                    state_id: from.id.clone(),
-                    to_state: to.to_string(),
-                    action_execution_id: input.action_execution_id().to_string(),
-                    question: Some(input.instruction().to_string()),
-                    answer_tail: None,
+                .filter(|input| input.state_id == from.id)
+                .and_then(|input| match input.continuation {
+                    InputContinuation::ResumeAgent => Some(LastAgentStep {
+                        state_id: from.id.clone(),
+                        to_state: to.to_string(),
+                        action_execution_id: input.action_execution_id().to_string(),
+                        question: Some(input.instruction().to_string()),
+                        answer_tail: None,
+                    }),
+                    // A problem left by hand: no question, but the answer
+                    // the agent did give.
+                    InputContinuation::ResolveOutput => Some(LastAgentStep {
+                        state_id: from.id.clone(),
+                        to_state: to.to_string(),
+                        action_execution_id: input.action_execution_id().to_string(),
+                        question: None,
+                        answer_tail: input.request.answer_tail.clone(),
+                    }),
+                    InputContinuation::CompleteStep => None,
                 })
         }
     } else {

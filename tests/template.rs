@@ -309,3 +309,53 @@ fn load_reference() -> narsor::domain::WorkflowDefinition {
         .join("tests/fixtures/implement_feature.yaml");
     load_from_file(path).expect("the §4 example must load without modification")
 }
+
+// ---------------------------------------------------------------------------
+// Static references (KTD15)
+// ---------------------------------------------------------------------------
+
+use narsor::workflow::{action_context_references, context_references};
+
+#[test]
+fn context_references_are_listed_once_in_first_use_order() {
+    let template = "{{ context.summary }} then {{context.variables.units}}, \
+                    {{ inputs.ticket }}, again {{ context.summary }}";
+    assert_eq!(
+        context_references(template),
+        vec!["summary".to_string(), "units".to_string()]
+    );
+}
+
+#[test]
+fn what_rendering_would_refuse_is_not_a_reference() {
+    let template = "{{ context.a | default('x') }} {{ context.a.b }} {{ context. }} \
+                    {{ workspace.path }} {{ context.open";
+    assert!(context_references(template).is_empty());
+    assert!(context_references("no placeholders at all").is_empty());
+}
+
+#[test]
+fn an_actions_references_cover_every_rendered_field() {
+    let script: ActionConfig = serde_json::from_value(json!({
+        "type": "script",
+        "command": "./{{ context.tool }}",
+        "args": ["--ticket", "{{ context.ticket }}"],
+        "working_dir": "{{ context.dir }}",
+        "env": { "B": "{{ context.b_env }}", "A": "{{ context.a_env }}" },
+    }))
+    .expect("a script action");
+    assert_eq!(
+        action_context_references(&script),
+        vec!["tool", "ticket", "dir", "a_env", "b_env"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+    );
+
+    let human: ActionConfig = serde_json::from_value(json!({
+        "type": "human",
+        "instruction": "Decide on {{ context.question }}.",
+    }))
+    .expect("a human action");
+    assert_eq!(action_context_references(&human), vec!["question"]);
+}

@@ -240,7 +240,7 @@ $ narsor conversation 4f1c8f0e-...-9b21 3f9c2e10-...-77aa
     4  2026-09-26T10:00:05+00:00  result     {"subtype":"success","result":"done"}
 ```
 
-### `input <EXECUTION_ID> [--field NAME=VALUE]… [--label LABEL]`
+### `input <EXECUTION_ID> [--field NAME=VALUE]… [--label LABEL] [--data NAME=VALUE]… [--variable NAME=VALUE]… [--comment TEXT]`
 
 Delivers a human answer to an `input_needed` execution and resumes it. `--field` fills in
 the form fields declared by the `human` action; `--label` names the output label
@@ -252,6 +252,25 @@ For an agent's `awaiting_input` question, submit `--field answer=...`; no
 `--label` is needed because the answer resumes the same agent action rather
 than selecting a transition. An agent may additionally return an `options`
 array: send one with `--field option=...`, optionally with `--field comment=...`.
+
+An agent step whose answer carried no usable output label — even after the
+engine asked it once more — waits as a **problem**: you supply the output the
+agent did not give. Pick it with `--label`, and give the step's `data` and
+context `variables` with `--data` and `--variable` (a value that reads as JSON,
+such as `3` or `true`, is taken as that; anything else is text). The request
+lists each label with its description and the keys it needs: a label leading
+to a `human` gate needs `--data question=...`, and one leading to a state whose
+templates use `{{ context.NAME }}` needs `--variable NAME=...` unless the
+context already holds it. `--comment` is kept in the event log with the answer.
+
+The answer is bound to the request `input` read: if the request was answered or
+closed in the meantime (another window, a transition), it is refused rather
+than applied to whatever the execution waits on next.
+
+```console
+$ narsor input 4f1c8f0e-...-9b21 --label implemented --data units_completed=3
+Input delivered to execution 4f1c8f0e-...-9b21.
+```
 
 ```console
 $ narsor input 4f1c8f0e-...-9b21 --field approval_status=approved

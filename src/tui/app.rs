@@ -82,8 +82,8 @@ use crate::api::{
     TransitionRequest,
 };
 use crate::domain::{
-    Context, Event, EventData, ExecutionStatus, HumanInputField, HumanInputType, InputParameter,
-    ParamType, State, WorkflowDefinition, WorkflowExecution, Workspace,
+    Context, Event, EventData, ExecutionStatus, HumanInputField, HumanInputType, InputCloseReason,
+    InputParameter, ParamType, State, WorkflowDefinition, WorkflowExecution, Workspace,
 };
 use crate::engine::actions::script::TRUNCATION_MARKER;
 use crate::engine::{
@@ -340,6 +340,9 @@ pub struct InputForm {
     pub row: usize,
     /// The last validation failure, if any.
     pub error: Option<String>,
+    /// The key of the request the form was opened on (KTD9): the answer is
+    /// refused if that request is no longer the one pending.
+    pub episode: String,
 }
 
 /// A free-form note sent with an explicit recovery of an agent step.
@@ -382,6 +385,7 @@ impl InputForm {
             label_index: 0,
             row: 0,
             error: None,
+            episode: pending.episode_key().to_string(),
         }
     }
 
@@ -435,7 +439,7 @@ impl InputForm {
             values.insert(field.name.clone(), Value::String(raw.to_string()));
         }
 
-        let mut delivery = HumanInputDelivery::with_values(values);
+        let mut delivery = HumanInputDelivery::with_values(values).for_episode(&self.episode);
         if let Some(label) = self.chosen_label() {
             delivery = delivery.choosing(label);
         } else if !self.label_choices.is_empty() && !infers_label(&self.fields) {
@@ -3782,7 +3786,31 @@ pub fn event_line(event: &Event) -> String {
         EventData::HumanInputRequested { instruction, .. } => {
             format!("human_input_requested  {instruction}")
         }
-        EventData::HumanInputReceived { .. } => "human_input_received".to_string(),
+        EventData::HumanInputReceived {
+            answered_by,
+            close_reason,
+            output_label,
+            ..
+        } => {
+            let by = answered_by.unwrap_or_default().name();
+            match (close_reason, output_label) {
+                (Some(reason), _) if *reason != InputCloseReason::Answered => {
+                    format!("human_input_received  closed by {} ({by})", reason.name())
+                }
+                (_, Some(label)) => format!("human_input_received  {by} → {label}"),
+                _ => format!("human_input_received  {by}"),
+            }
+        }
+        EventData::ProblemRaised {
+            state_id,
+            kind,
+            reason,
+            ..
+        } => format!(
+            "problem_raised  {} in {state_id}: {}",
+            kind.name(),
+            first_line(reason)
+        ),
         EventData::HumanTransitionSelected {
             from_state,
             to_state,

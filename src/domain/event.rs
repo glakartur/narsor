@@ -204,13 +204,66 @@ pub enum EventData {
         /// The end of that agent step's answer.
         #[serde(default)]
         answer_tail: Option<String>,
+        /// The key of the pending input this request opened (KTD9): a
+        /// delivery carrying another key answers a request that is gone.
+        #[serde(default)]
+        episode: Option<String>,
     },
+    /// A pending input stopped waiting: it was answered, or something else
+    /// closed it (KTD9, R5).
+    ///
+    /// Every field but `input` is `#[serde(default)]`, so an event log
+    /// written before they existed still reads — as an answer from the
+    /// operator, which is all an input could be closed by back then.
     HumanInputReceived {
+        /// The form's field values; empty when the input was closed without
+        /// an answer, or answered with a label alone.
         input: serde_json::Value,
+        /// Who closed it.
+        #[serde(default)]
+        answered_by: Option<AnsweredBy>,
+        /// How it was closed; `None` in older logs means answered.
+        #[serde(default)]
+        close_reason: Option<InputCloseReason>,
+        /// The key of the pending input that was closed.
+        #[serde(default)]
+        episode: Option<String>,
+        /// The output label the answer chose explicitly, if it chose one.
+        #[serde(default)]
+        output_label: Option<String>,
+        /// The step's `data`, when the answer resolved a problem.
+        #[serde(default)]
+        data: Option<serde_json::Value>,
+        /// The step's `variables`, when the answer resolved a problem.
+        #[serde(default)]
+        variables: Option<serde_json::Value>,
+        /// A free-text remark that came with the answer.
+        #[serde(default)]
+        comment: Option<String>,
     },
     HumanTransitionSelected {
         from_state: String,
         to_state: String,
+    },
+
+    /// A step needs an operator to settle what it ended with (KTD3, KTD4).
+    ///
+    /// Announces every new problem, so a client learns of one from the
+    /// stream: for [`ProblemKind::Output`] the execution is `InputNeeded`
+    /// on a pending input whose key is `episode`; for
+    /// [`ProblemKind::Failure`] it stays `Failed`.
+    ProblemRaised {
+        /// The state the problem is in.
+        state_id: String,
+        /// The last attempt of that state's action.
+        action_execution_id: String,
+        /// What kind of problem it is.
+        kind: ProblemKind,
+        /// Why the step could not go on by itself.
+        reason: String,
+        /// The key of the pending input that asks the operator, if one does.
+        #[serde(default)]
+        episode: Option<String>,
     },
 
     // External events
@@ -257,6 +310,92 @@ impl RepromptedBy {
         match self {
             Self::Engine => "engine",
             Self::Conductor => "conductor",
+        }
+    }
+}
+
+/// Who closed a pending input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnsweredBy {
+    /// A person, through the API (the TUI or the CLI).
+    #[default]
+    Operator,
+    /// The conductor, acting on its own or on a confirmed proposal.
+    Conductor,
+}
+
+impl AnsweredBy {
+    /// The name as the event log spells it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Conductor => "conductor",
+        }
+    }
+}
+
+/// How a pending input stopped waiting (R5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputCloseReason {
+    /// Someone answered it.
+    Answered,
+    /// A manual or forced transition left the state it was asked in.
+    Transition,
+    /// An operator interrupted the execution.
+    Interrupt,
+    /// An operator recovery started the state's action afresh.
+    Recover,
+}
+
+impl InputCloseReason {
+    /// The name as the event log spells it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Transition => "transition",
+            Self::Interrupt => "interrupt",
+            Self::Recover => "recover",
+        }
+    }
+}
+
+/// What a [`EventData::ProblemRaised`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProblemKind {
+    /// The step's action finished without a usable output label; the
+    /// operator supplies it (`InputNeeded`, `ResolveOutput`).
+    Output,
+    /// The step's action failed; the execution stays `Failed` (KTD4).
+    Failure,
+}
+
+impl ProblemKind {
+    /// The name as the event log spells it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Output => "output",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+impl EventData {
+    /// A [`EventData::HumanInputReceived`] carrying field values and nothing
+    /// more — how every answer was recorded before the event said who gave
+    /// it and how the input was closed.
+    pub fn human_input_received(input: serde_json::Value) -> Self {
+        Self::HumanInputReceived {
+            input,
+            answered_by: None,
+            close_reason: None,
+            episode: None,
+            output_label: None,
+            data: None,
+            variables: None,
+            comment: None,
         }
     }
 }
@@ -354,8 +493,40 @@ impl Event {
             EventData::HumanInputRequested { instruction, .. } => {
                 format!("Waiting for a human: {}", first_line(instruction))
             }
-            EventData::HumanInputReceived { input } => {
-                format!("Human input received: {}", summarize_input(input))
+            EventData::HumanInputReceived {
+                input,
+                answered_by,
+                close_reason,
+                output_label,
+                ..
+            } => {
+                let by = answered_by.unwrap_or_default().name();
+                match close_reason {
+                    Some(reason) if *reason != InputCloseReason::Answered => {
+                        format!("Human input closed by {} ({by})", reason.name())
+                    }
+                    _ => match output_label {
+                        Some(label) => format!(
+                            "Human input received from {by}: '{label}', {}",
+                            summarize_input(input)
+                        ),
+                        None => {
+                            format!("Human input received from {by}: {}", summarize_input(input))
+                        }
+                    },
+                }
+            }
+            EventData::ProblemRaised {
+                state_id,
+                kind,
+                reason,
+                ..
+            } => {
+                format!(
+                    "Problem ({}) in state '{state_id}': {}",
+                    kind.name(),
+                    first_line(reason)
+                )
             }
             EventData::HumanTransitionSelected {
                 from_state,

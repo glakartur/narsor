@@ -209,6 +209,10 @@ pub struct StubAgentExecutor {
 }
 
 impl StubAgentExecutor {
+    /// A "label" that makes the attempt fail as an action failure — unlike
+    /// an undeclared label, which is a format error (KTD7).
+    pub const FAIL: &'static str = "!fail";
+
     /// An executor that returns these labels, in order.
     pub fn new(labels: &[&str]) -> Self {
         Self {
@@ -248,6 +252,14 @@ impl ActionExecutor for StubAgentExecutor {
                 .expect("labels")
                 .pop_front()
                 .unwrap_or_else(|| "unexpected".to_string());
+
+            if label == StubAgentExecutor::FAIL {
+                return Err(ActionError {
+                    message: "the stub agent failed on purpose".to_string(),
+                    error_type: None,
+                    details: None,
+                });
+            }
 
             Ok(ActionOutcome::Completed(ActionResult {
                 output_label: label,
@@ -376,6 +388,37 @@ impl ActionExecutor for QuestioningAgentExecutor {
                 stdout: String::new(),
                 stderr: String::new(),
             }))
+        })
+    }
+}
+
+/// An `agent` executor whose answer never carries an output label, and whose
+/// harness reports no session to resume — so the engine cannot ask it again
+/// and the step becomes a problem straight away (U5).
+pub struct LabellessAgentExecutor {
+    answer: String,
+}
+
+impl LabellessAgentExecutor {
+    /// An executor that always answers `answer`, without a label.
+    pub fn answering(answer: &str) -> Self {
+        Self {
+            answer: answer.to_string(),
+        }
+    }
+}
+
+impl ActionExecutor for LabellessAgentExecutor {
+    fn execute<'a>(
+        &'a self,
+        _request: ActionRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(ActionError {
+                message: "no output label could be extracted from the agent's answer".to_string(),
+                error_type: Some(narsor::engine::actions::agent::MISSING_OUTPUT_LABEL.to_string()),
+                details: Some(json!({ "answer_tail": self.answer })),
+            })
         })
     }
 }

@@ -70,6 +70,7 @@ pub fn provider_name(provider: &DecisionProviderType) -> &'static str {
         DecisionProviderType::Rules => "rules",
         DecisionProviderType::Agent => "agent",
         DecisionProviderType::Human => "human",
+        DecisionProviderType::Conductor => "conductor",
     }
 }
 

@@ -15,6 +15,15 @@
 //!   loop (U7) calls around the executor, and they own the `InputNeeded` status, the
 //!   pending request on disk and the two events of the human interaction.
 //!
+//! # Three kinds of request
+//!
+//! The same record serves every wait for a person, told apart by its
+//! [`InputContinuation`]: a form or decision that completes a step, an
+//! agent's own question that resumes it, and a *problem* — an agent step that
+//! gave no usable output label, whose answer supplies that output (KTD3).
+//! Each request gets a key ([`PendingHumanInput::episode_key`]); a delivery
+//! naming it is refused once the request is gone (KTD9).
+//!
 //! # Where the pending request lives
 //!
 //! In its own `pending_input.json` beside `state.json`, not in a field of
@@ -51,9 +60,9 @@ use thiserror::Error;
 
 use super::{ActionExecutor, ActionOutcome, ActionRequest, SuspendedAction};
 use crate::domain::{
-    ActionConfig, ActionError, ActionExecutionId, ActionResult, EventData, ExecutionId,
-    ExecutionStatus, HumanActionConfig, HumanInputField, HumanInputType, OutputDefinition,
-    OutputLabel, StateId, WorkflowExecution,
+    ActionConfig, ActionError, ActionExecutionId, ActionResult, AnsweredBy, EventData, ExecutionId,
+    ExecutionStatus, HumanActionConfig, HumanInputField, HumanInputType, InputCloseReason,
+    OutputDefinition, OutputLabel, StateId, WorkflowExecution,
 };
 use crate::persistence::{ExecutionStore, PersistenceError};
 
@@ -180,8 +189,110 @@ pub struct PendingHumanInput {
     #[serde(default)]
     pub continuation: InputContinuation,
 
+    /// The key of this request (KTD9), fresh for every request raised, so a
+    /// delivery meant for an earlier one is told apart from an answer to
+    /// this one. Empty in records written before requests had keys; see
+    /// [`PendingHumanInput::episode_key`].
+    #[serde(default)]
+    pub episode: String,
+
+    /// What settling the step takes, when this request is a problem
+    /// ([`InputContinuation::ResolveOutput`]).
+    #[serde(default)]
+    pub problem: Option<OutputProblem>,
+
     /// When the request was raised.
     pub requested_at: DateTime<Utc>,
+}
+
+/// A step that ended without a usable output label, as the operator is asked
+/// to settle it (KTD3, R12).
+///
+/// Self-contained like the rest of [`PendingHumanInput`]: the form shows the
+/// agent's answers and what each label needs without loading the workflow
+/// definition, and [`resume`] validates against the same record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutputProblem {
+    /// Why the step could not go on by itself.
+    pub reason: String,
+
+    /// The agent's answers that were rejected, oldest first: the attempt and
+    /// the reprompt that followed it, when there was one.
+    #[serde(default)]
+    pub answers: Vec<RejectedAnswer>,
+
+    /// What choosing each of the state's labels requires, in the order of
+    /// [`PendingHumanInput::outputs`].
+    #[serde(default)]
+    pub requirements: Vec<OutputRequirement>,
+
+    /// The conductor's reading of the answers, when it made one (U10).
+    #[serde(default)]
+    pub analysis: Option<ConductorAnalysis>,
+}
+
+impl OutputProblem {
+    /// What choosing `label` requires, if the problem records it.
+    pub fn requirement_for(&self, label: &str) -> Option<&OutputRequirement> {
+        self.requirements
+            .iter()
+            .find(|requirement| requirement.label == label)
+    }
+}
+
+/// One agent answer that gave no usable output label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedAnswer {
+    /// The attempt that gave it.
+    pub action_execution_id: ActionExecutionId,
+
+    /// Why it was rejected.
+    pub reason: String,
+
+    /// The end of the answer, when there was one.
+    #[serde(default)]
+    pub answer_tail: Option<String>,
+}
+
+/// The keys a delivery choosing `label` must supply (KTD15, R18).
+///
+/// Worked out when the problem is raised, from the state the label leads to:
+/// `data` holds `question` when that state is a `human` gate, which shows the
+/// question the agent left open; `variables` holds every `context.NAME` its
+/// templates use that the context does not hold yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputRequirement {
+    /// The label this is about.
+    pub label: OutputLabel,
+
+    /// Keys the delivery's `data` must hold.
+    #[serde(default)]
+    pub data: Vec<String>,
+
+    /// Keys the delivery's `variables` (or the context) must hold.
+    #[serde(default)]
+    pub variables: Vec<String>,
+}
+
+/// The conductor's proposal for a problem (U10): shown on the form and
+/// prefilled, never applied by itself.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConductorAnalysis {
+    /// The label it would choose.
+    #[serde(default)]
+    pub label: Option<OutputLabel>,
+
+    /// The `data` it would supply.
+    #[serde(default)]
+    pub data: Map<String, Value>,
+
+    /// The `variables` it would supply.
+    #[serde(default)]
+    pub variables: Map<String, Value>,
+
+    /// Why.
+    #[serde(default)]
+    pub rationale: Option<String>,
 }
 
 /// What accepting a pending form does next.
@@ -193,6 +304,10 @@ pub enum InputContinuation {
     CompleteStep,
     /// The answer is fed back to the same agent state; no transition occurs.
     ResumeAgent,
+    /// A problem (KTD3): the answer is the output the agent step did not
+    /// give — a label with its `data` and `variables` — and completes the
+    /// step as if the agent had kept to its output contract.
+    ResolveOutput,
 }
 
 impl PendingHumanInput {
@@ -210,6 +325,8 @@ impl PendingHumanInput {
             request,
             outputs,
             continuation: InputContinuation::CompleteStep,
+            episode: new_episode(),
+            problem: None,
             requested_at: Utc::now(),
         }
     }
@@ -226,7 +343,42 @@ impl PendingHumanInput {
             request,
             outputs: Vec::new(),
             continuation: InputContinuation::ResumeAgent,
+            episode: new_episode(),
+            problem: None,
             requested_at: Utc::now(),
+        }
+    }
+
+    /// Builds a problem: the agent step of `state_id` ended without a usable
+    /// output label, and the operator is asked for one out of `outputs`.
+    pub fn for_problem(
+        execution_id: impl Into<ExecutionId>,
+        state_id: impl Into<StateId>,
+        request: HumanInputRequest,
+        outputs: Vec<OutputDefinition>,
+        problem: OutputProblem,
+    ) -> Self {
+        Self {
+            execution_id: execution_id.into(),
+            state_id: state_id.into(),
+            request,
+            outputs,
+            continuation: InputContinuation::ResolveOutput,
+            episode: new_episode(),
+            problem: Some(problem),
+            requested_at: Utc::now(),
+        }
+    }
+
+    /// The key a delivery names this request by (KTD9).
+    ///
+    /// A record written before requests had keys falls back to the attempt
+    /// that suspended, which is unique per request just the same.
+    pub fn episode_key(&self) -> &str {
+        if self.episode.is_empty() {
+            self.action_execution_id()
+        } else {
+            &self.episode
         }
     }
 
@@ -252,6 +404,11 @@ impl PendingHumanInput {
             .map(|output| output.label.clone())
             .collect()
     }
+}
+
+/// A fresh key for a newly raised request.
+fn new_episode() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// Reads [`PendingHumanInput::outputs`] in either shape it was ever written
@@ -287,6 +444,14 @@ where
 ///   pinned to a label with [`HumanInputDelivery::choosing`];
 /// * no fields at all — [`HumanInputDelivery::label`], which picks straight
 ///   from the state's `outputs`.
+///
+/// A problem ([`InputContinuation::ResolveOutput`]) takes the third shape: a
+/// label with the step's `data` and `variables`, which no other request
+/// accepts.
+///
+/// Every field is optional on the wire, so a client written before a field
+/// existed still delivers — without `episode`, though, its answer is not
+/// protected against landing on a newer request than the one it saw.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HumanInputDelivery {
     /// Values for the declared fields, by field name.
@@ -296,6 +461,28 @@ pub struct HumanInputDelivery {
     /// The output label the user picked, when they picked one explicitly.
     #[serde(default)]
     pub chosen_label: Option<OutputLabel>,
+
+    /// The step's `data`, for a problem.
+    #[serde(default)]
+    pub data: Map<String, Value>,
+
+    /// The step's `variables`, for a problem.
+    #[serde(default)]
+    pub variables: Map<String, Value>,
+
+    /// A free-text remark, kept in the event log with the answer.
+    #[serde(default)]
+    pub comment: Option<String>,
+
+    /// The key of the request this answers ([`PendingHumanInput::episode_key`]).
+    /// When given, a delivery to any other request is refused.
+    #[serde(default)]
+    pub episode: Option<String>,
+
+    /// Who is answering. Never read from the wire: whoever calls the API is
+    /// the operator, and only in-process callers answer as the conductor.
+    #[serde(skip)]
+    pub answered_by: AnsweredBy,
 }
 
 impl HumanInputDelivery {
@@ -303,21 +490,51 @@ impl HumanInputDelivery {
     pub fn with_values(values: Map<String, Value>) -> Self {
         Self {
             values,
-            chosen_label: None,
+            ..Self::default()
         }
     }
 
     /// A delivery that only picks a label, for an action without fields.
     pub fn label(label: impl Into<OutputLabel>) -> Self {
         Self {
-            values: Map::new(),
             chosen_label: Some(label.into()),
+            ..Self::default()
         }
     }
 
     /// The same delivery with an explicit label attached.
     pub fn choosing(mut self, label: impl Into<OutputLabel>) -> Self {
         self.chosen_label = Some(label.into());
+        self
+    }
+
+    /// The same delivery carrying the step's `data`.
+    pub fn with_data(mut self, data: Map<String, Value>) -> Self {
+        self.data = data;
+        self
+    }
+
+    /// The same delivery carrying the step's `variables`.
+    pub fn with_variables(mut self, variables: Map<String, Value>) -> Self {
+        self.variables = variables;
+        self
+    }
+
+    /// The same delivery with a remark attached.
+    pub fn with_comment(mut self, comment: impl Into<String>) -> Self {
+        self.comment = Some(comment.into());
+        self
+    }
+
+    /// The same delivery, bound to the request with this key.
+    pub fn for_episode(mut self, episode: impl Into<String>) -> Self {
+        self.episode = Some(episode.into());
+        self
+    }
+
+    /// The same delivery, made by `answered_by`.
+    pub fn answered_by(mut self, answered_by: AnsweredBy) -> Self {
+        self.answered_by = answered_by;
         self
     }
 }
@@ -426,9 +643,69 @@ pub enum HumanActionError {
         outputs: Vec<OutputLabel>,
     },
 
+    /// The delivery answers a request that is no longer pending (KTD9): it
+    /// was answered or closed, and possibly replaced by another one.
+    #[error(
+        "the input '{delivered}' of execution '{execution_id}' is no longer pending; \
+         the execution now waits on '{current}'"
+    )]
+    StaleEpisode {
+        /// The execution that was addressed.
+        execution_id: ExecutionId,
+        /// The key the delivery named.
+        delivered: String,
+        /// The key of the request pending now.
+        current: String,
+    },
+
+    /// A problem's answer chose a label without a key the state it leads to
+    /// needs (KTD15).
+    #[error("label '{label}' needs '{key}': the state it leads to uses it")]
+    MissingRequiredKey {
+        /// The label that was chosen.
+        label: OutputLabel,
+        /// The missing key, as `data.NAME` or `variables.NAME`.
+        key: String,
+    },
+
+    /// `data` or `variables` were delivered to a request that is not a
+    /// problem, where nothing would read them.
+    #[error(
+        "data and variables can only be delivered to resolve a step's output; \
+         this request takes field values and a label"
+    )]
+    UnexpectedStepValues,
+
     /// Reading or writing the store failed.
     #[error(transparent)]
     Persistence(#[from] PersistenceError),
+}
+
+impl HumanActionError {
+    /// Whether the delivery itself is at fault — a form a person can correct
+    /// and send again — rather than the execution's state or the store.
+    pub fn is_invalid_delivery(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingRequiredField { .. }
+                | Self::UndeclaredField { .. }
+                | Self::ValueNotPermitted { .. }
+                | Self::WrongValueType { .. }
+                | Self::NoLabelChosen { .. }
+                | Self::LabelNotDeclared { .. }
+                | Self::MissingRequiredKey { .. }
+                | Self::UnexpectedStepValues
+        )
+    }
+
+    /// Whether the delivery came too late: the execution no longer waits on
+    /// the request it answers.
+    pub fn is_stale(&self) -> bool {
+        matches!(
+            self,
+            Self::NotPaused { .. } | Self::NoPendingRequest { .. } | Self::StaleEpisode { .. }
+        )
+    }
 }
 
 /// Renders `; declared: a, b` for an error message, or nothing when empty.
@@ -463,6 +740,7 @@ pub fn suspend(
             instruction: pending.instruction().to_string(),
             question: pending.request.question.clone(),
             answer_tail: pending.request.answer_tail.clone(),
+            episode: Some(pending.episode_key().to_string()),
         },
     )?;
 
@@ -488,7 +766,12 @@ pub fn pending_input(
 
 /// Delivers an answer, resuming the execution.
 ///
-/// Refuses any execution that is not [`ExecutionStatus::InputNeeded`]. On success
+/// Refuses any execution that is not [`ExecutionStatus::InputNeeded`], and a
+/// delivery naming another request than the pending one (KTD9) — both on the
+/// same read the answer is applied to. For a problem
+/// ([`InputContinuation::ResolveOutput`]) the answer is the step's output:
+/// the result carries the chosen label with the delivered `data` and
+/// `variables`. On success
 /// the execution is back to `Running` on disk, `HumanInputReceived` is in the
 /// log, the pending file is gone, and the caller gets the [`ActionResult`] the
 /// engine loop transitions on. A rejected delivery changes nothing: the
@@ -513,21 +796,66 @@ pub fn resume(
         }
     })?;
 
+    // Checked on the same read the answer is applied to (KTD9): nothing
+    // between here and the writes below can bring the request back.
+    if let Some(delivered) = &delivery.episode {
+        if delivered != pending.episode_key() {
+            return Err(HumanActionError::StaleEpisode {
+                execution_id: execution_id.to_string(),
+                delivered: delivered.clone(),
+                current: pending.episode_key().to_string(),
+            });
+        }
+    }
+
     // Validation first, and before any write: a rejected delivery must leave
     // the execution exactly as paused as it was.
     let values = validate_values(pending.fields(), &delivery.values)?;
     validate_agent_answer(&pending, &values)?;
-    let label = match pending.continuation {
-        InputContinuation::CompleteStep => resolve_label(&pending, delivery, &values)?,
+    let (label, data, variables) = match pending.continuation {
+        InputContinuation::CompleteStep => {
+            reject_step_values(delivery)?;
+            let label = resolve_label(&pending, delivery, &values)?;
+            (label, Value::Object(values.clone()), values.clone())
+        }
         // This label is internal only. The engine observes `continuation` and
         // resumes the agent before any decision/transition code can read it.
-        InputContinuation::ResumeAgent => "__resume_agent__".to_string(),
+        InputContinuation::ResumeAgent => {
+            reject_step_values(delivery)?;
+            (
+                RESUME_AGENT_LABEL.to_string(),
+                Value::Object(values.clone()),
+                values.clone(),
+            )
+        }
+        InputContinuation::ResolveOutput => {
+            let label = resolve_output(&pending, delivery, &execution)?;
+            (
+                label,
+                Value::Object(delivery.data.clone()),
+                delivery.variables.clone(),
+            )
+        }
     };
 
+    let resolves_output = pending.continuation == InputContinuation::ResolveOutput;
     store.event_log(execution_id).append_next(
         &execution.id,
         EventData::HumanInputReceived {
             input: Value::Object(values.clone()),
+            answered_by: Some(delivery.answered_by),
+            close_reason: Some(InputCloseReason::Answered),
+            episode: Some(pending.episode_key().to_string()),
+            output_label: (pending.continuation != InputContinuation::ResumeAgent)
+                .then(|| label.clone()),
+            data: resolves_output.then(|| data.clone()),
+            variables: resolves_output.then(|| Value::Object(variables.clone())),
+            comment: delivery
+                .comment
+                .as_deref()
+                .map(str::trim)
+                .filter(|comment| !comment.is_empty())
+                .map(ToString::to_string),
         },
     )?;
 
@@ -540,8 +868,8 @@ pub fn resume(
 
     let result = ActionResult {
         output_label: label,
-        data: Value::Object(values.clone()),
-        variables: values,
+        data,
+        variables,
         exit_code: None,
         stdout: String::new(),
         stderr: String::new(),
@@ -552,6 +880,123 @@ pub fn resume(
         pending,
         result,
     })
+}
+
+/// The event that closes `pending` without an answer (R5): something else —
+/// a transition, a recovery — made the request moot, and a form still open
+/// on it has to be able to say so.
+pub fn closing_event(
+    pending: &PendingHumanInput,
+    reason: InputCloseReason,
+    closed_by: AnsweredBy,
+) -> EventData {
+    EventData::HumanInputReceived {
+        input: Value::Object(Map::new()),
+        answered_by: Some(closed_by),
+        close_reason: Some(reason),
+        episode: Some(pending.episode_key().to_string()),
+        output_label: None,
+        data: None,
+        variables: None,
+        comment: None,
+    }
+}
+
+/// Closes the request pending on `execution_id`, if there is one, with
+/// [`closing_event`] — the log first, so a crash in between leaves a request
+/// that is closed in the log and merely not yet removed, never a removed one
+/// the log does not account for.
+///
+/// Returns the request that was closed.
+pub fn close_pending(
+    store: &ExecutionStore,
+    execution_id: &str,
+    reason: InputCloseReason,
+    closed_by: AnsweredBy,
+) -> Result<Option<PendingHumanInput>, HumanActionError> {
+    let Some(pending) = store.load_pending_input::<PendingHumanInput>(execution_id)? else {
+        return Ok(None);
+    };
+    store.event_log(execution_id).append_next(
+        &execution_id.to_string(),
+        closing_event(&pending, reason, closed_by),
+    )?;
+    store.clear_pending_input(execution_id)?;
+    Ok(Some(pending))
+}
+
+/// The label [`resume`] reports for an agent's answer to its own question:
+/// internal only, never checked against a state or taken as a transition.
+const RESUME_AGENT_LABEL: &str = "__resume_agent__";
+
+/// Refuses `data`/`variables` on a request that is not a problem: nothing
+/// would read them, and silently dropping an operator's values is worse than
+/// saying so.
+fn reject_step_values(delivery: &HumanInputDelivery) -> Result<(), HumanActionError> {
+    if delivery.data.is_empty() && delivery.variables.is_empty() {
+        Ok(())
+    } else {
+        Err(HumanActionError::UnexpectedStepValues)
+    }
+}
+
+/// Validates the answer to a problem and returns the label it chooses.
+///
+/// The label must be one the state declares, and the delivery must hold
+/// every key the problem recorded for it (KTD15): a `data` key in `data`, a
+/// `variables` key in `variables` or already in the execution's context —
+/// the context is read from the same record the answer is applied to.
+fn resolve_output(
+    pending: &PendingHumanInput,
+    delivery: &HumanInputDelivery,
+    execution: &WorkflowExecution,
+) -> Result<OutputLabel, HumanActionError> {
+    let Some(label) = delivery.chosen_label.clone() else {
+        return Err(HumanActionError::NoLabelChosen {
+            outputs: pending.output_labels(),
+        });
+    };
+    if !pending.outputs.iter().any(|output| output.label == label) {
+        return Err(HumanActionError::LabelNotDeclared {
+            label,
+            outputs: pending.output_labels(),
+        });
+    }
+
+    let requirement = pending
+        .problem
+        .as_ref()
+        .and_then(|problem| problem.requirement_for(&label));
+    if let Some(requirement) = requirement {
+        let held = |map: &Map<String, Value>, key: &str| {
+            map.get(key).is_some_and(|value| !is_blank(value))
+        };
+        if let Some(key) = requirement
+            .data
+            .iter()
+            .find(|key| !held(&delivery.data, key))
+        {
+            return Err(HumanActionError::MissingRequiredKey {
+                label,
+                key: format!("data.{key}"),
+            });
+        }
+        if let Some(key) = requirement.variables.iter().find(|key| {
+            !held(&delivery.variables, key)
+                && !execution
+                    .context
+                    .variables
+                    .get(key.as_str())
+                    .is_some_and(|value| !is_blank(value))
+        }) {
+            return Err(HumanActionError::MissingRequiredKey {
+                label,
+                key: format!("variables.{key}"),
+            });
+        }
+    }
+
+    Ok(label)
 }
 
 /// Checks the delivered values against the declared fields.
@@ -634,7 +1079,7 @@ fn validate_agent_answer(
 }
 
 /// A value that counts as "not filled in": null, or an all-whitespace string.
-fn is_blank(value: &Value) -> bool {
+pub(crate) fn is_blank(value: &Value) -> bool {
     match value {
         Value::Null => true,
         Value::String(text) => text.trim().is_empty(),

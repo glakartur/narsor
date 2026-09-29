@@ -243,13 +243,55 @@ fn an_old_format_human_input_requested_event_deserializes_with_no_question() {
             instruction,
             question,
             answer_tail,
+            episode,
         } => {
             assert_eq!(instruction, "Approve?");
             assert_eq!(question, None);
             assert_eq!(answer_tail, None);
+            assert_eq!(episode, None);
         }
         other => panic!("unexpected event data: {other:?}"),
     }
+}
+
+/// Same guarantee for `HumanInputReceived`, which says who closed the input
+/// and how since the conductor plan's U5.
+#[test]
+fn an_old_format_human_input_received_event_deserializes_as_a_plain_answer() {
+    let old_format = serde_json::json!({
+        "id": "event-4",
+        "workflow_execution_id": "exec-old-format",
+        "timestamp": Utc::now().to_rfc3339(),
+        "sequence": 4,
+        "data": {
+            "type": "human_input_received",
+            "input": {"approval_status": "approved"}
+        }
+    });
+
+    let event: Event = serde_json::from_value(old_format).expect("deserialize the old event");
+    match &event.data {
+        EventData::HumanInputReceived {
+            input,
+            answered_by,
+            close_reason,
+            episode,
+            output_label,
+            data,
+            variables,
+            comment,
+        } => {
+            assert_eq!(input, &serde_json::json!({"approval_status": "approved"}));
+            assert!(answered_by.is_none() && close_reason.is_none() && episode.is_none());
+            assert!(output_label.is_none() && data.is_none() && variables.is_none());
+            assert!(comment.is_none());
+        }
+        other => panic!("unexpected event data: {other:?}"),
+    }
+    assert_eq!(
+        event.description(),
+        "Human input received from operator: approval_status"
+    );
 }
 
 /// Same guarantee for `ActionRetrying`, whose `state_id` is new in U1.

@@ -196,7 +196,7 @@ fn has_input_requested(events: &[Event]) -> bool {
 
 fn received_input(events: &[Event]) -> Option<Value> {
     events.iter().find_map(|event| match &event.data {
-        EventData::HumanInputReceived { input } => Some(input.clone()),
+        EventData::HumanInputReceived { input, .. } => Some(input.clone()),
         _ => None,
     })
 }
@@ -775,4 +775,361 @@ async fn a_pending_request_of_a_non_paused_execution_is_not_offered() {
     assert!(human::pending_input(&store, &execution.id)
         .expect("read pending")
         .is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Problems: the `ResolveOutput` request (U5)
+// ---------------------------------------------------------------------------
+
+use narsor::domain::{AnsweredBy, InputCloseReason};
+use narsor::engine::actions::human::{
+    InputContinuation, OutputProblem, OutputRequirement, RejectedAnswer,
+};
+use narsor::engine::HumanInputRequest;
+
+/// Suspends `execution` on a problem of state `work`: labels `implemented`
+/// (needs `variables.summary`) and `needs_human_decision` (needs
+/// `data.question`), after one rejected agent answer.
+fn raise_problem(store: &ExecutionStore, execution: &mut WorkflowExecution) -> PendingHumanInput {
+    let request = HumanInputRequest {
+        action_execution_id: "attempt-1".to_string(),
+        instruction: "Choose the label the step ends with.".to_string(),
+        fields: Vec::new(),
+        question: None,
+        answer_tail: Some("All done, tests pass.".to_string()),
+    };
+    let problem = OutputProblem {
+        reason: "no output label".to_string(),
+        answers: vec![RejectedAnswer {
+            action_execution_id: "attempt-1".to_string(),
+            reason: "no output label".to_string(),
+            answer_tail: Some("All done, tests pass.".to_string()),
+        }],
+        requirements: vec![
+            OutputRequirement {
+                label: "implemented".to_string(),
+                data: Vec::new(),
+                variables: vec!["summary".to_string()],
+            },
+            OutputRequirement {
+                label: "needs_human_decision".to_string(),
+                data: vec!["question".to_string()],
+                variables: Vec::new(),
+            },
+        ],
+        analysis: None,
+    };
+    let pending = PendingHumanInput::for_problem(
+        execution.id.clone(),
+        "work".to_string(),
+        request,
+        labels(&["implemented", "needs_human_decision"]),
+        problem,
+    );
+    human::suspend(store, execution, &pending).expect("suspend");
+    pending
+}
+
+fn object(value: Value) -> Map<String, Value> {
+    value.as_object().cloned().expect("an object")
+}
+
+#[test]
+fn a_problem_is_answered_with_a_label_its_data_and_its_variables() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = start_execution(&store, root.path());
+    let pending = raise_problem(&store, &mut execution);
+
+    let delivery = HumanInputDelivery::label("implemented")
+        .with_data(object(json!({ "units_completed": 3 })))
+        .with_variables(object(json!({ "summary": "login works" })))
+        .with_comment("  read the answer myself  ")
+        .for_episode(pending.episode_key());
+    let resumed = human::resume(&store, &execution.id, &delivery).expect("resume");
+
+    assert_eq!(
+        resumed.pending.continuation,
+        InputContinuation::ResolveOutput
+    );
+    assert_eq!(resumed.result.output_label, "implemented");
+    assert_eq!(resumed.result.data, json!({ "units_completed": 3 }));
+    assert_eq!(
+        resumed.result.variables,
+        object(json!({ "summary": "login works" }))
+    );
+    assert_eq!(
+        store.load_execution(&execution.id).expect("reload").status,
+        ExecutionStatus::Running
+    );
+    assert!(!store.has_pending_input(&execution.id));
+
+    let received = events(&store, &execution.id)
+        .into_iter()
+        .find_map(|event| match event.data {
+            data @ EventData::HumanInputReceived { .. } => Some(data),
+            _ => None,
+        })
+        .expect("HumanInputReceived");
+    let EventData::HumanInputReceived {
+        answered_by,
+        close_reason,
+        episode,
+        output_label,
+        data,
+        variables,
+        comment,
+        ..
+    } = received
+    else {
+        unreachable!()
+    };
+    assert_eq!(answered_by, Some(AnsweredBy::Operator));
+    assert_eq!(close_reason, Some(InputCloseReason::Answered));
+    assert_eq!(episode.as_deref(), Some(pending.episode_key()));
+    assert_eq!(output_label.as_deref(), Some("implemented"));
+    assert_eq!(data, Some(json!({ "units_completed": 3 })));
+    assert_eq!(variables, Some(json!({ "summary": "login works" })));
+    assert_eq!(comment.as_deref(), Some("read the answer myself"));
+}
+
+#[test]
+fn a_problem_answer_without_a_required_key_names_the_key_and_changes_nothing() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = start_execution(&store, root.path());
+    raise_problem(&store, &mut execution);
+
+    let error = human::resume(
+        &store,
+        &execution.id,
+        &HumanInputDelivery::label("needs_human_decision"),
+    )
+    .expect_err("the gate needs a question");
+    assert!(
+        matches!(&error, HumanActionError::MissingRequiredKey { key, .. } if key == "data.question"),
+        "{error:?}"
+    );
+    assert!(error.is_invalid_delivery());
+
+    // A blank value is no value.
+    let error = human::resume(
+        &store,
+        &execution.id,
+        &HumanInputDelivery::label("implemented")
+            .with_variables(object(json!({ "summary": "   " }))),
+    )
+    .expect_err("a blank summary is missing");
+    assert!(
+        matches!(&error, HumanActionError::MissingRequiredKey { key, .. } if key == "variables.summary"),
+        "{error:?}"
+    );
+
+    assert_eq!(
+        store.load_execution(&execution.id).expect("reload").status,
+        ExecutionStatus::InputNeeded
+    );
+    assert!(store.has_pending_input(&execution.id));
+    assert!(received_input(&events(&store, &execution.id)).is_none());
+}
+
+#[test]
+fn a_required_variable_the_context_already_holds_need_not_be_delivered() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = start_execution(&store, root.path());
+    execution
+        .context
+        .variables
+        .insert("summary".to_string(), json!("from an earlier step"));
+    store.save_execution(&execution).expect("save context");
+    raise_problem(&store, &mut execution);
+
+    let resumed = human::resume(
+        &store,
+        &execution.id,
+        &HumanInputDelivery::label("implemented"),
+    )
+    .expect("the context supplies the summary");
+    assert_eq!(resumed.result.output_label, "implemented");
+}
+
+#[test]
+fn a_problem_answer_needs_a_declared_label() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = start_execution(&store, root.path());
+    raise_problem(&store, &mut execution);
+
+    let error =
+        human::resume(&store, &execution.id, &HumanInputDelivery::default()).expect_err("no label");
+    assert!(
+        matches!(error, HumanActionError::NoLabelChosen { .. }),
+        "{error:?}"
+    );
+
+    let error = human::resume(&store, &execution.id, &HumanInputDelivery::label("done"))
+        .expect_err("not a declared label");
+    assert!(
+        matches!(error, HumanActionError::LabelNotDeclared { .. }),
+        "{error:?}"
+    );
+
+    // A problem has no fields: a field value is undeclared.
+    let error = human::resume(
+        &store,
+        &execution.id,
+        &HumanInputDelivery::with_values(object(json!({ "answer": "x" }))).choosing("implemented"),
+    )
+    .expect_err("no fields");
+    assert!(
+        matches!(error, HumanActionError::UndeclaredField { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn data_and_variables_are_refused_by_a_request_that_is_not_a_problem() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = start_execution(&store, root.path());
+    enter_human_state(
+        &store,
+        &mut execution,
+        "review",
+        &no_fields_action(),
+        &["ignore", "fix_it"],
+    )
+    .await;
+
+    let error = human::resume(
+        &store,
+        &execution.id,
+        &HumanInputDelivery::label("ignore").with_data(object(json!({ "x": 1 }))),
+    )
+    .expect_err("nothing would read the data");
+    assert!(
+        matches!(error, HumanActionError::UnexpectedStepValues),
+        "{error:?}"
+    );
+    assert!(store.has_pending_input(&execution.id));
+}
+
+#[tokio::test]
+async fn a_delivery_for_another_request_is_stale_and_changes_nothing() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = start_execution(&store, root.path());
+    let pending = enter_human_state(
+        &store,
+        &mut execution,
+        "review",
+        &no_fields_action(),
+        &["ignore", "fix_it"],
+    )
+    .await;
+    assert!(!pending.episode.is_empty(), "every new request has a key");
+
+    let error = human::resume(
+        &store,
+        &execution.id,
+        &HumanInputDelivery::label("ignore").for_episode("an-earlier-request"),
+    )
+    .expect_err("a stale key is refused");
+    assert!(
+        matches!(&error, HumanActionError::StaleEpisode { current, .. } if current == pending.episode_key()),
+        "{error:?}"
+    );
+    assert!(error.is_stale());
+    assert!(store.has_pending_input(&execution.id));
+
+    // Without a key (an older client) the answer is still taken.
+    human::resume(&store, &execution.id, &HumanInputDelivery::label("ignore"))
+        .expect("an unkeyed answer still resumes");
+}
+
+#[test]
+fn a_pending_record_without_a_key_is_named_by_its_attempt() {
+    let old_format = json!({
+        "execution_id": "exec-1",
+        "state_id": "review",
+        "action_execution_id": "attempt-7",
+        "instruction": "Approve?",
+        "outputs": ["approve"],
+        "requested_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let pending: PendingHumanInput =
+        serde_json::from_value(old_format).expect("an old record reads");
+    assert_eq!(pending.episode_key(), "attempt-7");
+    assert_eq!(pending.continuation, InputContinuation::CompleteStep);
+    assert!(pending.problem.is_none());
+}
+
+#[tokio::test]
+async fn closing_a_request_records_why_and_removes_it() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = start_execution(&store, root.path());
+    let pending = enter_human_state(
+        &store,
+        &mut execution,
+        "review",
+        &no_fields_action(),
+        &["ignore"],
+    )
+    .await;
+
+    let closed = human::close_pending(
+        &store,
+        &execution.id,
+        InputCloseReason::Recover,
+        AnsweredBy::Operator,
+    )
+    .expect("close")
+    .expect("there was a request");
+    assert_eq!(closed.episode_key(), pending.episode_key());
+    assert!(!store.has_pending_input(&execution.id));
+
+    let last = events(&store, &execution.id)
+        .pop()
+        .expect("the closing event");
+    assert!(
+        matches!(
+            &last.data,
+            EventData::HumanInputReceived {
+                close_reason: Some(InputCloseReason::Recover),
+                answered_by: Some(AnsweredBy::Operator),
+                episode: Some(episode),
+                ..
+            } if episode == pending.episode_key()
+        ),
+        "{:?}",
+        last.data
+    );
+    assert_eq!(
+        last.description(),
+        "Human input closed by recover (operator)"
+    );
+
+    // Nothing left: closing again is a no-op.
+    assert!(human::close_pending(
+        &store,
+        &execution.id,
+        InputCloseReason::Recover,
+        AnsweredBy::Operator
+    )
+    .expect("close again")
+    .is_none());
+}
+
+#[test]
+fn a_delivery_never_reads_who_answers_from_the_wire() {
+    let delivery: HumanInputDelivery =
+        serde_json::from_value(json!({ "chosen_label": "x", "answered_by": "conductor" }))
+            .expect("parse");
+    assert_eq!(delivery.answered_by, AnsweredBy::Operator);
+    let wire =
+        serde_json::to_value(HumanInputDelivery::label("x").answered_by(AnsweredBy::Conductor))
+            .expect("serialize");
+    assert!(wire.get("answered_by").is_none(), "{wire}");
 }

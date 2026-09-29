@@ -2400,10 +2400,9 @@ fn every_event_data_variant() -> Vec<EventData> {
             instruction: "approve?".to_string(),
             question: None,
             answer_tail: None,
+            episode: None,
         },
-        EventData::HumanInputReceived {
-            input: json!({"approval_status": "approved"}),
-        },
+        EventData::human_input_received(json!({"approval_status": "approved"})),
         EventData::HumanTransitionSelected {
             from_state: "review".to_string(),
             to_state: "done".to_string(),
@@ -2581,9 +2580,7 @@ async fn c_on_an_unlinked_event_names_the_reason_and_opens_nothing() {
     let last_sequence = app.events().last().expect("an event").sequence;
     let event = Event::new(
         execution_id,
-        EventData::HumanInputReceived {
-            input: json!({"approval_status": "approved"}),
-        },
+        EventData::human_input_received(json!({"approval_status": "approved"})),
         last_sequence + 1,
     );
     app.on_stream(Some(Ok(event)));

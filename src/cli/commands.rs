@@ -579,7 +579,23 @@ fn print_conversation_entry(entry: &crate::api::ConversationEntryDto) {
 // input / resume
 // ---------------------------------------------------------------------------
 
-/// `narsor input <id> [--field k=v]… [--label l]` — answer a question.
+/// What `narsor input` was told on its command line.
+#[derive(Debug, Clone, Default)]
+pub struct InputAnswer {
+    /// `--field name=value` pairs.
+    pub fields: Vec<String>,
+    /// `--label`.
+    pub label: Option<String>,
+    /// `--data name=value` pairs.
+    pub data: Vec<String>,
+    /// `--variable name=value` pairs.
+    pub variables: Vec<String>,
+    /// `--comment`.
+    pub comment: Option<String>,
+}
+
+/// `narsor input <id> [--field k=v]… [--label l] [--data k=v]… [--variable k=v]…
+/// [--comment text]` — answer a question, or resolve a problem.
 ///
 /// Goes through `ApiClient` (R4/D52), exactly like [`resume`]: `POST
 /// /executions/:id/input`, then [`wait_until_stopped`]. Used to construct its
@@ -592,12 +608,15 @@ fn print_conversation_entry(entry: &crate::api::ConversationEntryDto) {
 /// doc comment gives: the daemon always resolves the workflow from the
 /// execution's own recorded metadata, with no way for a REST call to point
 /// it at a local override path.
+///
+/// The answer is bound to the request this command read (KTD9): if another
+/// client answered or closed it in between, the daemon refuses this one
+/// rather than letting it land on whatever the execution waits on next.
 pub async fn input(
     config: &Resolved,
     flags: &Flags,
     execution_id: &str,
-    fields: &[String],
-    label: Option<String>,
+    answer: InputAnswer,
     definition_file: Option<&str>,
 ) -> Result<()> {
     if let Some(file) = definition_file {
@@ -609,7 +628,7 @@ pub async fn input(
     }
 
     let mut values = Map::new();
-    for pair in fields {
+    for pair in &answer.fields {
         let (name, raw) = pair.split_once('=').ok_or_else(|| {
             CliError::usage(format!(
                 "Invalid field '{pair}' — expected the form name=value."
@@ -618,9 +637,14 @@ pub async fn input(
         values.insert(name.to_string(), Value::String(raw.to_string()));
     }
 
-    let mut delivery = HumanInputDelivery::with_values(values);
-    if let Some(label) = label {
+    let mut delivery = HumanInputDelivery::with_values(values)
+        .with_data(step_values("data", &answer.data)?)
+        .with_variables(step_values("variable", &answer.variables)?);
+    if let Some(label) = answer.label {
         delivery = delivery.choosing(label);
+    }
+    if let Some(comment) = answer.comment {
+        delivery = delivery.with_comment(comment);
     }
 
     let client = daemon_client(config.state_dir(), flags).await?;
@@ -633,17 +657,25 @@ pub async fn input(
     // reason, so relying on the REST error alone would only report a bare
     // `500`.
     let current = load_execution_summary(&client, execution_id).await?;
-    if current.pending_input.is_none() {
+    let Some(pending) = &current.pending_input else {
         return Err(CliError::failure(format!(
             "Execution '{execution_id}' is not waiting for human input (status: {}).",
             status_name(&current.status)
         )));
-    }
+    };
+    let delivery = delivery.for_episode(pending.episode_key());
 
     client
         .deliver_input(execution_id, delivery)
         .await
-        .map_err(|error| client_error(execution_id, error))?;
+        .map_err(|error| match error {
+            ClientError::Conflict => CliError::failure(format!(
+                "Execution '{execution_id}' is no longer waiting for the input this answer was \
+                 for: it was answered or closed meanwhile, or another process is driving it \
+                 right now. Check it with 'narsor show {execution_id}'."
+            )),
+            other => client_error(execution_id, other),
+        })?;
 
     let summary = wait_until_stopped(&client, execution_id).await?;
 
@@ -657,6 +689,26 @@ pub async fn input(
         )));
     }
     Ok(())
+}
+
+/// Parses `name=value` pairs of `--data`/`--variable` into a map. A value
+/// that reads as JSON is taken as that, so `units_completed=3` is a number;
+/// anything else is the text as written.
+fn step_values(flag: &str, pairs: &[String]) -> Result<Map<String, Value>> {
+    let mut values = Map::new();
+    for pair in pairs {
+        let (name, raw) = pair
+            .split_once('=')
+            .filter(|(name, _)| !name.trim().is_empty())
+            .ok_or_else(|| {
+                CliError::usage(format!(
+                    "Invalid --{flag} '{pair}' — expected the form name=value."
+                ))
+            })?;
+        let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+        values.insert(name.trim().to_string(), value);
+    }
+    Ok(values)
 }
 
 /// `narsor resume <id>` — continue a paused execution.
@@ -1203,8 +1255,39 @@ fn print_pending_input(pending: &PendingHumanInput) {
             field.name, field.field_type
         );
     }
-    if !pending.outputs.is_empty() {
-        println!("  Output labels: {}", pending.output_labels().join(", "));
+    let Some(problem) = &pending.problem else {
+        if !pending.outputs.is_empty() {
+            println!("  Output labels: {}", pending.output_labels().join(", "));
+        }
+        return;
+    };
+
+    // A problem: the step's output is what is asked for (KTD3).
+    println!("  Problem: {}", problem.reason);
+    for answer in &problem.answers {
+        if let Some(tail) = &answer.answer_tail {
+            println!("  Agent answered ({}):", answer.action_execution_id);
+            for line in tail.lines() {
+                println!("    | {line}");
+            }
+        }
+    }
+    println!("  Resolve with --label and the keys that label needs:");
+    for output in &pending.outputs {
+        let description = output
+            .description
+            .as_deref()
+            .map(|description| format!("  — {description}"))
+            .unwrap_or_default();
+        println!("    --label {}{description}", output.label);
+        if let Some(requirement) = problem.requirement_for(&output.label) {
+            for key in &requirement.data {
+                println!("        requires --data {key}=…");
+            }
+            for key in &requirement.variables {
+                println!("        requires --variable {key}=…");
+            }
+        }
     }
 }
 

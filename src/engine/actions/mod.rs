@@ -51,8 +51,9 @@ pub use harness::{
     HarnessRequest, HarnessRun, OpenCodeAdapter,
 };
 pub use human::{
-    HumanActionError, HumanExecutor, HumanInputDelivery, HumanInputRequest, InputContinuation,
-    PendingHumanInput, ResumedHumanAction,
+    ConductorAnalysis, HumanActionError, HumanExecutor, HumanInputDelivery, HumanInputRequest,
+    InputContinuation, OutputProblem, OutputRequirement, PendingHumanInput, RejectedAnswer,
+    ResumedHumanAction,
 };
 pub use script::ScriptExecutor;
 

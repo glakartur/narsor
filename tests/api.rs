@@ -2217,3 +2217,321 @@ async fn post_transition_from_an_asking_agent_carries_its_question() {
     assert_eq!(request.question.as_deref(), Some("Which API version?"));
     assert_eq!(request.answer_tail, None);
 }
+
+// ---------------------------------------------------------------------------
+// Conductor plan U5: problems over `POST /input`, stale answers, closing
+// ---------------------------------------------------------------------------
+
+#[path = "engine_support/mod.rs"]
+mod engine_support;
+
+mod problems {
+    use super::*;
+
+    use narsor::domain::{AnsweredBy, InputCloseReason};
+    use narsor::engine::{ActionKind, InputContinuation, PendingHumanInput};
+
+    /// An execution of `agent_problem` stopped on its problem, and a server
+    /// over the engine that stopped it.
+    struct Problem {
+        _root: TempRoot,
+        store: ExecutionStore,
+        handle: api::ApiHandle,
+        execution_id: String,
+        pending: PendingHumanInput,
+    }
+
+    async fn problem_over_http() -> Problem {
+        let root = TempRoot::new();
+        let store = root.store();
+        let engine = Arc::new(Engine::new(store.clone()).with_executor(
+            ActionKind::Agent,
+            Arc::new(engine_support::LabellessAgentExecutor::answering(
+                "Done, all tests pass.",
+            )),
+        ));
+        let definition_path = engine_support::fixtures().join("engine/agent_problem.yaml");
+        let definition = load_from_file(&definition_path).expect("load the fixture");
+
+        let workspace_path = root.join("workspace");
+        fs::create_dir_all(&workspace_path).expect("create workspace dir");
+        fs::copy(
+            engine_support::fixtures().join("scripts/print_json.sh"),
+            workspace_path.join("print_json.sh"),
+        )
+        .expect("copy the fixture script");
+
+        let execution = engine
+            .start(
+                &definition,
+                serde_json::json!({}),
+                Workspace::local_folder(workspace_path.display().to_string()),
+            )
+            .expect("start execution");
+        pin_definition_path(&store, &execution.id, &definition_path);
+        engine
+            .run(&definition, &execution.id)
+            .await
+            .expect("run to the problem");
+        let pending: PendingHumanInput = store
+            .load_pending_input(&execution.id)
+            .expect("read")
+            .expect("the problem is pending");
+        assert_eq!(pending.continuation, InputContinuation::ResolveOutput);
+
+        let handle = start_server_with_engine(
+            Arc::clone(&engine),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+        )
+        .await;
+        Problem {
+            _root: root,
+            store,
+            handle,
+            execution_id: execution.id,
+            pending,
+        }
+    }
+
+    fn post_input(
+        problem: &Problem,
+        body: &serde_json::Value,
+    ) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> {
+        raw_client()
+            .post(url(
+                &problem.handle,
+                &format!("/executions/{}/input", problem.execution_id),
+            ))
+            .bearer_auth(problem.handle.token())
+            .json(body)
+            .send()
+    }
+
+    fn events(problem: &Problem) -> Vec<Event> {
+        problem
+            .store
+            .event_log(&problem.execution_id)
+            .read_all()
+            .expect("read events")
+    }
+
+    #[tokio::test]
+    async fn post_input_resolves_a_problem_with_label_data_and_variables() {
+        let problem = problem_over_http().await;
+
+        let response = post_input(
+            &problem,
+            &serde_json::json!({
+                "chosen_label": "implemented",
+                "data": { "units_completed": 3 },
+                "variables": { "summary": "login works" },
+                "episode": problem.pending.episode_key(),
+                // Not on the wire: whoever calls the API is the operator.
+                "answered_by": "conductor",
+            }),
+        )
+        .await
+        .expect("post input");
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+
+        wait_for_status(
+            &problem.store,
+            &problem.execution_id,
+            ExecutionStatus::Completed,
+            Duration::from_secs(5),
+        )
+        .await;
+        let events = events(&problem);
+        assert!(events.iter().any(|event| matches!(
+            &event.data,
+            EventData::DecisionMade { provider, output_label, .. }
+                if provider == "human" && output_label == "implemented"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.data,
+            EventData::HumanInputReceived {
+                answered_by: Some(AnsweredBy::Operator),
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_problem_answer_missing_a_required_key_is_a_bad_request_naming_it() {
+        let problem = problem_over_http().await;
+        let client = api::ApiClient::new(problem.handle.addr(), problem.handle.token());
+        let before = events(&problem).len();
+
+        let error = client
+            .deliver_input(
+                &problem.execution_id,
+                HumanInputDelivery::label("needs_human_decision")
+                    .for_episode(problem.pending.episode_key()),
+            )
+            .await
+            .expect_err("the gate needs data.question");
+        match error {
+            ClientError::Request { code, message } => {
+                assert_eq!(code, "invalid_input");
+                assert!(message.contains("data.question"), "{message}");
+            }
+            other => panic!("expected a 400 with a reason, got {other:?}"),
+        }
+
+        let execution = problem
+            .store
+            .load_execution(&problem.execution_id)
+            .expect("reload");
+        assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+        assert!(problem.store.has_pending_input(&problem.execution_id));
+        // Only the error note the engine records for any refused call.
+        assert!(events(&problem)[before..]
+            .iter()
+            .all(|event| matches!(event.data, EventData::Error { .. })));
+    }
+
+    #[tokio::test]
+    async fn an_answer_with_a_stale_episode_is_a_conflict_and_changes_nothing() {
+        let problem = problem_over_http().await;
+
+        let response = post_input(
+            &problem,
+            &serde_json::json!({
+                "chosen_label": "implemented",
+                "variables": { "summary": "x" },
+                "episode": "a-request-that-is-gone",
+            }),
+        )
+        .await
+        .expect("post input");
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+
+        let execution = problem
+            .store
+            .load_execution(&problem.execution_id)
+            .expect("reload");
+        assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+        let still: PendingHumanInput = problem
+            .store
+            .load_pending_input(&problem.execution_id)
+            .expect("read")
+            .expect("still pending");
+        assert_eq!(still.episode_key(), problem.pending.episode_key());
+        assert!(!events(&problem)
+            .iter()
+            .any(|event| matches!(event.data, EventData::HumanInputReceived { .. })));
+    }
+
+    /// Two answers to the same request at once: exactly one is taken. The
+    /// other either finds the execution claimed or, once the first has moved
+    /// it on to the gate, finds a newer request than the one it answers.
+    #[tokio::test]
+    async fn two_concurrent_answers_to_one_problem_yield_exactly_one_accepted() {
+        let problem = problem_over_http().await;
+        let body = serde_json::json!({
+            "chosen_label": "needs_human_decision",
+            "data": { "question": "Which API version?" },
+            "episode": problem.pending.episode_key(),
+        });
+
+        let (first, second) =
+            tokio::join!(post_input(&problem, &body), post_input(&problem, &body));
+        let statuses = [
+            first.expect("first answer").status(),
+            second.expect("second answer").status(),
+        ];
+        let accepted = statuses
+            .iter()
+            .filter(|status| **status == reqwest::StatusCode::ACCEPTED)
+            .count();
+        let conflicts = statuses
+            .iter()
+            .filter(|status| **status == reqwest::StatusCode::CONFLICT)
+            .count();
+        assert_eq!((accepted, conflicts), (1, 1), "{statuses:?}");
+
+        let execution = wait_for_status(
+            &problem.store,
+            &problem.execution_id,
+            ExecutionStatus::InputNeeded,
+            Duration::from_secs(5),
+        )
+        .await;
+        // Settled on the gate, answered once.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while problem
+            .store
+            .load_execution(&problem.execution_id)
+            .expect("reload")
+            .current_state
+            .as_deref()
+            != Some("resolve_ambiguity")
+        {
+            assert!(tokio::time::Instant::now() < deadline, "{execution:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let answers = events(&problem)
+            .iter()
+            .filter(|event| matches!(event.data, EventData::HumanInputReceived { .. }))
+            .count();
+        assert_eq!(answers, 1);
+
+        // A late retry of the same answer names a request that is gone.
+        let late = post_input(&problem, &body).await.expect("late answer");
+        assert_eq!(late.status(), reqwest::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn a_transition_closes_the_pending_problem_and_says_so() {
+        let problem = problem_over_http().await;
+
+        let response = raw_client()
+            .post(url(
+                &problem.handle,
+                &format!("/executions/{}/transition", problem.execution_id),
+            ))
+            .bearer_auth(problem.handle.token())
+            .json(&TransitionRequestBody {
+                label: Some("implemented".to_string()),
+                target: None,
+                force: false,
+            })
+            .send()
+            .await
+            .expect("post transition");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(!problem.store.has_pending_input(&problem.execution_id));
+
+        let events = events(&problem);
+        let closed = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.data,
+                    EventData::HumanInputReceived {
+                        close_reason: Some(InputCloseReason::Transition),
+                        answered_by: Some(AnsweredBy::Operator),
+                        episode: Some(episode),
+                        ..
+                    } if episode == problem.pending.episode_key()
+                )
+            })
+            .expect("the problem is closed by the transition");
+        let decided = events
+            .iter()
+            .position(|event| matches!(event.data, EventData::DecisionMade { .. }))
+            .expect("the transition's decision");
+        assert!(closed < decided, "closed first");
+
+        // What the agent did say travels on, as for any agent step left (KTD8).
+        let execution = problem
+            .store
+            .load_execution(&problem.execution_id)
+            .expect("reload");
+        assert_eq!(
+            execution.metadata["engine"]["last_agent_step"]["answer_tail"],
+            serde_json::json!("Done, all tests pass.")
+        );
+    }
+}

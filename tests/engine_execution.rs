@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engine_support::{
-    event_type, workflow, workflow_file, AnsweringAgentExecutor, Harness, QuestioningAgentExecutor,
-    StubAgentExecutor, TimeoutRecorder,
+    event_type, workflow, workflow_file, AnsweringAgentExecutor, Harness, LabellessAgentExecutor,
+    QuestioningAgentExecutor, StubAgentExecutor, TimeoutRecorder,
 };
 use narsor::domain::{EventData, ExecutionStatus};
 use narsor::engine::{
@@ -762,14 +762,25 @@ async fn running_a_paused_execution_is_refused() {
 #[tokio::test]
 async fn explicit_recovery_retries_an_interrupted_agent_step_and_passes_the_operator_note() {
     let harness = Harness::new();
+    // A real action failure — an undeclared label would be a format error
+    // and end as a problem instead (U5).
     let agent = Arc::new(StubAgentExecutor::new(&[
-        "unexpected",
+        StubAgentExecutor::FAIL,
         "ready",
         "implemented",
     ]));
     let engine =
         Arc::new(Engine::new(harness.store()).with_executor(ActionKind::Agent, agent.clone()));
-    let definition = workflow_file("implement_feature.yaml");
+    let mut definition = workflow_file("implement_feature.yaml");
+    // One attempt, so the failure is final without waiting out a backoff.
+    let policies = definition
+        .states
+        .values_mut()
+        .filter_map(|state| state.retry_policy.as_mut())
+        .chain(definition.globals.retry_policy.as_mut());
+    for policy in policies {
+        policy.max_attempts = 1;
+    }
 
     let failed = engine
         .start_and_run(
@@ -1458,4 +1469,302 @@ async fn a_human_decision_on_an_agent_carries_its_question() {
         .expect("the decision is pending");
     assert_eq!(pending.request.question.as_deref(), Some(LIMIT_QUESTION));
     assert_eq!(pending.request.answer_tail.as_deref(), Some("the answer"));
+}
+
+// ---------------------------------------------------------------------------
+// Problems: an agent step without a usable output label (U5)
+// ---------------------------------------------------------------------------
+
+mod problems {
+    use super::*;
+
+    use narsor::domain::{AnsweredBy, InputCloseReason, ProblemKind, WorkflowDefinition};
+    use narsor::engine::{HumanActionError, InputContinuation, PendingHumanInput};
+
+    const ANSWER: &str = "Done: 3 units implemented, every test passes.";
+
+    /// Runs `agent_problem` with `inputs` until its agent step becomes a
+    /// problem.
+    async fn raise_problem(
+        harness: &Harness,
+        inputs: Value,
+    ) -> (Engine, WorkflowDefinition, String, PendingHumanInput) {
+        let engine = Engine::new(harness.store()).with_executor(
+            ActionKind::Agent,
+            Arc::new(LabellessAgentExecutor::answering(ANSWER)),
+        );
+        let definition = workflow("agent_problem");
+        let execution = engine
+            .start_and_run(&definition, inputs, harness.workspace())
+            .await
+            .expect("run to the problem");
+        assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+        let pending = engine
+            .pending_input(&execution.id)
+            .expect("read the pending input")
+            .expect("a problem is pending");
+        (engine, definition, execution.id, pending)
+    }
+
+    fn object(value: Value) -> Map<String, Value> {
+        value.as_object().cloned().expect("an object")
+    }
+
+    #[tokio::test]
+    async fn a_problem_records_what_each_label_needs_and_announces_itself() {
+        let harness = Harness::new();
+        let (_engine, _definition, execution_id, pending) =
+            raise_problem(&harness, json!({})).await;
+
+        assert_eq!(pending.continuation, InputContinuation::ResolveOutput);
+        let problem = pending.problem.as_ref().expect("the problem record");
+        let implemented = problem.requirement_for("implemented").expect("implemented");
+        assert_eq!(implemented.variables, vec!["summary".to_string()]);
+        assert!(implemented.data.is_empty());
+        let decision = problem
+            .requirement_for("needs_human_decision")
+            .expect("needs_human_decision");
+        assert_eq!(decision.data, vec!["question".to_string()]);
+        assert!(decision.variables.is_empty());
+        assert_eq!(problem.answers.len(), 1);
+        assert_eq!(problem.answers[0].answer_tail.as_deref(), Some(ANSWER));
+
+        let types = harness.event_types(&execution_id);
+        let tail: Vec<&str> = types
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                "action_output_rejected",
+                "human_input_requested",
+                "problem_raised"
+            ]
+        );
+        let raised = harness
+            .events(&execution_id)
+            .into_iter()
+            .find_map(|event| match event.data {
+                EventData::ProblemRaised { kind, episode, .. } => Some((kind, episode)),
+                _ => None,
+            })
+            .expect("ProblemRaised");
+        assert_eq!(raised.0, ProblemKind::Output);
+        assert_eq!(raised.1.as_deref(), Some(pending.episode_key()));
+    }
+
+    #[tokio::test]
+    async fn a_variable_the_context_already_holds_is_not_required() {
+        let harness = Harness::new();
+        let (_engine, _definition, _execution_id, pending) =
+            raise_problem(&harness, json!({ "summary": "from the inputs" })).await;
+
+        let problem = pending.problem.expect("the problem record");
+        assert!(problem
+            .requirement_for("implemented")
+            .expect("implemented")
+            .variables
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_operator_resolves_a_problem_and_the_workflow_goes_on() {
+        let harness = Harness::new();
+        let (engine, definition, execution_id, pending) = raise_problem(&harness, json!({})).await;
+
+        let delivery = HumanInputDelivery::label("implemented")
+            .with_data(object(json!({ "units_completed": 3 })))
+            .with_variables(object(json!({ "summary": "login works" })))
+            .with_comment("the answer says it is done")
+            .for_episode(pending.episode_key());
+        let execution = engine
+            .deliver_human_input(&definition, &execution_id, &delivery)
+            .await
+            .expect("resolve the problem");
+
+        assert_eq!(execution.status, ExecutionStatus::Completed);
+        assert_eq!(
+            harness.stored_context(&execution_id)["variables"]["summary"],
+            json!("login works")
+        );
+
+        let events = harness.events(&execution_id);
+        let completed = events
+            .iter()
+            .find_map(|event| match &event.data {
+                EventData::ActionCompleted {
+                    action_execution_id,
+                    output_label,
+                } => Some((action_execution_id.clone(), output_label.clone())),
+                _ => None,
+            })
+            .expect("the step completes");
+        assert_eq!(completed.0, pending.action_execution_id());
+        assert_eq!(completed.1, "implemented");
+        let decision = events
+            .iter()
+            .find_map(|event| match &event.data {
+                EventData::DecisionMade {
+                    provider,
+                    output_label,
+                    reasoning,
+                } => Some((provider.clone(), output_label.clone(), reasoning.clone())),
+                _ => None,
+            })
+            .expect("a decision");
+        assert_eq!(decision.0, "human");
+        assert_eq!(decision.1, "implemented");
+        assert_eq!(decision.2.as_deref(), Some("the answer says it is done"));
+        assert!(events.iter().any(|event| matches!(
+            &event.data,
+            EventData::TransitionTaken { from_state, to_state, .. }
+                if from_state == "work" && to_state == "report"
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_label_leading_to_a_gate_needs_the_question_the_gate_shows() {
+        let harness = Harness::new();
+        let (engine, definition, execution_id, _pending) = raise_problem(&harness, json!({})).await;
+
+        let error = engine
+            .deliver_human_input(
+                &definition,
+                &execution_id,
+                &HumanInputDelivery::label("needs_human_decision"),
+            )
+            .await
+            .expect_err("the gate needs data.question");
+        assert!(
+            matches!(
+                &error,
+                EngineError::HumanInput(HumanActionError::MissingRequiredKey { key, .. })
+                    if key == "data.question"
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            harness
+                .store()
+                .load_execution(&execution_id)
+                .expect("reload")
+                .status,
+            ExecutionStatus::InputNeeded,
+            "a refused answer changes nothing"
+        );
+
+        let execution = engine
+            .deliver_human_input(
+                &definition,
+                &execution_id,
+                &HumanInputDelivery::label("needs_human_decision")
+                    .with_data(object(json!({ "question": "Which API version?" }))),
+            )
+            .await
+            .expect("resolve with the question");
+        assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+        assert_eq!(
+            execution.current_state.as_deref(),
+            Some("resolve_ambiguity")
+        );
+
+        // The gate shows the question the operator supplied beside what the
+        // agent actually said (KTD8).
+        let gate = engine
+            .pending_input(&execution_id)
+            .expect("read")
+            .expect("the gate is pending");
+        assert_eq!(gate.continuation, InputContinuation::CompleteStep);
+        assert_eq!(gate.request.question.as_deref(), Some("Which API version?"));
+        assert_eq!(gate.request.answer_tail.as_deref(), Some(ANSWER));
+    }
+
+    #[tokio::test]
+    async fn artifacts_in_the_delivered_data_are_registered_like_an_agents() {
+        let harness = Harness::new();
+        let (engine, definition, execution_id, _pending) =
+            raise_problem(&harness, json!({ "summary": "done" })).await;
+
+        engine
+            .deliver_human_input(
+                &definition,
+                &execution_id,
+                &HumanInputDelivery::label("implemented").with_data(object(json!({
+                    "artifacts": [{ "name": "plan", "path": "docs/plan.md" }]
+                }))),
+            )
+            .await
+            .expect("resolve the problem");
+
+        let created = harness
+            .events(&execution_id)
+            .into_iter()
+            .find_map(|event| match event.data {
+                EventData::ArtifactCreated { location, .. } => Some(location),
+                _ => None,
+            })
+            .expect("ArtifactCreated");
+        assert_eq!(created, "docs/plan.md");
+        assert_eq!(
+            harness.stored_context(&execution_id)["artifacts"]["plan"]["location"],
+            json!("docs/plan.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_conductor_resolving_a_problem_is_named_as_the_decider() {
+        let harness = Harness::new();
+        let (engine, definition, execution_id, pending) =
+            raise_problem(&harness, json!({ "summary": "done" })).await;
+
+        engine
+            .deliver_human_input(
+                &definition,
+                &execution_id,
+                &HumanInputDelivery::label("implemented")
+                    .for_episode(pending.episode_key())
+                    .answered_by(AnsweredBy::Conductor),
+            )
+            .await
+            .expect("resolve the problem");
+
+        let events = harness.events(&execution_id);
+        assert!(events.iter().any(|event| matches!(
+            &event.data,
+            EventData::DecisionMade { provider, .. } if provider == "conductor"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.data,
+            EventData::HumanInputReceived {
+                answered_by: Some(AnsweredBy::Conductor),
+                close_reason: Some(InputCloseReason::Answered),
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn an_answer_to_a_closed_problem_is_refused() {
+        let harness = Harness::new();
+        let (engine, definition, execution_id, pending) =
+            raise_problem(&harness, json!({ "summary": "done" })).await;
+        let delivery = HumanInputDelivery::label("implemented").for_episode(pending.episode_key());
+
+        engine
+            .deliver_human_input(&definition, &execution_id, &delivery)
+            .await
+            .expect("the first answer is taken");
+        let error = engine
+            .deliver_human_input(&definition, &execution_id, &delivery)
+            .await
+            .expect_err("the second finds nothing pending");
+        assert!(
+            matches!(&error, EngineError::HumanInput(human) if human.is_stale()),
+            "{error:?}"
+        );
+    }
 }

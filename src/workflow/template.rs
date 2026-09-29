@@ -304,6 +304,97 @@ impl<'a> TemplateScope<'a> {
     }
 }
 
+/// The context variables a template refers to, in first-use order and
+/// without repeats (KTD15).
+///
+/// Static: nothing is resolved, so it answers "which `context.NAME` will this
+/// template need" before any value exists. Only well-formed `context.NAME`
+/// and `context.variables.NAME` references count; whatever [`TemplateScope`]
+/// would refuse (a filter, an unterminated placeholder, an unsupported root)
+/// is not a variable anyone could supply, so it is left for rendering to
+/// report.
+pub fn context_references(template: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_context_references(template, &mut names);
+    names
+}
+
+/// The context variables an action's templates refer to, over exactly the
+/// fields [`TemplateScope::render_action`] renders, in first-use order and
+/// without repeats.
+pub fn action_context_references(action: &ActionConfig) -> Vec<String> {
+    let mut names = Vec::new();
+    match action {
+        ActionConfig::Agent(config) => collect_context_references(&config.prompt, &mut names),
+        ActionConfig::Script(config) => {
+            collect_context_references(&config.command, &mut names);
+            for arg in &config.args {
+                collect_context_references(arg, &mut names);
+            }
+            if let Some(dir) = &config.working_dir {
+                collect_context_references(dir, &mut names);
+            }
+            // Sorted, so the order does not depend on the map's.
+            let mut keys: Vec<&String> = config.env.keys().collect();
+            keys.sort();
+            for key in keys {
+                collect_context_references(&config.env[key], &mut names);
+            }
+        }
+        ActionConfig::Human(config) => collect_context_references(&config.instruction, &mut names),
+        ActionConfig::Wait(config) => {
+            if let Some(filter) = &config.filter {
+                collect_value_references(filter, &mut names);
+            }
+        }
+    }
+    names
+}
+
+/// Adds the context variables `template` refers to that `names` lacks.
+fn collect_context_references(template: &str, names: &mut Vec<String>) {
+    let mut rest = template;
+    while let Some(start) = rest.find(OPEN) {
+        let after_open = &rest[start + OPEN.len()..];
+        let Some(end) = after_open.find(CLOSE) else {
+            return;
+        };
+        if let Some(name) = context_name(after_open[..end].trim()) {
+            if !names.iter().any(|known| known == name) {
+                names.push(name.to_string());
+            }
+        }
+        rest = &after_open[end + CLOSE.len()..];
+    }
+}
+
+/// [`collect_context_references`] over every string inside a JSON value.
+fn collect_value_references(value: &Value, names: &mut Vec<String>) {
+    match value {
+        Value::String(text) => collect_context_references(text, names),
+        Value::Array(items) => {
+            for item in items {
+                collect_value_references(item, names);
+            }
+        }
+        Value::Object(entries) => {
+            for item in entries.values() {
+                collect_value_references(item, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The variable a `context.NAME` / `context.variables.NAME` reference names.
+fn context_name(reference: &str) -> Option<&str> {
+    if reference.contains('|') || reference.contains(char::is_whitespace) {
+        return None;
+    }
+    let path = reference.strip_prefix("context.")?;
+    plain_name(path.strip_prefix("variables.").unwrap_or(path))
+}
+
 /// Accepts a bare variable name, rejecting empty names and nested paths — the
 /// scope has no notion of drilling into a value.
 fn plain_name(candidate: &str) -> Option<&str> {

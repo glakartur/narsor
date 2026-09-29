@@ -1259,3 +1259,116 @@ fn two_concurrent_resumes_of_the_same_execution_exactly_one_succeeds() {
     let shown = cli(&root, &["show", &id]);
     assert!(shown.stdout.contains("Status:        completed"));
 }
+
+// ---------------------------------------------------------------------------
+// Conductor plan U5: resolving a problem from the command line
+// ---------------------------------------------------------------------------
+
+#[path = "engine_support/mod.rs"]
+mod engine_support;
+
+/// Stops a fresh `agent_problem` execution on its problem — its agent answers
+/// without a label and cannot be asked again — before any daemon runs, and
+/// returns its id.
+fn stop_on_a_problem(root: &TempRoot) -> String {
+    let definition_path = engine_support::fixtures().join("engine/agent_problem.yaml");
+    let definition = load_from_file(&definition_path).expect("load the fixture");
+    let workspace_path = root.path().join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    fs::copy(
+        engine_support::fixtures().join("scripts/print_json.sh"),
+        workspace_path.join("print_json.sh"),
+    )
+    .expect("copy the fixture script");
+
+    let store = ExecutionStore::new(root.path());
+    let engine = Engine::new(store.clone()).with_executor(
+        narsor::engine::ActionKind::Agent,
+        std::sync::Arc::new(engine_support::LabellessAgentExecutor::answering(
+            "Done: 3 units, all tests pass.",
+        )),
+    );
+    let execution = engine
+        .start(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start execution");
+
+    let mut pinned = store.load_execution(&execution.id).expect("reload");
+    pinned.metadata = serde_json::json!({
+        "cli": { "definition_path": definition_path.display().to_string() }
+    });
+    store
+        .save_execution(&pinned)
+        .expect("pin the definition path");
+
+    let stopped = tokio::runtime::Runtime::new()
+        .expect("a runtime")
+        .block_on(engine.run(&definition, &execution.id))
+        .expect("run to the problem");
+    assert_eq!(stopped.status, narsor::domain::ExecutionStatus::InputNeeded);
+    execution.id
+}
+
+#[test]
+fn input_resolves_a_problem_with_a_label_data_and_variables() {
+    let root = TempRoot::new();
+    let id = stop_on_a_problem(&root);
+
+    // The label leading to the gate needs the question it shows.
+    let refused = cli(&root, &["input", &id, "--label", "needs_human_decision"]);
+    assert_eq!(refused.code, EXIT_FAILURE, "{refused:?}");
+    assert!(refused.output().contains("data.question"), "{refused:?}");
+
+    let resolved = cli(
+        &root,
+        &[
+            "input",
+            &id,
+            "--label",
+            "implemented",
+            "--data",
+            "units_completed=3",
+            "--variable",
+            "summary=login works",
+            "--comment",
+            "read the answer",
+        ],
+    );
+    assert_eq!(resolved.code, EXIT_SUCCESS, "{resolved:?}");
+
+    let shown = cli(&root, &["show", &id]);
+    assert!(
+        shown.stdout.contains("Status:        completed"),
+        "{shown:?}"
+    );
+    assert!(shown.stdout.contains("login works"), "{shown:?}");
+
+    let events = cli(&root, &["events", &id]);
+    assert!(
+        events
+            .stdout
+            .contains("Decision 'implemented' made by 'human'"),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn input_with_a_malformed_data_pair_is_a_usage_error() {
+    let root = TempRoot::new();
+    let invocation = cli(
+        &root,
+        &[
+            "input",
+            "any-id",
+            "--label",
+            "implemented",
+            "--data",
+            "no-equals-sign",
+        ],
+    );
+    assert_eq!(invocation.code, EXIT_USAGE, "{invocation:?}");
+    assert!(invocation.output().contains("--data"), "{invocation:?}");
+}

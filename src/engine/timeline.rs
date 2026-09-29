@@ -555,7 +555,9 @@ pub fn build_timeline(
                 );
             }
 
-            EventData::DecisionMade { .. } | EventData::ArtifactCreated { .. } => {
+            EventData::DecisionMade { .. }
+            | EventData::ArtifactCreated { .. }
+            | EventData::ProblemRaised { .. } => {
                 link_positional(current_visit_last_position, &drafts, &mut links, seq);
             }
 

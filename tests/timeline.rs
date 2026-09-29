@@ -488,7 +488,7 @@ fn workflow_and_human_events_have_no_link_and_script_steps_have_no_conversation(
         inputs: json!({}),
     });
     log.push(state_entered("gather"));
-    let human_input_seq = log.push(EventData::HumanInputReceived { input: json!({}) });
+    let human_input_seq = log.push(EventData::human_input_received(json!({})));
     log.push(state_entered("build"));
     log.push(action_started("a1", "build", "script"));
     log.push(action_completed("a1", "success"));
