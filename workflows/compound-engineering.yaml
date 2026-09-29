@@ -50,13 +50,13 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"requirements_doc": "<repo-relative path>"}}
-        Use exactly one of these labels:
-          - "requirements_drafted" — the requirements document is written.
-          - "needs_direction" — the request is too open to write requirements
-            for without a human choosing a direction first.
     outputs:
-      - requirements_drafted
-      - needs_direction
+      - label: requirements_drafted
+        description: the requirements document is written.
+      - label: needs_direction
+        description: >-
+          the request is too open to write requirements for without a human
+          choosing a direction first.
     transitions:
       requirements_drafted: doc_review
       needs_direction: clarify_direction
@@ -84,8 +84,10 @@ states:
           required: true
           description: The direction to explore, in your own words.
     outputs:
-      - retry_brainstorm
-      - abandon
+      - label: retry_brainstorm
+        description: brainstorm again, in the direction given in the note.
+      - label: abandon
+        description: stop the pipeline here.
     transitions:
       retry_brainstorm: brainstorm
       abandon: cancelled
@@ -104,13 +106,12 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"findings": <count>}}
-        Use exactly one of these labels:
-          - "reviewed" — the document was reviewed and the findings recorded.
         If the review cannot be produced because the document is missing, the
         harness fails, or a tool is unavailable, report an action failure;
         do not emit a workflow output for an execution error.
     outputs:
-      - reviewed
+      - label: reviewed
+        description: the document was reviewed and the findings recorded.
     transitions:
       reviewed: approve_scope
     timeout: 30m
@@ -144,9 +145,12 @@ states:
             What the plan must respect — constraints, non-goals, or simply
             "as written".
     outputs:
-      - approved
-      - revise
-      - abandon
+      - label: approved
+        description: the scope is right; plan against it.
+      - label: revise
+        description: send the requirements back for another brainstorm.
+      - label: abandon
+        description: stop the pipeline here.
     transitions:
       approved: plan
       revise: brainstorm
@@ -176,16 +180,16 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"plan_doc": "<repo-relative path>"}}
-        Use exactly one of these labels:
-          - "plan_ready" — the plan is written and an implementer could start.
-          - "needs_scope_revision" — the approved requirements cannot be
-            planned as written. Explain the contradiction or missing dependency
-            in `data.question` so a person can revise the scope.
+        If you take `needs_scope_revision`, explain the contradiction or
+        missing dependency in `data.question` so a person can revise the scope.
         A sandbox, harness, tool, or write-permission problem is an action
         failure, not `needs_scope_revision`.
     outputs:
-      - plan_ready
-      - needs_scope_revision
+      - label: plan_ready
+        description: the plan is written and an implementer could start.
+      - label: needs_scope_revision
+        description: >-
+          the approved requirements cannot be planned as written.
     transitions:
       plan_ready: approve_plan
       needs_scope_revision: approve_scope
@@ -218,9 +222,12 @@ states:
           required: false
           description: What the plan gets wrong, if anything.
     outputs:
-      - approved
-      - revise
-      - abandon
+      - label: approved
+        description: the plan is right; start writing code.
+      - label: revise
+        description: send the plan back to be replanned.
+      - label: abandon
+        description: stop before any code is written.
     transitions:
       approved: work
       revise: plan
@@ -244,17 +251,17 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"units_completed": <count>}}
-        Use exactly one of these labels:
-          - "implemented" — the plan is implemented and the checks pass.
-          - "needs_human_decision" — you hit a genuine ambiguity the plan does
-            not settle, or the plan cannot be implemented as written. Do not
-            guess: take this label and state the question or blocker in
-            `data.question`.
+        Do not guess: if you take `needs_human_decision`, state the question or
+        blocker in `data.question`.
         A sandbox, harness, tool, or write-permission problem is an action
         failure, not a workflow output.
     outputs:
-      - implemented
-      - needs_human_decision
+      - label: implemented
+        description: the plan is implemented and the checks pass.
+      - label: needs_human_decision
+        description: >-
+          you hit a genuine ambiguity the plan does not settle, or the plan
+          cannot be implemented as written.
     transitions:
       implemented: simplify
       needs_human_decision: resolve_ambiguity
@@ -268,9 +275,9 @@ states:
     action:
       type: human
       message: >
-        The agent stopped on an ambiguity rather than guessing. Read its
-        question in the execution's data, answer it, or send the work back to
-        planning if the plan is the thing that is wrong.
+        The agent stopped on an ambiguity rather than guessing. Answer its
+        question, or send the work back to planning if the plan is the thing
+        that is wrong.
       inputs:
         - name: ambiguity_decision
           type: select
@@ -284,9 +291,12 @@ states:
           required: true
           description: The answer to the agent's question, or why you are replanning.
     outputs:
-      - answered
-      - replan
-      - abandon
+      - label: answered
+        description: the agent's question is answered; carry on with the work.
+      - label: replan
+        description: the plan is what is wrong; send the work back to planning.
+      - label: abandon
+        description: stop the pipeline here.
     transitions:
       answered: apply_clarification
       replan: plan
@@ -309,15 +319,15 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"units_completed": <count>}}
-        Use exactly one of these labels:
-          - "implemented" — the work is finished and the checks pass.
-          - "still_ambiguous" — the answer does not settle it; state what is
-            still open, or why the work remains impossible, in `data.question`.
+        If you take `still_ambiguous`, state what is still open, or why the
+        work remains impossible, in `data.question`.
         A sandbox, harness, tool, or write-permission problem is an action
         failure, not a workflow output.
     outputs:
-      - implemented
-      - still_ambiguous
+      - label: implemented
+        description: the work is finished and the checks pass.
+      - label: still_ambiguous
+        description: the answer does not settle the question.
     transitions:
       implemented: simplify
       still_ambiguous: resolve_ambiguity
@@ -336,14 +346,13 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"files_touched": <count>}}
-        Use exactly one of these labels:
-          - "simplified" — simplifications were applied and the checks pass.
-          - "unchanged" — the code is already as simple as it should be.
         If checks cannot pass after restoring the prior implementation, report
         an action failure; do not emit a workflow output for that error.
     outputs:
-      - simplified
-      - unchanged
+      - label: simplified
+        description: simplifications were applied and the checks pass.
+      - label: unchanged
+        description: the code is already as simple as it should be.
     transitions:
       simplified: code_review
       unchanged: code_review
@@ -372,15 +381,14 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"findings": <count>, "blockers": <count>}}
-        Use exactly one of these labels:
-          - "clean" — no actionable findings survived the confidence gate.
-          - "findings" — there are findings for a person to triage.
         If the review cannot be produced because no diff exists, the harness
         fails, or a tool is unavailable, report an action failure; do not emit
         a workflow output for an execution error.
     outputs:
-      - clean
-      - findings
+      - label: clean
+        description: no actionable findings survived the confidence gate.
+      - label: findings
+        description: there are findings for a person to triage.
     transitions:
       clean: approve_push
       findings: triage_findings
@@ -413,9 +421,12 @@ states:
           required: false
           description: Which findings to fix, and which you are accepting and why.
     outputs:
-      - fix
-      - accept
-      - abandon
+      - label: fix
+        description: have the agent fix the findings named in the note.
+      - label: accept
+        description: accept the findings and move on to publishing.
+      - label: abandon
+        description: stop the pipeline here.
     transitions:
       fix: fix_findings
       accept: approve_push
@@ -433,13 +444,13 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"fixed": <count>}}
-        Use exactly one of these labels:
-          - "fixed" — the findings are addressed and the checks pass.
-          - "blocked" — a finding cannot be fixed without a decision that is
-            not yours to make.
     outputs:
-      - fixed
-      - blocked
+      - label: fixed
+        description: the findings are addressed and the checks pass.
+      - label: blocked
+        description: >-
+          a finding cannot be fixed without a decision that is not yours to
+          make.
     transitions:
       fixed: code_review
       blocked: triage_findings
@@ -469,9 +480,12 @@ states:
           required: false
           description: Anything the PR description must say.
     outputs:
-      - approve
-      - revise
-      - abandon
+      - label: approve
+        description: push the branch and open a pull request under your name.
+      - label: revise
+        description: send the work back for more fixes before it is published.
+      - label: abandon
+        description: stop before anything leaves this machine.
     transitions:
       approve: commit_push_pr
       revise: fix_findings
@@ -491,12 +505,11 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"pr_url": "<url>"}, "variables": {"pr_url": "<url>"}}
-        Use exactly one of these labels:
-          - "pr_opened" — the branch is pushed and the pull request is open.
         If the commit, push, or pull-request creation fails, report an action
         failure; do not emit a workflow output for that execution error.
     outputs:
-      - pr_opened
+      - label: pr_opened
+        description: the branch is pushed and the pull request is open.
     transitions:
       pr_opened: pr_feedback_gate
     timeout: 30m
@@ -524,9 +537,12 @@ states:
           required: false
           description: What the reviewers asked for, if anything.
     outputs:
-      - feedback_received
-      - approved
-      - abandon
+      - label: feedback_received
+        description: reviewers asked for changes; resolve their threads.
+      - label: approved
+        description: the pull request is approved; write down what was learned.
+      - label: abandon
+        description: stop the pipeline here.
     transitions:
       feedback_received: resolve_pr_feedback
       approved: compound
@@ -546,13 +562,13 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"threads_resolved": <count>}}
-        Use exactly one of these labels:
-          - "resolved" — every thread is answered and the fixes are pushed;
-            the pull request goes back for re-review.
-          - "blocked" — a thread asks for a decision you cannot make.
     outputs:
-      - resolved
-      - blocked
+      - label: resolved
+        description: >-
+          every thread is answered and the fixes are pushed; the pull request
+          goes back for re-review.
+      - label: blocked
+        description: a thread asks for a decision you cannot make.
     transitions:
       resolved: pr_feedback_gate
       blocked: pr_feedback_gate
@@ -574,13 +590,11 @@ states:
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"doc": "<repo-relative path or null>"}}
-        Use exactly one of these labels:
-          - "documented" — a learning document was written.
-          - "nothing_to_document" — this run taught nothing that is not
-            already written down.
     outputs:
-      - documented
-      - nothing_to_document
+      - label: documented
+        description: a learning document was written.
+      - label: nothing_to_document
+        description: this run taught nothing that is not already written down.
     transitions:
       documented: finished
       nothing_to_document: finished

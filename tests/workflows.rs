@@ -4,8 +4,9 @@
 //! engineering chain and the Open Mercato SDLC — and they are user-facing
 //! artifacts, so they are held to the same bar as code: they validate with no
 //! violations, their human gates really can hand a label back to the engine,
-//! their agent prompts really name the labels their states declare, and each
-//! one runs end to end.
+//! their agent prompts carry no hand-written label list while the engine's
+//! contract names every declared label with its description, and each one runs
+//! end to end.
 //!
 //! **No real harness and no real `git`/`gh` is ever run here.** The agent
 //! states are driven by `tests/fixtures/harness/fake_harness.sh` through
@@ -24,6 +25,7 @@ use narsor::domain::{
 use narsor::engine::{
     ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry, HumanInputDelivery,
 };
+use narsor::engine::actions::agent::output_contract;
 use narsor::workflow::{load_from_file, validate_path};
 use serde_json::{json, Map, Value};
 
@@ -170,6 +172,15 @@ fn human_states(definition: &WorkflowDefinition) -> Vec<(&String, &State)> {
         .collect()
 }
 
+/// The prompt an agent state actually sends: its own prompt with the output
+/// contract the engine appends.
+fn built_prompt(state: &State) -> String {
+    let Some(ActionConfig::Agent(config)) = &state.action else {
+        panic!("built_prompt is only defined for agent states");
+    };
+    format!("{}{}", config.prompt, output_contract(&state.outputs))
+}
+
 /// The declared output labels of a state.
 fn labels(state: &State) -> Vec<String> {
     state
@@ -274,26 +285,58 @@ fn every_human_gate_offers_a_select_over_exactly_its_outputs() {
     }
 }
 
-/// The executor refuses to guess a label, so every agent prompt has to name the
-/// exact labels its state declares. This keeps a prompt and its `outputs` from
-/// drifting apart in a later edit.
+/// The executor refuses to guess a label, so the agent has to be told every
+/// label its state declares. The engine does that: it appends the output
+/// contract built from `outputs`. What the agent actually receives — the
+/// state's prompt plus that contract — must therefore name every declared
+/// label together with its description.
 #[test]
-fn every_agent_prompt_names_every_label_its_state_declares() {
+fn every_built_agent_prompt_names_every_label_with_its_description() {
     for (name, file) in SHIPPED {
         let definition = shipped(file);
         for (id, state) in agent_states(&definition) {
-            let Some(ActionConfig::Agent(config)) = &state.action else {
-                unreachable!("filtered to agent states");
-            };
-            assert!(
-                config.prompt.contains("output"),
-                "'{name}' state '{id}': the prompt must state the JSON output contract"
+            let prompt = built_prompt(state);
+            for output in &state.outputs {
+                let description = output.description.as_deref().unwrap_or_else(|| {
+                    panic!("'{name}' state '{id}': label '{}' has no description", output.label)
+                });
+                let line = format!("- `{}` — {}", output.label, description.trim());
+                assert!(
+                    prompt.contains(&line),
+                    "'{name}' state '{id}': the built prompt never lists '{line}'"
+                );
+            }
+        }
+    }
+}
+
+/// The label list lives in `outputs` and nowhere else. A prompt that repeats
+/// it by hand drifts from `outputs` in the first edit that touches only one of
+/// the two, so no built prompt may carry a second list next to the engine's.
+#[test]
+fn no_agent_prompt_carries_a_manual_label_list() {
+    for (name, file) in SHIPPED {
+        let definition = shipped(file);
+        for (id, state) in agent_states(&definition) {
+            let prompt = built_prompt(state);
+            assert_eq!(
+                prompt.to_lowercase().matches("exactly one of these labels").count(),
+                1,
+                "'{name}' state '{id}': only the engine's contract may introduce \
+                 the label list"
             );
             for label in labels(state) {
+                let quoted = format!("- \"{label}\"");
                 assert!(
-                    config.prompt.contains(&label),
-                    "'{name}' state '{id}': the prompt never names the declared \
-                     label '{label}', so the agent cannot be expected to return it"
+                    !prompt.contains(&quoted),
+                    "'{name}' state '{id}': label '{label}' is listed by hand as '{quoted}'"
+                );
+                let contract_bullet = format!("- `{label}`");
+                assert_eq!(
+                    prompt.matches(&contract_bullet).count(),
+                    1,
+                    "'{name}' state '{id}': label '{label}' must be listed once, by the \
+                     engine's contract"
                 );
             }
         }

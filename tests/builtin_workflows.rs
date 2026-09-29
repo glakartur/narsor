@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use narsor::domain::ActionConfig;
+use narsor::engine::actions::agent::output_contract;
 use narsor::workflows::{
     builtin, builtin_names, WorkflowOrigin, WorkflowResolver, BUILTIN_WORKFLOWS,
 };
@@ -264,6 +265,62 @@ fn builtin_agent_actions_inherit_the_operator_default_harness() {
             );
         }
     }
+}
+
+/// Every label of every state — agent, human and script alike — says what it
+/// means: the description is what the agent's contract, the input form and
+/// the transition menu show next to the label.
+#[test]
+fn every_builtin_label_has_a_description() {
+    for entry in BUILTIN_WORKFLOWS {
+        let definition = narsor::workflow::load_from_str(entry.source)
+            .unwrap_or_else(|error| panic!("the embedded '{}' loads: {error}", entry.name));
+        for (state_id, state) in &definition.states {
+            for output in &state.outputs {
+                let described = output
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| !description.trim().is_empty());
+                assert!(
+                    described,
+                    "built-in '{}' state '{state_id}': label '{}' has no description",
+                    entry.name, output.label
+                );
+            }
+        }
+    }
+}
+
+/// AE15: the `work` step no longer lists its labels by hand; the contract the
+/// engine appends names `needs_human_decision` together with its description.
+#[test]
+fn the_work_prompt_leaves_the_label_list_to_the_engine_contract() {
+    let entry = builtin("compound-engineering").expect("compound-engineering is built in");
+    let definition = narsor::workflow::load_from_str(entry.source).expect("it loads");
+    let work = &definition.states["work"];
+    let Some(ActionConfig::Agent(action)) = &work.action else {
+        panic!("'work' is an agent state");
+    };
+
+    assert!(
+        !action.prompt.contains("Use exactly one of these labels"),
+        "the prompt of 'work' still carries a hand-written label list"
+    );
+
+    let needs_human_decision = work
+        .outputs
+        .iter()
+        .find(|output| output.label == "needs_human_decision")
+        .expect("'work' declares needs_human_decision");
+    let description = needs_human_decision
+        .description
+        .as_deref()
+        .expect("needs_human_decision is described");
+    let contract = output_contract(&work.outputs);
+    assert!(
+        contract.contains(&format!("- `needs_human_decision` — {description}")),
+        "the engine's contract lists needs_human_decision with its description: {contract}"
+    );
 }
 
 /// The embedded text is the file in `workflows/`, byte for byte.
