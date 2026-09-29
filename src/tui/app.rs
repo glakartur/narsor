@@ -3759,7 +3759,7 @@ pub fn event_line(event: &Event) -> String {
             output_label,
             ..
         } => format!("decision_made  {provider} → {output_label}"),
-        EventData::HumanInputRequested { instruction } => {
+        EventData::HumanInputRequested { instruction, .. } => {
             format!("human_input_requested  {instruction}")
         }
         EventData::HumanInputReceived { .. } => "human_input_received".to_string(),

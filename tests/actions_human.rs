@@ -721,6 +721,37 @@ async fn a_pending_record_with_bare_output_labels_still_loads() {
     assert_eq!(resumed.result.output_label, "fix_it");
 }
 
+/// A `pending_input.json` written before requests carried the preceding
+/// agent's question still loads, with neither the question nor the tail.
+#[tokio::test]
+async fn a_pending_record_without_an_agent_question_still_loads() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = start_execution(&store, root.path());
+    enter_human_state(
+        &store,
+        &mut execution,
+        "human_review_tests",
+        &no_fields_action(),
+        &["ignore", "fix_it"],
+    )
+    .await;
+
+    let path = store.pending_input_file(&execution.id);
+    let mut record: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read the record")).expect("json");
+    let object = record.as_object_mut().expect("an object");
+    object.remove("question");
+    object.remove("answer_tail");
+    fs::write(&path, record.to_string()).expect("write the old shape");
+
+    let pending = human::pending_input(&store, &execution.id)
+        .expect("the old shape still reads")
+        .expect("the request is pending");
+    assert_eq!(pending.request.question, None);
+    assert_eq!(pending.request.answer_tail, None);
+}
+
 #[tokio::test]
 async fn a_pending_request_of_a_non_paused_execution_is_not_offered() {
     let root = TempRoot::new();

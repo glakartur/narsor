@@ -72,6 +72,7 @@ use crate::domain::{
     WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
 };
 use crate::engine::actions::agent::BUILT_IN_HARNESS;
+use crate::engine::actions::harness;
 use crate::engine::actions::human::{
     self, HumanActionError, HumanInputDelivery, HumanInputRequest, InputContinuation,
     PendingHumanInput,
@@ -96,6 +97,12 @@ pub const METADATA_ENGINE_KEY: &str = "engine";
 
 /// Key of the persisted mid-step state inside the engine's scratch area.
 pub const METADATA_PENDING_STEP_KEY: &str = "pending_step";
+
+/// Key of the record of the agent step behind the latest transition (KTD8).
+pub const METADATA_LAST_AGENT_STEP_KEY: &str = "last_agent_step";
+
+/// How much of an agent's answer travels with the input request after it.
+const ANSWER_TAIL_BYTES: usize = 2 * 1024;
 
 /// A one-shot operator note to attach to the next recovered agent attempt.
 const METADATA_OPERATOR_RECOVERY_NOTE_KEY: &str = "operator_recovery_note";
@@ -204,6 +211,53 @@ pub struct PendingStep {
     /// Artifacts the action reported, already recorded as events.
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
+}
+
+/// What the agent step behind the latest transition said (KTD8).
+///
+/// Persisted in `metadata.engine.last_agent_step` when a transition leaves an
+/// agent state, and dropped when one leaves any other state, so that a human
+/// gate entered right after an agent can show the agent's question. The
+/// action's own result is gone by then: `pending_step` is cleared the moment
+/// the transition is taken.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastAgentStep {
+    /// The agent state the transition left.
+    pub state_id: StateId,
+
+    /// The state the transition entered — the only one the record speaks to.
+    pub to_state: StateId,
+
+    /// The attempt that produced the answer.
+    pub action_execution_id: String,
+
+    /// The agent's `data.question`, when it stated one.
+    #[serde(default)]
+    pub question: Option<String>,
+
+    /// The end of the agent's answer.
+    #[serde(default)]
+    pub answer_tail: Option<String>,
+}
+
+impl LastAgentStep {
+    /// The record of `result`, produced in `state_id` by `action_execution_id`
+    /// and followed by a transition into `to_state`.
+    fn from_result(
+        state_id: StateId,
+        to_state: StateId,
+        action_execution_id: String,
+        result: &ActionResult,
+    ) -> Self {
+        let (question, answer_tail) = agent_answer(result);
+        Self {
+            state_id,
+            to_state,
+            action_execution_id,
+            question,
+            answer_tail,
+        }
+    }
 }
 
 /// Everything that stops the engine from running a step at all.
@@ -1157,7 +1211,11 @@ impl Engine {
                 .await;
 
             let failure = match attempted {
-                Ok(AttemptOutcome::AwaitingHumanInput(request)) => {
+                Ok(AttemptOutcome::AwaitingHumanInput(mut request)) => {
+                    if let Some(record) = preceding_agent_step(execution, state) {
+                        request.question = record.question;
+                        request.answer_tail = record.answer_tail;
+                    }
                     self.suspend_for_input(
                         execution,
                         state,
@@ -1374,10 +1432,19 @@ impl Engine {
         let outcome = match request {
             DecisionRequest::Resolved(outcome) => outcome,
             DecisionRequest::AwaitHuman { message } => {
+                // The question comes straight from the agent that just
+                // answered: its result is still at hand.
+                let (question, answer_tail) = if is_agent(state) {
+                    agent_answer(&pending.result)
+                } else {
+                    (None, None)
+                };
                 let request = HumanInputRequest {
                     action_execution_id: pending.action_execution_id.clone(),
                     instruction: message,
                     fields: Vec::new(),
+                    question,
+                    answer_tail,
                 };
                 self.suspend_for_input(
                     execution,
@@ -1436,6 +1503,18 @@ impl Engine {
                 },
             );
         }
+        // Before `pending_step` goes: it holds the answer the record is made
+        // of. Written from the same `save_execution` as the context, so the
+        // record and the transition cannot disagree after a crash.
+        let record = is_agent(state).then(|| {
+            LastAgentStep::from_result(
+                state.id.clone(),
+                target.clone(),
+                pending.action_execution_id.clone(),
+                &pending.result,
+            )
+        });
+        set_last_agent_step(execution, record.as_ref())?;
         self.clear_pending_step(execution);
         self.store.save_execution(execution)?;
 
@@ -1733,22 +1812,7 @@ impl Engine {
         execution: &WorkflowExecution,
         state_id: &str,
     ) -> Result<Option<PendingStep>, EngineError> {
-        let Some(value) = execution
-            .metadata
-            .get(METADATA_ENGINE_KEY)
-            .and_then(|engine| engine.get(METADATA_PENDING_STEP_KEY))
-        else {
-            return Ok(None);
-        };
-
-        let pending: PendingStep = serde_json::from_value(value.clone()).map_err(|error| {
-            EngineError::CorruptEngineMetadata {
-                execution_id: execution.id.clone(),
-                message: error.to_string(),
-            }
-        })?;
-
-        Ok((pending.state_id == state_id).then_some(pending))
+        stored_pending_step(execution, state_id)
     }
 
     /// Persists the mid-step state inside the execution record.
@@ -2056,6 +2120,147 @@ fn status_name(status: &ExecutionStatus) -> &'static str {
         ExecutionStatus::Cancelled => "cancelled",
         ExecutionStatus::Unknown => "unknown",
     }
+}
+
+/// The mid-step state of `execution`, when it belongs to `state_id`.
+fn stored_pending_step(
+    execution: &WorkflowExecution,
+    state_id: &str,
+) -> Result<Option<PendingStep>, EngineError> {
+    let Some(value) = execution
+        .metadata
+        .get(METADATA_ENGINE_KEY)
+        .and_then(|engine| engine.get(METADATA_PENDING_STEP_KEY))
+    else {
+        return Ok(None);
+    };
+
+    let pending: PendingStep = serde_json::from_value(value.clone()).map_err(|error| {
+        EngineError::CorruptEngineMetadata {
+            execution_id: execution.id.clone(),
+            message: error.to_string(),
+        }
+    })?;
+
+    Ok((pending.state_id == state_id).then_some(pending))
+}
+
+/// Whether `state` runs an agent.
+fn is_agent(state: &State) -> bool {
+    matches!(state.action, Some(ActionConfig::Agent(_)))
+}
+
+/// The `data.question` an agent stated and the end of its answer.
+///
+/// The answer is `stdout`, which keeps the head of an answer longer than the
+/// capture limit; its tail is then the end of what was kept.
+fn agent_answer(result: &ActionResult) -> (Option<String>, Option<String>) {
+    let question = result
+        .data
+        .get("question")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|question| !question.is_empty())
+        .map(ToString::to_string);
+    let answer_tail =
+        Some(harness::tail(&result.stdout, ANSWER_TAIL_BYTES)).filter(|tail| !tail.is_empty());
+    (question, answer_tail)
+}
+
+/// Replaces the record of the agent step behind the latest transition, or
+/// drops it when that transition did not leave an agent.
+fn set_last_agent_step(
+    execution: &mut WorkflowExecution,
+    record: Option<&LastAgentStep>,
+) -> Result<(), EngineError> {
+    match record {
+        Some(record) => {
+            let value = serde_json::to_value(record).map_err(|error| {
+                EngineError::CorruptEngineMetadata {
+                    execution_id: execution.id.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            engine_metadata_mut(execution).insert(METADATA_LAST_AGENT_STEP_KEY.to_string(), value);
+        }
+        None => {
+            if let Some(engine) = execution
+                .metadata
+                .get_mut(METADATA_ENGINE_KEY)
+                .and_then(Value::as_object_mut)
+            {
+                engine.remove(METADATA_LAST_AGENT_STEP_KEY);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The agent step whose transition led straight into `state`, if there is one.
+///
+/// Every transition rewrites or drops the record, so one naming `state` as
+/// its destination describes the transition that entered it — never a
+/// question from an earlier pass through a loop. An unreadable record is
+/// only lost context, not a reason to refuse the suspension.
+fn preceding_agent_step(execution: &WorkflowExecution, state: &State) -> Option<LastAgentStep> {
+    let value = execution
+        .metadata
+        .get(METADATA_ENGINE_KEY)?
+        .get(METADATA_LAST_AGENT_STEP_KEY)?;
+    let record: LastAgentStep = match serde_json::from_value(value.clone()) {
+        Ok(record) => record,
+        Err(error) => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                %error,
+                "the record of the last agent step is unreadable; the input request goes without it"
+            );
+            return None;
+        }
+    };
+    (record.to_state == state.id).then_some(record)
+}
+
+/// Records the step behind a manual transition from `from` into `to`, as
+/// [`Engine`] does for every transition it takes itself (KTD8).
+///
+/// A manual transition takes no decision, so the agent's answer is wherever
+/// the state left it: in `pending_step` when the agent finished and waited
+/// for a decision, or in `pending_input` when it asked a question of its own
+/// (then there is a question but no answer to quote). Leaving any other
+/// state drops the record.
+pub fn record_manual_transition(
+    execution: &mut WorkflowExecution,
+    from: &State,
+    to: &str,
+    pending_input: Option<&PendingHumanInput>,
+) -> Result<(), EngineError> {
+    let record = if is_agent(from) {
+        if let Some(pending) = stored_pending_step(execution, &from.id)? {
+            Some(LastAgentStep::from_result(
+                from.id.clone(),
+                to.to_string(),
+                pending.action_execution_id,
+                &pending.result,
+            ))
+        } else {
+            pending_input
+                .filter(|input| {
+                    input.state_id == from.id
+                        && input.continuation == InputContinuation::ResumeAgent
+                })
+                .map(|input| LastAgentStep {
+                    state_id: from.id.clone(),
+                    to_state: to.to_string(),
+                    action_execution_id: input.action_execution_id().to_string(),
+                    question: Some(input.instruction().to_string()),
+                    answer_tail: None,
+                })
+        }
+    } else {
+        None
+    };
+    set_last_agent_step(execution, record.as_ref())
 }
 
 /// Returns the engine-owned metadata object, normalizing records written

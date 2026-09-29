@@ -222,6 +222,36 @@ fn an_old_format_agent_session_event_deserializes_with_the_new_fields_absent() {
     }
 }
 
+/// Same guarantee for `HumanInputRequested`, which carries the preceding
+/// agent's question and answer tail since the conductor plan's U3.
+#[test]
+fn an_old_format_human_input_requested_event_deserializes_with_no_question() {
+    let old_format = serde_json::json!({
+        "id": "event-3",
+        "workflow_execution_id": "exec-old-format",
+        "timestamp": Utc::now().to_rfc3339(),
+        "sequence": 3,
+        "data": {
+            "type": "human_input_requested",
+            "instruction": "Approve?"
+        }
+    });
+
+    let event: Event = serde_json::from_value(old_format).expect("deserialize the old event");
+    match event.data {
+        EventData::HumanInputRequested {
+            instruction,
+            question,
+            answer_tail,
+        } => {
+            assert_eq!(instruction, "Approve?");
+            assert_eq!(question, None);
+            assert_eq!(answer_tail, None);
+        }
+        other => panic!("unexpected event data: {other:?}"),
+    }
+}
+
 /// Same guarantee for `ActionRetrying`, whose `state_id` is new in U1.
 #[test]
 fn an_old_format_action_retrying_event_deserializes_with_no_state_id() {

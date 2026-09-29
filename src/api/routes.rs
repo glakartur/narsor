@@ -69,8 +69,8 @@ use crate::api::dto::{
 };
 use crate::domain::{Event, EventData, ExecutionStatus};
 use crate::engine::{
-    build_timeline, terminal_status, Engine, EngineError, HumanActionError, HumanInputDelivery,
-    Timeline,
+    build_timeline, record_manual_transition, terminal_status, Engine, EngineError,
+    HumanActionError, HumanInputDelivery, PendingHumanInput, Timeline,
 };
 use crate::persistence::{
     ConversationSource, DefaultHarnessSelector, ExecutionStore, HarnessSelectionError,
@@ -867,6 +867,17 @@ async fn post_transition(
         .get(&target)
         .cloned()
         .ok_or_else(|| ApiError::Internal(format!("the workflow has no state '{target}'")))?;
+
+    // What the agent in the state being left said, for a gate the target may
+    // be (KTD8). Read before anything is written: the pending request is
+    // about to be cleared, and it only counts while input is actually needed.
+    let pending_input: Option<PendingHumanInput> =
+        if execution.status == ExecutionStatus::InputNeeded {
+            state.store.load_pending_input(&execution_id)?
+        } else {
+            None
+        };
+    record_manual_transition(&mut execution, from_state, &target, pending_input.as_ref())?;
 
     let log = state.store.event_log(&execution_id);
     let writes: Vec<EventData> = vec![

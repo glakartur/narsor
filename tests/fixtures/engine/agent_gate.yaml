@@ -1,0 +1,66 @@
+name: agent-gate
+version: 1
+description: >
+  An agent that may stop on an open question, a human gate that shows it, and
+  a clarification agent the gate loops through. A script in front of a second
+  gate shows that only an agent's question travels to the gate after it.
+
+states:
+  work:
+    action:
+      type: agent
+      prompt: Do the work.
+    outputs:
+      - needs_human_decision
+      - done
+    transitions:
+      needs_human_decision: resolve_ambiguity
+      done: check
+
+  resolve_ambiguity:
+    action:
+      type: human
+      message: The agent needs a decision.
+    outputs:
+      - clarified
+      - accept
+    transitions:
+      clarified: apply_clarification
+      accept: check
+
+  apply_clarification:
+    action:
+      type: agent
+      prompt: Apply the clarification.
+    outputs:
+      - needs_human_decision
+      - done
+    transitions:
+      needs_human_decision: resolve_ambiguity
+      done: check
+
+  check:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "ok"}'
+    outputs:
+      - ok
+    transitions:
+      ok: review
+
+  review:
+    action:
+      type: human
+      message: Ship it?
+    outputs:
+      - ship
+    transitions:
+      ship: finished
+
+  finished:
+    description: Shipped.
+
+terminal_states:
+  finished: completed

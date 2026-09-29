@@ -2055,3 +2055,165 @@ async fn client_stream_all_does_not_end_when_only_one_of_several_executions_fini
         "must have observed the fast execution's terminal event too"
     );
 }
+
+// ---------------------------------------------------------------------------
+// U3: a manual transition carries the agent's question to the gate after it
+// ---------------------------------------------------------------------------
+
+use narsor::domain::{ActionError, ActionResult};
+use narsor::engine::{
+    ActionExecutor, ActionKind, ActionOutcome, ActionRequest, HumanInputRequest, SuspendedAction,
+};
+
+/// An agent that either finishes with a question in its `data` or stops to
+/// ask one of its own (`awaiting_input`).
+enum AgentReply {
+    Finish,
+    Ask,
+}
+
+impl ActionExecutor for AgentReply {
+    fn execute<'a>(
+        &'a self,
+        request: ActionRequest<'a>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>,
+    > {
+        let action_execution_id = request.action_execution_id.to_string();
+        Box::pin(async move {
+            Ok(match self {
+                Self::Finish => ActionOutcome::Completed(ActionResult {
+                    output_label: "done".to_string(),
+                    data: serde_json::json!({ "question": "Account or user limit?" }),
+                    variables: serde_json::Map::new(),
+                    exit_code: Some(0),
+                    stdout: "the agent's answer".to_string(),
+                    stderr: String::new(),
+                }),
+                Self::Ask => ActionOutcome::Suspended(SuspendedAction::AwaitingAgentInput(
+                    HumanInputRequest {
+                        action_execution_id,
+                        instruction: "Which API version?".to_string(),
+                        fields: Vec::new(),
+                        question: None,
+                        answer_tail: None,
+                    },
+                )),
+            })
+        })
+    }
+}
+
+/// Runs an agent state up to where a person has to act, moves it by hand to
+/// the `resolve` gate and runs the gate; returns the gate's pending request.
+async fn manual_transition_to_gate(reply: AgentReply) -> HumanInputRequest {
+    let root = TempRoot::new();
+    let store = root.store();
+    let engine =
+        Arc::new(Engine::new(store.clone()).with_executor(ActionKind::Agent, Arc::new(reply)));
+
+    let yaml = r#"
+name: api-agent-gate-fixture
+version: 1
+states:
+  work:
+    action:
+      type: agent
+      prompt: Do the work.
+    outputs:
+      - done
+      - needs_human_decision
+    transitions:
+      done: finished
+      needs_human_decision: resolve
+    decision:
+      type: human
+      message: Accept the work?
+  resolve:
+    action:
+      type: human
+      message: Decide.
+    outputs:
+      - go
+    transitions:
+      go: finished
+  finished:
+    description: Done.
+terminal_states:
+  finished: completed
+"#;
+    let definition_path = root.join("api-agent-gate-fixture.yaml");
+    fs::write(&definition_path, yaml).expect("write definition");
+    let definition = load_from_file(&definition_path).expect("load definition");
+
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace dir");
+    let execution = engine
+        .start_and_run(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .await
+        .expect("run up to the person");
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    assert_eq!(execution.current_state.as_deref(), Some("work"));
+    // As `pin_definition_path` does, but keeping the engine's own metadata:
+    // the finished agent's answer waits there for the transition.
+    let mut execution = store.load_execution(&execution.id).expect("reload");
+    execution.metadata["cli"] =
+        serde_json::json!({ "definition_path": definition_path.display().to_string() });
+    store
+        .save_execution(&execution)
+        .expect("pin definition path");
+
+    let handle = start_server_with_engine(
+        Arc::clone(&engine),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let response = raw_client()
+        .post(url(
+            &handle,
+            &format!("/executions/{}/transition", execution.id),
+        ))
+        .bearer_auth(handle.token())
+        .json(&TransitionRequestBody {
+            label: Some("needs_human_decision".to_string()),
+            target: None,
+            force: false,
+        })
+        .send()
+        .await
+        .expect("post transition");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let execution = engine
+        .resume(&definition, &execution.id)
+        .await
+        .expect("run the gate");
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    assert_eq!(execution.current_state.as_deref(), Some("resolve"));
+    engine
+        .pending_input(&execution.id)
+        .expect("read pending input")
+        .expect("the gate is pending")
+        .request
+}
+
+#[tokio::test]
+async fn post_transition_from_a_finished_agent_carries_its_question() {
+    let request = manual_transition_to_gate(AgentReply::Finish).await;
+
+    assert_eq!(request.question.as_deref(), Some("Account or user limit?"));
+    assert_eq!(request.answer_tail.as_deref(), Some("the agent's answer"));
+}
+
+#[tokio::test]
+async fn post_transition_from_an_asking_agent_carries_its_question() {
+    let request = manual_transition_to_gate(AgentReply::Ask).await;
+
+    assert_eq!(request.question.as_deref(), Some("Which API version?"));
+    assert_eq!(request.answer_tail, None);
+}

@@ -24,8 +24,8 @@ pub use decision::{
 };
 pub use retry::RetrySchedule;
 pub use runner::{
-    terminal_status, ActionKind, AgentDefaults, Engine, EngineError, PendingStep, RunHandle,
-    EVENT_CHANNEL_CAPACITY,
+    record_manual_transition, terminal_status, ActionKind, AgentDefaults, Engine, EngineError,
+    LastAgentStep, PendingStep, RunHandle, EVENT_CHANNEL_CAPACITY,
 };
 pub use timeline::{
     build_timeline, ConversationState, EventLink, Position, PositionStatus, Timeline,

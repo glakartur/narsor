@@ -83,6 +83,8 @@ impl ActionExecutor for HumanExecutor {
                     action_execution_id: request.action_execution_id.to_string(),
                     instruction: config.instruction.clone(),
                     fields: config.inputs.clone(),
+                    question: None,
+                    answer_tail: None,
                 }),
             ))
         })
@@ -130,6 +132,17 @@ pub struct HumanInputRequest {
     /// Form fields the user is asked to fill in. May be empty.
     #[serde(default)]
     pub fields: Vec<HumanInputField>,
+
+    /// The question the agent step right before this request stated in its
+    /// `data.question`, if it stated one. Set by the engine, never by an
+    /// executor; absent in records written before the engine carried it.
+    #[serde(default)]
+    pub question: Option<String>,
+
+    /// The end of that agent step's answer — the only context there is when
+    /// it stated no question.
+    #[serde(default)]
+    pub answer_tail: Option<String>,
 }
 
 /// The durable record of a question awaiting an answer — `pending_input.json`.
@@ -448,6 +461,8 @@ pub fn suspend(
         &execution.id,
         EventData::HumanInputRequested {
             instruction: pending.instruction().to_string(),
+            question: pending.request.question.clone(),
+            answer_tail: pending.request.answer_tail.clone(),
         },
     )?;
 

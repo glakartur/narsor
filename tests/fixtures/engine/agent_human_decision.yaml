@@ -1,0 +1,26 @@
+name: agent-human-decision
+version: 1
+description: >
+  An agent whose answer a person turns into the transition: the request for
+  that decision follows the agent directly.
+
+states:
+  work:
+    action:
+      type: agent
+      prompt: Do the work.
+    outputs:
+      - done
+      - rework
+    transitions:
+      done: finished
+      rework: work
+    decision:
+      type: human
+      message: Accept the agent's work?
+
+  finished:
+    description: Done.
+
+terminal_states:
+  finished: completed

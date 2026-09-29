@@ -261,6 +261,51 @@ impl ActionExecutor for StubAgentExecutor {
     }
 }
 
+/// An `agent` executor that answers from a fixed list of replies: each one a
+/// label together with the `data` and the answer text a real agent returns.
+pub struct AnsweringAgentExecutor {
+    replies: Mutex<VecDeque<(String, Value, String)>>,
+}
+
+impl AnsweringAgentExecutor {
+    /// An executor that returns these `(label, data, answer)` replies, in order.
+    pub fn new(replies: Vec<(&str, Value, &str)>) -> Self {
+        Self {
+            replies: Mutex::new(
+                replies
+                    .into_iter()
+                    .map(|(label, data, answer)| (label.to_string(), data, answer.to_string()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl ActionExecutor for AnsweringAgentExecutor {
+    fn execute<'a>(
+        &'a self,
+        _request: ActionRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
+        Box::pin(async move {
+            let (output_label, data, stdout) = self
+                .replies
+                .lock()
+                .expect("replies")
+                .pop_front()
+                .unwrap_or_else(|| ("unexpected".to_string(), json!({}), String::new()));
+
+            Ok(ActionOutcome::Completed(ActionResult {
+                output_label,
+                data,
+                variables: Map::new(),
+                exit_code: Some(0),
+                stdout,
+                stderr: String::new(),
+            }))
+        })
+    }
+}
+
 /// An agent that asks once, then completes after the engine reruns the same
 /// state with the person's answer included in its prompt.
 pub struct QuestioningAgentExecutor {
@@ -318,6 +363,8 @@ impl ActionExecutor for QuestioningAgentExecutor {
                             description: None,
                             options: Vec::new(),
                         }],
+                        question: None,
+                        answer_tail: None,
                     }),
                 ));
             }

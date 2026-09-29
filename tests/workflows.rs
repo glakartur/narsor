@@ -22,10 +22,10 @@ use narsor::domain::{
     ActionConfig, ExecutionStatus, HumanInputType, State, TerminalStatus, WorkflowDefinition,
     Workspace,
 };
+use narsor::engine::actions::agent::output_contract;
 use narsor::engine::{
     ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry, HumanInputDelivery,
 };
-use narsor::engine::actions::agent::output_contract;
 use narsor::workflow::{load_from_file, validate_path};
 use serde_json::{json, Map, Value};
 
@@ -298,7 +298,10 @@ fn every_built_agent_prompt_names_every_label_with_its_description() {
             let prompt = built_prompt(state);
             for output in &state.outputs {
                 let description = output.description.as_deref().unwrap_or_else(|| {
-                    panic!("'{name}' state '{id}': label '{}' has no description", output.label)
+                    panic!(
+                        "'{name}' state '{id}': label '{}' has no description",
+                        output.label
+                    )
                 });
                 let line = format!("- `{}` — {}", output.label, description.trim());
                 assert!(
@@ -320,7 +323,10 @@ fn no_agent_prompt_carries_a_manual_label_list() {
         for (id, state) in agent_states(&definition) {
             let prompt = built_prompt(state);
             assert_eq!(
-                prompt.to_lowercase().matches("exactly one of these labels").count(),
+                prompt
+                    .to_lowercase()
+                    .matches("exactly one of these labels")
+                    .count(),
                 1,
                 "'{name}' state '{id}': only the engine's contract may introduce \
                  the label list"

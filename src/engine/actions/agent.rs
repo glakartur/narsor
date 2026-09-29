@@ -591,6 +591,8 @@ impl AgentExecutor {
                     action_execution_id: request.action_execution_id.to_string(),
                     instruction: question,
                     fields: agent_input_fields(options),
+                    question: None,
+                    answer_tail: None,
                 }),
             )),
         }

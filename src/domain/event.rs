@@ -161,6 +161,14 @@ pub enum EventData {
     // Human interaction events
     HumanInputRequested {
         instruction: String,
+        /// The `data.question` of the agent step the request follows, if any.
+        /// `#[serde(default)]` so an event log written before this field
+        /// still reads.
+        #[serde(default)]
+        question: Option<String>,
+        /// The end of that agent step's answer.
+        #[serde(default)]
+        answer_tail: Option<String>,
     },
     HumanInputReceived {
         input: serde_json::Value,
@@ -282,7 +290,7 @@ impl Event {
                 format!("Decision '{output_label}' made by '{provider}'")
             }
 
-            EventData::HumanInputRequested { instruction } => {
+            EventData::HumanInputRequested { instruction, .. } => {
                 format!("Waiting for a human: {}", first_line(instruction))
             }
             EventData::HumanInputReceived { input } => {

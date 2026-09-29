@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engine_support::{
-    event_type, workflow, workflow_file, Harness, QuestioningAgentExecutor, StubAgentExecutor,
-    TimeoutRecorder,
+    event_type, workflow, workflow_file, AnsweringAgentExecutor, Harness, QuestioningAgentExecutor,
+    StubAgentExecutor, TimeoutRecorder,
 };
 use narsor::domain::{EventData, ExecutionStatus};
 use narsor::engine::{
@@ -1230,4 +1230,232 @@ async fn an_engine_without_checkpoints_writes_none() {
             .exists(),
         "checkpointing is opt-in in M1"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The agent's question in the input request that follows it (KTD8)
+// ---------------------------------------------------------------------------
+
+const LIMIT_QUESTION: &str = "Czy limit ma dotyczyć konta czy użytkownika?";
+
+/// An engine whose agent states answer with `replies`, in order.
+fn engine_answering(harness: &Harness, replies: Vec<(&str, Value, &str)>) -> Engine {
+    Engine::new(harness.store()).with_executor(
+        ActionKind::Agent,
+        Arc::new(AnsweringAgentExecutor::new(replies)),
+    )
+}
+
+/// The `question` and `answer_tail` of every `HumanInputRequested`, in order.
+fn requested_questions(
+    harness: &Harness,
+    execution_id: &str,
+) -> Vec<(Option<String>, Option<String>)> {
+    harness
+        .events(execution_id)
+        .into_iter()
+        .filter_map(|event| match event.data {
+            EventData::HumanInputRequested {
+                question,
+                answer_tail,
+                ..
+            } => Some((question, answer_tail)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_gate_after_an_agent_carries_the_agents_question() {
+    let harness = Harness::new();
+    let engine = engine_answering(
+        &harness,
+        vec![(
+            "needs_human_decision",
+            json!({ "question": LIMIT_QUESTION }),
+            "I looked at the limits.\n{\"output\": \"needs_human_decision\"}",
+        )],
+    );
+    let definition = workflow("agent_gate");
+
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run up to the gate");
+
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    assert_eq!(
+        execution.current_state.as_deref(),
+        Some("resolve_ambiguity")
+    );
+    let pending = engine
+        .pending_input(&execution.id)
+        .expect("read pending input")
+        .expect("the gate is pending");
+    assert_eq!(pending.request.question.as_deref(), Some(LIMIT_QUESTION));
+    assert_eq!(
+        pending.request.answer_tail.as_deref(),
+        Some("I looked at the limits.\n{\"output\": \"needs_human_decision\"}")
+    );
+    assert_eq!(
+        pending.instruction(),
+        "The agent needs a decision.",
+        "the gate's own message is left as the workflow wrote it"
+    );
+
+    assert_eq!(
+        requested_questions(&harness, &execution.id),
+        vec![(
+            Some(LIMIT_QUESTION.to_string()),
+            pending.request.answer_tail.clone()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn without_a_question_the_gate_carries_the_end_of_the_answer() {
+    let harness = Harness::new();
+    let answer = format!("{}THE END", "x".repeat(5000));
+    let engine = engine_answering(
+        &harness,
+        vec![("needs_human_decision", json!({}), answer.as_str())],
+    );
+    let definition = workflow("agent_gate");
+
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run up to the gate");
+
+    let pending = engine
+        .pending_input(&execution.id)
+        .expect("read pending input")
+        .expect("the gate is pending");
+    assert_eq!(pending.request.question, None);
+    let tail = pending.request.answer_tail.expect("the answer's end");
+    assert!(tail.ends_with("THE END"), "{tail}");
+    assert!(
+        tail.len() <= 2 * 1024 + '…'.len_utf8(),
+        "only the tail travels, got {} bytes",
+        tail.len()
+    );
+}
+
+#[tokio::test]
+async fn a_gate_reached_again_shows_the_newest_question() {
+    let harness = Harness::new();
+    let engine = engine_answering(
+        &harness,
+        vec![
+            (
+                "needs_human_decision",
+                json!({ "question": "first question" }),
+                "first answer",
+            ),
+            (
+                "needs_human_decision",
+                json!({ "question": "second question" }),
+                "second answer",
+            ),
+        ],
+    );
+    let definition = workflow("agent_gate");
+
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run up to the gate");
+    let execution = engine
+        .deliver_human_input(
+            &definition,
+            &execution.id,
+            &HumanInputDelivery::label("clarified"),
+        )
+        .await
+        .expect("loop through apply_clarification back to the gate");
+
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    assert_eq!(
+        execution.current_state.as_deref(),
+        Some("resolve_ambiguity")
+    );
+    let pending = engine
+        .pending_input(&execution.id)
+        .expect("read pending input")
+        .expect("the gate is pending again");
+    assert_eq!(pending.request.question.as_deref(), Some("second question"));
+    assert_eq!(
+        pending.request.answer_tail.as_deref(),
+        Some("second answer")
+    );
+    assert_eq!(
+        requested_questions(&harness, &execution.id),
+        vec![
+            (
+                Some("first question".to_string()),
+                Some("first answer".to_string())
+            ),
+            (
+                Some("second question".to_string()),
+                Some("second answer".to_string())
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_gate_after_a_script_carries_no_question() {
+    // The agent did state a question, but a script ran between it and the
+    // gate: the gate follows the script, not the agent.
+    let harness = Harness::new();
+    let engine = engine_answering(
+        &harness,
+        vec![(
+            "done",
+            json!({ "question": "stale question" }),
+            "stale answer",
+        )],
+    );
+    let definition = workflow("agent_gate");
+
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run up to the review gate");
+
+    assert_eq!(execution.current_state.as_deref(), Some("review"));
+    let pending = engine
+        .pending_input(&execution.id)
+        .expect("read pending input")
+        .expect("the review gate is pending");
+    assert_eq!(pending.request.question, None);
+    assert_eq!(pending.request.answer_tail, None);
+    assert_eq!(
+        requested_questions(&harness, &execution.id),
+        vec![(None, None)]
+    );
+}
+
+#[tokio::test]
+async fn a_human_decision_on_an_agent_carries_its_question() {
+    let harness = Harness::new();
+    let engine = engine_answering(
+        &harness,
+        vec![("done", json!({ "question": LIMIT_QUESTION }), "the answer")],
+    );
+    let definition = workflow("agent_human_decision");
+
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run up to the decision");
+
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    assert_eq!(execution.current_state.as_deref(), Some("work"));
+    let pending = engine
+        .pending_input(&execution.id)
+        .expect("read pending input")
+        .expect("the decision is pending");
+    assert_eq!(pending.request.question.as_deref(), Some(LIMIT_QUESTION));
+    assert_eq!(pending.request.answer_tail.as_deref(), Some("the answer"));
 }

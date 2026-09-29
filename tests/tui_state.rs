@@ -2398,6 +2398,8 @@ fn every_event_data_variant() -> Vec<EventData> {
         },
         EventData::HumanInputRequested {
             instruction: "approve?".to_string(),
+            question: None,
+            answer_tail: None,
         },
         EventData::HumanInputReceived {
             input: json!({"approval_status": "approved"}),
