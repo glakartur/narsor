@@ -14,6 +14,11 @@
 //! `ActionCompleted` or `ActionFailed` after it is the definition of an
 //! interrupted action, and nothing else marks one.
 //!
+//! An agent answer without a usable output label is a format error, not a
+//! failure (KTD7): its attempt ends with `ActionOutputRejected`, and one new
+//! attempt, announced by `OutputReprompted` rather than `ActionRetrying`,
+//! resumes the agent's session to ask for the label again.
+//!
 //! Two deliberate refinements of the diagram in the plan:
 //!
 //! * **Templates are expanded after `ActionStarted`, not before.** Expansion can
@@ -67,11 +72,13 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::domain::{
-    ActionConfig, ActionResult, Artifact, ArtifactReference, DecisionProviderType, Event,
-    EventData, ExecutionId, ExecutionStatus, OutputDefinition, State, StateId, WorkflowDefinition,
-    WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
+    ActionConfig, ActionError, ActionResult, Artifact, ArtifactReference, DecisionProviderType,
+    Event, EventData, ExecutionId, ExecutionStatus, OutputDefinition, RepromptedBy, State, StateId,
+    WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
 };
-use crate::engine::actions::agent::BUILT_IN_HARNESS;
+use crate::engine::actions::agent::{
+    self, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL, SESSION_DATA_KEY,
+};
 use crate::engine::actions::harness;
 use crate::engine::actions::human::{
     self, HumanActionError, HumanInputDelivery, HumanInputRequest, InputContinuation,
@@ -100,6 +107,10 @@ pub const METADATA_PENDING_STEP_KEY: &str = "pending_step";
 
 /// Key of the record of the agent step behind the latest transition (KTD8).
 pub const METADATA_LAST_AGENT_STEP_KEY: &str = "last_agent_step";
+
+/// Key of an agent output that was rejected and still awaits its reprompt
+/// (KTD7).
+pub const METADATA_OUTPUT_REJECTION_KEY: &str = "output_rejection";
 
 /// How much of an agent's answer travels with the input request after it.
 const ANSWER_TAIL_BYTES: usize = 2 * 1024;
@@ -260,6 +271,109 @@ impl LastAgentStep {
     }
 }
 
+/// An agent attempt whose output was rejected as a format error (KTD7).
+///
+/// Persisted in `metadata.engine.output_rejection` from just before
+/// `ActionOutputRejected` until the reprompt announces itself with
+/// `OutputReprompted`. A restart in between finds the attempt closed in the
+/// log — reconciliation leaves the execution `Running` — and the next pass
+/// picks the reprompt up from this record instead of running the state's
+/// action afresh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputRejection {
+    /// The state whose action ran.
+    pub state_id: StateId,
+
+    /// The attempt whose output was rejected.
+    pub action_execution_id: String,
+
+    /// Why it was rejected.
+    pub reason: String,
+
+    /// The end of the agent's answer.
+    #[serde(default)]
+    pub answer_tail: Option<String>,
+
+    /// The harness the attempt ran on — where its session can be resumed.
+    #[serde(default)]
+    pub harness: Option<String>,
+
+    /// The harness's own session id, when it reported one.
+    #[serde(default)]
+    pub harness_session_id: Option<String>,
+}
+
+impl OutputRejection {
+    /// The rejection of an answer no label could be extracted from, when
+    /// `error` is one — `None` for any other failure.
+    fn from_error(state: &State, action_execution_id: &str, error: &ActionError) -> Option<Self> {
+        if error.error_type.as_deref() != Some(MISSING_OUTPUT_LABEL) {
+            return None;
+        }
+        let detail = |key: &str| {
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get(key))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        };
+        Some(Self {
+            state_id: state.id.clone(),
+            action_execution_id: action_execution_id.to_string(),
+            reason: error.message.clone(),
+            answer_tail: detail("answer_tail").filter(|tail| !tail.is_empty()),
+            harness: detail("harness"),
+            harness_session_id: detail("harness_session_id"),
+        })
+    }
+
+    /// The rejection of a result whose label the state does not declare,
+    /// when it is one — `None` for a declared label.
+    fn from_result(
+        state: &State,
+        action_execution_id: &str,
+        result: &ActionResult,
+    ) -> Option<Self> {
+        let error = match decision::check_label(state, &result.output_label) {
+            Err(error @ DecisionError::LabelNotDeclared { .. }) => error,
+            _ => return None,
+        };
+        let session = result.data.get(SESSION_DATA_KEY);
+        let session_field = |pointer: &str| {
+            session
+                .and_then(|session| session.pointer(pointer))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        };
+        Some(Self {
+            state_id: state.id.clone(),
+            action_execution_id: action_execution_id.to_string(),
+            reason: error.to_string(),
+            answer_tail: Some(harness::tail(&result.stdout, ANSWER_TAIL_BYTES))
+                .filter(|tail| !tail.is_empty()),
+            harness: session_field("/harness"),
+            harness_session_id: session_field("/config/harness_session_id"),
+        })
+    }
+
+    /// The rejection of an agent that asked a question instead of giving the
+    /// label it was asked for again (KTD7): a failed reprompt, never a
+    /// suspension that would restart the step in a fresh session.
+    fn from_question(state: &State, action_execution_id: &str, question: &str) -> Self {
+        Self {
+            state_id: state.id.clone(),
+            action_execution_id: action_execution_id.to_string(),
+            reason: format!(
+                "the agent asked for human input instead of giving its output label: {question}"
+            ),
+            answer_tail: None,
+            harness: None,
+            harness_session_id: None,
+        }
+    }
+}
+
 /// Everything that stops the engine from running a step at all.
 ///
 /// A *failing action* is not in here: an action that fails is an ordinary
@@ -364,6 +478,9 @@ enum AttemptOutcome {
     /// An agent asked a question and will be restarted in this same state once
     /// the person supplies its answer.
     AwaitingAgentInput(HumanInputRequest),
+    /// An agent answered without an output label the state accepts: a format
+    /// error, answered with a reprompt rather than a retry (KTD7).
+    OutputRejected(OutputRejection),
 }
 
 /// How the whole action of a state ended, retries included.
@@ -377,6 +494,14 @@ enum ActionUpshot {
     },
     /// The execution is suspended or failed, and that is already persisted.
     Stopped,
+}
+
+/// How a reprompt ended without a label the state accepts.
+enum RepromptFailure {
+    /// Another format error — including a question instead of the label.
+    Rejected(OutputRejection),
+    /// The run itself failed or timed out.
+    Failed(String),
 }
 
 /// An attempt that produced no result.
@@ -859,6 +984,10 @@ impl Engine {
             _ => return Err(self.not_runnable(&execution, "recovered")),
         }
 
+        // A recovery starts the state's action afresh. A rejected output left
+        // behind by an interrupted reprompt must not turn it into another one.
+        clear_engine_metadata(&mut execution, METADATA_OUTPUT_REJECTION_KEY);
+
         if let Some(comment) = comment.filter(|comment| !comment.trim().is_empty()) {
             engine_metadata_mut(&mut execution).insert(
                 METADATA_OPERATOR_RECOVERY_NOTE_KEY.to_string(),
@@ -1087,7 +1216,16 @@ impl Engine {
 
             let flow = match self.pending_step(&execution, &state_id)? {
                 Some(pending) => self.complete_step(definition, &mut execution, state, pending)?,
-                None => self.enter_state(definition, &mut execution, state).await?,
+                None => match stored_output_rejection(&execution, &state_id)? {
+                    // A pass that ended between a rejected output and its
+                    // reprompt: the attempt is closed, so it continues with
+                    // the reprompt instead of running the action afresh.
+                    Some(rejection) => {
+                        self.continue_rejected_output(definition, &mut execution, state, rejection)
+                            .await?
+                    }
+                    None => self.enter_state(definition, &mut execution, state).await?,
+                },
             };
 
             if flow == Flow::Stop {
@@ -1228,6 +1366,14 @@ impl Engine {
                     self.suspend_for_agent_input(execution, state, request)?;
                     return Ok(ActionUpshot::Stopped);
                 }
+                Ok(AttemptOutcome::OutputRejected(rejection)) => {
+                    // Outside the retry schedule on purpose (R15): a format
+                    // error is repaired in the same session, not re-run.
+                    self.reject_output(execution, &rejection)?;
+                    return self
+                        .reprompt(execution, state, action, rejection, timeout)
+                        .await;
+                }
                 Ok(AttemptOutcome::Completed(result)) => {
                     return Ok(ActionUpshot::Completed {
                         action_execution_id,
@@ -1316,6 +1462,61 @@ impl Engine {
         }
 
         let kind = ActionKind::of(action);
+        let outcome = self
+            .execute_rendered(execution, state, &rendered, action_execution_id, timeout)
+            .await?;
+
+        match outcome {
+            Ok(ActionOutcome::Completed(result)) => {
+                // A label the state does not declare is a format error of an
+                // agent, answered with a reprompt (KTD7); for any other action
+                // it stays the permanent failure `record_completion` reports.
+                if kind == ActionKind::Agent {
+                    if let Some(rejection) =
+                        OutputRejection::from_result(state, action_execution_id, &result)
+                    {
+                        return Ok(AttemptOutcome::OutputRejected(rejection));
+                    }
+                }
+                Ok(AttemptOutcome::Completed(result))
+            }
+
+            Ok(ActionOutcome::TimedOut(timed_out)) => {
+                match timed_out.resolve(&decision::permitted_labels(state)) {
+                    Ok(result) => Ok(AttemptOutcome::Completed(result)),
+                    Err(error) => Err(AttemptFailure::retriable(error.message)),
+                }
+            }
+
+            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingHumanInput(request))) => {
+                Ok(AttemptOutcome::AwaitingHumanInput(request))
+            }
+
+            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingAgentInput(request))) => {
+                Ok(AttemptOutcome::AwaitingAgentInput(request))
+            }
+
+            Err(error) => match OutputRejection::from_error(state, action_execution_id, &error) {
+                Some(rejection) => Ok(AttemptOutcome::OutputRejected(rejection)),
+                None => Err(AttemptFailure::retriable(error.message)),
+            },
+        }
+    }
+
+    /// Hands an already rendered action to its executor and closes the
+    /// attempt's conversation once it is over.
+    ///
+    /// The outer `Err` is a failure before anything ran (no executor for the
+    /// action type); the inner result is the executor's own.
+    async fn execute_rendered(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        rendered: &ActionConfig,
+        action_execution_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Result<ActionOutcome, ActionError>, AttemptFailure> {
+        let kind = ActionKind::of(rendered);
         let executor = self.executors.get(&kind).ok_or_else(|| {
             AttemptFailure::permanent(format!(
                 "state '{}' uses a {} action, which is not available in this version \
@@ -1326,7 +1527,7 @@ impl Engine {
         })?;
 
         let conversation_store = self.store.conversation_store(&execution.id);
-        let request = ActionRequest::new(&rendered, &execution.workspace, action_execution_id)
+        let request = ActionRequest::new(rendered, &execution.workspace, action_execution_id)
             .with_timeout(timeout)
             .with_execution_id(&execution.id)
             .with_conversation_store(&conversation_store)
@@ -1350,26 +1551,213 @@ impl Engine {
             );
         }
 
-        match outcome {
-            Ok(ActionOutcome::Completed(result)) => Ok(AttemptOutcome::Completed(result)),
+        Ok(outcome)
+    }
 
-            Ok(ActionOutcome::TimedOut(timed_out)) => {
-                match timed_out.resolve(&decision::permitted_labels(state)) {
-                    Ok(result) => Ok(AttemptOutcome::Completed(result)),
-                    Err(error) => Err(AttemptFailure::retriable(error.message)),
+    // -----------------------------------------------------------------------
+    // Format errors and the engine's reprompt (KTD7)
+    // -----------------------------------------------------------------------
+
+    /// Closes an attempt whose output was rejected: the record that lets a
+    /// later pass continue with the reprompt, then `ActionOutputRejected`.
+    ///
+    /// In this order so that a crash between the two leaves the attempt open
+    /// in the log — `Unknown`, as for any interrupted action — rather than a
+    /// closed attempt with nothing to continue from, which the next pass would
+    /// replay from the start of the state.
+    fn reject_output(
+        &self,
+        execution: &mut WorkflowExecution,
+        rejection: &OutputRejection,
+    ) -> Result<(), EngineError> {
+        let value = serde_json::to_value(rejection).map_err(|error| {
+            EngineError::CorruptEngineMetadata {
+                execution_id: execution.id.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        engine_metadata_mut(execution).insert(METADATA_OUTPUT_REJECTION_KEY.to_string(), value);
+        self.store.save_execution(execution)?;
+
+        self.emit(
+            &execution.id,
+            EventData::ActionOutputRejected {
+                action_execution_id: rejection.action_execution_id.clone(),
+                state_id: rejection.state_id.clone(),
+                reason: rejection.reason.clone(),
+                answer_tail: rejection.answer_tail.clone(),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Continues a step whose pass ended after its output was rejected and
+    /// before the reprompt started (a daemon restart in between).
+    async fn continue_rejected_output(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        rejection: OutputRejection,
+    ) -> Result<Flow, EngineError> {
+        let Some(action) = &state.action else {
+            clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
+            self.fail_action(
+                execution,
+                &rejection.action_execution_id,
+                format!("state '{}' is not terminal but has no action", state.id),
+            )?;
+            return Ok(Flow::Stop);
+        };
+        let timeout = self
+            .timeout_for(ActionKind::of(action), state, definition)
+            .map(Duration::from_secs);
+
+        match self
+            .reprompt(execution, state, action, rejection, timeout)
+            .await?
+        {
+            ActionUpshot::Stopped => Ok(Flow::Stop),
+            ActionUpshot::Completed {
+                action_execution_id,
+                result,
+            } => self.record_completion(definition, execution, state, action_execution_id, result),
+        }
+    }
+
+    /// The engine's one reprompt (R14): a new attempt resuming the rejected
+    /// attempt's harness session, read-only, on the harness it ran on, asking
+    /// only for the output object.
+    ///
+    /// Not a `retry_policy` retry (R15): it is announced by `OutputReprompted`,
+    /// never `ActionRetrying`, and whatever it ends with — a label, another
+    /// format error, a question, a failure — is final for the step. Until the
+    /// conductor exists (U10), everything but a label fails the action.
+    async fn reprompt(
+        &self,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        action: &ActionConfig,
+        rejection: OutputRejection,
+        timeout: Option<Duration>,
+    ) -> Result<ActionUpshot, EngineError> {
+        let resumable = match (action, &rejection.harness, &rejection.harness_session_id) {
+            (ActionConfig::Agent(config), Some(harness), Some(session)) => Some(
+                agent::reprompt_config(config, harness, session, &rejection.reason),
+            ),
+            _ => None,
+        };
+        let Some(config) = resumable else {
+            clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
+            self.fail_action(
+                execution,
+                &rejection.action_execution_id,
+                format!(
+                    "{} The agent could not be asked again for its output label: its \
+                     harness reported no session to resume.",
+                    rejection.reason
+                ),
+            )?;
+            return Ok(ActionUpshot::Stopped);
+        };
+
+        // Announced before the record goes: a crash in between leaves this
+        // attempt open in the log (`Unknown`), never a closed attempt with
+        // nothing left to continue from.
+        let action_execution_id = Uuid::new_v4().to_string();
+        execution.current_action_execution = Some(action_execution_id.clone());
+        self.emit(
+            &execution.id,
+            EventData::OutputReprompted {
+                action_execution_id: action_execution_id.clone(),
+                previous_attempt: rejection.action_execution_id.clone(),
+                state_id: state.id.clone(),
+                by: RepromptedBy::Engine,
+            },
+        )?;
+        clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
+        self.store.save_execution(execution)?;
+
+        let rendered = ActionConfig::Agent(config);
+        let outcome = match self
+            .execute_rendered(execution, state, &rendered, &action_execution_id, timeout)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                self.fail_action(execution, &action_execution_id, failure.message)?;
+                return Ok(ActionUpshot::Stopped);
+            }
+        };
+
+        let failure = match outcome {
+            Ok(ActionOutcome::Completed(result)) => {
+                match OutputRejection::from_result(state, &action_execution_id, &result) {
+                    None => {
+                        return Ok(ActionUpshot::Completed {
+                            action_execution_id,
+                            result,
+                        })
+                    }
+                    Some(rejection) => RepromptFailure::Rejected(rejection),
                 }
             }
-
-            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingHumanInput(request))) => {
-                Ok(AttemptOutcome::AwaitingHumanInput(request))
+            Ok(ActionOutcome::TimedOut(timed_out)) => {
+                match timed_out.resolve(&decision::permitted_labels(state)) {
+                    Ok(result) => {
+                        return Ok(ActionUpshot::Completed {
+                            action_execution_id,
+                            result,
+                        })
+                    }
+                    Err(error) => RepromptFailure::Failed(error.message),
+                }
             }
+            Ok(ActionOutcome::Suspended(
+                SuspendedAction::AwaitingAgentInput(request)
+                | SuspendedAction::AwaitingHumanInput(request),
+            )) => RepromptFailure::Rejected(OutputRejection::from_question(
+                state,
+                &action_execution_id,
+                &request.instruction,
+            )),
+            Err(error) => match OutputRejection::from_error(state, &action_execution_id, &error) {
+                Some(rejection) => RepromptFailure::Rejected(rejection),
+                None => RepromptFailure::Failed(error.message),
+            },
+        };
 
-            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingAgentInput(request))) => {
-                Ok(AttemptOutcome::AwaitingAgentInput(request))
+        match failure {
+            // Another format error: closed like the first one, then final.
+            RepromptFailure::Rejected(rejection) => {
+                self.emit(
+                    &execution.id,
+                    EventData::ActionOutputRejected {
+                        action_execution_id: action_execution_id.clone(),
+                        state_id: state.id.clone(),
+                        reason: rejection.reason.clone(),
+                        answer_tail: rejection.answer_tail.clone(),
+                    },
+                )?;
+                self.fail_action(
+                    execution,
+                    &action_execution_id,
+                    format!(
+                        "the agent did not give a usable output label even when asked again: {}",
+                        rejection.reason
+                    ),
+                )?;
             }
-
-            Err(error) => Err(AttemptFailure::retriable(error.message)),
+            // The reprompt itself failed; `retry_policy` does not apply to it.
+            RepromptFailure::Failed(message) => {
+                self.fail_action(
+                    execution,
+                    &action_execution_id,
+                    format!("asking the agent again for its output label failed: {message}"),
+                )?;
+            }
         }
+        Ok(ActionUpshot::Stopped)
     }
 
     /// Records a finished action: label check, `ActionCompleted`, artifacts,
@@ -1641,6 +2029,7 @@ impl Engine {
         execution.status = ExecutionStatus::Failed;
         execution.completed_at = Some(Utc::now());
         self.clear_pending_step(execution);
+        clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
         self.store.save_execution(execution)?;
         Ok(())
     }
@@ -2145,6 +2534,41 @@ fn stored_pending_step(
     Ok((pending.state_id == state_id).then_some(pending))
 }
 
+/// The rejected agent output of `execution` still owed its reprompt, when it
+/// belongs to `state_id`.
+fn stored_output_rejection(
+    execution: &WorkflowExecution,
+    state_id: &str,
+) -> Result<Option<OutputRejection>, EngineError> {
+    let Some(value) = execution
+        .metadata
+        .get(METADATA_ENGINE_KEY)
+        .and_then(|engine| engine.get(METADATA_OUTPUT_REJECTION_KEY))
+    else {
+        return Ok(None);
+    };
+
+    let rejection: OutputRejection = serde_json::from_value(value.clone()).map_err(|error| {
+        EngineError::CorruptEngineMetadata {
+            execution_id: execution.id.clone(),
+            message: error.to_string(),
+        }
+    })?;
+
+    Ok((rejection.state_id == state_id).then_some(rejection))
+}
+
+/// Drops one key of the engine's scratch area, if it is there.
+fn clear_engine_metadata(execution: &mut WorkflowExecution, key: &str) {
+    if let Some(engine) = execution
+        .metadata
+        .get_mut(METADATA_ENGINE_KEY)
+        .and_then(Value::as_object_mut)
+    {
+        engine.remove(key);
+    }
+}
+
 /// Whether `state` runs an agent.
 fn is_agent(state: &State) -> bool {
     matches!(state.action, Some(ActionConfig::Agent(_)))
@@ -2260,6 +2684,8 @@ pub fn record_manual_transition(
     } else {
         None
     };
+    // A manual transition abandons a rejected output still owed a reprompt.
+    clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
     set_last_agent_step(execution, record.as_ref())
 }
 

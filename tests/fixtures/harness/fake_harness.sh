@@ -9,7 +9,8 @@
 #   stdout, stdout.<n>   what to print on stdout (per call, then the fallback)
 #   stderr               what to print on stderr
 #   exit                 the exit code (default 0)
-#   sleep                seconds to sleep before answering (for timeout tests)
+#   sleep, sleep.<n>     seconds to sleep after answering (per call, then the
+#                        fallback; for timeout tests)
 #
 # and which it writes back, one set per call:
 #
@@ -52,7 +53,9 @@ if [ -f "$dir/stderr" ]; then
     cat "$dir/stderr" >&2
 fi
 
-if [ -f "$dir/sleep" ]; then
+if [ -f "$dir/sleep.$count" ]; then
+    sleep "$(cat "$dir/sleep.$count")"
+elif [ -f "$dir/sleep" ]; then
     sleep "$(cat "$dir/sleep")"
 fi
 

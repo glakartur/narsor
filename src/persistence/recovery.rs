@@ -7,9 +7,9 @@
 //! finer-grained record. Confronting them is possible only because the engine's
 //! emission order is fixed ([`crate::engine::runner`]):
 //!
-//! * an `ActionStarted` (or `ActionRetrying`) with no `ActionCompleted` or
-//!   `ActionFailed` after it means an action was in flight when the process
-//!   died;
+//! * an `ActionStarted` (or `ActionRetrying`, or `OutputReprompted`) with no
+//!   `ActionCompleted`, `ActionFailed` or `ActionOutputRejected` after it
+//!   means an action was in flight when the process died;
 //! * anything else means the step boundary was reached and `state.json` is
 //!   trustworthy.
 //!
@@ -152,8 +152,9 @@ pub fn recover(store: &ExecutionStore) -> Result<RecoveryReport> {
 /// this attempt's file again, whatever the event log says about the attempt
 /// itself — a `Paused`/`InputNeeded`/`Completed`/`Cancelled`/`Unknown` execution has no live
 /// writer left), or the event log records the attempt itself as finished
-/// (`ActionCompleted`, `ActionFailed`, or `ActionAttemptFailed` for that
-/// `action_execution_id`) while the execution keeps running its next state.
+/// (`ActionCompleted`, `ActionFailed`, `ActionAttemptFailed` or
+/// `ActionOutputRejected` for that `action_execution_id`) while the execution
+/// keeps running its next state.
 ///
 /// An attempt that is neither is presumed still open in another process and
 /// is left completely untouched — compressing out from under a live writer
@@ -198,9 +199,11 @@ pub fn compress_closed_conversations(store: &ExecutionStore) -> Result<Vec<(Exec
 }
 
 /// The `action_execution_id`s the event log records as finished, one way or
-/// another: a completed attempt, a final failure, or a failed attempt that
-/// will be retried under a *different* `action_execution_id` (D24) — either
-/// way, nothing more is ever written to *this* attempt's conversation file.
+/// another: a completed attempt, a final failure, a failed attempt that will
+/// be retried under a *different* `action_execution_id` (D24), or an attempt
+/// whose output was rejected and which a reprompt continues under a
+/// different id too (KTD7) — either way, nothing more is ever written to
+/// *this* attempt's conversation file.
 fn closed_attempt_ids(events: &[Event]) -> HashSet<String> {
     let mut closed = HashSet::new();
     for event in events {
@@ -214,6 +217,10 @@ fn closed_attempt_ids(events: &[Event]) -> HashSet<String> {
                 ..
             }
             | EventData::ActionAttemptFailed {
+                action_execution_id,
+                ..
+            }
+            | EventData::ActionOutputRejected {
                 action_execution_id,
                 ..
             } => {
@@ -320,7 +327,23 @@ fn unfinished_action(events: &[crate::domain::Event]) -> Option<(String, String)
                     open = Some((state_id.clone(), action_execution_id.clone()));
                 }
             }
-            EventData::ActionCompleted { .. } | EventData::ActionFailed { .. } => {
+            // A reprompt opens an attempt of its own (KTD7): a crash while it
+            // runs is an interrupted action like any other, since the resumed
+            // session may have done anything.
+            EventData::OutputReprompted {
+                action_execution_id,
+                state_id,
+                ..
+            } => {
+                open = Some((state_id.clone(), action_execution_id.clone()));
+            }
+            // A rejected output closes its attempt: nothing is in flight until
+            // the reprompt announces itself, and a pass continuing after a
+            // restart picks it up from the engine's own record rather than
+            // replaying the attempt.
+            EventData::ActionCompleted { .. }
+            | EventData::ActionFailed { .. }
+            | EventData::ActionOutputRejected { .. } => {
                 open = None;
             }
             // A suspended action is parked, not interrupted: the execution is

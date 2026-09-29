@@ -365,6 +365,55 @@ pub fn build_timeline(
                 links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
             }
 
+            EventData::OutputReprompted {
+                action_execution_id,
+                state_id,
+                ..
+            } => {
+                // A reprompt is a new attempt of the same visit, exactly like
+                // a retry, and runs the same (agent) action.
+                let inherited_action_type =
+                    current_visit_last_position.and_then(|idx| drafts[idx].action_type.clone());
+                let idx = push_attempt(
+                    &mut drafts,
+                    &mut state_attempt_counts,
+                    &state_visit_counts,
+                    state_id.clone(),
+                    Some(action_execution_id.clone()),
+                    inherited_action_type,
+                    event.timestamp,
+                );
+                by_attempt.insert(action_execution_id.clone(), idx);
+                current_visit_last_position = Some(idx);
+                open_position = Some(idx);
+                links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+            }
+
+            EventData::ActionOutputRejected {
+                action_execution_id,
+                reason,
+                ..
+            } => {
+                // The attempt is over without a usable label: shown as failed
+                // with the reason, but never as a pending `retry_policy` retry.
+                if let Some(&idx) = by_attempt.get(action_execution_id) {
+                    drafts[idx].outcome = Some(Outcome::Failed);
+                    drafts[idx].ended_at = Some(event.timestamp);
+                    drafts[idx].error = Some(format!("output rejected: {reason}"));
+                    if open_position == Some(idx) {
+                        open_position = None;
+                    }
+                    links.insert(seq, EventLink::Position(drafts[idx].label.clone()));
+                } else {
+                    links.insert(
+                        seq,
+                        EventLink::NoLink {
+                            reason: reasons::NO_ATTEMPT_YET.to_string(),
+                        },
+                    );
+                }
+            }
+
             EventData::ActionCompleted {
                 action_execution_id,
                 ..

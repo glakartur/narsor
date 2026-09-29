@@ -3753,6 +3753,26 @@ pub fn event_line(event: &Event) -> String {
         EventData::ActionRetrying { retry_count, .. } => {
             format!("action_retrying  attempt {retry_count}")
         }
+        EventData::ActionOutputRejected {
+            action_execution_id,
+            reason,
+            ..
+        } => format!(
+            "action_output_rejected  attempt {}: {}",
+            short_id(Some(action_execution_id)),
+            first_line(reason)
+        ),
+        EventData::OutputReprompted {
+            action_execution_id,
+            previous_attempt,
+            by,
+            ..
+        } => format!(
+            "output_reprompted  by {} (attempt {}, after {})",
+            by.name(),
+            short_id(Some(action_execution_id)),
+            short_id(Some(previous_attempt))
+        ),
         EventData::DecisionRequested { provider } => format!("decision_requested  {provider}"),
         EventData::DecisionMade {
             provider,
@@ -3890,6 +3910,14 @@ fn conversation_attempt(data: &EventData) -> Option<&str> {
             ..
         }
         | EventData::ActionRetrying {
+            action_execution_id,
+            ..
+        }
+        | EventData::ActionOutputRejected {
+            action_execution_id,
+            ..
+        }
+        | EventData::OutputReprompted {
             action_execution_id,
             ..
         } => Some(action_execution_id.as_str()),

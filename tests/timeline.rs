@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use narsor::domain::{Event, EventData, ExecutionStatus};
+use narsor::domain::{Event, EventData, ExecutionStatus, RepromptedBy};
 use narsor::engine::{build_timeline, ConversationState, EventLink, PositionStatus};
 use serde_json::json;
 
@@ -134,6 +134,63 @@ fn a_failed_attempt_then_a_successful_retry_gives_two_positions() {
     assert_eq!(second.label, "plan #2");
     assert_eq!(second.action_execution_id.as_deref(), Some("a2"));
     assert_eq!(second.status, PositionStatus::Succeeded);
+}
+
+/// KTD7: a reprompt is an attempt of its own, with its own conversation,
+/// next to the attempt whose output was rejected — which shows as failed
+/// with the reason, never as a pending retry.
+#[test]
+fn a_rejected_output_and_its_reprompt_are_two_positions() {
+    let mut log = Log::new();
+    log.push(state_entered("work"));
+    log.push(action_started("a1", "work", "agent"));
+    let rejected_seq = log.push(EventData::ActionOutputRejected {
+        action_execution_id: "a1".to_string(),
+        state_id: "work".to_string(),
+        reason: "no JSON object".to_string(),
+        answer_tail: None,
+    });
+    let reprompted_seq = log.push(EventData::OutputReprompted {
+        action_execution_id: "a2".to_string(),
+        previous_attempt: "a1".to_string(),
+        state_id: "work".to_string(),
+        by: RepromptedBy::Engine,
+    });
+    log.push(action_completed("a2", "implemented"));
+    log.push(decision_made("implemented"));
+    log.push(transition_taken("work", "done", "implemented"));
+
+    let timeline = build_timeline(
+        &log.events,
+        ExecutionStatus::Running,
+        &presence(&["a1", "a2"]),
+    );
+
+    assert_eq!(timeline.positions.len(), 2);
+    let rejected = &timeline.positions[0];
+    assert_eq!(rejected.label, "work #1");
+    assert_eq!(rejected.status, PositionStatus::Failed);
+    assert!(!rejected.retry_pending);
+    assert_eq!(
+        rejected.error.as_deref(),
+        Some("output rejected: no JSON object")
+    );
+
+    let reprompt = &timeline.positions[1];
+    assert_eq!(reprompt.label, "work #2");
+    assert_eq!(reprompt.action_execution_id.as_deref(), Some("a2"));
+    assert_eq!(reprompt.action_type.as_deref(), Some("agent"));
+    assert_eq!(reprompt.status, PositionStatus::Succeeded);
+    assert_eq!(reprompt.conversation, ConversationState::Recorded);
+
+    assert_eq!(
+        timeline.link(rejected_seq),
+        Some(&EventLink::Position("work #1".to_string()))
+    );
+    assert_eq!(
+        timeline.link(reprompted_seq),
+        Some(&EventLink::Position("work #2".to_string()))
+    );
 }
 
 /// Covers AE2: the final `ActionFailed` (no more retries) links to the

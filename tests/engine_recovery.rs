@@ -9,7 +9,7 @@
 mod engine_support;
 
 use engine_support::{workflow, Harness};
-use narsor::domain::{EventData, ExecutionStatus, WorkflowExecution};
+use narsor::domain::{EventData, ExecutionStatus, RepromptedBy, WorkflowExecution};
 use narsor::engine::{EngineError, PendingStep};
 use narsor::persistence::{
     reconcile, reconcile_all, recover, sweep_orphaned_workspaces, OrphanReason,
@@ -369,6 +369,132 @@ async fn recovery_reports_every_execution_and_clears_interrupted_writes() {
     // Reconciling twice is harmless: the second pass finds nothing running.
     let again = reconcile_all(&harness.store()).expect("reconcile again");
     assert!(again.iter().all(|entry| !entry.outcome.needs_attention()));
+}
+
+/// Writes the log of an agent attempt whose output was rejected (KTD7), and
+/// returns the rejected attempt's id.
+fn reject_output(harness: &Harness, execution: &WorkflowExecution) -> String {
+    let log = harness.store().event_log(&execution.id);
+    let rejected = "attempt-rejected".to_string();
+    for data in [
+        EventData::StateEntered {
+            state_id: "first".to_string(),
+        },
+        EventData::ActionStarted {
+            action_execution_id: rejected.clone(),
+            state_id: "first".to_string(),
+            action_type: "agent".to_string(),
+        },
+        EventData::ActionOutputRejected {
+            action_execution_id: rejected.clone(),
+            state_id: "first".to_string(),
+            reason: "no output label".to_string(),
+            answer_tail: Some("Done.".to_string()),
+        },
+    ] {
+        log.append_next(&execution.id, data).expect("append");
+    }
+    rejected
+}
+
+/// Restart matrix: a rejected output closes its attempt, so a daemon that
+/// stopped before the reprompt started finds nothing in flight.
+#[tokio::test]
+async fn a_restart_after_a_rejected_output_is_not_an_interrupted_action() {
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let definition = workflow("two_steps");
+    let execution = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    reject_output(&harness, &execution);
+
+    let report = recover(&harness.store()).expect("recover");
+
+    let verdict = report
+        .reconciled
+        .iter()
+        .find(|entry| entry.execution_id == execution.id)
+        .expect("the execution was reconciled");
+    assert_eq!(verdict.outcome, ReconciliationOutcome::Consistent);
+    assert_eq!(verdict.status, ExecutionStatus::Running);
+    let stored = harness
+        .store()
+        .load_execution(&execution.id)
+        .expect("load the execution");
+    assert_eq!(stored.status, ExecutionStatus::Running);
+}
+
+/// Restart matrix: a daemon that stopped while the reprompt ran leaves an
+/// interrupted action — the resumed session may have done anything.
+#[tokio::test]
+async fn a_restart_during_a_reprompt_leaves_the_execution_unknown() {
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let definition = workflow("two_steps");
+    let execution = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    let rejected = reject_output(&harness, &execution);
+    harness
+        .store()
+        .event_log(&execution.id)
+        .append_next(
+            &execution.id,
+            EventData::OutputReprompted {
+                action_execution_id: "attempt-reprompt".to_string(),
+                previous_attempt: rejected,
+                state_id: "first".to_string(),
+                by: RepromptedBy::Engine,
+            },
+        )
+        .expect("append OutputReprompted");
+
+    let report = recover(&harness.store()).expect("recover");
+
+    let verdict = report
+        .reconciled
+        .iter()
+        .find(|entry| entry.execution_id == execution.id)
+        .expect("the execution was reconciled");
+    assert_eq!(verdict.status, ExecutionStatus::Unknown);
+    assert_eq!(
+        verdict.outcome,
+        ReconciliationOutcome::InterruptedAction {
+            state_id: "first".to_string(),
+            action_execution_id: "attempt-reprompt".to_string(),
+        }
+    );
+}
+
+/// The same sweep while the execution keeps running: only the attempt the
+/// log closed with `ActionOutputRejected` is compressed.
+#[tokio::test]
+async fn a_running_executions_rejected_attempt_counts_as_closed() {
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let definition = workflow("two_steps");
+    let execution = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    let rejected = reject_output(&harness, &execution);
+
+    let conversations = harness.store().conversation_store(&execution.id);
+    let mut writer = conversations.writer(&rejected).expect("open a writer");
+    writer.append_narsor("the prompt").expect("append");
+    writer.finish().expect("finish the writer");
+
+    let report = recover(&harness.store()).expect("recover");
+
+    let stored = harness
+        .store()
+        .load_execution(&execution.id)
+        .expect("load the execution");
+    assert_eq!(stored.status, ExecutionStatus::Running);
+    assert_eq!(
+        report.compressed_conversations,
+        vec![(execution.id.clone(), rejected.clone())]
+    );
 }
 
 #[tokio::test]

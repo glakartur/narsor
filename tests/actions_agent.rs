@@ -19,16 +19,17 @@ use std::time::Duration;
 
 use narsor::domain::{
     ActionConfig, ActionError, AgentActionConfig, Context, EventData, ExecutionStatus,
-    OutputDefinition, Workspace, WorkspaceAccess,
+    OutputDefinition, RepromptedBy, Workspace, WorkspaceAccess,
 };
 use narsor::engine::actions::agent::{output_contract, AgentEventSink, SESSION_ID_VARIABLE};
 use narsor::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
-    CodexAdapter, Engine, HarnessRegistry, LoggingEventSink, OpenCodeAdapter,
+    CodexAdapter, Engine, HarnessRegistry, LoggingEventSink, OpenCodeAdapter, OutputRejection,
+    METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY,
 };
 use narsor::persistence::{
-    ConversationEntry, ConversationSource, ConversationStore, DefaultHarnessSelector,
-    ExecutionStore, StatePaths,
+    recover, ConversationEntry, ConversationSource, ConversationStore, DefaultHarnessSelector,
+    ExecutionStore, ReconciliationOutcome, StatePaths,
 };
 use narsor::workflow::{load_from_file, TemplateScope};
 use serde_json::{json, Value};
@@ -128,6 +129,13 @@ impl FakeHarness {
         self
     }
 
+    /// Makes the `nth` call (1-based) sleep after answering.
+    fn sleeps_on_call(&self, nth: usize, seconds: u64) -> &Self {
+        fs::write(self.dir.join(format!("sleep.{nth}")), seconds.to_string())
+            .expect("write the sleep");
+        self
+    }
+
     /// Makes the harness fail with an exit code and a message on stderr.
     fn fails(&self, code: i32, stderr: &str) -> &Self {
         fs::write(self.dir.join("exit"), code.to_string()).expect("write the exit code");
@@ -190,6 +198,18 @@ fn envelope(text: &str) -> String {
         "is_error": false,
         "session_id": "fake-session-1",
         "result": text,
+    })
+    .to_string()
+}
+
+/// A single `stream-json` `result` line reporting a failed run.
+fn failed_envelope(message: &str) -> String {
+    json!({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": true,
+        "session_id": "fake-session-1",
+        "result": message,
     })
     .to_string()
 }
@@ -601,6 +621,31 @@ async fn json_without_an_output_key_is_an_error() {
         error.message.contains("'output'"),
         "the message names the missing key: {}",
         error.message
+    );
+
+    // What the engine needs to ask the same session again (KTD7).
+    let details = error.details.expect("details");
+    assert_eq!(details["harness"], json!("claude-code"));
+    assert_eq!(details["harness_session_id"], json!("fake-session-1"));
+}
+
+/// The session config records the harness the attempt ran on, even when the
+/// action named none, so the session can be resumed where it lives (KTD7).
+#[tokio::test]
+async fn the_session_config_records_the_harness_that_ran() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"output":"ready"}"#));
+
+    let mut config = agent_action("do the thing");
+    config.harness = None;
+    let result = complete(&executor(&fake), config, &root.workspace()).await;
+
+    let session = &result.data["agent_session"];
+    assert_eq!(session["config"]["harness"], json!("claude-code"));
+    assert_eq!(
+        session["config"]["harness_session_id"],
+        json!("fake-session-1")
     );
 }
 
@@ -1532,9 +1577,11 @@ fn attempt_ids(fixture: &EngineFixture, execution_id: &str) -> Vec<String> {
 #[tokio::test]
 async fn a_retried_agent_state_gets_one_compressed_conversation_file_per_attempt() {
     let fixture = EngineFixture::new();
+    // A harness failure, not a missing label: a format error is answered
+    // with a reprompt rather than a retry (KTD7).
     fixture
         .fake
-        .answers_on_call(1, &envelope("no JSON here at all"))
+        .answers_on_call(1, &failed_envelope("the model is overloaded"))
         .answers_on_call(2, &envelope(r#"{"output":"ready"}"#));
 
     let definition = fixture.workflow(
@@ -1603,6 +1650,478 @@ inputs:
             "attempt '{attempt}' has at least the prompt and the completion entry"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Format errors and the engine's reprompt (KTD7)
+// ---------------------------------------------------------------------------
+
+/// A two-state agent workflow whose first state allows two attempts, so a
+/// test can tell a reprompt from a `retry_policy` retry.
+const REPROMPT_WORKFLOW: &str = r#"
+name: agent-reprompt
+version: 1
+states:
+  work:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: "Implement the feature."
+    outputs:
+      - label: implemented
+        description: The feature is implemented.
+      - label: needs_human_decision
+        description: A person has to decide first.
+    retry_policy:
+      max_attempts: 2
+      backoff: 0
+    transitions:
+      implemented: done
+      needs_human_decision: stopped
+  done:
+    description: Success.
+  stopped:
+    description: Failure.
+terminal_states:
+  done: completed
+  stopped: failed
+"#;
+
+/// Every event of an execution, in order.
+fn events_of(fixture: &EngineFixture, execution_id: &str) -> Vec<EventData> {
+    fixture
+        .store()
+        .event_log(execution_id)
+        .read_all()
+        .expect("read the event log")
+        .into_iter()
+        .map(|event| event.data)
+        .collect()
+}
+
+/// Whether `args` carries `flag` immediately followed by `value`.
+fn has_flag(args: &[String], flag: &str, value: &str) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == flag && pair[1] == value)
+}
+
+/// AE7: an answer without `output` is not an action failure. The engine asks
+/// the same session again, read-only, as a new attempt — and the state's
+/// `retry_policy` never moves.
+#[tokio::test]
+async fn a_missing_label_is_asked_for_again_in_the_same_read_only_session() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &envelope(r#"Done. {"data": {"units_completed": 3}}"#))
+        .answers_on_call(2, &envelope(r#"{"output":"implemented"}"#));
+
+    let definition = fixture.workflow(REPROMPT_WORKFLOW);
+    let execution = fixture
+        .engine()
+        .start_and_run(&definition, json!({}), fixture.workspace())
+        .await
+        .expect("run the workflow");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(fixture.fake.calls(), 2, "one attempt and one reprompt");
+
+    // The reprompt resumes the first call's session, read-only.
+    let first = fixture.fake.args(1);
+    let second = fixture.fake.args(2);
+    assert!(!first.iter().any(|arg| arg == "--resume"), "{first:?}");
+    assert!(
+        has_flag(&second, "--resume", "fake-session-1"),
+        "{second:?}"
+    );
+    assert!(has_flag(&second, "--permission-mode", "plan"), "{second:?}");
+
+    // The reprompt says what is wrong and lists the labels again.
+    let prompt = second.last().expect("a prompt");
+    assert!(prompt.contains("output"), "{prompt}");
+    assert!(
+        prompt.contains("- `implemented` — The feature is implemented.\n"),
+        "{prompt}"
+    );
+
+    // A new attempt with its own idempotency key.
+    assert_ne!(fixture.fake.action_id(1), fixture.fake.action_id(2));
+
+    // Rejection and reprompt are on record; the retry policy is untouched.
+    let types = fixture.event_types(&execution.id);
+    for absent in ["action_retrying", "action_attempt_failed", "action_failed"] {
+        assert!(!types.contains(&absent.to_string()), "{types:?}");
+    }
+    let events = events_of(&fixture, &execution.id);
+    let rejected = events
+        .iter()
+        .find_map(|data| match data {
+            EventData::ActionOutputRejected {
+                action_execution_id,
+                reason,
+                answer_tail,
+                ..
+            } => Some((
+                action_execution_id.clone(),
+                reason.clone(),
+                answer_tail.clone(),
+            )),
+            _ => None,
+        })
+        .expect("an ActionOutputRejected event");
+    assert_eq!(rejected.0, fixture.fake.action_id(1));
+    assert!(rejected.1.contains("'output'"), "{}", rejected.1);
+    assert!(
+        rejected
+            .2
+            .as_deref()
+            .is_some_and(|tail| tail.contains("units_completed")),
+        "{:?}",
+        rejected.2
+    );
+    let reprompted = events
+        .iter()
+        .find_map(|data| match data {
+            EventData::OutputReprompted {
+                action_execution_id,
+                previous_attempt,
+                by,
+                ..
+            } => Some((action_execution_id.clone(), previous_attempt.clone(), *by)),
+            _ => None,
+        })
+        .expect("an OutputReprompted event");
+    assert_eq!(reprompted.0, fixture.fake.action_id(2));
+    assert_eq!(reprompted.1, fixture.fake.action_id(1));
+    assert_eq!(reprompted.2, RepromptedBy::Engine);
+
+    // Each attempt has its own conversation file, both closed.
+    let conversations = fixture.store().conversation_store(&execution.id);
+    for attempt in [fixture.fake.action_id(1), fixture.fake.action_id(2)] {
+        let snapshot = conversations
+            .read(&attempt, 1, usize::MAX)
+            .expect("read the conversation")
+            .unwrap_or_else(|| panic!("attempt '{attempt}' has a conversation"));
+        assert!(snapshot.closed, "attempt '{attempt}' was compressed");
+    }
+}
+
+/// Runs [`REPROMPT_WORKFLOW`] on the fixture's engine.
+async fn run_reprompt_workflow(fixture: &EngineFixture) -> narsor::domain::WorkflowExecution {
+    let definition = fixture.workflow(REPROMPT_WORKFLOW);
+    fixture
+        .engine()
+        .start_and_run(&definition, json!({}), fixture.workspace())
+        .await
+        .expect("run the workflow")
+}
+
+/// The error of the execution's `ActionFailed`.
+fn action_failure(fixture: &EngineFixture, execution_id: &str) -> String {
+    events_of(fixture, execution_id)
+        .into_iter()
+        .find_map(|data| match data {
+            EventData::ActionFailed { error, .. } => Some(error),
+            _ => None,
+        })
+        .expect("an ActionFailed event")
+}
+
+/// A label the state does not declare is a format error too: asked again,
+/// not failed on the spot.
+#[tokio::test]
+async fn an_undeclared_label_is_asked_for_again_instead_of_failing_at_once() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &envelope(r#"{"output":"finished"}"#))
+        .answers_on_call(2, &envelope(r#"{"output":"implemented"}"#));
+
+    let execution = run_reprompt_workflow(&fixture).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(fixture.fake.calls(), 2);
+    assert!(has_flag(
+        &fixture.fake.args(2),
+        "--resume",
+        "fake-session-1"
+    ));
+
+    let reason = events_of(&fixture, &execution.id)
+        .into_iter()
+        .find_map(|data| match data {
+            EventData::ActionOutputRejected { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("an ActionOutputRejected event");
+    assert!(reason.contains("'finished'"), "{reason}");
+    let types = fixture.event_types(&execution.id);
+    assert!(
+        types.contains(&"output_reprompted".to_string()),
+        "{types:?}"
+    );
+    assert!(!types.contains(&"action_retrying".to_string()), "{types:?}");
+}
+
+/// A harness that reported no session cannot be asked again: the action fails
+/// with the reason, and the retry policy is not used for a format error.
+#[tokio::test]
+async fn without_a_harness_session_there_is_no_reprompt() {
+    let fixture = EngineFixture::new();
+    let no_session = json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "result": "All done, nothing to report.",
+    })
+    .to_string();
+    fixture.fake.answers(&no_session);
+
+    let execution = run_reprompt_workflow(&fixture).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Failed);
+    assert_eq!(fixture.fake.calls(), 1, "no reprompt and no retry");
+    let types = fixture.event_types(&execution.id);
+    assert!(
+        types.contains(&"action_output_rejected".to_string()),
+        "{types:?}"
+    );
+    for absent in ["output_reprompted", "action_retrying"] {
+        assert!(!types.contains(&absent.to_string()), "{types:?}");
+    }
+    let error = action_failure(&fixture, &execution.id);
+    assert!(error.contains("no session to resume"), "{error}");
+}
+
+/// A reprompt that again yields no label ends the step with a clear error —
+/// and still no `retry_policy` retry.
+#[tokio::test]
+async fn a_reprompt_without_a_label_fails_with_a_clear_error() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers(&envelope("I already told you, it is done."));
+
+    let execution = run_reprompt_workflow(&fixture).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Failed);
+    assert_eq!(
+        fixture.fake.calls(),
+        2,
+        "one attempt and one reprompt, no more"
+    );
+    let types = fixture.event_types(&execution.id);
+    assert_eq!(
+        types
+            .iter()
+            .filter(|kind| *kind == "action_output_rejected")
+            .count(),
+        2,
+        "{types:?}"
+    );
+    assert!(!types.contains(&"action_retrying".to_string()), "{types:?}");
+    let error = action_failure(&fixture, &execution.id);
+    assert!(error.contains("even when asked again"), "{error}");
+}
+
+/// KTD7: a question in reply to a reprompt is a failed reprompt, not a
+/// suspension that would restart the step in a fresh session.
+#[tokio::test]
+async fn a_question_in_reply_to_a_reprompt_is_a_failed_reprompt() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &envelope("Done, I think."))
+        .answers_on_call(
+            2,
+            &envelope(r#"{"status":"awaiting_input","question":"Which label do you mean?"}"#),
+        );
+
+    let execution = run_reprompt_workflow(&fixture).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Failed);
+    assert!(!fixture.store().has_pending_input(&execution.id));
+    let error = action_failure(&fixture, &execution.id);
+    assert!(error.contains("Which label do you mean?"), "{error}");
+}
+
+/// A timeout is an action failure, not a format error: it goes through the
+/// state's `retry_policy` exactly as before.
+#[tokio::test]
+async fn a_timeout_without_a_label_still_uses_the_retry_policy() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, "")
+        .sleeps_on_call(1, 30)
+        .answers_on_call(2, &envelope(r#"{"output":"implemented"}"#));
+
+    let definition = fixture.workflow(
+        &REPROMPT_WORKFLOW.replace("    retry_policy:\n", "    timeout: 1\n    retry_policy:\n"),
+    );
+    let execution = fixture
+        .engine()
+        .start_and_run(&definition, json!({}), fixture.workspace())
+        .await
+        .expect("run the workflow");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(fixture.fake.calls(), 2);
+    assert!(!fixture.fake.args(2).iter().any(|arg| arg == "--resume"));
+    let types = fixture.event_types(&execution.id);
+    assert!(types.contains(&"action_retrying".to_string()), "{types:?}");
+    for absent in ["action_output_rejected", "output_reprompted"] {
+        assert!(!types.contains(&absent.to_string()), "{types:?}");
+    }
+}
+
+/// KTD7: the reprompt resumes the session on the harness that ran the
+/// rejected attempt, even when the default harness changed in between.
+#[tokio::test]
+async fn the_reprompt_runs_on_the_harness_of_the_rejected_attempt() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &envelope("Done, no JSON."))
+        .sleeps_on_call(1, 1)
+        .answers_on_call(2, &envelope(r#"{"output":"implemented"}"#));
+    let selector = Arc::new(
+        DefaultHarnessSelector::load(
+            StatePaths::new(fixture.root.path()),
+            vec!["claude-code".into(), "opencode".into()],
+            "claude-code",
+        )
+        .await
+        .expect("load selector"),
+    );
+    let store = fixture.store();
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(ClaudeCodeAdapter::with_program(
+                fixture.fake.program(),
+            )))
+            .with_adapter(Arc::new(OpenCodeAdapter::with_program(
+                fixture.fake.program(),
+            ))),
+    )
+    .with_default_harness_selector(Arc::clone(&selector))
+    .with_event_sink(Arc::new(LoggingEventSink::new(store.clone(), None)));
+    let engine = Engine::new(store).with_executor(ActionKind::Agent, Arc::new(executor));
+
+    let definition =
+        fixture.workflow(&REPROMPT_WORKFLOW.replace("      harness: claude-code\n", ""));
+    let workspace = fixture.workspace();
+    let run = tokio::spawn(async move {
+        engine
+            .start_and_run(&definition, json!({}), workspace)
+            .await
+    });
+    for _ in 0..100 {
+        if fixture.fake.calls() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(fixture.fake.calls(), 1, "the first attempt started");
+    selector.set("opencode").await.expect("change the default");
+
+    let execution = run.await.expect("the run joins").expect("run the workflow");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let second = fixture.fake.args(2);
+    assert!(second.iter().any(|arg| arg == "--print"), "{second:?}");
+    assert!(
+        has_flag(&second, "--resume", "fake-session-1"),
+        "{second:?}"
+    );
+}
+
+/// Restart matrix: a daemon that stopped after `ActionOutputRejected` and
+/// before the reprompt started leaves nothing in flight. Startup recovery
+/// keeps the execution `Running`, and the next pass continues with the
+/// reprompt instead of running the state's action afresh.
+#[tokio::test]
+async fn a_restart_between_rejection_and_reprompt_continues_with_the_reprompt() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers(&envelope(r#"{"output":"implemented"}"#));
+    let store = fixture.store();
+    let engine = fixture.engine();
+    let definition = fixture.workflow(REPROMPT_WORKFLOW);
+    let mut execution = engine
+        .start(&definition, json!({}), fixture.workspace())
+        .expect("start");
+
+    // What the stopped daemon left behind: the attempt closed by its
+    // rejection, and the engine's record of it.
+    let log = store.event_log(&execution.id);
+    for data in [
+        EventData::StateEntered {
+            state_id: "work".to_string(),
+        },
+        EventData::ActionStarted {
+            action_execution_id: "attempt-1".to_string(),
+            state_id: "work".to_string(),
+            action_type: "agent".to_string(),
+        },
+        EventData::ActionOutputRejected {
+            action_execution_id: "attempt-1".to_string(),
+            state_id: "work".to_string(),
+            reason: "no output label".to_string(),
+            answer_tail: None,
+        },
+    ] {
+        log.append_next(&execution.id, data).expect("append");
+    }
+    let rejection = OutputRejection {
+        state_id: "work".to_string(),
+        action_execution_id: "attempt-1".to_string(),
+        reason: "no output label".to_string(),
+        answer_tail: None,
+        harness: Some("claude-code".to_string()),
+        harness_session_id: Some("session-7".to_string()),
+    };
+    execution.current_state = Some("work".to_string());
+    execution.metadata = json!({
+        METADATA_ENGINE_KEY: { METADATA_OUTPUT_REJECTION_KEY: rejection },
+    });
+    store
+        .save_execution(&execution)
+        .expect("save the execution");
+
+    let report = recover(&store).expect("recover");
+    let verdict = report
+        .reconciled
+        .iter()
+        .find(|entry| entry.execution_id == execution.id)
+        .expect("the execution was reconciled");
+    assert_eq!(verdict.outcome, ReconciliationOutcome::Consistent);
+    assert_eq!(verdict.status, ExecutionStatus::Running);
+
+    let execution = engine
+        .resume(&definition, &execution.id)
+        .await
+        .expect("resume");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(fixture.fake.calls(), 1, "only the reprompt ran");
+    let args = fixture.fake.args(1);
+    assert!(has_flag(&args, "--resume", "session-7"), "{args:?}");
+    assert!(has_flag(&args, "--permission-mode", "plan"), "{args:?}");
+    let types = fixture.event_types(&execution.id);
+    assert_eq!(
+        types
+            .iter()
+            .filter(|kind| *kind == "action_started")
+            .count(),
+        1,
+        "the state's action was not run afresh: {types:?}"
+    );
+    assert!(
+        types.contains(&"output_reprompted".to_string()),
+        "{types:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

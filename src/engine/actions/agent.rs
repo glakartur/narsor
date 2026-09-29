@@ -18,9 +18,11 @@
 //!    ([`ActionError`]) — it never falls back to `success`. In an unattended
 //!    pipeline a guessed label is a silently wrong transition, which is a far
 //!    worse outcome than a failure an operator can see. D20's tolerance for a
-//!    hallucinating agent is served by *retrying* — an [`ActionError`] is
-//!    retriable, so the state's `retry_policy` gives the agent another go, and
-//!    escalation to a human is the state's own business.
+//!    hallucinating agent is served by *asking again*: the failure is a
+//!    [`MISSING_OUTPUT_LABEL`] error carrying the harness and its session id,
+//!    and the engine resumes that session once, read-only, with
+//!    [`reprompt_config`] — outside the state's `retry_policy`, which stays
+//!    for real failures (KTD7).
 //! 3. **Record the session.** Every run creates an [`AgentSession`] and emits
 //!    `AgentSessionStarted` before it and `AgentSessionCompleted` /
 //!    `AgentSessionFailed` after it, with the harness's own session id captured
@@ -62,7 +64,7 @@ use super::{
 };
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, AgentActionConfig, AgentSession, AgentSessionStatus,
-    Event, EventData, OutputDefinition, Workspace,
+    Event, EventData, OutputDefinition, Workspace, WorkspaceAccess,
 };
 use crate::persistence::{
     ConversationSource, ConversationStore, ConversationWriter, DefaultHarnessSelector,
@@ -112,6 +114,47 @@ Do not use `awaiting_input` for a harness, sandbox, permission, or tool error; \
 those are action failures. Do not omit the JSON object: without it the workflow \
 cannot continue."
     )
+}
+
+/// The `error_type` of an answer no output label could be extracted from — a
+/// format error the engine answers with a reprompt, not with `retry_policy`
+/// (KTD7).
+pub const MISSING_OUTPUT_LABEL: &str = "missing_output_label";
+
+/// What the engine asks an agent whose answer carried no usable output label
+/// (KTD7), in the same harness session, before the output contract.
+///
+/// Generic on purpose: the reprompt only repairs the format of work already
+/// done, so it tells the agent not to carry on working. The reason the
+/// previous answer was rejected is quoted after it.
+pub const OUTPUT_REPROMPT: &str = "Your previous reply could not be used by the workflow, \
+because it did not end with a valid output object. Do not continue the task and do not \
+change any files: the work is already done. Reply only with the JSON object described \
+below, choosing the label that describes the work you already did.";
+
+/// The configuration of the engine's reprompt of an agent (KTD7).
+///
+/// Resumes `harness_session` on `harness` — the harness the rejected attempt
+/// ran on, never the current default, which may have changed since — with
+/// read-only workspace access, whatever the workflow declares: fixing the
+/// format of an answer is not further work. Any `resume_session` of the
+/// workflow's own is replaced by the session being repaired. `reason` says
+/// why the previous answer was rejected.
+pub fn reprompt_config(
+    original: &AgentActionConfig,
+    harness: &str,
+    harness_session: &str,
+    reason: &str,
+) -> AgentActionConfig {
+    let mut config = original.clone();
+    config.harness = Some(harness.to_string());
+    config.workspace_access = WorkspaceAccess::ReadOnly;
+    config.prompt = format!("{OUTPUT_REPROMPT}\n\nWhy it was rejected: {reason}");
+    config.parameters.insert(
+        RESUME_SESSION_PARAMETER.to_string(),
+        Value::String(harness_session.to_string()),
+    );
+    config
 }
 
 /// The harness used when neither the action nor the configuration names one.
@@ -559,7 +602,10 @@ impl AgentExecutor {
 
         let output = match extract_response(&run.text) {
             Ok(output) => output,
-            Err(error) => {
+            Err(mut error) => {
+                // What the engine needs to ask this same session again
+                // (KTD7): the harness it ran on and the session it left.
+                record_session_in_details(&mut error, harness, run.session_id.as_deref());
                 self.fail_session(
                     request.execution_id,
                     request.action_execution_id,
@@ -660,7 +706,11 @@ fn new_session(
         ended_at: None,
         status: AgentSessionStatus::Starting,
         model: config.model.clone(),
+        // The harness is recorded here as well as on the session itself, so
+        // the session config alone says where the session can be resumed
+        // (KTD7), even when the action named no harness.
         config: serde_json::json!({
+            "harness": harness,
             "read_only_paths": config.read_only_paths,
             "parameters": config.parameters,
         }),
@@ -1200,10 +1250,25 @@ fn no_label_error(reason: &str, text: &str) -> ActionError {
              The agent must end with a JSON object carrying an 'output' key \
              (WORKFLOW_SCHEMA.md §3.3.A)"
         ),
-        error_type: Some("missing_output_label".to_string()),
+        error_type: Some(MISSING_OUTPUT_LABEL.to_string()),
         details: Some(serde_json::json!({
             "answer_tail": super::harness::tail(text, FAILED_EXTRACTION_QUOTE_BYTES),
         })),
+    }
+}
+
+/// Adds the harness and its session id to the details of an extraction
+/// failure, so the engine can resume that session to ask for the label again.
+fn record_session_in_details(error: &mut ActionError, harness: &str, session_id: Option<&str>) {
+    let details = error
+        .details
+        .get_or_insert_with(|| Value::Object(Map::new()));
+    if let Value::Object(details) = details {
+        details.insert("harness".to_string(), Value::String(harness.to_string()));
+        details.insert(
+            "harness_session_id".to_string(),
+            session_id.map_or(Value::Null, |id| Value::String(id.to_string())),
+        );
     }
 }
 

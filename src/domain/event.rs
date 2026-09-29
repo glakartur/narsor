@@ -103,6 +103,41 @@ pub enum EventData {
         #[serde(default)]
         state_id: Option<String>,
     },
+    /// An agent attempt ended without an output label the state accepts
+    /// (KTD7): no JSON object, no `output`, or a label the state does not
+    /// declare.
+    ///
+    /// A format error, not an action failure: it closes the attempt (D23 and
+    /// the conversation sweep treat it like `ActionCompleted`/`ActionFailed`)
+    /// without consuming the state's `retry_policy`. What follows is a
+    /// reprompt ([`EventData::OutputReprompted`]) or `ActionFailed`.
+    ActionOutputRejected {
+        /// The attempt whose output was rejected.
+        action_execution_id: String,
+        /// The state whose action ran.
+        state_id: String,
+        /// Why the output was rejected.
+        reason: String,
+        /// The end of the agent's answer.
+        #[serde(default)]
+        answer_tail: Option<String>,
+    },
+    /// A new attempt asks the agent of a rejected attempt for its output label
+    /// again, by resuming its harness session (KTD7).
+    ///
+    /// Opens an attempt the way `ActionRetrying` does, with a fresh
+    /// `action_execution_id` (D24), but it is deliberately not a retry: the
+    /// state's `retry_policy` counter does not move.
+    OutputReprompted {
+        /// The new attempt.
+        action_execution_id: String,
+        /// The attempt whose output was rejected.
+        previous_attempt: String,
+        /// The state whose action is asked again.
+        state_id: String,
+        /// Who asked.
+        by: RepromptedBy,
+    },
 
     // Agent events
     AgentSessionStarted {
@@ -206,6 +241,26 @@ pub enum EventData {
     },
 }
 
+/// Who asked an agent again for its output label (KTD7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepromptedBy {
+    /// The engine's one generic reprompt.
+    Engine,
+    /// The conductor's reprompt with its own wording.
+    Conductor,
+}
+
+impl RepromptedBy {
+    /// The name as the event log spells it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Engine => "engine",
+            Self::Conductor => "conductor",
+        }
+    }
+}
+
 impl Event {
     /// Creates a new event
     pub fn new(workflow_execution_id: String, data: EventData, sequence: u64) -> Self {
@@ -266,6 +321,12 @@ impl Event {
             }
             EventData::ActionRetrying { retry_count, .. } => {
                 format!("Retrying the action (attempt {})", retry_count + 1)
+            }
+            EventData::ActionOutputRejected { reason, .. } => {
+                format!("Output rejected: {}", first_line(reason))
+            }
+            EventData::OutputReprompted { by, .. } => {
+                format!("Asked the agent again for its output (by {})", by.name())
             }
 
             EventData::AgentSessionStarted { harness, .. } => {
