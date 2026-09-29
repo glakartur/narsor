@@ -82,13 +82,13 @@ use crate::api::{
     TransitionRequest,
 };
 use crate::domain::{
-    Context, Event, EventData, ExecutionStatus, HumanInputField, HumanInputType, InputCloseReason,
-    InputParameter, ParamType, State, WorkflowDefinition, WorkflowExecution, Workspace,
+    Context, Event, EventData, ExecutionStatus, InputCloseReason, InputParameter, ParamType, State,
+    WorkflowDefinition, WorkflowExecution, Workspace,
 };
 use crate::engine::actions::script::TRUNCATION_MARKER;
 use crate::engine::{
     permitted_labels, permitted_outputs, ConversationState as PositionConversationState, EventLink,
-    HumanInputDelivery, InputContinuation, PendingHumanInput, Timeline,
+    InputContinuation, PendingHumanInput, Timeline,
 };
 use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
@@ -96,6 +96,10 @@ use crate::tasks;
 use crate::tui::conversation::{classify, ClassifiedEntry};
 use crate::tui::scroll::{sanitize, ScrollState};
 use crate::workflows::{ResolvedWorkflow, WorkflowEntry, WorkflowResolver};
+
+pub use crate::tui::input_form::{
+    Entry, EntryMap, FormAction, FormError, FormRow, InputForm, InputKind, ProblemForm,
+};
 
 /// The decision provider recorded for an operator's ordinary manual choice.
 pub const MANUAL_PROVIDER: &str = "human";
@@ -116,6 +120,11 @@ pub const MANUAL_REASON: &str = "Manual transition picked by the operator.";
 
 /// The label recorded for a forced transition, which by definition has none.
 pub const OVERRIDE_LABEL: &str = "override";
+
+/// Why `t` does not choose an output of a gate with required fields (R4).
+pub const GATE_NEEDS_FORM_MESSAGE: &str =
+    "This gate has required fields: answer it with i, so their values reach the workflow \
+     (o switches to a forced override).";
 
 // ---------------------------------------------------------------------------
 // Small state types
@@ -307,157 +316,14 @@ pub enum Request {
 }
 
 // ---------------------------------------------------------------------------
-// The human input form
+// The recovery note
 // ---------------------------------------------------------------------------
-
-/// One row of the generated form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FormRow {
-    /// A declared field, by index.
-    Field(usize),
-    /// The output label picker, shown when the state recorded a menu.
-    Label,
-}
-
-/// The human-input form, generated from [`PendingHumanInput::fields`].
-///
-/// A `text` field is an editable line, a `select` field cycles its `options`.
-/// The label row exists because §4's `human_clarification` has one text field
-/// and two outputs: nothing can be inferred there, so the operator picks.
-#[derive(Debug, Clone)]
-pub struct InputForm {
-    /// The question.
-    pub instruction: String,
-    /// The declared fields, in declaration order.
-    pub fields: Vec<HumanInputField>,
-    /// The current value of each field, by index.
-    pub values: Vec<String>,
-    /// The label choices: `None` means "let the engine infer it".
-    pub label_choices: Vec<Option<String>>,
-    /// Which label choice is selected.
-    pub label_index: usize,
-    /// The focused row.
-    pub row: usize,
-    /// The last validation failure, if any.
-    pub error: Option<String>,
-    /// The key of the request the form was opened on (KTD9): the answer is
-    /// refused if that request is no longer the one pending.
-    pub episode: String,
-}
 
 /// A free-form note sent with an explicit recovery of an agent step.
 #[derive(Debug, Clone, Default)]
 pub struct RecoveryCommentForm {
     /// The text to append to the next agent prompt.
     pub value: String,
-}
-
-impl InputForm {
-    /// Builds the form for a pending question.
-    pub fn new(pending: &PendingHumanInput) -> Self {
-        let fields = pending.fields().to_vec();
-        let values = fields
-            .iter()
-            .map(|field| match field.field_type {
-                // A select starts on its first option, so the common case is
-                // one keystroke: Enter.
-                HumanInputType::Select if field.required => {
-                    field.options.first().cloned().unwrap_or_default()
-                }
-                HumanInputType::Select => String::new(),
-                HumanInputType::Text => String::new(),
-            })
-            .collect();
-
-        let mut label_choices: Vec<Option<String>> = Vec::new();
-        if !pending.outputs.is_empty() {
-            if infers_label(&fields) {
-                label_choices.push(None);
-            }
-            label_choices.extend(pending.output_labels().into_iter().map(Some));
-        }
-
-        Self {
-            instruction: pending.instruction().to_string(),
-            fields,
-            values,
-            label_choices,
-            label_index: 0,
-            row: 0,
-            error: None,
-            episode: pending.episode_key().to_string(),
-        }
-    }
-
-    /// The rows, in the order they are drawn and navigated.
-    pub fn rows(&self) -> Vec<FormRow> {
-        let mut rows: Vec<FormRow> = (0..self.fields.len()).map(FormRow::Field).collect();
-        if !self.label_choices.is_empty() {
-            rows.push(FormRow::Label);
-        }
-        rows
-    }
-
-    /// The focused row, if the form has any.
-    pub fn current_row(&self) -> Option<FormRow> {
-        self.rows().get(self.row).copied()
-    }
-
-    /// The label the operator picked, if they picked one.
-    pub fn chosen_label(&self) -> Option<String> {
-        self.label_choices.get(self.label_index).cloned().flatten()
-    }
-
-    /// Validates by the same rules the engine applies (U6) and builds the
-    /// delivery.
-    ///
-    /// Duplicating the rules here is on purpose: the engine would reject the
-    /// same delivery, but only after a round trip, and the operator deserves
-    /// the complaint next to the field that caused it.
-    pub fn validate(&self) -> Result<HumanInputDelivery, String> {
-        let mut values = Map::new();
-
-        for (index, field) in self.fields.iter().enumerate() {
-            let raw = self.values.get(index).map(String::as_str).unwrap_or("");
-            if raw.trim().is_empty() {
-                if field.required {
-                    return Err(format!("Field '{}' is required.", field.name));
-                }
-                continue;
-            }
-
-            if field.field_type == HumanInputType::Select
-                && !field.options.iter().any(|option| option == raw)
-            {
-                return Err(format!(
-                    "'{raw}' is not a permitted value for field '{}'; permitted values: {}.",
-                    field.name,
-                    field.options.join(", ")
-                ));
-            }
-
-            values.insert(field.name.clone(), Value::String(raw.to_string()));
-        }
-
-        let mut delivery = HumanInputDelivery::with_values(values).for_episode(&self.episode);
-        if let Some(label) = self.chosen_label() {
-            delivery = delivery.choosing(label);
-        } else if !self.label_choices.is_empty() && !infers_label(&self.fields) {
-            return Err(
-                "Pick an output label: this state gives nothing to infer one from.".to_string(),
-            );
-        }
-        Ok(delivery)
-    }
-}
-
-/// Whether a single `select` field lets the engine infer the output label.
-fn infers_label(fields: &[HumanInputField]) -> bool {
-    fields
-        .iter()
-        .filter(|field| field.field_type == HumanInputType::Select)
-        .count()
-        == 1
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,8 +903,9 @@ impl HarnessSelectionModal {
 pub enum Modal {
     /// No overlay.
     None,
-    /// The generated human-input form.
-    Input(InputForm),
+    /// The generated human-input form. Boxed: a problem's form carries its
+    /// answers and key–value maps, far more than any other overlay.
+    Input(Box<InputForm>),
     /// Operator note for a recovered agent attempt.
     RecoveryComment(RecoveryCommentForm),
     /// The full content of one event (R1, R2, R3).
@@ -1432,8 +1299,23 @@ impl App {
         targets
     }
 
+    /// What `i` does for the pending request, if there is one: the three
+    /// kinds read differently in the bar (R10).
+    fn input_shortcut(&self) -> Option<&'static str> {
+        self.pending
+            .as_ref()
+            .map(|pending| match InputKind::of(pending.continuation) {
+                InputKind::Gate => "answer",
+                InputKind::AgentQuestion => "reply to agent",
+                InputKind::Problem => "resolve problem",
+            })
+    }
+
     /// The shortcuts the bottom bar shows, given the focus and the modal.
     pub fn shortcuts(&self) -> Vec<(&'static str, &'static str)> {
+        if let Modal::Input(form) = &self.modal {
+            return form_shortcuts(form);
+        }
         if let Screen::Task(view) = &self.screen {
             let mut keys = vec![
                 ("Tab", "axis/content"),
@@ -1445,17 +1327,14 @@ impl App {
             if view.focus == TaskFocus::Content {
                 keys.push(("Enter/space", "expand/collapse"));
             }
+            if let Some(action) = self.input_shortcut() {
+                keys.push(("i", action));
+            }
             keys.push(("Esc", "back"));
             return keys;
         }
         match &self.modal {
-            Modal::Input(_) => vec![
-                ("Tab/↑↓", "field"),
-                ("←/→", "value"),
-                ("letters", "type"),
-                ("Enter", "submit"),
-                ("Esc", "cancel"),
-            ],
+            Modal::Input(form) => form_shortcuts(form),
             Modal::RecoveryComment(_) => vec![
                 ("letters", "type operator note"),
                 ("Enter", "save note"),
@@ -1525,20 +1404,16 @@ impl App {
                         keys.push(("n", "new task"));
                         keys.push(("R", "repositories"));
                         keys.push(("s", "run/resume"));
-                        if self.pending.as_ref().is_some_and(|pending| {
-                            pending.continuation == InputContinuation::ResumeAgent
-                        }) {
-                            keys.push(("i", "reply to agent"));
+                        if let Some(action) = self.input_shortcut() {
+                            keys.push(("i", action));
                         }
                         keys.push(("t", "transition"));
                         keys.push(("x", "interrupt"));
                     }
                     Panel::Details => {
                         keys.push(("j/k", "variables"));
-                        if self.pending.as_ref().is_some_and(|pending| {
-                            pending.continuation == InputContinuation::ResumeAgent
-                        }) {
-                            keys.push(("i", "reply to agent"));
+                        if let Some(action) = self.input_shortcut() {
+                            keys.push(("i", action));
                         }
                         keys.push(("t", "transition"));
                         keys.push(("x", "interrupt"));
@@ -1855,7 +1730,7 @@ impl App {
                 self.request_conversation(&event)
             }
             KeyCode::Char('i') => {
-                self.open_input_or_recovery_comment();
+                self.open_input_form();
                 Request::None
             }
             KeyCode::Char('t') => {
@@ -2305,6 +2180,11 @@ impl App {
 
     /// Keys while the task view is open.
     fn on_key_task(&mut self, key: KeyEvent) -> Request {
+        // The input form opens over the task view and takes every key while
+        // it is open.
+        if matches!(self.modal, Modal::Input(_)) {
+            return self.on_key_form(key);
+        }
         match key.code {
             KeyCode::Esc => {
                 self.leave_task_view();
@@ -2320,6 +2200,10 @@ impl App {
                 Request::None
             }
             KeyCode::Char('r') => Request::TaskRefresh,
+            KeyCode::Char('i') => {
+                self.open_input_form_for_task();
+                Request::None
+            }
             KeyCode::Char('j') | KeyCode::Down => self.move_task_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_task_cursor(-1),
             KeyCode::PageDown => self.page_task_cursor(1),
@@ -2475,57 +2359,13 @@ impl App {
         let Modal::Input(form) = &mut self.modal else {
             return Request::None;
         };
-        let rows = form.rows();
-
-        match key.code {
-            KeyCode::Esc => {
+        match form.on_key(key) {
+            FormAction::None => Request::None,
+            FormAction::Submit => Request::SubmitInput,
+            FormAction::Cancel => {
                 self.modal = Modal::None;
                 Request::None
             }
-            KeyCode::Enter => Request::SubmitInput,
-            KeyCode::Tab | KeyCode::Down => {
-                if !rows.is_empty() {
-                    form.row = (form.row + 1) % rows.len();
-                }
-                Request::None
-            }
-            KeyCode::BackTab | KeyCode::Up => {
-                if !rows.is_empty() {
-                    form.row = (form.row + rows.len() - 1) % rows.len();
-                }
-                Request::None
-            }
-            KeyCode::Left => {
-                cycle_choice(form, -1);
-                Request::None
-            }
-            KeyCode::Right => {
-                cycle_choice(form, 1);
-                Request::None
-            }
-            KeyCode::Backspace => {
-                if let Some(FormRow::Field(index)) = form.current_row() {
-                    if form.fields[index].field_type == HumanInputType::Text {
-                        form.values[index].pop();
-                    }
-                }
-                Request::None
-            }
-            KeyCode::Char(character) => {
-                match form.current_row() {
-                    Some(FormRow::Field(index))
-                        if form.fields[index].field_type == HumanInputType::Text =>
-                    {
-                        form.values[index].push(character);
-                    }
-                    // On a select or the label row there is nothing to type, so
-                    // space steps to the next option.
-                    _ if character == ' ' => cycle_choice(form, 1),
-                    _ => {}
-                }
-                Request::None
-            }
-            _ => Request::None,
         }
     }
 
@@ -2556,6 +2396,7 @@ impl App {
 
     /// Keys inside the transition menu.
     fn on_key_transition(&mut self, key: KeyEvent) -> Request {
+        let gate_needs_form = self.gate_needs_form();
         let Modal::Transition(menu) = &mut self.modal else {
             return Request::None;
         };
@@ -2596,6 +2437,10 @@ impl App {
                     self.notice = Some(Notice::error("There is no transition to pick."));
                     return Request::None;
                 };
+                if menu.mode == TransitionMode::Outputs && gate_needs_form {
+                    self.notice = Some(Notice::error(GATE_NEEDS_FORM_MESSAGE));
+                    return Request::None;
+                }
                 if menu.mode == TransitionMode::Override {
                     // A forced transition never happens on one keystroke.
                     let from = self
@@ -2836,15 +2681,13 @@ impl App {
 
     // -- operations ---------------------------------------------------------
 
-    /// Opens the form for the question the selected execution is waiting on.
+    /// `i`: opens the form for whatever the selected execution waits on — a
+    /// gate, an agent's question or a problem (R1).
     pub fn open_input_form(&mut self) {
         match self.pending.as_ref() {
-            Some(pending) if pending.continuation == InputContinuation::ResumeAgent => {
-                self.modal = Modal::Input(InputForm::new(pending))
+            Some(pending) => {
+                self.modal = Modal::Input(Box::new(InputForm::new(pending, &self.variables)));
             }
-            Some(_) => self.notice = Some(Notice::error(
-                "This workflow decision is selected with t; i only replies to an agent/harness.",
-            )),
             None => {
                 self.notice = Some(Notice::error(
                     "The selected execution is not waiting for human input.",
@@ -2853,21 +2696,33 @@ impl App {
         }
     }
 
-    /// `i` replies only to the harness that raised the current question.
-    pub fn open_input_or_recovery_comment(&mut self) {
-        if let Some(pending) = self.pending.as_ref() {
-            if pending.continuation == InputContinuation::ResumeAgent {
-                self.open_input_form();
-            } else {
-                self.notice = Some(Notice::error(
-                    "This workflow decision is selected with t; i only replies to an agent/harness.",
-                ));
-            }
+    /// `i` in the task view: the same form, for the task on screen. The
+    /// task view is always entered on the selected execution, so its pending
+    /// request is the one [`App::pending`] holds; the check only guards
+    /// against the two ever disagreeing.
+    fn open_input_form_for_task(&mut self) {
+        let Screen::Task(view) = &self.screen else {
             return;
+        };
+        let matches_view = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.execution_id == view.execution_id);
+        if matches_view {
+            self.open_input_form();
+        } else {
+            self.notice = Some(Notice::error("This task is not waiting for human input."));
         }
-        self.notice = Some(Notice::error(
-            "The selected step is not awaiting a reply from an agent/harness.",
-        ));
+    }
+
+    /// Whether the pending request is a gate with required fields: choosing
+    /// one of its outputs with `t` would skip those fields, and the next
+    /// steps would never see their values (R4).
+    fn gate_needs_form(&self) -> bool {
+        self.pending.as_ref().is_some_and(|pending| {
+            pending.continuation == InputContinuation::CompleteStep
+                && pending.fields().iter().any(|field| field.required)
+        })
     }
 
     /// Opens the manual transition menu for the current state.
@@ -2915,8 +2770,8 @@ impl App {
     ///
     /// A failed validation is reported in the form and nothing is sent: a
     /// rejected answer must leave the execution exactly as paused as it was.
-    /// A validated delivery's outcome, once accepted, no longer reopens this
-    /// form; it surfaces later as a notice from the live stream (R6).
+    /// The form closes only once the daemon accepts the answer; what happens
+    /// after that surfaces as a notice from the live stream (R6).
     pub async fn submit_input(&mut self) {
         let Modal::Input(form) = &mut self.modal else {
             return;
@@ -2924,19 +2779,33 @@ impl App {
 
         let delivery = match form.validate() {
             Ok(delivery) => delivery,
-            Err(message) => {
-                form.error = Some(message.clone());
-                self.notice = Some(Notice::error(message));
+            Err(error) => {
+                self.notice = Some(Notice::error(error.message.clone()));
+                form.fail(error);
                 return;
             }
         };
+        let execution_id = form.execution_id.clone();
 
-        let Some(execution_id) = self.selected().map(|row| row.id.clone()) else {
-            return;
-        };
-
-        self.modal = Modal::None;
-        self.deliver(&execution_id, delivery).await;
+        match self.client.deliver_input(&execution_id, delivery).await {
+            Ok(_) => {
+                self.modal = Modal::None;
+                self.notice = Some(Notice::info(format!(
+                    "Delivered input to execution {execution_id}; running in the background."
+                )));
+            }
+            // The daemon has the last word (a `400` names what is wrong, a
+            // `409` says the request is gone): the form stays open with what
+            // was typed, so nothing has to be typed again.
+            Err(error) => {
+                let message = client_error_message(&execution_id, error);
+                if let Modal::Input(form) = &mut self.modal {
+                    form.error = Some(message.clone());
+                    form.error_row = None;
+                }
+                self.notice = Some(Notice::error(message));
+            }
+        }
     }
 
     /// Carries out the transition the operator picked.
@@ -2954,25 +2823,12 @@ impl App {
             self.force_transition(&target).await;
             return;
         }
+        if self.gate_needs_form() {
+            self.notice = Some(Notice::error(GATE_NEEDS_FORM_MESSAGE));
+            return;
+        }
 
         self.manual_transition(&target).await;
-    }
-
-    /// The shared tail of [`App::submit_input`]/[`App::deliver_label`]:
-    /// `client.deliver_input`, then a notice — success or failure — in the
-    /// same wording an operator already reads for every other mutating call
-    /// here.
-    async fn deliver(&mut self, execution_id: &str, delivery: HumanInputDelivery) {
-        match self.client.deliver_input(execution_id, delivery).await {
-            Ok(_) => {
-                self.notice = Some(Notice::info(format!(
-                    "Delivered input to execution {execution_id}; running in the background."
-                )));
-            }
-            Err(error) => {
-                self.notice = Some(Notice::error(client_error_message(execution_id, error)));
-            }
-        }
     }
 
     /// Takes a declared transition by hand — `POST /executions/:id/transition`
@@ -3551,6 +3407,21 @@ impl App {
 // helpers
 // ---------------------------------------------------------------------------
 
+/// The bar's shortcuts while the input form is open: `←`/`→` means
+/// something different on a key–value entry than on a choice.
+fn form_shortcuts(form: &InputForm) -> Vec<(&'static str, &'static str)> {
+    let mut keys = vec![("Tab/↑↓", "row")];
+    match form.current_row() {
+        Some(FormRow::Entry(..)) => keys.push(("←/→", "key/value")),
+        Some(FormRow::AddEntry(_)) => keys.push(("letters", "new key")),
+        _ => keys.push(("←/→", "value")),
+    }
+    keys.push(("letters", "type"));
+    keys.push(("Enter", "submit"));
+    keys.push(("Esc", "cancel"));
+    keys
+}
+
 /// Turns a [`ClientError`] into the notice text an operator reads — the
 /// TUI's counterpart of `src/cli/commands.rs`'s `client_error`, which does
 /// the same mapping for the CLI. `execution_id` (or, for `start_new_task`,
@@ -3611,35 +3482,6 @@ fn step(current: usize, delta: isize, length: usize) -> Option<usize> {
         return None;
     }
     Some(next as usize)
-}
-
-/// Steps the focused row's choice: a `select` field's option, or the label.
-fn cycle_choice(form: &mut InputForm, delta: isize) {
-    match form.current_row() {
-        Some(FormRow::Field(index)) => {
-            let field = &form.fields[index];
-            if field.field_type != HumanInputType::Select || field.options.is_empty() {
-                return;
-            }
-            let next = match field
-                .options
-                .iter()
-                .position(|option| option == &form.values[index])
-            {
-                Some(current) => wrap(current, delta, field.options.len()),
-                None if delta >= 0 => 0,
-                None => field.options.len() - 1,
-            };
-            form.values[index] = field.options[next].clone();
-        }
-        Some(FormRow::Label) => {
-            if form.label_choices.is_empty() {
-                return;
-            }
-            form.label_index = wrap(form.label_index, delta, form.label_choices.len());
-        }
-        None => {}
-    }
 }
 
 /// Steps the focused input's choice, when it has one.

@@ -1,0 +1,76 @@
+name: tui-gate
+version: 1
+description: >
+  Workflow fixture for the TUI's input form: a gate shaped like the bundled
+  `resolve_ambiguity` — a required `select` whose options are exactly the
+  state's outputs, and a required answer — then a script standing in for the
+  agent that applies the answer, and a second gate that declares no fields at
+  all. The script is reached through an absolute path handed in as an input,
+  so the test never writes into the repository.
+
+inputs:
+  - name: apply_path
+    type: string
+    required: true
+    description: Absolute path to the script that applies the answer.
+
+states:
+  resolve_ambiguity:
+    description: A person answers the question the agent stopped on.
+    allow_manual_override: true
+    action:
+      type: human
+      message: The agent stopped on an ambiguity rather than guessing.
+      inputs:
+        - name: ambiguity_decision
+          type: select
+          required: true
+          options:
+            - answered
+            - replan
+        - name: ambiguity_answer
+          type: text
+          required: true
+          description: The answer to the agent's question.
+    outputs:
+      - label: answered
+        description: the agent's question is answered; carry on with the work.
+      - label: replan
+        description: the plan is what is wrong; send the work back to planning.
+    transitions:
+      answered: apply_clarification
+      replan: replanned
+
+  apply_clarification:
+    description: Applies the answer the gate collected.
+    action:
+      type: script
+      command: "{{ inputs.apply_path }}"
+      args:
+        - "{{ context.ambiguity_answer }}"
+    outputs:
+      - applied
+    transitions:
+      applied: confirm
+
+  confirm:
+    description: A gate without fields, decided with t.
+    action:
+      type: human
+      message: Ship it?
+    outputs:
+      - ship
+      - hold
+    transitions:
+      ship: done
+      hold: replanned
+
+  done:
+    description: Shipped.
+
+  replanned:
+    description: Sent back.
+
+terminal_states:
+  done: completed
+  replanned: failed

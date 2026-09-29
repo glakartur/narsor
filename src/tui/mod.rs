@@ -74,6 +74,7 @@
 
 pub mod app;
 pub mod conversation;
+pub mod input_form;
 pub mod scroll;
 pub mod views;
 

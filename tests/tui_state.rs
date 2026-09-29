@@ -41,7 +41,7 @@ use std::fs;
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -55,18 +55,23 @@ use narsor::domain::{
     Event, EventData, ExecutionStatus, WorkflowDefinition, WorkflowExecution, Workspace,
 };
 use narsor::engine::actions::script::TRUNCATION_MARKER;
-use narsor::engine::Engine;
+use narsor::engine::{
+    ActionKind, ConductorAnalysis, Engine, HumanInputDelivery, InputContinuation, PendingHumanInput,
+};
 use narsor::persistence::conversation::ConversationSource;
 use narsor::persistence::{CatalogPaths, DaemonInfo, ExecutionStore, StatePaths, WorkPaths};
 use narsor::registry::{RepositoryEntry, RepositoryRegistry};
 use narsor::tui::app::{
-    event_detail_lines, event_line, task_position_line, App, Modal, NewTaskChoice, NewTaskStage,
-    Panel, RepositoryField, Request, Screen, StreamStatus, TaskContent, TransitionMode,
-    OVERRIDE_PROVIDER, OVERRIDE_REASON,
+    event_detail_lines, event_line, task_position_line, App, EntryMap, FormRow, InputKind, Modal,
+    NewTaskChoice, NewTaskStage, Panel, RepositoryField, Request, Screen, StreamStatus,
+    TaskContent, TransitionMode, GATE_NEEDS_FORM_MESSAGE, OVERRIDE_PROVIDER, OVERRIDE_REASON,
 };
 use narsor::tui::views;
 use narsor::workflow::load_from_file;
 use narsor::workflows::{builtin, WorkflowResolver};
+
+#[path = "engine_support/mod.rs"]
+mod engine_support;
 
 // ---------------------------------------------------------------------------
 // harness
@@ -526,9 +531,11 @@ async fn a_live_event_appends_to_the_stream_and_moves_the_view() {
     assert_eq!(app.stream_status(), &StreamStatus::Live);
 }
 
-/// A workflow decision is selected with `t`, never answered through `i`.
+/// `i` opens the form for a workflow gate too, not only for an agent's
+/// question (R1) — the review's `select` offers exactly its outputs, so it is
+/// the one choice of the label (KTD17), with no separate label row.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_workflow_decision_refuses_the_agent_reply_key() {
+async fn i_opens_the_gate_form_from_the_execution_list() {
     let root = TempRoot::new();
     paused_at_review(root.path()).await;
 
@@ -537,17 +544,29 @@ async fn a_workflow_decision_refuses_the_agent_reply_key() {
     app.refresh().await;
 
     assert!(app.pending().is_some(), "the question is visible");
+    assert_eq!(app.focus(), Panel::Executions);
     assert_eq!(app.on_key(key(KeyCode::Char('i'))), Request::None);
 
-    assert!(!matches!(app.modal(), Modal::Input(_)));
-    assert!(app.notice().expect("a notice").is_error);
+    let Modal::Input(form) = app.modal() else {
+        panic!("the gate's form is open");
+    };
+    assert_eq!(form.kind, InputKind::Gate);
+    assert_eq!(form.instruction, "Approve the prepared change?");
+    assert_eq!(
+        form.label_field,
+        Some(0),
+        "approval_status chooses the label"
+    );
+    assert_eq!(form.rows(), vec![FormRow::Field(0), FormRow::Field(1)]);
+    assert_eq!(form.chosen_label().as_deref(), Some("approved"));
 }
 
-/// A declared transition resolves a workflow decision.
+/// A declared transition resolves a workflow decision whose gate declares
+/// no fields: there is nothing `t` could lose, so it is not sent to `i`.
 #[tokio::test(flavor = "multi_thread")]
 async fn selecting_a_declared_transition_resumes_the_execution() {
     let root = TempRoot::new();
-    let execution_id = paused_at_review(root.path()).await;
+    let execution_id = paused_at_confirm(root.path()).await;
 
     let (daemon, client) = Daemon::start(root.path()).await;
     let mut app = app_over(&daemon, root.path()).await;
@@ -744,9 +763,11 @@ fn a_resize_preserves_the_panel_layout() {
 // error paths
 // ---------------------------------------------------------------------------
 
-/// The reply key does not open a form for a workflow decision.
+/// An empty required field stops the gate's form before anything is sent:
+/// the error is shown at the field, the focus moves to it, and the execution
+/// stays exactly as paused as it was.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_workflow_decision_cannot_be_submitted_as_an_agent_reply() {
+async fn an_empty_required_field_stops_the_gate_form_at_the_field() {
     let root = TempRoot::new();
     let execution_id = paused_at_review(root.path()).await;
     let before = events_of(root.path(), &execution_id).len();
@@ -755,9 +776,23 @@ async fn a_workflow_decision_cannot_be_submitted_as_an_agent_reply() {
     let mut app = app_over(&daemon, root.path()).await;
     app.refresh().await;
     app.on_key(key(KeyCode::Char('i')));
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::SubmitInput);
+    app.submit_input().await;
 
-    assert!(!matches!(app.modal(), Modal::Input(_)));
+    let Modal::Input(form) = app.modal() else {
+        panic!("the form stays open");
+    };
+    assert_eq!(form.error_row, Some(FormRow::Field(1)), "at the comment");
+    assert_eq!(form.current_row(), Some(FormRow::Field(1)), "focused there");
+    assert!(form
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("'comment' is required")));
     assert!(app.notice().expect("a notice").is_error);
+    assert!(
+        screen_of(&app).contains("↳ Field 'comment' is required."),
+        "the error is drawn under the field"
+    );
 
     let store = store_of(root.path());
     let execution = store
@@ -989,10 +1024,17 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
         "the script's variable reached the context panel"
     );
 
-    // `t` — choose the workflow's declared approved output.
-    app.on_key(key(KeyCode::Char('t')));
-    app.on_key(key(KeyCode::Enter));
-    app.apply_transition().await;
+    // `i` — answer the review: `approved` is preselected, the comment is
+    // typed, and Enter sends it.
+    app.on_key(key(KeyCode::Char('i')));
+    app.on_key(key(KeyCode::Tab));
+    type_text(&mut app, "looks good");
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::SubmitInput);
+    app.submit_input().await;
+    assert!(
+        matches!(app.modal(), Modal::None),
+        "an accepted answer closes the form"
+    );
     wait_until_settled(&client, &[&execution.id]).await;
 
     let stored = reload_until(root.path(), &execution.id, ExecutionStatus::Completed);
@@ -1000,6 +1042,12 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
     assert_eq!(stored.current_state.as_deref(), Some("done"));
 
     let recorded = events_of(root.path(), &execution.id);
+    assert!(recorded.iter().any(|event| matches!(
+        &event.data,
+        EventData::HumanInputReceived { input, output_label, .. }
+            if input["comment"] == "looks good"
+                && output_label.as_deref() == Some("approved")
+    )));
     assert!(recorded
         .iter()
         .any(|event| matches!(&event.data, EventData::DecisionMade { .. })));
@@ -1378,24 +1426,28 @@ async fn a_forced_transition_is_refused_while_a_background_pass_is_driving_the_s
     );
 }
 
-/// The agent reply form's advertised shortcuts must match what `on_key_form` actually
-/// handles. The bar and the help overlay once offered `j`/`k` for moving
-/// between fields, which never worked: on a text field those are typed as
-/// characters, and on a select row they are ignored. A hint that lies is worse
-/// than no hint, because the operator blames themselves for the key not working.
+/// `i` works from the details panel as well, and the bar says what it does
+/// there. While the form is open, the bar offers only keys `on_key_form`
+/// handles: `j`/`k` would be typed into a text field, so they are not
+/// advertised for moving between rows.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_workflow_decision_does_not_open_the_agent_reply_form() {
+async fn i_opens_the_gate_form_from_the_details_panel() {
     let root = TempRoot::new();
     paused_at_review(root.path()).await;
 
     let (daemon, _) = Daemon::start(root.path()).await;
     let mut app = app_over(&daemon, root.path()).await;
     app.refresh().await;
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(app.focus(), Panel::Details);
+    assert!(app.shortcuts().contains(&("i", "answer")));
+
     app.on_key(key(KeyCode::Char('i')));
-    assert!(
-        !matches!(app.modal(), Modal::Input(_)),
-        "a human gate is not a harness reply"
-    );
+    assert!(matches!(app.modal(), Modal::Input(_)));
+    assert!(app
+        .shortcuts()
+        .iter()
+        .all(|(keys, _)| !keys.contains('j') && !keys.contains('k')));
 }
 
 // ---------------------------------------------------------------------------
@@ -3340,5 +3392,621 @@ async fn harness_picker_uses_confirmed_snapshots_for_set_reset_and_errors() {
     assert_eq!(
         client.harness_selection().await.expect("snapshot"),
         confirmed_reset
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Conductor plan U6: the `i` form for every pending input, and `t` on a gate
+// ---------------------------------------------------------------------------
+
+/// The question the agent before the gate left open (AE2).
+const AGENT_QUESTION: &str = "Czy limit ma dotyczyć konta czy użytkownika?";
+
+/// The whole screen as drawn, cell symbols in order.
+fn screen_of(app: &App) -> String {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut terminal = Terminal::new(TestBackend::new(160, 60)).expect("a test terminal");
+    terminal
+        .draw(|frame| views::render(frame, app))
+        .expect("draw the screen");
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
+/// The fixture shaped like the bundled `resolve_ambiguity` gate.
+fn gate_definition_path() -> PathBuf {
+    fixtures().join("gate.yaml")
+}
+
+/// Runs the gate fixture up to its first gate — before a daemon exists for
+/// `root` — and, when given, records the question the agent step before it
+/// left open, the way the engine carries it (U3).
+async fn paused_at_gate(root: &Path, question: Option<&str>) -> String {
+    let engine = engine_for(root);
+    let definition = load_from_file(gate_definition_path()).expect("load the gate fixture");
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace");
+
+    let mut execution = engine
+        .start(
+            &definition,
+            json!({ "apply_path": fixtures().join("apply.sh").display().to_string() }),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start the execution");
+    execution.metadata = json!({
+        "cli": { "definition_path": gate_definition_path().display().to_string() }
+    });
+    engine
+        .store()
+        .save_execution(&execution)
+        .expect("record the definition path");
+
+    let execution = engine
+        .run(&definition, &execution.id)
+        .await
+        .expect("run up to the gate");
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    assert_eq!(
+        execution.current_state.as_deref(),
+        Some("resolve_ambiguity")
+    );
+
+    if let Some(question) = question {
+        let store = engine.store();
+        let mut pending: PendingHumanInput = store
+            .load_pending_input(&execution.id)
+            .expect("read the pending input")
+            .expect("the gate is pending");
+        pending.request.question = Some(question.to_string());
+        pending.request.answer_tail = Some("…so I stopped here.".to_string());
+        store
+            .save_pending_input(&execution.id, &pending)
+            .expect("record the agent's question");
+    }
+    execution.id
+}
+
+/// Runs the gate fixture past its first gate to the second one, `confirm`,
+/// which declares no fields.
+async fn paused_at_confirm(root: &Path) -> String {
+    let execution_id = paused_at_gate(root, None).await;
+    let engine = engine_for(root);
+    let definition = load_from_file(gate_definition_path()).expect("load the gate fixture");
+    let execution = engine
+        .deliver_human_input(
+            &definition,
+            &execution_id,
+            &HumanInputDelivery::with_values(
+                json!({ "ambiguity_decision": "answered", "ambiguity_answer": "B" })
+                    .as_object()
+                    .cloned()
+                    .expect("an object"),
+            ),
+        )
+        .await
+        .expect("answer the first gate");
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    assert_eq!(execution.current_state.as_deref(), Some("confirm"));
+    execution_id
+}
+
+/// Runs `agent_problem` until its agent step, which gives no output label,
+/// becomes a problem (U5) — with, when given, the conductor's analysis
+/// recorded on it the way U10 will.
+async fn paused_on_problem(root: &Path, analysis: Option<ConductorAnalysis>) -> String {
+    let store = store_of(root);
+    let engine = Engine::new(store.clone()).with_executor(
+        ActionKind::Agent,
+        Arc::new(engine_support::LabellessAgentExecutor::answering(
+            "Done, all tests pass.",
+        )),
+    );
+    let definition_path = engine_support::fixtures().join("engine/agent_problem.yaml");
+    let definition = load_from_file(&definition_path).expect("load the problem fixture");
+    let workspace_path = root.join("workspace");
+    fs::create_dir_all(&workspace_path).expect("create workspace");
+    fs::copy(
+        engine_support::fixtures().join("scripts/print_json.sh"),
+        workspace_path.join("print_json.sh"),
+    )
+    .expect("copy the fixture script");
+
+    let mut execution = engine
+        .start(
+            &definition,
+            json!({}),
+            Workspace::local_folder(workspace_path.display().to_string()),
+        )
+        .expect("start the execution");
+    execution.metadata = json!({
+        "cli": { "definition_path": definition_path.display().to_string() }
+    });
+    store
+        .save_execution(&execution)
+        .expect("record the definition path");
+    engine
+        .run(&definition, &execution.id)
+        .await
+        .expect("run to the problem");
+
+    let mut pending: PendingHumanInput = store
+        .load_pending_input(&execution.id)
+        .expect("read the pending input")
+        .expect("the problem is pending");
+    assert_eq!(pending.continuation, InputContinuation::ResolveOutput);
+    if analysis.is_some() {
+        pending.problem.as_mut().expect("a problem record").analysis = analysis;
+        store
+            .save_pending_input(&execution.id, &pending)
+            .expect("record the analysis");
+    }
+    execution.id
+}
+
+/// The open input form.
+fn input_form(app: &App) -> &narsor::tui::app::InputForm {
+    match app.modal() {
+        Modal::Input(form) => form,
+        other => panic!("the input form is open, got {other:?}"),
+    }
+}
+
+/// Moves the form's focus onto `row`.
+fn focus_row(app: &mut App, row: FormRow) {
+    for _ in 0..32 {
+        if input_form(app).current_row() == Some(row) {
+            return;
+        }
+        app.on_key(key(KeyCode::Tab));
+    }
+    panic!("the form has no row {row:?}");
+}
+
+/// The form shows the gate's message, the agent's question above the fields
+/// and the end of its answer (AE2, R7).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gate_form_shows_the_agents_question_above_the_fields() {
+    let root = TempRoot::new();
+    paused_at_gate(root.path(), Some(AGENT_QUESTION)).await;
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.on_key(key(KeyCode::Char('i')));
+
+    let form = input_form(&app);
+    assert_eq!(form.question.as_deref(), Some(AGENT_QUESTION));
+    let screen = screen_of(&app);
+    let message = screen
+        .find("The agent stopped on an ambiguity rather than guessing.")
+        .expect("the gate's message is drawn");
+    let question = screen.find(AGENT_QUESTION).expect("the question is drawn");
+    let field = screen
+        .find("ambiguity_decision*")
+        .expect("the choice is drawn");
+    assert!(
+        message < question && question < field,
+        "the question sits above the fields"
+    );
+    assert!(
+        screen.contains("…so I stopped here."),
+        "the answer's tail is drawn"
+    );
+}
+
+/// AE1: the operator answers `resolve_ambiguity` — `answered` is the choice,
+/// the answer is typed — and the next step receives that text. The second
+/// gate declares no fields, so `t` decides it as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gate_answer_reaches_the_next_step() {
+    let root = TempRoot::new();
+    let execution_id = paused_at_gate(root.path(), Some(AGENT_QUESTION)).await;
+
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+
+    app.on_key(key(KeyCode::Char('i')));
+    assert_eq!(input_form(&app).chosen_label().as_deref(), Some("answered"));
+    focus_row(&mut app, FormRow::Field(1));
+    type_text(&mut app, "używamy wariantu B");
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::SubmitInput);
+    app.submit_input().await;
+    assert!(
+        matches!(app.modal(), Modal::None),
+        "an accepted answer closes the form"
+    );
+    assert!(!app.notice().expect("a notice").is_error);
+
+    wait_until_settled(&client, &[&execution_id]).await;
+    let execution = reload_until(root.path(), &execution_id, ExecutionStatus::InputNeeded);
+    assert_eq!(execution.current_state.as_deref(), Some("confirm"));
+    assert_eq!(
+        execution.context.variables.get("applied_answer"),
+        Some(&json!("używamy wariantu B")),
+        "the step after the gate got the answer"
+    );
+    assert!(events_of(root.path(), &execution_id)
+        .iter()
+        .any(|event| matches!(
+            &event.data,
+            EventData::HumanInputReceived { input, output_label, .. }
+                if input["ambiguity_decision"] == "answered"
+                    && output_label.as_deref() == Some("answered")
+        )));
+
+    // `confirm` has no fields: `t` is not redirected there.
+    app.refresh().await;
+    app.on_key(key(KeyCode::Char('t')));
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::ApplyTransition);
+    app.apply_transition().await;
+    wait_until_settled(&client, &[&execution_id]).await;
+    let execution = reload_until(root.path(), &execution_id, ExecutionStatus::Completed);
+    assert_eq!(execution.current_state.as_deref(), Some("done"));
+}
+
+/// KTD17: a `select` whose options are exactly the outputs is one choice
+/// with the outputs' descriptions, and what is sent — the field's value and
+/// `chosen_label` — cannot disagree.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_select_matching_the_outputs_is_one_choice_with_descriptions() {
+    let root = TempRoot::new();
+    paused_at_gate(root.path(), None).await;
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.on_key(key(KeyCode::Char('i')));
+
+    let form = input_form(&app);
+    assert_eq!(form.label_field, Some(0));
+    assert!(
+        !form.rows().contains(&FormRow::Label),
+        "no second label picker"
+    );
+    let screen = screen_of(&app);
+    assert!(
+        screen.contains("● answered — the agent's question is answered; carry on with the work.")
+    );
+    assert!(
+        screen.contains("○ replan — the plan is what is wrong; send the work back to planning.")
+    );
+
+    app.on_key(key(KeyCode::Right));
+    focus_row(&mut app, FormRow::Field(1));
+    type_text(&mut app, "the plan misses the limits");
+
+    let form = input_form(&app);
+    assert_eq!(form.chosen_label().as_deref(), Some("replan"));
+    let delivery = form.validate().expect("a valid answer");
+    assert_eq!(delivery.values["ambiguity_decision"], "replan");
+    assert_eq!(delivery.chosen_label.as_deref(), Some("replan"));
+    assert!(screen_of(&app).contains("● replan"));
+}
+
+/// AE14: `t` → `answered` on a gate with required fields does not move on —
+/// it points to `i`, and the pending answer stays. Override mode is still
+/// there as a deliberate escape.
+#[tokio::test(flavor = "multi_thread")]
+async fn t_on_a_gate_with_required_fields_points_to_i() {
+    let root = TempRoot::new();
+    let execution_id = paused_at_gate(root.path(), None).await;
+    let before = events_of(root.path(), &execution_id).len();
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+
+    app.on_key(key(KeyCode::Char('t')));
+    let Modal::Transition(menu) = app.modal() else {
+        panic!("the transition menu is open");
+    };
+    assert_eq!(menu.current().map(String::as_str), Some("answered"));
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::None);
+    let notice = app.notice().expect("a notice");
+    assert!(notice.is_error);
+    assert_eq!(notice.text, GATE_NEEDS_FORM_MESSAGE);
+    assert!(
+        matches!(app.modal(), Modal::Transition(_)),
+        "the menu stays open"
+    );
+
+    // Even a caller that goes straight to the operation is refused.
+    app.apply_transition().await;
+    assert_eq!(
+        app.notice().expect("a notice").text,
+        GATE_NEEDS_FORM_MESSAGE
+    );
+
+    let store = store_of(root.path());
+    assert_eq!(
+        store.load_execution(&execution_id).expect("reload").status,
+        ExecutionStatus::InputNeeded
+    );
+    assert!(
+        store.has_pending_input(&execution_id),
+        "the gate still waits"
+    );
+    assert_eq!(events_of(root.path(), &execution_id).len(), before);
+
+    // A forced override stays available.
+    app.on_key(key(KeyCode::Char('o')));
+    app.on_key(key(KeyCode::Enter));
+    assert!(matches!(app.modal(), Modal::Confirm(_)));
+}
+
+/// `i` works from the task view, and the form is drawn over it; closing the
+/// form leaves the operator in the task view.
+#[tokio::test(flavor = "multi_thread")]
+async fn i_opens_the_form_from_the_task_view() {
+    let root = TempRoot::new();
+    paused_at_gate(root.path(), Some(AGENT_QUESTION)).await;
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::OpenTaskView);
+    app.open_task_for_execution().await;
+    assert!(matches!(app.screen(), Screen::Task(_)));
+    assert!(app.shortcuts().contains(&("i", "answer")));
+
+    app.on_key(key(KeyCode::Char('i')));
+    assert_eq!(input_form(&app).kind, InputKind::Gate);
+    assert!(
+        screen_of(&app).contains(AGENT_QUESTION),
+        "drawn over the task view"
+    );
+
+    // Keys go to the form, not to the task view.
+    focus_row(&mut app, FormRow::Field(1));
+    type_text(&mut app, "jk");
+    assert_eq!(input_form(&app).values[1], "jk");
+
+    app.on_key(key(KeyCode::Esc));
+    assert!(matches!(app.modal(), Modal::None));
+    assert!(
+        matches!(app.screen(), Screen::Task(_)),
+        "still in the task view"
+    );
+}
+
+/// An agent's own question opens as it always did: a reply form, titled as
+/// one, with the question as its message.
+#[tokio::test(flavor = "multi_thread")]
+async fn i_opens_the_reply_form_for_an_agents_question() {
+    let root = TempRoot::new();
+    let execution_id = paused_at_review(root.path()).await;
+    {
+        // Turn the pending review into the question an agent would raise.
+        let store = store_of(root.path());
+        let pending: PendingHumanInput = store
+            .load_pending_input(&execution_id)
+            .expect("read")
+            .expect("pending");
+        let mut request = pending.request.clone();
+        request.instruction = "Which API version?".to_string();
+        request.fields = vec![narsor::domain::HumanInputField {
+            name: "answer".to_string(),
+            field_type: narsor::domain::HumanInputType::Text,
+            required: true,
+            description: Some("Answer for the agent.".to_string()),
+            options: Vec::new(),
+        }];
+        let question = PendingHumanInput::for_agent(execution_id.clone(), "review", request);
+        store
+            .save_pending_input(&execution_id, &question)
+            .expect("save the agent's question");
+    }
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    assert!(app.shortcuts().contains(&("i", "reply to agent")));
+    app.on_key(key(KeyCode::Char('i')));
+
+    let form = input_form(&app);
+    assert_eq!(form.kind, InputKind::AgentQuestion);
+    assert_eq!(form.rows(), vec![FormRow::Field(0)]);
+    let screen = screen_of(&app);
+    assert!(screen.contains("Reply to the agent"));
+    assert!(screen.contains("Which API version?"));
+}
+
+/// A server-side refusal keeps the form open with what was typed: here the
+/// request was answered by someone else first, so the daemon says it is no
+/// longer pending (`409`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_delivery_keeps_the_form_and_its_content() {
+    let root = TempRoot::new();
+    let execution_id = paused_at_gate(root.path(), None).await;
+
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.on_key(key(KeyCode::Char('i')));
+    focus_row(&mut app, FormRow::Field(1));
+    type_text(&mut app, "mine");
+    let episode = input_form(&app).episode.clone();
+
+    // A second client answers the same request first.
+    client
+        .deliver_input(
+            &execution_id,
+            HumanInputDelivery::with_values(
+                json!({ "ambiguity_decision": "replan", "ambiguity_answer": "theirs" })
+                    .as_object()
+                    .cloned()
+                    .expect("an object"),
+            )
+            .for_episode(episode),
+        )
+        .await
+        .expect("the first answer is accepted");
+
+    app.on_key(key(KeyCode::Enter));
+    app.submit_input().await;
+
+    let form = input_form(&app);
+    assert_eq!(form.values[1], "mine", "nothing has to be typed again");
+    assert!(form.error.is_some(), "the refusal is shown in the form");
+    assert!(app.notice().expect("a notice").is_error);
+}
+
+/// A problem's form: the label choice with descriptions starts on the
+/// conductor's proposal, its proposed `variables` are prefilled and the key
+/// the label needs is marked; the rejected answer is shown. Sending it
+/// settles the step with that output.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_problem_form_offers_labels_and_prefilled_key_values() {
+    let root = TempRoot::new();
+    let execution_id = paused_on_problem(
+        root.path(),
+        Some(ConductorAnalysis {
+            label: Some("implemented".to_string()),
+            data: serde_json::Map::new(),
+            variables: json!({ "summary": "all units done" })
+                .as_object()
+                .cloned()
+                .expect("an object"),
+            rationale: Some("The answer says every test passes.".to_string()),
+        }),
+    )
+    .await;
+
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    assert!(app.shortcuts().contains(&("i", "resolve problem")));
+    app.on_key(key(KeyCode::Char('i')));
+
+    let form = input_form(&app);
+    assert_eq!(form.kind, InputKind::Problem);
+    assert_eq!(form.chosen_label().as_deref(), Some("implemented"));
+    let problem = form.problem.as_ref().expect("the problem's part");
+    assert_eq!(problem.variables.len(), 1);
+    assert_eq!(problem.variables[0].key, "summary");
+    assert_eq!(problem.variables[0].value, "all units done");
+    assert!(form.is_required(EntryMap::Variables, "summary"));
+
+    let screen = screen_of(&app);
+    assert!(screen.contains("Resolve the problem"));
+    assert!(screen.contains("● implemented — The feature is implemented."));
+    assert!(screen.contains("○ needs_human_decision — A person has to decide first."));
+    assert!(screen.contains("variables.summary* = all units done"));
+    assert!(
+        screen.contains("Done, all tests pass."),
+        "the agent's answer"
+    );
+    assert!(
+        screen.contains("The answer says every test passes."),
+        "the analysis"
+    );
+
+    focus_row(&mut app, FormRow::Comment);
+    type_text(&mut app, "checked by hand");
+    app.on_key(key(KeyCode::Enter));
+    app.submit_input().await;
+    assert!(matches!(app.modal(), Modal::None), "accepted");
+
+    wait_until_settled(&client, &[&execution_id]).await;
+    let execution = reload_until(root.path(), &execution_id, ExecutionStatus::Completed);
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert!(events_of(root.path(), &execution_id)
+        .iter()
+        .any(|event| matches!(
+            &event.data,
+            EventData::HumanInputReceived { output_label, variables, comment, .. }
+                if output_label.as_deref() == Some("implemented")
+                    && variables.as_ref().is_some_and(|v| v["summary"] == "all units done")
+                    && comment.as_deref() == Some("checked by hand")
+        )));
+}
+
+/// Switching a problem's label adds the keys the new label needs; an empty
+/// required key stops the form at its entry, and filling it in lets the
+/// answer through — `data.question` then reaches the gate the label leads to.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_problem_label_needing_a_key_is_refused_until_it_is_given() {
+    let root = TempRoot::new();
+    let execution_id = paused_on_problem(root.path(), None).await;
+
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.on_key(key(KeyCode::Char('i')));
+
+    // No analysis: the form starts on the first label.
+    assert_eq!(
+        input_form(&app).chosen_label().as_deref(),
+        Some("implemented")
+    );
+    focus_row(&mut app, FormRow::Label);
+    app.on_key(key(KeyCode::Right));
+    let form = input_form(&app);
+    assert_eq!(form.chosen_label().as_deref(), Some("needs_human_decision"));
+    let problem = form.problem.as_ref().expect("the problem's part");
+    let question = problem
+        .data
+        .iter()
+        .position(|entry| entry.key == "question")
+        .expect("the key the label needs is offered");
+    assert!(form.is_required(EntryMap::Data, "question"));
+
+    app.on_key(key(KeyCode::Enter));
+    app.submit_input().await;
+    let form = input_form(&app);
+    assert_eq!(
+        form.error_row,
+        Some(FormRow::Entry(EntryMap::Data, question))
+    );
+    assert!(form
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("data.question")));
+    assert_eq!(
+        store_of(root.path())
+            .load_execution(&execution_id)
+            .expect("reload")
+            .status,
+        ExecutionStatus::InputNeeded,
+        "nothing was sent"
+    );
+
+    // The focus is on the entry; typing fills its value in.
+    type_text(&mut app, "Account or user limit?");
+    // A key of the operator's own, added from the add row.
+    focus_row(&mut app, FormRow::AddEntry(EntryMap::Variables));
+    type_text(&mut app, "scope");
+    app.on_key(key(KeyCode::Right));
+    type_text(&mut app, "account");
+    app.on_key(key(KeyCode::Enter));
+    app.submit_input().await;
+    assert!(matches!(app.modal(), Modal::None), "accepted");
+
+    wait_until_settled(&client, &[&execution_id]).await;
+    let execution = reload_until(root.path(), &execution_id, ExecutionStatus::InputNeeded);
+    assert_eq!(
+        execution.current_state.as_deref(),
+        Some("resolve_ambiguity")
+    );
+    assert_eq!(
+        execution.context.variables.get("scope"),
+        Some(&json!("account"))
+    );
+    let gate: PendingHumanInput = store_of(root.path())
+        .load_pending_input(&execution_id)
+        .expect("read")
+        .expect("the gate is pending");
+    assert_eq!(
+        gate.request.question.as_deref(),
+        Some("Account or user limit?")
     );
 }

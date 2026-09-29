@@ -31,8 +31,8 @@ use ratatui::Frame;
 
 use super::app::{
     event_detail_lines, event_line, status_name, task_conversation_lines, task_events_lines,
-    task_position_line, App, FormRow, Modal, NewTaskStage, Panel, RepositoryField, Screen,
-    TaskContent, TaskFocus, TaskView, TransitionMode,
+    task_position_line, App, EntryMap, FormRow, InputForm, InputKind, Modal, NewTaskStage, Panel,
+    RepositoryField, Screen, TaskContent, TaskFocus, TaskView, TransitionMode,
 };
 use super::scroll::wrap_visible;
 use crate::domain::{ExecutionStatus, HumanInputType};
@@ -150,6 +150,12 @@ fn render_task_view(frame: &mut Frame, app: &App, view: &TaskView) {
     render_task_axis(frame, view, axis_area);
     render_task_content(frame, view, content_area);
     render_shortcuts(frame, app, shortcuts);
+
+    // `i` works from the task view too (R1), and its form is the only
+    // overlay drawn over it.
+    if matches!(app.modal(), Modal::Input(_)) {
+        render_input_modal(frame, app);
+    }
 }
 
 /// The task view's left pane: every position, in timeline order (R7).
@@ -555,31 +561,33 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
     let Modal::Input(form) = app.modal() else {
         return;
     };
-    let area = modal_area(frame, 70, 60);
+    let area = modal_area(frame, 80, 80);
     frame.render_widget(Clear, area);
 
-    let mut lines = vec![
-        Line::from(Span::styled(
-            form.instruction.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
+    let mut lines = input_context_lines(form);
+    lines.push(Line::from(""));
 
+    let dim = Style::default().fg(Color::DarkGray);
     let rows = form.rows();
+    let chosen = form.chosen_label();
     for (index, row) in rows.iter().enumerate() {
         let focused = index == form.row;
         let marker = if focused { "›" } else { " " };
-        let line = match row {
+        let text = match row {
             FormRow::Field(field_index) => {
                 let field = &form.fields[*field_index];
                 let requirement = if field.required { "*" } else { " " };
                 let value = form.values[*field_index].clone();
                 let hint = match field.field_type {
-                    HumanInputType::Select => {
-                        format!("  [{}]", field.options.join(" | "))
+                    _ if form.label_field == Some(*field_index) => {
+                        "  (chooses the output)".to_string()
                     }
-                    HumanInputType::Text => String::new(),
+                    HumanInputType::Select => format!("  [{}]", field.options.join(" | ")),
+                    HumanInputType::Text => field
+                        .description
+                        .as_ref()
+                        .map(|description| format!("  — {description}"))
+                        .unwrap_or_default(),
                 };
                 format!("{marker} {}{requirement}: {value}{hint}", field.name)
             }
@@ -592,26 +600,90 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
                     .unwrap_or_else(|| "(infer from the select field)".to_string());
                 format!("{marker} output label: {value}")
             }
+            FormRow::Entry(map, entry_index) => {
+                let entry = &form
+                    .problem
+                    .as_ref()
+                    .expect("entry rows exist only on a problem's form")
+                    .entries(*map)[*entry_index];
+                let requirement = if form.is_required(*map, &entry.key) {
+                    "*"
+                } else {
+                    " "
+                };
+                // The column typing goes to is bracketed on the focused row.
+                let (key, value) = match (focused, entry.editing_key) {
+                    (true, true) => (format!("[{}]", entry.key), entry.value.clone()),
+                    (true, false) => (entry.key.clone(), format!("[{}]", entry.value)),
+                    (false, _) => (entry.key.clone(), entry.value.clone()),
+                };
+                format!("{marker} {}.{key}{requirement} = {value}", map.name())
+            }
+            FormRow::AddEntry(map) => {
+                let noun = match map {
+                    EntryMap::Data => "a data key",
+                    EntryMap::Variables => "a variable",
+                };
+                format!("{marker} + add {noun} (type its name)")
+            }
+            FormRow::Comment => {
+                let comment = form
+                    .problem
+                    .as_ref()
+                    .map(|problem| problem.comment.clone())
+                    .unwrap_or_default();
+                format!("{marker} comment: {comment}")
+            }
         };
 
         lines.push(Line::from(Span::styled(
-            line,
+            text,
             if focused {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             },
         )));
+
+        // A choice of outputs lists every label with what it means (KTD17).
+        let offers_outputs = match row {
+            FormRow::Field(field_index) => form.label_field == Some(*field_index),
+            FormRow::Label => true,
+            _ => false,
+        };
+        if offers_outputs {
+            for output in &form.outputs {
+                let bullet = if chosen.as_deref() == Some(output.label.as_str()) {
+                    "●"
+                } else {
+                    "○"
+                };
+                let text = match form.description_of(&output.label) {
+                    Some(description) => format!("    {bullet} {} — {description}", output.label),
+                    None => format!("    {bullet} {}", output.label),
+                };
+                lines.push(Line::from(Span::styled(text, dim)));
+            }
+        }
+
+        if form.error_row == Some(*row) {
+            if let Some(error) = &form.error {
+                lines.push(Line::from(Span::styled(
+                    format!("    ↳ {error}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
     }
 
     if rows.is_empty() {
         lines.push(Line::from(Span::styled(
             "This action declares no fields: pick an output label with t.",
-            Style::default().fg(Color::DarkGray),
+            dim,
         )));
     }
 
-    if let Some(error) = &form.error {
+    if let (Some(error), None) = (&form.error, form.error_row) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             error.clone(),
@@ -619,11 +691,15 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
         )));
     }
 
+    let border = match form.kind {
+        InputKind::Problem => Color::Red,
+        InputKind::Gate | InputKind::AgentQuestion => Color::Yellow,
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(" Human input ");
+        .border_style(Style::default().fg(border))
+        .title(form.kind.title());
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -631,6 +707,70 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// How many trailing lines of an agent's answer the form shows.
+const ANSWER_TAIL_LINES: usize = 8;
+
+/// What the form says above its rows (R7, R12): the gate's message, the
+/// agent's question and the end of its answer, and for a problem why it is
+/// one, each rejected answer and the conductor's reasoning.
+fn input_context_lines(form: &InputForm) -> Vec<Line<'static>> {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![Line::from(Span::styled(form.instruction.clone(), bold))];
+
+    if let Some(question) = &form.question {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "The agent asks:",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(question.lines().map(|line| Line::from(line.to_string())));
+    }
+
+    match &form.problem {
+        Some(problem) => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("Problem: {}", problem.reason),
+                Style::default().fg(Color::Red),
+            )));
+            for answer in &problem.answers {
+                lines.push(Line::from(Span::styled(
+                    format!("Rejected answer: {}", answer.reason),
+                    bold,
+                )));
+                if let Some(tail) = &answer.answer_tail {
+                    lines.extend(tail_lines(tail, dim));
+                }
+            }
+            if let Some(rationale) = &problem.rationale {
+                lines.push(Line::from(Span::styled("Conductor's analysis:", bold)));
+                lines.extend(rationale.lines().map(|line| Line::from(line.to_string())));
+            }
+        }
+        None => {
+            if let Some(tail) = &form.answer_tail {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("End of the agent's answer:", bold)));
+                lines.extend(tail_lines(tail, dim));
+            }
+        }
+    }
+    lines
+}
+
+/// The last [`ANSWER_TAIL_LINES`] lines of an answer, indented.
+fn tail_lines(tail: &str, style: Style) -> Vec<Line<'static>> {
+    let all: Vec<&str> = tail.lines().collect();
+    let start = all.len().saturating_sub(ANSWER_TAIL_LINES);
+    all[start..]
+        .iter()
+        .map(|line| Line::from(Span::styled(format!("  {line}"), style)))
+        .collect()
 }
 
 /// The short free-form instruction saved for the next agent attempt.
@@ -1252,7 +1392,7 @@ fn render_help_modal(frame: &mut Frame) {
         Line::from("  n                 new task (pick a workflow and start it)"),
         Line::from("  R                 repositories (a — register, d — remove)"),
         Line::from("  s                 run / resume the selected execution"),
-        Line::from("  i                 human input form"),
+        Line::from("  i                 answer the pending input: gate, agent question, problem"),
         Line::from("  t                 manual transition (o — override mode)"),
         Line::from("  x                 interrupt active execution (confirmation required)"),
         Line::from("  f                 follow the event stream"),
@@ -1274,6 +1414,7 @@ fn render_help_modal(frame: &mut Frame) {
         Line::from("  Shift+Tab / ↑     previous field"),
         Line::from("  ← / → / space     change a select value, or the picked workflow"),
         Line::from("  letters / Backspace  edit a text field"),
+        Line::from("  ← / →             (problem data/variables) edit the key / the value"),
         Line::from("  Enter             submit,  Esc — cancel"),
     ];
 
