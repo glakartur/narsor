@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::domain::{ActionError, AgentActionConfig};
+use crate::domain::{ActionError, AgentActionConfig, WorkspaceAccess};
 
 pub use claude_code::{ClaudeCodeAdapter, CLAUDE_CODE};
 pub use codex::{CodexAdapter, CODEX};
@@ -42,6 +42,10 @@ pub use opencode::{OpenCodeAdapter, OPENCODE};
 pub struct HarnessRequest<'a> {
     /// The action configuration, templates already expanded.
     pub config: &'a AgentActionConfig,
+
+    /// Workflow-level workspace access, already parsed independently of the
+    /// selected harness.
+    pub workspace_access: WorkspaceAccess,
 
     /// The prompt as the harness will receive it: the state's prompt with the
     /// output-label contract appended.
@@ -201,7 +205,7 @@ impl Default for HarnessRegistry {
 /// Reads a string `parameters` entry.
 ///
 /// A parameter of the wrong JSON type is an error rather than a silent default:
-/// `permission_mode: true` is a mistake the author wants to be told about.
+/// `max_turns: true` is a mistake the author wants to be told about.
 pub(crate) fn string_parameter<'a>(
     config: &'a AgentActionConfig,
     key: &str,

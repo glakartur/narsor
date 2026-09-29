@@ -10,7 +10,7 @@
 //! {root}/executions/{execution_id}/
 //!     state.json                  -- the serialized WorkflowExecution
 //!     context.json                -- projection of the execution context
-//!     pending_input.json          -- the input request a paused execution awaits
+//!     pending_input.json          -- the input request an input-needed execution awaits
 //!     events/{sequence:08}.json   -- append-only event log
 //!     artifacts/{artifact_id}/    -- files produced by actions
 //!     conversations/{attempt_id}.jsonl        -- open attempt, see conversation

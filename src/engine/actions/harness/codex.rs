@@ -11,6 +11,7 @@ use super::{
     HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
 };
 use crate::domain::ActionError;
+use crate::domain::WorkspaceAccess;
 
 /// The `harness:` value this adapter answers to.
 pub const CODEX: &str = "codex";
@@ -20,8 +21,6 @@ pub const DEFAULT_PROGRAM: &str = "codex";
 
 const FAILURE_DETAIL_BYTES: usize = 2 * 1024;
 const APPROVAL_POLICY: &str = "never";
-/// A workflow must explicitly opt into a writable Codex sandbox.
-const DEFAULT_SANDBOX: &str = "read-only";
 
 /// Adapter for the Codex CLI.
 #[derive(Debug, Clone)]
@@ -103,10 +102,7 @@ impl HarnessAdapter for CodexAdapter {
 
 fn validate_parameters(request: &HarnessRequest<'_>) -> Result<(), ActionError> {
     for key in request.config.parameters.keys() {
-        if matches!(
-            key.as_str(),
-            "sandbox" | "approval_policy" | "resume_session"
-        ) {
+        if matches!(key.as_str(), "approval_policy" | "resume_session") {
             continue;
         }
         return Err(ActionError {
@@ -132,24 +128,18 @@ fn validate_parameters(request: &HarnessRequest<'_>) -> Result<(), ActionError> 
 }
 
 fn sandbox(request: &HarnessRequest<'_>) -> Result<String, ActionError> {
-    let sandbox = string_parameter(request.config, "sandbox", CODEX)?.unwrap_or(DEFAULT_SANDBOX);
-    match sandbox {
-        "read-only" | "workspace-write" => Ok(sandbox.to_string()),
-        "danger-full-access" => Err(unsafe_sandbox(sandbox)),
-        other => Err(ActionError {
-            message: format!("codex sandbox '{other}' is unsupported; allowed values are read-only, workspace-write"),
+    if request.config.parameters.contains_key("sandbox") {
+        return Err(ActionError {
+            message: "parameter 'sandbox' is no longer supported for harness 'codex'; use workflow-level 'workspace_access'".to_string(),
             error_type: Some("invalid_parameter".to_string()),
             details: Some(serde_json::json!({ "harness": CODEX, "parameter": "sandbox" })),
-        }),
+        });
     }
-}
-
-fn unsafe_sandbox(sandbox: &str) -> ActionError {
-    ActionError {
-        message: format!("codex sandbox '{sandbox}' is not allowed by Narsor"),
-        error_type: Some("unsafe_harness_argument".to_string()),
-        details: Some(serde_json::json!({ "harness": CODEX, "parameter": "sandbox" })),
+    Ok(match request.workspace_access {
+        WorkspaceAccess::ReadWrite => "workspace-write",
+        WorkspaceAccess::ReadOnly => "read-only",
     }
+    .to_string())
 }
 
 /// Codex's `--add-dir` grants workspace access, so it must not be used for

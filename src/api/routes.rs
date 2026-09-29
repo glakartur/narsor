@@ -39,10 +39,11 @@
 //! check is done by hand, in a `middleware::from_fn_with_state` layer that
 //! only ever returns a bare status code.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::{Path, Query, Request, State};
@@ -56,14 +57,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::broadcast;
+use tokio::task::AbortHandle;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::api::dto::{
     AcceptedResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
-    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
-    StartTaskResponse, TransitionRequest,
+    OperatorNoteRequest, RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest,
+    StartTaskRequest, StartTaskResponse, TransitionRequest,
 };
 use crate::domain::{Event, EventData, ExecutionStatus};
 use crate::engine::{
@@ -122,6 +124,7 @@ struct AppState {
     catalog_dir: PathBuf,
     work_dir: PathBuf,
     harness_selector: Option<Arc<DefaultHarnessSelector>>,
+    active_tasks: Arc<Mutex<HashMap<String, AbortHandle>>>,
 }
 
 /// Builds the router: the three original read-only endpoints (U5/U2) plus
@@ -150,6 +153,7 @@ pub fn router(
         catalog_dir,
         work_dir,
         harness_selector,
+        active_tasks: Arc::new(Mutex::new(HashMap::new())),
     };
     Router::new()
         .route("/executions/:execution_id/events", get(get_events))
@@ -173,6 +177,11 @@ pub fn router(
         .route("/tasks", post(post_start_task))
         .route("/executions/:execution_id/resume", post(post_resume))
         .route("/executions/:execution_id/recover", post(post_recover))
+        .route(
+            "/executions/:execution_id/operator-note",
+            post(post_operator_note),
+        )
+        .route("/executions/:execution_id/interrupt", post(post_interrupt))
         .route("/executions/:execution_id/input", post(post_input))
         .route(
             "/executions/:execution_id/transition",
@@ -603,7 +612,7 @@ async fn post_start_task(
 
     let execution_id = execution.id.clone();
     let engine = Arc::clone(&state.engine);
-    tokio::spawn(async move {
+    spawn_active(&state, execution_id.clone(), async move {
         let _ = engine.run(&definition, &execution_id).await;
     });
 
@@ -631,7 +640,7 @@ async fn post_resume(
     let definition = load_definition_for(&state, &execution)?;
 
     let handle = state.engine.try_begin_resume(&execution_id)?;
-    tokio::spawn(async move {
+    spawn_active(&state, execution_id.clone(), async move {
         let _ = handle.run_to_completion(&definition).await;
     });
 
@@ -656,7 +665,7 @@ async fn post_recover(
     let handle = state
         .engine
         .try_begin_recover(&execution_id, request.comment)?;
-    tokio::spawn(async move {
+    spawn_active(&state, execution_id.clone(), async move {
         let _ = handle.run_to_completion(&definition).await;
     });
 
@@ -664,6 +673,82 @@ async fn post_recover(
         StatusCode::ACCEPTED,
         Json(AcceptedResponse { execution_id }),
     ))
+}
+
+/// Stores an operator instruction for the next agent attempt. Terminal
+/// executions are valid targets; an active run must be interrupted first.
+async fn post_operator_note(
+    State(state): State<AppState>,
+    Path(execution_id): Path<String>,
+    Json(body): Json<OperatorNoteRequest>,
+) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
+    require_execution(&state, &execution_id)?;
+    if state.engine.is_active(&execution_id) {
+        return Err(ApiError::Conflict(format!(
+            "execution '{execution_id}' is being driven in the background right now"
+        )));
+    }
+    if body.note.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "operator note cannot be empty".to_string(),
+        ));
+    }
+    let mut execution = state.store.load_execution(&execution_id)?;
+    let metadata = execution
+        .metadata
+        .as_object_mut()
+        .ok_or_else(|| ApiError::Internal("execution metadata is not an object".to_string()))?;
+    let engine = metadata
+        .entry("engine")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| ApiError::Internal("engine metadata is not an object".to_string()))?;
+    engine.insert(
+        "operator_recovery_note".to_string(),
+        Value::String(body.note),
+    );
+    state.store.save_execution(&execution)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(AcceptedResponse { execution_id }),
+    ))
+}
+
+/// Aborts the daemon task that owns an active workflow pass. The executor's
+/// child-process guard kills an in-flight harness when that task is dropped.
+async fn post_interrupt(
+    State(state): State<AppState>,
+    Path(execution_id): Path<String>,
+) -> Result<Json<AcceptedResponse>, ApiError> {
+    require_execution(&state, &execution_id)?;
+    if !state.engine.is_active(&execution_id) {
+        return Err(ApiError::Conflict(format!(
+            "execution '{execution_id}' is not being processed"
+        )));
+    }
+    let handle = state
+        .active_tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&execution_id)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::Conflict(format!("execution '{execution_id}' cannot be interrupted"))
+        })?;
+    handle.abort();
+    Ok(Json(AcceptedResponse { execution_id }))
+}
+
+fn spawn_active<F>(state: &AppState, execution_id: String, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let task = tokio::spawn(future);
+    state
+        .active_tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(execution_id, task.abort_handle());
 }
 
 /// `POST /executions/:execution_id/input` — delivers a person's answer to a
@@ -685,7 +770,7 @@ async fn post_input(
         state
             .engine
             .try_begin_deliver_human_input(&definition, &execution_id, &delivery)?;
-    tokio::spawn(async move {
+    spawn_active(&state, execution_id.clone(), async move {
         let _ = handle.run_to_completion(&definition).await;
     });
 
@@ -746,12 +831,6 @@ async fn post_transition(
     })?;
 
     let (target, label, provider, reason) = if body.force {
-        if !from_state.allow_manual_override {
-            return Err(ApiError::BadRequest(format!(
-                "state '{from_state_id}' does not allow a forced transition \
-                 (allow_manual_override)"
-            )));
-        }
         let target = body.target.clone().ok_or_else(|| {
             ApiError::BadRequest("a forced transition requires a target state".to_string())
         })?;
@@ -895,9 +974,13 @@ fn build_summary(
         .load_context(&execution.id)
         .map(|context| context.variables)
         .unwrap_or_else(|_| execution.context.variables.clone());
-    summary.pending_input = store
-        .load_pending_input::<crate::engine::PendingHumanInput>(&execution.id)
-        .unwrap_or(None);
+    summary.pending_input = if execution.status == ExecutionStatus::InputNeeded {
+        store
+            .load_pending_input::<crate::engine::PendingHumanInput>(&execution.id)
+            .unwrap_or(None)
+    } else {
+        None
+    };
     Ok(summary)
 }
 

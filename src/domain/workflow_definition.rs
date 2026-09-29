@@ -237,6 +237,13 @@ pub struct AgentActionConfig {
     #[serde(default)]
     pub model: Option<String>,
 
+    /// Access the agent receives to its execution workspace.
+    ///
+    /// This is intentionally independent of a particular harness: each
+    /// adapter translates it to its native permission mechanism.
+    #[serde(default)]
+    pub workspace_access: WorkspaceAccess,
+
     /// Prompt to send to the agent
     pub prompt: String,
 
@@ -251,6 +258,19 @@ pub struct AgentActionConfig {
     /// Extra paths mounted read-only, relative to the workspace
     #[serde(default)]
     pub read_only_paths: Vec<String>,
+}
+
+/// The workflow-level workspace permission for an agent action.
+///
+/// New actions are writable unless they explicitly opt into report-only work.
+/// `serde(default)` also makes executions stored before this field existed
+/// retain that historical effective behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceAccess {
+    #[default]
+    ReadWrite,
+    ReadOnly,
 }
 
 /// Script action configuration

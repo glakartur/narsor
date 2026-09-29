@@ -343,7 +343,7 @@ fn a_completed_action_awaiting_a_human_decision_is_flagged() {
         reason: "waiting for a human decision".to_string(),
     });
 
-    let timeline = build_timeline(&log.events, ExecutionStatus::Paused, &HashSet::new());
+    let timeline = build_timeline(&log.events, ExecutionStatus::InputNeeded, &HashSet::new());
 
     assert_eq!(
         timeline.positions[0].status,

@@ -1161,7 +1161,7 @@ async fn wait_until_stopped(client: &ApiClient, execution_id: &str) -> Result<Ex
 /// Prints the pending question's full form ([`print_pending_input`]) —
 /// fields, types, allowed values, output labels, not just its instruction
 /// text — that [`run`]/[`resume`]/[`input`] always printed when a pass
-/// stops on a question, if `summary` says the execution is `Paused` right
+/// stops on a question, if `summary` says the execution is `InputNeeded` right
 /// now.
 ///
 /// `ExecutionSummary::pending_input` (added to `GET /executions` while
@@ -1176,7 +1176,7 @@ async fn wait_until_stopped(client: &ApiClient, execution_id: &str) -> Result<Ex
 /// `engine.pending_input()` returning `None` for that case before this
 /// unit.
 fn print_pending_input_if_any(summary: &ExecutionSummary) {
-    if summary.status != ExecutionStatus::Paused {
+    if summary.status != ExecutionStatus::InputNeeded {
         return;
     }
     if let Some(pending) = &summary.pending_input {
@@ -1221,6 +1221,7 @@ fn status_name(status: &ExecutionStatus) -> &'static str {
     match status {
         ExecutionStatus::Running => "running",
         ExecutionStatus::Paused => "paused",
+        ExecutionStatus::InputNeeded => "input_needed",
         ExecutionStatus::WaitingForEvent => "waiting_for_event",
         ExecutionStatus::Completed => "completed",
         ExecutionStatus::Failed => "failed",

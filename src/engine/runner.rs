@@ -61,7 +61,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -73,7 +73,8 @@ use crate::domain::{
 };
 use crate::engine::actions::agent::BUILT_IN_HARNESS;
 use crate::engine::actions::human::{
-    self, HumanActionError, HumanInputDelivery, HumanInputRequest, PendingHumanInput,
+    self, HumanActionError, HumanInputDelivery, HumanInputRequest, InputContinuation,
+    PendingHumanInput,
 };
 use crate::engine::actions::{
     ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
@@ -98,6 +99,7 @@ pub const METADATA_PENDING_STEP_KEY: &str = "pending_step";
 
 /// A one-shot operator note to attach to the next recovered agent attempt.
 const METADATA_OPERATOR_RECOVERY_NOTE_KEY: &str = "operator_recovery_note";
+const METADATA_AGENT_INPUT_KEY: &str = "agent_input";
 
 /// How an execution ends when it enters the terminal state `state`.
 ///
@@ -305,6 +307,9 @@ enum AttemptOutcome {
     Completed(ActionResult),
     /// The action is waiting for a person; the pass ends.
     AwaitingHumanInput(HumanInputRequest),
+    /// An agent asked a question and will be restarted in this same state once
+    /// the person supplies its answer.
+    AwaitingAgentInput(HumanInputRequest),
 }
 
 /// How the whole action of a state ended, retries included.
@@ -743,7 +748,7 @@ impl Engine {
 
     /// Resumes a paused execution and runs it on.
     ///
-    /// Refuses an execution that is paused on a question: that one needs an
+    /// Refuses an execution that needs input: that one needs an
     /// answer, not a nudge.
     ///
     /// A thin wrapper, unchanged in contract, over the two-phase split U3
@@ -765,7 +770,7 @@ impl Engine {
     }
 
     /// The synchronous half of [`Engine::resume`]: validates the execution's
-    /// status and, for a `Paused` one, flips it back to `Running` and emits
+    /// status and, for a manually `Paused` one, flips it back to `Running` and emits
     /// `WorkflowResumed` — everything [`Engine::resume`] did before it
     /// reached `run_loop`. Shared, not duplicated, between the borrowed
     /// (`resume`) and owned ([`Engine::try_begin_resume`]) entry points.
@@ -775,11 +780,6 @@ impl Engine {
         match execution.status {
             ExecutionStatus::Running => {}
             ExecutionStatus::Paused => {
-                if self.store.has_pending_input(execution_id) {
-                    return Err(EngineError::AwaitingHumanInput {
-                        execution_id: execution_id.to_string(),
-                    });
-                }
                 self.lock_pause_requests().remove(execution_id);
                 execution.status = ExecutionStatus::Running;
                 self.store.save_execution(&execution)?;
@@ -882,7 +882,7 @@ impl Engine {
         Ok(human::pending_input(&self.store, execution_id)?)
     }
 
-    /// Delivers an answer to a paused execution and runs it on.
+    /// Delivers an answer to an execution needing input and runs it on.
     ///
     /// Serves both places an execution can wait for a person: a `human` action,
     /// where the answer *is* the action's result, and a `human` decision, where
@@ -926,6 +926,16 @@ impl Engine {
 
         let state_id = self.current_state_id(&execution)?;
         let state = self.state_of(definition, &execution, &state_id)?;
+
+        if resumed.pending.continuation == InputContinuation::ResumeAgent {
+            let answer = agent_reply(&resumed.result.variables).ok_or_else(|| {
+                EngineError::HumanInput(HumanActionError::MissingRequiredField {
+                    field: "answer or option".to_string(),
+                })
+            })?;
+            self.store_agent_input(&mut execution, &state_id, &answer)?;
+            return Ok(HandleState::Ready(execution));
+        }
 
         let flow = match self.pending_step(&execution, &state_id)? {
             Some(pending) => {
@@ -1156,6 +1166,10 @@ impl Engine {
                     )?;
                     return Ok(ActionUpshot::Stopped);
                 }
+                Ok(AttemptOutcome::AwaitingAgentInput(request)) => {
+                    self.suspend_for_agent_input(execution, state, request)?;
+                    return Ok(ActionUpshot::Stopped);
+                }
                 Ok(AttemptOutcome::Completed(result)) => {
                     return Ok(ActionUpshot::Completed {
                         action_execution_id,
@@ -1231,6 +1245,12 @@ impl Engine {
         // explicit recovery. It remains durable until this point, so a daemon
         // restart before the attempt begins cannot silently discard it.
         if let ActionConfig::Agent(config) = &mut rendered {
+            if let Some(answer) = self.take_agent_input(execution, state)? {
+                config
+                    .prompt
+                    .push_str("\n\nHuman answer to your question:\n");
+                config.prompt.push_str(&answer);
+            }
             if let Some(note) = self.take_operator_recovery_note(execution)? {
                 config.prompt.push_str("\n\nOperator recovery note:\n");
                 config.prompt.push_str(&note);
@@ -1283,6 +1303,10 @@ impl Engine {
 
             Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingHumanInput(request))) => {
                 Ok(AttemptOutcome::AwaitingHumanInput(request))
+            }
+
+            Ok(ActionOutcome::Suspended(SuspendedAction::AwaitingAgentInput(request))) => {
+                Ok(AttemptOutcome::AwaitingAgentInput(request))
             }
 
             Err(error) => Err(AttemptFailure::retriable(error.message)),
@@ -1589,6 +1613,21 @@ impl Engine {
         self.publish_from(&execution.id, from)
     }
 
+    /// Pauses an agent state in place. No output label is produced and no
+    /// workflow transition is selected; `deliver_human_input` later records
+    /// the answer and runs this same state again.
+    fn suspend_for_agent_input(
+        &self,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        request: HumanInputRequest,
+    ) -> Result<(), EngineError> {
+        let pending = PendingHumanInput::for_agent(execution.id.clone(), state.id.clone(), request);
+        let from = self.store.event_log(&execution.id).next_sequence()?;
+        human::suspend(&self.store, execution, &pending)?;
+        self.publish_from(&execution.id, from)
+    }
+
     // -----------------------------------------------------------------------
     // Artifacts
     // -----------------------------------------------------------------------
@@ -1761,6 +1800,60 @@ impl Engine {
         Ok(note)
     }
 
+    /// Stores an answer for one agent state needing input. It lives in engine metadata
+    /// rather than workflow context: it is transient control data, not a
+    /// variable a later workflow step should inherit.
+    fn store_agent_input(
+        &self,
+        execution: &mut WorkflowExecution,
+        state_id: &str,
+        answer: &str,
+    ) -> Result<(), EngineError> {
+        engine_metadata_mut(execution).insert(
+            METADATA_AGENT_INPUT_KEY.to_string(),
+            json!({ "state_id": state_id, "answer": answer }),
+        );
+        self.store.save_execution(execution)?;
+        Ok(())
+    }
+
+    /// Consumes only an answer for the state currently executing. A mismatched
+    /// stale record is retained instead of leaking an answer into another
+    /// state after a manual transition.
+    fn take_agent_input(
+        &self,
+        execution: &mut WorkflowExecution,
+        state: &State,
+    ) -> Result<Option<String>, AttemptFailure> {
+        let Some(engine) = execution
+            .metadata
+            .get_mut("engine")
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(None);
+        };
+        let Some(record) = engine
+            .get(METADATA_AGENT_INPUT_KEY)
+            .and_then(Value::as_object)
+        else {
+            return Ok(None);
+        };
+        if record.get("state_id").and_then(Value::as_str) != Some(state.id.as_str()) {
+            return Ok(None);
+        }
+        let answer = record
+            .get("answer")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        if answer.is_some() {
+            engine.remove(METADATA_AGENT_INPUT_KEY);
+            self.store
+                .save_execution(execution)
+                .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
+        }
+        Ok(answer)
+    }
+
     /// Consumes a pending pause request, if there is one.
     fn take_pause_request(&self, execution_id: &str) -> bool {
         self.lock_pause_requests().remove(execution_id)
@@ -1875,7 +1968,7 @@ impl Engine {
 
     /// The error for an operation the execution's status does not allow.
     fn not_runnable(&self, execution: &WorkflowExecution, operation: &'static str) -> EngineError {
-        if execution.status == ExecutionStatus::Paused
+        if execution.status == ExecutionStatus::InputNeeded
             && self.store.has_pending_input(&execution.id)
         {
             return EngineError::AwaitingHumanInput {
@@ -1888,6 +1981,29 @@ impl Engine {
             operation,
         }
     }
+}
+
+/// Converts the agent-response form into the text injected into the next
+/// harness turn. A choice is clearly distinguished from arbitrary prose, and
+/// an optional comment stays attached to that choice.
+fn agent_reply(values: &Map<String, Value>) -> Option<String> {
+    let text = |name: &str| {
+        values
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(answer) = text("answer") {
+        return Some(answer.to_string());
+    }
+    let option = text("option")?;
+    let mut reply = format!("Selected option: {option}");
+    if let Some(comment) = text("comment") {
+        reply.push_str("\nComment: ");
+        reply.push_str(comment);
+    }
+    Some(reply)
 }
 
 /// Builds an artifact record from one entry of a `data.artifacts` list.
@@ -1932,6 +2048,7 @@ fn status_name(status: &ExecutionStatus) -> &'static str {
     match status {
         ExecutionStatus::Running => "running",
         ExecutionStatus::Paused => "paused",
+        ExecutionStatus::InputNeeded => "input_needed",
         ExecutionStatus::WaitingForEvent => "waiting_for_event",
         ExecutionStatus::Completed => "completed",
         ExecutionStatus::Failed => "failed",

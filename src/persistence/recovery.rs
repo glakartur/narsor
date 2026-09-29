@@ -20,7 +20,7 @@
 //! says why, and a person decides what happens next. D24's idempotency key
 //! exists so that person can retry deliberately.
 //!
-//! Only `Running` executions are reconciled. A `Paused` one parked itself
+//! Only `Running` executions are reconciled. A `Paused` or `InputNeeded` one parked itself
 //! durably (a human action suspends *without* an `ActionCompleted`, which would
 //! otherwise look exactly like an interrupted action), and a finished one has
 //! nothing left to reconcile.
@@ -150,7 +150,7 @@ pub fn recover(store: &ExecutionStore) -> Result<RecoveryReport> {
 /// "Closed" means either of two independent things, either being enough:
 /// the owning execution is no longer `Running` (nothing will ever append to
 /// this attempt's file again, whatever the event log says about the attempt
-/// itself — a `Paused`/`Completed`/`Cancelled`/`Unknown` execution has no live
+/// itself — a `Paused`/`InputNeeded`/`Completed`/`Cancelled`/`Unknown` execution has no live
 /// writer left), or the event log records the attempt itself as finished
 /// (`ActionCompleted`, `ActionFailed`, or `ActionAttemptFailed` for that
 /// `action_execution_id`) while the execution keeps running its next state.
@@ -324,7 +324,7 @@ fn unfinished_action(events: &[crate::domain::Event]) -> Option<(String, String)
                 open = None;
             }
             // A suspended action is parked, not interrupted: the execution is
-            // `Paused` and never reaches this function, but a workflow that was
+            // `InputNeeded` and never reaches this function, but a workflow that was
             // resumed keeps the request in its history, so it is cleared here
             // too.
             EventData::HumanInputReceived { .. } => {

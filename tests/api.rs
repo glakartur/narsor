@@ -788,7 +788,7 @@ async fn post_tasks_creates_an_execution_and_it_appears_in_the_list() {
     wait_for_status(
         &store,
         &execution_id,
-        ExecutionStatus::Paused,
+        ExecutionStatus::InputNeeded,
         Duration::from_secs(5),
     )
     .await;
@@ -849,7 +849,7 @@ async fn post_tasks_calls_the_real_start_task_and_records_a_resolvable_definitio
     wait_for_status(
         &store,
         &execution_id,
-        ExecutionStatus::Paused,
+        ExecutionStatus::InputNeeded,
         Duration::from_secs(5),
     )
     .await;
@@ -963,7 +963,7 @@ async fn post_input_delivers_an_answer_to_a_waiting_execution() {
         .expect("run to the human gate");
     assert_eq!(
         store.load_execution(&execution.id).expect("reload").status,
-        ExecutionStatus::Paused
+        ExecutionStatus::InputNeeded
     );
     assert!(store.has_pending_input(&execution.id));
 
@@ -1526,7 +1526,7 @@ async fn client_start_task_creates_an_execution_that_reaches_the_human_gate() {
     wait_for_status(
         &store,
         &response.execution_id,
-        ExecutionStatus::Paused,
+        ExecutionStatus::InputNeeded,
         Duration::from_secs(5),
     )
     .await;

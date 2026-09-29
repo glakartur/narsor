@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use narsor::domain::{
     ActionConfig, ActionError, AgentActionConfig, Context, EventData, ExecutionStatus, Workspace,
+    WorkspaceAccess,
 };
 use narsor::engine::actions::agent::{AgentEventSink, SESSION_ID_VARIABLE};
 use narsor::engine::{
@@ -331,6 +332,7 @@ fn agent_action(prompt: &str) -> AgentActionConfig {
     AgentActionConfig {
         harness: Some("claude-code".to_string()),
         model: None,
+        workspace_access: WorkspaceAccess::ReadWrite,
         prompt: prompt.to_string(),
         workspace: None,
         parameters: HashMap::new(),
@@ -452,6 +454,62 @@ async fn a_json_object_gives_the_label_and_its_variables() {
 
     assert_eq!(result.output_label, "ready");
     assert_eq!(result.variables.get("plan"), Some(&json!("plan.md")));
+}
+
+#[tokio::test]
+async fn an_agent_question_suspends_the_same_action_for_human_input() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(
+        r#"{"status":"awaiting_input","question":"Which API version should I target?"}"#,
+    ));
+
+    let outcome = execute(
+        &executor(&fake),
+        agent_action("implement the change"),
+        &root.workspace(),
+        None,
+    )
+    .await
+    .expect("the question is a suspension, not an action failure");
+
+    let ActionOutcome::Suspended(narsor::engine::actions::SuspendedAction::AwaitingAgentInput(
+        request,
+    )) = outcome
+    else {
+        panic!("expected an agent-input suspension");
+    };
+    assert_eq!(request.instruction, "Which API version should I target?");
+    assert_eq!(request.fields[0].name, "answer");
+}
+
+#[tokio::test]
+async fn an_agent_question_can_offer_choices_with_an_optional_comment() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(
+        r#"{"status":"awaiting_input","question":"Choose a version","options":["v1","v2"]}"#,
+    ));
+
+    let outcome = execute(
+        &executor(&fake),
+        agent_action("implement the change"),
+        &root.workspace(),
+        None,
+    )
+    .await
+    .expect("the menu is a suspension, not an action failure");
+
+    let ActionOutcome::Suspended(narsor::engine::actions::SuspendedAction::AwaitingAgentInput(
+        request,
+    )) = outcome
+    else {
+        panic!("expected an agent-input suspension");
+    };
+    assert_eq!(request.fields[0].name, "option");
+    assert_eq!(request.fields[0].options, vec!["v1", "v2"]);
+    assert_eq!(request.fields[1].name, "comment");
+    assert_eq!(request.fields[2].name, "answer");
 }
 
 #[tokio::test]
@@ -755,7 +813,7 @@ async fn the_model_and_the_read_only_paths_reach_the_argv() {
 }
 
 #[tokio::test]
-async fn the_permission_mode_is_configurable_per_action() {
+async fn claude_rejects_harness_specific_workspace_permissions() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&envelope(r#"{"output":"ready"}"#));
@@ -765,32 +823,33 @@ async fn the_permission_mode_is_configurable_per_action() {
         .parameters
         .insert("permission_mode".to_string(), json!("bypassPermissions"));
 
-    complete(&executor(&fake), config, &root.workspace()).await;
-
-    let args = fake.args(1);
+    let error = fail(&executor(&fake), config, &root.workspace()).await;
+    assert_eq!(error.error_type.as_deref(), Some("invalid_parameter"));
     assert!(
-        args.contains(&"--allow-dangerously-skip-permissions".to_string()),
-        "the bypass mode needs the CLI's own opt-in flag: {args:?}"
+        error.message.contains("workspace_access"),
+        "{}",
+        error.message
     );
-    assert_eq!(args[args.len() - 2], "bypassPermissions");
+    assert_eq!(fake.calls(), 0);
 }
 
 #[tokio::test]
-async fn an_unknown_permission_mode_is_rejected_before_anything_runs() {
+async fn claude_maps_read_only_workspace_access_to_plan_mode() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&envelope(r#"{"output":"ready"}"#));
 
     let mut config = agent_action("look around");
-    config
-        .parameters
-        .insert("permission_mode".to_string(), json!("yolo"));
+    config.workspace_access = WorkspaceAccess::ReadOnly;
 
-    let error = fail(&executor(&fake), config, &root.workspace()).await;
+    complete(&executor(&fake), config, &root.workspace()).await;
 
-    assert_eq!(error.error_type.as_deref(), Some("invalid_parameter"));
-    assert!(error.message.contains("acceptEdits"), "{}", error.message);
-    assert_eq!(fake.calls(), 0, "nothing may be run on a bad parameter");
+    let args = fake.args(1);
+    let mode = args
+        .iter()
+        .position(|arg| arg == "--permission-mode")
+        .unwrap();
+    assert_eq!(args[mode + 1], "plan");
 }
 
 #[tokio::test]
@@ -807,10 +866,6 @@ async fn the_opencode_adapter_builds_its_own_command_line() {
     let mut config = agent_action("look around");
     config.harness = Some("opencode".to_string());
     config.model = Some("anthropic/claude-sonnet-4".to_string());
-    config
-        .parameters
-        .insert("auto_approve".to_string(), json!(true));
-
     let result = complete(&executor, config, &root.workspace()).await;
 
     assert_eq!(result.output_label, "ready");
@@ -862,7 +917,7 @@ async fn the_codex_adapter_builds_a_safe_fresh_command_line_and_records_its_thre
     );
     assert!(
         args.windows(2)
-            .any(|pair| pair == ["--sandbox", "read-only"]),
+            .any(|pair| pair == ["--sandbox", "workspace-write"]),
         "{args:?}"
     );
     assert!(
@@ -929,8 +984,29 @@ async fn codex_rejects_unsafe_sandbox_before_spawn() {
         .insert("sandbox".to_string(), json!("danger-full-access"));
 
     let error = fail(&executor, config, &root.workspace()).await;
-    assert_eq!(error.error_type.as_deref(), Some("unsafe_harness_argument"));
+    assert_eq!(error.error_type.as_deref(), Some("invalid_parameter"));
     assert_eq!(fake.calls(), 0);
+}
+
+#[tokio::test]
+async fn codex_maps_read_only_workspace_access_to_its_native_sandbox() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&codex_stream("thread-7", r#"{"output":"ready"}"#));
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(CodexAdapter::with_program(fake.program()))),
+    );
+    let mut config = agent_action("look around");
+    config.harness = Some("codex".to_string());
+    config.workspace_access = WorkspaceAccess::ReadOnly;
+
+    complete(&executor, config, &root.workspace()).await;
+
+    assert!(fake
+        .args(1)
+        .windows(2)
+        .any(|pair| pair == ["--sandbox", "read-only"]));
 }
 
 #[tokio::test]
@@ -1831,9 +1907,7 @@ async fn the_real_claude_binary_honours_the_output_contract() {
         "Do not use any tools. Answer with the label 'ready' and nothing else \
          beyond the required JSON object.",
     );
-    config
-        .parameters
-        .insert("permission_mode".to_string(), json!("plan"));
+    config.workspace_access = WorkspaceAccess::ReadOnly;
 
     let result = complete(&AgentExecutor::new(), config, &root.workspace()).await;
 
@@ -1853,11 +1927,8 @@ fn which(name: &str) -> Option<PathBuf> {
 // Argument safety
 // ---------------------------------------------------------------------------
 
-/// `permission_mode` is checked against a whitelist, which is the field a
-/// reviewer reads before trusting a workflow. Every other value was pushed into
-/// a flag-value position raw, so a `model` beginning with `-` became another
-/// flag — and `--allow-dangerously-skip-permissions` smuggled through `model`
-/// would have escalated straight past that review.
+/// Every value passed in a flag-value position must reject an option-like
+/// spelling, so a `model` beginning with `-` cannot become another flag.
 #[tokio::test]
 async fn a_model_that_would_be_read_as_a_flag_is_refused() {
     let root = TempRoot::new();

@@ -188,9 +188,9 @@ fn run_creates_an_execution_and_prints_its_id() {
         invocation.stderr
     );
     assert!(!id.is_empty());
-    // The workflow stops at its human state, so the run ends paused.
+    // The workflow stops at its human state, so the run needs input.
     assert!(
-        invocation.stdout.contains("Status: paused"),
+        invocation.stdout.contains("Status: input_needed"),
         "stdout was:\n{}",
         invocation.stdout
     );
@@ -214,7 +214,7 @@ fn list_shows_the_created_execution_with_its_status() {
         .lines()
         .find(|line| line.contains(&id))
         .unwrap_or_else(|| panic!("`list` did not mention {id}:\n{}", invocation.stdout));
-    assert!(line.contains("paused"), "line was: {line}");
+    assert!(line.contains("input_needed"), "line was: {line}");
     assert!(line.contains("cli-greet"), "line was: {line}");
 }
 
@@ -232,7 +232,7 @@ fn show_prints_state_status_and_context_variables() {
     );
     let stdout = invocation.stdout;
     assert!(
-        stdout.contains("Status:        paused"),
+        stdout.contains("Status:        input_needed"),
         "stdout:\n{stdout}"
     );
     assert!(

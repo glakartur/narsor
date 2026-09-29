@@ -195,6 +195,38 @@ fn every_shipped_workflow_validates_without_a_single_violation() {
     }
 }
 
+#[test]
+fn shipped_workflows_use_finished_not_failed_as_a_workflow_terminal() {
+    for (name, file) in SHIPPED {
+        let definition = shipped(file);
+
+        assert!(
+            definition.states.contains_key("finished"),
+            "'{name}' has no finished state"
+        );
+        assert!(
+            !definition.states.contains_key("failed"),
+            "'{name}' has a failed pseudo-state"
+        );
+        assert_eq!(
+            definition
+                .states
+                .get("finished")
+                .and_then(|state| state.terminal_status),
+            Some(TerminalStatus::Completed),
+            "'{name}' does not complete through finished"
+        );
+        assert!(
+            definition
+                .states
+                .values()
+                .flat_map(|state| state.transitions.values())
+                .all(|target| target != "failed"),
+            "'{name}' transitions into a pseudo-state named 'failed'"
+        );
+    }
+}
+
 /// The trap of `WORKFLOW_SCHEMA.md` §3.3.C: a `text` field carries no output
 /// label, so a gate that only asks for prose stalls the workflow forever. A
 /// gate is only a gate if it hands a label back, and the engine derives one
@@ -285,9 +317,11 @@ fn every_agent_state_has_a_time_limit() {
 }
 
 /// §3.5: the list form of `terminal_states` means `completed` for every entry,
-/// which would quietly report a failed run as a success.
+/// so shipped workflows must use the mapping form.  A workflow can intentionally
+/// have no failure terminal: executor failures retain the active state and set
+/// the execution status to `failed` directly.
 #[test]
-fn terminals_are_declared_in_the_mapping_form_with_a_real_failure() {
+fn terminals_are_declared_in_the_mapping_form() {
     for (name, file) in SHIPPED {
         let definition = shipped(file);
         let terminals: Vec<(&String, &State)> = definition
@@ -308,13 +342,6 @@ fn terminals_are_declared_in_the_mapping_form_with_a_real_failure() {
                 "'{name}' terminal '{id}' must carry no action"
             );
         }
-
-        assert!(
-            terminals
-                .iter()
-                .any(|(_, state)| state.terminal_status == Some(TerminalStatus::Failed)),
-            "'{name}' has no terminal that really reports a failure"
-        );
     }
 }
 
@@ -411,7 +438,7 @@ async fn run_to_terminal(
     for answer in answers {
         assert_eq!(
             execution.status,
-            ExecutionStatus::Paused,
+            ExecutionStatus::InputNeeded,
             "expected the run to pause at '{}', it is {:?} in {:?}",
             answer.state,
             execution.status,
@@ -492,7 +519,7 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
     .await;
 
     assert_eq!(execution.status, ExecutionStatus::Completed);
-    assert_eq!(execution.current_state.as_deref(), Some("completed"));
+    assert_eq!(execution.current_state.as_deref(), Some("finished"));
     // The human's answers became context variables the later prompts read.
     assert_eq!(
         execution.context.variables.get("scope_notes"),
@@ -568,7 +595,7 @@ async fn the_open_mercato_pipeline_runs_through_its_review_loop_and_merge_gates(
     .await;
 
     assert_eq!(execution.status, ExecutionStatus::Completed);
-    assert_eq!(execution.current_state.as_deref(), Some("completed"));
+    assert_eq!(execution.current_state.as_deref(), Some("finished"));
     assert_eq!(
         execution.context.variables.get("qa_head"),
         Some(&json!("deadbeef")),
@@ -577,7 +604,8 @@ async fn the_open_mercato_pipeline_runs_through_its_review_loop_and_merge_gates(
 }
 
 /// The QA gate really does route a failure back into implementation, and the
-/// merge gate really can stop the pipeline — the two loops SDLC.md insists on.
+/// merge gate can stay paused in place and later be abandoned — the two loops
+/// SDLC.md insists on.
 #[tokio::test]
 async fn a_failed_qa_goes_back_to_implementation_and_a_held_merge_can_be_abandoned() {
     let root = TempRoot::new();
@@ -638,7 +666,7 @@ async fn a_failed_qa_goes_back_to_implementation_and_a_held_merge_can_be_abandon
                 &[("qa_decision", "qa_approved"), ("qa_head", "cafe5678")],
             ),
             Answer::new("approve_merge", &[("merge_decision", "hold")]),
-            Answer::new("blocked_gate", &[("block_decision", "abandon")]),
+            Answer::new("approve_merge", &[("merge_decision", "abandon")]),
         ],
     )
     .await;

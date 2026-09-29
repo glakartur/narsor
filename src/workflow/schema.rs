@@ -361,6 +361,11 @@ pub struct AgentActionSchema {
     #[serde(default)]
     pub model: Option<String>,
 
+    /// Workspace permission, translated to native harness permissions at run
+    /// time. Omitted means `read-write`.
+    #[serde(default)]
+    pub workspace_access: crate::domain::WorkspaceAccess,
+
     pub prompt: String,
 
     #[serde(default)]

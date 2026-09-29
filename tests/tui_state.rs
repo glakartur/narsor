@@ -52,8 +52,7 @@ use narsor::api::{ensure_daemon_running, ApiClient, ClientError};
 use narsor::config::Flags;
 use narsor::daemon::launch::set_exe_override_for_tests;
 use narsor::domain::{
-    Event, EventData, ExecutionStatus, HumanInputType, WorkflowDefinition, WorkflowExecution,
-    Workspace,
+    Event, EventData, ExecutionStatus, WorkflowDefinition, WorkflowExecution, Workspace,
 };
 use narsor::engine::actions::script::TRUNCATION_MARKER;
 use narsor::engine::Engine;
@@ -61,9 +60,9 @@ use narsor::persistence::conversation::ConversationSource;
 use narsor::persistence::{CatalogPaths, DaemonInfo, ExecutionStore, StatePaths, WorkPaths};
 use narsor::registry::{RepositoryEntry, RepositoryRegistry};
 use narsor::tui::app::{
-    event_detail_lines, event_line, task_position_line, App, FormRow, Modal, NewTaskChoice,
-    NewTaskStage, Panel, RepositoryField, Request, Screen, StreamStatus, TaskContent,
-    TransitionMode, OVERRIDE_PROVIDER, OVERRIDE_REASON,
+    event_detail_lines, event_line, task_position_line, App, Modal, NewTaskChoice, NewTaskStage,
+    Panel, RepositoryField, Request, Screen, StreamStatus, TaskContent, TransitionMode,
+    OVERRIDE_PROVIDER, OVERRIDE_REASON,
 };
 use narsor::tui::views;
 use narsor::workflow::load_from_file;
@@ -351,7 +350,7 @@ async fn paused_at_review(root: &Path) -> String {
         .run(&definition(), &execution.id)
         .await
         .expect("run up to the human state");
-    assert_eq!(execution.status, ExecutionStatus::Paused);
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
     assert_eq!(execution.current_state.as_deref(), Some("review"));
     execution.id
 }
@@ -485,7 +484,7 @@ async fn execution_list_reflects_the_store_with_its_statuses() {
         .iter()
         .find(|row| row.id == paused)
         .expect("the paused execution is listed");
-    assert_eq!(paused_row.status, ExecutionStatus::Paused);
+    assert_eq!(paused_row.status, ExecutionStatus::InputNeeded);
     assert_eq!(paused_row.current_state.as_deref(), Some("review"));
     assert_eq!(paused_row.workflow_id, definition().id);
 
@@ -527,9 +526,9 @@ async fn a_live_event_appends_to_the_stream_and_moves_the_view() {
     assert_eq!(app.stream_status(), &StreamStatus::Live);
 }
 
-/// A paused execution opens a form built from the definition's fields.
+/// A workflow decision is selected with `t`, never answered through `i`.
 #[tokio::test(flavor = "multi_thread")]
-async fn selecting_a_paused_execution_exposes_the_input_form() {
+async fn a_workflow_decision_refuses_the_agent_reply_key() {
     let root = TempRoot::new();
     paused_at_review(root.path()).await;
 
@@ -540,46 +539,22 @@ async fn selecting_a_paused_execution_exposes_the_input_form() {
     assert!(app.pending().is_some(), "the question is visible");
     assert_eq!(app.on_key(key(KeyCode::Char('i'))), Request::None);
 
-    let Modal::Input(form) = app.modal() else {
-        panic!("the input form is open");
-    };
-    assert_eq!(form.instruction, "Approve the prepared change?");
-
-    let names: Vec<&str> = form
-        .fields
-        .iter()
-        .map(|field| field.name.as_str())
-        .collect();
-    assert_eq!(names, vec!["approval_status", "comment"]);
-    assert_eq!(form.fields[0].field_type, HumanInputType::Select);
-    assert_eq!(form.fields[0].options, vec!["approved", "rejected"]);
-    assert_eq!(form.fields[1].field_type, HumanInputType::Text);
-
-    // The select starts on its first option, and a single select lets the label
-    // be inferred, so the label row offers that as its first choice.
-    assert_eq!(form.values[0], "approved");
-    assert_eq!(form.label_choices.first(), Some(&None));
-    assert!(form.rows().contains(&FormRow::Label));
+    assert!(!matches!(app.modal(), Modal::Input(_)));
+    assert!(app.notice().expect("a notice").is_error);
 }
 
-/// A valid form resumes the execution.
+/// A declared transition resolves a workflow decision.
 #[tokio::test(flavor = "multi_thread")]
-async fn submitting_a_valid_form_resumes_the_execution() {
+async fn selecting_a_declared_transition_resumes_the_execution() {
     let root = TempRoot::new();
     let execution_id = paused_at_review(root.path()).await;
 
     let (daemon, client) = Daemon::start(root.path()).await;
     let mut app = app_over(&daemon, root.path()).await;
     app.refresh().await;
-    app.on_key(key(KeyCode::Char('i')));
-
-    // approval_status already reads `approved`; move to `comment` and fill it.
-    app.on_key(key(KeyCode::Tab));
-    type_text(&mut app, "looks good");
-
-    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::SubmitInput);
-    app.submit_input().await;
-    assert!(!matches!(app.modal(), Modal::Input(_)), "the form closed");
+    app.on_key(key(KeyCode::Char('t')));
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::ApplyTransition);
+    app.apply_transition().await;
 
     wait_until_settled(&client, &[&execution_id]).await;
 
@@ -646,9 +621,10 @@ async fn an_execution_without_events_shows_an_empty_stream() {
     assert!(app.notice().is_none(), "an empty log is not an error");
 }
 
-/// A state that does not declare `allow_manual_override` offers no override.
+/// Manual step selection is available even when the workflow did not opt into
+/// the historical `allow_manual_override` escape hatch.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_state_without_allow_manual_override_offers_no_override_mode() {
+async fn a_state_without_allow_manual_override_still_offers_step_selection() {
     let root = TempRoot::new();
     let execution_id = paused_at_review(root.path()).await;
 
@@ -666,22 +642,22 @@ async fn a_state_without_allow_manual_override_offers_no_override_mode() {
     let mut app = app_over(&daemon, root.path()).await;
     app.refresh().await;
 
-    assert!(!app.override_allowed());
-    assert!(app.override_targets().is_empty());
+    assert!(app.override_allowed());
+    assert!(!app.override_targets().is_empty());
 
     app.on_key(key(KeyCode::Char('t')));
     let Modal::Transition(menu) = app.modal() else {
         panic!("the transition menu is open");
     };
-    assert!(!menu.override_allowed);
+    assert!(menu.override_allowed);
     assert_eq!(menu.mode, TransitionMode::Outputs);
 
-    // `o` must not switch modes for a state that forbids it.
+    // `o` switches to the global step picker.
     app.on_key(key(KeyCode::Char('o')));
     let Modal::Transition(menu) = app.modal() else {
         panic!("the transition menu is still open");
     };
-    assert_eq!(menu.mode, TransitionMode::Outputs);
+    assert_eq!(menu.mode, TransitionMode::Override);
 }
 
 /// A resize preserves the arrangement of the panels.
@@ -730,9 +706,9 @@ fn a_resize_preserves_the_panel_layout() {
 // error paths
 // ---------------------------------------------------------------------------
 
-/// An empty required field is reported and nothing is sent.
+/// The reply key does not open a form for a workflow decision.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_form_missing_a_required_field_reports_an_error_and_sends_nothing() {
+async fn a_workflow_decision_cannot_be_submitted_as_an_agent_reply() {
     let root = TempRoot::new();
     let execution_id = paused_at_review(root.path()).await;
     let before = events_of(root.path(), &execution_id).len();
@@ -742,22 +718,14 @@ async fn a_form_missing_a_required_field_reports_an_error_and_sends_nothing() {
     app.refresh().await;
     app.on_key(key(KeyCode::Char('i')));
 
-    // `comment` is required and nothing is typed into it.
-    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::SubmitInput);
-    app.submit_input().await;
-
-    let Modal::Input(form) = app.modal() else {
-        panic!("the form stays open so the operator can fix it");
-    };
-    let error = form.error.as_deref().expect("the form reports the failure");
-    assert!(error.contains("comment"), "error names the field: {error}");
+    assert!(!matches!(app.modal(), Modal::Input(_)));
     assert!(app.notice().expect("a notice").is_error);
 
     let store = store_of(root.path());
     let execution = store
         .load_execution(&execution_id)
         .expect("reload the execution");
-    assert_eq!(execution.status, ExecutionStatus::Paused);
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
     assert!(
         store.has_pending_input(&execution_id),
         "the question is still answerable"
@@ -966,7 +934,7 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
 
     assert_eq!(
         app.selected().expect("a selection").status,
-        ExecutionStatus::Paused
+        ExecutionStatus::InputNeeded
     );
     assert_eq!(
         app.selected()
@@ -983,12 +951,10 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
         "the script's variable reached the context panel"
     );
 
-    // `i` — the generated form, filled in and submitted.
-    app.on_key(key(KeyCode::Char('i')));
-    app.on_key(key(KeyCode::Tab));
-    type_text(&mut app, "approved after review");
+    // `t` — choose the workflow's declared approved output.
+    app.on_key(key(KeyCode::Char('t')));
     app.on_key(key(KeyCode::Enter));
-    app.submit_input().await;
+    app.apply_transition().await;
     wait_until_settled(&client, &[&execution.id]).await;
 
     let stored = reload_until(root.path(), &execution.id, ExecutionStatus::Completed);
@@ -998,7 +964,7 @@ async fn an_operator_drives_the_workflow_to_a_terminal_state_from_the_interface(
     let recorded = events_of(root.path(), &execution.id);
     assert!(recorded
         .iter()
-        .any(|event| matches!(&event.data, EventData::HumanInputReceived { .. })));
+        .any(|event| matches!(&event.data, EventData::DecisionMade { .. })));
     assert!(recorded
         .iter()
         .any(|event| matches!(&event.data, EventData::WorkflowCompleted { .. })));
@@ -1127,13 +1093,13 @@ async fn s_recovers_a_failed_execution_with_a_fresh_attempt() {
 
     assert_eq!(
         app.selected().expect("selection").status,
-        ExecutionStatus::Paused,
+        ExecutionStatus::InputNeeded,
         "the new script attempt reached the workflow's human checkpoint"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn i_opens_a_recovery_note_editor_for_a_failed_execution() {
+async fn i_is_unavailable_for_a_failed_execution() {
     let root = TempRoot::new();
     let execution = {
         let engine = engine_for(root.path());
@@ -1149,14 +1115,8 @@ async fn i_opens_a_recovery_note_editor_for_a_failed_execution() {
     app.refresh().await;
 
     assert_eq!(app.on_key(key(KeyCode::Char('i'))), Request::None);
-    assert!(matches!(app.modal(), Modal::RecoveryComment(_)));
-    app.on_key(key(KeyCode::Char('r')));
-    assert_eq!(
-        app.on_key(key(KeyCode::Enter)),
-        Request::RecoverSelected {
-            comment: Some("r".to_string())
-        }
-    );
+    assert!(!matches!(app.modal(), Modal::RecoveryComment(_)));
+    assert!(app.notice().expect("a notice").is_error);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1380,13 +1340,13 @@ async fn a_forced_transition_is_refused_while_a_background_pass_is_driving_the_s
     );
 }
 
-/// The form's advertised shortcuts must match what `on_key_form` actually
+/// The agent reply form's advertised shortcuts must match what `on_key_form` actually
 /// handles. The bar and the help overlay once offered `j`/`k` for moving
 /// between fields, which never worked: on a text field those are typed as
 /// characters, and on a select row they are ignored. A hint that lies is worse
 /// than no hint, because the operator blames themselves for the key not working.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_form_never_advertises_a_key_it_does_not_handle() {
+async fn a_workflow_decision_does_not_open_the_agent_reply_form() {
     let root = TempRoot::new();
     paused_at_review(root.path()).await;
 
@@ -1394,18 +1354,9 @@ async fn the_form_never_advertises_a_key_it_does_not_handle() {
     let mut app = app_over(&daemon, root.path()).await;
     app.refresh().await;
     app.on_key(key(KeyCode::Char('i')));
-    assert!(matches!(app.modal(), Modal::Input(_)), "the form is open");
-
-    let hints = app.shortcuts();
-    for (keys, _) in &hints {
-        assert!(
-            !keys.contains("j/k") && !keys.contains("j / k"),
-            "the form advertises {keys:?} for field movement, which on_key_form does not handle"
-        );
-    }
     assert!(
-        hints.iter().any(|(keys, _)| keys.contains("Tab")),
-        "the form must still advertise Tab for field movement: {hints:?}"
+        !matches!(app.modal(), Modal::Input(_)),
+        "a human gate is not a harness reply"
     );
 }
 
@@ -2167,7 +2118,7 @@ async fn starting_a_valid_new_task_creates_an_execution_that_is_listed_and_selec
 
     // It ran: the workflow stopped on its human state, and the question is
     // answerable from the interface straight away.
-    assert_eq!(selected.status, ExecutionStatus::Paused);
+    assert_eq!(selected.status, ExecutionStatus::InputNeeded);
     assert_eq!(selected.current_state.as_deref(), Some("review"));
     assert!(app.pending().is_some(), "the question is visible");
     // The definition resolved, which is what makes `i`, `t` and `s` work on it.

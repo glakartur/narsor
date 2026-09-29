@@ -25,14 +25,11 @@
 //!
 //! # Permissions
 //!
-//! `--auto` auto-approves every permission that is not explicitly denied. It is
-//! **off** by default: with Docker isolation (D14) deferred, D15's filesystem
-//! permissions are the only boundary, and turning every approval off by default
-//! would make a wrong prompt a machine-wide problem instead of a workspace-wide
-//! one. Set `parameters.auto_approve: true` per action to enable it. Without
-//! it, a tool call opencode would have asked about is not granted, and a
-//! workflow that needs one either finishes without doing the work or sits until
-//! the state's timeout — which is why the action's `timeout` matters here.
+//! `--auto` auto-approves every permission that is not explicitly denied. The
+//! workflow-level `workspace_access` policy controls it: read-write actions
+//! receive `--auto`, while read-only actions do not. OpenCode has no narrower
+//! workspace-only flag, so the provisioner's filesystem permissions remain the
+//! enforcement boundary.
 //!
 //! # `read_only_paths`
 //!
@@ -46,6 +43,7 @@ use super::{
     HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
 };
 use crate::domain::ActionError;
+use crate::domain::WorkspaceAccess;
 use serde_json::Value;
 
 /// The `harness:` value this adapter answers to.
@@ -120,7 +118,15 @@ impl HarnessAdapter for OpenCodeAdapter {
             }
         }
 
-        if bool_parameter(config, "auto_approve", OPENCODE)?.unwrap_or(false) {
+        if config.parameters.contains_key("auto_approve") {
+            return Err(ActionError {
+                message: "parameter 'auto_approve' is no longer supported for harness 'opencode'; use workflow-level 'workspace_access'".to_string(),
+                error_type: Some("invalid_parameter".to_string()),
+                details: Some(serde_json::json!({ "harness": OPENCODE, "parameter": "auto_approve" })),
+            });
+        }
+
+        if request.workspace_access == WorkspaceAccess::ReadWrite {
             args.push("--auto".to_string());
         }
 

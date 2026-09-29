@@ -96,6 +96,12 @@ pub struct RecoveryRequest {
     pub comment: Option<String>,
 }
 
+/// A one-shot instruction appended to the next agent attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNoteRequest {
+    pub note: String,
+}
+
 /// `POST /executions/:id/transition` request body.
 ///
 /// Mirrors the TUI's own split between an ordinary, declared transition and a
@@ -170,7 +176,7 @@ pub struct ExecutionSummary {
     /// place that interprets it stays that function, not this DTO.
     #[serde(default)]
     pub metadata: Value,
-    /// The question this execution is waiting on, if it is `Paused` on one
+    /// The question this execution is waiting on, if it is `InputNeeded` on one
     /// raised by `human::suspend` (an operator-requested `WorkflowPaused`
     /// has none, exactly as `Engine::pending_input` already returns `None`
     /// for it).

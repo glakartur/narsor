@@ -35,25 +35,20 @@
 //!
 //! Under `--print` nothing can be prompted for, so the mode decides what the
 //! agent may do on its own and what is simply refused — it never decides
-//! whether the run hangs. The default here is [`DEFAULT_PERMISSION_MODE`]
-//! (`acceptEdits`): the agent edits files in its workspace without asking, and
-//! anything heavier (running commands, reaching the network) is refused rather
-//! than waited on. `bypassPermissions` is available through
-//! `parameters.permission_mode` and is *not* the default: with Docker isolation
-//! (D14) still deferred, the only thing between an agent and the rest of the
-//! machine is D15's filesystem permissions, which guard against a mistake and
-//! not against a determined agent.
+//! whether the run hangs. Workflow-level `workspace_access` is translated to
+//! `acceptEdits` for read-write work and `plan` for read-only work. This keeps
+//! the workflow contract portable instead of exposing Claude-specific modes.
 
 use std::path::Path;
 
 use serde_json::Value;
 
 use super::{
-    bool_parameter, integer_parameter, reject_option_like, resolve_read_only_path,
-    string_parameter, tail, HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun,
-    HarnessStreamParser,
+    integer_parameter, reject_option_like, resolve_read_only_path, string_parameter, tail,
+    HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
 };
 use crate::domain::ActionError;
+use crate::domain::WorkspaceAccess;
 
 /// The `harness:` value this adapter answers to.
 pub const CLAUDE_CODE: &str = "claude-code";
@@ -61,24 +56,8 @@ pub const CLAUDE_CODE: &str = "claude-code";
 /// The binary the adapter runs unless it is built with another one.
 pub const DEFAULT_PROGRAM: &str = "claude";
 
-/// The permission mode used when `parameters.permission_mode` says nothing.
-///
-/// Deliberately not the most permissive one — see the module documentation.
+/// The native Claude mode for a writable workspace.
 pub const DEFAULT_PERMISSION_MODE: &str = "acceptEdits";
-
-/// The modes `claude --permission-mode` accepts.
-pub const PERMISSION_MODES: [&str; 6] = [
-    "acceptEdits",
-    "auto",
-    "bypassPermissions",
-    "manual",
-    "dontAsk",
-    "plan",
-];
-
-/// The mode that turns every permission check off, and which therefore also
-/// needs `--allow-dangerously-skip-permissions` to be accepted at all.
-const BYPASS_MODE: &str = "bypassPermissions";
 
 /// How much of stderr is quoted in a failure message.
 const FAILURE_DETAIL_BYTES: usize = 2 * 1024;
@@ -167,10 +146,6 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             reject_option_like(session, "resume_session", CLAUDE_CODE)?;
             args.push("--resume".to_string());
             args.push(session.to_string());
-        }
-
-        if mode == BYPASS_MODE {
-            args.push("--allow-dangerously-skip-permissions".to_string());
         }
 
         args.push("--permission-mode".to_string());
@@ -319,35 +294,28 @@ fn error_message(error: &Value) -> String {
 
 /// The permission mode of this run, validated against what the CLI accepts.
 fn permission_mode<'a>(request: &HarnessRequest<'a>) -> Result<&'a str, ActionError> {
-    let Some(mode) = string_parameter(request.config, "permission_mode", CLAUDE_CODE)? else {
-        // `parameters.dangerously_skip_permissions: true` is the short spelling
-        // of the same decision; it is kept because it reads as the warning it
-        // is, and because it matches the CLI's own flag name.
-        let skip = bool_parameter(request.config, "dangerously_skip_permissions", CLAUDE_CODE)?
-            .unwrap_or(false);
-        return Ok(if skip {
-            BYPASS_MODE
-        } else {
-            DEFAULT_PERMISSION_MODE
-        });
-    };
-
-    if !PERMISSION_MODES.contains(&mode) {
+    if request.config.parameters.contains_key("permission_mode")
+        || request
+            .config
+            .parameters
+            .contains_key("dangerously_skip_permissions")
+    {
         return Err(ActionError {
             message: format!(
-                "unknown permission_mode '{mode}' for harness '{CLAUDE_CODE}'; \
-                 supported modes are: {}",
-                PERMISSION_MODES.join(", ")
+                "harness permission parameters are not supported for '{CLAUDE_CODE}'; \
+                 use workflow-level 'workspace_access'"
             ),
             error_type: Some("invalid_parameter".to_string()),
             details: Some(serde_json::json!({
+                "harness": CLAUDE_CODE,
                 "parameter": "permission_mode",
-                "supported": PERMISSION_MODES,
             })),
         });
     }
-
-    Ok(mode)
+    Ok(match request.workspace_access {
+        WorkspaceAccess::ReadWrite => DEFAULT_PERMISSION_MODE,
+        WorkspaceAccess::ReadOnly => "plan",
+    })
 }
 
 /// One `--add-dir` entry: the path as the agent will see it.

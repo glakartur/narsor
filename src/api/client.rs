@@ -48,8 +48,8 @@ use crate::engine::{HumanInputDelivery, Timeline};
 
 use super::dto::{
     AcceptedResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
-    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
-    StartTaskResponse, TransitionRequest,
+    OperatorNoteRequest, RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest,
+    StartTaskRequest, StartTaskResponse, TransitionRequest,
 };
 use super::routes::ConversationResponse;
 
@@ -206,6 +206,22 @@ impl ApiClient {
     ) -> Result<AcceptedResponse, ClientError> {
         let url = format!("{}/executions/{execution_id}/recover", self.base_url);
         self.post_json(&url, &RecoveryRequest { comment }).await
+    }
+
+    /// Stores a one-shot operator instruction for the next agent attempt.
+    pub async fn operator_note(
+        &self,
+        execution_id: &str,
+        note: String,
+    ) -> Result<AcceptedResponse, ClientError> {
+        let url = format!("{}/executions/{execution_id}/operator-note", self.base_url);
+        self.post_json(&url, &OperatorNoteRequest { note }).await
+    }
+
+    /// Immediately interrupts the daemon task driving an execution.
+    pub async fn interrupt(&self, execution_id: &str) -> Result<AcceptedResponse, ClientError> {
+        let url = format!("{}/executions/{execution_id}/interrupt", self.base_url);
+        self.post_empty(&url).await
     }
 
     /// Delivers a person's answer to a paused execution — `POST

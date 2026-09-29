@@ -239,6 +239,8 @@ pub async fn run(
                         Request::ApplyTransition => app.apply_transition().await,
                         Request::RunSelected => app.run_selected().await,
                         Request::RecoverSelected { comment } => app.recover_selected(comment).await,
+                        Request::SaveOperatorNote { note } => app.save_operator_note(note).await,
+                        Request::InterruptSelected => app.interrupt_selected().await,
                         Request::StartNewTask => app.start_new_task().await,
                         Request::OpenConversation { sequence } => {
                             app.open_conversation_for_event(sequence).await

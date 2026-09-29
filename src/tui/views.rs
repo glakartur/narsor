@@ -128,6 +128,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Modal::EventDetail(_) => render_event_detail_modal(frame, app),
         Modal::Transition(_) => render_transition_modal(frame, app),
         Modal::Confirm(_) => render_confirm_modal(frame, app),
+        Modal::InterruptConfirm(_) => render_interrupt_confirm_modal(frame, app),
         Modal::Repositories(_) => render_repository_list_modal(frame, app),
         Modal::RepositoryForm(_) => render_repository_form_modal(frame, app),
         Modal::RepositoryRemove(_) => render_repository_remove_modal(frame, app),
@@ -298,6 +299,7 @@ fn status_style(status: &ExecutionStatus) -> Style {
     let colour = match status {
         ExecutionStatus::Running => Color::Green,
         ExecutionStatus::Paused => Color::Yellow,
+        ExecutionStatus::InputNeeded => Color::LightYellow,
         ExecutionStatus::WaitingForEvent => Color::Blue,
         ExecutionStatus::Completed => Color::Cyan,
         ExecutionStatus::Failed => Color::Red,
@@ -631,7 +633,7 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
     );
 }
 
-/// The short free-form note sent with an explicit recovery attempt.
+/// The short free-form instruction saved for the next agent attempt.
 fn render_recovery_comment_modal(frame: &mut Frame, app: &App) {
     let Modal::RecoveryComment(form) = app.modal() else {
         return;
@@ -640,10 +642,10 @@ fn render_recovery_comment_modal(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, area);
     let lines = vec![
         Line::from(Span::styled(
-            "Operator note for the new agent attempt",
+            "Operator instruction for the next agent attempt",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from("The execution will restart from its current state only after Enter."),
+        Line::from("Saving does not restart the execution; choose a step and run it when ready."),
         Line::from(""),
         Line::from(format!("› {}", form.value)),
     ];
@@ -651,7 +653,7 @@ fn render_recovery_comment_modal(frame: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
         .border_style(Style::default().fg(Color::Yellow))
-        .title(" Recover with note ");
+        .title(" Save operator instruction ");
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -783,6 +785,34 @@ fn render_confirm_modal(frame: &mut Frame, app: &App) {
 
     frame.render_widget(
         Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_interrupt_confirm_modal(frame: &mut Frame, app: &App) {
+    if !matches!(app.modal(), Modal::InterruptConfirm(_)) {
+        return;
+    }
+    let area = modal_area(frame, 60, 30);
+    frame.render_widget(Clear, area);
+    let lines = vec![
+        Line::from(Span::styled(
+            "Interrupt the active harness now?",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(
+            "Its current work is discarded; you may then send an instruction or choose a step.",
+        ),
+        Line::from(""),
+        Line::from("y — interrupt,  n/Esc — cancel"),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Double)
+                .title(" Interrupt execution "),
+        ),
         area,
     );
 }
@@ -1211,6 +1241,7 @@ fn render_help_modal(frame: &mut Frame) {
         Line::from("  s                 run / resume the selected execution"),
         Line::from("  i                 human input form"),
         Line::from("  t                 manual transition (o — override mode)"),
+        Line::from("  x                 interrupt active execution (confirmation required)"),
         Line::from("  f                 follow the event stream"),
         Line::from("  Enter             (Events panel) open the event's detail window"),
         Line::from("  c                 (Events panel / detail window) open its conversation"),

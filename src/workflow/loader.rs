@@ -226,6 +226,7 @@ fn compile_action(action: ActionSchema) -> ActionConfig {
         ActionSchema::Agent(agent) => ActionConfig::Agent(AgentActionConfig {
             harness: agent.harness,
             model: agent.model,
+            workspace_access: agent.workspace_access,
             prompt: agent.prompt,
             // The YAML contract has no per-action workspace (§6 lists it as a
             // future extension), so this stays unset.

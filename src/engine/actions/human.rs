@@ -2,7 +2,7 @@
 //!
 //! A human action is the one action that cannot be *run*. Entering such a state
 //! records what the user is being asked for, moves the execution to
-//! [`ExecutionStatus::Paused`] and gives control back to the caller; the answer
+//! [`ExecutionStatus::InputNeeded`] and gives control back to the caller; the answer
 //! arrives later — possibly in a different process, after a restart — through
 //! [`resume`].
 //!
@@ -12,7 +12,7 @@
 //!   configuration and reports [`ActionOutcome::Suspended`], doing no I/O and
 //!   knowing nothing about the state it belongs to.
 //! * [`suspend`] and [`resume`] are the durable half. They are what the engine
-//!   loop (U7) calls around the executor, and they own the `Paused` status, the
+//!   loop (U7) calls around the executor, and they own the `InputNeeded` status, the
 //!   pending request on disk and the two events of the human interaction.
 //!
 //! # Where the pending request lives
@@ -28,17 +28,17 @@
 //!   there would ripple through all of them.
 //!
 //! The usual objection to a second file is drift, and it is answered by making
-//! the file *not* authoritative: `status == Paused` in `state.json` is the
+//! the file *not* authoritative: `status == InputNeeded` in `state.json` is the
 //! truth, and [`resume`] checks the status before it ever looks at the pending
-//! file. A leftover `pending_input.json` next to a non-paused execution is
+//! file. A leftover `pending_input.json` next to an execution that does not need input is
 //! therefore inert, which is exactly what protects against a second delivery
 //! after a crash.
 //!
 //! # Crash safety
 //!
 //! [`suspend`] writes the pending file *before* it flips the status to
-//! `Paused`. A crash in between leaves a pending file that nothing reads —
-//! harmless. The other order would leave a paused execution with no record of
+//! `InputNeeded`. A crash in between leaves a pending file that nothing reads —
+//! harmless. The other order would leave an execution needing input with no record of
 //! what it is waiting for, which nothing could repair.
 
 use std::future::Future;
@@ -158,8 +158,25 @@ pub struct PendingHumanInput {
     #[serde(default)]
     pub outputs: Vec<OutputLabel>,
 
+    /// Whether the submitted form completes a human step or resumes the
+    /// agent action that asked the question. Older pending records were all
+    /// human-step forms, hence the explicit default.
+    #[serde(default)]
+    pub continuation: InputContinuation,
+
     /// When the request was raised.
     pub requested_at: DateTime<Utc>,
+}
+
+/// What accepting a pending form does next.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputContinuation {
+    /// The answer supplies a label and lets the workflow take its transition.
+    #[default]
+    CompleteStep,
+    /// The answer is fed back to the same agent state; no transition occurs.
+    ResumeAgent,
 }
 
 impl PendingHumanInput {
@@ -176,6 +193,23 @@ impl PendingHumanInput {
             state_id: state_id.into(),
             request,
             outputs,
+            continuation: InputContinuation::CompleteStep,
+            requested_at: Utc::now(),
+        }
+    }
+
+    /// Builds a question raised by an agent that must be resumed in-place.
+    pub fn for_agent(
+        execution_id: impl Into<ExecutionId>,
+        state_id: impl Into<StateId>,
+        request: HumanInputRequest,
+    ) -> Self {
+        Self {
+            execution_id: execution_id.into(),
+            state_id: state_id.into(),
+            request,
+            outputs: Vec::new(),
+            continuation: InputContinuation::ResumeAgent,
             requested_at: Utc::now(),
         }
     }
@@ -259,14 +293,14 @@ pub struct ResumedHumanAction {
 /// Everything that can go wrong around a human action.
 #[derive(Debug, Error)]
 pub enum HumanActionError {
-    /// The execution is not paused, so there is nothing to answer.
+    /// The execution is not awaiting input, so there is nothing to answer.
     ///
     /// This is the guard against a double delivery: once an answer has moved
     /// the execution back to `Running`, a second delivery of the same answer —
     /// after a restart, or from a second client — is refused here.
     #[error(
         "execution '{execution_id}' is {status} and cannot be resumed: \
-         delivering human input requires it to be paused"
+         delivering human input requires status input_needed"
     )]
     NotPaused {
         /// The execution that was addressed.
@@ -275,8 +309,8 @@ pub enum HumanActionError {
         status: String,
     },
 
-    /// The execution is paused but no pending request is stored for it.
-    #[error("execution '{execution_id}' is paused but has no pending human input request")]
+    /// The execution needs input but no pending request is stored for it.
+    #[error("execution '{execution_id}' is input_needed but has no pending human input request")]
     NoPendingRequest {
         /// The execution that was addressed.
         execution_id: ExecutionId,
@@ -358,7 +392,7 @@ fn name_list(names: &[String]) -> String {
     }
 }
 
-/// Suspends the execution on a human action: records the request, pauses, logs.
+/// Suspends the execution on a human action: records the request, marks input needed, logs.
 ///
 /// Mutates `execution` in place and persists it, so the caller's copy and the
 /// disk agree afterwards. The order of writes is load-bearing — see the module
@@ -370,7 +404,7 @@ pub fn suspend(
 ) -> Result<(), HumanActionError> {
     store.save_pending_input(&execution.id, pending)?;
 
-    execution.status = ExecutionStatus::Paused;
+    execution.status = ExecutionStatus::InputNeeded;
     execution.current_state = Some(pending.state_id.clone());
     execution.current_action_execution = Some(pending.action_execution_id().to_string());
     store.save_execution(execution)?;
@@ -389,14 +423,14 @@ pub fn suspend(
 /// answered.
 ///
 /// Returns `None` both when nothing is pending and when the execution is no
-/// longer paused, so a caller scanning the store never offers a form that
+/// longer needs input, so a caller scanning the store never offers a form that
 /// [`resume`] would refuse.
 pub fn pending_input(
     store: &ExecutionStore,
     execution_id: &str,
 ) -> Result<Option<PendingHumanInput>, HumanActionError> {
     let execution = store.load_execution(execution_id)?;
-    if execution.status != ExecutionStatus::Paused {
+    if execution.status != ExecutionStatus::InputNeeded {
         return Ok(None);
     }
     Ok(store.load_pending_input(execution_id)?)
@@ -404,11 +438,11 @@ pub fn pending_input(
 
 /// Delivers an answer, resuming the execution.
 ///
-/// Refuses any execution that is not [`ExecutionStatus::Paused`]. On success
+/// Refuses any execution that is not [`ExecutionStatus::InputNeeded`]. On success
 /// the execution is back to `Running` on disk, `HumanInputReceived` is in the
 /// log, the pending file is gone, and the caller gets the [`ActionResult`] the
 /// engine loop transitions on. A rejected delivery changes nothing: the
-/// execution stays paused and the request stays answerable.
+/// execution remains input-needed and the request stays answerable.
 pub fn resume(
     store: &ExecutionStore,
     execution_id: &str,
@@ -416,7 +450,7 @@ pub fn resume(
 ) -> Result<ResumedHumanAction, HumanActionError> {
     let mut execution = store.load_execution(execution_id)?;
 
-    if execution.status != ExecutionStatus::Paused {
+    if execution.status != ExecutionStatus::InputNeeded {
         return Err(HumanActionError::NotPaused {
             execution_id: execution_id.to_string(),
             status: status_name(&execution.status).to_string(),
@@ -432,7 +466,13 @@ pub fn resume(
     // Validation first, and before any write: a rejected delivery must leave
     // the execution exactly as paused as it was.
     let values = validate_values(pending.fields(), &delivery.values)?;
-    let label = resolve_label(&pending, delivery, &values)?;
+    validate_agent_answer(&pending, &values)?;
+    let label = match pending.continuation {
+        InputContinuation::CompleteStep => resolve_label(&pending, delivery, &values)?,
+        // This label is internal only. The engine observes `continuation` and
+        // resumes the agent before any decision/transition code can read it.
+        InputContinuation::ResumeAgent => "__resume_agent__".to_string(),
+    };
 
     store.event_log(execution_id).append_next(
         &execution.id,
@@ -519,6 +559,30 @@ fn validate_values(
     Ok(values)
 }
 
+/// An agent form with a menu accepts either free text, or one selected option
+/// (with an optional comment). This is checked before any durable write so a
+/// blank submission remains answerable.
+fn validate_agent_answer(
+    pending: &PendingHumanInput,
+    values: &Map<String, Value>,
+) -> Result<(), HumanActionError> {
+    if pending.continuation != InputContinuation::ResumeAgent {
+        return Ok(());
+    }
+    let filled = |name: &str| {
+        values
+            .get(name)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    if !filled("answer") && !filled("option") {
+        return Err(HumanActionError::MissingRequiredField {
+            field: "answer or option".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// A value that counts as "not filled in": null, or an all-whitespace string.
 fn is_blank(value: &Value) -> bool {
     match value {
@@ -586,6 +650,7 @@ fn status_name(status: &ExecutionStatus) -> &'static str {
     match status {
         ExecutionStatus::Running => "running",
         ExecutionStatus::Paused => "paused",
+        ExecutionStatus::InputNeeded => "input_needed",
         ExecutionStatus::WaitingForEvent => "waiting_for_event",
         ExecutionStatus::Completed => "completed",
         ExecutionStatus::Failed => "failed",

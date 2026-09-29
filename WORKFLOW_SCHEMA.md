@@ -157,15 +157,16 @@ action:
   type: agent
   harness: <claude-code|codex|opencode> # Opcjonalne — domyślnie z konfiguracji
                                       # (`agent_harness`, patrz README → Configuration),
-                                      # a w jej braku `claude-code`. Codex bez
-                                      # `parameters.sandbox` używa `read-only`.
+                                      # a w jej braku `claude-code`.
   model: <string>                     # Model AI (opcjonalne, np. "sonnet-3.5")
+  workspace_access: <read-write|read-only> # Opcjonalne; domyślnie read-write.
   prompt: |                           # Instrukcja dla agenta
     Analizuj kod w bieżącym katalogu.
     Znajdź potencjalne błędy bezpieczeństwa.
     Zapisz raport do pliku security_report.md.
   
-  # Opcjonalne ustawienia specyficzne dla harnessa
+  # Opcjonalne ustawienia specyficzne dla harnessa, niezwiązane z dostępem
+  # do workspace
   parameters:
     max_tokens: 4096
     temperature: 0.7
@@ -190,6 +191,23 @@ Przykładowy wynik agenta:
   "artifacts": ["security_report.md"]
 }
 ```
+
+**Pytanie agenta bez przejścia:** jeżeli agent potrzebuje odpowiedzi człowieka,
+ale workflow nie ma jeszcze przejść do wykonania, może zamiast wyniku zwrócić:
+
+```json
+{"status":"awaiting_input","question":"Którą wersję API mam obsłużyć?","options":["v1","v2"]}
+```
+
+Execution przechodzi wtedy do statusu `input_needed`, ale pozostaje w tym samym
+stanie `agent`. W TUI klawisz `i` jest dostępny wyłącznie dla takiego kroku
+agenta/harnessu: można podać dowolną odpowiedź albo wybrać opcję przedstawioną
+przez harnessa, opcjonalnie z komentarzem. Nie wybiera on wyjścia workflow;
+wybór zadeklarowanego przejścia bramy `human` odbywa się przez `t`.
+Odpowiedź przez `input` uruchamia ponownie tę samą akcję z dodaną odpowiedzią.
+Nie używaj tego wyniku dla błędów harnessa, sandboxa,
+uprawnień ani narzędzi — są to błędy akcji i kończą execution ze statusem
+`failed`, bez transition.
 
 ##### B. ScriptAction
 

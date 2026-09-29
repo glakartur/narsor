@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engine_support::{
-    event_type, workflow, workflow_file, Harness, StubAgentExecutor, TimeoutRecorder,
+    event_type, workflow, workflow_file, Harness, QuestioningAgentExecutor, StubAgentExecutor,
+    TimeoutRecorder,
 };
 use narsor::domain::{EventData, ExecutionStatus};
 use narsor::engine::{
@@ -105,7 +106,7 @@ async fn variables_reach_the_context_only_after_the_decision() {
         .await
         .expect("run up to the decision");
 
-    assert_eq!(execution.status, ExecutionStatus::Paused);
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
     let context = harness.stored_context(&execution.id);
     assert_eq!(
         context["variables"].get("checked"),
@@ -132,6 +133,50 @@ async fn variables_reach_the_context_only_after_the_decision() {
         })
         .collect();
     assert_eq!(providers, vec!["human"]);
+}
+
+#[tokio::test]
+async fn an_agent_question_pauses_and_resumes_the_same_workflow_state() {
+    let harness = Harness::new();
+    let agent = Arc::new(QuestioningAgentExecutor::new());
+    let engine = Engine::new(harness.store()).with_executor(ActionKind::Agent, agent.clone());
+    let definition = workflow("agent_question");
+
+    let paused = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("agent question pauses the execution");
+    assert_eq!(paused.status, ExecutionStatus::InputNeeded);
+    assert_eq!(paused.current_state.as_deref(), Some("implement"));
+    assert_eq!(
+        engine
+            .pending_input(&paused.id)
+            .expect("read pending input")
+            .expect("agent question is pending")
+            .instruction(),
+        "Which API version should I use?"
+    );
+
+    let resumed = engine
+        .deliver_human_input(
+            &definition,
+            &paused.id,
+            &HumanInputDelivery::with_values(Map::from_iter([("answer".to_string(), json!("v2"))])),
+        )
+        .await
+        .expect("answer resumes the same agent state");
+    assert_eq!(resumed.status, ExecutionStatus::Completed);
+    assert_eq!(resumed.current_state.as_deref(), Some("finished"));
+    assert!(agent.prompts()[1].contains("Human answer to your question:\nv2"));
+    assert_eq!(
+        harness
+            .events(&paused.id)
+            .into_iter()
+            .filter(|event| matches!(event.data, EventData::TransitionTaken { .. }))
+            .count(),
+        1,
+        "the answer itself must not take a transition"
+    );
 }
 
 #[tokio::test]
@@ -555,6 +600,14 @@ async fn a_missing_context_variable_fails_the_action_on_entry() {
     assert_eq!(execution.status, ExecutionStatus::Failed);
     assert_eq!(execution.current_state.as_deref(), Some("greet"));
 
+    assert!(
+        !harness.events(&execution.id).into_iter().any(|event| matches!(
+            event.data,
+            EventData::TransitionTaken { .. }
+        )),
+        "an action failure must leave the execution on the failed state rather than take a workflow transition"
+    );
+
     let message = harness
         .events(&execution.id)
         .into_iter()
@@ -681,7 +734,7 @@ async fn running_a_paused_execution_is_refused() {
         .start_and_run(&definition, json!({}), harness.workspace())
         .await
         .expect("run up to the decision");
-    assert_eq!(execution.status, ExecutionStatus::Paused);
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
 
     let error = engine
         .run(&definition, &execution.id)
@@ -860,7 +913,7 @@ async fn the_reference_workflow_pauses_for_a_person_and_carries_on() {
         .await
         .expect("run up to the question");
 
-    assert_eq!(execution.status, ExecutionStatus::Paused);
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
     assert_eq!(
         execution.current_state.as_deref(),
         Some("human_clarification")

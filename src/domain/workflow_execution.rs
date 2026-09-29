@@ -16,8 +16,10 @@ pub type ExecutionId = String;
 pub enum ExecutionStatus {
     /// Execution is running
     Running,
-    /// Execution is paused (e.g., waiting for human input)
+    /// Execution was explicitly paused by an operator.
     Paused,
+    /// Execution is waiting for a decision or answer from a person.
+    InputNeeded,
     /// Execution is waiting for an external event
     WaitingForEvent,
     /// Execution completed successfully

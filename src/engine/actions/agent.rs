@@ -53,8 +53,12 @@ use uuid::Uuid;
 use super::harness::{
     HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun, HarnessStreamParser,
 };
+use super::human::HumanInputRequest;
 use super::script::{truncate, MAX_BUFFERED_OUTPUT_BYTES};
-use super::{ActionExecutor, ActionOutcome, ActionRequest, TimedOutAction, ACTION_ID_ENV_VAR};
+use super::{
+    ActionExecutor, ActionOutcome, ActionRequest, SuspendedAction, TimedOutAction,
+    ACTION_ID_ENV_VAR,
+};
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, AgentActionConfig, AgentSession, AgentSessionStatus,
     Event, EventData, Workspace,
@@ -75,7 +79,11 @@ nothing after it:\n\
 {\"output\": \"<label>\", \"data\": {}, \"variables\": {}, \"artifacts\": []}\n\
 `output` is required and must be exactly one of the labels listed above (or, \
 if none were listed, the label the task asks for). `data`, `variables` and \
-`artifacts` are optional. Do not omit the JSON object: without it the workflow \
+`artifacts` are optional. If, and only if, you need a person to answer a \
+question before continuing this same task, return instead:\n\
+{\"status\":\"awaiting_input\",\"question\":\"<question>\",\"options\":[\"<optional choice>\"]}\n\
+Do not use `awaiting_input` for a harness, sandbox, permission, or tool error; \
+those are action failures. Do not omit the JSON object: without it the workflow \
 cannot continue.";
 
 /// The harness used when neither the action nor the configuration names one.
@@ -394,6 +402,7 @@ impl AgentExecutor {
 
         let invocation = match adapter.invocation(&HarnessRequest {
             config,
+            workspace_access: config.workspace_access,
             prompt: &prompt,
             workspace,
             resume_session: resume,
@@ -520,7 +529,7 @@ impl AgentExecutor {
             return Err(harness_error(adapter.as_ref(), failure, &finished, &run));
         }
 
-        let output = match extract_output(&run.text) {
+        let output = match extract_response(&run.text) {
             Ok(output) => output,
             Err(error) => {
                 self.fail_session(
@@ -545,9 +554,18 @@ impl AgentExecutor {
             },
         );
 
-        Ok(ActionOutcome::Completed(build_result(
-            output, &session, &run, &finished,
-        )))
+        match output {
+            AgentResponse::Completed(output) => Ok(ActionOutcome::Completed(build_result(
+                output, &session, &run, &finished,
+            ))),
+            AgentResponse::AwaitingInput { question, options } => Ok(ActionOutcome::Suspended(
+                SuspendedAction::AwaitingAgentInput(HumanInputRequest {
+                    action_execution_id: request.action_execution_id.to_string(),
+                    instruction: question,
+                    fields: agent_input_fields(options),
+                }),
+            )),
+        }
     }
 
     /// Marks the session failed and says so in the log.
@@ -970,6 +988,56 @@ pub struct AgentOutput {
     pub variables: Map<String, Value>,
 }
 
+#[derive(Debug, Clone)]
+enum AgentResponse {
+    Completed(AgentOutput),
+    AwaitingInput {
+        question: String,
+        options: Vec<String>,
+    },
+}
+
+/// Turns an agent's optional menu into a response form. Without a menu the
+/// reply is required free text; with one, the operator can either type a free
+/// answer or pick an option, optionally adding a comment.
+fn agent_input_fields(options: Vec<String>) -> Vec<crate::domain::HumanInputField> {
+    use crate::domain::{HumanInputField, HumanInputType};
+
+    if options.is_empty() {
+        return vec![HumanInputField {
+            name: "answer".to_string(),
+            field_type: HumanInputType::Text,
+            required: true,
+            description: Some("Answer for the agent.".to_string()),
+            options,
+        }];
+    }
+
+    vec![
+        HumanInputField {
+            name: "option".to_string(),
+            field_type: HumanInputType::Select,
+            required: false,
+            description: Some("Optional choice proposed by the agent.".to_string()),
+            options,
+        },
+        HumanInputField {
+            name: "comment".to_string(),
+            field_type: HumanInputType::Text,
+            required: false,
+            description: Some("Optional comment attached to the choice.".to_string()),
+            options: Vec::new(),
+        },
+        HumanInputField {
+            name: "answer".to_string(),
+            field_type: HumanInputType::Text,
+            required: false,
+            description: Some("Free-form answer instead of a choice.".to_string()),
+            options: Vec::new(),
+        },
+    ]
+}
+
 /// Extracts the output payload from whatever the agent said (D19/D20).
 ///
 /// Accepts a bare JSON object, a fenced `json` code block, and a JSON object
@@ -981,6 +1049,18 @@ pub struct AgentOutput {
 /// * nothing in the answer parses as a JSON object;
 /// * objects are there, but none carries a string `output`.
 pub fn extract_output(text: &str) -> Result<AgentOutput, ActionError> {
+    match extract_response(text)? {
+        AgentResponse::Completed(output) => Ok(output),
+        AgentResponse::AwaitingInput { .. } => Err(no_label_error(
+            "the agent requested human input instead of producing an output label",
+            text,
+        )),
+    }
+}
+
+/// Extracts either a normal label or a request that pauses the same agent
+/// action. The last matching object wins, following the normal output rule.
+fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
     let objects = json_objects(text);
 
     if objects.is_empty() {
@@ -992,14 +1072,59 @@ pub fn extract_output(text: &str) -> Result<AgentOutput, ActionError> {
 
     let Some(object) = objects.iter().rev().find_map(|value| {
         let object = value.as_object()?;
-        object.get("output").and_then(Value::as_str)?;
-        Some(object)
+        if object.get("status").and_then(Value::as_str) == Some("awaiting_input") {
+            Some(object)
+        } else {
+            object.get("output").and_then(Value::as_str).map(|_| object)
+        }
     }) else {
         return Err(no_label_error(
             "the agent's answer contains JSON, but no object with a string 'output' key",
             text,
         ));
     };
+
+    if object.get("status").and_then(Value::as_str) == Some("awaiting_input") {
+        let Some(question) = object.get("question").and_then(Value::as_str) else {
+            return Err(no_label_error(
+                "the agent requested human input without a string 'question'",
+                text,
+            ));
+        };
+        if question.trim().is_empty() {
+            return Err(no_label_error(
+                "the agent requested human input with an empty question",
+                text,
+            ));
+        }
+        let options = match object.get("options") {
+            None => Vec::new(),
+            Some(Value::Array(options)) => options
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()
+                .filter(|options| {
+                    !options.is_empty() && options.iter().all(|option| !option.trim().is_empty())
+                })
+                .map(|options| options.into_iter().map(ToString::to_string).collect())
+                .ok_or_else(|| {
+                    no_label_error(
+                        "the agent's input options must be a non-empty array of non-empty strings",
+                        text,
+                    )
+                })?,
+            Some(_) => {
+                return Err(no_label_error(
+                    "the agent's input options must be an array of strings",
+                    text,
+                ))
+            }
+        };
+        return Ok(AgentResponse::AwaitingInput {
+            question: question.to_string(),
+            options,
+        });
+    }
 
     let output_label = object
         .get("output")
@@ -1027,11 +1152,11 @@ pub fn extract_output(text: &str) -> Result<AgentOutput, ActionError> {
         .cloned()
         .unwrap_or_default();
 
-    Ok(AgentOutput {
+    Ok(AgentResponse::Completed(AgentOutput {
         output_label,
         data,
         variables,
-    })
+    }))
 }
 
 /// How much of the agent's answer an extraction failure quotes back.

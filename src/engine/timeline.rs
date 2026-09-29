@@ -43,7 +43,7 @@
 //! 4. Still open (no completion event at all) in a `Running` execution →
 //!    [`PositionStatus::InProgress`].
 //! 5. Already `Succeeded` (1 fired), but the state hasn't transitioned out of
-//!    yet and the execution is `Paused` → [`PositionStatus::AwaitingDecision`].
+//!    yet and the execution is `InputNeeded` → [`PositionStatus::AwaitingDecision`].
 //!    This is the one place a later fact (the execution parked itself
 //!    waiting on a human) is allowed to relabel an already-resolved outcome:
 //!    the action truly did complete, but nothing has acted on that yet.
@@ -145,7 +145,7 @@ pub enum PositionStatus {
     /// Still open, and the execution is `Running`.
     InProgress,
     /// Its action completed, but the state hasn't transitioned out yet and
-    /// the execution is `Paused` — waiting on a human decision.
+    /// the execution is `InputNeeded` — waiting on a human decision.
     AwaitingDecision,
 }
 
@@ -764,7 +764,7 @@ fn finalize(
             Some(Outcome::Succeeded) => {
                 if draft.visit_closed {
                     PositionStatus::Succeeded
-                } else if execution_status == ExecutionStatus::Paused {
+                } else if execution_status == ExecutionStatus::InputNeeded {
                     PositionStatus::AwaitingDecision
                 } else {
                     PositionStatus::Succeeded
@@ -773,6 +773,7 @@ fn finalize(
             None => {
                 if execution_status == ExecutionStatus::Running
                     || execution_status == ExecutionStatus::Paused
+                    || execution_status == ExecutionStatus::InputNeeded
                 {
                     PositionStatus::InProgress
                 } else {

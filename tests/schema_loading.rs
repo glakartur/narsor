@@ -5,7 +5,7 @@
 
 use narsor::domain::{
     ActionConfig, ExecutionStatus, HumanInputType, ParamType, State, TerminalStatus,
-    WorkflowDefinition, WorkspaceSpec,
+    WorkflowDefinition, WorkspaceAccess, WorkspaceSpec,
 };
 use narsor::engine::terminal_status;
 use narsor::workflow::{load_from_file, load_from_str};
@@ -901,4 +901,38 @@ fn an_agent_action_stored_before_the_harness_became_optional_still_reads() {
     let config: AgentActionConfig =
         serde_json::from_value(new).expect("a record written since must read too");
     assert_eq!(config.harness, None);
+    assert_eq!(config.workspace_access, WorkspaceAccess::ReadWrite);
+}
+
+#[test]
+fn agent_workspace_access_defaults_to_read_write_and_accepts_read_only() {
+    let yaml = r#"
+name: access
+version: 1
+states:
+  write:
+    action:
+      type: agent
+      prompt: write a report
+    outputs: [done]
+    transitions: { done: read }
+  read:
+    action:
+      type: agent
+      workspace_access: read-only
+      prompt: inspect a report
+    outputs: [done]
+    transitions: { done: completed }
+  completed:
+    description: end
+terminal_states: { completed: completed }
+"#;
+
+    let definition = load_from_str(yaml).expect("workspace access values should load");
+    let access = |state_id| match state(&definition, state_id).action.as_ref().unwrap() {
+        ActionConfig::Agent(config) => config.workspace_access,
+        other => panic!("expected agent action, got {other:?}"),
+    };
+    assert_eq!(access("write"), WorkspaceAccess::ReadWrite);
+    assert_eq!(access("read"), WorkspaceAccess::ReadOnly);
 }

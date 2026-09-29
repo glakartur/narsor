@@ -49,8 +49,8 @@ pub use harness::{
     HarnessRequest, HarnessRun, OpenCodeAdapter,
 };
 pub use human::{
-    HumanActionError, HumanExecutor, HumanInputDelivery, HumanInputRequest, PendingHumanInput,
-    ResumedHumanAction,
+    HumanActionError, HumanExecutor, HumanInputDelivery, HumanInputRequest, InputContinuation,
+    PendingHumanInput, ResumedHumanAction,
 };
 pub use script::ScriptExecutor;
 
@@ -195,6 +195,10 @@ impl ActionOutcome {
 pub enum SuspendedAction {
     /// A person has to fill in the form described by the request (§3.3.C).
     AwaitingHumanInput(HumanInputRequest),
+    /// An agent has completed its current turn but needs an answer before the
+    /// same workflow state can continue. This is not a workflow output and
+    /// must therefore never select a transition.
+    AwaitingAgentInput(HumanInputRequest),
 }
 
 /// An attempt that was stopped because it ran out of time.

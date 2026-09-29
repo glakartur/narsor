@@ -165,7 +165,10 @@ async fn enter_human_state(
 ) -> PendingHumanInput {
     let action_execution_id = uuid::Uuid::new_v4().to_string();
     let SuspendedAction::AwaitingHumanInput(request) =
-        request_for(action, &action_execution_id).await;
+        request_for(action, &action_execution_id).await
+    else {
+        panic!("a human action must request human input");
+    };
 
     let pending = PendingHumanInput::new(
         execution.id.clone(),
@@ -211,7 +214,10 @@ fn values(pairs: &[(&str, Value)]) -> Map<String, Value> {
 #[tokio::test]
 async fn executor_suspends_instead_of_running_anything() {
     let action = clarification_action();
-    let SuspendedAction::AwaitingHumanInput(request) = request_for(&action, "action-1").await;
+    let SuspendedAction::AwaitingHumanInput(request) = request_for(&action, "action-1").await
+    else {
+        panic!("a human action must request human input");
+    };
 
     assert_eq!(request.action_execution_id, "action-1");
     assert!(request.instruction.contains("doprecyzować"));
@@ -259,9 +265,9 @@ async fn entering_a_human_state_pauses_logs_and_stores_the_request() {
     .await;
 
     // In memory and on disk alike.
-    assert_eq!(execution.status, ExecutionStatus::Paused);
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
     let stored = store.load_execution(&execution.id).expect("load");
-    assert_eq!(stored.status, ExecutionStatus::Paused);
+    assert_eq!(stored.status, ExecutionStatus::InputNeeded);
     assert_eq!(stored.current_state.as_deref(), Some("human_clarification"));
     assert_eq!(
         stored.current_action_execution.as_deref(),
@@ -447,7 +453,7 @@ async fn a_missing_required_field_is_rejected_by_name_and_leaves_it_paused() {
     // Nothing moved: the request is still there to be answered.
     assert_eq!(
         store.load_execution(&execution.id).expect("load").status,
-        ExecutionStatus::Paused
+        ExecutionStatus::InputNeeded
     );
     assert!(store.has_pending_input(&execution.id));
 }
@@ -479,7 +485,7 @@ async fn a_select_value_outside_its_options_is_rejected_with_the_permitted_value
 
     assert_eq!(
         store.load_execution(&execution.id).expect("load").status,
-        ExecutionStatus::Paused
+        ExecutionStatus::InputNeeded
     );
 }
 
@@ -598,7 +604,7 @@ async fn a_pending_request_survives_a_restart_and_can_still_be_satisfied() {
             &["clarified", "abort"],
         )
         .await;
-        assert_eq!(execution.status, ExecutionStatus::Paused);
+        assert_eq!(execution.status, ExecutionStatus::InputNeeded);
         execution.id
     };
     // Every in-memory object of the first "process" is gone at this point:

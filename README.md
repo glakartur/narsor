@@ -242,11 +242,16 @@ $ narsor conversation 4f1c8f0e-...-9b21 3f9c2e10-...-77aa
 
 ### `input <EXECUTION_ID> [--field NAME=VALUE]… [--label LABEL]`
 
-Delivers a human answer to a paused execution and resumes it. `--field` fills in
+Delivers a human answer to an `input_needed` execution and resumes it. `--field` fills in
 the form fields declared by the `human` action; `--label` names the output label
 explicitly — needed when the action has no fields, or when it has several and
 the label cannot be derived from a single `select` field. `--file` points at the
 definition when the file has moved.
+
+For an agent's `awaiting_input` question, submit `--field answer=...`; no
+`--label` is needed because the answer resumes the same agent action rather
+than selecting a transition. An agent may additionally return an `options`
+array: send one with `--field option=...`, optionally with `--field comment=...`.
 
 ```console
 $ narsor input 4f1c8f0e-...-9b21 --field approval_status=approved
@@ -545,11 +550,12 @@ analyze:
     type: agent
     harness: claude-code          # optional; or: codex, opencode
     model: opus                   # optional, passed through verbatim
+    workspace_access: read-only   # optional; default: read-write
     prompt: |
       Analyse the repository for: {{ inputs.feature_description }}.
       Write the plan to plan.md.
-    parameters:                   # optional, harness-specific
-      permission_mode: acceptEdits
+    parameters:                   # optional, harness-specific but not access control
+      max_turns: 20
     read_only_paths:              # optional, relative to the workspace
       - ../other-repo/src
   outputs: [ready, ambiguous]
@@ -569,6 +575,14 @@ with `narsor config show`; a workflow meant to run reproducibly should declare
 `timeout` on an agent state works the same way: declared, it wins; absent, the
 configured `agent_timeout` applies. Script and human states are untouched by
 that setting — a script state that declares no limit still has none.
+
+An agent that needs a person's answer without changing workflow stage returns
+`{"status":"awaiting_input","question":"...","options":["..."]}` rather than an output label.
+Narsor leaves the execution on that same agent state with status `input_needed`; the
+normal `narsor input <id> --field answer='...'` command resumes that state and
+adds the answer to the next agent prompt. Harness, sandbox, permission and tool
+failures remain action failures: the execution is `failed` on the current state
+and no workflow transition is taken.
 
 **The harness binary is a runtime prerequisite, like `git`.** It is never
 bundled and never installed; a missing one is reported as an action error
@@ -601,12 +615,16 @@ carries the session id as well as the text. The flag that takes exactly one
 value is always the last one before the prompt, so a prompt can never be read
 as a flag's argument.
 
-`parameters` is the per-action, harness-specific part: `permission_mode`,
-`max_turns`, `append_system_prompt`, `dangerously_skip_permissions`,
-`resume_session` for `claude-code`; `agent`, `auto_approve`, `fork`,
-`resume_session` for `opencode`; `sandbox` (`read-only` or `workspace-write`),
-`approval_policy` (only `never`) and `resume_session` for `codex`. An unknown
-value or a wrong type is an error
+`workspace_access` is the portable access policy for the action: `read-write`
+(the default) or `read-only`. It is translated to each harness's native flags,
+so a workflow does not need to know which harness is selected. `parameters`
+remain harness-specific for settings unrelated to that policy: `max_turns`,
+`append_system_prompt` and `resume_session` for `claude-code`; `agent`, `fork`
+and `resume_session` for `opencode`; `approval_policy` (only `never`) and
+`resume_session` for `codex`. The former access knobs (`permission_mode`,
+`dangerously_skip_permissions`, `auto_approve`, and `sandbox`) are rejected
+to prevent a per-harness setting from overriding the portable policy. An
+unknown value or a wrong type is an error
 before anything is run — never a silent default.
 
 ### The JSON output contract
@@ -681,33 +699,21 @@ The narsor runs unattended, so a harness that stopped on a permission
 prompt would hang a workflow until its timeout. Both harnesses are therefore run
 in their batch mode, where nothing can be prompted for.
 
-The default is deliberately **not** the most permissive setting:
-
-- `claude-code` runs with `--permission-mode acceptEdits`. The agent edits files
-  in its workspace on its own; anything heavier is refused rather than waited
-  on. `parameters.permission_mode` accepts `acceptEdits`, `auto`,
-  `bypassPermissions`, `manual`, `dontAsk` and `plan`, and `bypassPermissions`
-  additionally passes the CLI's own `--allow-dangerously-skip-permissions`.
-- `opencode` runs **without** `--auto`. Set `parameters.auto_approve: true` to
-  auto-approve every permission that is not explicitly denied. Without it, a
-  tool call opencode would have asked about is simply not granted, so an action
-  that needs one either finishes without doing the work or sits until the state's
-  `timeout` — which is the reason to set a `timeout` on agent states.
-- `codex` always passes `approval_policy=never` and permits only the native
-  `read-only` and `workspace-write` sandboxes; the default is `read-only`, and
-  a workflow must explicitly request `workspace-write`. `danger-full-access`
-  and bypass requests fail before the process starts; its operator-provided
-  environment and profile are otherwise preserved for authentication and
-  skills.
+The portable default is **`read-write`**. The adapter maps it to Claude's
+`acceptEdits`, OpenCode's `--auto`, and Codex's `workspace-write`. An action
+that must inspect only sets `workspace_access: read-only`; it maps to Claude's
+`plan` mode, omits OpenCode's auto-approval flag, and uses Codex's `read-only`
+sandbox. Codex always passes `approval_policy=never` and never allows
+`danger-full-access`; its operator-provided environment and profile are
+otherwise preserved for authentication and skills.
 
 **The security consequence is real and is not hypothetical.** Containerisation
 (D14) is still deferred, so the only boundary around an agent is D15's
 filesystem layout and permission bits — which protects against a mistake, not
-against a determined or prompt-injected agent. An agent run with
-`bypassPermissions` or `auto_approve` has, for practical purposes, the
-narsor's own access to the machine: your files, your credentials, your
-network. Turn either on for a workflow you wrote, over a repository you trust,
-and never for an untrusted workflow or an untrusted prompt.
+against a determined or prompt-injected agent. In particular, OpenCode's
+read-write mapping auto-approves its tool requests; without container isolation
+this can reach beyond the workspace. Use writable actions only for workflows
+and prompts you trust.
 
 ---
 
@@ -894,7 +900,7 @@ Under the `--root` directory (`./.narsor` by default):
 ├── executions/{execution_id}/
 │   ├── state.json                  # WorkflowExecution: status, current state, context
 │   ├── context.json                # the context projection (variables, artifacts, workspace)
-│   ├── pending_input.json          # the question a paused execution is waiting on
+│   ├── pending_input.json          # the question an input-needed execution is waiting on
 │   ├── definition.yaml             # pinned copy of the workflow definition for this execution
 │   ├── checkpoint.bundle           # git bundle of the workspace delta against base_commit
 │   ├── checkpoint.git/             # scratch area for materialising the checkpoint

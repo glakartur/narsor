@@ -292,7 +292,7 @@ async fn a_crash_after_the_action_resumes_at_the_decision() {
 }
 
 #[tokio::test]
-async fn a_paused_execution_is_left_alone() {
+async fn an_execution_needing_input_is_left_alone() {
     let harness = Harness::new();
     let engine = harness.engine();
     let definition = workflow("human_decision");
@@ -301,19 +301,19 @@ async fn a_paused_execution_is_left_alone() {
         .start_and_run(&definition, json!({}), harness.workspace())
         .await
         .expect("run up to the question");
-    assert_eq!(execution.status, ExecutionStatus::Paused);
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
 
     let reconciliation = reconcile(&harness.store(), &execution.id).expect("reconcile");
     assert_eq!(
         reconciliation.outcome,
         ReconciliationOutcome::NotApplicable {
-            status: ExecutionStatus::Paused
+            status: ExecutionStatus::InputNeeded
         }
     );
 
     // Still answerable afterwards.
     let stored = harness.store().load_execution(&execution.id).expect("load");
-    assert_eq!(stored.status, ExecutionStatus::Paused);
+    assert_eq!(stored.status, ExecutionStatus::InputNeeded);
     assert!(engine
         .pending_input(&execution.id)
         .expect("pending input")

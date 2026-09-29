@@ -15,8 +15,10 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use narsor::domain::{
-    ActionConfig, ActionError, ActionResult, Event, ExecutionStatus, WorkflowDefinition, Workspace,
+    ActionConfig, ActionError, ActionResult, Event, ExecutionStatus, HumanInputField,
+    HumanInputType, WorkflowDefinition, Workspace,
 };
+use narsor::engine::actions::{HumanInputRequest, SuspendedAction};
 use narsor::engine::{ActionExecutor, ActionOutcome, ActionRequest, Engine};
 use narsor::persistence::ExecutionStore;
 use narsor::workflow::load_from_file;
@@ -185,6 +187,7 @@ pub fn status_name(status: &ExecutionStatus) -> &'static str {
     match status {
         ExecutionStatus::Running => "running",
         ExecutionStatus::Paused => "paused",
+        ExecutionStatus::InputNeeded => "input_needed",
         ExecutionStatus::WaitingForEvent => "waiting_for_event",
         ExecutionStatus::Completed => "completed",
         ExecutionStatus::Failed => "failed",
@@ -248,6 +251,78 @@ impl ActionExecutor for StubAgentExecutor {
 
             Ok(ActionOutcome::Completed(ActionResult {
                 output_label: label,
+                data: json!({}),
+                variables: Map::new(),
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            }))
+        })
+    }
+}
+
+/// An agent that asks once, then completes after the engine reruns the same
+/// state with the person's answer included in its prompt.
+pub struct QuestioningAgentExecutor {
+    calls: Mutex<usize>,
+    prompts: Mutex<Vec<String>>,
+}
+
+impl QuestioningAgentExecutor {
+    pub fn new() -> Self {
+        Self {
+            calls: Mutex::new(0),
+            prompts: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().expect("prompts").clone()
+    }
+}
+
+impl ActionExecutor for QuestioningAgentExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: ActionRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
+        let prompt = match request.action {
+            ActionConfig::Agent(config) => config.prompt.clone(),
+            _ => {
+                return Box::pin(async {
+                    Err(ActionError {
+                        message: "the questioning agent received a non-agent action".to_string(),
+                        error_type: None,
+                        details: None,
+                    })
+                })
+            }
+        };
+        self.prompts.lock().expect("prompts").push(prompt);
+        let call = {
+            let mut calls = self.calls.lock().expect("calls");
+            *calls += 1;
+            *calls
+        };
+        let action_execution_id = request.action_execution_id.to_string();
+        Box::pin(async move {
+            if call == 1 {
+                return Ok(ActionOutcome::Suspended(
+                    SuspendedAction::AwaitingAgentInput(HumanInputRequest {
+                        action_execution_id,
+                        instruction: "Which API version should I use?".to_string(),
+                        fields: vec![HumanInputField {
+                            name: "answer".to_string(),
+                            field_type: HumanInputType::Text,
+                            required: true,
+                            description: None,
+                            options: Vec::new(),
+                        }],
+                    }),
+                ));
+            }
+            Ok(ActionOutcome::Completed(ActionResult {
+                output_label: "done".to_string(),
                 data: json!({}),
                 variables: Map::new(),
                 exit_code: None,

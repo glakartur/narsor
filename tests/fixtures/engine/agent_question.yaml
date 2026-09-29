@@ -1,0 +1,15 @@
+name: agent-question
+version: 1
+states:
+  implement:
+    action:
+      type: agent
+      prompt: Implement the requested change.
+    outputs:
+      - done
+    transitions:
+      done: finished
+  finished:
+    description: Done.
+terminal_states:
+  finished: completed

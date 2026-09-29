@@ -106,14 +106,13 @@ states:
           {"output": "<label>", "data": {"findings": <count>}}
         Use exactly one of these labels:
           - "reviewed" — the document was reviewed and the findings recorded.
-          - "review_failed" — the review could not be produced at all (no
-            document, or the reviewers could not run).
+        If the review cannot be produced because the document is missing, the
+        harness fails, or a tool is unavailable, report an action failure;
+        do not emit a workflow output for an execution error.
     outputs:
       - reviewed
-      - review_failed
     transitions:
       reviewed: approve_scope
-      review_failed: failed
     timeout: 30m
     retry_policy:
       max_attempts: 2
@@ -179,14 +178,17 @@ states:
           {"output": "<label>", "data": {"plan_doc": "<repo-relative path>"}}
         Use exactly one of these labels:
           - "plan_ready" — the plan is written and an implementer could start.
-          - "planning_blocked" — the plan cannot be written (the requirements
-            contradict the codebase, or a dependency does not exist).
+          - "needs_scope_revision" — the approved requirements cannot be
+            planned as written. Explain the contradiction or missing dependency
+            in `data.question` so a person can revise the scope.
+        A sandbox, harness, tool, or write-permission problem is an action
+        failure, not `needs_scope_revision`.
     outputs:
       - plan_ready
-      - planning_blocked
+      - needs_scope_revision
     transitions:
       plan_ready: approve_plan
-      planning_blocked: failed
+      needs_scope_revision: approve_scope
     timeout: 1h
     retry_policy:
       max_attempts: 2
@@ -245,18 +247,17 @@ states:
         Use exactly one of these labels:
           - "implemented" — the plan is implemented and the checks pass.
           - "needs_human_decision" — you hit a genuine ambiguity the plan does
-            not settle. Do not guess: take this label and state the question in
+            not settle, or the plan cannot be implemented as written. Do not
+            guess: take this label and state the question or blocker in
             `data.question`.
-          - "blocked" — the work cannot proceed at all (the plan is
-            unimplementable as written).
+        A sandbox, harness, tool, or write-permission problem is an action
+        failure, not a workflow output.
     outputs:
       - implemented
       - needs_human_decision
-      - blocked
     transitions:
       implemented: simplify
       needs_human_decision: resolve_ambiguity
-      blocked: failed
     timeout: 2h
 
   resolve_ambiguity:
@@ -311,16 +312,15 @@ states:
         Use exactly one of these labels:
           - "implemented" — the work is finished and the checks pass.
           - "still_ambiguous" — the answer does not settle it; state what is
-            still open in `data.question`.
-          - "blocked" — the work cannot proceed at all.
+            still open, or why the work remains impossible, in `data.question`.
+        A sandbox, harness, tool, or write-permission problem is an action
+        failure, not a workflow output.
     outputs:
       - implemented
       - still_ambiguous
-      - blocked
     transitions:
       implemented: simplify
       still_ambiguous: resolve_ambiguity
-      blocked: failed
     timeout: 2h
 
   simplify:
@@ -339,16 +339,14 @@ states:
         Use exactly one of these labels:
           - "simplified" — simplifications were applied and the checks pass.
           - "unchanged" — the code is already as simple as it should be.
-          - "regressed" — a simplification broke the checks and could not be
-            walked back cleanly.
+        If checks cannot pass after restoring the prior implementation, report
+        an action failure; do not emit a workflow output for that error.
     outputs:
       - simplified
       - unchanged
-      - regressed
     transitions:
       simplified: code_review
       unchanged: code_review
-      regressed: failed
     timeout: 45m
     retry_policy:
       max_attempts: 2
@@ -365,6 +363,7 @@ states:
       do with the findings is the next gate's question.
     action:
       type: agent
+      workspace_access: read-only
       prompt: |
         Run the `ce-code-review` skill with `mode:report-only` over the changes
         on this branch. Dispatch the persona reviewers, merge and deduplicate
@@ -376,16 +375,15 @@ states:
         Use exactly one of these labels:
           - "clean" — no actionable findings survived the confidence gate.
           - "findings" — there are findings for a person to triage.
-          - "review_failed" — the review could not be produced (no diff, or
-            the reviewers could not run).
+        If the review cannot be produced because no diff exists, the harness
+        fails, or a tool is unavailable, report an action failure; do not emit
+        a workflow output for an execution error.
     outputs:
       - clean
       - findings
-      - review_failed
     transitions:
       clean: approve_push
       findings: triage_findings
-      review_failed: failed
     timeout: 1h
     retry_policy:
       max_attempts: 2
@@ -495,13 +493,12 @@ states:
           {"output": "<label>", "data": {"pr_url": "<url>"}, "variables": {"pr_url": "<url>"}}
         Use exactly one of these labels:
           - "pr_opened" — the branch is pushed and the pull request is open.
-          - "push_failed" — the commit, the push or the PR creation failed.
+        If the commit, push, or pull-request creation fails, report an action
+        failure; do not emit a workflow output for that execution error.
     outputs:
       - pr_opened
-      - push_failed
     transitions:
       pr_opened: pr_feedback_gate
-      push_failed: failed
     timeout: 30m
 
   pr_feedback_gate:
@@ -585,8 +582,8 @@ states:
       - documented
       - nothing_to_document
     transitions:
-      documented: completed
-      nothing_to_document: completed
+      documented: finished
+      nothing_to_document: finished
     timeout: 30m
     retry_policy:
       max_attempts: 2
@@ -596,16 +593,12 @@ states:
   # Terminals
   # -------------------------------------------------------------------------
 
-  completed:
+  finished:
     description: Merged-ready work, reviewed, published and its learning written down.
-
-  failed:
-    description: The pipeline could not carry the work further.
 
   cancelled:
     description: A person stopped the pipeline.
 
 terminal_states:
-  completed: completed
-  failed: failed
+  finished: completed
   cancelled: cancelled

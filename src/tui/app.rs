@@ -88,7 +88,7 @@ use crate::domain::{
 use crate::engine::actions::script::TRUNCATION_MARKER;
 use crate::engine::{
     permitted_labels, ConversationState as PositionConversationState, EventLink,
-    HumanInputDelivery, PendingHumanInput, Timeline,
+    HumanInputDelivery, InputContinuation, PendingHumanInput, Timeline,
 };
 use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
@@ -267,6 +267,10 @@ pub enum Request {
     /// Recover a failed or interrupted execution, optionally with an operator
     /// note for the next agent attempt.
     RecoverSelected { comment: Option<String> },
+    /// Save a one-shot instruction for the next agent attempt.
+    SaveOperatorNote { note: String },
+    /// Abort the active daemon task after an explicit confirmation.
+    InterruptSelected,
     /// Create the execution the new-task form describes and run it.
     StartNewTask,
     /// Open the task view at the position `sequence`'s event resolves to,
@@ -354,7 +358,10 @@ impl InputForm {
             .map(|field| match field.field_type {
                 // A select starts on its first option, so the common case is
                 // one keystroke: Enter.
-                HumanInputType::Select => field.options.first().cloned().unwrap_or_default(),
+                HumanInputType::Select if field.required => {
+                    field.options.first().cloned().unwrap_or_default()
+                }
+                HumanInputType::Select => String::new(),
                 HumanInputType::Text => String::new(),
             })
             .collect();
@@ -948,6 +955,9 @@ pub struct OverrideConfirm {
     pub from: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptConfirm;
+
 /// The scrollable window opened by `Enter` on an event (R1).
 #[derive(Debug, Clone)]
 pub struct EventDetail {
@@ -1021,6 +1031,7 @@ pub enum Modal {
     Transition(TransitionMenu),
     /// The confirmation of a forced transition.
     Confirm(OverrideConfirm),
+    InterruptConfirm(InterruptConfirm),
     /// The listing of registered repositories.
     Repositories(RepositoryList),
     /// The form that registers a repository.
@@ -1381,17 +1392,12 @@ impl App {
 
     /// Whether the current state allows a forced transition.
     pub fn override_allowed(&self) -> bool {
-        self.current_state()
-            .map(|state| state.allow_manual_override)
-            .unwrap_or(false)
+        self.current_state().is_some()
     }
 
     /// The states a forced transition may target: every state but the current
     /// one, and only when the current state allows an override at all.
     pub fn override_targets(&self) -> Vec<String> {
-        if !self.override_allowed() {
-            return Vec::new();
-        }
         let Some(definition) = self.definition.as_ref() else {
             return Vec::new();
         };
@@ -1436,7 +1442,7 @@ impl App {
             ],
             Modal::RecoveryComment(_) => vec![
                 ("letters", "type operator note"),
-                ("Enter", "recover with note"),
+                ("Enter", "save note"),
                 ("Esc", "cancel"),
             ],
             Modal::Transition(menu) => {
@@ -1455,6 +1461,7 @@ impl App {
                 ("Esc", "close"),
             ],
             Modal::Confirm(_) => vec![("y", "confirm"), ("n/Esc", "cancel")],
+            Modal::InterruptConfirm(_) => vec![("y", "interrupt"), ("n/Esc", "cancel")],
             Modal::RepositoryRemove(_) => vec![("y", "remove"), ("n/Esc", "cancel")],
             Modal::Repositories(_) => vec![
                 ("j/k", "select"),
@@ -1502,13 +1509,23 @@ impl App {
                         keys.push(("n", "new task"));
                         keys.push(("R", "repositories"));
                         keys.push(("s", "run/resume"));
-                        keys.push(("i", "input"));
+                        if self.pending.as_ref().is_some_and(|pending| {
+                            pending.continuation == InputContinuation::ResumeAgent
+                        }) {
+                            keys.push(("i", "reply to agent"));
+                        }
                         keys.push(("t", "transition"));
+                        keys.push(("x", "interrupt"));
                     }
                     Panel::Details => {
                         keys.push(("j/k", "variables"));
-                        keys.push(("i", "input"));
+                        if self.pending.as_ref().is_some_and(|pending| {
+                            pending.continuation == InputContinuation::ResumeAgent
+                        }) {
+                            keys.push(("i", "reply to agent"));
+                        }
                         keys.push(("t", "transition"));
+                        keys.push(("x", "interrupt"));
                     }
                     Panel::Events => {
                         keys.push(("j/k", "scroll"));
@@ -1762,6 +1779,7 @@ impl App {
             Modal::EventDetail(_) => self.on_key_event_detail(key),
             Modal::Transition(_) => self.on_key_transition(key),
             Modal::Confirm(_) => self.on_key_confirm(key),
+            Modal::InterruptConfirm(_) => self.on_key_interrupt_confirm(key),
             Modal::Repositories(_) => self.on_key_repositories(key),
             Modal::RepositoryForm(_) => self.on_key_repository_form(key),
             Modal::RepositoryRemove(_) => self.on_key_repository_remove(key),
@@ -1826,6 +1844,10 @@ impl App {
             }
             KeyCode::Char('t') => {
                 self.open_transition_menu();
+                Request::None
+            }
+            KeyCode::Char('x') => {
+                self.modal = Modal::InterruptConfirm(InterruptConfirm);
                 Request::None
             }
             KeyCode::Char('n') => {
@@ -2491,7 +2513,7 @@ impl App {
         }
     }
 
-    /// Keys inside the free-form recovery-note editor.
+    /// Keys inside the free-form operator-note editor.
     fn on_key_recovery_comment(&mut self, key: KeyEvent) -> Request {
         let Modal::RecoveryComment(form) = &mut self.modal else {
             return Request::None;
@@ -2501,8 +2523,8 @@ impl App {
                 self.modal = Modal::None;
                 Request::None
             }
-            KeyCode::Enter => Request::RecoverSelected {
-                comment: Some(std::mem::take(&mut form.value)),
+            KeyCode::Enter => Request::SaveOperatorNote {
+                note: std::mem::take(&mut form.value),
             },
             KeyCode::Backspace => {
                 form.value.pop();
@@ -2578,6 +2600,17 @@ impl App {
     fn on_key_confirm(&mut self, key: KeyEvent) -> Request {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => Request::ApplyTransition,
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.modal = Modal::None;
+                Request::None
+            }
+            _ => Request::None,
+        }
+    }
+
+    fn on_key_interrupt_confirm(&mut self, key: KeyEvent) -> Request {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Request::InterruptSelected,
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.modal = Modal::None;
                 Request::None
@@ -2790,7 +2823,12 @@ impl App {
     /// Opens the form for the question the selected execution is waiting on.
     pub fn open_input_form(&mut self) {
         match self.pending.as_ref() {
-            Some(pending) => self.modal = Modal::Input(InputForm::new(pending)),
+            Some(pending) if pending.continuation == InputContinuation::ResumeAgent => {
+                self.modal = Modal::Input(InputForm::new(pending))
+            }
+            Some(_) => self.notice = Some(Notice::error(
+                "This workflow decision is selected with t; i only replies to an agent/harness.",
+            )),
             None => {
                 self.notice = Some(Notice::error(
                     "The selected execution is not waiting for human input.",
@@ -2799,19 +2837,21 @@ impl App {
         }
     }
 
-    /// `i` answers a pending human question, or supplies an operator note for
-    /// a deliberate recovery. It is never an implicit retry for a live task.
+    /// `i` replies only to the harness that raised the current question.
     pub fn open_input_or_recovery_comment(&mut self) {
-        if self.pending.is_some() {
-            self.open_input_form();
+        if let Some(pending) = self.pending.as_ref() {
+            if pending.continuation == InputContinuation::ResumeAgent {
+                self.open_input_form();
+            } else {
+                self.notice = Some(Notice::error(
+                    "This workflow decision is selected with t; i only replies to an agent/harness.",
+                ));
+            }
             return;
         }
-        match self.selected().map(|row| &row.status) {
-            Some(ExecutionStatus::Failed | ExecutionStatus::Unknown) => {
-                self.modal = Modal::RecoveryComment(RecoveryCommentForm::default());
-            }
-            _ => self.open_input_form(),
-        }
+        self.notice = Some(Notice::error(
+            "The selected step is not awaiting a reply from an agent/harness.",
+        ));
     }
 
     /// Opens the manual transition menu for the current state.
@@ -2830,13 +2870,6 @@ impl App {
         let outputs = self.permitted_transitions();
         let states = self.override_targets();
         let override_allowed = self.override_allowed();
-
-        if outputs.is_empty() && !override_allowed {
-            self.notice = Some(Notice::error(
-                "The current state declares no outputs and allows no override.",
-            ));
-            return;
-        }
 
         self.modal = Modal::Transition(TransitionMenu {
             mode: if outputs.is_empty() {
@@ -2899,28 +2932,7 @@ impl App {
             return;
         }
 
-        // Choosing a declared label while the execution waits on a question is
-        // an ordinary answer, so it goes through `deliver_input`, not
-        // `transition` — exactly as before.
-        if self.pending.is_some() {
-            self.deliver_label(&target).await;
-        } else {
-            self.manual_transition(&target).await;
-        }
-    }
-
-    /// Answers a pending question with nothing but a label — `POST
-    /// /executions/:id/input` with [`HumanInputDelivery::label`]. See
-    /// [`App::submit_input`] for why this is now a short, directly-awaited
-    /// call rather than a backgrounded one.
-    async fn deliver_label(&mut self, label: &str) {
-        let Some(execution_id) = self.selected().map(|row| row.id.clone()) else {
-            return;
-        };
-
-        self.modal = Modal::None;
-        let delivery = HumanInputDelivery::label(label.to_string());
-        self.deliver(&execution_id, delivery).await;
+        self.manual_transition(&target).await;
     }
 
     /// The shared tail of [`App::submit_input`]/[`App::deliver_label`]:
@@ -2967,13 +2979,6 @@ impl App {
     /// refusal for whatever narrow path might still reach this with it
     /// disallowed.
     async fn force_transition(&mut self, target: &str) {
-        if !self.override_allowed() {
-            self.notice = Some(Notice::error(
-                "This state does not allow a forced transition (allow_manual_override).",
-            ));
-            self.modal = Modal::None;
-            return;
-        }
         let Some(execution_id) = self.selected().map(|row| row.id.clone()) else {
             return;
         };
@@ -3483,6 +3488,40 @@ impl App {
             }
         }
     }
+
+    /// Persists an instruction for the next agent attempt without implicitly
+    /// restarting a terminal execution.
+    pub async fn save_operator_note(&mut self, note: String) {
+        let Some(row) = self.selected().cloned() else {
+            return;
+        };
+        self.modal = Modal::None;
+        match self.client.operator_note(&row.id, note).await {
+            Ok(_) => {
+                self.notice = Some(Notice::info(format!(
+                    "Saved an operator instruction for execution {}.",
+                    row.id
+                )))
+            }
+            Err(error) => self.notice = Some(Notice::error(client_error_message(&row.id, error))),
+        }
+    }
+
+    pub async fn interrupt_selected(&mut self) {
+        let Some(row) = self.selected().cloned() else {
+            return;
+        };
+        self.modal = Modal::None;
+        match self.client.interrupt(&row.id).await {
+            Ok(_) => {
+                self.notice = Some(Notice::info(format!(
+                    "Interrupted execution {}. You can now add an instruction or choose a step.",
+                    row.id
+                )))
+            }
+            Err(error) => self.notice = Some(Notice::error(client_error_message(&row.id, error))),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3559,12 +3598,15 @@ fn cycle_choice(form: &mut InputForm, delta: isize) {
             if field.field_type != HumanInputType::Select || field.options.is_empty() {
                 return;
             }
-            let current = field
+            let next = match field
                 .options
                 .iter()
                 .position(|option| option == &form.values[index])
-                .unwrap_or(0);
-            let next = wrap(current, delta, field.options.len());
+            {
+                Some(current) => wrap(current, delta, field.options.len()),
+                None if delta >= 0 => 0,
+                None => field.options.len() - 1,
+            };
             form.values[index] = field.options[next].clone();
         }
         Some(FormRow::Label) => {
@@ -3611,9 +3653,8 @@ fn apply_to_row(row: &mut ExecutionRow, data: &EventData) {
             row.status = ExecutionStatus::Running;
         }
         EventData::WorkflowResumed => row.status = ExecutionStatus::Running,
-        EventData::WorkflowPaused { .. } | EventData::HumanInputRequested { .. } => {
-            row.status = ExecutionStatus::Paused
-        }
+        EventData::WorkflowPaused { .. } => row.status = ExecutionStatus::Paused,
+        EventData::HumanInputRequested { .. } => row.status = ExecutionStatus::InputNeeded,
         EventData::WorkflowCompleted { .. } => row.status = ExecutionStatus::Completed,
         EventData::WorkflowFailed { .. } => row.status = ExecutionStatus::Failed,
         EventData::WorkflowCancelled { .. } => row.status = ExecutionStatus::Cancelled,
@@ -3651,6 +3692,7 @@ pub fn status_name(status: &ExecutionStatus) -> &'static str {
     match status {
         ExecutionStatus::Running => "running",
         ExecutionStatus::Paused => "paused",
+        ExecutionStatus::InputNeeded => "input_needed",
         ExecutionStatus::WaitingForEvent => "waiting_for_event",
         ExecutionStatus::Completed => "completed",
         ExecutionStatus::Failed => "failed",

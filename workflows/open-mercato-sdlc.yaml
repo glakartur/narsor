@@ -258,13 +258,13 @@ states:
           {"output": "<label>", "data": {"states_covered": []}}
         Use exactly one of these labels:
           - "shaped" — the flow and its states are written down.
-          - "shaping_blocked" — the flow cannot be settled from what exists.
+        If the flow cannot be settled without a person's direction, request
+        `awaiting_input` and ask the question. A tool, sandbox, permission, or
+        harness problem is an action failure, not a workflow output.
     outputs:
       - shaped
-      - shaping_blocked
     transitions:
       shaped: approve_design
-      shaping_blocked: failed
     timeout: 1h
     retry_policy:
       max_attempts: 2
@@ -326,14 +326,13 @@ states:
           {"output": "<label>", "data": {"files_changed": <count>}}
         Use exactly one of these labels:
           - "implemented" — the change is complete with its tests.
-          - "blocked" — the work cannot proceed without a human clearing
-            something; say what in `data.reason`.
+        If the work needs a human decision, request `awaiting_input` and ask
+        the question. A tool, sandbox, permission, or harness problem is an
+        action failure, not a workflow output.
     outputs:
       - implemented
-      - blocked
     transitions:
       implemented: validation_gate
-      blocked: blocked_gate
     timeout: 3h
 
   validation_gate:
@@ -380,13 +379,12 @@ states:
           {"output": "<label>", "data": {"pr": "<number>"}, "variables": {"pr_number": "<number>"}}
         Use exactly one of these labels:
           - "pr_opened" — the pull request is open and labelled.
-          - "push_failed" — the push or the PR creation failed.
+        A failed commit, push, or pull-request creation is an action failure,
+        not a workflow output.
     outputs:
       - pr_opened
-      - push_failed
     transitions:
       pr_opened: code_review
-      push_failed: failed
     timeout: 30m
 
   code_review:
@@ -412,15 +410,15 @@ states:
         Use exactly one of these labels:
           - "approved" — an approving review is submitted.
           - "changes_requested" — findings were raised for the author.
-          - "review_blocked" — the review cannot be produced at all.
+        If the review needs a human decision, request `awaiting_input` and ask
+        the question. A tool, sandbox, permission, or harness problem is an
+        action failure, not a workflow output.
     outputs:
       - approved
       - changes_requested
-      - review_blocked
     transitions:
       approved: qa_routing
       changes_requested: address_feedback
-      review_blocked: blocked_gate
     timeout: 1h
     retry_policy:
       max_attempts: 2
@@ -442,13 +440,13 @@ states:
           {"output": "<label>", "data": {"threads_addressed": <count>}}
         Use exactly one of these labels:
           - "updated" — the changes are pushed and the PR is back in `review`.
-          - "blocked" — a requested change needs a human to clear something.
+        If a requested change needs a human decision, request `awaiting_input`
+        and ask the question. A tool, sandbox, permission, or harness problem
+        is an action failure, not a workflow output.
     outputs:
       - updated
-      - blocked
     transitions:
       updated: code_review
-      blocked: blocked_gate
     timeout: 2h
 
   # -------------------------------------------------------------------------
@@ -506,13 +504,14 @@ states:
           {"output": "<label>", "data": {"scenarios": <count>, "qa_head": "<sha>"}}
         Use exactly one of these labels:
           - "evidence_ready" — the evidence is attached for a QA reviewer.
-          - "qa_blocked" — the app could not be exercised at all.
+        If QA cannot proceed until a person resolves an environmental or
+        product question, request `awaiting_input` and ask the question. A
+        tool, sandbox, permission, or harness problem is an action failure,
+        not a workflow output.
     outputs:
       - evidence_ready
-      - qa_blocked
     transitions:
       evidence_ready: qa_signoff
-      qa_blocked: blocked_gate
     timeout: 2h
 
   qa_signoff:
@@ -580,13 +579,13 @@ states:
           {"output": "<label>", "data": {"blockers": []}}
         Use exactly one of these labels:
           - "mergeable" — every gate is satisfied and the checks are green.
-          - "merge_blocked" — name the blocking gate in `data.blockers`.
+        If a blocking gate needs a person's decision, request `awaiting_input`
+        and name it in the question. A tool, sandbox, permission, or harness
+        problem is an action failure, not a workflow output.
     outputs:
       - mergeable
-      - merge_blocked
     transitions:
       mergeable: approve_merge
-      merge_blocked: blocked_gate
     timeout: 30m
     retry_policy:
       max_attempts: 2
@@ -622,7 +621,7 @@ states:
       - abandon
     transitions:
       merge: merge_pr
-      hold: blocked_gate
+      hold: approve_merge
       abandon: cancelled
 
   merge_pr:
@@ -643,13 +642,13 @@ states:
           {"output": "<label>", "data": {"merge_commit": "<sha or null>"}}
         Use exactly one of these labels:
           - "merged" — squash-merged into main.
-          - "merge_refused" — a gate failed on the re-check; nothing merged.
+        If a gate needs a person's decision, request `awaiting_input` and ask
+        the question. A tool, sandbox, permission, or harness problem is an
+        action failure, not a workflow output.
     outputs:
       - merged
-      - merge_refused
     transitions:
       merged: housekeeping
-      merge_refused: blocked_gate
     timeout: 30m
 
   housekeeping:
@@ -670,60 +669,23 @@ states:
           {"output": "<label>", "data": {"closed": <count>, "follow_ups": <count>}}
         Use exactly one of these labels:
           - "reconciled" — the tracker matches reality and follow-ups are filed.
-          - "housekeeping_incomplete" — something could not be reconciled; it
-            is named on the PR.
+        If a person must decide how to reconcile something, request
+        `awaiting_input` and ask the question. A tool, sandbox, permission, or
+        harness problem is an action failure, not a workflow output.
     outputs:
       - reconciled
-      - housekeeping_incomplete
     transitions:
-      reconciled: completed
-      housekeeping_incomplete: completed
+      reconciled: finished
     timeout: 30m
     retry_policy:
       max_attempts: 2
       backoff: 30s
 
   # -------------------------------------------------------------------------
-  # The human-owned block
-  # -------------------------------------------------------------------------
-
-  blocked_gate:
-    description: >
-      HUMAN GATE — `blocked` and `do-not-merge` are set and cleared by humans
-      and stop the flow wherever it is. Every dead end in this pipeline routes
-      here rather than failing silently, so that a person decides whether the
-      work resumes, goes back for re-review, or ends.
-    action:
-      type: human
-      message: >
-        The pipeline is blocked and only a human clears a block. Decide where
-        it resumes: back to implementation, back to review, or stop here.
-      inputs:
-        - name: block_decision
-          type: select
-          required: true
-          options:
-            - resume_implementation
-            - resume_review
-            - abandon
-        - name: block_notes
-          type: text
-          required: false
-          description: What you cleared, and what the next step must respect.
-    outputs:
-      - resume_implementation
-      - resume_review
-      - abandon
-    transitions:
-      resume_implementation: implement
-      resume_review: code_review
-      abandon: cancelled
-
-  # -------------------------------------------------------------------------
   # Terminals
   # -------------------------------------------------------------------------
 
-  completed:
+  finished:
     description: Squash-merged into main, with the tracker reconciled behind it.
 
   closed_no_action:
@@ -731,14 +693,10 @@ states:
       Closed cleanly with nothing to do — nothing worth building, not
       reproducible, already fixed, or already claimed by somebody else.
 
-  failed:
-    description: The pipeline could not carry the ticket further.
-
   cancelled:
     description: A person stopped the pipeline.
 
 terminal_states:
-  completed: completed
+  finished: completed
   closed_no_action: completed
-  failed: failed
   cancelled: cancelled
