@@ -371,11 +371,23 @@ pub enum WorkspaceRef {
 }
 
 /// Definition of a possible output from an action
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputDefinition {
     pub label: OutputLabel,
-    #[serde(default)]
+    /// What choosing this label means, shown wherever the label is offered
+    /// (the agent's output contract, the input form, the transition menu).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+impl OutputDefinition {
+    /// An output with no description.
+    pub fn new(label: impl Into<OutputLabel>) -> Self {
+        Self {
+            label: label.into(),
+            description: None,
+        }
+    }
 }
 
 /// Label identifying an output/transition
@@ -478,6 +490,9 @@ pub enum ValidationError {
 
     #[error("State '{state}' has a transition for label '{label}', which is not declared in its outputs")]
     TransitionWithoutOutput { state: StateId, label: OutputLabel },
+
+    #[error("State '{state}' declares output '{label}' more than once")]
+    DuplicateOutput { state: StateId, label: OutputLabel },
 
     #[error("State '{0}' is not reachable from the initial state")]
     UnreachableState(StateId),

@@ -19,7 +19,8 @@ pub mod runner;
 pub mod timeline;
 
 pub use decision::{
-    check_label, decide, permitted_labels, DecisionError, DecisionOutcome, DecisionRequest,
+    check_label, decide, permitted_labels, permitted_outputs, DecisionError, DecisionOutcome,
+    DecisionRequest,
 };
 pub use retry::RetrySchedule;
 pub use runner::{

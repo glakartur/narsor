@@ -133,6 +133,20 @@ fn validate_graph(definition: &WorkflowDefinition, errors: &mut Vec<ValidationEr
             }
         }
 
+        // Checked on the compiled list, so a label declared once bare and once
+        // as an object is caught the same as a plain repeat.
+        let mut declared = HashSet::new();
+        let mut reported = HashSet::new();
+        for output in &state.outputs {
+            let label = output.label.as_str();
+            if !declared.insert(label) && reported.insert(label) {
+                errors.push(ValidationError::DuplicateOutput {
+                    state: state_id.clone(),
+                    label: output.label.clone(),
+                });
+            }
+        }
+
         if state.terminal {
             if !state.transitions.is_empty() {
                 errors.push(ValidationError::TerminalStateWithTransitions(

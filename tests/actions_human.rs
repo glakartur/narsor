@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use narsor::domain::{
     ActionConfig, Event, EventData, ExecutionStatus, HumanActionConfig, HumanInputField,
-    HumanInputType, WorkflowExecution, Workspace,
+    HumanInputType, OutputDefinition, WorkflowExecution, Workspace,
 };
 use narsor::engine::actions::human::{
     self, HumanActionError, PendingHumanInput, ResumedHumanAction,
@@ -114,8 +114,9 @@ fn no_fields_action() -> ActionConfig {
     })
 }
 
-fn labels(labels: &[&str]) -> Vec<String> {
-    labels.iter().map(|label| label.to_string()).collect()
+/// Outputs without descriptions, as a state declaring bare labels has them.
+fn labels(labels: &[&str]) -> Vec<OutputDefinition> {
+    labels.iter().copied().map(OutputDefinition::new).collect()
 }
 
 /// A fresh running execution, saved in the store.
@@ -651,6 +652,73 @@ async fn a_pending_request_survives_a_restart_and_can_still_be_satisfied() {
     let log = events(&store, &execution_id);
     assert!(has_input_requested(&log));
     assert!(received_input(&log).is_some());
+}
+
+/// Output descriptions are part of the durable record, so a form rebuilt
+/// after a restart can still say what each label means.
+#[tokio::test]
+async fn output_descriptions_survive_in_the_pending_record() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = start_execution(&store, root.path());
+    let SuspendedAction::AwaitingHumanInput(request) =
+        request_for(&no_fields_action(), "action-1").await
+    else {
+        panic!("a human action must request human input");
+    };
+    let outputs = vec![
+        OutputDefinition {
+            label: "ignore".to_string(),
+            description: Some("The failures are known and harmless.".to_string()),
+        },
+        OutputDefinition::new("fix_it"),
+    ];
+    let pending = PendingHumanInput::new(
+        execution.id.clone(),
+        "human_review_tests",
+        request,
+        outputs.clone(),
+    );
+    human::suspend(&store, &mut execution, &pending).expect("suspend");
+
+    let reread = human::pending_input(&ExecutionStore::new(root.path()), &execution.id)
+        .expect("read pending")
+        .expect("the request is pending");
+    assert_eq!(reread.outputs, outputs);
+    assert_eq!(reread.output_labels(), ["ignore", "fix_it"]);
+}
+
+/// A `pending_input.json` written before outputs had descriptions — a plain
+/// list of labels — still loads, and is still answerable.
+#[tokio::test]
+async fn a_pending_record_with_bare_output_labels_still_loads() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = start_execution(&store, root.path());
+    enter_human_state(
+        &store,
+        &mut execution,
+        "human_review_tests",
+        &no_fields_action(),
+        &["ignore", "fix_it"],
+    )
+    .await;
+
+    // Rewrite the record in the old shape, the way an older narsor left it.
+    let path = store.pending_input_file(&execution.id);
+    let mut record: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read the record")).expect("json");
+    record["outputs"] = json!(["ignore", "fix_it"]);
+    fs::write(&path, record.to_string()).expect("write the old shape");
+
+    let pending = human::pending_input(&store, &execution.id)
+        .expect("the old shape still reads")
+        .expect("the request is pending");
+    assert_eq!(pending.outputs, labels(&["ignore", "fix_it"]));
+
+    let resumed = human::resume(&store, &execution.id, &HumanInputDelivery::label("fix_it"))
+        .expect("the old record is still answerable");
+    assert_eq!(resumed.result.output_label, "fix_it");
 }
 
 #[tokio::test]

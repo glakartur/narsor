@@ -206,9 +206,14 @@ fn compile_state(
         outputs: state
             .outputs
             .into_iter()
-            .map(|label| OutputDefinition {
-                label,
-                description: None,
+            .map(|output| OutputDefinition {
+                label: output.label,
+                // A blank description says nothing; treating it as absent
+                // keeps an empty dash out of every place labels are listed.
+                description: output
+                    .description
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty()),
             })
             .collect(),
         transitions: state.transitions,

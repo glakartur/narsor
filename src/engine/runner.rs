@@ -68,7 +68,7 @@ use uuid::Uuid;
 
 use crate::domain::{
     ActionConfig, ActionResult, Artifact, ArtifactReference, DecisionProviderType, Event,
-    EventData, ExecutionId, ExecutionStatus, OutputLabel, State, StateId, WorkflowDefinition,
+    EventData, ExecutionId, ExecutionStatus, OutputDefinition, State, StateId, WorkflowDefinition,
     WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
 };
 use crate::engine::actions::agent::BUILT_IN_HARNESS;
@@ -1162,7 +1162,7 @@ impl Engine {
                         execution,
                         state,
                         request,
-                        decision::permitted_labels(state),
+                        decision::permitted_outputs(state),
                     )?;
                     return Ok(ActionUpshot::Stopped);
                 }
@@ -1271,7 +1271,8 @@ impl Engine {
         let request = ActionRequest::new(&rendered, &execution.workspace, action_execution_id)
             .with_timeout(timeout)
             .with_execution_id(&execution.id)
-            .with_conversation_store(&conversation_store);
+            .with_conversation_store(&conversation_store)
+            .with_outputs(&state.outputs);
 
         let outcome = executor.execute(request).await;
 
@@ -1382,7 +1383,7 @@ impl Engine {
                     execution,
                     state,
                     request,
-                    decision::permitted_labels(state),
+                    decision::permitted_outputs(state),
                 )?;
                 return Ok(Flow::Stop);
             }
@@ -1604,7 +1605,7 @@ impl Engine {
         execution: &mut WorkflowExecution,
         state: &State,
         request: HumanInputRequest,
-        outputs: Vec<OutputLabel>,
+        outputs: Vec<OutputDefinition>,
     ) -> Result<(), EngineError> {
         let pending =
             PendingHumanInput::new(execution.id.clone(), state.id.clone(), request, outputs);

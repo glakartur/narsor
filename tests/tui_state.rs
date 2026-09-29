@@ -584,6 +584,44 @@ async fn permitted_transitions_are_exactly_the_declared_outputs() {
     assert_eq!(menu.entries(), ["approved", "rejected"]);
 }
 
+/// The transition menu says what each declared output means, where the
+/// workflow gives a description — in the menu's model and on screen.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_transition_menu_shows_output_descriptions() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let root = TempRoot::new();
+    paused_at_review(root.path()).await;
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+
+    app.on_key(key(KeyCode::Char('t')));
+    let Modal::Transition(menu) = app.modal() else {
+        panic!("the transition menu is open");
+    };
+    assert_eq!(menu.description(0), Some("The change is ready to land."));
+    assert_eq!(menu.description(1), None, "`rejected` declares none");
+
+    let mut terminal = Terminal::new(TestBackend::new(160, 48)).expect("a test terminal");
+    terminal
+        .draw(|frame| views::render(frame, &app))
+        .expect("draw the screen");
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        screen.contains("approved — The change is ready to land."),
+        "the description is drawn next to its label"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // edge cases
 // ---------------------------------------------------------------------------

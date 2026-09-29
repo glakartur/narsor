@@ -40,7 +40,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use crate::domain::{ActionConfig, ActionError, ActionResult, OutputLabel, Workspace};
+use crate::domain::{
+    ActionConfig, ActionError, ActionResult, OutputDefinition, OutputLabel, Workspace,
+};
 use crate::persistence::ConversationStore;
 
 pub use agent::{AgentEventSink, AgentExecutor, AgentOutput, LoggingEventSink};
@@ -100,6 +102,16 @@ pub struct ActionRequest<'a> {
     /// test with nothing wired up, where writing a conversation would have
     /// nowhere meaningful to land.
     pub conversation_store: Option<&'a ConversationStore>,
+
+    /// The outputs the state declares, in declaration order.
+    ///
+    /// Informational only — the "no label validation" rule above still
+    /// holds. [`AgentExecutor`] lists them in the output contract it appends
+    /// to the prompt, so the agent is told the permitted labels (and what
+    /// each one means) by the engine rather than by the prompt's author.
+    /// Empty means the caller supplied none, and the contract then asks for
+    /// whatever label the task names.
+    pub outputs: &'a [OutputDefinition],
 }
 
 impl<'a> ActionRequest<'a> {
@@ -116,6 +128,7 @@ impl<'a> ActionRequest<'a> {
             action_execution_id,
             execution_id: None,
             conversation_store: None,
+            outputs: &[],
         }
     }
 
@@ -134,6 +147,12 @@ impl<'a> ActionRequest<'a> {
     /// Returns the same request naming where its conversation is recorded.
     pub fn with_conversation_store(mut self, store: &'a ConversationStore) -> Self {
         self.conversation_store = Some(store);
+        self
+    }
+
+    /// Returns the same request carrying the state's declared outputs.
+    pub fn with_outputs(mut self, outputs: &'a [OutputDefinition]) -> Self {
+        self.outputs = outputs;
         self
     }
 }

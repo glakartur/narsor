@@ -721,14 +721,21 @@ fn render_transition_modal(frame: &mut Frame, app: &App) {
     }
     for (index, entry) in menu.entries().iter().enumerate() {
         let focused = index == menu.selected;
-        lines.push(Line::from(Span::styled(
+        let mut spans = vec![Span::styled(
             format!("{} {entry}", if focused { "›" } else { " " }),
             if focused {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             },
-        )));
+        )];
+        if let Some(description) = menu.description(index) {
+            spans.push(Span::styled(
+                format!(" — {description}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
 
     lines.push(Line::from(""));
@@ -750,7 +757,13 @@ fn render_transition_modal(frame: &mut Frame, app: &App) {
         }))
         .title(title);
 
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    // Wrapped, so a long label description stays readable in the modal.
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// The confirmation a forced transition has to pass.

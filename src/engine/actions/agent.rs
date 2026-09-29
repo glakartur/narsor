@@ -6,11 +6,12 @@
 //!
 //! # The three jobs
 //!
-//! 1. **Ask properly.** The state's prompt is sent with
-//!    [`AGENT_OUTPUT_CONTRACT`] appended, so the agent is told — in the same
+//! 1. **Ask properly.** The state's prompt is sent with the
+//!    [`output_contract`] appended, so the agent is told — in the same
 //!    breath as the task — that it has to finish with a JSON object carrying
-//!    `output`. D19 calls this "forcing structure on the agent"; forcing it
-//!    starts with saying it.
+//!    `output`, and which labels (with their descriptions) it may use. D19
+//!    calls this "forcing structure on the agent"; forcing it starts with
+//!    saying it.
 //! 2. **Read robustly, guess never.** Agents wrap JSON in prose, in fences, or
 //!    in both. [`extract_output`] takes the *last* JSON object anywhere in the
 //!    answer that has an `output` key. When there is none, the action fails
@@ -61,30 +62,57 @@ use super::{
 };
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, AgentActionConfig, AgentSession, AgentSessionStatus,
-    Event, EventData, Workspace,
+    Event, EventData, OutputDefinition, Workspace,
 };
 use crate::persistence::{
     ConversationSource, ConversationStore, ConversationWriter, DefaultHarnessSelector,
     ExecutionStore,
 };
 
-/// Appended to every prompt, so the agent is told the contract it has to meet.
+/// Builds the output contract appended to every prompt, so the agent is told
+/// the contract it has to meet.
 ///
 /// Kept deliberately short and imperative: it competes for attention with the
 /// state's own prompt, and a long preamble is the first thing a model drops.
-pub const AGENT_OUTPUT_CONTRACT: &str = "\n\n\
+///
+/// The permitted labels come from the state itself (`outputs`, in declaration
+/// order), each followed by its description when the workflow gives one. The
+/// engine is therefore the single source of the list: a prompt no longer has
+/// to repeat the labels for the agent to know them. With no outputs to list
+/// (a direct call with nothing wired up) the agent is pointed at the label
+/// the task asks for instead.
+pub fn output_contract(outputs: &[OutputDefinition]) -> String {
+    let labels = if outputs.is_empty() {
+        "`output` is required and must be the label the task asks for.\n".to_string()
+    } else {
+        let mut list =
+            "`output` is required and must be exactly one of these labels:\n".to_string();
+        for output in outputs {
+            match output.description.as_deref().map(str::trim) {
+                Some(description) if !description.is_empty() => {
+                    list.push_str(&format!("- `{}` — {description}\n", output.label));
+                }
+                _ => list.push_str(&format!("- `{}`\n", output.label)),
+            }
+        }
+        list
+    };
+
+    format!(
+        "\n\n\
 ---\n\
 When you are done, end your reply with a single JSON object on its own, and \
 nothing after it:\n\
-{\"output\": \"<label>\", \"data\": {}, \"variables\": {}, \"artifacts\": []}\n\
-`output` is required and must be exactly one of the labels listed above (or, \
-if none were listed, the label the task asks for). `data`, `variables` and \
-`artifacts` are optional. If, and only if, you need a person to answer a \
-question before continuing this same task, return instead:\n\
-{\"status\":\"awaiting_input\",\"question\":\"<question>\",\"options\":[\"<optional choice>\"]}\n\
+{{\"output\": \"<label>\", \"data\": {{}}, \"variables\": {{}}, \"artifacts\": []}}\n\
+{labels}\
+`data`, `variables` and `artifacts` are optional. If, and only if, you need a \
+person to answer a question before continuing this same task, return instead:\n\
+{{\"status\":\"awaiting_input\",\"question\":\"<question>\",\"options\":[\"<optional choice>\"]}}\n\
 Do not use `awaiting_input` for a harness, sandbox, permission, or tool error; \
 those are action failures. Do not omit the JSON object: without it the workflow \
-cannot continue.";
+cannot continue."
+    )
+}
 
 /// The harness used when neither the action nor the configuration names one.
 ///
@@ -391,7 +419,7 @@ impl AgentExecutor {
 
         let mut session = new_session(config, harness, request.execution_id);
 
-        let prompt = format!("{}{AGENT_OUTPUT_CONTRACT}", config.prompt);
+        let prompt = format!("{}{}", config.prompt, output_contract(request.outputs));
         let workspace = Path::new(&request.workspace.path);
 
         // Opened before `invocation` (Key Technical Decisions): even an

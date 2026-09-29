@@ -925,7 +925,7 @@ async fn the_reference_workflow_pauses_for_a_person_and_carries_on() {
         .expect("there is one");
     assert_eq!(pending.state_id, "human_clarification");
     assert_eq!(pending.fields().len(), 1);
-    assert_eq!(pending.outputs, vec!["clarified", "abort"]);
+    assert_eq!(pending.output_labels(), vec!["clarified", "abort"]);
 
     let mut values = Map::new();
     values.insert(

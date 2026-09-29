@@ -1204,7 +1204,7 @@ fn print_pending_input(pending: &PendingHumanInput) {
         );
     }
     if !pending.outputs.is_empty() {
-        println!("  Output labels: {}", pending.outputs.join(", "));
+        println!("  Output labels: {}", pending.output_labels().join(", "));
     }
 }
 

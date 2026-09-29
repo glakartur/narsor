@@ -307,9 +307,10 @@ pub struct StateSchema {
     #[serde(default)]
     pub action: Option<ActionSchema>,
 
-    /// Possible output labels.
+    /// Possible output labels, each optionally described — see
+    /// [`OutputSchema`].
     #[serde(default)]
-    pub outputs: Vec<String>,
+    pub outputs: Vec<OutputSchema>,
 
     /// Mapping from output label to target state.
     #[serde(default)]
@@ -334,6 +335,77 @@ pub struct StateSchema {
     /// Allows the operator to force an arbitrary transition out of this state.
     #[serde(default)]
     pub allow_manual_override: bool,
+}
+
+/// One entry of a state's `outputs` list (§3.3), in either of its two forms.
+///
+/// A bare label is the original contract; the object form adds a description
+/// the engine shows wherever the label is offered — the agent's output
+/// contract, the input form, the transition menu:
+///
+/// ```yaml
+/// outputs:
+///   - success                                   # bare label
+///   - label: needs_human
+///     description: A person has to decide first  # described label
+/// ```
+///
+/// Both compile to the same [`crate::domain::OutputDefinition`]; a bare label
+/// simply has no description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputSchema {
+    pub label: String,
+    pub description: Option<String>,
+}
+
+/// The object form of an [`OutputSchema`]. `deny_unknown_fields` keeps a
+/// misspelled `descripton:` from being dropped silently.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutputObjectSchema {
+    label: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for OutputSchema {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OutputVisitor;
+
+        impl<'de> Visitor<'de> for OutputVisitor {
+            type Value = OutputSchema;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str(
+                    "an output label, or a mapping with 'label' and an optional 'description'",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(OutputSchema {
+                    label: value.to_string(),
+                    description: None,
+                })
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let object =
+                    OutputObjectSchema::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(OutputSchema {
+                    label: object.label,
+                    description: object.description,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(OutputVisitor)
+    }
 }
 
 /// Action configuration (§3.3.A–D).

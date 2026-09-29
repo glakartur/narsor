@@ -87,7 +87,7 @@ use crate::domain::{
 };
 use crate::engine::actions::script::TRUNCATION_MARKER;
 use crate::engine::{
-    permitted_labels, ConversationState as PositionConversationState, EventLink,
+    permitted_labels, permitted_outputs, ConversationState as PositionConversationState, EventLink,
     HumanInputDelivery, InputContinuation, PendingHumanInput, Timeline,
 };
 use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
@@ -371,7 +371,7 @@ impl InputForm {
             if infers_label(&fields) {
                 label_choices.push(None);
             }
-            label_choices.extend(pending.outputs.iter().cloned().map(Some));
+            label_choices.extend(pending.output_labels().into_iter().map(Some));
         }
 
         Self {
@@ -923,6 +923,9 @@ pub struct TransitionMenu {
     pub mode: TransitionMode,
     /// The declared output labels of the current state.
     pub outputs: Vec<String>,
+    /// The description of each entry of `outputs`, by index; `None` where
+    /// the workflow gives none.
+    pub output_descriptions: Vec<Option<String>>,
     /// Every other state of the workflow, for the override mode.
     pub states: Vec<String>,
     /// The selected entry of the current mode's list.
@@ -943,6 +946,15 @@ impl TransitionMenu {
     /// The highlighted entry.
     pub fn current(&self) -> Option<&String> {
         self.entries().get(self.selected)
+    }
+
+    /// The description of the entry at `index` of the mode currently shown.
+    /// Only declared outputs carry one; an override target never does.
+    pub fn description(&self, index: usize) -> Option<&str> {
+        match self.mode {
+            TransitionMode::Outputs => self.output_descriptions.get(index)?.as_deref(),
+            TransitionMode::Override => None,
+        }
     }
 }
 
@@ -2867,7 +2879,13 @@ impl App {
             return;
         }
 
-        let outputs = self.permitted_transitions();
+        let (outputs, output_descriptions): (Vec<String>, Vec<Option<String>>) = self
+            .current_state()
+            .map(permitted_outputs)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|output| (output.label, output.description))
+            .unzip();
         let states = self.override_targets();
         let override_allowed = self.override_allowed();
 
@@ -2878,6 +2896,7 @@ impl App {
                 TransitionMode::Outputs
             },
             outputs,
+            output_descriptions,
             states,
             selected: 0,
             override_allowed,

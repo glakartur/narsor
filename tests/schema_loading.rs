@@ -936,3 +936,97 @@ terminal_states: { completed: completed }
     assert_eq!(access("write"), WorkspaceAccess::ReadWrite);
     assert_eq!(access("read"), WorkspaceAccess::ReadOnly);
 }
+
+// ---------------------------------------------------------------------------
+// Output labels with descriptions (§3.3)
+// ---------------------------------------------------------------------------
+
+/// A two-state workflow whose `review` state declares `outputs` as given.
+fn with_outputs(outputs: &str) -> String {
+    format!(
+        r#"
+name: described-outputs
+version: 1
+states:
+  review:
+    action:
+      type: script
+      command: ./review.sh
+    outputs:
+{outputs}
+    transitions:
+      approved: done
+      rejected: done
+  done:
+    description: end
+terminal_states: [done]
+"#
+    )
+}
+
+#[test]
+fn outputs_mix_bare_labels_and_described_ones() {
+    let yaml = with_outputs(
+        "      - approved\n      - label: rejected\n        description: The change needs another pass.",
+    );
+
+    let definition = load_from_str(&yaml).expect("the mixed form should load");
+    let outputs = &state(&definition, "review").outputs;
+
+    let labels: Vec<&str> = outputs.iter().map(|o| o.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["approved", "rejected"],
+        "declaration order is kept"
+    );
+    assert_eq!(outputs[0].description, None);
+    assert_eq!(
+        outputs[1].description.as_deref(),
+        Some("The change needs another pass.")
+    );
+}
+
+#[test]
+fn a_described_output_without_a_description_is_a_bare_label() {
+    let yaml =
+        with_outputs("      - label: approved\n      - label: rejected\n        description: '  '");
+
+    let definition = load_from_str(&yaml).expect("the object form without a description loads");
+    let outputs = &state(&definition, "review").outputs;
+
+    assert_eq!(outputs[0].description, None);
+    assert_eq!(outputs[1].description, None, "a blank description is none");
+}
+
+#[test]
+fn an_output_object_with_an_unknown_key_is_rejected_with_the_state() {
+    let yaml = with_outputs(
+        "      - approved\n      - label: rejected\n        descripton: typo in the key",
+    );
+
+    let message = load_from_str(&yaml)
+        .expect_err("a misspelled key in an output must be rejected")
+        .to_string();
+    assert!(message.contains("descripton"), "names the key: {message}");
+    assert!(
+        message.contains("states.review"),
+        "names the state: {message}"
+    );
+}
+
+#[test]
+fn an_output_object_without_a_label_is_rejected_with_the_state() {
+    let yaml = with_outputs("      - approved\n      - description: a label is missing here");
+
+    let message = load_from_str(&yaml)
+        .expect_err("an output object needs a label")
+        .to_string();
+    assert!(
+        message.contains("label"),
+        "names the missing field: {message}"
+    );
+    assert!(
+        message.contains("states.review"),
+        "names the state: {message}"
+    );
+}

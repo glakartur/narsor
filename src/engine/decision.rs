@@ -23,7 +23,8 @@
 //! where D20 (an agent that has to be told to pick again) will hook in.
 
 use crate::domain::{
-    ActionResult, DecisionConfig, DecisionProviderType, OutputLabel, State, StateId,
+    ActionResult, DecisionConfig, DecisionProviderType, OutputDefinition, OutputLabel, State,
+    StateId,
 };
 
 /// Message shown to an operator asked to pick a transition, when the workflow
@@ -120,6 +121,14 @@ pub fn permitted_labels(state: &State) -> Vec<OutputLabel> {
         .iter()
         .map(|output| output.label.clone())
         .collect()
+}
+
+/// The outputs a state declares, descriptions included, in declaration order.
+///
+/// The same set as [`permitted_labels`], for the places that offer the labels
+/// to someone choosing between them and should say what each one means.
+pub fn permitted_outputs(state: &State) -> Vec<OutputDefinition> {
+    state.outputs.clone()
 }
 
 /// Asks the state's decision provider which label the transition follows.

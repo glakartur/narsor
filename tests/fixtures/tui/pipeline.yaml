@@ -6,7 +6,9 @@ description: >
   path creates an empty working directory, and the script is reached through an
   absolute path handed in as an input — the test therefore never writes into the
   repository. The `review` state declares `allow_manual_override`, which is what
-  makes the override mode reachable; `prepare` deliberately does not.
+  makes the override mode reachable; `prepare` deliberately does not. Its
+  `approved` output carries a description and `rejected` does not, so both
+  forms of an output reach the transition menu.
 
 inputs:
   - name: script_path
@@ -54,7 +56,8 @@ states:
           required: true
           description: Note for the record; the reviewer must write one.
     outputs:
-      - approved
+      - label: approved
+        description: The change is ready to land.
       - rejected
     transitions:
       approved: done

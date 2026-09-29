@@ -130,9 +130,10 @@ Serce definicji workflow. Każdy klucz w sekcji `states` to unikalny identyfikat
     type: <agent|script|human|wait>
     # ... szczegóły akcji
   outputs:                            # Lista dopuszczalnych etykiet wyjścia
-    - success
+    - success                         # Goła etykieta
     - failure
-    - needs_human
+    - label: needs_human               # Etykieta z opisem (opcjonalnym)
+      description: Agent potrzebuje decyzji człowieka, zanim pójdzie dalej.
   transitions:                        # Mapowanie: etykieta -> następny stan
     success: next_state
     failure: error_handler
@@ -145,6 +146,22 @@ Serce definicji workflow. Każdy klucz w sekcji `states` to unikalny identyfikat
     max_attempts: 3
     backoff: 5s
 ```
+
+#### Etykiety wyjścia (`outputs`)
+
+Każdy element listy `outputs` ma jedną z dwóch form, które można mieszać w
+jednym stanie:
+
+*   **goła etykieta** — sam napis, np. `- success`;
+*   **obiekt** — `{label, description}`: `label` jest wymagany, `description`
+    opcjonalny. Nieznany klucz (np. literówka `descripton`) albo brak `label`
+    to błąd ładowania wskazujący stan.
+
+Opis jest jedynym źródłem wyjaśnienia, co znaczy dana etykieta. Silnik pokazuje
+go wszędzie tam, gdzie etykieta jest do wyboru: w kontrakcie wyjścia doklejanym
+do promptu agenta (§3.3.A), w oczekującym inpucie (`pending_input.json`) i w
+menu ręcznego przejścia TUI (`t`). Pusty opis znaczy tyle co jego brak.
+Etykieta może wystąpić w `outputs` tylko raz, niezależnie od formy (§5).
 
 #### Typy Akcji (Action Types):
 
@@ -178,6 +195,22 @@ action:
 
 **Wymagane wyjścia (outputs):**
 Agent musi zwrócić JSON z kluczem `output` odpowiadającym jednej z zadeklarowanych etykiet.
+
+**Kontrakt wyjścia budowany przez silnik:** do każdego promptu agenta silnik
+dokleja kontrakt wyjścia: format końcowego obiektu JSON oraz listę dozwolonych
+etykiet stanu, w kolejności deklaracji w `outputs`, każdą z opisem po myślniku,
+jeśli workflow go podał:
+
+```text
+`output` is required and must be exactly one of these labels:
+- `success` — Zadanie wykonane, raport zapisany.
+- `failure`
+```
+
+Prompt stanu nie musi więc (i nie powinien) powtarzać listy etykiet — wystarczy
+opisać je w `outputs`. Instrukcje dotyczące `data` (np. „podaj pytanie w
+`data.question`”) nadal należą do promptu, bo kontrakt mówi tylko o etykietach.
+
 Przykładowy wynik agenta:
 ```json
 {
@@ -507,6 +540,7 @@ Przed uruchomieniem workflow, definicja musi przejść walidację:
 1.  **Spójność Grafu:**
     *   Wszystkie stany wskazane w `transitions` muszą istnieć w sekcji `states`.
     *   Każda etykieta w `outputs` musi mieć odpowiadające jej przejście w `transitions` (chyba że stan jest terminalny).
+    *   Etykieta w `outputs` nie może się powtarzać, również między formą gołą a obiektem (§3.3).
     *   Musi istnieć co najmniej jeden stan początkowy (pierwszy zdefiniowany lub oznaczony flagą `initial: true`).
     *   Muszą istnieć stany terminalne osiągalne z każdego innego stanu (brak deadlocków).
 

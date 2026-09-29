@@ -117,6 +117,54 @@ fn transition_for_an_undeclared_label_is_rejected() {
 }
 
 #[test]
+fn an_output_declared_twice_in_mixed_forms_is_rejected() {
+    let errors = errors_of("duplicate_output.yaml");
+    let duplicates: Vec<_> = errors
+        .iter()
+        .filter(|err| matches!(err, ValidationError::DuplicateOutput { .. }))
+        .collect();
+    assert!(
+        matches!(
+            duplicates[..],
+            [ValidationError::DuplicateOutput { state, label }]
+                if state == "start" && label == "success"
+        ),
+        "exactly one duplicate is reported, got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn described_outputs_pass_validation() {
+    let definition = load_from_str(
+        r#"
+name: described
+version: 1
+states:
+  start:
+    action:
+      type: script
+      command: ./run.sh
+    outputs:
+      - success
+      - label: failure
+        description: The run did not finish.
+    transitions:
+      success: done
+      failure: done
+  done:
+    description: end
+terminal_states: [done]
+"#,
+    )
+    .expect("the described form loads");
+
+    if let Err(errors) = definition.validate() {
+        panic!("got: {}", describe(&errors));
+    }
+}
+
+#[test]
 fn unreachable_state_is_rejected() {
     let errors = errors_of("unreachable_state.yaml");
     assert!(

@@ -45,15 +45,15 @@ use std::future::Future;
 use std::pin::Pin;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
 use super::{ActionExecutor, ActionOutcome, ActionRequest, SuspendedAction};
 use crate::domain::{
     ActionConfig, ActionError, ActionExecutionId, ActionResult, EventData, ExecutionId,
-    ExecutionStatus, HumanActionConfig, HumanInputField, HumanInputType, OutputLabel, StateId,
-    WorkflowExecution,
+    ExecutionStatus, HumanActionConfig, HumanInputField, HumanInputType, OutputDefinition,
+    OutputLabel, StateId, WorkflowExecution,
 };
 use crate::persistence::{ExecutionStore, PersistenceError};
 
@@ -149,14 +149,17 @@ pub struct PendingHumanInput {
     #[serde(flatten)]
     pub request: HumanInputRequest,
 
-    /// The output labels the state declares.
+    /// The outputs the state declares, with their descriptions.
     ///
     /// This is the menu a user picks from when the action declares no fields
     /// (§3.3.C, `human_review_tests` in §4), and it is what the TUI offers
     /// alongside the form otherwise. Empty means the caller recorded no menu,
     /// and then [`resume`] leaves judging the label entirely to U7.
-    #[serde(default)]
-    pub outputs: Vec<OutputLabel>,
+    ///
+    /// Records written before labels had descriptions hold plain strings;
+    /// [`deserialize_outputs`] reads those as labels without a description.
+    #[serde(default, deserialize_with = "deserialize_outputs")]
+    pub outputs: Vec<OutputDefinition>,
 
     /// Whether the submitted form completes a human step or resumes the
     /// agent action that asked the question. Older pending records were all
@@ -186,7 +189,7 @@ impl PendingHumanInput {
         execution_id: impl Into<ExecutionId>,
         state_id: impl Into<StateId>,
         request: HumanInputRequest,
-        outputs: Vec<OutputLabel>,
+        outputs: Vec<OutputDefinition>,
     ) -> Self {
         Self {
             execution_id: execution_id.into(),
@@ -228,6 +231,38 @@ impl PendingHumanInput {
     pub fn action_execution_id(&self) -> &str {
         &self.request.action_execution_id
     }
+
+    /// The declared output labels, without their descriptions.
+    pub fn output_labels(&self) -> Vec<OutputLabel> {
+        self.outputs
+            .iter()
+            .map(|output| output.label.clone())
+            .collect()
+    }
+}
+
+/// Reads [`PendingHumanInput::outputs`] in either shape it was ever written
+/// in: the current `{label, description}` objects, or the bare labels of
+/// records written before outputs had descriptions.
+fn deserialize_outputs<'de, D>(deserializer: D) -> Result<Vec<OutputDefinition>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StoredOutput {
+        Label(OutputLabel),
+        Defined(OutputDefinition),
+    }
+
+    let stored = Vec::<StoredOutput>::deserialize(deserializer)?;
+    Ok(stored
+        .into_iter()
+        .map(|output| match output {
+            StoredOutput::Label(label) => OutputDefinition::new(label),
+            StoredOutput::Defined(definition) => definition,
+        })
+        .collect())
 }
 
 /// An answer on its way in.
@@ -619,10 +654,12 @@ fn resolve_label(
     values: &Map<String, Value>,
 ) -> Result<OutputLabel, HumanActionError> {
     if let Some(label) = &delivery.chosen_label {
-        if !pending.outputs.is_empty() && !pending.outputs.iter().any(|output| output == label) {
+        if !pending.outputs.is_empty()
+            && !pending.outputs.iter().any(|output| &output.label == label)
+        {
             return Err(HumanActionError::LabelNotDeclared {
                 label: label.clone(),
-                outputs: pending.outputs.clone(),
+                outputs: pending.output_labels(),
             });
         }
         return Ok(label.clone());
@@ -641,7 +678,7 @@ fn resolve_label(
     }
 
     Err(HumanActionError::NoLabelChosen {
-        outputs: pending.outputs.clone(),
+        outputs: pending.output_labels(),
     })
 }
 

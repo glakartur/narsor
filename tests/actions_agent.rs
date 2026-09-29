@@ -18,10 +18,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use narsor::domain::{
-    ActionConfig, ActionError, AgentActionConfig, Context, EventData, ExecutionStatus, Workspace,
-    WorkspaceAccess,
+    ActionConfig, ActionError, AgentActionConfig, Context, EventData, ExecutionStatus,
+    OutputDefinition, Workspace, WorkspaceAccess,
 };
-use narsor::engine::actions::agent::{AgentEventSink, SESSION_ID_VARIABLE};
+use narsor::engine::actions::agent::{output_contract, AgentEventSink, SESSION_ID_VARIABLE};
 use narsor::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
     CodexAdapter, Engine, HarnessRegistry, LoggingEventSink, OpenCodeAdapter,
@@ -1103,6 +1103,81 @@ async fn the_harness_receives_the_expanded_prompt_and_the_output_contract() {
     );
 }
 
+/// The prompt a request with `outputs` sends to the fake harness.
+async fn prompt_sent_with_outputs(outputs: &[OutputDefinition]) -> String {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"output":"ready"}"#));
+
+    let action = ActionConfig::Agent(agent_action("do the thing"));
+    let workspace = root.workspace();
+    executor(&fake)
+        .execute(ActionRequest::new(&action, &workspace, ACTION_EXECUTION_ID).with_outputs(outputs))
+        .await
+        .expect("the action runs");
+
+    fake.args(1).last().expect("a prompt").clone()
+}
+
+/// The declared labels are listed by the engine, in declaration order, each
+/// with its description where the workflow gives one.
+#[tokio::test]
+async fn the_output_contract_lists_the_declared_labels_with_their_descriptions() {
+    let outputs = [
+        OutputDefinition {
+            label: "ready".to_string(),
+            description: Some("The plan is written and nothing is unclear.".to_string()),
+        },
+        OutputDefinition::new("ambiguous"),
+    ];
+
+    let prompt = prompt_sent_with_outputs(&outputs).await;
+
+    let ready = prompt
+        .find("- `ready` — The plan is written and nothing is unclear.\n")
+        .unwrap_or_else(|| panic!("the described label is listed: {prompt}"));
+    let ambiguous = prompt
+        .find("- `ambiguous`\n")
+        .unwrap_or_else(|| panic!("the bare label is listed: {prompt}"));
+    assert!(ready < ambiguous, "declaration order is kept: {prompt}");
+    assert!(
+        !prompt.contains("listed above"),
+        "the contract no longer relies on the prompt's author: {prompt}"
+    );
+}
+
+/// A state without descriptions gets a plain list — no dangling dashes.
+#[test]
+fn a_contract_without_descriptions_lists_bare_labels_only() {
+    let contract = output_contract(&[
+        OutputDefinition::new("approved"),
+        OutputDefinition {
+            label: "rejected".to_string(),
+            // Blank is treated as no description at all.
+            description: Some("   ".to_string()),
+        },
+    ]);
+
+    assert!(contract.contains("- `approved`\n"), "{contract}");
+    assert!(contract.contains("- `rejected`\n"), "{contract}");
+    assert!(!contract.contains(" — "), "{contract}");
+}
+
+/// With no outputs to list, the agent is pointed at the label the task names.
+#[tokio::test]
+async fn a_request_without_outputs_asks_for_the_label_the_task_names() {
+    let prompt = prompt_sent_with_outputs(&[]).await;
+
+    assert!(
+        prompt.contains("the label the task asks for"),
+        "the fallback wording is used: {prompt}"
+    );
+    assert!(
+        !prompt.contains("- `"),
+        "no label list is rendered: {prompt}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The process (U5's rules, applied to a harness)
 // ---------------------------------------------------------------------------
@@ -1337,6 +1412,61 @@ inputs:
     // The prompt reached the harness expanded.
     let prompt = fixture.fake.args(1).last().expect("a prompt").clone();
     assert!(prompt.starts_with("Analyse the login module"), "{prompt}");
+}
+
+/// The engine hands the state's outputs to the executor: the prompt of an
+/// agent state lists every declared label and its description, without the
+/// workflow's prompt naming a single one (AE15).
+#[tokio::test]
+async fn the_engine_appends_the_states_labels_and_descriptions_to_the_prompt() {
+    let fixture = EngineFixture::new();
+    fixture.fake.answers(&envelope(r#"{"output":"ready"}"#));
+
+    let definition = fixture.workflow(
+        r#"
+name: agent-described-outputs
+version: 1
+states:
+  analyze:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: "Analyse the module."
+    outputs:
+      - label: ready
+        description: The analysis is complete.
+      - ambiguous
+      - label: needs_human_decision
+        description: A person has to choose between the options first.
+    transitions:
+      ready: done
+      ambiguous: stopped
+      needs_human_decision: stopped
+  done:
+    description: Success.
+  stopped:
+    description: Failure.
+terminal_states:
+  done: completed
+  stopped: failed
+"#,
+    );
+
+    let execution = fixture
+        .engine()
+        .start_and_run(&definition, json!({}), fixture.workspace())
+        .await
+        .expect("run the workflow");
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+
+    let prompt = fixture.fake.args(1).last().expect("a prompt").clone();
+    for line in [
+        "- `ready` — The analysis is complete.\n",
+        "- `ambiguous`\n",
+        "- `needs_human_decision` — A person has to choose between the options first.\n",
+    ] {
+        assert!(prompt.contains(line), "missing {line:?} in: {prompt}");
+    }
 }
 
 #[tokio::test]
@@ -1892,7 +2022,7 @@ async fn a_resumed_session_reaches_the_argv_and_the_prompt_entry() {
 ///
 /// Ignored by default: it costs money, needs credentials and is not
 /// deterministic. Run it on purpose with `cargo test -- --ignored`, and read it
-/// as the answer to "does the contract in [`AGENT_OUTPUT_CONTRACT`] actually
+/// as the answer to "does the contract built by [`output_contract`] actually
 /// work on a real model?".
 #[tokio::test]
 #[ignore = "drives the real `claude` binary: costs money, needs credentials"]
