@@ -14,9 +14,22 @@
 //! Right after recovery, and before the API accepts anything,
 //! [`continue_at_startup`] carries on what recovery found safely stopped
 //! (D55's restart matrix): a reprompt a restart cut short between the
-//! rejection and its start gets a new pass, and the conductor serves its
-//! unanswered chat messages again. It is the daemon's only replay, and it
-//! only ever continues what cannot repeat a side effect.
+//! rejection and its start gets a new pass, so does a label rescue (F1) the
+//! restart cut short, and the conductor serves its unanswered chat messages
+//! again. It is the daemon's only replay, and it only ever continues what
+//! cannot repeat a side effect.
+//!
+//! # Shutdown during the conductor's label rescue
+//!
+//! The rescue (F1) runs inline in a pass, and a pause is honoured only at
+//! the next step boundary — so a `SIGTERM` during the conductor's
+//! invocation does not stop it early: the drain below waits for it like
+//! for any running action, up to its timeout, and the process then exits
+//! anyway, taking the invocation with it. That is deliberate. The rescue is
+//! recorded before the conductor is invoked and the invocation is counted
+//! before it runs, so the next start repeats it (R24's one repeat) instead
+//! of losing it; interrupting it earlier would only spend that repeat
+//! sooner.
 //!
 //! # Why shutdown is a poll, not a wait
 //!
@@ -40,7 +53,7 @@ use crate::api::{ActiveTasks, ApiServices};
 use crate::conductor::{ConductorRegistry, HarnessInvoker};
 use crate::config::Resolved;
 use crate::domain::ExecutionStatus;
-use crate::engine::{owed_reprompt, Engine, HarnessRegistry};
+use crate::engine::{owed_output_rescue, owed_reprompt, Engine, HarnessRegistry};
 use crate::persistence::{
     DaemonInfo, DefaultHarnessSelector, ExecutionStore, ReconciliationOutcome, RecoveryReport,
 };
@@ -131,7 +144,13 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     )
     .with_default_harness_selector(Arc::clone(&selector))
     .with_agent_timeout(agent_timeout_secs);
-    let conductor = ConductorRegistry::new(Arc::clone(&engine), Arc::new(invoker));
+    // Held here for the daemon's whole life: the engine only holds it
+    // weakly, and hands a step without a usable output label to it (F1).
+    let conductor = Arc::new(ConductorRegistry::new(
+        Arc::clone(&engine),
+        Arc::new(invoker),
+    ));
+    engine.attach_conductor(&conductor);
     if let Some(recovery) = &recovery {
         continue_at_startup(
             &engine,
@@ -246,10 +265,14 @@ fn recover_at_startup(store: &ExecutionStore) -> Option<RecoveryReport> {
 ///   (KTD7): the attempt is closed, so a new pass — spawned exactly as
 ///   `POST /executions/:id/resume` spawns one — asks the agent again instead
 ///   of replaying anything.
-/// * `Running` with an interrupted automatic conductor invocation: left
-///   `Running` and reported; carrying it on is the conductor's F1 (U10).
+/// * `Running` with a label rescue still owed (F1): a new pass carries it on
+///   — it invokes the conductor, or applies a decision the conductor saved
+///   before the restart without invoking it. When the conductor's invocation
+///   was under way (its marker is left, `ConductorInterrupted`), invoking
+///   it again is R24's one repeat, counted before it runs.
 /// * The conductor's own rows: unanswered chat messages and interrupted
-///   advisory invocations are served again
+///   advisory invocations are served again, and what a rescue left for an
+///   execution that no longer owes one is discarded
 ///   ([`ConductorRegistry::restore_at_startup`]).
 pub fn continue_at_startup(
     engine: &Arc<Engine>,
@@ -264,7 +287,7 @@ pub fn continue_at_startup(
         }
         match &reconciliation.outcome {
             ReconciliationOutcome::Consistent => {
-                continue_owed_reprompt(
+                continue_owed_step(
                     engine,
                     active_tasks,
                     catalog_dir,
@@ -272,11 +295,17 @@ pub fn continue_at_startup(
                 );
             }
             ReconciliationOutcome::ConductorInterrupted { trigger, .. } => {
-                tracing::warn!(
+                tracing::info!(
                     execution_id = %reconciliation.execution_id,
                     trigger = trigger.name(),
                     "daemon: the conductor was interrupted while it worked on this \
-                     execution; it stays running and waits for the conductor"
+                     execution; invoking it again"
+                );
+                continue_owed_step(
+                    engine,
+                    active_tasks,
+                    catalog_dir,
+                    &reconciliation.execution_id,
                 );
             }
             _ => {}
@@ -290,6 +319,12 @@ pub fn continue_at_startup(
                     execution_id = %execution_id,
                     requests,
                     "daemon: the conductor resumes its queue after the restart"
+                );
+            }
+            for execution_id in &restore.discarded {
+                tracing::info!(
+                    execution_id = %execution_id,
+                    "daemon: discarded a label rescue for an execution that moved on"
                 );
             }
             for (execution_id, requests, pending) in &restore.parked {
@@ -308,30 +343,31 @@ pub fn continue_at_startup(
 }
 
 /// Spawns a pass for `execution_id` when it stopped between a rejected
-/// output and its reprompt, and logs what happened.
-fn continue_owed_reprompt(
+/// output and its reprompt, or during the conductor's rescue of its output
+/// label, and logs what happened.
+fn continue_owed_step(
     engine: &Arc<Engine>,
     active_tasks: &ActiveTasks,
     catalog_dir: &Path,
     execution_id: &str,
 ) {
-    match spawn_owed_reprompt(engine, active_tasks, catalog_dir, execution_id) {
+    match spawn_owed_step(engine, active_tasks, catalog_dir, execution_id) {
         Ok(true) => tracing::info!(
             execution_id,
-            "daemon: continuing a reprompt the restart interrupted"
+            "daemon: continuing a step the restart interrupted"
         ),
         Ok(false) => {}
         Err(error) => tracing::warn!(
             execution_id,
             error = %error,
-            "daemon: could not continue a reprompt the restart interrupted"
+            "daemon: could not continue a step the restart interrupted"
         ),
     }
 }
 
-/// Whether `execution_id` owes a reprompt — and if it does, claims it and
-/// spawns its pass.
-fn spawn_owed_reprompt(
+/// Whether `execution_id` owes a reprompt or a label rescue — and if it
+/// does, claims it and spawns its pass.
+fn spawn_owed_step(
     engine: &Arc<Engine>,
     active_tasks: &ActiveTasks,
     catalog_dir: &Path,
@@ -341,10 +377,13 @@ fn spawn_owed_reprompt(
         .store()
         .load_execution(execution_id)
         .map_err(|error| error.to_string())?;
-    if owed_reprompt(&execution)
+    let owes_reprompt = owed_reprompt(&execution)
         .map_err(|error| error.to_string())?
-        .is_none()
-    {
+        .is_some();
+    let owes_rescue = owed_output_rescue(&execution)
+        .map_err(|error| error.to_string())?
+        .is_some();
+    if !owes_reprompt && !owes_rescue {
         return Ok(false);
     }
     let definition =

@@ -49,6 +49,11 @@
 //! the moment `ActionCompleted` is emitted, and the loop checks for it before
 //! entering a state: when one is there, the step resumes at the decision.
 //!
+//! When even that attempt gives no label, or there is no session to ask
+//! again, the step is handed to the conductor inline, under the pass's claim
+//! (F1, KTD10): it chooses the output, asks the agent once more in its own
+//! words, or makes the step a problem for the operator ([`rescue`]).
+//!
 //! # Terminal states say how they end
 //!
 //! Whether reaching a terminal means success or failure is **declared**, not
@@ -61,7 +66,7 @@
 //! [`terminal_status`].
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -71,6 +76,7 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::conductor::ConductorRegistry;
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, AnsweredBy, Artifact, ArtifactReference,
     DecisionProviderType, Event, EventData, ExecutionId, ExecutionStatus, InputCloseReason,
@@ -82,8 +88,8 @@ use crate::engine::actions::agent::{
 };
 use crate::engine::actions::harness;
 use crate::engine::actions::human::{
-    self, HumanActionError, HumanInputDelivery, HumanInputRequest, InputContinuation,
-    OutputProblem, OutputRequirement, PendingHumanInput, RejectedAnswer,
+    self, ConductorAnalysis, HumanActionError, HumanInputDelivery, HumanInputRequest,
+    InputContinuation, OutputProblem, OutputRequirement, PendingHumanInput, RejectedAnswer,
 };
 use crate::engine::actions::{
     ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
@@ -93,6 +99,8 @@ use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequ
 use crate::engine::retry::RetrySchedule;
 use crate::persistence::{read_json, DefaultHarnessSelector, ExecutionStore, PersistenceError};
 use crate::workflow::{action_context_references, TemplateScope};
+
+mod rescue;
 
 /// How many events the in-process broadcast channel buffers per receiver.
 ///
@@ -112,6 +120,9 @@ pub const METADATA_LAST_AGENT_STEP_KEY: &str = "last_agent_step";
 /// Key of an agent output that was rejected and still awaits its reprompt
 /// (KTD7).
 pub const METADATA_OUTPUT_REJECTION_KEY: &str = "output_rejection";
+
+/// Key of a step whose output the conductor is rescuing (F1, U10).
+pub const METADATA_OUTPUT_RESCUE_KEY: &str = "output_rescue";
 
 /// How much of an agent's answer travels with the input request after it.
 const ANSWER_TAIL_BYTES: usize = 2 * 1024;
@@ -375,6 +386,79 @@ impl OutputRejection {
     }
 }
 
+/// A step whose agent gave no usable output label, even when asked again,
+/// handed to the conductor (F1, U10).
+///
+/// Persisted in `metadata.engine.output_rescue` from the moment the step is
+/// handed over — before the event that closes the last attempt — until its
+/// transition is taken or it becomes a problem. A pass that finds it (after
+/// a restart, or an interrupt) carries the rescue on instead of entering
+/// the state afresh: nothing the conductor does can have a side effect, so
+/// this is the one place a pass continues rather than replays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputRescue {
+    /// The state whose output is rescued.
+    pub state_id: StateId,
+
+    /// The agent's answers without a label, oldest first. The last one's
+    /// attempt is the rescue's episode (KTD9) and the attempt the step
+    /// completes under.
+    pub answers: Vec<RejectedAnswer>,
+
+    /// Why the step has no label yet.
+    pub reason: String,
+
+    /// The harness the agent's session ran on, when it said.
+    #[serde(default)]
+    pub harness: Option<String>,
+
+    /// The agent's session, to ask it again in (the conductor's (b)).
+    #[serde(default)]
+    pub harness_session_id: Option<String>,
+
+    /// Whether the conductor's one reprompt was used (R17).
+    #[serde(default)]
+    pub conductor_reprompted: bool,
+}
+
+impl OutputRescue {
+    /// The rescue of the step whose first answer was `rejection`.
+    fn after(rejection: &OutputRejection) -> Self {
+        Self {
+            state_id: rejection.state_id.clone(),
+            answers: vec![RejectedAnswer::from(rejection)],
+            reason: rejection.reason.clone(),
+            harness: rejection.harness.clone(),
+            harness_session_id: rejection.harness_session_id.clone(),
+            conductor_reprompted: false,
+        }
+    }
+
+    /// Adds the answer of a reprompt that gave no label.
+    fn record(&mut self, failure: &UnlabelledAnswer) {
+        self.answers.push(failure.answer.clone());
+        self.reason = failure.reason.clone();
+        if failure.harness_session_id.is_some() {
+            self.harness = failure.harness.clone().or_else(|| self.harness.clone());
+            self.harness_session_id = failure.harness_session_id.clone();
+        }
+    }
+
+    /// The episode of the rescue (KTD9): the attempt of the last answer.
+    pub fn episode(&self) -> &str {
+        self.answers
+            .last()
+            .map(|answer| answer.action_execution_id.as_str())
+            .unwrap_or_default()
+    }
+
+    /// Whether the conductor may still ask the agent again: once, and only
+    /// in a session there is to resume (R17).
+    pub fn can_reprompt(&self) -> bool {
+        !self.conductor_reprompted && self.harness.is_some() && self.harness_session_id.is_some()
+    }
+}
+
 impl From<&OutputRejection> for RejectedAnswer {
     fn from(rejection: &OutputRejection) -> Self {
         Self {
@@ -505,6 +589,47 @@ enum ActionUpshot {
     },
     /// The execution is suspended or failed, and that is already persisted.
     Stopped,
+    /// The step already took its transition without the action's own
+    /// result — the conductor's rescue settled it (F1) — and the pass goes
+    /// on.
+    Transitioned,
+}
+
+impl ActionUpshot {
+    /// The upshot of a step the conductor's rescue settled with `flow`.
+    fn settled(flow: Flow) -> Self {
+        match flow {
+            Flow::Stop => Self::Stopped,
+            Flow::Continue => Self::Transitioned,
+        }
+    }
+}
+
+/// How one attempt asking the agent again for its label ended.
+pub(super) enum RepromptEnd {
+    /// The agent gave a label the state accepts.
+    Labelled {
+        /// The reprompt attempt.
+        action_execution_id: String,
+        /// Its result.
+        result: ActionResult,
+    },
+    /// It gave none; the attempt is still to be closed.
+    Unlabelled(UnlabelledAnswer),
+    /// The execution failed, and that is already persisted.
+    Stopped,
+}
+
+/// A reprompt attempt that gave no usable label.
+pub(super) struct UnlabelledAnswer {
+    /// The answer, as a problem shows it.
+    answer: RejectedAnswer,
+    /// Why the step still has no label.
+    reason: String,
+    /// The harness the attempt ran on, when it said.
+    harness: Option<String>,
+    /// The session it ran in, when it said.
+    harness_session_id: Option<String>,
 }
 
 /// How a reprompt ended without a label the state accepts.
@@ -560,6 +685,7 @@ pub struct Engine {
     pause_requests: Mutex<HashSet<ExecutionId>>,
     active_runs: Mutex<HashSet<ExecutionId>>,
     checkpoints: bool,
+    conductor: OnceLock<Weak<ConductorRegistry>>,
 }
 
 /// Holds the "already running" claim on one execution for as long as a pass is
@@ -705,6 +831,7 @@ impl Engine {
             pause_requests: Mutex::new(HashSet::new()),
             active_runs: Mutex::new(HashSet::new()),
             checkpoints: false,
+            conductor: OnceLock::new(),
         }
     }
 
@@ -754,6 +881,25 @@ impl Engine {
     pub fn with_executor(mut self, kind: ActionKind, executor: Arc<dyn ActionExecutor>) -> Self {
         self.executors.insert(kind, executor);
         self
+    }
+
+    /// Hands every step whose agent gives no usable output label, even
+    /// when asked again, to `registry`'s conductor (F1, U10).
+    ///
+    /// Held weakly: the registry holds the engine, and the engine must not
+    /// keep it alive in return. Whoever attaches it keeps it — the daemon,
+    /// for as long as it runs. Without one (or once it is gone) such a step
+    /// becomes a problem for the operator straight away, as it did before
+    /// the conductor existed. Only the first registry attached counts.
+    pub fn attach_conductor(&self, registry: &Arc<ConductorRegistry>) {
+        if self.conductor.set(Arc::downgrade(registry)).is_err() {
+            tracing::warn!("a conductor is already attached to this engine; ignoring another");
+        }
+    }
+
+    /// The conductor attached to this engine, while it is alive.
+    fn conductor(&self) -> Option<Arc<ConductorRegistry>> {
+        self.conductor.get().and_then(Weak::upgrade)
     }
 
     /// The store this engine persists to.
@@ -1012,6 +1158,7 @@ impl Engine {
         // and a request left behind must say it was closed by the recovery
         // rather than linger as if it could still be answered.
         clear_engine_metadata(&mut execution, METADATA_OUTPUT_REJECTION_KEY);
+        clear_engine_metadata(&mut execution, METADATA_OUTPUT_RESCUE_KEY);
         let from = self.store.event_log(execution_id).next_sequence()?;
         human::close_pending(
             &self.store,
@@ -1297,18 +1444,33 @@ impl Engine {
             let state_id = self.current_state_id(&execution)?;
             let state = self.state_of(definition, &execution, &state_id)?;
 
-            let flow = match self.pending_step(&execution, &state_id)? {
-                Some(pending) => self.complete_step(definition, &mut execution, state, pending)?,
-                None => match stored_output_rejection(&execution, &state_id)? {
-                    // A pass that ended between a rejected output and its
-                    // reprompt: the attempt is closed, so it continues with
-                    // the reprompt instead of running the action afresh.
-                    Some(rejection) => {
-                        self.continue_rejected_output(definition, &mut execution, state, rejection)
-                            .await?
+            let flow = if let Some(rescue) = stored_output_rescue(&execution, &state_id)? {
+                // A pass that ended while the conductor was rescuing the
+                // step's output (a restart, an interrupt): the rescue goes on
+                // from its record, never from the start of the state.
+                self.continue_output_rescue(definition, &mut execution, state, rescue)
+                    .await?
+            } else {
+                match self.pending_step(&execution, &state_id)? {
+                    Some(pending) => {
+                        self.complete_step(definition, &mut execution, state, pending)?
                     }
-                    None => self.enter_state(definition, &mut execution, state).await?,
-                },
+                    None => match stored_output_rejection(&execution, &state_id)? {
+                        // A pass that ended between a rejected output and its
+                        // reprompt: the attempt is closed, so it continues with
+                        // the reprompt instead of running the action afresh.
+                        Some(rejection) => {
+                            self.continue_rejected_output(
+                                definition,
+                                &mut execution,
+                                state,
+                                rejection,
+                            )
+                            .await?
+                        }
+                        None => self.enter_state(definition, &mut execution, state).await?,
+                    },
+                }
             };
 
             if flow == Flow::Stop {
@@ -1366,6 +1528,7 @@ impl Engine {
             .await?
         {
             ActionUpshot::Stopped => Ok(Flow::Stop),
+            ActionUpshot::Transitioned => Ok(Flow::Continue),
             ActionUpshot::Completed {
                 action_execution_id,
                 result,
@@ -1701,6 +1864,7 @@ impl Engine {
             .await?
         {
             ActionUpshot::Stopped => Ok(Flow::Stop),
+            ActionUpshot::Transitioned => Ok(Flow::Continue),
             ActionUpshot::Completed {
                 action_execution_id,
                 result,
@@ -1713,11 +1877,10 @@ impl Engine {
     /// only for the output object.
     ///
     /// Not a `retry_policy` retry (R15): it is announced by `OutputReprompted`,
-    /// never `ActionRetrying`, and whatever it ends with — a label, another
-    /// format error, a question, a failure — is final for the step. Until the
-    /// conductor exists (U10), everything but a label — and a rejected
-    /// attempt with no session to resume — becomes a problem for the
-    /// operator ([`Engine::raise_output_problem`]).
+    /// never `ActionRetrying`. Whatever it ends with but a label — another
+    /// format error, a question, a failure — and a rejected attempt with no
+    /// session to resume, hands the step to the conductor (F1,
+    /// [`Engine::rescue_output`]).
     async fn reprompt(
         &self,
         definition: &WorkflowDefinition,
@@ -1727,7 +1890,7 @@ impl Engine {
         rejection: OutputRejection,
         timeout: Option<Duration>,
     ) -> Result<ActionUpshot, EngineError> {
-        let first = RejectedAnswer::from(&rejection);
+        let mut rescue = OutputRescue::after(&rejection);
         let resumable = match (action, &rejection.harness, &rejection.harness_session_id) {
             (ActionConfig::Agent(config), Some(harness), Some(session)) => Some(
                 agent::reprompt_config(config, harness, session, &rejection.reason),
@@ -1735,20 +1898,68 @@ impl Engine {
             _ => None,
         };
         let Some(config) = resumable else {
-            self.raise_output_problem(
-                definition,
-                execution,
-                state,
-                vec![first],
-                format!(
-                    "{} The agent could not be asked again for its output label: its \
-                     harness reported no session to resume.",
-                    rejection.reason
-                ),
-            )?;
-            return Ok(ActionUpshot::Stopped);
+            rescue.reason = format!(
+                "{} The agent could not be asked again for its output label: its harness \
+                 reported no session to resume.",
+                rejection.reason
+            );
+            self.begin_rescue(execution, &rescue)?;
+            let flow = self
+                .rescue_output(definition, execution, state, rescue, timeout)
+                .await?;
+            return Ok(ActionUpshot::settled(flow));
         };
 
+        match self
+            .reprompt_attempt(
+                execution,
+                state,
+                config,
+                &rejection.action_execution_id,
+                RepromptedBy::Engine,
+                timeout,
+            )
+            .await?
+        {
+            RepromptEnd::Labelled {
+                action_execution_id,
+                result,
+            } => Ok(ActionUpshot::Completed {
+                action_execution_id,
+                result,
+            }),
+            RepromptEnd::Stopped => Ok(ActionUpshot::Stopped),
+            RepromptEnd::Unlabelled(failure) => {
+                rescue.record(&failure);
+                // The record before the event that closes the attempt: a
+                // crash in between leaves the attempt open (`Unknown`), and
+                // one after it leaves the rescue to continue from (F1).
+                self.begin_rescue(execution, &rescue)?;
+                self.close_unlabelled(execution, state, &failure.answer)?;
+                let flow = self
+                    .rescue_output(definition, execution, state, rescue, timeout)
+                    .await?;
+                Ok(ActionUpshot::settled(flow))
+            }
+        }
+    }
+
+    /// One attempt asking the agent of `previous_attempt` again for its
+    /// output label, resuming its session with `config` (KTD7) — the engine's
+    /// reprompt or the conductor's (F1).
+    ///
+    /// An attempt that ends without a label is returned as it is, still
+    /// open: closing it with `ActionOutputRejected` is the caller's, after
+    /// it recorded what comes next.
+    pub(super) async fn reprompt_attempt(
+        &self,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        config: crate::domain::AgentActionConfig,
+        previous_attempt: &str,
+        by: RepromptedBy,
+        timeout: Option<Duration>,
+    ) -> Result<RepromptEnd, EngineError> {
         // Announced before the record goes: a crash in between leaves this
         // attempt open in the log (`Unknown`), never a closed attempt with
         // nothing left to continue from.
@@ -1758,9 +1969,9 @@ impl Engine {
             &execution.id,
             EventData::OutputReprompted {
                 action_execution_id: action_execution_id.clone(),
-                previous_attempt: rejection.action_execution_id.clone(),
+                previous_attempt: previous_attempt.to_string(),
                 state_id: state.id.clone(),
-                by: RepromptedBy::Engine,
+                by,
             },
         )?;
         clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
@@ -1774,7 +1985,7 @@ impl Engine {
             Ok(outcome) => outcome,
             Err(failure) => {
                 self.fail_action(execution, &action_execution_id, failure.message)?;
-                return Ok(ActionUpshot::Stopped);
+                return Ok(RepromptEnd::Stopped);
             }
         };
 
@@ -1782,7 +1993,7 @@ impl Engine {
             Ok(ActionOutcome::Completed(result)) => {
                 match OutputRejection::from_result(state, &action_execution_id, &result) {
                     None => {
-                        return Ok(ActionUpshot::Completed {
+                        return Ok(RepromptEnd::Labelled {
                             action_execution_id,
                             result,
                         })
@@ -1793,7 +2004,7 @@ impl Engine {
             Ok(ActionOutcome::TimedOut(timed_out)) => {
                 match timed_out.resolve(&decision::permitted_labels(state)) {
                     Ok(result) => {
-                        return Ok(ActionUpshot::Completed {
+                        return Ok(RepromptEnd::Labelled {
                             action_execution_id,
                             result,
                         })
@@ -1815,42 +2026,71 @@ impl Engine {
             },
         };
 
-        // Either way the reprompt attempt is over without a label: closed
-        // like the first one, and the step becomes a problem. A reprompt that
-        // failed outright is closed the same way — it is a failed reprompt,
-        // not an action failure, and `retry_policy` does not apply to it.
-        let (second, reason) = match failure {
-            RepromptFailure::Rejected(rejection) => {
-                let reason = format!(
+        // Either way the attempt is over without a label. A reprompt that
+        // failed outright ends the same way — it is a failed reprompt, not an
+        // action failure, and `retry_policy` does not apply to it.
+        Ok(RepromptEnd::Unlabelled(match failure {
+            RepromptFailure::Rejected(rejection) => UnlabelledAnswer {
+                answer: RejectedAnswer::from(&rejection),
+                reason: format!(
                     "the agent did not give a usable output label even when asked again: {}",
                     rejection.reason
-                );
-                (RejectedAnswer::from(&rejection), reason)
-            }
+                ),
+                harness: rejection.harness,
+                harness_session_id: rejection.harness_session_id,
+            },
             RepromptFailure::Failed(message) => {
                 let reason =
                     format!("asking the agent again for its output label failed: {message}");
-                (
-                    RejectedAnswer {
+                UnlabelledAnswer {
+                    answer: RejectedAnswer {
                         action_execution_id: action_execution_id.clone(),
                         reason: reason.clone(),
                         answer_tail: None,
                     },
                     reason,
-                )
+                    harness: None,
+                    harness_session_id: None,
+                }
             }
-        };
+        }))
+    }
+
+    /// Closes a reprompt attempt that gave no label: `ActionOutputRejected`.
+    pub(super) fn close_unlabelled(
+        &self,
+        execution: &WorkflowExecution,
+        state: &State,
+        answer: &RejectedAnswer,
+    ) -> Result<(), EngineError> {
         self.emit(
             &execution.id,
             EventData::ActionOutputRejected {
-                action_execution_id: action_execution_id.clone(),
+                action_execution_id: answer.action_execution_id.clone(),
                 state_id: state.id.clone(),
-                reason: second.reason.clone(),
-                answer_tail: second.answer_tail.clone(),
+                reason: answer.reason.clone(),
+                answer_tail: answer.answer_tail.clone(),
             },
         )?;
-        self.raise_output_problem(definition, execution, state, vec![first, second], reason)?;
-        Ok(ActionUpshot::Stopped)
+        Ok(())
+    }
+
+    /// Records `rescue` as the step's rescue under way, replacing a rejected
+    /// output still owed its reprompt, and saves the execution.
+    pub(super) fn begin_rescue(
+        &self,
+        execution: &mut WorkflowExecution,
+        rescue: &OutputRescue,
+    ) -> Result<(), EngineError> {
+        let value =
+            serde_json::to_value(rescue).map_err(|error| EngineError::CorruptEngineMetadata {
+                execution_id: execution.id.clone(),
+                message: error.to_string(),
+            })?;
+        clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
+        engine_metadata_mut(execution).insert(METADATA_OUTPUT_RESCUE_KEY.to_string(), value);
+        self.store.save_execution(execution)?;
+        Ok(())
     }
 
     /// Suspends a step whose agent gave no usable output label as a problem
@@ -1859,6 +2099,8 @@ impl Engine {
     ///
     /// The last answer's attempt is the one the request suspends on; an
     /// answer to the request completes the step under that attempt.
+    /// `analysis` is the conductor's reading of the answers, when it made
+    /// one (U10).
     fn raise_output_problem(
         &self,
         definition: &WorkflowDefinition,
@@ -1866,8 +2108,10 @@ impl Engine {
         state: &State,
         answers: Vec<RejectedAnswer>,
         reason: String,
+        analysis: Option<ConductorAnalysis>,
     ) -> Result<(), EngineError> {
         clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
+        clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
 
         let action_execution_id = answers
             .last()
@@ -1882,7 +2126,7 @@ impl Engine {
             reason: reason.clone(),
             answers,
             requirements: output_requirements(definition, execution, state),
-            analysis: None,
+            analysis,
         };
         let request = HumanInputRequest {
             action_execution_id: action_execution_id.clone(),
@@ -2080,6 +2324,8 @@ impl Engine {
         });
         set_last_agent_step(execution, record.as_ref())?;
         self.clear_pending_step(execution);
+        // A rescued step is over once its transition is taken (F1).
+        clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
         self.store.save_execution(execution)?;
 
         self.emit(
@@ -2206,6 +2452,7 @@ impl Engine {
         execution.completed_at = Some(Utc::now());
         self.clear_pending_step(execution);
         clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
+        clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
         self.store.save_execution(execution)?;
         Ok(())
     }
@@ -2725,6 +2972,46 @@ pub fn owed_reprompt(
     }
 }
 
+/// The rescue of an output label (F1) `execution` still owes at its current
+/// state, if any.
+///
+/// For the daemon's startup hook: an execution left `Running` with such a
+/// record stopped while the conductor worked on its step — before it was
+/// asked, while it was invoked, or after its decision was saved — and a new
+/// pass carries the rescue on.
+pub fn owed_output_rescue(
+    execution: &WorkflowExecution,
+) -> Result<Option<OutputRescue>, EngineError> {
+    match execution.current_state.as_deref() {
+        Some(state_id) => stored_output_rescue(execution, state_id),
+        None => Ok(None),
+    }
+}
+
+/// The rescue of `execution`'s output label under way, when it belongs to
+/// `state_id`.
+fn stored_output_rescue(
+    execution: &WorkflowExecution,
+    state_id: &str,
+) -> Result<Option<OutputRescue>, EngineError> {
+    let Some(value) = execution
+        .metadata
+        .get(METADATA_ENGINE_KEY)
+        .and_then(|engine| engine.get(METADATA_OUTPUT_RESCUE_KEY))
+    else {
+        return Ok(None);
+    };
+
+    let rescue: OutputRescue = serde_json::from_value(value.clone()).map_err(|error| {
+        EngineError::CorruptEngineMetadata {
+            execution_id: execution.id.clone(),
+            message: error.to_string(),
+        }
+    })?;
+
+    Ok((rescue.state_id == state_id).then_some(rescue))
+}
+
 /// The rejected agent output of `execution` still owed its reprompt, when it
 /// belongs to `state_id`.
 fn stored_output_rejection(
@@ -2931,8 +3218,10 @@ pub fn record_manual_transition(
     } else {
         None
     };
-    // A manual transition abandons a rejected output still owed a reprompt.
+    // A manual transition abandons a rejected output still owed a reprompt,
+    // and a rescue the conductor had not finished.
     clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
+    clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
     set_last_agent_step(execution, record.as_ref())
 }
 

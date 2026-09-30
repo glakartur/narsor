@@ -21,6 +21,8 @@
 //! * [`invoke`] — the invocation itself on the default harness, read-only
 //!   (KTD5), built from a [`snapshot`] of the execution and a [`prompt`],
 //!   answered with a checked [`response`] (KTD6).
+//! * [`rescue`] — the conductor's half of the label rescue (F1): the inline
+//!   invocation, and its decisions saved before they are applied (KTD13).
 //! * [`ConductorRegistry`] — the actors the daemon started, and the
 //!   interrupts of advisory invocations (KTD10).
 //!
@@ -29,14 +31,17 @@
 //! [`ConductorRegistry::restore_at_startup`] is the conductor's half of the
 //! daemon's startup hook, run after `persistence::recovery::recover`. It is
 //! the only replay the daemon does, acceptable because an invocation only
-//! reads. What it covers so far: an unanswered chat message is served again;
-//! an interrupted advisory invocation loses its marker and runs again.
-//! Automatic requests (F1, F3) found on disk are reported, not run: which
-//! rows of the restart matrix apply to them is U10's and U11's.
+//! reads. What it covers: an unanswered chat message is served again; an
+//! interrupted advisory invocation loses its marker and runs again. A label
+//! rescue (F1) is never run from here: the engine's pass that carries the
+//! step on invokes the conductor again (see [`rescue`]), and what a rescue
+//! left for an execution that no longer owes one is discarded. Step
+//! failures (F3) found on disk are reported, not run (U11).
 
 pub mod actor;
 pub mod invoke;
 pub mod prompt;
+pub mod rescue;
 pub mod response;
 pub mod snapshot;
 pub mod store;
@@ -60,8 +65,8 @@ pub use store::{
     PendingInvocation, QueuedRequest, SavedDecision, CONDUCTOR_STATE_VERSION,
 };
 
-use crate::domain::ExecutionId;
-use crate::engine::Engine;
+use crate::domain::{ConductorTrigger, ExecutionId, ExecutionStatus};
+use crate::engine::{owed_output_rescue, Engine};
 use crate::persistence::Result;
 
 /// The conductor actors of one daemon, one per execution, started on
@@ -81,6 +86,9 @@ pub struct ConductorRestore {
     /// Automatic requests left on disk for their own restart rows
     /// (U10, U11), per execution.
     pub parked: Vec<(ExecutionId, Vec<QueuedRequest>, Option<PendingInvocation>)>,
+    /// Executions whose leftover label rescue was discarded: they no longer
+    /// owe one.
+    pub discarded: Vec<ExecutionId>,
 }
 
 impl ConductorRegistry {
@@ -159,6 +167,16 @@ impl ConductorRegistry {
                 actor.start();
                 restore.requeued.push((execution_id.clone(), queued));
             }
+            if self.leaves_stale_rescue(&actor) {
+                match self.discard_rescue(&execution_id) {
+                    Ok(_) => restore.discarded.push(execution_id.clone()),
+                    Err(error) => tracing::warn!(
+                        execution_id = %execution_id,
+                        error = %error,
+                        "conductor: could not discard a stale label rescue"
+                    ),
+                }
+            }
             let (requests, pending) = actor.parked_automatic();
             if !requests.is_empty() || pending.is_some() {
                 restore.parked.push((execution_id, requests, pending));
@@ -166,6 +184,32 @@ impl ConductorRegistry {
         }
 
         Ok(restore)
+    }
+
+    /// Whether `actor` holds something of a label rescue — a marker, a
+    /// queued request, an unapplied decision — for an execution that no
+    /// longer owes one: it is not `Running`, or has no rescue record at its
+    /// current state (the step moved on, or never got that far).
+    fn leaves_stale_rescue(&self, actor: &ConductorActor) -> bool {
+        let state = actor.state();
+        let is_rescue = |request: &QueuedRequest| request.trigger == ConductorTrigger::OutputRescue;
+        let holds_rescue = state.queue.iter().any(is_rescue)
+            || state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| is_rescue(&pending.request))
+            || !state.unapplied_decisions.is_empty();
+        if !holds_rescue {
+            return false;
+        }
+        match self.engine.store().load_execution(actor.execution_id()) {
+            Ok(execution) => {
+                execution.status != ExecutionStatus::Running
+                    || !matches!(owed_output_rescue(&execution), Ok(Some(_)))
+            }
+            // An execution that cannot be read is left as it is.
+            Err(_) => false,
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<ExecutionId, Arc<ConductorActor>>> {

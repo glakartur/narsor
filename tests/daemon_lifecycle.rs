@@ -740,10 +740,18 @@ async fn a_fresh_daemon_does_not_mark_an_execution_stopped_in_the_conductor_unkn
             .any(|event| matches!(event.data, EventData::Error { .. })),
         "no interrupted-action error was recorded"
     );
-    assert_eq!(
-        conductor.load_state().expect("load the conductor's state"),
-        state,
-        "the marker is left for the conductor's own restart row"
+    // The execution recorded no rescue of its own (the marker alone is not
+    // enough to carry a step on), so there is nothing to invoke again: the
+    // marker is stale and discarded, and the conductor never runs.
+    let left = conductor.load_state().expect("load the conductor's state");
+    assert_eq!(left.pending, None, "{left:?}");
+    assert!(left.queue.is_empty(), "{left:?}");
+    assert!(
+        !log.read_all()
+            .expect("read the log")
+            .iter()
+            .any(|event| matches!(event.data, EventData::ConductorStarted { .. })),
+        "the conductor was not invoked"
     );
 
     send_sigterm(child.id());
@@ -914,6 +922,244 @@ async fn a_fresh_daemon_continues_a_reprompt_the_restart_interrupted() {
             ..
         }
     )));
+
+    send_sigterm(child.id());
+    wait_for_exit(&mut child, Duration::from_secs(10));
+}
+
+// ---------------------------------------------------------------------------
+// The conductor's label rescue (F1, U10) across a daemon restart
+// ---------------------------------------------------------------------------
+
+/// Seeds `REPROMPT_WORKFLOW` stopped during the rescue of its `work` state's
+/// output: the rejected attempt closed in the log, the rescue recorded in
+/// the execution, `Running`. The conductor's own leftovers are the test's.
+fn seed_rescue(root: &Path) -> (ExecutionStore, narsor::domain::WorkflowExecution) {
+    let work = root.join("work");
+    fs::create_dir_all(&work).expect("create a work dir");
+    let definition_path = root.join("reprompt.yaml");
+    fs::write(&definition_path, REPROMPT_WORKFLOW).expect("write the workflow");
+    let definition = narsor::workflow::load_from_file(&definition_path).expect("load it");
+    let store = ExecutionStore::new(root);
+    let engine = Engine::new(store.clone());
+    let mut execution = engine
+        .start(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(work.display().to_string()),
+        )
+        .expect("seed the execution");
+    fs::write(
+        store.paths().definition_file(&execution.id),
+        REPROMPT_WORKFLOW,
+    )
+    .expect("pin the definition");
+
+    let log = store.event_log(&execution.id);
+    for data in [
+        EventData::StateEntered {
+            state_id: "work".to_string(),
+        },
+        EventData::ActionStarted {
+            action_execution_id: "attempt-rejected".to_string(),
+            state_id: "work".to_string(),
+            action_type: "agent".to_string(),
+        },
+        EventData::ActionOutputRejected {
+            action_execution_id: "attempt-rejected".to_string(),
+            state_id: "work".to_string(),
+            reason: "the answer has no 'output'".to_string(),
+            answer_tail: Some("Done, all tests pass.".to_string()),
+        },
+    ] {
+        log.append_next(&execution.id, data).expect("append");
+    }
+    execution.current_state = Some("work".to_string());
+    execution.current_action_execution = Some("attempt-rejected".to_string());
+    execution.metadata = serde_json::json!({
+        "engine": {
+            "output_rescue": {
+                "state_id": "work",
+                "answers": [{
+                    "action_execution_id": "attempt-rejected",
+                    "reason": "the answer has no 'output'",
+                    "answer_tail": "Done, all tests pass.",
+                }],
+                "reason": "the answer has no 'output'",
+            }
+        }
+    });
+    store
+        .save_execution(&execution)
+        .expect("save the execution");
+    (store, execution)
+}
+
+/// Spawns a daemon over `root` whose `PATH` starts with `bin`.
+fn spawn_daemon_with_path(root: &Path, bin: &Path) -> Child {
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    Command::new(env!("CARGO_BIN_EXE_narsor"))
+        .arg("--root")
+        .arg(root)
+        .arg("daemon")
+        .env("PATH", path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the daemon")
+}
+
+/// Leaves the conductor's marker of the rescue invocation a restart cut
+/// short, counted as the episode's first try.
+fn leave_rescue_marker(store: &ExecutionStore, execution_id: &str) -> ConductorStore {
+    let conductor = ConductorStore::new(store.paths(), execution_id);
+    let request = QueuedRequest::new(
+        ConductorTrigger::OutputRescue,
+        ConductorPurpose::ChooseOutputAfterReprompt,
+    )
+    .with_episode("attempt-rejected");
+    let mut state = ConductorState {
+        pending: Some(PendingInvocation {
+            invocation_id: "invocation-cut-short".to_string(),
+            request: request.clone(),
+            started_at: chrono::Utc::now(),
+        }),
+        ..ConductorState::default()
+    };
+    state.queue.push(request);
+    state
+        .invocation_attempts
+        .insert("attempt-rejected".to_string(), 1);
+    conductor.save_state(&state).expect("seed the marker");
+    conductor
+}
+
+fn wait_for_status(store: &ExecutionStore, execution_id: &str, status: ExecutionStatus) -> bool {
+    store
+        .load_execution(execution_id)
+        .map(|stored| stored.status == status)
+        .unwrap_or(false)
+}
+
+/// Restart matrix: a daemon that stopped during the conductor's rescue
+/// invocation invokes it once more at the next start — R24's one repeat,
+/// counted before it runs — and applies what it chose.
+#[tokio::test]
+async fn a_fresh_daemon_repeats_a_rescue_invocation_the_restart_cut_short() {
+    let root = TempRoot::new();
+    let bin = fake_claude(
+        &root.path().join("bin"),
+        r#"{"decision": "choose_output", "label": "implemented", "confidence": "high",
+            "rationale": "the agent said all tests pass"}"#,
+    );
+    let (store, execution) = seed_rescue(root.path());
+    let conductor = leave_rescue_marker(&store, &execution.id);
+
+    let mut child = spawn_daemon_with_path(root.path(), &bin);
+    let _info = wait_for_daemon_info(root.path(), Duration::from_secs(10));
+    wait_for(
+        "the rescued execution completed",
+        Duration::from_secs(15),
+        || wait_for_status(&store, &execution.id, ExecutionStatus::Completed),
+    )
+    .await;
+
+    let count = fs::read_to_string(bin.join("count")).expect("the conductor ran");
+    assert_eq!(count.trim(), "1", "invoked once more, and only once");
+    let state = conductor.load_state().expect("load the conductor's state");
+    assert_eq!(state.attempts("attempt-rejected"), 2);
+    assert_eq!(state.pending, None);
+    assert!(state.queue.is_empty(), "{state:?}");
+    let events = store.event_log(&execution.id).read_all().expect("read");
+    assert!(events.iter().any(|event| matches!(
+        &event.data,
+        EventData::DecisionMade { provider, output_label, .. }
+            if provider == "conductor" && output_label == "implemented"
+    )));
+
+    send_sigterm(child.id());
+    wait_for_exit(&mut child, Duration::from_secs(10));
+}
+
+/// Restart matrix: when that one repeat fails too, the step is a problem
+/// with the agent's raw answer — never a third invocation.
+#[tokio::test]
+async fn a_fresh_daemon_makes_a_problem_when_the_repeated_rescue_fails() {
+    let root = TempRoot::new();
+    let bin = fake_claude(&root.path().join("bin"), "no JSON at all");
+    fs::write(bin.join("exit"), "1").expect("make the harness fail");
+    let (store, execution) = seed_rescue(root.path());
+    leave_rescue_marker(&store, &execution.id);
+
+    let mut child = spawn_daemon_with_path(root.path(), &bin);
+    let _info = wait_for_daemon_info(root.path(), Duration::from_secs(10));
+    wait_for("the step became a problem", Duration::from_secs(15), || {
+        wait_for_status(&store, &execution.id, ExecutionStatus::InputNeeded)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let count = fs::read_to_string(bin.join("count")).expect("the conductor ran");
+    assert_eq!(count.trim(), "1", "no repeat after the repeat");
+    let pending: narsor::engine::PendingHumanInput = store
+        .load_pending_input(&execution.id)
+        .expect("read the pending input")
+        .expect("a problem");
+    let problem = pending.problem.expect("a problem");
+    assert_eq!(problem.analysis, None);
+    assert_eq!(
+        problem.answers[0].answer_tail.as_deref(),
+        Some("Done, all tests pass.")
+    );
+
+    send_sigterm(child.id());
+    wait_for_exit(&mut child, Duration::from_secs(10));
+}
+
+/// Restart matrix: a choice the conductor saved before the restart is
+/// applied at the next start without invoking it again.
+#[tokio::test]
+async fn a_fresh_daemon_applies_a_saved_choice_without_invoking_the_conductor() {
+    let root = TempRoot::new();
+    // Never to be run; there only so a mistake cannot reach a real harness.
+    let bin = fake_claude(&root.path().join("bin"), "{}");
+    let (store, execution) = seed_rescue(root.path());
+    let conductor = ConductorStore::new(store.paths(), &execution.id);
+    conductor
+        .save_state(&ConductorState {
+            unapplied_decisions: vec![narsor::conductor::SavedDecision {
+                decision_id: "decision-saved".to_string(),
+                kind: narsor::domain::ConductorDecisionKind::ChooseOutput,
+                episode: Some("attempt-rejected".to_string()),
+                state_id: Some("work".to_string()),
+                output_label: Some("implemented".to_string()),
+                data: serde_json::json!({}),
+                variables: serde_json::json!({}),
+                confidence: narsor::domain::Confidence::High,
+                rationale: Some("the agent said all tests pass".to_string()),
+                context_before: serde_json::json!({}),
+                saved_at: chrono::Utc::now(),
+            }],
+            ..ConductorState::default()
+        })
+        .expect("save the decision");
+
+    let mut child = spawn_daemon_with_path(root.path(), &bin);
+    let _info = wait_for_daemon_info(root.path(), Duration::from_secs(10));
+    wait_for(
+        "the saved choice was applied",
+        Duration::from_secs(15),
+        || wait_for_status(&store, &execution.id, ExecutionStatus::Completed),
+    )
+    .await;
+
+    assert!(!bin.join("count").exists(), "the conductor was not invoked");
+    let state = conductor.load_state().expect("load the conductor's state");
+    assert!(state.unapplied_decisions.is_empty(), "{state:?}");
 
     send_sigterm(child.id());
     wait_for_exit(&mut child, Duration::from_secs(10));

@@ -157,6 +157,25 @@ pub fn reprompt_config(
     config
 }
 
+/// What follows the conductor's own words when it asks the agent again
+/// (F1): the same boundaries as the engine's reprompt.
+pub const CONDUCTOR_REPROMPT_GUARD: &str = "Do not continue the task and do not change any \
+files. Reply only with the JSON object described below.";
+
+/// The configuration of the conductor's reprompt of an agent (F1, R17):
+/// [`reprompt_config`] with the conductor's `prompt` in place of the
+/// engine's generic one.
+pub fn conductor_reprompt_config(
+    original: &AgentActionConfig,
+    harness: &str,
+    harness_session: &str,
+    prompt: &str,
+) -> AgentActionConfig {
+    let mut config = reprompt_config(original, harness, harness_session, "");
+    config.prompt = format!("{}\n\n{CONDUCTOR_REPROMPT_GUARD}", prompt.trim());
+    config
+}
+
 /// The harness used when neither the action nor the configuration names one.
 ///
 /// The name the adapter itself registers under, not a second spelling of it:

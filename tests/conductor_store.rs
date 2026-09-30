@@ -684,9 +684,32 @@ async fn an_unanswered_chat_message_is_served_again_after_a_restart() {
     .await;
 }
 
+/// Marks the fixture's execution as rescuing the output of state `first`
+/// (F1), the way the engine records it before it invokes the conductor.
+fn owe_output_rescue(fixture: &Fixture, episode: &str) {
+    let store = fixture.harness.store();
+    let mut execution = store
+        .load_execution(&fixture.execution_id)
+        .expect("load the execution");
+    execution.current_state = Some("first".to_string());
+    execution.metadata = json!({
+        "engine": {
+            "output_rescue": {
+                "state_id": "first",
+                "answers": [{ "action_execution_id": episode, "reason": "no output label" }],
+                "reason": "no output label",
+            }
+        }
+    });
+    store
+        .save_execution(&execution)
+        .expect("save the execution");
+}
+
 #[tokio::test]
 async fn automatic_requests_on_disk_are_left_for_their_own_restart_rows() {
     let fixture = Fixture::new();
+    owe_output_rescue(&fixture, "episode-1");
     let store = fixture.store();
     let rescue = output_rescue("episode-1");
     let diagnosis = QueuedRequest::new(
@@ -711,6 +734,7 @@ async fn automatic_requests_on_disk_are_left_for_their_own_restart_rows() {
     let restore = registry.restore_at_startup().expect("restore");
 
     assert!(restore.requeued.is_empty());
+    assert!(restore.discarded.is_empty(), "the rescue is still owed");
     assert_eq!(restore.parked.len(), 1);
     let (execution_id, parked, pending) = &restore.parked[0];
     assert_eq!(execution_id, &fixture.execution_id);
@@ -729,6 +753,66 @@ async fn automatic_requests_on_disk_are_left_for_their_own_restart_rows() {
         state,
         "the disk is untouched"
     );
+}
+
+/// What a label rescue left for an execution that no longer owes one — the
+/// step moved on, or never recorded the rescue — is dropped at startup;
+/// requests of other triggers stay parked for their own rows.
+#[tokio::test]
+async fn a_rescue_left_for_an_execution_that_moved_on_is_discarded() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let rescue = output_rescue("episode-1");
+    let diagnosis = QueuedRequest::new(
+        ConductorTrigger::StepFailure,
+        ConductorPurpose::DiagnoseFailure,
+    )
+    .with_episode("episode-2");
+    let mut state = ConductorState {
+        pending: Some(PendingInvocation {
+            invocation_id: "cut-short".to_string(),
+            request: rescue.clone(),
+            started_at: Utc::now(),
+        }),
+        ..ConductorState::default()
+    };
+    state.queue = vec![rescue, diagnosis.clone()];
+    state.invocation_attempts.insert("episode-1".to_string(), 1);
+    state.unapplied_decisions.push(SavedDecision {
+        decision_id: "decision-1".to_string(),
+        kind: ConductorDecisionKind::ChooseOutput,
+        episode: Some("episode-1".to_string()),
+        state_id: Some("first".to_string()),
+        output_label: Some("done".to_string()),
+        data: json!({}),
+        variables: json!({}),
+        confidence: Confidence::High,
+        rationale: None,
+        context_before: json!({}),
+        saved_at: Utc::now(),
+    });
+    store.save_state(&state).expect("save the state");
+
+    let stub = Arc::new(StubInvoker::default());
+    let registry = fixture.registry(stub.clone());
+    let restore = registry.restore_at_startup().expect("restore");
+
+    assert_eq!(restore.discarded, vec![fixture.execution_id.clone()]);
+    assert_eq!(restore.parked.len(), 1);
+    assert_eq!(restore.parked[0].1, vec![diagnosis.clone()]);
+    assert_eq!(restore.parked[0].2, None);
+
+    let stored = store.load_state().expect("load");
+    assert_eq!(stored.pending, None);
+    assert_eq!(stored.queue, vec![diagnosis]);
+    assert!(stored.unapplied_decisions.is_empty());
+    assert_eq!(
+        stored.attempts("episode-1"),
+        1,
+        "the count of what ran stays"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(stub.calls().is_empty(), "nothing automatic runs by itself");
 }
 
 // ---------------------------------------------------------------------------

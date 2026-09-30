@@ -8,12 +8,20 @@
 
 mod engine_support;
 
+use std::sync::Arc;
+
 use engine_support::{workflow, Harness};
-use narsor::conductor::{ConductorState, ConductorStore, PendingInvocation, QueuedRequest};
-use narsor::domain::{
-    ConductorPurpose, ConductorTrigger, EventData, ExecutionStatus, RepromptedBy, WorkflowExecution,
+use narsor::conductor::{
+    ConductorInvoker, ConductorRegistry, ConductorState, ConductorStore, Invocation,
+    InvocationOutcome, PendingInvocation, QueuedRequest, SavedDecision,
 };
-use narsor::engine::{EngineError, PendingStep};
+use narsor::domain::{
+    ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Confidence, EventData,
+    ExecutionStatus, RepromptedBy, WorkflowExecution,
+};
+use narsor::engine::{
+    owed_output_rescue, ActionKind, Engine, EngineError, PendingHumanInput, PendingStep,
+};
 use narsor::persistence::{
     reconcile, reconcile_all, recover, sweep_orphaned_workspaces, OrphanReason,
     ReconciliationOutcome,
@@ -697,4 +705,371 @@ async fn a_restart_during_a_chat_answer_leaves_the_execution_consistent() {
 
     assert_eq!(verdict.outcome, ReconciliationOutcome::Consistent);
     assert_eq!(verdict.status, ExecutionStatus::Running);
+}
+
+// ---------------------------------------------------------------------------
+// The conductor's label rescue (F1, U10) across a restart
+// ---------------------------------------------------------------------------
+
+/// A conductor that must not be needed: it fails every invocation and
+/// counts them, with the attempt each one was.
+#[derive(Default)]
+struct CountingConductor {
+    attempts: std::sync::Mutex<Vec<u32>>,
+}
+
+impl ConductorInvoker for CountingConductor {
+    fn invoke<'a>(
+        &'a self,
+        invocation: &'a Invocation,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = InvocationOutcome> + Send + 'a>> {
+        self.attempts.lock().unwrap().push(invocation.attempt);
+        Box::pin(async {
+            InvocationOutcome::Failed {
+                error: "the counting conductor fails".to_string(),
+            }
+        })
+    }
+}
+
+/// An engine over `harness` whose agent must not run again, with a
+/// conductor attached.
+fn rescuing_engine(
+    harness: &Harness,
+    conductor: Arc<CountingConductor>,
+) -> (
+    Arc<Engine>,
+    Arc<ConductorRegistry>,
+    Arc<engine_support::StubAgentExecutor>,
+) {
+    let agent = Arc::new(engine_support::StubAgentExecutor::new(&[]));
+    let engine = Arc::new(
+        harness
+            .engine()
+            .with_executor(ActionKind::Agent, agent.clone()),
+    );
+    let registry = Arc::new(ConductorRegistry::new(Arc::clone(&engine), conductor));
+    engine.attach_conductor(&registry);
+    (engine, registry, agent)
+}
+
+/// Writes what a daemon that stopped during the rescue of `agent_problem`'s
+/// `work` state left behind: the rejected attempt closed in the log, the
+/// rescue recorded in the execution, still `Running`.
+fn leave_rescue(harness: &Harness, engine: &Engine) -> WorkflowExecution {
+    let mut execution = engine
+        .start(&workflow("agent_problem"), json!({}), harness.workspace())
+        .expect("start");
+    let log = harness.store().event_log(&execution.id);
+    for data in [
+        EventData::StateEntered {
+            state_id: "work".to_string(),
+        },
+        EventData::ActionStarted {
+            action_execution_id: "attempt-rejected".to_string(),
+            state_id: "work".to_string(),
+            action_type: "agent".to_string(),
+        },
+        EventData::ActionOutputRejected {
+            action_execution_id: "attempt-rejected".to_string(),
+            state_id: "work".to_string(),
+            reason: "no output label".to_string(),
+            answer_tail: Some("Done, all green.".to_string()),
+        },
+    ] {
+        log.append_next(&execution.id, data).expect("append");
+    }
+    execution.current_state = Some("work".to_string());
+    execution.current_action_execution = Some("attempt-rejected".to_string());
+    execution.metadata = json!({
+        "engine": {
+            "output_rescue": {
+                "state_id": "work",
+                "answers": [{
+                    "action_execution_id": "attempt-rejected",
+                    "reason": "no output label",
+                    "answer_tail": "Done, all green.",
+                }],
+                "reason": "no output label",
+            }
+        }
+    });
+    harness
+        .store()
+        .save_execution(&execution)
+        .expect("save the execution");
+    execution
+}
+
+/// The choice (a) the conductor saved before the restart.
+fn saved_choice() -> SavedDecision {
+    SavedDecision {
+        decision_id: "decision-saved".to_string(),
+        kind: ConductorDecisionKind::ChooseOutput,
+        episode: Some("attempt-rejected".to_string()),
+        state_id: Some("work".to_string()),
+        output_label: Some("implemented".to_string()),
+        data: json!({ "units_completed": 3 }),
+        variables: json!({ "summary": "three units" }),
+        confidence: Confidence::High,
+        rationale: Some("the agent said it was done".to_string()),
+        context_before: json!({}),
+        saved_at: chrono::Utc::now(),
+    }
+}
+
+fn count_events(harness: &Harness, execution_id: &str, kind: &str) -> usize {
+    harness
+        .event_types(execution_id)
+        .iter()
+        .filter(|event| event.as_str() == kind)
+        .count()
+}
+
+/// The window U5 left open — the reprompt's rejection recorded, the problem
+/// not yet raised — is closed by the rescue's record: a restart there finds
+/// the execution consistent and still owing the rescue.
+#[tokio::test]
+async fn a_restart_before_the_rescue_began_owes_the_rescue() {
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let execution = leave_rescue(&harness, &engine);
+
+    let verdict = reconcile(&harness.store(), &execution.id).expect("reconcile");
+
+    assert_eq!(verdict.outcome, ReconciliationOutcome::Consistent);
+    let stored = harness.store().load_execution(&execution.id).expect("load");
+    assert!(owed_output_rescue(&stored).expect("read").is_some());
+}
+
+/// Restart matrix: a choice saved before the restart, before its result was
+/// recorded, is applied by the next pass without invoking the conductor.
+#[tokio::test]
+async fn a_restart_after_a_saved_choice_applies_it_without_asking_again() {
+    let harness = Harness::new();
+    let conductor = Arc::new(CountingConductor::default());
+    let (engine, registry, agent) = rescuing_engine(&harness, conductor.clone());
+    let execution = leave_rescue(&harness, &engine);
+    let store = ConductorStore::new(harness.store().paths(), &execution.id);
+    store
+        .save_state(&ConductorState {
+            unapplied_decisions: vec![saved_choice()],
+            ..ConductorState::default()
+        })
+        .expect("save the decision");
+
+    let verdict = reconcile(&harness.store(), &execution.id).expect("reconcile");
+    assert_eq!(verdict.outcome, ReconciliationOutcome::Consistent);
+
+    let finished = engine
+        .run(&workflow("agent_problem"), &execution.id)
+        .await
+        .expect("carry the rescue on");
+
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+    assert!(conductor.attempts.lock().unwrap().is_empty(), "not invoked");
+    assert!(agent.prompts().is_empty(), "the agent did not run again");
+    assert_eq!(
+        count_events(&harness, &execution.id, "conductor_decision"),
+        1
+    );
+    assert_eq!(count_events(&harness, &execution.id, "action_completed"), 2);
+    let provider = harness
+        .events(&execution.id)
+        .into_iter()
+        .find_map(|event| match event.data {
+            EventData::DecisionMade { provider, .. } => Some(provider),
+            _ => None,
+        });
+    assert_eq!(provider.as_deref(), Some("conductor"));
+    assert_eq!(
+        finished.context.variables.get("summary"),
+        Some(&json!("three units"))
+    );
+    assert!(store
+        .load_state()
+        .expect("load")
+        .unapplied_decisions
+        .is_empty());
+    drop(registry);
+}
+
+/// The same after the result was recorded (`ActionCompleted` and the
+/// mid-step state): only the decision is left, still the conductor's.
+#[tokio::test]
+async fn a_restart_after_the_choices_result_takes_only_the_decision() {
+    let harness = Harness::new();
+    let conductor = Arc::new(CountingConductor::default());
+    let (engine, _registry, _agent) = rescuing_engine(&harness, conductor.clone());
+    let mut execution = leave_rescue(&harness, &engine);
+    let decision = saved_choice();
+    harness
+        .store()
+        .event_log(&execution.id)
+        .append_next(
+            &execution.id,
+            EventData::ActionCompleted {
+                action_execution_id: "attempt-rejected".to_string(),
+                output_label: "implemented".to_string(),
+            },
+        )
+        .expect("append");
+    let pending = PendingStep {
+        state_id: "work".to_string(),
+        action_execution_id: "attempt-rejected".to_string(),
+        result: narsor::domain::ActionResult {
+            output_label: "implemented".to_string(),
+            data: decision.data.clone(),
+            variables: decision.variables.as_object().cloned().unwrap_or_default(),
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+        artifacts: Vec::new(),
+    };
+    execution.metadata["engine"]["pending_step"] =
+        serde_json::to_value(&pending).expect("serialize");
+    harness.store().save_execution(&execution).expect("save");
+    ConductorStore::new(harness.store().paths(), &execution.id)
+        .save_state(&ConductorState {
+            unapplied_decisions: vec![decision],
+            ..ConductorState::default()
+        })
+        .expect("save the decision");
+
+    let finished = engine
+        .run(&workflow("agent_problem"), &execution.id)
+        .await
+        .expect("carry the rescue on");
+
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+    assert!(conductor.attempts.lock().unwrap().is_empty());
+    let completed: Vec<String> = harness
+        .events(&execution.id)
+        .into_iter()
+        .filter_map(|event| match event.data {
+            EventData::ActionCompleted {
+                action_execution_id,
+                ..
+            } => Some(action_execution_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        completed
+            .iter()
+            .filter(|id| *id == "attempt-rejected")
+            .count(),
+        1,
+        "the result is not recorded twice: {completed:?}"
+    );
+    let provider = harness
+        .events(&execution.id)
+        .into_iter()
+        .find_map(|event| match event.data {
+            EventData::DecisionMade { provider, .. } => Some(provider),
+            _ => None,
+        });
+    assert_eq!(provider.as_deref(), Some("conductor"));
+}
+
+/// Restart matrix: a restart during the conductor's invocation — counted
+/// before it ran — is followed by one more invocation, R24's repeat; when
+/// that one fails too, the step is a problem, and nothing more is invoked.
+#[tokio::test]
+async fn a_restart_during_the_invocation_invokes_the_conductor_once_more() {
+    let harness = Harness::new();
+    let conductor = Arc::new(CountingConductor::default());
+    let (engine, _registry, agent) = rescuing_engine(&harness, conductor.clone());
+    let execution = leave_rescue(&harness, &engine);
+    let store = leave_conductor_marker(&harness, &execution, ConductorTrigger::OutputRescue);
+    let mut state = store.load_state().expect("load");
+    state
+        .invocation_attempts
+        .insert("attempt-rejected".to_string(), 1);
+    store
+        .save_state(&state)
+        .expect("count the cut-short attempt");
+
+    let verdict = reconcile(&harness.store(), &execution.id).expect("reconcile");
+    assert!(matches!(
+        verdict.outcome,
+        ReconciliationOutcome::ConductorInterrupted { .. }
+    ));
+
+    let stopped = engine
+        .run(&workflow("agent_problem"), &execution.id)
+        .await
+        .expect("carry the rescue on");
+
+    assert_eq!(*conductor.attempts.lock().unwrap(), vec![2]);
+    assert!(agent.prompts().is_empty());
+    assert_eq!(stopped.status, ExecutionStatus::InputNeeded);
+    let pending = harness
+        .store()
+        .load_pending_input::<PendingHumanInput>(&execution.id)
+        .expect("read")
+        .expect("a problem");
+    let problem = pending.problem.expect("a problem");
+    assert_eq!(problem.analysis, None);
+    assert!(problem.reason.contains("the counting conductor fails"));
+    let left = store.load_state().expect("load");
+    assert_eq!(left.pending, None, "{left:?}");
+    assert!(left.queue.is_empty(), "the stale request is gone: {left:?}");
+}
+
+/// A rescue whose invocations were all spent before the restart is not
+/// invoked again: it is a problem straight away.
+#[tokio::test]
+async fn a_rescue_whose_invocations_are_spent_is_a_problem() {
+    let harness = Harness::new();
+    let conductor = Arc::new(CountingConductor::default());
+    let (engine, _registry, _agent) = rescuing_engine(&harness, conductor.clone());
+    let execution = leave_rescue(&harness, &engine);
+    let store = leave_conductor_marker(&harness, &execution, ConductorTrigger::OutputRescue);
+    let mut state = store.load_state().expect("load");
+    state
+        .invocation_attempts
+        .insert("attempt-rejected".to_string(), 2);
+    store.save_state(&state).expect("count both attempts");
+
+    let stopped = engine
+        .run(&workflow("agent_problem"), &execution.id)
+        .await
+        .expect("carry the rescue on");
+
+    assert!(conductor.attempts.lock().unwrap().is_empty());
+    assert_eq!(stopped.status, ExecutionStatus::InputNeeded);
+    assert_eq!(count_events(&harness, &execution.id, "problem_raised"), 1);
+}
+
+/// A recovery after the conductor's reprompt was cut short drops the rescue:
+/// the state's action starts afresh.
+#[tokio::test]
+async fn a_recovery_drops_the_rescue() {
+    let harness = Harness::new();
+    let engine = Arc::new(harness.engine());
+    let execution = leave_rescue(&harness, &engine);
+    harness
+        .store()
+        .event_log(&execution.id)
+        .append_next(
+            &execution.id,
+            EventData::OutputReprompted {
+                action_execution_id: "attempt-conductor-reprompt".to_string(),
+                previous_attempt: "attempt-rejected".to_string(),
+                state_id: "work".to_string(),
+                by: RepromptedBy::Conductor,
+            },
+        )
+        .expect("append");
+    let verdict = reconcile(&harness.store(), &execution.id).expect("reconcile");
+    assert_eq!(verdict.status, ExecutionStatus::Unknown);
+
+    let handle = engine
+        .try_begin_recover(&execution.id, None)
+        .expect("begin the recovery");
+    drop(handle);
+    let stored = harness.store().load_execution(&execution.id).expect("load");
+    assert!(owed_output_rescue(&stored).expect("read").is_none());
 }
