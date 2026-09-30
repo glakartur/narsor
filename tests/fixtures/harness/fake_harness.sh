@@ -7,8 +7,8 @@
 # driven entirely by files in its own directory, which the test writes:
 #
 #   stdout, stdout.<n>   what to print on stdout (per call, then the fallback)
-#   stderr               what to print on stderr
-#   exit                 the exit code (default 0)
+#   stderr, stderr.<n>   what to print on stderr (per call, then the fallback)
+#   exit, exit.<n>       the exit code (per call, then the fallback; default 0)
 #   sleep, sleep.<n>     seconds to sleep after answering (per call, then the
 #                        fallback; for timeout tests)
 #
@@ -49,7 +49,9 @@ elif [ -f "$dir/stdout" ]; then
     cat "$dir/stdout"
 fi
 
-if [ -f "$dir/stderr" ]; then
+if [ -f "$dir/stderr.$count" ]; then
+    cat "$dir/stderr.$count" >&2
+elif [ -f "$dir/stderr" ]; then
     cat "$dir/stderr" >&2
 fi
 
@@ -59,7 +61,9 @@ elif [ -f "$dir/sleep" ]; then
     sleep "$(cat "$dir/sleep")"
 fi
 
-if [ -f "$dir/exit" ]; then
+if [ -f "$dir/exit.$count" ]; then
+    exit "$(cat "$dir/exit.$count")"
+elif [ -f "$dir/exit" ]; then
     exit "$(cat "$dir/exit")"
 fi
 

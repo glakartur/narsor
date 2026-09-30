@@ -37,7 +37,7 @@ use chrono::Utc;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::api::{ActiveTasks, ApiServices};
-use crate::conductor::{ConductorRegistry, UnavailableInvoker};
+use crate::conductor::{ConductorRegistry, HarnessInvoker};
 use crate::config::Resolved;
 use crate::domain::ExecutionStatus;
 use crate::engine::{owed_reprompt, Engine, HarnessRegistry};
@@ -113,6 +113,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
                 CliError::failure(format!("could not load default harness selection: {error}"))
             })?,
     );
+    let agent_timeout_secs = defaults.timeout_secs;
     let engine = Arc::new(
         Engine::new(store.clone())
             .with_agent_defaults_and_selector(defaults, Arc::clone(&selector)),
@@ -121,10 +122,16 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     // One registry of background passes for the API and the startup hook,
     // so a pass the hook spawns can be interrupted like any other.
     let active_tasks = ActiveTasks::new();
-    // The conductor has no harness-backed invocation yet (U9): until then
-    // every invocation fails, which a chat message answers with an error
-    // entry (KTD12).
-    let conductor = ConductorRegistry::new(Arc::clone(&engine), Arc::new(UnavailableInvoker));
+    // The conductor runs on the same live default harness as a harnessless
+    // agent step, read-only (KTD5), bounded by the agent timeout.
+    let invoker = HarnessInvoker::new(
+        store.clone(),
+        config.catalog_dir().to_path_buf(),
+        config.work_dir().to_path_buf(),
+    )
+    .with_default_harness_selector(Arc::clone(&selector))
+    .with_agent_timeout(agent_timeout_secs);
+    let conductor = ConductorRegistry::new(Arc::clone(&engine), Arc::new(invoker));
     if let Some(recovery) = &recovery {
         continue_at_startup(
             &engine,

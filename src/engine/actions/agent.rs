@@ -64,7 +64,7 @@ use super::{
 };
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, AgentActionConfig, AgentSession, AgentSessionStatus,
-    Event, EventData, OutputDefinition, Workspace, WorkspaceAccess,
+    Event, EventData, OutputDefinition, WorkspaceAccess,
 };
 use crate::persistence::{
     ConversationSource, ConversationStore, ConversationWriter, DefaultHarnessSelector,
@@ -501,8 +501,8 @@ impl AgentExecutor {
         let ending = spawn_and_wait(
             &invocation.program,
             &invocation.args,
-            request.workspace,
-            request.action_execution_id,
+            workspace,
+            Some(request.action_execution_id),
             request.timeout,
             adapter.stream_parser(),
             &conversation,
@@ -741,23 +741,46 @@ fn resume_session(config: &AgentActionConfig) -> Result<Option<&str>, ActionErro
 }
 
 /// A harness process that ran to completion, already parsed.
-struct FinishedRun {
+pub(crate) struct FinishedRun {
     /// What the adapter's stream parser distilled from the stdout stream.
-    run: HarnessRun,
+    pub(crate) run: HarnessRun,
     /// The process's exit code.
-    exit_code: i32,
+    pub(crate) exit_code: i32,
     /// A bounded capture of stderr, for error messages only — the full text,
     /// unbounded, is what the conversation file holds (R14).
-    stderr: String,
+    pub(crate) stderr: String,
 }
 
 /// How the harness process ended, from [`spawn_and_wait`]'s point of view.
-enum SpawnEnding {
+pub(crate) enum SpawnEnding {
     /// It ran to completion (successfully or not — that is `run.failure`'s
     /// business, not this type's).
     Finished(FinishedRun),
     /// The time limit ran out and the process was killed.
     TimedOut,
+}
+
+/// Runs one harness process outside any action attempt — no conversation
+/// file, no `ORCHESTRATOR_ACTION_ID` — for the conductor (U9), which reuses
+/// the spawning (through [`spawn_retrying_text_busy`]), the pipe draining and
+/// the stream parsing of an agent step without being one.
+pub(crate) async fn run_harness_process(
+    program: &str,
+    args: &[String],
+    working_dir: &Path,
+    limit: Option<Duration>,
+    parser: Box<dyn HarnessStreamParser>,
+) -> Result<SpawnEnding, ActionError> {
+    spawn_and_wait(
+        program,
+        args,
+        working_dir,
+        None,
+        limit,
+        parser,
+        &ConversationSink::none(),
+    )
+    .await
 }
 
 /// Runs the harness, draining both pipes while it goes and feeding every
@@ -772,19 +795,18 @@ enum SpawnEnding {
 async fn spawn_and_wait(
     program: &str,
     args: &[String],
-    workspace: &Workspace,
-    action_execution_id: &str,
+    working_dir: &Path,
+    action_execution_id: Option<&str>,
     limit: Option<Duration>,
     parser: Box<dyn HarnessStreamParser>,
     conversation: &ConversationSink,
 ) -> Result<SpawnEnding, ActionError> {
-    let working_dir = Path::new(&workspace.path);
-
     let mut command = Command::new(program);
+    command.args(args).current_dir(working_dir);
+    if let Some(action_execution_id) = action_execution_id {
+        command.env(ACTION_ID_ENV_VAR, action_execution_id);
+    }
     command
-        .args(args)
-        .current_dir(working_dir)
-        .env(ACTION_ID_ENV_VAR, action_execution_id)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1277,7 +1299,7 @@ fn record_session_in_details(error: &mut ActionError, harness: &str, session_id:
 /// Scanning for balanced braces — string- and escape-aware, so a `}` inside a
 /// string never ends an object — rather than looking for fences: it finds the
 /// fenced case too, since the fence markers are outside the braces.
-fn json_objects(text: &str) -> Vec<Value> {
+pub(crate) fn json_objects(text: &str) -> Vec<Value> {
     let bytes = text.as_bytes();
     let mut found = Vec::new();
 

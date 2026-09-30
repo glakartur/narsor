@@ -15,8 +15,12 @@
 //! * [`store`] — the conductor's own files of one execution: state, chat,
 //!   annotations (KTD2).
 //! * [`actor`] — one actor per execution, the only writer of those files,
-//!   with its two-priority durable queue (KTD11) and the seam
-//!   ([`ConductorInvoker`]) the actual invocation plugs into (U9).
+//!   with its two-priority durable queue (KTD11), R24's one repeat of a
+//!   failed automatic invocation, and the seam ([`ConductorInvoker`]) the
+//!   actual invocation plugs into.
+//! * [`invoke`] — the invocation itself on the default harness, read-only
+//!   (KTD5), built from a [`snapshot`] of the execution and a [`prompt`],
+//!   answered with a checked [`response`] (KTD6).
 //! * [`ConductorRegistry`] — the actors the daemon started, and the
 //!   interrupts of advisory invocations (KTD10).
 //!
@@ -31,6 +35,10 @@
 //! rows of the restart matrix apply to them is U10's and U11's.
 
 pub mod actor;
+pub mod invoke;
+pub mod prompt;
+pub mod response;
+pub mod snapshot;
 pub mod store;
 
 use std::collections::HashMap;
@@ -39,7 +47,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub use actor::{
     AdvisoryInterrupts, ConductorActor, ConductorAnswer, ConductorInvoker, Invocation,
     InvocationOutcome, InvocationQueue, UnavailableInvoker, CONDUCTOR_UNAVAILABLE,
+    MAX_AUTOMATIC_ATTEMPTS,
 };
+pub use invoke::{ConductorAccess, HarnessInvoker, DEFAULT_CONDUCTOR_TIMEOUT};
+pub use response::{
+    allowed_decisions, proposals_allowed, ConductorResponse, Decision, DecisionKind, ProposalKind,
+    ProposedAction, ResponseError,
+};
+pub use snapshot::{Snapshot, SnapshotBudget, SnapshotInput};
 pub use store::{
     Annotation, ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore,
     PendingInvocation, QueuedRequest, SavedDecision, CONDUCTOR_STATE_VERSION,

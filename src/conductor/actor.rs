@@ -72,12 +72,18 @@ pub struct Invocation {
     pub attempt: u32,
 }
 
+/// How many invocations R24 allows an automatic trigger's episode: the
+/// first, and one repeat after a failure.
+pub const MAX_AUTOMATIC_ATTEMPTS: u32 = 2;
+
 /// What the conductor answered (KTD6).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConductorAnswer {
     /// Its message for the chat, if it has one.
     pub message: Option<String>,
-    /// Its structured response, for whoever asked to act on (U9–U12).
+    /// Its structured response, already checked for the invocation's
+    /// purpose: read it back with
+    /// [`crate::conductor::ConductorResponse::from_value`].
     pub response: Value,
 }
 
@@ -117,10 +123,9 @@ impl InvocationOutcome {
 /// The seam through which the conductor is actually run (U9).
 ///
 /// Everything around an invocation — queueing, the marker, the counters,
-/// the events, the chat entries — is the actor's; an invoker only turns one
-/// [`Invocation`] into an outcome. It is never told to retry: R24's one
-/// repeat is the invoker's own business, and [`Invocation::attempt`] says
-/// how many tries a restart already counted.
+/// the events, the chat entries, and R24's one repeat — is the actor's; an
+/// invoker only turns one [`Invocation`] into an outcome, once, and never
+/// retries by itself. [`Invocation::attempt`] says which try it is.
 ///
 /// Hand-rolled async for `dyn` dispatch, the same way
 /// [`crate::engine::ActionExecutor`] does it.
@@ -132,12 +137,12 @@ pub trait ConductorInvoker: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = InvocationOutcome> + Send + 'a>>;
 }
 
-/// The invoker of a daemon that has no conductor to run yet: every
-/// invocation fails, saying so.
+/// An invoker with no conductor to run: every invocation fails, saying so.
 ///
-/// Stands in until the harness-backed invoker exists (U9), so the queue,
-/// the chat and the restart rows can already be driven end to end — a chat
-/// message gets an error entry (KTD12) rather than waiting forever.
+/// For a registry that must exist without a harness behind it — a test of
+/// the queue, the chat or the restart rows driven end to end — where a chat
+/// message then gets an error entry (KTD12) rather than waiting forever.
+/// The daemon runs [`crate::conductor::HarnessInvoker`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnavailableInvoker;
 
@@ -503,21 +508,50 @@ impl ConductorActor {
         }
     }
 
+    /// Serves one request: one invocation, and for a failed automatic one
+    /// its one repeat (R24).
+    ///
+    /// The repeat lives here rather than in the invoker so that it is
+    /// counted like the first try — durably, before it runs ([`Self::begin`])
+    /// — and a restart in between knows it was already spent. Each try is an
+    /// invocation of its own, with its own `ConductorStarted`/`Finished`. A
+    /// try counted as the second by an earlier run of the daemon gets no
+    /// repeat, and neither does a chat or an annotation, whose failure is an
+    /// error entry and nothing more (KTD12).
     async fn serve(&self, request: QueuedRequest, attachment: Attachment) -> Result<()> {
         let Attachment {
             chat,
             waiter: mut waiter_slot,
         } = attachment;
 
-        let invocation = self.begin(request, chat)?;
-        self.record(EventData::ConductorStarted {
-            invocation_id: invocation.invocation_id.clone(),
-            trigger: invocation.request.trigger,
-            purpose: invocation.request.purpose,
-            episode: invocation.request.episode.clone(),
-        });
+        let mut tries = 0;
+        let (invocation, outcome) = loop {
+            tries += 1;
+            let invocation = self.begin(request.clone(), chat.clone())?;
+            self.record(EventData::ConductorStarted {
+                invocation_id: invocation.invocation_id.clone(),
+                trigger: invocation.request.trigger,
+                purpose: invocation.request.purpose,
+                episode: invocation.request.episode.clone(),
+            });
 
-        let outcome = self.run(&invocation, waiter_slot.as_mut()).await;
+            let outcome = self.run(&invocation, waiter_slot.as_mut()).await;
+
+            let repeat = matches!(outcome, InvocationOutcome::Failed { .. })
+                && invocation.request.trigger.is_automatic()
+                && tries < MAX_AUTOMATIC_ATTEMPTS
+                && invocation.attempt < MAX_AUTOMATIC_ATTEMPTS;
+            if !repeat {
+                break (invocation, outcome);
+            }
+            // The request stays queued and the next `begin` replaces the
+            // marker, so a restart right here serves the repeat.
+            self.record(EventData::ConductorFinished {
+                invocation_id: invocation.invocation_id.clone(),
+                outcome: outcome.event_outcome(),
+                error: outcome.error(),
+            });
+        };
 
         self.finish(&invocation, &outcome)?;
         self.record(EventData::ConductorFinished {

@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use narsor::conductor::{
     ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, PendingInvocation,
-    QueuedRequest, CONDUCTOR_UNAVAILABLE,
+    QueuedRequest,
 };
 use narsor::domain::{
     ConductorOutcome, ConductorPurpose, ConductorTrigger, EventData, ExecutionStatus, Workspace,
@@ -566,12 +566,38 @@ async fn wait_for(what: &str, timeout: Duration, mut condition: impl FnMut() -> 
     }
 }
 
+/// Installs the fake harness of `tests/fixtures/harness` as `claude` in a
+/// directory of its own, answering every call with `text`, and returns that
+/// directory — to put first on a daemon's `PATH`, so the conductor never
+/// reaches a real harness.
+fn fake_claude(dir: &Path, text: &str) -> PathBuf {
+    fs::create_dir_all(dir).expect("create the harness directory");
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/harness/fake_harness.sh");
+    let temp = dir.join(format!(".claude.{}.tmp", uuid::Uuid::new_v4()));
+    fs::copy(&source, &temp).expect("copy the fake harness");
+    fs::rename(&temp, dir.join("claude")).expect("move the fake harness into place");
+    let answer = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "conductor-session",
+        "result": text,
+    });
+    fs::write(dir.join("stdout"), format!("{answer}\n")).expect("write the answer");
+    dir.to_path_buf()
+}
+
 /// Restart matrix: a chat message the conductor had not answered when the
-/// daemon stopped is answered after the next start — here with the error
-/// entry of a daemon that cannot invoke the conductor yet (KTD12).
+/// daemon stopped is answered after the next start, by the conductor run on
+/// the (fake) default harness.
 #[tokio::test]
 async fn a_fresh_daemon_answers_a_chat_message_left_unanswered() {
     let root = TempRoot::new();
+    let bin = fake_claude(
+        &root.path().join("bin"),
+        r#"{"decision": "reply", "message": "It is about to run its first step."}"#,
+    );
     let (store, execution) = seed_two_steps(root.path());
     let conductor = ConductorStore::new(store.paths(), &execution.id);
     let message = conductor
@@ -582,7 +608,20 @@ async fn a_fresh_daemon_answers_a_chat_message_left_unanswered() {
         ))
         .expect("seed an unanswered message");
 
-    let mut child = spawn_daemon(root.path());
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_narsor"))
+        .arg("--root")
+        .arg(root.path())
+        .arg("daemon")
+        .env("PATH", path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the daemon");
     let info = wait_for_daemon_info(root.path(), Duration::from_secs(10));
     let client = narsor::api::ApiClient::new(info.addr, &info.token);
 
@@ -602,8 +641,8 @@ async fn a_fresh_daemon_answers_a_chat_message_left_unanswered() {
     let answer = &chat.entries[1];
     assert_eq!(answer.in_reply_to.as_deref(), Some(message.id.as_str()));
     assert_eq!(answer.author, ChatAuthor::Conductor);
-    assert_eq!(answer.kind, ChatEntryKind::Error);
-    assert_eq!(answer.text, CONDUCTOR_UNAVAILABLE);
+    assert_eq!(answer.kind, ChatEntryKind::Message);
+    assert_eq!(answer.text, "It is about to run its first step.");
 
     let log = store.event_log(&execution.id);
     wait_for(
@@ -614,7 +653,7 @@ async fn a_fresh_daemon_answers_a_chat_message_left_unanswered() {
                 matches!(
                     event.data,
                     EventData::ConductorFinished {
-                        outcome: ConductorOutcome::Failed,
+                        outcome: ConductorOutcome::Completed,
                         ..
                     }
                 )
