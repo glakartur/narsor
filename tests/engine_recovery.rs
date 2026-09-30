@@ -20,7 +20,8 @@ use narsor::domain::{
     ExecutionStatus, RepromptedBy, WorkflowExecution,
 };
 use narsor::engine::{
-    owed_output_rescue, ActionKind, Engine, EngineError, PendingHumanInput, PendingStep,
+    owed_output_rescue, step_failure, ActionKind, Engine, EngineError, PendingHumanInput,
+    PendingStep, Recovery, StepFailure,
 };
 use narsor::persistence::{
     reconcile, reconcile_all, recover, sweep_orphaned_workspaces, OrphanReason,
@@ -1072,4 +1073,134 @@ async fn a_recovery_drops_the_rescue() {
     drop(handle);
     let stored = harness.store().load_execution(&execution.id).expect("load");
     assert!(owed_output_rescue(&stored).expect("read").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// A failed step the conductor took up (F3, U11)
+// ---------------------------------------------------------------------------
+
+/// Leaves `execution` failed on a step failure the conductor took up, as
+/// the pass that failed saves it: the status and the record in one save.
+fn fail_for_the_conductor(harness: &Harness, execution: &mut WorkflowExecution, key: &str) {
+    let failure = StepFailure {
+        state_id: "first".to_string(),
+        action_execution_id: key.to_string(),
+        episode: key.to_string(),
+        error: "the build broke".to_string(),
+        side_effect_free: true,
+        conductor_retry: false,
+    };
+    execution.status = ExecutionStatus::Failed;
+    execution.current_state = Some("first".to_string());
+    execution.metadata = json!({ "engine": { "step_failure": failure } });
+    harness
+        .store()
+        .save_execution(execution)
+        .expect("save the execution");
+}
+
+/// The sweep keeps the workspace of an execution failed on a step the
+/// conductor took up — a retry, confirmed or its own, needs it — and sweeps
+/// that of one failed with nothing for the conductor, as before.
+#[tokio::test]
+async fn the_sweep_keeps_the_workspace_of_a_failure_the_conductor_took_up() {
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let definition = workflow("two_steps");
+    let mut diagnosed = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start one");
+    fail_for_the_conductor(&harness, &mut diagnosed, "attempt-1");
+    let mut plain = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start another");
+    plain.status = ExecutionStatus::Failed;
+    harness.store().save_execution(&plain).expect("save");
+
+    let provisioner = WorkspaceProvisioner::new(harness.root().join("workspaces"));
+    for execution_id in [diagnosed.id.as_str(), plain.id.as_str()] {
+        std::fs::create_dir_all(provisioner.task_dir(execution_id)).expect("a workspace");
+    }
+
+    let orphans = sweep_orphaned_workspaces(&harness.store(), &provisioner, CleanupPolicy::Remove)
+        .expect("sweep");
+
+    let ids: Vec<&str> = orphans
+        .iter()
+        .map(|orphan| orphan.execution_id.as_str())
+        .collect();
+    assert_eq!(ids, vec![plain.id.as_str()]);
+    assert!(provisioner.task_dir(&diagnosed.id).exists());
+    assert!(!provisioner.task_dir(&plain.id).exists());
+}
+
+/// KTD9: a recovery naming a failure the execution is no longer failed on
+/// is refused and changes nothing; one naming the current failure clears
+/// the record in the same save as the status change.
+#[tokio::test]
+async fn a_recovery_names_the_failure_it_answers() {
+    let harness = Harness::new();
+    let engine = Arc::new(harness.engine());
+    let mut execution = engine
+        .start(&workflow("two_steps"), json!({}), harness.workspace())
+        .expect("start");
+    fail_for_the_conductor(&harness, &mut execution, "attempt-2");
+    let events_before = harness.events(&execution.id).len();
+
+    let stale = engine.try_begin_recover_with(
+        &execution.id,
+        Recovery {
+            comment: None,
+            episode: Some("attempt-1".to_string()),
+            conductor_retry: false,
+        },
+    );
+    assert!(
+        matches!(
+            stale,
+            Err(EngineError::StaleEpisode { ref expected, ref current, .. })
+                if expected == "attempt-1" && current.as_deref() == Some("attempt-2")
+        ),
+        "{:?}",
+        stale.err()
+    );
+    let stored = harness.store().load_execution(&execution.id).expect("load");
+    assert_eq!(stored.status, ExecutionStatus::Failed);
+    assert!(step_failure(&stored).expect("read").is_some());
+    assert_eq!(
+        harness.events(&execution.id).len(),
+        events_before,
+        "a stale recovery records nothing"
+    );
+
+    let handle = engine
+        .try_begin_recover_with(
+            &execution.id,
+            Recovery {
+                comment: Some("once more".to_string()),
+                episode: Some("attempt-2".to_string()),
+                conductor_retry: true,
+            },
+        )
+        .expect("the current failure is recovered");
+    drop(handle);
+    let stored = harness.store().load_execution(&execution.id).expect("load");
+    assert_eq!(stored.status, ExecutionStatus::Running);
+    assert!(stored.metadata["engine"].get("step_failure").is_none());
+    assert_eq!(
+        stored.metadata["engine"]["conductor_retry"],
+        json!({ "state_id": "first", "episode": "attempt-2" }),
+        "the conductor's retry keeps the failure's episode"
+    );
+
+    // Once recovered, the same key is stale.
+    let again = engine.try_begin_recover_with(
+        &execution.id,
+        Recovery {
+            comment: None,
+            episode: Some("attempt-2".to_string()),
+            conductor_retry: false,
+        },
+    );
+    assert!(matches!(again, Err(EngineError::StaleEpisode { .. })));
 }

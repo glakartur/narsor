@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::conductor::response::ProposedAction;
 use crate::domain::{
     ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Confidence, ExecutionId,
 };
@@ -97,6 +98,12 @@ pub struct ConductorState {
     /// them instead of asking the conductor again.
     #[serde(default)]
     pub unapplied_decisions: Vec<SavedDecision>,
+
+    /// What the conductor concluded about the latest failed step it took up
+    /// (F3). It is the operator's problem while the execution is still
+    /// failed on the same attempt (KTD4).
+    #[serde(default)]
+    pub failure: Option<FailureReport>,
 }
 
 impl Default for ConductorState {
@@ -108,6 +115,7 @@ impl Default for ConductorState {
             invocation_attempts: BTreeMap::new(),
             used_retries: BTreeSet::new(),
             unapplied_decisions: Vec::new(),
+            failure: None,
         }
     }
 }
@@ -226,6 +234,55 @@ pub struct SavedDecision {
     pub context_before: Value,
     /// When it was saved.
     pub saved_at: DateTime<Utc>,
+}
+
+/// What the conductor concluded about one failed step (F3, U11).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FailureReport {
+    /// The failure it is about: its last failed attempt (KTD9).
+    pub key: String,
+    /// The failure's episode, the entry into the state (KTD14).
+    pub episode: String,
+    /// The state that failed.
+    pub state_id: String,
+    /// What the problem says: the diagnosis, or the raw error.
+    pub reason: String,
+    /// How the conductor concluded.
+    pub outcome: FailureOutcome,
+    /// When.
+    pub concluded_at: DateTime<Utc>,
+}
+
+impl FailureReport {
+    /// Whether the report leaves a problem for the operator (KTD4) — every
+    /// outcome but the conductor's own retry.
+    pub fn is_problem(&self) -> bool {
+        !matches!(self.outcome, FailureOutcome::Retried { .. })
+    }
+}
+
+/// How the conductor concluded about a failed step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FailureOutcome {
+    /// It diagnosed the failure, and proposed what to do (R22).
+    Diagnosed {
+        /// What went wrong, as it sees it.
+        diagnosis: String,
+        /// What it proposes, for the operator to confirm (R28).
+        #[serde(default)]
+        proposals: Vec<ProposedAction>,
+    },
+    /// It restarted the step once, with `note` (R21).
+    Retried {
+        /// The note the restarted step was given.
+        note: String,
+    },
+    /// It could not diagnose it (R24): the operator gets the raw error.
+    Unanswered {
+        /// Why.
+        error: String,
+    },
 }
 
 /// Who wrote a chat entry.

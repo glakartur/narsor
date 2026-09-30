@@ -2627,3 +2627,188 @@ mod problems {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Conductor plan U11: a failed step's problem, and recoveries that name it
+// ---------------------------------------------------------------------------
+
+mod failures {
+    use super::*;
+
+    use narsor::conductor::{FailureOutcome, FailureReport};
+    use narsor::domain::ProblemKind;
+    use narsor::engine::StepFailure;
+
+    /// An execution of `two_steps` failed on `first` with a step failure
+    /// the conductor diagnosed, and a server over it.
+    struct Failed {
+        _root: TempRoot,
+        store: ExecutionStore,
+        handle: api::ApiHandle,
+        execution_id: String,
+    }
+
+    async fn failed_over_http() -> Failed {
+        let root = TempRoot::new();
+        let store = root.store();
+        let engine = Arc::new(Engine::new(store.clone()));
+        let definition_path = engine_support::fixtures().join("engine/two_steps.yaml");
+        let definition = load_from_file(&definition_path).expect("load the fixture");
+        let workspace_path = root.join("workspace");
+        fs::create_dir_all(&workspace_path).expect("create workspace dir");
+        fs::copy(
+            engine_support::fixtures().join("scripts/print_json.sh"),
+            workspace_path.join("print_json.sh"),
+        )
+        .expect("copy the fixture script");
+
+        let mut execution = engine
+            .start(
+                &definition,
+                serde_json::json!({}),
+                Workspace::local_folder(workspace_path.display().to_string()),
+            )
+            .expect("start execution");
+        let failure = StepFailure {
+            state_id: "first".to_string(),
+            action_execution_id: "attempt-2".to_string(),
+            episode: "attempt-2".to_string(),
+            error: "the build broke".to_string(),
+            side_effect_free: false,
+            conductor_retry: false,
+        };
+        execution.status = ExecutionStatus::Failed;
+        execution.current_state = Some("first".to_string());
+        execution.metadata = serde_json::json!({
+            "cli": { "definition_path": definition_path.display().to_string() },
+            "engine": { "step_failure": failure },
+        });
+        store.save_execution(&execution).expect("save the failure");
+
+        let conductor = ConductorStore::new(store.paths(), &execution.id);
+        conductor
+            .save_state(&ConductorState {
+                failure: Some(FailureReport {
+                    key: "attempt-2".to_string(),
+                    episode: "attempt-2".to_string(),
+                    state_id: "first".to_string(),
+                    reason: "A dependency is missing.".to_string(),
+                    outcome: FailureOutcome::Diagnosed {
+                        diagnosis: "A dependency is missing.".to_string(),
+                        proposals: Vec::new(),
+                    },
+                    concluded_at: Utc::now(),
+                }),
+                ..ConductorState::default()
+            })
+            .expect("save the conductor's report");
+
+        let handle = start_server_with_engine(
+            Arc::clone(&engine),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+        )
+        .await;
+        Failed {
+            _root: root,
+            store,
+            handle,
+            execution_id: execution.id,
+        }
+    }
+
+    fn post_recover(
+        failed: &Failed,
+        body: &serde_json::Value,
+    ) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> {
+        raw_client()
+            .post(url(
+                &failed.handle,
+                &format!("/executions/{}/recover", failed.execution_id),
+            ))
+            .bearer_auth(failed.handle.token())
+            .json(body)
+            .send()
+    }
+
+    /// KTD4: a failed step stays `Failed`, and the list shows the
+    /// conductor's diagnosis as its problem, keyed by the failure.
+    #[tokio::test]
+    async fn the_list_shows_a_diagnosed_failure_as_the_executions_problem() {
+        let failed = failed_over_http().await;
+        let list = failed
+            .handle
+            .client()
+            .list_executions()
+            .await
+            .expect("list executions");
+        let summary = list
+            .executions
+            .iter()
+            .find(|summary| summary.id == failed.execution_id)
+            .expect("listed");
+        assert_eq!(summary.status, ExecutionStatus::Failed);
+        let problem = summary.problem.clone().expect("a problem");
+        assert_eq!(problem.kind, ProblemKind::Failure);
+        assert_eq!(problem.reason, "A dependency is missing.");
+        assert_eq!(problem.episode.as_deref(), Some("attempt-2"));
+
+        let state = failed
+            .handle
+            .client()
+            .conductor_state(&failed.execution_id)
+            .await
+            .expect("the conductor's state");
+        assert_eq!(
+            state.failure.map(|report| report.key).as_deref(),
+            Some("attempt-2")
+        );
+    }
+
+    /// KTD9: a recovery naming a failure the execution is no longer failed
+    /// on is `409` and changes nothing; one naming the current failure is
+    /// accepted, and the problem is gone with the failure record.
+    #[tokio::test]
+    async fn a_recovery_naming_a_stale_failure_is_a_conflict() {
+        let failed = failed_over_http().await;
+
+        let stale = post_recover(
+            &failed,
+            &serde_json::json!({ "episode": "attempt-1", "comment": "again" }),
+        )
+        .await
+        .expect("send");
+        assert_eq!(stale.status(), reqwest::StatusCode::CONFLICT);
+        let stored = failed
+            .store
+            .load_execution(&failed.execution_id)
+            .expect("load");
+        assert_eq!(stored.status, ExecutionStatus::Failed);
+        assert!(stored.metadata["engine"].get("step_failure").is_some());
+
+        let accepted = failed
+            .handle
+            .client()
+            .recover_failure(&failed.execution_id, "attempt-2", None)
+            .await
+            .expect("the current failure is recovered");
+        assert_eq!(accepted.execution_id, failed.execution_id);
+        let stored = failed
+            .store
+            .load_execution(&failed.execution_id)
+            .expect("load");
+        assert!(stored.metadata["engine"].get("step_failure").is_none());
+        let list = failed
+            .handle
+            .client()
+            .list_executions()
+            .await
+            .expect("list executions");
+        let summary = list
+            .executions
+            .iter()
+            .find(|summary| summary.id == failed.execution_id)
+            .expect("listed");
+        assert_eq!(summary.problem, None);
+    }
+}

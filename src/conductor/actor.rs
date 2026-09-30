@@ -32,9 +32,10 @@
 //!   the pass's claim) by dropping the wait: interrupting the pass drops it,
 //!   and the invocation is aborted with it.
 //!
-//! An interrupted automatic invocation keeps its marker in `state.json`: it
-//! did not finish, and what that means for the execution is the startup
-//! hook's to decide (U10, U11). An interrupted advisory one simply ends.
+//! An interrupted label rescue keeps its marker in `state.json`: it did not
+//! finish, and what that means for the execution is the startup hook's to
+//! decide (U10). An interrupted advisory one — a diagnosis (F3) included —
+//! simply ends, and whoever waited for it concludes (U11).
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -51,7 +52,7 @@ use crate::conductor::store::{
     ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, PendingInvocation,
     QueuedRequest,
 };
-use crate::domain::{ConductorOutcome, EventData, ExecutionId};
+use crate::domain::{ConductorOutcome, ConductorTrigger, EventData, ExecutionId};
 use crate::engine::Engine;
 use crate::persistence::Result;
 
@@ -609,7 +610,7 @@ impl ConductorActor {
         let owned = invocation.clone();
         let task = tokio::spawn(async move { invoker.invoke(&owned).await });
 
-        let advisory = !invocation.request.trigger.is_automatic();
+        let advisory = invocation.request.trigger.is_advisory();
         if advisory {
             self.advisory.register(
                 &self.execution_id,
@@ -660,8 +661,12 @@ impl ConductorActor {
         let mut next = inner.state.clone();
         next.queue
             .retain(|queued| queued.request_id != invocation.request.request_id);
-        let keeps_marker =
-            invocation.request.trigger.is_automatic() && *outcome == InvocationOutcome::Interrupted;
+        // Only the label rescue's marker outlives an interruption: the pass
+        // that carries the rescue on reads it (U10). A diagnosis (F3) is
+        // concluded by whoever waited for it, and owed again after a restart
+        // from the execution's own record (U11).
+        let keeps_marker = invocation.request.trigger == ConductorTrigger::OutputRescue
+            && *outcome == InvocationOutcome::Interrupted;
         if !keeps_marker {
             next.pending = None;
         }

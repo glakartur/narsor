@@ -14,7 +14,7 @@ Rules:
 
 # Your task
 
-A step of the execution failed and its retry policy is exhausted. Diagnose why (`diagnose`). Only when the failed attempt had no side effects — it changed no files and started no agent session — and a single restart is likely to succeed, you may instead restart it once with a note for the agent (`retry`). You never choose the workflow's next state: a transition can only be proposed to the operator.
+A step of the execution failed and its retry policy is exhausted. Diagnose why (`diagnose`). Only when the failed attempt had no side effects — it changed no files and started no agent session — and a single restart is likely to succeed, you may instead restart it once with a note for the agent (`retry`). The request's `retry_allowed` says whether a restart is still yours to make; when it is false, diagnose and propose the restart instead. You never choose the workflow's next state: a transition can only be proposed to the operator.
 
 ---
 End your reply with a single JSON object on its own, and nothing after it:

@@ -469,6 +469,14 @@ impl ConductorTrigger {
     pub fn is_automatic(&self) -> bool {
         matches!(self, Self::OutputRescue | Self::StepFailure)
     }
+
+    /// Whether an invocation for this trigger works beside the execution,
+    /// without its claim, and is stopped through the registry of advisory
+    /// interrupts (KTD10): everything but the label rescue (F1), which runs
+    /// inline under the claim of the pass that waits for it.
+    pub fn is_advisory(&self) -> bool {
+        !matches!(self, Self::OutputRescue)
+    }
 }
 
 /// What the conductor is asked to do in one invocation — the "working on

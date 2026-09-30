@@ -75,8 +75,9 @@ conversation shows it, with every value the label needs; otherwise escalate."
             "A step of the execution failed and its retry policy is exhausted. Diagnose why \
 (`diagnose`). Only when the failed attempt had no side effects — it changed no files and started \
 no agent session — and a single restart is likely to succeed, you may instead restart it once \
-with a note for the agent (`retry`). You never choose the workflow's next state: a transition \
-can only be proposed to the operator."
+with a note for the agent (`retry`). The request's `retry_allowed` says whether a restart is \
+still yours to make; when it is false, diagnose and propose the restart instead. You never choose \
+the workflow's next state: a transition can only be proposed to the operator."
         }
         ConductorPurpose::ReplyToChat => {
             "Answer the operator's message (`reply`). When your answer suggests an action on \

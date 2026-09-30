@@ -73,7 +73,7 @@ use crate::domain::{AnsweredBy, Event, EventData, ExecutionStatus, InputCloseRea
 use crate::engine::actions::human;
 use crate::engine::{
     build_timeline, record_manual_transition, terminal_status, Engine, EngineError,
-    HumanInputDelivery, PendingHumanInput, Timeline,
+    HumanInputDelivery, PendingHumanInput, Recovery, Timeline,
 };
 use crate::persistence::{
     ConversationSource, DefaultHarnessSelector, ExecutionStore, HarnessSelectionError,
@@ -366,7 +366,9 @@ impl From<EngineError> for ApiError {
         match error {
             EngineError::AlreadyRunning { .. }
             | EngineError::NotRunnable { .. }
-            | EngineError::AwaitingHumanInput { .. } => ApiError::Conflict(error.to_string()),
+            | EngineError::AwaitingHumanInput { .. }
+            // Somebody acted on the failure first (KTD9).
+            | EngineError::StaleEpisode { .. } => ApiError::Conflict(error.to_string()),
             // Too late: the request was answered or closed meanwhile (KTD9).
             EngineError::HumanInput(ref human) if human.is_stale() => {
                 ApiError::Conflict(error.to_string())
@@ -722,9 +724,14 @@ async fn post_recover(
     let execution = state.store.load_execution(&execution_id)?;
     let definition = load_definition_for(&state, &execution)?;
 
-    let handle = state
-        .engine
-        .try_begin_recover(&execution_id, request.comment)?;
+    let handle = state.engine.try_begin_recover_with(
+        &execution_id,
+        Recovery {
+            comment: request.comment,
+            episode: request.episode,
+            conductor_retry: false,
+        },
+    )?;
     spawn_active(&state, execution_id.clone(), async move {
         let _ = handle.run_to_completion(&definition).await;
     });
@@ -1055,10 +1062,14 @@ fn build_summary(
     } else {
         None
     };
-    summary.problem = summary
-        .pending_input
-        .as_ref()
-        .and_then(ActiveProblem::of_pending);
+    summary.problem = match &summary.pending_input {
+        Some(pending) => ActiveProblem::of_pending(pending),
+        // A failed step stays `Failed` (KTD4): its problem is the
+        // conductor's report, while the execution is still failed on it.
+        None => crate::conductor::active_failure_problem(store, execution)
+            .as_ref()
+            .map(ActiveProblem::of_failure),
+    };
     Ok(summary)
 }
 

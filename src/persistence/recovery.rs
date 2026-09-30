@@ -450,7 +450,10 @@ fn unfinished_action(events: &[crate::domain::Event]) -> Option<(String, String)
 /// live execution behind them.
 ///
 /// A workspace is orphaned when the store holds no execution of that id, or
-/// holds one that has finished. Removal goes through the provisioner, so a
+/// holds one that has finished — except a `Failed` one stopped on a step
+/// failure the conductor took up (F3): it is being diagnosed, or waits for
+/// the operator with a diagnosis whose proposals — a retry above all — need
+/// the workspace. Removal goes through the provisioner, so a
 /// repository with uncommitted or unpushed work is kept and reported as
 /// [`CleanupOutcome::Blocked`] instead: losing an agent's work costs more than
 /// the disk space.
@@ -467,7 +470,7 @@ pub fn sweep_orphaned_workspaces(
             false => OrphanReason::NoExecution,
             true => {
                 let execution = store.load_execution(&execution_id)?;
-                if !execution.is_terminal() {
+                if !execution.is_terminal() || awaits_conductor(&execution) {
                     continue;
                 }
                 OrphanReason::ExecutionFinished {
@@ -493,6 +496,12 @@ pub fn sweep_orphaned_workspaces(
 
     orphans.sort_by(|left, right| left.execution_id.cmp(&right.execution_id));
     Ok(orphans)
+}
+
+/// Whether `execution` is failed on a step failure the conductor took up —
+/// its record says so, and an unreadable one counts as a yes.
+fn awaits_conductor(execution: &crate::domain::WorkflowExecution) -> bool {
+    !matches!(crate::engine::step_failure(execution), Ok(None))
 }
 
 /// The execution ids that have a workspace directory, in no particular order.

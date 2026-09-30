@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::conductor::{
-    ChatEntry, ConductorState, PendingInvocation, QueuedRequest, SavedDecision,
+    ChatEntry, ConductorState, FailureReport, PendingInvocation, QueuedRequest, SavedDecision,
 };
 use crate::domain::{ExecutionStatus, ProblemKind, WorkflowExecution};
 use crate::engine::{InputContinuation, PendingHumanInput};
@@ -97,6 +97,12 @@ pub struct AcceptedResponse {
 pub struct RecoveryRequest {
     #[serde(default)]
     pub comment: Option<String>,
+    /// The key of the step failure the recovery answers (KTD9), as the
+    /// execution's [`ActiveProblem::episode`] names it: once the execution is
+    /// no longer failed on it, the recovery is refused with `409`. Without
+    /// it, whatever the execution is stopped on is recovered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode: Option<String>,
 }
 
 /// A one-shot instruction appended to the next agent attempt.
@@ -189,12 +195,13 @@ pub struct ExecutionSummary {
     /// (conductor plan U7) — what a client needs to count and colour it
     /// without reading the event log.
     ///
-    /// Filled today for a problem input ([`ProblemKind::Output`], derived
-    /// from `pending_input`). A [`ProblemKind::Failure`] leaves the execution
-    /// `Failed` with no pending input; the record that says it is still
-    /// active arrives with the conductor's failure handling (U11), which
-    /// fills this field from it. Until then a client learns of one only from
-    /// the live `ProblemRaised` event.
+    /// For a problem input ([`ProblemKind::Output`]) it is derived from
+    /// `pending_input`. A [`ProblemKind::Failure`] leaves the execution
+    /// `Failed` with no pending input (KTD4): it is the conductor's report
+    /// of the failure the execution is still failed on — its diagnosis, or
+    /// the raw error when it could not make one — with the failure's key as
+    /// `episode`, the key a recovery answering it names. A failure the
+    /// conductor is still diagnosing, or retried by itself, is no problem.
     #[serde(default)]
     pub problem: Option<ActiveProblem>,
 }
@@ -212,6 +219,15 @@ pub struct ActiveProblem {
 }
 
 impl ActiveProblem {
+    /// The problem the conductor's report of a failed step stands for (F3).
+    pub fn of_failure(report: &FailureReport) -> Self {
+        Self {
+            kind: ProblemKind::Failure,
+            reason: report.reason.clone(),
+            episode: Some(report.key.clone()),
+        }
+    }
+
     /// The problem a pending input stands for, if it is a problem input.
     pub fn of_pending(pending: &PendingHumanInput) -> Option<Self> {
         if pending.continuation != InputContinuation::ResolveOutput {
@@ -288,6 +304,11 @@ pub struct ConductorStateResponse {
     /// Decisions saved but not yet applied (KTD13).
     #[serde(default)]
     pub unapplied_decisions: Vec<SavedDecision>,
+    /// What the conductor concluded about the latest failed step it took up
+    /// (F3) — a problem only while the execution is still failed on it; see
+    /// [`ExecutionSummary::problem`].
+    #[serde(default)]
+    pub failure: Option<FailureReport>,
 }
 
 impl ConductorStateResponse {
@@ -300,6 +321,7 @@ impl ConductorStateResponse {
             invocation_attempts: state.invocation_attempts,
             used_retries: state.used_retries,
             unapplied_decisions: state.unapplied_decisions,
+            failure: state.failure,
         }
     }
 }

@@ -54,6 +54,11 @@
 //! (F1, KTD10): it chooses the output, asks the agent once more in its own
 //! words, or makes the step a problem for the operator ([`rescue`]).
 //!
+//! A step whose action failed for good — its `retry_policy` ran out — fails
+//! the execution as it always did, and the same save records the failure
+//! for the conductor, which diagnoses it beside the failed execution and may
+//! restart it once through an ordinary recovery (F3, [`failure`]).
+//!
 //! # Terminal states say how they end
 //!
 //! Whether reaching a terminal means success or failure is **declared**, not
@@ -100,7 +105,12 @@ use crate::engine::retry::RetrySchedule;
 use crate::persistence::{read_json, DefaultHarnessSelector, ExecutionStore, PersistenceError};
 use crate::workflow::{action_context_references, TemplateScope};
 
+mod failure;
 mod rescue;
+
+pub use failure::{
+    step_failure, Recovery, StepFailure, METADATA_CONDUCTOR_RETRY_KEY, METADATA_STEP_FAILURE_KEY,
+};
 
 /// How many events the in-process broadcast channel buffers per receiver.
 ///
@@ -553,6 +563,29 @@ pub enum EngineError {
         /// The execution a second driver tried to advance.
         execution_id: ExecutionId,
     },
+
+    /// A request named a step failure the execution is no longer stopped
+    /// on (KTD9): somebody acted on it first.
+    #[error(
+        "execution '{execution_id}' is no longer failed on '{expected}'{}",
+        failed_now(.current)
+    )]
+    StaleEpisode {
+        /// The execution that was addressed.
+        execution_id: ExecutionId,
+        /// The failure the request named.
+        expected: String,
+        /// The failure it is stopped on now, if any.
+        current: Option<String>,
+    },
+}
+
+/// The tail of [`EngineError::StaleEpisode`]'s message.
+fn failed_now(current: &Option<String>) -> String {
+    match current {
+        Some(current) => format!(" (it is failed on '{current}')"),
+        None => String::new(),
+    }
 }
 
 /// Whether the loop keeps stepping.
@@ -646,6 +679,9 @@ struct AttemptFailure {
     message: String,
     /// Whether trying again could plausibly give a different answer.
     retriable: bool,
+    /// Whether the attempt cannot have had a side effect (KTD14): nothing
+    /// ran, or what ran left no trace of having acted.
+    side_effect_free: bool,
 }
 
 impl AttemptFailure {
@@ -655,16 +691,25 @@ impl AttemptFailure {
         Self {
             message: message.into(),
             retriable: true,
+            side_effect_free: false,
         }
     }
 
     /// A failure that repeating cannot fix: a broken template, an unknown
-    /// action type, a label the state does not declare.
+    /// action type, a label the state does not declare. Every one of them
+    /// stops the attempt before its action runs.
     fn permanent(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             retriable: false,
+            side_effect_free: true,
         }
+    }
+
+    /// The same failure, known to have had no side effect when `clean`.
+    fn side_effect_free_if(mut self, clean: bool) -> Self {
+        self.side_effect_free = clean;
+        self
     }
 }
 
@@ -1142,16 +1187,30 @@ impl Engine {
     /// The synchronous half of an explicit operator recovery. Recovery is
     /// deliberately limited to terminal failure or interruption states, so it
     /// cannot turn daemon startup into an automatic replay.
+    ///
+    /// A recovery naming a step failure's key is refused once the execution
+    /// is no longer failed on it (KTD9); the failure record goes in the same
+    /// save as the status change, and so does the conductor's retry
+    /// ([`Recovery`]).
     fn prepare_recover(
         &self,
         execution_id: &str,
-        comment: Option<String>,
+        recovery: Recovery,
     ) -> Result<WorkflowExecution, EngineError> {
         let mut execution = self.store.load_execution(execution_id)?;
         match execution.status {
             ExecutionStatus::Failed | ExecutionStatus::Unknown => {}
+            _ if recovery.episode.is_some() => {
+                return Err(EngineError::StaleEpisode {
+                    execution_id: execution_id.to_string(),
+                    expected: recovery.episode.unwrap_or_default(),
+                    current: None,
+                })
+            }
             _ => return Err(self.not_runnable(&execution, "recovered")),
         }
+        self.recover_step_failure(&mut execution, &recovery)?;
+        let comment = recovery.comment;
 
         // A recovery starts the state's action afresh. A rejected output left
         // behind by an interrupted reprompt must not turn it into another one,
@@ -1222,8 +1281,22 @@ impl Engine {
         execution_id: &str,
         comment: Option<String>,
     ) -> Result<RunHandle, EngineError> {
+        self.try_begin_recover_with(execution_id, Recovery::with_comment(comment))
+    }
+
+    /// [`Engine::try_begin_recover`] as `recovery` describes it: with the key
+    /// of the step failure it answers, and for the conductor's one retry.
+    ///
+    /// A stale key is [`EngineError::StaleEpisode`], and — like
+    /// [`EngineError::AlreadyRunning`] — is not recorded as an `Error`
+    /// event: whoever acted first is what the log shows.
+    pub fn try_begin_recover_with(
+        self: &Arc<Self>,
+        execution_id: &str,
+        recovery: Recovery,
+    ) -> Result<RunHandle, EngineError> {
         let claim = self.claim_active_run(execution_id)?;
-        match self.prepare_recover(execution_id, comment) {
+        match self.prepare_recover(execution_id, recovery) {
             Ok(execution) => Ok(RunHandle {
                 engine: Arc::clone(self),
                 execution_id: execution_id.to_string(),
@@ -1231,7 +1304,9 @@ impl Engine {
                 state: HandleState::Ready(execution),
             }),
             Err(error) => {
-                self.note_engine_error(execution_id, &error);
+                if !matches!(error, EngineError::StaleEpisode { .. }) {
+                    self.note_engine_error(execution_id, &error);
+                }
                 Err(error)
             }
         }
@@ -1576,6 +1651,11 @@ impl Engine {
             .timeout_for(kind, state, definition)
             .map(Duration::from_secs);
 
+        // The conductor's retry is one attempt, never a new round of the
+        // policy (KTD14).
+        let single_attempt = failure::conductor_retry_of(execution, &state.id)?.is_some();
+        let mut side_effect_free = true;
+
         let mut attempt = 1_u32;
         let mut action_execution_id = Uuid::new_v4().to_string();
 
@@ -1629,8 +1709,14 @@ impl Engine {
                 Err(failure) => failure,
             };
 
-            if !failure.retriable || !schedule.permits_another(attempt) {
-                self.fail_action(execution, &action_execution_id, failure.message)?;
+            side_effect_free &= failure.side_effect_free;
+            if !failure.retriable || single_attempt || !schedule.permits_another(attempt) {
+                self.fail_attempts(
+                    execution,
+                    &action_execution_id,
+                    failure.message,
+                    side_effect_free,
+                )?;
                 return Ok(ActionUpshot::Stopped);
             }
 
@@ -1744,7 +1830,15 @@ impl Engine {
 
             Err(error) => match OutputRejection::from_error(state, action_execution_id, &error) {
                 Some(rejection) => Ok(AttemptOutcome::OutputRejected(rejection)),
-                None => Err(AttemptFailure::retriable(error.message)),
+                None => {
+                    let clean = self.attempt_left_no_trace(
+                        kind,
+                        &execution.id,
+                        action_execution_id,
+                        &error,
+                    );
+                    Err(AttemptFailure::retriable(error.message).side_effect_free_if(clean))
+                }
             },
         }
     }
@@ -2324,8 +2418,10 @@ impl Engine {
         });
         set_last_agent_step(execution, record.as_ref())?;
         self.clear_pending_step(execution);
-        // A rescued step is over once its transition is taken (F1).
+        // A rescued step is over once its transition is taken (F1), and so
+        // is the conductor's retry of a failed one (F3).
         clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
+        clear_engine_metadata(execution, METADATA_CONDUCTOR_RETRY_KEY);
         self.store.save_execution(execution)?;
 
         self.emit(
@@ -2419,16 +2515,33 @@ impl Engine {
         execution.status = status;
         execution.completed_at = Some(Utc::now());
         self.clear_pending_step(execution);
+        clear_engine_metadata(execution, METADATA_CONDUCTOR_RETRY_KEY);
         self.store.save_execution(execution)?;
         Ok(())
     }
 
     /// Records a failed action and the failed execution that follows from it.
+    ///
+    /// For a failure met after the action ran — a label, a decision — so it
+    /// counts as one that may have had side effects.
     fn fail_action(
         &self,
         execution: &mut WorkflowExecution,
         action_execution_id: &str,
         message: impl Into<String>,
+    ) -> Result<(), EngineError> {
+        self.fail_attempts(execution, action_execution_id, message, false)
+    }
+
+    /// Records the failed action whose last attempt was `action_execution_id`
+    /// and the failed execution that follows; `side_effect_free` says whether
+    /// none of its attempts can have acted (KTD14).
+    fn fail_attempts(
+        &self,
+        execution: &mut WorkflowExecution,
+        action_execution_id: &str,
+        message: impl Into<String>,
+        side_effect_free: bool,
     ) -> Result<(), EngineError> {
         let message = message.into();
         self.emit(
@@ -2438,7 +2551,12 @@ impl Engine {
                 error: message.clone(),
             },
         )?;
-        self.fail_execution(execution, message)
+        self.fail_step(
+            execution,
+            Some(action_execution_id),
+            message,
+            side_effect_free,
+        )
     }
 
     /// Ends the execution as `Failed`, with no transition taken.
@@ -2447,13 +2565,37 @@ impl Engine {
         execution: &mut WorkflowExecution,
         error: String,
     ) -> Result<(), EngineError> {
-        self.emit(&execution.id, EventData::WorkflowFailed { error })?;
+        self.fail_step(execution, None, error, false)
+    }
+
+    /// Ends the execution as `Failed` on its step's attempt `failed_attempt`,
+    /// and hands the failure to the conductor (F3) — in the same save that
+    /// makes it `Failed`, the record the conductor reads, then the trigger
+    /// once it is durable.
+    fn fail_step(
+        &self,
+        execution: &mut WorkflowExecution,
+        failed_attempt: Option<&str>,
+        error: String,
+        side_effect_free: bool,
+    ) -> Result<(), EngineError> {
+        self.emit(
+            &execution.id,
+            EventData::WorkflowFailed {
+                error: error.clone(),
+            },
+        )?;
         execution.status = ExecutionStatus::Failed;
         execution.completed_at = Some(Utc::now());
+        let conductor =
+            self.record_step_failure(execution, failed_attempt, &error, side_effect_free)?;
         self.clear_pending_step(execution);
         clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
         clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
         self.store.save_execution(execution)?;
+        if let Some(conductor) = conductor {
+            conductor.step_failed(&execution.id);
+        }
         Ok(())
     }
 
@@ -3219,9 +3361,11 @@ pub fn record_manual_transition(
         None
     };
     // A manual transition abandons a rejected output still owed a reprompt,
-    // and a rescue the conductor had not finished.
+    // a rescue the conductor had not finished, and a failure it diagnoses.
     clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
     clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
+    clear_engine_metadata(execution, METADATA_STEP_FAILURE_KEY);
+    clear_engine_metadata(execution, METADATA_CONDUCTOR_RETRY_KEY);
     set_last_agent_step(execution, record.as_ref())
 }
 

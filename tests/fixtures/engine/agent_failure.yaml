@@ -1,0 +1,29 @@
+name: agent-failure
+version: 1
+description: >
+  One agent step under a policy of two attempts, run on the fake harness.
+  When both attempts fail the execution fails, and the conductor diagnoses
+  the step (F3).
+
+globals:
+  retry_policy:
+    max_attempts: 2
+    backoff: 0s
+
+states:
+  work:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: Implement the feature.
+    outputs:
+      - label: implemented
+        description: The feature is implemented.
+    transitions:
+      implemented: done
+
+  done:
+    description: Done.
+
+terminal_states:
+  done: completed

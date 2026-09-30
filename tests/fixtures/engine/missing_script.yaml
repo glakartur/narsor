@@ -1,0 +1,27 @@
+name: missing-script
+version: 1
+description: >
+  A script state whose command does not exist, under a policy of two
+  attempts: its process never starts, so no attempt can have had a side
+  effect.
+
+globals:
+  retry_policy:
+    max_attempts: 2
+    backoff: 0s
+
+states:
+  build:
+    action:
+      type: script
+      command: ./no_such_script.sh
+    outputs:
+      - success
+    transitions:
+      success: completed
+
+  completed:
+    description: Unreachable in practice.
+
+terminal_states:
+  - completed

@@ -229,7 +229,33 @@ impl ApiClient {
         comment: Option<String>,
     ) -> Result<AcceptedResponse, ClientError> {
         let url = format!("{}/executions/{execution_id}/recover", self.base_url);
-        self.post_json(&url, &RecoveryRequest { comment }).await
+        self.post_json(
+            &url,
+            &RecoveryRequest {
+                comment,
+                episode: None,
+            },
+        )
+        .await
+    }
+
+    /// Recovers an execution from the step failure `episode` names (KTD9):
+    /// refused with `409` once it is no longer failed on it.
+    pub async fn recover_failure(
+        &self,
+        execution_id: &str,
+        episode: &str,
+        comment: Option<String>,
+    ) -> Result<AcceptedResponse, ClientError> {
+        let url = format!("{}/executions/{execution_id}/recover", self.base_url);
+        self.post_json(
+            &url,
+            &RecoveryRequest {
+                comment,
+                episode: Some(episode.to_string()),
+            },
+        )
+        .await
     }
 
     /// Stores a one-shot operator instruction for the next agent attempt.

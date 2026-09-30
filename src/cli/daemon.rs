@@ -15,9 +15,10 @@
 //! [`continue_at_startup`] carries on what recovery found safely stopped
 //! (D55's restart matrix): a reprompt a restart cut short between the
 //! rejection and its start gets a new pass, so does a label rescue (F1) the
-//! restart cut short, and the conductor serves its unanswered chat messages
-//! again. It is the daemon's only replay, and it only ever continues what
-//! cannot repeat a side effect.
+//! restart cut short, the conductor serves its unanswered chat messages
+//! again, and diagnoses again a failed step (F3) it had not concluded about.
+//! It is the daemon's only replay, and it only ever continues what cannot
+//! repeat a side effect.
 //!
 //! # Shutdown during the conductor's label rescue
 //!
@@ -42,7 +43,9 @@
 //! anyway, and whatever was interrupted mid-action is exactly what
 //! `persistence::recovery::recover` is for, at the next start (AE6).
 
-use std::path::Path;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -50,9 +53,9 @@ use chrono::Utc;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::api::{ActiveTasks, ApiServices};
-use crate::conductor::{ConductorRegistry, HarnessInvoker};
+use crate::conductor::{ConductorRegistry, HarnessInvoker, PassLauncher};
 use crate::config::Resolved;
-use crate::domain::ExecutionStatus;
+use crate::domain::{ExecutionStatus, WorkflowDefinition, WorkflowExecution};
 use crate::engine::{owed_output_rescue, owed_reprompt, Engine, HarnessRegistry};
 use crate::persistence::{
     DaemonInfo, DefaultHarnessSelector, ExecutionStore, ReconciliationOutcome, RecoveryReport,
@@ -146,10 +149,17 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     .with_agent_timeout(agent_timeout_secs);
     // Held here for the daemon's whole life: the engine only holds it
     // weakly, and hands a step without a usable output label to it (F1).
-    let conductor = Arc::new(ConductorRegistry::new(
-        Arc::clone(&engine),
-        Arc::new(invoker),
-    ));
+    // A pass the conductor starts — its one retry of a failed step (F3) —
+    // is driven like one the API starts, and interrupted the same way.
+    let conductor = Arc::new(
+        ConductorRegistry::new(Arc::clone(&engine), Arc::new(invoker)).with_pass_launcher(
+            Arc::new(DaemonPasses {
+                store: store.clone(),
+                catalog_dir: config.catalog_dir().to_path_buf(),
+                active_tasks: active_tasks.clone(),
+            }),
+        ),
+    );
     engine.attach_conductor(&conductor);
     if let Some(recovery) = &recovery {
         continue_at_startup(
@@ -274,9 +284,12 @@ fn recover_at_startup(store: &ExecutionStore) -> Option<RecoveryReport> {
 ///   advisory invocations are served again, and what a rescue left for an
 ///   execution that no longer owes one is discarded
 ///   ([`ConductorRegistry::restore_at_startup`]).
+/// * `Failed` with a step failure (F3) the conductor had not concluded
+///   about: it is diagnosed again — R24's one repeat when the restart cut
+///   the invocation short ([`ConductorRegistry::restore_failures_at_startup`]).
 pub fn continue_at_startup(
     engine: &Arc<Engine>,
-    conductor: &ConductorRegistry,
+    conductor: &Arc<ConductorRegistry>,
     active_tasks: &ActiveTasks,
     catalog_dir: &Path,
     recovery: &RecoveryReport,
@@ -339,6 +352,48 @@ pub fn continue_at_startup(
         Err(error) => {
             tracing::warn!(error = %error, "daemon: the conductor could not be restored");
         }
+    }
+
+    match conductor.restore_failures_at_startup() {
+        Ok(diagnosed) => {
+            for execution_id in &diagnosed {
+                tracing::info!(
+                    execution_id = %execution_id,
+                    "daemon: the conductor diagnoses again a failed step it had not concluded about"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "daemon: the conductor's failed-step diagnoses could not be restored"
+            );
+        }
+    }
+}
+
+/// The daemon's [`PassLauncher`]: a pass the conductor starts resolves its
+/// definition as the API does and runs in the registry of background
+/// passes, so `POST /executions/:id/interrupt` stops it like any other.
+struct DaemonPasses {
+    store: ExecutionStore,
+    catalog_dir: PathBuf,
+    active_tasks: ActiveTasks,
+}
+
+impl PassLauncher for DaemonPasses {
+    fn definition(
+        &self,
+        execution: &WorkflowExecution,
+    ) -> std::result::Result<WorkflowDefinition, String> {
+        crate::tasks::resolve_definition(&self.catalog_dir, self.store.paths(), execution)
+            .map_err(|error| error.to_string())?
+            .load()
+            .map_err(|error| error.to_string())
+    }
+
+    fn launch(&self, execution_id: &str, pass: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        self.active_tasks.spawn(execution_id.to_string(), pass);
     }
 }
 

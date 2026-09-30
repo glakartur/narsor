@@ -23,6 +23,8 @@
 //!   answered with a checked [`response`] (KTD6).
 //! * [`rescue`] — the conductor's half of the label rescue (F1): the inline
 //!   invocation, and its decisions saved before they are applied (KTD13).
+//! * [`failure`] — the conductor at a failed step (F3): the advisory
+//!   diagnosis, the one retry, the side-effect classification of attempts.
 //! * [`ConductorRegistry`] — the actors the daemon started, and the
 //!   interrupts of advisory invocations (KTD10).
 //!
@@ -35,10 +37,13 @@
 //! interrupted advisory invocation loses its marker and runs again. A label
 //! rescue (F1) is never run from here: the engine's pass that carries the
 //! step on invokes the conductor again (see [`rescue`]), and what a rescue
-//! left for an execution that no longer owes one is discarded. Step
-//! failures (F3) found on disk are reported, not run (U11).
+//! left for an execution that no longer owes one is discarded. A step
+//! failure (F3) still owed its diagnosis is diagnosed again by
+//! [`ConductorRegistry::restore_failures_at_startup`], from the execution's
+//! own record rather than from anything parked here.
 
 pub mod actor;
+pub mod failure;
 pub mod invoke;
 pub mod prompt;
 pub mod rescue;
@@ -47,13 +52,14 @@ pub mod snapshot;
 pub mod store;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 pub use actor::{
     AdvisoryInterrupts, ConductorActor, ConductorAnswer, ConductorInvoker, Invocation,
     InvocationOutcome, InvocationQueue, UnavailableInvoker, CONDUCTOR_UNAVAILABLE,
     MAX_AUTOMATIC_ATTEMPTS,
 };
+pub use failure::{active_failure_problem, agent_attempt_left_traces, PassLauncher};
 pub use invoke::{ConductorAccess, HarnessInvoker, DEFAULT_CONDUCTOR_TIMEOUT};
 pub use response::{
     allowed_decisions, proposals_allowed, ConductorResponse, Decision, DecisionKind, ProposalKind,
@@ -62,7 +68,8 @@ pub use response::{
 pub use snapshot::{Snapshot, SnapshotBudget, SnapshotInput};
 pub use store::{
     Annotation, ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore,
-    PendingInvocation, QueuedRequest, SavedDecision, CONDUCTOR_STATE_VERSION,
+    FailureOutcome, FailureReport, PendingInvocation, QueuedRequest, SavedDecision,
+    CONDUCTOR_STATE_VERSION,
 };
 
 use crate::domain::{ConductorTrigger, ExecutionId, ExecutionStatus};
@@ -76,6 +83,8 @@ pub struct ConductorRegistry {
     invoker: Arc<dyn ConductorInvoker>,
     advisory: Arc<AdvisoryInterrupts>,
     actors: Mutex<HashMap<ExecutionId, Arc<ConductorActor>>>,
+    launcher: OnceLock<Arc<dyn PassLauncher>>,
+    diagnoses: failure::Diagnoses,
 }
 
 /// What [`ConductorRegistry::restore_at_startup`] found and did.
@@ -99,7 +108,17 @@ impl ConductorRegistry {
             invoker,
             advisory: Arc::new(AdvisoryInterrupts::default()),
             actors: Mutex::new(HashMap::new()),
+            launcher: OnceLock::new(),
+            diagnoses: failure::Diagnoses::default(),
         }
+    }
+
+    /// Returns the registry able to start a pass of its own — the one retry
+    /// of a failed step (F3, R21). Without a launcher, a retry the
+    /// conductor decides on is only proposed.
+    pub fn with_pass_launcher(self, launcher: Arc<dyn PassLauncher>) -> Self {
+        let _ = self.launcher.set(launcher);
+        self
     }
 
     /// The actor of `execution_id`, opened (and its queue rebuilt from
