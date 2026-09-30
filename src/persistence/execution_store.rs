@@ -231,6 +231,12 @@ impl ExecutionStore {
             removed.extend(cleanup_orphaned_temp_files(
                 &self.paths.conversations_dir(&execution_id),
             )?);
+            removed.extend(cleanup_orphaned_temp_files(
+                &self.paths.conductor_dir(&execution_id),
+            )?);
+            removed.extend(cleanup_orphaned_temp_files(
+                &self.paths.conductor_annotations_dir(&execution_id),
+            )?);
         }
         Ok(removed)
     }

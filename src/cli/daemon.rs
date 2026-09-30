@@ -9,6 +9,15 @@
 //! for reconciling whatever a previous, differently-killed holder left
 //! behind, and after this unit that is always the daemon, never the TUI.
 //!
+//! # The startup hook
+//!
+//! Right after recovery, and before the API accepts anything,
+//! [`continue_at_startup`] carries on what recovery found safely stopped
+//! (D55's restart matrix): a reprompt a restart cut short between the
+//! rejection and its start gets a new pass, and the conductor serves its
+//! unanswered chat messages again. It is the daemon's only replay, and it
+//! only ever continues what cannot repeat a side effect.
+//!
 //! # Why shutdown is a poll, not a wait
 //!
 //! `Engine::pause` (D34) only ever takes effect at the next step boundary —
@@ -27,9 +36,14 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use tokio::signal::unix::{signal, SignalKind};
 
+use crate::api::{ActiveTasks, ApiServices};
+use crate::conductor::{ConductorRegistry, UnavailableInvoker};
 use crate::config::Resolved;
-use crate::engine::{Engine, HarnessRegistry};
-use crate::persistence::{DaemonInfo, DefaultHarnessSelector, ExecutionStore};
+use crate::domain::ExecutionStatus;
+use crate::engine::{owed_reprompt, Engine, HarnessRegistry};
+use crate::persistence::{
+    DaemonInfo, DefaultHarnessSelector, ExecutionStore, ReconciliationOutcome, RecoveryReport,
+};
 
 use super::commands::{CliError, Result};
 
@@ -84,7 +98,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     let paths = config.state_paths();
     let store = ExecutionStore::new(config.state_dir());
 
-    recover_at_startup(&store);
+    let recovery = recover_at_startup(&store);
 
     let defaults = config.agent_defaults();
     let supported = HarnessRegistry::defaults()
@@ -104,13 +118,33 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
             .with_agent_defaults_and_selector(defaults, Arc::clone(&selector)),
     );
 
+    // One registry of background passes for the API and the startup hook,
+    // so a pass the hook spawns can be interrupted like any other.
+    let active_tasks = ActiveTasks::new();
+    // The conductor has no harness-backed invocation yet (U9): until then
+    // every invocation fails, which a chat message answers with an error
+    // entry (KTD12).
+    let conductor = ConductorRegistry::new(Arc::clone(&engine), Arc::new(UnavailableInvoker));
+    if let Some(recovery) = &recovery {
+        continue_at_startup(
+            &engine,
+            &conductor,
+            &active_tasks,
+            config.catalog_dir(),
+            recovery,
+        );
+    }
+
     // The engine and API share one selector, so a confirmed setting affects
     // later harnessless attempts without restarting the daemon.
-    let api_handle = crate::api::start_with_harness_selector(
+    let api_handle = crate::api::start_with_services(
         Arc::clone(&engine),
         config.catalog_dir().to_path_buf(),
         config.work_dir().to_path_buf(),
-        Some(selector),
+        ApiServices {
+            harness_selector: Some(selector),
+            active_tasks,
+        },
     )
     .await
     .map_err(|error| {
@@ -176,8 +210,9 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
 
 /// Reconciles every stored execution against its event log (D23) — moved
 /// here, verbatim in behaviour, from `tui::mod::run`. Best-effort: a failure
-/// here must not stop the daemon from starting.
-fn recover_at_startup(store: &ExecutionStore) {
+/// here must not stop the daemon from starting, and leaves no report for
+/// the startup hook to act on.
+fn recover_at_startup(store: &ExecutionStore) -> Option<RecoveryReport> {
     match crate::persistence::recovery::recover(store) {
         Ok(report) => {
             for reconciliation in report.needing_attention() {
@@ -187,11 +222,136 @@ fn recover_at_startup(store: &ExecutionStore) {
                      interrupted action; it was marked Unknown and needs attention"
                 );
             }
+            Some(report)
         }
         Err(error) => {
             tracing::warn!(error = %error, "daemon: startup recovery sweep failed");
+            None
         }
     }
+}
+
+/// The daemon's startup hook (D55): carries on, after `recover`, what the
+/// restart matrix says may be carried on. Best-effort per execution, like
+/// recovery itself.
+///
+/// * `Running`, consistent, with a rejected output still owed its reprompt
+///   (KTD7): the attempt is closed, so a new pass — spawned exactly as
+///   `POST /executions/:id/resume` spawns one — asks the agent again instead
+///   of replaying anything.
+/// * `Running` with an interrupted automatic conductor invocation: left
+///   `Running` and reported; carrying it on is the conductor's F1 (U10).
+/// * The conductor's own rows: unanswered chat messages and interrupted
+///   advisory invocations are served again
+///   ([`ConductorRegistry::restore_at_startup`]).
+pub fn continue_at_startup(
+    engine: &Arc<Engine>,
+    conductor: &ConductorRegistry,
+    active_tasks: &ActiveTasks,
+    catalog_dir: &Path,
+    recovery: &RecoveryReport,
+) {
+    for reconciliation in &recovery.reconciled {
+        if reconciliation.status != ExecutionStatus::Running {
+            continue;
+        }
+        match &reconciliation.outcome {
+            ReconciliationOutcome::Consistent => {
+                continue_owed_reprompt(
+                    engine,
+                    active_tasks,
+                    catalog_dir,
+                    &reconciliation.execution_id,
+                );
+            }
+            ReconciliationOutcome::ConductorInterrupted { trigger, .. } => {
+                tracing::warn!(
+                    execution_id = %reconciliation.execution_id,
+                    trigger = trigger.name(),
+                    "daemon: the conductor was interrupted while it worked on this \
+                     execution; it stays running and waits for the conductor"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    match conductor.restore_at_startup() {
+        Ok(restore) => {
+            for (execution_id, requests) in &restore.requeued {
+                tracing::info!(
+                    execution_id = %execution_id,
+                    requests,
+                    "daemon: the conductor resumes its queue after the restart"
+                );
+            }
+            for (execution_id, requests, pending) in &restore.parked {
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    queued = requests.len(),
+                    interrupted = pending.is_some(),
+                    "daemon: automatic conductor requests were left from before the restart"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "daemon: the conductor could not be restored");
+        }
+    }
+}
+
+/// Spawns a pass for `execution_id` when it stopped between a rejected
+/// output and its reprompt, and logs what happened.
+fn continue_owed_reprompt(
+    engine: &Arc<Engine>,
+    active_tasks: &ActiveTasks,
+    catalog_dir: &Path,
+    execution_id: &str,
+) {
+    match spawn_owed_reprompt(engine, active_tasks, catalog_dir, execution_id) {
+        Ok(true) => tracing::info!(
+            execution_id,
+            "daemon: continuing a reprompt the restart interrupted"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            execution_id,
+            error = %error,
+            "daemon: could not continue a reprompt the restart interrupted"
+        ),
+    }
+}
+
+/// Whether `execution_id` owes a reprompt — and if it does, claims it and
+/// spawns its pass.
+fn spawn_owed_reprompt(
+    engine: &Arc<Engine>,
+    active_tasks: &ActiveTasks,
+    catalog_dir: &Path,
+    execution_id: &str,
+) -> std::result::Result<bool, String> {
+    let execution = engine
+        .store()
+        .load_execution(execution_id)
+        .map_err(|error| error.to_string())?;
+    if owed_reprompt(&execution)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let definition =
+        crate::tasks::resolve_definition(catalog_dir, engine.store().paths(), &execution)
+            .map_err(|error| error.to_string())?
+            .load()
+            .map_err(|error| error.to_string())?;
+    let handle = engine
+        .try_begin_resume(execution_id)
+        .map_err(|error| error.to_string())?;
+    active_tasks.spawn(execution_id.to_string(), async move {
+        let _ = handle.run_to_completion(&definition).await;
+    });
+    Ok(true)
 }
 
 fn cleanup_discovery_file(path: &Path) {

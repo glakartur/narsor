@@ -24,8 +24,8 @@ pub use decision::{
 };
 pub use retry::RetrySchedule;
 pub use runner::{
-    record_manual_transition, terminal_status, ActionKind, AgentDefaults, Engine, EngineError,
-    LastAgentStep, OutputRejection, PendingStep, RunHandle, EVENT_CHANNEL_CAPACITY,
+    owed_reprompt, record_manual_transition, terminal_status, ActionKind, AgentDefaults, Engine,
+    EngineError, LastAgentStep, OutputRejection, PendingStep, RunHandle, EVENT_CHANNEL_CAPACITY,
     METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY,
 };
 pub use timeline::{

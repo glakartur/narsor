@@ -772,6 +772,18 @@ impl Engine {
         self.events.subscribe()
     }
 
+    /// Appends an event to an execution's log and publishes it to the live
+    /// stream, exactly as the engine's own events are.
+    ///
+    /// For the daemon's other in-process writers of the log — the conductor
+    /// (D55) records its `Conductor*` events here. It never touches the
+    /// execution's `state.json`, which only the pass holding the claim
+    /// writes (KTD2), so it is safe to call whether or not a pass runs:
+    /// concurrent appends each get their own sequence number.
+    pub fn record_event(&self, execution_id: &str, data: EventData) -> Result<Event, EngineError> {
+        self.emit(execution_id, data)
+    }
+
     // -----------------------------------------------------------------------
     // Starting, running, pausing
     // -----------------------------------------------------------------------
@@ -2696,6 +2708,21 @@ fn stored_pending_step(
     })?;
 
     Ok((pending.state_id == state_id).then_some(pending))
+}
+
+/// The rejected agent output `execution` still owes a reprompt at its current
+/// state (KTD7), if any.
+///
+/// For the daemon's startup hook: an execution left `Running` with such a
+/// record stopped between the rejection and the reprompt, and a new pass
+/// picks the reprompt up rather than replaying the attempt.
+pub fn owed_reprompt(
+    execution: &WorkflowExecution,
+) -> Result<Option<OutputRejection>, EngineError> {
+    match execution.current_state.as_deref() {
+        Some(state_id) => stored_output_rejection(execution, state_id),
+        None => Ok(None),
+    }
 }
 
 /// The rejected agent output of `execution` still owed its reprompt, when it

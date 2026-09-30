@@ -67,17 +67,20 @@
 //! plan is explicit: the TUI must not start silently degraded. [`start`]
 //! returns an error the caller is expected to treat as fatal.
 
+mod active;
 mod client;
 mod discovery;
 pub mod dto;
 mod routes;
 
+pub use active::ActiveTasks;
 pub use client::{ApiClient, ClientError};
 pub use discovery::{ensure_daemon_running, DiscoveryError};
 pub use dto::{
-    AcceptedResponse, ActiveProblem, ExecutionListResponse, ExecutionSummary,
-    HarnessSelectionSnapshot, OperatorNoteRequest, RequestErrorResponse,
-    SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse, TransitionRequest,
+    AcceptedResponse, ActiveProblem, ConductorChatResponse, ConductorStateResponse,
+    ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot, OperatorNoteRequest,
+    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
+    TransitionRequest,
 };
 pub use routes::{ConversationEntryDto, ConversationResponse};
 
@@ -219,6 +222,39 @@ pub async fn start_with_harness_selector(
     work_dir: PathBuf,
     harness_selector: Option<Arc<DefaultHarnessSelector>>,
 ) -> Result<ApiHandle, ApiStartError> {
+    start_with_services(
+        engine,
+        catalog_dir,
+        work_dir,
+        ApiServices {
+            harness_selector,
+            active_tasks: ActiveTasks::new(),
+        },
+    )
+    .await
+}
+
+/// What the daemon shares with its API server beyond the engine.
+#[derive(Debug, Clone, Default)]
+pub struct ApiServices {
+    /// The live default-harness selector (D54).
+    pub harness_selector: Option<Arc<DefaultHarnessSelector>>,
+    /// The background passes, shared with the daemon's startup hook so a
+    /// pass it spawns can be interrupted through the API.
+    pub active_tasks: ActiveTasks,
+}
+
+/// Starts the API server with everything the daemon shares with it.
+pub async fn start_with_services(
+    engine: Arc<Engine>,
+    catalog_dir: PathBuf,
+    work_dir: PathBuf,
+    services: ApiServices,
+) -> Result<ApiHandle, ApiStartError> {
+    let ApiServices {
+        harness_selector,
+        active_tasks,
+    } = services;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(ApiStartError)?;
@@ -233,6 +269,7 @@ pub async fn start_with_harness_selector(
         catalog_dir,
         work_dir,
         harness_selector,
+        active_tasks,
     );
     let shutdown = Arc::new(Notify::new());
     let shutdown_wait = Arc::clone(&shutdown);

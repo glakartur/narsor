@@ -31,8 +31,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use narsor::domain::{EventData, ExecutionStatus, Workspace};
-use narsor::engine::Engine;
+use narsor::conductor::{
+    ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, PendingInvocation,
+    QueuedRequest, CONDUCTOR_UNAVAILABLE,
+};
+use narsor::domain::{
+    ConductorOutcome, ConductorPurpose, ConductorTrigger, EventData, ExecutionStatus, Workspace,
+};
+use narsor::engine::{Engine, OutputRejection};
 use narsor::persistence::{DaemonInfo, ExecutionStore};
 
 /// A temporary directory that deletes itself when it goes out of scope.
@@ -530,4 +536,346 @@ async fn new_mutating_requests_are_refused_once_shutdown_begins_not_only_after_t
 
     let status = wait_for_exit(&mut child, Duration::from_secs(15));
     assert!(status.success(), "daemon should still exit cleanly");
+}
+
+// ---------------------------------------------------------------------------
+// The startup hook (D55): what recovery found safely stopped is carried on
+// ---------------------------------------------------------------------------
+
+/// Seeds a store with a started `two_steps` execution and returns it.
+fn seed_two_steps(root: &Path) -> (ExecutionStore, narsor::domain::WorkflowExecution) {
+    fs::create_dir_all(root.join("work")).expect("create a work dir");
+    let store = ExecutionStore::new(root);
+    let engine = Engine::new(store.clone());
+    let definition = engine_support::workflow("two_steps");
+    let workspace = Workspace::local_folder(root.join("work").display().to_string());
+    let execution = engine
+        .start(&definition, serde_json::json!({}), workspace)
+        .expect("seed the execution");
+    (store, execution)
+}
+
+/// Polls `condition` until it holds, up to `timeout`.
+async fn wait_for(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !condition() {
+        if Instant::now() >= deadline {
+            panic!("timed out after {timeout:?} waiting until {what}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Restart matrix: a chat message the conductor had not answered when the
+/// daemon stopped is answered after the next start — here with the error
+/// entry of a daemon that cannot invoke the conductor yet (KTD12).
+#[tokio::test]
+async fn a_fresh_daemon_answers_a_chat_message_left_unanswered() {
+    let root = TempRoot::new();
+    let (store, execution) = seed_two_steps(root.path());
+    let conductor = ConductorStore::new(store.paths(), &execution.id);
+    let message = conductor
+        .append_chat(ChatEntry::new(
+            ChatAuthor::Operator,
+            ChatEntryKind::Message,
+            "what is the task doing?",
+        ))
+        .expect("seed an unanswered message");
+
+    let mut child = spawn_daemon(root.path());
+    let info = wait_for_daemon_info(root.path(), Duration::from_secs(10));
+    let client = narsor::api::ApiClient::new(info.addr, &info.token);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let chat = loop {
+        let chat = client
+            .conductor_chat(&execution.id, 0)
+            .await
+            .expect("read the chat over the API");
+        if chat.entries.len() >= 2 || Instant::now() >= deadline {
+            break chat;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(chat.entries.len(), 2, "{:?}", chat.entries);
+    assert_eq!(chat.entries[0], message);
+    let answer = &chat.entries[1];
+    assert_eq!(answer.in_reply_to.as_deref(), Some(message.id.as_str()));
+    assert_eq!(answer.author, ChatAuthor::Conductor);
+    assert_eq!(answer.kind, ChatEntryKind::Error);
+    assert_eq!(answer.text, CONDUCTOR_UNAVAILABLE);
+
+    let log = store.event_log(&execution.id);
+    wait_for(
+        "the invocation was recorded",
+        Duration::from_secs(5),
+        || {
+            log.read_all().expect("read the log").iter().any(|event| {
+                matches!(
+                    event.data,
+                    EventData::ConductorFinished {
+                        outcome: ConductorOutcome::Failed,
+                        ..
+                    }
+                )
+            })
+        },
+    )
+    .await;
+    assert!(log
+        .read_all()
+        .expect("read the log")
+        .iter()
+        .any(|event| matches!(
+            event.data,
+            EventData::ConductorStarted {
+                trigger: ConductorTrigger::Chat,
+                purpose: ConductorPurpose::ReplyToChat,
+                ..
+            }
+        )));
+
+    let state = client
+        .conductor_state(&execution.id)
+        .await
+        .expect("read the conductor's state over the API");
+    assert!(state.unanswered_chat.is_empty(), "{state:?}");
+    assert_eq!(state.pending, None);
+
+    send_sigterm(child.id());
+    wait_for_exit(&mut child, Duration::from_secs(10));
+}
+
+/// Restart matrix: `Running` with the conductor's F1 marker and no open
+/// attempt stopped in the conductor, not in an action — a fresh daemon
+/// leaves it `Running`, not `Unknown`.
+#[tokio::test]
+async fn a_fresh_daemon_does_not_mark_an_execution_stopped_in_the_conductor_unknown() {
+    let root = TempRoot::new();
+    let (store, execution) = seed_two_steps(root.path());
+    let log = store.event_log(&execution.id);
+    for data in [
+        EventData::StateEntered {
+            state_id: "first".to_string(),
+        },
+        EventData::ActionStarted {
+            action_execution_id: "attempt-rejected".to_string(),
+            state_id: "first".to_string(),
+            action_type: "agent".to_string(),
+        },
+        EventData::ActionOutputRejected {
+            action_execution_id: "attempt-rejected".to_string(),
+            state_id: "first".to_string(),
+            reason: "no output label".to_string(),
+            answer_tail: None,
+        },
+    ] {
+        log.append_next(&execution.id, data).expect("append");
+    }
+    let conductor = ConductorStore::new(store.paths(), &execution.id);
+    let request = QueuedRequest::new(
+        ConductorTrigger::OutputRescue,
+        ConductorPurpose::ChooseOutput,
+    )
+    .with_episode("attempt-rejected");
+    let mut state = ConductorState {
+        pending: Some(PendingInvocation {
+            invocation_id: "invocation-cut-short".to_string(),
+            request: request.clone(),
+            started_at: chrono::Utc::now(),
+        }),
+        ..ConductorState::default()
+    };
+    state.queue.push(request);
+    conductor.save_state(&state).expect("seed the marker");
+
+    let mut child = spawn_daemon(root.path());
+    let _info = wait_for_daemon_info(root.path(), Duration::from_secs(10));
+
+    let stored = store.load_execution(&execution.id).expect("load");
+    assert_eq!(stored.status, ExecutionStatus::Running);
+    assert!(
+        !log.read_all()
+            .expect("read the log")
+            .iter()
+            .any(|event| matches!(event.data, EventData::Error { .. })),
+        "no interrupted-action error was recorded"
+    );
+    assert_eq!(
+        conductor.load_state().expect("load the conductor's state"),
+        state,
+        "the marker is left for the conductor's own restart row"
+    );
+
+    send_sigterm(child.id());
+    wait_for_exit(&mut child, Duration::from_secs(10));
+}
+
+/// Installs the fake harness as `claude` in `bin`, so a daemon whose `PATH`
+/// starts there runs it for `claude-code`. Copied under a temporary name and
+/// renamed into place (see `FakeHarness::install` in `tests/actions_agent.rs`
+/// for the ETXTBSY reason).
+fn install_fake_claude(bin: &Path) {
+    fs::create_dir_all(bin).expect("create the bin dir");
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/harness/fake_harness.sh");
+    let temp = bin.join(format!(".claude.{}.tmp", uuid::Uuid::new_v4()));
+    fs::copy(&source, &temp).expect("copy the fake harness");
+    fs::rename(&temp, bin.join("claude")).expect("move the fake harness into place");
+}
+
+const REPROMPT_WORKFLOW: &str = r#"
+name: daemon-reprompt
+version: 1
+states:
+  work:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: "Implement the feature."
+    outputs:
+      - label: implemented
+        description: The feature is implemented.
+      - label: needs_human_decision
+        description: A person has to decide first.
+    transitions:
+      implemented: done
+      needs_human_decision: stopped
+  done:
+    description: Success.
+  stopped:
+    description: Failure.
+terminal_states:
+  done: completed
+  stopped: failed
+"#;
+
+/// Restart matrix (U4): a daemon that stopped between a rejected output and
+/// its reprompt left the attempt closed and the execution `Running`; the
+/// next start spawns a pass that asks the same session again, read-only,
+/// instead of replaying the attempt.
+#[tokio::test]
+async fn a_fresh_daemon_continues_a_reprompt_the_restart_interrupted() {
+    let root = TempRoot::new();
+    let bin = root.path().join("bin");
+    install_fake_claude(&bin);
+    fs::write(
+        bin.join("stdout.1"),
+        serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "session_id": "fake-session-1",
+            "result": r#"{"output":"implemented"}"#,
+        })
+        .to_string(),
+    )
+    .expect("write the harness answer");
+
+    let work = root.path().join("work");
+    fs::create_dir_all(&work).expect("create a work dir");
+    let definition_path = root.path().join("reprompt.yaml");
+    fs::write(&definition_path, REPROMPT_WORKFLOW).expect("write the workflow");
+    let definition = narsor::workflow::load_from_file(&definition_path).expect("load it");
+    let store = ExecutionStore::new(root.path());
+    let engine = Engine::new(store.clone());
+    let mut execution = engine
+        .start(
+            &definition,
+            serde_json::json!({}),
+            Workspace::local_folder(work.display().to_string()),
+        )
+        .expect("seed the execution");
+    fs::write(
+        store.paths().definition_file(&execution.id),
+        REPROMPT_WORKFLOW,
+    )
+    .expect("pin the definition");
+
+    let log = store.event_log(&execution.id);
+    for data in [
+        EventData::StateEntered {
+            state_id: "work".to_string(),
+        },
+        EventData::ActionStarted {
+            action_execution_id: "attempt-rejected".to_string(),
+            state_id: "work".to_string(),
+            action_type: "agent".to_string(),
+        },
+        EventData::ActionOutputRejected {
+            action_execution_id: "attempt-rejected".to_string(),
+            state_id: "work".to_string(),
+            reason: "the answer has no 'output'".to_string(),
+            answer_tail: Some("Done.".to_string()),
+        },
+    ] {
+        log.append_next(&execution.id, data).expect("append");
+    }
+    let rejection = OutputRejection {
+        state_id: "work".to_string(),
+        action_execution_id: "attempt-rejected".to_string(),
+        reason: "the answer has no 'output'".to_string(),
+        answer_tail: Some("Done.".to_string()),
+        harness: Some("claude-code".to_string()),
+        harness_session_id: Some("fake-session-1".to_string()),
+    };
+    execution
+        .metadata
+        .as_object_mut()
+        .expect("metadata is an object")
+        .insert(
+            "engine".to_string(),
+            serde_json::json!({ "output_rejection": rejection }),
+        );
+    execution.current_state = Some("work".to_string());
+    store
+        .save_execution(&execution)
+        .expect("save the execution");
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_narsor"))
+        .arg("--root")
+        .arg(root.path())
+        .arg("daemon")
+        .env("PATH", path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the daemon");
+    let _info = wait_for_daemon_info(root.path(), Duration::from_secs(10));
+
+    wait_for(
+        "the reprompted execution completed",
+        Duration::from_secs(15),
+        || {
+            store
+                .load_execution(&execution.id)
+                .map(|stored| stored.status == ExecutionStatus::Completed)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+
+    let count = fs::read_to_string(bin.join("count")).expect("the harness ran");
+    assert_eq!(count.trim(), "1", "one reprompt, no replay of the attempt");
+    let args = fs::read_to_string(bin.join("args.1")).expect("the harness's arguments");
+    assert!(
+        args.contains("--resume\n--%ARG%--\nfake-session-1"),
+        "{args}"
+    );
+    let events = log.read_all().expect("read the log");
+    assert!(events.iter().any(|event| matches!(
+        event.data,
+        EventData::OutputReprompted {
+            by: narsor::domain::RepromptedBy::Engine,
+            ..
+        }
+    )));
+
+    send_sigterm(child.id());
+    wait_for_exit(&mut child, Duration::from_secs(10));
 }

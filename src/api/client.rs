@@ -47,9 +47,10 @@ use crate::domain::{Event, EventData};
 use crate::engine::{HumanInputDelivery, Timeline};
 
 use super::dto::{
-    AcceptedResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
-    OperatorNoteRequest, RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest,
-    StartTaskRequest, StartTaskResponse, TransitionRequest,
+    AcceptedResponse, ConductorChatResponse, ConductorStateResponse, ExecutionListResponse,
+    ExecutionSummary, HarnessSelectionSnapshot, OperatorNoteRequest, RecoveryRequest,
+    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
+    TransitionRequest,
 };
 use super::routes::ConversationResponse;
 
@@ -155,6 +156,29 @@ impl ApiClient {
     /// The step timeline of `execution_id`.
     pub async fn timeline(&self, execution_id: &str) -> Result<Timeline, ClientError> {
         let url = format!("{}/executions/{execution_id}/timeline", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// What the conductor of `execution_id` is doing and has kept (D55).
+    pub async fn conductor_state(
+        &self,
+        execution_id: &str,
+    ) -> Result<ConductorStateResponse, ClientError> {
+        let url = format!("{}/executions/{execution_id}/conductor", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// The conductor's chat history of `execution_id` after sequence
+    /// `after`.
+    pub async fn conductor_chat(
+        &self,
+        execution_id: &str,
+        after: u64,
+    ) -> Result<ConductorChatResponse, ClientError> {
+        let url = format!(
+            "{}/executions/{execution_id}/conductor/chat?after={after}",
+            self.base_url
+        );
         self.get_json(&url).await
     }
 
@@ -614,11 +638,18 @@ fn extract_sse_events(
 
 /// Whether `data` is one of the three events that end a workflow execution
 /// — see [`ApiClient::stream_execution`]'s contract.
+///
+/// The conductor's events (`ConductorStarted`/`Finished`/`Decision`) never
+/// end a stream, even when they follow `WorkflowFailed` (F3): the
+/// conductor works beside an execution, it does not change how it ends.
 fn is_terminal_event(data: &EventData) -> bool {
-    matches!(
-        data,
+    match data {
         EventData::WorkflowCompleted { .. }
-            | EventData::WorkflowFailed { .. }
-            | EventData::WorkflowCancelled { .. }
-    )
+        | EventData::WorkflowFailed { .. }
+        | EventData::WorkflowCancelled { .. } => true,
+        EventData::ConductorStarted { .. }
+        | EventData::ConductorFinished { .. }
+        | EventData::ConductorDecision { .. } => false,
+        _ => false,
+    }
 }

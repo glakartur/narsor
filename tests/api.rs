@@ -12,6 +12,10 @@ use std::time::Duration;
 use chrono::Utc;
 use narsor::api;
 use narsor::api::{ClientError, ExecutionListResponse, ExecutionSummary, StartTaskResponse};
+use narsor::conductor::{
+    ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, PendingInvocation,
+    QueuedRequest,
+};
 use narsor::domain::{
     Context, Event, EventData, ExecutionStatus, RepositoryInfo, WorkflowDefinition,
     WorkflowExecution, Workspace,
@@ -623,6 +627,94 @@ async fn events_endpoint_only_returns_events_after_the_given_sequence() {
 
     assert_eq!(events.len(), 2);
     assert!(events.iter().all(|event| event.sequence > 1));
+}
+
+/// An execution the conductor never worked on has an empty conductor state
+/// and an empty chat — not an error (U8).
+#[tokio::test]
+async fn conductor_endpoints_answer_an_old_execution_with_an_empty_state() {
+    let root = TempRoot::new();
+    let store = root.store();
+    store
+        .save_execution(&sample_execution("exec-old", ExecutionStatus::Completed))
+        .expect("save execution");
+
+    let handle = start_server(store).await;
+    let client = handle.client();
+
+    let state = client
+        .conductor_state("exec-old")
+        .await
+        .expect("conductor state");
+    assert_eq!(state, api::ConductorStateResponse::default());
+    let chat = client.conductor_chat("exec-old", 0).await.expect("chat");
+    assert!(chat.entries.is_empty());
+
+    assert!(matches!(
+        client.conductor_state("does-not-exist").await,
+        Err(ClientError::NotFound)
+    ));
+    assert!(matches!(
+        client.conductor_chat("does-not-exist", 0).await,
+        Err(ClientError::NotFound)
+    ));
+}
+
+/// The conductor's state and chat history are read from its store: what is
+/// under way, what waits for an answer, and the chat after a sequence.
+#[tokio::test]
+async fn conductor_endpoints_return_the_state_and_the_chat_after_a_sequence() {
+    let root = TempRoot::new();
+    let store = root.store();
+    store
+        .save_execution(&sample_execution("exec-chat", ExecutionStatus::Running))
+        .expect("save execution");
+    let conductor = ConductorStore::new(store.paths(), "exec-chat");
+    let answered = conductor
+        .append_chat(ChatEntry::new(
+            ChatAuthor::Operator,
+            ChatEntryKind::Message,
+            "first",
+        ))
+        .expect("append");
+    let reply = conductor
+        .append_chat(
+            ChatEntry::new(ChatAuthor::Conductor, ChatEntryKind::Message, "noted")
+                .replying_to(&answered.id),
+        )
+        .expect("append");
+    let open = conductor
+        .append_chat(ChatEntry::new(
+            ChatAuthor::Operator,
+            ChatEntryKind::Message,
+            "second",
+        ))
+        .expect("append");
+    let request = QueuedRequest::for_chat(&open);
+    let mut state = ConductorState {
+        pending: Some(PendingInvocation {
+            invocation_id: "invocation-1".to_string(),
+            request,
+            started_at: Utc::now(),
+        }),
+        ..ConductorState::default()
+    };
+    state.used_retries.insert("episode-1".to_string());
+    conductor.save_state(&state).expect("save the state");
+
+    let handle = start_server(store).await;
+    let client = handle.client();
+
+    let response = client
+        .conductor_state("exec-chat")
+        .await
+        .expect("conductor state");
+    assert_eq!(response.pending, state.pending);
+    assert_eq!(response.unanswered_chat, vec![open.id.clone()]);
+    assert!(response.used_retries.contains("episode-1"));
+
+    let chat = client.conductor_chat("exec-chat", 1).await.expect("chat");
+    assert_eq!(chat.entries, vec![reply, open]);
 }
 
 // --- Error paths -----------------------------------------------------------

@@ -39,11 +39,11 @@
 //! check is done by hand, in a `middleware::from_fn_with_state` layer that
 //! only ever returns a bare status code.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, Query, Request, State};
@@ -57,16 +57,18 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::broadcast;
-use tokio::task::AbortHandle;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 
+use crate::api::active::ActiveTasks;
 use crate::api::dto::{
-    AcceptedResponse, ActiveProblem, ExecutionListResponse, ExecutionSummary,
-    HarnessSelectionSnapshot, OperatorNoteRequest, RecoveryRequest, RequestErrorResponse,
-    SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse, TransitionRequest,
+    AcceptedResponse, ActiveProblem, ConductorChatResponse, ConductorStateResponse,
+    ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot, OperatorNoteRequest,
+    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
+    StartTaskResponse, TransitionRequest,
 };
+use crate::conductor::ConductorStore;
 use crate::domain::{AnsweredBy, Event, EventData, ExecutionStatus, InputCloseReason};
 use crate::engine::actions::human;
 use crate::engine::{
@@ -125,7 +127,7 @@ struct AppState {
     catalog_dir: PathBuf,
     work_dir: PathBuf,
     harness_selector: Option<Arc<DefaultHarnessSelector>>,
-    active_tasks: Arc<Mutex<HashMap<String, AbortHandle>>>,
+    active_tasks: ActiveTasks,
 }
 
 /// Builds the router: the three original read-only endpoints (U5/U2) plus
@@ -146,6 +148,7 @@ pub fn router(
     catalog_dir: PathBuf,
     work_dir: PathBuf,
     harness_selector: Option<Arc<DefaultHarnessSelector>>,
+    active_tasks: ActiveTasks,
 ) -> Router {
     let state = AppState {
         engine,
@@ -154,7 +157,7 @@ pub fn router(
         catalog_dir,
         work_dir,
         harness_selector,
-        active_tasks: Arc::new(Mutex::new(HashMap::new())),
+        active_tasks,
     };
     Router::new()
         .route("/executions/:execution_id/events", get(get_events))
@@ -164,6 +167,14 @@ pub fn router(
             get(get_conversation),
         )
         .route("/executions", get(get_executions))
+        .route(
+            "/executions/:execution_id/conductor",
+            get(get_conductor_state),
+        )
+        .route(
+            "/executions/:execution_id/conductor/chat",
+            get(get_conductor_chat),
+        )
         .route(
             "/settings/agent-harness",
             get(get_harness_selection)
@@ -440,6 +451,44 @@ async fn get_events(
         .filter(|event| event.sequence > query.after)
         .collect();
     Ok(Json(events))
+}
+
+/// `GET /executions/:execution_id/conductor`
+///
+/// Read straight from the conductor's store (D55): its state file is
+/// replaced atomically and its chat is append-only, so a reader needs no
+/// part in the actor's serialization. An execution without a `conductor/`
+/// directory answers with the empty state.
+async fn get_conductor_state(
+    State(state): State<AppState>,
+    Path(execution_id): Path<String>,
+) -> Result<Json<ConductorStateResponse>, ApiError> {
+    require_execution(&state, &execution_id)?;
+    let conductor = ConductorStore::new(state.store.paths(), &execution_id);
+    let unanswered = conductor
+        .unanswered_chat()?
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
+    Ok(Json(ConductorStateResponse::new(
+        conductor.load_state()?,
+        unanswered,
+    )))
+}
+
+/// `GET /executions/:execution_id/conductor/chat?after=<sequence>`
+///
+/// The chat history (R26) after `after`, in the order it was written.
+async fn get_conductor_chat(
+    State(state): State<AppState>,
+    Path(execution_id): Path<String>,
+    Query(query): Query<EventsQuery>,
+) -> Result<Json<ConductorChatResponse>, ApiError> {
+    require_execution(&state, &execution_id)?;
+    let conductor = ConductorStore::new(state.store.paths(), &execution_id);
+    Ok(Json(ConductorChatResponse {
+        entries: conductor.read_chat_after(query.after)?,
+    }))
 }
 
 /// `GET /executions/:execution_id/timeline`
@@ -737,15 +786,9 @@ async fn post_interrupt(
             "execution '{execution_id}' is not being processed"
         )));
     }
-    let handle = state
-        .active_tasks
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&execution_id)
-        .cloned()
-        .ok_or_else(|| {
-            ApiError::Conflict(format!("execution '{execution_id}' cannot be interrupted"))
-        })?;
+    let handle = state.active_tasks.get(&execution_id).ok_or_else(|| {
+        ApiError::Conflict(format!("execution '{execution_id}' cannot be interrupted"))
+    })?;
     handle.abort();
     Ok(Json(AcceptedResponse { execution_id }))
 }
@@ -754,12 +797,7 @@ fn spawn_active<F>(state: &AppState, execution_id: String, future: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let task = tokio::spawn(future);
-    state
-        .active_tasks
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(execution_id, task.abort_handle());
+    state.active_tasks.spawn(execution_id, future);
 }
 
 /// `POST /executions/:execution_id/input` — delivers a person's answer to a

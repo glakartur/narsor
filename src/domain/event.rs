@@ -266,6 +266,58 @@ pub enum EventData {
         episode: Option<String>,
     },
 
+    // Conductor events (D55)
+    /// The conductor began one invocation for this execution (R11).
+    ///
+    /// Not an action attempt: it opens nothing D23 reconciles, and the
+    /// conductor's own marker is what survives a restart (KTD3, KTD11).
+    ConductorStarted {
+        /// The invocation this event opens; [`EventData::ConductorFinished`]
+        /// names the same one.
+        invocation_id: String,
+        /// What asked for the invocation.
+        trigger: ConductorTrigger,
+        /// What the conductor is asked to do.
+        purpose: ConductorPurpose,
+        /// The episode the invocation is about (KTD9), when it is about one.
+        #[serde(default)]
+        episode: Option<String>,
+    },
+    /// The conductor's invocation ended, one way or another.
+    ConductorFinished {
+        /// The invocation that ended.
+        invocation_id: String,
+        /// How it ended.
+        outcome: ConductorOutcome,
+        /// Why it failed, when it did.
+        #[serde(default)]
+        error: Option<String>,
+    },
+    /// The conductor decided something about the execution (R31): recorded
+    /// with its confidence and rationale so it can be read back — and, for
+    /// a chosen output, undone (KTD13).
+    ConductorDecision {
+        /// The decision, as the conductor's store keys it.
+        decision_id: String,
+        /// What was decided.
+        kind: ConductorDecisionKind,
+        /// The state the decision is about.
+        #[serde(default)]
+        state_id: Option<String>,
+        /// The output label chosen, for a decision that chooses one.
+        #[serde(default)]
+        output_label: Option<String>,
+        /// The episode the decision belongs to (KTD9).
+        #[serde(default)]
+        episode: Option<String>,
+        /// How sure the conductor was; absent means `low` (KTD6).
+        #[serde(default)]
+        confidence: Confidence,
+        /// Why.
+        #[serde(default)]
+        rationale: Option<String>,
+    },
+
     // External events
     ExternalEventReceived {
         event_type: String,
@@ -378,6 +430,149 @@ impl ProblemKind {
         match self {
             Self::Output => "output",
             Self::Failure => "failure",
+        }
+    }
+}
+
+/// What asked the conductor for an invocation (KTD11).
+///
+/// Automatic triggers (F1, F3) are served before anything an operator asked
+/// for; see [`ConductorTrigger::is_automatic`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConductorTrigger {
+    /// F1: an agent step still has no usable output label after the
+    /// engine's reprompt.
+    OutputRescue,
+    /// F3: a step failed after its `retry_policy` ran out.
+    StepFailure,
+    /// F4: an operator wrote in the conductor's chat.
+    Chat,
+    /// R30: a `human` gate was entered and can be summarized.
+    Annotation,
+}
+
+impl ConductorTrigger {
+    /// The name as the event log spells it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::OutputRescue => "output_rescue",
+            Self::StepFailure => "step_failure",
+            Self::Chat => "chat",
+            Self::Annotation => "annotation",
+        }
+    }
+
+    /// Whether the engine raised this trigger by itself (F1, F3) rather
+    /// than an operator — which is what puts it first in the queue and
+    /// makes a failed invocation a problem (KTD11, KTD12).
+    pub fn is_automatic(&self) -> bool {
+        matches!(self, Self::OutputRescue | Self::StepFailure)
+    }
+}
+
+/// What the conductor is asked to do in one invocation — the "working on
+/// what" of R11.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConductorPurpose {
+    /// Choose the output of a step whose agent gave none (F1).
+    ChooseOutput,
+    /// Choose the output after the conductor's own reprompt failed too: a
+    /// second reprompt is no longer allowed (R17).
+    ChooseOutputAfterReprompt,
+    /// Diagnose a failed step and propose what to do (F3).
+    DiagnoseFailure,
+    /// Answer the operator's chat message (F4).
+    ReplyToChat,
+    /// Summarize a `human` gate for the operator (R30).
+    SummarizeGate,
+}
+
+impl ConductorPurpose {
+    /// The name as the event log spells it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::ChooseOutput => "choose_output",
+            Self::ChooseOutputAfterReprompt => "choose_output_after_reprompt",
+            Self::DiagnoseFailure => "diagnose_failure",
+            Self::ReplyToChat => "reply_to_chat",
+            Self::SummarizeGate => "summarize_gate",
+        }
+    }
+}
+
+/// How a conductor invocation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConductorOutcome {
+    /// It answered.
+    Completed,
+    /// It could not answer: a process error, a timeout, an unusable
+    /// response (R24).
+    Failed,
+    /// Someone stopped it before it answered.
+    Interrupted,
+}
+
+impl ConductorOutcome {
+    /// The name as the event log spells it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// What a [`EventData::ConductorDecision`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConductorDecisionKind {
+    /// (a): the step completes with an output the conductor chose.
+    ChooseOutput,
+    /// (b): the agent is asked again, in the conductor's own words.
+    Reprompt,
+    /// (c): the step becomes a problem for the operator.
+    Escalate,
+    /// The failed step is tried once more (R21).
+    Retry,
+    /// A proposal the operator confirmed was carried out (R28).
+    ExecuteProposal,
+}
+
+impl ConductorDecisionKind {
+    /// The name as the event log spells it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::ChooseOutput => "choose_output",
+            Self::Reprompt => "reprompt",
+            Self::Escalate => "escalate",
+            Self::Retry => "retry",
+            Self::ExecuteProposal => "execute_proposal",
+        }
+    }
+}
+
+/// How sure the conductor was of a decision (KTD6). Anything it does not
+/// declare is `low`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    /// Sure enough to act without the operator.
+    High,
+    /// Not sure enough; the default.
+    #[default]
+    Low,
+}
+
+impl Confidence {
+    /// The name as the event log spells it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Low => "low",
         }
     }
 }
@@ -534,6 +729,35 @@ impl Event {
             } => {
                 format!("Human chose the transition {from_state} -> {to_state}")
             }
+
+            EventData::ConductorStarted { purpose, .. } => {
+                format!("Conductor started: {}", purpose.name())
+            }
+            EventData::ConductorFinished { outcome, error, .. } => match error {
+                Some(error) => format!(
+                    "Conductor finished ({}): {}",
+                    outcome.name(),
+                    first_line(error)
+                ),
+                None => format!("Conductor finished ({})", outcome.name()),
+            },
+            EventData::ConductorDecision {
+                kind,
+                output_label,
+                confidence,
+                ..
+            } => match output_label {
+                Some(label) => format!(
+                    "Conductor decided to {} '{label}' ({} confidence)",
+                    kind.name(),
+                    confidence.name()
+                ),
+                None => format!(
+                    "Conductor decided to {} ({} confidence)",
+                    kind.name(),
+                    confidence.name()
+                ),
+            },
 
             EventData::ExternalEventReceived {
                 event_type, source, ..

@@ -4000,6 +4000,34 @@ pub fn event_line(event: &Event) -> String {
             kind.name(),
             first_line(reason)
         ),
+        EventData::ConductorStarted {
+            trigger, purpose, ..
+        } => format!("conductor_started  {} ({})", purpose.name(), trigger.name()),
+        EventData::ConductorFinished { outcome, error, .. } => match error {
+            Some(error) => format!(
+                "conductor_finished  {}: {}",
+                outcome.name(),
+                first_line(error)
+            ),
+            None => format!("conductor_finished  {}", outcome.name()),
+        },
+        EventData::ConductorDecision {
+            kind,
+            output_label,
+            confidence,
+            ..
+        } => match output_label {
+            Some(label) => format!(
+                "conductor_decision  {} → {label} ({})",
+                kind.name(),
+                confidence.name()
+            ),
+            None => format!(
+                "conductor_decision  {} ({})",
+                kind.name(),
+                confidence.name()
+            ),
+        },
         EventData::HumanTransitionSelected {
             from_state,
             to_state,

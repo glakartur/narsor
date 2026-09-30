@@ -7,12 +7,15 @@
 //! makes the wire contract easy to review without wading through handler
 //! bodies.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::conductor::{
+    ChatEntry, ConductorState, PendingInvocation, QueuedRequest, SavedDecision,
+};
 use crate::domain::{ExecutionStatus, ProblemKind, WorkflowExecution};
 use crate::engine::{InputContinuation, PendingHumanInput};
 
@@ -257,4 +260,54 @@ impl From<&WorkflowExecution> for ExecutionSummary {
 pub struct ExecutionListResponse {
     /// Every execution in the store, in [`crate::persistence::ExecutionStore::list_execution_ids`]'s order.
     pub executions: Vec<ExecutionSummary>,
+}
+
+/// `GET /executions/:id/conductor` — what the conductor of one execution is
+/// doing and has kept (R11, R26).
+///
+/// An execution the conductor never worked on answers with the empty
+/// state, not `404`: it simply has nothing to show yet.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConductorStateResponse {
+    /// The invocation under way, if one is — the "conductor is working on
+    /// ..." of R11.
+    #[serde(default)]
+    pub pending: Option<PendingInvocation>,
+    /// Requests other than chat waiting their turn.
+    #[serde(default)]
+    pub queue: Vec<QueuedRequest>,
+    /// The operator messages still waiting for an answer, oldest first.
+    #[serde(default)]
+    pub unanswered_chat: Vec<String>,
+    /// Invocations counted per episode for automatic triggers (R24).
+    #[serde(default)]
+    pub invocation_attempts: BTreeMap<String, u32>,
+    /// Episodes whose one retry was used (R21).
+    #[serde(default)]
+    pub used_retries: BTreeSet<String>,
+    /// Decisions saved but not yet applied (KTD13).
+    #[serde(default)]
+    pub unapplied_decisions: Vec<SavedDecision>,
+}
+
+impl ConductorStateResponse {
+    /// The response for `state` and the ids of the unanswered messages.
+    pub fn new(state: ConductorState, unanswered_chat: Vec<String>) -> Self {
+        Self {
+            pending: state.pending,
+            queue: state.queue,
+            unanswered_chat,
+            invocation_attempts: state.invocation_attempts,
+            used_retries: state.used_retries,
+            unapplied_decisions: state.unapplied_decisions,
+        }
+    }
+}
+
+/// `GET /executions/:id/conductor/chat?after=<sequence>` — the chat history
+/// after a sequence number, in order.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConductorChatResponse {
+    /// The entries with `sequence > after`.
+    pub entries: Vec<ChatEntry>,
 }

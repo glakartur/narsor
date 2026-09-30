@@ -9,7 +9,10 @@
 mod engine_support;
 
 use engine_support::{workflow, Harness};
-use narsor::domain::{EventData, ExecutionStatus, RepromptedBy, WorkflowExecution};
+use narsor::conductor::{ConductorState, ConductorStore, PendingInvocation, QueuedRequest};
+use narsor::domain::{
+    ConductorPurpose, ConductorTrigger, EventData, ExecutionStatus, RepromptedBy, WorkflowExecution,
+};
 use narsor::engine::{EngineError, PendingStep};
 use narsor::persistence::{
     reconcile, reconcile_all, recover, sweep_orphaned_workspaces, OrphanReason,
@@ -576,4 +579,122 @@ async fn a_sweep_can_report_without_deleting() {
     assert_eq!(orphans.len(), 1);
     assert!(!orphans[0].cleanup.is_removed());
     assert!(provisioner.task_dir("ghost-execution").exists());
+}
+
+/// Writes the marker of a conductor invocation that was under way for
+/// `trigger` when the daemon stopped.
+fn leave_conductor_marker(
+    harness: &Harness,
+    execution: &WorkflowExecution,
+    trigger: ConductorTrigger,
+) -> ConductorStore {
+    let store = ConductorStore::new(harness.store().paths(), &execution.id);
+    let request = QueuedRequest::new(trigger, ConductorPurpose::ChooseOutput)
+        .with_episode("attempt-rejected");
+    let mut state = ConductorState {
+        pending: Some(PendingInvocation {
+            invocation_id: "invocation-cut-short".to_string(),
+            request: request.clone(),
+            started_at: chrono::Utc::now(),
+        }),
+        ..ConductorState::default()
+    };
+    state.queue.push(request);
+    store.save_state(&state).expect("save the conductor state");
+    store
+}
+
+/// Restart matrix: a daemon that stopped while the conductor chose an
+/// output (F1) left no attempt open — the execution stays `Running`, not
+/// `Unknown`, and the marker stays for the conductor to carry on.
+#[tokio::test]
+async fn a_restart_during_the_conductors_rescue_is_not_an_interrupted_action() {
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let definition = workflow("two_steps");
+    let execution = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    reject_output(&harness, &execution);
+    let conductor = leave_conductor_marker(&harness, &execution, ConductorTrigger::OutputRescue);
+
+    let report = recover(&harness.store()).expect("recover");
+
+    let verdict = report
+        .reconciled
+        .iter()
+        .find(|entry| entry.execution_id == execution.id)
+        .expect("the execution was reconciled");
+    assert_eq!(verdict.status, ExecutionStatus::Running);
+    assert_eq!(
+        verdict.outcome,
+        ReconciliationOutcome::ConductorInterrupted {
+            trigger: ConductorTrigger::OutputRescue,
+            invocation_id: "invocation-cut-short".to_string(),
+        }
+    );
+    assert!(!verdict.outcome.needs_attention());
+    let stored = harness
+        .store()
+        .load_execution(&execution.id)
+        .expect("load the execution");
+    assert_eq!(stored.status, ExecutionStatus::Running);
+    assert!(conductor.load_state().expect("load").pending.is_some());
+}
+
+/// Restart matrix: the conductor's own reprompt was running — that is an
+/// attempt, so the execution is `Unknown`, and the marker goes with it.
+#[tokio::test]
+async fn a_restart_during_the_conductors_reprompt_leaves_the_execution_unknown() {
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let definition = workflow("two_steps");
+    let execution = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    let rejected = reject_output(&harness, &execution);
+    harness
+        .store()
+        .event_log(&execution.id)
+        .append_next(
+            &execution.id,
+            EventData::OutputReprompted {
+                action_execution_id: "attempt-conductor-reprompt".to_string(),
+                previous_attempt: rejected,
+                state_id: "first".to_string(),
+                by: RepromptedBy::Conductor,
+            },
+        )
+        .expect("append OutputReprompted");
+    let conductor = leave_conductor_marker(&harness, &execution, ConductorTrigger::OutputRescue);
+
+    let report = recover(&harness.store()).expect("recover");
+
+    let verdict = report
+        .reconciled
+        .iter()
+        .find(|entry| entry.execution_id == execution.id)
+        .expect("the execution was reconciled");
+    assert_eq!(verdict.status, ExecutionStatus::Unknown);
+    assert!(verdict.outcome.needs_attention());
+    let state = conductor.load_state().expect("load");
+    assert_eq!(state.pending, None, "the marker is cleared");
+}
+
+/// A chat invocation cut short is no reason to treat the execution
+/// differently: without an open attempt it is simply consistent.
+#[tokio::test]
+async fn a_restart_during_a_chat_answer_leaves_the_execution_consistent() {
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let definition = workflow("two_steps");
+    let execution = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    leave_conductor_marker(&harness, &execution, ConductorTrigger::Chat);
+
+    let verdict = reconcile(&harness.store(), &execution.id).expect("reconcile");
+
+    assert_eq!(verdict.outcome, ReconciliationOutcome::Consistent);
+    assert_eq!(verdict.status, ExecutionStatus::Running);
 }

@@ -104,6 +104,12 @@ pub const CONVERSATION_JSONL_SUFFIX: &str = ".jsonl";
 /// Suffix of a conversation file whose attempt has closed.
 pub const CONVERSATION_ZST_SUFFIX: &str = ".jsonl.zst";
 
+/// Directory of the conductor's own store inside an execution (D55, KTD2).
+pub const CONDUCTOR_DIR: &str = "conductor";
+
+/// Directory of gate annotations inside [`CONDUCTOR_DIR`] (R30).
+pub const CONDUCTOR_ANNOTATIONS_DIR: &str = "annotations";
+
 /// The one checkpoint kept for an execution (R25).
 pub const CHECKPOINT_FILE: &str = "checkpoint.bundle";
 
@@ -220,6 +226,20 @@ impl StatePaths {
     /// `{root}/executions/{execution_id}/artifacts/{artifact_id}`
     pub fn artifact_dir(&self, execution_id: &ExecutionId, artifact_id: &str) -> PathBuf {
         self.artifacts_dir(execution_id).join(artifact_id)
+    }
+
+    /// `{root}/executions/{execution_id}/conductor`
+    ///
+    /// The conductor's state, chat and annotations (KTD2): beside the
+    /// execution's own files, written by nobody but the conductor.
+    pub fn conductor_dir(&self, execution_id: &str) -> PathBuf {
+        self.execution_dir(execution_id).join(CONDUCTOR_DIR)
+    }
+
+    /// `{root}/executions/{execution_id}/conductor/annotations`
+    pub fn conductor_annotations_dir(&self, execution_id: &str) -> PathBuf {
+        self.conductor_dir(execution_id)
+            .join(CONDUCTOR_ANNOTATIONS_DIR)
     }
 
     /// `{root}/executions/{execution_id}/conversations`

@@ -15,6 +15,7 @@
 //!     artifacts/{artifact_id}/    -- files produced by actions
 //!     conversations/{attempt_id}.jsonl        -- open attempt, see conversation
 //!     conversations/{attempt_id}.jsonl.zst    -- closed attempt, compressed
+//!     conductor/                  -- the conductor's store, see crate::conductor
 //! ```
 //!
 //! Every write goes through [`atomic`]: a temporary file in the *same*

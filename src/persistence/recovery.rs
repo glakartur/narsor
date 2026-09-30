@@ -20,6 +20,18 @@
 //! says why, and a person decides what happens next. D24's idempotency key
 //! exists so that person can retry deliberately.
 //!
+//! # The conductor's marker
+//!
+//! The conductor (D55) runs no action attempt of its own and writes a
+//! marker to its store while an invocation is under way. A `Running`
+//! execution with the marker of an automatic invocation (F1) and no open
+//! attempt stopped *in the conductor*, not in an action: nothing it did can
+//! have had a side effect, so it stays `Running` and is reported as
+//! [`ReconciliationOutcome::ConductorInterrupted`] for the startup hook. The
+//! same marker beside an open attempt — the conductor's own reprompt was
+//! running — is an interrupted action like any other, and the marker is
+//! cleared with it.
+//!
 //! Only `Running` executions are reconciled. A `Paused` or `InputNeeded` one parked itself
 //! durably (a human action suspends *without* an `ActionCompleted`, which would
 //! otherwise look exactly like an interrupted action), and a finished one has
@@ -40,7 +52,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::domain::{Event, EventData, ExecutionId, ExecutionStatus};
+use crate::conductor::ConductorStore;
+use crate::domain::{ConductorTrigger, Event, EventData, ExecutionId, ExecutionStatus};
 use crate::persistence::{ExecutionStore, PersistenceError, Result};
 use crate::workspace::{CleanupOutcome, CleanupPolicy, WorkspaceProvisioner};
 
@@ -55,6 +68,16 @@ pub enum ReconciliationOutcome {
 
     /// `state.json` and the log agree; the execution can simply be run on.
     Consistent,
+
+    /// The conductor's automatic invocation was under way, with no action
+    /// attempt open (D55): the execution stays `Running` for the startup
+    /// hook to carry on.
+    ConductorInterrupted {
+        /// What the interrupted invocation was for.
+        trigger: ConductorTrigger,
+        /// The invocation, as its `ConductorStarted` named it.
+        invocation_id: String,
+    },
 
     /// An action was in flight when the process died.
     InterruptedAction {
@@ -264,13 +287,31 @@ pub fn reconcile(store: &ExecutionStore, execution_id: &str) -> Result<Reconcili
     let log = store.event_log(execution_id);
     let events = log.read_all()?;
 
+    let conductor = ConductorStore::new(store.paths(), execution_id);
+    let marker = automatic_conductor_marker(&conductor);
+
     let Some((state_id, action_execution_id)) = unfinished_action(&events) else {
+        let outcome = match marker {
+            Some((trigger, invocation_id)) => ReconciliationOutcome::ConductorInterrupted {
+                trigger,
+                invocation_id,
+            },
+            None => ReconciliationOutcome::Consistent,
+        };
         return Ok(Reconciliation {
             execution_id: execution_id.to_string(),
             status: ExecutionStatus::Running,
-            outcome: ReconciliationOutcome::Consistent,
+            outcome,
         });
     };
+
+    // The conductor's own reprompt was running (the restart matrix): the
+    // attempt is what decides, and the conductor has nothing left to resume.
+    if marker.is_some() {
+        let mut state = conductor.load_state()?;
+        state.pending = None;
+        conductor.save_state(&state)?;
+    }
 
     let message = format!(
         "action '{action_execution_id}' of state '{state_id}' was still running when the \
@@ -301,6 +342,34 @@ pub fn reconcile(store: &ExecutionStore, execution_id: &str) -> Result<Reconcili
             action_execution_id,
         },
     })
+}
+
+/// The trigger and id of the automatic conductor invocation (F1) under way
+/// for this execution, if its marker says one is.
+///
+/// A conductor state that cannot be read is logged and treated as no
+/// marker: the execution is then reconciled exactly as it was before the
+/// conductor existed, which errs on the side of `Unknown`, never of a
+/// replay.
+fn automatic_conductor_marker(conductor: &ConductorStore) -> Option<(ConductorTrigger, String)> {
+    if !conductor.exists() {
+        return None;
+    }
+    let state = match conductor.load_state() {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(
+                execution_id = conductor.execution_id(),
+                error = %error,
+                "recovery: could not read the conductor's state; ignoring its marker"
+            );
+            return None;
+        }
+    };
+    state
+        .pending
+        .filter(|pending| pending.request.trigger == ConductorTrigger::OutputRescue)
+        .map(|pending| (pending.request.trigger, pending.invocation_id))
 }
 
 /// Finds an action that was started (or retried) and never finished.
@@ -364,6 +433,12 @@ fn unfinished_action(events: &[crate::domain::Event]) -> Option<(String, String)
             // leaves the execution `InputNeeded`, which is never reconciled;
             // one about a failure follows `ActionFailed`.
             EventData::ProblemRaised { .. } => {}
+            // The conductor runs no action attempt (D55): its invocation is
+            // tracked by its own marker, which `reconcile` reads, and never
+            // opens or closes one here.
+            EventData::ConductorStarted { .. }
+            | EventData::ConductorFinished { .. }
+            | EventData::ConductorDecision { .. } => {}
             _ => {}
         }
     }
