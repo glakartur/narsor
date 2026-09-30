@@ -352,3 +352,28 @@ fn resolving_writes_nothing_and_needs_no_writable_home() {
     assert!(resolved.is_ok());
     assert!(!user.exists(), "nothing was created to resolve a setting");
 }
+
+#[test]
+fn the_tui_refresh_interval_defaults_to_ten_seconds_and_the_environment_beats_the_file() {
+    let root = TempRoot::new();
+
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    assert!(resolved.is_ok(), "{:?}", resolved.errors());
+    assert_eq!(resolved.tui_refresh_interval(), Some(10));
+
+    root.user_config("tui_refresh_interval: 30s\n");
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    assert_eq!(resolved.tui_refresh_interval(), Some(30));
+
+    let resolved = resolve_with(
+        &Flags::default(),
+        &environment(&[("NARSOR_TUI_REFRESH_INTERVAL", "none")]),
+        &cascade(&root),
+    );
+    assert!(resolved.is_ok(), "{:?}", resolved.errors());
+    assert_eq!(resolved.tui_refresh_interval(), None, "none turns it off");
+    assert_eq!(
+        resolved.source(SettingKey::TuiRefreshInterval),
+        &Source::Env("NARSOR_TUI_REFRESH_INTERVAL".to_string())
+    );
+}

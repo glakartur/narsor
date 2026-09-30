@@ -401,12 +401,12 @@ fn known_keys() -> String {
 fn value_of(setting: SettingKey, raw: &serde_yaml::Value) -> Result<SettingValue, String> {
     // The shapes YAML offers that text does not: an explicit null and a bare
     // integer, both of which a duration accepts.
-    if setting == SettingKey::AgentTimeout {
+    if setting.is_duration() {
         if raw.is_null() {
             return Ok(SettingValue::Duration(None));
         }
         if let Some(seconds) = raw.as_u64() {
-            return Ok(SettingValue::Duration(Some(seconds)));
+            return duration_value(setting, seconds);
         }
     }
 
@@ -444,15 +444,16 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             }
         }
 
-        SettingKey::AgentTimeout => {
-            // The spelled-out word means "no limit", so a value inherited from
-            // /etc/narsor/ can be revoked and not only replaced.
+        SettingKey::AgentTimeout | SettingKey::TuiRefreshInterval => {
+            // The spelled-out word means "no limit" (for the refresh: no
+            // periodic read at all), so a value inherited from /etc/narsor/
+            // can be revoked and not only replaced.
             if text.trim().eq_ignore_ascii_case(NO_LIMIT) {
                 return Ok(SettingValue::Duration(None));
             }
-            parse_duration(text)
-                .map(|seconds| SettingValue::Duration(Some(seconds)))
-                .map_err(|error| format!("{error}; or '{NO_LIMIT}' for no limit at all"))
+            let seconds = parse_duration(text)
+                .map_err(|error| format!("{error}; or '{NO_LIMIT}' for no limit at all"))?;
+            duration_value(setting, seconds)
         }
 
         SettingKey::LogLevel => {
@@ -467,6 +468,20 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             }
         }
     }
+}
+
+/// A duration in seconds, checked against what its setting can live with.
+///
+/// A refresh interval of zero would have the interface re-read the daemon on
+/// every redraw; `none` is the way to turn the periodic read off.
+fn duration_value(setting: SettingKey, seconds: u64) -> Result<SettingValue, String> {
+    if setting == SettingKey::TuiRefreshInterval && seconds == 0 {
+        return Err(format!(
+            "the refresh interval must be at least one second; or '{NO_LIMIT}' to turn \
+             the periodic refresh off"
+        ));
+    }
+    Ok(SettingValue::Duration(Some(seconds)))
 }
 
 /// The value as text, or a complaint naming what was found instead.

@@ -1035,8 +1035,17 @@ pub fn tui(config: &Resolved, flags: &Flags) -> Result<()> {
     let handle = tokio::runtime::Handle::current();
     let catalog = config.catalog_paths();
     let work = config.work_paths();
+    let refresh_interval = config
+        .tui_refresh_interval()
+        .map(std::time::Duration::from_secs);
     tokio::task::block_in_place(move || {
-        handle.block_on(crate::tui::run(state, flags.clone(), catalog, work))
+        handle.block_on(crate::tui::run(
+            state,
+            flags.clone(),
+            catalog,
+            work,
+            refresh_interval,
+        ))
     })
     .map_err(|error| {
         CliError::failure(format!(

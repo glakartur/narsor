@@ -57,6 +57,11 @@ pub const RUST_LOG: &str = "RUST_LOG";
 /// revoked rather than only replaced.
 pub const NO_LIMIT: &str = "none";
 
+/// How often the terminal interface re-reads the daemon when nothing says
+/// otherwise (KTD16): often enough that a waiting task is noticed without
+/// `r`, rarely enough that an idle interface does not hammer the daemon.
+pub const DEFAULT_TUI_REFRESH_SECS: u64 = 10;
+
 // ---------------------------------------------------------------------------
 // The registry
 // ---------------------------------------------------------------------------
@@ -81,17 +86,21 @@ pub enum SettingKey {
     AgentTimeout,
     /// The logging level, when `RUST_LOG` does not say otherwise.
     LogLevel,
+    /// How often the terminal interface re-reads the daemon on its own
+    /// (KTD16), on top of the refreshes the live stream triggers.
+    TuiRefreshInterval,
 }
 
 impl SettingKey {
     /// Every setting, in the order `config show` prints them.
-    pub const ALL: [SettingKey; 6] = [
+    pub const ALL: [SettingKey; 7] = [
         SettingKey::CatalogDir,
         SettingKey::StateDir,
         SettingKey::WorkDir,
         SettingKey::AgentHarness,
         SettingKey::AgentTimeout,
         SettingKey::LogLevel,
+        SettingKey::TuiRefreshInterval,
     ];
 
     /// The three roots, in the order `config show` prints them.
@@ -110,6 +119,7 @@ impl SettingKey {
             SettingKey::AgentHarness => "agent_harness",
             SettingKey::AgentTimeout => "agent_timeout",
             SettingKey::LogLevel => "log_level",
+            SettingKey::TuiRefreshInterval => "tui_refresh_interval",
         }
     }
 
@@ -138,7 +148,8 @@ impl SettingKey {
             | SettingKey::WorkDir
             | SettingKey::AgentHarness
             | SettingKey::AgentTimeout
-            | SettingKey::LogLevel => false,
+            | SettingKey::LogLevel
+            | SettingKey::TuiRefreshInterval => false,
         }
     }
 
@@ -159,7 +170,19 @@ impl SettingKey {
             }
             SettingKey::AgentTimeout => SettingValue::Duration(None),
             SettingKey::LogLevel => SettingValue::Text(LOG_OFF.to_string()),
+            SettingKey::TuiRefreshInterval => {
+                SettingValue::Duration(Some(DEFAULT_TUI_REFRESH_SECS))
+            }
         }
+    }
+
+    /// Whether the value is a duration, which the file may also write as a
+    /// bare number of seconds or as an explicit null.
+    pub fn is_duration(self) -> bool {
+        matches!(
+            self,
+            SettingKey::AgentTimeout | SettingKey::TuiRefreshInterval
+        )
     }
 }
 
@@ -376,7 +399,8 @@ mod tests {
                 "work_dir",
                 "agent_harness",
                 "agent_timeout",
-                "log_level"
+                "log_level",
+                "tui_refresh_interval"
             ],
             "the registry is the one place the settings live, and the three \
              roots lead because that is the order `config show` prints"
@@ -488,6 +512,11 @@ mod tests {
             SettingKey::AgentTimeout.built_in(),
             SettingValue::Duration(None),
             "no limit, which is what an agent action without one gets today"
+        );
+        assert_eq!(
+            SettingKey::TuiRefreshInterval.built_in(),
+            SettingValue::Duration(Some(10)),
+            "KTD16: the interface re-reads the daemon every ten seconds"
         );
     }
 

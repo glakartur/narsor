@@ -75,13 +75,14 @@
 pub mod app;
 pub mod conversation;
 pub mod input_form;
+pub mod refresh;
 pub mod scroll;
 pub mod views;
 
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
 use crossterm::cursor::{Hide, Show};
@@ -98,7 +99,7 @@ use tokio::sync::mpsc;
 use crate::api::ensure_daemon_running;
 use crate::config::Flags;
 
-use app::{App, Request};
+use app::{App, Request, StreamStatus};
 
 /// The terminal this interface draws on.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -196,6 +197,7 @@ pub async fn run(
     flags: Flags,
     catalog: CatalogPaths,
     work: WorkPaths,
+    refresh_interval: Option<Duration>,
 ) -> io::Result<()> {
     install_panic_hook();
 
@@ -216,7 +218,7 @@ pub async fn run(
     // not guarantee.
     let mut events = Box::pin(client.stream_all());
 
-    let mut app = App::new(state, catalog, work, client);
+    let mut app = App::new(state, catalog, work, client).with_refresh_interval(refresh_interval);
     app.refresh().await;
 
     let mut guard = TerminalGuard::enter()?;
@@ -261,8 +263,18 @@ pub async fn run(
                 Some(_) => {}
                 None => app.quit(),
             },
-            received = events.next() => app.on_stream(received),
+            // A closed stream stays closed: polling it again would only
+            // spin, and the periodic refresh below keeps the view current.
+            received = events.next(), if app.stream_status() != &StreamStatus::Disconnected => {
+                app.on_stream(received)
+            }
             _ = tokio::time::sleep(TICK) => {}
+        }
+
+        // KTD16: the periodic read and the refresh a relevant live event
+        // asked for, neither of which disturbs what the operator is doing.
+        if app.refresh_due(Instant::now()) {
+            app.auto_refresh().await;
         }
     }
 

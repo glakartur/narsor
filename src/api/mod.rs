@@ -75,9 +75,9 @@ mod routes;
 pub use client::{ApiClient, ClientError};
 pub use discovery::{ensure_daemon_running, DiscoveryError};
 pub use dto::{
-    AcceptedResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
-    OperatorNoteRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
-    StartTaskResponse, TransitionRequest,
+    AcceptedResponse, ActiveProblem, ExecutionListResponse, ExecutionSummary,
+    HarnessSelectionSnapshot, OperatorNoteRequest, RequestErrorResponse,
+    SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse, TransitionRequest,
 };
 pub use routes::{ConversationEntryDto, ConversationResponse};
 

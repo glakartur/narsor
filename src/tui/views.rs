@@ -31,11 +31,17 @@ use ratatui::Frame;
 
 use super::app::{
     event_detail_lines, event_line, status_name, task_conversation_lines, task_events_lines,
-    task_position_line, App, EntryMap, FormRow, InputForm, InputKind, Modal, NewTaskStage, Panel,
-    RepositoryField, Screen, TaskContent, TaskFocus, TaskView, TransitionMode,
+    task_position_line, App, Attention, EntryMap, FormRow, InputForm, InputKind, Modal,
+    NewTaskStage, Panel, RepositoryField, Screen, TaskContent, TaskFocus, TaskView, TransitionMode,
 };
 use super::scroll::wrap_visible;
 use crate::domain::{ExecutionStatus, HumanInputType};
+
+/// The colour of an execution waiting on a question.
+const QUESTION_COLOUR: Color = Color::LightYellow;
+
+/// The colour of an execution stopped on a problem.
+const PROBLEM_COLOUR: Color = Color::LightRed;
 
 /// Height of the shortcut bar, borders included.
 const SHORTCUT_BAR_HEIGHT: u16 = 3;
@@ -300,8 +306,18 @@ fn panel_block(app: &App, panel: Panel, suffix: Option<String>) -> Block<'static
         ))
 }
 
-/// The colour a status is drawn in.
-fn status_style(status: &ExecutionStatus) -> Style {
+/// The colour a status is drawn in; a question and a problem each have
+/// their own, whatever the status underneath (R10).
+fn status_style(status: &ExecutionStatus, attention: Option<Attention>) -> Style {
+    match attention {
+        Some(Attention::Question) => return Style::default().fg(QUESTION_COLOUR),
+        Some(Attention::Problem) => {
+            return Style::default()
+                .fg(PROBLEM_COLOUR)
+                .add_modifier(Modifier::BOLD)
+        }
+        None => {}
+    }
     let colour = match status {
         ExecutionStatus::Running => Color::Green,
         ExecutionStatus::Paused => Color::Yellow,
@@ -317,11 +333,12 @@ fn status_style(status: &ExecutionStatus) -> Style {
 
 /// Left panel: every execution with its status and current state.
 fn render_executions(frame: &mut Frame, app: &App, area: Rect) {
-    let block = panel_block(
-        app,
-        Panel::Executions,
-        Some(format!("{}", app.executions().len())),
-    );
+    // R9: how many tasks wait on the operator, in the panel's header.
+    let suffix = match app.attention_counts().summary() {
+        Some(waiting) => format!("{} · {waiting}", app.executions().len()),
+        None => format!("{}", app.executions().len()),
+    };
+    let block = panel_block(app, Panel::Executions, Some(suffix));
 
     if app.executions().is_empty() {
         let hint = Paragraph::new(
@@ -338,12 +355,18 @@ fn render_executions(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|row| {
             let short: String = row.id.chars().take(8).collect();
+            let attention = row.attention();
+            let style = status_style(&row.status, attention);
+            let mut status = vec![
+                Span::styled(short, Style::default().fg(Color::White)),
+                Span::raw("  "),
+                Span::styled(status_name(&row.status), style),
+            ];
+            if let Some(attention) = attention {
+                status.push(Span::styled(format!(" · {}", attention.label()), style));
+            }
             ListItem::new(vec![
-                Line::from(vec![
-                    Span::styled(short, Style::default().fg(Color::White)),
-                    Span::raw("  "),
-                    Span::styled(status_name(&row.status), status_style(&row.status)),
-                ]),
+                Line::from(status),
                 Line::from(Span::styled(
                     format!(
                         "  {} · {}",
@@ -393,8 +416,13 @@ fn render_details(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("Status     ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                status_name(&execution.status),
-                status_style(&execution.status),
+                match app.selected_attention() {
+                    Some(attention) => {
+                        format!("{} ({})", status_name(&execution.status), attention.label())
+                    }
+                    None => status_name(&execution.status).to_string(),
+                },
+                status_style(&execution.status, app.selected_attention()),
             ),
         ]),
         Line::from(vec![
@@ -408,17 +436,7 @@ fn render_details(frame: &mut Frame, app: &App, area: Rect) {
         ]),
     ];
 
-    if let Some(pending) = app.pending() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("Waiting for an answer: {}", pending.instruction()),
-            Style::default().fg(Color::Yellow),
-        )));
-        lines.push(Line::from(Span::styled(
-            "Press i to open the form.",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
+    lines.extend(waiting_lines(app));
 
     if let Some(error) = app.definition_error() {
         lines.push(Line::from(""));
@@ -478,6 +496,51 @@ fn render_details(frame: &mut Frame, app: &App, area: Rect) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// What the selected execution waits on, described by its kind (R10): a
+/// workflow's question, an agent's question, or a problem.
+fn waiting_lines(app: &App) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let question = Style::default().fg(QUESTION_COLOUR);
+    let problem = Style::default()
+        .fg(PROBLEM_COLOUR)
+        .add_modifier(Modifier::BOLD);
+    let (text, style, hint) = match (app.pending(), app.selected_problem()) {
+        (Some(pending), _) => match InputKind::of(pending.continuation) {
+            InputKind::Gate => (
+                format!("Question — the workflow asks: {}", pending.instruction()),
+                question,
+                Some("Press i to answer it."),
+            ),
+            InputKind::AgentQuestion => (
+                format!("Question — the agent asks: {}", pending.instruction()),
+                question,
+                Some("Press i to reply to the agent."),
+            ),
+            InputKind::Problem => (
+                format!(
+                    "Problem — {}",
+                    pending
+                        .problem
+                        .as_ref()
+                        .map(|problem| problem.reason.as_str())
+                        .unwrap_or_else(|| pending.instruction())
+                ),
+                problem,
+                Some("Press i to settle it."),
+            ),
+        },
+        (None, Some(active)) if app.selected_attention() == Some(Attention::Problem) => {
+            (format!("Problem — {}", active.reason), problem, None)
+        }
+        _ => return Vec::new(),
+    };
+    let mut lines = vec![Line::from(""), Line::from(Span::styled(text, style))];
+    if let Some(hint) = hint {
+        lines.push(Line::from(Span::styled(hint, dim)));
+    }
+    lines
 }
 
 /// Bottom right panel: the live event stream, with the channel's health.
@@ -564,7 +627,22 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
     let area = modal_area(frame, 80, 80);
     frame.render_widget(Clear, area);
 
-    let mut lines = input_context_lines(form);
+    let mut lines = Vec::new();
+    if let Some(closure) = &form.closed {
+        // R5: the request is gone; what was typed stays below, unsendable.
+        lines.push(Line::from(Span::styled(
+            format!("✖ {}", closure.message()),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "This form can no longer be sent. What you typed is kept; Esc closes it.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.extend(input_context_lines(form));
     lines.push(Line::from(""));
 
     let dim = Style::default().fg(Color::DarkGray);
@@ -691,15 +769,21 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
         )));
     }
 
-    let border = match form.kind {
-        InputKind::Problem => Color::Red,
-        InputKind::Gate | InputKind::AgentQuestion => Color::Yellow,
+    let border = match (form.closed.is_some(), form.kind) {
+        (true, _) => Color::DarkGray,
+        (false, InputKind::Problem) => PROBLEM_COLOUR,
+        (false, InputKind::Gate | InputKind::AgentQuestion) => QUESTION_COLOUR,
+    };
+    let title = if form.closed.is_some() {
+        format!("{}(closed) ", form.kind.title())
+    } else {
+        form.kind.title().to_string()
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
         .border_style(Style::default().fg(border))
-        .title(form.kind.title());
+        .title(title);
 
     frame.render_widget(
         Paragraph::new(lines)

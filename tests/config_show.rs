@@ -45,13 +45,14 @@ const EXIT_FAILURE: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 
 /// Every setting the command must account for (R7).
-const EVERY_SETTING: [&str; 6] = [
+const EVERY_SETTING: [&str; 7] = [
     "catalog_dir",
     "state_dir",
     "work_dir",
     "agent_harness",
     "agent_timeout",
     "log_level",
+    "tui_refresh_interval",
 ];
 
 /// A temporary directory that deletes itself when it goes out of scope.
@@ -585,4 +586,29 @@ fn the_closing_message_does_not_promise_a_marker_that_is_not_there() {
         "so the message must not point at a marker: {}",
         invocation.stderr
     );
+}
+
+#[test]
+fn the_tui_refresh_interval_is_shown_from_the_file_and_from_the_environment() {
+    needs_no_system_config!();
+    // KTD16: the interval is an ordinary setting, visible like every other.
+    let root = TempRoot::new();
+
+    let invocation = show(&root, &[], &[]);
+    assert_eq!(invocation.code, EXIT_SUCCESS, "{}", invocation.stderr);
+    let row = row_for(&invocation.stdout, "tui_refresh_interval");
+    assert!(row.contains("10s") && row.contains("built-in"), "{row}");
+
+    let config = root.config("tui_refresh_interval: 30\n");
+    let invocation = show(&root, &[], &[]);
+    assert_eq!(invocation.code, EXIT_SUCCESS, "{}", invocation.stderr);
+    let row = row_for(&invocation.stdout, "tui_refresh_interval");
+    assert!(row.contains("30s"), "{row}");
+    assert!(row.contains(&config.display().to_string()), "{row}");
+
+    let invocation = show(&root, &[("NARSOR_TUI_REFRESH_INTERVAL", "5s")], &[]);
+    assert_eq!(invocation.code, EXIT_SUCCESS, "{}", invocation.stderr);
+    let row = row_for(&invocation.stdout, "tui_refresh_interval");
+    assert!(row.contains("5s"), "{row}");
+    assert!(row.contains("NARSOR_TUI_REFRESH_INTERVAL"), "{row}");
 }

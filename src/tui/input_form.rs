@@ -26,7 +26,9 @@ use std::collections::HashSet;
 use crossterm::event::{KeyCode, KeyEvent};
 use serde_json::{Map, Value};
 
-use crate::domain::{HumanInputField, HumanInputType, OutputDefinition};
+use crate::domain::{
+    AnsweredBy, EventData, HumanInputField, HumanInputType, InputCloseReason, OutputDefinition,
+};
 use crate::engine::actions::human::is_blank;
 use crate::engine::{
     HumanInputDelivery, InputContinuation, OutputRequirement, PendingHumanInput, RejectedAnswer,
@@ -343,6 +345,102 @@ pub struct InputForm {
     /// The key of the request the form was opened on (KTD9): the answer is
     /// refused if that request is no longer the one pending.
     pub episode: String,
+    /// How the request was closed, once it no longer is the one pending
+    /// (R5): the form stays open with what was typed, but cannot be sent.
+    pub closed: Option<InputClosure>,
+}
+
+/// How the request an open form answers stopped waiting — someone else's
+/// answer, a transition, an interrupt, a recovery (R5, AE13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputClosure {
+    /// Who closed it, when the log says.
+    pub answered_by: Option<AnsweredBy>,
+    /// How it was closed, when the log says.
+    pub reason: Option<InputCloseReason>,
+    /// The answer that closed it, summarised on one line.
+    pub answer: Option<String>,
+}
+
+impl InputClosure {
+    /// A closure nothing explains: the request is simply no longer pending.
+    pub fn unexplained() -> Self {
+        Self {
+            answered_by: None,
+            reason: None,
+            answer: None,
+        }
+    }
+
+    /// The closure a `HumanInputReceived` records, with the episode it
+    /// closed; `None` for any other event.
+    pub fn from_event(data: &EventData) -> Option<(Option<&str>, Self)> {
+        let EventData::HumanInputReceived {
+            input,
+            answered_by,
+            close_reason,
+            episode,
+            output_label,
+            data,
+            variables,
+            comment,
+        } = data
+        else {
+            return None;
+        };
+        let mut parts = Vec::new();
+        if let Some(label) = output_label {
+            parts.push(format!("'{label}'"));
+        }
+        for values in [Some(input), data.as_ref(), variables.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(map) = values.as_object() {
+                parts.extend(
+                    map.iter()
+                        .map(|(key, value)| format!("{key}={}", value_as_text(value))),
+                );
+            }
+        }
+        if let Some(comment) = comment.as_deref().filter(|comment| !comment.is_empty()) {
+            parts.push(format!("comment: {comment}"));
+        }
+        let closure = Self {
+            answered_by: *answered_by,
+            reason: close_reason.or(Some(InputCloseReason::Answered)),
+            answer: (!parts.is_empty()).then(|| parts.join(", ")),
+        };
+        Some((episode.as_deref(), closure))
+    }
+
+    /// What the form says about it.
+    pub fn message(&self) -> String {
+        let by = self.answered_by.map(|by| match by {
+            AnsweredBy::Operator => "an operator",
+            AnsweredBy::Conductor => "the conductor",
+        });
+        match self.reason {
+            Some(InputCloseReason::Transition) => match by {
+                Some(by) => format!("Closed by a transition ({by})."),
+                None => "Closed by a transition.".to_string(),
+            },
+            Some(InputCloseReason::Interrupt) => {
+                "Closed: the execution was interrupted.".to_string()
+            }
+            Some(InputCloseReason::Recover) => {
+                "Closed: the step was recovered and starts afresh.".to_string()
+            }
+            Some(InputCloseReason::Answered) => {
+                let by = by.unwrap_or("someone else");
+                match &self.answer {
+                    Some(answer) => format!("Already answered by {by}: {answer}"),
+                    None => format!("Already answered by {by}."),
+                }
+            }
+            None => "This input is no longer pending: it was closed elsewhere.".to_string(),
+        }
+    }
 }
 
 impl InputForm {
@@ -430,6 +528,7 @@ impl InputForm {
             error: None,
             error_row: None,
             episode: pending.episode_key().to_string(),
+            closed: None,
         };
         form.sync_required_entries();
         form
@@ -602,6 +701,15 @@ impl InputForm {
             ));
         }
         Ok(delivery)
+    }
+
+    /// Marks the request as closed, keeping everything typed (R5). The first
+    /// closure sticks: a later refresh must not replace the answer it named
+    /// with a vaguer one.
+    pub fn close(&mut self, closure: InputClosure) {
+        if self.closed.is_none() {
+            self.closed = Some(closure);
+        }
     }
 
     /// Records a failure and moves the focus to the row it is about.

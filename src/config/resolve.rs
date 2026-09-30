@@ -80,7 +80,10 @@ impl Flags {
                 .root
                 .clone()
                 .map(|root| (SettingValue::Path(root), "--root")),
-            SettingKey::AgentHarness | SettingKey::AgentTimeout | SettingKey::LogLevel => None,
+            SettingKey::AgentHarness
+            | SettingKey::AgentTimeout
+            | SettingKey::LogLevel
+            | SettingKey::TuiRefreshInterval => None,
         }
     }
 }
@@ -249,6 +252,14 @@ impl Resolved {
         self.value(SettingKey::AgentTimeout)
             .as_duration()
             .expect("the timeout is a duration")
+    }
+
+    /// How often the terminal interface re-reads the daemon on its own
+    /// (KTD16); `None` turns the periodic read off.
+    pub fn tui_refresh_interval(&self) -> Option<u64> {
+        self.value(SettingKey::TuiRefreshInterval)
+            .as_duration()
+            .expect("the refresh interval is a duration")
     }
 
     /// What the engine needs from the configuration for an `agent` action.

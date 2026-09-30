@@ -13,8 +13,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::domain::{ExecutionStatus, WorkflowExecution};
-use crate::engine::PendingHumanInput;
+use crate::domain::{ExecutionStatus, ProblemKind, WorkflowExecution};
+use crate::engine::{InputContinuation, PendingHumanInput};
 
 /// Authoritative default-harness selection returned by `GET`, `PUT`, and
 /// `DELETE /settings/agent-harness`.
@@ -182,6 +182,48 @@ pub struct ExecutionSummary {
     /// for it).
     #[serde(default)]
     pub pending_input: Option<PendingHumanInput>,
+    /// The problem this execution is stopped on, if it is stopped on one
+    /// (conductor plan U7) — what a client needs to count and colour it
+    /// without reading the event log.
+    ///
+    /// Filled today for a problem input ([`ProblemKind::Output`], derived
+    /// from `pending_input`). A [`ProblemKind::Failure`] leaves the execution
+    /// `Failed` with no pending input; the record that says it is still
+    /// active arrives with the conductor's failure handling (U11), which
+    /// fills this field from it. Until then a client learns of one only from
+    /// the live `ProblemRaised` event.
+    #[serde(default)]
+    pub problem: Option<ActiveProblem>,
+}
+
+/// A problem an execution is stopped on (KTD3, KTD4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveProblem {
+    /// Whether the step lacks its output or failed.
+    pub kind: ProblemKind,
+    /// Why the step could not go on by itself.
+    pub reason: String,
+    /// The key of the pending input that asks the operator, if one does.
+    #[serde(default)]
+    pub episode: Option<String>,
+}
+
+impl ActiveProblem {
+    /// The problem a pending input stands for, if it is a problem input.
+    pub fn of_pending(pending: &PendingHumanInput) -> Option<Self> {
+        if pending.continuation != InputContinuation::ResolveOutput {
+            return None;
+        }
+        Some(Self {
+            kind: ProblemKind::Output,
+            reason: pending
+                .problem
+                .as_ref()
+                .map(|problem| problem.reason.clone())
+                .unwrap_or_else(|| pending.instruction().to_string()),
+            episode: Some(pending.episode_key().to_string()),
+        })
+    }
 }
 
 impl From<&WorkflowExecution> for ExecutionSummary {
@@ -205,6 +247,7 @@ impl From<&WorkflowExecution> for ExecutionSummary {
             variables: execution.context.variables.clone(),
             metadata: execution.metadata.clone(),
             pending_input: None,
+            problem: None,
         }
     }
 }

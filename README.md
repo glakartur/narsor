@@ -830,6 +830,7 @@ data_dir: /srv/narsor        # executions, workspaces, the registry
 agent_harness: claude-code   # for an agent action that names none itself
 agent_timeout: 30m           # for an agent action that declares none; `none` for no limit
 log_level: info              # off, error, warn, info, debug, trace
+tui_refresh_interval: 10s    # how often the TUI re-reads the daemon; `none` turns it off
 ```
 
 Every one of them is available as an environment variable too, mechanically:
@@ -840,6 +841,7 @@ Every one of them is available as an environment variable too, mechanically:
 | `agent_harness` | `NARSOR_AGENT_HARNESS` | `claude-code` |
 | `agent_timeout` | `NARSOR_AGENT_TIMEOUT` | `none` |
 | `log_level` | `NARSOR_LOG_LEVEL` | `off` |
+| `tui_refresh_interval` | `NARSOR_TUI_REFRESH_INTERVAL` | `10s` |
 
 An **empty** variable counts as unset, because that is how Kubernetes renders
 an unset key of a ConfigMap.

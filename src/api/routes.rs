@@ -63,9 +63,9 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
 
 use crate::api::dto::{
-    AcceptedResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
-    OperatorNoteRequest, RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest,
-    StartTaskRequest, StartTaskResponse, TransitionRequest,
+    AcceptedResponse, ActiveProblem, ExecutionListResponse, ExecutionSummary,
+    HarnessSelectionSnapshot, OperatorNoteRequest, RecoveryRequest, RequestErrorResponse,
+    SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse, TransitionRequest,
 };
 use crate::domain::{AnsweredBy, Event, EventData, ExecutionStatus, InputCloseReason};
 use crate::engine::actions::human;
@@ -1017,6 +1017,10 @@ fn build_summary(
     } else {
         None
     };
+    summary.problem = summary
+        .pending_input
+        .as_ref()
+        .and_then(ActiveProblem::of_pending);
     Ok(summary)
 }
 

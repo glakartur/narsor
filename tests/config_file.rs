@@ -358,3 +358,29 @@ fn the_keys_that_held_up_survive_beside_the_ones_that_did_not() {
     );
     assert!(!parsed.is_ok());
 }
+
+#[test]
+fn the_tui_refresh_interval_takes_a_duration_or_none_but_never_zero() {
+    for (written, expected) in [
+        ("30", Some(30u64)),
+        ("2m", Some(120)),
+        ("none", None),
+        ("~", None),
+    ] {
+        let values = parse(&format!("tui_refresh_interval: {written}\n"))
+            .unwrap_or_else(|errors| panic!("'{written}' must parse: {:?}", messages(&errors)));
+        assert_eq!(
+            values.get(SettingKey::TuiRefreshInterval),
+            Some(&SettingValue::Duration(expected)),
+            "'{written}'"
+        );
+    }
+
+    // Zero would re-read the daemon on every redraw.
+    for written in ["0", "0s"] {
+        let errors =
+            parse(&format!("tui_refresh_interval: {written}\n")).expect_err("zero is refused");
+        let report = messages(&errors).join("\n");
+        assert!(report.contains("at least one second"), "{report}");
+    }
+}

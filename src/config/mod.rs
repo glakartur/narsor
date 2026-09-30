@@ -31,4 +31,7 @@ pub mod settings;
 pub use cascade::{CascadeError, ConfigCascade, Resolution};
 pub use file::{FileError, FileValues, ParsedFile};
 pub use resolve::{resolve, ConfigError, Environment, Flags, Resolved};
-pub use settings::{render_value, SettingKey, SettingValue, Source, ENV_PREFIX, MASK, NO_LIMIT};
+pub use settings::{
+    render_value, SettingKey, SettingValue, Source, DEFAULT_TUI_REFRESH_SECS, ENV_PREFIX, MASK,
+    NO_LIMIT,
+};

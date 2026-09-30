@@ -48,9 +48,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifi
 use futures::{Stream, StreamExt as _};
 use serde_json::{json, Value};
 
+use narsor::api::TransitionRequest;
 use narsor::api::{ensure_daemon_running, ApiClient, ClientError};
 use narsor::config::Flags;
 use narsor::daemon::launch::set_exe_override_for_tests;
+use narsor::domain::{AnsweredBy, InputCloseReason, ProblemKind};
 use narsor::domain::{
     Event, EventData, ExecutionStatus, WorkflowDefinition, WorkflowExecution, Workspace,
 };
@@ -62,9 +64,10 @@ use narsor::persistence::conversation::ConversationSource;
 use narsor::persistence::{CatalogPaths, DaemonInfo, ExecutionStore, StatePaths, WorkPaths};
 use narsor::registry::{RepositoryEntry, RepositoryRegistry};
 use narsor::tui::app::{
-    event_detail_lines, event_line, task_position_line, App, EntryMap, FormRow, InputKind, Modal,
-    NewTaskChoice, NewTaskStage, Panel, RepositoryField, Request, Screen, StreamStatus,
-    TaskContent, TransitionMode, GATE_NEEDS_FORM_MESSAGE, OVERRIDE_PROVIDER, OVERRIDE_REASON,
+    event_detail_lines, event_line, task_position_line, App, Attention, EntryMap, FormRow,
+    InputKind, Modal, NewTaskChoice, NewTaskStage, Panel, RepositoryField, Request, Screen,
+    StreamStatus, TaskContent, TransitionMode, GATE_NEEDS_FORM_MESSAGE, OVERRIDE_PROVIDER,
+    OVERRIDE_REASON,
 };
 use narsor::tui::views;
 use narsor::workflow::load_from_file;
@@ -4009,4 +4012,483 @@ async fn a_problem_label_needing_a_key_is_refused_until_it_is_given() {
         gate.request.question.as_deref(),
         Some("Account or user limit?")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Conductor plan U7: non-destructive refresh, counters, colours and notices
+// ---------------------------------------------------------------------------
+
+/// Characterization (U7 execution note): a refresh keeps the selection, the
+/// event cursor and the follow mode the operator left the stream in, and
+/// appends what is new instead of reloading it from scratch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_keeps_the_selection_the_event_cursor_and_the_follow_mode() {
+    let root = TempRoot::new();
+    let first = paused_at_review(root.path()).await;
+    let second = paused_at_review(root.path()).await;
+
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.select_execution(&second).await;
+    let selected = app.selected_index();
+
+    // The operator scrolls the stream up: reading, not following.
+    app.on_key(key(KeyCode::Tab));
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(app.focus(), Panel::Events);
+    app.on_key(key(KeyCode::Char('k')));
+    app.on_key(key(KeyCode::Char('k')));
+    let cursor = app.event_cursor();
+    let backfilled = app.events().len();
+    assert!(!app.follows_stream());
+    assert!(cursor + 1 < backfilled);
+
+    app.refresh().await;
+
+    assert_eq!(app.selected_index(), selected);
+    assert_eq!(
+        app.selected().map(|row| row.id.as_str()),
+        Some(second.as_str())
+    );
+    assert_eq!(app.event_cursor(), cursor, "the cursor stays where it was");
+    assert!(!app.follows_stream(), "the follow mode is kept");
+    assert_eq!(app.events().len(), backfilled);
+
+    // New events are appended; the cursor still does not move.
+    client
+        .deliver_input(
+            &second,
+            HumanInputDelivery::with_values(
+                json!({ "approval_status": "approved", "comment": "fine" })
+                    .as_object()
+                    .cloned()
+                    .expect("an object"),
+            ),
+        )
+        .await
+        .expect("answer the review");
+    wait_until_settled(&client, &[&second]).await;
+    app.refresh().await;
+
+    assert!(app.events().len() > backfilled, "the new events are there");
+    assert_eq!(app.event_cursor(), cursor);
+    assert!(!app.follows_stream());
+    let sequences: Vec<u64> = app.events().iter().map(|event| event.sequence).collect();
+    let mut sorted = sequences.clone();
+    sorted.dedup();
+    assert_eq!(sequences, sorted, "nothing was appended twice");
+    assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+    let _ = first;
+}
+
+/// The row of one execution.
+fn row_of<'a>(app: &'a App, execution_id: &str) -> &'a narsor::tui::app::ExecutionRow {
+    app.executions()
+        .iter()
+        .find(|row| row.id == execution_id)
+        .unwrap_or_else(|| panic!("{execution_id} is listed"))
+}
+
+/// The next sequence number of the selected execution's stream.
+fn next_sequence(app: &App) -> u64 {
+    app.events().last().map_or(1, |event| event.sequence + 1)
+}
+
+/// AE11: an open `i` form with typed content survives the automatic
+/// refresh, while another task's status on the list is brought up to date.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_automatic_refresh_keeps_an_open_form_and_updates_the_list() {
+    let root = TempRoot::new();
+    let other = paused_at_review(root.path()).await;
+    let gate = paused_at_gate(root.path(), None).await;
+
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    assert!(!app.refresh_due(std::time::Instant::now()));
+    assert!(
+        app.refresh_due(std::time::Instant::now() + Duration::from_secs(10)),
+        "the built-in interval is ten seconds"
+    );
+    assert_eq!(app.on_key(key(KeyCode::Char('r'))), Request::Refresh);
+
+    app.select_execution(&gate).await;
+    app.on_key(key(KeyCode::Char('i')));
+    focus_row(&mut app, FormRow::Field(1));
+    type_text(&mut app, "wariant A");
+
+    // Another window answers the other task.
+    client
+        .deliver_input(
+            &other,
+            HumanInputDelivery::with_values(
+                json!({ "approval_status": "approved", "comment": "fine" })
+                    .as_object()
+                    .cloned()
+                    .expect("an object"),
+            ),
+        )
+        .await
+        .expect("answer the review");
+    wait_until_settled(&client, &[&other]).await;
+
+    app.auto_refresh().await;
+
+    let form = input_form(&app);
+    assert_eq!(form.values[1], "wariant A", "what was typed is kept");
+    assert!(form.closed.is_none(), "the gate is still pending");
+    assert_eq!(input_form(&app).current_row(), Some(FormRow::Field(1)));
+    assert_eq!(row_of(&app, &other).status, ExecutionStatus::Completed);
+    assert_eq!(
+        app.selected().map(|row| row.id.as_str()),
+        Some(gate.as_str())
+    );
+}
+
+/// AE12 (counters and notice): while the operator watches task A, task B
+/// turns into a problem — the header counts it and the bar names B.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_problem_on_another_task_is_counted_and_announced() {
+    let root = TempRoot::new();
+    let watched = paused_at_review(root.path()).await;
+    let problem = paused_on_problem(root.path(), None).await;
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.select_execution(&watched).await;
+
+    let counts = app.attention_counts();
+    assert_eq!((counts.questions, counts.problems), (1, 1));
+    assert_eq!(counts.summary().as_deref(), Some("1 question · 1 problem"));
+    assert_eq!(row_of(&app, &problem).attention(), Some(Attention::Problem));
+    assert_eq!(
+        row_of(&app, &watched).attention(),
+        Some(Attention::Question)
+    );
+    assert!(screen_of(&app).contains("1 question · 1 problem"));
+
+    // The stream announces B's problem while A is selected.
+    app.on_stream(Some(Ok(Event::new(
+        problem.clone(),
+        EventData::ProblemRaised {
+            state_id: "implement".to_string(),
+            action_execution_id: "attempt".to_string(),
+            kind: ProblemKind::Output,
+            reason: "no output label".to_string(),
+            episode: None,
+        },
+        1_000,
+    ))));
+    let notice = app.notice().expect("a notice");
+    assert!(notice.text.contains(&problem), "{}", notice.text);
+    assert!(notice.text.contains("problem"), "{}", notice.text);
+    assert!(app.refresh_requested(), "the event asks for a refresh");
+    assert_eq!(
+        app.selected().map(|row| row.id.as_str()),
+        Some(watched.as_str())
+    );
+
+    // A question on an unselected task is announced too.
+    app.on_stream(Some(Ok(Event::new(
+        problem.clone(),
+        EventData::HumanInputRequested {
+            instruction: "Which variant?".to_string(),
+            question: None,
+            answer_tail: None,
+            episode: None,
+        },
+        1_001,
+    ))));
+    let notice = app.notice().expect("a notice");
+    assert!(notice.text.contains(&problem) && notice.text.contains("Which variant?"));
+}
+
+/// A `Failed` execution with an active failure problem counts as a problem,
+/// and a refresh does not forget what the stream said about it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failure_problem_from_the_stream_counts_and_survives_a_refresh() {
+    let root = TempRoot::new();
+    let store = store_of(root.path());
+    let failed = seeded_execution("failed-with-problem", ExecutionStatus::Failed);
+    store.save_execution(&failed).expect("seed");
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    assert_eq!(
+        app.attention_counts().problems,
+        0,
+        "failed alone is no problem"
+    );
+
+    app.on_stream(Some(Ok(Event::new(
+        failed.id.clone(),
+        EventData::ProblemRaised {
+            state_id: "plan".to_string(),
+            action_execution_id: "attempt".to_string(),
+            kind: ProblemKind::Failure,
+            reason: "the harness did not start".to_string(),
+            episode: None,
+        },
+        1,
+    ))));
+    assert_eq!(app.attention_counts().problems, 1);
+
+    app.refresh().await;
+    assert_eq!(app.attention_counts().problems, 1);
+    assert!(screen_of(&app).contains("Problem — the harness did not start"));
+}
+
+/// AE13 (TUI): "wariant A" is typed, the conductor closes the input with
+/// "wariant B" — the form says who answered and what, refuses to send, and
+/// keeps "wariant A".
+#[tokio::test(flavor = "multi_thread")]
+async fn an_input_answered_by_the_conductor_closes_the_open_form() {
+    let root = TempRoot::new();
+    let execution_id = paused_at_gate(root.path(), None).await;
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.on_key(key(KeyCode::Char('i')));
+    focus_row(&mut app, FormRow::Field(1));
+    type_text(&mut app, "wariant A");
+    let episode = input_form(&app).episode.clone();
+
+    let sequence = next_sequence(&app);
+    app.on_stream(Some(Ok(Event::new(
+        execution_id.clone(),
+        EventData::HumanInputReceived {
+            input: json!({ "ambiguity_answer": "wariant B" }),
+            answered_by: Some(AnsweredBy::Conductor),
+            close_reason: Some(InputCloseReason::Answered),
+            episode: Some(episode),
+            output_label: Some("answered".to_string()),
+            data: None,
+            variables: None,
+            comment: None,
+        },
+        sequence,
+    ))));
+
+    let form = input_form(&app);
+    let closure = form.closed.as_ref().expect("the form is closed");
+    let message = closure.message();
+    assert!(message.contains("the conductor"), "{message}");
+    assert!(message.contains("wariant B"), "{message}");
+    assert_eq!(form.values[1], "wariant A");
+
+    assert_eq!(
+        app.on_key(key(KeyCode::Enter)),
+        Request::None,
+        "nothing is sent"
+    );
+    assert!(app.notice().expect("a notice").is_error);
+    app.submit_input().await;
+    assert!(
+        matches!(app.modal(), Modal::Input(_)),
+        "still open until Esc"
+    );
+    assert_eq!(
+        store_of(root.path())
+            .load_execution(&execution_id)
+            .expect("reload")
+            .status,
+        ExecutionStatus::InputNeeded,
+        "the daemon was never asked"
+    );
+    let screen = screen_of(&app);
+    assert!(screen.contains("(closed)"));
+    assert!(screen.contains("wariant B"));
+
+    app.on_key(key(KeyCode::Esc));
+    assert!(matches!(app.modal(), Modal::None));
+}
+
+/// Another window takes the gate's transition with `t`: at the next refresh
+/// the open form says it was closed by a transition.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transition_from_another_window_closes_the_open_form_at_the_refresh() {
+    let root = TempRoot::new();
+    let execution_id = paused_at_gate(root.path(), None).await;
+
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.on_key(key(KeyCode::Char('i')));
+    focus_row(&mut app, FormRow::Field(1));
+    type_text(&mut app, "mine");
+
+    client
+        .transition(
+            &execution_id,
+            TransitionRequest {
+                label: Some("replan".to_string()),
+                target: None,
+                force: false,
+            },
+        )
+        .await
+        .expect("the transition is accepted");
+    wait_until_settled(&client, &[&execution_id]).await;
+
+    app.auto_refresh().await;
+
+    let form = input_form(&app);
+    let closure = form.closed.as_ref().expect("the form is closed");
+    assert_eq!(closure.reason, Some(InputCloseReason::Transition));
+    assert!(
+        closure.message().contains("transition"),
+        "{}",
+        closure.message()
+    );
+    assert_eq!(form.values[1], "mine");
+}
+
+/// An operator in another window answers first: the refresh closes the
+/// form with that answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_from_another_window_closes_the_open_form_at_the_refresh() {
+    let root = TempRoot::new();
+    let execution_id = paused_at_gate(root.path(), None).await;
+
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.on_key(key(KeyCode::Char('i')));
+    focus_row(&mut app, FormRow::Field(1));
+    type_text(&mut app, "mine");
+
+    client
+        .deliver_input(
+            &execution_id,
+            HumanInputDelivery::with_values(
+                json!({ "ambiguity_decision": "replan", "ambiguity_answer": "theirs" })
+                    .as_object()
+                    .cloned()
+                    .expect("an object"),
+            ),
+        )
+        .await
+        .expect("the first answer is accepted");
+    wait_until_settled(&client, &[&execution_id]).await;
+
+    app.refresh().await;
+
+    let form = input_form(&app);
+    let message = form.closed.as_ref().expect("closed").message();
+    assert!(message.contains("an operator"), "{message}");
+    assert!(message.contains("theirs"), "{message}");
+    assert_eq!(form.values[1], "mine");
+}
+
+/// With the stream gone, the periodic read still brings statuses up to date.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disconnected_stream_still_gets_statuses_from_the_periodic_read() {
+    let root = TempRoot::new();
+    let execution_id = paused_at_review(root.path()).await;
+
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path())
+        .await
+        .with_refresh_interval(Some(Duration::from_secs(1)));
+    app.refresh().await;
+    app.on_stream(None);
+    assert_eq!(app.stream_status(), &StreamStatus::Disconnected);
+
+    client
+        .deliver_input(
+            &execution_id,
+            HumanInputDelivery::with_values(
+                json!({ "approval_status": "approved", "comment": "fine" })
+                    .as_object()
+                    .cloned()
+                    .expect("an object"),
+            ),
+        )
+        .await
+        .expect("answer the review");
+    wait_until_settled(&client, &[&execution_id]).await;
+
+    assert!(app.refresh_due(std::time::Instant::now() + Duration::from_secs(1)));
+    app.auto_refresh().await;
+    assert_eq!(
+        row_of(&app, &execution_id).status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(app.attention_counts().summary(), None);
+}
+
+/// The automatic refresh leaves the task view's axis where the operator put
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_automatic_refresh_keeps_the_task_views_cursor() {
+    let root = TempRoot::new();
+    paused_at_review(root.path()).await;
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::OpenTaskView);
+    app.open_task_for_execution().await;
+    app.on_key(key(KeyCode::Char('g')));
+    app.load_task_position().await;
+    let before = task_view(&app).axis_scroll.offset();
+    let selected = task_view(&app).selected.clone();
+
+    app.auto_refresh().await;
+
+    assert!(matches!(app.screen(), Screen::Task(_)));
+    assert_eq!(task_view(&app).axis_scroll.offset(), before);
+    assert_eq!(task_view(&app).selected, selected);
+}
+
+/// R10: a question and a problem read differently — their own words in the
+/// list and the details, their own colours.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_and_a_problem_have_their_own_colours_and_descriptions() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let root = TempRoot::new();
+    let question = paused_at_gate(root.path(), None).await;
+    let problem = paused_on_problem(root.path(), None).await;
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+
+    let colour_of = |app: &App, needle: &str| {
+        let mut terminal = Terminal::new(TestBackend::new(160, 60)).expect("a test terminal");
+        terminal
+            .draw(|frame| views::render(frame, app))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let cells = buffer.content();
+        let wanted: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+        let at = (0..cells.len())
+            .find(|start| {
+                wanted.iter().enumerate().all(|(offset, symbol)| {
+                    cells.get(start + offset).map(|cell| cell.symbol()) == Some(symbol.as_str())
+                })
+            })
+            .expect("the text is on screen");
+        cells[at].fg
+    };
+
+    app.select_execution(&question).await;
+    let screen = screen_of(&app);
+    assert!(screen.contains("Question — the workflow asks"), "{screen}");
+    assert!(screen.contains("input_needed (question)"));
+    let question_colour = colour_of(&app, "input_needed (question)");
+
+    app.select_execution(&problem).await;
+    let screen = screen_of(&app);
+    assert!(screen.contains("Problem — "), "{screen}");
+    assert!(screen.contains("input_needed (problem)"));
+    let problem_colour = colour_of(&app, "input_needed (problem)");
+
+    assert_ne!(question_colour, problem_colour);
 }

@@ -72,18 +72,20 @@
 //! interface does not hold a second.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Map, Value};
 
 use crate::api::{
-    ApiClient, ClientError, ConversationResponse, ExecutionSummary, HarnessSelectionSnapshot,
-    TransitionRequest,
+    ActiveProblem, ApiClient, ClientError, ConversationResponse, ExecutionSummary,
+    HarnessSelectionSnapshot, TransitionRequest,
 };
+use crate::config::DEFAULT_TUI_REFRESH_SECS;
 use crate::domain::{
-    Context, Event, EventData, ExecutionStatus, InputCloseReason, InputParameter, ParamType, State,
-    WorkflowDefinition, WorkflowExecution, Workspace,
+    Context, Event, EventData, ExecutionStatus, InputCloseReason, InputParameter, ParamType,
+    ProblemKind, State, WorkflowDefinition, WorkflowExecution, Workspace,
 };
 use crate::engine::actions::script::TRUNCATION_MARKER;
 use crate::engine::{
@@ -94,11 +96,13 @@ use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
 use crate::tasks;
 use crate::tui::conversation::{classify, ClassifiedEntry};
+use crate::tui::refresh::RefreshSchedule;
 use crate::tui::scroll::{sanitize, ScrollState};
 use crate::workflows::{ResolvedWorkflow, WorkflowEntry, WorkflowResolver};
 
 pub use crate::tui::input_form::{
-    Entry, EntryMap, FormAction, FormError, FormRow, InputForm, InputKind, ProblemForm,
+    Entry, EntryMap, FormAction, FormError, FormRow, InputClosure, InputForm, InputKind,
+    ProblemForm,
 };
 
 /// The decision provider recorded for an operator's ordinary manual choice.
@@ -220,6 +224,110 @@ pub struct ExecutionRow {
     pub status: ExecutionStatus,
     /// The state it sits in, if it sits in one.
     pub current_state: Option<String>,
+    /// What the pending input continues, when the daemon reported one — the
+    /// difference between a question and a problem (R10).
+    pub input: Option<InputContinuation>,
+    /// The problem it is stopped on, from the summary or from a live
+    /// `ProblemRaised`.
+    pub problem: Option<ActiveProblem>,
+}
+
+impl ExecutionRow {
+    /// The row a daemon summary describes.
+    fn of_summary(summary: &ExecutionSummary) -> Self {
+        Self {
+            id: summary.id.clone(),
+            workflow_id: summary.workflow_id.clone(),
+            status: summary.status.clone(),
+            current_state: summary.current_state.clone(),
+            input: summary
+                .pending_input
+                .as_ref()
+                .map(|pending| pending.continuation),
+            problem: summary.problem.clone(),
+        }
+    }
+
+    /// Whether it waits for an operator, and on what (R9, R10).
+    ///
+    /// A question is an `InputNeeded` gate or agent question; a problem is
+    /// an `InputNeeded` problem input, or a `Failed` execution with an
+    /// active failure problem.
+    pub fn attention(&self) -> Option<Attention> {
+        match self.status {
+            ExecutionStatus::InputNeeded => {
+                let problem = self.input == Some(InputContinuation::ResolveOutput)
+                    || (self.input.is_none()
+                        && self
+                            .problem
+                            .as_ref()
+                            .is_some_and(|problem| problem.kind == ProblemKind::Output));
+                Some(if problem {
+                    Attention::Problem
+                } else {
+                    Attention::Question
+                })
+            }
+            ExecutionStatus::Failed => self
+                .problem
+                .as_ref()
+                .filter(|problem| problem.kind == ProblemKind::Failure)
+                .map(|_| Attention::Problem),
+            _ => None,
+        }
+    }
+}
+
+/// What an execution waits on an operator for (R9, R10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attention {
+    /// A gate or an agent's question: someone has to answer.
+    Question,
+    /// A step that could not go on by itself: someone has to settle it.
+    Problem,
+}
+
+impl Attention {
+    /// The word drawn next to the status.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Question => "question",
+            Self::Problem => "problem",
+        }
+    }
+}
+
+/// How many executions wait on a question and how many on a problem.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttentionCounts {
+    /// Executions waiting on a question.
+    pub questions: usize,
+    /// Executions stopped on a problem.
+    pub problems: usize,
+}
+
+impl AttentionCounts {
+    /// The header's text, e.g. "2 questions · 1 problem"; `None` when
+    /// nothing waits.
+    pub fn summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.questions > 0 {
+            parts.push(plural(self.questions, "question"));
+        }
+        if self.problems > 0 {
+            parts.push(plural(self.problems, "problem"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
+/// "1 problem", "2 problems".
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
 }
 
 /// A message shown in the bottom bar until the next operation replaces it.
@@ -1086,6 +1194,8 @@ pub struct App {
     stream: StreamStatus,
     notice: Option<Notice>,
     quit: bool,
+    /// When the next automatic refresh is due (KTD16).
+    refresh: RefreshSchedule,
     catalog: CatalogPaths,
     /// Kept for constructor symmetry with the CLI's own "three roots" and
     /// for any future feature that needs it — nothing currently reads it:
@@ -1155,7 +1265,19 @@ impl App {
             stream: StreamStatus::Live,
             notice: None,
             quit: false,
+            refresh: RefreshSchedule::new(
+                Some(Duration::from_secs(DEFAULT_TUI_REFRESH_SECS)),
+                Instant::now(),
+            ),
         }
+    }
+
+    /// The same, re-reading the daemon on its own every `interval`
+    /// (`tui_refresh_interval`); `None` leaves only the refreshes the live
+    /// stream asks for, and `r`.
+    pub fn with_refresh_interval(mut self, interval: Option<Duration>) -> Self {
+        self.refresh = RefreshSchedule::new(interval, Instant::now());
+        self
     }
 
     // -- read-only accessors, for the views and the tests ------------------
@@ -1240,6 +1362,39 @@ impl App {
     /// The health of the live channel.
     pub fn stream_status(&self) -> &StreamStatus {
         &self.stream
+    }
+
+    /// How many executions wait on a question and on a problem (R9).
+    pub fn attention_counts(&self) -> AttentionCounts {
+        let mut counts = AttentionCounts::default();
+        for row in &self.executions {
+            match row.attention() {
+                Some(Attention::Question) => counts.questions += 1,
+                Some(Attention::Problem) => counts.problems += 1,
+                None => {}
+            }
+        }
+        counts
+    }
+
+    /// What the highlighted execution waits on, if anything.
+    pub fn selected_attention(&self) -> Option<Attention> {
+        self.selected().and_then(ExecutionRow::attention)
+    }
+
+    /// The problem the highlighted execution is stopped on, if any.
+    pub fn selected_problem(&self) -> Option<&ActiveProblem> {
+        self.selected().and_then(|row| row.problem.as_ref())
+    }
+
+    /// Whether an automatic refresh is due at `now` (KTD16).
+    pub fn refresh_due(&self, now: Instant) -> bool {
+        self.refresh.is_due(now)
+    }
+
+    /// Whether a live event is waiting for the refresh it asked for.
+    pub fn refresh_requested(&self) -> bool {
+        self.refresh.is_requested()
     }
 
     /// The message in the bottom bar.
@@ -1457,20 +1612,31 @@ impl App {
                 self.notice = Some(Notice::error(format!(
                     "Could not read the execution list: {error}"
                 )));
+                self.refresh.done(Instant::now());
                 return;
             }
         };
 
-        self.executions = listing
+        // Rows are rebuilt from the daemon's word, except for what only the
+        // stream has told this interface so far: a failure problem the
+        // summary does not carry yet (see `ExecutionSummary::problem`).
+        let rows = listing
             .executions
-            .into_iter()
-            .map(|summary| ExecutionRow {
-                id: summary.id,
-                workflow_id: summary.workflow_id,
-                status: summary.status,
-                current_state: summary.current_state,
+            .iter()
+            .map(|summary| {
+                let mut row = ExecutionRow::of_summary(summary);
+                if row.problem.is_none() && row.status == ExecutionStatus::Failed {
+                    row.problem = self
+                        .executions
+                        .iter()
+                        .find(|old| old.id == row.id && old.status == ExecutionStatus::Failed)
+                        .and_then(|old| old.problem.clone())
+                        .filter(|problem| problem.kind == ProblemKind::Failure);
+                }
+                row
             })
             .collect();
+        self.executions = rows;
 
         self.selected = previous
             .and_then(|id| self.executions.iter().position(|row| row.id == id))
@@ -1480,6 +1646,18 @@ impl App {
         }
 
         self.reload_selection().await;
+        self.refresh.done(Instant::now());
+    }
+
+    /// The refresh the event loop runs when [`App::refresh_due`] says so
+    /// (KTD16): the list and the selection, and the task view's axis and
+    /// conversation when it is showing. Nothing the operator is looking at
+    /// or typing into is reset.
+    pub async fn auto_refresh(&mut self) {
+        self.refresh().await;
+        if matches!(self.screen, Screen::Task(_)) {
+            self.refresh_task().await;
+        }
     }
 
     /// Re-reads everything that depends on which execution is selected — a
@@ -1488,19 +1666,25 @@ impl App {
     /// through every caller of this method (cursor movement, `select_execution`,
     /// a mutation's own follow-up reload): simplicity over saving one small
     /// request on a loopback connection.
+    ///
+    /// Non-destructive when the selection has not changed (KTD16): the
+    /// variable and event cursors and the follow mode stay as the operator
+    /// left them, only events newer than the last one held are appended, and
+    /// the modal is never touched — an open input form whose request is no
+    /// longer the pending one is only marked closed ([`App::sync_open_form`]).
+    /// Selecting a different execution loads it from scratch.
     pub async fn reload_selection(&mut self) {
-        self.execution = None;
-        self.definition = None;
-        self.definition_error = None;
-        self.pending = None;
-        self.variables.clear();
-        self.variable_cursor = 0;
-        self.events.clear();
-        self.event_cursor = 0;
-
         let Some(id) = self.selected().map(|row| row.id.clone()) else {
+            self.clear_selection();
             return;
         };
+        let same = self
+            .execution
+            .as_ref()
+            .is_some_and(|execution| execution.id == id);
+        if !same {
+            self.clear_selection();
+        }
 
         let summary = match self.client.list_executions().await {
             Ok(listing) => listing.executions.into_iter().find(|row| row.id == id),
@@ -1512,6 +1696,7 @@ impl App {
             }
         };
         let Some(summary) = summary else {
+            self.clear_selection();
             self.notice = Some(Notice::error(format!(
                 "Could not load execution '{id}': not found"
             )));
@@ -1521,14 +1706,21 @@ impl App {
         let mut variables: Vec<(String, Value)> = summary.variables.clone().into_iter().collect();
         variables.sort_by(|left, right| left.0.cmp(&right.0));
         self.variables = variables;
+        self.variable_cursor = self
+            .variable_cursor
+            .min(self.variables.len().saturating_sub(1));
         self.pending = summary.pending_input.clone();
 
         // An execution with no events is an empty stream, not a failure: it has
         // simply not got anywhere yet.
-        match self.client.events(&id, 0).await {
+        let after = self.events.last().map_or(0, |event| event.sequence);
+        match self.client.events(&id, after).await {
             Ok(events) => {
-                self.events = events;
-                self.event_cursor = self.events.len().saturating_sub(1);
+                let fresh = events.into_iter().filter(|event| event.sequence > after);
+                self.events.extend(fresh);
+                if self.follow || !same {
+                    self.event_cursor = self.events.len().saturating_sub(1);
+                }
             }
             Err(error) => {
                 self.notice = Some(Notice::error(format!(
@@ -1537,8 +1729,58 @@ impl App {
             }
         }
 
+        self.definition = None;
+        self.definition_error = None;
         self.load_definition(&summary);
         self.execution = Some(summary);
+        self.sync_open_form();
+    }
+
+    /// Forgets everything that belongs to the previous selection.
+    fn clear_selection(&mut self) {
+        self.execution = None;
+        self.definition = None;
+        self.definition_error = None;
+        self.pending = None;
+        self.variables.clear();
+        self.variable_cursor = 0;
+        self.events.clear();
+        self.event_cursor = 0;
+    }
+
+    /// Marks an open input form closed when the request it answers is no
+    /// longer the pending one (R5, AE13) — never rebuilds it, so what the
+    /// operator typed stays. The closing `HumanInputReceived` says who closed
+    /// it and how; without one the form only says it is no longer pending.
+    fn sync_open_form(&mut self) {
+        let Modal::Input(form) = &mut self.modal else {
+            return;
+        };
+        if form.closed.is_some()
+            || self
+                .execution
+                .as_ref()
+                .map(|execution| execution.id.as_str())
+                != Some(form.execution_id.as_str())
+        {
+            return;
+        }
+        let still_pending = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.episode_key() == form.episode);
+        if still_pending {
+            return;
+        }
+        let closure = self
+            .events
+            .iter()
+            .rev()
+            .filter_map(|event| InputClosure::from_event(&event.data))
+            .find(|(episode, _)| *episode == Some(form.episode.as_str()))
+            .map(|(_, closure)| closure)
+            .unwrap_or_else(InputClosure::unexplained);
+        form.close(closure);
     }
 
     /// Resolves the definition the selected execution runs.
@@ -1627,6 +1869,23 @@ impl App {
         // in addition to the row update above, not a replacement for it.
         if let Some(notice) = notice_for(&event) {
             self.notice = Some(notice);
+        }
+
+        // The stream says something changed; the daemon has the full story
+        // (the pending input, the problem, the context), read a moment later
+        // so a burst of events costs one read (KTD16).
+        if triggers_refresh(&event.data) {
+            self.refresh.request(Instant::now());
+        }
+
+        // Someone else closed the request the open form answers: the form
+        // says so at once, rather than at the next refresh (R5).
+        if let (Modal::Input(form), Some((Some(episode), closure))) =
+            (&mut self.modal, InputClosure::from_event(&event.data))
+        {
+            if form.execution_id == event.workflow_execution_id && form.episode == episode {
+                form.close(closure);
+            }
         }
 
         let selected = self.selected().map(|row| row.id.clone());
@@ -2361,6 +2620,13 @@ impl App {
         };
         match form.on_key(key) {
             FormAction::None => Request::None,
+            // A closed request cannot be answered any more (R5): the form
+            // stays, with what was typed, until Esc.
+            FormAction::Submit if form.closed.is_some() => {
+                let message = closed_form_message(form);
+                self.notice = Some(Notice::error(message));
+                Request::None
+            }
             FormAction::Submit => Request::SubmitInput,
             FormAction::Cancel => {
                 self.modal = Modal::None;
@@ -2776,6 +3042,10 @@ impl App {
         let Modal::Input(form) = &mut self.modal else {
             return;
         };
+        if form.closed.is_some() {
+            self.notice = Some(Notice::error(closed_form_message(form)));
+            return;
+        }
 
         let delivery = match form.validate() {
             Ok(delivery) => delivery,
@@ -3410,6 +3680,9 @@ impl App {
 /// The bar's shortcuts while the input form is open: `←`/`→` means
 /// something different on a key–value entry than on a choice.
 fn form_shortcuts(form: &InputForm) -> Vec<(&'static str, &'static str)> {
+    if form.closed.is_some() {
+        return vec![("Esc", "close the form")];
+    }
     let mut keys = vec![("Tab/↑↓", "row")];
     match form.current_row() {
         Some(FormRow::Entry(..)) => keys.push(("←/→", "key/value")),
@@ -3420,6 +3693,15 @@ fn form_shortcuts(form: &InputForm) -> Vec<(&'static str, &'static str)> {
     keys.push(("Enter", "submit"));
     keys.push(("Esc", "cancel"));
     keys
+}
+
+/// Why a closed form is not sent.
+fn closed_form_message(form: &InputForm) -> String {
+    let closure = form.closed.as_ref().map(InputClosure::message);
+    format!(
+        "{} Nothing was sent; Esc closes the form.",
+        closure.unwrap_or_default()
+    )
 }
 
 /// Turns a [`ClientError`] into the notice text an operator reads — the
@@ -3511,31 +3793,96 @@ fn wrap(current: usize, delta: isize, length: usize) -> usize {
 
 /// Keeps a list row in step with a live event, so the list does not go stale
 /// between refreshes.
+///
+/// A new status forgets the input and the problem the row was waiting on;
+/// `ProblemRaised` sets the problem (it follows the `HumanInputRequested` of
+/// a problem input, and the `WorkflowFailed` of a failure). What kind of
+/// input a bare `HumanInputRequested` opened only the next refresh says, so
+/// until then it counts as a question.
 fn apply_to_row(row: &mut ExecutionRow, data: &EventData) {
-    match data {
+    let status = match data {
         EventData::StateEntered { state_id } => {
             row.current_state = Some(state_id.clone());
-            row.status = ExecutionStatus::Running;
+            ExecutionStatus::Running
         }
-        EventData::WorkflowResumed => row.status = ExecutionStatus::Running,
-        EventData::WorkflowPaused { .. } => row.status = ExecutionStatus::Paused,
-        EventData::HumanInputRequested { .. } => row.status = ExecutionStatus::InputNeeded,
-        EventData::WorkflowCompleted { .. } => row.status = ExecutionStatus::Completed,
-        EventData::WorkflowFailed { .. } => row.status = ExecutionStatus::Failed,
-        EventData::WorkflowCancelled { .. } => row.status = ExecutionStatus::Cancelled,
-        _ => {}
-    }
+        EventData::WorkflowResumed => ExecutionStatus::Running,
+        EventData::WorkflowPaused { .. } => ExecutionStatus::Paused,
+        EventData::HumanInputRequested { .. } => ExecutionStatus::InputNeeded,
+        EventData::WorkflowCompleted { .. } => ExecutionStatus::Completed,
+        EventData::WorkflowFailed { .. } => ExecutionStatus::Failed,
+        EventData::WorkflowCancelled { .. } => ExecutionStatus::Cancelled,
+        EventData::HumanInputReceived { .. } => {
+            row.input = None;
+            if row
+                .problem
+                .as_ref()
+                .is_some_and(|problem| problem.kind == ProblemKind::Output)
+            {
+                row.problem = None;
+            }
+            return;
+        }
+        EventData::ProblemRaised {
+            kind,
+            reason,
+            episode,
+            ..
+        } => {
+            row.problem = Some(ActiveProblem {
+                kind: *kind,
+                reason: reason.clone(),
+                episode: episode.clone(),
+            });
+            if *kind == ProblemKind::Output {
+                row.input = Some(InputContinuation::ResolveOutput);
+            }
+            return;
+        }
+        _ => return,
+    };
+    row.status = status;
+    row.input = None;
+    row.problem = None;
+}
+
+/// Whether a live event changes what a refresh would show (KTD16): a
+/// status, a pending input, a problem.
+///
+/// U13: the conductor's own events (it started, it finished) belong here
+/// too, once they exist, so its state reaches the list without `r`.
+fn triggers_refresh(data: &EventData) -> bool {
+    matches!(
+        data,
+        EventData::WorkflowResumed
+            | EventData::WorkflowPaused { .. }
+            | EventData::WorkflowCompleted { .. }
+            | EventData::WorkflowFailed { .. }
+            | EventData::WorkflowCancelled { .. }
+            | EventData::HumanInputRequested { .. }
+            | EventData::HumanInputReceived { .. }
+            | EventData::ProblemRaised { .. }
+    )
 }
 
 /// The bottom-bar notice a background run's outcome produces, if any (R4, R6).
 ///
-/// Only a terminal or error event names an outcome worth interrupting the
-/// operator for; reaching a human checkpoint (`WorkflowPaused`,
-/// `HumanInputRequested`) is an ordinary part of a run, not one, so it
-/// produces no notice here.
+/// A terminal or error event names an outcome worth interrupting the
+/// operator for, and so does any task starting to wait on the operator — a
+/// question or a problem (R9), for every task, not only the selected one.
+/// An operator's own pause (`WorkflowPaused`) produces none.
 fn notice_for(event: &Event) -> Option<Notice> {
     let execution_id = &event.workflow_execution_id;
     match &event.data {
+        EventData::HumanInputRequested { instruction, .. } => Some(Notice::info(format!(
+            "Execution {execution_id} waits for an answer: {} (i answers it).",
+            first_line(instruction)
+        ))),
+        EventData::ProblemRaised {
+            state_id, reason, ..
+        } => Some(Notice::error(format!(
+            "Execution {execution_id} has a problem in state '{state_id}': {}",
+            first_line(reason)
+        ))),
         EventData::WorkflowCompleted { .. } => {
             Some(Notice::info(format!("Execution {execution_id} completed.")))
         }
