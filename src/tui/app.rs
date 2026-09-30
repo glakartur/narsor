@@ -3722,7 +3722,7 @@ fn client_error_message(execution_id: &str, error: ClientError) -> String {
         ClientError::Unavailable(detail) => {
             format!("Could not reach the narsor daemon: {detail}")
         }
-        ClientError::Request { message, .. } => message,
+        ClientError::Request { message, .. } | ClientError::Refused { message, .. } => message,
         ClientError::Server(detail) => {
             format!("The narsor daemon reported an error: {detail}")
         }
@@ -4028,6 +4028,11 @@ pub fn event_line(event: &Event) -> String {
                 confidence.name()
             ),
         },
+        EventData::ConductorDecisionUndone {
+            decision_id,
+            state_id,
+            ..
+        } => format!("conductor_decision_undone  {decision_id} → {state_id}"),
         EventData::HumanTransitionSelected {
             from_state,
             to_state,

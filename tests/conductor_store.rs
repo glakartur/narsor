@@ -216,6 +216,8 @@ async fn state_chat_and_annotations_survive_reopening_the_store() {
         confidence: Confidence::High,
         rationale: Some("the agent said it is done".to_string()),
         context_before: json!({ "variables": {} }),
+        answers: Vec::new(),
+        reason: None,
         saved_at: Utc::now(),
     });
     store.save_state(&state).expect("save the state");
@@ -789,6 +791,8 @@ async fn a_rescue_left_for_an_execution_that_moved_on_is_discarded() {
         confidence: Confidence::High,
         rationale: None,
         context_before: json!({}),
+        answers: Vec::new(),
+        reason: None,
         saved_at: Utc::now(),
     });
     store.save_state(&state).expect("save the state");

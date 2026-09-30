@@ -438,7 +438,8 @@ fn unfinished_action(events: &[crate::domain::Event]) -> Option<(String, String)
             // opens or closes one here.
             EventData::ConductorStarted { .. }
             | EventData::ConductorFinished { .. }
-            | EventData::ConductorDecision { .. } => {}
+            | EventData::ConductorDecision { .. }
+            | EventData::ConductorDecisionUndone { .. } => {}
             _ => {}
         }
     }

@@ -470,3 +470,32 @@ impl ActionExecutor for TimeoutRecorder {
         })
     }
 }
+
+/// Puts the fake harness of `tests/fixtures/harness` first on this test
+/// process's `PATH` as `claude`, once, and returns the new `PATH`.
+///
+/// Every daemon a test spawns inherits the variable, and a daemon runs its
+/// conductor on the default harness — at every `human` gate (R30), on every
+/// chat message — so without this a daemon under test would reach for a real
+/// `claude`. The fake answers nothing unless a test writes it an answer, which
+/// the conductor takes as an invocation that failed: an error in its chat,
+/// and nothing else (KTD12).
+pub fn fake_claude_first_on_path() -> String {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let bin = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("fake-claude-{}", std::process::id()));
+        fs::create_dir_all(&bin).expect("create the fake claude's directory");
+        let temp = bin.join(format!(".claude.{}.tmp", uuid::Uuid::new_v4()));
+        fs::copy(fixtures().join("harness/fake_harness.sh"), &temp).expect("copy the fake harness");
+        fs::rename(&temp, bin.join("claude")).expect("move the fake harness into place");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        std::env::set_var("PATH", &path);
+        path
+    })
+    .clone()
+}

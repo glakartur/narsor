@@ -46,11 +46,13 @@ use serde_json::Value;
 use crate::domain::{Event, EventData};
 use crate::engine::{HumanInputDelivery, Timeline};
 
+use crate::conductor::{ChatEntry, ProposalOutcome, UndoOutcome};
+
 use super::dto::{
-    AcceptedResponse, ConductorChatResponse, ConductorStateResponse, ExecutionListResponse,
-    ExecutionSummary, HarnessSelectionSnapshot, OperatorNoteRequest, RecoveryRequest,
-    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
-    TransitionRequest,
+    AcceptedResponse, ChatMessageRequest, ConductorChatResponse, ConductorStateResponse,
+    ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot, OperatorNoteRequest,
+    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
+    StartTaskResponse, TransitionRequest,
 };
 use super::routes::ConversationResponse;
 
@@ -81,6 +83,11 @@ pub enum ClientError {
     /// so a caller (the CLI, the TUI) can tell "try again, something else is
     /// driving this" from "the server broke".
     Conflict,
+    /// A `409` the server gave its reason for — a proposal of the
+    /// conductor's about a moment the execution has moved on from (KTD9), a
+    /// decision already undone: the request conflicts with the execution's
+    /// state, and `message` says how, for the operator to read.
+    Refused { code: String, message: String },
     /// The server rejected a validly decoded request and supplied a safe,
     /// typed reason suitable for an operator-facing UI.
     Request { code: String, message: String },
@@ -96,6 +103,9 @@ impl std::fmt::Display for ClientError {
             ClientError::Unauthorized => write!(f, "API rejected the request: bad token"),
             ClientError::NotFound => write!(f, "API: not found"),
             ClientError::Conflict => write!(f, "API: conflict (409)"),
+            ClientError::Refused { code, message } => {
+                write!(f, "API refused the request ({code}): {message}")
+            }
             ClientError::Request { code, message } => {
                 write!(f, "API request rejected ({code}): {message}")
             }
@@ -293,6 +303,66 @@ impl ApiClient {
     ) -> Result<ExecutionSummary, ClientError> {
         let url = format!("{}/executions/{execution_id}/transition", self.base_url);
         self.post_json(&url, &request).await
+    }
+
+    /// Writes `text` to the conductor of `execution_id` (F4) — `POST
+    /// /executions/:id/conductor/chat`. Returns the entry as written; the
+    /// answer follows in the chat history.
+    pub async fn post_chat(
+        &self,
+        execution_id: &str,
+        text: &str,
+    ) -> Result<ChatEntry, ClientError> {
+        let url = format!("{}/executions/{execution_id}/conductor/chat", self.base_url);
+        self.post_json(
+            &url,
+            &ChatMessageRequest {
+                text: text.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Carries out the conductor's proposal `proposal_id` (R28). A second
+    /// confirmation answers the first one's outcome; one about a moment the
+    /// execution has moved on from is [`ClientError::Refused`].
+    pub async fn confirm_proposal(
+        &self,
+        execution_id: &str,
+        proposal_id: &str,
+    ) -> Result<ProposalOutcome, ClientError> {
+        let url = format!(
+            "{}/executions/{execution_id}/conductor/proposals/{proposal_id}/confirm",
+            self.base_url
+        );
+        self.post_empty(&url).await
+    }
+
+    /// Rejects the conductor's proposal `proposal_id`.
+    pub async fn reject_proposal(
+        &self,
+        execution_id: &str,
+        proposal_id: &str,
+    ) -> Result<ProposalOutcome, ClientError> {
+        let url = format!(
+            "{}/executions/{execution_id}/conductor/proposals/{proposal_id}/reject",
+            self.base_url
+        );
+        self.post_empty(&url).await
+    }
+
+    /// Undoes the conductor's chosen output `decision_id` (KTD13): the
+    /// step is a problem again at its state.
+    pub async fn undo_decision(
+        &self,
+        execution_id: &str,
+        decision_id: &str,
+    ) -> Result<UndoOutcome, ClientError> {
+        let url = format!(
+            "{}/executions/{execution_id}/conductor/decisions/{decision_id}/undo",
+            self.base_url
+        );
+        self.post_empty(&url).await
     }
 
     /// Every stored execution, summarised — `GET /executions`.
@@ -501,7 +571,13 @@ async fn handle_json_response<T: DeserializeOwned>(
             .map_err(|error| ClientError::Server(error.to_string())),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ClientError::Unauthorized),
         StatusCode::NOT_FOUND => Err(ClientError::NotFound),
-        StatusCode::CONFLICT => Err(ClientError::Conflict),
+        StatusCode::CONFLICT => match response.json::<RequestErrorResponse>().await {
+            Ok(error) => Err(ClientError::Refused {
+                code: error.code,
+                message: error.message,
+            }),
+            Err(_) => Err(ClientError::Conflict),
+        },
         StatusCode::BAD_REQUEST => {
             let error = response
                 .json::<RequestErrorResponse>()
@@ -675,7 +751,8 @@ fn is_terminal_event(data: &EventData) -> bool {
         | EventData::WorkflowCancelled { .. } => true,
         EventData::ConductorStarted { .. }
         | EventData::ConductorFinished { .. }
-        | EventData::ConductorDecision { .. } => false,
+        | EventData::ConductorDecision { .. }
+        | EventData::ConductorDecisionUndone { .. } => false,
         _ => false,
     }
 }

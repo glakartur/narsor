@@ -184,6 +184,13 @@ pub enum Command {
         file: Option<String>,
     },
 
+    /// Talks to the conductor of an execution: its chat, its proposals, and
+    /// the undo of its decisions.
+    Conductor {
+        #[command(subcommand)]
+        command: ConductorCommand,
+    },
+
     /// Resumes a paused execution that is not waiting for human input.
     Resume {
         /// The execution identifier.
@@ -236,6 +243,69 @@ pub enum Command {
 }
 
 /// The daemon half of the command line.
+/// `narsor conductor ...` (F4, R28, R31).
+#[derive(Debug, Subcommand)]
+pub enum ConductorCommand {
+    /// Writes a message to the conductor and prints its answer, with any
+    /// action it proposes.
+    Chat {
+        /// The execution to talk about.
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: String,
+
+        /// The message.
+        #[arg(value_name = "MESSAGE")]
+        message: String,
+
+        /// Returns once the message is written, without waiting for the
+        /// answer.
+        #[arg(long)]
+        no_wait: bool,
+    },
+
+    /// Prints the chat history: messages, proposals and decisions.
+    History {
+        /// The execution whose chat to print.
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: String,
+    },
+
+    /// Carries out a proposal of the conductor's.
+    Confirm {
+        /// The execution the proposal is about.
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: String,
+
+        /// The proposal: its id, or its number in the chat history.
+        #[arg(value_name = "PROPOSAL")]
+        proposal: String,
+    },
+
+    /// Rejects a proposal of the conductor's.
+    Reject {
+        /// The execution the proposal is about.
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: String,
+
+        /// The proposal: its id, or its number in the chat history.
+        #[arg(value_name = "PROPOSAL")]
+        proposal: String,
+    },
+
+    /// Undoes the conductor's choice of a step's output: the step becomes a
+    /// problem again at its state.
+    Undo {
+        /// The execution the decision is about.
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: String,
+
+        /// The decision: its id, or the number of its entry in the chat
+        /// history.
+        #[arg(value_name = "DECISION")]
+        decision: String,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
     /// Sends a graceful stop signal (`SIGTERM`) to the running daemon.
@@ -355,6 +425,7 @@ impl Command {
             | Command::Conversation { .. }
             | Command::Input { .. }
             | Command::Resume { .. }
+            | Command::Conductor { .. }
             | Command::Workflow { .. }
             | Command::Repo { .. }
             | Command::Tui
@@ -447,6 +518,28 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Resume { execution_id, file } => {
             commands::resume(&config, &flags, &execution_id, file.as_deref()).await
         }
+        Command::Conductor { command } => match command {
+            ConductorCommand::Chat {
+                execution_id,
+                message,
+                no_wait,
+            } => commands::conductor_chat(&state, &flags, &execution_id, &message, !no_wait).await,
+            ConductorCommand::History { execution_id } => {
+                commands::conductor_history(&state, &flags, &execution_id).await
+            }
+            ConductorCommand::Confirm {
+                execution_id,
+                proposal,
+            } => commands::conductor_settle(&state, &flags, &execution_id, &proposal, true).await,
+            ConductorCommand::Reject {
+                execution_id,
+                proposal,
+            } => commands::conductor_settle(&state, &flags, &execution_id, &proposal, false).await,
+            ConductorCommand::Undo {
+                execution_id,
+                decision,
+            } => commands::conductor_undo(&state, &flags, &execution_id, &decision).await,
+        },
         Command::Workflow { command } => match command {
             WorkflowCommand::List => commands::workflow_list(&catalog),
             WorkflowCommand::Show { workflow } => commands::workflow_show(&catalog, &workflow),

@@ -317,6 +317,19 @@ pub enum EventData {
         #[serde(default)]
         rationale: Option<String>,
     },
+    /// An operator undid a chosen output (a) of the conductor's (KTD13): the
+    /// context from before it is back, and the step it settled is a
+    /// problem again at the same state. Its agent step is not run again.
+    ConductorDecisionUndone {
+        /// The decision undone, as [`EventData::ConductorDecision`] named it.
+        decision_id: String,
+        /// The state the decision was about, and the problem is raised in.
+        state_id: String,
+        /// What undoing could not take back: a step after the decision that
+        /// had already started, whose side effects stay.
+        #[serde(default)]
+        warning: Option<String>,
+    },
 
     // External events
     ExternalEventReceived {
@@ -399,6 +412,11 @@ pub enum InputCloseReason {
     Interrupt,
     /// An operator recovery started the state's action afresh.
     Recover,
+    /// The execution was cancelled.
+    Cancel,
+    /// An undone decision of the conductor's moved the execution back to
+    /// the step it settled (KTD13).
+    Undo,
 }
 
 impl InputCloseReason {
@@ -409,6 +427,8 @@ impl InputCloseReason {
             Self::Transition => "transition",
             Self::Interrupt => "interrupt",
             Self::Recover => "recover",
+            Self::Cancel => "cancel",
+            Self::Undo => "undo",
         }
     }
 }
@@ -766,6 +786,12 @@ impl Event {
                     confidence.name()
                 ),
             },
+
+            EventData::ConductorDecisionUndone {
+                decision_id,
+                state_id,
+                ..
+            } => format!("Conductor decision {decision_id} undone: back to '{state_id}'"),
 
             EventData::ExternalEventReceived {
                 event_type, source, ..

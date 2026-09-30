@@ -88,10 +88,19 @@ fn cli(root: &TempRoot, args: &[&str]) -> Invocation {
 /// the same root, which cannot each borrow the same `&TempRoot` across a
 /// `thread::spawn`'s `'static` bound.
 fn cli_at(root: &Path, args: &[&str]) -> Invocation {
+    cli_on_path(root, args, &engine_support::fake_claude_first_on_path())
+}
+
+/// [`cli_at`] with `path` as the `PATH` of the process — and of the daemon
+/// it may spawn, whose conductor runs `claude` from it.
+fn cli_on_path(root: &Path, args: &[&str], path: &str) -> Invocation {
     let output = Command::new(env!("CARGO_BIN_EXE_narsor"))
         .current_dir(root)
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("HOME", root)
+        // The daemon this spawns runs the conductor at every human gate: on
+        // the fake harness, never a real `claude`.
+        .env("PATH", path)
         .arg("--root")
         .arg(root)
         .args(args)
@@ -1371,4 +1380,161 @@ fn input_with_a_malformed_data_pair_is_a_usage_error() {
     );
     assert_eq!(invocation.code, EXIT_USAGE, "{invocation:?}");
     assert!(invocation.output().contains("--data"), "{invocation:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The conductor's chat (U12)
+// ---------------------------------------------------------------------------
+
+/// A fake `claude` of this test's own, first on the `PATH` it returns,
+/// answering every invocation of the conductor with `response`.
+fn conductor_answering(root: &TempRoot, response: serde_json::Value) -> String {
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&bin).expect("create the bin directory");
+    let temp = bin.join(format!(".claude.{}.tmp", uuid::Uuid::new_v4()));
+    fs::copy(fixtures().join("harness/fake_harness.sh"), &temp).expect("copy the fake harness");
+    fs::rename(&temp, bin.join("claude")).expect("move the fake harness into place");
+    let envelope = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "conductor-session",
+        "result": response.to_string(),
+    });
+    fs::write(bin.join("stdout"), format!("{envelope}\n")).expect("write the answer");
+    format!(
+        "{}:{}",
+        bin.display(),
+        engine_support::fake_claude_first_on_path()
+    )
+}
+
+/// F4, R28: the chat written from the CLI and from the API is one history;
+/// a proposal in it is confirmed from the CLI, by its number, once.
+#[test]
+fn the_cli_and_the_api_share_the_conductors_chat() {
+    let root = TempRoot::new();
+    let path = conductor_answering(
+        &root,
+        serde_json::json!({
+            "decision": "reply",
+            "message": "I would approve the announcement.",
+            "confidence": "high",
+            "rationale": "The script announced the greeting.",
+            "proposals": [{
+                "kind": "answer_input",
+                "summary": "Approve the announcement",
+                "values": {"approval_status": "approved"}
+            }],
+        }),
+    );
+    let started = cli_on_path(
+        root.path(),
+        &[
+            "run",
+            &greet_workflow(),
+            "--input",
+            "greeting=Hello",
+            "--input",
+            &announce_script(),
+        ],
+        &path,
+    );
+    assert_eq!(started.code, EXIT_SUCCESS, "stderr: {}", started.stderr);
+    let id = execution_id(&started.stdout);
+
+    let chat = cli_on_path(
+        root.path(),
+        &["conductor", "chat", &id, "should I approve it?"],
+        &path,
+    );
+    assert_eq!(chat.code, EXIT_SUCCESS, "stderr: {}", chat.stderr);
+    assert!(
+        chat.stdout.contains("operator: should I approve it?"),
+        "{}",
+        chat.stdout
+    );
+    assert!(
+        chat.stdout
+            .contains("conductor: I would approve the announcement."),
+        "{}",
+        chat.stdout
+    );
+    let proposal_line = chat
+        .stdout
+        .lines()
+        .find(|line| line.contains("conductor (proposal): Approve the announcement"))
+        .unwrap_or_else(|| panic!("no proposal in:\n{}", chat.stdout));
+    let proposal_number = proposal_line
+        .trim_start_matches('#')
+        .split_whitespace()
+        .next()
+        .expect("the proposal's number")
+        .to_string();
+
+    // The same history, written over the API.
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    runtime.block_on(async {
+        let info = narsor::persistence::DaemonInfo::read(
+            &narsor::persistence::StatePaths::new(root.path()).daemon_file(),
+        )
+        .expect("the daemon is discoverable");
+        narsor::api::ApiClient::new(info.addr, info.token)
+            .post_chat(&id, "and from the API?")
+            .await
+            .expect("post over the API");
+    });
+    let history = cli_on_path(root.path(), &["conductor", "history", &id], &path);
+    assert_eq!(history.code, EXIT_SUCCESS, "stderr: {}", history.stderr);
+    let from_cli = history
+        .stdout
+        .find("operator: should I approve it?")
+        .expect("the CLI's message");
+    let from_api = history
+        .stdout
+        .find("operator: and from the API?")
+        .unwrap_or_else(|| panic!("the API's message is missing:\n{}", history.stdout));
+    assert!(from_cli < from_api, "{}", history.stdout);
+
+    // Confirmed by its number: the gate is answered, once.
+    let confirmed = cli_on_path(
+        root.path(),
+        &["conductor", "confirm", &id, &proposal_number],
+        &path,
+    );
+    assert_eq!(confirmed.code, EXIT_SUCCESS, "stderr: {}", confirmed.stderr);
+    assert!(
+        confirmed.stdout.contains("Answered the pending input."),
+        "{}",
+        confirmed.stdout
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let shown = cli_on_path(root.path(), &["show", &id], &path);
+        if shown.stdout.contains("Status:        completed") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the answer did not complete the execution:\n{}",
+            shown.stdout
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let again = cli_on_path(
+        root.path(),
+        &["conductor", "confirm", &id, &proposal_number],
+        &path,
+    );
+    assert_eq!(again.code, EXIT_SUCCESS, "stderr: {}", again.stderr);
+    assert!(
+        again.stdout.contains("already been settled"),
+        "{}",
+        again.stdout
+    );
+
+    // Only a choice of the conductor's can be undone.
+    let undo = cli_on_path(root.path(), &["conductor", "undo", &id, "no-such"], &path);
+    assert_eq!(undo.code, EXIT_FAILURE);
+    assert!(undo.stderr.contains("has no decision"), "{}", undo.stderr);
 }

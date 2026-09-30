@@ -78,6 +78,7 @@ fn spawn_daemon(root: &Path) -> Child {
         .arg("--root")
         .arg(root)
         .arg("daemon")
+        .env("PATH", engine_support::fake_claude_first_on_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1142,6 +1143,8 @@ async fn a_fresh_daemon_applies_a_saved_choice_without_invoking_the_conductor() 
                 confidence: narsor::domain::Confidence::High,
                 rationale: Some("the agent said all tests pass".to_string()),
                 context_before: serde_json::json!({}),
+                answers: Vec::new(),
+                reason: None,
                 saved_at: chrono::Utc::now(),
             }],
             ..ConductorState::default()

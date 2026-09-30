@@ -224,6 +224,34 @@ pub struct ProposedAction {
     pub text: Option<String>,
 }
 
+impl ProposedAction {
+    /// A chat line for the proposal, for one without a summary.
+    pub fn describe(&self) -> String {
+        match self.kind {
+            ProposalKind::Retry => match &self.text {
+                Some(note) => format!("Restart the failed step with the note: {note}"),
+                None => "Restart the failed step".to_string(),
+            },
+            ProposalKind::Transition => format!(
+                "Take the transition of output '{}'",
+                self.label.as_deref().unwrap_or_default()
+            ),
+            ProposalKind::Abort => "Cancel the execution".to_string(),
+            ProposalKind::MessageAgent => format!(
+                "Tell the agent: {}",
+                self.text.as_deref().unwrap_or_default()
+            ),
+            ProposalKind::AnswerInput => {
+                let values = Value::Object(self.values.clone());
+                match &self.label {
+                    Some(label) => format!("Answer the pending input with '{label}', {values}"),
+                    None => format!("Answer the pending input with {values}"),
+                }
+            }
+        }
+    }
+}
+
 /// The conductor's whole answer, parsed and checked for its purpose.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConductorResponse {

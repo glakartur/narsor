@@ -562,7 +562,8 @@ pub fn build_timeline(
             | EventData::ProblemRaised { .. }
             | EventData::ConductorStarted { .. }
             | EventData::ConductorFinished { .. }
-            | EventData::ConductorDecision { .. } => {
+            | EventData::ConductorDecision { .. }
+            | EventData::ConductorDecisionUndone { .. } => {
                 link_positional(current_visit_last_position, &drafts, &mut links, seq);
             }
 

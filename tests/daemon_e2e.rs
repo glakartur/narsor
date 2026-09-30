@@ -30,6 +30,8 @@
 //! in for a different operator re-attaching later, or the TUI, or `narsor
 //! list`.
 
+mod engine_support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -83,6 +85,9 @@ fn init_exe_override() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         set_exe_override_for_tests(Path::new(env!("CARGO_BIN_EXE_narsor")));
+        // Every daemon spawned from here inherits it: its conductor runs on
+        // the fake harness, never a real `claude`.
+        engine_support::fake_claude_first_on_path();
     });
 }
 

@@ -180,6 +180,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         ApiServices {
             harness_selector: Some(selector),
             active_tasks,
+            conductor: Some(Arc::clone(&conductor)),
         },
     )
     .await

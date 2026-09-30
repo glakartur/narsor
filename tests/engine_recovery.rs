@@ -815,6 +815,8 @@ fn saved_choice() -> SavedDecision {
         confidence: Confidence::High,
         rationale: Some("the agent said it was done".to_string()),
         context_before: json!({}),
+        answers: Vec::new(),
+        reason: None,
         saved_at: chrono::Utc::now(),
     }
 }

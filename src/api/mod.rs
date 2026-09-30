@@ -77,13 +77,14 @@ pub use active::ActiveTasks;
 pub use client::{ApiClient, ClientError};
 pub use discovery::{ensure_daemon_running, DiscoveryError};
 pub use dto::{
-    AcceptedResponse, ActiveProblem, ConductorChatResponse, ConductorStateResponse,
-    ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot, OperatorNoteRequest,
-    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
-    TransitionRequest,
+    AcceptedResponse, ActiveProblem, ChatMessageRequest, ConductorChatResponse,
+    ConductorStateResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
+    OperatorNoteRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
+    StartTaskResponse, TransitionRequest,
 };
 pub use routes::{ConversationEntryDto, ConversationResponse};
 
+use crate::conductor::ConductorRegistry;
 use crate::engine::Engine;
 use crate::persistence::DefaultHarnessSelector;
 use std::fmt;
@@ -229,19 +230,33 @@ pub async fn start_with_harness_selector(
         ApiServices {
             harness_selector,
             active_tasks: ActiveTasks::new(),
+            conductor: None,
         },
     )
     .await
 }
 
 /// What the daemon shares with its API server beyond the engine.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ApiServices {
     /// The live default-harness selector (D54).
     pub harness_selector: Option<Arc<DefaultHarnessSelector>>,
     /// The background passes, shared with the daemon's startup hook so a
     /// pass it spawns can be interrupted through the API.
     pub active_tasks: ActiveTasks,
+    /// The conductor (D55): its chat, its proposals and the undo of its
+    /// decisions are served only when there is one.
+    pub conductor: Option<Arc<ConductorRegistry>>,
+}
+
+impl fmt::Debug for ApiServices {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiServices")
+            .field("harness_selector", &self.harness_selector)
+            .field("active_tasks", &self.active_tasks)
+            .field("conductor", &self.conductor.is_some())
+            .finish()
+    }
 }
 
 /// Starts the API server with everything the daemon shares with it.
@@ -251,10 +266,6 @@ pub async fn start_with_services(
     work_dir: PathBuf,
     services: ApiServices,
 ) -> Result<ApiHandle, ApiStartError> {
-    let ApiServices {
-        harness_selector,
-        active_tasks,
-    } = services;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(ApiStartError)?;
@@ -268,8 +279,7 @@ pub async fn start_with_services(
         token.clone(),
         catalog_dir,
         work_dir,
-        harness_selector,
-        active_tasks,
+        services,
     );
     let shutdown = Arc::new(Notify::new());
     let shutdown_wait = Arc::clone(&shutdown);

@@ -431,6 +431,10 @@ impl InputClosure {
             Some(InputCloseReason::Recover) => {
                 "Closed: the step was recovered and starts afresh.".to_string()
             }
+            Some(InputCloseReason::Cancel) => "Closed: the execution was cancelled.".to_string(),
+            Some(InputCloseReason::Undo) => {
+                "Closed: a decision of the conductor's was undone.".to_string()
+            }
             Some(InputCloseReason::Answered) => {
                 let by = by.unwrap_or("someone else");
                 match &self.answer {

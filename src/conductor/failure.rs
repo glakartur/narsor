@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Map};
 use uuid::Uuid;
 
 use crate::conductor::actor::{ConductorActor, InvocationOutcome, MAX_AUTOMATIC_ATTEMPTS};
@@ -613,14 +613,16 @@ impl ConductorRegistry {
             }));
             actor.append_chat(entry)?;
             for proposal in proposals {
-                let text = non_empty(proposal.summary.as_deref())
-                    .unwrap_or_else(|| describe_proposal(proposal));
+                let text =
+                    non_empty(proposal.summary.as_deref()).unwrap_or_else(|| proposal.describe());
                 let mut entry =
                     ChatEntry::new(ChatAuthor::Conductor, ChatEntryKind::Proposal, text);
                 entry.payload = Some(json!({
                     "episode": failure.key(),
                     "state_id": failure.state_id,
                     "proposal": proposal,
+                    "confidence": response.map(|response| response.confidence),
+                    "rationale": response.and_then(|response| response.rationale.clone()),
                 }));
                 actor.append_chat(entry)?;
             }
@@ -720,29 +722,6 @@ fn retry_proposal(note: &str) -> ProposedAction {
         label: None,
         values: Map::new(),
         text: Some(note.to_string()),
-    }
-}
-
-/// A chat line for a proposal without a summary.
-fn describe_proposal(proposal: &ProposedAction) -> String {
-    match proposal.kind {
-        ProposalKind::Retry => match &proposal.text {
-            Some(note) => format!("Restart the failed step with the note: {note}"),
-            None => "Restart the failed step".to_string(),
-        },
-        ProposalKind::Transition => format!(
-            "Take the transition of output '{}'",
-            proposal.label.as_deref().unwrap_or_default()
-        ),
-        ProposalKind::Abort => "Cancel the execution".to_string(),
-        ProposalKind::MessageAgent => format!(
-            "Tell the agent: {}",
-            proposal.text.as_deref().unwrap_or_default()
-        ),
-        ProposalKind::AnswerInput => {
-            let values = Value::Object(proposal.values.clone());
-            format!("Answer the pending input with {values}")
-        }
     }
 }
 

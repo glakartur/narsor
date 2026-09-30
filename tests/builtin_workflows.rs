@@ -24,6 +24,8 @@
 //! that opens the files compares them byte for byte with what is embedded, so
 //! the two cannot drift.
 
+mod engine_support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -164,10 +166,13 @@ fn cli_with_path(root: &TempRoot, args: &[&str], bin: Option<&Path>) -> Invocati
         .arg(root.root())
         .args(args);
 
-    if let Some(bin) = bin {
-        let inherited = std::env::var("PATH").unwrap_or_default();
-        command.env("PATH", format!("{}:{inherited}", bin.display()));
-    }
+    // The daemon a run spawns runs the conductor at every human gate: on
+    // the fake harness, never a real `claude`.
+    let inherited = engine_support::fake_claude_first_on_path();
+    match bin {
+        Some(bin) => command.env("PATH", format!("{}:{inherited}", bin.display())),
+        None => command.env("PATH", inherited),
+    };
 
     let output = command.output().expect("run the narsor binary");
     Invocation {

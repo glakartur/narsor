@@ -106,10 +106,14 @@ use crate::persistence::{read_json, DefaultHarnessSelector, ExecutionStore, Pers
 use crate::workflow::{action_context_references, TemplateScope};
 
 mod failure;
+mod operations;
 mod rescue;
 
 pub use failure::{
     step_failure, Recovery, StepFailure, METADATA_CONDUCTOR_RETRY_KEY, METADATA_STEP_FAILURE_KEY,
+};
+pub use operations::{
+    execution_episode, ManualTransition, OutputDecisionUndo, UndoneOutputDecision,
 };
 
 /// How many events the in-process broadcast channel buffers per receiver.
@@ -578,6 +582,38 @@ pub enum EngineError {
         /// The failure it is stopped on now, if any.
         current: Option<String>,
     },
+
+    /// A request was made at a moment the execution has moved on from
+    /// (KTD9): a proposal of the conductor's about an input already
+    /// answered, a state already left.
+    #[error(
+        "execution '{execution_id}' has moved on since this was asked for (it was at \
+         '{expected}'{})",
+        now_at(.current)
+    )]
+    EpisodeChanged {
+        /// The execution that was addressed.
+        execution_id: ExecutionId,
+        /// Where the request expected it to be.
+        expected: String,
+        /// Where it is now, if anywhere.
+        current: Option<String>,
+    },
+
+    /// A manual transition the definition does not allow.
+    #[error("{message}")]
+    InvalidTransition {
+        /// Why.
+        message: String,
+    },
+}
+
+/// The tail of [`EngineError::EpisodeChanged`]'s message.
+fn now_at(current: &Option<String>) -> String {
+    match current {
+        Some(current) => format!(", it is now at '{current}'"),
+        None => String::new(),
+    }
 }
 
 /// The tail of [`EngineError::StaleEpisode`]'s message.
@@ -2632,7 +2668,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Suspends the execution on a question and records it durably.
+    /// Suspends the execution on a `human` gate — a `human` action or a
+    /// `human` decision — and records it durably.
     fn suspend_for_input(
         &self,
         execution: &mut WorkflowExecution,
@@ -2644,7 +2681,14 @@ impl Engine {
             PendingHumanInput::new(execution.id.clone(), state.id.clone(), request, outputs);
         let from = self.store.event_log(&execution.id).next_sequence()?;
         human::suspend(&self.store, execution, &pending)?;
-        self.publish_from(&execution.id, from)
+        self.publish_from(&execution.id, from)?;
+        // The conductor summarizes the gate beside it (R30): advisory, after
+        // the gate is durable, and never an answer — the gate waits for the
+        // operator whatever the summary says.
+        if let Some(conductor) = self.conductor() {
+            conductor.gate_suspended(&execution.id, &pending);
+        }
+        Ok(())
     }
 
     /// Pauses an agent state in place. No output label is produced and no

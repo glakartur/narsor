@@ -48,6 +48,7 @@ use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
+use crate::conductor::chat::{chat_answer, conclude_annotation, ProposalContext};
 use crate::conductor::store::{
     ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, PendingInvocation,
     QueuedRequest,
@@ -524,6 +525,12 @@ impl ConductorActor {
             chat,
             waiter: mut waiter_slot,
         } = attachment;
+        // What the answer's proposals are about: the execution as the
+        // conductor is about to see it (KTD9).
+        let context = match request.trigger {
+            ConductorTrigger::Chat => ProposalContext::of(self.engine.store(), &self.execution_id),
+            _ => ProposalContext::default(),
+        };
 
         let mut tries = 0;
         let (invocation, outcome) = loop {
@@ -554,7 +561,7 @@ impl ConductorActor {
             });
         };
 
-        self.finish(&invocation, &outcome)?;
+        self.finish(&invocation, &outcome, &context)?;
         self.record(EventData::ConductorFinished {
             invocation_id: invocation.invocation_id.clone(),
             outcome: outcome.event_outcome(),
@@ -649,13 +656,29 @@ impl ConductorActor {
         }
     }
 
-    /// Records what the invocation left behind: the chat's answer, the
-    /// request taken off the queue, the marker cleared.
-    fn finish(&self, invocation: &Invocation, outcome: &InvocationOutcome) -> Result<()> {
+    /// Records what the invocation left behind: the chat's answer and its
+    /// proposals, a gate's summary, the request taken off the queue, the
+    /// marker cleared.
+    fn finish(
+        &self,
+        invocation: &Invocation,
+        outcome: &InvocationOutcome,
+        context: &ProposalContext,
+    ) -> Result<()> {
         let mut inner = self.lock();
 
         if let Some(message) = &invocation.chat_message {
-            self.store.append_chat(chat_answer(message, outcome))?;
+            for entry in chat_answer(message, outcome, context) {
+                self.store.append_chat(entry)?;
+            }
+        }
+        if invocation.request.trigger == ConductorTrigger::Annotation {
+            conclude_annotation(
+                self.engine.store(),
+                &self.store,
+                &invocation.request,
+                outcome,
+            )?;
         }
 
         let mut next = inner.state.clone();
@@ -690,29 +713,4 @@ impl ConductorActor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-}
-
-/// The chat entry that answers `message` with `outcome`: the conductor's
-/// message, or an error entry saying why there is none (KTD12).
-fn chat_answer(message: &ChatEntry, outcome: &InvocationOutcome) -> ChatEntry {
-    let entry = match outcome {
-        InvocationOutcome::Answered(ConductorAnswer {
-            message: Some(text),
-            ..
-        }) => ChatEntry::new(ChatAuthor::Conductor, ChatEntryKind::Message, text.clone()),
-        InvocationOutcome::Answered(_) => ChatEntry::new(
-            ChatAuthor::Conductor,
-            ChatEntryKind::Error,
-            "the conductor gave no answer",
-        ),
-        InvocationOutcome::Failed { error } => {
-            ChatEntry::new(ChatAuthor::Conductor, ChatEntryKind::Error, error.clone())
-        }
-        InvocationOutcome::Interrupted => ChatEntry::new(
-            ChatAuthor::Conductor,
-            ChatEntryKind::Error,
-            "the conductor was interrupted before it answered",
-        ),
-    };
-    entry.replying_to(&message.id)
 }

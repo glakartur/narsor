@@ -8,6 +8,8 @@
 //! waits for the PID to actually die) before its `TempRoot` is dropped —
 //! nothing here is meant to outlive the test that started it.
 
+mod engine_support;
+
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::{Duration, Instant};
@@ -60,6 +62,9 @@ fn init_exe_override() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         set_exe_override_for_tests(Path::new(env!("CARGO_BIN_EXE_narsor")));
+        // Every daemon spawned from here inherits it: its conductor runs on
+        // the fake harness, never a real `claude`.
+        engine_support::fake_claude_first_on_path();
     });
 }
 

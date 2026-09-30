@@ -25,6 +25,11 @@
 //!   invocation, and its decisions saved before they are applied (KTD13).
 //! * [`failure`] — the conductor at a failed step (F3): the advisory
 //!   diagnosis, the one retry, the side-effect classification of attempts.
+//! * [`chat`] — the operator's chat (F4) and the summaries of `human`
+//!   gates (R30), both advisory.
+//! * [`proposal`] — what the conductor proposed, carried out once the
+//!   operator confirms it (R28).
+//! * [`undo`] — undoing a chosen output of the conductor's (KTD13).
 //! * [`ConductorRegistry`] — the actors the daemon started, and the
 //!   interrupts of advisory invocations (KTD10).
 //!
@@ -43,13 +48,16 @@
 //! own record rather than from anything parked here.
 
 pub mod actor;
+pub mod chat;
 pub mod failure;
 pub mod invoke;
 pub mod prompt;
+pub mod proposal;
 pub mod rescue;
 pub mod response;
 pub mod snapshot;
 pub mod store;
+pub mod undo;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -59,8 +67,10 @@ pub use actor::{
     InvocationOutcome, InvocationQueue, UnavailableInvoker, CONDUCTOR_UNAVAILABLE,
     MAX_AUTOMATIC_ATTEMPTS,
 };
+pub use chat::{annotation_of, ProposalContext, ProposalRecord};
 pub use failure::{active_failure_problem, agent_attempt_left_traces, PassLauncher};
 pub use invoke::{ConductorAccess, HarnessInvoker, DEFAULT_CONDUCTOR_TIMEOUT};
+pub use proposal::{ConfirmedProposal, ProposalError, ProposalOutcome, ProposalStatus};
 pub use response::{
     allowed_decisions, proposals_allowed, ConductorResponse, Decision, DecisionKind, ProposalKind,
     ProposedAction, ResponseError,
@@ -71,6 +81,7 @@ pub use store::{
     FailureOutcome, FailureReport, PendingInvocation, QueuedRequest, SavedDecision,
     CONDUCTOR_STATE_VERSION,
 };
+pub use undo::{UndoError, UndoOutcome};
 
 use crate::domain::{ConductorTrigger, ExecutionId, ExecutionStatus};
 use crate::engine::{owed_output_rescue, Engine};
@@ -85,6 +96,11 @@ pub struct ConductorRegistry {
     actors: Mutex<HashMap<ExecutionId, Arc<ConductorActor>>>,
     launcher: OnceLock<Arc<dyn PassLauncher>>,
     diagnoses: failure::Diagnoses,
+    /// Serializes settling proposals, so two confirmations of one proposal
+    /// carry it out once (KTD9).
+    settling: Mutex<()>,
+    /// Serializes undoing decisions, so a decision is undone once.
+    undoing: tokio::sync::Mutex<()>,
 }
 
 /// What [`ConductorRegistry::restore_at_startup`] found and did.
@@ -110,6 +126,8 @@ impl ConductorRegistry {
             actors: Mutex::new(HashMap::new()),
             launcher: OnceLock::new(),
             diagnoses: failure::Diagnoses::default(),
+            settling: Mutex::new(()),
+            undoing: tokio::sync::Mutex::new(()),
         }
     }
 

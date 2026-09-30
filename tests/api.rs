@@ -2812,3 +2812,426 @@ mod failures {
         assert_eq!(summary.problem, None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Conductor plan U12: the chat, proposals, gate summaries and undo
+// ---------------------------------------------------------------------------
+
+mod conductor_chat {
+    use super::*;
+
+    use std::collections::{HashMap, VecDeque};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    use narsor::api::ApiServices;
+    use narsor::conductor::{
+        ConductorAnswer, ConductorInvoker, ConductorRegistry, Invocation, InvocationOutcome,
+        ProposalStatus,
+    };
+    use narsor::domain::{AnsweredBy, ConductorPurpose, InputCloseReason};
+    use narsor::engine::{ActionExecutor, ActionKind, PendingHumanInput};
+
+    /// A conductor answering each purpose from a list of its own; anything
+    /// unscripted fails.
+    struct ScriptedConductor {
+        answers: Mutex<HashMap<ConductorPurpose, VecDeque<serde_json::Value>>>,
+    }
+
+    impl ConductorInvoker for ScriptedConductor {
+        fn invoke<'a>(
+            &'a self,
+            invocation: &'a Invocation,
+        ) -> Pin<Box<dyn Future<Output = InvocationOutcome> + Send + 'a>> {
+            let answer = self
+                .answers
+                .lock()
+                .unwrap()
+                .get_mut(&invocation.request.purpose)
+                .and_then(VecDeque::pop_front);
+            Box::pin(async move {
+                match answer {
+                    Some(response) => InvocationOutcome::Answered(ConductorAnswer {
+                        message: response
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToString::to_string),
+                        response,
+                    }),
+                    None => InvocationOutcome::Failed {
+                        error: "nothing scripted".to_string(),
+                    },
+                }
+            })
+        }
+    }
+
+    /// An execution stopped by `definition_path`'s workflow, and a server
+    /// with a scripted conductor over the engine that stopped it.
+    struct Served {
+        _root: TempRoot,
+        store: ExecutionStore,
+        handle: api::ApiHandle,
+        execution_id: String,
+        _registry: Arc<ConductorRegistry>,
+    }
+
+    async fn served(
+        definition_path: PathBuf,
+        inputs: serde_json::Value,
+        agent: Option<Arc<dyn ActionExecutor>>,
+        answers: Vec<(ConductorPurpose, serde_json::Value)>,
+    ) -> Served {
+        let root = TempRoot::new();
+        let store = root.store();
+        let mut engine = Engine::new(store.clone());
+        if let Some(agent) = agent {
+            engine = engine.with_executor(ActionKind::Agent, agent);
+        }
+        let engine = Arc::new(engine);
+        let mut by_purpose: HashMap<ConductorPurpose, VecDeque<serde_json::Value>> = HashMap::new();
+        for (purpose, answer) in answers {
+            by_purpose.entry(purpose).or_default().push_back(answer);
+        }
+        let registry = Arc::new(ConductorRegistry::new(
+            Arc::clone(&engine),
+            Arc::new(ScriptedConductor {
+                answers: Mutex::new(by_purpose),
+            }),
+        ));
+        engine.attach_conductor(&registry);
+
+        let definition = load_from_file(&definition_path).expect("load the fixture");
+        let workspace_path = root.join("workspace");
+        fs::create_dir_all(&workspace_path).expect("create workspace dir");
+        fs::copy(
+            engine_support::fixtures().join("scripts/print_json.sh"),
+            workspace_path.join("print_json.sh"),
+        )
+        .expect("copy the fixture script");
+        let execution = engine
+            .start(
+                &definition,
+                inputs,
+                Workspace::local_folder(workspace_path.display().to_string()),
+            )
+            .expect("start execution");
+        pin_definition_path(&store, &execution.id, &definition_path);
+        engine
+            .run(&definition, &execution.id)
+            .await
+            .expect("run until it stops");
+
+        let handle = api::start_with_services(
+            engine,
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            ApiServices {
+                conductor: Some(Arc::clone(&registry)),
+                ..ApiServices::default()
+            },
+        )
+        .await
+        .expect("server starts");
+        Served {
+            _root: root,
+            store,
+            handle,
+            execution_id: execution.id,
+            _registry: registry,
+        }
+    }
+
+    /// The pipeline, stopped at its `review` gate.
+    async fn at_the_review(answers: Vec<(ConductorPurpose, serde_json::Value)>) -> Served {
+        served(
+            pipeline_definition_path(),
+            serde_json::json!({
+                "script_path": prepare_script_path().display().to_string(),
+                "ticket": "ORC-12",
+            }),
+            None,
+            answers,
+        )
+        .await
+    }
+
+    fn approve_proposal() -> (ConductorPurpose, serde_json::Value) {
+        (
+            ConductorPurpose::ReplyToChat,
+            serde_json::json!({
+                "decision": "reply",
+                "message": "I would approve it.",
+                "confidence": "high",
+                "rationale": "The preparation succeeded.",
+                "proposals": [{
+                    "kind": "answer_input",
+                    "summary": "Approve the change",
+                    "values": {"approval_status": "approved", "comment": "approved by the conductor"}
+                }],
+            }),
+        )
+    }
+
+    /// Posts `text` and waits for the proposal the conductor answers with.
+    async fn proposal_for(served: &Served, text: &str) -> String {
+        let client = served.handle.client();
+        let posted = client
+            .post_chat(&served.execution_id, text)
+            .await
+            .expect("post the message");
+        assert_eq!(posted.text, text);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let chat = client
+                .conductor_chat(&served.execution_id, posted.sequence)
+                .await
+                .expect("read the chat");
+            if let Some(proposal) = chat
+                .entries
+                .iter()
+                .find(|entry| entry.kind == ChatEntryKind::Proposal)
+            {
+                return proposal.id.clone();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no proposal came: {:?}",
+                chat.entries
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn summary(served: &Served) -> ExecutionSummary {
+        served
+            .handle
+            .client()
+            .list_executions()
+            .await
+            .expect("list")
+            .executions
+            .into_iter()
+            .find(|summary| summary.id == served.execution_id)
+            .expect("the execution is listed")
+    }
+
+    /// R30, AE16: the gate's summary rides on the pending input's read, and
+    /// the gate waits; R28: a proposal confirmed over the API answers it —
+    /// once, however often it is confirmed.
+    #[tokio::test]
+    async fn the_chat_proposes_and_a_confirmation_over_the_api_answers_once() {
+        let served = at_the_review(vec![
+            (
+                ConductorPurpose::SummarizeGate,
+                serde_json::json!({
+                    "decision": "annotate",
+                    "summary": "The change was prepared for ORC-12.",
+                    "recommendation": "approved",
+                }),
+            ),
+            approve_proposal(),
+        ])
+        .await;
+        let client = served.handle.client();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let listed = loop {
+            let listed = summary(&served).await;
+            if listed.annotation.is_some() || tokio::time::Instant::now() >= deadline {
+                break listed;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(listed.status, ExecutionStatus::InputNeeded);
+        let pending: PendingHumanInput = listed.pending_input.clone().expect("the gate");
+        let annotation = listed.annotation.expect("the gate's summary");
+        assert_eq!(annotation.key, pending.episode_key());
+        assert_eq!(annotation.recommendation.as_deref(), Some("approved"));
+
+        let proposal = proposal_for(&served, "approve it for me").await;
+        assert_eq!(
+            summary(&served).await.status,
+            ExecutionStatus::InputNeeded,
+            "nothing happens before the confirmation"
+        );
+
+        let first = client
+            .confirm_proposal(&served.execution_id, &proposal)
+            .await
+            .expect("confirm");
+        assert_eq!(first.status, ProposalStatus::Executed);
+        assert!(!first.repeated);
+        wait_for_status(
+            &served.store,
+            &served.execution_id,
+            ExecutionStatus::Completed,
+            Duration::from_secs(5),
+        )
+        .await;
+        let second = client
+            .confirm_proposal(&served.execution_id, &proposal)
+            .await
+            .expect("confirm again");
+        assert!(second.repeated);
+        assert_eq!(second.decision_id, first.decision_id);
+
+        let events = client
+            .events(&served.execution_id, 0)
+            .await
+            .expect("events");
+        let answers: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.data {
+                EventData::HumanInputReceived {
+                    answered_by,
+                    close_reason: Some(InputCloseReason::Answered),
+                    episode,
+                    ..
+                } => Some((*answered_by, episode.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            vec![(
+                Some(AnsweredBy::Conductor),
+                Some(pending.episode_key().to_string())
+            )]
+        );
+    }
+
+    /// KTD9: a proposal confirmed after the operator answered the gate is a
+    /// `409` whose body says why; an unknown proposal is `404`.
+    #[tokio::test]
+    async fn a_stale_confirmation_is_a_conflict_with_its_reason() {
+        let served = at_the_review(vec![approve_proposal()]).await;
+        let client = served.handle.client();
+        let proposal = proposal_for(&served, "approve it").await;
+
+        let pending = summary(&served).await.pending_input.expect("the gate");
+        client
+            .deliver_input(
+                &served.execution_id,
+                HumanInputDelivery::with_values(
+                    serde_json::json!({"approval_status": "rejected", "comment": "no"})
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                )
+                .for_episode(pending.episode_key()),
+            )
+            .await
+            .expect("the operator answers first");
+        wait_for_status(
+            &served.store,
+            &served.execution_id,
+            ExecutionStatus::Failed,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        match client
+            .confirm_proposal(&served.execution_id, &proposal)
+            .await
+        {
+            Err(ClientError::Refused { code, message }) => {
+                assert_eq!(code, "stale_proposal");
+                assert!(message.contains("moved on"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(matches!(
+            client
+                .confirm_proposal(&served.execution_id, "no-such-proposal")
+                .await,
+            Err(ClientError::NotFound)
+        ));
+        assert_eq!(
+            served
+                .store
+                .load_execution(&served.execution_id)
+                .unwrap()
+                .status,
+            ExecutionStatus::Failed
+        );
+    }
+
+    /// KTD13 over the API: the conductor's choice is undone, once; anything
+    /// that is not one is refused.
+    #[tokio::test]
+    async fn a_chosen_output_is_undone_over_the_api() {
+        let served = served(
+            engine_support::fixtures().join("engine/agent_problem.yaml"),
+            serde_json::json!({}),
+            Some(Arc::new(engine_support::LabellessAgentExecutor::answering(
+                "Done, all tests pass.",
+            ))),
+            vec![(
+                ConductorPurpose::ChooseOutputAfterReprompt,
+                serde_json::json!({
+                    "decision": "choose_output",
+                    "label": "implemented",
+                    "variables": {"summary": "all tests pass"},
+                    "confidence": "high",
+                }),
+            )],
+        )
+        .await;
+        let client = served.handle.client();
+        assert_eq!(summary(&served).await.status, ExecutionStatus::Completed);
+        let decision = client
+            .conductor_chat(&served.execution_id, 0)
+            .await
+            .expect("chat")
+            .entries
+            .into_iter()
+            .find(|entry| entry.kind == ChatEntryKind::Decision)
+            .and_then(|entry| {
+                entry
+                    .payload?
+                    .get("decision_id")?
+                    .as_str()
+                    .map(String::from)
+            })
+            .expect("the decision in the chat");
+
+        let undone = client
+            .undo_decision(&served.execution_id, &decision)
+            .await
+            .expect("undo");
+        assert_eq!(undone.state_id, "work");
+        assert!(undone.warning.is_some());
+        let listed = summary(&served).await;
+        assert_eq!(listed.status, ExecutionStatus::InputNeeded);
+        assert_eq!(
+            listed.problem.and_then(|problem| problem.episode),
+            Some(undone.episode)
+        );
+
+        assert!(matches!(
+            client.undo_decision(&served.execution_id, &decision).await,
+            Err(ClientError::Refused { ref code, .. }) if code == "already_undone"
+        ));
+        assert!(matches!(
+            client.undo_decision(&served.execution_id, "no-such").await,
+            Err(ClientError::NotFound)
+        ));
+    }
+
+    /// Without a conductor behind the server, the chat cannot be written.
+    #[tokio::test]
+    async fn without_a_conductor_the_chat_is_not_served() {
+        let root = TempRoot::new();
+        let store = root.store();
+        store
+            .save_execution(&sample_execution("exec-chat", ExecutionStatus::Paused))
+            .expect("save");
+        let handle = start_server(store).await;
+        assert!(matches!(
+            handle.client().post_chat("exec-chat", "hello").await,
+            Err(ClientError::Server(_))
+        ));
+    }
+}

@@ -49,6 +49,7 @@ use crate::conductor::response::ProposedAction;
 use crate::domain::{
     ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Confidence, ExecutionId,
 };
+use crate::engine::RejectedAnswer;
 use crate::persistence::atomic::ensure_dir;
 use crate::persistence::{read_json, write_json_atomic, PersistenceError, Result, StatePaths};
 
@@ -232,6 +233,13 @@ pub struct SavedDecision {
     /// The execution's context before the decision, to restore on undo.
     #[serde(default)]
     pub context_before: Value,
+    /// The agent's answers without a label the decision settled, oldest
+    /// first: an undo raises the problem again with them (KTD13).
+    #[serde(default)]
+    pub answers: Vec<RejectedAnswer>,
+    /// Why the step had no label, for the problem an undo raises again.
+    #[serde(default)]
+    pub reason: Option<String>,
     /// When it was saved.
     pub saved_at: DateTime<Utc>,
 }

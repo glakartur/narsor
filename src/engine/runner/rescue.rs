@@ -177,6 +177,8 @@ impl Engine {
                                 rationale: response.rationale.clone(),
                                 context_before: serde_json::to_value(&execution.context)
                                     .unwrap_or(Value::Null),
+                                answers: rescue.answers.clone(),
+                                reason: Some(rescue.reason.clone()),
                                 saved_at: Utc::now(),
                             };
                             conductor.save_decision(
@@ -563,6 +565,8 @@ fn unsaved_decision(
         confidence: response.confidence,
         rationale,
         context_before: Value::Null,
+        answers: Vec::new(),
+        reason: None,
         saved_at: Utc::now(),
     }
 }

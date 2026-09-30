@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::conductor::{
-    ChatEntry, ConductorState, FailureReport, PendingInvocation, QueuedRequest, SavedDecision,
+    Annotation, ChatEntry, ConductorState, FailureReport, PendingInvocation, QueuedRequest,
+    SavedDecision,
 };
 use crate::domain::{ExecutionStatus, ProblemKind, WorkflowExecution};
 use crate::engine::{InputContinuation, PendingHumanInput};
@@ -204,6 +205,12 @@ pub struct ExecutionSummary {
     /// conductor is still diagnosing, or retried by itself, is no problem.
     #[serde(default)]
     pub problem: Option<ActiveProblem>,
+    /// The conductor's summary of the `human` gate `pending_input` is, when
+    /// it made one (R30): advisory only — the gate waits for the operator
+    /// whatever it recommends. Keyed by the input's episode, so it is never
+    /// shown for another input than the one it summarizes.
+    #[serde(default)]
+    pub annotation: Option<Annotation>,
 }
 
 /// A problem an execution is stopped on (KTD3, KTD4).
@@ -267,6 +274,7 @@ impl From<&WorkflowExecution> for ExecutionSummary {
             metadata: execution.metadata.clone(),
             pending_input: None,
             problem: None,
+            annotation: None,
         }
     }
 }
@@ -324,6 +332,14 @@ impl ConductorStateResponse {
             failure: state.failure,
         }
     }
+}
+
+/// `POST /executions/:id/conductor/chat` request body: the operator's
+/// message to the conductor (F4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessageRequest {
+    /// What the operator writes.
+    pub text: String,
 }
 
 /// `GET /executions/:id/conductor/chat?after=<sequence>` — the chat history

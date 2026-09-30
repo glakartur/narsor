@@ -63,17 +63,19 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::api::active::ActiveTasks;
 use crate::api::dto::{
-    AcceptedResponse, ActiveProblem, ConductorChatResponse, ConductorStateResponse,
-    ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot, OperatorNoteRequest,
-    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
-    StartTaskResponse, TransitionRequest,
+    AcceptedResponse, ActiveProblem, ChatMessageRequest, ConductorChatResponse,
+    ConductorStateResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
+    OperatorNoteRequest, RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest,
+    StartTaskRequest, StartTaskResponse, TransitionRequest,
 };
-use crate::conductor::ConductorStore;
-use crate::domain::{AnsweredBy, Event, EventData, ExecutionStatus, InputCloseReason};
-use crate::engine::actions::human;
+use crate::api::ApiServices;
+use crate::conductor::{
+    annotation_of, ChatEntry, ConductorRegistry, ConductorStore, ProposalError, ProposalOutcome,
+    UndoError, UndoOutcome,
+};
+use crate::domain::{AnsweredBy, Event, ExecutionStatus};
 use crate::engine::{
-    build_timeline, record_manual_transition, terminal_status, Engine, EngineError,
-    HumanInputDelivery, PendingHumanInput, Recovery, Timeline,
+    build_timeline, Engine, EngineError, HumanInputDelivery, ManualTransition, Recovery, Timeline,
 };
 use crate::persistence::{
     ConversationSource, DefaultHarnessSelector, ExecutionStore, HarnessSelectionError,
@@ -104,10 +106,6 @@ const OVERRIDE_REASON: &str =
 /// `src/tui/app.rs`'s `MANUAL_REASON`.
 const MANUAL_REASON: &str = "Manual transition picked by the operator.";
 
-/// The label recorded for a forced transition, which by definition has none
-/// — same value as `src/tui/app.rs`'s `OVERRIDE_LABEL`.
-const OVERRIDE_LABEL: &str = "override";
-
 /// Default byte budget for a conversation read when the caller does not ask
 /// for a specific one.
 ///
@@ -128,6 +126,7 @@ struct AppState {
     work_dir: PathBuf,
     harness_selector: Option<Arc<DefaultHarnessSelector>>,
     active_tasks: ActiveTasks,
+    conductor: Option<Arc<ConductorRegistry>>,
 }
 
 /// Builds the router: the three original read-only endpoints (U5/U2) plus
@@ -147,8 +146,7 @@ pub fn router(
     token: String,
     catalog_dir: PathBuf,
     work_dir: PathBuf,
-    harness_selector: Option<Arc<DefaultHarnessSelector>>,
-    active_tasks: ActiveTasks,
+    services: ApiServices,
 ) -> Router {
     let state = AppState {
         engine,
@@ -156,8 +154,9 @@ pub fn router(
         token,
         catalog_dir,
         work_dir,
-        harness_selector,
-        active_tasks,
+        harness_selector: services.harness_selector,
+        active_tasks: services.active_tasks,
+        conductor: services.conductor,
     };
     Router::new()
         .route("/executions/:execution_id/events", get(get_events))
@@ -173,7 +172,19 @@ pub fn router(
         )
         .route(
             "/executions/:execution_id/conductor/chat",
-            get(get_conductor_chat),
+            get(get_conductor_chat).post(post_conductor_chat),
+        )
+        .route(
+            "/executions/:execution_id/conductor/proposals/:proposal_id/confirm",
+            post(post_confirm_proposal),
+        )
+        .route(
+            "/executions/:execution_id/conductor/proposals/:proposal_id/reject",
+            post(post_reject_proposal),
+        )
+        .route(
+            "/executions/:execution_id/conductor/decisions/:decision_id/undo",
+            post(post_undo_decision),
         )
         .route(
             "/settings/agent-harness",
@@ -285,6 +296,13 @@ enum ApiError {
     /// state (already being driven, or being transitioned by hand while
     /// active). `409`.
     Conflict(String),
+    /// A conflict the operator is told the reason of — a proposal about a
+    /// moment that has passed (KTD9), a decision already undone. `409`
+    /// with a [`RequestErrorResponse`] body.
+    Refused {
+        code: &'static str,
+        message: String,
+    },
     Storage(PersistenceError),
     /// Anything else that stops a handler from completing — mirrors
     /// `Storage`'s `500`, kept distinct only so the log line names the right
@@ -312,6 +330,14 @@ impl IntoResponse for ApiError {
                 tracing::debug!(message, "api: conflict");
                 StatusCode::CONFLICT.into_response()
             }
+            ApiError::Refused { code, message } => (
+                StatusCode::CONFLICT,
+                Json(RequestErrorResponse {
+                    code: code.to_owned(),
+                    message,
+                }),
+            )
+                .into_response(),
             ApiError::Storage(error) => {
                 tracing::warn!(error = %error, "api: storage error serving request");
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -368,7 +394,9 @@ impl From<EngineError> for ApiError {
             | EngineError::NotRunnable { .. }
             | EngineError::AwaitingHumanInput { .. }
             // Somebody acted on the failure first (KTD9).
-            | EngineError::StaleEpisode { .. } => ApiError::Conflict(error.to_string()),
+            | EngineError::StaleEpisode { .. }
+            | EngineError::EpisodeChanged { .. } => ApiError::Conflict(error.to_string()),
+            EngineError::InvalidTransition { message } => ApiError::BadRequest(message),
             // Too late: the request was answered or closed meanwhile (KTD9).
             EngineError::HumanInput(ref human) if human.is_stale() => {
                 ApiError::Conflict(error.to_string())
@@ -491,6 +519,150 @@ async fn get_conductor_chat(
     Ok(Json(ConductorChatResponse {
         entries: conductor.read_chat_after(query.after)?,
     }))
+}
+
+/// The conductor of this daemon, for the endpoints only it can serve.
+fn require_conductor(state: &AppState) -> Result<Arc<ConductorRegistry>, ApiError> {
+    state
+        .conductor
+        .clone()
+        .ok_or_else(|| ApiError::Internal("no conductor runs behind this API server".into()))
+}
+
+/// `POST /executions/:execution_id/conductor/chat` — the operator writes to
+/// the conductor (F4).
+///
+/// Answers `202` with the entry as written, at once: the conductor's answer
+/// comes later, as further entries of the same history (`GET .../chat`),
+/// whichever client wrote the message.
+async fn post_conductor_chat(
+    State(state): State<AppState>,
+    Path(execution_id): Path<String>,
+    Json(body): Json<ChatMessageRequest>,
+) -> Result<(StatusCode, Json<ChatEntry>), ApiError> {
+    require_execution(&state, &execution_id)?;
+    let conductor = require_conductor(&state)?;
+    let text = body.text.trim();
+    if text.is_empty() {
+        return Err(ApiError::Request {
+            code: "empty_message",
+            message: "a chat message cannot be empty".to_string(),
+        });
+    }
+    let entry = conductor.post_chat(&execution_id, text)?;
+    Ok((StatusCode::ACCEPTED, Json(entry)))
+}
+
+/// `POST /executions/:execution_id/conductor/proposals/:proposal_id/confirm`
+/// — carries out a proposal of the conductor's (R28).
+///
+/// Idempotent: a second confirmation answers the first one's outcome with
+/// `repeated: true` and does nothing. A proposal about a moment the
+/// execution has moved on from is `409` with the reason (KTD9). When
+/// carrying it out starts a pass, the pass runs in the background like any
+/// other and can be interrupted.
+async fn post_confirm_proposal(
+    State(state): State<AppState>,
+    Path((execution_id, proposal_id)): Path<(String, String)>,
+) -> Result<Json<ProposalOutcome>, ApiError> {
+    require_execution(&state, &execution_id)?;
+    let conductor = require_conductor(&state)?;
+    let execution = state.store.load_execution(&execution_id)?;
+    let definition = load_definition_for(&state, &execution)?;
+
+    let confirmed = conductor.confirm_proposal(&definition, &execution_id, &proposal_id)?;
+    if let Some(pass) = confirmed.pass {
+        spawn_active(&state, execution_id.clone(), async move {
+            let _ = pass.run_to_completion(&definition).await;
+        });
+    }
+    Ok(Json(confirmed.outcome))
+}
+
+/// `POST /executions/:execution_id/conductor/proposals/:proposal_id/reject`
+/// — the operator turns a proposal down; it can no longer be confirmed.
+async fn post_reject_proposal(
+    State(state): State<AppState>,
+    Path((execution_id, proposal_id)): Path<(String, String)>,
+) -> Result<Json<ProposalOutcome>, ApiError> {
+    require_execution(&state, &execution_id)?;
+    let conductor = require_conductor(&state)?;
+    Ok(Json(
+        conductor.reject_proposal(&execution_id, &proposal_id)?,
+    ))
+}
+
+/// `POST /executions/:execution_id/conductor/decisions/:decision_id/undo` —
+/// undoes a chosen output of the conductor's (KTD13).
+///
+/// A pass driving the execution is interrupted first; the answer carries a
+/// warning when a step after the decision had already started. Anything but
+/// a chosen output is `400`; a decision already undone is `409`.
+async fn post_undo_decision(
+    State(state): State<AppState>,
+    Path((execution_id, decision_id)): Path<(String, String)>,
+) -> Result<Json<UndoOutcome>, ApiError> {
+    require_execution(&state, &execution_id)?;
+    let conductor = require_conductor(&state)?;
+    let execution = state.store.load_execution(&execution_id)?;
+    let definition = load_definition_for(&state, &execution)?;
+
+    let active_tasks = state.active_tasks.clone();
+    let interrupted = execution_id.clone();
+    let outcome = conductor
+        .undo_decision(&definition, &execution_id, &decision_id, move || {
+            if let Some(handle) = active_tasks.get(&interrupted) {
+                handle.abort();
+            }
+        })
+        .await?;
+    Ok(Json(outcome))
+}
+
+impl From<ProposalError> for ApiError {
+    fn from(error: ProposalError) -> Self {
+        match error {
+            ProposalError::NotFound(_) => ApiError::ExecutionNotFound,
+            ProposalError::Stale(message) => ApiError::Refused {
+                code: "stale_proposal",
+                message,
+            },
+            ProposalError::Settled(message) => ApiError::Refused {
+                code: "proposal_settled",
+                message,
+            },
+            ProposalError::Busy(message) => ApiError::Refused {
+                code: "execution_busy",
+                message,
+            },
+            ProposalError::Invalid(message) => ApiError::Request {
+                code: "invalid_proposal",
+                message,
+            },
+            ProposalError::Failed(message) => ApiError::Internal(message),
+        }
+    }
+}
+
+impl From<UndoError> for ApiError {
+    fn from(error: UndoError) -> Self {
+        match error {
+            UndoError::NotFound(_) => ApiError::ExecutionNotFound,
+            UndoError::NotUndoable(message) => ApiError::Request {
+                code: "not_undoable",
+                message,
+            },
+            UndoError::AlreadyUndone(message) => ApiError::Refused {
+                code: "already_undone",
+                message,
+            },
+            UndoError::Busy(message) => ApiError::Refused {
+                code: "execution_busy",
+                message,
+            },
+            UndoError::Failed(message) => ApiError::Internal(message),
+        }
+    }
 }
 
 /// `GET /executions/:execution_id/timeline`
@@ -847,8 +1019,9 @@ async fn post_input(
 ///
 /// Reimplements `src/tui/app.rs`'s `write_transition` (reached today only
 /// through `manual_transition`/`force_transition`, both fed from a menu the
-/// TUI already built out of *legal* choices): `engine.is_active` refuses a
-/// concurrently-driven execution first (`409`), and — the one check the TUI
+/// TUI already built out of *legal* choices), now in
+/// [`Engine::take_manual_transition`], which takes the execution's claim — a
+/// concurrently-driven execution is `409` — and — the one check the TUI
 /// never needed, because its menu could not offer an illegal choice in the
 /// first place — the requested transition is validated against the
 /// workflow's own declared transitions before anything is written:
@@ -867,151 +1040,30 @@ async fn post_transition(
     Json(body): Json<TransitionRequest>,
 ) -> Result<Json<ExecutionSummary>, ApiError> {
     require_execution(&state, &execution_id)?;
-
-    // A background pass may be advancing this execution right now — this
-    // check is what keeps a hand-written transition from racing that pass's
-    // own appends and its own `save_execution` (see `write_transition`'s own
-    // comment on the same check).
-    if state.engine.is_active(&execution_id) {
-        return Err(ApiError::Conflict(format!(
-            "execution '{execution_id}' is being driven in the background right now"
-        )));
-    }
-
-    let mut execution = state.store.load_execution(&execution_id)?;
+    let execution = state.store.load_execution(&execution_id)?;
     let definition = load_definition_for(&state, &execution)?;
 
-    let from_state_id = execution
-        .current_state
-        .clone()
-        .unwrap_or_else(|| definition.initial_state.clone());
-    let from_state = definition.states.get(&from_state_id).ok_or_else(|| {
-        ApiError::Internal(format!(
-            "execution '{execution_id}' is at state '{from_state_id}', which its workflow does \
-             not define"
-        ))
-    })?;
-
-    let (target, label, provider, reason) = if body.force {
-        let target = body.target.clone().ok_or_else(|| {
-            ApiError::BadRequest("a forced transition requires a target state".to_string())
-        })?;
-        if !definition.states.contains_key(&target) {
-            return Err(ApiError::BadRequest(format!(
-                "the workflow has no state '{target}'"
-            )));
-        }
-        (
-            target,
-            OVERRIDE_LABEL.to_string(),
-            OVERRIDE_PROVIDER,
-            OVERRIDE_REASON,
-        )
+    // The claim the engine takes for the transition is what keeps it from
+    // racing a background pass's own appends and saves: an execution being
+    // driven right now is `409`.
+    let (provider, reason) = if body.force {
+        (OVERRIDE_PROVIDER, OVERRIDE_REASON)
     } else {
-        let label = body.label.clone().ok_or_else(|| {
-            ApiError::BadRequest("label is required unless force is set".to_string())
-        })?;
-        let target = from_state.transitions.get(&label).cloned().ok_or_else(|| {
-            ApiError::BadRequest(format!(
-                "state '{from_state_id}' has no transition for label '{label}' — this is not a \
-                 legal transition from the current state"
-            ))
-        })?;
-        (target, label, MANUAL_PROVIDER, MANUAL_REASON)
+        (MANUAL_PROVIDER, MANUAL_REASON)
     };
-
-    // Guaranteed to exist: the forced branch checked it above, and the
-    // ordinary branch's target came from the current state's own
-    // `transitions` map, which the loader already validates points at a
-    // declared state (`WORKFLOW_SCHEMA.md` §5).
-    let target_state = definition
-        .states
-        .get(&target)
-        .cloned()
-        .ok_or_else(|| ApiError::Internal(format!("the workflow has no state '{target}'")))?;
-
-    // What the agent in the state being left said, for a gate the target may
-    // be (KTD8). Read before anything is written: the pending request is
-    // about to be cleared, and it only counts while input is actually needed.
-    let pending_input: Option<PendingHumanInput> =
-        if execution.status == ExecutionStatus::InputNeeded {
-            state.store.load_pending_input(&execution_id)?
-        } else {
-            None
-        };
-    record_manual_transition(&mut execution, from_state, &target, pending_input.as_ref())?;
-
-    let log = state.store.event_log(&execution_id);
-    // A request still open is closed by this transition, first, so a form
-    // left open on it can say what closed it (R5).
-    if let Some(pending) = &pending_input {
-        log.append_next(
-            &execution_id,
-            human::closing_event(pending, InputCloseReason::Transition, AnsweredBy::Operator),
-        )?;
-    }
-    let writes: Vec<EventData> = vec![
-        EventData::DecisionMade {
+    let execution = state.engine.take_manual_transition(
+        &definition,
+        &execution_id,
+        &ManualTransition {
+            label: body.label,
+            target: body.target,
+            force: body.force,
             provider: provider.to_string(),
-            output_label: label.clone(),
-            reasoning: Some(reason.to_string()),
+            reason: reason.to_string(),
+            by: AnsweredBy::Operator,
+            episode: None,
         },
-        EventData::HumanTransitionSelected {
-            from_state: from_state_id.clone(),
-            to_state: target.clone(),
-        },
-        EventData::StateExited {
-            state_id: from_state_id.clone(),
-            output_label: label.clone(),
-        },
-        EventData::TransitionTaken {
-            from_state: from_state_id.clone(),
-            to_state: target.clone(),
-            output_label: label.clone(),
-        },
-    ];
-    for data in writes {
-        log.append_next(&execution_id, data)?;
-    }
-
-    execution.current_state = Some(target.clone());
-    execution.current_action_execution = None;
-
-    if target_state.terminal {
-        let status = terminal_status(&target_state);
-        execution.status = status.clone();
-        execution.completed_at = Some(Utc::now());
-
-        let closing = match status {
-            ExecutionStatus::Failed => EventData::WorkflowFailed {
-                error: format!("Forced transition into terminal state '{target}'."),
-            },
-            ExecutionStatus::Cancelled => EventData::WorkflowCancelled {
-                reason: format!("Forced transition into terminal state '{target}'."),
-            },
-            _ => EventData::WorkflowCompleted {
-                result: Value::Object(Map::new()),
-            },
-        };
-        let entered = EventData::StateEntered {
-            state_id: target.clone(),
-        };
-        for data in [entered, closing] {
-            log.append_next(&execution_id, data)?;
-        }
-    } else {
-        execution.status = ExecutionStatus::Paused;
-        log.append_next(
-            &execution_id,
-            EventData::WorkflowPaused {
-                reason: format!("Manual transition into state '{target}'; waiting to be resumed."),
-            },
-        )?;
-    }
-
-    // A question asked in the state just left can no longer be answered.
-    state.store.clear_pending_input(&execution_id)?;
-    state.store.save_execution(&execution)?;
+    )?;
 
     Ok(Json(ExecutionSummary::from(&execution)))
 }
@@ -1062,6 +1114,10 @@ fn build_summary(
     } else {
         None
     };
+    summary.annotation = summary
+        .pending_input
+        .as_ref()
+        .and_then(|pending| annotation_of(store, &execution.id, pending));
     summary.problem = match &summary.pending_input {
         Some(pending) => ActiveProblem::of_pending(pending),
         // A failed step stays `Failed` (KTD4): its problem is the
@@ -1190,6 +1246,7 @@ mod sse_stream_tests {
     //! [`sse_event_stream`] — the exact function both SSE handlers call —
     //! exercises the same `Err(Lagged(_))` branch deterministically.
     use super::*;
+    use crate::domain::EventData;
 
     #[tokio::test]
     async fn lagged_receiver_skips_missed_events_but_keeps_streaming() {
