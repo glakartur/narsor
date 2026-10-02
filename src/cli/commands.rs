@@ -37,7 +37,9 @@ use serde_json::{Map, Value};
 
 use crate::api::{ApiClient, ClientError, ConversationResponse, ExecutionSummary};
 use crate::conductor::{ChatAuthor, ChatEntry, ChatEntryKind};
-use crate::domain::{Event, ExecutionStatus, InputParameter, ParamType, WorkflowDefinition};
+use crate::domain::{
+    Event, ExecutionStatus, InputParameter, ParamType, ProblemKind, WorkflowDefinition,
+};
 use crate::engine::{
     ConversationState, HumanInputDelivery, PendingHumanInput, Position, PositionStatus,
 };
@@ -189,7 +191,7 @@ pub async fn run(
 
     let summary = wait_until_stopped(&client, &started.execution_id).await?;
     print_summary(&summary);
-    print_pending_input_if_any(&summary);
+    print_open_matters(&summary);
 
     if summary.status == ExecutionStatus::Failed {
         return Err(CliError::failure(format!(
@@ -372,6 +374,7 @@ pub async fn show(state: &Path, flags: &Flags, execution_id: &str) -> Result<()>
     if let Some(pending) = &execution.pending_input {
         print_pending_input(pending);
     }
+    print_conductor_matters(&execution);
     Ok(())
 }
 
@@ -682,7 +685,7 @@ pub async fn input(
 
     println!("Input delivered to execution {}.", summary.id);
     print_summary(&summary);
-    print_pending_input_if_any(&summary);
+    print_open_matters(&summary);
     if summary.status == ExecutionStatus::Failed {
         return Err(CliError::failure(format!(
             "Execution {} failed.",
@@ -754,7 +757,68 @@ pub async fn resume(
 
     println!("Resumed execution {}.", summary.id);
     print_summary(&summary);
-    print_pending_input_if_any(&summary);
+    print_open_matters(&summary);
+    if summary.status == ExecutionStatus::Failed {
+        return Err(CliError::failure(format!(
+            "Execution {} failed.",
+            summary.id
+        )));
+    }
+    Ok(())
+}
+
+/// `narsor recover <id> [--comment TEXT]` — starts the failed step of an
+/// execution afresh (`POST /executions/:id/recover`), the CLI counterpart of
+/// the TUI's failure form.
+///
+/// Bound to the failure the execution is failed on, like `input` is bound
+/// to the input it answers: the key is taken from the summary's problem, so
+/// a recovery that comes after somebody else acted on the failure (another
+/// window, the conductor's own retry) is refused with a `409` — said here as
+/// a sentence — instead of starting the step a second time. An execution
+/// failed without such a problem (its failure still being diagnosed, or
+/// left `unknown` by a restart) is recovered without a key.
+pub async fn recover(
+    state: &Path,
+    flags: &Flags,
+    execution_id: &str,
+    comment: Option<String>,
+) -> Result<()> {
+    let client = daemon_client(state, flags).await?;
+    let current = load_execution_summary(&client, execution_id).await?;
+    if !matches!(
+        current.status,
+        ExecutionStatus::Failed | ExecutionStatus::Unknown
+    ) {
+        return Err(CliError::failure(format!(
+            "Execution '{execution_id}' has no failed step to recover (status: {}).",
+            current.status.as_str()
+        )));
+    }
+    let failure = current
+        .problem
+        .as_ref()
+        .filter(|problem| problem.kind == ProblemKind::Failure)
+        .and_then(|problem| problem.episode.clone());
+
+    let accepted = match &failure {
+        Some(episode) => client.recover_failure(execution_id, episode, comment).await,
+        None => client.recover(execution_id, comment).await,
+    };
+    accepted.map_err(|error| match error {
+        ClientError::Conflict => CliError::failure(format!(
+            "Execution '{execution_id}' is no longer failed on the failure this recovery was \
+             for: it was recovered or changed meanwhile, or another process is driving it right \
+             now. Check it with 'narsor show {execution_id}'."
+        )),
+        other => client_error(execution_id, other),
+    })?;
+
+    let summary = wait_until_stopped(&client, execution_id).await?;
+
+    println!("Recovered execution {}.", summary.id);
+    print_summary(&summary);
+    print_open_matters(&summary);
     if summary.status == ExecutionStatus::Failed {
         return Err(CliError::failure(format!(
             "Execution {} failed.",
@@ -917,6 +981,64 @@ pub async fn conductor_undo(
         eprintln!("Warning: {warning}");
     }
     Ok(())
+}
+
+/// `narsor conductor status <id>` — what the conductor of an execution is
+/// doing and what it kept (`GET /executions/:id/conductor`), as the TUI's
+/// conductor pane reads it.
+pub async fn conductor_status(state: &Path, flags: &Flags, execution_id: &str) -> Result<()> {
+    let client = daemon_client(state, flags).await?;
+    let conductor = client
+        .conductor_state(execution_id)
+        .await
+        .map_err(|error| client_error(execution_id, error))?;
+
+    match &conductor.pending {
+        Some(pending) => println!(
+            "Working on:    {} ({}, since {}){}",
+            pending.request.purpose.name(),
+            pending.request.trigger.name(),
+            pending.started_at.to_rfc3339(),
+            episode_suffix(pending.request.episode.as_deref())
+        ),
+        None => println!("Working on:    nothing"),
+    }
+    println!("Queued:        {}", conductor.queue.len());
+    for queued in &conductor.queue {
+        println!(
+            "  {} ({}){}",
+            queued.purpose.name(),
+            queued.trigger.name(),
+            episode_suffix(queued.episode.as_deref())
+        );
+    }
+    println!("Unanswered:    {}", conductor.unanswered_chat.len());
+    for (episode, attempts) in &conductor.invocation_attempts {
+        println!("Attempts:      {attempts} for {episode}");
+    }
+    for episode in &conductor.used_retries {
+        println!("Retry used:    {episode}");
+    }
+    if !conductor.unapplied_decisions.is_empty() {
+        println!(
+            "Unapplied:     {} decision(s)",
+            conductor.unapplied_decisions.len()
+        );
+    }
+    if let Some(failure) = &conductor.failure {
+        println!(
+            "Last failure:  {} at '{}': {}",
+            failure.key, failure.state_id, failure.reason
+        );
+    }
+    Ok(())
+}
+
+/// ` for <episode>`, or nothing.
+fn episode_suffix(episode: Option<&str>) -> String {
+    episode
+        .map(|episode| format!(" for {episode}"))
+        .unwrap_or_default()
 }
 
 /// The id of the `kind` entry numbered `reference` in the chat, when
@@ -1427,9 +1549,10 @@ async fn wait_until_stopped(client: &ApiClient, execution_id: &str) -> Result<Ex
 
 /// Prints the pending question's full form ([`print_pending_input`]) —
 /// fields, types, allowed values, output labels, not just its instruction
-/// text — that [`run`]/[`resume`]/[`input`] always printed when a pass
-/// stops on a question, if `summary` says the execution is `InputNeeded` right
-/// now.
+/// text — that [`run`]/[`resume`]/[`input`]/[`recover`] always printed when
+/// a pass stops on a question, if `summary` says the execution is
+/// `InputNeeded` right now; then what the conductor adds to it
+/// ([`print_conductor_matters`]).
 ///
 /// `ExecutionSummary::pending_input` (added to `GET /executions` while
 /// migrating the TUI off `Arc<Engine>`, U7) already carries this whole form
@@ -1442,12 +1565,49 @@ async fn wait_until_stopped(client: &ApiClient, execution_id: &str) -> Result<Ex
 /// pending question and `pending_input` is `None` for it, matching
 /// `engine.pending_input()` returning `None` for that case before this
 /// unit.
-fn print_pending_input_if_any(summary: &ExecutionSummary) {
-    if summary.status != ExecutionStatus::InputNeeded {
-        return;
+fn print_open_matters(summary: &ExecutionSummary) {
+    if summary.status == ExecutionStatus::InputNeeded {
+        if let Some(pending) = &summary.pending_input {
+            print_pending_input(pending);
+        }
     }
-    if let Some(pending) = &summary.pending_input {
-        print_pending_input(pending);
+    print_conductor_matters(summary);
+}
+
+/// What the conductor adds to `summary`, as the TUI shows it: the failure
+/// a `Failed` execution is a problem on (F3), the summary of the gate it
+/// waits on (R30), and what the conductor is working on right now (R11).
+///
+/// A problem input ([`ProblemKind::Output`]) is not repeated here: the
+/// pending input's form already says it.
+fn print_conductor_matters(summary: &ExecutionSummary) {
+    if let Some(problem) = summary
+        .problem
+        .as_ref()
+        .filter(|problem| problem.kind == ProblemKind::Failure)
+    {
+        println!("Problem ({}): {}", problem.kind.name(), problem.reason);
+        if let Some(episode) = &problem.episode {
+            println!("  Failure: {episode}");
+        }
+        println!(
+            "  Recover with: narsor recover {} [--comment TEXT]",
+            summary.id
+        );
+    }
+    if let Some(annotation) = &summary.annotation {
+        println!("Conductor's summary: {}", annotation.summary);
+        if let Some(recommendation) = &annotation.recommendation {
+            println!("  Recommends: {recommendation}");
+        }
+    }
+    if let Some(activity) = &summary.conductor {
+        println!(
+            "Conductor working: {} ({}, since {})",
+            activity.purpose.name(),
+            activity.trigger.name(),
+            activity.started_at.to_rfc3339()
+        );
     }
 }
 

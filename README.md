@@ -164,7 +164,13 @@ ID                                     STATUS     STATE                  WORKFLO
 ### `show <EXECUTION_ID>`
 
 The status, the current state, the workspace and the context variables; plus the
-question and its form fields, when the execution is waiting on a human.
+question and its form fields, when the execution is waiting on a human. When the
+conductor has something to add, `show` prints it too: the problem a `failed`
+execution is stopped on (the conductor's diagnosis, or the raw error) with the
+failure's key and the `recover` command to answer it, the conductor's summary
+and recommendation of the `human` gate the execution waits on, and what the
+conductor is working on right now. `run`, `input`, `resume` and `recover` print
+the same when they return.
 
 ```console
 $ narsor show 4f1c8f0e-...-9b21
@@ -285,6 +291,34 @@ Resumes an execution that was paused by something **other** than a question for
 a human (a manual `pause`, for instance). An execution waiting for an answer
 needs `input`, not `resume` — that is the guard against delivering the same
 answer twice.
+
+### `recover <EXECUTION_ID> [--comment TEXT]`
+
+Starts the failed step of a `failed` (or, after a daemon restart, `unknown`)
+execution afresh — the CLI counterpart of the interface's failure form. The
+comment is handed to the step's next attempt. The recovery is bound to the
+failure the execution is failed on, the key `show` prints: if somebody acted on
+that failure first (another window, the conductor's own retry), it is refused
+with a readable message instead of starting the step twice. Like `resume`, it
+waits for the execution to stop and exits `1` if it failed again.
+
+```console
+$ narsor recover 4f1c8f0e-...-9b21 --comment "The script is back in place."
+Recovered execution 4f1c8f0e-...-9b21.
+Status: completed
+Current state: completed
+```
+
+### `conductor chat|history|confirm|reject|undo|status <EXECUTION_ID> …`
+
+The conductor of an execution (see [The conductor](#the-conductor)):
+`chat <ID> "<MESSAGE>" [--no-wait]` writes to it and prints its answer and
+proposals, `history <ID>` prints the chat, `confirm <ID> <PROPOSAL>` and
+`reject <ID> <PROPOSAL>` settle a proposal (by id or by its number in the
+history), `undo <ID> <DECISION>` takes back its latest choice of a step's
+output, and `status <ID>` prints what it is doing and what it kept: the
+invocation under way, the queue, the attempts counted per episode, the latest
+failure it took up.
 
 ### `config show [--format table|json]`
 
@@ -647,7 +681,8 @@ you ask about the task. Whatever it proposes — answering the pending input,
 telling the agent something, restarting the failed step, taking a transition,
 cancelling — happens only once you confirm it (`narsor conductor confirm`,
 `reject`, `undo`). A proposal about a moment the execution has moved on from
-is refused (`409`).
+is refused (`409`). Only the conductor's latest choice of an output can be
+undone, and never on a cancelled execution.
 
 **Read-only, per harness.** On `claude-code` and `codex` the conductor runs in
 the task's workspace in the harness's own read-only mode (`plan`,

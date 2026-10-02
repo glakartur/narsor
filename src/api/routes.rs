@@ -656,6 +656,14 @@ impl From<UndoError> for ApiError {
                 code: "already_undone",
                 message,
             },
+            UndoError::Superseded(message) => ApiError::Refused {
+                code: "decision_superseded",
+                message,
+            },
+            UndoError::Cancelled(message) => ApiError::Refused {
+                code: "execution_cancelled",
+                message,
+            },
             UndoError::Busy(message) => ApiError::Refused {
                 code: "execution_busy",
                 message,

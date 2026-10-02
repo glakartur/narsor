@@ -21,7 +21,7 @@ use serde_json::{json, Map, Value};
 
 use crate::conductor::store::{ChatAuthor, ChatEntry, ChatEntryKind, SavedDecision};
 use crate::conductor::ConductorRegistry;
-use crate::domain::{ConductorDecisionKind, WorkflowDefinition};
+use crate::domain::{ConductorDecisionKind, ExecutionStatus, WorkflowDefinition};
 use crate::engine::{ConductorAnalysis, EngineError, OutputDecisionUndo};
 
 /// The `kind` of the chat entry that records an undone decision.
@@ -59,6 +59,11 @@ pub enum UndoError {
     NotUndoable(String),
     /// It was undone already.
     AlreadyUndone(String),
+    /// A later choice of the conductor's, or an undo, came after it: only
+    /// the latest choice can be undone.
+    Superseded(String),
+    /// The execution was cancelled: an undo does not bring it back.
+    Cancelled(String),
     /// The execution could not be taken from the pass driving it.
     Busy(String),
     /// Something broke on the way.
@@ -71,6 +76,8 @@ impl std::fmt::Display for UndoError {
             Self::NotFound(message)
             | Self::NotUndoable(message)
             | Self::AlreadyUndone(message)
+            | Self::Superseded(message)
+            | Self::Cancelled(message)
             | Self::Busy(message)
             | Self::Failed(message) => f.write_str(message),
         }
@@ -101,6 +108,9 @@ impl ConductorRegistry {
     ) -> Result<UndoOutcome, UndoError> {
         let _undoing = self.undoing.lock().await;
         let decision = self.undoable_decision(execution_id, decision_id)?;
+        if self.engine.store().load_execution(execution_id)?.status == ExecutionStatus::Cancelled {
+            return Err(cancelled(execution_id));
+        }
         let state_id = decision.state_id.clone().ok_or_else(|| {
             UndoError::NotUndoable(format!(
                 "The decision '{decision_id}' does not say which state it settled."
@@ -143,6 +153,9 @@ impl ConductorRegistry {
             .engine
             .undo_output_decision(definition, execution_id, &undo)
             .map_err(|error| match error {
+                EngineError::NotRunnable { status, .. } if status == "cancelled" => {
+                    cancelled(execution_id)
+                }
                 EngineError::AlreadyRunning { .. } => UndoError::Busy(format!(
                     "Execution '{execution_id}' is being driven again; the decision was not \
                      undone. Try again once it stops."
@@ -186,44 +199,39 @@ impl ConductorRegistry {
         })
     }
 
-    /// The saved decision `decision_id`, if it is one an undo takes back.
+    /// The saved decision `decision_id`, if it is one an undo takes back:
+    /// a chosen output of the conductor's, not undone yet, and the latest
+    /// one of the execution.
+    ///
+    /// Only the latest: undoing an older choice would throw away everything
+    /// since it — later choices included — and leave those later choices
+    /// undoable, so contexts could be swapped back and forth. A decision
+    /// followed by another choice, or by an undo, is superseded.
     fn undoable_decision(
         &self,
         execution_id: &str,
         decision_id: &str,
     ) -> Result<SavedDecision, UndoError> {
         let chat = self.store(execution_id).read_chat()?;
-        let names = |entry: &&ChatEntry| {
+        let names = |entry: &ChatEntry| {
             entry.kind == ChatEntryKind::Decision
-                && entry
-                    .payload
-                    .as_ref()
-                    .and_then(|payload| payload.get("decision_id"))
-                    .and_then(Value::as_str)
-                    == Some(decision_id)
+                && payload_str(entry, "decision_id") == Some(decision_id)
         };
-        if chat.iter().filter(names).any(|entry| {
-            entry
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("kind"))
-                .and_then(Value::as_str)
-                == Some(UNDONE)
-        }) {
+        if chat.iter().any(|entry| names(entry) && is_undo(entry)) {
             return Err(UndoError::AlreadyUndone(format!(
                 "The decision '{decision_id}' was already undone."
             )));
         }
-        let entry = chat
+        let position = chat
             .iter()
-            .filter(names)
-            .find(|entry| entry.author == ChatAuthor::Conductor)
+            .position(|entry| names(entry) && entry.author == ChatAuthor::Conductor)
             .ok_or_else(|| {
                 UndoError::NotFound(format!(
                     "Execution '{execution_id}' has no decision '{decision_id}' of the \
                      conductor's."
                 ))
             })?;
+        let entry = &chat[position];
         let not_undoable = || {
             UndoError::NotUndoable(format!(
                 "The decision '{decision_id}' cannot be undone: only the conductor's choice of \
@@ -240,8 +248,42 @@ impl ConductorRegistry {
         {
             return Err(not_undoable());
         }
+        let superseded = chat[position + 1..]
+            .iter()
+            .filter(|later| later.kind == ChatEntryKind::Decision)
+            .any(|later| is_undo(later) || is_chosen_output(later));
+        if superseded {
+            return Err(UndoError::Superseded(format!(
+                "The decision '{decision_id}' cannot be undone any more: a later choice of the \
+                 conductor's, or an undo, came after it. Only the latest choice can be taken \
+                 back."
+            )));
+        }
         Ok(decision)
     }
+}
+
+/// The string `key` of `entry`'s payload, if it has one.
+fn payload_str<'a>(entry: &'a ChatEntry, key: &str) -> Option<&'a str> {
+    entry.payload.as_ref()?.get(key)?.as_str()
+}
+
+/// Whether `entry` records an undone decision.
+fn is_undo(entry: &ChatEntry) -> bool {
+    payload_str(entry, "kind") == Some(UNDONE)
+}
+
+/// Whether `entry` records a chosen output of the conductor's.
+fn is_chosen_output(entry: &ChatEntry) -> bool {
+    entry.author == ChatAuthor::Conductor
+        && payload_str(entry, "kind") == Some(ConductorDecisionKind::ChooseOutput.name())
+}
+
+/// The refusal to undo a decision of the cancelled `execution_id`.
+fn cancelled(execution_id: &str) -> UndoError {
+    UndoError::Cancelled(format!(
+        "Execution '{execution_id}' was cancelled; undoing a decision does not bring it back."
+    ))
 }
 
 /// `value` as an object; anything else is no values at all.

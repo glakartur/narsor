@@ -149,6 +149,7 @@ impl Engine {
                 reason: reason.to_string(),
             },
         )?;
+        self.abandon_conductor_rescue(execution_id);
         Ok(execution)
     }
 
@@ -278,6 +279,7 @@ impl Engine {
         // A question asked in the state just left can no longer be answered.
         self.store.clear_pending_input(execution_id)?;
         self.store.save_execution(&execution)?;
+        self.abandon_conductor_rescue(execution_id);
         Ok(execution)
     }
 
@@ -298,6 +300,11 @@ impl Engine {
     ) -> Result<UndoneOutputDecision, EngineError> {
         let _guard = self.begin_run(execution_id)?;
         let mut execution = self.store.load_execution(execution_id)?;
+        // A cancellation is the operator's explicit end of the execution;
+        // an undo does not revive it.
+        if execution.status == ExecutionStatus::Cancelled {
+            return Err(self.not_runnable(&execution, "undone"));
+        }
         let state = self.state_of(definition, &execution, &undo.state_id)?;
         let context: Context =
             serde_json::from_value(undo.context_before.clone()).map_err(|error| {
@@ -362,6 +369,7 @@ impl Engine {
             Some(undo.analysis.clone()),
         )?;
 
+        self.abandon_conductor_rescue(execution_id);
         let episode = self
             .store
             .load_pending_input::<PendingHumanInput>(execution_id)?
@@ -412,6 +420,31 @@ impl Engine {
                 if started.len() == 1 { "it" } else { "they" },
             )
         }))
+    }
+
+    /// Drops what an interrupted label rescue left in the conductor's store
+    /// of `execution_id` — its marker, a queued request, unapplied
+    /// decisions — once the step it was about has been abandoned
+    /// ([`abandon_step_records`]): without it, the conductor would go on
+    /// showing activity for an execution that no longer owes a rescue.
+    ///
+    /// The execution's own record is already written; a failure here only
+    /// leaves a stale marker the startup hook discards, so it is logged
+    /// rather than returned.
+    fn abandon_conductor_rescue(&self, execution_id: &str) {
+        let Some(conductor) = self.conductor() else {
+            return;
+        };
+        if !conductor.store(execution_id).exists() {
+            return;
+        }
+        if let Err(error) = conductor.discard_rescue(execution_id) {
+            tracing::warn!(
+                execution_id,
+                %error,
+                "conductor: could not discard an abandoned label rescue"
+            );
+        }
     }
 
     /// Refuses a request made at `expected` once the execution has moved on

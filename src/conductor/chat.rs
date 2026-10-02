@@ -24,7 +24,9 @@
 //!
 //! An annotation is kept under the key of the input it summarizes, and only
 //! while that input is still pending when the summary arrives: one for an
-//! input the operator already answered is dropped. Either way it never
+//! input the operator already answered is dropped. A summary still queued
+//! when its input closes is never run, and one under way is interrupted
+//! (see [`super::actor`]). Either way it never
 //! reopens anything — the pending input is the execution's own record, which
 //! nothing here writes.
 
@@ -246,7 +248,7 @@ pub(super) fn conclude_annotation(
 }
 
 /// Whether `execution_id` still waits on the input `key`.
-fn still_pending(executions: &ExecutionStore, execution_id: &str, key: &str) -> bool {
+pub(super) fn still_pending(executions: &ExecutionStore, execution_id: &str, key: &str) -> bool {
     let Ok(execution) = executions.load_execution(execution_id) else {
         return false;
     };

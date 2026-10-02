@@ -23,7 +23,7 @@ use narsor::conductor::{
     Invocation, InvocationOutcome, SavedDecision,
 };
 use narsor::domain::{
-    ActionConfig, ActionError, ActionResult, ConductorDecisionKind, ConductorPurpose,
+    ActionConfig, ActionError, ActionResult, AnsweredBy, ConductorDecisionKind, ConductorPurpose,
     ConductorTrigger, Confidence, EventData, ExecutionStatus, ProblemKind, RepromptedBy,
     WorkflowExecution,
 };
@@ -134,6 +134,8 @@ enum Script {
     Fail,
     /// It never answers by itself.
     Hang,
+    /// It fails once `gate` is opened.
+    FailAfter(Arc<Notify>),
 }
 
 /// A conductor that answers from a list, and records every invocation.
@@ -197,6 +199,12 @@ impl ConductorInvoker for ScriptedConductor {
                     let _flag = DropFlag(Arc::clone(&self.dropped));
                     self.started.notify_one();
                     std::future::pending::<InvocationOutcome>().await
+                }
+                Script::FailAfter(gate) => {
+                    gate.notified().await;
+                    InvocationOutcome::Failed {
+                        error: "the scripted conductor failed".to_string(),
+                    }
                 }
             }
         })
@@ -928,6 +936,189 @@ async fn an_interrupt_during_the_inline_invocation_stops_the_conductor() {
     let state = store.load_state().expect("load the conductor's state");
     assert_eq!(state.pending, None);
     assert!(state.queue.is_empty(), "{state:?}");
+}
+
+/// Waits until `condition` holds, for at most five seconds.
+async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting until {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Starts `agent_problem` and runs a pass of it in the background until the
+/// conductor's inline invocation is under way (`started`), then interrupts
+/// the pass. Returns the execution.
+async fn interrupted_during_the_rescue(fixture: &Fixture) -> WorkflowExecution {
+    let execution = fixture
+        .engine
+        .start(
+            &workflow("agent_problem"),
+            json!({}),
+            fixture.harness.workspace(),
+        )
+        .expect("start");
+    let engine = Arc::clone(&fixture.engine);
+    let id = execution.id.clone();
+    let pass = tokio::spawn(async move {
+        let _ = engine.run(&workflow("agent_problem"), &id).await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), fixture.conductor.started.notified())
+        .await
+        .expect("the conductor was invoked");
+    pass.abort();
+    let _ = pass.await;
+    wait_until("the invocation was stopped", || {
+        fixture.conductor.dropped.load(Ordering::SeqCst)
+    })
+    .await;
+    wait_until("the engine let go of the execution", || {
+        !fixture.engine.is_active(&execution.id)
+    })
+    .await;
+    execution
+}
+
+/// A cancelled execution owes no rescue: what an interrupted rescue left
+/// in the conductor's store goes with the cancellation, so no phantom
+/// conductor activity is shown for it.
+#[tokio::test]
+async fn cancelling_after_an_interrupted_rescue_drops_its_marker() {
+    let fixture = Fixture::new(two_answers_without_label(), vec![Script::Hang]);
+    let execution = interrupted_during_the_rescue(&fixture).await;
+    let store = fixture.conductor_store(&execution.id);
+    wait_until("the interrupted invocation finished", || {
+        store
+            .load_state()
+            .is_ok_and(|state| state.pending.is_some() && state.queue.is_empty())
+    })
+    .await;
+
+    fixture
+        .engine
+        .cancel_execution(&execution.id, "not needed", AnsweredBy::Operator, None)
+        .expect("cancel");
+
+    let state = store.load_state().expect("load the conductor's state");
+    assert_eq!(state.pending, None, "{state:?}");
+    assert!(state.queue.is_empty(), "{state:?}");
+    let actor = fixture.registry.actor(&execution.id).expect("the actor");
+    assert_eq!(actor.state().pending, None);
+}
+
+/// A manual transition after an interrupted rescue moves the step on: the
+/// rescue's marker goes with it.
+#[tokio::test]
+async fn a_manual_transition_after_an_interrupted_rescue_drops_its_marker() {
+    let fixture = Fixture::new(two_answers_without_label(), vec![Script::Hang]);
+    let execution = interrupted_during_the_rescue(&fixture).await;
+    let store = fixture.conductor_store(&execution.id);
+    wait_until("the interrupted invocation finished", || {
+        store
+            .load_state()
+            .is_ok_and(|state| state.pending.is_some() && state.queue.is_empty())
+    })
+    .await;
+
+    fixture
+        .engine
+        .take_manual_transition(
+            &workflow("agent_problem"),
+            &execution.id,
+            &narsor::engine::ManualTransition {
+                label: Some("implemented".to_string()),
+                target: None,
+                force: false,
+                provider: "human".to_string(),
+                reason: "done by hand".to_string(),
+                by: AnsweredBy::Operator,
+                episode: None,
+            },
+        )
+        .expect("transition");
+
+    let state = store.load_state().expect("load the conductor's state");
+    assert_eq!(state.pending, None, "{state:?}");
+}
+
+/// A rescue request whose pass was interrupted while it waited behind
+/// another invocation is never served: no attempt is counted for its
+/// episode, so the pass that carries the rescue on still has R24's repeat.
+#[tokio::test]
+async fn a_rescue_abandoned_in_the_queue_does_not_spend_its_attempts() {
+    let chat_gate = Arc::new(Notify::new());
+    let fixture = Fixture::new(
+        two_answers_without_label(),
+        vec![
+            Script::FailAfter(Arc::clone(&chat_gate)),
+            Script::Fail,
+            choose(
+                "implemented",
+                "high",
+                json!({}),
+                json!({ "summary": "done" }),
+            ),
+        ],
+    );
+    let definition = workflow("agent_problem");
+    let execution = fixture
+        .engine
+        .start(&definition, json!({}), fixture.harness.workspace())
+        .expect("start");
+    // The operator's chat runs first, and the rescue queues behind it.
+    fixture
+        .registry
+        .post_chat(&execution.id, "what is going on?")
+        .expect("post");
+    wait_until("the chat is answered", || {
+        fixture.conductor.calls().len() == 1
+    })
+    .await;
+    let actor = fixture.registry.actor(&execution.id).expect("the actor");
+    let engine = Arc::clone(&fixture.engine);
+    let id = execution.id.clone();
+    let pass = tokio::spawn(async move {
+        let _ = engine.run(&workflow("agent_problem"), &id).await;
+    });
+    wait_until("the rescue is queued", || actor.queued() == 1).await;
+
+    // Interrupted while queued, then the chat finishes.
+    pass.abort();
+    let _ = pass.await;
+    chat_gate.notify_one();
+    wait_until("the queue is drained", || {
+        let state = actor.state();
+        actor.queued() == 0 && state.pending.is_none() && state.queue.is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        fixture.conductor.calls().len(),
+        1,
+        "the rescue was not served"
+    );
+    let state = actor.state();
+    assert!(state.invocation_attempts.is_empty(), "{state:?}");
+
+    // The pass that carries the rescue on gets both tries.
+    let resumed = fixture
+        .engine
+        .run(&definition, &execution.id)
+        .await
+        .expect("carry the rescue on");
+    assert_eq!(resumed.status, ExecutionStatus::Completed);
+    assert_eq!(
+        fixture.conductor.purposes(),
+        vec![
+            (ConductorPurpose::ReplyToChat, 1),
+            (ConductorPurpose::ChooseOutput, 1),
+            (ConductorPurpose::ChooseOutput, 2)
+        ]
+    );
 }
 
 /// Without a conductor attached, a step the reprompt did not settle is a

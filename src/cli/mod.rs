@@ -184,6 +184,21 @@ pub enum Command {
         file: Option<String>,
     },
 
+    /// Starts a failed step of an execution afresh, with an optional note
+    /// for its next attempt.
+    ///
+    /// Bound to the failure the execution is failed on (its episode key, as
+    /// `show` prints it): refused if it was recovered or changed meanwhile.
+    Recover {
+        /// The execution identifier.
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: String,
+
+        /// A note handed to the step's next attempt.
+        #[arg(long, value_name = "TEXT")]
+        comment: Option<String>,
+    },
+
     /// Talks to the conductor of an execution: its chat, its proposals, and
     /// the undo of its decisions.
     Conductor {
@@ -261,6 +276,15 @@ pub enum ConductorCommand {
         /// answer.
         #[arg(long)]
         no_wait: bool,
+    },
+
+    /// Prints what the conductor is doing for an execution and what it
+    /// kept: the invocation under way, the queue, the attempts counted, the
+    /// latest failure it took up.
+    Status {
+        /// The execution whose conductor to show.
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: String,
     },
 
     /// Prints the chat history: messages, proposals and decisions.
@@ -425,6 +449,7 @@ impl Command {
             | Command::Conversation { .. }
             | Command::Input { .. }
             | Command::Resume { .. }
+            | Command::Recover { .. }
             | Command::Conductor { .. }
             | Command::Workflow { .. }
             | Command::Repo { .. }
@@ -518,7 +543,14 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Resume { execution_id, file } => {
             commands::resume(&config, &flags, &execution_id, file.as_deref()).await
         }
+        Command::Recover {
+            execution_id,
+            comment,
+        } => commands::recover(&state, &flags, &execution_id, comment).await,
         Command::Conductor { command } => match command {
+            ConductorCommand::Status { execution_id } => {
+                commands::conductor_status(&state, &flags, &execution_id).await
+            }
             ConductorCommand::Chat {
                 execution_id,
                 message,

@@ -565,6 +565,124 @@ async fn a_summary_that_arrives_after_the_answer_is_dropped() {
     assert_eq!(answers_received(&fixture.events(&execution.id)).len(), 1);
 }
 
+/// R30: a summary still queued when the operator answers its gate is never
+/// run — no invocation is spent on a gate nobody waits on.
+#[tokio::test]
+async fn a_summary_queued_for_an_answered_gate_is_not_run() {
+    let chat_gate = Arc::new(Notify::new());
+    let fixture = Fixture::new(
+        "human_decision",
+        None,
+        vec![
+            (
+                ConductorPurpose::ReplyToChat,
+                Script::Gated(
+                    Arc::clone(&chat_gate),
+                    json!({"decision": "reply", "message": "Hello.", "confidence": "high"}),
+                ),
+            ),
+            (
+                ConductorPurpose::SummarizeGate,
+                Script::Answer(json!({"decision": "annotate", "summary": "Too late."})),
+            ),
+        ],
+    );
+    let execution = fixture
+        .engine
+        .start(&fixture.definition, json!({}), fixture.harness.workspace())
+        .expect("start");
+    // The operator's chat runs first, so the gate's summary queues behind it.
+    fixture
+        .registry
+        .post_chat(&execution.id, "hello")
+        .expect("post");
+    wait_until("the chat is under way", || {
+        fixture.conductor.calls().len() == 1
+    })
+    .await;
+    let at_gate = fixture
+        .engine
+        .run(&fixture.definition, &execution.id)
+        .await
+        .expect("run to the gate");
+    assert_eq!(at_gate.status, ExecutionStatus::InputNeeded);
+    let pending = fixture.pending(&execution.id);
+    let actor = fixture.registry.actor(&execution.id).expect("the actor");
+    assert_eq!(actor.queued(), 1, "the summary waits behind the chat");
+
+    fixture
+        .engine
+        .deliver_human_input(
+            &fixture.definition,
+            &execution.id,
+            &HumanInputDelivery::label("ok").for_episode(pending.episode_key()),
+        )
+        .await
+        .expect("the operator answers");
+    chat_gate.notify_one();
+    fixture.wait_until_idle(&execution.id).await;
+
+    let calls = fixture.conductor.calls();
+    assert_eq!(calls.len(), 1, "only the chat ran: {calls:?}");
+    assert_eq!(calls[0].request.purpose, ConductorPurpose::ReplyToChat);
+    assert!(!fixture.events(&execution.id).iter().any(|data| matches!(
+        data,
+        EventData::ConductorStarted {
+            trigger: ConductorTrigger::Annotation,
+            ..
+        }
+    )));
+}
+
+/// R30: a summary under way when the operator answers its gate is
+/// interrupted rather than left to run to its end.
+#[tokio::test]
+async fn a_running_summary_is_interrupted_when_its_gate_is_answered() {
+    let never = Arc::new(Notify::new());
+    let fixture = Fixture::new(
+        "human_decision",
+        None,
+        vec![(
+            ConductorPurpose::SummarizeGate,
+            Script::Gated(
+                Arc::clone(&never),
+                json!({"decision": "annotate", "summary": "Never."}),
+            ),
+        )],
+    );
+    let (execution, pending) = at_the_gate(&fixture).await;
+    wait_until("the summary started", || {
+        !fixture.conductor.calls().is_empty()
+    })
+    .await;
+
+    fixture
+        .engine
+        .deliver_human_input(
+            &fixture.definition,
+            &execution.id,
+            &HumanInputDelivery::label("ok").for_episode(pending.episode_key()),
+        )
+        .await
+        .expect("the operator answers");
+    fixture.wait_until_idle(&execution.id).await;
+
+    assert!(fixture.events(&execution.id).iter().any(|data| matches!(
+        data,
+        EventData::ConductorFinished {
+            outcome: narsor::domain::ConductorOutcome::Interrupted,
+            ..
+        }
+    )));
+    assert_eq!(
+        fixture
+            .conductor_store(&execution.id)
+            .load_annotation(pending.episode_key())
+            .expect("read the annotation"),
+        None
+    );
+}
+
 /// KTD12: a summary the conductor cannot make is an error in the chat, and
 /// nothing else.
 #[tokio::test]
@@ -989,6 +1107,133 @@ async fn undoing_a_chosen_output_makes_the_step_a_problem_again() {
     );
 }
 
+/// The `agent_problem` fixture whose conductor completes the step with its
+/// choice (a); runs it and returns the execution with the decision's id.
+async fn completed_by_a_chosen_output() -> (Fixture, WorkflowExecution, String) {
+    let fixture = Fixture::new(
+        "agent_problem",
+        Some(Arc::new(LabellessAgentExecutor::answering("Done."))),
+        vec![(
+            ConductorPurpose::ChooseOutputAfterReprompt,
+            Script::Answer(json!({
+                "decision": "choose_output",
+                "label": "implemented",
+                "data": {"units_completed": 3},
+                "variables": {"summary": "three units"},
+                "confidence": "high",
+            })),
+        )],
+    );
+    let execution = fixture.run(json!({})).await;
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let decision_id = fixture
+        .events(&execution.id)
+        .iter()
+        .find_map(|data| match data {
+            EventData::ConductorDecision {
+                decision_id,
+                kind: ConductorDecisionKind::ChooseOutput,
+                ..
+            } => Some(decision_id.clone()),
+            _ => None,
+        })
+        .expect("the conductor chose the output");
+    (fixture, execution, decision_id)
+}
+
+/// Writes a later choice of the conductor's, `later-choice`, after the
+/// decision `first` — a copy of it, as a looping workflow would make.
+fn note_a_later_choice(fixture: &Fixture, execution_id: &str, first: &str) {
+    let saved: narsor::conductor::SavedDecision = fixture
+        .chat(execution_id)
+        .iter()
+        .find(|entry| {
+            entry.kind == ChatEntryKind::Decision
+                && entry
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("decision_id"))
+                    == Some(&json!(first))
+        })
+        .and_then(|entry| serde_json::from_value(entry.payload.clone()?).ok())
+        .expect("the saved decision");
+    let later = narsor::conductor::SavedDecision {
+        decision_id: "later-choice".to_string(),
+        ..saved
+    };
+    fixture
+        .registry
+        .note_decision(execution_id, &later, None)
+        .expect("note a later choice");
+}
+
+/// KTD13: only the latest choice can be undone. One followed by a later
+/// choice of the conductor's is superseded and refused, and nothing changes.
+#[tokio::test]
+async fn an_older_chosen_output_cannot_be_undone() {
+    let (fixture, execution, first) = completed_by_a_chosen_output().await;
+    note_a_later_choice(&fixture, &execution.id, &first);
+
+    let refused = fixture
+        .registry
+        .undo_decision(&fixture.definition, &execution.id, &first, || {})
+        .await
+        .expect_err("superseded");
+    assert!(matches!(refused, UndoError::Superseded(_)), "{refused:?}");
+    let now = fixture.load(&execution.id);
+    assert_eq!(now.status, ExecutionStatus::Completed);
+    assert!(!fixture
+        .events(&execution.id)
+        .iter()
+        .any(|data| matches!(data, EventData::ConductorDecisionUndone { .. })));
+}
+
+/// KTD13: once a later decision was undone, an earlier one cannot be
+/// undone either — it would restore a context from before the operator's
+/// own correction.
+#[tokio::test]
+async fn a_choice_before_an_undo_cannot_be_undone() {
+    let (fixture, execution, first) = completed_by_a_chosen_output().await;
+    note_a_later_choice(&fixture, &execution.id, &first);
+    fixture
+        .registry
+        .undo_decision(&fixture.definition, &execution.id, "later-choice", || {})
+        .await
+        .expect("the latest choice is undoable");
+
+    let refused = fixture
+        .registry
+        .undo_decision(&fixture.definition, &execution.id, &first, || {})
+        .await
+        .expect_err("superseded by the undo");
+    assert!(matches!(refused, UndoError::Superseded(_)), "{refused:?}");
+}
+
+/// A cancelled execution stays cancelled: undoing a decision of it is
+/// refused, and nothing changes.
+#[tokio::test]
+async fn a_decision_of_a_cancelled_execution_cannot_be_undone() {
+    let (fixture, execution, decision_id) = completed_by_a_chosen_output().await;
+    let mut cancelled = fixture.load(&execution.id);
+    cancelled.status = ExecutionStatus::Cancelled;
+    fixture
+        .harness
+        .store()
+        .save_execution(&cancelled)
+        .expect("save the execution");
+
+    let refused = fixture
+        .registry
+        .undo_decision(&fixture.definition, &execution.id, &decision_id, || {})
+        .await
+        .expect_err("cancelled");
+    assert!(matches!(refused, UndoError::Cancelled(_)), "{refused:?}");
+    assert_eq!(
+        fixture.load(&execution.id).status,
+        ExecutionStatus::Cancelled
+    );
+}
+
 /// A workflow whose agent step is followed by a step that runs for long:
 /// the conductor's choice leads into it, and it is still running when the
 /// choice is undone.
@@ -1230,4 +1475,80 @@ async fn a_confirmed_retry_recovers_the_failed_step() {
         2
     );
     assert_eq!(executed_proposals(&events).len(), 1);
+}
+
+/// A failed step whose record is gone (a failure from before the feature, a
+/// forced terminal), or an execution a restart left `Unknown`, has no
+/// failure key; a retry confirmed on it is carried out, not refused as
+/// stale.
+async fn retry_confirmed_without_a_failure_record(status: ExecutionStatus) {
+    let fixture = Fixture::new(
+        "missing_script",
+        None,
+        vec![(
+            ConductorPurpose::ReplyToChat,
+            reply_proposing(
+                "Try it once more.",
+                json!({"kind": "retry", "text": "The script is back."}),
+            ),
+        )],
+    );
+    let execution = fixture.run(json!({})).await;
+    assert_eq!(execution.status, ExecutionStatus::Failed);
+    wait_until("the failure was raised as a problem", || {
+        fixture
+            .events(&execution.id)
+            .iter()
+            .any(|data| matches!(data, EventData::ProblemRaised { .. }))
+    })
+    .await;
+    fixture.wait_until_idle(&execution.id).await;
+
+    let mut stripped = fixture.load(&execution.id);
+    stripped.status = status;
+    if let Some(engine) = stripped
+        .metadata
+        .get_mut("engine")
+        .and_then(Value::as_object_mut)
+    {
+        engine.remove("step_failure");
+    }
+    fixture
+        .harness
+        .store()
+        .save_execution(&stripped)
+        .expect("save the execution");
+    assert!(narsor::engine::step_failure(&stripped)
+        .expect("read")
+        .is_none());
+
+    let (proposal, record) = proposal_of(&fixture.ask(&execution.id, "retry it").await);
+    assert!(record.episode.is_some(), "the proposal names its moment");
+    let confirmed = fixture
+        .registry
+        .confirm_proposal(&fixture.definition, &execution.id, &proposal.id)
+        .expect("a retry without a failure record is carried out, not refused as stale");
+    confirmed
+        .pass
+        .expect("the recovery runs")
+        .run_to_completion(&fixture.definition)
+        .await
+        .expect("run");
+
+    let events = fixture.events(&execution.id);
+    assert_eq!(
+        count(&events, |data| matches!(data, EventData::WorkflowResumed)),
+        1
+    );
+    assert_eq!(executed_proposals(&events).len(), 1);
+}
+
+#[tokio::test]
+async fn a_confirmed_retry_recovers_a_failed_step_without_a_failure_record() {
+    retry_confirmed_without_a_failure_record(ExecutionStatus::Failed).await;
+}
+
+#[tokio::test]
+async fn a_confirmed_retry_recovers_an_unknown_execution() {
+    retry_confirmed_without_a_failure_record(ExecutionStatus::Unknown).await;
 }

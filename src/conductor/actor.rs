@@ -30,7 +30,12 @@
 //!   and never holds a handle to an engine pass;
 //! * one somebody waits for ([`ConductorActor::invoke`], F1 inline under
 //!   the pass's claim) by dropping the wait: interrupting the pass drops it,
-//!   and the invocation is aborted with it.
+//!   and the invocation is aborted with it;
+//! * a gate's summary by itself, once the gate it summarizes is no longer
+//!   pending.
+//!
+//! A request nobody needs any more by its turn — its waiter gone, its gate
+//! closed — is taken off the queue without running at all.
 //!
 //! An interrupted label rescue keeps its marker in `state.json`: it did not
 //! finish, and what that means for the execution is the startup hook's to
@@ -41,6 +46,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::Value;
@@ -48,7 +54,7 @@ use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
-use crate::conductor::chat::{chat_answer, conclude_annotation, ProposalContext};
+use crate::conductor::chat::{chat_answer, conclude_annotation, still_pending, ProposalContext};
 use crate::conductor::store::{
     ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, PendingInvocation,
     QueuedRequest,
@@ -77,6 +83,10 @@ pub struct Invocation {
 /// How many invocations R24 allows an automatic trigger's episode: the
 /// first, and one repeat after a failure.
 pub const MAX_AUTOMATIC_ATTEMPTS: u32 = 2;
+
+/// How often a running gate summary looks whether its gate is still
+/// pending.
+const GATE_WATCH_INTERVAL: Duration = Duration::from_millis(200);
 
 /// What the conductor answered (KTD6).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -500,6 +510,9 @@ impl ConductorActor {
             chat,
             waiter: mut waiter_slot,
         } = attachment;
+        if self.is_abandoned(&request, waiter_slot.as_ref()) {
+            return self.drop_request(&request);
+        }
         // What the answer's proposals are about: the execution as the
         // conductor is about to see it (KTD9).
         let context = match request.trigger {
@@ -545,6 +558,54 @@ impl ConductorActor {
 
         if let Some(waiter) = waiter_slot {
             let _ = waiter.send(outcome);
+        }
+        Ok(())
+    }
+
+    /// Whether `request` is not worth an invocation any more:
+    ///
+    /// * nobody waits for it any more — the pass that asked for it inline
+    ///   (F1) was interrupted while it was queued behind another
+    ///   invocation. Serving it would count an R24 attempt for its episode
+    ///   and abort straight away, spending the repeat the pass that carries
+    ///   the rescue on is owed;
+    /// * it summarizes a gate the execution no longer waits on — the
+    ///   operator answered it, or it was closed otherwise, while the
+    ///   summary was queued (R30).
+    fn is_abandoned(
+        &self,
+        request: &QueuedRequest,
+        waiter: Option<&oneshot::Sender<InvocationOutcome>>,
+    ) -> bool {
+        if waiter.is_some_and(oneshot::Sender::is_closed) {
+            return true;
+        }
+        request.trigger == ConductorTrigger::Annotation
+            && !still_pending(
+                self.engine.store(),
+                &self.execution_id,
+                request.episode.as_deref().unwrap_or_default(),
+            )
+    }
+
+    /// Takes an abandoned `request` off the durable queue without serving
+    /// it: no attempt is counted, no marker written, no event recorded. A
+    /// label rescue's marker from an earlier, interrupted invocation stays
+    /// as it is — the pass that carries the rescue on reads it (U10).
+    fn drop_request(&self, request: &QueuedRequest) -> Result<()> {
+        tracing::debug!(
+            execution_id = %self.execution_id,
+            request_id = %request.request_id,
+            trigger = ?request.trigger,
+            "conductor: dropped a request nobody needs any more"
+        );
+        let mut inner = self.lock();
+        let mut next = inner.state.clone();
+        next.queue
+            .retain(|queued| queued.request_id != request.request_id);
+        if next != inner.state {
+            self.store.save_state(&next)?;
+            inner.state = next;
         }
         Ok(())
     }
@@ -602,19 +663,26 @@ impl ConductorActor {
         }
         let abort = task.abort_handle();
 
-        let joined = match waiter {
-            Some(waiter) => {
-                tokio::select! {
-                    joined = task => Some(joined),
-                    () = waiter.closed() => {
-                        // Nobody waits any more: the pass that asked was
-                        // interrupted, and the invocation goes with it.
-                        abort.abort();
-                        None
-                    }
-                }
+        let nobody_waits = async {
+            match waiter {
+                Some(waiter) => waiter.closed().await,
+                None => std::future::pending().await,
             }
-            None => Some(task.await),
+        };
+        let joined = tokio::select! {
+            joined = task => Some(joined),
+            () = nobody_waits => {
+                // Nobody waits any more: the pass that asked was
+                // interrupted, and the invocation goes with it.
+                abort.abort();
+                None
+            }
+            () = self.gate_closed(&invocation.request) => {
+                // The gate it summarizes was answered or closed: the
+                // summary would be dropped anyway (R30).
+                abort.abort();
+                None
+            }
         };
 
         if advisory {
@@ -628,6 +696,21 @@ impl ConductorActor {
                 error: format!("the conductor's invocation panicked: {error}"),
             },
             Some(Err(_)) | None => InvocationOutcome::Interrupted,
+        }
+    }
+
+    /// Resolves once the gate an annotation `request` summarizes is no
+    /// longer pending; never for any other request.
+    async fn gate_closed(&self, request: &QueuedRequest) {
+        if request.trigger != ConductorTrigger::Annotation {
+            return std::future::pending().await;
+        }
+        let key = request.episode.as_deref().unwrap_or_default();
+        loop {
+            tokio::time::sleep(GATE_WATCH_INTERVAL).await;
+            if !still_pending(self.engine.store(), &self.execution_id, key) {
+                return;
+            }
         }
     }
 

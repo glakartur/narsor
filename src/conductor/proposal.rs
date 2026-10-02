@@ -38,7 +38,7 @@ use crate::domain::{
     AnsweredBy, ConductorDecisionKind, EventData, ExecutionStatus, WorkflowDefinition,
 };
 use crate::engine::{
-    execution_episode, Engine, EngineError, HumanInputDelivery, InputContinuation,
+    execution_episode, step_failure, Engine, EngineError, HumanInputDelivery, InputContinuation,
     ManualTransition, PendingHumanInput, Recovery, RunHandle,
 };
 
@@ -390,11 +390,20 @@ impl ConductorRegistry {
                 }
             }
             ProposalKind::Retry => {
+                // Bound to the failure's key only when the execution failed
+                // on a recorded step failure: an `Unknown` execution, or a
+                // failed one without a record, has no such key to compare
+                // against, and the check above already refused a late
+                // confirmation.
+                let failure_key = step_failure(&execution)
+                    .ok()
+                    .flatten()
+                    .map(|failure| failure.key().to_string());
                 let pass = engine.try_begin_recover_with(
                     execution_id,
                     Recovery {
                         comment: proposal.text.clone(),
-                        episode: Some(episode.to_string()),
+                        episode: failure_key,
                         conductor_retry: false,
                     },
                 )?;

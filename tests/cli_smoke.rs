@@ -1538,3 +1538,139 @@ fn the_cli_and_the_api_share_the_conductors_chat() {
     assert_eq!(undo.code, EXIT_FAILURE);
     assert!(undo.stderr.contains("has no decision"), "{}", undo.stderr);
 }
+
+// ---------------------------------------------------------------------------
+// recover / conductor status: the CLI counterparts of the TUI's failure form
+// and conductor pane
+// ---------------------------------------------------------------------------
+
+/// Waits until `show` of `id` prints `needle`, and returns what it printed.
+fn show_until(root: &TempRoot, id: &str, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let shown = cli(root, &["show", id]);
+        if shown.stdout.contains(needle) {
+            return shown.stdout;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "'show' never printed '{needle}':\n{}",
+            shown.stdout
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// `show` says what a failed execution is a problem on and how to recover
+/// it; `recover` starts the failed step afresh, bound to that failure.
+#[test]
+fn recover_restarts_a_failed_step_shown_as_a_problem() {
+    let root = TempRoot::new();
+    let workflow = engine_support::fixtures()
+        .join("engine/missing_script.yaml")
+        .display()
+        .to_string();
+    let started = cli(&root, &["run", &workflow]);
+    assert_eq!(started.code, EXIT_FAILURE, "{started:?}");
+    let id = execution_id(&started.stdout);
+
+    // The conductor's diagnosis fails on the fake harness: the problem is
+    // the raw error, under the failure's key.
+    let shown = show_until(&root, &id, "Problem (failure):");
+    assert!(shown.contains("  Failure: "), "{shown}");
+    assert!(
+        shown.contains(&format!("Recover with: narsor recover {id}")),
+        "{shown}"
+    );
+
+    let recovered = cli(&root, &["recover", &id, "--comment", "the script is back"]);
+    assert_eq!(recovered.code, EXIT_FAILURE, "still missing: {recovered:?}");
+    assert!(
+        recovered
+            .stdout
+            .contains(&format!("Recovered execution {id}.")),
+        "{recovered:?}"
+    );
+    let steps = cli(&root, &["steps", &id]);
+    assert!(
+        steps
+            .stdout
+            .lines()
+            .any(|line| line.starts_with("build #3")),
+        "the recovery ran the step again:\n{}",
+        steps.stdout
+    );
+}
+
+/// `recover` of an execution that has no failed step says why, without
+/// asking the daemon to recover anything.
+#[test]
+fn recover_of_an_execution_that_did_not_fail_explains_the_status() {
+    let root = TempRoot::new();
+    let (started, id) = start_greet(&root);
+    assert_eq!(started.code, EXIT_SUCCESS, "{started:?}");
+
+    let refused = cli(&root, &["recover", &id]);
+    assert_eq!(refused.code, EXIT_FAILURE, "{refused:?}");
+    assert!(
+        refused
+            .stderr
+            .contains("has no failed step to recover (status: input_needed)"),
+        "{refused:?}"
+    );
+}
+
+/// `conductor status` prints what the conductor of an execution is doing
+/// and what it kept.
+#[test]
+fn conductor_status_prints_what_the_conductor_is_doing() {
+    let root = TempRoot::new();
+    let (started, id) = start_greet(&root);
+    assert_eq!(started.code, EXIT_SUCCESS, "{started:?}");
+
+    let status = cli(&root, &["conductor", "status", &id]);
+    assert_eq!(status.code, EXIT_SUCCESS, "{status:?}");
+    assert!(status.stdout.contains("Working on:"), "{status:?}");
+    assert!(status.stdout.contains("Queued:"), "{status:?}");
+    assert!(status.stdout.contains("Unanswered:    0"), "{status:?}");
+
+    let unknown = cli(&root, &["conductor", "status", "no-such-execution"]);
+    assert_eq!(unknown.code, EXIT_FAILURE, "{unknown:?}");
+}
+
+/// R30: `show` prints the conductor's summary of the gate an execution
+/// waits on, with what it recommends.
+#[test]
+fn show_prints_the_conductors_summary_of_a_gate() {
+    let root = TempRoot::new();
+    let path = conductor_answering(
+        &root,
+        serde_json::json!({
+            "decision": "annotate",
+            "summary": "The greeting was announced.",
+            "recommendation": "approved",
+            "confidence": "high",
+        }),
+    );
+    let started = cli_on_path(
+        root.path(),
+        &[
+            "run",
+            &greet_workflow(),
+            "--input",
+            "greeting=Hello",
+            "--input",
+            &announce_script(),
+        ],
+        &path,
+    );
+    assert_eq!(started.code, EXIT_SUCCESS, "stderr: {}", started.stderr);
+    let id = execution_id(&started.stdout);
+
+    let shown = show_until(&root, &id, "Conductor's summary:");
+    assert!(
+        shown.contains("Conductor's summary: The greeting was announced."),
+        "{shown}"
+    );
+    assert!(shown.contains("  Recommends: approved"), "{shown}");
+}
