@@ -1,7 +1,7 @@
 ---
 title: Dyrygent, odpowiedzi na input_needed i ratowanie brakującego labela
 type: feat
-status: active
+status: completed
 date: 2026-09-29
 origin: docs/brainstorms/2026-09-29-dyrygent-i-obsluga-input-needed-requirements.md
 ---

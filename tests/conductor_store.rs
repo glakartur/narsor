@@ -353,6 +353,30 @@ async fn appending_after_a_torn_chat_line_drops_the_fragment() {
 }
 
 #[tokio::test]
+async fn a_complete_last_entry_without_its_newline_survives_the_next_append() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let first = store
+        .append_chat(operator_message("first"))
+        .expect("append");
+
+    let path = store.dir().join("chat.jsonl");
+    let mut raw = std::fs::read(&path).expect("read the chat file");
+    assert_eq!(raw.pop(), Some(b'\n'), "the entry ends its line");
+    std::fs::write(&path, raw).expect("drop the newline");
+
+    let second = store
+        .append_chat(operator_message("second"))
+        .expect("append after the unterminated entry");
+
+    assert_eq!(second.sequence, first.sequence + 1);
+    assert_eq!(
+        store.read_chat().expect("read the chat"),
+        vec![first, second]
+    );
+}
+
+#[tokio::test]
 async fn a_state_file_of_another_version_is_refused() {
     let fixture = Fixture::new();
     let store = fixture.store();

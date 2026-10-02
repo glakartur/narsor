@@ -574,6 +574,21 @@ fn drop_torn_tail(path: &Path) -> Result<()> {
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |newline| newline + 1);
+
+    // A last line that parses is an entry every read already returns; only
+    // its newline is missing. Ending it keeps the entry rather than losing it.
+    if serde_json::from_slice::<ChatEntry>(&bytes[keep..]).is_ok() {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|source| PersistenceError::io(path, source))?;
+        file.write_all(b"\n")
+            .map_err(|source| PersistenceError::io(path, source))?;
+        return file
+            .sync_data()
+            .map_err(|source| PersistenceError::io(path, source));
+    }
+
     let file = OpenOptions::new()
         .write(true)
         .open(path)
