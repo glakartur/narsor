@@ -73,7 +73,9 @@
 //! already-running execution) requires it.
 
 pub mod app;
+pub mod chat;
 pub mod conversation;
+pub mod failure_form;
 pub mod input_form;
 pub mod refresh;
 pub mod scroll;
@@ -256,6 +258,26 @@ pub async fn run(
                             app.set_harness_selection(harness).await
                         }
                         Request::ResetHarnessSelection => app.reset_harness_selection().await,
+                        Request::OpenFailureForm => app.open_failure_form().await,
+                        Request::LoadChat => app.load_chat().await,
+                        Request::SendChat => app.send_chat().await,
+                        Request::ConfirmProposal {
+                            execution_id,
+                            proposal_id,
+                        } => app.confirm_proposal(&execution_id, &proposal_id).await,
+                        Request::RejectProposal {
+                            execution_id,
+                            proposal_id,
+                        } => app.reject_proposal(&execution_id, &proposal_id).await,
+                        Request::UndoDecision {
+                            execution_id,
+                            decision_id,
+                        } => app.undo_decision(&execution_id, &decision_id).await,
+                        Request::RecoverFailure {
+                            execution_id,
+                            episode,
+                            comment,
+                        } => app.recover_failure(&execution_id, &episode, comment).await,
                     }
                 }
                 // A resize needs no state change: the next draw re-derives the

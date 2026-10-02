@@ -71,7 +71,7 @@
 //! is one copy of the rules that decide what `git` is asked to clone, and this
 //! interface does not hold a second.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -79,13 +79,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Map, Value};
 
 use crate::api::{
-    ActiveProblem, ApiClient, ClientError, ConversationResponse, ExecutionSummary,
-    HarnessSelectionSnapshot, TransitionRequest,
+    ActiveProblem, ApiClient, ClientError, ConductorActivity, ConversationResponse,
+    ExecutionSummary, HarnessSelectionSnapshot, TransitionRequest,
 };
 use crate::config::DEFAULT_TUI_REFRESH_SECS;
 use crate::domain::{
-    Context, Event, EventData, ExecutionStatus, InputCloseReason, InputParameter, ParamType,
-    ProblemKind, State, WorkflowDefinition, WorkflowExecution, Workspace,
+    ConductorDecisionKind, ConductorPurpose, Context, Event, EventData, ExecutionStatus,
+    InputCloseReason, InputParameter, ParamType, ProblemKind, State, WorkflowDefinition,
+    WorkflowExecution, Workspace,
 };
 use crate::engine::actions::script::TRUNCATION_MARKER;
 use crate::engine::{
@@ -95,8 +96,10 @@ use crate::engine::{
 use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
 use crate::tasks;
+use crate::tui::chat::{ChatFocus, ChatPanel};
 use crate::tui::conversation::{classify, ClassifiedEntry};
-use crate::tui::refresh::RefreshSchedule;
+use crate::tui::failure_form::{FailureAction, FailureForm};
+use crate::tui::refresh::{RefreshSchedule, DEBOUNCE};
 use crate::tui::scroll::{sanitize, ScrollState};
 use crate::workflows::{ResolvedWorkflow, WorkflowEntry, WorkflowResolver};
 
@@ -230,6 +233,9 @@ pub struct ExecutionRow {
     /// The problem it is stopped on, from the summary or from a live
     /// `ProblemRaised`.
     pub problem: Option<ActiveProblem>,
+    /// What the conductor is working on for it, from the summary or from a
+    /// live `ConductorStarted` (R11).
+    pub conductor: Option<ConductorActivity>,
 }
 
 impl ExecutionRow {
@@ -245,7 +251,16 @@ impl ExecutionRow {
                 .as_ref()
                 .map(|pending| pending.continuation),
             problem: summary.problem.clone(),
+            conductor: summary.conductor.clone(),
         }
+    }
+
+    /// "conductor: diagnosing the failure" while the conductor works on it
+    /// (R11, AE12); `None` otherwise.
+    pub fn conductor_line(&self) -> Option<String> {
+        self.conductor
+            .as_ref()
+            .map(|activity| conductor_working_text(activity.purpose))
     }
 
     /// Whether it waits for an operator, and on what (R9, R10).
@@ -421,6 +436,36 @@ pub enum Request {
     SetHarnessSelection { harness: String },
     /// Remove the durable override and return to the configured default.
     ResetHarnessSelection,
+    /// Open the failure variant of the `i` form (KTD4): it reads the
+    /// conductor's report and the proposals for it first.
+    OpenFailureForm,
+    /// Read the task view's conductor chat, from after the last entry held.
+    LoadChat,
+    /// Send the chat panel's draft to the conductor (F4).
+    SendChat,
+    /// Carry out a proposal of the conductor's (R28).
+    ConfirmProposal {
+        execution_id: String,
+        proposal_id: String,
+    },
+    /// Reject a proposal of the conductor's.
+    RejectProposal {
+        execution_id: String,
+        proposal_id: String,
+    },
+    /// Undo a chosen output of the conductor's, once confirmed (R31,
+    /// KTD13).
+    UndoDecision {
+        execution_id: String,
+        decision_id: String,
+    },
+    /// Restart a failed step with a note, through the recovery that names
+    /// the failure's key (KTD9).
+    RecoverFailure {
+        execution_id: String,
+        episode: String,
+        comment: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,6 +1061,10 @@ pub enum Modal {
     Input(Box<InputForm>),
     /// Operator note for a recovered agent attempt.
     RecoveryComment(RecoveryCommentForm),
+    /// The failure variant of `i` (KTD4): the conductor's diagnosis, its
+    /// proposals and a restart with a note — or the raw error. Boxed for
+    /// the same reason as [`Modal::Input`].
+    Failure(Box<FailureForm>),
     /// The full content of one event (R1, R2, R3).
     EventDetail(EventDetail),
     /// The manual transition menu.
@@ -1158,6 +1207,9 @@ pub struct TaskView {
     /// Which conversation entries (by `entry_number`) are expanded past
     /// [`TASK_ENTRY_COLLAPSE_LINES`] (R10).
     pub expanded: HashSet<u64>,
+    /// The conductor's chat (F4): its history, and the message being
+    /// written, which no refresh resets.
+    pub chat: ChatPanel,
 }
 
 // ---------------------------------------------------------------------------
@@ -1196,6 +1248,11 @@ pub struct App {
     quit: bool,
     /// When the next automatic refresh is due (KTD16).
     refresh: RefreshSchedule,
+    /// `WorkflowFailed` notices held back while the conductor may still
+    /// take up the failure, by execution, with when they arrived — the
+    /// problem or the conductor's own retry is what the operator hears of
+    /// instead (U13).
+    held_failures: HashMap<String, (Notice, Instant)>,
     catalog: CatalogPaths,
     /// Kept for constructor symmetry with the CLI's own "three roots" and
     /// for any future feature that needs it — nothing currently reads it:
@@ -1269,6 +1326,7 @@ impl App {
                 Some(Duration::from_secs(DEFAULT_TUI_REFRESH_SECS)),
                 Instant::now(),
             ),
+            held_failures: HashMap::new(),
         }
     }
 
@@ -1387,6 +1445,20 @@ impl App {
         self.selected().and_then(|row| row.problem.as_ref())
     }
 
+    /// The list row of `execution_id`, if the list holds it.
+    pub fn row(&self, execution_id: &str) -> Option<&ExecutionRow> {
+        self.executions.iter().find(|row| row.id == execution_id)
+    }
+
+    /// Whether the highlighted execution is `Failed` on a problem the
+    /// conductor reported (KTD4): `i` opens the failure form for it.
+    fn selected_failure_problem(&self) -> Option<&ActiveProblem> {
+        self.selected()
+            .filter(|row| row.status == ExecutionStatus::Failed)
+            .and_then(|row| row.problem.as_ref())
+            .filter(|problem| problem.kind == ProblemKind::Failure)
+    }
+
     /// Whether an automatic refresh is due at `now` (KTD16).
     pub fn refresh_due(&self, now: Instant) -> bool {
         self.refresh.is_due(now)
@@ -1457,6 +1529,9 @@ impl App {
     /// What `i` does for the pending request, if there is one: the three
     /// kinds read differently in the bar (R10).
     fn input_shortcut(&self) -> Option<&'static str> {
+        if self.pending.is_none() && self.selected_failure_problem().is_some() {
+            return Some("resolve failure");
+        }
         self.pending
             .as_ref()
             .map(|pending| match InputKind::of(pending.continuation) {
@@ -1471,7 +1546,13 @@ impl App {
         if let Modal::Input(form) = &self.modal {
             return form_shortcuts(form);
         }
+        if let Modal::Failure(form) = &self.modal {
+            return failure_shortcuts(form);
+        }
         if let Screen::Task(view) = &self.screen {
+            if view.chat.open {
+                return chat_shortcuts(&view.chat);
+            }
             let mut keys = vec![
                 ("Tab", "axis/content"),
                 ("j/k", "select"),
@@ -1485,11 +1566,13 @@ impl App {
             if let Some(action) = self.input_shortcut() {
                 keys.push(("i", action));
             }
+            keys.push(("c", "conductor chat"));
             keys.push(("Esc", "back"));
             return keys;
         }
         match &self.modal {
             Modal::Input(form) => form_shortcuts(form),
+            Modal::Failure(form) => failure_shortcuts(form),
             Modal::RecoveryComment(_) => vec![
                 ("letters", "type operator note"),
                 ("Enter", "save note"),
@@ -1637,6 +1720,7 @@ impl App {
             })
             .collect();
         self.executions = rows;
+        self.release_held_failures(Instant::now());
 
         self.selected = previous
             .and_then(|id| self.executions.iter().position(|row| row.id == id))
@@ -1647,6 +1731,42 @@ impl App {
 
         self.reload_selection().await;
         self.refresh.done(Instant::now());
+    }
+
+    /// Decides what became of each held `WorkflowFailed` notice, now that
+    /// the list says where its execution stands: a problem is announced
+    /// instead, an execution that moved on (recovered, retried by the
+    /// conductor) needs no notice, one the conductor still works on stays
+    /// held, and a failure nobody took up is announced as it was.
+    fn release_held_failures(&mut self, now: Instant) {
+        for (id, (notice, held_at)) in std::mem::take(&mut self.held_failures) {
+            let Some(row) = self.row(&id) else {
+                continue;
+            };
+            if row.status != ExecutionStatus::Failed {
+                continue;
+            }
+            if let Some(problem) = &row.problem {
+                self.notice = Some(Notice::error(format!(
+                    "Execution {id} has a problem: {}",
+                    first_line(&problem.reason)
+                )));
+                continue;
+            }
+            // Too fresh to tell: the conductor's marker may not be written
+            // yet. The refresh the failure itself asked for comes later.
+            if row.conductor.is_some() || now.duration_since(held_at) < DEBOUNCE {
+                self.held_failures.insert(id, (notice, held_at));
+                continue;
+            }
+            self.notice = Some(notice);
+        }
+    }
+
+    /// Whether a `WorkflowFailed` notice of `execution_id` is held back
+    /// while the conductor may take up the failure.
+    pub fn holds_failure_notice(&self, execution_id: &str) -> bool {
+        self.held_failures.contains_key(execution_id)
     }
 
     /// The refresh the event loop runs when [`App::refresh_due`] says so
@@ -1753,6 +1873,21 @@ impl App {
     /// operator typed stays. The closing `HumanInputReceived` says who closed
     /// it and how; without one the form only says it is no longer pending.
     fn sync_open_form(&mut self) {
+        if let (Modal::Failure(form), Some(execution)) = (&mut self.modal, &self.execution) {
+            let still_failed = execution.status == ExecutionStatus::Failed
+                && execution
+                    .problem
+                    .as_ref()
+                    .is_some_and(|problem| problem.episode.as_deref() == Some(form.key.as_str()));
+            if execution.id == form.execution_id && !still_failed && form.closed.is_none() {
+                form.closed = Some(
+                    "The execution is no longer failed on this failure: it was recovered or \
+                     settled elsewhere. Nothing from this form can be sent; Esc closes it."
+                        .to_string(),
+                );
+            }
+            return;
+        }
         let Modal::Input(form) = &mut self.modal else {
             return;
         };
@@ -1770,6 +1905,11 @@ impl App {
             .as_ref()
             .is_some_and(|pending| pending.episode_key() == form.episode);
         if still_pending {
+            // The conductor's summary of the gate is made beside it and may
+            // arrive after the form was opened (R30).
+            if let Some(execution) = &self.execution {
+                form.annotate(execution.annotation.as_ref());
+            }
             return;
         }
         let closure = self
@@ -1861,14 +2001,34 @@ impl App {
             .iter_mut()
             .find(|row| row.id == event.workflow_execution_id)
         {
-            apply_to_row(row, &event.data);
+            apply_to_row(row, &event);
         }
 
         // A background run's outcome is set as a notice by execution id, not
         // only for whichever execution happens to be selected (R6) — this is
         // in addition to the row update above, not a replacement for it.
+        // A failure the conductor may take up is not announced yet: the
+        // problem it raises, or its own retry, is (U13). A refresh releases
+        // a failure nobody took up (`release_held_failures`).
+        match &event.data {
+            EventData::ProblemRaised { .. }
+            | EventData::ConductorDecision {
+                kind: ConductorDecisionKind::Retry,
+                ..
+            } => {
+                self.held_failures.remove(&event.workflow_execution_id);
+            }
+            _ => {}
+        }
         if let Some(notice) = notice_for(&event) {
-            self.notice = Some(notice);
+            if matches!(event.data, EventData::WorkflowFailed { .. }) {
+                self.held_failures.insert(
+                    event.workflow_execution_id.clone(),
+                    (notice, Instant::now()),
+                );
+            } else {
+                self.notice = Some(notice);
+            }
         }
 
         // The stream says something changed; the daemon has the full story
@@ -1925,6 +2085,7 @@ impl App {
                 Request::None
             }
             Modal::Input(_) => self.on_key_form(key),
+            Modal::Failure(_) => self.on_key_failure(key),
             Modal::RecoveryComment(_) => self.on_key_recovery_comment(key),
             Modal::EventDetail(_) => self.on_key_event_detail(key),
             Modal::Transition(_) => self.on_key_transition(key),
@@ -1988,10 +2149,7 @@ impl App {
                 };
                 self.request_conversation(&event)
             }
-            KeyCode::Char('i') => {
-                self.open_input_form();
-                Request::None
-            }
+            KeyCode::Char('i') => self.request_input_form(),
             KeyCode::Char('t') => {
                 self.open_transition_menu();
                 Request::None
@@ -2281,6 +2439,7 @@ impl App {
             focus: TaskFocus::Axis,
             content: TaskContent::Empty,
             expanded: HashSet::new(),
+            chat: ChatPanel::default(),
         }));
     }
 
@@ -2315,6 +2474,9 @@ impl App {
         }
 
         self.load_selected_task_position(true).await;
+        if matches!(&self.screen, Screen::Task(view) if view.chat.loaded) {
+            self.load_chat().await;
+        }
     }
 
     /// Loads the currently selected position's content from scratch —
@@ -2444,10 +2606,24 @@ impl App {
         if matches!(self.modal, Modal::Input(_)) {
             return self.on_key_form(key);
         }
+        if matches!(self.modal, Modal::Failure(_)) {
+            return self.on_key_failure(key);
+        }
+        // The chat takes every key while it is open, so a message can be
+        // typed; Esc closes it and keeps the draft.
+        if matches!(&self.screen, Screen::Task(view) if view.chat.open) {
+            return self.on_key_chat(key);
+        }
         match key.code {
             KeyCode::Esc => {
                 self.leave_task_view();
                 Request::None
+            }
+            KeyCode::Char('c') => {
+                if let Screen::Task(view) = &mut self.screen {
+                    view.chat.open = true;
+                }
+                Request::LoadChat
             }
             KeyCode::Tab => {
                 if let Screen::Task(view) = &mut self.screen {
@@ -2459,10 +2635,7 @@ impl App {
                 Request::None
             }
             KeyCode::Char('r') => Request::TaskRefresh,
-            KeyCode::Char('i') => {
-                self.open_input_form_for_task();
-                Request::None
-            }
+            KeyCode::Char('i') => self.open_input_form_for_task(),
             KeyCode::Char('j') | KeyCode::Down => self.move_task_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_task_cursor(-1),
             KeyCode::PageDown => self.page_task_cursor(1),
@@ -2633,6 +2806,144 @@ impl App {
                 Request::None
             }
         }
+    }
+
+    /// Keys inside the failure form (KTD4).
+    fn on_key_failure(&mut self, key: KeyEvent) -> Request {
+        let Modal::Failure(form) = &mut self.modal else {
+            return Request::None;
+        };
+        let action = form.on_key(key);
+        if let (
+            Some(closed),
+            FailureAction::Confirm(_) | FailureAction::Reject(_) | FailureAction::Restart(_),
+        ) = (&form.closed, &action)
+        {
+            self.notice = Some(Notice::error(closed.clone()));
+            return Request::None;
+        }
+        let execution_id = form.execution_id.clone();
+        match action {
+            FailureAction::None => Request::None,
+            FailureAction::Cancel => {
+                self.modal = Modal::None;
+                Request::None
+            }
+            FailureAction::Confirm(proposal_id) => Request::ConfirmProposal {
+                execution_id,
+                proposal_id,
+            },
+            FailureAction::Reject(proposal_id) => Request::RejectProposal {
+                execution_id,
+                proposal_id,
+            },
+            FailureAction::Restart(note) => Request::RecoverFailure {
+                execution_id,
+                episode: form.key.clone(),
+                comment: Some(note.trim().to_string()).filter(|note| !note.is_empty()),
+            },
+        }
+    }
+
+    /// Keys inside the task view's conductor chat (F4, R28, R31).
+    fn on_key_chat(&mut self, key: KeyEvent) -> Request {
+        let Screen::Task(view) = &mut self.screen else {
+            return Request::None;
+        };
+        let execution_id = view.execution_id.clone();
+        let chat = &mut view.chat;
+
+        // An undo waits for its own confirmation, which shows what the
+        // decision was, how sure the conductor was and why (R31).
+        if let Some(confirm) = &chat.undo {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let decision_id = confirm.decision_id.clone();
+                    chat.undo = None;
+                    return Request::UndoDecision {
+                        execution_id,
+                        decision_id,
+                    };
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => chat.undo = None,
+                _ => {}
+            }
+            return Request::None;
+        }
+
+        match (key.code, chat.focus) {
+            (KeyCode::Esc, _) => chat.open = false,
+            (KeyCode::Tab | KeyCode::BackTab, _) => {
+                chat.focus = match chat.focus {
+                    ChatFocus::Draft => ChatFocus::History,
+                    ChatFocus::History => ChatFocus::Draft,
+                };
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('j'), ChatFocus::History) => chat.move_selection(1),
+            (KeyCode::Up, _) | (KeyCode::Char('k'), ChatFocus::History) => chat.move_selection(-1),
+            (KeyCode::Char('g') | KeyCode::Home, ChatFocus::History) => chat.selected = 0,
+            (KeyCode::Char('G') | KeyCode::End, ChatFocus::History) => {
+                chat.selected = chat.entries.len().saturating_sub(1)
+            }
+            (KeyCode::Enter, ChatFocus::Draft) => {
+                if chat.draft.trim().is_empty() {
+                    self.notice = Some(Notice::error("Write a message to the conductor first."));
+                    return Request::None;
+                }
+                return Request::SendChat;
+            }
+            (KeyCode::Backspace, ChatFocus::Draft) => {
+                chat.draft.pop();
+            }
+            (KeyCode::Char(character), ChatFocus::Draft) => chat.draft.push(character),
+            (KeyCode::Char('y') | KeyCode::Enter, ChatFocus::History) => {
+                match chat
+                    .selected_item()
+                    .and_then(|item| item.open_proposal().map(String::from))
+                {
+                    Some(proposal_id) => {
+                        return Request::ConfirmProposal {
+                            execution_id,
+                            proposal_id,
+                        }
+                    }
+                    None => {
+                        self.notice = Some(Notice::error(
+                            "The selected entry is not a proposal waiting for confirmation.",
+                        ))
+                    }
+                }
+            }
+            (KeyCode::Char('n'), ChatFocus::History) => {
+                match chat
+                    .selected_item()
+                    .and_then(|item| item.open_proposal().map(String::from))
+                {
+                    Some(proposal_id) => {
+                        return Request::RejectProposal {
+                            execution_id,
+                            proposal_id,
+                        }
+                    }
+                    None => {
+                        self.notice = Some(Notice::error(
+                            "The selected entry is not a proposal waiting for confirmation.",
+                        ))
+                    }
+                }
+            }
+            (KeyCode::Char('u'), ChatFocus::History) => {
+                if !chat.ask_undo() {
+                    self.notice = Some(Notice::error(
+                        "Only the conductor's choice of an output that was not undone yet can \
+                         be undone.",
+                    ));
+                }
+            }
+            (KeyCode::Char('r'), ChatFocus::History) => return Request::LoadChat,
+            _ => {}
+        }
+        Request::None
     }
 
     /// Keys inside the free-form operator-note editor.
@@ -2952,7 +3263,13 @@ impl App {
     pub fn open_input_form(&mut self) {
         match self.pending.as_ref() {
             Some(pending) => {
-                self.modal = Modal::Input(Box::new(InputForm::new(pending, &self.variables)));
+                let annotation = self
+                    .execution
+                    .as_ref()
+                    .and_then(|execution| execution.annotation.as_ref());
+                self.modal = Modal::Input(Box::new(
+                    InputForm::new(pending, &self.variables).with_annotation(annotation),
+                ));
             }
             None => {
                 self.notice = Some(Notice::error(
@@ -2966,19 +3283,45 @@ impl App {
     /// task view is always entered on the selected execution, so its pending
     /// request is the one [`App::pending`] holds; the check only guards
     /// against the two ever disagreeing.
-    fn open_input_form_for_task(&mut self) {
+    fn open_input_form_for_task(&mut self) -> Request {
         let Screen::Task(view) = &self.screen else {
-            return;
+            return Request::None;
         };
         let matches_view = self
             .pending
             .as_ref()
             .is_some_and(|pending| pending.execution_id == view.execution_id);
-        if matches_view {
-            self.open_input_form();
-        } else {
-            self.notice = Some(Notice::error("This task is not waiting for human input."));
+        let selected_view = self
+            .selected()
+            .is_some_and(|row| row.id == view.execution_id);
+        if matches_view || (selected_view && self.pending.is_none()) {
+            return self.request_input_form();
         }
+        self.notice = Some(Notice::error("This task is not waiting for human input."));
+        Request::None
+    }
+
+    /// `i`: the form for whatever the selected execution waits on — or, for
+    /// one `Failed` on a problem the conductor reported, the failure form
+    /// (KTD4), which first needs the report from the daemon.
+    fn request_input_form(&mut self) -> Request {
+        if self.pending.is_none() {
+            if self.selected_failure_problem().is_some() {
+                return Request::OpenFailureForm;
+            }
+            let diagnosing = self
+                .selected()
+                .filter(|row| row.status == ExecutionStatus::Failed)
+                .and_then(ExecutionRow::conductor_line);
+            if let Some(working) = diagnosing {
+                self.notice = Some(Notice::info(format!(
+                    "{working}. The failure can be settled with i once it concludes."
+                )));
+                return Request::None;
+            }
+        }
+        self.open_input_form();
+        Request::None
     }
 
     /// Whether the pending request is a gate with required fields: choosing
@@ -3671,6 +4014,223 @@ impl App {
             Err(error) => self.notice = Some(Notice::error(client_error_message(&row.id, error))),
         }
     }
+
+    // -- the conductor (U13) ----------------------------------------------
+
+    /// Opens the failure form of the selected execution (KTD4): the
+    /// conductor's report of the failure, and its proposals still open.
+    pub async fn open_failure_form(&mut self) {
+        let Some(execution_id) = self
+            .selected_failure_problem()
+            .and_then(|_| self.selected())
+            .map(|row| row.id.clone())
+        else {
+            self.notice = Some(Notice::error(
+                "The selected execution is not failed on a problem.",
+            ));
+            return;
+        };
+        let state = match self.client.conductor_state(&execution_id).await {
+            Ok(state) => state,
+            Err(error) => {
+                self.notice = Some(Notice::error(client_error_message(&execution_id, error)));
+                return;
+            }
+        };
+        let chat = match self.client.conductor_chat(&execution_id, 0).await {
+            Ok(chat) => chat.entries,
+            Err(error) => {
+                self.notice = Some(Notice::error(client_error_message(&execution_id, error)));
+                return;
+            }
+        };
+        let form = state
+            .failure
+            .as_ref()
+            .and_then(|report| FailureForm::new(&execution_id, report, &chat));
+        match form {
+            Some(form) => self.modal = Modal::Failure(Box::new(form)),
+            None => {
+                self.notice = Some(Notice::error(format!(
+                    "Execution {execution_id} is no longer failed on a problem."
+                )));
+                self.refresh().await;
+            }
+        }
+    }
+
+    /// Reads the task view's chat from after the last entry it holds (F4):
+    /// the whole history the first time, which is how it survives a restart
+    /// of this interface (R26).
+    pub async fn load_chat(&mut self) {
+        let Screen::Task(view) = &self.screen else {
+            return;
+        };
+        let execution_id = view.execution_id.clone();
+        let after = view.chat.last_sequence();
+        match self.client.conductor_chat(&execution_id, after).await {
+            Ok(response) => {
+                if let Screen::Task(view) = &mut self.screen {
+                    if view.execution_id == execution_id {
+                        view.chat.append(response.entries);
+                    }
+                }
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not read the conductor's chat: {}",
+                    client_error_message(&execution_id, error)
+                )));
+            }
+        }
+    }
+
+    /// Sends the chat's draft to the conductor (F4). The draft is kept until
+    /// the daemon accepts it, so nothing has to be typed again after a
+    /// failure; its answer follows in the history.
+    pub async fn send_chat(&mut self) {
+        let Screen::Task(view) = &self.screen else {
+            return;
+        };
+        let execution_id = view.execution_id.clone();
+        let text = view.chat.draft.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        match self.client.post_chat(&execution_id, &text).await {
+            Ok(_) => {
+                if let Screen::Task(view) = &mut self.screen {
+                    view.chat.draft.clear();
+                }
+                self.notice = Some(Notice::info(
+                    "Sent to the conductor; its answer follows in the chat.",
+                ));
+                self.load_chat().await;
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(client_error_message(&execution_id, error)));
+            }
+        }
+    }
+
+    /// Carries out a proposal of the conductor's (R28). A proposal about a
+    /// moment the execution has moved on from is refused (KTD9): the
+    /// operator reads why, and the view is read again.
+    pub async fn confirm_proposal(&mut self, execution_id: &str, proposal_id: &str) {
+        let result = self
+            .client
+            .confirm_proposal(execution_id, proposal_id)
+            .await;
+        self.settle_proposal(execution_id, result).await;
+    }
+
+    /// Rejects a proposal of the conductor's.
+    pub async fn reject_proposal(&mut self, execution_id: &str, proposal_id: &str) {
+        let result = self.client.reject_proposal(execution_id, proposal_id).await;
+        self.settle_proposal(execution_id, result).await;
+    }
+
+    /// Reports what became of a proposal, then reads the view again — a
+    /// carried-out proposal moved the execution on, a refused one says the
+    /// view was stale.
+    async fn settle_proposal(
+        &mut self,
+        execution_id: &str,
+        result: Result<crate::conductor::ProposalOutcome, ClientError>,
+    ) {
+        match result {
+            Ok(outcome) => {
+                let mut text = outcome.message;
+                if outcome.repeated {
+                    text.push_str(" (It had already been settled; nothing was done now.)");
+                }
+                self.notice = Some(Notice::info(text));
+                if matches!(&self.modal, Modal::Failure(form) if form.execution_id == execution_id)
+                {
+                    self.modal = Modal::None;
+                }
+            }
+            Err(error) => {
+                let message = match error {
+                    ClientError::Refused { message, .. } => {
+                        format!("The situation changed, nothing was done: {message}")
+                    }
+                    other => client_error_message(execution_id, other),
+                };
+                if let Modal::Failure(form) = &mut self.modal {
+                    form.error = Some(message.clone());
+                }
+                self.notice = Some(Notice::error(message));
+            }
+        }
+        self.reread_after_conductor_action().await;
+    }
+
+    /// Undoes a chosen output of the conductor's (R31, KTD13): the step is a
+    /// problem again at its state. The daemon's answer says what undoing
+    /// could not take back.
+    pub async fn undo_decision(&mut self, execution_id: &str, decision_id: &str) {
+        match self.client.undo_decision(execution_id, decision_id).await {
+            Ok(outcome) => self.notice = Some(Notice::info(outcome.message)),
+            Err(error) => {
+                let message = match error {
+                    ClientError::Refused { message, .. } => message,
+                    other => client_error_message(execution_id, other),
+                };
+                self.notice = Some(Notice::error(message));
+            }
+        }
+        self.reread_after_conductor_action().await;
+    }
+
+    /// Restarts the failed step `episode` names with `comment` (KTD4,
+    /// KTD9): refused once the execution is no longer failed on it.
+    pub async fn recover_failure(
+        &mut self,
+        execution_id: &str,
+        episode: &str,
+        comment: Option<String>,
+    ) {
+        let with_note = comment.is_some();
+        match self
+            .client
+            .recover_failure(execution_id, episode, comment)
+            .await
+        {
+            Ok(_) => {
+                self.modal = Modal::None;
+                self.notice = Some(Notice::info(if with_note {
+                    format!(
+                        "Execution {execution_id} restarts the failed step with your note, in \
+                         the background."
+                    )
+                } else {
+                    format!("Execution {execution_id} restarts the failed step in the background.")
+                }));
+            }
+            Err(error) => {
+                let message = client_error_message(execution_id, error);
+                if let Modal::Failure(form) = &mut self.modal {
+                    form.error = Some(message.clone());
+                }
+                self.notice = Some(Notice::error(message));
+            }
+        }
+        self.reread_after_conductor_action().await;
+    }
+
+    /// Reads the list, the selection and — in the task view — its chat
+    /// again, keeping the notice the action left.
+    async fn reread_after_conductor_action(&mut self) {
+        let notice = self.notice.clone();
+        self.refresh().await;
+        if matches!(self.screen, Screen::Task(_)) {
+            self.refresh_task().await;
+        }
+        if self.notice.as_ref().is_none_or(|current| !current.is_error) {
+            self.notice = notice;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3693,6 +4253,63 @@ fn form_shortcuts(form: &InputForm) -> Vec<(&'static str, &'static str)> {
     keys.push(("Enter", "submit"));
     keys.push(("Esc", "cancel"));
     keys
+}
+
+/// The bar's shortcuts while the failure form is open.
+fn failure_shortcuts(form: &FailureForm) -> Vec<(&'static str, &'static str)> {
+    if form.closed.is_some() {
+        return vec![("Esc", "close the form")];
+    }
+    let mut keys = vec![("Tab/↑↓", "row")];
+    match form.current_row() {
+        crate::tui::failure_form::FailureRow::Proposal(_) => {
+            keys.push(("Enter/y", "confirm proposal"));
+            keys.push(("n", "reject proposal"));
+        }
+        crate::tui::failure_form::FailureRow::Note => {
+            keys.push(("letters", "type the note"));
+            keys.push(("Enter", "restart with the note"));
+        }
+    }
+    keys.push(("Esc", "close"));
+    keys
+}
+
+/// The bar's shortcuts while the chat is open.
+fn chat_shortcuts(chat: &ChatPanel) -> Vec<(&'static str, &'static str)> {
+    if chat.undo.is_some() {
+        return vec![("y", "undo the decision"), ("n/Esc", "keep it")];
+    }
+    match chat.focus {
+        ChatFocus::Draft => vec![
+            ("letters", "type a message"),
+            ("Enter", "send"),
+            ("Tab", "history"),
+            ("Esc", "close the chat"),
+        ],
+        ChatFocus::History => vec![
+            ("j/k", "select"),
+            ("y", "confirm"),
+            ("n", "reject"),
+            ("u", "undo decision"),
+            ("r", "reload"),
+            ("Tab", "write"),
+            ("Esc", "close the chat"),
+        ],
+    }
+}
+
+/// What the conductor is doing, as the list and the task view say it
+/// (R11, AE12).
+pub fn conductor_working_text(purpose: ConductorPurpose) -> String {
+    let what = match purpose {
+        ConductorPurpose::ChooseOutput => "choosing the output",
+        ConductorPurpose::ChooseOutputAfterReprompt => "choosing the output after a reprompt",
+        ConductorPurpose::DiagnoseFailure => "diagnosing the failure",
+        ConductorPurpose::ReplyToChat => "answering the chat",
+        ConductorPurpose::SummarizeGate => "summarizing the gate",
+    };
+    format!("conductor: {what}")
 }
 
 /// Why a closed form is not sent.
@@ -3799,8 +4416,28 @@ fn wrap(current: usize, delta: isize, length: usize) -> usize {
 /// a problem input, and the `WorkflowFailed` of a failure). What kind of
 /// input a bare `HumanInputRequested` opened only the next refresh says, so
 /// until then it counts as a question.
-fn apply_to_row(row: &mut ExecutionRow, data: &EventData) {
-    let status = match data {
+fn apply_to_row(row: &mut ExecutionRow, event: &Event) {
+    let status = match &event.data {
+        // The conductor works beside the execution (KTD3): its activity is
+        // no status, and no status change ends it.
+        EventData::ConductorStarted {
+            trigger,
+            purpose,
+            episode,
+            ..
+        } => {
+            row.conductor = Some(ConductorActivity {
+                purpose: *purpose,
+                trigger: *trigger,
+                episode: episode.clone(),
+                started_at: event.timestamp,
+            });
+            return;
+        }
+        EventData::ConductorFinished { .. } => {
+            row.conductor = None;
+            return;
+        }
         EventData::StateEntered { state_id } => {
             row.current_state = Some(state_id.clone());
             ExecutionStatus::Running
@@ -3846,10 +4483,9 @@ fn apply_to_row(row: &mut ExecutionRow, data: &EventData) {
 }
 
 /// Whether a live event changes what a refresh would show (KTD16): a
-/// status, a pending input, a problem.
-///
-/// U13: the conductor's own events (it started, it finished) belong here
-/// too, once they exist, so its state reaches the list without `r`.
+/// status, a pending input, a problem — and the conductor's work: it
+/// started or finished (R11), decided, or had a decision undone, which is
+/// what reaches the list, the forms and the chat without `r`.
 fn triggers_refresh(data: &EventData) -> bool {
     matches!(
         data,
@@ -3861,6 +4497,10 @@ fn triggers_refresh(data: &EventData) -> bool {
             | EventData::HumanInputRequested { .. }
             | EventData::HumanInputReceived { .. }
             | EventData::ProblemRaised { .. }
+            | EventData::ConductorStarted { .. }
+            | EventData::ConductorFinished { .. }
+            | EventData::ConductorDecision { .. }
+            | EventData::ConductorDecisionUndone { .. }
     )
 }
 
@@ -3886,8 +4526,33 @@ fn notice_for(event: &Event) -> Option<Notice> {
         EventData::WorkflowCompleted { .. } => {
             Some(Notice::info(format!("Execution {execution_id} completed.")))
         }
+        // Held while the conductor may take the failure up; see
+        // `App::on_engine_event`.
         EventData::WorkflowFailed { error } => Some(Notice::error(format!(
             "Execution {execution_id} failed: {error}"
+        ))),
+        EventData::ConductorDecision {
+            kind: ConductorDecisionKind::Retry,
+            state_id,
+            rationale,
+            ..
+        } => Some(Notice::info(format!(
+            "The conductor restarts the failed step '{}' of execution {execution_id} once{}",
+            state_id.as_deref().unwrap_or("-"),
+            rationale
+                .as_deref()
+                .map(|why| format!(": {}", first_line(why)))
+                .unwrap_or_else(|| ".".to_string())
+        ))),
+        EventData::ConductorDecisionUndone {
+            state_id, warning, ..
+        } => Some(Notice::info(format!(
+            "A decision of the conductor's on execution {execution_id} was undone: the step \
+             '{state_id}' is a problem again.{}",
+            warning
+                .as_deref()
+                .map(|warning| format!(" {warning}"))
+                .unwrap_or_default()
         ))),
         EventData::WorkflowCancelled { reason } => Some(Notice::error(format!(
             "Execution {execution_id} was cancelled: {reason}"

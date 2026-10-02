@@ -50,9 +50,15 @@ use serde_json::{json, Value};
 
 use narsor::api::TransitionRequest;
 use narsor::api::{ensure_daemon_running, ApiClient, ClientError};
+use narsor::conductor::{
+    Annotation, ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore,
+    FailureOutcome, FailureReport,
+};
 use narsor::config::Flags;
 use narsor::daemon::launch::set_exe_override_for_tests;
-use narsor::domain::{AnsweredBy, InputCloseReason, ProblemKind};
+use narsor::domain::{
+    AnsweredBy, ConductorPurpose, ConductorTrigger, InputCloseReason, ProblemKind,
+};
 use narsor::domain::{
     Event, EventData, ExecutionStatus, WorkflowDefinition, WorkflowExecution, Workspace,
 };
@@ -69,6 +75,7 @@ use narsor::tui::app::{
     StreamStatus, TaskContent, TransitionMode, GATE_NEEDS_FORM_MESSAGE, OVERRIDE_PROVIDER,
     OVERRIDE_REASON,
 };
+use narsor::tui::chat::{ChatFocus, ChatItem, ProposalState};
 use narsor::tui::views;
 use narsor::workflow::load_from_file;
 use narsor::workflows::{builtin, WorkflowResolver};
@@ -124,6 +131,10 @@ fn init_exe_override() {
 /// the daemons it spawns.
 struct Daemon {
     pid: u32,
+    /// The process, when this test spawned it itself rather than through
+    /// `ensure_daemon_running` ([`Daemon::start_on_path`]): it is reaped on
+    /// drop, so it never lingers as a zombie `kill(pid, 0)` still sees.
+    child: Option<std::process::Child>,
 }
 
 impl Daemon {
@@ -134,7 +145,51 @@ impl Daemon {
         let client = Self::discover(root).await;
         let info = DaemonInfo::read(&StatePaths::new(root).daemon_file())
             .expect("daemon.json exists once ensure_daemon_running returns");
-        (Self { pid: info.pid }, client)
+        (
+            Self {
+                pid: info.pid,
+                child: None,
+            },
+            client,
+        )
+    }
+
+    /// Spawns a daemon over `root` whose `PATH` is `path` — the way a test
+    /// gives its conductor a fake `claude` of its own, scripted with an
+    /// answer, without touching the fake every other daemon of this process
+    /// shares.
+    async fn start_on_path(root: &Path, path: &str) -> (Self, ApiClient) {
+        init_exe_override();
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_narsor"))
+            .arg("--root")
+            .arg(root)
+            .arg("daemon")
+            .env("PATH", path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the daemon");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let client = loop {
+            if let Ok(info) = DaemonInfo::read(&StatePaths::new(root).daemon_file()) {
+                let client = ApiClient::new(info.addr, &info.token);
+                if info.pid == child.id() && client.list_executions().await.is_ok() {
+                    break client;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        (
+            Self {
+                pid: child.id(),
+                child: Some(child),
+            },
+            client,
+        )
     }
 
     /// A fresh client for the daemon this handle already spawned — cheap: it
@@ -167,6 +222,11 @@ impl Drop for Daemon {
                     libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
                 }
                 break;
+            }
+            if let Some(child) = &mut self.child {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -4494,4 +4554,752 @@ async fn a_question_and_a_problem_have_their_own_colours_and_descriptions() {
     let problem_colour = colour_of(&app, "input_needed (problem)");
 
     assert_ne!(question_colour, problem_colour);
+}
+
+// ---------------------------------------------------------------------------
+// The conductor in the interface (U13)
+// ---------------------------------------------------------------------------
+
+/// The key of the step failure `failed_at_prepare` records.
+const FAILURE_KEY: &str = "attempt-1";
+
+/// The error the failed step of `failed_at_prepare` failed with.
+const FAILURE_ERROR: &str = "the script exploded";
+
+/// An execution of the pipeline fixture failed at its first step, with the
+/// step-failure record the engine leaves for the conductor (F3). Its
+/// definition is resolvable and its script runs, so a recovery reaches the
+/// `review` gate. Pre-daemon only.
+fn failed_at_prepare(root: &Path) -> String {
+    let engine = engine_for(root);
+    let mut execution = start(&engine, root);
+    execution.status = ExecutionStatus::Failed;
+    execution.current_state = Some("prepare".to_string());
+    execution.completed_at = Some(chrono::Utc::now());
+    execution.metadata["engine"] = json!({
+        "step_failure": {
+            "state_id": "prepare",
+            "action_execution_id": FAILURE_KEY,
+            "episode": FAILURE_KEY,
+            "error": FAILURE_ERROR,
+            "side_effect_free": false,
+        }
+    });
+    engine
+        .store()
+        .save_execution(&execution)
+        .expect("record the failure");
+    execution.id
+}
+
+/// The conductor's report of `failed_at_prepare`'s failure, as it leaves
+/// it once it concluded. Pre-daemon only.
+fn report_failure(root: &Path, execution_id: &str, outcome: FailureOutcome, reason: &str) {
+    let conductor = ConductorStore::new(&StatePaths::new(root), execution_id);
+    let state = ConductorState {
+        failure: Some(FailureReport {
+            key: FAILURE_KEY.to_string(),
+            episode: FAILURE_KEY.to_string(),
+            state_id: "prepare".to_string(),
+            reason: reason.to_string(),
+            outcome,
+            concluded_at: chrono::Utc::now(),
+        }),
+        ..ConductorState::default()
+    };
+    conductor.save_state(&state).expect("save the report");
+}
+
+/// Appends `entry` to the chat of `execution_id`. Pre-daemon only.
+fn seed_chat(root: &Path, execution_id: &str, entry: ChatEntry) -> ChatEntry {
+    ConductorStore::new(&StatePaths::new(root), execution_id)
+        .append_chat(entry)
+        .expect("seed the chat")
+}
+
+/// A chat entry of the conductor's with `payload`.
+fn conductor_entry(kind: ChatEntryKind, text: &str, payload: Value) -> ChatEntry {
+    let mut entry = ChatEntry::new(ChatAuthor::Conductor, kind, text);
+    entry.payload = Some(payload);
+    entry
+}
+
+/// The open failure form.
+fn failure_form(app: &App) -> &narsor::tui::failure_form::FailureForm {
+    match app.modal() {
+        Modal::Failure(form) => form,
+        other => panic!("the failure form is open, got {other:?}"),
+    }
+}
+
+/// Opens the task view of the selected execution and its chat, with the
+/// history read.
+async fn open_chat(app: &mut App) {
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::OpenTaskView);
+    app.open_task_for_execution().await;
+    assert_eq!(app.on_key(key(KeyCode::Char('c'))), Request::LoadChat);
+    app.load_chat().await;
+    assert!(task_view(app).chat.open);
+}
+
+/// Moves the chat's focus to the history and its selection onto the first
+/// entry `wanted` accepts.
+fn select_chat_entry(app: &mut App, wanted: impl Fn(&ChatItem) -> bool) {
+    if task_view(app).chat.focus == ChatFocus::Draft {
+        app.on_key(key(KeyCode::Tab));
+    }
+    app.on_key(key(KeyCode::Char('g')));
+    for _ in 0..64 {
+        let item = task_view(app).chat.selected_item().expect("an entry");
+        if wanted(&item) {
+            return;
+        }
+        app.on_key(key(KeyCode::Char('j')));
+    }
+    panic!("no chat entry matches");
+}
+
+/// A fake `claude` of this test's own answering every invocation of the
+/// conductor with `response`, and the `PATH` that puts it first.
+fn conductor_answering(root: &Path, response: Value) -> String {
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("create the bin directory");
+    let temp = bin.join(format!(".claude.{}.tmp", uuid::Uuid::new_v4()));
+    fs::copy(
+        engine_support::fixtures().join("harness/fake_harness.sh"),
+        &temp,
+    )
+    .expect("copy the fake harness");
+    fs::rename(&temp, bin.join("claude")).expect("move the fake harness into place");
+    let envelope = json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "conductor-session",
+        "result": response.to_string(),
+    });
+    fs::write(bin.join("stdout"), format!("{envelope}\n")).expect("write the answer");
+    format!(
+        "{}:{}",
+        bin.display(),
+        engine_support::fake_claude_first_on_path()
+    )
+}
+
+/// AE12: while the conductor diagnoses task B's failure, the list says so at
+/// B, the failure itself is not announced, and once it raises the problem
+/// the header counts it and the bar names B. The task view's header says
+/// what the conductor is doing too.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_conductor_at_work_is_shown_and_its_problem_counted() {
+    let root = TempRoot::new();
+    let watched = paused_at_review(root.path()).await;
+    let failed = seeded_execution("b-failed", ExecutionStatus::Failed);
+    store_of(root.path())
+        .save_execution(&failed)
+        .expect("seed B");
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.select_execution(&watched).await;
+    let before = app.notice().cloned();
+
+    app.on_stream(Some(Ok(Event::new(
+        failed.id.clone(),
+        EventData::WorkflowFailed {
+            error: "the harness did not start".to_string(),
+        },
+        1,
+    ))));
+    assert_eq!(app.notice().cloned(), before, "the failure is held back");
+    assert!(app.holds_failure_notice(&failed.id));
+
+    app.on_stream(Some(Ok(Event::new(
+        failed.id.clone(),
+        EventData::ConductorStarted {
+            invocation_id: "invocation-1".to_string(),
+            trigger: ConductorTrigger::StepFailure,
+            purpose: ConductorPurpose::DiagnoseFailure,
+            episode: Some("attempt".to_string()),
+        },
+        2,
+    ))));
+    assert!(
+        app.refresh_requested(),
+        "the conductor's start asks for one"
+    );
+    assert_eq!(
+        row_of(&app, &failed.id).conductor_line().as_deref(),
+        Some("conductor: diagnosing the failure")
+    );
+    assert!(screen_of(&app).contains("◆ conductor: diagnosing the failure"));
+    assert_eq!(row_of(&app, &watched).conductor_line(), None);
+
+    app.on_stream(Some(Ok(Event::new(
+        failed.id.clone(),
+        EventData::ProblemRaised {
+            state_id: "plan".to_string(),
+            action_execution_id: "attempt".to_string(),
+            kind: ProblemKind::Failure,
+            reason: "the harness is not installed".to_string(),
+            episode: Some("attempt".to_string()),
+        },
+        3,
+    ))));
+    app.on_stream(Some(Ok(Event::new(
+        failed.id.clone(),
+        EventData::ConductorFinished {
+            invocation_id: "invocation-1".to_string(),
+            outcome: narsor::domain::ConductorOutcome::Completed,
+            error: None,
+        },
+        4,
+    ))));
+    assert!(!app.holds_failure_notice(&failed.id));
+    let notice = app.notice().expect("a notice");
+    assert!(
+        notice.text.contains(&failed.id) && notice.text.contains("problem"),
+        "{}",
+        notice.text
+    );
+    assert_eq!(row_of(&app, &failed.id).conductor_line(), None);
+    assert_eq!(
+        app.attention_counts().summary().as_deref(),
+        Some("1 question · 1 problem")
+    );
+    assert!(screen_of(&app).contains("1 question · 1 problem"));
+
+    // The task view's header.
+    app.select_execution(&failed.id).await;
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::OpenTaskView);
+    app.open_task_for_execution().await;
+    app.on_stream(Some(Ok(Event::new(
+        failed.id.clone(),
+        EventData::ConductorStarted {
+            invocation_id: "invocation-2".to_string(),
+            trigger: ConductorTrigger::Chat,
+            purpose: ConductorPurpose::ReplyToChat,
+            episode: None,
+        },
+        5,
+    ))));
+    assert!(screen_of(&app).contains("b-failed · conductor: answering the chat"));
+}
+
+/// A failure the conductor does not take up is announced after all, at the
+/// refresh that shows nobody did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failure_nobody_takes_up_is_announced_at_the_refresh() {
+    let root = TempRoot::new();
+    let failed = seeded_execution("c-failed", ExecutionStatus::Failed);
+    store_of(root.path())
+        .save_execution(&failed)
+        .expect("seed C");
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.on_stream(Some(Ok(Event::new(
+        failed.id.clone(),
+        EventData::WorkflowFailed {
+            error: "the disk is full".to_string(),
+        },
+        1,
+    ))));
+    assert!(app.holds_failure_notice(&failed.id));
+
+    tokio::time::sleep(narsor::tui::refresh::DEBOUNCE + Duration::from_millis(50)).await;
+    app.refresh().await;
+    assert!(!app.holds_failure_notice(&failed.id));
+    let notice = app.notice().expect("a notice");
+    assert!(notice.is_error);
+    assert!(notice.text.contains("the disk is full"), "{}", notice.text);
+}
+
+/// AE4 (view): the problem form shows the agent's answers, the conductor's
+/// analysis, each label with its description — and marks what the
+/// conductor proposed until the operator edits it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_problem_form_shows_the_analysis_and_marks_the_proposed_values() {
+    let root = TempRoot::new();
+    let execution_id = paused_on_problem(
+        root.path(),
+        Some(ConductorAnalysis {
+            label: Some("implemented".to_string()),
+            data: serde_json::Map::new(),
+            variables: json!({ "summary": "all units done" })
+                .as_object()
+                .cloned()
+                .expect("an object"),
+            rationale: Some("Both answers say every test passes.".to_string()),
+        }),
+    )
+    .await;
+    // The answer the conductor's own reprompt got, the way U10 adds it.
+    let store = store_of(root.path());
+    let mut pending: PendingHumanInput = store
+        .load_pending_input(&execution_id)
+        .expect("read the pending input")
+        .expect("the problem is pending");
+    let problem = pending.problem.as_mut().expect("a problem record");
+    let mut second = problem.answers[0].clone();
+    second.action_execution_id = "reprompt".to_string();
+    second.answer_tail = Some("Still done: every test is green.".to_string());
+    problem.answers.push(second);
+    store
+        .save_pending_input(&execution_id, &pending)
+        .expect("record the second answer");
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.on_key(key(KeyCode::Char('i')));
+
+    let form = input_form(&app);
+    let problem = form.problem.as_ref().expect("the problem's part");
+    assert_eq!(problem.answers.len(), 2, "the answer and the reprompt's");
+    assert!(form.is_proposed_label("implemented"));
+    assert!(problem.variables[0].is_proposed());
+
+    let screen = screen_of(&app);
+    assert!(screen.contains("Conductor's analysis"), "{screen}");
+    assert!(screen.contains("◆ proposed output: implemented"));
+    assert!(screen.contains("Both answers say every test passes."));
+    assert!(screen.contains("● implemented — The feature is implemented.  ◆ conductor's proposal"));
+    assert!(screen.contains("○ needs_human_decision — A person has to decide first."));
+    assert!(screen.contains("variables.summary* = all units done  ◆ conductor"));
+    assert!(screen.contains("Done, all tests pass."), "the first answer");
+    assert!(
+        screen.contains("Still done: every test is green."),
+        "the second answer"
+    );
+
+    // An edited value is the operator's own.
+    focus_row(&mut app, FormRow::Entry(EntryMap::Variables, 0));
+    type_text(&mut app, "!");
+    let form = input_form(&app);
+    assert!(!form.problem.as_ref().expect("problem").variables[0].is_proposed());
+    assert!(!screen_of(&app).contains("all units done  ◆ conductor"));
+}
+
+/// AE16 (view): the gate's form shows the conductor's summary and its
+/// recommendation, as advice — the fields are still the operator's.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gate_form_shows_the_conductors_summary_and_recommendation() {
+    let root = TempRoot::new();
+    let execution_id = paused_at_gate(root.path(), None).await;
+    let pending: PendingHumanInput = store_of(root.path())
+        .load_pending_input(&execution_id)
+        .expect("read the pending input")
+        .expect("the gate is pending");
+    ConductorStore::new(&StatePaths::new(root.path()), &execution_id)
+        .save_annotation(&Annotation {
+            key: pending.episode_key().to_string(),
+            summary: "The plan covers both variants; variant B is cheaper.".to_string(),
+            recommendation: Some("answered: variant B".to_string()),
+            created_at: chrono::Utc::now(),
+        })
+        .expect("save the summary");
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.on_key(key(KeyCode::Char('i')));
+
+    let form = input_form(&app);
+    let annotation = form.annotation.as_ref().expect("the summary");
+    assert_eq!(
+        annotation.recommendation.as_deref(),
+        Some("answered: variant B")
+    );
+    assert!(
+        !form.values.iter().any(|value| value.contains("variant B")),
+        "the recommendation fills in nothing"
+    );
+    let screen = screen_of(&app);
+    assert!(screen.contains("Conductor's summary (advisory"), "{screen}");
+    assert!(screen.contains("The plan covers both variants; variant B is cheaper."));
+    assert!(screen.contains("◆ recommendation: answered: variant B"));
+}
+
+/// KTD4: `i` on a failed step the conductor diagnosed shows the diagnosis,
+/// with its confidence and rationale, and its proposal; a restart with a
+/// note from the form starts the step again.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_failure_form_shows_the_diagnosis_and_restarts_with_a_note() {
+    let root = TempRoot::new();
+    let execution_id = failed_at_prepare(root.path());
+    let proposal = json!({
+        "kind": "retry",
+        "summary": "Restart the step once the ticket exists",
+        "text": "the ticket exists now",
+    });
+    report_failure(
+        root.path(),
+        &execution_id,
+        FailureOutcome::Diagnosed {
+            diagnosis: "The ticket file is missing.".to_string(),
+            proposals: vec![serde_json::from_value(proposal.clone()).expect("a proposal")],
+        },
+        "The ticket file is missing.",
+    );
+    seed_chat(
+        root.path(),
+        &execution_id,
+        conductor_entry(
+            ChatEntryKind::Message,
+            "The ticket file is missing.",
+            json!({
+                "kind": "diagnosis",
+                "episode": FAILURE_KEY,
+                "state_id": "prepare",
+                "diagnosis": "The ticket file is missing.",
+                "confidence": "low",
+                "rationale": "The script stops on a missing ticket.",
+            }),
+        ),
+    );
+    seed_chat(
+        root.path(),
+        &execution_id,
+        conductor_entry(
+            ChatEntryKind::Proposal,
+            "Restart the step once the ticket exists",
+            json!({
+                "episode": FAILURE_KEY,
+                "state_id": "prepare",
+                "proposal": proposal,
+                "confidence": "low",
+                "rationale": "The script stops on a missing ticket.",
+            }),
+        ),
+    );
+
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    assert_eq!(app.selected_attention(), Some(Attention::Problem));
+    assert!(app.shortcuts().contains(&("i", "resolve failure")));
+    assert_eq!(
+        app.on_key(key(KeyCode::Char('i'))),
+        Request::OpenFailureForm
+    );
+    app.open_failure_form().await;
+
+    let form = failure_form(&app);
+    assert_eq!(form.key, FAILURE_KEY);
+    assert_eq!(
+        form.diagnosis.as_deref(),
+        Some("The ticket file is missing.")
+    );
+    assert_eq!(form.raw_error, None);
+    assert_eq!(form.proposals.len(), 1);
+    let screen = screen_of(&app);
+    assert!(screen.contains("Resolve the failure"), "{screen}");
+    assert!(screen.contains("Conductor's diagnosis:"));
+    assert!(screen.contains("confidence: low"));
+    assert!(screen.contains("why: The script stops on a missing ticket."));
+    assert!(screen.contains("◆ Restart the step once the ticket exists"));
+
+    // The note row follows the proposal.
+    app.on_key(key(KeyCode::Tab));
+    type_text(&mut app, "the ticket is there now");
+    let request = app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        request,
+        Request::RecoverFailure {
+            execution_id: execution_id.clone(),
+            episode: FAILURE_KEY.to_string(),
+            comment: Some("the ticket is there now".to_string()),
+        }
+    );
+    app.recover_failure(
+        &execution_id,
+        FAILURE_KEY,
+        Some("the ticket is there now".to_string()),
+    )
+    .await;
+    assert!(matches!(app.modal(), Modal::None), "the form closed");
+    assert!(!app.notice().expect("a notice").is_error);
+
+    wait_until_settled(&client, &[&execution_id]).await;
+    let execution = reload_until(root.path(), &execution_id, ExecutionStatus::InputNeeded);
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    assert_eq!(execution.current_state.as_deref(), Some("review"));
+}
+
+/// R24 (view): a conductor that cannot answer — the fake `claude` answers
+/// nothing, twice — leaves the raw error, and the failure form shows it
+/// with no analysis at all. Until it concludes, the list says the conductor
+/// is on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_failure_form_shows_the_raw_error_after_two_conductor_failures() {
+    let root = TempRoot::new();
+    let execution_id = failed_at_prepare(root.path());
+
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let row = row_of(&app, &execution_id);
+        if row.problem.is_some() {
+            break;
+        }
+        assert_eq!(
+            row.conductor_line().as_deref(),
+            Some("conductor: diagnosing the failure"),
+            "an owed diagnosis is shown before it concludes"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the conductor never concluded"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        app.refresh().await;
+    }
+    let state = client
+        .conductor_state(&execution_id)
+        .await
+        .expect("read the conductor's state");
+    assert_eq!(
+        state.invocation_attempts.get(FAILURE_KEY).copied(),
+        Some(2),
+        "one invocation and its one repeat"
+    );
+
+    app.select_execution(&execution_id).await;
+    assert_eq!(
+        app.on_key(key(KeyCode::Char('i'))),
+        Request::OpenFailureForm
+    );
+    app.open_failure_form().await;
+    let form = failure_form(&app);
+    assert_eq!(form.diagnosis, None);
+    assert!(form.proposals.is_empty());
+    let raw = form.raw_error.as_deref().expect("the raw error");
+    assert!(raw.contains(FAILURE_ERROR), "{raw}");
+    let screen = screen_of(&app);
+    assert!(screen.contains("Error:"), "{screen}");
+    assert!(!screen.contains("Conductor's diagnosis"));
+}
+
+/// F4, R28, R26: a message from the chat is answered with a proposal, which
+/// is carried out once confirmed and is recorded so in the history — and
+/// that history is there again after the interface restarts. A draft being
+/// written survives the automatic refresh.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_proposal_is_confirmed_and_the_history_survives_a_restart() {
+    let root = TempRoot::new();
+    let execution_id = paused_at_review(root.path()).await;
+    let path = conductor_answering(
+        root.path(),
+        json!({
+            "decision": "reply",
+            "message": "The change is prepared; I would approve it.",
+            "confidence": "high",
+            "rationale": "The script prepared ORC-7.",
+            "proposals": [{
+                "kind": "answer_input",
+                "summary": "Approve the prepared change",
+                "values": {"approval_status": "approved", "comment": "checked by the conductor"}
+            }],
+        }),
+    );
+
+    let (daemon, client) = Daemon::start_on_path(root.path(), &path).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    open_chat(&mut app).await;
+
+    type_text(&mut app, "should I approve it?");
+    app.auto_refresh().await;
+    assert_eq!(task_view(&app).chat.draft, "should I approve it?");
+
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::SendChat);
+    app.send_chat().await;
+    assert_eq!(task_view(&app).chat.draft, "", "the sent draft is cleared");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !task_view(&app)
+        .chat
+        .items()
+        .iter()
+        .any(|item| item.open_proposal().is_some())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the conductor never proposed: {:?}",
+            task_view(&app).chat.entries
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        app.load_chat().await;
+    }
+    assert!(screen_of(&app).contains("(proposal, open)"));
+
+    select_chat_entry(&mut app, |item| item.open_proposal().is_some());
+    let proposal_id = task_view(&app)
+        .chat
+        .selected_item()
+        .and_then(|item| item.open_proposal().map(String::from))
+        .expect("an open proposal");
+    assert_eq!(
+        app.on_key(key(KeyCode::Char('y'))),
+        Request::ConfirmProposal {
+            execution_id: execution_id.clone(),
+            proposal_id: proposal_id.clone(),
+        }
+    );
+    app.confirm_proposal(&execution_id, &proposal_id).await;
+    assert!(!app.notice().expect("a notice").is_error);
+
+    wait_until_settled(&client, &[&execution_id]).await;
+    let execution = reload_until(root.path(), &execution_id, ExecutionStatus::Completed);
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    app.load_chat().await;
+    let items = task_view(&app).chat.items();
+    let confirmed = items
+        .iter()
+        .find(|item| item.entry.id == proposal_id)
+        .expect("the proposal is in the history");
+    assert_eq!(confirmed.proposal, Some(ProposalState::Executed));
+    assert!(screen_of(&app).contains("(proposal, carried out)"));
+    let history = task_view(&app).chat.entries.len();
+
+    // A new interface reads the whole history again.
+    drop(app);
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    app.select_execution(&execution_id).await;
+    open_chat(&mut app).await;
+    let chat = &task_view(&app).chat;
+    assert_eq!(chat.entries.len(), history);
+    assert!(chat
+        .entries
+        .iter()
+        .any(|entry| entry.text == "should I approve it?"));
+    assert!(screen_of(&app).contains("should I approve it?"));
+}
+
+/// KTD9 (view): a proposal about a gate that is no longer the pending one
+/// is refused — the operator reads that the situation changed, nothing is
+/// done, and the view is read again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_proposal_is_refused_with_a_message() {
+    let root = TempRoot::new();
+    let execution_id = paused_at_review(root.path()).await;
+    seed_chat(
+        root.path(),
+        &execution_id,
+        conductor_entry(
+            ChatEntryKind::Proposal,
+            "Approve the prepared change",
+            json!({
+                "episode": "an-earlier-gate",
+                "state_id": "review",
+                "proposal": {
+                    "kind": "answer_input",
+                    "values": {"approval_status": "approved", "comment": "fine"}
+                },
+            }),
+        ),
+    );
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    open_chat(&mut app).await;
+    select_chat_entry(&mut app, |item| item.open_proposal().is_some());
+    let Request::ConfirmProposal {
+        execution_id: id,
+        proposal_id,
+    } = app.on_key(key(KeyCode::Char('y')))
+    else {
+        panic!("y confirms the selected proposal");
+    };
+    assert_eq!(id, execution_id);
+    app.confirm_proposal(&execution_id, &proposal_id).await;
+
+    let notice = app.notice().expect("a notice");
+    assert!(notice.is_error);
+    assert!(
+        notice.text.contains("The situation changed"),
+        "{}",
+        notice.text
+    );
+    assert!(matches!(app.screen(), Screen::Task(_)), "still in the view");
+    assert!(task_view(&app).chat.open, "the chat stays open");
+    assert_eq!(
+        store_of(root.path())
+            .load_execution(&execution_id)
+            .expect("reload")
+            .status,
+        ExecutionStatus::InputNeeded,
+        "nothing was done"
+    );
+    assert_eq!(
+        row_of(&app, &execution_id).status,
+        ExecutionStatus::InputNeeded
+    );
+}
+
+/// R31 (view): undoing the conductor's choice of an output first asks, with
+/// what it chose, how sure it was and why; `y` sends the undo.
+#[tokio::test(flavor = "multi_thread")]
+async fn undoing_a_decision_asks_with_its_confidence_and_rationale() {
+    let root = TempRoot::new();
+    let execution_id = paused_at_review(root.path()).await;
+    seed_chat(
+        root.path(),
+        &execution_id,
+        conductor_entry(
+            ChatEntryKind::Decision,
+            "Chose the output 'implemented' at 'implement'.",
+            json!({
+                "decision_id": "decision-1",
+                "kind": "choose_output",
+                "state_id": "implement",
+                "output_label": "implemented",
+                "confidence": "high",
+                "rationale": "Both answers say every test passes.",
+                "saved_at": chrono::Utc::now(),
+            }),
+        ),
+    );
+
+    let (daemon, _) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+    app.refresh().await;
+    open_chat(&mut app).await;
+    let screen = screen_of(&app);
+    assert!(screen.contains("u — undo this decision"), "{screen}");
+
+    select_chat_entry(&mut app, |item| item.undoable_decision().is_some());
+    assert_eq!(app.on_key(key(KeyCode::Char('u'))), Request::None);
+    let undo = task_view(&app).chat.undo.clone().expect("the confirmation");
+    assert_eq!(undo.decision_id, "decision-1");
+    let screen = screen_of(&app);
+    assert!(
+        screen.contains("it chose the output 'implemented'"),
+        "{screen}"
+    );
+    assert!(screen.contains("confidence: high"));
+    assert!(screen.contains("why: Both answers say every test passes."));
+    assert!(screen.contains("keeps its side effects"));
+
+    // `n` keeps it, `y` asks for the undo.
+    app.on_key(key(KeyCode::Char('n')));
+    assert!(task_view(&app).chat.undo.is_none());
+    app.on_key(key(KeyCode::Char('u')));
+    assert_eq!(
+        app.on_key(key(KeyCode::Char('y'))),
+        Request::UndoDecision {
+            execution_id: execution_id.clone(),
+            decision_id: "decision-1".to_string(),
+        }
+    );
+    // The daemon has no such decision saved: it refuses, and says so.
+    app.undo_decision(&execution_id, "decision-1").await;
+    assert!(app.notice().expect("a notice").is_error);
 }

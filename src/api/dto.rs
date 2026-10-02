@@ -17,8 +17,10 @@ use crate::conductor::{
     Annotation, ChatEntry, ConductorState, FailureReport, PendingInvocation, QueuedRequest,
     SavedDecision,
 };
-use crate::domain::{ExecutionStatus, ProblemKind, WorkflowExecution};
-use crate::engine::{InputContinuation, PendingHumanInput};
+use crate::domain::{
+    ConductorPurpose, ConductorTrigger, ExecutionStatus, ProblemKind, WorkflowExecution,
+};
+use crate::engine::{InputContinuation, PendingHumanInput, StepFailure};
 
 /// Authoritative default-harness selection returned by `GET`, `PUT`, and
 /// `DELETE /settings/agent-harness`.
@@ -211,6 +213,58 @@ pub struct ExecutionSummary {
     /// shown for another input than the one it summarizes.
     #[serde(default)]
     pub annotation: Option<Annotation>,
+    /// What the conductor is working on for this execution right now, if
+    /// anything (R11): the "conductor working: ..." of a list row.
+    #[serde(default)]
+    pub conductor: Option<ConductorActivity>,
+}
+
+/// The conductor's invocation under way for one execution (R11), as a list
+/// row needs it — the marker of [`PendingInvocation`] without its payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConductorActivity {
+    /// What the conductor is doing.
+    pub purpose: ConductorPurpose,
+    /// What asked for it.
+    pub trigger: ConductorTrigger,
+    /// The episode it is about (KTD9), when it is about one.
+    #[serde(default)]
+    pub episode: Option<String>,
+    /// When it started.
+    pub started_at: DateTime<Utc>,
+}
+
+impl ConductorActivity {
+    /// The activity the marker `pending` stands for.
+    pub fn of_pending(pending: &PendingInvocation) -> Self {
+        Self {
+            purpose: pending.request.purpose,
+            trigger: pending.request.trigger,
+            episode: pending.request.episode.clone(),
+            started_at: pending.started_at,
+        }
+    }
+
+    /// The activity a request still waiting its turn stands for.
+    pub fn of_queued(queued: &QueuedRequest) -> Self {
+        Self {
+            purpose: queued.purpose,
+            trigger: queued.trigger,
+            episode: queued.episode.clone(),
+            started_at: queued.queued_at,
+        }
+    }
+
+    /// The diagnosis `failure` of `execution` is owed, before the conductor
+    /// has written anything of it (F3).
+    pub fn owed_diagnosis(failure: &StepFailure, execution: &WorkflowExecution) -> Self {
+        Self {
+            purpose: ConductorPurpose::DiagnoseFailure,
+            trigger: ConductorTrigger::StepFailure,
+            episode: Some(failure.key().to_string()),
+            started_at: execution.completed_at.unwrap_or_else(Utc::now),
+        }
+    }
 }
 
 /// A problem an execution is stopped on (KTD3, KTD4).
@@ -275,6 +329,7 @@ impl From<&WorkflowExecution> for ExecutionSummary {
             pending_input: None,
             problem: None,
             annotation: None,
+            conductor: None,
         }
     }
 }

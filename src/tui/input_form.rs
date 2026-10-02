@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use crossterm::event::{KeyCode, KeyEvent};
 use serde_json::{Map, Value};
 
+use crate::conductor::Annotation;
 use crate::domain::{
     AnsweredBy, EventData, HumanInputField, HumanInputType, InputCloseReason, OutputDefinition,
 };
@@ -144,6 +145,14 @@ impl Entry {
             _ => Value::String(self.value.clone()),
         }
     }
+
+    /// Whether the entry still holds the value the conductor proposed: it
+    /// came from its analysis, and the operator has not edited it.
+    pub fn is_proposed(&self) -> bool {
+        self.original
+            .as_ref()
+            .is_some_and(|original| value_as_text(original) == self.value)
+    }
 }
 
 /// What a problem's form carries on top of a gate's.
@@ -155,6 +164,8 @@ pub struct ProblemForm {
     pub answers: Vec<RejectedAnswer>,
     /// The conductor's reasoning, when it analysed the problem.
     pub rationale: Option<String>,
+    /// The label the conductor proposed, when it proposed one.
+    pub proposed_label: Option<String>,
     /// What each label requires (KTD15).
     pub requirements: Vec<OutputRequirement>,
     /// Context variables that already hold a value: a label needing one of
@@ -336,6 +347,9 @@ pub struct InputForm {
     pub label_field: Option<usize>,
     /// What a problem adds: its answers, requirements and key–value maps.
     pub problem: Option<ProblemForm>,
+    /// The conductor's summary of the gate, when it made one (R30, AE16):
+    /// advisory only, the answer is still the operator's.
+    pub annotation: Option<Annotation>,
     /// The focused row.
     pub row: usize,
     /// The last validation or delivery failure, if any.
@@ -490,6 +504,7 @@ impl InputForm {
                 reason: problem.reason.clone(),
                 answers: problem.answers.clone(),
                 rationale: analysis.rationale.clone(),
+                proposed_label: analysis.label.clone(),
                 requirements: problem.requirements.clone(),
                 context_variables: context
                     .iter()
@@ -528,6 +543,7 @@ impl InputForm {
             label_index,
             label_field,
             problem,
+            annotation: None,
             row: 0,
             error: None,
             error_row: None,
@@ -536,6 +552,29 @@ impl InputForm {
         };
         form.sync_required_entries();
         form
+    }
+
+    /// The same form, with the conductor's summary of the gate it answers.
+    /// One about another input than this form's is ignored.
+    pub fn with_annotation(mut self, annotation: Option<&Annotation>) -> Self {
+        self.annotate(annotation);
+        self
+    }
+
+    /// Takes the conductor's summary of the gate once it arrives — it is
+    /// made beside the gate and may come after the form was opened.
+    pub fn annotate(&mut self, annotation: Option<&Annotation>) {
+        if let Some(annotation) = annotation.filter(|annotation| annotation.key == self.episode) {
+            self.annotation = Some(annotation.clone());
+        }
+    }
+
+    /// Whether `label` is the one the conductor proposed for this problem.
+    pub fn is_proposed_label(&self, label: &str) -> bool {
+        self.problem
+            .as_ref()
+            .and_then(|problem| problem.proposed_label.as_deref())
+            == Some(label)
     }
 
     /// The rows, in the order they are drawn and navigated.

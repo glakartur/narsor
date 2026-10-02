@@ -419,10 +419,23 @@ The split is proportional, so a resize preserves the arrangement; only the
 shortcut bar has a fixed height. Modals (the input form, the transition menu,
 the override confirmation, the key map) are centred overlays drawn on top.
 
-Updates come from `Engine::subscribe`, not from polling the disk; the event log
-is read once, to backfill the history of a newly selected execution. A
-broadcast channel that lags or closes is shown as an explicit indicator in the
-Events panel title rather than a view that silently stops moving.
+Updates come from the daemon's live event stream; the event log is read once,
+to backfill the history of a newly selected execution. A stream that lags or
+closes is shown as an explicit indicator in the Events panel title rather than
+a view that silently stops moving. On top of the stream, the interface re-reads
+the daemon on its own: every `tui_refresh_interval` (10 s by default, `none`
+turns it off; see [Configuration](#configuration)), and shortly after any event
+that changes a status, a pending input, a problem or what the conductor is
+doing. A refresh never resets what is on screen: the selection, the cursors,
+the follow mode, an open form with what was typed into it and a half-written
+chat message all stay.
+
+The header counts what waits for an operator — `2 questions · 1 problem` — and
+a question or a problem on a task other than the selected one is announced on
+the status bar. A **question** (yellow) is a `human` gate or an agent's
+question; a **problem** (red) is a step the engine and the conductor could not
+settle: an agent answer without a usable output label, or a step that failed
+and stays `failed` with the conductor's report beside it.
 
 **Key map** (also available in the interface itself, under `?`):
 
@@ -447,7 +460,20 @@ Events panel title rather than a view that silently stops moving.
 | Task view | `g` / `Home`, `G` / `End` | first / last entry of the focused pane |
 | Task view | `r` | reload the step axis and re-read the selected step's content |
 | Task view | `Enter`, `space` (content pane) | expand or collapse a conversation entry |
+| Task view | `i` | the same input form as on the panels, or the failure form of a failed step |
+| Task view | `c` | open the conductor's chat (below the step's content) |
 | Task view | `Esc` | back to where the task view was opened from, selection preserved |
+| Conductor chat | printable keys, `Backspace`, `Enter` | write a message, send it |
+| Conductor chat | `Tab` | switch between the message and the history |
+| Conductor chat (history) | `j` / `↓`, `k` / `↑`, `g` / `G` | select an entry |
+| Conductor chat (history) | `y` / `Enter`, `n` | confirm, reject the selected proposal |
+| Conductor chat (history) | `u` | undo the selected decision (then `y` to confirm, `n` / `Esc` to keep it) |
+| Conductor chat (history) | `r` | read the chat again |
+| Conductor chat | `Esc` | close the chat; the message being written is kept |
+| Failure form | `Tab` / `↓`, `Shift+Tab` / `↑` | next / previous row |
+| Failure form | `y` / `Enter`, `n` (on a proposal) | confirm, reject the proposal |
+| Failure form | printable keys, `Enter` (on the note) | write the note, restart the step with it |
+| Failure form | `Esc` | close |
 | Event detail window | `j` / `↓`, `k` / `↑`, `PgUp` / `PgDn`, `g` / `G` | scroll |
 | Event detail window | `Esc` | close |
 | Input form | `Tab` / `↓`, `Shift+Tab` / `↑` | next / previous field |
@@ -494,10 +520,9 @@ on an execution selects the step currently running, or the last one when
 nothing is. Conversation entries are shown by kind (user, assistant, thinking,
 tool call, tool result, the harness's final result, system, `stderr`, narsor)
 and long ones are collapsed to a few lines by default — `Enter`/`space`
-expands or collapses the one under the content cursor. Nothing here
-auto-refreshes: `r` re-reads the step axis and the selected step's content
-from the embedded API (below), on demand, including a step that is still
-running. `Esc` returns to wherever the task view was opened from — the
+expands or collapses the one under the content cursor. The view is refreshed
+with the rest of the interface, and `r` re-reads the step axis and the
+selected step's content on demand, including a step that is still running. `Esc` returns to wherever the task view was opened from — the
 execution list, the Events panel, or the detail window — with that view's
 selection exactly as it was, even if new events arrived while the task view
 was open.
@@ -545,6 +570,36 @@ module (`src/tasks`), so the workspace is expanded, resolved registry-first and
 cloned identically whichever started the task, and an execution started here is
 resumable from the command line and vice versa.
 
+**The conductor in the interface.** Everything the conductor does is visible
+and settled from here (see [The conductor](#the-conductor)):
+
+* while it works on a task, the list row, the details panel and the task
+  view's header say what it is doing — `◆ conductor: diagnosing the failure`,
+  `conductor: choosing the output after a reprompt`, `conductor: answering the
+  chat`;
+* `i` on a **problem** shows the agent's answers, the conductor's analysis and
+  each output label with its description; the label and the `data`/`variables`
+  values the conductor proposed are marked `◆` until edited;
+* `i` on a **gate** the conductor summarized shows its summary and
+  recommendation above the fields — advisory only, the answer stays yours;
+* `i` on a **failed step** opens the failure form: the conductor's diagnosis
+  with its confidence and rationale, the actions it proposed (each confirmed
+  or rejected there), and a restart of the step with a note for its next
+  attempt. The restart names the failure, so it is refused if the execution
+  has moved on meanwhile. When the conductor could not answer — twice — the
+  form shows the raw error and no analysis;
+* `c` in the task view opens the chat: the whole history (it lives in the
+  daemon, so it is there after the interface restarts), each proposal with
+  its state, each decision with its confidence and rationale. A proposal is
+  carried out only when you confirm it; one about a moment the execution has
+  moved on from is refused with a message, and the view is read again. The
+  conductor's own choice of a step's output can be undone: the confirmation
+  shows what it chose, how sure it was and why, and the step becomes a
+  problem again — a step after it that already started keeps its side
+  effects;
+* a failure the conductor takes up is not announced on the status bar as
+  `failed`; the problem it raises, or its one restart of the step, is.
+
 **The one thing only the TUI can do** is the forced transition to an arbitrary
 state; there is no CLI equivalent for it yet.
 
@@ -554,6 +609,52 @@ appended to `{root}/narsor.log` instead; with `RUST_LOG` unset no
 subscriber is installed at all and the records are dropped. Either way nothing
 reaches the terminal while the interface is up. Every other subcommand keeps
 logging to stderr.
+
+---
+
+## The conductor
+
+The daemon runs a **conductor** beside every execution: an assistant on the
+default harness (the one `agent_harness` names, or the harness picked in the
+interface) that reads the task and never writes it. It has one history per
+execution, with its chat, kept under the daemon's data directory, so it
+survives a restart of the daemon and of the interface.
+
+It steps in on its own in three places, each with fixed limits:
+
+* **A step without a usable output label.** The engine first asks the agent
+  once more in the same session. If that does not help either, the conductor
+  reads the answers and either chooses the output (with the `data` and
+  `variables` it needs), asks the agent once more itself, or hands the step to
+  the operator as a **problem** with its analysis. At most two extra questions
+  reach the agent in total. A choice it made can be undone.
+* **A step that failed** after its `retry_policy` ran out. The execution stays
+  `failed`. The conductor diagnoses the failure and proposes what to do; it may
+  restart the step once by itself, with a note, and only when no attempt of the
+  step can have had a side effect. It never chooses a transition after a
+  failure — that can only be proposed.
+* **A `human` gate.** It may add a summary and a recommendation to the form.
+  The gate always waits for the operator.
+
+Every decision it takes is an event with its confidence and rationale
+(`narsor events`). If the conductor itself cannot answer, its invocation is
+repeated once — also across a daemon restart — and then the operator gets a
+problem with the raw error; a failure of the conductor never triggers the
+conductor again.
+
+**The chat** (`c` in the task view, or `narsor conductor chat|history`) lets
+you ask about the task. Whatever it proposes — answering the pending input,
+telling the agent something, restarting the failed step, taking a transition,
+cancelling — happens only once you confirm it (`narsor conductor confirm`,
+`reject`, `undo`). A proposal about a moment the execution has moved on from
+is refused (`409`).
+
+**Read-only, per harness.** On `claude-code` and `codex` the conductor runs in
+the task's workspace in the harness's own read-only mode (`plan`,
+`--sandbox read-only`). `opencode` has no such mode, so there the conductor
+runs in an empty scratch directory and knows the task only from the snapshot
+it is given: on opencode, read-only means **isolation from the workspace
+directory, not a sandbox**.
 
 ---
 

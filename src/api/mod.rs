@@ -77,7 +77,7 @@ pub use active::ActiveTasks;
 pub use client::{ApiClient, ClientError};
 pub use discovery::{ensure_daemon_running, DiscoveryError};
 pub use dto::{
-    AcceptedResponse, ActiveProblem, ChatMessageRequest, ConductorChatResponse,
+    AcceptedResponse, ActiveProblem, ChatMessageRequest, ConductorActivity, ConductorChatResponse,
     ConductorStateResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
     OperatorNoteRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
     StartTaskResponse, TransitionRequest,

@@ -34,6 +34,8 @@ use super::app::{
     task_position_line, App, Attention, EntryMap, FormRow, InputForm, InputKind, Modal,
     NewTaskStage, Panel, RepositoryField, Screen, TaskContent, TaskFocus, TaskView, TransitionMode,
 };
+use super::chat::{chat_item_lines, ChatFocus, ChatPanel};
+use super::failure_form::FailureRow;
 use super::scroll::wrap_visible;
 use crate::domain::{ExecutionStatus, HumanInputType};
 
@@ -42,6 +44,9 @@ const QUESTION_COLOUR: Color = Color::LightYellow;
 
 /// The colour of an execution stopped on a problem.
 const PROBLEM_COLOUR: Color = Color::LightRed;
+
+/// The colour of what the conductor does or proposes.
+const CONDUCTOR_COLOUR: Color = Color::LightMagenta;
 
 /// Height of the shortcut bar, borders included.
 const SHORTCUT_BAR_HEIGHT: u16 = 3;
@@ -130,6 +135,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     match app.modal() {
         Modal::None => {}
         Modal::Input(_) => render_input_modal(frame, app),
+        Modal::Failure(_) => render_failure_modal(frame, app),
         Modal::RecoveryComment(_) => render_recovery_comment_modal(frame, app),
         Modal::EventDetail(_) => render_event_detail_modal(frame, app),
         Modal::Transition(_) => render_transition_modal(frame, app),
@@ -153,19 +159,109 @@ fn render_task_view(frame: &mut Frame, app: &App, view: &TaskView) {
     let [axis_area, content_area] =
         Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(body);
 
-    render_task_axis(frame, view, axis_area);
-    render_task_content(frame, view, content_area);
+    render_task_axis(frame, app, view, axis_area);
+    if view.chat.open {
+        // The chat shares the right column with the step's content, so the
+        // conversation it talks about stays in sight.
+        let [content_area, chat_area] =
+            Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .areas(content_area);
+        render_task_content(frame, view, content_area);
+        render_chat_panel(frame, &view.chat, chat_area);
+    } else {
+        render_task_content(frame, view, content_area);
+    }
     render_shortcuts(frame, app, shortcuts);
 
-    // `i` works from the task view too (R1), and its form is the only
-    // overlay drawn over it.
-    if matches!(app.modal(), Modal::Input(_)) {
-        render_input_modal(frame, app);
+    // `i` works from the task view too (R1), and its forms are the only
+    // overlays drawn over it.
+    match app.modal() {
+        Modal::Input(_) => render_input_modal(frame, app),
+        Modal::Failure(_) => render_failure_modal(frame, app),
+        _ => {}
     }
 }
 
+/// The conductor's chat in the task view (F4): the history, each proposal
+/// with its state and each decision with its confidence and rationale, and
+/// the message being written — or the confirmation an undo waits for.
+fn render_chat_panel(frame: &mut Frame, chat: &ChatPanel, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(CONDUCTOR_COLOUR))
+        .title(format!(" Conductor chat — {} entries ", chat.entries.len()));
+    let inner_width = area.width.saturating_sub(2).max(1) as usize;
+    let inner_height = area.height.saturating_sub(2).max(1) as usize;
+
+    let mut footer: Vec<String> = vec![String::new()];
+    if let Some(undo) = &chat.undo {
+        footer.push(format!("Undo the conductor's decision: {}", undo.text));
+        if let Some(label) = &undo.label {
+            footer.push(format!("  it chose the output '{label}'"));
+        }
+        footer.push(format!(
+            "  confidence: {}",
+            undo.confidence
+                .map_or("unknown", |confidence| confidence.name())
+        ));
+        if let Some(rationale) = &undo.rationale {
+            footer.push(format!("  why: {rationale}"));
+        }
+        footer.push(
+            "  The step becomes a problem again; a step after it that already started keeps \
+             its side effects."
+                .to_string(),
+        );
+        footer.push("  y — undo,  n/Esc — keep it".to_string());
+    } else {
+        let marker = if chat.focus == ChatFocus::Draft {
+            "›"
+        } else {
+            " "
+        };
+        footer.push(format!("{marker} message: {}", chat.draft));
+    }
+
+    let items = chat.items();
+    let mut lines: Vec<String> = Vec::new();
+    let mut selected_start = 0;
+    if items.is_empty() {
+        lines.push(if chat.loaded {
+            "No messages yet: write to the conductor below.".to_string()
+        } else {
+            "Loading the chat…".to_string()
+        });
+    }
+    for (index, item) in items.iter().enumerate() {
+        let selected = index == chat.selected && chat.focus == ChatFocus::History;
+        if index == chat.selected {
+            selected_start = lines.len();
+        }
+        for (number, line) in chat_item_lines(item).into_iter().enumerate() {
+            let marker = if selected && number == 0 {
+                "› "
+            } else {
+                "  "
+            };
+            lines.push(format!("{marker}{line}"));
+        }
+    }
+
+    let history_height = inner_height.saturating_sub(footer.len()).max(1);
+    let offset = if lines.len() <= history_height {
+        0
+    } else {
+        selected_start.min(lines.len() - history_height)
+    };
+    let mut visible = wrap_visible(&lines, inner_width, offset, history_height);
+    visible.extend(footer);
+    let visible: Vec<Line> = visible.into_iter().map(Line::from).collect();
+    frame.render_widget(Paragraph::new(visible).block(block), area);
+}
+
 /// The task view's left pane: every position, in timeline order (R7).
-fn render_task_axis(frame: &mut Frame, view: &TaskView, area: Rect) {
+fn render_task_axis(frame: &mut Frame, app: &App, view: &TaskView, area: Rect) {
     let focused = view.focus == TaskFocus::Axis;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -179,7 +275,16 @@ fn render_task_axis(frame: &mut Frame, view: &TaskView, area: Rect) {
         } else {
             Color::DarkGray
         }))
-        .title(format!(" Steps — {} ", view.execution_id));
+        .title(
+            match app
+                .row(&view.execution_id)
+                .and_then(|row| row.conductor_line())
+            {
+                // R11: the task's header says what the conductor is doing.
+                Some(working) => format!(" Steps — {} · {working} ", view.execution_id),
+                None => format!(" Steps — {} ", view.execution_id),
+            },
+        );
 
     if view.timeline.positions.is_empty() {
         frame.render_widget(
@@ -365,7 +470,7 @@ fn render_executions(frame: &mut Frame, app: &App, area: Rect) {
             if let Some(attention) = attention {
                 status.push(Span::styled(format!(" · {}", attention.label()), style));
             }
-            ListItem::new(vec![
+            let mut lines = vec![
                 Line::from(status),
                 Line::from(Span::styled(
                     format!(
@@ -375,7 +480,15 @@ fn render_executions(frame: &mut Frame, app: &App, area: Rect) {
                     ),
                     Style::default().fg(Color::DarkGray),
                 )),
-            ])
+            ];
+            // R11, AE12: what the conductor is doing for this task.
+            if let Some(working) = row.conductor_line() {
+                lines.push(Line::from(Span::styled(
+                    format!("  ◆ {working}"),
+                    Style::default().fg(CONDUCTOR_COLOUR),
+                )));
+            }
+            ListItem::new(lines)
         })
         .collect();
 
@@ -435,6 +548,13 @@ fn render_details(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
     ];
+
+    if let Some(working) = app.selected().and_then(|row| row.conductor_line()) {
+        lines.push(Line::from(Span::styled(
+            format!("◆ {working}"),
+            Style::default().fg(CONDUCTOR_COLOUR),
+        )));
+    }
 
     lines.extend(waiting_lines(app));
 
@@ -531,9 +651,11 @@ fn waiting_lines(app: &App) -> Vec<Line<'static>> {
                 Some("Press i to settle it."),
             ),
         },
-        (None, Some(active)) if app.selected_attention() == Some(Attention::Problem) => {
-            (format!("Problem — {}", active.reason), problem, None)
-        }
+        (None, Some(active)) if app.selected_attention() == Some(Attention::Problem) => (
+            format!("Problem — {}", active.reason),
+            problem,
+            Some("Press i to settle it."),
+        ),
         _ => return Vec::new(),
     };
     let mut lines = vec![Line::from(""), Line::from(Span::styled(text, style))];
@@ -676,7 +798,12 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
                     .cloned()
                     .flatten()
                     .unwrap_or_else(|| "(infer from the select field)".to_string());
-                format!("{marker} output label: {value}")
+                let proposed = if form.is_proposed_label(&value) {
+                    "  ◆ proposed by the conductor"
+                } else {
+                    ""
+                };
+                format!("{marker} output label: {value}{proposed}")
             }
             FormRow::Entry(map, entry_index) => {
                 let entry = &form
@@ -695,7 +822,16 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
                     (true, false) => (entry.key.clone(), format!("[{}]", entry.value)),
                     (false, _) => (entry.key.clone(), entry.value.clone()),
                 };
-                format!("{marker} {}.{key}{requirement} = {value}", map.name())
+                // Values the conductor proposed are marked until edited.
+                let proposed = if entry.is_proposed() {
+                    "  ◆ conductor"
+                } else {
+                    ""
+                };
+                format!(
+                    "{marker} {}.{key}{requirement} = {value}{proposed}",
+                    map.name()
+                )
             }
             FormRow::AddEntry(map) => {
                 let noun = match map {
@@ -736,9 +872,16 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
                 } else {
                     "○"
                 };
+                let proposed = if form.is_proposed_label(&output.label) {
+                    "  ◆ conductor's proposal"
+                } else {
+                    ""
+                };
                 let text = match form.description_of(&output.label) {
-                    Some(description) => format!("    {bullet} {} — {description}", output.label),
-                    None => format!("    {bullet} {}", output.label),
+                    Some(description) => {
+                        format!("    {bullet} {} — {description}{proposed}", output.label)
+                    }
+                    None => format!("    {bullet} {}{proposed}", output.label),
                 };
                 lines.push(Line::from(Span::styled(text, dim)));
             }
@@ -831,9 +974,25 @@ fn input_context_lines(form: &InputForm) -> Vec<Line<'static>> {
                     lines.extend(tail_lines(tail, dim));
                 }
             }
-            if let Some(rationale) = &problem.rationale {
-                lines.push(Line::from(Span::styled("Conductor's analysis:", bold)));
-                lines.extend(rationale.lines().map(|line| Line::from(line.to_string())));
+            if problem.rationale.is_some() || problem.proposed_label.is_some() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Conductor's analysis (◆ marks what it proposed):",
+                    bold.fg(CONDUCTOR_COLOUR),
+                )));
+                if let Some(label) = &problem.proposed_label {
+                    lines.push(Line::from(Span::styled(
+                        format!("  ◆ proposed output: {label}"),
+                        Style::default().fg(CONDUCTOR_COLOUR),
+                    )));
+                }
+                if let Some(rationale) = &problem.rationale {
+                    lines.extend(
+                        rationale
+                            .lines()
+                            .map(|line| Line::from(format!("  {line}"))),
+                    );
+                }
             }
         }
         None => {
@@ -844,7 +1003,158 @@ fn input_context_lines(form: &InputForm) -> Vec<Line<'static>> {
             }
         }
     }
+
+    // R30, AE16: the conductor's summary of the gate, advisory only.
+    if let Some(annotation) = &form.annotation {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Conductor's summary (advisory — the answer is yours):",
+            bold.fg(CONDUCTOR_COLOUR),
+        )));
+        lines.extend(
+            annotation
+                .summary
+                .lines()
+                .map(|line| Line::from(format!("  {line}"))),
+        );
+        if let Some(recommendation) = &annotation.recommendation {
+            lines.push(Line::from(Span::styled(
+                format!("  ◆ recommendation: {recommendation}"),
+                Style::default().fg(CONDUCTOR_COLOUR),
+            )));
+        }
+    }
     lines
+}
+
+/// The failure variant of `i` (KTD4): the failed step, the conductor's
+/// diagnosis and proposals — or the raw error when it could not make one
+/// (R24) — and the restart with a note.
+fn render_failure_modal(frame: &mut Frame, app: &App) {
+    let Modal::Failure(form) = app.modal() else {
+        return;
+    };
+    let area = modal_area(frame, 80, 80);
+    frame.render_widget(Clear, area);
+
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let conductor = Style::default().fg(CONDUCTOR_COLOUR);
+    let mut lines = Vec::new();
+    if let Some(closed) = &form.closed {
+        lines.push(Line::from(Span::styled(
+            format!("✖ {closed}"),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("The step '{}' failed.", form.state_id),
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )));
+
+    match (&form.diagnosis, &form.raw_error) {
+        (Some(diagnosis), _) => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Conductor's diagnosis:",
+                bold.fg(CONDUCTOR_COLOUR),
+            )));
+            lines.extend(
+                diagnosis
+                    .lines()
+                    .map(|line| Line::from(format!("  {line}"))),
+            );
+            if let Some(confidence) = form.confidence {
+                lines.push(Line::from(Span::styled(
+                    format!("  confidence: {}", confidence.name()),
+                    conductor,
+                )));
+            }
+            if let Some(rationale) = &form.rationale {
+                lines.push(Line::from(Span::styled(
+                    format!("  why: {rationale}"),
+                    conductor,
+                )));
+            }
+        }
+        (None, Some(error)) => {
+            // R24: the conductor could not answer twice; the operator gets
+            // the failure as it was, and no analysis.
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("Error:", bold)));
+            lines.extend(error.lines().map(|line| Line::from(format!("  {line}"))));
+        }
+        (None, None) => {}
+    }
+
+    lines.push(Line::from(""));
+    if !form.proposals.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "The conductor proposes (nothing happens until you confirm):",
+            bold,
+        )));
+    }
+    for (index, row) in form.rows().iter().enumerate() {
+        let focused = index == form.row;
+        let marker = if focused { "›" } else { " " };
+        let text = match row {
+            FailureRow::Proposal(proposal) => {
+                let item = &form.proposals[*proposal];
+                format!("{marker} ◆ {}", item.entry.text)
+            }
+            FailureRow::Note => {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Restart the step with a note for its next attempt:",
+                    bold,
+                )));
+                format!("{marker} note: {}", form.note.value)
+            }
+        };
+        lines.push(Line::from(Span::styled(
+            text,
+            if focused {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            },
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "A restart names this failure: if the execution moved on meanwhile, it is refused.",
+        dim,
+    )));
+
+    if let Some(error) = &form.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(if form.closed.is_some() {
+            Color::DarkGray
+        } else {
+            PROBLEM_COLOUR
+        }))
+        .title(if form.closed.is_some() {
+            " Resolve the failure (closed) "
+        } else {
+            " Resolve the failure "
+        });
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// The last [`ANSWER_TAIL_LINES`] lines of an answer, indented.
@@ -1476,12 +1786,22 @@ fn render_help_modal(frame: &mut Frame) {
         Line::from("  n                 new task (pick a workflow and start it)"),
         Line::from("  R                 repositories (a — register, d — remove)"),
         Line::from("  s                 run / resume the selected execution"),
-        Line::from("  i                 answer the pending input: gate, agent question, problem"),
+        Line::from("  i                 answer the pending input: gate, agent question, problem;"),
+        Line::from(
+            "                    on a failed step: diagnosis, proposals, restart with a note",
+        ),
         Line::from("  t                 manual transition (o — override mode)"),
         Line::from("  x                 interrupt active execution (confirmation required)"),
         Line::from("  f                 follow the event stream"),
         Line::from("  Enter             (Events panel) open the event's detail window"),
         Line::from("  c                 (Events panel / detail window) open its conversation"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Task view",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  c                 conductor chat: Enter sends, Tab switches to the history,"),
+        Line::from("                    y / n confirm / reject a proposal, u undoes a decision"),
         Line::from(""),
         Line::from(Span::styled(
             "Event detail window",

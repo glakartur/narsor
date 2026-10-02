@@ -63,7 +63,7 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::api::active::ActiveTasks;
 use crate::api::dto::{
-    AcceptedResponse, ActiveProblem, ChatMessageRequest, ConductorChatResponse,
+    AcceptedResponse, ActiveProblem, ChatMessageRequest, ConductorActivity, ConductorChatResponse,
     ConductorStateResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
     OperatorNoteRequest, RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest,
     StartTaskRequest, StartTaskResponse, TransitionRequest,
@@ -1126,7 +1126,39 @@ fn build_summary(
             .as_ref()
             .map(ActiveProblem::of_failure),
     };
+    summary.conductor = conductor_activity(store, execution);
     Ok(summary)
+}
+
+/// What the conductor of `execution` is working on (R11): the invocation
+/// under way, else the first request waiting its turn, else the diagnosis
+/// a step failure still owes — the engine records the failure before the
+/// conductor's own marker is written, so a list read in between still
+/// shows that the conductor takes it up. `None` when it has nothing to do.
+fn conductor_activity(
+    store: &ExecutionStore,
+    execution: &crate::domain::WorkflowExecution,
+) -> Option<ConductorActivity> {
+    let conductor = ConductorStore::new(store.paths(), &execution.id);
+    let state = if conductor.exists() {
+        Some(conductor.load_state().ok()?)
+    } else {
+        None
+    };
+    if let Some(state) = &state {
+        if let Some(pending) = &state.pending {
+            return Some(ConductorActivity::of_pending(pending));
+        }
+        if let Some(queued) = state.queue.first() {
+            return Some(ConductorActivity::of_queued(queued));
+        }
+    }
+    let failure = crate::engine::step_failure(execution).ok().flatten()?;
+    let concluded = state
+        .as_ref()
+        .and_then(|state| state.failure.as_ref())
+        .is_some_and(|report| report.key == failure.key());
+    (!concluded).then(|| ConductorActivity::owed_diagnosis(&failure, execution))
 }
 
 // ---------------------------------------------------------------------------
