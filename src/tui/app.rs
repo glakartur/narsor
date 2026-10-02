@@ -3948,7 +3948,7 @@ impl App {
             other => {
                 self.notice = Some(Notice::error(format!(
                     "An execution that is {} cannot be run.",
-                    status_name(&other)
+                    other.as_str()
                 )));
                 return;
             }
@@ -4561,20 +4561,6 @@ fn notice_for(event: &Event) -> Option<Notice> {
             "Execution {execution_id}: {message}"
         ))),
         _ => None,
-    }
-}
-
-/// The schema spelling of a status — the same words the CLI prints.
-pub fn status_name(status: &ExecutionStatus) -> &'static str {
-    match status {
-        ExecutionStatus::Running => "running",
-        ExecutionStatus::Paused => "paused",
-        ExecutionStatus::InputNeeded => "input_needed",
-        ExecutionStatus::WaitingForEvent => "waiting_for_event",
-        ExecutionStatus::Completed => "completed",
-        ExecutionStatus::Failed => "failed",
-        ExecutionStatus::Cancelled => "cancelled",
-        ExecutionStatus::Unknown => "unknown",
     }
 }
 

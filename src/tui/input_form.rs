@@ -439,9 +439,6 @@ impl InputClosure {
                 Some(by) => format!("Closed by a transition ({by})."),
                 None => "Closed by a transition.".to_string(),
             },
-            Some(InputCloseReason::Interrupt) => {
-                "Closed: the execution was interrupted.".to_string()
-            }
             Some(InputCloseReason::Recover) => {
                 "Closed: the step was recovered and starts afresh.".to_string()
             }

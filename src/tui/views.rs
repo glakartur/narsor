@@ -30,9 +30,9 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use super::app::{
-    event_detail_lines, event_line, status_name, task_conversation_lines, task_events_lines,
-    task_position_line, App, Attention, EntryMap, FormRow, InputForm, InputKind, Modal,
-    NewTaskStage, Panel, RepositoryField, Screen, TaskContent, TaskFocus, TaskView, TransitionMode,
+    event_detail_lines, event_line, task_conversation_lines, task_events_lines, task_position_line,
+    App, Attention, EntryMap, FormRow, InputForm, InputKind, Modal, NewTaskStage, Panel,
+    RepositoryField, Screen, TaskContent, TaskFocus, TaskView, TransitionMode,
 };
 use super::chat::{chat_item_lines, ChatFocus, ChatPanel};
 use super::failure_form::FailureRow;
@@ -465,7 +465,7 @@ fn render_executions(frame: &mut Frame, app: &App, area: Rect) {
             let mut status = vec![
                 Span::styled(short, Style::default().fg(Color::White)),
                 Span::raw("  "),
-                Span::styled(status_name(&row.status), style),
+                Span::styled(row.status.as_str(), style),
             ];
             if let Some(attention) = attention {
                 status.push(Span::styled(format!(" · {}", attention.label()), style));
@@ -531,9 +531,9 @@ fn render_details(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 match app.selected_attention() {
                     Some(attention) => {
-                        format!("{} ({})", status_name(&execution.status), attention.label())
+                        format!("{} ({})", execution.status.as_str(), attention.label())
                     }
-                    None => status_name(&execution.status).to_string(),
+                    None => execution.status.as_str().to_string(),
                 },
                 status_style(&execution.status, app.selected_attention()),
             ),

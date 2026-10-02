@@ -10,6 +10,8 @@
 //! `~/.config`. `/etc/narsor/` is not writable by a test and is therefore
 //! never a factor.
 
+mod engine_support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -100,7 +102,7 @@ fn cli(root: &TempRoot, environment: &[(&str, &str)], args: &[&str]) -> Invocati
     command
         .current_dir(root.path())
         .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", engine_support::fake_claude_first_on_path())
         .env("HOME", root.path())
         .env("XDG_CONFIG_HOME", root.path().join("config"));
     for (name, value) in environment {

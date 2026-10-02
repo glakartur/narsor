@@ -320,7 +320,7 @@ pub async fn list(state: &Path, flags: &Flags) -> Result<()> {
         println!(
             "{:<38} {:<10} {:<22} {}",
             execution.id,
-            status_name(&execution.status),
+            execution.status.as_str(),
             execution.current_state.as_deref().unwrap_or("-"),
             execution.workflow_id
         );
@@ -347,7 +347,7 @@ pub async fn show(state: &Path, flags: &Flags, execution_id: &str) -> Result<()>
         "Workflow:      {} (version {})",
         execution.workflow_id, execution.workflow_version
     );
-    println!("Status:        {}", status_name(&execution.status));
+    println!("Status:        {}", execution.status.as_str());
     println!(
         "Current state: {}",
         execution.current_state.as_deref().unwrap_or("-")
@@ -661,7 +661,7 @@ pub async fn input(
     let Some(pending) = &current.pending_input else {
         return Err(CliError::failure(format!(
             "Execution '{execution_id}' is not waiting for human input (status: {}).",
-            status_name(&current.status)
+            current.status.as_str()
         )));
     };
     let delivery = delivery.for_episode(pending.episode_key());
@@ -1282,7 +1282,7 @@ fn print_summary(summary: &ExecutionSummary) {
 /// print byte-for-byte what they always did regardless of which of the two
 /// shapes above they are holding.
 fn print_status_line(status: &ExecutionStatus, current_state: Option<&str>) {
-    println!("Status: {}", status_name(status));
+    println!("Status: {}", status.as_str());
     println!("Current state: {}", current_state.unwrap_or("-"));
 }
 
@@ -1512,20 +1512,6 @@ fn is_final(status: &ExecutionStatus) -> bool {
         status,
         ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
     )
-}
-
-/// The schema spelling of a status.
-fn status_name(status: &ExecutionStatus) -> &'static str {
-    match status {
-        ExecutionStatus::Running => "running",
-        ExecutionStatus::Paused => "paused",
-        ExecutionStatus::InputNeeded => "input_needed",
-        ExecutionStatus::WaitingForEvent => "waiting_for_event",
-        ExecutionStatus::Completed => "completed",
-        ExecutionStatus::Failed => "failed",
-        ExecutionStatus::Cancelled => "cancelled",
-        ExecutionStatus::Unknown => "unknown",
-    }
 }
 
 // ---------------------------------------------------------------------------

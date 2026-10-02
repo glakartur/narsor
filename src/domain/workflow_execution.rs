@@ -32,6 +32,22 @@ pub enum ExecutionStatus {
     Unknown,
 }
 
+impl ExecutionStatus {
+    /// The schema spelling of the status — the same words the CLI prints.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExecutionStatus::Running => "running",
+            ExecutionStatus::Paused => "paused",
+            ExecutionStatus::InputNeeded => "input_needed",
+            ExecutionStatus::WaitingForEvent => "waiting_for_event",
+            ExecutionStatus::Completed => "completed",
+            ExecutionStatus::Failed => "failed",
+            ExecutionStatus::Cancelled => "cancelled",
+            ExecutionStatus::Unknown => "unknown",
+        }
+    }
+}
+
 /// A running or completed workflow execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowExecution {

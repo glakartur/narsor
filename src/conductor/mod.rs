@@ -64,8 +64,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 pub use actor::{
     AdvisoryInterrupts, ConductorActor, ConductorAnswer, ConductorInvoker, Invocation,
-    InvocationOutcome, InvocationQueue, UnavailableInvoker, CONDUCTOR_UNAVAILABLE,
-    MAX_AUTOMATIC_ATTEMPTS,
+    InvocationOutcome, InvocationQueue, MAX_AUTOMATIC_ATTEMPTS,
 };
 pub use chat::{annotation_of, ProposalContext, ProposalRecord};
 pub use failure::{active_failure_problem, agent_attempt_left_traces, PassLauncher};

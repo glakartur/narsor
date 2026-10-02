@@ -408,8 +408,6 @@ pub enum InputCloseReason {
     Answered,
     /// A manual or forced transition left the state it was asked in.
     Transition,
-    /// An operator interrupted the execution.
-    Interrupt,
     /// An operator recovery started the state's action afresh.
     Recover,
     /// The execution was cancelled.
@@ -425,7 +423,6 @@ impl InputCloseReason {
         match self {
             Self::Answered => "answered",
             Self::Transition => "transition",
-            Self::Interrupt => "interrupt",
             Self::Recover => "recover",
             Self::Cancel => "cancel",
             Self::Undo => "undo",

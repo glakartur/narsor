@@ -18,7 +18,6 @@ use narsor::conductor::{
     Annotation, ChatAuthor, ChatEntry, ChatEntryKind, ConductorActor, ConductorAnswer,
     ConductorInvoker, ConductorRegistry, ConductorState, ConductorStore, Invocation,
     InvocationOutcome, InvocationQueue, PendingInvocation, QueuedRequest, SavedDecision,
-    UnavailableInvoker, CONDUCTOR_UNAVAILABLE,
 };
 use narsor::domain::{
     ConductorDecisionKind, ConductorOutcome, ConductorPurpose, ConductorTrigger, Confidence,
@@ -31,6 +30,27 @@ use tokio::sync::{oneshot, Notify};
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
+
+/// An invoker with no conductor to run: every invocation fails, saying so,
+/// so a chat message gets an error entry (KTD12) rather than waiting forever.
+#[derive(Debug, Clone, Copy, Default)]
+struct UnavailableInvoker;
+
+/// The error an [`UnavailableInvoker`] fails every invocation with.
+const CONDUCTOR_UNAVAILABLE: &str = "the conductor cannot be invoked in this version";
+
+impl ConductorInvoker for UnavailableInvoker {
+    fn invoke<'a>(
+        &'a self,
+        _invocation: &'a Invocation,
+    ) -> Pin<Box<dyn Future<Output = InvocationOutcome> + Send + 'a>> {
+        Box::pin(async {
+            InvocationOutcome::Failed {
+                error: CONDUCTOR_UNAVAILABLE.to_string(),
+            }
+        })
+    }
+}
 
 /// A stub conductor: answers every invocation with a message naming what it
 /// was asked, remembers the order it was asked in, and — when told to —
@@ -304,6 +324,32 @@ async fn a_chat_line_cut_short_by_a_crash_is_skipped() {
     std::fs::write(&path, raw).expect("write a torn line");
 
     assert_eq!(store.read_chat().expect("read the chat"), vec![entry]);
+}
+
+#[tokio::test]
+async fn appending_after_a_torn_chat_line_drops_the_fragment() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let first = store
+        .append_chat(operator_message("first"))
+        .expect("append");
+
+    let path = store.dir().join("chat.jsonl");
+    let mut raw = std::fs::read(&path).expect("read the chat file");
+    raw.extend_from_slice(br#"{"id":"half-writ"#);
+    std::fs::write(&path, raw).expect("write a torn line");
+
+    let second = store
+        .append_chat(operator_message("second"))
+        .expect("append after the torn line");
+    let third = store
+        .append_chat(operator_message("third"))
+        .expect("append again");
+
+    assert_eq!(
+        store.read_chat().expect("read the chat"),
+        vec![first, second, third]
+    );
 }
 
 #[tokio::test]

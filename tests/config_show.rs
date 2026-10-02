@@ -6,6 +6,8 @@
 //! `HOME` and `XDG_CONFIG_HOME` point inside each test's own temporary root,
 //! so the cascade can never reach the developer's own `~/.config`.
 
+mod engine_support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -100,7 +102,7 @@ fn show(root: &TempRoot, environment: &[(&str, &str)], args: &[&str]) -> Invocat
     command
         .current_dir(root.path())
         .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", engine_support::fake_claude_first_on_path())
         .env("HOME", root.path())
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .arg("config")
@@ -254,7 +256,7 @@ fn it_works_without_a_home_and_without_the_state_directory_existing() {
     let output = command
         .current_dir(root.path())
         .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", engine_support::fake_claude_first_on_path())
         .args(["--root", &absent.display().to_string(), "config", "show"])
         .output()
         .expect("run the narsor binary");
@@ -347,7 +349,7 @@ fn an_unknown_key_is_reported_while_list_in_the_same_directory_refuses_outright(
     let listing = Command::new(env!("CARGO_BIN_EXE_narsor"))
         .current_dir(root.path())
         .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", engine_support::fake_claude_first_on_path())
         .env("HOME", root.path())
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .arg("list")

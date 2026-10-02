@@ -139,31 +139,6 @@ pub trait ConductorInvoker: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = InvocationOutcome> + Send + 'a>>;
 }
 
-/// An invoker with no conductor to run: every invocation fails, saying so.
-///
-/// For a registry that must exist without a harness behind it — a test of
-/// the queue, the chat or the restart rows driven end to end — where a chat
-/// message then gets an error entry (KTD12) rather than waiting forever.
-/// The daemon runs [`crate::conductor::HarnessInvoker`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UnavailableInvoker;
-
-/// The error an [`UnavailableInvoker`] fails every invocation with.
-pub const CONDUCTOR_UNAVAILABLE: &str = "the conductor cannot be invoked in this version";
-
-impl ConductorInvoker for UnavailableInvoker {
-    fn invoke<'a>(
-        &'a self,
-        _invocation: &'a Invocation,
-    ) -> Pin<Box<dyn Future<Output = InvocationOutcome> + Send + 'a>> {
-        Box::pin(async {
-            InvocationOutcome::Failed {
-                error: CONDUCTOR_UNAVAILABLE.to_string(),
-            }
-        })
-    }
-}
-
 /// Handles to the advisory invocations under way, per execution (KTD10).
 ///
 /// Deliberately a registry of its own rather than entries in the API's

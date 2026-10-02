@@ -786,7 +786,7 @@ pub fn resume(
     if execution.status != ExecutionStatus::InputNeeded {
         return Err(HumanActionError::NotPaused {
             execution_id: execution_id.to_string(),
-            status: status_name(&execution.status).to_string(),
+            status: execution.status.as_str().to_string(),
         });
     }
 
@@ -1140,18 +1140,4 @@ fn resolve_label(
     Err(HumanActionError::NoLabelChosen {
         outputs: pending.output_labels(),
     })
-}
-
-/// The schema spelling of a status, for error messages.
-fn status_name(status: &ExecutionStatus) -> &'static str {
-    match status {
-        ExecutionStatus::Running => "running",
-        ExecutionStatus::Paused => "paused",
-        ExecutionStatus::InputNeeded => "input_needed",
-        ExecutionStatus::WaitingForEvent => "waiting_for_event",
-        ExecutionStatus::Completed => "completed",
-        ExecutionStatus::Failed => "failed",
-        ExecutionStatus::Cancelled => "cancelled",
-        ExecutionStatus::Unknown => "unknown",
-    }
 }

@@ -2819,25 +2819,12 @@ impl Engine {
         execution: &mut WorkflowExecution,
         pending: &PendingStep,
     ) -> Result<(), EngineError> {
-        let value =
-            serde_json::to_value(pending).map_err(|error| EngineError::CorruptEngineMetadata {
-                execution_id: execution.id.clone(),
-                message: error.to_string(),
-            })?;
-
-        engine_metadata_mut(execution).insert(METADATA_PENDING_STEP_KEY.to_string(), value);
-        Ok(())
+        write_engine_record(execution, METADATA_PENDING_STEP_KEY, pending)
     }
 
     /// Drops the mid-step state.
     fn clear_pending_step(&self, execution: &mut WorkflowExecution) {
-        if let Some(engine) = execution
-            .metadata
-            .get_mut(METADATA_ENGINE_KEY)
-            .and_then(Value::as_object_mut)
-        {
-            engine.remove(METADATA_PENDING_STEP_KEY);
-        }
+        clear_engine_metadata(execution, METADATA_PENDING_STEP_KEY);
     }
 
     /// Removes and persists the note destined for the next agent attempt.
@@ -3040,7 +3027,7 @@ impl Engine {
         }
         EngineError::NotRunnable {
             execution_id: execution.id.clone(),
-            status: status_name(&execution.status).to_string(),
+            status: execution.status.as_str().to_string(),
             operation,
         }
     }
@@ -3106,41 +3093,15 @@ fn artifact_from(entry: &Value, action_execution_id: &str) -> Option<Artifact> {
     Some(artifact)
 }
 
-/// The schema spelling of an execution status, for error messages.
-fn status_name(status: &ExecutionStatus) -> &'static str {
-    match status {
-        ExecutionStatus::Running => "running",
-        ExecutionStatus::Paused => "paused",
-        ExecutionStatus::InputNeeded => "input_needed",
-        ExecutionStatus::WaitingForEvent => "waiting_for_event",
-        ExecutionStatus::Completed => "completed",
-        ExecutionStatus::Failed => "failed",
-        ExecutionStatus::Cancelled => "cancelled",
-        ExecutionStatus::Unknown => "unknown",
-    }
-}
-
 /// The mid-step state of `execution`, when it belongs to `state_id`.
 fn stored_pending_step(
     execution: &WorkflowExecution,
     state_id: &str,
 ) -> Result<Option<PendingStep>, EngineError> {
-    let Some(value) = execution
-        .metadata
-        .get(METADATA_ENGINE_KEY)
-        .and_then(|engine| engine.get(METADATA_PENDING_STEP_KEY))
-    else {
-        return Ok(None);
-    };
-
-    let pending: PendingStep = serde_json::from_value(value.clone()).map_err(|error| {
-        EngineError::CorruptEngineMetadata {
-            execution_id: execution.id.clone(),
-            message: error.to_string(),
-        }
-    })?;
-
-    Ok((pending.state_id == state_id).then_some(pending))
+    Ok(
+        read_engine_record::<PendingStep>(execution, METADATA_PENDING_STEP_KEY)?
+            .filter(|pending| pending.state_id == state_id),
+    )
 }
 
 /// The rejected agent output `execution` still owes a reprompt at its current
@@ -3180,22 +3141,10 @@ fn stored_output_rescue(
     execution: &WorkflowExecution,
     state_id: &str,
 ) -> Result<Option<OutputRescue>, EngineError> {
-    let Some(value) = execution
-        .metadata
-        .get(METADATA_ENGINE_KEY)
-        .and_then(|engine| engine.get(METADATA_OUTPUT_RESCUE_KEY))
-    else {
-        return Ok(None);
-    };
-
-    let rescue: OutputRescue = serde_json::from_value(value.clone()).map_err(|error| {
-        EngineError::CorruptEngineMetadata {
-            execution_id: execution.id.clone(),
-            message: error.to_string(),
-        }
-    })?;
-
-    Ok((rescue.state_id == state_id).then_some(rescue))
+    Ok(
+        read_engine_record::<OutputRescue>(execution, METADATA_OUTPUT_RESCUE_KEY)?
+            .filter(|rescue| rescue.state_id == state_id),
+    )
 }
 
 /// The rejected agent output of `execution` still owed its reprompt, when it
@@ -3204,22 +3153,45 @@ fn stored_output_rejection(
     execution: &WorkflowExecution,
     state_id: &str,
 ) -> Result<Option<OutputRejection>, EngineError> {
+    Ok(
+        read_engine_record::<OutputRejection>(execution, METADATA_OUTPUT_REJECTION_KEY)?
+            .filter(|rejection| rejection.state_id == state_id),
+    )
+}
+
+/// Reads one record of the engine's scratch area.
+pub(super) fn read_engine_record<T: serde::de::DeserializeOwned>(
+    execution: &WorkflowExecution,
+    key: &str,
+) -> Result<Option<T>, EngineError> {
     let Some(value) = execution
         .metadata
         .get(METADATA_ENGINE_KEY)
-        .and_then(|engine| engine.get(METADATA_OUTPUT_REJECTION_KEY))
+        .and_then(|engine| engine.get(key))
     else {
         return Ok(None);
     };
-
-    let rejection: OutputRejection = serde_json::from_value(value.clone()).map_err(|error| {
-        EngineError::CorruptEngineMetadata {
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| EngineError::CorruptEngineMetadata {
             execution_id: execution.id.clone(),
             message: error.to_string(),
-        }
-    })?;
+        })
+}
 
-    Ok((rejection.state_id == state_id).then_some(rejection))
+/// Writes one record of the engine's scratch area.
+pub(super) fn write_engine_record<T: Serialize>(
+    execution: &mut WorkflowExecution,
+    key: &str,
+    record: &T,
+) -> Result<(), EngineError> {
+    let value =
+        serde_json::to_value(record).map_err(|error| EngineError::CorruptEngineMetadata {
+            execution_id: execution.id.clone(),
+            message: error.to_string(),
+        })?;
+    engine_metadata_mut(execution).insert(key.to_string(), value);
+    Ok(())
 }
 
 /// Drops one key of the engine's scratch area, if it is there.

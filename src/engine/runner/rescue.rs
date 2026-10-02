@@ -616,11 +616,5 @@ fn set_output_rescue(
     execution: &mut WorkflowExecution,
     rescue: &OutputRescue,
 ) -> Result<(), EngineError> {
-    let value =
-        serde_json::to_value(rescue).map_err(|error| EngineError::CorruptEngineMetadata {
-            execution_id: execution.id.clone(),
-            message: error.to_string(),
-        })?;
-    engine_metadata_mut(execution).insert(METADATA_OUTPUT_RESCUE_KEY.to_string(), value);
-    Ok(())
+    write_engine_record(execution, METADATA_OUTPUT_RESCUE_KEY, rescue)
 }

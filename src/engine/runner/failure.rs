@@ -132,41 +132,6 @@ pub(super) fn conductor_retry_of(
     )
 }
 
-/// Reads one record of the engine's scratch area.
-fn read_engine_record<T: serde::de::DeserializeOwned>(
-    execution: &WorkflowExecution,
-    key: &str,
-) -> Result<Option<T>, EngineError> {
-    let Some(value) = execution
-        .metadata
-        .get(METADATA_ENGINE_KEY)
-        .and_then(|engine| engine.get(key))
-    else {
-        return Ok(None);
-    };
-    serde_json::from_value(value.clone())
-        .map(Some)
-        .map_err(|error| EngineError::CorruptEngineMetadata {
-            execution_id: execution.id.clone(),
-            message: error.to_string(),
-        })
-}
-
-/// Writes one record of the engine's scratch area.
-fn write_engine_record<T: Serialize>(
-    execution: &mut WorkflowExecution,
-    key: &str,
-    record: &T,
-) -> Result<(), EngineError> {
-    let value =
-        serde_json::to_value(record).map_err(|error| EngineError::CorruptEngineMetadata {
-            execution_id: execution.id.clone(),
-            message: error.to_string(),
-        })?;
-    engine_metadata_mut(execution).insert(key.to_string(), value);
-    Ok(())
-}
-
 impl Engine {
     /// Records the step failure the execution is about to be saved with,
     /// for the conductor to diagnose, and returns the conductor to hand it

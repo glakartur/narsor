@@ -465,10 +465,13 @@ impl ConductorStore {
     /// Not safe against a concurrent writer of the same file — that is what
     /// the actor is for. The line goes out in one `write` of a file opened
     /// for appending and is synced before this returns, so a crash leaves at
-    /// worst an incomplete last line, which every read skips.
+    /// worst an incomplete last line, which every read skips. That torn
+    /// fragment is cut off before the next line goes out; appended to as it
+    /// is, it would fuse with the new line into one that never parses.
     pub fn append_chat(&self, mut entry: ChatEntry) -> Result<ChatEntry> {
         let path = self.chat_file();
         entry.sequence = self.last_chat_sequence()? + 1;
+        drop_torn_tail(&path)?;
 
         let mut line =
             serde_json::to_vec(&entry).map_err(|source| PersistenceError::Serialize {
@@ -553,6 +556,32 @@ impl ConductorStore {
             Err(error) => Err(error),
         }
     }
+}
+
+/// Truncates the file at `path` to just after its last newline, dropping the
+/// incomplete line a crash may have left; a missing file or one that already
+/// ends with a newline is left alone.
+fn drop_torn_tail(path: &Path) -> Result<()> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(PersistenceError::io(path, source)),
+    };
+    if bytes.last().is_none_or(|byte| *byte == b'\n') {
+        return Ok(());
+    }
+    let keep = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|source| PersistenceError::io(path, source))?;
+    file.set_len(keep as u64)
+        .map_err(|source| PersistenceError::io(path, source))?;
+    file.sync_data()
+        .map_err(|source| PersistenceError::io(path, source))
 }
 
 /// The operator messages of `entries` that no later entry answers.
