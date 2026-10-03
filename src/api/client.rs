@@ -44,7 +44,7 @@
 //! credential other than the caller's own bearer token: the control plane is
 //! the only endpoint a client ever talks to (R1, R41).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,6 +78,10 @@ use crate::controller_protocol::{
     OwnerCommandRequest, OwnerCommandResponse, SetDefaultBackendRequest, SetPriorityRequest,
     SubmitInputRequest, SubmitInputResponse, TaskListResponse, TaskSummary, TimelineResponse,
 };
+use crate::materials::{
+    MaterialListResponse, MaterialSummary, MaterialUploadResponse, MaterialView,
+    BUNDLE_CONTENT_TYPE,
+};
 use crate::orchestration::TaskEvent;
 
 use super::token::{TokenCell, TokenSource};
@@ -97,6 +101,10 @@ const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a relayed conversation page may take: the control plane waits
 /// for the runner's next poll before it can answer.
 const CONVERSATION_PAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long one material upload or blob download may take: tens of
+/// megabytes over a real network, far beyond a control request's bound.
+const MATERIAL_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// First delay before [`ApiClient::follow_control_events`] reconnects after
 /// a failure; doubled per consecutive failure up to
@@ -622,6 +630,103 @@ impl ApiClient {
             self.base_url
         );
         self.get_json(&url).await
+    }
+
+    /// Uploads an encoded material bundle to a remote task (U9) —
+    /// `POST /control/v1/tasks/:task_id/materials`. Repeating an upload
+    /// whose manifest names its `material_id` is safe.
+    pub async fn upload_material(
+        &self,
+        task_id: &str,
+        bundle: Bytes,
+    ) -> Result<MaterialUploadResponse, ClientError> {
+        let url = format!("{}/control/v1/tasks/{task_id}/materials", self.base_url);
+        let response = self
+            .send(&self.stream_http, |http, token| {
+                http.post(&url)
+                    .bearer_auth(token)
+                    .header(reqwest::header::CONTENT_TYPE, BUNDLE_CONTENT_TYPE)
+                    .body(bundle.clone())
+                    .timeout(MATERIAL_TRANSFER_TIMEOUT)
+            })
+            .await?;
+        handle_json_response(response).await
+    }
+
+    /// The remote task's materials.
+    pub async fn materials(&self, task_id: &str) -> Result<MaterialListResponse, ClientError> {
+        let url = format!("{}/control/v1/tasks/{task_id}/materials", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// One material of the remote task, with its manifest.
+    pub async fn material(
+        &self,
+        task_id: &str,
+        material_id: &str,
+    ) -> Result<MaterialView, ClientError> {
+        let url = format!(
+            "{}/control/v1/tasks/{task_id}/materials/{material_id}",
+            self.base_url
+        );
+        self.get_json(&url).await
+    }
+
+    /// Deletes one material at the control plane.
+    pub async fn delete_material(
+        &self,
+        task_id: &str,
+        material_id: &str,
+    ) -> Result<MaterialSummary, ClientError> {
+        let url = format!(
+            "{}/control/v1/tasks/{task_id}/materials/{material_id}",
+            self.base_url
+        );
+        self.delete_json(&url).await
+    }
+
+    /// Downloads one material: its manifest and every blob, each checked
+    /// against its digest and size before it is returned. Nothing is
+    /// written anywhere; [`crate::materials::write_files`] does that.
+    pub async fn fetch_material(
+        &self,
+        task_id: &str,
+        material_id: &str,
+    ) -> Result<(MaterialView, BTreeMap<String, Bytes>), ClientError> {
+        let view = self.material(task_id, material_id).await?;
+        let mut blobs = BTreeMap::new();
+        for (sha256, size) in crate::materials::blob_order(&view.files) {
+            let url = format!(
+                "{}/control/v1/tasks/{task_id}/materials/{material_id}/blobs/{sha256}",
+                self.base_url
+            );
+            let response = self
+                .send(&self.stream_http, |http, token| {
+                    http.get(&url)
+                        .bearer_auth(token)
+                        .timeout(MATERIAL_TRANSFER_TIMEOUT)
+                })
+                .await?;
+            if response.status() != StatusCode::OK {
+                return Err(
+                    match handle_json_response::<serde_json::Value>(response).await {
+                        Err(error) => error,
+                        Ok(_) => ClientError::Server("unexpected answer to a blob download".into()),
+                    },
+                );
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| ClientError::Unavailable(error.to_string()))?;
+            if bytes.len() as u64 != size || crate::materials::sha256_hex(&bytes) != sha256 {
+                return Err(ClientError::Server(format!(
+                    "blob {sha256} of material '{material_id}' does not match its manifest"
+                )));
+            }
+            blobs.insert(sha256, bytes);
+        }
+        Ok((view, blobs))
     }
 
     /// Creates a one-time code that enrolls one controller for `backend_id`.

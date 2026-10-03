@@ -314,6 +314,35 @@ pub enum TaskEventKind {
         /// Every input whose status changed, with its new status.
         updates: Vec<InputUpdate>,
     },
+    /// A task material changed (U9). Counts only: a material's file names
+    /// and bytes never travel in an event, so the durable log and every SSE
+    /// stream replaying it stay free of material content (R30, KTD4).
+    MaterialChanged {
+        /// The material.
+        material_id: String,
+        /// What happened to it.
+        change: MaterialChange,
+        /// How many files it holds.
+        files: u32,
+        /// Their total size in bytes.
+        total_bytes: u64,
+    },
+}
+
+/// What happened to a task material (U9).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterialChange {
+    /// The owner uploaded it; it waits for the runner.
+    Uploaded,
+    /// The runner published it from the task's outbox.
+    Published,
+    /// The runner wrote it onto task storage and acknowledged it.
+    Delivered,
+    /// The owner deleted it.
+    Deleted,
+    /// Its time to live ran out and the control plane removed it.
+    Expired,
 }
 
 /// One status change of a queued input.

@@ -36,16 +36,25 @@ pub struct ProcessEnvironment {
     pub home: PathBuf,
     /// `env`-delivered secrets, by variable name.
     pub secrets: Vec<(String, SecretValue)>,
+    /// Plain variables the runner adds itself (where the task finds its
+    /// materials and leaves documents for its owner, U9).
+    pub task: Vec<(String, String)>,
 }
 
 impl ProcessEnvironment {
     /// Every variable to set, the secrets last.
     pub fn variables(&self) -> impl Iterator<Item = (&str, &str)> {
-        std::iter::once(("HOME", self.home.to_str().unwrap_or_default())).chain(
-            self.secrets
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.expose())),
-        )
+        std::iter::once(("HOME", self.home.to_str().unwrap_or_default()))
+            .chain(
+                self.task
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            )
+            .chain(
+                self.secrets
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.expose())),
+            )
     }
 }
 
@@ -98,6 +107,7 @@ impl MountedSecrets {
         let mut process = ProcessEnvironment {
             home: home.to_path_buf(),
             secrets: Vec::new(),
+            task: Vec::new(),
         };
         for reference in &environment.secrets {
             if let Some(problem) = reference.delivery.problem() {

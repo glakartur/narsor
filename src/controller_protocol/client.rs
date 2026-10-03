@@ -16,10 +16,17 @@ use serde::Serialize;
 use super::wire::*;
 use crate::api::{handle_json_response, ClientError};
 use crate::auth::pop::{rotation_message, ControllerCredential, ControllerKey};
+use crate::materials::{
+    MaterialAckRequest, MaterialAckResponse, MaterialUploadResponse, MaterialView,
+    BUNDLE_CONTENT_TYPE,
+};
 use crate::orchestration::RunnerSnapshot;
 
 /// Bound of a plain request; a long-poll adds its own wait on top.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound of one material blob download or publication (U9).
+const MATERIAL_TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How a client proves who it is.
 #[derive(Clone)]
@@ -94,6 +101,42 @@ impl Transport {
         self.send(request, body).await
     }
 
+    /// `GET path`, answered with raw bytes (a material blob).
+    async fn get_bytes(&self, path: &str) -> Result<bytes::Bytes, ClientError> {
+        let request = self
+            .http
+            .get(self.url(path))
+            .timeout(MATERIAL_TRANSFER_TIMEOUT);
+        let response = self.send_raw(request, Vec::new()).await?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(
+                match handle_json_response::<serde_json::Value>(response).await {
+                    Err(error) => error,
+                    Ok(_) => ClientError::Server("unexpected answer to a download".to_string()),
+                },
+            );
+        }
+        response
+            .bytes()
+            .await
+            .map_err(|error| ClientError::Unavailable(error.to_string()))
+    }
+
+    /// `POST path` with a body of `content_type`, decoding a JSON answer.
+    async fn post_raw<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<T, ClientError> {
+        let request = self
+            .http
+            .request(Method::POST, self.url(path))
+            .header(CONTENT_TYPE, content_type)
+            .timeout(MATERIAL_TRANSFER_TIMEOUT);
+        self.send(request, body).await
+    }
+
     /// Builds the request, authenticates it — a controller signs the exact
     /// method, path with query and body bytes that go on the wire — and
     /// decodes the answer.
@@ -102,6 +145,16 @@ impl Transport {
         request: reqwest::RequestBuilder,
         body: Vec<u8>,
     ) -> Result<T, ClientError> {
+        let response = self.send_raw(request, body).await?;
+        handle_json_response(response).await
+    }
+
+    /// [`Self::send`] without decoding the answer.
+    async fn send_raw(
+        &self,
+        request: reqwest::RequestBuilder,
+        body: Vec<u8>,
+    ) -> Result<reqwest::Response, ClientError> {
         let mut request = request
             .body(body.clone())
             .build()
@@ -123,12 +176,10 @@ impl Transport {
                 HeaderValue::from_str(&authorization).map_err(|_| ClientError::Unauthorized)?;
             request.headers_mut().insert(AUTHORIZATION, value);
         }
-        let response = self
-            .http
+        self.http
             .execute(request)
             .await
-            .map_err(|error| ClientError::Unavailable(error.to_string()))?;
-        handle_json_response(response).await
+            .map_err(|error| ClientError::Unavailable(error.to_string()))
     }
 }
 
@@ -331,16 +382,21 @@ impl RunnerClient {
         pending_input_id: Option<&str>,
         wait_secs: u64,
     ) -> Result<RunnerPollResponse, ClientError> {
-        self.transport
-            .get(
-                "/runner/v1/poll",
-                &RunnerPollQuery {
-                    pending_input_id: pending_input_id.map(str::to_string),
-                    wait_secs: Some(wait_secs),
-                },
-                Duration::from_secs(wait_secs),
-            )
-            .await
+        self.poll_with(&RunnerPollQuery {
+            pending_input_id: pending_input_id.map(str::to_string),
+            wait_secs: Some(wait_secs),
+            defer_materials: false,
+        })
+        .await
+    }
+
+    /// `GET /runner/v1/poll` with every option of [`RunnerPollQuery`].
+    pub async fn poll_with(
+        &self,
+        query: &RunnerPollQuery,
+    ) -> Result<RunnerPollResponse, ClientError> {
+        let wait = Duration::from_secs(query.wait_secs.unwrap_or(0));
+        self.transport.get("/runner/v1/poll", query, wait).await
     }
 
     /// `POST /runner/v1/renew`.
@@ -358,6 +414,59 @@ impl RunnerClient {
     ) -> Result<ConversationPageAccepted, ClientError> {
         self.transport
             .post(&format!("/runner/v1/conversation-pages/{request_id}"), page)
+            .await
+    }
+
+    /// `GET /runner/v1/materials/:material_id` — a material of this
+    /// runner's task, with its manifest.
+    pub async fn material(&self, material_id: &str) -> Result<MaterialView, ClientError> {
+        self.transport
+            .get(
+                &format!("/runner/v1/materials/{material_id}"),
+                &(),
+                Duration::ZERO,
+            )
+            .await
+    }
+
+    /// `GET /runner/v1/materials/:material_id/blobs/:sha256` — unverified
+    /// bytes; the caller checks them against the manifest.
+    pub async fn material_blob(
+        &self,
+        material_id: &str,
+        sha256: &str,
+    ) -> Result<bytes::Bytes, ClientError> {
+        self.transport
+            .get_bytes(&format!(
+                "/runner/v1/materials/{material_id}/blobs/{sha256}"
+            ))
+            .await
+    }
+
+    /// `POST /runner/v1/materials/:material_id/ack`.
+    pub async fn ack_material(
+        &self,
+        material_id: &str,
+        manifest_digest: &str,
+    ) -> Result<MaterialAckResponse, ClientError> {
+        self.transport
+            .post(
+                &format!("/runner/v1/materials/{material_id}/ack"),
+                &MaterialAckRequest {
+                    manifest_digest: manifest_digest.to_string(),
+                },
+            )
+            .await
+    }
+
+    /// `POST /runner/v1/materials` — publishes an encoded bundle from the
+    /// task's outbox.
+    pub async fn publish_material(
+        &self,
+        bundle: Vec<u8>,
+    ) -> Result<MaterialUploadResponse, ClientError> {
+        self.transport
+            .post_raw("/runner/v1/materials", BUNDLE_CONTENT_TYPE, bundle)
             .await
     }
 

@@ -52,7 +52,10 @@
 //! snapshots (`POST /runner/v1/snapshots`: cursors and summaries only),
 //! long-polls (`GET /runner/v1/poll`) for its directive and for owner
 //! answers to exactly the input request it waits on, acknowledges each
-//! answer, and renews its credential. Losing the control plane never stops
+//! answer, and renews its credential. The same poll announces task
+//! materials the owner uploaded (U9, [`crate::materials`]): the runner
+//! fetches and verifies them over `/runner/v1/materials/…`, acknowledges
+//! each, and publishes the documents its task leaves for the owner. Losing the control plane never stops
 //! it (R14): it keeps working and reports a later cursor when it can.
 //!
 //! # Owner contract

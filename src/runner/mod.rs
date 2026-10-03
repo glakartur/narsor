@@ -23,8 +23,8 @@
 //!    storage is never cloned again.
 //! 5. **Decide how to continue** (below), then run the Engine with the
 //!    harness pinned in the launch spec (R42) while a control loop reports
-//!    snapshots, long-polls for directives, input and page requests, and
-//!    renews the credential.
+//!    snapshots, long-polls for directives, input, page requests and
+//!    materials (U9), and renews the credential.
 //!
 //! # Unexpected loss needs an explicit owner decision (R13)
 //!
@@ -64,6 +64,7 @@
 
 pub mod cli;
 pub mod init;
+mod materials;
 pub mod preflight;
 pub mod secrets;
 mod snapshot;
@@ -82,7 +83,7 @@ use tokio::time::Instant;
 use crate::api::{ClientError, ConversationEntryDto, ConversationResponse};
 use crate::controller_protocol::{
     ConversationPageRequest, DeliveredInput, RunnerClient, RunnerDirective, RunnerLaunchView,
-    RunnerPollResponse,
+    RunnerPollQuery, RunnerPollResponse,
 };
 use crate::domain::{
     ExecutionStatus, LaunchDefinitionError, RepositoryInfo, TaskId, TaskLaunchSpec, TaskWorkspace,
@@ -97,6 +98,11 @@ pub use init::{initialize, Initialization};
 pub use preflight::{BaseImageContract, ContractViolation};
 pub use secrets::{MountedSecrets, ProcessEnvironment};
 pub use storage::{SessionRecord, TaskStorage};
+
+/// Variable naming the directory of delivered materials (U9).
+pub const MATERIALS_ENV: &str = "NARSOR_MATERIALS_DIR";
+/// Variable naming the outbox, whose folders are published to the owner.
+pub const OUTBOX_ENV: &str = "NARSOR_OUTBOX_DIR";
 
 /// Problem code: the base image breaks the runner contract (R22).
 pub const PROBLEM_BASE_IMAGE: &str = "base_image_contract";
@@ -302,7 +308,7 @@ pub async fn run(
     }
 
     let secrets = MountedSecrets::new(config.secrets_dir.clone());
-    let environment = match secrets.materialize(&spec.environment, &storage.home_dir()) {
+    let mut environment = match secrets.materialize(&spec.environment, &storage.home_dir()) {
         Ok(environment) => environment,
         Err(error) => {
             return Ok(
@@ -310,6 +316,16 @@ pub async fn run(
             )
         }
     };
+    // Where the task finds its materials and leaves documents for its
+    // owner (U9) — both on task storage, outside the workspace.
+    environment.task.push((
+        MATERIALS_ENV.to_string(),
+        storage.materials_dir().display().to_string(),
+    ));
+    environment.task.push((
+        OUTBOX_ENV.to_string(),
+        storage.outbox_dir().display().to_string(),
+    ));
     apply_environment(&environment);
 
     if let Err(error) = initialize(&storage, &store, &config.task_id, &spec, &secrets) {
@@ -341,6 +357,9 @@ pub async fn run(
         execution_id: None,
         directive: RunnerDirective::Continue,
         pass: None,
+        outbox_due: true,
+        material_failures: 0,
+        material_retry_at: None,
     };
     session.begin(&spec).await
 }
@@ -551,6 +570,13 @@ struct Session {
     execution_id: Option<String>,
     directive: RunnerDirective,
     pass: Option<JoinHandle<Result<WorkflowExecution, EngineError>>>,
+    /// Whether the outbox should be looked at: at start and after every
+    /// engine pass, the only times the task can have left something there.
+    outbox_due: bool,
+    /// Consecutive material deliveries that failed, and when to try again:
+    /// until then the poll defers materials (U9).
+    material_failures: u32,
+    material_retry_at: Option<Instant>,
 }
 
 /// How the work on this storage continues.
@@ -749,6 +775,11 @@ impl Session {
         let mut pause_asked = false;
 
         loop {
+            // Before a pause or stop is honoured: what the last pass left
+            // for the owner goes out while this workload still exists.
+            if self.outbox_due && !self.pass_active() && self.link.ready() {
+                self.publish_outbox().await;
+            }
             match self.directive {
                 RunnerDirective::PauseAtSafePoint => {
                     if self.pass_active() {
@@ -799,13 +830,14 @@ impl Session {
             }
             if poll.is_none() && self.link.ready() {
                 if let Some(client) = self.link.client() {
-                    let wait = self.timing.poll_wait.as_secs();
-                    let asked = pending.clone();
+                    let query = RunnerPollQuery {
+                        pending_input_id: pending.clone(),
+                        wait_secs: Some(self.timing.poll_wait.as_secs()),
+                        defer_materials: self.materials_deferred(),
+                    };
                     poll = Some(InFlightPoll {
                         asked: pending.clone(),
-                        handle: tokio::spawn(
-                            async move { client.poll(asked.as_deref(), wait).await },
-                        ),
+                        handle: tokio::spawn(async move { client.poll_with(&query).await }),
                     });
                 }
             }
@@ -815,6 +847,7 @@ impl Session {
                 finished = wait_for(&mut self.pass) => {
                     self.pass = None;
                     dirty = true;
+                    self.outbox_due = true;
                     match finished {
                         Ok(Ok(execution)) => tracing::info!(status = ?execution.status, "the engine pass stopped"),
                         Ok(Err(error)) => tracing::warn!(%error, "the engine pass ended with an error"),
@@ -937,6 +970,9 @@ impl Session {
         }
         for request in response.conversation_pages {
             self.serve_page(request).await;
+        }
+        if !response.materials.is_empty() && !self.materials_deferred() {
+            self.receive_materials(response.materials).await;
         }
         Ok(())
     }

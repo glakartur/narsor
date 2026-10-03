@@ -20,9 +20,9 @@ use super::error::{OrchestrationError, Result};
 use super::lifecycle::{command_effect, observation_effect, CommandEffect, ObservationEffect};
 use super::model::{
     ArchiveTombstone, BackendLease, CommandOutcome, CommandReceipt, CommandRequest,
-    ControllerReport, LeaseToken, NewTask, Observation, ObservedState, OwnerCommand, ReportOutcome,
-    TaskAssignment, TaskEvent, TaskEventKind, TaskLifecycle, TaskRecord, BACKEND_LEASE_VERSION,
-    TASK_RECORD_VERSION,
+    ControllerReport, LeaseToken, MaterialChange, NewTask, Observation, ObservedState,
+    OwnerCommand, ReportOutcome, TaskAssignment, TaskEvent, TaskEventKind, TaskLifecycle,
+    TaskRecord, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
 };
 use super::store::OrchestrationStore;
 use crate::domain::{BackendId, TaskId};
@@ -55,6 +55,10 @@ pub struct OrchestrationRecovery {
     /// Events that had been committed in a record but not yet appended to
     /// the log, and were appended now: `(task, sequence)`.
     pub republished_events: Vec<(TaskId, u64)>,
+    /// Leftovers of the material store (U9) that were removed: uploads a
+    /// crash interrupted before they became materials, and materials of
+    /// tasks archived before their purge completed.
+    pub removed_material_leftovers: Vec<PathBuf>,
 }
 
 /// Whether a mutation changed the record.
@@ -494,12 +498,44 @@ impl ControlPlane {
         Ok(task_storage.initialize_task_launch_spec(task_id, &record.launch_spec)?)
     }
 
+    /// Records that a material of the task changed (U9): one event carrying
+    /// the material id and counts, nothing of its content.
+    ///
+    /// Desired state is untouched; the event exists so clients following
+    /// the stream learn that the task's materials changed and re-read them.
+    pub fn record_material_change(
+        &self,
+        task_id: &TaskId,
+        material_id: &str,
+        change: MaterialChange,
+        files: u32,
+        total_bytes: u64,
+    ) -> Result<TaskRecord> {
+        let (record, ()) = self.mutate(task_id, |_, _| {
+            Ok(Mutation::Changed(
+                TaskEventKind::MaterialChanged {
+                    material_id: material_id.to_string(),
+                    change,
+                    files,
+                    total_bytes,
+                },
+                (),
+            ))
+        })?;
+        Ok(record)
+    }
+
     /// Startup repair of the orchestration directory.
     ///
     /// Removes orphaned temporary files and appends any event a record
     /// committed but a crash kept out of the log. Nothing else is judged:
     /// unlike local recovery, a remote task's lifecycle changes only through
     /// controller reconciliation, never because this process restarted.
+    ///
+    /// The material store (U9) is repaired here too, so the one startup
+    /// recovery the daemon runs covers it: interrupted uploads are dropped
+    /// and an archived task's materials removed. A failure there is logged
+    /// rather than returned — it must not keep task records unrepaired.
     pub fn recover(&self) -> Result<OrchestrationRecovery> {
         let removed_temp_files = self.store.cleanup_orphaned_temp_files()?;
         let mut republished_events = Vec::new();
@@ -510,9 +546,26 @@ impl ControlPlane {
                 republished_events.push((task_id, record.revision));
             }
         }
+        let materials = crate::materials::MaterialStore::new(
+            self.store.paths(),
+            crate::materials::MaterialLimits::default(),
+        );
+        let removed_material_leftovers = materials
+            .recover(|task_id| match self.store.load_task(task_id) {
+                Ok(record) => record.lifecycle.is_archival(),
+                // Materials of a task that does not exist belong to nobody.
+                Err(OrchestrationError::TaskNotFound(_)) => true,
+                // An unreadable record is no proof of archival: keep them.
+                Err(_) => false,
+            })
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "material store recovery failed");
+                Vec::new()
+            });
         Ok(OrchestrationRecovery {
             removed_temp_files,
             republished_events,
+            removed_material_leftovers,
         })
     }
 

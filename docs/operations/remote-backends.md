@@ -453,6 +453,10 @@ narsor task input <task> --field reason=ok [--label approved] [--comment …]
 narsor task conversation <task> [<attempt>] [--from N]
 narsor task events <task> [--follow]
 narsor task watch [--cursor C]               # every task, reconnecting from the cursor
+narsor task materials upload <task> <path>... [--id ID] [--label T] [--ttl-secs N]
+narsor task materials list|show <task> [<material>]
+narsor task materials download <task> <material> <dest-dir> [--force]
+narsor task materials delete <task> <material>
 narsor auth whoami | claim <code>
 narsor controller enroll-code <backend> | list | revoke <id>
 narsor tui --remote                          # implied by --server
@@ -462,6 +466,69 @@ In the TUI's remote mode: `j/k` move, `Enter` opens a task, `p` pause, `u`
 resume, `s` start afresh, `a` archive (asks first), `P` priority (queued
 tasks), `i` answer the pending input, `c`/`n`/`[`/`]` read the conversation
 through the control plane, `b` default backend, `r` refresh, `?` help.
+
+### Task materials
+
+A *material* is a one-off, bounded set of regular files attached to a task:
+input you hand the agent (a few files, a snapshot of a local folder) and
+small documents the task leaves for you. It is a copy, never a live mount of
+your machine, and it never becomes a commit in the product repository.
+
+* **Upload.** `narsor task materials upload <task> <path>...` snapshots the
+  given files and folders once: each file under its own name, each folder's
+  content under the folder's name. Symbolic links are never followed; links,
+  sockets, FIFOs, devices and `.git` directories inside a folder are skipped
+  and listed on stderr; a link or special file named explicitly is refused.
+  Repeat an upload safely with `--id`: the same id with the same files
+  answers with the existing material, with other files it is refused.
+* **Delivery.** The task's runner learns about the material on its next
+  long-poll, downloads manifest and blobs with its own incarnation-bound
+  credential, verifies every SHA-256, and writes the files atomically to
+  `{task storage}/materials/<material>/` — beside the workspace, never in
+  it. The agent finds that directory in `$NARSOR_MATERIALS_DIR`. A material
+  uploaded to a queued or paused task waits for the next runner.
+* **Documents back.** Every folder the task writes into `$NARSOR_OUTBOX_DIR`
+  (`{task storage}/outbox/<name>/`) is published as a material labelled
+  `<name>` once no engine step runs, then removed from the outbox. A folder
+  the control plane refuses is renamed `<name>.rejected`. Download it with
+  `narsor task materials download <task> <material> <dest-dir>`: it writes
+  only inside `<dest-dir>`, never through a symbolic link, and refuses to
+  overwrite an existing file unless `--force` (which still never replaces a
+  link or a directory).
+* **Expiry.** A material lives 7 days unless `--ttl-secs` says otherwise
+  (at most 30 days), or until you delete it. Deleting or expiring removes
+  the control plane's copy; a copy already delivered to task storage stays
+  there until the task is archived. Archive removes all of the task's
+  materials, and an archived task takes no new ones.
+
+Limits (per material unless stated): 1000 files, 16 MiB per file, 64 MiB in
+total (8 MiB for a document the task publishes), 32 materials and 256 MiB per
+task. Paths must be normalized relative paths: no absolute paths, `..`, `.`,
+empty components, backslashes, colons, control characters or `.git`
+components, at most 1024 bytes and 32 levels, and no two paths that differ
+only in letter case.
+
+Where the bytes live: at the control plane under `{state}/materials/` (one
+directory per task and material, blobs named by their SHA-256), outside task
+records, event logs and the SSE stream — events say only
+`material <id> uploaded|delivered|published|deleted|expired` with a file
+count and a byte total. An upload is staged and renamed into place only when
+complete and verified; anything a crash leaves half-done is removed at the
+next daemon start.
+
+API (owner, behind the owner gate; another owner's task is a `404`):
+
+| method | path | |
+| --- | --- | --- |
+| `POST` | `/control/v1/tasks/:task/materials` | upload (`application/vnd.narsor.material-bundle`) |
+| `GET` | `/control/v1/tasks/:task/materials` | list |
+| `GET` | `/control/v1/tasks/:task/materials/:material` | manifest |
+| `GET` | `/control/v1/tasks/:task/materials/:material/blobs/:sha256` | one blob |
+| `DELETE` | `/control/v1/tasks/:task/materials/:material` | delete |
+
+Runner (behind the runner credential, its own task only):
+`GET /runner/v1/materials/:material`, `GET …/blobs/:sha256`,
+`POST …/ack`, and `POST /runner/v1/materials` to publish.
 
 ## 12. Smoke tests
 
@@ -506,7 +573,9 @@ The ordinary test suite needs no cluster. Against a real cluster:
   the backend's own mechanisms.
 * No workspace revisions, local download/upload of a workspace, or central
   replication of task storage. Task storage is not a backup.
-* Bounded task materials (upload/download) are not available yet.
+* Task materials are one-off copies, bounded in size (section 11); there is
+  no synchronization, and no removal of a copy already delivered to task
+  storage short of archiving the task.
 * No automatic restart after workload loss and no automatic retention
   cleanup — both are owner decisions by design.
 * OIDC device-code login is not built in: use a token helper that writes a

@@ -383,7 +383,7 @@ pub(crate) struct FileLock {
 }
 
 impl FileLock {
-    fn acquire(path: PathBuf) -> Result<Self> {
+    pub(crate) fn acquire(path: PathBuf) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| PersistenceError::io(parent, source))?;
         }

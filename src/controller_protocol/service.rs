@@ -15,6 +15,8 @@ use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::oneshot;
 
+mod materials;
+
 use super::credentials::{
     ControllerAuthenticator, ControllerIdentity, ControllerRecord, CredentialStore,
     RunnerAuthenticator, RunnerIdentity,
@@ -23,6 +25,7 @@ use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
 use crate::domain::{BackendId, TaskId};
 use crate::environment::{LaunchError, LaunchIntent, LaunchResolver};
+use crate::materials::{MaterialLimits, MaterialStore};
 use crate::orchestration::{
     BackendCapacity, BackendLease, CommandRequest, ControlPlane, ControllerReport,
     ConversationAvailability, InputRequest, LeaseToken, NewTask, Observation, OwnerRef,
@@ -124,6 +127,7 @@ pub struct ProtocolService {
     changes: broadcast::Sender<TaskId>,
     launch: Arc<dyn LaunchResolver>,
     pages: Mutex<PageRelay>,
+    materials: MaterialStore,
 }
 
 impl std::fmt::Debug for ProtocolService {
@@ -153,7 +157,9 @@ impl ProtocolService {
     ) -> Self {
         let credentials = CredentialStore::new(control.clone());
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
+        let materials = MaterialStore::new(control.store().paths(), MaterialLimits::default());
         Self {
+            materials,
             controller_auth: Arc::new(credentials.clone()),
             runner_auth: Arc::new(credentials.clone()),
             control,
@@ -169,6 +175,12 @@ impl ProtocolService {
     /// signed proof-of-possession, [`crate::auth::pop`]).
     pub fn with_controller_authenticator(mut self, auth: Arc<dyn ControllerAuthenticator>) -> Self {
         self.controller_auth = auth;
+        self
+    }
+
+    /// Replaces the bounds of task materials (U9).
+    pub fn with_material_limits(mut self, limits: MaterialLimits) -> Self {
+        self.materials = MaterialStore::new(self.control.store().paths(), limits);
         self
     }
 
@@ -350,15 +362,21 @@ impl ProtocolService {
             ));
         }
         let capacity = self.capacity(&record.assignment.backend_id);
+        let command = request.command;
         let outcome = self.control.command_with_capacity(
             &record.task_id,
             CommandRequest {
-                command: request.command,
+                command,
                 idempotency_key: request.idempotency_key,
                 expected_generation: request.expected_generation,
             },
             &capacity,
         )?;
+        if command == crate::orchestration::OwnerCommand::Archive {
+            // Archive removes the task's materials too (U9) — also on a
+            // replay, which finishes a purge a crash may have cut short.
+            self.purge_materials(&record.task_id);
+        }
         let mut task = outcome.task;
         if !outcome.replayed {
             self.notify(&record.task_id);
@@ -1145,6 +1163,7 @@ impl ProtocolService {
             .touch_runner(identity, None)?
             .ok_or(ProtocolError::Unauthorized)?;
         let pending = query.pending_input_id.as_deref();
+        let defer_materials = query.defer_materials;
         let poll = || -> ProtocolResult<RunnerPollResponse> {
             let (inputs, changed) = self.control.deliver_inputs(
                 &identity.task_id,
@@ -1173,6 +1192,7 @@ impl ProtocolService {
                 credential_expires_at: session.expires_at,
                 launch: launch_view(identity, &record),
                 conversation_pages: self.page_requests(&identity.task_id),
+                materials: self.material_announcements(&identity.task_id),
             })
         };
         let wait = self.long_poll(query.wait_secs);
@@ -1181,6 +1201,7 @@ impl ProtocolService {
                 let response = poll()?;
                 let actionable = !response.inputs.is_empty()
                     || !response.conversation_pages.is_empty()
+                    || (!defer_materials && !response.materials.is_empty())
                     || response.directive != RunnerDirective::Continue;
                 Ok(actionable.then_some(response))
             })

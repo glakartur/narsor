@@ -28,6 +28,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -46,6 +47,10 @@ use super::wire::*;
 use crate::auth::pop::SignedRequest;
 use crate::auth::Operator;
 use crate::domain::TaskId;
+use crate::materials::{
+    MaterialAckRequest, MaterialAckResponse, MaterialListResponse, MaterialSummary,
+    MaterialUploadResponse, MaterialView, BUNDLE_CONTENT_TYPE,
+};
 use crate::orchestration::{OwnerRef, TaskEvent};
 
 type Service = Arc<ProtocolService>;
@@ -82,6 +87,18 @@ where
             get(get_conversation_page),
         )
         .route("/control/v1/tasks/:task_id/input", post(post_input))
+        .route(
+            "/control/v1/tasks/:task_id/materials",
+            get(list_materials).post(post_material),
+        )
+        .route(
+            "/control/v1/tasks/:task_id/materials/:material_id",
+            get(get_material).delete(delete_material),
+        )
+        .route(
+            "/control/v1/tasks/:task_id/materials/:material_id/blobs/:sha256",
+            get(get_material_blob),
+        )
         .route("/control/v1/tasks/:task_id/events", get(get_events))
         .route("/control/v1/events/stream", get(get_stream))
         .route(
@@ -138,6 +155,19 @@ where
         .route(
             "/runner/v1/conversation-pages/:request_id",
             post(post_conversation_page),
+        )
+        .route("/runner/v1/materials", post(post_runner_material))
+        .route(
+            "/runner/v1/materials/:material_id",
+            get(get_runner_material),
+        )
+        .route(
+            "/runner/v1/materials/:material_id/blobs/:sha256",
+            get(get_runner_material_blob),
+        )
+        .route(
+            "/runner/v1/materials/:material_id/ack",
+            post(post_runner_material_ack),
         )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&service),
@@ -591,5 +621,141 @@ async fn post_conversation_page(
         &identity,
         &request_id,
         page,
+    )?))
+}
+
+// ---------------------------------------------------------------------------
+// Materials (U9)
+// ---------------------------------------------------------------------------
+
+/// Refuses an upload body that does not declare itself a material bundle,
+/// so nothing else is ever parsed as one.
+fn require_bundle(headers: &HeaderMap) -> ProtocolResult<()> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if content_type.split(';').next().map(str::trim) == Some(BUNDLE_CONTENT_TYPE) {
+        Ok(())
+    } else {
+        Err(ProtocolError::bad_request(
+            "invalid_content_type",
+            format!("a material upload is sent as {BUNDLE_CONTENT_TYPE}"),
+        ))
+    }
+}
+
+/// A stored blob as an opaque octet stream.
+async fn blob_response(path: std::path::PathBuf) -> ProtocolResult<Response> {
+    let bytes = tokio::fs::read(&path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            // Deleted or expired between the lookup and the read.
+            ProtocolError::NotFound
+        } else {
+            ProtocolError::Internal(format!("cannot read '{}': {error}", path.display()))
+        }
+    })?;
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
+}
+
+async fn post_material(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(task_id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> ProtocolResult<(StatusCode, Json<MaterialUploadResponse>)> {
+    require_bundle(&headers)?;
+    let response = service
+        .upload_material(&owner, &task_id, body.into_data_stream())
+        .await?;
+    let status = if response.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(response)))
+}
+
+async fn list_materials(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(task_id): Path<String>,
+) -> ProtocolResult<Json<MaterialListResponse>> {
+    Ok(Json(service.list_materials(&owner, &task_id)?))
+}
+
+async fn get_material(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path((task_id, material_id)): Path<(String, String)>,
+) -> ProtocolResult<Json<MaterialView>> {
+    Ok(Json(service.material(&owner, &task_id, &material_id)?))
+}
+
+async fn get_material_blob(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path((task_id, material_id, sha256)): Path<(String, String, String)>,
+) -> ProtocolResult<Response> {
+    blob_response(service.material_blob(&owner, &task_id, &material_id, &sha256)?).await
+}
+
+async fn delete_material(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path((task_id, material_id)): Path<(String, String)>,
+) -> ProtocolResult<Json<MaterialSummary>> {
+    Ok(Json(service.delete_material(
+        &owner,
+        &task_id,
+        &material_id,
+    )?))
+}
+
+async fn post_runner_material(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    headers: HeaderMap,
+    body: Body,
+) -> ProtocolResult<(StatusCode, Json<MaterialUploadResponse>)> {
+    require_bundle(&headers)?;
+    let response = service
+        .runner_publish_material(&identity, body.into_data_stream())
+        .await?;
+    let status = if response.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(response)))
+}
+
+async fn get_runner_material(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Path(material_id): Path<String>,
+) -> ProtocolResult<Json<MaterialView>> {
+    Ok(Json(service.runner_material(&identity, &material_id)?))
+}
+
+async fn get_runner_material_blob(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Path((material_id, sha256)): Path<(String, String)>,
+) -> ProtocolResult<Response> {
+    blob_response(service.runner_material_blob(&identity, &material_id, &sha256)?).await
+}
+
+async fn post_runner_material_ack(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Path(material_id): Path<String>,
+    Json(request): Json<MaterialAckRequest>,
+) -> ProtocolResult<Json<MaterialAckResponse>> {
+    Ok(Json(service.runner_ack_material(
+        &identity,
+        &material_id,
+        request,
     )?))
 }

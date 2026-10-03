@@ -840,6 +840,12 @@ pub struct RunnerPollQuery {
     /// Long-poll bound; capped by the server.
     #[serde(default)]
     pub wait_secs: Option<u64>,
+    /// The runner is backing off materials it could not deliver: pending
+    /// materials are still listed in the answer, but they alone do not end
+    /// the long-poll early (U9). Without it a material that cannot be
+    /// delivered right now would turn the long-poll into a busy loop.
+    #[serde(default)]
+    pub defer_materials: bool,
 }
 
 /// An owner answer handed to the runner.
@@ -873,6 +879,12 @@ pub struct RunnerPollResponse {
     /// with `POST /runner/v1/conversation-pages/:request_id`.
     #[serde(default)]
     pub conversation_pages: Vec<ConversationPageRequest>,
+    /// Owner materials not yet acknowledged (U9): fetch each manifest and
+    /// its blobs, write them onto task storage, then acknowledge with
+    /// `POST /runner/v1/materials/:material_id/ack`. Redelivered until
+    /// acknowledged.
+    #[serde(default)]
+    pub materials: Vec<crate::materials::MaterialAnnouncement>,
 }
 
 /// An owner's request for one bounded page of one attempt's raw

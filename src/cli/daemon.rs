@@ -284,7 +284,8 @@ const ADMISSION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5
 /// Two inputs change without any request announcing it: a controller's
 /// lease running out (its capacity is then withheld and waiting tasks say
 /// `controller_offline`) and an operator editing a backend's limit in the
-/// catalogue. The handle is dropped with the daemon's runtime.
+/// catalogue. Task materials whose time to live ran out are swept on the
+/// same tick (U9). The handle is dropped with the daemon's runtime.
 fn spawn_periodic_admission(control: Arc<ProtocolService>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(ADMISSION_INTERVAL);
@@ -293,8 +294,12 @@ fn spawn_periodic_admission(control: Arc<ProtocolService>) -> tokio::task::JoinH
             interval.tick().await;
             let control = Arc::clone(&control);
             // File I/O under advisory locks: keep it off the async workers.
-            if let Err(error) = tokio::task::spawn_blocking(move || control.reschedule_all()).await
-            {
+            // The same tick expires task materials whose time ran out (U9).
+            let pass = move || {
+                control.reschedule_all();
+                control.sweep_materials();
+            };
+            if let Err(error) = tokio::task::spawn_blocking(pass).await {
                 tracing::warn!(%error, "scheduler: periodic admission pass panicked");
             }
         }

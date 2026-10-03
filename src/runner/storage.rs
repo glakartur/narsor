@@ -10,6 +10,10 @@
 //!                   its event log, conversations, and the copied launch spec
 //!     workspace/    the clone of the pinned commit (R39), or an empty folder
 //!     home/         the task's private, persistent `$HOME` (R17, R42)
+//!     materials/    owner materials delivered by the control plane (U9),
+//!                   one verified, complete directory per material id
+//!     outbox/       documents the task leaves for its owner: each folder
+//!                   is published as a material once no engine pass runs
 //!     narsor/       the runner's bookkeeping, below
 //!         runner.lock        held for as long as one runner works here
 //!         initialized.json   the initialization marker (R39)
@@ -18,7 +22,12 @@
 //!         report.json        the last snapshot sequence handed out
 //!         inputs.json        owner inputs this storage already consumed
 //!         workspace.partial/ a clone under way, never a workspace
+//!         materials.partial/ a material delivery under way
 //! ```
+//!
+//! `materials/` and `outbox/` sit beside the workspace, never inside it: a
+//! material reaches the agent without ever touching the product
+//! repository's history or status (R30, AE7).
 //!
 //! Secrets are deliberately *not* part of this layout: they are mounted
 //! read-only outside it and only ever referenced from it (see
@@ -52,6 +61,10 @@ pub const WORKSPACE_DIR: &str = "workspace";
 pub const HOME_DIR: &str = "home";
 /// Directory of the runner's own bookkeeping.
 pub const BOOKKEEPING_DIR: &str = "narsor";
+/// Directory of delivered materials (U9).
+pub const MATERIALS_DIR: &str = "materials";
+/// Directory the task leaves documents in for its owner (U9).
+pub const OUTBOX_DIR: &str = "outbox";
 
 /// Entries a filesystem may put into a fresh volume on its own. Anything
 /// else in an uninitialized storage means it is not empty (R39).
@@ -95,6 +108,21 @@ impl TaskStorage {
     /// `{root}/narsor`
     pub fn bookkeeping_dir(&self) -> PathBuf {
         self.root.join(BOOKKEEPING_DIR)
+    }
+
+    /// `{root}/materials`
+    pub fn materials_dir(&self) -> PathBuf {
+        self.root.join(MATERIALS_DIR)
+    }
+
+    /// `{root}/outbox`
+    pub fn outbox_dir(&self) -> PathBuf {
+        self.root.join(OUTBOX_DIR)
+    }
+
+    /// `{root}/narsor/materials.partial`
+    pub fn partial_materials_dir(&self) -> PathBuf {
+        self.bookkeeping_dir().join("materials.partial")
     }
 
     /// `{root}/narsor/workspace.partial`
@@ -154,7 +182,13 @@ impl TaskStorage {
 
     /// Creates the directories every run needs, all on the storage.
     pub fn prepare(&self) -> Result<(), RunnerError> {
-        for dir in [self.state_dir(), self.home_dir(), self.bookkeeping_dir()] {
+        for dir in [
+            self.state_dir(),
+            self.home_dir(),
+            self.bookkeeping_dir(),
+            self.materials_dir(),
+            self.outbox_dir(),
+        ] {
             create_dir(&dir)?;
         }
         Ok(())
@@ -163,10 +197,17 @@ impl TaskStorage {
     /// Entries of an uninitialized storage that are not this runner's own
     /// (and not the filesystem's), i.e. what makes it not empty.
     pub fn foreign_entries(&self) -> Result<Vec<String>, RunnerError> {
-        let ours: BTreeSet<&str> = [STATE_DIR, WORKSPACE_DIR, HOME_DIR, BOOKKEEPING_DIR]
-            .into_iter()
-            .chain(FILESYSTEM_ENTRIES)
-            .collect();
+        let ours: BTreeSet<&str> = [
+            STATE_DIR,
+            WORKSPACE_DIR,
+            HOME_DIR,
+            BOOKKEEPING_DIR,
+            MATERIALS_DIR,
+            OUTBOX_DIR,
+        ]
+        .into_iter()
+        .chain(FILESYSTEM_ENTRIES)
+        .collect();
         let entries =
             fs::read_dir(&self.root).map_err(|source| RunnerError::io(&self.root, source))?;
         let mut foreign = Vec::new();

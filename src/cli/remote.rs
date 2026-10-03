@@ -30,6 +30,7 @@ use crate::controller_protocol::{
     TaskSummary, WorkspaceRequest,
 };
 use crate::engine::HumanInputDelivery;
+use crate::materials::{snapshot_paths, write_files, MaterialLimits, MaterialOrigin, WriteMode};
 use crate::orchestration::{OwnerCommand, TaskEvent, TaskEventKind};
 use crate::persistence::StatePaths;
 use crate::tui::conversation::classify;
@@ -150,6 +151,80 @@ pub enum TaskCommand {
         /// Resume after this stream cursor.
         #[arg(long, value_name = "CURSOR")]
         cursor: Option<String>,
+    },
+    /// Bounded one-off files for a task: upload, list, download, delete.
+    Materials {
+        /// What to do.
+        #[command(subcommand)]
+        action: MaterialsCommand,
+    },
+}
+
+/// `narsor task materials …` (U9).
+#[derive(Debug, Subcommand)]
+pub enum MaterialsCommand {
+    /// Uploads a one-off snapshot of files and folders to the task. Each
+    /// file goes in under its own name, each folder's content under the
+    /// folder's name. Links are never followed; links and special files
+    /// inside a folder are skipped and listed.
+    Upload {
+        /// The task id.
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+        /// Files and folders to send.
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<PathBuf>,
+        /// Material id: repeating the same upload with it is safe.
+        #[arg(long = "id", value_name = "ID")]
+        material_id: Option<String>,
+        /// A label for people; the single path's name when omitted.
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+        /// Time to live in seconds; bounded by the control plane.
+        #[arg(long = "ttl-secs", value_name = "SECONDS")]
+        ttl_secs: Option<u64>,
+    },
+    /// Lists the task's materials, with delivery state and expiry.
+    List {
+        /// The task id.
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+    },
+    /// Shows one material's files.
+    Show {
+        /// The task id.
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+        /// The material id.
+        #[arg(value_name = "MATERIAL_ID")]
+        material_id: String,
+    },
+    /// Downloads a material into a folder. Writes only inside it, never
+    /// through a link, and refuses to overwrite an existing file unless
+    /// `--force`.
+    Download {
+        /// The task id.
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+        /// The material id.
+        #[arg(value_name = "MATERIAL_ID")]
+        material_id: String,
+        /// The folder to write into; created when missing.
+        #[arg(value_name = "DEST_DIR")]
+        dest: PathBuf,
+        /// Replace existing regular files.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Deletes a material at the control plane. A copy already delivered
+    /// to the task's storage stays there until the task is archived.
+    Delete {
+        /// The task id.
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+        /// The material id.
+        #[arg(value_name = "MATERIAL_ID")]
+        material_id: String,
     },
 }
 
@@ -519,6 +594,7 @@ pub async fn task(
             }
             Ok(())
         }
+        TaskCommand::Materials { action } => materials(&client, action).await,
         TaskCommand::Watch { cursor } => {
             let cursor = match cursor {
                 Some(cursor) => cursor,
@@ -531,6 +607,137 @@ pub async fn task(
                 }
             };
             follow_events(&client, Some(cursor), None).await
+        }
+    }
+}
+
+/// Runs one `narsor task materials` command.
+async fn materials(client: &ApiClient, command: MaterialsCommand) -> Result<()> {
+    match command {
+        MaterialsCommand::Upload {
+            task_id,
+            paths,
+            material_id,
+            label,
+            ttl_secs,
+        } => {
+            let limits = MaterialLimits::default();
+            let snapshot = snapshot_paths(&paths, &limits, limits.max_total_bytes)
+                .map_err(|error| CliError::failure(format!("Nothing was uploaded: {error}")))?;
+            for skipped in &snapshot.skipped {
+                eprintln!("skipped {}: {}", skipped.path.display(), skipped.reason);
+            }
+            let mut bundle = snapshot.bundle;
+            bundle.manifest.material_id = material_id;
+            if label.is_some() {
+                bundle.manifest.label = label;
+            }
+            bundle.manifest.ttl_secs = ttl_secs;
+            let body = bundle
+                .encode()
+                .map_err(|error| CliError::failure(format!("Nothing was uploaded: {error}")))?;
+            let response = client
+                .upload_material(&task_id, body.into())
+                .await
+                .map_err(|error| failure("The material was not uploaded", error))?;
+            let material = &response.material;
+            println!(
+                "{} material {}: {} file(s), {} bytes, expires {}.",
+                if response.replayed {
+                    "Already uploaded:"
+                } else {
+                    "Uploaded"
+                },
+                material.material_id,
+                material.file_count,
+                material.total_bytes,
+                material.expires_at.to_rfc3339()
+            );
+            println!("The task's runner receives it on its next poll; nothing is committed.");
+            Ok(())
+        }
+        MaterialsCommand::List { task_id } => {
+            let listing = client
+                .materials(&task_id)
+                .await
+                .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
+            if listing.materials.is_empty() {
+                println!("No materials.");
+            }
+            for material in &listing.materials {
+                let state = match (material.origin, material.delivered_at) {
+                    (MaterialOrigin::Runner, _) => "from the task".to_string(),
+                    (MaterialOrigin::Owner, Some(at)) => format!("delivered {}", at.to_rfc3339()),
+                    (MaterialOrigin::Owner, None) => "waiting for the runner".to_string(),
+                };
+                println!(
+                    "{:<40} {:>5} file(s) {:>10} bytes  {:<34} expires {}  {}",
+                    material.material_id,
+                    material.file_count,
+                    material.total_bytes,
+                    state,
+                    material.expires_at.to_rfc3339(),
+                    material.label.as_deref().unwrap_or("")
+                );
+            }
+            Ok(())
+        }
+        MaterialsCommand::Show {
+            task_id,
+            material_id,
+        } => {
+            let view = client
+                .material(&task_id, &material_id)
+                .await
+                .map_err(|error| {
+                    failure(&format!("Could not load material '{material_id}'"), error)
+                })?;
+            for file in &view.files {
+                println!("{:>10}  {}  {}", file.size, file.sha256, file.path);
+            }
+            Ok(())
+        }
+        MaterialsCommand::Download {
+            task_id,
+            material_id,
+            dest,
+            force,
+        } => {
+            let (view, blobs) = client
+                .fetch_material(&task_id, &material_id)
+                .await
+                .map_err(|error| failure(&format!("Could not download '{material_id}'"), error))?;
+            std::fs::create_dir_all(&dest).map_err(|error| {
+                CliError::failure(format!("Cannot create '{}': {error}", dest.display()))
+            })?;
+            let mode = if force {
+                WriteMode::Overwrite
+            } else {
+                WriteMode::Refuse
+            };
+            let written = write_files(&dest, &view.files, &blobs, mode)
+                .map_err(|error| CliError::failure(format!("Nothing was written: {error}")))?;
+            println!(
+                "Wrote {} file(s) of material {} into {}.",
+                written.len(),
+                material_id,
+                dest.display()
+            );
+            Ok(())
+        }
+        MaterialsCommand::Delete {
+            task_id,
+            material_id,
+        } => {
+            let removed = client
+                .delete_material(&task_id, &material_id)
+                .await
+                .map_err(|error| failure(&format!("Could not delete '{material_id}'"), error))?;
+            println!(
+                "Deleted material {} at the control plane ({} file(s)).",
+                removed.material_id, removed.file_count
+            );
+            Ok(())
         }
     }
 }
@@ -613,6 +820,12 @@ fn print_event(event: &TaskEvent) {
         TaskEventKind::PriorityChanged { priority } => format!("priority {priority}"),
         TaskEventKind::QueueChanged { reason } => format!("queue: {}", reason.describe()),
         TaskEventKind::InputsUpdated { updates } => format!("{} input(s) updated", updates.len()),
+        TaskEventKind::MaterialChanged {
+            material_id,
+            change,
+            files,
+            total_bytes,
+        } => format!("material {material_id} {change:?} ({files} file(s), {total_bytes} bytes)"),
     };
     println!(
         "{:>4}  {}  {:<24} {:<12} {kind}",

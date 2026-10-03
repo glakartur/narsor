@@ -1835,6 +1835,137 @@ mod remote_cli {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn materials_are_uploaded_listed_downloaded_and_deleted_from_the_cli() {
+        let harness = RemoteHarness::start().await;
+        let token = harness.handle.token().to_string();
+        let token = Some(token.as_str());
+        let created = remote(
+            &harness,
+            token,
+            &[
+                "task",
+                "create",
+                "implement-feature",
+                "--workflow-version",
+                "1",
+                "--backend",
+                "k8s",
+                "--task-id",
+                "t-1",
+            ],
+        )
+        .await;
+        assert_eq!(created.code, EXIT_SUCCESS, "{}", created.output());
+
+        let local = harness.root.path().join("brief");
+        std::fs::create_dir_all(local.join("docs")).unwrap();
+        std::fs::write(local.join("docs/spec.md"), "the spec").unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", local.join("link")).unwrap();
+        let brief = local.display().to_string();
+        let upload = remote(
+            &harness,
+            token,
+            &[
+                "task",
+                "materials",
+                "upload",
+                "t-1",
+                &brief,
+                "--id",
+                "brief",
+            ],
+        )
+        .await;
+        assert_eq!(upload.code, EXIT_SUCCESS, "{}", upload.output());
+        assert!(
+            upload.stdout.contains("Uploaded material brief: 1 file(s)"),
+            "{}",
+            upload.stdout
+        );
+        assert!(
+            upload.stderr.contains("skipped") && upload.stderr.contains("link"),
+            "{}",
+            upload.stderr
+        );
+
+        let list = remote(&harness, token, &["task", "materials", "list", "t-1"]).await;
+        assert_eq!(list.code, EXIT_SUCCESS, "{}", list.output());
+        assert!(
+            list.stdout.contains("waiting for the runner"),
+            "{}",
+            list.stdout
+        );
+        let show = remote(
+            &harness,
+            token,
+            &["task", "materials", "show", "t-1", "brief"],
+        )
+        .await;
+        assert!(
+            show.stdout.contains("brief/docs/spec.md"),
+            "{}",
+            show.output()
+        );
+
+        let dest = harness.root.path().join("download");
+        let dest_arg = dest.display().to_string();
+        let download = remote(
+            &harness,
+            token,
+            &["task", "materials", "download", "t-1", "brief", &dest_arg],
+        )
+        .await;
+        assert_eq!(download.code, EXIT_SUCCESS, "{}", download.output());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("brief/docs/spec.md")).unwrap(),
+            "the spec"
+        );
+        let again = remote(
+            &harness,
+            token,
+            &["task", "materials", "download", "t-1", "brief", &dest_arg],
+        )
+        .await;
+        assert_eq!(again.code, EXIT_FAILURE, "{}", again.output());
+        assert!(again.stderr.contains("already exists"), "{}", again.stderr);
+        let forced = remote(
+            &harness,
+            token,
+            &[
+                "task",
+                "materials",
+                "download",
+                "t-1",
+                "brief",
+                &dest_arg,
+                "--force",
+            ],
+        )
+        .await;
+        assert_eq!(forced.code, EXIT_SUCCESS, "{}", forced.output());
+
+        let deleted = remote(
+            &harness,
+            token,
+            &["task", "materials", "delete", "t-1", "brief"],
+        )
+        .await;
+        assert_eq!(deleted.code, EXIT_SUCCESS, "{}", deleted.output());
+        let events = remote(&harness, token, &["task", "events", "t-1"]).await;
+        assert!(
+            events.stdout.contains("material brief Uploaded"),
+            "{}",
+            events.stdout
+        );
+        assert!(
+            events.stdout.contains("material brief Deleted"),
+            "{}",
+            events.stdout
+        );
+        assert!(!events.stdout.contains("spec.md"), "{}", events.stdout);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_remote_server_needs_a_token_and_a_good_one() {
         let harness = RemoteHarness::start().await;
         let missing = remote(&harness, None, &["task", "list"]).await;

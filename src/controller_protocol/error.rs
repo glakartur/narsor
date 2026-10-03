@@ -117,6 +117,26 @@ impl From<OrchestrationError> for ProtocolError {
     }
 }
 
+impl From<crate::materials::MaterialError> for ProtocolError {
+    fn from(error: crate::materials::MaterialError) -> Self {
+        use crate::materials::MaterialError as E;
+        let message = error.to_string();
+        match error {
+            E::NotFound => Self::NotFound,
+            E::InvalidPath { .. } => Self::bad_request("invalid_material_path", message),
+            E::InvalidManifest(_) => Self::bad_request("invalid_material_manifest", message),
+            E::TooLarge(_) => Self::bad_request("material_too_large", message),
+            E::DigestMismatch(_) => Self::bad_request("material_digest_mismatch", message),
+            E::Incomplete(_) => Self::bad_request("material_incomplete", message),
+            E::Refused(_) => Self::bad_request("material_refused", message),
+            E::QuotaExceeded(_) => Self::conflict("material_quota_exceeded", message),
+            E::IdReused(_) => Self::conflict("material_id_reused", message),
+            E::TaskArchived(_) => Self::conflict("task_archived", message),
+            E::Persistence(_) | E::Io { .. } | E::Internal(_) => Self::Internal(message),
+        }
+    }
+}
+
 impl IntoResponse for ProtocolError {
     fn into_response(self) -> Response {
         match self {

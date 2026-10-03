@@ -20,6 +20,8 @@
 //! {state}/orchestration/…             -- control-plane task records, leases,
 //!                                        controller identities, runner sessions
 //! {state}/launch-specs/{task}.json    -- immutable launch input (task storage)
+//! {state}/materials/…                 -- bounded task materials (U9): manifests
+//!                                        and blobs, outside any workspace
 //!
 //! {work}/tasks/{id}/code/…           -- WorkPaths: local scratch, disposable
 //! ```
@@ -205,6 +207,30 @@ pub const RUNNER_SESSION_FILE: &str = "runner-session.json";
 /// Not inside `executions/{id}`: a directory there without a `state.json`
 /// would show up in every execution listing as a broken execution.
 pub const LAUNCH_SPECS_DIR: &str = "launch-specs";
+
+/// Bounded task materials (U9), directly under the state root.
+///
+/// A sibling of [`ORCHESTRATION_DIR`], not inside it: material blobs are
+/// opaque user bytes, and nothing that walks task records, event logs or
+/// controller identities should ever come across them. Every task id is a
+/// valid identifier, which never starts with `.`, so the two dot-directories
+/// below can never collide with a task.
+pub const MATERIALS_DIR: &str = "materials";
+
+/// Uploads under way, one sub-directory each, inside [`MATERIALS_DIR`]. An
+/// upload becomes a material only by being renamed out of here, so whatever
+/// is left here after a crash is garbage.
+pub const MATERIALS_STAGING_DIR: &str = ".staging";
+
+/// Per-task advisory locks of the material store, inside [`MATERIALS_DIR`]
+/// and outside the task directories, which archive deletes.
+pub const MATERIALS_LOCKS_DIR: &str = ".locks";
+
+/// The record (manifest and delivery state) of one material.
+pub const MATERIAL_RECORD_FILE: &str = "material.json";
+
+/// Directory of one material's content-addressed blobs.
+pub const MATERIAL_BLOBS_DIR: &str = "blobs";
 
 /// The one checkpoint kept for an execution (R25).
 pub const CHECKPOINT_FILE: &str = "checkpoint.bundle";
@@ -400,6 +426,46 @@ impl StatePaths {
     pub fn runner_session_file(&self, task_id: &str) -> PathBuf {
         self.orchestration_task_dir(task_id)
             .join(RUNNER_SESSION_FILE)
+    }
+
+    /// `{root}/materials`
+    pub fn materials_dir(&self) -> PathBuf {
+        self.root.join(MATERIALS_DIR)
+    }
+
+    /// `{root}/materials/.staging`
+    pub fn materials_staging_dir(&self) -> PathBuf {
+        self.materials_dir().join(MATERIALS_STAGING_DIR)
+    }
+
+    /// `{root}/materials/.locks/{task_id}.lock`
+    pub fn task_materials_lock_file(&self, task_id: &str) -> PathBuf {
+        self.materials_dir()
+            .join(MATERIALS_LOCKS_DIR)
+            .join(format!("{task_id}.lock"))
+    }
+
+    /// `{root}/materials/{task_id}`
+    pub fn task_materials_dir(&self, task_id: &str) -> PathBuf {
+        self.materials_dir().join(task_id)
+    }
+
+    /// `{root}/materials/{task_id}/{material_id}`
+    pub fn material_dir(&self, task_id: &str, material_id: &str) -> PathBuf {
+        self.task_materials_dir(task_id).join(material_id)
+    }
+
+    /// `{root}/materials/{task_id}/{material_id}/material.json`
+    pub fn material_record_file(&self, task_id: &str, material_id: &str) -> PathBuf {
+        self.material_dir(task_id, material_id)
+            .join(MATERIAL_RECORD_FILE)
+    }
+
+    /// `{root}/materials/{task_id}/{material_id}/blobs/{sha256}`
+    pub fn material_blob_file(&self, task_id: &str, material_id: &str, sha256: &str) -> PathBuf {
+        self.material_dir(task_id, material_id)
+            .join(MATERIAL_BLOBS_DIR)
+            .join(sha256)
     }
 
     /// `{root}/orchestration/controllers`
