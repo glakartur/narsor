@@ -51,6 +51,12 @@ crossterm = "0.29.0"
 # Conversation log compression (closed attempts only, see src/persistence/conversation.rs)
 zstd = "0.13"
 
+# Hashing of controller, enrollment and runner bearer credentials before they
+# are stored (src/controller_protocol/credentials.rs): the control plane keeps
+# only a digest of each secret, so its state directory never holds a usable
+# credential. Already in the lock file through other crates.
+sha2 = "0.10"
+
 # Lossless byte-for-byte encoding of raw harness lines inside a JSONL envelope
 base64 = "0.22"
 

@@ -17,7 +17,8 @@
 //! {state}/executions/{id}/…          -- StatePaths: owned by one process
 //! {state}/narsor.log
 //! {state}/agent-harness.json          -- operator-selected default harness
-//! {state}/orchestration/…             -- control-plane task records, leases
+//! {state}/orchestration/…             -- control-plane task records, leases,
+//!                                        controller identities, runner sessions
 //! {state}/launch-specs/{task}.json    -- immutable launch input (task storage)
 //!
 //! {work}/tasks/{id}/code/…           -- WorkPaths: local scratch, disposable
@@ -143,6 +144,28 @@ pub const BACKEND_LEASE_FILE: &str = "lease.json";
 
 /// Advisory lock serializing lease acquisition and renewal of one backend.
 pub const BACKEND_LEASE_LOCK_FILE: &str = "lease.lock";
+
+/// Directory of one sub-directory per enrolled controller identity (R37),
+/// inside [`ORCHESTRATION_DIR`].
+pub const ORCHESTRATION_CONTROLLERS_DIR: &str = "controllers";
+
+/// The record of one controller identity: backend scope, credential hash,
+/// revocation, heartbeat and acknowledged generations.
+pub const CONTROLLER_RECORD_FILE: &str = "controller.json";
+
+/// Advisory lock serializing mutations of one controller record.
+pub const CONTROLLER_LOCK_FILE: &str = "controller.lock";
+
+/// Directory of one-time controller enrollment codes, inside
+/// [`ORCHESTRATION_DIR`].
+pub const ORCHESTRATION_ENROLLMENTS_DIR: &str = "enrollments";
+
+/// Advisory lock serializing enrollment creation and redemption.
+pub const ENROLLMENTS_LOCK_FILE: &str = "enroll.lock";
+
+/// The current runner credential of one task (KTD3), next to its record but
+/// outside it, so the credential hash never travels with the record.
+pub const RUNNER_SESSION_FILE: &str = "runner-session.json";
 
 /// Directory of immutable task launch specifications on task storage.
 ///
@@ -302,6 +325,48 @@ impl StatePaths {
     /// `{root}/launch-specs/{task_id}.json`
     pub fn task_launch_spec_file(&self, task_id: &str) -> PathBuf {
         self.launch_specs_dir().join(format!("{task_id}.json"))
+    }
+
+    /// `{root}/orchestration/tasks/{task_id}/runner-session.json`
+    pub fn runner_session_file(&self, task_id: &str) -> PathBuf {
+        self.orchestration_task_dir(task_id)
+            .join(RUNNER_SESSION_FILE)
+    }
+
+    /// `{root}/orchestration/controllers`
+    pub fn orchestration_controllers_dir(&self) -> PathBuf {
+        self.orchestration_dir().join(ORCHESTRATION_CONTROLLERS_DIR)
+    }
+
+    /// `{root}/orchestration/controllers/{controller_id}/controller.json`
+    pub fn controller_record_file(&self, controller_id: &str) -> PathBuf {
+        self.orchestration_controllers_dir()
+            .join(controller_id)
+            .join(CONTROLLER_RECORD_FILE)
+    }
+
+    /// `{root}/orchestration/controllers/{controller_id}/controller.lock`
+    pub fn controller_lock_file(&self, controller_id: &str) -> PathBuf {
+        self.orchestration_controllers_dir()
+            .join(controller_id)
+            .join(CONTROLLER_LOCK_FILE)
+    }
+
+    /// `{root}/orchestration/enrollments`
+    pub fn orchestration_enrollments_dir(&self) -> PathBuf {
+        self.orchestration_dir().join(ORCHESTRATION_ENROLLMENTS_DIR)
+    }
+
+    /// `{root}/orchestration/enrollments/{enrollment_id}.json`
+    pub fn enrollment_file(&self, enrollment_id: &str) -> PathBuf {
+        self.orchestration_enrollments_dir()
+            .join(format!("{enrollment_id}.json"))
+    }
+
+    /// `{root}/orchestration/enrollments/enroll.lock`
+    pub fn enrollments_lock_file(&self) -> PathBuf {
+        self.orchestration_enrollments_dir()
+            .join(ENROLLMENTS_LOCK_FILE)
     }
 
     /// `{state}/executions/{id}/checkpoint.bundle`.

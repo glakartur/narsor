@@ -5,6 +5,7 @@
 //! [`super::control_plane`].
 
 use crate::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
+use crate::engine::{HumanInputDelivery, PendingHumanInput, Timeline};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -272,6 +273,40 @@ pub enum TaskEventKind {
         /// Epoch of the reporting controller's lease.
         lease_epoch: u64,
     },
+    /// A runner snapshot was accepted (KTD3). Carries only the cursors a
+    /// client needs to decide whether to re-read the task, never content.
+    RunnerReported {
+        /// Pod (or container) incarnation that reported.
+        incarnation: String,
+        /// The runner's own engine event cursor.
+        event_cursor: u64,
+        /// The runner's execution status.
+        execution_status: ExecutionStatus,
+        /// The input request the runner waits on, if any.
+        pending_input_id: Option<String>,
+    },
+    /// The owner queued an answer for a pending input request.
+    InputQueued {
+        /// Control-plane id of the queued input.
+        input_id: String,
+        /// The runner's pending-input id it answers.
+        pending_input_id: String,
+    },
+    /// Queued inputs changed status (delivered, consumed, rejected or made
+    /// obsolete by the runner moving on).
+    InputsUpdated {
+        /// Every input whose status changed, with its new status.
+        updates: Vec<InputUpdate>,
+    },
+}
+
+/// One status change of a queued input.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputUpdate {
+    /// The input.
+    pub input_id: String,
+    /// Its new status.
+    pub status: InputStatus,
 }
 
 /// One entry of a task's durable control-plane event log.
@@ -337,6 +372,16 @@ pub struct TaskRecord {
     pub archive: Option<ArchiveTombstone>,
     /// Every accepted owner command, in order.
     pub commands: Vec<CommandReceipt>,
+    /// The last accepted runner snapshot (KTD4's "last safe summary"). Kept
+    /// after the runner goes away, so a paused or interrupted task still
+    /// shows what it last did — with its observation time, never upgraded
+    /// to a fabricated terminal state.
+    #[serde(default)]
+    pub runner: Option<RunnerObservation>,
+    /// Owner inputs queued for the runner, oldest first; the audit trail of
+    /// every answer, whose payload is dropped once it is settled.
+    #[serde(default)]
+    pub inputs: Vec<QueuedInput>,
     /// The event of revision [`Self::revision`]: an outbox of one, so a crash
     /// between writing the record and appending the event is repaired from
     /// the record itself (see `OrchestrationStore::publish_last_event`).
@@ -350,6 +395,228 @@ impl TaskRecord {
             .iter()
             .find(|receipt| receipt.idempotency_key == idempotency_key)
     }
+
+    /// Whether a runner launched at `launch_generation` was superseded by a
+    /// later owner start or resume (KTD3).
+    ///
+    /// A start or resume launches a new incarnation on the same storage, so
+    /// every credential and report of an older launch is fenced from that
+    /// moment on — even before the controller issued the new incarnation's
+    /// credential. Pause and archive do not supersede: the running runner
+    /// must still see them and acknowledge its safe point.
+    pub fn supersedes_launch(&self, launch_generation: u64) -> bool {
+        self.commands.iter().any(|receipt| {
+            matches!(receipt.command, OwnerCommand::Start | OwnerCommand::Resume)
+                && receipt.generation_after > launch_generation
+        })
+    }
+
+    /// The pending-input id of the last accepted runner snapshot.
+    pub fn pending_input_id(&self) -> Option<&str> {
+        self.runner
+            .as_ref()
+            .and_then(|runner| runner.snapshot.pending_input.as_ref())
+            .map(|pending| pending.id.as_str())
+    }
+
+    /// Finds a queued input by id.
+    pub fn input(&self, input_id: &str) -> Option<&QueuedInput> {
+        self.inputs.iter().find(|input| input.input_id == input_id)
+    }
+}
+
+/// Where the runner's engine stands, as positions rather than content.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionCursor {
+    /// The execution on task storage, once the runner created it.
+    pub execution_id: Option<String>,
+    /// The workflow state it is in.
+    pub current_state: Option<String>,
+    /// The action execution (attempt) under way or last run.
+    pub action_execution_id: Option<String>,
+}
+
+/// The input request a runner is waiting on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingInputRef {
+    /// Identity of the request: [`PendingHumanInput::episode_key`]. An owner
+    /// answer names it, and is refused for any other.
+    pub id: String,
+    /// The agent attempt that asked, when an agent asked.
+    pub attempt_id: Option<String>,
+    /// The form, exactly as the runner's engine recorded it, so a client
+    /// renders it without the workflow definition.
+    pub form: PendingHumanInput,
+}
+
+/// One attempt's conversation, summarized: never its content (KTD4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationAttemptSummary {
+    /// Attempt (action execution) id.
+    pub attempt_id: String,
+    /// State the attempt ran in.
+    pub state_id: Option<String>,
+    /// Number of recorded entries.
+    pub entries: u64,
+    /// Whether the attempt's record is closed.
+    pub closed: bool,
+    /// When its last entry was written.
+    pub last_entry_at: Option<DateTime<Utc>>,
+}
+
+/// Whether the runner can serve its conversation, and what it holds.
+///
+/// The raw transcript stays on task storage; the control plane only ever
+/// stores this summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ConversationAvailability {
+    /// The runner is live and holds these attempts' records.
+    Live {
+        /// Summary of each attempt with a conversation record.
+        attempts: Vec<ConversationAttemptSummary>,
+    },
+    /// The runner cannot serve it (for instance while shutting down).
+    Unavailable {
+        /// Why, for humans.
+        reason: String,
+    },
+}
+
+impl Default for ConversationAvailability {
+    fn default() -> Self {
+        Self::Live {
+            attempts: Vec::new(),
+        }
+    }
+}
+
+/// Everything a runner reports about its work (KTD3, KTD4).
+///
+/// Cursors and summaries only: workspace files, secret values and raw
+/// conversation lines never leave task storage through this type.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunnerSnapshot {
+    /// Runner-assigned, strictly increasing within one incarnation. Orders
+    /// reports that arrive out of order; restarts at any value with a new
+    /// incarnation.
+    pub snapshot_sequence: u64,
+    /// The runner's execution status — the work-state detail.
+    pub execution_status: ExecutionStatus,
+    /// Where its engine stands.
+    #[serde(default)]
+    pub execution_cursor: ExecutionCursor,
+    /// Sequence of the last event in the runner's own event log. Never goes
+    /// backwards, not even across incarnations: the log lives on task
+    /// storage, which outlives every Pod.
+    pub event_cursor: u64,
+    /// The input request it waits on.
+    #[serde(default)]
+    pub pending_input: Option<PendingInputRef>,
+    /// Its conversation's availability and summary.
+    #[serde(default)]
+    pub conversation: ConversationAvailability,
+    /// The step timeline (positions and links, no content).
+    #[serde(default)]
+    pub timeline: Option<Timeline>,
+    /// True when the runner stands at a durable safe point and may lose its
+    /// compute without losing work (the acknowledgement a pause waits for).
+    #[serde(default)]
+    pub safe_point: bool,
+    /// When the runner took this snapshot.
+    pub observed_at: DateTime<Utc>,
+}
+
+/// The last accepted runner snapshot with its provenance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunnerObservation {
+    /// The incarnation that reported it.
+    pub incarnation: String,
+    /// The generation that incarnation was launched at.
+    pub launch_generation: u64,
+    /// The snapshot.
+    pub snapshot: RunnerSnapshot,
+    /// When the control plane accepted it.
+    pub received_at: DateTime<Utc>,
+    /// The desired generation of a pause this runner acknowledged with a
+    /// safe point — the precondition for removing its compute (KTD2).
+    #[serde(default)]
+    pub safe_point_generation: Option<u64>,
+}
+
+/// What became of a queued owner input.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum InputStatus {
+    /// Waiting for the runner to poll it.
+    Queued,
+    /// Handed to the runner; redelivered until it acknowledges.
+    Delivered,
+    /// The runner accepted it.
+    Consumed,
+    /// The runner refused it (its own validation).
+    Rejected,
+    /// The runner moved on to another request before it was delivered; it
+    /// was never handed over and the runner was never touched.
+    Obsolete,
+}
+
+impl InputStatus {
+    /// True once nothing more can happen to the input.
+    pub fn is_settled(self) -> bool {
+        matches!(self, Self::Consumed | Self::Rejected | Self::Obsolete)
+    }
+}
+
+/// One owner answer queued for the runner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueuedInput {
+    /// Control-plane id, unique within the task.
+    pub input_id: String,
+    /// Owner-chosen key; a retry with it returns this input.
+    pub idempotency_key: String,
+    /// The runner request it answers.
+    pub pending_input_id: String,
+    /// Its status.
+    pub status: InputStatus,
+    /// The answer itself, dropped once settled: the control plane relays
+    /// input, it does not keep a copy of the conversation.
+    pub delivery: Option<HumanInputDelivery>,
+    /// When the owner submitted it.
+    pub submitted_at: DateTime<Utc>,
+    /// When its status last changed.
+    pub updated_at: DateTime<Utc>,
+    /// The runner's reason, when it rejected the input.
+    pub detail: Option<String>,
+}
+
+/// An owner input as submitted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputRequest {
+    /// The runner request it answers.
+    pub pending_input_id: String,
+    /// Owner-chosen key; a retry reuses it.
+    pub idempotency_key: String,
+    /// The answer.
+    pub delivery: HumanInputDelivery,
+}
+
+/// The result of queueing an owner input.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputOutcome {
+    /// The queued input.
+    pub input: QueuedInput,
+    /// True when this was a retry answered from the existing input.
+    pub replayed: bool,
+}
+
+/// The result of a runner snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunnerReportOutcome {
+    /// The task as it is now.
+    pub task: TaskRecord,
+    /// False when the snapshot was a duplicate and changed nothing.
+    pub applied: bool,
 }
 
 /// Everything needed to create a task.

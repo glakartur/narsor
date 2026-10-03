@@ -58,7 +58,7 @@ pub struct OrchestrationRecovery {
 }
 
 /// Whether a mutation changed the record.
-enum Mutation<T> {
+pub(crate) enum Mutation<T> {
     /// Nothing to write; the value is returned as is.
     Unchanged(T),
     /// Commit a new revision described by this event.
@@ -89,6 +89,12 @@ impl ControlPlane {
     /// The underlying file store.
     pub fn store(&self) -> &OrchestrationStore {
         &self.store
+    }
+
+    /// "Now" by this control plane's clock — the one lease expiry and
+    /// observation staleness are judged by.
+    pub fn now(&self) -> DateTime<Utc> {
+        self.clock.now()
     }
 
     /// Creates a queued task, idempotently.
@@ -142,6 +148,8 @@ impl ControlPlane {
             observed: None,
             archive: None,
             commands: Vec::new(),
+            runner: None,
+            inputs: Vec::new(),
             last_event: TaskEvent {
                 sequence: 1,
                 task_id: request.task_id.clone(),
@@ -307,6 +315,53 @@ impl ControlPlane {
         self.store.load_lease(backend_id)
     }
 
+    /// Gives the lease up voluntarily (a controller shutting down cleanly),
+    /// so another controller may take over at once instead of waiting for
+    /// expiry. The epoch stays; the next acquisition increments it, which
+    /// fences every report still in flight under this one.
+    pub fn release_lease(&self, token: &LeaseToken) -> Result<BackendLease> {
+        let _lock = self.store.lock_backend(&token.backend_id)?;
+        let mut lease = self.current_lease(token)?;
+        lease.expires_at = lease.expires_at.min(self.clock.now());
+        self.store.save_lease(&lease)?;
+        Ok(lease)
+    }
+
+    /// Ends `controller_id`'s hold on the backend's lease, if it holds it —
+    /// the lease half of revoking a controller identity (R37).
+    ///
+    /// Expiring the lease is enough to fence it: reports under an expired
+    /// lease are refused, and the revoked identity can no longer
+    /// authenticate to renew it. Returns the lease as it is afterwards, or
+    /// `None` when `controller_id` did not hold it.
+    pub fn revoke_lease(
+        &self,
+        backend_id: &BackendId,
+        controller_id: &str,
+    ) -> Result<Option<BackendLease>> {
+        let _lock = self.store.lock_backend(backend_id)?;
+        let Some(mut lease) = self.store.load_lease(backend_id)? else {
+            return Ok(None);
+        };
+        if lease.controller_id != controller_id {
+            return Ok(None);
+        }
+        lease.expires_at = lease.expires_at.min(self.clock.now());
+        self.store.save_lease(&lease)?;
+        Ok(Some(lease))
+    }
+
+    /// The backend's lease if `controller_id` holds it unexpired.
+    pub fn held_lease(
+        &self,
+        backend_id: &BackendId,
+        controller_id: &str,
+    ) -> Result<Option<BackendLease>> {
+        Ok(self.store.load_lease(backend_id)?.filter(|lease| {
+            lease.controller_id == controller_id && self.clock.now() < lease.expires_at
+        }))
+    }
+
     /// Accepts a controller observation.
     ///
     /// Refused unless the lease is the backend's current, unexpired one and
@@ -437,7 +492,7 @@ impl ControlPlane {
     }
 
     /// The serialized read-modify-write of one task.
-    fn mutate<T>(
+    pub(crate) fn mutate<T>(
         &self,
         task_id: &TaskId,
         operation: impl FnOnce(&mut TaskRecord, DateTime<Utc>) -> Result<Mutation<T>>,

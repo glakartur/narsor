@@ -22,9 +22,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use narsor::api;
+use narsor::controller_protocol::{
+    ControlEventEnvelope, CreateTaskRequest, LaunchRequest, OwnerCommandRequest, ProtocolService,
+};
 use narsor::domain::{Event, Workspace};
 use narsor::engine::Engine;
+use narsor::orchestration::{ControlPlane, OwnerCommand};
+use narsor::persistence::paths::StatePaths;
 use narsor::persistence::ExecutionStore;
 use narsor::workflow::load_from_file;
 
@@ -448,4 +454,197 @@ async fn execution_stream_reports_an_unknown_execution_as_not_found() {
         .await
         .expect("request the stream for an unknown execution");
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// The control plane's durable event stream (U2)
+// ---------------------------------------------------------------------------
+
+/// A server with the remote-task control plane on `root`.
+async fn start_control_plane_server(root: &TempRoot) -> api::ApiHandle {
+    let control = ControlPlane::new(StatePaths::new(root.path()));
+    api::start_with_services(
+        Arc::new(Engine::new(root.store())),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+        api::ApiServices {
+            control: Some(Arc::new(ProtocolService::new(control))),
+            ..api::ApiServices::default()
+        },
+    )
+    .await
+    .expect("server starts")
+}
+
+async fn create_remote(client: &api::ApiClient, task_id: &str) {
+    client
+        .create_control_task(&CreateTaskRequest {
+            task_id: Some(task_id.to_string()),
+            backend_id: "k8s".to_string(),
+            priority: 0,
+            launch: LaunchRequest {
+                workflow_id: "wf".to_string(),
+                workflow_version: 1,
+                inputs: serde_json::json!({}),
+                workspace: serde_json::json!({}),
+            },
+        })
+        .await
+        .expect("create remote task");
+}
+
+async fn archive_remote(client: &api::ApiClient, task_id: &str) {
+    client
+        .control_command(
+            task_id,
+            &OwnerCommandRequest {
+                command: OwnerCommand::Archive,
+                idempotency_key: format!("archive-{task_id}"),
+                expected_generation: None,
+            },
+        )
+        .await
+        .expect("archive remote task");
+}
+
+/// The next envelope of a control stream, failing the test after a bound.
+async fn next_envelope<S>(stream: &mut S) -> ControlEventEnvelope
+where
+    S: futures::Stream<Item = Result<ControlEventEnvelope, api::ClientError>> + Unpin,
+{
+    tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("an event within the deadline")
+        .expect("the stream stays open")
+        .expect("a well-formed event")
+}
+
+/// Asserts nothing more arrives for a short while — a duplicate would.
+async fn assert_quiet<S>(stream: &mut S)
+where
+    S: futures::Stream<Item = Result<ControlEventEnvelope, api::ClientError>> + Unpin,
+{
+    let extra = tokio::time::timeout(Duration::from_millis(300), stream.next()).await;
+    assert!(extra.is_err(), "unexpected extra event: {extra:?}");
+}
+
+fn position(envelope: &ControlEventEnvelope) -> (String, u64) {
+    (envelope.event.task_id.to_string(), envelope.event.sequence)
+}
+
+#[tokio::test]
+async fn control_stream_replays_missed_events_once_then_goes_live() {
+    let root = TempRoot::new();
+    let handle = start_control_plane_server(&root).await;
+    let client = handle.client();
+    create_remote(&client, "task-1").await;
+    create_remote(&client, "task-2").await;
+    let seen = client.control_tasks().await.expect("list").cursor;
+
+    // Missed while disconnected.
+    archive_remote(&client, "task-1").await;
+    create_remote(&client, "task-3").await;
+
+    let mut stream = Box::pin(client.stream_control_events(Some(&seen), None));
+    let replayed = vec![
+        position(&next_envelope(&mut stream).await),
+        position(&next_envelope(&mut stream).await),
+    ];
+    assert_eq!(
+        replayed,
+        [("task-1".to_string(), 2), ("task-3".to_string(), 1)]
+    );
+
+    // Live.
+    archive_remote(&client, "task-2").await;
+    let live = next_envelope(&mut stream).await;
+    assert_eq!(position(&live), ("task-2".to_string(), 2));
+    assert_quiet(&mut stream).await;
+    drop(stream);
+
+    // Reconnecting with the last cursor repeats nothing.
+    let mut resumed = Box::pin(client.stream_control_events(Some(&live.cursor), None));
+    archive_remote(&client, "task-3").await;
+    assert_eq!(
+        position(&next_envelope(&mut resumed).await),
+        ("task-3".to_string(), 2)
+    );
+    assert_quiet(&mut resumed).await;
+}
+
+#[tokio::test]
+async fn control_stream_without_a_cursor_replays_from_the_start_and_filters_by_task() {
+    let root = TempRoot::new();
+    let handle = start_control_plane_server(&root).await;
+    let client = handle.client();
+    create_remote(&client, "task-1").await;
+    create_remote(&client, "task-2").await;
+    archive_remote(&client, "task-2").await;
+
+    let mut only_two = Box::pin(client.stream_control_events(None, Some("task-2")));
+    assert_eq!(
+        position(&next_envelope(&mut only_two).await),
+        ("task-2".to_string(), 1)
+    );
+    let last = next_envelope(&mut only_two).await;
+    assert_eq!(position(&last), ("task-2".to_string(), 2));
+    assert_eq!(last.cursor, "task-2:2");
+    archive_remote(&client, "task-1").await;
+    assert_quiet(&mut only_two).await;
+}
+
+#[tokio::test]
+async fn control_stream_resumes_from_the_last_event_id_header() {
+    let root = TempRoot::new();
+    let handle = start_control_plane_server(&root).await;
+    let client = handle.client();
+    create_remote(&client, "task-1").await;
+    archive_remote(&client, "task-1").await;
+
+    let response = reqwest::Client::new()
+        .get(url(&handle, "/control/v1/events/stream"))
+        .bearer_auth(handle.token())
+        .header("Last-Event-ID", "task-1:1")
+        .send()
+        .await
+        .expect("stream request");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut body = response.bytes_stream();
+    let mut text = String::new();
+    while !text.contains("\n\n") {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .expect("a frame within the deadline")
+            .expect("stream open")
+            .expect("chunk");
+        text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    let frame = &text[..text.find("\n\n").unwrap()];
+    assert!(frame.contains("event: task"), "{frame}");
+    assert!(frame.contains("id: task-1:2"), "{frame}");
+    let data = frame
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("data line");
+    let envelope: ControlEventEnvelope = serde_json::from_str(data).expect("envelope");
+    assert_eq!(envelope.event.sequence, 2);
+
+    let invalid = reqwest::Client::new()
+        .get(url(
+            &handle,
+            "/control/v1/events/stream?cursor=not%20a%20cursor",
+        ))
+        .bearer_auth(handle.token())
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let unauthenticated = reqwest::Client::new()
+        .get(url(&handle, "/control/v1/events/stream"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(unauthenticated.text().await.unwrap().is_empty());
 }

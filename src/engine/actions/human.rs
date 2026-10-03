@@ -130,7 +130,7 @@ fn action_type_name(action: &ActionConfig) -> &'static str {
 /// Deliberately free of everything the executor cannot know — which execution
 /// and state this belongs to, and which labels the state declares. That context
 /// is added by the engine in [`PendingHumanInput::new`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HumanInputRequest {
     /// Id of the [`crate::domain::ActionExecution`] that suspended.
     pub action_execution_id: ActionExecutionId,
@@ -159,7 +159,7 @@ pub struct HumanInputRequest {
 /// Self-contained on purpose: everything the TUI needs to render the form and
 /// everything [`resume`] needs to validate an answer is here, so neither has to
 /// load the workflow definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingHumanInput {
     /// The execution that is waiting.
     pub execution_id: ExecutionId,

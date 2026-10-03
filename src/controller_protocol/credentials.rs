@@ -1,0 +1,606 @@
+//! Controller and runner identities, and the bearer credentials that prove
+//! them (R37, KTD3, KTD6).
+//!
+//! # Three secrets, one shape
+//!
+//! | prefix | proves | issued by | lifetime |
+//! | --- | --- | --- | --- |
+//! | `nse` | right to enroll one controller for one backend | owner/operator | one redemption, expiry-bound |
+//! | `nsc` | a controller identity scoped to one backend | enrollment | until revoked |
+//! | `nsr` | one runner incarnation of one task launch | the backend's lease holder | short, renewable |
+//!
+//! Every token reads `{prefix}.{id}.{secret}`: the id names the record to
+//! check against, so verifying never scans, and the secret is compared with
+//! the stored SHA-256 digest in constant time. Only digests are stored — the
+//! state directory never holds a usable credential — and records are written
+//! `0600`.
+//!
+//! # Why the check is behind a trait
+//!
+//! Random bearer secrets are U2's stand-in for controller credentials; U7
+//! replaces them with mTLS or signed proof-of-possession. The HTTP layer
+//! therefore asks a [`ControllerAuthenticator`]/[`RunnerAuthenticator`] for
+//! an identity and knows nothing about how it was proven.
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::domain::{BackendId, TaskId};
+use crate::orchestration::{ControlPlane, OrchestrationError, Result, TaskLifecycle};
+use crate::persistence::{read_json, write_json_atomic_with_mode};
+
+/// Current schema version of [`ControllerRecord`].
+pub const CONTROLLER_RECORD_VERSION: u32 = 1;
+/// Current schema version of [`EnrollmentRecord`].
+pub const ENROLLMENT_RECORD_VERSION: u32 = 1;
+/// Current schema version of [`RunnerSession`].
+pub const RUNNER_SESSION_VERSION: u32 = 1;
+
+const ENROLLMENT_PREFIX: &str = "nse";
+const CONTROLLER_PREFIX: &str = "nsc";
+const RUNNER_PREFIX: &str = "nsr";
+
+/// Mode of every file holding a credential digest.
+const CREDENTIAL_FILE_MODE: u32 = 0o600;
+
+/// Compares two byte strings in time that depends only on their lengths, not
+/// their contents — every token is a bearer secret, so a length-leaking or
+/// early-exit comparison would give a caller a timing side channel to
+/// brute-force it byte by byte.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+/// A freshly issued bearer token, shown to its holder exactly once.
+///
+/// `Debug` is redacted so a token never ends up in a log line by accident.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BearerToken(String);
+
+impl BearerToken {
+    fn issue(prefix: &str, id: &str) -> Self {
+        // Two v4 UUIDs: 244 bits from the OS generator, hex without dots so
+        // the token splits unambiguously on its last `.`.
+        let secret = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        Self(format!("{prefix}.{id}.{secret}"))
+    }
+
+    /// The token as presented in `Authorization: Bearer …`.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    fn digest(&self) -> String {
+        digest(&self.0)
+    }
+}
+
+impl fmt::Debug for BearerToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BearerToken(<redacted>)")
+    }
+}
+
+impl From<String> for BearerToken {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+fn digest(token: &str) -> String {
+    let hash = Sha256::digest(token.as_bytes());
+    let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("sha256:{hex}")
+}
+
+/// The id a `{prefix}.{id}.{secret}` token names, when it has that prefix.
+fn token_id<'a>(prefix: &str, token: &'a str) -> Option<&'a str> {
+    let rest = token.strip_prefix(prefix)?.strip_prefix('.')?;
+    let (id, secret) = rest.rsplit_once('.')?;
+    (!id.is_empty() && !secret.is_empty()).then_some(id)
+}
+
+fn matches_digest(token: &str, stored: &str) -> bool {
+    constant_time_eq(digest(token).as_bytes(), stored.as_bytes())
+}
+
+/// Who a controller credential proves: one identity, one backend (R37).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerIdentity {
+    /// The identity.
+    pub controller_id: String,
+    /// The only backend it may act for.
+    pub backend_id: BackendId,
+}
+
+/// Who a runner credential proves: one incarnation of one task launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerIdentity {
+    /// The task.
+    pub task_id: TaskId,
+    /// The generation the incarnation was launched at.
+    pub launch_generation: u64,
+    /// The incarnation (a Pod UID, a container id).
+    pub incarnation: String,
+}
+
+/// Turns a presented controller bearer token into an identity, or `None`.
+///
+/// `None` covers every refusal — unknown, malformed, revoked — on purpose:
+/// the HTTP layer answers all of them with the same bare `401`.
+pub trait ControllerAuthenticator: Send + Sync {
+    /// The identity `bearer` proves, if any.
+    fn authenticate_controller(&self, bearer: &str) -> Option<ControllerIdentity>;
+}
+
+/// Turns a presented runner bearer token into an identity, or `None`
+/// (unknown, expired, an old incarnation, a superseded launch).
+pub trait RunnerAuthenticator: Send + Sync {
+    /// The identity `bearer` proves, if any.
+    fn authenticate_runner(&self, bearer: &str) -> Option<RunnerIdentity>;
+}
+
+/// The durable record of one controller identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ControllerRecord {
+    /// Schema version.
+    pub record_version: u32,
+    /// The identity.
+    pub controller_id: String,
+    /// The one backend it is scoped to.
+    pub backend_id: BackendId,
+    /// Operator-chosen label.
+    pub name: Option<String>,
+    /// Digest of its credential.
+    pub credential_digest: String,
+    /// When it enrolled.
+    pub enrolled_at: DateTime<Utc>,
+    /// When it was revoked; a revoked identity never authenticates again.
+    pub revoked_at: Option<DateTime<Utc>>,
+    /// Its last heartbeat.
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    /// Highest desired generation acknowledged per task. Survives
+    /// reconnects, so a reconnecting controller is only sent what is newer.
+    #[serde(default)]
+    pub acknowledged: BTreeMap<String, u64>,
+}
+
+/// A one-time enrollment code's record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnrollmentRecord {
+    /// Schema version.
+    pub record_version: u32,
+    /// Its id (the middle of the code).
+    pub enrollment_id: String,
+    /// The backend the enrolled controller will be scoped to.
+    pub backend_id: BackendId,
+    /// Label passed on to the controller record.
+    pub name: Option<String>,
+    /// Digest of the code.
+    pub code_digest: String,
+    /// When it was created.
+    pub created_at: DateTime<Utc>,
+    /// After this it cannot be redeemed.
+    pub expires_at: DateTime<Utc>,
+    /// When it was redeemed; once set it cannot be redeemed again.
+    pub redeemed_at: Option<DateTime<Utc>>,
+    /// The controller it produced.
+    pub controller_id: Option<String>,
+}
+
+/// The current runner credential of a task.
+///
+/// One per task: issuing for a new incarnation replaces it, which is what
+/// makes an old incarnation's credential stop working.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunnerSession {
+    /// Schema version.
+    pub record_version: u32,
+    /// The task.
+    pub task_id: TaskId,
+    /// The incarnation it was issued for.
+    pub incarnation: String,
+    /// The desired generation that incarnation was launched at.
+    pub launch_generation: u64,
+    /// Digest of the credential.
+    pub credential_digest: String,
+    /// Lease epoch of the controller that issued it.
+    pub issued_by_epoch: u64,
+    /// When it was issued.
+    pub issued_at: DateTime<Utc>,
+    /// After this it is refused unless renewed.
+    pub expires_at: DateTime<Utc>,
+    /// When the runner was last heard from (snapshot, poll or renewal):
+    /// how a client tells a quiet runner from an unreachable one.
+    pub last_contact_at: Option<DateTime<Utc>>,
+}
+
+/// A controller identity as just enrolled, with its one-time-visible token.
+#[derive(Debug, Clone)]
+pub struct EnrolledController {
+    /// The new record.
+    pub record: ControllerRecord,
+    /// Its credential.
+    pub credential: BearerToken,
+}
+
+/// File-backed controller, enrollment and runner credentials, on the same
+/// state root and locks as the control plane.
+#[derive(Debug, Clone)]
+pub struct CredentialStore {
+    control: ControlPlane,
+}
+
+impl CredentialStore {
+    /// Credentials stored beside `control`'s records, judged by its clock.
+    pub fn new(control: ControlPlane) -> Self {
+        Self { control }
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        self.control.now()
+    }
+
+    fn paths(&self) -> &crate::persistence::StatePaths {
+        self.control.store().paths()
+    }
+
+    // ---------------------------------------------------------------
+    // Enrollment
+    // ---------------------------------------------------------------
+
+    /// Creates a one-time code that enrolls one controller for `backend_id`.
+    pub fn create_enrollment(
+        &self,
+        backend_id: &BackendId,
+        name: Option<String>,
+        ttl: Duration,
+    ) -> Result<(EnrollmentRecord, BearerToken)> {
+        let _lock = self.control.store().lock_enrollments()?;
+        let enrollment_id = format!("enr-{}", uuid::Uuid::new_v4().simple());
+        let code = BearerToken::issue(ENROLLMENT_PREFIX, &enrollment_id);
+        let now = self.now();
+        let record = EnrollmentRecord {
+            record_version: ENROLLMENT_RECORD_VERSION,
+            enrollment_id: enrollment_id.clone(),
+            backend_id: backend_id.clone(),
+            name,
+            code_digest: code.digest(),
+            created_at: now,
+            expires_at: now + ttl,
+            redeemed_at: None,
+            controller_id: None,
+        };
+        write_json_atomic_with_mode(
+            &self.paths().enrollment_file(&enrollment_id),
+            &record,
+            CREDENTIAL_FILE_MODE,
+        )?;
+        Ok((record, code))
+    }
+
+    /// Redeems an enrollment code into a new controller identity, once.
+    ///
+    /// `None` for anything that is not a valid, unexpired, unredeemed code;
+    /// the caller answers it with a bare refusal. Redemption and identity
+    /// creation run under one lock, so two racing redemptions cannot both
+    /// succeed.
+    pub fn redeem_enrollment(&self, code: &str) -> Result<Option<EnrolledController>> {
+        let Some(enrollment_id) = token_id(ENROLLMENT_PREFIX, code) else {
+            return Ok(None);
+        };
+        if !is_plain_id(enrollment_id) {
+            return Ok(None);
+        }
+        let _lock = self.control.store().lock_enrollments()?;
+        let path = self.paths().enrollment_file(enrollment_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let mut enrollment: EnrollmentRecord = read_json(&path)?;
+        let now = self.now();
+        if !matches_digest(code, &enrollment.code_digest)
+            || enrollment.redeemed_at.is_some()
+            || now >= enrollment.expires_at
+        {
+            return Ok(None);
+        }
+
+        let controller_id = format!("ctl-{}", uuid::Uuid::new_v4().simple());
+        let credential = BearerToken::issue(CONTROLLER_PREFIX, &controller_id);
+        let record = ControllerRecord {
+            record_version: CONTROLLER_RECORD_VERSION,
+            controller_id: controller_id.clone(),
+            backend_id: enrollment.backend_id.clone(),
+            name: enrollment.name.clone(),
+            credential_digest: credential.digest(),
+            enrolled_at: now,
+            revoked_at: None,
+            last_heartbeat_at: None,
+            acknowledged: BTreeMap::new(),
+        };
+        // The identity first, then the redemption mark: a crash in between
+        // leaves an identity nobody holds the credential of and a code that
+        // still redeems — never a redeemed code without an identity.
+        self.save_controller(&record)?;
+        enrollment.redeemed_at = Some(now);
+        enrollment.controller_id = Some(controller_id);
+        write_json_atomic_with_mode(&path, &enrollment, CREDENTIAL_FILE_MODE)?;
+        Ok(Some(EnrolledController { record, credential }))
+    }
+
+    // ---------------------------------------------------------------
+    // Controller identities
+    // ---------------------------------------------------------------
+
+    /// One controller record, if it exists.
+    pub fn controller(&self, controller_id: &str) -> Result<Option<ControllerRecord>> {
+        if !is_plain_id(controller_id) {
+            return Ok(None);
+        }
+        let path = self.paths().controller_record_file(controller_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let record: ControllerRecord = read_json(&path)?;
+        if record.record_version > CONTROLLER_RECORD_VERSION {
+            return Err(OrchestrationError::UnsupportedRecordVersion {
+                what: path.display().to_string(),
+                version: record.record_version,
+            });
+        }
+        Ok(Some(record))
+    }
+
+    /// Every controller record, sorted by id.
+    pub fn controllers(&self) -> Result<Vec<ControllerRecord>> {
+        let dir = self.paths().orchestration_controllers_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(crate::persistence::PersistenceError::io(&dir, source).into())
+            }
+        };
+        let mut records = Vec::new();
+        for entry in entries.flatten() {
+            if let Some(id) = entry.file_name().to_str() {
+                if let Some(record) = self.controller(id)? {
+                    records.push(record);
+                }
+            }
+        }
+        records.sort_by(|a, b| a.controller_id.cmp(&b.controller_id));
+        Ok(records)
+    }
+
+    /// Revokes a controller identity for good and fences its lease (R37).
+    /// Returns the record afterwards, `None` when it does not exist.
+    /// Revoking twice keeps the first revocation time.
+    pub fn revoke_controller(&self, controller_id: &str) -> Result<Option<ControllerRecord>> {
+        let Some(record) = self.update_controller(controller_id, |record, now| {
+            record.revoked_at.get_or_insert(now);
+        })?
+        else {
+            return Ok(None);
+        };
+        self.control
+            .revoke_lease(&record.backend_id, &record.controller_id)?;
+        Ok(Some(record))
+    }
+
+    /// Records a heartbeat.
+    pub fn record_heartbeat(&self, controller_id: &str) -> Result<Option<ControllerRecord>> {
+        self.update_controller(controller_id, |record, now| {
+            record.last_heartbeat_at = Some(now);
+        })
+    }
+
+    /// Raises the acknowledged generation of each `(task, generation)`;
+    /// never lowers it, so a duplicate or reordered acknowledgement is
+    /// harmless.
+    pub fn acknowledge(
+        &self,
+        controller_id: &str,
+        acks: &[(TaskId, u64)],
+    ) -> Result<Option<ControllerRecord>> {
+        self.update_controller(controller_id, |record, _| {
+            for (task_id, generation) in acks {
+                let entry = record.acknowledged.entry(task_id.to_string()).or_insert(0);
+                *entry = (*entry).max(*generation);
+            }
+        })
+    }
+
+    fn update_controller(
+        &self,
+        controller_id: &str,
+        change: impl FnOnce(&mut ControllerRecord, DateTime<Utc>),
+    ) -> Result<Option<ControllerRecord>> {
+        if self.controller(controller_id)?.is_none() {
+            return Ok(None);
+        }
+        let _lock = self.control.store().lock_controller(controller_id)?;
+        let Some(mut record) = self.controller(controller_id)? else {
+            return Ok(None);
+        };
+        change(&mut record, self.now());
+        self.save_controller(&record)?;
+        Ok(Some(record))
+    }
+
+    fn save_controller(&self, record: &ControllerRecord) -> Result<()> {
+        Ok(write_json_atomic_with_mode(
+            &self.paths().controller_record_file(&record.controller_id),
+            record,
+            CREDENTIAL_FILE_MODE,
+        )?)
+    }
+
+    // ---------------------------------------------------------------
+    // Runner sessions
+    // ---------------------------------------------------------------
+
+    /// Issues the credential of `incarnation`, launched at
+    /// `launch_generation`, replacing whatever credential the task had: from
+    /// now on only this incarnation authenticates.
+    pub fn issue_runner_session(
+        &self,
+        task_id: &TaskId,
+        incarnation: &str,
+        launch_generation: u64,
+        issued_by_epoch: u64,
+        ttl: Duration,
+    ) -> Result<(RunnerSession, BearerToken)> {
+        let _lock = self.control.store().lock_task(task_id)?;
+        let credential = BearerToken::issue(RUNNER_PREFIX, task_id.as_str());
+        let now = self.now();
+        let session = RunnerSession {
+            record_version: RUNNER_SESSION_VERSION,
+            task_id: task_id.clone(),
+            incarnation: incarnation.to_string(),
+            launch_generation,
+            credential_digest: credential.digest(),
+            issued_by_epoch,
+            issued_at: now,
+            expires_at: now + ttl,
+            last_contact_at: None,
+        };
+        self.save_session(&session)?;
+        Ok((session, credential))
+    }
+
+    /// The task's current runner session, if one was ever issued.
+    pub fn runner_session(&self, task_id: &TaskId) -> Result<Option<RunnerSession>> {
+        let path = self.paths().runner_session_file(task_id.as_str());
+        if !path.exists() {
+            return Ok(None);
+        }
+        let session: RunnerSession = read_json(&path)?;
+        if session.record_version > RUNNER_SESSION_VERSION {
+            return Err(OrchestrationError::UnsupportedRecordVersion {
+                what: path.display().to_string(),
+                version: session.record_version,
+            });
+        }
+        Ok(Some(session))
+    }
+
+    /// Records contact from `identity` and, when `renew_for` is given,
+    /// extends its credential. `None` when the session was replaced
+    /// meanwhile — the caller's incarnation is no longer current.
+    pub fn touch_runner(
+        &self,
+        identity: &RunnerIdentity,
+        renew_for: Option<Duration>,
+    ) -> Result<Option<RunnerSession>> {
+        let _lock = self.control.store().lock_task(&identity.task_id)?;
+        let Some(mut session) = self.runner_session(&identity.task_id)? else {
+            return Ok(None);
+        };
+        if session.incarnation != identity.incarnation
+            || session.launch_generation != identity.launch_generation
+        {
+            return Ok(None);
+        }
+        let now = self.now();
+        session.last_contact_at = Some(now);
+        if let Some(ttl) = renew_for {
+            session.expires_at = now + ttl;
+        }
+        self.save_session(&session)?;
+        Ok(Some(session))
+    }
+
+    fn save_session(&self, session: &RunnerSession) -> Result<()> {
+        Ok(write_json_atomic_with_mode(
+            &self.paths().runner_session_file(session.task_id.as_str()),
+            session,
+            CREDENTIAL_FILE_MODE,
+        )?)
+    }
+
+    fn verify_runner(&self, bearer: &str) -> Result<Option<RunnerIdentity>> {
+        let Some(task_id) = token_id(RUNNER_PREFIX, bearer) else {
+            return Ok(None);
+        };
+        let Ok(task_id) = TaskId::parse(task_id) else {
+            return Ok(None);
+        };
+        let Some(session) = self.runner_session(&task_id)? else {
+            return Ok(None);
+        };
+        if !matches_digest(bearer, &session.credential_digest) || self.now() >= session.expires_at {
+            return Ok(None);
+        }
+        let record = self.control.task(&task_id)?;
+        if record.lifecycle == TaskLifecycle::Archived
+            || record.supersedes_launch(session.launch_generation)
+        {
+            return Ok(None);
+        }
+        Ok(Some(RunnerIdentity {
+            task_id,
+            launch_generation: session.launch_generation,
+            incarnation: session.incarnation,
+        }))
+    }
+
+    fn verify_controller(&self, bearer: &str) -> Result<Option<ControllerIdentity>> {
+        let Some(controller_id) = token_id(CONTROLLER_PREFIX, bearer) else {
+            return Ok(None);
+        };
+        let Some(record) = self.controller(controller_id)? else {
+            return Ok(None);
+        };
+        if !matches_digest(bearer, &record.credential_digest) || record.revoked_at.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(ControllerIdentity {
+            controller_id: record.controller_id,
+            backend_id: record.backend_id,
+        }))
+    }
+}
+
+impl ControllerAuthenticator for CredentialStore {
+    fn authenticate_controller(&self, bearer: &str) -> Option<ControllerIdentity> {
+        self.verify_controller(bearer).unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "controller protocol: credential check failed");
+            None
+        })
+    }
+}
+
+impl RunnerAuthenticator for CredentialStore {
+    fn authenticate_runner(&self, bearer: &str) -> Option<RunnerIdentity> {
+        self.verify_runner(bearer).unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "runner protocol: credential check failed");
+            None
+        })
+    }
+}
+
+/// Ids this module generates are `[a-z]+-[0-9a-f]+`; anything else named in
+/// a token is not one of them and must never reach a path join.
+fn is_plain_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}

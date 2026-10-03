@@ -73,10 +73,14 @@ use crate::conductor::{
     annotation_of, ChatEntry, ConductorRegistry, ConductorStore, ProposalError, ProposalOutcome,
     UndoError, UndoOutcome,
 };
+use crate::controller_protocol::credentials::constant_time_eq;
+use crate::controller_protocol::http as protocol_http;
+use crate::controller_protocol::LOCAL_OWNER;
 use crate::domain::{AnsweredBy, Event, ExecutionStatus};
 use crate::engine::{
     build_timeline, Engine, EngineError, HumanInputDelivery, ManualTransition, Recovery, Timeline,
 };
+use crate::orchestration::OwnerRef;
 use crate::persistence::{
     ConversationSource, DefaultHarnessSelector, ExecutionStore, HarnessSelectionError,
     HarnessSelectionSnapshot as PersistenceHarnessSelectionSnapshot, PersistenceError,
@@ -135,6 +139,12 @@ struct AppState {
 /// /executions/:id/transition` and `GET /executions` — all behind the same
 /// bearer-token gate.
 ///
+/// With a control plane in `services` (U2), its owner routes
+/// (`/control/v1/…`) join the gated set, while its controller
+/// (`/controller/v1/…`) and runner (`/runner/v1/…`) routes are merged after
+/// the gate: they authenticate with their own credentials
+/// ([`crate::controller_protocol::http`]), never with the owner token.
+///
 /// `catalog_dir`/`work_dir` are what [`crate::tasks::start_task`] and
 /// workflow-reference resolution ([`WorkflowResolver`]) need — the daemon's
 /// own catalogue and work roots (`config::Resolved::catalog_dir`/
@@ -148,6 +158,7 @@ pub fn router(
     work_dir: PathBuf,
     services: ApiServices,
 ) -> Router {
+    let control = services.control.clone();
     let state = AppState {
         engine,
         store,
@@ -158,7 +169,7 @@ pub fn router(
         active_tasks: services.active_tasks,
         conductor: services.conductor,
     };
-    Router::new()
+    let mut owner = Router::new()
         .route("/executions/:execution_id/events", get(get_events))
         .route("/executions/:execution_id/timeline", get(get_timeline))
         .route(
@@ -209,16 +220,35 @@ pub fn router(
         .route(
             "/executions/:execution_id/transition",
             post(post_transition),
-        )
-        .layer(middleware::from_fn_with_state(state.clone(), require_token))
-        .with_state(state)
+        );
+    if let Some(control) = &control {
+        owner = owner.merge(protocol_http::owner_routes(Arc::clone(control)));
+    }
+    // The owner gate covers everything above; controllers and runners are
+    // not owners and pass their own credential gates instead (U2).
+    let mut router = owner.layer(middleware::from_fn_with_state(state.clone(), require_token));
+    if let Some(control) = control {
+        router = router
+            .merge(protocol_http::controller_routes(Arc::clone(&control)))
+            .merge(protocol_http::runner_routes(control));
+    }
+    router.with_state(state)
 }
 
 /// Refuses any request whose `Authorization` header is missing or does not
 /// match the process token, with no response body either way — a caller
 /// cannot distinguish "wrong token" from "no token" from the response
 /// itself, which is the point.
-async fn require_token(State(state): State<AppState>, request: Request, next: Next) -> Response {
+///
+/// An accepted request is the local owner's (trusted loopback mode has one
+/// owner): the gate records that as the request's [`OwnerRef`], which the
+/// control-plane routes scope every task to. U7's OIDC gate records the
+/// verified identity in the same place instead.
+async fn require_token(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let expected = format!("Bearer {}", state.token);
     let presented = request
         .headers()
@@ -227,6 +257,7 @@ async fn require_token(State(state): State<AppState>, request: Request, next: Ne
 
     match presented {
         Some(value) if constant_time_eq(value.as_bytes(), expected.as_bytes()) => {
+            request.extensions_mut().insert(OwnerRef::new(LOCAL_OWNER));
             next.run(request).await
         }
         _ => StatusCode::UNAUTHORIZED.into_response(),
@@ -262,20 +293,6 @@ fn require_harness_selector(state: &AppState) -> Result<Arc<DefaultHarnessSelect
     state.harness_selector.clone().ok_or_else(|| {
         ApiError::Internal("default harness selector was not configured for this API server".into())
     })
-}
-
-/// Compares two byte strings in time that depends only on their lengths, not
-/// their contents — the token is a bearer secret, so a length-leaking or
-/// early-exit comparison would give a caller on the same loopback interface
-/// a timing side channel to brute-force it byte by byte.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
 }
 
 /// An error a handler can return; every variant maps to a status code with

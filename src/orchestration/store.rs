@@ -8,7 +8,13 @@
 //! {state}/orchestration/tasks/{task}/events/{seq}.json TaskEvent (exclusive create)
 //! {state}/orchestration/backends/{backend}/lease.json  BackendLease
 //! {state}/orchestration/backends/{backend}/lease.lock
+//! {state}/orchestration/tasks/{task}/runner-session.json   runner credential (U2)
+//! {state}/orchestration/controllers/{id}/controller.json  controller identity (U2)
+//! {state}/orchestration/enrollments/{id}.json             one-time enrollment (U2)
 //! ```
+//!
+//! The last three belong to `crate::controller_protocol`, which uses this
+//! store's locks and atomic writes but owns their shapes.
 //!
 //! # Commit protocol
 //!
@@ -254,6 +260,12 @@ impl OrchestrationStore {
         for backend_dir in subdirectories(&self.paths.orchestration_backends_dir())? {
             removed.extend(cleanup_orphaned_temp_files(&backend_dir)?);
         }
+        for controller_dir in subdirectories(&self.paths.orchestration_controllers_dir())? {
+            removed.extend(cleanup_orphaned_temp_files(&controller_dir)?);
+        }
+        removed.extend(cleanup_orphaned_temp_files(
+            &self.paths.orchestration_enrollments_dir(),
+        )?);
         Ok(removed)
     }
 
@@ -270,6 +282,16 @@ impl OrchestrationStore {
     /// Exclusive lock for one backend's lease.
     pub(crate) fn lock_backend(&self, backend_id: &BackendId) -> Result<FileLock> {
         FileLock::acquire(self.paths.backend_lease_lock_file(backend_id.as_str()))
+    }
+
+    /// Exclusive lock for mutating one controller identity record.
+    pub(crate) fn lock_controller(&self, controller_id: &str) -> Result<FileLock> {
+        FileLock::acquire(self.paths.controller_lock_file(controller_id))
+    }
+
+    /// Exclusive lock for creating and redeeming enrollment codes.
+    pub(crate) fn lock_enrollments(&self) -> Result<FileLock> {
+        FileLock::acquire(self.paths.enrollments_lock_file())
     }
 }
 

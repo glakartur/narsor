@@ -9,7 +9,8 @@
 //! * [`model`] — records and messages;
 //! * `lifecycle` — the state machine, as pure transition rules;
 //! * [`store`] — the file layout and its crash-safe commit protocol;
-//! * [`control_plane`] — the API owners and controllers mutate tasks through.
+//! * [`control_plane`] — the API owners and controllers mutate tasks through;
+//! * `runner_state` — runner snapshots and owner input on the same record.
 //!
 //! Records live under `{state}/orchestration/`, outside `executions/`, so
 //! local crash recovery (`persistence::recovery`) never sees them; use
@@ -19,6 +20,7 @@ pub mod control_plane;
 pub mod error;
 pub(crate) mod lifecycle;
 pub mod model;
+mod runner_state;
 pub mod store;
 
 pub use control_plane::{Clock, ControlPlane, OrchestrationRecovery, SystemClock};

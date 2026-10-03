@@ -55,6 +55,13 @@ use super::dto::{
     StartTaskResponse, TransitionRequest,
 };
 use super::routes::ConversationResponse;
+use crate::controller_protocol::{
+    ControlEventEnvelope, ControllerListResponse, ControllerView,
+    ConversationResponse as RemoteConversationResponse, CreateEnrollmentRequest, CreateTaskRequest,
+    EnrollmentResponse, OwnerCommandRequest, OwnerCommandResponse, SubmitInputRequest,
+    SubmitInputResponse, TaskListResponse, TaskSummary, TimelineResponse,
+};
+use crate::orchestration::TaskEvent;
 
 /// How long a single request may take before it is treated as the server
 /// being unavailable — and, since every call is awaited on the TUI's
@@ -400,6 +407,111 @@ impl ApiClient {
     }
 
     // -----------------------------------------------------------------
+    // Remote-task control plane (U2, KTD4)
+    // -----------------------------------------------------------------
+
+    /// Creates a remote task — `POST /control/v1/tasks`. Idempotent when
+    /// the request names its `task_id`.
+    pub async fn create_control_task(
+        &self,
+        request: &CreateTaskRequest,
+    ) -> Result<TaskSummary, ClientError> {
+        let url = format!("{}/control/v1/tasks", self.base_url);
+        self.post_json(&url, request).await
+    }
+
+    /// The caller's remote tasks and the stream cursor at that state.
+    pub async fn control_tasks(&self) -> Result<TaskListResponse, ClientError> {
+        let url = format!("{}/control/v1/tasks", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// One remote task's normalized summary.
+    pub async fn control_task(&self, task_id: &str) -> Result<TaskSummary, ClientError> {
+        let url = format!("{}/control/v1/tasks/{task_id}", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// An owner command (pause, resume, start, archive) on a remote task.
+    pub async fn control_command(
+        &self,
+        task_id: &str,
+        request: &OwnerCommandRequest,
+    ) -> Result<OwnerCommandResponse, ClientError> {
+        let url = format!("{}/control/v1/tasks/{task_id}/commands", self.base_url);
+        self.post_json(&url, request).await
+    }
+
+    /// The last timeline the remote task's runner reported.
+    pub async fn control_timeline(&self, task_id: &str) -> Result<TimelineResponse, ClientError> {
+        let url = format!("{}/control/v1/tasks/{task_id}/timeline", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// The remote task's conversation summary, or why it is unavailable.
+    pub async fn control_conversation(
+        &self,
+        task_id: &str,
+    ) -> Result<RemoteConversationResponse, ClientError> {
+        let url = format!("{}/control/v1/tasks/{task_id}/conversation", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// Submits an answer to the remote runner's pending input request.
+    pub async fn control_input(
+        &self,
+        task_id: &str,
+        request: &SubmitInputRequest,
+    ) -> Result<SubmitInputResponse, ClientError> {
+        let url = format!("{}/control/v1/tasks/{task_id}/input", self.base_url);
+        self.post_json(&url, request).await
+    }
+
+    /// The remote task's control-plane events after `after`.
+    pub async fn control_events(
+        &self,
+        task_id: &str,
+        after: u64,
+    ) -> Result<Vec<TaskEvent>, ClientError> {
+        let url = format!(
+            "{}/control/v1/tasks/{task_id}/events?after={after}",
+            self.base_url
+        );
+        self.get_json(&url).await
+    }
+
+    /// Creates a one-time code that enrolls one controller for `backend_id`.
+    pub async fn create_enrollment(
+        &self,
+        backend_id: &str,
+        request: &CreateEnrollmentRequest,
+    ) -> Result<EnrollmentResponse, ClientError> {
+        let url = format!(
+            "{}/control/v1/backends/{backend_id}/enrollments",
+            self.base_url
+        );
+        self.post_json(&url, request).await
+    }
+
+    /// Every controller identity.
+    pub async fn controllers(&self) -> Result<ControllerListResponse, ClientError> {
+        let url = format!("{}/control/v1/controllers", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// Revokes a controller identity and fences its lease.
+    pub async fn revoke_controller(
+        &self,
+        controller_id: &str,
+    ) -> Result<ControllerView, ClientError> {
+        let url = format!(
+            "{}/control/v1/controllers/{controller_id}/revoke",
+            self.base_url
+        );
+        self.post_empty(&url).await
+    }
+
+    // -----------------------------------------------------------------
     // SSE (U5)
     // -----------------------------------------------------------------
 
@@ -417,7 +529,7 @@ impl ApiClient {
         execution_id: &str,
     ) -> impl Stream<Item = Result<Event, ClientError>> {
         let url = format!("{}/executions/{execution_id}/stream", self.base_url);
-        self.sse_stream(url, Some(execution_id.to_string()))
+        self.sse_stream(url, engine_event_decoder(Some(execution_id.to_string())))
     }
 
     /// An SSE stream of every event from every execution the daemon runs.
@@ -425,32 +537,58 @@ impl ApiClient {
     /// Unlike [`ApiClient::stream_execution`], there is no single execution
     /// whose terminal event would end this stream — it keeps running until
     /// the connection itself ends (the server stops, or the caller drops
-    /// it). This is enforced by passing no `terminal_scope` to
-    /// [`ApiClient::sse_stream`]: `extract_sse_events` only ever treats a
-    /// terminal event as stream-ending when it is scoped to a specific
-    /// execution id, which this call does not have.
+    /// it). This is enforced by giving [`engine_event_decoder`] no
+    /// `terminal_scope`: it only ever treats a terminal event as
+    /// stream-ending when it is scoped to a specific execution id, which
+    /// this call does not have.
     pub fn stream_all(&self) -> impl Stream<Item = Result<Event, ClientError>> {
         let url = format!("{}/events/stream", self.base_url);
-        self.sse_stream(url, None)
+        self.sse_stream(url, engine_event_decoder(None))
+    }
+
+    /// The control plane's durable event stream (U2): every event after
+    /// `cursor` (all of them when `None`) exactly once, then live ones.
+    ///
+    /// Each item carries the cursor *after* it; reconnecting with the last
+    /// one seen resumes without a gap or a repeat. `task_id` restricts the
+    /// stream to one task. The stream never ends on content.
+    pub fn stream_control_events(
+        &self,
+        cursor: Option<&str>,
+        task_id: Option<&str>,
+    ) -> impl Stream<Item = Result<ControlEventEnvelope, ClientError>> {
+        let mut params = Vec::new();
+        if let Some(cursor) = cursor {
+            params.push(("cursor", cursor));
+        }
+        if let Some(task_id) = task_id {
+            params.push(("task_id", task_id));
+        }
+        let url = reqwest::Url::parse_with_params(
+            &format!("{}/control/v1/events/stream", self.base_url),
+            &params,
+        )
+        .map(String::from)
+        .unwrap_or_else(|_| format!("{}/control/v1/events/stream", self.base_url));
+        let decode: FrameDecoder<ControlEventEnvelope> =
+            Box::new(|data| serde_json::from_str(data).ok().map(|item| (item, false)));
+        self.sse_stream(url, decode)
     }
 
     /// Connects to `url` over [`ApiClient::stream_http`] (no request
     /// timeout — see its doc comment) and turns the response into a stream
-    /// of parsed [`Event`]s, or a single [`ClientError`] item when the
+    /// of items `decode` produces, or a single [`ClientError`] item when the
     /// connection itself could not be established or the server refused it
     /// before ever opening the stream.
     ///
-    /// `terminal_scope` is the execution id whose terminal event should end
-    /// the stream, or `None` for a stream — [`ApiClient::stream_all`] — that
-    /// must never self-terminate on content: passed straight through to
-    /// [`sse_events`]/[`extract_sse_events`], which is the single parsing
-    /// pipeline both [`ApiClient::stream_execution`] and
-    /// [`ApiClient::stream_all`] share.
-    fn sse_stream(
+    /// `decode` is the only thing that differs between the streams this
+    /// client reads: it parses one frame's `data:` payload and says whether
+    /// that item ends the stream (see [`engine_event_decoder`]).
+    fn sse_stream<T: Send + 'static>(
         &self,
         url: String,
-        terminal_scope: Option<String>,
-    ) -> impl Stream<Item = Result<Event, ClientError>> {
+        decode: FrameDecoder<T>,
+    ) -> impl Stream<Item = Result<T, ClientError>> {
         let http = self.stream_http.clone();
         let token = self.token.clone();
 
@@ -463,7 +601,7 @@ impl ApiClient {
             };
 
             match response.status() {
-                StatusCode::OK => sse_events(response, terminal_scope).boxed(),
+                StatusCode::OK => sse_events(response, decode).boxed(),
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                     single_error_stream(ClientError::Unauthorized)
                 }
@@ -556,16 +694,16 @@ impl ApiClient {
 /// read endpoint that gains a conflict case does not have to duplicate this
 /// match), anything else → [`ClientError::Server`].
 ///
-/// `200` and `202` both count as success: every mutating endpoint in this
-/// plan answers one or the other (`202 Accepted` for a call that only
-/// kicks off a background pass, `200 OK` for `transition`, which answers
-/// synchronously) and the body is always the type the caller asked to
-/// decode.
-async fn handle_json_response<T: DeserializeOwned>(
+/// `200`, `201` and `202` all count as success: every mutating endpoint
+/// answers one of them (`202 Accepted` for a call that only kicks off a
+/// background pass, `201 Created` for a control-plane record that now
+/// exists, `200 OK` for everything answered synchronously) and the body is
+/// always the type the caller asked to decode.
+pub(crate) async fn handle_json_response<T: DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, ClientError> {
     match response.status() {
-        StatusCode::OK | StatusCode::ACCEPTED => response
+        StatusCode::OK | StatusCode::CREATED | StatusCode::ACCEPTED => response
             .json::<T>()
             .await
             .map_err(|error| ClientError::Server(error.to_string())),
@@ -597,30 +735,56 @@ async fn handle_json_response<T: DeserializeOwned>(
 /// A boxed stream yielding exactly one `Err(error)` then ending — the shape
 /// every early-exit branch of [`ApiClient::sse_stream`] needs, so that every
 /// branch of its `match` produces the same concrete (boxed) stream type.
-fn single_error_stream(
+fn single_error_stream<T: Send + 'static>(
     error: ClientError,
-) -> futures::stream::BoxStream<'static, Result<Event, ClientError>> {
+) -> futures::stream::BoxStream<'static, Result<T, ClientError>> {
     stream::once(async move { Err(error) }).boxed()
 }
 
+/// Decodes one SSE frame's `data:` payload into an item and says whether
+/// that item ends the stream; `None` skips the frame (a payload this
+/// stream does not understand).
+type FrameDecoder<T> = Box<dyn FnMut(&str) -> Option<(T, bool)> + Send>;
+
+/// The decoder of the engine's event streams.
+///
+/// A terminal event ends the stream only when it belongs to
+/// `terminal_scope` — per [`ApiClient::stream_execution`]'s contract when
+/// that is `Some(execution_id)`. When it is `None`
+/// ([`ApiClient::stream_all`]), a terminal event never ends it: this is the
+/// one piece of state that makes the two streams' contracts different
+/// despite sharing one parser. Getting this scoping wrong is not
+/// hypothetical — an earlier version ended on *any* terminal event
+/// regardless of whose it was, which silently killed the global stream the
+/// moment the first of several concurrently running executions finished.
+fn engine_event_decoder(terminal_scope: Option<String>) -> FrameDecoder<Event> {
+    Box::new(move |data| {
+        let event = serde_json::from_str::<Event>(data).ok()?;
+        let terminal = is_terminal_event(&event.data)
+            && terminal_scope.as_deref() == Some(event.workflow_execution_id.as_str());
+        Some((event, terminal))
+    })
+}
+
 /// State threaded through [`stream::unfold`] to turn a raw byte stream (the
-/// response body) into parsed [`Event`]s.
+/// response body) into parsed items.
 ///
 /// # Why a hand-rolled parser rather than a library like `eventsource-stream`
 ///
 /// SSE's wire format here is about as simple as it gets — this server only
-/// ever emits `event: engine\ndata: <json>\n\n` frames
-/// (`src/api/routes.rs`'s `sse_event_stream`), with axum's own `KeepAlive`
-/// comments the only other thing on the wire. `tests/sse.rs` already proved
-/// out exactly this parsing approach (frame-split on `"\n\n"`, then a
-/// `data: ` line per frame) against the real server before this unit existed,
-/// so reusing it here needs no new dependency and no translation between a
-/// library's event type and [`Event`] — a `serde_json::from_str::<Event>`
-/// straight off the `data: ` line is the whole job. A library would only pay
-/// for itself if this client had to interoperate with an SSE producer it did
-/// not also control, which is not the case: the only server behind this
-/// client is `src/api/routes.rs`, in the same crate.
-struct SseState<S> {
+/// ever emits `event: <kind>\nid: <cursor>\ndata: <json>\n\n` frames
+/// (`src/api/routes.rs`'s `sse_event_stream`, the control plane's stream in
+/// `src/controller_protocol/http.rs`), with axum's own `KeepAlive` comments
+/// the only other thing on the wire. `tests/sse.rs` already proved out
+/// exactly this parsing approach (frame-split on `"\n\n"`, then a `data: `
+/// line per frame) against the real server, so reusing it needs no new
+/// dependency and no translation between a library's event type and ours —
+/// a `serde_json::from_str` straight off the `data: ` line is the whole job.
+/// The control stream's cursor travels inside the JSON as well as in `id:`,
+/// so the parser never needs the `id:` line. A library would only pay for
+/// itself if this client had to interoperate with an SSE producer it did
+/// not also control, which is not the case.
+struct SseState<S, T> {
     /// The response body's byte stream.
     inner: S,
     /// Bytes read so far that do not yet form a complete `"\n\n"`-terminated
@@ -628,29 +792,27 @@ struct SseState<S> {
     buffer: String,
     /// Parsed items not yet handed back to the caller — a single chunk off
     /// the wire can contain more than one complete frame.
-    queue: VecDeque<Result<Event, ClientError>>,
-    /// Set once a terminal event has been queued, or the underlying stream
-    /// ended/errored — once `true` and `queue` is empty, the stream is over.
+    queue: VecDeque<Result<T, ClientError>>,
+    /// Set once a stream-ending item has been queued, or the underlying
+    /// stream ended/errored — once `true` and `queue` is empty, the stream
+    /// is over.
     done: bool,
-    /// The execution id whose terminal event ends this stream, or `None` for
-    /// a stream that must never self-terminate on content
-    /// ([`ApiClient::stream_all`]). See [`extract_sse_events`].
-    terminal_scope: Option<String>,
+    /// Turns a frame's payload into an item.
+    decode: FrameDecoder<T>,
 }
 
-/// Turns a successful (`200 OK`) SSE response into a stream of parsed
-/// [`Event`]s, ending after `terminal_scope`'s terminal event (or never
-/// self-terminating, when `terminal_scope` is `None`) — see [`SseState`].
-fn sse_events(
+/// Turns a successful (`200 OK`) SSE response into a stream of decoded
+/// items, ending after an item `decode` marks as final — see [`SseState`].
+fn sse_events<T: Send + 'static>(
     response: reqwest::Response,
-    terminal_scope: Option<String>,
-) -> impl Stream<Item = Result<Event, ClientError>> {
+    decode: FrameDecoder<T>,
+) -> impl Stream<Item = Result<T, ClientError>> {
     let state = SseState {
         inner: response.bytes_stream(),
         buffer: String::new(),
         queue: VecDeque::new(),
         done: false,
-        terminal_scope,
+        decode,
     };
     stream::unfold(state, |state| sse_unfold_step(state))
 }
@@ -658,9 +820,9 @@ fn sse_events(
 /// One step of [`stream::unfold`] over [`SseState`]: drains any already
 /// parsed item first, otherwise reads and parses another chunk off the wire,
 /// looping until there is an item to hand back or the stream is over.
-async fn sse_unfold_step<S>(
-    mut state: SseState<S>,
-) -> Option<(Result<Event, ClientError>, SseState<S>)>
+async fn sse_unfold_step<S, T>(
+    mut state: SseState<S, T>,
+) -> Option<(Result<T, ClientError>, SseState<S, T>)>
 where
     S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
@@ -679,7 +841,7 @@ where
                     &mut state.buffer,
                     &mut state.queue,
                     &mut state.done,
-                    state.terminal_scope.as_deref(),
+                    &mut state.decode,
                 );
             }
             Some(Err(error)) => {
@@ -696,26 +858,17 @@ where
 }
 
 /// Extracts every complete `"\n\n"`-terminated frame currently in `buffer`,
-/// parses each one's `data: ` line as an [`Event`], and appends it to
-/// `queue` — silently skipping a frame that has no `data: ` line (axum's
-/// `KeepAlive` comment frames) or whose `data: ` line does not parse as an
-/// `Event` (defence in depth; every real frame this server sends does).
+/// decodes each one's `data: ` line, and appends it to `queue` — silently
+/// skipping a frame that has no `data: ` line (axum's `KeepAlive` comment
+/// frames) or whose payload `decode` does not accept (defence in depth;
+/// every real frame this server sends decodes).
 ///
-/// Sets `*done = true` the moment a terminal event *belonging to
-/// `terminal_scope`* is queued — per [`ApiClient::stream_execution`]'s
-/// contract when `terminal_scope` is `Some(execution_id)`. When
-/// `terminal_scope` is `None` ([`ApiClient::stream_all`]), a terminal event
-/// never sets `done`: this is the one piece of state that makes the two
-/// streams' contracts different despite sharing this parser. Getting this
-/// scoping wrong is not hypothetical — an earlier version of this function
-/// ended on *any* terminal event regardless of whose it was, which silently
-/// killed the global stream the moment the first of several concurrently
-/// running executions finished.
-fn extract_sse_events(
+/// Sets `*done = true` the moment `decode` marks an item as the last one.
+fn extract_sse_events<T>(
     buffer: &mut String,
-    queue: &mut VecDeque<Result<Event, ClientError>>,
+    queue: &mut VecDeque<Result<T, ClientError>>,
     done: &mut bool,
-    terminal_scope: Option<&str>,
+    decode: &mut FrameDecoder<T>,
 ) {
     while let Some(idx) = buffer.find("\n\n") {
         let frame = buffer[..idx].to_string();
@@ -725,13 +878,11 @@ fn extract_sse_events(
             let Some(data) = line.strip_prefix("data: ") else {
                 continue;
             };
-            let Ok(event) = serde_json::from_str::<Event>(data) else {
+            let Some((item, last)) = decode(data) else {
                 continue;
             };
-            let terminal = is_terminal_event(&event.data)
-                && terminal_scope == Some(event.workflow_execution_id.as_str());
-            queue.push_back(Ok(event));
-            if terminal {
+            queue.push_back(Ok(item));
+            if last {
                 *done = true;
             }
         }

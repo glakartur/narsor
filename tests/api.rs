@@ -3235,3 +3235,147 @@ mod conductor_chat {
         ));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Remote-task control plane routes (U2)
+// ---------------------------------------------------------------------------
+
+async fn start_server_with_control_plane(root: &TempRoot) -> api::ApiHandle {
+    let control = narsor::orchestration::ControlPlane::new(StatePaths::new(root.path()));
+    api::start_with_services(
+        Arc::new(Engine::new(root.store())),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+        api::ApiServices {
+            control: Some(Arc::new(narsor::controller_protocol::ProtocolService::new(
+                control,
+            ))),
+            ..api::ApiServices::default()
+        },
+    )
+    .await
+    .expect("server starts")
+}
+
+fn remote_task(task_id: &str, backend_id: &str) -> narsor::controller_protocol::CreateTaskRequest {
+    narsor::controller_protocol::CreateTaskRequest {
+        task_id: Some(task_id.to_string()),
+        backend_id: backend_id.to_string(),
+        priority: 0,
+        launch: narsor::controller_protocol::LaunchRequest {
+            workflow_id: "implement-feature".to_string(),
+            workflow_version: 1,
+            inputs: serde_json::json!({}),
+            workspace: serde_json::json!({}),
+        },
+    }
+}
+
+#[tokio::test]
+async fn control_plane_routes_sit_behind_the_owner_token_beside_the_local_ones() {
+    let root = TempRoot::new();
+    seed_execution_with_retry(&root.store(), "exec-1");
+    let handle = start_server_with_control_plane(&root).await;
+    let raw = raw_client();
+
+    let refused = raw
+        .get(url(&handle, "/control/v1/tasks"))
+        .send()
+        .await
+        .expect("request without token");
+    assert_eq!(refused.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(refused.text().await.unwrap().is_empty());
+
+    let client = handle.client();
+    let created = client
+        .create_control_task(&remote_task("task-1", "k8s"))
+        .await
+        .expect("create");
+    assert_eq!(
+        created.lifecycle,
+        narsor::orchestration::TaskLifecycle::Queued
+    );
+    assert_eq!(created.generation, 1);
+    assert!(created.runner.is_none() && created.observation.is_none());
+    let again = client
+        .create_control_task(&remote_task("task-1", "k8s"))
+        .await
+        .expect("idempotent create");
+    assert_eq!(again.revision, created.revision);
+
+    // The local daemon path is untouched.
+    let local = client.list_executions().await.expect("local executions");
+    assert_eq!(local.executions.len(), 1);
+    assert_eq!(
+        client
+            .timeline("exec-1")
+            .await
+            .expect("timeline")
+            .positions
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn control_plane_refusals_are_typed() {
+    let root = TempRoot::new();
+    let handle = start_server_with_control_plane(&root).await;
+    let client = handle.client();
+
+    match client
+        .create_control_task(&remote_task("../escape", "k8s"))
+        .await
+    {
+        Err(ClientError::Request { code, .. }) => assert_eq!(code, "invalid_identifier"),
+        other => panic!("expected a typed 400, got {other:?}"),
+    }
+
+    client
+        .create_control_task(&remote_task("task-1", "k8s"))
+        .await
+        .expect("create");
+    match client
+        .create_control_task(&remote_task("task-1", "other-backend"))
+        .await
+    {
+        Err(ClientError::Refused { code, .. }) => assert_eq!(code, "task_conflict"),
+        other => panic!("expected a typed 409, got {other:?}"),
+    }
+
+    let pause = narsor::controller_protocol::OwnerCommandRequest {
+        command: narsor::orchestration::OwnerCommand::Pause,
+        idempotency_key: "pause-1".to_string(),
+        expected_generation: None,
+    };
+    match client.control_command("task-1", &pause).await {
+        Err(ClientError::Refused { code, .. }) => assert_eq!(code, "illegal_command"),
+        other => panic!("a queued task cannot pause, got {other:?}"),
+    }
+    let stale = narsor::controller_protocol::OwnerCommandRequest {
+        command: narsor::orchestration::OwnerCommand::Archive,
+        idempotency_key: "archive-1".to_string(),
+        expected_generation: Some(9),
+    };
+    match client.control_command("task-1", &stale).await {
+        Err(ClientError::Refused { code, .. }) => assert_eq!(code, "stale_generation"),
+        other => panic!("expected stale generation, got {other:?}"),
+    }
+    assert!(matches!(
+        client.control_task("no-such-task").await,
+        Err(ClientError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn control_plane_routes_are_absent_without_a_control_plane() {
+    let root = TempRoot::new();
+    let handle = start_server(root.store()).await;
+    let response = raw_client()
+        .get(url(&handle, "/control/v1/tasks"))
+        .bearer_auth(handle.token())
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}

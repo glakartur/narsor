@@ -327,7 +327,7 @@ pub enum HumanInputType {
 }
 
 /// A single form field of a `HumanAction`
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HumanInputField {
     pub name: String,
 

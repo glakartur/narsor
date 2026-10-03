@@ -8,6 +8,7 @@ pub mod api;
 pub mod cli;
 pub mod conductor;
 pub mod config;
+pub mod controller_protocol;
 pub mod daemon;
 pub mod domain;
 pub mod engine;

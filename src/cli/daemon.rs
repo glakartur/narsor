@@ -9,6 +9,13 @@
 //! for reconciling whatever a previous, differently-killed holder left
 //! behind, and after this unit that is always the daemon, never the TUI.
 //!
+//! # Control-plane recovery
+//!
+//! The remote-task control plane (`crate::orchestration`) keeps its own
+//! records beside the executions; [`recover_orchestration_at_startup`]
+//! repairs them right after local recovery and before the API — whose
+//! control-plane routes this daemon serves — accepts anything.
+//!
 //! # The startup hook
 //!
 //! Right after recovery, and before the API accepts anything,
@@ -55,8 +62,10 @@ use tokio::signal::unix::{signal, SignalKind};
 use crate::api::{ActiveTasks, ApiServices};
 use crate::conductor::{ConductorRegistry, HarnessInvoker, PassLauncher};
 use crate::config::Resolved;
+use crate::controller_protocol::ProtocolService;
 use crate::domain::{ExecutionStatus, WorkflowDefinition, WorkflowExecution};
 use crate::engine::{owed_output_rescue, owed_reprompt, Engine, HarnessRegistry};
+use crate::orchestration::ControlPlane;
 use crate::persistence::{
     DaemonInfo, DefaultHarnessSelector, ExecutionStore, ReconciliationOutcome, RecoveryReport,
 };
@@ -115,6 +124,9 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     let store = ExecutionStore::new(config.state_dir());
 
     let recovery = recover_at_startup(&store);
+    let control = Arc::new(ProtocolService::new(recover_orchestration_at_startup(
+        ControlPlane::new(paths.clone()),
+    )));
 
     let defaults = config.agent_defaults();
     let supported = HarnessRegistry::defaults()
@@ -181,6 +193,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
             harness_selector: Some(selector),
             active_tasks,
             conductor: Some(Arc::clone(&conductor)),
+            control: Some(control),
         },
     )
     .await
@@ -266,6 +279,36 @@ fn recover_at_startup(store: &ExecutionStore) -> Option<RecoveryReport> {
             None
         }
     }
+}
+
+/// Repairs the control plane's own records (U2) — orphaned temporary files
+/// and events a crash kept out of a task's log — before the API serves
+/// them, so a stream replay never skips one. Unlike local recovery it judges
+/// no task: a remote task's lifecycle changes only through its controller's
+/// reconciliation, never because this process restarted. Best-effort like
+/// [`recover_at_startup`]: a failure is logged and the daemon still starts.
+pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
+    match control.recover() {
+        Ok(recovery) => {
+            for path in &recovery.removed_temp_files {
+                tracing::info!(
+                    path = %path.display(),
+                    "daemon: removed an interrupted control-plane write"
+                );
+            }
+            for (task_id, sequence) in &recovery.republished_events {
+                tracing::info!(
+                    task_id = %task_id,
+                    sequence,
+                    "daemon: republished a control-plane event a crash kept out of the log"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "daemon: control-plane recovery failed");
+        }
+    }
+    control
 }
 
 /// The daemon's startup hook (D55): carries on, after `recover`, what the

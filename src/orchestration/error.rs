@@ -147,6 +147,91 @@ pub enum OrchestrationError {
         presented: BackendId,
     },
 
+    /// The runner's launch was superseded by a newer start or resume, or the
+    /// task is archived: its credential and reports are fenced.
+    #[error("runner incarnation '{incarnation}' of task '{task_id}' is no longer current")]
+    RunnerSuperseded {
+        /// The task.
+        task_id: TaskId,
+        /// The fenced incarnation.
+        incarnation: String,
+    },
+
+    /// A runner snapshot is older than one already accepted.
+    #[error("task '{task_id}': runner snapshot {presented} is older than accepted {accepted}")]
+    StaleRunnerSnapshot {
+        /// The task.
+        task_id: TaskId,
+        /// What was accepted (`event cursor/sequence`).
+        accepted: String,
+        /// What was offered.
+        presented: String,
+    },
+
+    /// The owner answered an input request the runner is not waiting on.
+    #[error("task '{task_id}' is not waiting on input '{presented}' (waiting on {pending:?})")]
+    ObsoleteInput {
+        /// The task.
+        task_id: TaskId,
+        /// The request the answer named.
+        presented: String,
+        /// The request the runner last reported, if any.
+        pending: Option<String>,
+    },
+
+    /// Another answer to the same request is already queued.
+    #[error(
+        "task '{task_id}' already has input '{input_id}' queued for request '{pending_input_id}'"
+    )]
+    InputAlreadyQueued {
+        /// The task.
+        task_id: TaskId,
+        /// The queued input.
+        input_id: String,
+        /// The request both answer.
+        pending_input_id: String,
+    },
+
+    /// An input idempotency key was reused for a different answer.
+    #[error(
+        "input idempotency key '{key}' of task '{task_id}' was already used for another answer"
+    )]
+    InputKeyReused {
+        /// The task.
+        task_id: TaskId,
+        /// The reused key.
+        key: String,
+    },
+
+    /// No queued input with this id exists.
+    #[error("task '{task_id}' has no input '{input_id}'")]
+    InputNotFound {
+        /// The task.
+        task_id: TaskId,
+        /// The input id.
+        input_id: String,
+    },
+
+    /// The input was already settled differently.
+    #[error("input '{input_id}' of task '{task_id}' is already {status:?}")]
+    InputAlreadySettled {
+        /// The task.
+        task_id: TaskId,
+        /// The input id.
+        input_id: String,
+        /// Its settled status.
+        status: super::model::InputStatus,
+    },
+
+    /// The task's lifecycle does not let a runner take input.
+    #[error("task '{task_id}' does not accept input while {lifecycle:?}")]
+    TaskNotAcceptingInput {
+        /// The task.
+        task_id: TaskId,
+        /// Its lifecycle.
+        lifecycle: TaskLifecycle,
+    },
+
     /// The advisory lock could not be taken.
     #[error("cannot lock '{path}': {source}")]
     Lock {

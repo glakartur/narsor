@@ -74,6 +74,7 @@ pub mod dto;
 mod routes;
 
 pub use active::ActiveTasks;
+pub(crate) use client::handle_json_response;
 pub use client::{ApiClient, ClientError};
 pub use discovery::{ensure_daemon_running, DiscoveryError};
 pub use dto::{
@@ -85,6 +86,7 @@ pub use dto::{
 pub use routes::{ConversationEntryDto, ConversationResponse};
 
 use crate::conductor::ConductorRegistry;
+use crate::controller_protocol::ProtocolService;
 use crate::engine::Engine;
 use crate::persistence::DefaultHarnessSelector;
 use std::fmt;
@@ -231,6 +233,7 @@ pub async fn start_with_harness_selector(
             harness_selector,
             active_tasks: ActiveTasks::new(),
             conductor: None,
+            control: None,
         },
     )
     .await
@@ -247,6 +250,9 @@ pub struct ApiServices {
     /// The conductor (D55): its chat, its proposals and the undo of its
     /// decisions are served only when there is one.
     pub conductor: Option<Arc<ConductorRegistry>>,
+    /// The remote-task control plane (U2): its owner, controller and runner
+    /// routes are served only when there is one.
+    pub control: Option<Arc<ProtocolService>>,
 }
 
 impl fmt::Debug for ApiServices {
@@ -255,6 +261,7 @@ impl fmt::Debug for ApiServices {
             .field("harness_selector", &self.harness_selector)
             .field("active_tasks", &self.active_tasks)
             .field("conductor", &self.conductor.is_some())
+            .field("control", &self.control.is_some())
             .finish()
     }
 }
