@@ -1,0 +1,124 @@
+# The environment controller of one Kubernetes backend (`narsor controller`).
+#
+# Before applying:
+#   * set the image digest of the Narsor release below;
+#   * set NARSOR_CONTROL_PLANE (and NARSOR_RUNNER_CONTROL_PLANE when task
+#     Pods reach the control plane under another URL);
+#   * keep backend.yaml in step with the admission parameters
+#     (admission-policy.yaml, ConfigMap narsor-admission);
+#   * create the one-time enrollment code Secret (first start only):
+#       kubectl -n narsor-system create secret generic \
+#         narsor-controller-enrollment --from-literal=code=<code>
+#     On its first start the controller enrolls, writes its `nsk.` credential
+#     (0600) to its state volume and from then on ignores the code; delete
+#     the Secret afterwards.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: narsor-controller-config
+  namespace: narsor-system
+data:
+  backend.yaml: |
+    namespace: narsor-tasks
+    # Must have reclaimPolicy: Delete — archive destroys the task storage.
+    storage_class: narsor-delete
+    storage_mib: 10240
+    workload_service_account: narsor-task
+    run_as_user: 1000
+    run_as_group: 1000
+    fs_group: 1000
+    allowed_registries:
+      - registry.example/
+      - ghcr.io/narsor/
+    allowed_secrets:
+      - narsor-github/token
+    start_timeout_secs: 900
+---
+# The controller's identity lives here; it survives restarts and upgrades.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: narsor-controller-state
+  namespace: narsor-system
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 16Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: narsor-controller
+  namespace: narsor-system
+  labels:
+    app.kubernetes.io/name: narsor-controller
+spec:
+  # One controller per backend holds the lease; a second replica would only
+  # stand by. Recreate: the old Pod releases the lease and the state volume
+  # before the new one starts.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: narsor-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: narsor-controller
+    spec:
+      serviceAccountName: narsor-controller
+      # The controller talks to the API server with its own token.
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: ghcr.io/narsor/narsor@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args: ["controller"]
+          env:
+            - name: NARSOR_CONTROL_PLANE
+              value: https://narsor.example
+            - name: NARSOR_CONTROLLER_CREDENTIAL_FILE
+              value: /var/lib/narsor-controller/controller.credential
+            - name: NARSOR_KUBERNETES_CONFIG
+              value: /etc/narsor/backend.yaml
+            - name: NARSOR_ENROLLMENT_CODE
+              valueFrom:
+                secretKeyRef:
+                  name: narsor-controller-enrollment
+                  key: code
+                  optional: true
+            - name: RUST_LOG
+              value: narsor=info
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/narsor
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/narsor-controller
+      volumes:
+        - name: config
+          configMap:
+            name: narsor-controller-config
+        - name: state
+          persistentVolumeClaim:
+            claimName: narsor-controller-state

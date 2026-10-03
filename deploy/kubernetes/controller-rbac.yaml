@@ -1,0 +1,75 @@
+# The controller's permissions: namespaced, and only what the adapter calls
+# (src/backends/kubernetes). In particular:
+#
+# * no pods/exec, pods/attach, pods/portforward or pods/ephemeralcontainers —
+#   the controller never enters a workload (KTD3);
+# * Secrets: create only. The controller writes each incarnation's launch
+#   Secret (runner credential + launch spec), owned by its Pod so the garbage
+#   collector deletes it; it can neither read, list nor delete a Secret.
+#   Creating Pods is still a secret-injection capability — the admission
+#   policy is what limits which Secrets a Pod may mount;
+# * no update/patch of anything: a Pod is never modified, only replaced.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: narsor-controller
+  namespace: narsor-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: narsor-controller
+  namespace: narsor-tasks
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  # Diagnostics only (why a Pod does not start); never written.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: narsor-controller
+  namespace: narsor-tasks
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: narsor-controller
+subjects:
+  - kind: ServiceAccount
+    name: narsor-controller
+    namespace: narsor-system
+---
+# The one cluster-scoped read: the controller checks that the task storage
+# class deletes volumes with their claims before it creates or deletes a PVC
+# (archive must destroy the task storage, R34).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: narsor-controller-storageclasses
+rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: narsor-controller-storageclasses
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: narsor-controller-storageclasses
+subjects:
+  - kind: ServiceAccount
+    name: narsor-controller
+    namespace: narsor-system

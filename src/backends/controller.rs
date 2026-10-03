@@ -673,6 +673,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             task_id: command.task_id.clone(),
             generation: command.generation,
             incarnation,
+            lease_epoch: context.epoch,
             launch_spec: command.launch_spec.clone(),
             control_plane_url: self.config.runner_control_plane_url.clone(),
             credential: RunnerCredential::new(issued.credential),

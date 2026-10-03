@@ -31,6 +31,7 @@
 //! which is also the code clap itself returns for a malformed command line.
 
 pub mod commands;
+pub mod controller;
 pub mod daemon;
 
 use std::path::PathBuf;
@@ -262,6 +263,13 @@ pub enum Command {
     /// mounted task storage and reports to the control plane. See
     /// [`crate::runner::cli`] for the invocation and exit-code contract.
     Runner(crate::runner::cli::RunnerArgs),
+
+    /// Runs the environment controller of one backend (U5).
+    ///
+    /// Started next to the backend (for Kubernetes, as the Deployment in
+    /// `deploy/kubernetes/`): it enrolls once with a one-time code, then
+    /// reconciles the backend with the control plane.
+    Controller(controller::ControllerArgs),
 }
 
 /// The daemon half of the command line.
@@ -466,6 +474,9 @@ impl Command {
             // is in its launch spec — so whatever file a base image happens
             // to carry must not keep a task from starting.
             Command::Runner(_) => true,
+            // Configured by its own flags and environment only, like the
+            // runner: it reads no Narsor configuration file.
+            Command::Controller(_) => true,
         }
     }
 }
@@ -520,6 +531,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
     // The runner has its own exit-code contract (see `crate::runner::cli`).
     let command = match cli.command {
         Command::Runner(args) => return crate::runner::cli::run_command(args).await,
+        Command::Controller(args) => return controller::run_command(args).await,
         command => command,
     };
     let outcome = match command {
@@ -624,7 +636,9 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             None => daemon::run_daemon(&config).await,
             Some(DaemonCommand::Stop) => daemon::stop_daemon(&config),
         },
-        Command::Runner(_) => unreachable!("the runner returned above"),
+        Command::Runner(_) | Command::Controller(_) => {
+            unreachable!("the runner and the controller returned above")
+        }
     };
 
     match outcome {

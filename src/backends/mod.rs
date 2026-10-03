@@ -33,12 +33,15 @@
 //!   tests);
 //! * [`local`] — `narsor runner` as a local child process over a local
 //!   directory, the supported local adapter;
+//! * [`kubernetes`] — one Pod and one PVC per task (KTD2), the first
+//!   production remote adapter;
 //! * [`testkit`] — counters, fault injection and a severable control-plane
 //!   link usable with *any* adapter, so every adapter runs one contract
 //!   suite.
 
 pub mod controller;
 pub mod fake;
+pub mod kubernetes;
 pub mod local;
 pub mod testkit;
 
@@ -50,6 +53,7 @@ use crate::environment::{BackendCapabilities, BackendKind};
 
 pub use controller::{Controller, ControllerConfig, ControllerLink, ControllerStatus, StepOutcome};
 pub use fake::FakeBackend;
+pub use kubernetes::{KubernetesBackend, KubernetesBackendConfig};
 pub use local::{LocalBackend, LocalBackendConfig};
 
 /// The deterministic names of one task's backend resources (R7).
@@ -186,6 +190,12 @@ pub struct WorkloadLaunch {
     pub generation: u64,
     /// Runner incarnation the credential is bound to.
     pub incarnation: String,
+    /// Fencing epoch of the lease the launching controller held. Recorded
+    /// on the workload (KTD2) so a platform-side reader — an operator, an
+    /// admission policy, a later controller — can tell which lease holder
+    /// created it; an adapter may also refuse to act over a workload a newer
+    /// lease holder created.
+    pub lease_epoch: u64,
     /// The immutable launch input, mounted read-only.
     pub launch_spec: TaskLaunchSpec,
     /// Base URL the runner reaches the control plane at.

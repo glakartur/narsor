@@ -44,7 +44,9 @@ validator = { version = "0.16", features = ["derive"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
-clap = { version = "4.6.7", features = ["derive"] }
+# "env": `narsor controller` reads its settings from flags or environment
+# variables (a Deployment sets env, an operator types flags).
+clap = { version = "4.6.7", features = ["derive", "env"] }
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 
@@ -63,7 +65,12 @@ sha2 = "0.10"
 base64 = "0.22"
 
 # HTTP client for the embedded API (src/api/client.rs), the controller and
-# runner protocol clients and OIDC discovery (src/auth/oidc.rs). No default
+# runner protocol clients, OIDC discovery (src/auth/oidc.rs) and the
+# Kubernetes adapter's API client (src/backends/kubernetes/client.rs). The
+# adapter deliberately does not pull in `kube` + `k8s-openapi`: it uses five
+# resource kinds through a dozen plain REST calls, and the generated API
+# surface would cost far more compile time than the hand-written minimal
+# types it needs (src/backends/kubernetes/objects.rs). No default
 # middleware. "rustls-tls": a controller or runner reaches a network-mode
 # control plane over HTTPS, and an OIDC issuer is only ever reached over
 # HTTPS; rustls keeps the build free of a system OpenSSL.
