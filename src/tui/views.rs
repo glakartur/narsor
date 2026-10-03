@@ -34,7 +34,7 @@ use super::app::{
     App, Attention, EntryMap, FormRow, InputForm, InputKind, Modal, NewTaskStage, Panel,
     RepositoryField, Screen, TaskContent, TaskFocus, TaskView, TransitionMode,
 };
-use super::chat::{chat_item_lines, ChatFocus, ChatPanel};
+use super::chat::{ChatFocus, ChatPanel};
 use super::failure_form::FailureRow;
 use super::scroll::wrap_visible;
 use crate::domain::{ExecutionStatus, HumanInputType};
@@ -223,37 +223,30 @@ fn render_chat_panel(frame: &mut Frame, chat: &ChatPanel, area: Rect) {
         footer.push(format!("{marker} message: {}", chat.draft));
     }
 
-    let items = chat.items();
     let mut lines: Vec<String> = Vec::new();
-    let mut selected_start = 0;
-    if items.is_empty() {
+    if chat.transcript.entries().is_empty() {
         lines.push(if chat.loaded {
             "No messages yet: write to the conductor below.".to_string()
         } else {
             "Loading the chat…".to_string()
         });
-    }
-    for (index, item) in items.iter().enumerate() {
-        let selected = index == chat.selected && chat.focus == ChatFocus::History;
-        if index == chat.selected {
-            selected_start = lines.len();
-        }
-        for (number, line) in chat_item_lines(item).into_iter().enumerate() {
-            let marker = if selected && number == 0 {
-                "› "
-            } else {
-                "  "
-            };
-            lines.push(format!("{marker}{line}"));
+    } else {
+        let action_entry = chat
+            .action_item()
+            .map(|item| super::transcript::TranscriptEntryId::from(item.entry.id));
+        let mut last_entry = None;
+        for line in chat.transcript.logical_lines() {
+            let starts_entry = last_entry.as_ref() != Some(&line.entry_id);
+            let marked = chat.focus == ChatFocus::Action
+                && starts_entry
+                && action_entry.as_ref() == Some(&line.entry_id);
+            lines.push(format!("{}{}", if marked { "› " } else { "  " }, line.text));
+            last_entry = Some(line.entry_id);
         }
     }
 
     let history_height = inner_height.saturating_sub(footer.len()).max(1);
-    let offset = if lines.len() <= history_height {
-        0
-    } else {
-        selected_start.min(lines.len() - history_height)
-    };
+    let offset = chat.transcript.scroll_offset();
     let mut visible = wrap_visible(&lines, inner_width, offset, history_height);
     visible.extend(footer);
     let visible: Vec<Line> = visible.into_iter().map(Line::from).collect();

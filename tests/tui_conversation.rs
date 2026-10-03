@@ -217,7 +217,9 @@ fn json_with_no_type_field_is_raw() {
 mod conductor_chat {
     use narsor::conductor::{ChatAuthor, ChatEntry, ChatEntryKind};
     use narsor::domain::Confidence;
-    use narsor::tui::chat::{chat_item_lines, chat_items, ChatPanel, ProposalState, UndoState};
+    use narsor::tui::chat::{
+        chat_item_lines, chat_items, ChatActionTarget, ChatPanel, ProposalState, UndoState,
+    };
     use serde_json::{json, Value};
 
     fn entry(
@@ -340,6 +342,26 @@ mod conductor_chat {
         panel.undo = None;
         panel.selected = 0;
         assert!(!panel.ask_undo(), "a proposal is no decision to undo");
+    }
+
+    #[test]
+    fn transcript_reading_and_action_target_survive_new_entries_independently() {
+        let mut panel = ChatPanel::default();
+        let entries = (1..=30).map(proposal).collect();
+        panel.append(entries);
+        assert!(panel.transcript.is_following_end());
+        panel.line_up();
+        let anchor = panel.transcript.anchor().expect("older reading anchor");
+        assert!(!panel.transcript.is_following_end());
+
+        panel.cycle_action_target(0);
+        let target = panel.action_target.clone().expect("open proposal target");
+        assert!(matches!(target, ChatActionTarget::Proposal(_)));
+
+        panel.append(vec![proposal(31)]);
+        assert_eq!(panel.action_target, Some(target));
+        assert_eq!(panel.transcript.anchor().expect("restored anchor"), anchor);
+        assert!(!panel.transcript.is_following_end());
     }
 }
 

@@ -18,6 +18,9 @@ use serde_json::Value;
 
 use crate::conductor::{ChatAuthor, ChatEntry, ChatEntryKind};
 use crate::domain::{ConductorDecisionKind, Confidence};
+use crate::tui::transcript::{
+    DisplayMode, TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptState,
+};
 
 /// The `kind` a chat decision entry records for a carried-out proposal.
 const EXECUTED: &str = "execute_proposal";
@@ -226,9 +229,18 @@ pub fn chat_item_lines(item: &ChatItem) -> Vec<String> {
 pub enum ChatFocus {
     /// The message being written: letters type, `Enter` sends.
     Draft,
-    /// The history: `j`/`k` select, `y`/`n` settle a proposal, `u` undoes a
-    /// decision.
-    History,
+    /// The history: navigation moves the independent transcript viewport.
+    Reading,
+    /// A separately chosen proposal or decision accepts action keys.
+    Action,
+}
+
+/// A durable action address, never a display offset.  Entries can arrive or
+/// be re-rendered without making an operator act on a different item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatActionTarget {
+    Proposal(String),
+    Decision(String),
 }
 
 /// The confirmation an undo goes through (R31): the decision with its
@@ -261,8 +273,13 @@ pub struct ChatPanel {
     pub draft: String,
     /// Which half takes the keys.
     pub focus: ChatFocus,
-    /// The highlighted history entry.
+    /// Legacy item cursor used by older callers to find an item.  It is not
+    /// the reading viewport and is never the stored action address.
     pub selected: usize,
+    /// Shared reading state for the chronological conductor transcript.
+    pub transcript: TranscriptState,
+    /// The durable proposal or decision selected for an action.
+    pub action_target: Option<ChatActionTarget>,
     /// The undo waiting for its confirmation, if one is.
     pub undo: Option<UndoConfirm>,
 }
@@ -276,12 +293,20 @@ impl Default for ChatPanel {
             draft: String::new(),
             focus: ChatFocus::Draft,
             selected: 0,
+            transcript: TranscriptState::new(TranscriptId::from("conductor")),
+            action_target: None,
             undo: None,
         }
     }
 }
 
 impl ChatPanel {
+    /// Gives transcript expansion identities a task-specific namespace.
+    pub fn set_execution(&mut self, execution_id: &str) {
+        self.transcript
+            .set_conversation(TranscriptId::from(format!("conductor:{execution_id}")));
+    }
+
     /// The history with each entry's state.
     pub fn items(&self) -> Vec<ChatItem> {
         chat_items(&self.entries)
@@ -292,15 +317,46 @@ impl ChatPanel {
         self.items().into_iter().nth(self.selected)
     }
 
+    /// The item named by the durable action target, if it is still viable.
+    pub fn action_item(&self) -> Option<ChatItem> {
+        let target = self.action_target.as_ref()?;
+        self.items().into_iter().find(|item| match target {
+            ChatActionTarget::Proposal(id) => item.open_proposal() == Some(id.as_str()),
+            ChatActionTarget::Decision(id) => item.undoable_decision() == Some(id.as_str()),
+        })
+    }
+
+    /// Refreshes the semantic projection without losing the transcript's
+    /// viewport anchor.  Raw mode serializes the complete retained entry.
+    fn sync_transcript(&mut self, replace: bool) -> bool {
+        let entries = self
+            .items()
+            .iter()
+            .map(chat_transcript_entry)
+            .collect::<Vec<_>>();
+        if replace {
+            self.transcript.replace_entries(entries);
+        } else if self.transcript.entries().is_empty() && !self.loaded {
+            self.transcript.load(entries);
+        } else {
+            self.transcript.replace_entries(entries);
+        }
+        let stale_target = self.action_target.is_some() && self.action_item().is_none();
+        if stale_target {
+            self.action_target = None;
+        }
+        stale_target
+    }
+
     /// The sequence of the last entry held, from which the next read
     /// continues.
     pub fn last_sequence(&self) -> u64 {
         self.entries.last().map_or(0, |entry| entry.sequence)
     }
 
-    /// Appends the entries newer than the last one held. A selection at the
-    /// end of the history follows it.
-    pub fn append(&mut self, entries: Vec<ChatEntry>) {
+    /// Appends the entries newer than the last one held.  The transcript
+    /// follows new entries only while it was already at its end.
+    pub fn append(&mut self, entries: Vec<ChatEntry>) -> bool {
         let following = self.selected + 1 >= self.entries.len();
         let after = self.last_sequence();
         self.entries
@@ -309,6 +365,7 @@ impl ChatPanel {
         if following {
             self.selected = self.entries.len().saturating_sub(1);
         }
+        self.sync_transcript(true)
     }
 
     /// Moves the history's selection by `delta`, within its bounds.
@@ -320,10 +377,63 @@ impl ChatPanel {
         self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
     }
 
+    pub fn line_down(&mut self) {
+        self.transcript.line_down();
+    }
+    pub fn line_up(&mut self) {
+        self.transcript.line_up();
+    }
+    pub fn page_down(&mut self) {
+        self.transcript.page_down();
+    }
+    pub fn page_up(&mut self) {
+        self.transcript.page_up();
+    }
+    pub fn to_top(&mut self) {
+        self.transcript.to_top();
+    }
+    pub fn to_bottom(&mut self) {
+        self.transcript.to_bottom();
+    }
+
+    pub fn cycle_action_target(&mut self, delta: isize) {
+        let targets = self
+            .items()
+            .into_iter()
+            .filter_map(|item| {
+                item.open_proposal()
+                    .map(|id| ChatActionTarget::Proposal(id.to_string()))
+                    .or_else(|| {
+                        item.undoable_decision()
+                            .map(|id| ChatActionTarget::Decision(id.to_string()))
+                    })
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            self.action_target = None;
+            return;
+        }
+        let current = self
+            .action_target
+            .as_ref()
+            .and_then(|target| targets.iter().position(|candidate| candidate == target))
+            .unwrap_or(0);
+        self.action_target = Some(
+            targets[(current as isize + delta).rem_euclid(targets.len() as isize) as usize].clone(),
+        );
+    }
+
+    pub fn toggle_raw(&mut self) {
+        self.transcript.set_mode(match self.transcript.mode() {
+            DisplayMode::Rendered => DisplayMode::Raw,
+            DisplayMode::Raw => DisplayMode::Rendered,
+        });
+    }
+
     /// Asks for the undo of the highlighted entry, when it is a decision
     /// that can be undone; returns whether it is.
     pub fn ask_undo(&mut self) -> bool {
-        let Some(item) = self.selected_item() else {
+        let Some(item) = self.action_item().or_else(|| self.selected_item()) else {
             return false;
         };
         let Some(decision_id) = item.undoable_decision().map(ToString::to_string) else {
@@ -338,4 +448,27 @@ impl ChatPanel {
         });
         true
     }
+}
+
+/// Adapts a conductor entry to the source-neutral transcript contract.
+fn chat_transcript_entry(item: &ChatItem) -> TranscriptEntry {
+    let raw =
+        serde_json::to_vec(&item.entry).unwrap_or_else(|_| item.entry.text.as_bytes().to_vec());
+    let technical_lines = item
+        .entry
+        .payload
+        .as_ref()
+        .map_or_else(Vec::new, |payload| {
+            serde_json::to_string_pretty(payload)
+                .unwrap_or_else(|_| payload.to_string())
+                .lines()
+                .map(|line| format!("   {line}"))
+                .collect()
+        });
+    TranscriptEntry::new(
+        TranscriptEntryId::from(item.entry.id.clone()),
+        chat_item_lines(item),
+        raw,
+    )
+    .with_technical_lines(technical_lines)
 }

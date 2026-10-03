@@ -96,7 +96,7 @@ use crate::engine::{
 use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
 use crate::tasks;
-use crate::tui::chat::{ChatFocus, ChatPanel};
+use crate::tui::chat::{ChatActionTarget, ChatFocus, ChatPanel};
 use crate::tui::conversation::{classify, ClassifiedEntry, EntryKind};
 use crate::tui::failure_form::{FailureAction, FailureForm};
 use crate::tui::refresh::{RefreshSchedule, DEBOUNCE};
@@ -2434,7 +2434,7 @@ impl App {
         }
 
         self.screen = Screen::Task(Box::new(TaskView {
-            execution_id,
+            execution_id: execution_id.clone(),
             origin,
             timeline,
             selected,
@@ -2443,7 +2443,11 @@ impl App {
             focus: TaskFocus::Axis,
             content: TaskContent::Empty,
             expanded: HashSet::new(),
-            chat: ChatPanel::default(),
+            chat: {
+                let mut chat = ChatPanel::default();
+                chat.set_execution(&execution_id);
+                chat
+            },
         }));
     }
 
@@ -2904,17 +2908,44 @@ impl App {
 
         match (key.code, chat.focus) {
             (KeyCode::Esc, _) => chat.open = false,
-            (KeyCode::Tab | KeyCode::BackTab, _) => {
+            (KeyCode::Tab, _) => {
                 chat.focus = match chat.focus {
-                    ChatFocus::Draft => ChatFocus::History,
-                    ChatFocus::History => ChatFocus::Draft,
+                    ChatFocus::Draft => ChatFocus::Reading,
+                    ChatFocus::Reading => {
+                        chat.cycle_action_target(0);
+                        ChatFocus::Action
+                    }
+                    ChatFocus::Action => ChatFocus::Draft,
                 };
             }
-            (KeyCode::Down, _) | (KeyCode::Char('j'), ChatFocus::History) => chat.move_selection(1),
-            (KeyCode::Up, _) | (KeyCode::Char('k'), ChatFocus::History) => chat.move_selection(-1),
-            (KeyCode::Char('g') | KeyCode::Home, ChatFocus::History) => chat.selected = 0,
-            (KeyCode::Char('G') | KeyCode::End, ChatFocus::History) => {
-                chat.selected = chat.entries.len().saturating_sub(1)
+            (KeyCode::BackTab, _) => {
+                chat.focus = match chat.focus {
+                    ChatFocus::Draft => ChatFocus::Action,
+                    ChatFocus::Reading => ChatFocus::Draft,
+                    ChatFocus::Action => ChatFocus::Reading,
+                };
+            }
+            (KeyCode::Down, ChatFocus::Reading) | (KeyCode::Char('j'), ChatFocus::Reading) => {
+                chat.line_down()
+            }
+            (KeyCode::Up, ChatFocus::Reading) | (KeyCode::Char('k'), ChatFocus::Reading) => {
+                chat.line_up()
+            }
+            (KeyCode::PageDown, ChatFocus::Reading) | (KeyCode::Char('d'), ChatFocus::Reading) => {
+                chat.page_down()
+            }
+            (KeyCode::PageUp, ChatFocus::Reading) | (KeyCode::Char('b'), ChatFocus::Reading) => {
+                chat.page_up()
+            }
+            (KeyCode::Char('g') | KeyCode::Home, ChatFocus::Reading) => chat.to_top(),
+            (KeyCode::Char('G') | KeyCode::End, ChatFocus::Reading) => chat.to_bottom(),
+            (KeyCode::Char('['), ChatFocus::Action) => chat.cycle_action_target(-1),
+            (KeyCode::Char(']'), ChatFocus::Action) => chat.cycle_action_target(1),
+            (KeyCode::Char('v'), ChatFocus::Reading) => chat.toggle_raw(),
+            (KeyCode::Char('e'), ChatFocus::Reading) => {
+                if let Some(anchor) = chat.transcript.anchor() {
+                    chat.transcript.toggle_expanded(&anchor.entry_id);
+                }
             }
             (KeyCode::Enter, ChatFocus::Draft) => {
                 if chat.draft.trim().is_empty() {
@@ -2927,11 +2958,17 @@ impl App {
                 chat.draft.pop();
             }
             (KeyCode::Char(character), ChatFocus::Draft) => chat.draft.push(character),
-            (KeyCode::Char('y') | KeyCode::Enter, ChatFocus::History) => {
-                match chat
-                    .selected_item()
-                    .and_then(|item| item.open_proposal().map(String::from))
-                {
+            (KeyCode::Char('y') | KeyCode::Enter, ChatFocus::Action | ChatFocus::Reading) => {
+                let proposal_id = match chat.action_target.as_ref() {
+                    Some(ChatActionTarget::Proposal(id)) => Some(id.clone()),
+                    // Legacy programmatic callers can still select an entry;
+                    // capture its immutable ID before asking the daemon.
+                    None => chat
+                        .selected_item()
+                        .and_then(|item| item.open_proposal().map(String::from)),
+                    _ => None,
+                };
+                match proposal_id {
                     Some(proposal_id) => {
                         return Request::ConfirmProposal {
                             execution_id,
@@ -2940,16 +2977,20 @@ impl App {
                     }
                     None => {
                         self.notice = Some(Notice::error(
-                            "The selected entry is not a proposal waiting for confirmation.",
+                            "No selected action target is a proposal waiting for confirmation.",
                         ))
                     }
                 }
             }
-            (KeyCode::Char('n'), ChatFocus::History) => {
-                match chat
-                    .selected_item()
-                    .and_then(|item| item.open_proposal().map(String::from))
-                {
+            (KeyCode::Char('n'), ChatFocus::Action | ChatFocus::Reading) => {
+                let proposal_id = match chat.action_target.as_ref() {
+                    Some(ChatActionTarget::Proposal(id)) => Some(id.clone()),
+                    None => chat
+                        .selected_item()
+                        .and_then(|item| item.open_proposal().map(String::from)),
+                    _ => None,
+                };
+                match proposal_id {
                     Some(proposal_id) => {
                         return Request::RejectProposal {
                             execution_id,
@@ -2958,12 +2999,12 @@ impl App {
                     }
                     None => {
                         self.notice = Some(Notice::error(
-                            "The selected entry is not a proposal waiting for confirmation.",
+                            "No selected action target is a proposal waiting for confirmation.",
                         ))
                     }
                 }
             }
-            (KeyCode::Char('u'), ChatFocus::History) => {
+            (KeyCode::Char('u'), ChatFocus::Action | ChatFocus::Reading) => {
                 if !chat.ask_undo() {
                     self.notice = Some(Notice::error(
                         "Only the conductor's choice of an output that was not undone yet can \
@@ -2971,7 +3012,9 @@ impl App {
                     ));
                 }
             }
-            (KeyCode::Char('r'), ChatFocus::History) => return Request::LoadChat,
+            (KeyCode::Char('r'), ChatFocus::Reading | ChatFocus::Action) => {
+                return Request::LoadChat
+            }
             _ => {}
         }
         Request::None
@@ -4101,10 +4144,16 @@ impl App {
         let after = view.chat.last_sequence();
         match self.client.conductor_chat(&execution_id, after).await {
             Ok(response) => {
+                let mut stale_target = false;
                 if let Screen::Task(view) = &mut self.screen {
                     if view.execution_id == execution_id {
-                        view.chat.append(response.entries);
+                        stale_target = view.chat.append(response.entries);
                     }
+                }
+                if stale_target {
+                    self.notice = Some(Notice::error(
+                        "The selected conductor action is no longer available after refresh.",
+                    ));
                 }
             }
             Err(error) => {
@@ -4315,11 +4364,20 @@ fn chat_shortcuts(chat: &ChatPanel) -> Vec<(&'static str, &'static str)> {
         ChatFocus::Draft => vec![
             ("letters", "type a message"),
             ("Enter", "send"),
-            ("Tab", "history"),
+            ("Tab", "read history"),
             ("Esc", "close the chat"),
         ],
-        ChatFocus::History => vec![
-            ("j/k", "select"),
+        ChatFocus::Reading => vec![
+            ("j/k", "scroll history"),
+            ("PgUp/PgDn", "page"),
+            ("g/G", "top/bottom"),
+            ("e", "detail"),
+            ("v", "raw/rendered"),
+            ("Tab", "actions"),
+            ("Esc", "close the chat"),
+        ],
+        ChatFocus::Action => vec![
+            ("[/]", "choose action"),
             ("y", "confirm"),
             ("n", "reject"),
             ("u", "undo decision"),
