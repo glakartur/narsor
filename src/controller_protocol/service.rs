@@ -25,8 +25,8 @@ use crate::domain::{BackendId, TaskId};
 use crate::environment::{LaunchError, LaunchIntent, LaunchResolver};
 use crate::orchestration::{
     BackendLease, CommandRequest, ControlPlane, ControllerReport, ConversationAvailability,
-    InputRequest, LeaseToken, NewTask, Observation, OwnerRef, RunnerObservation, TaskEvent,
-    TaskLifecycle, TaskRecord,
+    InputRequest, LeaseToken, NewTask, OwnerRef, RunnerObservation, TaskEvent, TaskLifecycle,
+    TaskRecord,
 };
 
 /// A launch that did not resolve, as the owner sees it: a `400` naming the
@@ -770,23 +770,13 @@ impl ProtocolService {
     /// `PausedAtSafePoint` additionally requires the runner to have
     /// acknowledged a safe point for the current generation (KTD2): compute
     /// is removed only after that, never on the controller's word alone.
+    /// [`ControlPlane::report`] enforces it, so every writer is held to it.
     pub fn report(
         &self,
         identity: &ControllerIdentity,
         request: ReportRequest,
     ) -> ProtocolResult<ReportResponse> {
         let record = self.backend_task(identity, &request.task_id)?;
-        if request.observation == Observation::PausedAtSafePoint
-            && !safe_point_acknowledged(&record)
-        {
-            return Err(ProtocolError::conflict(
-                "safe_point_not_acknowledged",
-                format!(
-                    "the runner of task '{}' has not acknowledged a safe point for generation {}",
-                    record.task_id, record.generation
-                ),
-            ));
-        }
         let outcome = self.control.report(ControllerReport {
             task_id: record.task_id.clone(),
             lease: lease_token(identity, request.lease_epoch),
@@ -1287,13 +1277,6 @@ fn desired_command(record: &TaskRecord) -> Option<DesiredCommand> {
             received_at: runner.received_at,
         }),
     })
-}
-
-fn safe_point_acknowledged(record: &TaskRecord) -> bool {
-    record
-        .runner
-        .as_ref()
-        .is_some_and(|runner| runner.safe_point_generation == Some(record.generation))
 }
 
 /// Whether `value` can name an attempt: the Engine's ids are UUIDs, and

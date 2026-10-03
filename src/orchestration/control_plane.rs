@@ -368,8 +368,10 @@ impl ControlPlane {
     /// not older than the last accepted report; the desired generation is the
     /// current one; the resource version is not older than the last accepted
     /// one of the same incarnation; and the observation is legal from the
-    /// current lifecycle. A pure redelivery is absorbed with
-    /// `applied: false`. Workload loss never schedules a replacement — the
+    /// current lifecycle; `PausedAtSafePoint` additionally needs the runner's
+    /// safe-point acknowledgement for the current generation
+    /// ([`OrchestrationError::SafePointNotAcknowledged`]). A pure redelivery
+    /// is absorbed with `applied: false`. Workload loss never schedules a replacement — the
     /// task waits in Interrupted/Unknown for an owner command (R13).
     pub fn report(&self, report: ControllerReport) -> Result<ReportOutcome> {
         let (task, applied) = self.mutate(&report.task_id, |record, now| {
@@ -423,6 +425,17 @@ impl ControlPlane {
                 }
                 ObservationEffect::Unchanged => {}
                 ObservationEffect::Transition(next) => {
+                    // Checked here, not only at the protocol edge, so no
+                    // writer — an HTTP controller or an in-process adapter —
+                    // can remove compute on its own word (KTD2).
+                    if report.observation == Observation::PausedAtSafePoint
+                        && !safe_point_acknowledged(record)
+                    {
+                        return Err(OrchestrationError::SafePointNotAcknowledged {
+                            task_id: record.task_id.clone(),
+                            generation: record.generation,
+                        });
+                    }
                     record.lifecycle = next;
                     match report.observation {
                         Observation::StartAccepted => record.resources_may_exist = true,
@@ -587,6 +600,15 @@ fn same_creation(record: &TaskRecord, request: &NewTask) -> bool {
         && record.owner == request.owner
         && record.assignment.backend_id == request.backend_id
         && record.priority == request.priority
+}
+
+/// Whether the runner acknowledged a safe point for the task's current
+/// desired generation — the only permission to complete a pause.
+pub(crate) fn safe_point_acknowledged(record: &TaskRecord) -> bool {
+    record
+        .runner
+        .as_ref()
+        .is_some_and(|runner| runner.safe_point_generation == Some(record.generation))
 }
 
 /// Refuses a report about an older version of the same resource incarnation.

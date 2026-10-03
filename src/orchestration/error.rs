@@ -100,6 +100,16 @@ pub enum OrchestrationError {
         presented: u64,
     },
 
+    /// The controller reported a pause complete although the runner has not
+    /// acknowledged a safe point for the current generation (KTD2).
+    #[error("the runner of task '{task_id}' has not acknowledged a safe point for generation {generation}")]
+    SafePointNotAcknowledged {
+        /// The task.
+        task_id: TaskId,
+        /// The pause's desired generation.
+        generation: u64,
+    },
+
     /// The backend lease is held by another, unexpired controller.
     #[error("backend '{backend_id}' lease is held by '{holder}' until {expires_at}")]
     LeaseHeld {

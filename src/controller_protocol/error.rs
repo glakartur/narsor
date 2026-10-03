@@ -88,6 +88,9 @@ impl From<OrchestrationError> for ProtocolError {
             E::IllegalCommand { .. } => Self::conflict("illegal_command", message),
             E::IllegalObservation { .. } => Self::conflict("illegal_observation", message),
             E::StaleObservation { .. } => Self::conflict("stale_observation", message),
+            E::SafePointNotAcknowledged { .. } => {
+                Self::conflict("safe_point_not_acknowledged", message)
+            }
             E::LeaseHeld { .. } => Self::conflict("lease_held", message),
             E::StaleLease { .. } => Self::conflict("stale_lease", message),
             E::LeaseExpired { .. } => Self::conflict("lease_expired", message),

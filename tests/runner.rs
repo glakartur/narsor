@@ -95,8 +95,14 @@ struct Fixture {
 impl Fixture {
     /// A fixture whose runner routes are served right away.
     async fn served() -> Self {
+        // Bind before anyone learns the address: reserving a port and
+        // re-binding it later lets a parallel test grab it in between.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the control plane");
         let mut fixture = Self::unserved();
-        fixture.serve().await;
+        fixture.addr = listener.local_addr().expect("address");
+        fixture.serve_on(listener);
         fixture
     }
 
@@ -149,6 +155,10 @@ impl Fixture {
         let listener = tokio::net::TcpListener::bind(self.addr)
             .await
             .expect("bind the control plane");
+        self.serve_on(listener);
+    }
+
+    fn serve_on(&mut self, listener: tokio::net::TcpListener) {
         let router: Router = runner_routes(Arc::clone(&self.service));
         self.server = Some(tokio::spawn(async move {
             axum::serve(listener, router).await.expect("serve");

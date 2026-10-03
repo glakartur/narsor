@@ -5,11 +5,11 @@
 //! serialization, recovery after partial writes — live in file operations.
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use narsor::domain::{BackendId, TaskId, TaskLaunchSpec};
+use narsor::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
 use narsor::orchestration::{
     BackendLease, Clock, CommandRequest, ControlPlane, ControllerReport, NewTask, Observation,
-    ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef, ResourceIdentity, TaskEventKind,
-    TaskLifecycle, TaskRecord,
+    ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef, ResourceIdentity, RunnerSnapshot,
+    TaskEventKind, TaskLifecycle, TaskRecord,
 };
 use narsor::persistence::paths::{temp_path_for, StatePaths};
 use narsor::persistence::ExecutionStore;
@@ -117,10 +117,41 @@ impl Fixture {
         lease: &BackendLease,
         observation: Observation,
     ) -> Result<TaskRecord, OrchestrationError> {
+        if observation == Observation::PausedAtSafePoint {
+            self.acknowledge_safe_point(id);
+        }
         let generation = self.control.task(&task(id)).unwrap().generation;
         self.control
             .report(report(id, lease, generation, observation, None))
             .map(|outcome| outcome.task)
+    }
+
+    /// Lets the task's runner acknowledge a safe point, when a pause waits
+    /// for one: the control plane completes a pause only after that (KTD2).
+    fn acknowledge_safe_point(&self, id: &str) {
+        let record = self.control.task(&task(id)).unwrap();
+        if record.lifecycle != TaskLifecycle::PauseRequested {
+            return;
+        }
+        let launch_generation = record
+            .commands
+            .iter()
+            .filter(|receipt| matches!(receipt.command, OwnerCommand::Start | OwnerCommand::Resume))
+            .map(|receipt| receipt.generation_after)
+            .max()
+            .unwrap_or(1);
+        let sequence = record
+            .runner
+            .as_ref()
+            .map_or(1, |runner| runner.snapshot.snapshot_sequence + 1);
+        self.control
+            .record_runner_snapshot(
+                &task(id),
+                &format!("pod-g{launch_generation}"),
+                launch_generation,
+                safe_point_snapshot(sequence),
+            )
+            .expect("safe-point snapshot");
     }
 
     /// Drives a fresh task to `Running` through its controller.
@@ -189,6 +220,21 @@ fn report(
             runner_status: None,
             detail: None,
         },
+        observed_at: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap(),
+    }
+}
+
+fn safe_point_snapshot(sequence: u64) -> RunnerSnapshot {
+    RunnerSnapshot {
+        snapshot_sequence: sequence,
+        execution_status: ExecutionStatus::Running,
+        execution_cursor: Default::default(),
+        event_cursor: 0,
+        pending_input: None,
+        conversation: Default::default(),
+        timeline: None,
+        safe_point: true,
+        problem: None,
         observed_at: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap(),
     }
 }
@@ -902,6 +948,7 @@ fn the_event_log_is_monotonic_and_survives_reopening() {
         .unwrap()
         .is_empty());
 
+    fx.acknowledge_safe_point("task-1");
     let generation = reopened.task(&task("task-1")).unwrap().generation;
     reopened
         .report(report(
@@ -912,9 +959,52 @@ fn the_event_log_is_monotonic_and_survives_reopening() {
             None,
         ))
         .expect("a reopened handle keeps appending");
+    // The runner's safe point is sequence 5, the pause completing 6.
     let next = fx.control.events_since(&task("task-1"), 4).unwrap();
-    assert_eq!(next.len(), 1);
-    assert_eq!(next[0].sequence, 5);
+    let sequences: Vec<u64> = next.iter().map(|event| event.sequence).collect();
+    assert_eq!(sequences, [5, 6]);
+}
+
+#[test]
+fn a_pause_completes_only_after_the_runner_acknowledged_a_safe_point() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.running("task-1", &lease);
+    let pausing = fx.command("task-1", OwnerCommand::Pause, "pause-1");
+
+    // Straight to the control plane, without the protocol service in front:
+    // an in-process adapter is held to the same rule (KTD2).
+    let refused = fx
+        .control
+        .report(report(
+            "task-1",
+            &lease,
+            pausing.generation,
+            Observation::PausedAtSafePoint,
+            None,
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(refused, OrchestrationError::SafePointNotAcknowledged { generation, .. } if generation == pausing.generation),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fx.control.task(&task("task-1")).unwrap().lifecycle,
+        TaskLifecycle::PauseRequested
+    );
+
+    fx.acknowledge_safe_point("task-1");
+    let paused = fx
+        .control
+        .report(report(
+            "task-1",
+            &lease,
+            pausing.generation,
+            Observation::PausedAtSafePoint,
+            None,
+        ))
+        .expect("acknowledged pause");
+    assert_eq!(paused.task.lifecycle, TaskLifecycle::Paused);
 }
 
 #[test]
