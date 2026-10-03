@@ -415,10 +415,14 @@ pub async fn require_trusted_proxy(
         .headers()
         .get(FORWARDED_PROTO)
         .and_then(|value| value.to_str().ok())
-        // A chain of proxies lists one scheme per hop; the first is the
-        // client's own.
-        .and_then(|value| value.split(',').next())
-        .is_some_and(|scheme| scheme.trim().eq_ignore_ascii_case("https"));
+        // A chain of proxies lists one scheme per hop, and a proxy that
+        // appends lets the client forge the leading entries. Only a list in
+        // which every hop is https cannot have been downgraded anywhere.
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .all(|scheme| scheme.trim().eq_ignore_ascii_case("https"))
+        });
     match peer {
         Some(peer) if policy.allows(peer) && https => next.run(request).await,
         _ => StatusCode::FORBIDDEN.into_response(),

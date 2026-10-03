@@ -852,6 +852,15 @@ async fn network_mode_serves_only_https_requests_from_trusted_proxies() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(plain(Some("https")).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        plain(Some("https, http")).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "a client-forged leading https cannot hide a plain-http hop"
+    );
+    assert_eq!(
+        plain(Some("https, https")).await.unwrap().status(),
+        StatusCode::OK
+    );
 
     let elsewhere = NetworkServer::start(
         &issuer,
