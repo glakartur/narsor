@@ -1,9 +1,10 @@
 //! Durable storage of executions: `state.json`, `context.json`, artifacts.
 
 use super::{PersistenceError, Result};
-use crate::domain::{Context, ExecutionId, WorkflowExecution};
+use crate::domain::{Context, ExecutionId, TaskId, TaskLaunchSpec, WorkflowExecution};
 use crate::persistence::atomic::{
     cleanup_orphaned_temp_files, ensure_dir, read_json, write_json_atomic,
+    write_json_atomic_exclusive,
 };
 use crate::persistence::conversation::ConversationStore;
 use crate::persistence::event_log::EventLog;
@@ -77,6 +78,53 @@ impl ExecutionStore {
             });
         }
         read_json(&path)
+    }
+
+    /// Copies an immutable launch specification to task storage once (R18).
+    ///
+    /// `Ok(true)` means this caller initialized the storage; `Ok(false)` means
+    /// an identical spec was already there — the ordinary outcome of a
+    /// reconnect or a redelivered command, which must reconcile rather than
+    /// bootstrap a second runner. A different spec is a hard
+    /// [`PersistenceError::LaunchSpecConflict`]: task storage belongs to one
+    /// launch for its whole life. The write is exclusive (`link(2)`), so two
+    /// racing initializers cannot both win.
+    pub fn initialize_task_launch_spec(
+        &self,
+        task_id: &TaskId,
+        spec: &TaskLaunchSpec,
+    ) -> Result<bool> {
+        let path = self.paths.task_launch_spec_file(task_id.as_str());
+        if !spec.digest_is_valid() {
+            return Err(PersistenceError::LaunchSpecConflict {
+                task_id: task_id.to_string(),
+                path,
+            });
+        }
+        if write_json_atomic_exclusive(&path, spec)? {
+            return Ok(true);
+        }
+        let existing: TaskLaunchSpec = read_json(&path)?;
+        // Full content, not only the digest: the digest is a non-cryptographic
+        // integrity check (see `TaskLaunchSpec::compute_digest`).
+        if existing == *spec {
+            Ok(false)
+        } else {
+            Err(PersistenceError::LaunchSpecConflict {
+                task_id: task_id.to_string(),
+                path,
+            })
+        }
+    }
+
+    /// Reads the pinned launch specification of a task, or `None` when this
+    /// task storage was never initialized.
+    pub fn load_task_launch_spec(&self, task_id: &TaskId) -> Result<Option<TaskLaunchSpec>> {
+        let path = self.paths.task_launch_spec_file(task_id.as_str());
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(&path).map(Some)
     }
 
     /// Persists only `context.json`.
@@ -212,7 +260,7 @@ impl ExecutionStore {
     ///
     /// Returns the paths that were removed.
     pub fn cleanup_orphaned_temp_files(&self) -> Result<Vec<PathBuf>> {
-        let mut removed = Vec::new();
+        let mut removed = cleanup_orphaned_temp_files(&self.paths.launch_specs_dir())?;
         for execution_id in self.list_execution_ids()? {
             removed.extend(cleanup_orphaned_temp_files(
                 &self.paths.execution_dir(&execution_id),

@@ -11,6 +11,7 @@ pub mod config;
 pub mod daemon;
 pub mod domain;
 pub mod engine;
+pub mod orchestration;
 pub mod persistence;
 pub mod registry;
 pub mod tasks;

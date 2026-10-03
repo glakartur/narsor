@@ -809,3 +809,64 @@ fn workspace_round_trips_its_base_commit() {
         Some("0123456789abcdef0123456789abcdef01234567")
     );
 }
+
+fn sample_launch_spec(feature: &str) -> narsor::domain::TaskLaunchSpec {
+    narsor::domain::TaskLaunchSpec::new(
+        "implement-feature",
+        3,
+        serde_json::json!({ "feature": feature }),
+        serde_json::json!({ "repository": "narsor" }),
+    )
+}
+
+#[test]
+fn a_launch_spec_initializes_task_storage_exactly_once() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let task_id = narsor::domain::TaskId::parse("task-1").unwrap();
+    let spec = sample_launch_spec("remote backends");
+
+    assert_eq!(store.load_task_launch_spec(&task_id).unwrap(), None);
+    assert!(store.initialize_task_launch_spec(&task_id, &spec).unwrap());
+    assert!(!store.initialize_task_launch_spec(&task_id, &spec).unwrap());
+    assert_eq!(store.load_task_launch_spec(&task_id).unwrap(), Some(spec));
+
+    let other = sample_launch_spec("something else");
+    assert!(matches!(
+        store.initialize_task_launch_spec(&task_id, &other),
+        Err(PersistenceError::LaunchSpecConflict { .. })
+    ));
+}
+
+#[test]
+fn a_launch_spec_that_does_not_match_its_digest_is_refused() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let task_id = narsor::domain::TaskId::parse("task-1").unwrap();
+    let mut spec = sample_launch_spec("remote backends");
+    spec.inputs = serde_json::json!({ "feature": "tampered" });
+
+    assert!(matches!(
+        store.initialize_task_launch_spec(&task_id, &spec),
+        Err(PersistenceError::LaunchSpecConflict { .. })
+    ));
+    assert_eq!(store.load_task_launch_spec(&task_id).unwrap(), None);
+}
+
+#[test]
+fn launch_specs_are_not_executions_and_their_temp_files_are_swept() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let task_id = narsor::domain::TaskId::parse("task-1").unwrap();
+    store
+        .initialize_task_launch_spec(&task_id, &sample_launch_spec("x"))
+        .unwrap();
+    let orphan = temp_path_for(&store.paths().task_launch_spec_file("task-2"));
+    fs::write(&orphan, b"{\"torn\":").unwrap();
+
+    assert!(store.list_execution_ids().unwrap().is_empty());
+    let removed = store.cleanup_orphaned_temp_files().unwrap();
+    assert_eq!(removed, vec![orphan.clone()]);
+    assert!(!orphan.exists());
+    assert!(store.load_task_launch_spec(&task_id).unwrap().is_some());
+}

@@ -35,7 +35,8 @@ pub mod recovery;
 pub use agent_harness::{DefaultHarnessSelector, HarnessSelectionError, HarnessSelectionSnapshot};
 pub use atomic::{
     cleanup_orphaned_temp_files, read_json, write_atomic, write_atomic_exclusive,
-    write_atomic_with_mode, write_json_atomic, write_json_atomic_with_mode,
+    write_atomic_with_mode, write_json_atomic, write_json_atomic_exclusive,
+    write_json_atomic_with_mode,
 };
 pub use conversation::{
     ConversationEntry, ConversationSnapshot, ConversationSource, ConversationStore,
@@ -104,6 +105,11 @@ pub enum PersistenceError {
         /// The path that was expected to exist.
         path: PathBuf,
     },
+
+    /// Task storage was already initialized from a different launch
+    /// specification, or the offered one does not match its own digest.
+    #[error("task '{task_id}' launch specification conflicts with '{path}'")]
+    LaunchSpecConflict { task_id: String, path: PathBuf },
 
     /// An event with this sequence number is already on disk.
     ///

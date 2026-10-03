@@ -1,0 +1,27 @@
+//! Durable, backend-neutral orchestration of remote tasks (KTD1, KTD3).
+//!
+//! The control plane owns *assignment*, *desired lifecycle*, the *fenced
+//! controller leases* and the *last observed* backend/runner summary of every
+//! task. It never reads or writes a `WorkflowExecution`: the runner's work
+//! state stays authoritative on task storage, and nothing here can be used to
+//! reconstruct it — or to recreate a workload — after a controller loss.
+//!
+//! * [`model`] — records and messages;
+//! * `lifecycle` — the state machine, as pure transition rules;
+//! * [`store`] — the file layout and its crash-safe commit protocol;
+//! * [`control_plane`] — the API owners and controllers mutate tasks through.
+//!
+//! Records live under `{state}/orchestration/`, outside `executions/`, so
+//! local crash recovery (`persistence::recovery`) never sees them; use
+//! [`ControlPlane::recover`] at startup instead.
+
+pub mod control_plane;
+pub mod error;
+pub(crate) mod lifecycle;
+pub mod model;
+pub mod store;
+
+pub use control_plane::{Clock, ControlPlane, OrchestrationRecovery, SystemClock};
+pub use error::{OrchestrationError, Result};
+pub use model::*;
+pub use store::OrchestrationStore;

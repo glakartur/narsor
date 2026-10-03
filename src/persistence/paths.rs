@@ -17,6 +17,8 @@
 //! {state}/executions/{id}/…          -- StatePaths: owned by one process
 //! {state}/narsor.log
 //! {state}/agent-harness.json          -- operator-selected default harness
+//! {state}/orchestration/…             -- control-plane task records, leases
+//! {state}/launch-specs/{task}.json    -- immutable launch input (task storage)
 //!
 //! {work}/tasks/{id}/code/…           -- WorkPaths: local scratch, disposable
 //! ```
@@ -110,6 +112,44 @@ pub const CONDUCTOR_DIR: &str = "conductor";
 /// Directory of gate annotations inside [`CONDUCTOR_DIR`] (R30).
 pub const CONDUCTOR_ANNOTATIONS_DIR: &str = "annotations";
 
+/// Durable control-plane records (KTD1), directly under the state root.
+///
+/// Deliberately a sibling of [`EXECUTIONS_DIR`] rather than inside it: local
+/// crash recovery (`persistence::recovery`) walks `executions/` and marks an
+/// interrupted action `Unknown`, and a remote task's orchestration record must
+/// never be judged by that rule — only controller reconciliation knows whether
+/// its workload is still alive.
+pub const ORCHESTRATION_DIR: &str = "orchestration";
+
+/// Directory of one sub-directory per orchestrated task, inside
+/// [`ORCHESTRATION_DIR`].
+pub const ORCHESTRATION_TASKS_DIR: &str = "tasks";
+
+/// Directory of one sub-directory per backend (its controller lease), inside
+/// [`ORCHESTRATION_DIR`].
+pub const ORCHESTRATION_BACKENDS_DIR: &str = "backends";
+
+/// The orchestration record of one task.
+pub const TASK_RECORD_FILE: &str = "task.json";
+
+/// Advisory lock serializing every mutation of one task record.
+pub const TASK_LOCK_FILE: &str = "task.lock";
+
+/// Advisory lock serializing task creation (identifier and queue sequence).
+pub const TASKS_CREATE_LOCK_FILE: &str = "create.lock";
+
+/// The fenced controller lease of one backend (KTD3).
+pub const BACKEND_LEASE_FILE: &str = "lease.json";
+
+/// Advisory lock serializing lease acquisition and renewal of one backend.
+pub const BACKEND_LEASE_LOCK_FILE: &str = "lease.lock";
+
+/// Directory of immutable task launch specifications on task storage.
+///
+/// Not inside `executions/{id}`: a directory there without a `state.json`
+/// would show up in every execution listing as a broken execution.
+pub const LAUNCH_SPECS_DIR: &str = "launch-specs";
+
 /// The one checkpoint kept for an execution (R25).
 pub const CHECKPOINT_FILE: &str = "checkpoint.bundle";
 
@@ -189,6 +229,79 @@ impl StatePaths {
     /// `{root}/executions/{execution_id}/context.json`
     pub fn context_file(&self, execution_id: &str) -> PathBuf {
         self.execution_dir(execution_id).join(CONTEXT_FILE)
+    }
+
+    /// `{root}/orchestration`
+    pub fn orchestration_dir(&self) -> PathBuf {
+        self.root.join(ORCHESTRATION_DIR)
+    }
+
+    /// `{root}/orchestration/tasks`
+    pub fn orchestration_tasks_dir(&self) -> PathBuf {
+        self.orchestration_dir().join(ORCHESTRATION_TASKS_DIR)
+    }
+
+    /// `{root}/orchestration/tasks/create.lock`
+    pub fn orchestration_create_lock_file(&self) -> PathBuf {
+        self.orchestration_tasks_dir().join(TASKS_CREATE_LOCK_FILE)
+    }
+
+    /// `{root}/orchestration/tasks/{task_id}`
+    pub fn orchestration_task_dir(&self, task_id: &str) -> PathBuf {
+        self.orchestration_tasks_dir().join(task_id)
+    }
+
+    /// `{root}/orchestration/tasks/{task_id}/task.json`
+    pub fn orchestration_task_file(&self, task_id: &str) -> PathBuf {
+        self.orchestration_task_dir(task_id).join(TASK_RECORD_FILE)
+    }
+
+    /// `{root}/orchestration/tasks/{task_id}/task.lock`
+    pub fn orchestration_task_lock_file(&self, task_id: &str) -> PathBuf {
+        self.orchestration_task_dir(task_id).join(TASK_LOCK_FILE)
+    }
+
+    /// `{root}/orchestration/tasks/{task_id}/events`
+    pub fn orchestration_task_events_dir(&self, task_id: &str) -> PathBuf {
+        self.orchestration_task_dir(task_id).join(EVENTS_DIR)
+    }
+
+    /// `{root}/orchestration/tasks/{task_id}/events/{sequence:08}.json`
+    pub fn orchestration_task_event_file(&self, task_id: &str, sequence: u64) -> PathBuf {
+        self.orchestration_task_events_dir(task_id)
+            .join(event_file_name(sequence))
+    }
+
+    /// `{root}/orchestration/backends`
+    pub fn orchestration_backends_dir(&self) -> PathBuf {
+        self.orchestration_dir().join(ORCHESTRATION_BACKENDS_DIR)
+    }
+
+    /// `{root}/orchestration/backends/{backend_id}`
+    pub fn orchestration_backend_dir(&self, backend_id: &str) -> PathBuf {
+        self.orchestration_backends_dir().join(backend_id)
+    }
+
+    /// `{root}/orchestration/backends/{backend_id}/lease.json`
+    pub fn backend_lease_file(&self, backend_id: &str) -> PathBuf {
+        self.orchestration_backend_dir(backend_id)
+            .join(BACKEND_LEASE_FILE)
+    }
+
+    /// `{root}/orchestration/backends/{backend_id}/lease.lock`
+    pub fn backend_lease_lock_file(&self, backend_id: &str) -> PathBuf {
+        self.orchestration_backend_dir(backend_id)
+            .join(BACKEND_LEASE_LOCK_FILE)
+    }
+
+    /// `{root}/launch-specs`
+    pub fn launch_specs_dir(&self) -> PathBuf {
+        self.root.join(LAUNCH_SPECS_DIR)
+    }
+
+    /// `{root}/launch-specs/{task_id}.json`
+    pub fn task_launch_spec_file(&self, task_id: &str) -> PathBuf {
+        self.launch_specs_dir().join(format!("{task_id}.json"))
     }
 
     /// `{state}/executions/{id}/checkpoint.bundle`.
