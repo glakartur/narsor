@@ -76,6 +76,10 @@ use narsor::tui::app::{
     OVERRIDE_REASON,
 };
 use narsor::tui::chat::{ChatFocus, ChatItem, ProposalState};
+use narsor::tui::transcript::{
+    decode_raw_display, raw_display, DisplayMode, TranscriptEntry, TranscriptEntryId, TranscriptId,
+    TranscriptState,
+};
 use narsor::tui::views;
 use narsor::workflow::load_from_file;
 use narsor::workflows::{builtin, WorkflowResolver};
@@ -3314,6 +3318,136 @@ async fn moving_the_axis_cursor_visits_every_position() {
     app.on_key(key(KeyCode::Char('G')));
     app.load_task_position().await;
     assert_eq!(task_view(&app).selected.as_deref(), Some("plan #2"));
+}
+
+// ---------------------------------------------------------------------------
+// U1: shared transcript presentation state
+// ---------------------------------------------------------------------------
+
+fn transcript_entry(id: &str, lines: &[&str]) -> TranscriptEntry {
+    TranscriptEntry::new(
+        TranscriptEntryId::from(id),
+        lines.iter().map(|line| (*line).to_string()).collect(),
+        id.as_bytes().to_vec(),
+    )
+}
+
+#[test]
+fn transcript_scrolls_logical_lines_without_selecting_entries() {
+    let mut transcript = TranscriptState::new(TranscriptId::from("attempt-a"));
+    transcript.load(vec![transcript_entry(
+        "one",
+        &[
+            "line 0", "line 1", "line 2", "line 3", "line 4", "line 5", "line 6", "line 7",
+            "line 8", "line 9",
+        ],
+    )]);
+    transcript.set_viewport(3);
+
+    transcript.to_top();
+    transcript.line_down();
+    assert_eq!(transcript.scroll_offset(), 1);
+    transcript.page_down();
+    assert_eq!(transcript.scroll_offset(), 4);
+    transcript.to_bottom();
+    assert_eq!(transcript.scroll_offset(), 7);
+    transcript.page_up();
+    assert_eq!(transcript.scroll_offset(), 4);
+    transcript.to_top();
+    assert_eq!(transcript.scroll_offset(), 0);
+}
+
+#[test]
+fn transcript_opens_at_end_and_preserves_an_older_anchor_on_append() {
+    let mut empty = TranscriptState::new(TranscriptId::from("empty-attempt"));
+    empty.load(Vec::new());
+    assert!(empty.is_following_end());
+    assert_eq!(empty.scroll_offset(), 0);
+    empty.append(vec![transcript_entry("first", &["first line"])]);
+    assert!(empty.is_following_end());
+
+    let mut transcript = TranscriptState::new(TranscriptId::from("attempt-a"));
+    transcript.set_viewport(2);
+    transcript.load(vec![
+        transcript_entry("one", &["one-a", "one-b"]),
+        transcript_entry("two", &["two-a", "two-b"]),
+    ]);
+    assert_eq!(transcript.scroll_offset(), 2);
+    assert!(transcript.is_following_end());
+
+    transcript.append(vec![transcript_entry("three", &["three-a"])]);
+    assert_eq!(transcript.scroll_offset(), 3);
+    assert!(transcript.is_following_end());
+
+    transcript.to_top();
+    transcript.line_down();
+    let anchor = transcript.anchor().expect("anchor while reading");
+    assert_eq!(anchor.entry_id, TranscriptEntryId::from("one"));
+    assert_eq!(anchor.logical_line, 1);
+    assert!(!transcript.is_following_end());
+
+    transcript.append(vec![transcript_entry("four", &["four-a"])]);
+    assert_eq!(transcript.anchor(), Some(anchor));
+    assert_eq!(transcript.scroll_offset(), 1);
+}
+
+#[test]
+fn transcript_reanchors_across_detail_mode_resize_and_missing_entry() {
+    let mut transcript = TranscriptState::new(TranscriptId::from("attempt-a"));
+    transcript.set_viewport(2);
+    transcript.load(vec![
+        transcript_entry("one", &["one-a", "one-b"]),
+        transcript_entry("two", &["two-a", "two-b"])
+            .with_technical_lines(vec!["detail-a".into(), "detail-b".into()]),
+    ]);
+    transcript.to_top();
+    transcript.line_down();
+    let anchor = transcript.anchor().unwrap();
+
+    transcript.toggle_expanded(&TranscriptEntryId::from("two"));
+    assert_eq!(transcript.anchor(), Some(anchor));
+    transcript.set_mode(DisplayMode::Raw);
+    assert_eq!(
+        transcript.anchor().unwrap().entry_id,
+        TranscriptEntryId::from("one")
+    );
+    transcript.set_viewport(1);
+    assert_eq!(
+        transcript.anchor().unwrap().entry_id,
+        TranscriptEntryId::from("one")
+    );
+
+    transcript.replace_entries(vec![transcript_entry("two", &["replacement"])]);
+    assert_eq!(
+        transcript.anchor().unwrap().entry_id,
+        TranscriptEntryId::from("two")
+    );
+    assert_eq!(transcript.scroll_offset(), 0);
+}
+
+#[test]
+fn transcript_expansion_is_scoped_to_its_conversation() {
+    let entry = TranscriptEntryId::from("1");
+    let mut first = TranscriptState::new(TranscriptId::from("attempt-a"));
+    first.load(vec![
+        transcript_entry("1", &["body"]).with_technical_lines(vec!["detail".into()])
+    ]);
+    first.toggle_expanded(&entry);
+    assert!(first.is_expanded(&entry));
+
+    first.set_conversation(TranscriptId::from("attempt-b"));
+    assert!(!first.is_expanded(&entry));
+    first.set_conversation(TranscriptId::from("attempt-a"));
+    assert!(first.is_expanded(&entry));
+}
+
+#[test]
+fn transcript_raw_display_is_terminal_safe_and_reversible() {
+    let raw = b"before\x1b[31m\0after\xff";
+    let shown = raw_display(raw);
+    assert!(!shown.contains('\x1b'));
+    assert!(!shown.contains('\0'));
+    assert_eq!(decode_raw_display(&shown).unwrap(), raw);
 }
 
 // ---------------------------------------------------------------------------

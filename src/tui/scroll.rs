@@ -97,6 +97,24 @@ impl ScrollState {
         self.offset = self.max_offset(total_lines);
     }
 
+    /// Sets the first visible logical line, clamped to the supplied content.
+    ///
+    /// Presentation models use this when restoring a stable content anchor
+    /// after their lines have changed shape (for example after a resize).
+    pub fn set_offset(&mut self, offset: usize, total_lines: usize) {
+        self.offset = offset.min(self.max_offset(total_lines));
+    }
+
+    /// Clamps the current position after the caller replaces its content.
+    pub fn clamp(&mut self, total_lines: usize) {
+        self.set_offset(self.offset, total_lines);
+    }
+
+    /// Whether the final logical line is visible at the bottom of the view.
+    pub fn is_at_bottom(&self, total_lines: usize) -> bool {
+        self.offset >= self.max_offset(total_lines)
+    }
+
     /// The last legal offset for `total_lines` lines in the current viewport.
     fn max_offset(&self, total_lines: usize) -> usize {
         total_lines.saturating_sub(self.viewport.max(1))

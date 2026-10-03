@@ -81,6 +81,7 @@ pub mod refresh;
 pub mod remote;
 pub mod remote_views;
 pub mod scroll;
+pub mod transcript;
 pub mod views;
 
 use std::io::{self, Stdout};
