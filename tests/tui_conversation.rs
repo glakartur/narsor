@@ -212,6 +212,55 @@ fn json_with_no_type_field_is_raw() {
     assert_eq!(classified.kind, EntryKind::Raw);
 }
 
+/// AE1/AE3: rendered mode has a concise semantic body for every supported
+/// harness role, while the diagnostic source remains byte-for-byte available.
+#[test]
+fn semantic_projection_keeps_the_complete_source_for_diagnostics() {
+    let cases = [
+        (
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Readable reply"}]}}"#,
+            EntryKind::Assistant,
+            "Readable reply",
+        ),
+        (
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"Check the state"}]}}"#,
+            EntryKind::Thinking,
+            "Check the state",
+        ),
+        (
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"bash","input":{"command":"git status"}}]}}"#,
+            EntryKind::ToolCall,
+            "calling bash",
+        ),
+        (
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"clean"}]}}"#,
+            EntryKind::ToolResult,
+            "tool result",
+        ),
+        (
+            r#"{"type":"result","subtype":"success","result":"Finished"}"#,
+            EntryKind::Result,
+            "Finished",
+        ),
+        (
+            r#"{"type":"api_retry","detail":"backing off"}"#,
+            EntryKind::Raw,
+            r#"{"type":"api_retry","detail":"backing off"}"#,
+        ),
+    ];
+
+    for (raw, kind, rendered) in cases {
+        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        assert_eq!(classified.kind, kind, "{raw}");
+        assert_eq!(classified.text, rendered, "{raw}");
+        assert_eq!(
+            classified.raw,
+            raw.as_bytes(),
+            "raw mode must remain lossless"
+        );
+    }
+}
+
 // --- the conductor's chat (U13) ----------------------------------------------
 
 mod conductor_chat {
@@ -362,6 +411,37 @@ mod conductor_chat {
         assert_eq!(panel.action_target, Some(target));
         assert_eq!(panel.transcript.anchor().expect("restored anchor"), anchor);
         assert!(!panel.transcript.is_following_end());
+    }
+
+    #[test]
+    fn refresh_clears_a_settled_action_target_without_moving_older_reading() {
+        let mut panel = ChatPanel::default();
+        panel.append((1..=30).map(proposal).collect());
+        panel.line_up();
+        let anchor = panel.transcript.anchor().expect("older reading anchor");
+        panel.cycle_action_target(0);
+        let ChatActionTarget::Proposal(proposal_id) = panel
+            .action_target
+            .clone()
+            .expect("an open proposal target")
+        else {
+            panic!("the target is a proposal");
+        };
+
+        panel.append(vec![entry(
+            31,
+            ChatAuthor::Operator,
+            ChatEntryKind::Decision,
+            "Rejected the proposal",
+            json!({"kind": "proposal_rejected", "proposal_id": proposal_id}),
+        )]);
+
+        assert!(panel.action_target.is_none(), "a stale target cannot act");
+        assert_eq!(panel.transcript.anchor(), Some(anchor));
+        assert!(
+            !panel.transcript.is_following_end(),
+            "a refresh must not pull an operator out of older context"
+        );
     }
 }
 

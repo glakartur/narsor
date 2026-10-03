@@ -1330,7 +1330,7 @@ impl RemoteApp {
                         };
                     }
                     entries.extend(page_entries.iter().map(classify));
-                    if page_truncated_tail || next_entry <= from {
+                    if page_closed || page_truncated_tail || next_entry <= from {
                         break PageView {
                             attempt_id: attempt_id.clone(),
                             entries,
@@ -1338,7 +1338,7 @@ impl RemoteApp {
                             closed: page_closed,
                             no_record: false,
                             truncated_tail: page_truncated_tail,
-                            complete: false,
+                            complete: page_closed && !page_truncated_tail,
                             transcript: TranscriptState::new(TranscriptId::from(
                                 attempt_id.clone(),
                             )),
