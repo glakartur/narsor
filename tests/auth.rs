@@ -248,6 +248,8 @@ struct NetworkOptions {
     proxy: ProxyPolicy,
     cors: CorsPolicy,
     min_refresh_interval: Duration,
+    /// Clock-skew leeway of token validation; `None` keeps the default.
+    leeway: Option<Duration>,
 }
 
 impl Default for NetworkOptions {
@@ -257,6 +259,7 @@ impl Default for NetworkOptions {
             proxy: loopback_proxy(),
             cors: CorsPolicy::deny(),
             min_refresh_interval: Duration::from_secs(60),
+            leeway: None,
         }
     }
 }
@@ -265,9 +268,11 @@ impl NetworkServer {
     async fn start(issuer: &MockIssuer, options: NetworkOptions) -> Self {
         let root = TempRoot::new();
         let paths = StatePaths::new(root.path());
+        let defaults = OidcSettings::new(issuer.url(), AUDIENCE);
         let verifier = OidcVerifier::new(OidcSettings {
             min_refresh_interval: options.min_refresh_interval,
-            ..OidcSettings::new(issuer.url(), AUDIENCE)
+            leeway: options.leeway.unwrap_or(defaults.leeway),
+            ..defaults
         })
         .expect("verifier");
         let (owners, ownership) =
@@ -1336,4 +1341,307 @@ async fn owner_records_survive_a_restart_and_a_foreign_issuer_is_refused() {
     // An owner of another issuer could never log in: refused at startup.
     let error = OwnerStore::open(&paths, "https://other.example", None).unwrap_err();
     assert!(error.to_string().contains("owner_subject"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// The remote-aware client (U8)
+// ---------------------------------------------------------------------------
+
+/// What the forwarding proxy saw of one request.
+#[derive(Debug, Clone)]
+struct Forwarded {
+    path_and_query: String,
+    authorization: Option<String>,
+    status: u16,
+}
+
+#[derive(Clone)]
+struct ProxyState {
+    upstream: String,
+    http: reqwest::Client,
+    seen: Arc<Mutex<Vec<Forwarded>>>,
+}
+
+/// A TLS-terminating proxy stand-in on a loopback port: forwards method,
+/// path, query, body and the bearer token unchanged, adds
+/// `X-Forwarded-Proto: https`, and streams the answer back — what the
+/// network-mode client talks to instead of the daemon itself.
+struct ForwardingProxy {
+    addr: SocketAddr,
+    seen: Arc<Mutex<Vec<Forwarded>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ForwardingProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl ForwardingProxy {
+    async fn start(upstream: SocketAddr) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the proxy");
+        let addr = listener.local_addr().expect("proxy address");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = ProxyState {
+            upstream: format!("http://{upstream}"),
+            http: reqwest::Client::new(),
+            seen: Arc::clone(&seen),
+        };
+        let router = Router::new().fallback(forward).with_state(state);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve the proxy");
+        });
+        Self { addr, seen, task }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn seen(&self) -> Vec<Forwarded> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+async fn forward(
+    State(proxy): State<ProxyState>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    let (parts, body) = request.into_parts();
+    let body = axum::body::to_bytes(body, usize::MAX).await.expect("body");
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or("/".to_string(), |value| value.to_string());
+    let authorization = parts
+        .headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let mut upstream = proxy
+        .http
+        .request(parts.method, format!("{}{path_and_query}", proxy.upstream))
+        .header("x-forwarded-proto", "https")
+        .body(body);
+    for name in ["authorization", "content-type", "last-event-id"] {
+        if let Some(value) = parts.headers.get(name) {
+            upstream = upstream.header(name, value);
+        }
+    }
+    let response = upstream.send().await.expect("upstream answers");
+    proxy.seen.lock().unwrap().push(Forwarded {
+        path_and_query,
+        authorization: authorization.map(|value| value.trim_start_matches("Bearer ").to_string()),
+        status: response.status().as_u16(),
+    });
+    let mut builder = axum::response::Response::builder().status(response.status());
+    if let Some(value) = response.headers().get("content-type") {
+        builder = builder.header("content-type", value);
+    }
+    builder
+        .body(axum::body::Body::from_stream(response.bytes_stream()))
+        .expect("response")
+}
+
+fn token_file(root: &TempRoot, token: &str) -> PathBuf {
+    let path = root.path().join("access-token");
+    fs::write(&path, format!("{token}\n")).expect("write the token file");
+    path
+}
+
+#[tokio::test]
+async fn a_network_client_rereads_its_token_file_after_a_401_and_only_then() {
+    let key = IssuerKey::es256("k1");
+    let issuer = MockIssuer::start(&[&key]).await;
+    let server = NetworkServer::start(
+        &issuer,
+        NetworkOptions {
+            owner_subject: Some("alice".to_string()),
+            leeway: Some(Duration::ZERO),
+            ..NetworkOptions::default()
+        },
+    )
+    .await;
+    let proxy = ForwardingProxy::start(server.handle.addr()).await;
+    let tokens = TempRoot::new();
+    let expired = issuer.token_expiring_in(&key, "alice", -120);
+    let path = token_file(&tokens, &expired);
+    let client = api::ApiClient::remote(&proxy.url(), api::TokenSource::File(path.clone()))
+        .expect("a loopback http URL is accepted");
+
+    // The file still holds the expired token: re-reading it changes
+    // nothing, so the 401 stands — and the request is not retried.
+    assert!(matches!(
+        client.whoami().await,
+        Err(ClientError::Unauthorized)
+    ));
+    let first: Vec<_> = proxy.seen();
+    assert_eq!(
+        first.len(),
+        1,
+        "an unchanged token is not sent twice: {first:?}"
+    );
+
+    // The helper refreshed the file: the next 401 makes the client re-read
+    // it and the same request goes through with the new token.
+    let fresh = issuer.token(&key, "alice");
+    fs::write(&path, &fresh).unwrap();
+    let listing = client.control_tasks().await.expect("the fresh token works");
+    assert!(listing.tasks.is_empty());
+    let seen = proxy.seen();
+    let tail: Vec<_> = seen[1..]
+        .iter()
+        .map(|f| (f.status, f.authorization.clone()))
+        .collect();
+    assert_eq!(
+        tail,
+        vec![(401, Some(expired.clone())), (200, Some(fresh.clone()))],
+        "the cached token first, then the re-read one"
+    );
+
+    // A 403 is not a token problem: a stranger's valid token is not re-read.
+    let stranger = issuer.token(&key, "mallory");
+    let path = token_file(&tokens, &stranger);
+    let other = api::ApiClient::remote(&proxy.url(), api::TokenSource::File(path)).unwrap();
+    let before = proxy.seen().len();
+    assert!(matches!(
+        other.control_tasks().await,
+        Err(ClientError::Forbidden)
+    ));
+    assert_eq!(proxy.seen().len(), before + 1);
+}
+
+#[tokio::test]
+async fn a_remote_url_must_be_https_unless_it_is_loopback() {
+    let source = || api::TokenSource::Static("t".to_string());
+    assert!(api::ApiClient::remote("https://narsor.example.com/", source()).is_ok());
+    assert!(api::ApiClient::remote("http://127.0.0.1:8080", source()).is_ok());
+    assert!(api::ApiClient::remote("http://[::1]:8080", source()).is_ok());
+    for refused in [
+        "http://narsor.example.com",
+        "https://user:pw@narsor.example.com",
+        "https://narsor.example.com/?token=x",
+        "ftp://narsor.example.com",
+    ] {
+        assert!(
+            matches!(
+                api::ApiClient::remote(refused, source()),
+                Err(ClientError::Request { .. })
+            ),
+            "{refused} must be refused"
+        );
+    }
+    // The prefix of a proxy mounting the API elsewhere is kept.
+    let client = api::ApiClient::remote("https://example.com/narsor/", source()).unwrap();
+    assert_eq!(client.base_url(), "https://example.com/narsor");
+    assert!(
+        !format!("{client:?}").contains("\"t\""),
+        "the token is never printed"
+    );
+}
+
+#[tokio::test]
+async fn a_network_event_stream_reconnects_from_its_cursor_with_a_fresh_token() {
+    let key = IssuerKey::es256("k1");
+    let issuer = MockIssuer::start(&[&key]).await;
+    let server = NetworkServer::start(
+        &issuer,
+        NetworkOptions {
+            owner_subject: Some("alice".to_string()),
+            leeway: Some(Duration::ZERO),
+            ..NetworkOptions::default()
+        },
+    )
+    .await;
+    let proxy = ForwardingProxy::start(server.handle.addr()).await;
+    let tokens = TempRoot::new();
+    let short = issuer.token_expiring_in(&key, "alice", 3);
+    let path = token_file(&tokens, &short);
+    let client =
+        api::ApiClient::remote(&proxy.url(), api::TokenSource::File(path.clone())).unwrap();
+
+    let cursor = client.control_tasks().await.expect("list").cursor;
+    let mut stream = Box::pin(client.follow_control_events(Some(cursor), None));
+    assert_eq!(
+        server.create_task(&short, "task-a").await,
+        StatusCode::CREATED
+    );
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("an event before expiry")
+        .expect("the stream is open")
+        .expect("an event");
+    assert_eq!(first.event.task_id.as_str(), "task-a");
+    let resume_from = first.cursor.clone();
+
+    // The helper refreshes the token; the stream ends at the old token's
+    // expiry and reconnects on its own, from the cursor, with the new one.
+    let fresh = issuer.token(&key, "alice");
+    fs::write(&path, &fresh).unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(
+        server.create_task(&fresh, "task-b").await,
+        StatusCode::CREATED
+    );
+    // Everything after the cursor arrives once — task-a's later events
+    // (its queue verdict) and task-b — and nothing is repeated.
+    let mut seen = vec![(first.event.task_id.to_string(), first.event.sequence)];
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(envelope)) => {
+                    let key = (envelope.event.task_id.to_string(), envelope.event.sequence);
+                    assert!(!seen.contains(&key), "{key:?} was delivered twice");
+                    seen.push(key);
+                    if envelope.event.task_id.as_str() == "task-b" {
+                        break;
+                    }
+                }
+                Some(Err(ClientError::Unavailable(_))) => continue,
+                other => panic!("the stream should have reconnected: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("task-b's event after the reconnect");
+
+    let streams: Vec<_> = proxy
+        .seen()
+        .into_iter()
+        .filter(|f| f.path_and_query.starts_with("/control/v1/events/stream"))
+        .collect();
+    let reconnect = streams.last().expect("a reconnect");
+    assert_eq!(reconnect.status, 200);
+    assert_eq!(reconnect.authorization.as_deref(), Some(fresh.as_str()));
+    let resumed = streams
+        .iter()
+        .filter(|f| f.status == 200)
+        .nth(1)
+        .expect("a second, successful connection");
+    let encoded = url_encode(&resume_from);
+    assert!(
+        !resume_from.is_empty() && resumed.path_and_query.contains("cursor="),
+        "resumed from a cursor: {} (first event's {encoded})",
+        resumed.path_and_query
+    );
+    assert!(
+        streams
+            .iter()
+            .any(|f| f.status == 401 && f.authorization.as_deref() == Some(short.as_str())),
+        "the expired token drew a 401 before the re-read: {streams:?}"
+    );
+}
+
+fn url_encode(text: &str) -> String {
+    reqwest::Url::parse_with_params("http://x/", &[("c", text)])
+        .unwrap()
+        .query()
+        .unwrap()
+        .trim_start_matches("c=")
+        .to_string()
 }

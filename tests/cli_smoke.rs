@@ -1275,6 +1275,8 @@ fn two_concurrent_resumes_of_the_same_execution_exactly_one_succeeds() {
 
 #[path = "engine_support/mod.rs"]
 mod engine_support;
+mod environment_support;
+mod remote_support;
 
 /// Stops a fresh `agent_problem` execution on its problem — its agent answers
 /// without a label and cannot be asked again — before any daemon runs, and
@@ -1673,4 +1675,182 @@ fn show_prints_the_conductors_summary_of_a_gate() {
         "{shown}"
     );
     assert!(shown.contains("  Recommends: approved"), "{shown}");
+}
+
+// ---------------------------------------------------------------------------
+// Remote tasks through the control plane (U8)
+// ---------------------------------------------------------------------------
+
+mod remote_cli {
+    use std::process::Command;
+
+    use super::remote_support::RemoteHarness;
+    use super::{Invocation, EXIT_FAILURE, EXIT_SUCCESS};
+
+    /// Runs the binary against the control plane at `server`, with `token`
+    /// in `NARSOR_TOKEN` when given — never on the command line.
+    async fn remote(harness: &RemoteHarness, token: Option<&str>, args: &[&str]) -> Invocation {
+        let root = harness.root.path().to_path_buf();
+        let server = harness.base_url();
+        let token = token.map(str::to_string);
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        tokio::task::spawn_blocking(move || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_narsor"));
+            command
+                .current_dir(&root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("HOME", &root)
+                .env_remove("NARSOR_TOKEN")
+                .env_remove("NARSOR_TOKEN_FILE")
+                .env_remove("NARSOR_TOKEN_COMMAND")
+                .env("NARSOR_SERVER", &server)
+                .arg("--root")
+                .arg(&root)
+                .args(&args);
+            if let Some(token) = token {
+                command.env("NARSOR_TOKEN", token);
+            }
+            let output = command.output().expect("run the narsor binary");
+            Invocation {
+                code: output.status.code().expect("exited normally"),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            }
+        })
+        .await
+        .expect("the binary ran")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tasks_are_created_listed_and_steered_through_a_remote_control_plane() {
+        let harness = RemoteHarness::start().await;
+        let token = harness.handle.token().to_string();
+        let token = Some(token.as_str());
+
+        let created = remote(
+            &harness,
+            token,
+            &[
+                "task",
+                "create",
+                "implement-feature",
+                "--workflow-version",
+                "1",
+                "--backend",
+                "k8s",
+                "--input",
+                "ticket=NAR-1",
+                "--task-id",
+                "t-1",
+            ],
+        )
+        .await;
+        assert_eq!(created.code, EXIT_SUCCESS, "{}", created.output());
+        assert!(
+            created.stdout.contains("Created task: t-1"),
+            "{}",
+            created.stdout
+        );
+        assert!(created.stdout.contains("Backend: k8s"));
+
+        // The default backend changes where new tasks go, not t-1.
+        let set = remote(&harness, token, &["backend", "default", "set", "backend-a"]).await;
+        assert_eq!(set.code, EXIT_SUCCESS, "{}", set.output());
+        assert!(
+            set.stdout.contains("Effective: backend-a"),
+            "{}",
+            set.stdout
+        );
+        let second = remote(
+            &harness,
+            token,
+            &[
+                "task",
+                "create",
+                "implement-feature",
+                "--workflow-version",
+                "1",
+                "--task-id",
+                "t-2",
+            ],
+        )
+        .await;
+        assert_eq!(second.code, EXIT_SUCCESS, "{}", second.output());
+        assert!(
+            second.stdout.contains("Backend: backend-a"),
+            "{}",
+            second.stdout
+        );
+
+        let list = remote(&harness, token, &["task", "list"]).await;
+        assert_eq!(list.code, EXIT_SUCCESS, "{}", list.output());
+        let row = |id: &str| {
+            list.stdout
+                .lines()
+                .find(|line| line.starts_with(id))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(
+            row("t-1").contains("k8s") && row("t-1").contains("queued"),
+            "{}",
+            list.stdout
+        );
+        assert!(row("t-2").contains("backend-a"), "{}", list.stdout);
+
+        let show = remote(&harness, token, &["task", "show", "t-1"]).await;
+        assert_eq!(show.code, EXIT_SUCCESS, "{}", show.output());
+        assert!(show.stdout.contains("Lifecycle  queued"), "{}", show.stdout);
+
+        // A pause of a queued task is refused readably; archive is accepted.
+        let pause = remote(&harness, token, &["task", "pause", "t-1"]).await;
+        assert_eq!(pause.code, EXIT_FAILURE, "{}", pause.output());
+        assert!(pause.stderr.contains("pause refused"), "{}", pause.stderr);
+        let archive = remote(&harness, token, &["task", "archive", "t-2"]).await;
+        assert_eq!(archive.code, EXIT_SUCCESS, "{}", archive.output());
+        assert!(
+            archive.stdout.contains("archive accepted"),
+            "{}",
+            archive.stdout
+        );
+
+        let priority = remote(&harness, token, &["task", "priority", "t-1", "5"]).await;
+        assert_eq!(priority.code, EXIT_SUCCESS, "{}", priority.output());
+        assert!(priority.stdout.contains("is now 5"));
+
+        let events = remote(&harness, token, &["task", "events", "t-1"]).await;
+        assert_eq!(events.code, EXIT_SUCCESS, "{}", events.output());
+        assert!(events.stdout.contains("created"), "{}", events.stdout);
+        assert!(events.stdout.contains("priority 5"), "{}", events.stdout);
+
+        let who = remote(&harness, token, &["auth", "whoami"]).await;
+        assert_eq!(who.code, EXIT_SUCCESS, "{}", who.output());
+        assert!(who.stdout.contains("Mode: trusted"), "{}", who.stdout);
+
+        let code = remote(&harness, token, &["controller", "enroll-code", "k8s"]).await;
+        assert_eq!(code.code, EXIT_SUCCESS, "{}", code.output());
+        assert!(code.stdout.contains("Enrollment code: "), "{}", code.stdout);
+        let controllers = remote(&harness, token, &["controller", "list"]).await;
+        assert_eq!(controllers.code, EXIT_SUCCESS, "{}", controllers.output());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remote_server_needs_a_token_and_a_good_one() {
+        let harness = RemoteHarness::start().await;
+        let missing = remote(&harness, None, &["task", "list"]).await;
+        assert_eq!(missing.code, EXIT_FAILURE);
+        assert!(
+            missing.stderr.contains("NARSOR_TOKEN"),
+            "{}",
+            missing.stderr
+        );
+
+        let wrong = remote(&harness, Some("not-the-token"), &["task", "list"]).await;
+        assert_eq!(wrong.code, EXIT_FAILURE);
+        assert!(
+            wrong.stderr.contains("rejected the token"),
+            "{}",
+            wrong.stderr
+        );
+    }
 }

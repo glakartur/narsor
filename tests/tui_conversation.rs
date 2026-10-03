@@ -14,6 +14,9 @@ use narsor::api::ConversationEntryDto;
 use narsor::persistence::conversation::ConversationSource;
 use narsor::tui::conversation::{classify, EntryKind};
 
+mod environment_support;
+mod remote_support;
+
 fn entry(source: ConversationSource, raw: &str) -> ConversationEntryDto {
     ConversationEntryDto {
         entry_number: 1,
@@ -337,5 +340,143 @@ mod conductor_chat {
         panel.undo = None;
         panel.selected = 0;
         assert!(!panel.ask_undo(), "a proposal is no decision to undo");
+    }
+}
+
+// --- AE12: a remote conversation and its input, through the control plane --
+
+mod remote_conversation {
+    use std::time::Duration;
+
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+    use chrono::Utc;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use narsor::api::{ConversationEntryDto, ConversationResponse};
+    use narsor::controller_protocol::RunnerClient;
+    use narsor::persistence::conversation::ConversationSource;
+    use narsor::tui::conversation::EntryKind;
+    use narsor::tui::remote::{RemoteApp, RemoteModal, RemoteRequest, RemoteScreen, Tone};
+
+    use super::remote_support::{snapshot, RemoteHarness};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Plays the runner's side of the relay: answers every page request
+    /// with two entries of the asked attempt, until aborted.
+    fn serve_pages(runner: RunnerClient) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let Ok(poll) = runner.poll(Some("episode-1"), 1).await else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
+                for request in poll.conversation_pages {
+                    let entries = vec![
+                        ConversationEntryDto {
+                            entry_number: request.from_entry + 1,
+                            timestamp: Utc::now(),
+                            source: ConversationSource::Narsor,
+                            raw_base64: BASE64.encode(b"the prompt"),
+                        },
+                        ConversationEntryDto {
+                            entry_number: request.from_entry + 2,
+                            timestamp: Utc::now(),
+                            source: ConversationSource::Stdout,
+                            raw_base64: BASE64.encode(
+                                br#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"planned"}]}}"#,
+                            ),
+                        },
+                    ];
+                    let page = ConversationResponse::Recorded {
+                        entries,
+                        next_entry: request.from_entry + 3,
+                        closed: true,
+                        truncated_tail: false,
+                    };
+                    runner
+                        .upload_conversation_page(&request.request_id, &page)
+                        .await
+                        .expect("upload the page");
+                }
+            }
+        })
+    }
+
+    /// Covers AE12: the TUI reads a remote task's conversation and answers
+    /// its pending input through the control plane — it never opens a
+    /// connection to the runner or the backend, and the answer reaches the
+    /// runner waiting on exactly that request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_remote_mode_reads_a_conversation_and_answers_the_pending_input() {
+        let harness = RemoteHarness::start().await;
+        let running = harness
+            .running("task-1", "k8s", snapshot(1, Some("episode-1")))
+            .await;
+        let pages = serve_pages(running.runner.clone());
+
+        let mut app = RemoteApp::new(harness.owner.clone());
+        app.refresh().await;
+        assert_eq!(app.tasks().len(), 1);
+        let request = app.on_key(key(KeyCode::Enter));
+        assert_eq!(request, RemoteRequest::OpenDetail);
+        app.perform(request).await;
+        assert_eq!(app.screen(), RemoteScreen::Detail);
+        let lines: Vec<String> = app.selected_lines().into_iter().map(|l| l.text).collect();
+        assert!(
+            lines.iter().any(|l| l.starts_with("Conversation live")),
+            "{lines:#?}"
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Awaiting   input episode-1")));
+
+        // c: the latest attempt's page, relayed from the live runner.
+        let request = app.on_key(key(KeyCode::Char('c')));
+        app.perform(request).await;
+        let page = app
+            .detail()
+            .and_then(|detail| detail.page.clone())
+            .expect("a page was read");
+        assert_eq!(page.attempt_id, "act-6");
+        let kinds: Vec<EntryKind> = page.entries.iter().map(|entry| entry.kind).collect();
+        assert_eq!(kinds, vec![EntryKind::Narsor, EntryKind::Assistant]);
+        assert!(page.entries[1].text.contains("planned"));
+        pages.abort();
+
+        // i: the form of the pending request; Enter sends it.
+        assert_eq!(app.on_key(key(KeyCode::Char('i'))), RemoteRequest::None);
+        assert!(matches!(app.modal(), RemoteModal::Input(_)));
+        for c in "looks good".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let request = app.on_key(key(KeyCode::Enter));
+        assert_eq!(request, RemoteRequest::SubmitInput);
+        app.perform(request).await;
+        assert!(matches!(app.modal(), RemoteModal::None));
+        let notice = app.notice().expect("an outcome").clone();
+        assert_eq!(notice.tone, Tone::Good, "{}", notice.text);
+
+        // The runner waiting on episode-1 receives exactly that answer.
+        let poll = running
+            .runner
+            .poll(Some("episode-1"), 2)
+            .await
+            .expect("poll");
+        assert_eq!(poll.inputs.len(), 1);
+        let delivered = &poll.inputs[0];
+        assert_eq!(delivered.pending_input_id, "episode-1");
+        assert_eq!(
+            delivered.delivery.values.get("reason"),
+            Some(&serde_json::json!("looks good"))
+        );
+
+        // Answered: the task no longer offers the form.
+        app.refresh().await;
+        app.open_input();
+        assert!(matches!(app.modal(), RemoteModal::None));
     }
 }

@@ -78,6 +78,8 @@ pub mod conversation;
 pub mod failure_form;
 pub mod input_form;
 pub mod refresh;
+pub mod remote;
+pub mod remote_views;
 pub mod scroll;
 pub mod views;
 
@@ -322,4 +324,74 @@ fn read_terminal_events(sender: &mpsc::UnboundedSender<TerminalEvent>, stop: &At
             Err(_) => return,
         }
     }
+}
+
+/// Runs the remote tasks mode ([`remote`]) over `client` until the operator
+/// quits.
+///
+/// The same loop shape as [`run`]: keys from a reader thread, the
+/// control-plane event stream and a redraw tick in one `select!`. Unlike the
+/// local stream, this one is opened from the cursor of the first listing and
+/// reconnects on its own ([`crate::api::ApiClient::follow_control_events`]),
+/// so an expired network-mode token or a recycled proxy connection costs a
+/// "reconnecting" marker, not missed events. Events that the list cannot
+/// apply directly ask for a re-read, debounced by [`refresh::RefreshSchedule`],
+/// which also runs the periodic read.
+pub async fn run_remote(
+    client: crate::api::ApiClient,
+    refresh_interval: Option<Duration>,
+) -> io::Result<()> {
+    install_panic_hook();
+
+    let mut app = remote::RemoteApp::new(client);
+    app.refresh().await;
+    let mut events = Box::pin(
+        app.client()
+            .follow_control_events(app.cursor().map(str::to_string), None),
+    );
+    let mut schedule = refresh::RefreshSchedule::new(refresh_interval, Instant::now());
+
+    let mut guard = TerminalGuard::enter()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let (keys_tx, mut keys_rx) = mpsc::unbounded_channel();
+    let reader_stop = Arc::clone(&stop);
+    let reader = std::thread::spawn(move || read_terminal_events(&keys_tx, &reader_stop));
+
+    while !app.should_quit() {
+        guard
+            .terminal()
+            .draw(|frame| remote_views::render(frame, &app))?;
+
+        tokio::select! {
+            incoming = keys_rx.recv() => match incoming {
+                Some(TerminalEvent::Key(key)) if key.kind == KeyEventKind::Press => {
+                    let request = app.on_key(key);
+                    let manual = request == remote::RemoteRequest::Refresh;
+                    app.perform(request).await;
+                    if manual {
+                        schedule.done(Instant::now());
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            },
+            received = events.next(), if !matches!(app.stream(), remote::RemoteStream::Ended(_)) => {
+                app.on_stream(received);
+                if app.refresh_wanted() {
+                    schedule.request(Instant::now());
+                }
+            }
+            _ = tokio::time::sleep(TICK) => {}
+        }
+
+        if schedule.is_due(Instant::now()) {
+            app.refresh().await;
+            schedule.done(Instant::now());
+        }
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    drop(guard);
+    let _ = reader.join();
+    Ok(())
 }

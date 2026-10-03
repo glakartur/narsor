@@ -190,7 +190,7 @@ fn capture_keeps_a_tracked_file_that_became_ignored() {
     // then deletes it.
     let temp = TempRoot::new();
     let work = temp.join("work");
-    let base = repo_with_base(&work);
+    let _base = repo_with_base(&work);
 
     fs::write(work.join("kept.txt"), "tracked\n").expect("write kept");
     git(&work, &["add", "--", "kept.txt"]);

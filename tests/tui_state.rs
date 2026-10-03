@@ -82,6 +82,8 @@ use narsor::workflows::{builtin, WorkflowResolver};
 
 #[path = "engine_support/mod.rs"]
 mod engine_support;
+mod environment_support;
+mod remote_support;
 
 // ---------------------------------------------------------------------------
 // harness
@@ -5302,4 +5304,379 @@ async fn undoing_a_decision_asks_with_its_confidence_and_rationale() {
     // The daemon has no such decision saved: it refuses, and says so.
     app.undo_decision(&execution_id, "decision-1").await;
     assert!(app.notice().expect("a notice").is_error);
+}
+
+// ---------------------------------------------------------------------------
+// The remote tasks mode (U8)
+// ---------------------------------------------------------------------------
+
+mod remote_tasks {
+    use chrono::{Duration, TimeZone, Utc};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use narsor::api::ClientError;
+    use narsor::controller_protocol::{ControlEventEnvelope, OwnerCommandRequest, QueueView};
+    use narsor::domain::TaskId;
+    use narsor::orchestration::{
+        Observation, OwnerCommand, QueueReason, TaskEvent, TaskEventKind, TaskLifecycle,
+    };
+    use narsor::tui::remote::{
+        age, command_outcome, queue_badge, status_badge, RemoteApp, RemoteModal, RemoteRequest,
+        RemoteStream, Tone,
+    };
+
+    use super::remote_support::{report, snapshot, RemoteHarness};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    async fn press(app: &mut RemoteApp, code: KeyCode) {
+        let request = app.on_key(key(code));
+        app.perform(request).await;
+    }
+
+    fn texts(app: &RemoteApp) -> Vec<String> {
+        app.selected_lines()
+            .into_iter()
+            .map(|line| line.text)
+            .collect()
+    }
+
+    fn queue(reason: QueueReason) -> QueueView {
+        QueueView {
+            message: reason.describe(),
+            reason,
+            since: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn each_queue_reason_has_its_own_badge_and_tone() {
+        let waiting = queue_badge(&queue(QueueReason::WaitingForCapacity {
+            position: 2,
+            running: 3,
+            limit: 3,
+        }));
+        assert_eq!(
+            (waiting.text.as_str(), waiting.tone),
+            ("#2 · 3/3", Tone::Normal)
+        );
+        let offline = queue_badge(&queue(QueueReason::ControllerOffline));
+        assert_eq!(offline.tone, Tone::Warning);
+        let unknown = queue_badge(&queue(QueueReason::BackendUnknown {
+            detail: "gone".into(),
+        }));
+        assert_eq!(unknown.tone, Tone::Error);
+        assert!(unknown.text.contains("gone"));
+        let admitted = queue_badge(&queue(QueueReason::Admitted));
+        assert_eq!(
+            (admitted.text.as_str(), admitted.tone),
+            ("starting…", Tone::Good)
+        );
+    }
+
+    #[test]
+    fn ages_are_short_and_never_negative() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap();
+        assert_eq!(age(now, now - Duration::seconds(5)), "5s");
+        assert_eq!(age(now, now - Duration::minutes(3)), "3m");
+        assert_eq!(age(now, now - Duration::hours(2)), "2h");
+        assert_eq!(age(now, now + Duration::seconds(30)), "0s");
+    }
+
+    #[test]
+    fn a_full_backend_on_resume_is_backend_full_not_a_task_failure() {
+        let outcome = command_outcome(
+            OwnerCommand::Resume,
+            &Err(ClientError::Refused {
+                code: "backend_at_capacity".into(),
+                message: "backend 'k8s' has no free capacity (3 of 3 slots in use)".into(),
+            }),
+        );
+        assert_eq!(outcome.tone, Tone::Warning);
+        assert!(outcome.text.starts_with("Backend full"), "{}", outcome.text);
+        assert!(outcome.text.contains("keeps its state"));
+
+        let other = command_outcome(
+            OwnerCommand::Pause,
+            &Err(ClientError::Refused {
+                code: "illegal_command".into(),
+                message: "no".into(),
+            }),
+        );
+        assert_eq!(other.tone, Tone::Error);
+    }
+
+    /// AE3: choosing a default backend changes where *new* tasks go; the
+    /// running task stays on its backend and keeps running.
+    #[tokio::test]
+    async fn the_default_backend_selector_affects_new_tasks_only() {
+        let harness = RemoteHarness::start().await;
+        harness.running("task-1", "k8s", snapshot(1, None)).await;
+        let mut app = RemoteApp::new(harness.owner.clone());
+        app.refresh().await;
+        assert_eq!(app.default_backend().unwrap().effective, "k8s");
+
+        press(&mut app, KeyCode::Char('b')).await;
+        let RemoteModal::DefaultBackend(picker) = app.modal() else {
+            panic!("the picker is open");
+        };
+        assert_eq!(picker.choices[0], "k8s", "the effective backend first");
+        for c in "backend-a".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(app.default_backend().unwrap().effective, "backend-a");
+        let notice = app.notice().unwrap();
+        assert!(
+            notice.text.contains("existing tasks stay"),
+            "{}",
+            notice.text
+        );
+
+        let created = harness.create("task-2", None).await;
+        assert_eq!(created.backend_id.as_str(), "backend-a");
+        app.refresh().await;
+        let first = &app.tasks()[0];
+        assert_eq!(first.backend_id.as_str(), "k8s");
+        assert_eq!(first.lifecycle, TaskLifecycle::Running);
+
+        // Reset: the first row returns to the configured default.
+        press(&mut app, KeyCode::Char('b')).await;
+        app.on_key(key(KeyCode::Up));
+        while !matches!(app.modal(), RemoteModal::DefaultBackend(p) if p.index == 0) {
+            app.on_key(key(KeyCode::Up));
+        }
+        press(&mut app, KeyCode::Enter).await;
+        let view = app.default_backend().unwrap();
+        assert_eq!(
+            (view.effective.as_str(), view.override_backend.is_none()),
+            ("k8s", true)
+        );
+    }
+
+    /// R14: a controller (and runner) that went quiet turns the last
+    /// observation stale — shown with its age — while the client still
+    /// reads the last durable state instead of an invented one.
+    #[tokio::test]
+    async fn a_disconnected_controller_shows_a_stale_last_known_state() {
+        let harness = RemoteHarness::start().await;
+        harness.running("task-1", "k8s", snapshot(1, None)).await;
+        let mut app = RemoteApp::new(harness.owner.clone());
+        app.refresh().await;
+        let live = texts(&app);
+        assert!(live.iter().any(|l| l.contains("online")), "{live:#?}");
+        assert!(!live.iter().any(|l| l.contains("stale")), "{live:#?}");
+
+        harness.clock.advance(Duration::minutes(10));
+        app.refresh().await;
+        let task = &app.tasks()[0];
+        assert_eq!(task.lifecycle, TaskLifecycle::Running, "never invented");
+        let lines = texts(&app);
+        assert!(lines.iter().any(|l| l.contains("offline")), "{lines:#?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("Observed") && l.contains("stale")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("Runner") && l.contains("ago") && l.contains("stale")),
+            "{lines:#?}"
+        );
+        let badge = status_badge(task);
+        assert_eq!(badge.tone, Tone::Warning);
+        assert!(badge.text.contains("stale"), "{}", badge.text);
+    }
+
+    /// Pause, resume and archive go through the one owner API; the request
+    /// names the task and nothing about where it runs.
+    #[tokio::test]
+    async fn pause_resume_and_archive_through_the_control_plane_only() {
+        let harness = RemoteHarness::start().await;
+        let running = harness.running("task-1", "k8s", snapshot(1, None)).await;
+        let mut app = RemoteApp::new(harness.owner.clone());
+        app.refresh().await;
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('p'))),
+            RemoteRequest::Command(OwnerCommand::Pause)
+        );
+        app.perform(RemoteRequest::Command(OwnerCommand::Pause))
+            .await;
+        assert_eq!(app.tasks()[0].lifecycle, TaskLifecycle::PauseRequested);
+        assert_eq!(app.notice().unwrap().tone, Tone::Good);
+
+        // The runner reaches its safe point, the controller removes compute.
+        let mut safe = snapshot(2, None);
+        safe.safe_point = true;
+        running.runner.snapshot(&safe).await.expect("safe point");
+        running
+            .controller
+            .report(&report(
+                "task-1",
+                running.epoch,
+                2,
+                Observation::PausedAtSafePoint,
+                Some(2),
+            ))
+            .await
+            .expect("paused");
+        press(&mut app, KeyCode::Char('r')).await;
+        app.perform(RemoteRequest::OpenDetail).await;
+        assert_eq!(app.tasks()[0].lifecycle, TaskLifecycle::Paused);
+        let lines = texts(&app);
+        assert!(
+            lines.iter().any(
+                |l| l.starts_with("Conversation unavailable: the task is paused")
+                    && l.contains("last safe summary")
+            ),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("attempt act-6")),
+            "{lines:#?}"
+        );
+        // Reading it is refused locally, explicitly, without a relay call.
+        press(&mut app, KeyCode::Char('c')).await;
+        assert!(app.notice().unwrap().text.contains("unavailable"));
+        // Pausing again is pointless and says so.
+        assert_eq!(app.on_key(key(KeyCode::Char('p'))), RemoteRequest::None);
+
+        press(&mut app, KeyCode::Char('u')).await;
+        assert_eq!(app.tasks()[0].lifecycle, TaskLifecycle::Provisioning);
+
+        assert_eq!(app.on_key(key(KeyCode::Char('a'))), RemoteRequest::None);
+        assert!(matches!(app.modal(), RemoteModal::ConfirmArchive { .. }));
+        press(&mut app, KeyCode::Char('y')).await;
+        assert!(app.tasks()[0].lifecycle.is_archival());
+        assert!(app.notice().unwrap().text.starts_with("archive accepted"));
+
+        // What a command sends: the command, a key and a generation.
+        let body = serde_json::to_value(OwnerCommandRequest {
+            command: OwnerCommand::Pause,
+            idempotency_key: "k".into(),
+            expected_generation: Some(1),
+        })
+        .unwrap();
+        let mut keys: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["command", "expected_generation", "idempotency_key"]);
+    }
+
+    #[tokio::test]
+    async fn priority_is_edited_for_queued_tasks_only() {
+        let harness = RemoteHarness::start().await;
+        harness.running("task-1", "k8s", snapshot(1, None)).await;
+        // Another backend without a controller: task-2 stays queued.
+        harness.create("task-2", Some("backend-b")).await;
+        let mut app = RemoteApp::new(harness.owner.clone());
+        app.refresh().await;
+
+        assert_eq!(app.on_key(key(KeyCode::Char('P'))), RemoteRequest::None);
+        assert!(matches!(app.modal(), RemoteModal::None));
+        assert!(app.notice().unwrap().text.contains("not queued"));
+
+        assert!(app.select("task-2"));
+        let queued = &app.tasks()[1];
+        assert_eq!(queued.lifecycle, TaskLifecycle::Queued);
+        let badge = status_badge(queued);
+        assert_eq!(badge.tone, Tone::Warning, "{}", badge.text);
+        assert!(badge.text.contains("controller offline"));
+
+        app.on_key(key(KeyCode::Char('P')));
+        assert!(matches!(app.modal(), RemoteModal::Priority { .. }));
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Char('7')));
+        press(&mut app, KeyCode::Enter).await;
+        assert_eq!(app.tasks()[1].priority, 7);
+    }
+
+    #[tokio::test]
+    async fn stream_events_update_the_list_and_report_reconnects() {
+        let harness = RemoteHarness::start().await;
+        harness.create("task-1", Some("backend-b")).await;
+        let mut app = RemoteApp::new(harness.owner.clone());
+        app.refresh().await;
+
+        let event = |kind| ControlEventEnvelope {
+            cursor: "c-9".into(),
+            event: TaskEvent {
+                sequence: 9,
+                task_id: TaskId::parse("task-1").unwrap(),
+                at: Utc::now(),
+                lifecycle: TaskLifecycle::Queued,
+                generation: 1,
+                kind,
+            },
+        };
+        app.on_stream(Some(Ok(event(TaskEventKind::QueueChanged {
+            reason: QueueReason::WaitingForCapacity {
+                position: 1,
+                running: 3,
+                limit: 3,
+            },
+        }))));
+        assert_eq!(app.stream(), &RemoteStream::Live);
+        assert_eq!(app.cursor(), Some("c-9"));
+        assert_eq!(status_badge(&app.tasks()[0]).text, "queued · #1 · 3/3");
+        assert!(!app.refresh_wanted());
+
+        app.on_stream(Some(Ok(event(TaskEventKind::PriorityChanged {
+            priority: 4,
+        }))));
+        assert_eq!(app.tasks()[0].priority, 4);
+
+        app.on_stream(Some(Ok(event(TaskEventKind::InputsUpdated {
+            updates: vec![],
+        }))));
+        assert!(
+            app.refresh_wanted(),
+            "what the list cannot apply is re-read"
+        );
+
+        app.on_stream(Some(Err(ClientError::Unavailable("refused".into()))));
+        assert!(matches!(app.stream(), RemoteStream::Reconnecting(_)));
+        app.on_stream(Some(Err(ClientError::Unauthorized)));
+        assert!(matches!(app.stream(), RemoteStream::Ended(_)));
+    }
+
+    #[tokio::test]
+    async fn the_remote_mode_draws_its_list_detail_and_modals() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let harness = RemoteHarness::start().await;
+        harness
+            .running("task-1", "k8s", snapshot(1, Some("episode-1")))
+            .await;
+        let mut app = RemoteApp::new(harness.owner.clone());
+        app.refresh().await;
+
+        let draw = |app: &RemoteApp| {
+            let mut terminal = Terminal::new(TestBackend::new(160, 48)).expect("a test terminal");
+            terminal
+                .draw(|frame| narsor::tui::remote_views::render(frame, app))
+                .expect("draw");
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        let screen = draw(&app);
+        assert!(screen.contains("Remote tasks"), "the list panel");
+        assert!(screen.contains("awaiting input"), "the badge");
+        assert!(screen.contains("default backend: k8s"));
+
+        press(&mut app, KeyCode::Enter).await;
+        app.on_key(key(KeyCode::Char('i')));
+        let screen = draw(&app);
+        assert!(screen.contains("Approve the plan?"), "the input form");
+    }
 }

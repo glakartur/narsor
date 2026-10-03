@@ -29,9 +29,24 @@
 //! quit. A loopback, same-process, read-only server has no legitimate reason
 //! to take seconds to answer; if it ever does, failing fast matters more
 //! here than it would for a client with no such coupling to input latency.
+//!
+//! # Remote control planes (U8)
+//!
+//! [`ApiClient::remote`] talks to a control plane at a URL instead of a
+//! loopback port: `https://…` behind the TLS-terminating proxy of a network
+//! deployment, or plain `http://` to a loopback address only (a trusted
+//! daemon, a local tunnel). Its timeout is longer, because a network hop
+//! legitimately takes longer than a loopback one, and its token comes from a
+//! [`TokenSource`] that is re-read after a `401` — see [`super::token`] for
+//! why a `401` and a `403` are told apart and only the first is retried.
+//!
+//! Nothing a request carries names a backend address, a runner or a
+//! credential other than the caller's own bearer token: the control plane is
+//! the only endpoint a client ever talks to (R1, R41).
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -55,6 +70,7 @@ use super::dto::{
     StartTaskResponse, TransitionRequest,
 };
 use super::routes::ConversationResponse;
+use crate::auth::{ClaimRequest, OwnerView, WhoAmIResponse};
 use crate::controller_protocol::{
     ControlEventEnvelope, ControllerListResponse, ControllerView, ConversationPage,
     ConversationPageQuery, ConversationResponse as RemoteConversationResponse,
@@ -64,12 +80,31 @@ use crate::controller_protocol::{
 };
 use crate::orchestration::TaskEvent;
 
+use super::token::{TokenCell, TokenSource};
+
 /// How long a single request may take before it is treated as the server
 /// being unavailable — and, since every call is awaited on the TUI's
 /// key-handling path, the worst-case stall an operator can see from a single
 /// slow request. See the module doc for why this is short rather than
 /// generous.
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// The request timeout of a client built by [`ApiClient::remote`]: a proxy,
+/// TLS and a real network sit between it and the control plane, so the
+/// loopback bound would turn ordinary latency into "unavailable".
+const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a relayed conversation page may take: the control plane waits
+/// for the runner's next poll before it can answer.
+const CONVERSATION_PAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// First delay before [`ApiClient::follow_control_events`] reconnects after
+/// a failure; doubled per consecutive failure up to
+/// [`MAX_RECONNECT_DELAY`].
+const FIRST_RECONNECT_DELAY: Duration = Duration::from_millis(250);
+
+/// Upper bound of the reconnect delay.
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
 
 /// A distinguishable failure of a client call.
 #[derive(Debug)]
@@ -79,8 +114,17 @@ pub enum ClientError {
     /// the "API unavailable" case the plan calls for — distinct from a
     /// `401`/`404` that a live server chose to send.
     Unavailable(String),
-    /// The token was missing or wrong.
+    /// The token was missing or wrong (`401`) — and, for a client whose
+    /// [`TokenSource`] can be re-read, still wrong after re-reading it.
     Unauthorized,
+    /// The token is valid but its holder may not do this (`403`): not the
+    /// installation owner, not the operator, or — in network mode — the
+    /// request did not come through the trusted, TLS-terminating proxy.
+    /// A fresh token does not help, so it is never retried.
+    Forbidden,
+    /// No usable token could be obtained from the client's [`TokenSource`]
+    /// (an unreadable file, a failing token command).
+    Credential(String),
     /// The execution (or, for conversations, the enclosing execution) is
     /// not known to the server.
     NotFound,
@@ -109,6 +153,12 @@ impl std::fmt::Display for ClientError {
         match self {
             ClientError::Unavailable(detail) => write!(f, "API unavailable: {detail}"),
             ClientError::Unauthorized => write!(f, "API rejected the request: bad token"),
+            ClientError::Forbidden => write!(
+                f,
+                "API refused the request: not the owner of this installation, or not \
+                 reached through its trusted proxy"
+            ),
+            ClientError::Credential(detail) => write!(f, "no usable API token: {detail}"),
             ClientError::NotFound => write!(f, "API: not found"),
             ClientError::Conflict => write!(f, "API: conflict (409)"),
             ClientError::Refused { code, message } => {
@@ -124,10 +174,15 @@ impl std::fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
-/// A client bound to one running server, over `http://127.0.0.1:<port>`.
+/// A client bound to one running server: a loopback daemon
+/// ([`ApiClient::new`]) or a control plane at a URL ([`ApiClient::remote`]).
+///
+/// Cheap to clone: clones share their connection pools and their token, so
+/// a token refreshed by one serves the others.
+#[derive(Clone)]
 pub struct ApiClient {
     base_url: String,
-    token: String,
+    token: Arc<TokenCell>,
     http: reqwest::Client,
     /// A second client, deliberately built with no request timeout, used
     /// only by [`ApiClient::stream_execution`]/[`ApiClient::stream_all`].
@@ -143,23 +198,60 @@ pub struct ApiClient {
     stream_http: reqwest::Client,
 }
 
+impl std::fmt::Debug for ApiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiClient")
+            .field("base_url", &self.base_url)
+            .field("token", &self.token)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ApiClient {
     /// Builds a client for the server at `addr`, presenting `token` on every
     /// request.
     pub fn new(addr: SocketAddr, token: impl Into<String>) -> Self {
+        Self::build(
+            format!("http://{addr}"),
+            TokenSource::Static(token.into()),
+            REQUEST_TIMEOUT,
+        )
+    }
+
+    /// Builds a client for the control plane at `base_url`, presenting the
+    /// token `source` yields.
+    ///
+    /// `base_url` must be `https://…`; plain `http://` is accepted for a
+    /// loopback host only, so a token is never sent in clear text over a
+    /// network. A path prefix (a proxy mounting the API under `/narsor`) is
+    /// kept; a query, a fragment or credentials in the URL are refused.
+    pub fn remote(base_url: &str, source: TokenSource) -> Result<Self, ClientError> {
+        let base_url = normalize_base_url(base_url).map_err(|message| ClientError::Request {
+            code: "invalid_server_url".to_string(),
+            message,
+        })?;
+        Ok(Self::build(base_url, source, REMOTE_REQUEST_TIMEOUT))
+    }
+
+    fn build(base_url: String, source: TokenSource, timeout: Duration) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(timeout)
             .build()
             .expect("reqwest client with only a timeout configured never fails to build");
         let stream_http = reqwest::Client::builder()
             .build()
             .expect("reqwest client with no special configuration never fails to build");
         Self {
-            base_url: format!("http://{addr}"),
-            token: token.into(),
+            base_url,
+            token: Arc::new(TokenCell::new(source)),
             http,
             stream_http,
         }
+    }
+
+    /// The server's base URL, without a trailing slash.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Events of `execution_id` with `sequence > after`.
@@ -499,14 +591,13 @@ impl ApiClient {
             self.base_url
         );
         let response = self
-            .stream_http
-            .get(url)
-            .bearer_auth(&self.token)
-            .query(query)
-            .timeout(std::time::Duration::from_secs(60))
-            .send()
-            .await
-            .map_err(|error| ClientError::Unavailable(error.to_string()))?;
+            .send(&self.stream_http, |http, token| {
+                http.get(&url)
+                    .bearer_auth(token)
+                    .query(query)
+                    .timeout(CONVERSATION_PAGE_TIMEOUT)
+            })
+            .await?;
         handle_json_response(response).await
     }
 
@@ -562,6 +653,32 @@ impl ApiClient {
             self.base_url
         );
         self.post_empty(&url).await
+    }
+
+    // -----------------------------------------------------------------
+    // Identity (U7, U8)
+    // -----------------------------------------------------------------
+
+    /// What the server makes of this client's token — `GET /auth/v1/whoami`.
+    pub async fn whoami(&self) -> Result<WhoAmIResponse, ClientError> {
+        let url = format!("{}/auth/v1/whoami", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// Claims an unowned network-mode installation with the one-time code
+    /// its daemon printed (R38) — `POST /auth/v1/claim`. A wrong or spent
+    /// code, or an installation owned by somebody else, is
+    /// [`ClientError::Forbidden`]; a trusted-mode daemon, which has no owner
+    /// to claim, answers [`ClientError::NotFound`].
+    pub async fn claim(&self, claim_code: &str) -> Result<OwnerView, ClientError> {
+        let url = format!("{}/auth/v1/claim", self.base_url);
+        self.post_json(
+            &url,
+            &ClaimRequest {
+                claim_code: claim_code.to_string(),
+            },
+        )
+        .await
     }
 
     // -----------------------------------------------------------------
@@ -628,6 +745,39 @@ impl ApiClient {
         self.sse_stream(url, decode)
     }
 
+    /// [`ApiClient::stream_control_events`] that outlives its connections.
+    ///
+    /// A control-plane stream ends for ordinary reasons: the access token it
+    /// was opened with expires (network mode ends the stream at exactly that
+    /// moment), a proxy recycles the connection, the daemon restarts. This
+    /// stream reconnects after each of them from the cursor of the last
+    /// event it yielded, so nothing is missed or repeated, re-reading the
+    /// token when the reconnect draws a `401`.
+    ///
+    /// A failed (re)connect is yielded as an `Err` item — a client shows it
+    /// as "reconnecting" — and retried after a growing delay
+    /// ([`FIRST_RECONNECT_DELAY`] … [`MAX_RECONNECT_DELAY`]) while it is a
+    /// transport or server failure. A refusal a retry cannot fix
+    /// ([`ClientError::Unauthorized`] after re-reading the token,
+    /// [`ClientError::Forbidden`], [`ClientError::NotFound`], an invalid
+    /// cursor) is yielded once and ends the stream.
+    pub fn follow_control_events(
+        &self,
+        cursor: Option<String>,
+        task_id: Option<String>,
+    ) -> impl Stream<Item = Result<ControlEventEnvelope, ClientError>> {
+        let state = FollowState {
+            client: self.clone(),
+            cursor,
+            task_id,
+            connection: None,
+            delivered: false,
+            failures: 0,
+            done: false,
+        };
+        stream::unfold(state, follow_step)
+    }
+
     /// Connects to `url` over [`ApiClient::stream_http`] (no request
     /// timeout — see its doc comment) and turns the response into a stream
     /// of items `decode` produces, or a single [`ClientError`] item when the
@@ -642,23 +792,31 @@ impl ApiClient {
         url: String,
         decode: FrameDecoder<T>,
     ) -> impl Stream<Item = Result<T, ClientError>> {
-        let http = self.stream_http.clone();
-        let token = self.token.clone();
+        let client = self.clone();
 
         async move {
-            let response = match http.get(&url).bearer_auth(&token).send().await {
+            let response = match client
+                .send(&client.stream_http, |http, token| {
+                    http.get(&url).bearer_auth(token)
+                })
+                .await
+            {
                 Ok(response) => response,
-                Err(error) => {
-                    return single_error_stream(ClientError::Unavailable(error.to_string()));
-                }
+                Err(error) => return single_error_stream(error),
             };
 
             match response.status() {
                 StatusCode::OK => sse_events(response, decode).boxed(),
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                    single_error_stream(ClientError::Unauthorized)
-                }
+                StatusCode::UNAUTHORIZED => single_error_stream(ClientError::Unauthorized),
+                StatusCode::FORBIDDEN => single_error_stream(ClientError::Forbidden),
                 StatusCode::NOT_FOUND => single_error_stream(ClientError::NotFound),
+                StatusCode::BAD_REQUEST => match response.json::<RequestErrorResponse>().await {
+                    Ok(error) => single_error_stream(ClientError::Request {
+                        code: error.code,
+                        message: error.message,
+                    }),
+                    Err(error) => single_error_stream(ClientError::Server(error.to_string())),
+                },
                 status => {
                     single_error_stream(ClientError::Server(format!("unexpected status {status}")))
                 }
@@ -671,14 +829,37 @@ impl ApiClient {
     // Request helpers
     // -----------------------------------------------------------------
 
-    async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ClientError> {
-        let response = self
-            .http
-            .get(url)
-            .bearer_auth(&self.token)
+    /// Sends the request `build` makes with the current token; after a
+    /// `401`, re-reads the token and — when that yields another one — sends
+    /// it once more. Every other answer is returned as it is.
+    ///
+    /// Retrying after a `401` is safe for every method: the gate refuses a
+    /// request before any handler runs, so nothing of the first attempt took
+    /// effect.
+    async fn send(
+        &self,
+        http: &reqwest::Client,
+        build: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, ClientError> {
+        let token = self.token.current().await?;
+        let response = build(http, &token)
             .send()
             .await
             .map_err(|error| ClientError::Unavailable(error.to_string()))?;
+        if response.status() != StatusCode::UNAUTHORIZED || !self.token.refresh(&token).await? {
+            return Ok(response);
+        }
+        let token = self.token.current().await?;
+        build(http, &token)
+            .send()
+            .await
+            .map_err(|error| ClientError::Unavailable(error.to_string()))
+    }
+
+    async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ClientError> {
+        let response = self
+            .send(&self.http, |http, token| http.get(url).bearer_auth(token))
+            .await?;
         handle_json_response(response).await
     }
 
@@ -689,25 +870,18 @@ impl ApiClient {
         body: &B,
     ) -> Result<T, ClientError> {
         let response = self
-            .http
-            .post(url)
-            .bearer_auth(&self.token)
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| ClientError::Unavailable(error.to_string()))?;
+            .send(&self.http, |http, token| {
+                http.post(url).bearer_auth(token).json(body)
+            })
+            .await?;
         handle_json_response(response).await
     }
 
     /// `POST url` with no body, decoding the response as `T`.
     async fn post_empty<T: DeserializeOwned>(&self, url: &str) -> Result<T, ClientError> {
         let response = self
-            .http
-            .post(url)
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|error| ClientError::Unavailable(error.to_string()))?;
+            .send(&self.http, |http, token| http.post(url).bearer_auth(token))
+            .await?;
         handle_json_response(response).await
     }
 
@@ -717,30 +891,140 @@ impl ApiClient {
         body: &B,
     ) -> Result<T, ClientError> {
         let response = self
-            .http
-            .put(url)
-            .bearer_auth(&self.token)
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| ClientError::Unavailable(error.to_string()))?;
+            .send(&self.http, |http, token| {
+                http.put(url).bearer_auth(token).json(body)
+            })
+            .await?;
         handle_json_response(response).await
     }
 
     async fn delete_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ClientError> {
         let response = self
-            .http
-            .delete(url)
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|error| ClientError::Unavailable(error.to_string()))?;
+            .send(&self.http, |http, token| {
+                http.delete(url).bearer_auth(token)
+            })
+            .await?;
         handle_json_response(response).await
     }
 }
 
+/// Checks and normalizes the base URL of [`ApiClient::remote`].
+fn normalize_base_url(raw: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(raw.trim())
+        .map_err(|error| format!("'{raw}' is not a URL: {error}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("the server URL must not carry credentials".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("the server URL must not have a query or a fragment".to_string());
+    }
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback_host(&url) => {}
+        "http" => {
+            return Err(format!(
+                "'{raw}' is plain http to a non-loopback host; the control plane must be \
+                 reached over https so the token is never sent in clear text"
+            ))
+        }
+        other => return Err(format!("unsupported URL scheme '{other}'")),
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// What [`ApiClient::follow_control_events`] unfolds over.
+struct FollowState {
+    client: ApiClient,
+    /// Cursor after the last event yielded; the next connection starts here.
+    cursor: Option<String>,
+    task_id: Option<String>,
+    connection:
+        Option<futures::stream::BoxStream<'static, Result<ControlEventEnvelope, ClientError>>>,
+    /// Whether the current connection yielded an event yet.
+    delivered: bool,
+    /// Consecutive failed or empty connections; sets the reconnect delay.
+    failures: u32,
+    done: bool,
+}
+
+/// The delay before reconnect attempt number `failures` (0: at once).
+fn reconnect_delay(failures: u32) -> Duration {
+    if failures == 0 {
+        return Duration::ZERO;
+    }
+    let factor = 2u32.saturating_pow(failures.saturating_sub(1).min(16));
+    FIRST_RECONNECT_DELAY
+        .saturating_mul(factor)
+        .min(MAX_RECONNECT_DELAY)
+}
+
+async fn follow_step(
+    mut state: FollowState,
+) -> Option<(Result<ControlEventEnvelope, ClientError>, FollowState)> {
+    loop {
+        if state.done {
+            return None;
+        }
+        if state.connection.is_none() {
+            tokio::time::sleep(reconnect_delay(state.failures)).await;
+            state.connection = Some(
+                state
+                    .client
+                    .stream_control_events(state.cursor.as_deref(), state.task_id.as_deref())
+                    .boxed(),
+            );
+            state.delivered = false;
+        }
+        let next = state.connection.as_mut()?.next().await;
+        match next {
+            Some(Ok(envelope)) => {
+                state.cursor = Some(envelope.cursor.clone());
+                state.delivered = true;
+                state.failures = 0;
+                return Some((Ok(envelope), state));
+            }
+            Some(Err(error @ (ClientError::Unavailable(_) | ClientError::Server(_)))) => {
+                state.connection = None;
+                state.failures = state.failures.saturating_add(1);
+                return Some((Err(error), state));
+            }
+            Some(Err(error)) => {
+                state.done = true;
+                return Some((Err(error), state));
+            }
+            // The server ended the stream (token expiry, a recycled
+            // connection): reconnect from the cursor. Immediately after a
+            // connection that delivered something, with a growing delay
+            // after one that ended without delivering anything, so a server
+            // that keeps closing at once is not hammered.
+            None => {
+                state.connection = None;
+                if state.delivered {
+                    state.failures = 0;
+                } else {
+                    state.failures = state.failures.saturating_add(1);
+                }
+            }
+        }
+    }
+}
+
 /// Maps a response's status to a [`ClientError`] the same way for every
-/// call this client makes, `2xx` aside: `401`/`403` → [`ClientError::Unauthorized`],
+/// call this client makes, `2xx` aside: `401` → [`ClientError::Unauthorized`],
+/// `403` → [`ClientError::Forbidden`],
 /// `404` → [`ClientError::NotFound`], `409` → [`ClientError::Conflict`] (the
 /// one status [`ApiClient::get_json`] never actually sees, since nothing it
 /// calls mutates anything — kept in the shared helper anyway so a future
@@ -760,7 +1044,8 @@ pub(crate) async fn handle_json_response<T: DeserializeOwned>(
             .json::<T>()
             .await
             .map_err(|error| ClientError::Server(error.to_string())),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ClientError::Unauthorized),
+        StatusCode::UNAUTHORIZED => Err(ClientError::Unauthorized),
+        StatusCode::FORBIDDEN => Err(ClientError::Forbidden),
         StatusCode::NOT_FOUND => Err(ClientError::NotFound),
         StatusCode::CONFLICT => match response.json::<RequestErrorResponse>().await {
             Ok(error) => Err(ClientError::Refused {

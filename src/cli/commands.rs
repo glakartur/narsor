@@ -1380,6 +1380,35 @@ pub fn tui(config: &Resolved, flags: &Flags) -> Result<()> {
     })
 }
 
+/// `narsor tui --remote` (or `narsor --server <url> tui`) — the remote
+/// tasks mode ([`crate::tui::remote`]) over the control plane `target`
+/// names, or over the local daemon's control plane without one.
+pub fn tui_remote(
+    config: &Resolved,
+    flags: &Flags,
+    target: &crate::api::ServerTarget,
+) -> Result<()> {
+    let state = StatePaths::new(config.state_dir());
+    let handle = tokio::runtime::Handle::current();
+    let refresh_interval = config
+        .tui_refresh_interval()
+        .map(std::time::Duration::from_secs);
+    tokio::task::block_in_place(move || {
+        handle.block_on(async {
+            let client = crate::api::connect(target, &state, flags)
+                .await
+                .map_err(CliError::failure)?;
+            crate::tui::run_remote(client, refresh_interval)
+                .await
+                .map_err(|error| {
+                    CliError::failure(format!(
+                        "The terminal interface stopped with an error: {error}"
+                    ))
+                })
+        })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // shared helpers
 // ---------------------------------------------------------------------------
@@ -1441,6 +1470,9 @@ fn client_error(execution_id: &str, error: ClientError) -> CliError {
         )),
         ClientError::Unauthorized => {
             CliError::failure("The narsor daemon rejected the request: bad token".to_string())
+        }
+        error @ (ClientError::Forbidden | ClientError::Credential(_)) => {
+            CliError::failure(error.to_string())
         }
         ClientError::Unavailable(detail) => {
             CliError::failure(format!("Could not reach the narsor daemon: {detail}"))
@@ -1538,10 +1570,11 @@ async fn wait_until_stopped(client: &ApiClient, execution_id: &str) -> Result<Ex
             // `Ok(None)` means the stream ended on its own (its terminal
             // event, or the connection dropping): stop polling it, a
             // finished stream would otherwise just return `None` forever.
-            Some(active) => match tokio::time::timeout(STATUS_POLL_INTERVAL, active.next()).await {
-                Ok(None) => stream = None,
-                Ok(Some(_)) | Err(_) => {}
-            },
+            Some(active) => {
+                if let Ok(None) = tokio::time::timeout(STATUS_POLL_INTERVAL, active.next()).await {
+                    stream = None;
+                }
+            }
             None => tokio::time::sleep(STATUS_POLL_INTERVAL).await,
         }
     }

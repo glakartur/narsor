@@ -4336,6 +4336,7 @@ fn client_error_message(execution_id: &str, error: ClientError) -> String {
         ClientError::Unauthorized => {
             "The narsor daemon rejected the request: bad token".to_string()
         }
+        error @ (ClientError::Forbidden | ClientError::Credential(_)) => error.to_string(),
         ClientError::Unavailable(detail) => {
             format!("Could not reach the narsor daemon: {detail}")
         }

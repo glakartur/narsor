@@ -33,6 +33,7 @@
 pub mod commands;
 pub mod controller;
 pub mod daemon;
+pub mod remote;
 
 use std::path::PathBuf;
 
@@ -75,6 +76,27 @@ pub struct Cli {
     /// the next step of the cascade: the operator named this file.
     #[arg(long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
+
+    /// The control plane to talk to, as an `https://` URL (U8). Without it,
+    /// remote-task commands use the trusted local daemon of the state
+    /// directory.
+    #[arg(long, global = true, env = "NARSOR_SERVER", value_name = "URL")]
+    pub server: Option<String>,
+
+    /// A file holding the OIDC access token for `--server`, re-read after
+    /// every `401`. `NARSOR_TOKEN` holds a fixed token instead.
+    #[arg(long, global = true, env = "NARSOR_TOKEN_FILE", value_name = "FILE")]
+    pub token_file: Option<PathBuf>,
+
+    /// A command printing the OIDC access token for `--server`, run again
+    /// after every `401`.
+    #[arg(
+        long,
+        global = true,
+        env = "NARSOR_TOKEN_COMMAND",
+        value_name = "COMMAND"
+    )]
+    pub token_command: Option<String>,
 
     /// The subcommand to run.
     #[command(subcommand)]
@@ -240,7 +262,33 @@ pub enum Command {
     },
 
     /// Opens the full-screen terminal interface.
-    Tui,
+    Tui {
+        /// Shows the control plane's remote tasks instead of the local
+        /// executions; implied by `--server`.
+        #[arg(long)]
+        remote: bool,
+    },
+
+    /// Creates, inspects and steers remote tasks through the control plane.
+    Task {
+        /// What to do.
+        #[command(subcommand)]
+        command: remote::TaskCommand,
+    },
+
+    /// The backends of remote tasks: the default backend of new tasks.
+    Backend {
+        /// What to do.
+        #[command(subcommand)]
+        command: remote::BackendCommand,
+    },
+
+    /// Network-mode identity: claim the installation, see who you are.
+    Auth {
+        /// What to do.
+        #[command(subcommand)]
+        command: remote::AuthCommand,
+    },
 
     /// Runs the daemon that owns `Engine`/`ExecutionStore` for as long as the
     /// machine stays up (U2), or sends the running one a graceful stop
@@ -269,7 +317,20 @@ pub enum Command {
     /// Started next to the backend (for Kubernetes, as the Deployment in
     /// `deploy/kubernetes/`): it enrolls once with a one-time code, then
     /// reconciles the backend with the control plane.
-    Controller(controller::ControllerArgs),
+    Controller(ControllerCli),
+}
+
+/// `narsor controller`: run a controller (flags only), or — with a
+/// subcommand — manage controller identities as the installation operator.
+#[derive(Debug, clap::Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+pub struct ControllerCli {
+    /// Operator commands; without one, the controller runs.
+    #[command(subcommand)]
+    pub admin: Option<remote::ControllerAdminCommand>,
+    /// The controller's own flags.
+    #[command(flatten)]
+    pub run: Option<controller::ControllerArgs>,
 }
 
 /// The daemon half of the command line.
@@ -468,14 +529,18 @@ impl Command {
             | Command::Conductor { .. }
             | Command::Workflow { .. }
             | Command::Repo { .. }
-            | Command::Tui
+            | Command::Tui { .. }
+            | Command::Task { .. }
+            | Command::Backend { .. }
+            | Command::Auth { .. }
             | Command::Daemon { .. } => false,
             // The runner reads no configuration at all — everything it runs
             // is in its launch spec — so whatever file a base image happens
             // to carry must not keep a task from starting.
             Command::Runner(_) => true,
             // Configured by its own flags and environment only, like the
-            // runner: it reads no Narsor configuration file.
+            // runner: it reads no Narsor configuration file. Its operator
+            // subcommands talk to a control plane and need none either.
             Command::Controller(_) => true,
         }
     }
@@ -526,12 +591,16 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         root: cli.root.clone(),
         config: cli.config.clone(),
     };
+    let target = remote::server_target(cli.server, cli.token_file, cli.token_command);
     let catalog = config.catalog_dir().to_path_buf();
     let state = config.state_dir().to_path_buf();
     // The runner has its own exit-code contract (see `crate::runner::cli`).
     let command = match cli.command {
         Command::Runner(args) => return crate::runner::cli::run_command(args).await,
-        Command::Controller(args) => return controller::run_command(args).await,
+        Command::Controller(ControllerCli {
+            admin: None,
+            run: Some(args),
+        }) => return controller::run_command(args).await,
         command => command,
     };
     let outcome = match command {
@@ -631,14 +700,28 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Config { command } => match command {
             ConfigCommand::Show { format } => commands::config_show(&config, format),
         },
-        Command::Tui => commands::tui(&config, &flags),
+        Command::Tui { remote } => {
+            if remote || target.is_remote() {
+                commands::tui_remote(&config, &flags, &target)
+            } else {
+                commands::tui(&config, &flags)
+            }
+        }
+        Command::Task { command } => remote::task(command, &target, &state, &catalog, &flags).await,
+        Command::Backend { command } => remote::backend(command, &target, &state, &flags).await,
+        Command::Auth { command } => remote::auth(command, &target, &state, &flags).await,
+        Command::Controller(ControllerCli { admin, .. }) => match admin {
+            Some(command) => remote::controller_admin(command, &target, &state, &flags).await,
+            None => Err(commands::CliError::usage(
+                "narsor controller needs its flags (--control-plane, --credential-file, \
+                 --kubernetes-config) or an operator subcommand (enroll-code, list, revoke)",
+            )),
+        },
         Command::Daemon { command } => match command {
             None => daemon::run_daemon(&config).await,
             Some(DaemonCommand::Stop) => daemon::stop_daemon(&config),
         },
-        Command::Runner(_) | Command::Controller(_) => {
-            unreachable!("the runner and the controller returned above")
-        }
+        Command::Runner(_) => unreachable!("the runner returned above"),
     };
 
     match outcome {
@@ -667,7 +750,7 @@ mod tests {
 
         for command in [
             Command::List,
-            Command::Tui,
+            Command::Tui { remote: false },
             Command::Validate {
                 workflow: "any".to_string(),
             },

@@ -382,3 +382,64 @@ async fn a_stale_lock_file_naming_a_dead_pid_is_reaped_instead_of_deadlocking() 
     let info = DaemonInfo::read(&paths.daemon_file()).expect("daemon.json exists");
     stop_and_reap(info.pid);
 }
+
+// ---------------------------------------------------------------------------
+// The remote connection path (U8)
+// ---------------------------------------------------------------------------
+
+/// A local network-mode daemon has no token to discover: the client is told
+/// to connect through `--server` with an OIDC token instead of being handed
+/// a client that cannot authenticate.
+#[tokio::test]
+async fn connecting_without_a_server_to_a_network_mode_daemon_asks_for_one() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TempRoot::new();
+    let paths = state_paths(&root);
+    DaemonInfo {
+        pid: std::process::id(),
+        addr: "127.0.0.1:9".parse().unwrap(),
+        token: String::new(),
+        started_at: Utc::now(),
+    }
+    .write(&paths.daemon_file())
+    .expect("write the discovery file");
+    fs::set_permissions(paths.daemon_file(), fs::Permissions::from_mode(0o600)).unwrap();
+
+    let error = narsor::api::connect(
+        &narsor::api::ServerTarget::default(),
+        &paths,
+        &flags_for(&root),
+    )
+    .await
+    .expect_err("no local token in network mode");
+    assert!(error.contains("--server"), "{error}");
+    assert!(error.contains("NARSOR_TOKEN_FILE"), "{error}");
+}
+
+#[tokio::test]
+async fn a_remote_target_needs_a_token_and_https() {
+    let root = TempRoot::new();
+    let paths = state_paths(&root);
+    let without_token = narsor::api::ServerTarget {
+        server: Some("https://narsor.example.com".to_string()),
+        token: None,
+    };
+    let error = narsor::api::connect(&without_token, &paths, &flags_for(&root))
+        .await
+        .expect_err("a token is required");
+    assert!(error.contains("NARSOR_TOKEN"), "{error}");
+
+    let clear_text = narsor::api::ServerTarget {
+        server: Some("http://narsor.example.com".to_string()),
+        token: Some(narsor::api::TokenSource::Static("t".to_string())),
+    };
+    let error = narsor::api::connect(&clear_text, &paths, &flags_for(&root))
+        .await
+        .expect_err("plain http to another host is refused");
+    assert!(error.contains("https"), "{error}");
+    assert!(
+        !paths.daemon_file().exists(),
+        "a remote target never launches a local daemon"
+    );
+}

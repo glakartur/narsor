@@ -79,13 +79,16 @@
 
 mod active;
 mod client;
+pub mod connect;
 mod discovery;
 pub mod dto;
 mod routes;
+pub mod token;
 
 pub use active::ActiveTasks;
 pub(crate) use client::handle_json_response;
 pub use client::{ApiClient, ClientError};
+pub use connect::{connect, ServerTarget};
 pub use discovery::{ensure_daemon_running, DiscoveryError};
 pub use dto::{
     AcceptedResponse, ActiveProblem, ChatMessageRequest, ConductorActivity, ConductorChatResponse,
@@ -94,6 +97,7 @@ pub use dto::{
     StartTaskResponse, TransitionRequest,
 };
 pub use routes::{ConversationEntryDto, ConversationResponse};
+pub use token::TokenSource;
 
 use crate::auth::gate::{self, NetworkAuth, OwnerAuth};
 use crate::auth::{CorsPolicy, ProxyPolicy};

@@ -111,7 +111,7 @@ fn init_tracing(cli: &Cli, resolved: &Resolved) -> anyhow::Result<()> {
         return Ok(());
     };
 
-    if matches!(cli.command, Command::Tui) {
+    if matches!(cli.command, Command::Tui { .. }) {
         let Some(file) = open_log_file(&resolved.state_paths()) else {
             // The directory is not writable. The interface still runs; the
             // logs are the thing given up, never the screen.

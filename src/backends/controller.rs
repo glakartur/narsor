@@ -260,7 +260,7 @@ impl From<ClientError> for CallError {
             }
             // A revoked identity can no longer act; it must not touch the
             // backend any more than a fenced one.
-            ClientError::Unauthorized => {
+            ClientError::Unauthorized | ClientError::Forbidden | ClientError::Credential(_) => {
                 Self::Interrupt(Interrupt::Fenced("controller credential refused".into()))
             }
             ClientError::Refused { code, message } if LEASE_CODES.contains(&code.as_str()) => {

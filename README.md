@@ -77,6 +77,8 @@ narsor tui
 |---|---|---|
 | `--root <DIRECTORY>` | `./.narsor` | The data directory: executions and workspaces. Applies to every subcommand, `tui` included. |
 | `--config <FILE>` | searched for | The configuration file to read instead of searching. A path that is not there is a usage error, not a fall-through. |
+| `--server <URL>` | `NARSOR_SERVER`, else the local daemon | The control plane for `task`, `backend`, `auth`, `controller` and `tui --remote`: `https://` (plain `http://` only for loopback). See [Remote tasks](#remote-tasks-and-backends). |
+| `--token-file <FILE>`, `--token-command <CMD>` | `NARSOR_TOKEN_FILE`, `NARSOR_TOKEN_COMMAND`, `NARSOR_TOKEN` | Where the OIDC token for `--server` comes from; a file or command is read again after a `401`. Never a command-line value. |
 | `--help`, `--version` | — | Help and version. |
 
 `tracing` logs go to **stderr** and the output of the command to **stdout**, so
@@ -645,6 +647,37 @@ reaches the terminal while the interface is up. Every other subcommand keeps
 logging to stderr.
 
 ---
+
+## Remote tasks and backends
+
+Besides the local executions above, the daemon is a **control plane** for
+remote tasks: each task runs isolated on a registered backend (Kubernetes
+first, or the `local` backend), with its own storage, and is created, paused,
+resumed and archived through one owner API — clients never talk to a backend
+or a runner directly.
+
+```bash
+narsor backend default                        # which backend new tasks get (set/reset to change)
+narsor task create implement-feature --input ticket=NAR-1 [--backend k8s] [--priority 5]
+narsor task list                              # backend, lifecycle, queue reason, staleness
+narsor task show <task>                       # observations with their age, timeline, conversation
+narsor task pause|resume|start|archive <task> # archive deletes the workload and its storage
+narsor task input <task> --field reason=ok    # answer the input the runner waits for
+narsor task conversation <task> [<attempt>]   # read through the control plane
+narsor task watch                             # follow every task's events
+narsor tui --remote                           # the remote tasks mode of the interface
+```
+
+Without `--server` these use the local daemon (trusted mode). For a network
+deployment pass `--server https://…` (or `NARSOR_SERVER`) and an OIDC access
+token via `NARSOR_TOKEN_FILE`, `NARSOR_TOKEN_COMMAND` or `NARSOR_TOKEN`; a
+fresh installation is claimed once with `narsor auth claim <code>`, and the
+owner enrolls controllers with `narsor controller enroll-code <backend>`.
+
+Installation, network mode (OIDC, owner claim, TLS proxy), the backend and
+image catalogue, secrets, the Kubernetes manifests, controller enrollment and
+credential rotation, lifecycle and scheduling semantics are described in
+[`docs/operations/remote-backends.md`](docs/operations/remote-backends.md).
 
 ## The conductor
 
