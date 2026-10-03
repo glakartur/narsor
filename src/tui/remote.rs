@@ -44,7 +44,7 @@ use crate::orchestration::{
 use super::app::agent_transcript_entry;
 use super::conversation::{classify, ClassifiedEntry};
 use super::input_form::{FormAction, InputForm};
-use super::transcript::{DisplayMode, TranscriptId, TranscriptState};
+use super::transcript::{TranscriptId, TranscriptState};
 
 /// Soft cap on the raw bytes of one relayed conversation page.
 pub const PAGE_BYTE_BUDGET: u64 = 64 * 1024;
@@ -994,10 +994,7 @@ impl RemoteApp {
                     return RemoteRequest::None;
                 }
                 KeyCode::Char('v') => {
-                    transcript.set_mode(match transcript.mode() {
-                        DisplayMode::Rendered => DisplayMode::Raw,
-                        DisplayMode::Raw => DisplayMode::Rendered,
-                    });
+                    transcript.toggle_mode();
                     return RemoteRequest::None;
                 }
                 KeyCode::Char('e') | KeyCode::Enter | KeyCode::Char(' ') => {
@@ -1384,10 +1381,8 @@ impl RemoteApp {
                 .filter(|previous| previous.attempt_id == page.attempt_id)
             {
                 page.transcript = previous.transcript.clone();
-                page.transcript.replace_entries(entries);
-            } else {
-                page.transcript.load(entries);
             }
+            page.transcript.replace_entries(entries);
             detail.page = Some(page);
         }
     }

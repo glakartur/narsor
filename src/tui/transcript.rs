@@ -202,6 +202,14 @@ impl TranscriptState {
         self.restore_after_change(anchor, following);
     }
 
+    /// Switches between the readable projection and exact diagnostic source.
+    pub fn toggle_mode(&mut self) {
+        self.set_mode(match self.mode {
+            DisplayMode::Rendered => DisplayMode::Raw,
+            DisplayMode::Raw => DisplayMode::Rendered,
+        });
+    }
+
     pub fn toggle_expanded(&mut self, entry: &TranscriptEntryId) {
         let anchor = self.anchor();
         let following = self.following_end;

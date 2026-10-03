@@ -141,7 +141,7 @@ fn project_stdout_line(text: &str) -> (EntryKind, String) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return (EntryKind::Raw, text.to_owned());
     };
-    let kind = classify_stdout_line(text);
+    let kind = classify_stdout_value(&value);
     let projected = match kind {
         EntryKind::Assistant => value
             .pointer("/message/content")
@@ -202,11 +202,7 @@ fn project_stdout_line(text: &str) -> (EntryKind, String) {
     (kind, projected)
 }
 
-/// Sniffs the shape of one stdout line by its top-level `type` field.
-fn classify_stdout_line(text: &str) -> EntryKind {
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return EntryKind::Raw;
-    };
+fn classify_stdout_value(value: &Value) -> EntryKind {
     let Some(type_field) = value.get("type").and_then(Value::as_str) else {
         return EntryKind::Raw;
     };
@@ -214,8 +210,8 @@ fn classify_stdout_line(text: &str) -> EntryKind {
     match type_field {
         // Claude Code: one full message envelope per line; the message's own
         // content blocks (grouped by `message.id`) carry the finer kind.
-        "assistant" => classify_message_content(&value).unwrap_or(EntryKind::Assistant),
-        "user" => classify_message_content(&value).unwrap_or(EntryKind::User),
+        "assistant" => classify_message_content(value).unwrap_or(EntryKind::Assistant),
+        "user" => classify_message_content(value).unwrap_or(EntryKind::User),
         "system" => EntryKind::System,
         "result" => EntryKind::Result,
 
@@ -231,7 +227,7 @@ fn classify_stdout_line(text: &str) -> EntryKind {
         "turn.completed" => EntryKind::Result,
         "turn.failed" => EntryKind::System,
         "item.started" | "item.updated" | "item.completed" => {
-            classify_codex_item(&value, type_field).unwrap_or(EntryKind::Raw)
+            classify_codex_item(value, type_field).unwrap_or(EntryKind::Raw)
         }
 
         _ => EntryKind::Raw,

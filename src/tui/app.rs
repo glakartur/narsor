@@ -101,9 +101,7 @@ use crate::tui::conversation::{classify, ClassifiedEntry, EntryKind};
 use crate::tui::failure_form::{FailureAction, FailureForm};
 use crate::tui::refresh::{RefreshSchedule, DEBOUNCE};
 use crate::tui::scroll::{sanitize, ScrollState};
-use crate::tui::transcript::{
-    DisplayMode, TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptState,
-};
+use crate::tui::transcript::{TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptState};
 use crate::workflows::{ResolvedWorkflow, WorkflowEntry, WorkflowResolver};
 
 pub use crate::tui::input_form::{
@@ -2612,11 +2610,7 @@ impl App {
                     let mut entries = existing;
                     entries.extend(fresh);
                     let projected = entries.iter().map(agent_transcript_entry).collect();
-                    if append {
-                        transcript.replace_entries(projected);
-                    } else {
-                        transcript.load(projected);
-                    }
+                    transcript.replace_entries(projected);
                     view.content = TaskContent::Conversation {
                         entries,
                         next_entry,
@@ -2875,10 +2869,7 @@ impl App {
         let TaskContent::Conversation { transcript, .. } = &mut view.content else {
             return;
         };
-        transcript.set_mode(match transcript.mode() {
-            DisplayMode::Rendered => DisplayMode::Raw,
-            DisplayMode::Raw => DisplayMode::Rendered,
-        });
+        transcript.toggle_mode();
     }
 
     fn toggle_task_transcript_detail(&mut self) {
@@ -3053,7 +3044,7 @@ impl App {
                 chat.draft.pop();
             }
             (KeyCode::Char(character), ChatFocus::Draft) => chat.draft.push(character),
-            (KeyCode::Char('y') | KeyCode::Enter, ChatFocus::Action | ChatFocus::Reading) => {
+            (KeyCode::Char('y') | KeyCode::Enter, ChatFocus::Action) => {
                 let proposal_id = match chat.action_target.as_ref() {
                     Some(ChatActionTarget::Proposal(id)) => Some(id.clone()),
                     // Legacy programmatic callers can still select an entry;
@@ -3077,7 +3068,7 @@ impl App {
                     }
                 }
             }
-            (KeyCode::Char('n'), ChatFocus::Action | ChatFocus::Reading) => {
+            (KeyCode::Char('n'), ChatFocus::Action) => {
                 let proposal_id = match chat.action_target.as_ref() {
                     Some(ChatActionTarget::Proposal(id)) => Some(id.clone()),
                     None => chat
@@ -3099,7 +3090,7 @@ impl App {
                     }
                 }
             }
-            (KeyCode::Char('u'), ChatFocus::Action | ChatFocus::Reading) => {
+            (KeyCode::Char('u'), ChatFocus::Action) => {
                 if !chat.ask_undo() {
                     self.notice = Some(Notice::error(
                         "Only the conductor's choice of an output that was not undone yet can \

@@ -18,9 +18,7 @@ use serde_json::Value;
 
 use crate::conductor::{ChatAuthor, ChatEntry, ChatEntryKind};
 use crate::domain::{ConductorDecisionKind, Confidence};
-use crate::tui::transcript::{
-    DisplayMode, TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptState,
-};
+use crate::tui::transcript::{TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptState};
 
 /// The `kind` a chat decision entry records for a carried-out proposal.
 const EXECUTED: &str = "execute_proposal";
@@ -328,19 +326,13 @@ impl ChatPanel {
 
     /// Refreshes the semantic projection without losing the transcript's
     /// viewport anchor.  Raw mode serializes the complete retained entry.
-    fn sync_transcript(&mut self, replace: bool) -> bool {
+    fn sync_transcript(&mut self) -> bool {
         let entries = self
             .items()
             .iter()
             .map(chat_transcript_entry)
             .collect::<Vec<_>>();
-        if replace {
-            self.transcript.replace_entries(entries);
-        } else if self.transcript.entries().is_empty() && !self.loaded {
-            self.transcript.load(entries);
-        } else {
-            self.transcript.replace_entries(entries);
-        }
+        self.transcript.replace_entries(entries);
         let stale_target = self.action_target.is_some() && self.action_item().is_none();
         if stale_target {
             self.action_target = None;
@@ -365,7 +357,7 @@ impl ChatPanel {
         if following {
             self.selected = self.entries.len().saturating_sub(1);
         }
-        self.sync_transcript(true)
+        self.sync_transcript()
     }
 
     /// Moves the history's selection by `delta`, within its bounds.
@@ -424,10 +416,7 @@ impl ChatPanel {
     }
 
     pub fn toggle_raw(&mut self) {
-        self.transcript.set_mode(match self.transcript.mode() {
-            DisplayMode::Rendered => DisplayMode::Raw,
-            DisplayMode::Raw => DisplayMode::Rendered,
-        });
+        self.transcript.toggle_mode();
     }
 
     /// Asks for the undo of the highlighted entry, when it is a decision
