@@ -2979,17 +2979,17 @@ async fn expanding_a_conversation_entry_toggles_and_collapses_again() {
         .sequence;
     app.open_conversation_for_event(completed_sequence).await;
 
-    let entry_number = match &task_view(&app).content {
-        TaskContent::Conversation { entries, .. } => {
-            entries
-                .first()
+    let entry_id = match &task_view(&app).content {
+        TaskContent::Conversation { transcript, .. } => {
+            transcript
+                .anchor()
                 .expect("attempt-2 has at least one entry")
-                .entry_number
+                .entry_id
         }
         other => panic!("expected a loaded conversation, got {other:?}"),
     };
     assert!(
-        !task_view(&app).expanded.contains(&entry_number),
+        !matches!(&task_view(&app).content, TaskContent::Conversation { transcript, .. } if transcript.is_expanded(&entry_id)),
         "entry should start collapsed"
     );
 
@@ -2998,16 +2998,26 @@ async fn expanding_a_conversation_entry_toggles_and_collapses_again() {
     app.on_key(key(KeyCode::Tab));
     app.on_key(key(KeyCode::Enter));
     assert!(
-        task_view(&app).expanded.contains(&entry_number),
-        "first Enter should expand the entry: {:?}",
-        task_view(&app).expanded
+        matches!(&task_view(&app).content, TaskContent::Conversation { transcript, .. } if transcript.is_expanded(&entry_id)),
+        "first Enter should expand the transcript entry"
     );
 
     app.on_key(key(KeyCode::Enter));
     assert!(
-        !task_view(&app).expanded.contains(&entry_number),
-        "second Enter should collapse the entry again: {:?}",
-        task_view(&app).expanded
+        !matches!(&task_view(&app).content, TaskContent::Conversation { transcript, .. } if transcript.is_expanded(&entry_id)),
+        "second Enter should collapse the transcript entry"
+    );
+
+    app.on_key(key(KeyCode::Char('v')));
+    assert!(
+        matches!(&task_view(&app).content, TaskContent::Conversation { transcript, .. } if transcript.mode() == DisplayMode::Raw),
+        "content focus switches the same transcript to diagnostic raw mode"
+    );
+    assert!(
+        app.shortcuts()
+            .iter()
+            .any(|(key, description)| *key == "v" && *description == "raw/rendered"),
+        "the focused content bar documents raw mode"
     );
 }
 

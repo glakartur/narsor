@@ -41,8 +41,10 @@ use crate::orchestration::{
     TaskEventKind, TaskLifecycle,
 };
 
+use super::app::agent_transcript_entry;
 use super::conversation::{classify, ClassifiedEntry};
 use super::input_form::{FormAction, InputForm};
+use super::transcript::{DisplayMode, TranscriptId, TranscriptState};
 
 /// Soft cap on the raw bytes of one relayed conversation page.
 pub const PAGE_BYTE_BUDGET: u64 = 64 * 1024;
@@ -586,6 +588,8 @@ pub struct PageView {
     /// Every readable forward page was collected before this page was made
     /// visible.
     pub complete: bool,
+    /// Shared logical-line reader state for this attempt.
+    pub transcript: TranscriptState,
 }
 
 /// What is loaded about the selected task beyond its summary.
@@ -832,6 +836,20 @@ impl RemoteApp {
         } else {
             keys.push(("Esc", "back"));
             keys.push(("c", "conversation"));
+            if self
+                .detail()
+                .and_then(|detail| detail.page.as_ref())
+                .is_some()
+            {
+                keys.extend([
+                    ("j/k", "scroll history"),
+                    ("PgUp/PgDn", "page history"),
+                    ("g/G", "history top/bottom"),
+                    ("e", "detail"),
+                    ("v", "raw/rendered"),
+                    ("[/]", "other attempt"),
+                ]);
+            }
         }
         if let Some(task) = self.selected() {
             match task.lifecycle {
@@ -933,6 +951,62 @@ impl RemoteApp {
                     _ => {}
                 }
                 return RemoteRequest::None;
+            }
+        }
+
+        if self.screen == RemoteScreen::Detail
+            && self
+                .detail()
+                .and_then(|detail| detail.page.as_ref())
+                .is_some()
+        {
+            let transcript = &mut self
+                .detail
+                .as_mut()
+                .expect("detail checked")
+                .page
+                .as_mut()
+                .expect("page checked")
+                .transcript;
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    transcript.line_down();
+                    return RemoteRequest::None;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    transcript.line_up();
+                    return RemoteRequest::None;
+                }
+                KeyCode::PageDown => {
+                    transcript.page_down();
+                    return RemoteRequest::None;
+                }
+                KeyCode::PageUp => {
+                    transcript.page_up();
+                    return RemoteRequest::None;
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    transcript.to_top();
+                    return RemoteRequest::None;
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    transcript.to_bottom();
+                    return RemoteRequest::None;
+                }
+                KeyCode::Char('v') => {
+                    transcript.set_mode(match transcript.mode() {
+                        DisplayMode::Rendered => DisplayMode::Raw,
+                        DisplayMode::Raw => DisplayMode::Rendered,
+                    });
+                    return RemoteRequest::None;
+                }
+                KeyCode::Char('e') | KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Some(anchor) = transcript.anchor() {
+                        transcript.toggle_expanded(&anchor.entry_id);
+                    }
+                    return RemoteRequest::None;
+                }
+                _ => {}
             }
         }
 
@@ -1243,38 +1317,45 @@ impl RemoteApp {
                 }) => {
                     if page_entries.is_empty() {
                         break PageView {
-                            attempt_id,
+                            attempt_id: attempt_id.clone(),
                             entries,
                             next_entry,
                             closed: page_closed,
                             no_record: false,
                             truncated_tail: page_truncated_tail,
                             complete: !page_truncated_tail,
+                            transcript: TranscriptState::new(TranscriptId::from(
+                                attempt_id.clone(),
+                            )),
                         };
                     }
                     entries.extend(page_entries.iter().map(classify));
                     if page_truncated_tail || next_entry <= from {
                         break PageView {
-                            attempt_id,
+                            attempt_id: attempt_id.clone(),
                             entries,
                             next_entry,
                             closed: page_closed,
                             no_record: false,
                             truncated_tail: page_truncated_tail,
                             complete: false,
+                            transcript: TranscriptState::new(TranscriptId::from(
+                                attempt_id.clone(),
+                            )),
                         };
                     }
                     from = next_entry;
                 }
                 Ok(PageResponse::NoRecord) => {
                     break PageView {
-                        attempt_id,
+                        attempt_id: attempt_id.clone(),
                         entries: Vec::new(),
                         next_entry: 0,
                         closed: true,
                         no_record: true,
                         truncated_tail: false,
                         complete: true,
+                        transcript: TranscriptState::new(TranscriptId::from(attempt_id.clone())),
                     }
                 }
                 Err(ClientError::Refused { code, message })
@@ -1295,6 +1376,18 @@ impl RemoteApp {
             }
         };
         if let Some(detail) = self.detail.as_mut() {
+            let mut page = page;
+            let entries = page.entries.iter().map(agent_transcript_entry).collect();
+            if let Some(previous) = detail
+                .page
+                .as_ref()
+                .filter(|previous| previous.attempt_id == page.attempt_id)
+            {
+                page.transcript = previous.transcript.clone();
+                page.transcript.replace_entries(entries);
+            } else {
+                page.transcript.load(entries);
+            }
             detail.page = Some(page);
         }
     }

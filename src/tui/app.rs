@@ -101,6 +101,9 @@ use crate::tui::conversation::{classify, ClassifiedEntry, EntryKind};
 use crate::tui::failure_form::{FailureAction, FailureForm};
 use crate::tui::refresh::{RefreshSchedule, DEBOUNCE};
 use crate::tui::scroll::{sanitize, ScrollState};
+use crate::tui::transcript::{
+    DisplayMode, TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptState,
+};
 use crate::workflows::{ResolvedWorkflow, WorkflowEntry, WorkflowResolver};
 
 pub use crate::tui::input_form::{
@@ -1174,6 +1177,9 @@ pub enum TaskContent {
         /// tail is deliberately not called complete: its final record is not
         /// yet safe to show as retained history.
         complete: bool,
+        /// Source-neutral reader state.  Unlike `content_scroll`, this is a
+        /// logical-line viewport and preserves its anchor across reloads.
+        transcript: TranscriptState,
     },
     /// No conversation to show — a script step, an agent step whose
     /// conversation never started, or an old-format log (R11) — so the
@@ -1565,7 +1571,13 @@ impl App {
                 ("r", "refresh"),
             ];
             if view.focus == TaskFocus::Content {
-                keys.push(("Enter/space", "expand/collapse"));
+                if matches!(view.content, TaskContent::Conversation { .. }) {
+                    keys[1] = ("j/k", "scroll history");
+                    keys.push(("Enter/space/e", "expand detail"));
+                    keys.push(("v", "raw/rendered"));
+                } else {
+                    keys.push(("Enter/space", "expand/collapse"));
+                }
             }
             if let Some(action) = self.input_shortcut() {
                 keys.push(("i", action));
@@ -2579,22 +2591,39 @@ impl App {
                     }
                 };
                 if let Screen::Task(view) = &mut self.screen {
-                    let existing = if append {
+                    let (existing, mut transcript) = if append {
                         match std::mem::replace(&mut view.content, TaskContent::Empty) {
-                            TaskContent::Conversation { entries, .. } => entries,
-                            _ => Vec::new(),
+                            TaskContent::Conversation {
+                                entries,
+                                transcript,
+                                ..
+                            } => (entries, transcript),
+                            _ => (
+                                Vec::new(),
+                                TranscriptState::new(TranscriptId::from(attempt_id.clone())),
+                            ),
                         }
                     } else {
-                        Vec::new()
+                        (
+                            Vec::new(),
+                            TranscriptState::new(TranscriptId::from(attempt_id.clone())),
+                        )
                     };
                     let mut entries = existing;
                     entries.extend(fresh);
+                    let projected = entries.iter().map(agent_transcript_entry).collect();
+                    if append {
+                        transcript.replace_entries(projected);
+                    } else {
+                        transcript.load(projected);
+                    }
                     view.content = TaskContent::Conversation {
                         entries,
                         next_entry,
                         closed,
                         truncated_tail,
                         complete,
+                        transcript,
                     };
                 }
             }
@@ -2677,6 +2706,14 @@ impl App {
             KeyCode::PageUp => self.page_task_cursor(-1),
             KeyCode::Char('g') | KeyCode::Home => self.jump_task_cursor(false),
             KeyCode::Char('G') | KeyCode::End => self.jump_task_cursor(true),
+            KeyCode::Char('v') if self.task_transcript_focused() => {
+                self.toggle_task_raw();
+                Request::None
+            }
+            KeyCode::Char('e') if self.task_transcript_focused() => {
+                self.toggle_task_transcript_detail();
+                Request::None
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 self.toggle_task_entry_expanded();
                 Request::None
@@ -2690,7 +2727,7 @@ impl App {
         match view.focus {
             TaskFocus::Axis => view.timeline.positions.len(),
             TaskFocus::Content => match &view.content {
-                TaskContent::Conversation { entries, .. } => entries.len(),
+                TaskContent::Conversation { transcript, .. } => transcript.logical_lines().len(),
                 TaskContent::Events { events, .. } => events.len(),
                 TaskContent::Empty => 0,
             },
@@ -2703,6 +2740,16 @@ impl App {
         let Screen::Task(view) = &mut self.screen else {
             return Request::None;
         };
+        if view.focus == TaskFocus::Content {
+            if let TaskContent::Conversation { transcript, .. } = &mut view.content {
+                if delta >= 0 {
+                    transcript.line_down();
+                } else {
+                    transcript.line_up();
+                }
+                return Request::None;
+            }
+        }
         let total = Self::task_pane_len(view);
         let scroll = match view.focus {
             TaskFocus::Axis => &mut view.axis_scroll,
@@ -2725,6 +2772,16 @@ impl App {
         let Screen::Task(view) = &mut self.screen else {
             return Request::None;
         };
+        if view.focus == TaskFocus::Content {
+            if let TaskContent::Conversation { transcript, .. } = &mut view.content {
+                if direction >= 0 {
+                    transcript.page_down();
+                } else {
+                    transcript.page_up();
+                }
+                return Request::None;
+            }
+        }
         let total = Self::task_pane_len(view);
         let scroll = match view.focus {
             TaskFocus::Axis => &mut view.axis_scroll,
@@ -2743,6 +2800,16 @@ impl App {
         let Screen::Task(view) = &mut self.screen else {
             return Request::None;
         };
+        if view.focus == TaskFocus::Content {
+            if let TaskContent::Conversation { transcript, .. } = &mut view.content {
+                if to_end {
+                    transcript.to_bottom();
+                } else {
+                    transcript.to_top();
+                }
+                return Request::None;
+            }
+        }
         let total = Self::task_pane_len(view);
         let scroll = match view.focus {
             TaskFocus::Axis => &mut view.axis_scroll,
@@ -2786,15 +2853,43 @@ impl App {
         if view.focus != TaskFocus::Content {
             return;
         }
-        let TaskContent::Conversation { entries, .. } = &view.content else {
+        let TaskContent::Conversation { transcript, .. } = &mut view.content else {
             return;
         };
-        let Some(entry) = entries.get(view.content_scroll.offset()) else {
+        let Some(anchor) = transcript.anchor() else {
             return;
         };
-        let number = entry.entry_number;
-        if !view.expanded.insert(number) {
-            view.expanded.remove(&number);
+        transcript.toggle_expanded(&anchor.entry_id);
+    }
+
+    fn task_transcript_focused(&self) -> bool {
+        matches!(&self.screen,
+            Screen::Task(view) if view.focus == TaskFocus::Content
+                && matches!(view.content, TaskContent::Conversation { .. }))
+    }
+
+    fn toggle_task_raw(&mut self) {
+        let Screen::Task(view) = &mut self.screen else {
+            return;
+        };
+        let TaskContent::Conversation { transcript, .. } = &mut view.content else {
+            return;
+        };
+        transcript.set_mode(match transcript.mode() {
+            DisplayMode::Rendered => DisplayMode::Raw,
+            DisplayMode::Raw => DisplayMode::Rendered,
+        });
+    }
+
+    fn toggle_task_transcript_detail(&mut self) {
+        let Screen::Task(view) = &mut self.screen else {
+            return;
+        };
+        let TaskContent::Conversation { transcript, .. } = &mut view.content else {
+            return;
+        };
+        if let Some(anchor) = transcript.anchor() {
+            transcript.toggle_expanded(&anchor.entry_id);
         }
     }
 
@@ -5047,6 +5142,46 @@ pub fn task_conversation_lines(
         }
     }
     lines
+}
+
+/// Adapts one retained agent record into the presentation model shared with
+/// conductor and remote conversations. The readable projection remains the
+/// default while raw mode can always return to the exact retained bytes.
+pub(crate) fn agent_transcript_entry(entry: &ClassifiedEntry) -> TranscriptEntry {
+    let header = format!(
+        "[{}] {}  {}  ({:?})",
+        entry.entry_number,
+        entry.timestamp.format("%H:%M:%S"),
+        entry.kind.label(),
+        entry.source
+    );
+    let technical = matches!(
+        entry.kind,
+        EntryKind::Thinking
+            | EntryKind::ToolCall
+            | EntryKind::ToolResult
+            | EntryKind::System
+            | EntryKind::Stderr
+            | EntryKind::Raw
+    );
+    let body: Vec<String> = sanitize(&entry.text).lines().map(str::to_owned).collect();
+    let rendered_lines = if technical {
+        vec![
+            header,
+            format!("  {} diagnostic — e/Enter to expand", entry.kind.label()),
+        ]
+    } else {
+        let mut lines = vec![header];
+        lines.extend(body.clone());
+        lines
+    };
+    let technical_lines = if technical { body } else { Vec::new() };
+    TranscriptEntry::new(
+        TranscriptEntryId::from(entry.entry_number.to_string()),
+        rendered_lines,
+        entry.raw.clone(),
+    )
+    .with_technical_lines(technical_lines)
 }
 
 /// The task view's content pane, for a step with no conversation (R11): its

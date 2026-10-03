@@ -154,13 +154,18 @@ fn render_conversation(frame: &mut Frame, app: &RemoteApp, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ))],
     };
-    // Show the end of the page: the newest entries matter most.
     let height = area.height.saturating_sub(2) as usize;
-    let skip = lines.len().saturating_sub(height);
+    let offset = page.map_or(0, |page| page.transcript.scroll_offset());
     frame.render_widget(
-        Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>())
-            .block(panel(title))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(offset)
+                .take(height)
+                .collect::<Vec<_>>(),
+        )
+        .block(panel(title))
+        .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -173,17 +178,10 @@ fn page_lines(page: &PageView) -> Vec<Line<'static>> {
         ))];
     }
     let mut lines: Vec<Line> = page
-        .entries
-        .iter()
-        .map(|entry| {
-            Line::from(vec![
-                Span::styled(
-                    format!("{:>5} {:<10} ", entry.entry_number, entry.kind.label()),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(sanitize(&entry.text)),
-            ])
-        })
+        .transcript
+        .logical_lines()
+        .into_iter()
+        .map(|line| Line::from(sanitize(&line.text)))
         .collect();
     lines.push(Line::from(Span::styled(
         if page.truncated_tail {

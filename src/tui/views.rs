@@ -30,9 +30,9 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use super::app::{
-    event_detail_lines, event_line, task_conversation_lines, task_events_lines, task_position_line,
-    App, Attention, EntryMap, FormRow, InputForm, InputKind, Modal, NewTaskStage, Panel,
-    RepositoryField, Screen, TaskContent, TaskFocus, TaskView, TransitionMode,
+    event_detail_lines, event_line, task_events_lines, task_position_line, App, Attention,
+    EntryMap, FormRow, InputForm, InputKind, Modal, NewTaskStage, Panel, RepositoryField, Screen,
+    TaskContent, TaskFocus, TaskView, TransitionMode,
 };
 use super::chat::{ChatFocus, ChatPanel};
 use super::failure_form::FailureRow;
@@ -355,19 +355,14 @@ fn render_task_content(frame: &mut Frame, view: &TaskView, area: Rect) {
         }))
         .title(title);
 
-    // The content pane always renders starting at the selected entry, so a
-    // variable-height entry (a collapsed vs. an expanded tool result) never
-    // has to be measured in advance to keep the cursor on screen — the same
-    // reasoning `render_task_axis` applies to positions, adapted for
-    // entries whose rendered height is not uniform.
-    let cursor = view.content_scroll.offset();
     let lines: Vec<String> = match &view.content {
-        TaskContent::Conversation { entries, .. } => {
-            let start = cursor.min(entries.len());
-            task_conversation_lines(&entries[start..], 0, &view.expanded)
-        }
+        TaskContent::Conversation { transcript, .. } => transcript
+            .logical_lines()
+            .into_iter()
+            .map(|line| line.text)
+            .collect(),
         TaskContent::Events { message, events } => {
-            let start = cursor.min(events.len());
+            let start = view.content_scroll.offset().min(events.len());
             task_events_lines(message, &events[start..], 0)
         }
         TaskContent::Empty => vec!["Loading…".to_string()],
@@ -375,7 +370,11 @@ fn render_task_content(frame: &mut Frame, view: &TaskView, area: Rect) {
 
     let inner_width = area.width.saturating_sub(2).max(1) as usize;
     let inner_height = area.height.saturating_sub(2).max(1) as usize;
-    let visible: Vec<Line> = wrap_visible(&lines, inner_width, 0, inner_height)
+    let offset = match &view.content {
+        TaskContent::Conversation { transcript, .. } => transcript.scroll_offset(),
+        _ => view.content_scroll.offset(),
+    };
+    let visible: Vec<Line> = wrap_visible(&lines, inner_width, offset, inner_height)
         .into_iter()
         .map(Line::from)
         .collect();
@@ -1802,7 +1801,9 @@ fn render_help_modal(frame: &mut Frame) {
             "Task view",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from("  c                 conductor chat: Enter sends, Tab switches to the history,"),
+        Line::from("  Content focus     j/k, PgUp/PgDn, g/G read transcript history; e/Enter expands detail; v toggles raw"),
+        Line::from("  c                 conductor chat: Tab cycles draft / history / action target"),
+        Line::from("                    draft types and Enter sends; history uses navigation, e detail, v raw; [/] chooses actions"),
         Line::from("                    y / n confirm / reject a proposal, u undoes a decision"),
         Line::from(""),
         Line::from(Span::styled(
