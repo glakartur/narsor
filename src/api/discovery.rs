@@ -88,6 +88,14 @@ pub enum DiscoveryError {
     /// Detach-spawning a fresh daemon process failed at the OS level (e.g.
     /// `current_exe()`, opening the log file, or the `fork`/`exec` itself).
     Spawn(std::io::Error),
+    /// The discovery file is readable or writable by someone other than
+    /// this user, or belongs to another user: it could point this client —
+    /// and the token it would send — at somebody else's server, so it is
+    /// not trusted, and not removed either (it is not this user's to remove).
+    Unprotected(std::path::PathBuf),
+    /// The daemon on this state root runs in network mode: it has no local
+    /// token, and a client authenticates with an OIDC token instead.
+    NetworkMode,
     /// Waited [`DISCOVERY_TIMEOUT`] without ever seeing a discovery file
     /// that both names a live PID and answers an authenticated health
     /// check — whether this caller was the one spawning or was waiting on
@@ -104,6 +112,17 @@ impl std::fmt::Display for DiscoveryError {
             DiscoveryError::Spawn(error) => {
                 write!(f, "could not launch the narsor daemon: {error}")
             }
+            DiscoveryError::Unprotected(path) => write!(
+                f,
+                "refusing the daemon discovery file '{}': it must belong to you and be \
+                 readable by you only (mode 0600)",
+                path.display()
+            ),
+            DiscoveryError::NetworkMode => write!(
+                f,
+                "the narsor daemon on this state directory runs in network mode; connect \
+                 to it with an OIDC token instead of the local discovery file"
+            ),
             DiscoveryError::Timeout => write!(
                 f,
                 "timed out waiting for the narsor daemon to start and answer"
@@ -117,7 +136,9 @@ impl std::error::Error for DiscoveryError {
         match self {
             DiscoveryError::Persistence(error) => Some(error),
             DiscoveryError::Spawn(error) => Some(error),
-            DiscoveryError::Timeout => None,
+            DiscoveryError::Unprotected(_)
+            | DiscoveryError::NetworkMode
+            | DiscoveryError::Timeout => None,
         }
     }
 }
@@ -145,7 +166,10 @@ pub async fn ensure_daemon_running(
 ) -> Result<ApiClient, DiscoveryError> {
     let daemon_file = paths.daemon_file();
 
-    if let Ok(info) = DaemonInfo::read(&daemon_file) {
+    if let Some(info) = read_protected(&daemon_file)? {
+        if info.is_alive() && info.token.is_empty() {
+            return Err(DiscoveryError::NetworkMode);
+        }
         if info.is_alive() && health_check(&info).await {
             return Ok(client_for(&info));
         }
@@ -285,7 +309,7 @@ async fn poll_until_ready(
 ) -> Result<DaemonInfo, DiscoveryError> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(info) = DaemonInfo::read(daemon_file) {
+        if let Some(info) = read_protected(daemon_file)? {
             if health_check(&info).await {
                 return Ok(info);
             }
@@ -295,6 +319,28 @@ async fn poll_until_ready(
         }
         tokio::time::sleep(DISCOVERY_POLL_INTERVAL).await;
     }
+}
+
+/// Reads the discovery file, but only trusts one that is protected: a
+/// regular file owned by this user with no group or other permission bits
+/// — the way the daemon writes it (`0600` from the first byte). Trusted
+/// mode's whole security rests on that file being private (R36).
+///
+/// `Ok(None)` when there is no usable file (absent, not a regular file,
+/// unparseable): the same as no daemon, as before.
+fn read_protected(path: &Path) -> Result<Option<DaemonInfo>, DiscoveryError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return Ok(None),
+    };
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if metadata.uid() != me || metadata.mode() & 0o077 != 0 {
+        return Err(DiscoveryError::Unprotected(path.to_path_buf()));
+    }
+    Ok(DaemonInfo::read(path).ok())
 }
 
 /// A real, authenticated request against the address/token a discovery

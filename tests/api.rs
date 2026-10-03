@@ -746,6 +746,45 @@ async fn missing_or_wrong_token_is_refused() {
     assert_eq!(wrong_token.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
+/// U7: trusted mode answers who the caller is only with the process token,
+/// and has no owner to claim.
+#[tokio::test]
+async fn trusted_mode_names_itself_to_the_token_holder_and_has_nothing_to_claim() {
+    let root = TempRoot::new();
+    let handle = start_server(root.store()).await;
+    let raw = reqwest::Client::new();
+
+    let whoami: serde_json::Value = raw
+        .get(url(&handle, "/auth/v1/whoami"))
+        .bearer_auth(handle.token())
+        .send()
+        .await
+        .expect("whoami")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(whoami["mode"], "trusted");
+    assert_eq!(whoami["owner"], true);
+
+    let stranger = raw
+        .get(url(&handle, "/auth/v1/whoami"))
+        .bearer_auth("not-the-token")
+        .send()
+        .await
+        .expect("whoami");
+    assert_eq!(stranger.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(stranger.text().await.unwrap().is_empty());
+
+    let claim = raw
+        .post(url(&handle, "/auth/v1/claim"))
+        .bearer_auth(handle.token())
+        .json(&serde_json::json!({ "claim_code": "nsclaim-x" }))
+        .send()
+        .await
+        .expect("claim");
+    assert_eq!(claim.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn unknown_execution_is_reported_as_not_found() {
     let root = TempRoot::new();

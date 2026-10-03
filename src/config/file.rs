@@ -410,7 +410,26 @@ fn value_of(setting: SettingKey, raw: &serde_yaml::Value) -> Result<SettingValue
         }
     }
 
+    // A list may be written as a YAML sequence of texts; it is held as the
+    // same comma-separated text the environment variable carries, so both
+    // are validated by one path.
+    if setting.is_list() {
+        if let Some(items) = raw.as_sequence() {
+            let texts = items.iter().map(text_of).collect::<Result<Vec<_>, _>>()?;
+            return value_from_text(setting, &texts.join(","));
+        }
+    }
+
     value_from_text(setting, &text_of(raw)?)
+}
+
+/// The entries of a comma-separated list setting, trimmed, empties dropped.
+pub fn split_list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Validates one value written as text.
@@ -465,6 +484,52 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             // The same character set as a backend id; only the word differs.
             .map_err(|error| error.to_string().replacen("backend", "profile", 1)),
 
+        SettingKey::ServerMode => one_of(
+            text,
+            "server mode",
+            &[settings::SERVER_MODE_TRUSTED, settings::SERVER_MODE_NETWORK],
+        ),
+
+        SettingKey::TlsTermination => one_of(
+            text,
+            "TLS termination",
+            &[
+                settings::TLS_TERMINATION_NONE,
+                settings::TLS_TERMINATION_PROXY,
+            ],
+        ),
+
+        SettingKey::ServerBind => {
+            crate::auth::parse_bind(text).map(|_| SettingValue::Text(text.trim().to_string()))
+        }
+
+        SettingKey::OidcIssuer => {
+            if text.trim().is_empty() {
+                return Ok(SettingValue::Text(String::new()));
+            }
+            crate::auth::parse_issuer(text).map(|_| SettingValue::Text(text.trim().to_string()))
+        }
+
+        SettingKey::OidcAudience | SettingKey::OwnerSubject => {
+            Ok(SettingValue::Text(text.trim().to_string()))
+        }
+
+        SettingKey::TrustedProxies => {
+            let items = split_list(text);
+            for item in &items {
+                crate::auth::parse_proxy(item)?;
+            }
+            Ok(SettingValue::Text(items.join(",")))
+        }
+
+        SettingKey::CorsAllowedOrigins => {
+            let items = split_list(text);
+            for item in &items {
+                crate::auth::parse_origin(item)?;
+            }
+            Ok(SettingValue::Text(items.join(",")))
+        }
+
         SettingKey::LogLevel => {
             let level = text.trim().to_lowercase();
             if LOG_LEVELS.contains(&level.as_str()) {
@@ -476,6 +541,19 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
                 ))
             }
         }
+    }
+}
+
+/// One word out of a closed set, compared without regard to case.
+fn one_of(text: &str, what: &str, allowed: &[&str]) -> Result<SettingValue, String> {
+    let word = text.trim().to_lowercase();
+    if allowed.contains(&word.as_str()) {
+        Ok(SettingValue::Text(word))
+    } else {
+        Err(format!(
+            "unknown {what} '{text}'; allowed values are: {}",
+            allowed.join(", ")
+        ))
     }
 }
 

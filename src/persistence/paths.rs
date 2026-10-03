@@ -79,6 +79,19 @@ pub const DAEMON_FILE: &str = "daemon.json";
 /// several clients discovering no daemon at once.
 pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
 
+/// Network-mode ownership records (U7, R38): the installation owner and,
+/// until somebody claims it, the one-time claim code.
+pub const AUTH_DIR: &str = "auth";
+
+/// The installation owner's durable record.
+pub const OWNER_FILE: &str = "owner.json";
+
+/// The digest of the current one-time claim code.
+pub const CLAIM_FILE: &str = "claim.json";
+
+/// The current one-time claim code itself, for the operator to read (`0600`).
+pub const CLAIM_CODE_FILE: &str = "claim-code";
+
 /// Versioned durable override for the daemon's default agent harness.
 ///
 /// This is state owned by the daemon, rather than configuration: deployments
@@ -237,6 +250,26 @@ impl StatePaths {
     /// `{root}/daemon.lock`
     pub fn daemon_lock_file(&self) -> PathBuf {
         self.root.join(DAEMON_LOCK_FILE)
+    }
+
+    /// `{root}/auth`
+    pub fn auth_dir(&self) -> PathBuf {
+        self.root.join(AUTH_DIR)
+    }
+
+    /// `{root}/auth/owner.json`
+    pub fn owner_file(&self) -> PathBuf {
+        self.auth_dir().join(OWNER_FILE)
+    }
+
+    /// `{root}/auth/claim.json`
+    pub fn claim_file(&self) -> PathBuf {
+        self.auth_dir().join(CLAIM_FILE)
+    }
+
+    /// `{root}/auth/claim-code`
+    pub fn claim_code_file(&self) -> PathBuf {
+        self.auth_dir().join(CLAIM_CODE_FILE)
     }
 
     /// `{root}/agent-harness.json`

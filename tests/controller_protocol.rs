@@ -144,10 +144,11 @@ impl Harness {
             .create_enrollment(backend, &CreateEnrollmentRequest::default())
             .await
             .expect("enrollment code");
-        let (client, enrolled) = ControllerClient::enroll(self.base_url(), &code.enrollment_code)
+        let (client, _) = ControllerClient::enroll(self.base_url(), &code.enrollment_code)
             .await
             .expect("enroll");
-        (client, enrolled.credential)
+        let credential = client.credential().expect("a signing credential");
+        (client, credential)
     }
 
     async fn enroll(&self, backend: &str) -> ControllerClient {

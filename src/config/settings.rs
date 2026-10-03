@@ -67,6 +67,28 @@ pub const DEFAULT_TUI_REFRESH_SECS: u64 = 10;
 /// installation without any remote backend has always used.
 pub const DEFAULT_BACKEND: &str = "local";
 
+/// The server's security mode when nothing says otherwise (R36): the local
+/// daemon's loopback-only random-token mode, which is what every
+/// installation ran before network mode existed.
+pub const SERVER_MODE_TRUSTED: &str = "trusted";
+
+/// The networked mode (R35): OIDC users, one installation owner, TLS
+/// terminated by a trusted proxy.
+pub const SERVER_MODE_NETWORK: &str = "network";
+
+/// Where the server listens when nothing says otherwise: a loopback port the
+/// system picks, so several local daemons never collide.
+pub const DEFAULT_SERVER_BIND: &str = "127.0.0.1:0";
+
+/// No TLS policy: only valid in trusted mode, whose socket never leaves the
+/// machine.
+pub const TLS_TERMINATION_NONE: &str = "none";
+
+/// TLS is terminated by a reverse proxy at one of `trusted_proxies`; the
+/// server accepts only connections from those addresses that say the client
+/// spoke HTTPS.
+pub const TLS_TERMINATION_PROXY: &str = "proxy";
+
 // ---------------------------------------------------------------------------
 // The registry
 // ---------------------------------------------------------------------------
@@ -100,11 +122,29 @@ pub enum SettingKey {
     /// The user profile a new remote task uses when its request names none
     /// (R16).
     DefaultProfile,
+    /// `trusted` (loopback, random token) or `network` (OIDC, one owner).
+    ServerMode,
+    /// The address the daemon's API listens on.
+    ServerBind,
+    /// The OIDC issuer network mode trusts, matched exactly.
+    OidcIssuer,
+    /// The audience every accepted token must carry.
+    OidcAudience,
+    /// The OIDC subject that owns the installation (R38); unset means the
+    /// first identity presenting the one-time claim code becomes the owner.
+    OwnerSubject,
+    /// Who terminates TLS in network mode: `proxy` (or `none` in trusted mode).
+    TlsTermination,
+    /// Addresses (or CIDR ranges) of the TLS-terminating proxies.
+    TrustedProxies,
+    /// Browser origins allowed to call the API; empty denies every
+    /// cross-origin request.
+    CorsAllowedOrigins,
 }
 
 impl SettingKey {
     /// Every setting, in the order `config show` prints them.
-    pub const ALL: [SettingKey; 9] = [
+    pub const ALL: [SettingKey; 17] = [
         SettingKey::CatalogDir,
         SettingKey::StateDir,
         SettingKey::WorkDir,
@@ -114,6 +154,14 @@ impl SettingKey {
         SettingKey::TuiRefreshInterval,
         SettingKey::DefaultBackend,
         SettingKey::DefaultProfile,
+        SettingKey::ServerMode,
+        SettingKey::ServerBind,
+        SettingKey::OidcIssuer,
+        SettingKey::OidcAudience,
+        SettingKey::OwnerSubject,
+        SettingKey::TlsTermination,
+        SettingKey::TrustedProxies,
+        SettingKey::CorsAllowedOrigins,
     ];
 
     /// The three roots, in the order `config show` prints them.
@@ -135,6 +183,14 @@ impl SettingKey {
             SettingKey::TuiRefreshInterval => "tui_refresh_interval",
             SettingKey::DefaultBackend => "default_backend",
             SettingKey::DefaultProfile => "default_profile",
+            SettingKey::ServerMode => "server_mode",
+            SettingKey::ServerBind => "server_bind",
+            SettingKey::OidcIssuer => "oidc_issuer",
+            SettingKey::OidcAudience => "oidc_audience",
+            SettingKey::OwnerSubject => "owner_subject",
+            SettingKey::TlsTermination => "tls_termination",
+            SettingKey::TrustedProxies => "trusted_proxies",
+            SettingKey::CorsAllowedOrigins => "cors_allowed_origins",
         }
     }
 
@@ -166,7 +222,15 @@ impl SettingKey {
             | SettingKey::LogLevel
             | SettingKey::TuiRefreshInterval
             | SettingKey::DefaultBackend
-            | SettingKey::DefaultProfile => false,
+            | SettingKey::DefaultProfile
+            | SettingKey::ServerMode
+            | SettingKey::ServerBind
+            | SettingKey::OidcIssuer
+            | SettingKey::OidcAudience
+            | SettingKey::OwnerSubject
+            | SettingKey::TlsTermination
+            | SettingKey::TrustedProxies
+            | SettingKey::CorsAllowedOrigins => false,
         }
     }
 
@@ -194,7 +258,26 @@ impl SettingKey {
             SettingKey::DefaultProfile => {
                 SettingValue::Text(crate::environment::DEFAULT_PROFILE.to_string())
             }
+            SettingKey::ServerMode => SettingValue::Text(SERVER_MODE_TRUSTED.to_string()),
+            SettingKey::ServerBind => SettingValue::Text(DEFAULT_SERVER_BIND.to_string()),
+            SettingKey::TlsTermination => SettingValue::Text(TLS_TERMINATION_NONE.to_string()),
+            // Empty text is "not set": network mode refuses to start without
+            // the ones it needs (`crate::auth::SecuritySettings::validate`).
+            SettingKey::OidcIssuer
+            | SettingKey::OidcAudience
+            | SettingKey::OwnerSubject
+            | SettingKey::TrustedProxies
+            | SettingKey::CorsAllowedOrigins => SettingValue::Text(String::new()),
         }
+    }
+
+    /// Whether the value is a list, which the file may also write as a YAML
+    /// sequence and the environment writes comma-separated.
+    pub fn is_list(self) -> bool {
+        matches!(
+            self,
+            SettingKey::TrustedProxies | SettingKey::CorsAllowedOrigins
+        )
     }
 
     /// Whether the value is a duration, which the file may also write as a
@@ -423,7 +506,15 @@ mod tests {
                 "log_level",
                 "tui_refresh_interval",
                 "default_backend",
-                "default_profile"
+                "default_profile",
+                "server_mode",
+                "server_bind",
+                "oidc_issuer",
+                "oidc_audience",
+                "owner_subject",
+                "tls_termination",
+                "trusted_proxies",
+                "cors_allowed_origins"
             ],
             "the registry is the one place the settings live, and the three \
              roots lead because that is the order `config show` prints"

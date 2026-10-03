@@ -85,7 +85,15 @@ impl Flags {
             | SettingKey::LogLevel
             | SettingKey::TuiRefreshInterval
             | SettingKey::DefaultBackend
-            | SettingKey::DefaultProfile => None,
+            | SettingKey::DefaultProfile
+            | SettingKey::ServerMode
+            | SettingKey::ServerBind
+            | SettingKey::OidcIssuer
+            | SettingKey::OidcAudience
+            | SettingKey::OwnerSubject
+            | SettingKey::TlsTermination
+            | SettingKey::TrustedProxies
+            | SettingKey::CorsAllowedOrigins => None,
         }
     }
 }
@@ -276,6 +284,20 @@ impl Resolved {
         self.value(SettingKey::DefaultProfile)
             .as_text()
             .expect("the default profile is text")
+    }
+
+    /// One text setting as written, `None` when it is empty (not set).
+    pub fn text(&self, setting: SettingKey) -> Option<&str> {
+        self.value(setting)
+            .as_text()
+            .filter(|text| !text.trim().is_empty())
+    }
+
+    /// A list setting's entries, in the order written.
+    pub fn list(&self, setting: SettingKey) -> Vec<String> {
+        self.text(setting)
+            .map(super::file::split_list)
+            .unwrap_or_default()
     }
 
     /// What the engine needs from the configuration for an `agent` action.

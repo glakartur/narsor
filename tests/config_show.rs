@@ -47,7 +47,7 @@ const EXIT_FAILURE: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 
 /// Every setting the command must account for (R7).
-const EVERY_SETTING: [&str; 9] = [
+const EVERY_SETTING: [&str; 17] = [
     "catalog_dir",
     "state_dir",
     "work_dir",
@@ -57,6 +57,14 @@ const EVERY_SETTING: [&str; 9] = [
     "tui_refresh_interval",
     "default_backend",
     "default_profile",
+    "server_mode",
+    "server_bind",
+    "oidc_issuer",
+    "oidc_audience",
+    "owner_subject",
+    "tls_termination",
+    "trusted_proxies",
+    "cors_allowed_origins",
 ];
 
 /// A temporary directory that deletes itself when it goes out of scope.

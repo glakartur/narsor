@@ -51,26 +51,54 @@ crossterm = "0.29.0"
 # Conversation log compression (closed attempts only, see src/persistence/conversation.rs)
 zstd = "0.13"
 
-# Hashing of controller, enrollment and runner bearer credentials before they
-# are stored (src/controller_protocol/credentials.rs): the control plane keeps
-# only a digest of each secret, so its state directory never holds a usable
-# credential. Already in the lock file through other crates.
+# Hashing of enrollment codes, runner credentials and the owner claim code
+# before they are stored (src/controller_protocol/credentials.rs,
+# src/auth/owner.rs), and of signed controller request bodies
+# (src/auth/pop.rs): the control plane keeps only a digest of each secret, so
+# its state directory never holds a usable credential. Already in the lock
+# file through other crates.
 sha2 = "0.10"
 
 # Lossless byte-for-byte encoding of raw harness lines inside a JSONL envelope
 base64 = "0.22"
 
-# HTTP client for the embedded API (src/api/client.rs). No TLS and no default
-# middleware: the server is loopback-only (see src/api/mod.rs), so the extra
-# default features would be dead weight.
+# HTTP client for the embedded API (src/api/client.rs), the controller and
+# runner protocol clients and OIDC discovery (src/auth/oidc.rs). No default
+# middleware. "rustls-tls": a controller or runner reaches a network-mode
+# control plane over HTTPS, and an OIDC issuer is only ever reached over
+# HTTPS; rustls keeps the build free of a system OpenSSL.
 # "stream" adds `Response::bytes_stream`/`chunk`, needed by the SSE
-# integration tests (tests/sse.rs) to read a streaming response body; the
-# embedded client itself (src/api/client.rs) only ever reads whole bodies and
-# does not use it.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+# integration tests (tests/sse.rs, tests/auth.rs) to read a streaming
+# response body; the embedded client itself (src/api/client.rs) only ever
+# reads whole bodies and does not use it.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 # Named explicitly so `src/api/client.rs`'s hand-rolled SSE parser can name
 # `bytes::Bytes` (the item type of `reqwest::Response::bytes_stream()`)
 # without going through reqwest's own re-export surface, which does not
 # expose it. Already pulled in transitively by reqwest/hyper.
 bytes = "1"
+
+# OIDC access-token verification in network mode (src/auth/oidc.rs):
+# signature, algorithm and registered-claim checks against the issuer's
+# JWKS. `rust_crypto` keeps it pure Rust (no C toolchain for aws-lc); PEM
+# support is off because keys only ever arrive as JWKs.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+
+# Controller proof-of-possession (src/auth/pop.rs): each controller holds an
+# Ed25519 key it generated itself and signs every request. Already pulled in
+# by jsonwebtoken's `rust_crypto`; named here for key generation.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# The OS random source for generating those keys.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Trusted-proxy address ranges of the network mode's TLS-termination policy
+# (src/auth/settings.rs). Already in the lock file through reqwest.
+ipnet = "2"
+
+[dev-dependencies]
+# ES256 keys for the in-process mock OIDC issuer of tests/auth.rs. Already in
+# the tree through jsonwebtoken's `rust_crypto`.
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+# EdDSA test keys exported as PKCS#8, the form jsonwebtoken signs with.
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }

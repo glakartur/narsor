@@ -59,7 +59,10 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use tokio::signal::unix::{signal, SignalKind};
 
-use crate::api::{ActiveTasks, ApiServices};
+use crate::api::{ActiveTasks, ApiServices, ServerSecurity};
+use crate::auth::{
+    NetworkAuth, OidcVerifier, OwnerStore, SecurityPlan, SecuritySettings, StartupOwnership,
+};
 use crate::conductor::{ConductorRegistry, HarnessInvoker, PassLauncher};
 use crate::config::Resolved;
 use crate::controller_protocol::ProtocolService;
@@ -123,6 +126,9 @@ const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// the only way out is that signal.
 pub async fn run_daemon(config: &Resolved) -> Result<()> {
     let paths = config.state_paths();
+    // Before anything is touched: a security configuration that does not
+    // hold up must stop the daemon, not leave it half started (U7).
+    let security = server_security(config, &paths)?;
     let store = ExecutionStore::new(config.state_dir());
 
     let recovery = recover_at_startup(&store);
@@ -195,7 +201,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
 
     // The engine and API share one selector, so a confirmed setting affects
     // later harnessless attempts without restarting the daemon.
-    let api_handle = crate::api::start_with_services(
+    let api_handle = crate::api::serve(
         Arc::clone(&engine),
         config.catalog_dir().to_path_buf(),
         config.work_dir().to_path_buf(),
@@ -205,6 +211,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
             conductor: Some(Arc::clone(&conductor)),
             control: Some(control),
         },
+        security,
     )
     .await
     .map_err(|error| {
@@ -266,6 +273,58 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     cleanup_discovery_file(&paths.daemon_file());
 
     Ok(())
+}
+
+/// The server's security mode from the configuration (U7), or a failure
+/// naming every problem.
+///
+/// In network mode this also opens the installation's ownership records:
+/// with no owner configured or recorded, a fresh one-time claim code is
+/// printed to stderr (the daemon's log in a container) and stored `0600`
+/// beside them for the operator.
+fn server_security(
+    config: &Resolved,
+    paths: &crate::persistence::StatePaths,
+) -> Result<ServerSecurity> {
+    let plan = SecuritySettings::from_config(config)
+        .validate()
+        .map_err(|error| CliError::failure(error.to_string()))?;
+    let network = match plan {
+        SecurityPlan::Trusted { bind, cors } => return Ok(ServerSecurity::Trusted { bind, cors }),
+        SecurityPlan::Network(network) => network,
+    };
+    let issuer = network.oidc.issuer.clone();
+    let verifier = OidcVerifier::new(network.oidc)
+        .map_err(|error| CliError::failure(format!("oidc_issuer: {error}")))?;
+    let (owners, ownership) = OwnerStore::open(paths, &issuer, network.owner_subject.as_deref())
+        .map_err(|error| {
+            CliError::failure(format!(
+                "could not open the installation owner record: {error}"
+            ))
+        })?;
+    match ownership {
+        StartupOwnership::Owned(owner) => tracing::info!(
+            subject = %owner.subject,
+            bound_by = ?owner.bound_by,
+            "daemon: network mode; the installation has an owner"
+        ),
+        StartupOwnership::Unclaimed { code, code_file } => {
+            eprintln!(
+                "narsor: this installation has no owner yet. The first user to claim it with \
+                 this one-time code becomes its owner:\n  {}\n(also stored in {}; a restart \
+                 issues a new code)",
+                code.expose(),
+                code_file.display()
+            );
+            tracing::warn!("daemon: network mode; the installation is unclaimed");
+        }
+    }
+    Ok(ServerSecurity::Network {
+        bind: network.bind,
+        auth: Arc::new(NetworkAuth::new(verifier, owners)),
+        proxy: network.proxy,
+        cors: network.cors,
+    })
 }
 
 /// Reconciles every stored execution against its event log (D23) — moved

@@ -11,7 +11,17 @@
 //! Each gate answers every refusal with a bare `401` — the same rule as the
 //! API's token gate, so a credential is never confirmed or denied by
 //! anything but the status code. `POST /controller/v1/enroll` sits outside
-//! the controller gate: the one-time code in its body is the credential.
+//! the controller gate: the one-time code in its body, signed by the key it
+//! binds, is the credential.
+//!
+//! The controller gate reads the whole (bounded) body before the handler
+//! does: a controller's signature covers it ([`crate::auth::pop`]), so a
+//! request cannot be replayed with another body.
+//!
+//! Enrollment codes, the controller list and revocation are the installation
+//! operator's: the owner gate marks such a caller with
+//! [`crate::auth::Operator`], and these handlers refuse anyone else with a
+//! bare `403`.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -33,6 +43,8 @@ use super::credentials::{ControllerIdentity, RunnerIdentity};
 use super::error::{ProtocolError, ProtocolResult};
 use super::service::ProtocolService;
 use super::wire::*;
+use crate::auth::pop::SignedRequest;
+use crate::auth::Operator;
 use crate::domain::TaskId;
 use crate::orchestration::{OwnerRef, TaskEvent};
 
@@ -40,6 +52,10 @@ type Service = Arc<ProtocolService>;
 
 /// How often an idle control-plane stream sends a keep-alive comment.
 const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Largest controller request body the gate reads to check its signature.
+/// Controllers send small JSON documents; nothing legitimate comes close.
+const MAX_CONTROLLER_BODY: usize = 1024 * 1024;
 
 /// Owner-facing routes. They expect the caller's [`OwnerRef`] in the
 /// request extensions, put there by the API's owner gate.
@@ -83,6 +99,7 @@ where
 {
     let gated = Router::new()
         .route("/controller/v1/heartbeat", post(post_heartbeat))
+        .route("/controller/v1/key", post(post_rotate_key))
         .route("/controller/v1/lease", post(post_acquire_lease))
         .route("/controller/v1/lease/renew", post(post_renew_lease))
         .route("/controller/v1/lease/release", post(post_release_lease))
@@ -132,20 +149,45 @@ fn bearer(request: &Request) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
-/// The controller credential gate: a bare `401` for anything but a valid,
-/// unrevoked controller credential.
+/// The controller gate: a bare `401` for anything but a fresh, unreplayed
+/// request signed by the key of an unrevoked controller identity.
 async fn require_controller(
     State(service): State<Service>,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> Response {
-    match bearer(&request).and_then(|token| service.authenticate_controller(token)) {
+    let (parts, body) = request.into_parts();
+    let Ok(body) = axum::body::to_bytes(body, MAX_CONTROLLER_BODY).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let authorization = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or(parts.uri.path(), |value| value.as_str());
+    let identity = service.authenticate_controller(&SignedRequest {
+        authorization,
+        method: parts.method.as_str(),
+        path_and_query,
+        body: &body,
+    });
+    match identity {
         Some(identity) => {
+            let mut request = Request::from_parts(parts, axum::body::Body::from(body));
             request.extensions_mut().insert(identity);
             next.run(request).await
         }
         None => StatusCode::UNAUTHORIZED.into_response(),
     }
+}
+
+/// The installation operator, or a bare `403` (R37: only the operator
+/// enrolls, lists and revokes controllers).
+fn require_operator(operator: Option<Extension<Operator>>) -> ProtocolResult<()> {
+    operator.map(|_| ()).ok_or(ProtocolError::Forbidden)
 }
 
 /// The runner credential gate: a bare `401` for anything but the current,
@@ -251,23 +293,29 @@ async fn get_events(
 
 async fn post_enrollment(
     State(service): State<Service>,
+    operator: Option<Extension<Operator>>,
     Path(backend_id): Path<String>,
     Json(request): Json<CreateEnrollmentRequest>,
 ) -> ProtocolResult<(StatusCode, Json<EnrollmentResponse>)> {
+    require_operator(operator)?;
     let response = service.create_enrollment(&backend_id, request)?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn list_controllers(
     State(service): State<Service>,
+    operator: Option<Extension<Operator>>,
 ) -> ProtocolResult<Json<ControllerListResponse>> {
+    require_operator(operator)?;
     Ok(Json(service.controllers()?))
 }
 
 async fn post_revoke_controller(
     State(service): State<Service>,
+    operator: Option<Extension<Operator>>,
     Path(controller_id): Path<String>,
 ) -> ProtocolResult<Json<ControllerView>> {
+    require_operator(operator)?;
     Ok(Json(service.revoke_controller(&controller_id)?))
 }
 
@@ -391,6 +439,14 @@ async fn post_enroll(
 ) -> ProtocolResult<(StatusCode, Json<EnrollResponse>)> {
     let response = service.enroll(request)?;
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn post_rotate_key(
+    State(service): State<Service>,
+    Extension(identity): Extension<ControllerIdentity>,
+    Json(request): Json<RotateKeyRequest>,
+) -> ProtocolResult<Json<RotateKeyResponse>> {
+    Ok(Json(service.rotate_controller_key(&identity, request)?))
 }
 
 async fn post_heartbeat(

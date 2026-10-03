@@ -20,6 +20,9 @@ use crate::orchestration::OrchestrationError;
 pub enum ProtocolError {
     /// No, a wrong, a revoked or an outdated credential. Bare `401`.
     Unauthorized,
+    /// The caller is authenticated but may not do this (an owner who is not
+    /// the installation's operator). Bare `403`.
+    Forbidden,
     /// The thing does not exist *for this caller*. Bare `404`.
     NotFound,
     /// The request is malformed. `400` with a reason.
@@ -60,6 +63,7 @@ impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unauthorized => f.write_str("unauthorized"),
+            Self::Forbidden => f.write_str("forbidden"),
             Self::NotFound => f.write_str("not found"),
             Self::BadRequest { code, message } | Self::Conflict { code, message } => {
                 write!(f, "{code}: {message}")
@@ -113,6 +117,7 @@ impl IntoResponse for ProtocolError {
     fn into_response(self) -> Response {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
+            Self::Forbidden => StatusCode::FORBIDDEN.into_response(),
             Self::NotFound => StatusCode::NOT_FOUND.into_response(),
             Self::BadRequest { code, message } => (
                 StatusCode::BAD_REQUEST,

@@ -14,7 +14,8 @@ mod engine_support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Whether this machine has a real system-wide configuration file.
 ///
@@ -700,4 +701,173 @@ fn the_root_flag_sets_all_three_and_every_row_names_it() {
             "{setting} must name the flag as its source: {row}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Server security mode (U7)
+// ---------------------------------------------------------------------------
+
+/// Starts `narsor daemon` the way [`cli`] runs a command, but never waits on
+/// it forever: a daemon that wrongly starts is killed after `deadline`, and
+/// its exit code then reads as the signal's.
+fn daemon(root: &TempRoot, environment: &[(&str, &str)], deadline: Duration) -> Invocation {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_narsor"));
+    command
+        .current_dir(root.path())
+        .env_clear()
+        .env("PATH", engine_support::fake_claude_first_on_path())
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = command.arg("daemon").spawn().expect("start the daemon");
+    let started = Instant::now();
+    while child.try_wait().expect("poll the daemon").is_none() {
+        if started.elapsed() > deadline {
+            // SAFETY: a plain signal to our own child.
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().expect("collect the daemon");
+    Invocation {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// The variables of a complete network-mode configuration, against a
+/// loopback issuer that is never contacted at startup.
+const NETWORK_MODE: [(&str, &str); 6] = [
+    ("NARSOR_SERVER_MODE", "network"),
+    ("NARSOR_SERVER_BIND", "127.0.0.1:0"),
+    ("NARSOR_OIDC_ISSUER", "http://127.0.0.1:9"),
+    ("NARSOR_OIDC_AUDIENCE", "narsor-api"),
+    ("NARSOR_TLS_TERMINATION", "proxy"),
+    ("NARSOR_TRUSTED_PROXIES", "127.0.0.1"),
+];
+
+#[test]
+fn trusted_mode_refuses_to_listen_beyond_loopback() {
+    needs_no_system_config!();
+    for bind in ["0.0.0.0:7400", "[::]:7400", "[::ffff:127.0.0.1]:7400"] {
+        let root = TempRoot::new();
+        let invocation = daemon(
+            &root,
+            &[("NARSOR_SERVER_BIND", bind)],
+            Duration::from_secs(20),
+        );
+        assert_eq!(
+            invocation.code, EXIT_FAILURE,
+            "{bind}: {}",
+            invocation.stderr
+        );
+        assert!(
+            invocation.stderr.contains("server_bind") && invocation.stderr.contains("loopback"),
+            "{bind}: {}",
+            invocation.stderr
+        );
+        assert!(
+            !root.path().join(".narsor/daemon.json").exists(),
+            "nothing was published"
+        );
+    }
+}
+
+#[test]
+fn network_mode_without_issuer_audience_or_tls_policy_refuses_to_start() {
+    needs_no_system_config!();
+    let root = TempRoot::new();
+    let invocation = daemon(
+        &root,
+        &[("NARSOR_SERVER_MODE", "network")],
+        Duration::from_secs(20),
+    );
+    assert_eq!(invocation.code, EXIT_FAILURE, "{}", invocation.stderr);
+    for named in [
+        "oidc_issuer",
+        "oidc_audience",
+        "tls_termination",
+        "trusted_proxies",
+    ] {
+        assert!(
+            invocation.stderr.contains(named),
+            "every missing piece is named at once — {named}: {}",
+            invocation.stderr
+        );
+    }
+}
+
+#[test]
+fn an_insecure_security_value_stops_the_daemon_with_the_key_named() {
+    needs_no_system_config!();
+    let cases: [(&str, &str); 4] = [
+        (
+            "server_mode: network\noidc_issuer: http://issuer.example\n",
+            "oidc_issuer",
+        ),
+        ("cors_allowed_origins: [\"*\"]\n", "cors_allowed_origins"),
+        ("trusted_proxies: 0.0.0.0/0\n", "trusted_proxies"),
+        // Network-only settings in trusted mode are refused, not ignored.
+        ("oidc_issuer: https://issuer.example\n", "server_mode"),
+    ];
+    for (file, named) in cases {
+        let root = TempRoot::new();
+        root.config(file);
+        let invocation = daemon(&root, &[], Duration::from_secs(20));
+        assert_eq!(
+            invocation.code, EXIT_FAILURE,
+            "{file}: {}",
+            invocation.stderr
+        );
+        assert!(
+            invocation.stderr.contains(named),
+            "{file} must name {named}: {}",
+            invocation.stderr
+        );
+    }
+}
+
+#[test]
+fn an_unclaimed_network_daemon_prints_and_stores_a_one_time_claim_code() {
+    use std::os::unix::fs::PermissionsExt;
+
+    needs_no_system_config!();
+    let root = TempRoot::new();
+    let code_file = root.path().join(".narsor/auth/claim-code");
+    let watcher = {
+        let code_file = code_file.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(20) {
+                if let Ok(metadata) = fs::metadata(&code_file) {
+                    return Some((
+                        metadata.permissions().mode() & 0o777,
+                        fs::read_to_string(&code_file).unwrap_or_default(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            None
+        })
+    };
+    // Runs until the deadline, then stops on SIGTERM like any daemon.
+    let invocation = daemon(&root, &NETWORK_MODE, Duration::from_secs(4));
+    let (mode, code) = watcher
+        .join()
+        .unwrap()
+        .unwrap_or_else(|| panic!("no claim code was stored: {}", invocation.stderr));
+    assert_eq!(mode, 0o600, "the code is readable by the operator only");
+    let code = code.trim();
+    assert!(code.starts_with("nsclaim-"), "{code}");
+    assert!(
+        invocation.stderr.contains(code),
+        "the code is printed for the operator: {}",
+        invocation.stderr
+    );
 }

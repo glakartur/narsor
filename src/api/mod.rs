@@ -60,12 +60,22 @@
 //!
 //! # Bind address and startup failure
 //!
-//! The server binds `127.0.0.1:0` — an OS-assigned port — so that several
-//! narsor TUI processes on one machine never collide, and so tests can run
-//! this server many times over without any port coordination. If the bind
-//! itself fails (no loopback interface, exhausted file descriptors, ...) the
-//! plan is explicit: the TUI must not start silently degraded. [`start`]
-//! returns an error the caller is expected to treat as fatal.
+//! By default the server binds `127.0.0.1:0` — an OS-assigned port — so that
+//! several narsor processes on one machine never collide, and so tests can
+//! run this server many times over without any port coordination. If the
+//! bind itself fails (no loopback interface, exhausted file descriptors, ...)
+//! the plan is explicit: the caller must not start silently degraded.
+//! [`start`] returns an error the caller is expected to treat as fatal.
+//!
+//! # Trusted and network mode (U7)
+//!
+//! Everything above describes **trusted mode**, which stays the default.
+//! [`serve`] also runs the server in **network mode** ([`ServerSecurity`]):
+//! any bind address, OIDC tokens of the installation owner instead of the
+//! process token, and only connections from the TLS-terminating proxies.
+//! [`crate::auth`] explains both; this module only wires them in. Even a
+//! hand-built trusted configuration is refused here unless its address is
+//! loopback, so no caller can expose the token-only API by accident.
 
 mod active;
 mod client;
@@ -85,6 +95,8 @@ pub use dto::{
 };
 pub use routes::{ConversationEntryDto, ConversationResponse};
 
+use crate::auth::gate::{self, NetworkAuth, OwnerAuth};
+use crate::auth::{CorsPolicy, ProxyPolicy};
 use crate::conductor::ConductorRegistry;
 use crate::controller_protocol::ProtocolService;
 use crate::engine::Engine;
@@ -101,6 +113,15 @@ use uuid::Uuid;
 /// Failure to start the local API server.
 #[derive(Debug)]
 pub struct ApiStartError(std::io::Error);
+
+impl ApiStartError {
+    fn refused(message: impl Into<String>) -> Self {
+        Self(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            message.into(),
+        ))
+    }
+}
 
 impl fmt::Display for ApiStartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -137,7 +158,8 @@ impl ApiHandle {
         self.addr
     }
 
-    /// The bearer token every request must present.
+    /// The bearer token every request must present — trusted mode only;
+    /// empty in network mode, whose callers present OIDC tokens instead.
     pub fn token(&self) -> &str {
         &self.token
     }
@@ -266,36 +288,115 @@ impl fmt::Debug for ApiServices {
     }
 }
 
-/// Starts the API server with everything the daemon shares with it.
+/// Starts the API server with everything the daemon shares with it, in
+/// trusted mode on a random loopback port.
 pub async fn start_with_services(
     engine: Arc<Engine>,
     catalog_dir: PathBuf,
     work_dir: PathBuf,
     services: ApiServices,
 ) -> Result<ApiHandle, ApiStartError> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(ApiStartError)?;
-    let addr = listener.local_addr().map_err(ApiStartError)?;
-    let token = Uuid::new_v4().to_string();
-
-    let store = engine.store().clone();
-    let app = routes::router(
+    serve(
         engine,
-        store,
-        token.clone(),
         catalog_dir,
         work_dir,
         services,
-    );
+        ServerSecurity::trusted_loopback(),
+    )
+    .await
+}
+
+/// How the server is exposed and who may call it.
+#[derive(Debug, Clone)]
+pub enum ServerSecurity {
+    /// Loopback only, the process's random token.
+    Trusted {
+        /// A loopback address; anything else is refused.
+        bind: SocketAddr,
+        /// Browser origins allowed to call.
+        cors: CorsPolicy,
+    },
+    /// OIDC users behind a TLS-terminating proxy.
+    Network {
+        /// Where to listen.
+        bind: SocketAddr,
+        /// Token verification and the installation owner.
+        auth: Arc<NetworkAuth>,
+        /// The proxies allowed to connect.
+        proxy: ProxyPolicy,
+        /// Browser origins allowed to call.
+        cors: CorsPolicy,
+    },
+}
+
+impl ServerSecurity {
+    /// Trusted mode on a system-chosen loopback port.
+    pub fn trusted_loopback() -> Self {
+        Self::Trusted {
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            cors: CorsPolicy::deny(),
+        }
+    }
+}
+
+/// Starts the API server in the given security mode.
+pub async fn serve(
+    engine: Arc<Engine>,
+    catalog_dir: PathBuf,
+    work_dir: PathBuf,
+    services: ApiServices,
+    security: ServerSecurity,
+) -> Result<ApiHandle, ApiStartError> {
+    let (bind, auth, proxy, cors) = match security {
+        ServerSecurity::Trusted { bind, cors } => {
+            let ip = bind.ip();
+            let mapped = matches!(ip, std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some());
+            if !ip.is_loopback() || mapped {
+                return Err(ApiStartError::refused(format!(
+                    "trusted mode serves only on loopback, not on {bind}"
+                )));
+            }
+            let token = Uuid::new_v4().to_string();
+            (bind, OwnerAuth::Trusted { token }, None, cors)
+        }
+        ServerSecurity::Network {
+            bind,
+            auth,
+            proxy,
+            cors,
+        } => (bind, OwnerAuth::Network(auth), Some(proxy), cors),
+    };
+    let token = match &auth {
+        OwnerAuth::Trusted { token } => token.clone(),
+        OwnerAuth::Network(_) => String::new(),
+    };
+    let listener = TcpListener::bind(bind).await.map_err(ApiStartError)?;
+    let addr = listener.local_addr().map_err(ApiStartError)?;
+
+    let store = engine.store().clone();
+    let mut app = routes::router(engine, store, auth, catalog_dir, work_dir, services);
+    if let Some(cors) = gate::cors_layer(&cors) {
+        app = app.layer(cors);
+    }
+    // Outermost: in network mode nothing — not even a CORS preflight — is
+    // answered to a peer that is not a trusted proxy.
+    if let Some(proxy) = proxy {
+        app = app.layer(axum::middleware::from_fn_with_state(
+            Arc::new(proxy),
+            gate::require_trusted_proxy,
+        ));
+    }
     let shutdown = Arc::new(Notify::new());
     let shutdown_wait = Arc::clone(&shutdown);
     let task = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                shutdown_wait.notified().await;
-            })
-            .await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            shutdown_wait.notified().await;
+        })
+        .await;
     });
 
     Ok(ApiHandle {

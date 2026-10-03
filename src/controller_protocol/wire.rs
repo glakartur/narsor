@@ -426,24 +426,68 @@ pub struct ControllerListResponse {
 // Controller side (KTD3)
 // ---------------------------------------------------------------------------
 
-/// `POST /controller/v1/enroll` (unauthenticated: the code is the proof).
+/// `POST /controller/v1/enroll` (no credential yet: the one-time code and
+/// a signature by the key being bound are the proof).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnrollRequest {
     /// The one-time code.
     pub enrollment_code: String,
+    /// The controller's Ed25519 public key, base64url without padding.
+    /// Missing reads as empty, so an incomplete enrollment is refused with
+    /// the same bare `401` as a wrong code rather than a parse error.
+    #[serde(default)]
+    pub public_key: String,
+    /// Signature by that key over
+    /// [`crate::auth::pop::enrollment_message`]: the enrolling party holds it.
+    #[serde(default)]
+    pub proof: String,
 }
 
-/// The new identity and its credential, shown exactly once.
+impl EnrollRequest {
+    /// An enrollment of `key` with `enrollment_code`, signed by the key.
+    pub fn signed(enrollment_code: &str, key: &crate::auth::pop::ControllerKey) -> Self {
+        let public_key = key.public_key();
+        Self {
+            enrollment_code: enrollment_code.to_string(),
+            proof: key.sign(&crate::auth::pop::enrollment_message(
+                enrollment_code,
+                &public_key,
+            )),
+            public_key,
+        }
+    }
+}
+
+/// The new identity. The server never knew a secret of it: the controller
+/// keeps its private key and signs every later request with it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnrollResponse {
     /// Identity.
     pub controller_id: String,
     /// Backend it is scoped to.
     pub backend_id: BackendId,
-    /// Bearer credential for every later request.
-    pub credential: String,
     /// Protocol version the server speaks.
     pub protocol_version: u32,
+}
+
+/// `POST /controller/v1/key` — replaces the identity's public key. Signed
+/// with the current key like every request; `proof` is the new key's
+/// signature over [`crate::auth::pop::rotation_message`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RotateKeyRequest {
+    /// The new public key.
+    pub public_key: String,
+    /// Signature by the new key.
+    pub proof: String,
+}
+
+/// The identity after a key rotation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RotateKeyResponse {
+    /// Identity.
+    pub controller_id: String,
+    /// When the new key took effect; the old one stopped working then.
+    pub rotated_at: DateTime<Utc>,
 }
 
 /// A lease as the controller sees it.

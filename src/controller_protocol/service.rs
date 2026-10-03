@@ -40,8 +40,9 @@ fn launch_refusal(error: LaunchError) -> ProtocolError {
 }
 
 /// The owner every request authenticated by the local daemon token acts
-/// as. Trusted loopback mode has exactly one owner; U7's OIDC mode puts the
-/// verified `(issuer, subject)` here instead.
+/// as. Trusted loopback mode has exactly one owner; network mode uses the
+/// verified OIDC `(issuer, subject)` instead
+/// ([`crate::auth::OidcIdentity::owner_ref`]).
 pub const LOCAL_OWNER: &str = "local";
 
 /// How many change notifications may queue for a slow listener before it
@@ -164,8 +165,8 @@ impl ProtocolService {
         }
     }
 
-    /// Replaces how controller credentials are verified (U7: mTLS, signed
-    /// proof-of-possession).
+    /// Replaces how controller requests are verified (the default checks
+    /// signed proof-of-possession, [`crate::auth::pop`]).
     pub fn with_controller_authenticator(mut self, auth: Arc<dyn ControllerAuthenticator>) -> Self {
         self.controller_auth = auth;
         self
@@ -209,9 +210,12 @@ impl ProtocolService {
         let _ = self.changes.send(task_id.clone());
     }
 
-    /// The controller a bearer token proves, if any.
-    pub fn authenticate_controller(&self, bearer: &str) -> Option<ControllerIdentity> {
-        self.controller_auth.authenticate_controller(bearer)
+    /// The controller a signed request proves, if any.
+    pub fn authenticate_controller(
+        &self,
+        request: &crate::auth::pop::SignedRequest<'_>,
+    ) -> Option<ControllerIdentity> {
+        self.controller_auth.authenticate_controller(request)
     }
 
     /// The runner a bearer token proves, if any.
@@ -224,6 +228,10 @@ impl ProtocolService {
     // -----------------------------------------------------------------
 
     /// Creates a queued task for `owner`, idempotently by task id.
+    ///
+    /// An id already taken by another owner's task is answered `NotFound`,
+    /// exactly like every other request about that task: a conflict would
+    /// confirm to this owner that the other task exists.
     pub fn create_task(
         &self,
         owner: &OwnerRef,
@@ -234,6 +242,9 @@ impl ProtocolService {
             None => TaskId::parse(format!("task-{}", uuid::Uuid::new_v4().simple()))
                 .expect("a generated task id is always valid"),
         };
+        if self.someone_else_owns(owner, &task_id)? {
+            return Err(ProtocolError::NotFound);
+        }
         // Resolution reads configuration only; a refusal here returns before
         // the control plane is asked to store anything, so an invalid backend
         // limit, an unregistered secret, an unsupported harness or a missing
@@ -254,10 +265,26 @@ impl ProtocolService {
                 resources: launch.resources,
             })
             .map_err(launch_refusal)?;
-        let record = self.control.create_task(
-            NewTask::new(task_id, owner.clone(), resolved.backend_id, resolved.spec)
+        let record = self
+            .control
+            .create_task(
+                NewTask::new(
+                    task_id.clone(),
+                    owner.clone(),
+                    resolved.backend_id,
+                    resolved.spec,
+                )
                 .with_priority(request.priority),
-        )?;
+            )
+            .map_err(|error| match error {
+                // Created by another owner between the check above and now.
+                crate::orchestration::OrchestrationError::TaskConflict(_)
+                    if self.someone_else_owns(owner, &task_id).unwrap_or(true) =>
+                {
+                    ProtocolError::NotFound
+                }
+                other => other.into(),
+            })?;
         self.notify(&record.task_id);
         self.summarize(&record)
     }
@@ -550,6 +577,15 @@ impl ProtocolService {
         Ok(merged)
     }
 
+    /// Whether `task_id` names a task of an owner other than `owner`.
+    fn someone_else_owns(&self, owner: &OwnerRef, task_id: &TaskId) -> ProtocolResult<bool> {
+        match self.control.task(task_id) {
+            Ok(record) => Ok(record.owner != *owner),
+            Err(crate::orchestration::OrchestrationError::TaskNotFound(_)) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Whether `task_id` names one of the owner's tasks.
     pub fn owns(&self, owner: &OwnerRef, task_id: &TaskId) -> bool {
         self.control
@@ -603,17 +639,46 @@ impl ProtocolService {
     // Controller side
     // -----------------------------------------------------------------
 
-    /// Redeems an enrollment code into a controller identity.
+    /// Redeems an enrollment code into a controller identity bound to the
+    /// request's public key.
     pub fn enroll(&self, request: EnrollRequest) -> ProtocolResult<EnrollResponse> {
-        let enrolled = self
+        let record = self
             .credentials
-            .redeem_enrollment(&request.enrollment_code)?
+            .redeem_enrollment(
+                &request.enrollment_code,
+                &request.public_key,
+                &request.proof,
+            )?
             .ok_or(ProtocolError::Unauthorized)?;
         Ok(EnrollResponse {
-            controller_id: enrolled.record.controller_id,
-            backend_id: enrolled.record.backend_id,
-            credential: enrolled.credential.expose().to_string(),
+            controller_id: record.controller_id,
+            backend_id: record.backend_id,
             protocol_version: PROTOCOL_VERSION,
+        })
+    }
+
+    /// Replaces the calling controller's key with the request's new one,
+    /// which must sign the rotation itself (proof of possession).
+    pub fn rotate_controller_key(
+        &self,
+        identity: &ControllerIdentity,
+        request: RotateKeyRequest,
+    ) -> ProtocolResult<RotateKeyResponse> {
+        let message =
+            crate::auth::pop::rotation_message(&identity.controller_id, &request.public_key);
+        if !crate::auth::pop::verify(&request.public_key, &message, &request.proof) {
+            return Err(ProtocolError::bad_request(
+                "invalid_key_proof",
+                "the new key must sign the rotation of this identity",
+            ));
+        }
+        let record = self
+            .credentials
+            .rotate_controller_key(&identity.controller_id, &request.public_key)?
+            .ok_or(ProtocolError::Unauthorized)?;
+        Ok(RotateKeyResponse {
+            controller_id: record.controller_id,
+            rotated_at: record.key_rotated_at.unwrap_or_else(|| self.control.now()),
         })
     }
 

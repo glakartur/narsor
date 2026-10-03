@@ -5,6 +5,7 @@
 //! tests under `tests/` link against it.
 
 pub mod api;
+pub mod auth;
 pub mod backends;
 pub mod cli;
 pub mod conductor;

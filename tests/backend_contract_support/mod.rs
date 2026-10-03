@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use narsor::auth::{ControllerCredential, ControllerKey};
 use narsor::backends::testkit::{ProbeCounters, Probed, SeverableLink};
 use narsor::backends::{
     BackendErrorKind, Controller, ControllerConfig, ExecutionBackend, TaskObservation,
@@ -164,18 +165,19 @@ impl<T: ContractTarget> Harness<T> {
 
     // -- controllers --------------------------------------------------------
 
-    /// Enrolls a new controller identity for the backend; its credential.
+    /// Enrolls a new controller identity for the backend with a fresh key;
+    /// its persistable credential.
     pub fn enroll(&self) -> String {
         let code = self
             .service
             .create_enrollment(BACKEND, CreateEnrollmentRequest::default())
             .expect("enrollment code");
-        self.service
-            .enroll(EnrollRequest {
-                enrollment_code: code.enrollment_code,
-            })
-            .expect("enroll")
-            .credential
+        let key = ControllerKey::generate();
+        let enrolled = self
+            .service
+            .enroll(EnrollRequest::signed(&code.enrollment_code, &key))
+            .expect("enroll");
+        ControllerCredential::new(enrolled.controller_id, key).expose()
     }
 
     /// Starts a controller with a new identity and the default lease.

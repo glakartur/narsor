@@ -37,7 +37,9 @@
 //! body content" on a refusal — the token itself must not be confirmed or
 //! denied by anything the response says beyond the status code — so the
 //! check is done by hand, in a `middleware::from_fn_with_state` layer that
-//! only ever returns a bare status code.
+//! only ever returns a bare status code. The layer is
+//! [`crate::auth::gate::require_owner`]: the process token in trusted mode,
+//! the installation owner's OIDC token in network mode (U7).
 
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -46,9 +48,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
-use axum::middleware::{self, Next};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -69,18 +71,16 @@ use crate::api::dto::{
     StartTaskRequest, StartTaskResponse, TransitionRequest,
 };
 use crate::api::ApiServices;
+use crate::auth::gate::{self, OwnerAuth};
 use crate::conductor::{
     annotation_of, ChatEntry, ConductorRegistry, ConductorStore, ProposalError, ProposalOutcome,
     UndoError, UndoOutcome,
 };
-use crate::controller_protocol::credentials::constant_time_eq;
 use crate::controller_protocol::http as protocol_http;
-use crate::controller_protocol::LOCAL_OWNER;
 use crate::domain::{AnsweredBy, Event, ExecutionStatus};
 use crate::engine::{
     build_timeline, Engine, EngineError, HumanInputDelivery, ManualTransition, Recovery, Timeline,
 };
-use crate::orchestration::OwnerRef;
 use crate::persistence::{
     ConversationSource, DefaultHarnessSelector, ExecutionStore, HarnessSelectionError,
     HarnessSelectionSnapshot as PersistenceHarnessSelectionSnapshot, PersistenceError,
@@ -125,7 +125,6 @@ const DEFAULT_BYTE_BUDGET: usize = 1024 * 1024;
 struct AppState {
     engine: Arc<Engine>,
     store: ExecutionStore,
-    token: String,
     catalog_dir: PathBuf,
     work_dir: PathBuf,
     harness_selector: Option<Arc<DefaultHarnessSelector>>,
@@ -137,7 +136,10 @@ struct AppState {
 /// the mutating surface U3 adds — `POST /tasks`, `POST
 /// /executions/:id/resume`, `POST /executions/:id/input`, `POST
 /// /executions/:id/transition` and `GET /executions` — all behind the same
-/// bearer-token gate.
+/// owner gate (`auth`: the process token, or the owner's OIDC token).
+///
+/// The identity routes (`/auth/v1/…`) sit outside it: a caller who is not
+/// the owner yet must be able to claim the installation.
 ///
 /// With a control plane in `services` (U2), its owner routes
 /// (`/control/v1/…`) join the gated set, while its controller
@@ -153,7 +155,7 @@ struct AppState {
 pub fn router(
     engine: Arc<Engine>,
     store: ExecutionStore,
-    token: String,
+    auth: OwnerAuth,
     catalog_dir: PathBuf,
     work_dir: PathBuf,
     services: ApiServices,
@@ -162,7 +164,6 @@ pub fn router(
     let state = AppState {
         engine,
         store,
-        token,
         catalog_dir,
         work_dir,
         harness_selector: services.harness_selector,
@@ -226,42 +227,18 @@ pub fn router(
     }
     // The owner gate covers everything above; controllers and runners are
     // not owners and pass their own credential gates instead (U2).
-    let mut router = owner.layer(middleware::from_fn_with_state(state.clone(), require_token));
+    let mut router = owner
+        .layer(middleware::from_fn_with_state(
+            auth.clone(),
+            gate::require_owner,
+        ))
+        .merge(gate::auth_routes(auth));
     if let Some(control) = control {
         router = router
             .merge(protocol_http::controller_routes(Arc::clone(&control)))
             .merge(protocol_http::runner_routes(control));
     }
     router.with_state(state)
-}
-
-/// Refuses any request whose `Authorization` header is missing or does not
-/// match the process token, with no response body either way — a caller
-/// cannot distinguish "wrong token" from "no token" from the response
-/// itself, which is the point.
-///
-/// An accepted request is the local owner's (trusted loopback mode has one
-/// owner): the gate records that as the request's [`OwnerRef`], which the
-/// control-plane routes scope every task to. U7's OIDC gate records the
-/// verified identity in the same place instead.
-async fn require_token(
-    State(state): State<AppState>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    let expected = format!("Bearer {}", state.token);
-    let presented = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-
-    match presented {
-        Some(value) if constant_time_eq(value.as_bytes(), expected.as_bytes()) => {
-            request.extensions_mut().insert(OwnerRef::new(LOCAL_OWNER));
-            next.run(request).await
-        }
-        _ => StatusCode::UNAUTHORIZED.into_response(),
-    }
 }
 
 /// Reads the daemon's authoritative default-harness setting.

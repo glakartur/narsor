@@ -8,10 +8,12 @@
 //!
 //! # Controller contract
 //!
-//! 1. **Enroll** once with an operator-issued one-time code
-//!    (`POST /controller/v1/enroll`); the resulting identity is scoped to one
-//!    backend and revocable (R37). Every later request carries its
-//!    credential.
+//! 1. **Enroll** once with an operator-issued one-time code and a key pair
+//!    the controller generated (`POST /controller/v1/enroll`); the resulting
+//!    identity is scoped to one backend and revocable (R37). Every later
+//!    request is signed with the private key — fresh, single-use and bound
+//!    to its method, path and body ([`crate::auth::pop`]); the key can be
+//!    rotated (`POST /controller/v1/key`).
 //! 2. **Lease**: acquire the backend's lease (`POST /controller/v1/lease`)
 //!    and renew it well before expiry. Every report carries the lease epoch;
 //!    a newer acquisition, a release or a revocation fences older epochs.
@@ -61,7 +63,8 @@
 //! files, secret values and raw transcripts are never part of any of it.
 //!
 //! * [`wire`] — every request and response;
-//! * [`credentials`] — identities, bearer secrets and the pluggable checks;
+//! * [`credentials`] — identities, enrollment codes, runner secrets,
+//!   controller keys and the pluggable checks;
 //! * [`service`] — the server-side handling, independent of HTTP;
 //! * [`http`] — routers, credential gates and handlers;
 //! * [`client`] — typed controller and runner clients.

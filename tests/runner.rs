@@ -120,13 +120,17 @@ impl Fixture {
             .create_enrollment(BACKEND, CreateEnrollmentRequest::default())
             .expect("enrollment");
         let enrolled = service
-            .enroll(EnrollRequest {
-                enrollment_code: code.enrollment_code,
-            })
+            .enroll(EnrollRequest::signed(
+                &code.enrollment_code,
+                &narsor::auth::ControllerKey::generate(),
+            ))
             .expect("enroll");
-        let controller = service
-            .authenticate_controller(&enrolled.credential)
-            .expect("controller identity");
+        // The identity the controller gate would prove; this fixture calls
+        // the service in-process, past the HTTP gate.
+        let controller = narsor::controller_protocol::ControllerIdentity {
+            controller_id: enrolled.controller_id,
+            backend_id: enrolled.backend_id,
+        };
         let epoch = service
             .acquire_lease(
                 &controller,

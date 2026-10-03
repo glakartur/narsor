@@ -302,6 +302,10 @@ pub struct Controller<B, L> {
     observe_failures: HashMap<TaskId, u32>,
     /// The last status report per task, so an unchanged one is not resent.
     last_status: HashMap<TaskId, (u64, ObservedSummary, Option<ResourceIdentity>)>,
+    /// Tasks whose runner was seen gone during a pause while the desired
+    /// state did not yet show its safe point: judged again on a desired
+    /// state read after that observation.
+    exited_before_ack: HashSet<TaskId>,
 }
 
 impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
@@ -315,6 +319,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             acknowledged: HashMap::new(),
             observe_failures: HashMap::new(),
             last_status: HashMap::new(),
+            exited_before_ack: HashSet::new(),
         }
     }
 
@@ -417,6 +422,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         self.acknowledged.retain(|task, _| live.contains(task));
         self.observe_failures.retain(|task, _| live.contains(task));
         self.last_status.retain(|task, _| live.contains(task));
+        self.exited_before_ack.retain(|task| live.contains(task));
         self.acknowledge(&response.commands).await?;
 
         let mut progress = Progress::Settled;
@@ -752,7 +758,9 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         let Some(observed) = self.observe(context, true).await? else {
             return Ok(Progress::Settling);
         };
+        let task_id = &context.command.task_id;
         if acknowledged {
+            self.exited_before_ack.remove(task_id);
             if observed.workload.is_some()
                 && !self
                     .release(context)
@@ -780,6 +788,17 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             // A runner exits 0 during a pause only after the control plane
             // accepted its safe point: this view of it is just older.
             Some(workload) if workload.phase == (WorkloadPhase::Exited { code: Some(0) }) => {
+                Ok(Progress::Settling)
+            }
+            // A runner acknowledges its safe point and then exits, but the
+            // desired state in hand was read before this observation: a
+            // runner that is not this instance's child exits with no code
+            // to tell, so a newer desired state decides. Only a gone runner
+            // still unacknowledged after that is lost.
+            Some(workload)
+                if workload.phase == (WorkloadPhase::Exited { code: None })
+                    && self.exited_before_ack.insert(task_id.clone()) =>
+            {
                 Ok(Progress::Settling)
             }
             Some(workload) => {

@@ -8,27 +8,43 @@
 
 use std::time::Duration;
 
+use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::wire::*;
 use crate::api::{handle_json_response, ClientError};
+use crate::auth::pop::{rotation_message, ControllerCredential, ControllerKey};
 use crate::orchestration::RunnerSnapshot;
 
 /// Bound of a plain request; a long-poll adds its own wait on top.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How a client proves who it is.
+#[derive(Clone)]
+enum Credential {
+    /// A runner's bearer secret (or, for a credential that is not a valid
+    /// controller credential, the text as given — refused by the server).
+    Bearer(String),
+    /// A controller's key: every request is signed. Boxed: it is much
+    /// larger than the other variants.
+    Signed(Box<ControllerCredential>),
+    /// Nothing (enrollment).
+    None,
+}
+
 /// A small HTTP helper shared by both clients.
 #[derive(Clone)]
 struct Transport {
     base_url: String,
-    credential: String,
+    credential: Credential,
     http: reqwest::Client,
 }
 
 impl std::fmt::Debug for Transport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The credential is a bearer secret: never in a log line.
+        // The credential is a secret: never in a log line.
         f.debug_struct("Transport")
             .field("base_url", &self.base_url)
             .field("credential", &"<redacted>")
@@ -37,10 +53,10 @@ impl std::fmt::Debug for Transport {
 }
 
 impl Transport {
-    fn new(base_url: impl Into<String>, credential: impl Into<String>) -> Self {
+    fn new(base_url: impl Into<String>, credential: Credential) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            credential: credential.into(),
+            credential,
             http: reqwest::Client::new(),
         }
     }
@@ -55,16 +71,12 @@ impl Transport {
         query: &Q,
         wait: Duration,
     ) -> Result<T, ClientError> {
-        let response = self
+        let request = self
             .http
             .get(self.url(path))
-            .bearer_auth(&self.credential)
             .query(query)
-            .timeout(REQUEST_TIMEOUT + wait)
-            .send()
-            .await
-            .map_err(|error| ClientError::Unavailable(error.to_string()))?;
-        handle_json_response(response).await
+            .timeout(REQUEST_TIMEOUT + wait);
+        self.send(request, Vec::new()).await
     }
 
     async fn post<B: Serialize, T: DeserializeOwned>(
@@ -72,13 +84,48 @@ impl Transport {
         path: &str,
         body: &B,
     ) -> Result<T, ClientError> {
+        let body = serde_json::to_vec(body)
+            .map_err(|error| ClientError::Server(format!("cannot encode the request: {error}")))?;
+        let request = self
+            .http
+            .request(Method::POST, self.url(path))
+            .header(CONTENT_TYPE, "application/json")
+            .timeout(REQUEST_TIMEOUT);
+        self.send(request, body).await
+    }
+
+    /// Builds the request, authenticates it — a controller signs the exact
+    /// method, path with query and body bytes that go on the wire — and
+    /// decodes the answer.
+    async fn send<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        body: Vec<u8>,
+    ) -> Result<T, ClientError> {
+        let mut request = request
+            .body(body.clone())
+            .build()
+            .map_err(|error| ClientError::Unavailable(error.to_string()))?;
+        let authorization = match &self.credential {
+            Credential::Bearer(token) => Some(format!("Bearer {token}")),
+            Credential::Signed(credential) => {
+                let url = request.url();
+                let path_and_query = match url.query() {
+                    Some(query) => format!("{}?{query}", url.path()),
+                    None => url.path().to_string(),
+                };
+                Some(credential.authorization(request.method().as_str(), &path_and_query, &body))
+            }
+            Credential::None => None,
+        };
+        if let Some(authorization) = authorization {
+            let value =
+                HeaderValue::from_str(&authorization).map_err(|_| ClientError::Unauthorized)?;
+            request.headers_mut().insert(AUTHORIZATION, value);
+        }
         let response = self
             .http
-            .post(self.url(path))
-            .bearer_auth(&self.credential)
-            .json(body)
-            .timeout(REQUEST_TIMEOUT)
-            .send()
+            .execute(request)
             .await
             .map_err(|error| ClientError::Unavailable(error.to_string()))?;
         handle_json_response(response).await
@@ -86,40 +133,85 @@ impl Transport {
 }
 
 /// A client for one enrolled controller identity.
+///
+/// It holds the identity's private key and signs every request with it
+/// ([`crate::auth::pop`]); no secret ever travels.
 #[derive(Debug, Clone)]
 pub struct ControllerClient {
     transport: Transport,
 }
 
 impl ControllerClient {
-    /// A client presenting `credential` to the control plane at `base_url`
-    /// (`http://host:port`).
+    /// A client presenting the persisted controller `credential`
+    /// (`nsk.…`, see [`ControllerCredential`]) to the control plane at
+    /// `base_url`. Anything that is not such a credential is sent as given
+    /// and refused by the server.
     pub fn new(base_url: impl Into<String>, credential: impl Into<String>) -> Self {
+        let credential = credential.into();
+        let credential = match ControllerCredential::parse(&credential) {
+            Some(parsed) => Credential::Signed(Box::new(parsed)),
+            None => Credential::Bearer(credential),
+        };
         Self {
             transport: Transport::new(base_url, credential),
         }
     }
 
-    /// Redeems a one-time enrollment code and returns a client for the new
-    /// identity together with its details.
+    /// Generates a key pair, redeems a one-time enrollment code binding its
+    /// public half, and returns a client for the new identity together with
+    /// its details. Persist [`Self::credential`] to reconnect later.
     pub async fn enroll(
         base_url: impl Into<String>,
         enrollment_code: &str,
     ) -> Result<(Self, EnrollResponse), ClientError> {
-        let anonymous = Transport::new(base_url, String::new());
-        let response = anonymous
-            .http
-            .post(anonymous.url("/controller/v1/enroll"))
-            .json(&EnrollRequest {
-                enrollment_code: enrollment_code.to_string(),
-            })
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|error| ClientError::Unavailable(error.to_string()))?;
-        let enrolled: EnrollResponse = handle_json_response(response).await?;
-        let client = Self::new(anonymous.base_url, enrolled.credential.clone());
+        let anonymous = Transport::new(base_url, Credential::None);
+        let key = ControllerKey::generate();
+        let enrolled: EnrollResponse = anonymous
+            .post(
+                "/controller/v1/enroll",
+                &EnrollRequest::signed(enrollment_code, &key),
+            )
+            .await?;
+        let credential = ControllerCredential::new(enrolled.controller_id.clone(), key);
+        let client = Self {
+            transport: Transport::new(anonymous.base_url, Credential::Signed(Box::new(credential))),
+        };
         Ok((client, enrolled))
+    }
+
+    /// The persistable credential of this identity (its id and private
+    /// key), `None` for a client built from something else. A secret: store
+    /// it `0600`, never log it.
+    pub fn credential(&self) -> Option<String> {
+        match &self.transport.credential {
+            Credential::Signed(credential) => Some(credential.expose()),
+            _ => None,
+        }
+    }
+
+    /// `POST /controller/v1/key` — rotates to a freshly generated key and
+    /// returns a client holding it. From the server's answer on, this
+    /// client's key is refused.
+    pub async fn rotate_key(&self) -> Result<(Self, RotateKeyResponse), ClientError> {
+        let Credential::Signed(current) = &self.transport.credential else {
+            return Err(ClientError::Unauthorized);
+        };
+        let key = ControllerKey::generate();
+        let public_key = key.public_key();
+        let request = RotateKeyRequest {
+            proof: key.sign(&rotation_message(current.controller_id(), &public_key)),
+            public_key,
+        };
+        let response: RotateKeyResponse =
+            self.transport.post("/controller/v1/key", &request).await?;
+        let credential = ControllerCredential::new(current.controller_id(), key);
+        let client = Self {
+            transport: Transport::new(
+                self.transport.base_url.clone(),
+                Credential::Signed(Box::new(credential)),
+            ),
+        };
+        Ok((client, response))
     }
 
     /// `POST /controller/v1/heartbeat`.
@@ -220,7 +312,7 @@ impl RunnerClient {
     /// file) to the control plane at `base_url`.
     pub fn new(base_url: impl Into<String>, credential: impl Into<String>) -> Self {
         Self {
-            transport: Transport::new(base_url, credential),
+            transport: Transport::new(base_url, Credential::Bearer(credential.into())),
         }
     }
 
