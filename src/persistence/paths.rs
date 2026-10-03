@@ -168,6 +168,16 @@ pub const BACKEND_LEASE_FILE: &str = "lease.json";
 /// Advisory lock serializing lease acquisition and renewal of one backend.
 pub const BACKEND_LEASE_LOCK_FILE: &str = "lease.lock";
 
+/// Advisory lock serializing the scheduling decisions of one backend (U10).
+pub const BACKEND_SCHEDULE_LOCK_FILE: &str = "schedule.lock";
+
+/// The owner's durable default-backend override (R10), inside
+/// [`ORCHESTRATION_DIR`].
+pub const DEFAULT_BACKEND_FILE: &str = "default-backend.json";
+
+/// Advisory lock serializing changes of [`DEFAULT_BACKEND_FILE`].
+pub const DEFAULT_BACKEND_LOCK_FILE: &str = "default-backend.lock";
+
 /// Directory of one sub-directory per enrolled controller identity (R37),
 /// inside [`ORCHESTRATION_DIR`].
 pub const ORCHESTRATION_CONTROLLERS_DIR: &str = "controllers";
@@ -358,6 +368,22 @@ impl StatePaths {
     pub fn backend_lease_lock_file(&self, backend_id: &str) -> PathBuf {
         self.orchestration_backend_dir(backend_id)
             .join(BACKEND_LEASE_LOCK_FILE)
+    }
+
+    /// `{root}/orchestration/backends/{backend_id}/schedule.lock`
+    pub fn backend_schedule_lock_file(&self, backend_id: &str) -> PathBuf {
+        self.orchestration_backend_dir(backend_id)
+            .join(BACKEND_SCHEDULE_LOCK_FILE)
+    }
+
+    /// `{root}/orchestration/default-backend.json`
+    pub fn default_backend_file(&self) -> PathBuf {
+        self.orchestration_dir().join(DEFAULT_BACKEND_FILE)
+    }
+
+    /// `{root}/orchestration/default-backend.lock`
+    pub fn default_backend_lock_file(&self) -> PathBuf {
+        self.orchestration_dir().join(DEFAULT_BACKEND_LOCK_FILE)
     }
 
     /// `{root}/launch-specs`

@@ -3424,3 +3424,366 @@ async fn control_plane_routes_are_absent_without_a_control_plane() {
         .expect("request");
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 }
+
+// ---------------------------------------------------------------------------
+// Default backend, priority and queue admission (U10)
+// ---------------------------------------------------------------------------
+
+/// A served control plane plus the in-process service, so a test can play
+/// the controller of a backend without an HTTP controller gate.
+async fn start_scheduling_server(
+    root: &TempRoot,
+) -> (
+    api::ApiHandle,
+    Arc<narsor::controller_protocol::ProtocolService>,
+) {
+    let control = narsor::orchestration::ControlPlane::new(StatePaths::new(root.path()));
+    let service = Arc::new(narsor::controller_protocol::ProtocolService::new(
+        control,
+        environment_support::seeded_resolver(root.path()),
+    ));
+    let handle = api::start_with_services(
+        Arc::new(Engine::new(root.store())),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+        api::ApiServices {
+            control: Some(Arc::clone(&service)),
+            ..api::ApiServices::default()
+        },
+    )
+    .await
+    .expect("server starts");
+    (handle, service)
+}
+
+/// One enrolled controller holding `backend`'s lease, called in-process.
+struct InProcessController {
+    service: Arc<narsor::controller_protocol::ProtocolService>,
+    identity: narsor::controller_protocol::ControllerIdentity,
+    epoch: u64,
+}
+
+impl InProcessController {
+    fn online(service: &Arc<narsor::controller_protocol::ProtocolService>, backend: &str) -> Self {
+        use narsor::controller_protocol::{
+            AcquireLeaseRequest, CreateEnrollmentRequest, EnrollRequest,
+        };
+        let code = service
+            .create_enrollment(backend, CreateEnrollmentRequest::default())
+            .expect("enrollment");
+        let enrolled = service
+            .enroll(EnrollRequest::signed(
+                &code.enrollment_code,
+                &narsor::auth::ControllerKey::generate(),
+            ))
+            .expect("enroll");
+        let identity = narsor::controller_protocol::ControllerIdentity {
+            controller_id: enrolled.controller_id,
+            backend_id: enrolled.backend_id,
+        };
+        let epoch = service
+            .acquire_lease(
+                &identity,
+                AcquireLeaseRequest {
+                    ttl_secs: Some(600),
+                },
+            )
+            .expect("lease")
+            .epoch;
+        Self {
+            service: Arc::clone(service),
+            identity,
+            epoch,
+        }
+    }
+
+    /// The tasks this controller is offered a start for.
+    fn offered_starts(&self) -> Vec<String> {
+        self.service
+            .commands(&self.identity, true)
+            .expect("commands")
+            .commands
+            .into_iter()
+            .filter(|command| command.action == narsor::controller_protocol::DesiredAction::Start)
+            .map(|command| command.task_id.to_string())
+            .collect()
+    }
+
+    fn report(
+        &self,
+        task: &str,
+        observation: narsor::orchestration::Observation,
+    ) -> Result<(), narsor::controller_protocol::ProtocolError> {
+        let generation = self
+            .service
+            .control_plane()
+            .task(&narsor::domain::TaskId::parse(task).unwrap())
+            .unwrap()
+            .generation;
+        self.service
+            .report(
+                &self.identity,
+                narsor::controller_protocol::ReportRequest {
+                    task_id: task.to_string(),
+                    lease_epoch: self.epoch,
+                    desired_generation: generation,
+                    observation,
+                    resource: None,
+                    summary: Default::default(),
+                    observed_at: Utc::now(),
+                },
+            )
+            .map(|_| ())
+    }
+
+    fn run(&self, task: &str) {
+        use narsor::orchestration::Observation;
+        self.report(task, Observation::StartAccepted)
+            .expect("start accepted");
+        self.report(task, Observation::RunnerReady)
+            .expect("runner ready");
+    }
+}
+
+fn set_backend_limit(root: &TempRoot, backend: &str, limit: u32) {
+    let mut record = environment_support::backend(backend);
+    record.limits.max_concurrent_tasks = limit;
+    narsor::environment::EnvironmentCatalog::new(root.path())
+        .save_backend(&record)
+        .expect("save backend");
+}
+
+fn inheriting_task(task_id: &str) -> narsor::controller_protocol::CreateTaskRequest {
+    narsor::controller_protocol::CreateTaskRequest {
+        backend_id: None,
+        ..remote_task(task_id, "unused")
+    }
+}
+
+#[tokio::test]
+async fn new_tasks_inherit_the_owner_default_backend_and_existing_tasks_never_move() {
+    use narsor::controller_protocol::SetDefaultBackendRequest;
+    use narsor::orchestration::TaskLifecycle;
+    let root = TempRoot::new();
+    let (handle, service) = start_scheduling_server(&root).await;
+    let client = handle.client();
+
+    let initial = client.control_default_backend().await.expect("default");
+    assert_eq!(
+        (initial.configured.as_str(), initial.effective.as_str()),
+        ("k8s", "k8s")
+    );
+    assert_eq!((initial.override_backend, initial.revision), (None, 0));
+
+    let chosen = client
+        .control_set_default_backend(&SetDefaultBackendRequest {
+            backend_id: Some("backend-a".to_string()),
+        })
+        .await
+        .expect("choose backend-a");
+    assert_eq!(chosen.effective, "backend-a");
+    assert_eq!(chosen.revision, 1);
+
+    let inherited = client
+        .create_control_task(&inheriting_task("inherits"))
+        .await
+        .expect("create inheriting");
+    assert_eq!(inherited.backend_id.as_str(), "backend-a");
+    let explicit = client
+        .create_control_task(&remote_task("explicit", "k8s"))
+        .await
+        .expect("create explicit");
+    assert_eq!(explicit.backend_id.as_str(), "k8s");
+
+    let controller = InProcessController::online(&service, "backend-a");
+    controller.run("inherits");
+    let running = client.control_task("inherits").await.expect("task");
+    assert_eq!(running.lifecycle, TaskLifecycle::Running);
+
+    // AE3: changing the default moves nothing and stops nothing.
+    client
+        .control_set_default_backend(&SetDefaultBackendRequest {
+            backend_id: Some("backend-b".to_string()),
+        })
+        .await
+        .expect("choose backend-b");
+    let after = client.control_task("inherits").await.expect("task");
+    assert_eq!(after.backend_id.as_str(), "backend-a");
+    assert_eq!(after.lifecycle, TaskLifecycle::Running);
+    assert_eq!(after.generation, running.generation);
+
+    // An identical create retry returns the existing task instead of
+    // resolving the changed default into a conflict.
+    let retried = client
+        .create_control_task(&inheriting_task("inherits"))
+        .await
+        .expect("idempotent retry after a default change");
+    assert_eq!(retried.backend_id.as_str(), "backend-a");
+    assert_eq!(retried.revision, after.revision);
+
+    let later = client
+        .create_control_task(&inheriting_task("later"))
+        .await
+        .expect("create later");
+    assert_eq!(later.backend_id.as_str(), "backend-b");
+
+    match client
+        .control_set_default_backend(&SetDefaultBackendRequest {
+            backend_id: Some("nowhere".to_string()),
+        })
+        .await
+    {
+        Err(ClientError::Request { code, .. }) => assert_eq!(code, "unknown_backend"),
+        other => panic!("an unregistered default must be refused, got {other:?}"),
+    }
+    let reset = client
+        .control_set_default_backend(&SetDefaultBackendRequest { backend_id: None })
+        .await
+        .expect("reset");
+    assert_eq!(reset.effective, "k8s");
+    assert_eq!(reset.override_backend, None);
+}
+
+#[tokio::test]
+async fn queued_tasks_wait_for_capacity_in_priority_order_with_a_visible_reason() {
+    use narsor::controller_protocol::SetPriorityRequest;
+    use narsor::orchestration::{Observation, QueueReason, TaskEventKind, TaskLifecycle};
+    let root = TempRoot::new();
+    let (handle, service) = start_scheduling_server(&root).await;
+    // Read fresh by every decision: no restart needed.
+    set_backend_limit(&root, "k8s", 1);
+    let client = handle.client();
+
+    // Nobody can start anything yet: the controller is offline.
+    let first = client
+        .create_control_task(&remote_task("first", "k8s"))
+        .await
+        .expect("create");
+    let queue = first.queue.expect("a queue verdict");
+    assert_eq!(queue.reason, QueueReason::ControllerOffline);
+    assert!(queue.message.contains("controller"), "{}", queue.message);
+
+    let controller = InProcessController::online(&service, "k8s");
+    assert_eq!(controller.offered_starts(), ["first"]);
+    controller.run("first");
+
+    for (id, priority) in [("low", 0), ("high", 5)] {
+        let mut request = remote_task(id, "k8s");
+        request.priority = priority;
+        client.create_control_task(&request).await.expect("create");
+    }
+    let reason =
+        |summary: narsor::controller_protocol::TaskSummary| summary.queue.map(|queue| queue.reason);
+    assert_eq!(
+        reason(client.control_task("high").await.unwrap()),
+        Some(QueueReason::WaitingForCapacity {
+            position: 1,
+            running: 1,
+            limit: 1
+        })
+    );
+    assert!(
+        controller.offered_starts().is_empty(),
+        "the limit is reached"
+    );
+    match controller.report("high", Observation::StartAccepted) {
+        Err(narsor::controller_protocol::ProtocolError::Conflict { code, .. }) => {
+            assert_eq!(code, "not_admitted")
+        }
+        other => panic!("an unadmitted start must be refused, got {other:?}"),
+    }
+
+    // The owner reorders the waiting; the running task is untouched (AE3).
+    let raised = client
+        .control_set_priority(
+            "low",
+            &SetPriorityRequest {
+                priority: 9,
+                expected_generation: Some(1),
+            },
+        )
+        .await
+        .expect("raise priority");
+    assert_eq!(raised.priority, 9);
+    assert_eq!(
+        reason(raised),
+        Some(QueueReason::WaitingForCapacity {
+            position: 1,
+            running: 1,
+            limit: 1
+        })
+    );
+    let events = client.control_events("low", 0).await.expect("events");
+    assert!(events.iter().any(|event| matches!(
+        event.kind,
+        TaskEventKind::QueueChanged {
+            reason: QueueReason::WaitingForCapacity { position: 1, .. }
+        }
+    )));
+    match client
+        .control_set_priority(
+            "first",
+            &SetPriorityRequest {
+                priority: -1,
+                expected_generation: None,
+            },
+        )
+        .await
+    {
+        Err(ClientError::Refused { code, .. }) => assert_eq!(code, "task_not_queued"),
+        other => panic!("a running task's priority is not queue order, got {other:?}"),
+    }
+    match client
+        .control_set_priority(
+            "low",
+            &SetPriorityRequest {
+                priority: 1,
+                expected_generation: Some(4),
+            },
+        )
+        .await
+    {
+        Err(ClientError::Refused { code, .. }) => assert_eq!(code, "stale_generation"),
+        other => panic!("expected a stale generation, got {other:?}"),
+    }
+    let running = client.control_task("first").await.unwrap();
+    assert_eq!(
+        (running.lifecycle, running.generation),
+        (TaskLifecycle::Running, 1)
+    );
+
+    // Archiving the running task frees the slot for the first in line.
+    client
+        .control_command(
+            "first",
+            &narsor::controller_protocol::OwnerCommandRequest {
+                command: narsor::orchestration::OwnerCommand::Archive,
+                idempotency_key: "archive-first".to_string(),
+                expected_generation: None,
+            },
+        )
+        .await
+        .expect("archive");
+    controller
+        .report("first", Observation::ResourcesDeleted)
+        .expect("deleted");
+    assert_eq!(
+        reason(client.control_task("low").await.unwrap()),
+        Some(QueueReason::Admitted)
+    );
+    assert_eq!(controller.offered_starts(), ["low"]);
+
+    // A revoked controller withholds the backend's capacity.
+    service
+        .revoke_controller(&controller.identity.controller_id)
+        .expect("revoke");
+    assert_eq!(
+        reason(client.control_task("high").await.unwrap()),
+        Some(QueueReason::ControllerOffline)
+    );
+    assert_eq!(
+        reason(client.control_task("low").await.unwrap()),
+        Some(QueueReason::Admitted),
+        "an admitted task keeps its reservation"
+    );
+}

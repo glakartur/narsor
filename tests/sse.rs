@@ -553,20 +553,27 @@ async fn control_stream_replays_missed_events_once_then_goes_live() {
     archive_remote(&client, "task-1").await;
     create_remote(&client, "task-3").await;
 
+    // Every task's second event is its queue verdict (U10): no controller
+    // is online, so it waits.
     let mut stream = Box::pin(client.stream_control_events(Some(&seen), None));
     let replayed = vec![
+        position(&next_envelope(&mut stream).await),
         position(&next_envelope(&mut stream).await),
         position(&next_envelope(&mut stream).await),
     ];
     assert_eq!(
         replayed,
-        [("task-1".to_string(), 2), ("task-3".to_string(), 1)]
+        [
+            ("task-1".to_string(), 3),
+            ("task-3".to_string(), 1),
+            ("task-3".to_string(), 2)
+        ]
     );
 
     // Live.
     archive_remote(&client, "task-2").await;
     let live = next_envelope(&mut stream).await;
-    assert_eq!(position(&live), ("task-2".to_string(), 2));
+    assert_eq!(position(&live), ("task-2".to_string(), 3));
     assert_quiet(&mut stream).await;
     drop(stream);
 
@@ -575,7 +582,7 @@ async fn control_stream_replays_missed_events_once_then_goes_live() {
     archive_remote(&client, "task-3").await;
     assert_eq!(
         position(&next_envelope(&mut resumed).await),
-        ("task-3".to_string(), 2)
+        ("task-3".to_string(), 3)
     );
     assert_quiet(&mut resumed).await;
 }
@@ -594,9 +601,14 @@ async fn control_stream_without_a_cursor_replays_from_the_start_and_filters_by_t
         position(&next_envelope(&mut only_two).await),
         ("task-2".to_string(), 1)
     );
+    // Its queue verdict (U10), then the archive.
+    assert_eq!(
+        position(&next_envelope(&mut only_two).await),
+        ("task-2".to_string(), 2)
+    );
     let last = next_envelope(&mut only_two).await;
-    assert_eq!(position(&last), ("task-2".to_string(), 2));
-    assert_eq!(last.cursor, "task-2:2");
+    assert_eq!(position(&last), ("task-2".to_string(), 3));
+    assert_eq!(last.cursor, "task-2:3");
     archive_remote(&client, "task-1").await;
     assert_quiet(&mut only_two).await;
 }

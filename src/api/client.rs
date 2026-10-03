@@ -58,9 +58,9 @@ use super::routes::ConversationResponse;
 use crate::controller_protocol::{
     ControlEventEnvelope, ControllerListResponse, ControllerView, ConversationPage,
     ConversationPageQuery, ConversationResponse as RemoteConversationResponse,
-    CreateEnrollmentRequest, CreateTaskRequest, EnrollmentResponse, OwnerCommandRequest,
-    OwnerCommandResponse, SubmitInputRequest, SubmitInputResponse, TaskListResponse, TaskSummary,
-    TimelineResponse,
+    CreateEnrollmentRequest, CreateTaskRequest, DefaultBackendView, EnrollmentResponse,
+    OwnerCommandRequest, OwnerCommandResponse, SetDefaultBackendRequest, SetPriorityRequest,
+    SubmitInputRequest, SubmitInputResponse, TaskListResponse, TaskSummary, TimelineResponse,
 };
 use crate::orchestration::TaskEvent;
 
@@ -441,6 +441,33 @@ impl ApiClient {
     ) -> Result<OwnerCommandResponse, ClientError> {
         let url = format!("{}/control/v1/tasks/{task_id}/commands", self.base_url);
         self.post_json(&url, request).await
+    }
+
+    /// Changes a queued remote task's priority (R11); repeating the
+    /// current value is a no-op.
+    pub async fn control_set_priority(
+        &self,
+        task_id: &str,
+        request: &SetPriorityRequest,
+    ) -> Result<TaskSummary, ClientError> {
+        let url = format!("{}/control/v1/tasks/{task_id}/priority", self.base_url);
+        self.post_json(&url, request).await
+    }
+
+    /// The default backend of new remote tasks (R10).
+    pub async fn control_default_backend(&self) -> Result<DefaultBackendView, ClientError> {
+        let url = format!("{}/control/v1/default-backend", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// Chooses (or with `backend_id: None` clears) the default backend of
+    /// new remote tasks; existing tasks never move.
+    pub async fn control_set_default_backend(
+        &self,
+        request: &SetDefaultBackendRequest,
+    ) -> Result<DefaultBackendView, ClientError> {
+        let url = format!("{}/control/v1/default-backend", self.base_url);
+        self.put_json(&url, request).await
     }
 
     /// The last timeline the remote task's runner reported.

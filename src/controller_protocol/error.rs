@@ -106,6 +106,10 @@ impl From<OrchestrationError> for ProtocolError {
             E::InputAlreadyQueued { .. } => Self::conflict("input_already_queued", message),
             E::InputAlreadySettled { .. } => Self::conflict("input_already_settled", message),
             E::TaskNotAcceptingInput { .. } => Self::conflict("task_not_accepting_input", message),
+            E::NotAdmitted(_) => Self::conflict("not_admitted", message),
+            E::BackendAtCapacity { .. } => Self::conflict("backend_at_capacity", message),
+            E::BackendUnavailable { .. } => Self::conflict("backend_unavailable", message),
+            E::TaskNotQueued { .. } => Self::conflict("task_not_queued", message),
             E::Persistence(_) | E::UnsupportedRecordVersion { .. } | E::Lock { .. } => {
                 Self::Internal(message)
             }

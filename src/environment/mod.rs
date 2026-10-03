@@ -11,7 +11,7 @@
 //!
 //! | What | Where |
 //! | --- | --- |
-//! | owner default backend (R10) | setting `default_backend` (flag/env/file) |
+//! | owner default backend (R10) | `PUT /control/v1/default-backend`, else setting `default_backend` |
 //! | owner default profile (R16) | setting `default_profile` |
 //! | backends (R3) | `{catalog}/backends/{id}.yaml` — [`BackendRecord`] |
 //! | profiles (R16) | `{catalog}/profiles/{id}.yaml` — [`ProfileRecord`] |

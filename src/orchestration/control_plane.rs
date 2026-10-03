@@ -110,7 +110,7 @@ impl ControlPlane {
         let _creation = self.store.lock_creation()?;
         if self.store.task_exists(&request.task_id) {
             let existing = self.store.load_task(&request.task_id)?;
-            return if same_creation(&existing, &request) {
+            return if same_creation(&existing, &request) || same_request(&existing, &request) {
                 Ok(existing)
             } else {
                 Err(OrchestrationError::TaskConflict(request.task_id))
@@ -150,6 +150,9 @@ impl ControlPlane {
             commands: Vec::new(),
             runner: None,
             inputs: Vec::new(),
+            reservation: None,
+            queue: None,
+            request_digest: request.request_digest,
             last_event: TaskEvent {
                 sequence: 1,
                 task_id: request.task_id.clone(),
@@ -436,6 +439,15 @@ impl ControlPlane {
                             generation: record.generation,
                         });
                     }
+                    // Checked here for the same reason: admission is the
+                    // control plane's decision (U10), so no controller —
+                    // a stale one, one that never read the commands — can
+                    // start a task the scheduler did not give a slot.
+                    if report.observation == Observation::StartAccepted
+                        && record.reservation.is_none()
+                    {
+                        return Err(OrchestrationError::NotAdmitted(record.task_id.clone()));
+                    }
                     record.lifecycle = next;
                     match report.observation {
                         Observation::StartAccepted => record.resources_may_exist = true,
@@ -525,6 +537,13 @@ impl ControlPlane {
         match operation(&mut record, now)? {
             Mutation::Unchanged(value) => Ok((record, value)),
             Mutation::Changed(kind, value) => {
+                // A reservation and a queue verdict mean something only
+                // while queued: once the task leaves `Queued` its lifecycle
+                // holds (or releases) the slot by itself (U10).
+                if record.lifecycle != TaskLifecycle::Queued {
+                    record.reservation = None;
+                    record.queue = None;
+                }
                 record.revision += 1;
                 record.last_event = TaskEvent {
                     sequence: record.revision,
@@ -600,6 +619,15 @@ fn same_creation(record: &TaskRecord, request: &NewTask) -> bool {
         && record.owner == request.owner
         && record.assignment.backend_id == request.backend_id
         && record.priority == request.priority
+}
+
+/// Whether the stored record was created from a request with the same
+/// digest — a retry of the identical owner request, which must return the
+/// task even if the configuration it once resolved against changed since.
+fn same_request(record: &TaskRecord, request: &NewTask) -> bool {
+    record.owner == request.owner
+        && record.request_digest.is_some()
+        && record.request_digest == request.request_digest
 }
 
 /// Whether the runner acknowledged a safe point for the task's current

@@ -157,6 +157,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         Arc::clone(&selector) as Arc<dyn HarnessDefaults>,
     );
     let control = Arc::new(ProtocolService::new(control_plane, Arc::new(launch)));
+    let _scheduler = spawn_periodic_admission(Arc::clone(&control));
     let agent_timeout_secs = defaults.timeout_secs;
     let engine = Arc::new(
         Engine::new(store.clone())
@@ -273,6 +274,31 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     cleanup_discovery_file(&paths.daemon_file());
 
     Ok(())
+}
+
+/// How often the daemon re-evaluates queue admission on its own (U10).
+const ADMISSION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Re-evaluates admission periodically, beside the event-driven passes.
+///
+/// Two inputs change without any request announcing it: a controller's
+/// lease running out (its capacity is then withheld and waiting tasks say
+/// `controller_offline`) and an operator editing a backend's limit in the
+/// catalogue. The handle is dropped with the daemon's runtime.
+fn spawn_periodic_admission(control: Arc<ProtocolService>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(ADMISSION_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let control = Arc::clone(&control);
+            // File I/O under advisory locks: keep it off the async workers.
+            if let Err(error) = tokio::task::spawn_blocking(move || control.reschedule_all()).await
+            {
+                tracing::warn!(%error, "scheduler: periodic admission pass panicked");
+            }
+        }
+    })
 }
 
 /// The server's security mode from the configuration (U7), or a failure

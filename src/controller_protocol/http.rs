@@ -67,6 +67,11 @@ where
         .route("/control/v1/tasks", get(list_tasks).post(create_task))
         .route("/control/v1/tasks/:task_id", get(get_task))
         .route("/control/v1/tasks/:task_id/commands", post(post_command))
+        .route("/control/v1/tasks/:task_id/priority", post(post_priority))
+        .route(
+            "/control/v1/default-backend",
+            get(get_default_backend).put(put_default_backend),
+        )
         .route("/control/v1/tasks/:task_id/timeline", get(get_timeline))
         .route(
             "/control/v1/tasks/:task_id/conversation",
@@ -241,6 +246,30 @@ async fn post_command(
     Json(request): Json<OwnerCommandRequest>,
 ) -> ProtocolResult<Json<OwnerCommandResponse>> {
     Ok(Json(service.command(&owner, &task_id, request)?))
+}
+
+async fn post_priority(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(task_id): Path<String>,
+    Json(request): Json<SetPriorityRequest>,
+) -> ProtocolResult<Json<TaskSummary>> {
+    Ok(Json(service.set_priority(&owner, &task_id, request)?))
+}
+
+async fn get_default_backend(
+    State(service): State<Service>,
+    Extension(_owner): Extension<OwnerRef>,
+) -> ProtocolResult<Json<DefaultBackendView>> {
+    Ok(Json(service.default_backend()?))
+}
+
+async fn put_default_backend(
+    State(service): State<Service>,
+    Extension(_owner): Extension<OwnerRef>,
+    Json(request): Json<SetDefaultBackendRequest>,
+) -> ProtocolResult<Json<DefaultBackendView>> {
+    Ok(Json(service.set_default_backend(request)?))
 }
 
 async fn get_timeline(

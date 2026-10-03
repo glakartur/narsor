@@ -8,6 +8,8 @@
 //! {state}/orchestration/tasks/{task}/events/{seq}.json TaskEvent (exclusive create)
 //! {state}/orchestration/backends/{backend}/lease.json  BackendLease
 //! {state}/orchestration/backends/{backend}/lease.lock
+//! {state}/orchestration/backends/{backend}/schedule.lock  admission lock (U10)
+//! {state}/orchestration/default-backend.json           owner default backend (U10)
 //! {state}/orchestration/tasks/{task}/runner-session.json   runner credential (U2)
 //! {state}/orchestration/controllers/{id}/controller.json  controller identity (U2)
 //! {state}/orchestration/enrollments/{id}.json             one-time enrollment (U2)
@@ -31,7 +33,8 @@
 
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    BackendLease, TaskEvent, TaskRecord, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
+    BackendLease, DefaultBackendSelection, TaskEvent, TaskRecord, BACKEND_LEASE_VERSION,
+    DEFAULT_BACKEND_SELECTION_VERSION, TASK_RECORD_VERSION,
 };
 use crate::domain::{BackendId, TaskId};
 use crate::persistence::atomic::{
@@ -246,6 +249,31 @@ impl OrchestrationStore {
         Ok(write_json_atomic(&path, lease)?)
     }
 
+    /// Loads the owner's default-backend override, if one was ever set.
+    pub fn load_default_backend(&self) -> Result<Option<DefaultBackendSelection>> {
+        let path = self.paths.default_backend_file();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let selection: DefaultBackendSelection = read_json(&path)?;
+        if selection.record_version > DEFAULT_BACKEND_SELECTION_VERSION {
+            return Err(OrchestrationError::UnsupportedRecordVersion {
+                what: path.display().to_string(),
+                version: selection.record_version,
+            });
+        }
+        Ok(Some(selection))
+    }
+
+    /// Atomically replaces the default-backend override. Call only under
+    /// [`Self::lock_default_backend`].
+    pub(crate) fn save_default_backend(&self, selection: &DefaultBackendSelection) -> Result<()> {
+        Ok(write_json_atomic(
+            &self.paths.default_backend_file(),
+            selection,
+        )?)
+    }
+
     /// Removes orphaned `.tmp` files of interrupted writes anywhere below
     /// `orchestration/`. Each is the trace of a crash before a rename; the
     /// target still holds its last complete version.
@@ -266,6 +294,9 @@ impl OrchestrationStore {
         removed.extend(cleanup_orphaned_temp_files(
             &self.paths.orchestration_enrollments_dir(),
         )?);
+        removed.extend(cleanup_orphaned_temp_files(
+            &self.paths.orchestration_dir(),
+        )?);
         Ok(removed)
     }
 
@@ -282,6 +313,16 @@ impl OrchestrationStore {
     /// Exclusive lock for one backend's lease.
     pub(crate) fn lock_backend(&self, backend_id: &BackendId) -> Result<FileLock> {
         FileLock::acquire(self.paths.backend_lease_lock_file(backend_id.as_str()))
+    }
+
+    /// Exclusive lock for one backend's scheduling decisions (U10).
+    pub(crate) fn lock_schedule(&self, backend_id: &BackendId) -> Result<FileLock> {
+        FileLock::acquire(self.paths.backend_schedule_lock_file(backend_id.as_str()))
+    }
+
+    /// Exclusive lock for changing the default-backend override.
+    pub(crate) fn lock_default_backend(&self) -> Result<FileLock> {
+        FileLock::acquire(self.paths.default_backend_lock_file())
     }
 
     /// Exclusive lock for mutating one controller identity record.

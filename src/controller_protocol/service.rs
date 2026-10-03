@@ -24,9 +24,9 @@ use super::wire::*;
 use crate::domain::{BackendId, TaskId};
 use crate::environment::{LaunchError, LaunchIntent, LaunchResolver};
 use crate::orchestration::{
-    BackendLease, CommandRequest, ControlPlane, ControllerReport, ConversationAvailability,
-    InputRequest, LeaseToken, NewTask, OwnerRef, RunnerObservation, TaskEvent, TaskLifecycle,
-    TaskRecord,
+    BackendCapacity, BackendLease, CommandRequest, ControlPlane, ControllerReport,
+    ConversationAvailability, InputRequest, LeaseToken, NewTask, Observation, OwnerRef,
+    RunnerObservation, TaskEvent, TaskLifecycle, TaskRecord,
 };
 
 /// A launch that did not resolve, as the owner sees it: a `400` naming the
@@ -237,14 +237,35 @@ impl ProtocolService {
         owner: &OwnerRef,
         request: CreateTaskRequest,
     ) -> ProtocolResult<TaskSummary> {
+        let request_digest = request_digest(&request)?;
         let task_id = match request.task_id {
             Some(task_id) => parse_identifier(TaskId::parse(task_id))?,
             None => TaskId::parse(format!("task-{}", uuid::Uuid::new_v4().simple()))
                 .expect("a generated task id is always valid"),
         };
-        if self.someone_else_owns(owner, &task_id)? {
-            return Err(ProtocolError::NotFound);
+        match self.control.task(&task_id) {
+            Ok(existing) if existing.owner != *owner => return Err(ProtocolError::NotFound),
+            // A retry of the identical request: the task it created, even if
+            // the configuration it resolved against — the default backend, a
+            // limit, an image — changed since. Resolving again could only
+            // produce a spurious conflict (U10).
+            Ok(existing) if existing.request_digest.as_deref() == Some(&request_digest) => {
+                return self.summarize(&existing);
+            }
+            Ok(_) | Err(crate::orchestration::OrchestrationError::TaskNotFound(_)) => {}
+            Err(error) => return Err(error.into()),
         }
+        // The owner's durable default backend (R10) is read here, once, for
+        // a request that names none; the configured one applies when the
+        // owner never chose. The task is pinned to the result for good.
+        let backend = match request.backend_id {
+            Some(backend) => Some(backend),
+            None => self
+                .control
+                .default_backend()?
+                .and_then(|selection| selection.backend)
+                .map(|backend| backend.to_string()),
+        };
         // Resolution reads configuration only; a refusal here returns before
         // the control plane is asked to store anything, so an invalid backend
         // limit, an unregistered secret, an unsupported harness or a missing
@@ -254,7 +275,7 @@ impl ProtocolService {
         let resolved = self
             .launch
             .resolve(&LaunchIntent {
-                backend: request.backend_id,
+                backend,
                 workflow_id: launch.workflow_id,
                 workflow_version: launch.workflow_version,
                 inputs: launch.inputs,
@@ -274,7 +295,8 @@ impl ProtocolService {
                     resolved.backend_id,
                     resolved.spec,
                 )
-                .with_priority(request.priority),
+                .with_priority(request.priority)
+                .with_request_digest(request_digest),
             )
             .map_err(|error| match error {
                 // Created by another owner between the check above and now.
@@ -286,7 +308,8 @@ impl ProtocolService {
                 other => other.into(),
             })?;
         self.notify(&record.task_id);
-        self.summarize(&record)
+        self.reschedule(&record.assignment.backend_id);
+        self.owned_summary(owner, &record.task_id)
     }
 
     /// The owner's tasks and the stream cursor at exactly that state.
@@ -326,22 +349,147 @@ impl ProtocolService {
                 "an owner command needs an idempotency key",
             ));
         }
-        let outcome = self.control.command(
+        let capacity = self.capacity(&record.assignment.backend_id);
+        let outcome = self.control.command_with_capacity(
             &record.task_id,
             CommandRequest {
                 command: request.command,
                 idempotency_key: request.idempotency_key,
                 expected_generation: request.expected_generation,
             },
+            &capacity,
         )?;
+        let mut task = outcome.task;
         if !outcome.replayed {
             self.notify(&record.task_id);
+            // An archive releases a slot (or a queued task's place).
+            self.reschedule(&record.assignment.backend_id);
+            task = self.control.task(&record.task_id)?;
         }
         Ok(OwnerCommandResponse {
-            task: self.summarize(&outcome.task)?,
+            task: self.summarize(&task)?,
             receipt: outcome.receipt,
             replayed: outcome.replayed,
         })
+    }
+
+    /// Changes a queued task's priority and re-evaluates its backend's
+    /// queue (R11). Never stops or reorders anything holding compute.
+    pub fn set_priority(
+        &self,
+        owner: &OwnerRef,
+        task_id: &str,
+        request: SetPriorityRequest,
+    ) -> ProtocolResult<TaskSummary> {
+        let record = self.owned_task(owner, task_id)?;
+        let (_, changed) = self.control.set_priority(
+            &record.task_id,
+            request.priority,
+            request.expected_generation,
+        )?;
+        if changed {
+            self.notify(&record.task_id);
+            self.reschedule(&record.assignment.backend_id);
+        }
+        self.owned_summary(owner, &record.task_id)
+    }
+
+    /// The default backend of new tasks (R10).
+    pub fn default_backend(&self) -> ProtocolResult<DefaultBackendView> {
+        let selection = self.control.default_backend()?;
+        let configured = self.launch.configured_default_backend();
+        let override_backend = selection
+            .as_ref()
+            .and_then(|selection| selection.backend.clone());
+        Ok(DefaultBackendView {
+            effective: override_backend
+                .as_ref()
+                .map_or_else(|| configured.clone(), ToString::to_string),
+            configured,
+            override_backend,
+            revision: selection.as_ref().map_or(0, |selection| selection.revision),
+            updated_at: selection.and_then(|selection| selection.updated_at),
+        })
+    }
+
+    /// Durably chooses the default backend of new tasks, or clears the
+    /// choice (R10). The backend must be registered and usable now; tasks
+    /// that exist keep their backend.
+    pub fn set_default_backend(
+        &self,
+        request: SetDefaultBackendRequest,
+    ) -> ProtocolResult<DefaultBackendView> {
+        let backend = match request.backend_id {
+            Some(backend) => {
+                let backend = parse_identifier(BackendId::parse(backend))?;
+                self.launch
+                    .backend_limit(&backend)
+                    .map_err(launch_refusal)?;
+                Some(backend)
+            }
+            None => None,
+        };
+        self.control.set_default_backend(backend)?;
+        // Moves nothing — queued tasks keep their backend — but a client
+        // watching the queue gets fresh reasons all the same.
+        self.reschedule_all();
+        self.default_backend()
+    }
+
+    /// Re-evaluates admission on every backend that has a queued task.
+    ///
+    /// The daemon calls it periodically, because some inputs change without
+    /// any request: a controller's lease runs out, the operator edits a
+    /// backend's limit. Failures are logged; the next pass retries.
+    pub fn reschedule_all(&self) {
+        let backends: std::collections::BTreeSet<BackendId> = match self.control.list_tasks() {
+            Ok(tasks) => tasks
+                .into_iter()
+                .filter(|task| task.lifecycle == TaskLifecycle::Queued)
+                .map(|task| task.assignment.backend_id)
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, "scheduler: cannot list tasks");
+                return;
+            }
+        };
+        for backend in backends {
+            self.reschedule(&backend);
+        }
+    }
+
+    /// Re-evaluates admission on `backend_id` against its limit as
+    /// configured right now, announcing every task that changed.
+    ///
+    /// Runs after the mutation that prompted it was committed, so a failure
+    /// here must not fail that request: it is logged, and the next trigger
+    /// (or the daemon's periodic pass) decides again.
+    pub fn reschedule(&self, backend_id: &BackendId) {
+        let capacity = self.capacity(backend_id);
+        match self.control.schedule(backend_id, &capacity) {
+            Ok(changed) => {
+                for task_id in changed {
+                    self.notify(&task_id);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(backend = %backend_id, %error, "scheduler: admission pass failed");
+            }
+        }
+    }
+
+    /// The backend's capacity per configuration, read fresh.
+    fn capacity(&self, backend_id: &BackendId) -> BackendCapacity {
+        match self.launch.backend_limit(backend_id) {
+            Ok(limit) => BackendCapacity::Limit(limit),
+            Err(error) => BackendCapacity::Unavailable(error.to_string()),
+        }
+    }
+
+    /// The owner's task, re-read and summarized.
+    fn owned_summary(&self, owner: &OwnerRef, task_id: &TaskId) -> ProtocolResult<TaskSummary> {
+        let record = self.owned_task(owner, task_id.as_str())?;
+        self.summarize(&record)
     }
 
     /// The last timeline the task's runner reported.
@@ -632,6 +780,9 @@ impl ProtocolService {
             .credentials
             .revoke_controller(controller_id)?
             .ok_or(ProtocolError::NotFound)?;
+        // Its lease expired with it: new starts are withheld until another
+        // controller holds the backend, and the waiting tasks say so.
+        self.reschedule(&record.backend_id);
         self.controller_view(&record)
     }
 
@@ -709,6 +860,8 @@ impl ProtocolService {
             self.control
                 .acquire_lease(&identity.backend_id, &identity.controller_id, ttl)?;
         self.credentials.record_heartbeat(&identity.controller_id)?;
+        // A controller is back: the backend's capacity is available again.
+        self.reschedule(&identity.backend_id);
         Ok(lease_view(lease))
     }
 
@@ -723,6 +876,8 @@ impl ProtocolService {
             .control
             .renew_lease(&lease_token(identity, request.epoch), ttl)?;
         self.credentials.record_heartbeat(&identity.controller_id)?;
+        // A renewal may revive a lease that had lapsed.
+        self.reschedule(&identity.backend_id);
         Ok(lease_view(lease))
     }
 
@@ -735,6 +890,7 @@ impl ProtocolService {
         let lease = self
             .control
             .release_lease(&lease_token(identity, request.epoch))?;
+        self.reschedule(&identity.backend_id);
         Ok(lease_view(lease))
     }
 
@@ -746,6 +902,9 @@ impl ProtocolService {
         all: bool,
     ) -> ProtocolResult<CommandsResponse> {
         let lease = self.require_lease(identity)?;
+        // Decide admission before answering: the controller asking is the
+        // proof its backend is online, and its limit is read fresh.
+        self.reschedule(&identity.backend_id);
         let acknowledged = self
             .credentials
             .controller(&identity.controller_id)?
@@ -762,6 +921,10 @@ impl ProtocolService {
                         .get(record.task_id.as_str())
                         .copied()
                         .unwrap_or(0)
+            })
+            // A queued task is offered only once the scheduler admitted it.
+            .filter(|record| {
+                record.lifecycle != TaskLifecycle::Queued || record.reservation.is_some()
             })
             .filter_map(desired_command)
             .collect();
@@ -842,6 +1005,15 @@ impl ProtocolService {
         request: ReportRequest,
     ) -> ProtocolResult<ReportResponse> {
         let record = self.backend_task(identity, &request.task_id)?;
+        if request.observation == Observation::StartAccepted
+            && record.lifecycle == TaskLifecycle::Queued
+            && record.reservation.is_none()
+        {
+            // A start may only be accepted with a reservation; give the
+            // scheduler its chance first rather than refuse a controller
+            // that merely reported before any pass ran.
+            self.reschedule(&identity.backend_id);
+        }
         let outcome = self.control.report(ControllerReport {
             task_id: record.task_id.clone(),
             lease: lease_token(identity, request.lease_epoch),
@@ -853,6 +1025,8 @@ impl ProtocolService {
         })?;
         if outcome.applied {
             self.notify(&record.task_id);
+            // A pause, a loss, a completed archive may each free a slot.
+            self.reschedule(&identity.backend_id);
         }
         Ok(ReportResponse {
             applied: outcome.applied,
@@ -1155,6 +1329,7 @@ impl ProtocolService {
             runner,
             controller,
             inputs: record.inputs.iter().map(InputView::from).collect(),
+            queue: record.queue.as_ref().map(QueueView::from),
             as_of: now,
         })
     }
@@ -1405,6 +1580,13 @@ fn bounded_ttl(requested: Option<u64>, default: Duration, max: Duration) -> Dura
         }
         None => default,
     }
+}
+
+/// Digest of a create request — what an identical retry presents again.
+fn request_digest(request: &CreateTaskRequest) -> ProtocolResult<String> {
+    let value = serde_json::to_value(request)
+        .map_err(|error| ProtocolError::Internal(format!("cannot digest a request: {error}")))?;
+    Ok(crate::domain::canonical_sha256(&value))
 }
 
 fn parse_identifier<T>(parsed: Result<T, crate::domain::InvalidIdentifier>) -> ProtocolResult<T> {

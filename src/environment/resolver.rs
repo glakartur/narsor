@@ -9,8 +9,10 @@
 //! # Precedence
 //!
 //! * **Backend** — the request's explicit `backend`, else the owner default
-//!   (`default_backend`, R10). An existing task never re-resolves, so
-//!   changing the default moves no task.
+//!   (R10): the override the owner chose through the control plane, which
+//!   fills in `backend` before resolution, else the configured
+//!   `default_backend`. An existing task never re-resolves, so changing the
+//!   default moves no task.
 //! * **Base image** — a step's `image` wins over the workflow's
 //!   `globals.image`, which wins over the repository's `base_image` (R15).
 //!   The step overrides are recorded separately, each with its
@@ -270,6 +272,15 @@ impl LaunchError {
 pub trait LaunchResolver: Send + Sync {
     /// Resolves and validates `intent`, reading but never writing.
     fn resolve(&self, intent: &LaunchIntent) -> Result<ResolvedLaunch, LaunchError>;
+
+    /// `max_concurrent_tasks` of a registered, usable backend, read fresh
+    /// from configuration on every call, so the scheduler applies a changed
+    /// limit to its next decision (U10).
+    fn backend_limit(&self, backend: &BackendId) -> Result<u32, LaunchError>;
+
+    /// The configured `default_backend` — the fallback when the owner has
+    /// not chosen one through the control plane (R10).
+    fn configured_default_backend(&self) -> String;
 }
 
 /// The harness registry and the live default harness (R42).
@@ -402,6 +413,12 @@ impl CatalogLaunchResolver {
             .clone()
             .unwrap_or_else(|| self.owner.default_backend.clone());
         let backend_id = BackendId::parse(requested)?;
+        let record = self.usable_backend(&backend_id)?;
+        Ok((backend_id, record))
+    }
+
+    /// The registered record of `backend_id`, refused when it is unusable.
+    fn usable_backend(&self, backend_id: &BackendId) -> Result<BackendRecord, LaunchError> {
         let record = self
             .catalog
             .backend(backend_id.as_str())?
@@ -413,7 +430,7 @@ impl CatalogLaunchResolver {
                 problems,
             });
         }
-        Ok((backend_id, record))
+        Ok(record)
     }
 
     fn workflow(&self, intent: &LaunchIntent) -> Result<WorkflowDefinition, LaunchError> {
@@ -696,6 +713,14 @@ impl SecretSet {
 }
 
 impl LaunchResolver for CatalogLaunchResolver {
+    fn backend_limit(&self, backend: &BackendId) -> Result<u32, LaunchError> {
+        Ok(self.usable_backend(backend)?.limits.max_concurrent_tasks)
+    }
+
+    fn configured_default_backend(&self) -> String {
+        self.owner.default_backend.clone()
+    }
+
     fn resolve(&self, intent: &LaunchIntent) -> Result<ResolvedLaunch, LaunchError> {
         let (backend_id, backend) = self.backend(intent)?;
         let definition = self.workflow(intent)?;

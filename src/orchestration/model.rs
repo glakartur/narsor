@@ -15,6 +15,9 @@ pub const TASK_RECORD_VERSION: u32 = 1;
 /// Current schema version of [`BackendLease`].
 pub const BACKEND_LEASE_VERSION: u32 = 1;
 
+/// Current schema version of [`DefaultBackendSelection`].
+pub const DEFAULT_BACKEND_SELECTION_VERSION: u32 = 1;
+
 /// Orchestration state of a task (the plan's state diagram).
 ///
 /// Deliberately separate from [`ExecutionStatus`]: this is what the control
@@ -23,7 +26,8 @@ pub const BACKEND_LEASE_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskLifecycle {
-    /// Waiting for a controller to accept it (admission is U10's concern).
+    /// Waiting for a capacity reservation, or holding one and waiting for
+    /// its controller to accept the start (U10, see [`super::scheduler`]).
     Queued,
     /// A controller accepted the start or a resume; the runner is not ready.
     Provisioning,
@@ -292,6 +296,18 @@ pub enum TaskEventKind {
         /// The runner's pending-input id it answers.
         pending_input_id: String,
     },
+    /// The owner changed the queue priority of a queued task (R11).
+    PriorityChanged {
+        /// The new priority.
+        priority: i32,
+    },
+    /// The scheduler's verdict on a queued task changed: it was admitted,
+    /// or why it waits changed (U10). Carried in the stream so a client
+    /// shows the reason without polling.
+    QueueChanged {
+        /// The new verdict.
+        reason: QueueReason,
+    },
     /// Queued inputs changed status (delivered, consumed, rejected or made
     /// obsolete by the runner moving on).
     InputsUpdated {
@@ -382,6 +398,21 @@ pub struct TaskRecord {
     /// every answer, whose payload is dropped once it is settled.
     #[serde(default)]
     pub inputs: Vec<QueuedInput>,
+    /// The capacity slot the scheduler granted while the task is queued
+    /// (U10). Only a task holding one is offered `Start`, and only such a
+    /// task may be accepted by its controller; cleared once the task leaves
+    /// `Queued`, from where its lifecycle itself holds the slot.
+    #[serde(default)]
+    pub reservation: Option<CapacityReservation>,
+    /// Why the queued task waits, or that it was admitted; `None` outside
+    /// `Queued` and before the scheduler first looked at it.
+    #[serde(default)]
+    pub queue: Option<QueueStatus>,
+    /// Digest of the owner's create request, so a retry of the identical
+    /// request returns this task without resolving the configuration again
+    /// — which may have changed meanwhile (a new default backend).
+    #[serde(default)]
+    pub request_digest: Option<String>,
     /// The event of revision [`Self::revision`]: an outbox of one, so a crash
     /// between writing the record and appending the event is repaired from
     /// the record itself (see `OrchestrationStore::publish_last_event`).
@@ -389,6 +420,37 @@ pub struct TaskRecord {
 }
 
 impl TaskRecord {
+    /// Whether the task occupies one of its backend's capacity slots.
+    ///
+    /// Conservative on purpose (R6, R11, R13): a slot is free only once the
+    /// control plane *knows* the task has no compute.
+    ///
+    /// * `Provisioning`, `Running`, `PauseRequested` — compute exists or is
+    ///   being created;
+    /// * `Queued` with a reservation — admitted, the controller may create
+    ///   compute any moment;
+    /// * `Interrupted`, `Unknown` — the workload may still exist (a dead Pod
+    ///   object, a node that is merely unreachable), and only the owner's
+    ///   start/resume or archive resolves that; both keep or release the
+    ///   slot explicitly, so a retry never has to wait for capacity;
+    /// * `Archiving` — deletion is requested but not confirmed.
+    ///
+    /// `Paused` releases its slot: the safe point was acknowledged and the
+    /// compute removed (R12). `Archived` and an unadmitted `Queued` task
+    /// hold nothing.
+    pub fn holds_capacity(&self) -> bool {
+        match self.lifecycle {
+            TaskLifecycle::Queued => self.reservation.is_some(),
+            TaskLifecycle::Provisioning
+            | TaskLifecycle::Running
+            | TaskLifecycle::PauseRequested
+            | TaskLifecycle::Interrupted
+            | TaskLifecycle::Unknown
+            | TaskLifecycle::Archiving => true,
+            TaskLifecycle::Paused | TaskLifecycle::Archived => false,
+        }
+    }
+
     /// Finds the receipt of an idempotency key.
     pub fn receipt(&self, idempotency_key: &str) -> Option<&CommandReceipt> {
         self.commands
@@ -441,6 +503,110 @@ impl TaskRecord {
     pub fn input(&self, input_id: &str) -> Option<&QueuedInput> {
         self.inputs.iter().find(|input| input.input_id == input_id)
     }
+}
+
+/// A capacity slot granted to a queued task (U10).
+///
+/// Durable on the task record itself, so a reservation and the task it
+/// belongs to are committed together and survive a restart: what counts
+/// against a backend's limit is always derivable from the records alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapacityReservation {
+    /// When the scheduler granted it.
+    pub granted_at: DateTime<Utc>,
+}
+
+/// The scheduler's verdict on a queued task (U10), for humans and clients.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "reason")]
+pub enum QueueReason {
+    /// Holds a reservation; its controller is offered the start.
+    Admitted,
+    /// Every slot of the backend is taken.
+    WaitingForCapacity {
+        /// 1-based place among the backend's waiting tasks: higher priority
+        /// first, creation order among equals.
+        position: u32,
+        /// Slots in use: tasks holding compute plus admitted tasks whose
+        /// start was not accepted yet.
+        running: u32,
+        /// The backend's `max_concurrent_tasks`, as configured right now.
+        limit: u32,
+    },
+    /// No controller holds an unexpired lease of the backend (it is down,
+    /// unreachable or was revoked), so no new start is admitted: a slot
+    /// handed out now could only be used once a controller returns, and by
+    /// then the owner may have reordered the queue. Carries no position on
+    /// purpose: while nothing can start, the order is not news, and every
+    /// archive would otherwise re-announce every waiting task.
+    ControllerOffline,
+    /// The backend is not registered any more, or its record is unusable.
+    BackendUnknown {
+        /// What is wrong with it.
+        detail: String,
+    },
+}
+
+impl QueueReason {
+    /// A one-line explanation for people.
+    pub fn describe(&self) -> String {
+        match self {
+            QueueReason::Admitted => "admitted; waiting for the controller to start it".into(),
+            QueueReason::WaitingForCapacity {
+                position,
+                running,
+                limit,
+            } => format!(
+                "waiting for capacity: position {position} in the queue, \
+                 {running} of {limit} slots in use"
+            ),
+            QueueReason::ControllerOffline => {
+                "waiting for the backend's controller to come online".into()
+            }
+            QueueReason::BackendUnknown { detail } => {
+                format!("cannot be scheduled: {detail}")
+            }
+        }
+    }
+}
+
+/// The current [`QueueReason`] of a queued task and since when it holds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueueStatus {
+    /// The verdict.
+    pub reason: QueueReason,
+    /// When the scheduler reached it.
+    pub since: DateTime<Utc>,
+}
+
+/// Capacity of a backend as configuration states it right now (U10).
+///
+/// Read fresh by the caller on every scheduling decision, so a changed
+/// limit applies to the next decision without a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendCapacity {
+    /// `max_concurrent_tasks` of a usable backend record.
+    Limit(u32),
+    /// The backend cannot be used; why.
+    Unavailable(String),
+}
+
+/// The durable owner choice of the default backend (R10).
+///
+/// Only an *override* of the configured `default_backend`; absent or
+/// `backend: None` means the configured value applies. It is read when a
+/// task is created and never again for that task, so changing it moves
+/// nothing that already exists.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DefaultBackendSelection {
+    /// Schema version.
+    pub record_version: u32,
+    /// Grows with every change.
+    pub revision: u64,
+    /// The chosen backend, `None` after a reset.
+    pub backend: Option<BackendId>,
+    /// When it last changed.
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 /// Where the runner's engine stands, as positions rather than content.
@@ -666,6 +832,9 @@ pub struct NewTask {
     pub launch_spec: TaskLaunchSpec,
     /// Queue priority, default 0.
     pub priority: i32,
+    /// Digest of the owner request it came from, if any (see
+    /// [`TaskRecord::request_digest`]).
+    pub request_digest: Option<String>,
 }
 
 impl NewTask {
@@ -682,7 +851,14 @@ impl NewTask {
             backend_id,
             launch_spec,
             priority: 0,
+            request_digest: None,
         }
+    }
+
+    /// Records the digest of the owner request.
+    pub fn with_request_digest(mut self, digest: impl Into<String>) -> Self {
+        self.request_digest = Some(digest.into());
+        self
     }
 
     /// Sets the queue priority.

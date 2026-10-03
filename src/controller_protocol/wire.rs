@@ -27,8 +27,8 @@ use crate::domain::{BackendId, ExecutionStatus, ResourceProfile, TaskId, TaskLau
 use crate::engine::{HumanInputDelivery, Timeline};
 use crate::orchestration::{
     ArchiveTombstone, CommandReceipt, ConversationAttemptSummary, ExecutionCursor, InputStatus,
-    Observation, ObservedSummary, OwnerCommand, PendingInputRef, QueuedInput, ResourceIdentity,
-    RunnerProblem, RunnerSnapshot, TaskEvent, TaskLifecycle,
+    Observation, ObservedSummary, OwnerCommand, PendingInputRef, QueueReason, QueueStatus,
+    QueuedInput, ResourceIdentity, RunnerProblem, RunnerSnapshot, TaskEvent, TaskLifecycle,
 };
 
 /// Version of this protocol; part of every path (`…/v1/…`).
@@ -89,9 +89,11 @@ pub struct WorkspaceRequest {
 /// `POST /control/v1/tasks`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CreateTaskRequest {
-    /// Client-chosen id; repeating the same request with it is idempotent
-    /// while the configuration it resolves against is unchanged.
-    /// Generated when absent — but then a retry creates a second task.
+    /// Client-chosen id; repeating the identical request with it returns
+    /// the task it created, even after the configuration it resolved
+    /// against (the default backend, say) changed. A *different* request
+    /// with the same id is a `task_conflict`. Generated when absent — but
+    /// then a retry creates a second task.
     #[serde(default)]
     pub task_id: Option<String>,
     /// Backend to pin the task to (R10); the owner's `default_backend` when
@@ -250,9 +252,71 @@ pub struct TaskSummary {
     pub controller: Option<ControllerPresence>,
     /// Owner inputs, oldest first.
     pub inputs: Vec<InputView>,
+    /// While queued: whether the task was admitted, or why it waits (U10).
+    /// `None` outside `Queued`.
+    #[serde(default)]
+    pub queue: Option<QueueView>,
     /// The control plane's "now" this summary was computed at, so a client
     /// can show the age of every timestamp above.
     pub as_of: DateTime<Utc>,
+}
+
+/// The scheduler's verdict on a queued task, as clients see it (U10).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueueView {
+    /// Machine-readable verdict.
+    pub reason: QueueReason,
+    /// The same, for people.
+    pub message: String,
+    /// Since when it holds.
+    pub since: DateTime<Utc>,
+}
+
+impl From<&QueueStatus> for QueueView {
+    fn from(status: &QueueStatus) -> Self {
+        Self {
+            message: status.reason.describe(),
+            reason: status.reason.clone(),
+            since: status.since,
+        }
+    }
+}
+
+/// `POST /control/v1/tasks/:task_id/priority`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetPriorityRequest {
+    /// The new priority, higher first (R11). Repeating the current value
+    /// is a no-op, which makes a retry safe without a key.
+    pub priority: i32,
+    /// Refuse unless the task is still at this desired generation.
+    #[serde(default)]
+    pub expected_generation: Option<u64>,
+}
+
+/// `GET`/`PUT /control/v1/default-backend`: the backend a new task without
+/// an explicit one is pinned to (R10).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DefaultBackendView {
+    /// The configured `default_backend`, the fallback.
+    pub configured: String,
+    /// The owner's durable choice, if any.
+    #[serde(rename = "override")]
+    pub override_backend: Option<BackendId>,
+    /// What a new task gets: the override, else the configured value.
+    pub effective: String,
+    /// Grows with every change of the override; 0 when never set.
+    pub revision: u64,
+    /// When the override last changed.
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// `PUT /control/v1/default-backend`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetDefaultBackendRequest {
+    /// A registered backend; `null` removes the override, so the
+    /// configured value applies again. Existing tasks never move.
+    #[serde(default)]
+    pub backend_id: Option<String>,
 }
 
 /// `GET /control/v1/tasks`.
@@ -543,7 +607,10 @@ pub struct LeaseEpochRequest {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DesiredAction {
-    /// Queued: take the start over. **Report `StartAccepted` and wait for
+    /// Queued and admitted by the control plane's scheduler (U10) — a
+    /// queued task without a capacity reservation is not offered at all,
+    /// and its `StartAccepted` would be refused as `not_admitted`.
+    /// Take the start over. **Report `StartAccepted` and wait for
     /// it to be accepted before creating any resource.** An archive racing
     /// the start completes at once on a task no controller accepted, so a
     /// resource created before the report would leak; a refused report

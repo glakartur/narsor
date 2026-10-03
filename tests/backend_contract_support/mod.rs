@@ -138,9 +138,15 @@ impl<T: ContractTarget> Harness<T> {
         };
         let state = root.0.join("control");
         fs::create_dir_all(&state).expect("state root");
+        let launch = crate::environment_support::seeded_resolver(&state);
+        // The scheduler admits a task only on a registered backend, with
+        // its limit read from the catalogue (U10).
+        narsor::environment::EnvironmentCatalog::new(&state)
+            .save_backend(&crate::environment_support::backend(BACKEND))
+            .expect("register the contract backend");
         let service = Arc::new(ProtocolService::new(
             narsor::orchestration::ControlPlane::new(StatePaths::new(&state)),
-            crate::environment_support::seeded_resolver(&state),
+            launch,
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -225,6 +231,16 @@ impl<T: ContractTarget> Harness<T> {
     /// Reconnects controller `index`.
     pub fn restore(&self, index: usize) {
         self.controllers[index].link.restore();
+    }
+
+    /// Changes the backend's `max_concurrent_tasks` in the catalogue; the
+    /// scheduler reads it fresh at its next decision (U10).
+    pub fn set_limit(&self, limit: u32) {
+        let mut record = crate::environment_support::backend(BACKEND);
+        record.limits.max_concurrent_tasks = limit;
+        narsor::environment::EnvironmentCatalog::new(self.root.0.join("control"))
+            .save_backend(&record)
+            .expect("save the backend");
     }
 
     /// The controller currently holding the backend's lease, if any.
@@ -879,6 +895,59 @@ pub async fn parallel_tasks_are_isolated<T: ContractTarget>() {
     assert_eq!(counters.storages_created, 2, "{counters:?}");
 }
 
+/// U10: the controller is offered — and can only get accepted — as many
+/// starts as the backend's limit allows. A waiting task says why it
+/// waits, a pause releases the slot to it, and a resume finding the
+/// backend full is refused rather than stopping anything (R11).
+pub async fn the_controller_never_starts_more_than_the_limit<T: ContractTarget>() {
+    let Some(mut h) = Harness::<T>::new().await else {
+        return;
+    };
+    h.set_limit(1);
+    h.start_controller();
+    h.create("task-1");
+    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+    h.create("task-2");
+    h.settle().await;
+
+    assert_eq!(h.lifecycle("task-2"), TaskLifecycle::Queued);
+    assert!(
+        h.reported("task-2").is_empty(),
+        "no start was even accepted"
+    );
+    assert_eq!(
+        h.record("task-2").queue.map(|queue| queue.reason),
+        Some(narsor::orchestration::QueueReason::WaitingForCapacity {
+            position: 1,
+            running: 1,
+            limit: 1,
+        })
+    );
+    assert_eq!(h.counters().workloads_created, 1, "{:?}", h.counters());
+
+    // Pausing releases the compute and its slot: the waiting task starts.
+    h.must("task-1", OwnerCommand::Pause, "pause-1");
+    h.wait_lifecycle("task-1", TaskLifecycle::Paused).await;
+    h.wait_lifecycle("task-2", TaskLifecycle::Running).await;
+
+    // Resuming now would exceed the limit: refused, nothing stops.
+    match h.command("task-1", OwnerCommand::Resume, "resume-1") {
+        Err(ProtocolError::Conflict { code, .. }) => assert_eq!(code, "backend_at_capacity"),
+        other => panic!("a resume beyond the limit must be refused: {other:?}"),
+    }
+    h.settle().await;
+    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Paused);
+    assert_eq!(h.lifecycle("task-2"), TaskLifecycle::Running);
+    assert!(alive(&h.observe("task-2").await));
+
+    h.must("task-2", OwnerCommand::Archive, "archive-2");
+    h.wait_lifecycle("task-2", TaskLifecycle::Archived).await;
+    h.must("task-1", OwnerCommand::Resume, "resume-2");
+    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+    let counters = h.counters();
+    assert_eq!(counters.workloads_created, 3, "{counters:?}");
+}
+
 /// Expands the whole suite for one target into a module of tests.
 macro_rules! contract_suite {
     ($module:ident, $target:ty) => {
@@ -897,7 +966,8 @@ macro_rules! contract_suite {
                 delayed_deletion_and_resume_during_pause,
                 lease_handoff_between_controllers,
                 archive_racing_start_creates_nothing,
-                parallel_tasks_are_isolated);
+                parallel_tasks_are_isolated,
+                the_controller_never_starts_more_than_the_limit);
         }
     };
     (@tests $target:ty; $($scenario:ident),* $(,)?) => {

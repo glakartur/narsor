@@ -7,9 +7,9 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
 use narsor::orchestration::{
-    BackendLease, Clock, CommandRequest, ControlPlane, ControllerReport, NewTask, Observation,
-    ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef, ResourceIdentity, RunnerSnapshot,
-    TaskEventKind, TaskLifecycle, TaskRecord,
+    BackendCapacity, BackendLease, Clock, CommandRequest, ControlPlane, ControllerReport, NewTask,
+    Observation, ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef, QueueReason,
+    ResourceIdentity, RunnerSnapshot, TaskEventKind, TaskLifecycle, TaskRecord,
 };
 use narsor::persistence::paths::{temp_path_for, StatePaths};
 use narsor::persistence::ExecutionStore;
@@ -120,10 +120,23 @@ impl Fixture {
         if observation == Observation::PausedAtSafePoint {
             self.acknowledge_safe_point(id);
         }
+        if observation == Observation::StartAccepted {
+            self.admit(id);
+        }
         let generation = self.control.task(&task(id)).unwrap().generation;
         self.control
             .report(report(id, lease, generation, observation, None))
             .map(|outcome| outcome.task)
+    }
+
+    /// Lets the scheduler admit the task's backend queue, as the control
+    /// plane does before offering a start (U10). A no-op for a task that is
+    /// not queued, or whose backend has no live controller.
+    fn admit(&self, id: &str) {
+        let record = self.control.task(&task(id)).unwrap();
+        self.control
+            .schedule(&record.assignment.backend_id, &BackendCapacity::Limit(16))
+            .expect("admission pass");
     }
 
     /// Lets the task's runner acknowledge a safe point, when a pause waits
@@ -932,7 +945,8 @@ fn the_event_log_is_monotonic_and_survives_reopening() {
     let reopened = fx.reopen();
     let all = reopened.events_since(&task("task-1"), 0).unwrap();
     let sequences: Vec<u64> = all.iter().map(|event| event.sequence).collect();
-    assert_eq!(sequences, [1, 2, 3, 4]);
+    // Created, admitted (U10), start accepted, runner ready, pause.
+    assert_eq!(sequences, [1, 2, 3, 4, 5]);
     assert_eq!(
         all.last().unwrap().kind,
         TaskEventKind::OwnerCommandAccepted {
@@ -944,7 +958,7 @@ fn the_event_log_is_monotonic_and_survives_reopening() {
     let tail = reopened.events_since(&task("task-1"), 2).unwrap();
     assert_eq!(tail, all[2..]);
     assert!(reopened
-        .events_since(&task("task-1"), 4)
+        .events_since(&task("task-1"), 5)
         .unwrap()
         .is_empty());
 
@@ -959,10 +973,10 @@ fn the_event_log_is_monotonic_and_survives_reopening() {
             None,
         ))
         .expect("a reopened handle keeps appending");
-    // The runner's safe point is sequence 5, the pause completing 6.
-    let next = fx.control.events_since(&task("task-1"), 4).unwrap();
+    // The runner's safe point is sequence 6, the pause completing 7.
+    let next = fx.control.events_since(&task("task-1"), 5).unwrap();
     let sequences: Vec<u64> = next.iter().map(|event| event.sequence).collect();
-    assert_eq!(sequences, [5, 6]);
+    assert_eq!(sequences, [6, 7]);
 }
 
 #[test]
@@ -1058,7 +1072,8 @@ fn a_mutation_after_an_interrupted_publish_keeps_the_log_gapless() {
     let lease = fx.lease("k8s", "controller-a");
     fx.observe("task-1", &lease, Observation::StartAccepted)
         .unwrap();
-    fs::remove_file(fx.root.paths().orchestration_task_event_file("task-1", 2)).unwrap();
+    // Created (1), admitted (2), start accepted (3): lose the last publish.
+    fs::remove_file(fx.root.paths().orchestration_task_event_file("task-1", 3)).unwrap();
 
     fx.observe("task-1", &lease, Observation::RunnerReady)
         .unwrap();
@@ -1069,7 +1084,7 @@ fn a_mutation_after_an_interrupted_publish_keeps_the_log_gapless() {
         .iter()
         .map(|event| event.sequence)
         .collect();
-    assert_eq!(sequences, [1, 2, 3]);
+    assert_eq!(sequences, [1, 2, 3, 4]);
 }
 
 #[test]
@@ -1142,4 +1157,415 @@ fn reading_the_event_log_while_a_writer_appends_never_sees_a_gap() {
             }
         });
     });
+}
+
+// ---------------------------------------------------------------------------
+// Admission by backend capacity (U10)
+// ---------------------------------------------------------------------------
+
+fn k8s() -> BackendId {
+    backend_id("k8s")
+}
+
+fn limit(slots: u32) -> BackendCapacity {
+    BackendCapacity::Limit(slots)
+}
+
+fn reason(fx: &Fixture, id: &str) -> Option<QueueReason> {
+    fx.control
+        .task(&task(id))
+        .unwrap()
+        .queue
+        .map(|queue| queue.reason)
+}
+
+fn create_with_priority(fx: &Fixture, id: &str, priority: i32) {
+    fx.control
+        .create_task(new_task(id, "k8s").with_priority(priority))
+        .expect("create task");
+}
+
+/// Reports straight to the control plane, without the fixture's admission.
+fn report_now(
+    fx: &Fixture,
+    id: &str,
+    lease: &BackendLease,
+    observation: Observation,
+) -> Result<TaskRecord, OrchestrationError> {
+    let generation = fx.control.task(&task(id)).unwrap().generation;
+    fx.control
+        .report(report(id, lease, generation, observation, None))
+        .map(|outcome| outcome.task)
+}
+
+#[test]
+fn a_controller_cannot_start_a_task_the_scheduler_did_not_admit() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.create("task-1");
+
+    let refused = report_now(&fx, "task-1", &lease, Observation::StartAccepted).unwrap_err();
+    assert!(matches!(refused, OrchestrationError::NotAdmitted(_)));
+    assert_eq!(fx.control.task(&task("task-1")).unwrap().revision, 1);
+
+    assert_eq!(
+        fx.control.schedule(&k8s(), &limit(1)).unwrap(),
+        [task("task-1")]
+    );
+    assert_eq!(reason(&fx, "task-1"), Some(QueueReason::Admitted));
+    let started = report_now(&fx, "task-1", &lease, Observation::StartAccepted).unwrap();
+    assert_eq!(started.lifecycle, TaskLifecycle::Provisioning);
+    // Leaving the queue drops the reservation: the lifecycle holds the slot.
+    assert_eq!(started.reservation, None);
+    assert_eq!(started.queue, None);
+    assert_eq!(fx.control.capacity_in_use(&k8s()).unwrap(), 1);
+}
+
+#[test]
+fn at_capacity_priority_orders_the_waiting_and_fifo_breaks_ties_without_preemption() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.create("running");
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    report_now(&fx, "running", &lease, Observation::StartAccepted).unwrap();
+    report_now(&fx, "running", &lease, Observation::RunnerReady).unwrap();
+
+    create_with_priority(&fx, "low", 0);
+    create_with_priority(&fx, "high-first", 5);
+    create_with_priority(&fx, "high-second", 5);
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+
+    let waiting = |position| QueueReason::WaitingForCapacity {
+        position,
+        running: 1,
+        limit: 1,
+    };
+    assert_eq!(reason(&fx, "high-first"), Some(waiting(1)));
+    assert_eq!(reason(&fx, "high-second"), Some(waiting(2)));
+    assert_eq!(reason(&fx, "low"), Some(waiting(3)));
+    // A full backend never stops what runs (R11).
+    let running = fx.control.task(&task("running")).unwrap();
+    assert_eq!(running.lifecycle, TaskLifecycle::Running);
+    assert_eq!(running.generation, 1);
+
+    // A repeated pass over an unchanged backend writes nothing.
+    assert!(fx.control.schedule(&k8s(), &limit(1)).unwrap().is_empty());
+
+    // Raising the low task above the others moves it to the front.
+    let (_, changed) = fx
+        .control
+        .set_priority(&task("low"), 9, None)
+        .expect("set priority");
+    assert!(changed);
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    assert_eq!(reason(&fx, "low"), Some(waiting(1)));
+    assert_eq!(reason(&fx, "high-first"), Some(waiting(2)));
+
+    // One more slot: exactly the first in line is admitted.
+    let admitted = fx.control.schedule(&k8s(), &limit(2)).unwrap();
+    assert!(admitted.contains(&task("low")));
+    assert_eq!(reason(&fx, "low"), Some(QueueReason::Admitted));
+    assert_eq!(
+        reason(&fx, "high-first"),
+        Some(QueueReason::WaitingForCapacity {
+            position: 1,
+            running: 2,
+            limit: 2,
+        })
+    );
+
+    // Lowering the limit again takes no reservation back.
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    assert_eq!(reason(&fx, "low"), Some(QueueReason::Admitted));
+    assert_eq!(fx.control.capacity_in_use(&k8s()).unwrap(), 2);
+    assert!(matches!(
+        report_now(&fx, "high-first", &lease, Observation::StartAccepted),
+        Err(OrchestrationError::NotAdmitted(_))
+    ));
+}
+
+#[test]
+fn an_offline_controller_withholds_capacity_but_keeps_granted_reservations() {
+    let fx = Fixture::new();
+    fx.create("task-1");
+    fx.control.schedule(&k8s(), &limit(2)).unwrap();
+    assert_eq!(reason(&fx, "task-1"), Some(QueueReason::ControllerOffline));
+
+    let lease = fx.lease("k8s", "controller-a");
+    fx.control.schedule(&k8s(), &limit(2)).unwrap();
+    assert_eq!(reason(&fx, "task-1"), Some(QueueReason::Admitted));
+
+    // Revoking the controller expires its lease: the backend is offline.
+    fx.control
+        .revoke_lease(&k8s(), "controller-a")
+        .unwrap()
+        .expect("held lease");
+    fx.create("task-2");
+    fx.control.schedule(&k8s(), &limit(2)).unwrap();
+    assert_eq!(reason(&fx, "task-2"), Some(QueueReason::ControllerOffline));
+    assert_eq!(reason(&fx, "task-1"), Some(QueueReason::Admitted));
+    assert!(report_now(&fx, "task-1", &lease, Observation::StartAccepted).is_err());
+
+    // A lease that merely ran out withholds capacity the same way.
+    fx.lease("k8s", "controller-b");
+    fx.clock.advance(Duration::minutes(10));
+    fx.control.schedule(&k8s(), &limit(2)).unwrap();
+    assert_eq!(reason(&fx, "task-2"), Some(QueueReason::ControllerOffline));
+
+    let lease = fx.lease("k8s", "controller-b");
+    fx.control.schedule(&k8s(), &limit(2)).unwrap();
+    assert_eq!(reason(&fx, "task-2"), Some(QueueReason::Admitted));
+    report_now(&fx, "task-1", &lease, Observation::StartAccepted).expect("first in line starts");
+}
+
+#[test]
+fn an_unknown_backend_admits_nothing_and_says_so() {
+    let fx = Fixture::new();
+    fx.lease("k8s", "controller-a");
+    fx.create("task-1");
+    fx.control
+        .schedule(
+            &k8s(),
+            &BackendCapacity::Unavailable("backend 'k8s' is not registered".into()),
+        )
+        .unwrap();
+    assert_eq!(
+        reason(&fx, "task-1"),
+        Some(QueueReason::BackendUnknown {
+            detail: "backend 'k8s' is not registered".into()
+        })
+    );
+    assert_eq!(fx.control.task(&task("task-1")).unwrap().reservation, None);
+}
+
+#[test]
+fn which_lifecycles_hold_capacity() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    let in_use = || fx.control.capacity_in_use(&k8s()).unwrap();
+
+    fx.create("task-1");
+    assert_eq!(in_use(), 0, "an unadmitted task holds nothing");
+    fx.running("task-1", &lease);
+    assert_eq!(in_use(), 1);
+
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    assert_eq!(in_use(), 1, "pause requested: compute still exists");
+    fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    assert_eq!(in_use(), 0, "paused: compute removed at the safe point");
+
+    fx.command("task-1", OwnerCommand::Resume, "resume-1");
+    fx.observe(
+        "task-1",
+        &lease,
+        Observation::WorkloadLost { state_known: true },
+    )
+    .unwrap();
+    assert_eq!(in_use(), 1, "interrupted: a workload may still exist");
+    fx.command("task-1", OwnerCommand::Archive, "archive-1");
+    assert_eq!(in_use(), 1, "archiving: deletion not confirmed yet");
+    fx.observe("task-1", &lease, Observation::ResourcesDeleted)
+        .unwrap();
+    assert_eq!(in_use(), 0, "archived");
+}
+
+#[test]
+fn archive_releases_an_admitted_or_provisioning_task_deterministically() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    for id in ["admitted", "provisioning", "waiting"] {
+        fx.create(id);
+    }
+    fx.control.schedule(&k8s(), &limit(2)).unwrap();
+    report_now(&fx, "provisioning", &lease, Observation::StartAccepted).unwrap();
+    assert_eq!(
+        reason(&fx, "waiting"),
+        Some(QueueReason::WaitingForCapacity {
+            position: 1,
+            running: 2,
+            limit: 2,
+        })
+    );
+
+    // An admitted task never accepted by a controller: archived at once,
+    // its slot free for the next pass.
+    let archived = fx.command("admitted", OwnerCommand::Archive, "archive-a");
+    assert_eq!(archived.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(archived.reservation, None);
+    fx.control.schedule(&k8s(), &limit(2)).unwrap();
+    assert_eq!(reason(&fx, "waiting"), Some(QueueReason::Admitted));
+
+    // Cancelled provisioning holds its slot until deletion is confirmed.
+    fx.command("provisioning", OwnerCommand::Archive, "archive-p");
+    fx.create("next");
+    fx.control.schedule(&k8s(), &limit(2)).unwrap();
+    assert!(matches!(
+        reason(&fx, "next"),
+        Some(QueueReason::WaitingForCapacity { running: 2, .. })
+    ));
+    fx.observe("provisioning", &lease, Observation::ResourcesDeleted)
+        .unwrap();
+    fx.control.schedule(&k8s(), &limit(2)).unwrap();
+    assert_eq!(reason(&fx, "next"), Some(QueueReason::Admitted));
+}
+
+#[test]
+fn concurrent_creation_and_admission_never_exceed_the_limit() {
+    let fx = Fixture::new();
+    fx.lease("k8s", "controller-a");
+    std::thread::scope(|scope| {
+        for index in 0..12 {
+            let control = fx.reopen();
+            scope.spawn(move || {
+                control
+                    .create_task(new_task(&format!("task-{index}"), "k8s"))
+                    .expect("create");
+                control.schedule(&k8s(), &limit(3)).expect("schedule");
+            });
+        }
+    });
+    let tasks = fx.control.list_tasks().unwrap();
+    let admitted: Vec<u64> = tasks
+        .iter()
+        .filter(|task| task.reservation.is_some())
+        .map(|task| task.queue_sequence)
+        .collect();
+    assert_eq!(admitted.len(), 3, "{admitted:?}");
+    assert_eq!(fx.control.capacity_in_use(&k8s()).unwrap(), 3);
+}
+
+#[test]
+fn a_priority_change_is_idempotent_generation_checked_and_only_for_the_queued() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.create("queued");
+
+    let stale = fx
+        .control
+        .set_priority(&task("queued"), 3, Some(7))
+        .unwrap_err();
+    assert!(matches!(stale, OrchestrationError::StaleGeneration { .. }));
+
+    let (record, changed) = fx
+        .control
+        .set_priority(&task("queued"), 3, Some(1))
+        .unwrap();
+    assert!(changed);
+    assert_eq!((record.priority, record.generation), (3, 1));
+    assert_eq!(
+        record.last_event.kind,
+        TaskEventKind::PriorityChanged { priority: 3 }
+    );
+    let (again, changed) = fx
+        .control
+        .set_priority(&task("queued"), 3, Some(1))
+        .unwrap();
+    assert!(!changed);
+    assert_eq!(again.revision, record.revision);
+
+    // AE3: a running task is never reordered, let alone stopped.
+    let running = fx.running("running", &lease);
+    let refused = fx
+        .control
+        .set_priority(&task("running"), 10, None)
+        .unwrap_err();
+    assert!(matches!(
+        refused,
+        OrchestrationError::TaskNotQueued {
+            lifecycle: TaskLifecycle::Running,
+            ..
+        }
+    ));
+    assert_eq!(fx.control.task(&task("running")).unwrap(), running);
+}
+
+#[test]
+fn resuming_a_paused_task_needs_a_free_slot() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.running("paused", &lease);
+    fx.command("paused", OwnerCommand::Pause, "pause-1");
+    fx.observe("paused", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    fx.running("other", &lease);
+
+    let resume = CommandRequest::new(OwnerCommand::Resume, "resume-1");
+    let refused = fx
+        .control
+        .command_with_capacity(&task("paused"), resume.clone(), &limit(1))
+        .unwrap_err();
+    assert!(matches!(
+        refused,
+        OrchestrationError::BackendAtCapacity {
+            running: 1,
+            limit: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        fx.control.task(&task("paused")).unwrap().lifecycle,
+        TaskLifecycle::Paused
+    );
+
+    let resumed = fx
+        .control
+        .command_with_capacity(&task("paused"), resume.clone(), &limit(2))
+        .expect("a free slot");
+    assert_eq!(resumed.task.lifecycle, TaskLifecycle::Provisioning);
+    // A retry is answered from its receipt, whatever the capacity now.
+    let retried = fx
+        .control
+        .command_with_capacity(&task("paused"), resume, &limit(1))
+        .expect("retry");
+    assert!(retried.replayed);
+
+    // Retrying an interrupted task keeps the slot it holds: no check.
+    fx.observe(
+        "other",
+        &lease,
+        Observation::WorkloadLost { state_known: true },
+    )
+    .unwrap();
+    fx.control
+        .command_with_capacity(
+            &task("other"),
+            CommandRequest::new(OwnerCommand::Start, "start-1"),
+            &limit(2),
+        )
+        .expect("an interrupted task already holds its slot");
+}
+
+#[test]
+fn the_default_backend_override_is_durable_and_idempotent() {
+    let fx = Fixture::new();
+    assert_eq!(fx.control.default_backend().unwrap(), None);
+    let first = fx.control.set_default_backend(Some(k8s())).unwrap();
+    assert_eq!((first.revision, first.backend.clone()), (1, Some(k8s())));
+    assert_eq!(fx.control.set_default_backend(Some(k8s())).unwrap(), first);
+
+    let reopened = fx.reopen();
+    assert_eq!(reopened.default_backend().unwrap(), Some(first));
+    let cleared = reopened.set_default_backend(None).unwrap();
+    assert_eq!((cleared.revision, cleared.backend), (2, None));
+}
+
+#[test]
+fn an_identical_create_request_returns_the_task_by_its_digest() {
+    let fx = Fixture::new();
+    let created = fx
+        .control
+        .create_task(new_task("task-1", "k8s").with_request_digest("sha256:request"))
+        .unwrap();
+    // The configuration changed: the same request now resolves elsewhere.
+    let retried = fx
+        .control
+        .create_task(new_task("task-1", "backend-b").with_request_digest("sha256:request"))
+        .unwrap();
+    assert_eq!(retried, created);
+    let conflict = fx
+        .control
+        .create_task(new_task("task-1", "backend-b").with_request_digest("sha256:other"))
+        .unwrap_err();
+    assert!(matches!(conflict, OrchestrationError::TaskConflict(_)));
 }
