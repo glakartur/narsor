@@ -65,10 +65,12 @@ use crate::config::Resolved;
 use crate::controller_protocol::ProtocolService;
 use crate::domain::{ExecutionStatus, WorkflowDefinition, WorkflowExecution};
 use crate::engine::{owed_output_rescue, owed_reprompt, Engine, HarnessRegistry};
+use crate::environment::{CatalogLaunchResolver, HarnessDefaults, OwnerDefaults};
 use crate::orchestration::ControlPlane;
 use crate::persistence::{
     DaemonInfo, DefaultHarnessSelector, ExecutionStore, ReconciliationOutcome, RecoveryReport,
 };
+use crate::workflows::WorkflowResolver;
 
 use super::commands::{CliError, Result};
 
@@ -124,9 +126,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     let store = ExecutionStore::new(config.state_dir());
 
     let recovery = recover_at_startup(&store);
-    let control = Arc::new(ProtocolService::new(recover_orchestration_at_startup(
-        ControlPlane::new(paths.clone()),
-    )));
+    let control_plane = recover_orchestration_at_startup(ControlPlane::new(paths.clone()));
 
     let defaults = config.agent_defaults();
     let supported = HarnessRegistry::defaults()
@@ -141,6 +141,16 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
                 CliError::failure(format!("could not load default harness selection: {error}"))
             })?,
     );
+    // Remote tasks resolve against the same catalogue and pin the same live
+    // default harness a local harnessless step would use (R42), read when
+    // each task is created — never re-read for an existing one (U6).
+    let launch = CatalogLaunchResolver::new(
+        config.catalog_dir(),
+        WorkflowResolver::new(config.catalog_dir()),
+        OwnerDefaults::from_config(config),
+        Arc::clone(&selector) as Arc<dyn HarnessDefaults>,
+    );
+    let control = Arc::new(ProtocolService::new(control_plane, Arc::new(launch)));
     let agent_timeout_secs = defaults.timeout_secs;
     let engine = Arc::new(
         Engine::new(store.clone())

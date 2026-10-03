@@ -7,6 +7,8 @@
 //! clock, so lease expiry and staleness are deterministic; long-polls use
 //! real time but are only ever asked to wait briefly.
 
+mod environment_support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -101,7 +103,10 @@ impl Harness {
         let clock = ManualClock::new();
         let control = ControlPlane::with_clock(StatePaths::new(root.path()), clock.clone());
         let services = ApiServices {
-            control: Some(Arc::new(ProtocolService::new(control))),
+            control: Some(Arc::new(ProtocolService::new(
+                control,
+                environment_support::seeded_resolver(root.path()),
+            ))),
             ..ApiServices::default()
         };
         let engine = Arc::new(Engine::new(ExecutionStore::new(root.path())));
@@ -223,13 +228,16 @@ impl Harness {
 fn create_request(task: &str, backend: &str) -> CreateTaskRequest {
     CreateTaskRequest {
         task_id: Some(task.to_string()),
-        backend_id: backend.to_string(),
+        backend_id: Some(backend.to_string()),
         priority: 0,
         launch: LaunchRequest {
             workflow_id: "implement-feature".to_string(),
             workflow_version: 1,
             inputs: serde_json::json!({ "ticket": "NAR-1" }),
-            workspace: serde_json::json!({ "remote": "git@example.com:team/app.git" }),
+            workspace: None,
+            profile: None,
+            harness: None,
+            resources: None,
         },
     }
 }
@@ -1139,7 +1147,9 @@ async fn owner_scope_hides_other_owners_tasks() {
                 "wf",
                 1,
                 serde_json::json!({}),
-                serde_json::json!({}),
+                narsor::domain::TaskWorkspace::None,
+                narsor::domain::ResolvedEnvironment::harness_only("claude-code"),
+                narsor::domain::ResourceProfile::new(1000, 2048),
             ),
         ))
         .expect("foreign task");
@@ -1194,7 +1204,9 @@ async fn the_daemon_recovers_the_control_plane_at_startup_and_serves_it() {
                 "wf",
                 1,
                 serde_json::json!({}),
-                serde_json::json!({}),
+                narsor::domain::TaskWorkspace::None,
+                narsor::domain::ResolvedEnvironment::harness_only("claude-code"),
+                narsor::domain::ResourceProfile::new(1000, 2048),
             ),
         ))
         .expect("create");
@@ -1268,4 +1280,218 @@ fn wait_for_exit(child: &mut Child, timeout: StdDuration) {
         }
         std::thread::sleep(StdDuration::from_millis(20));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Launch resolution on the create path (U6)
+// ---------------------------------------------------------------------------
+
+/// The `400` reason of a refused request.
+fn request_code(result: Result<impl std::fmt::Debug, ClientError>) -> String {
+    match result {
+        Err(ClientError::Request { code, .. }) => code,
+        other => panic!("expected a 400 with a reason, got {other:?}"),
+    }
+}
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(files_under(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+#[tokio::test]
+async fn a_launch_that_does_not_resolve_is_refused_and_stores_nothing() {
+    let harness = Harness::start().await;
+    let catalog = narsor::environment::EnvironmentCatalog::new(harness.root.path());
+    let mut bad_limits = environment_support::backend("backend-a");
+    bad_limits.limits.max_concurrent_tasks = 0;
+    fs::write(
+        harness.root.path().join("backends/backend-a.yaml"),
+        serde_yaml::to_string(&bad_limits).unwrap(),
+    )
+    .unwrap();
+    catalog
+        .save_profile(&narsor::environment::ProfileRecord {
+            id: "unregistered".to_string(),
+            version: 1,
+            secrets: vec!["aws-key".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+    fs::write(
+        harness.root.path().join("workflows/no-image.yaml"),
+        environment_support::workflow_yaml("no-image", None),
+    )
+    .unwrap();
+
+    let mut cases = Vec::new();
+    let mut request = create_request("task-1", "nowhere");
+    cases.push(("unknown_backend", request.clone()));
+    request.backend_id = Some("backend-a".to_string());
+    cases.push(("invalid_backend", request.clone()));
+    request = create_request("task-1", "k8s");
+    request.launch.profile = Some("unregistered".to_string());
+    cases.push(("unregistered_secret", request.clone()));
+    request = create_request("task-1", "k8s");
+    request.launch.harness = Some("nonesuch".to_string());
+    cases.push(("unsupported_harness", request.clone()));
+    request = create_request("task-1", "k8s");
+    request.launch.workflow_id = "no-image".to_string();
+    cases.push(("missing_base_image", request.clone()));
+
+    for (code, request) in cases {
+        assert_eq!(
+            request_code(harness.owner.create_control_task(&request).await),
+            code
+        );
+    }
+
+    let listed = harness.owner.control_tasks().await.expect("list");
+    assert!(listed.tasks.is_empty(), "no partial assignment");
+    let state = StatePaths::new(harness.root.path());
+    assert!(
+        files_under(&state.orchestration_dir()).is_empty(),
+        "no task record, event or lock was written: {:?}",
+        files_under(&state.orchestration_dir())
+    );
+}
+
+#[tokio::test]
+async fn the_create_path_uses_the_owner_default_backend_unless_overridden() {
+    let harness = Harness::start().await;
+    let mut request = create_request("task-1", "k8s");
+    request.backend_id = None;
+    let by_default = harness
+        .owner
+        .create_control_task(&request)
+        .await
+        .expect("create");
+    assert_eq!(by_default.backend_id.as_str(), "k8s");
+
+    let explicit = harness.create("task-2", "backend-b").await;
+    assert_eq!(explicit.backend_id.as_str(), "backend-b");
+    assert_eq!(
+        by_default.environment_identity, explicit.environment_identity,
+        "the same images on two backends of the same kind"
+    );
+}
+
+#[tokio::test]
+async fn an_existing_task_keeps_its_resolved_environment_after_configuration_changes() {
+    let harness = Harness::start().await;
+    let first = harness.create("task-1", "k8s").await;
+
+    // The operator moves the workflow to a new image afterwards.
+    fs::write(
+        harness.root.path().join("workflows/implement-feature.yaml"),
+        environment_support::workflow_yaml(
+            "implement-feature",
+            Some(&format!(
+                "ghcr.io/acme/dev@{}",
+                environment_support::digest('7')
+            )),
+        ),
+    )
+    .unwrap();
+    let second = harness.create("task-2", "k8s").await;
+    assert_ne!(second.environment_identity, first.environment_identity);
+
+    let again = harness.task("task-1").await;
+    assert_eq!(again.environment_identity, first.environment_identity);
+    assert_eq!(again.launch_digest, first.launch_digest);
+
+    let (controller, _) = harness.controller("k8s").await;
+    let commands = controller.commands(0, true).await.expect("commands");
+    let spec = &commands
+        .commands
+        .iter()
+        .find(|command| command.task_id.as_str() == "task-1")
+        .expect("task-1 command")
+        .launch_spec;
+    assert_eq!(
+        spec.environment.base_image.as_ref().unwrap().pinned,
+        environment_support::workflow_image(),
+        "the controller still receives the digest pinned at creation"
+    );
+}
+
+#[tokio::test]
+async fn secret_values_never_reach_records_responses_or_events() {
+    // A credential value as the backend's own store would hold it. The
+    // control plane is only ever told where it lives.
+    const SENTINEL: &str = "SENTINEL-s3cr3t-value-6f1c";
+    let value = narsor::domain::SecretValue::new(SENTINEL);
+    assert!(!format!("{value:?}").contains(SENTINEL));
+
+    let harness = Harness::start().await;
+    narsor::environment::EnvironmentCatalog::new(harness.root.path())
+        .save_profile(&narsor::environment::ProfileRecord {
+            id: "default".to_string(),
+            version: 1,
+            secrets: vec!["github-token".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+    let summary = harness.create("task-1", "k8s").await;
+    let (controller, _) = harness.controller("k8s").await;
+    let commands = controller.commands(0, true).await.expect("commands");
+    let events = harness
+        .owner
+        .control_events("task-1", 0)
+        .await
+        .expect("events");
+
+    let spec = &commands.commands[0].launch_spec;
+    assert_eq!(spec.environment.secrets.len(), 1, "the reference is there");
+    let mut serialized = vec![
+        serde_json::to_string(&summary).unwrap(),
+        serde_json::to_string(&commands).unwrap(),
+        serde_json::to_string(&events).unwrap(),
+        serde_json::to_string(spec).unwrap(),
+    ];
+    for path in files_under(harness.root.path()) {
+        if let Ok(text) = fs::read_to_string(&path) {
+            serialized.push(text);
+        }
+    }
+    assert!(serialized
+        .iter()
+        .any(|text| text.contains("narsor-github/token")));
+    for text in serialized {
+        assert!(!text.contains(SENTINEL), "a secret value leaked: {text}");
+    }
+}
+
+#[tokio::test]
+async fn a_launch_request_with_an_unknown_field_is_refused() {
+    let harness = Harness::start().await;
+    let mut body = serde_json::to_value(create_request("task-1", "k8s")).unwrap();
+    body["launch"]["secret_value"] = serde_json::json!("hunter2");
+    let response = reqwest::Client::new()
+        .post(format!("{}/control/v1/tasks", harness.base_url()))
+        .bearer_auth(harness.handle.token())
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert!(response.status().is_client_error(), "{}", response.status());
+    assert!(harness
+        .owner
+        .control_tasks()
+        .await
+        .unwrap()
+        .tasks
+        .is_empty());
 }

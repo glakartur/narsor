@@ -294,6 +294,7 @@ fn initial_state_that_does_not_exist_is_rejected() {
             terminal: true,
             terminal_status: None,
             allow_manual_override: false,
+            image: None,
         },
     );
 
@@ -634,4 +635,76 @@ terminal_states:
             "harness: {written} must be reported: {errors:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Image overrides (U6, R15)
+// ---------------------------------------------------------------------------
+
+fn image_workflow(globals_image: &str, step_image: &str, terminal_image: &str) -> String {
+    format!(
+        r#"
+name: images
+version: 1
+globals:
+{globals_image}
+states:
+  build:
+{step_image}
+    action:
+      type: script
+      command: make
+    outputs: [success]
+    transitions:
+      success: done
+  done:
+{terminal_image}
+    description: finished
+terminal_states: [done]
+"#
+    )
+}
+
+#[test]
+fn every_unusable_image_is_reported_at_once() {
+    let yaml = image_workflow(
+        "  image: ubuntu:24.04",
+        "    image: Not/A/Valid:ref",
+        "    image: ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let errors = narsor::workflow::validate_source(&yaml).expect("the file loads");
+    let report = describe(&errors);
+
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidImage { field, reason }
+                if field == "globals.image" && reason.contains("no digest")
+        )),
+        "a tag under the default pinned policy is refused: {report}"
+    );
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidImage { field, .. } if field == "states.build.image"
+        )),
+        "{report}"
+    );
+    assert!(
+        errors.iter().any(
+            |error| matches!(error, ValidationError::ImageOnTerminalState(state) if state == "done")
+        ),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_tag_under_the_resolve_policy_is_valid_until_task_creation() {
+    let yaml = image_workflow(
+        "  image:\n    reference: ubuntu:24.04\n    digest_policy: resolve",
+        "    description: builds",
+        "",
+    );
+    let errors = narsor::workflow::validate_source(&yaml).expect("the file loads");
+    assert!(errors.is_empty(), "{}", describe(&errors));
 }

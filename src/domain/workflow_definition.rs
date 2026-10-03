@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::domain::ExecutionStatus;
+use crate::domain::{ExecutionStatus, ImageSpec};
 
 /// Unique identifier for a workflow definition
 pub type WorkflowDefinitionId = String;
@@ -68,6 +68,12 @@ pub struct GlobalsConfig {
     /// Default retry policy for actions
     #[serde(default)]
     pub retry_policy: Option<RetryPolicy>,
+
+    /// Base-image override for the whole workflow (`globals.image`). Not
+    /// propagated to the states: provenance (R18) has to tell a workflow
+    /// override from a step override, so each keeps its own field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageSpec>,
 }
 
 /// Default workspace configuration for an execution
@@ -209,6 +215,11 @@ pub struct State {
     /// Whether manual transition override is allowed
     #[serde(default)]
     pub allow_manual_override: bool,
+
+    /// Base-image override for this step (R15): wins over `globals.image`
+    /// and over the repository's base image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageSpec>,
 }
 
 /// Configuration for an action
@@ -537,4 +548,11 @@ pub enum ValidationError {
         field: &'static str,
         variable: String,
     },
+
+    // --- Environment (R15) ---
+    #[error("Field '{field}' has an unusable image: {reason}")]
+    InvalidImage { field: String, reason: String },
+
+    #[error("Terminal state '{0}' cannot override the image: it runs nothing")]
+    ImageOnTerminalState(StateId),
 }

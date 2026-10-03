@@ -161,6 +161,7 @@ mod tests {
         let globals = GlobalsConfig {
             timeout_secs: None,
             retry_policy: Some(policy(2, 1, 1.0)),
+            image: None,
         };
 
         let mut state = State {
@@ -175,6 +176,7 @@ mod tests {
             terminal: false,
             terminal_status: None,
             allow_manual_override: false,
+            image: None,
         };
 
         assert_eq!(RetrySchedule::resolve(&state, &globals).max_attempts(), 2);

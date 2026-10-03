@@ -2,6 +2,8 @@
 //! real temporary store and a real bound loopback port, answering the three
 //! read-only endpoints through the real `ApiClient`.
 
+mod environment_support;
+
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -3249,6 +3251,7 @@ async fn start_server_with_control_plane(root: &TempRoot) -> api::ApiHandle {
         api::ApiServices {
             control: Some(Arc::new(narsor::controller_protocol::ProtocolService::new(
                 control,
+                environment_support::seeded_resolver(root.path()),
             ))),
             ..api::ApiServices::default()
         },
@@ -3260,13 +3263,16 @@ async fn start_server_with_control_plane(root: &TempRoot) -> api::ApiHandle {
 fn remote_task(task_id: &str, backend_id: &str) -> narsor::controller_protocol::CreateTaskRequest {
     narsor::controller_protocol::CreateTaskRequest {
         task_id: Some(task_id.to_string()),
-        backend_id: backend_id.to_string(),
+        backend_id: Some(backend_id.to_string()),
         priority: 0,
         launch: narsor::controller_protocol::LaunchRequest {
             workflow_id: "implement-feature".to_string(),
             workflow_version: 1,
             inputs: serde_json::json!({}),
-            workspace: serde_json::json!({}),
+            workspace: None,
+            profile: None,
+            harness: None,
+            resources: None,
         },
     }
 }

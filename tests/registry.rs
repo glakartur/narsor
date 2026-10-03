@@ -800,3 +800,68 @@ fn looking_up_something_that_cannot_be_an_id_reports_absence_not_a_refusal() {
         .expect_err("an operator naming an unusable id must be told");
     assert!(matches!(&error, RegistryError::InvalidId { .. }), "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// Base image and Git credential (U6, R15, R39)
+// ---------------------------------------------------------------------------
+
+const PINNED: &str =
+    "ghcr.io/acme/api-dev@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+#[test]
+fn a_base_image_and_git_credential_round_trip_in_both_policies() {
+    let root = TempRoot::new();
+    let registry = root.registry();
+    let pinned = full_entry()
+        .with_base_image(narsor::domain::ImageSpec::pinned(PINNED))
+        .with_git_credential("github-token");
+    registry.add(pinned.clone()).expect("add");
+    assert_eq!(registry.get("acme-api").unwrap(), Some(pinned));
+
+    let text = fs::read_to_string(registry.entry_path("acme-api")).unwrap();
+    assert!(
+        text.contains(&format!("base_image: {PINNED}")),
+        "a pinned image is written as a plain reference: {text}"
+    );
+
+    let resolving = full_entry().with_base_image(narsor::domain::ImageSpec::resolve(
+        "ghcr.io/acme/api-dev:2026.10",
+    ));
+    registry.update(resolving.clone()).expect("update");
+    assert_eq!(registry.get("acme-api").unwrap(), Some(resolving));
+}
+
+#[test]
+fn an_unusable_base_image_is_refused_when_registered() {
+    let root = TempRoot::new();
+    let registry = root.registry();
+    for image in [
+        narsor::domain::ImageSpec::pinned("ghcr.io/acme/api-dev:2026.10"),
+        narsor::domain::ImageSpec::resolve("ghcr.io/acme/api-dev"),
+        narsor::domain::ImageSpec::pinned("--privileged@sha256:00"),
+    ] {
+        let error = registry
+            .add(full_entry().with_base_image(image.clone()))
+            .expect_err("refused");
+        assert!(
+            matches!(error, RegistryError::InvalidBaseImage { .. }),
+            "{image:?}: {error}"
+        );
+    }
+    assert!(registry.list().unwrap().is_empty(), "nothing was written");
+}
+
+#[test]
+fn an_entry_written_before_base_images_still_reads() {
+    let root = TempRoot::new();
+    let registry = root.registry();
+    fs::create_dir_all(registry.dir()).unwrap();
+    fs::write(
+        registry.entry_path("legacy"),
+        "name: legacy\nprovider: git\nremote: https://example.com/legacy.git\n",
+    )
+    .unwrap();
+    let entry = registry.get("legacy").unwrap().expect("present");
+    assert_eq!(entry.base_image, None);
+    assert_eq!(entry.git_credential, None);
+}

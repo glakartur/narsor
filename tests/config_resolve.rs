@@ -377,3 +377,50 @@ fn the_tui_refresh_interval_defaults_to_ten_seconds_and_the_environment_beats_th
         &Source::Env("NARSOR_TUI_REFRESH_INTERVAL".to_string())
     );
 }
+
+// ---------------------------------------------------------------------------
+// Owner defaults for remote tasks (U6, R10, R16)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_default_backend_and_profile_layer_like_every_other_setting() {
+    let root = TempRoot::new();
+    let cascade = ConfigCascade::with_dirs(None, Some(root.user_dir()), None);
+
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade);
+    assert_eq!(resolved.default_backend(), "local");
+    assert_eq!(resolved.default_profile(), "default");
+
+    root.user_config("default_backend: k8s-prod\ndefault_profile: artur\n");
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade);
+    assert!(resolved.is_ok(), "{:?}", resolved.errors());
+    assert_eq!(resolved.default_backend(), "k8s-prod");
+    assert_eq!(resolved.default_profile(), "artur");
+
+    let resolved = resolve_with(
+        &Flags::default(),
+        &environment(&[("NARSOR_DEFAULT_BACKEND", "fake-1")]),
+        &cascade,
+    );
+    assert_eq!(resolved.default_backend(), "fake-1");
+    assert_eq!(
+        resolved.source(SettingKey::DefaultBackend),
+        &Source::Env("NARSOR_DEFAULT_BACKEND".to_string())
+    );
+}
+
+#[test]
+fn a_default_backend_that_cannot_be_an_identifier_is_refused() {
+    let root = TempRoot::new();
+    let cascade = ConfigCascade::with_dirs(None, Some(root.user_dir()), None);
+    root.user_config("default_backend: ../escape\ndefault_profile: \"a b\"\n");
+
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade);
+    let keys: Vec<_> = resolved.errors().iter().filter_map(|e| e.key()).collect();
+    assert_eq!(keys, vec!["default_backend", "default_profile"]);
+    assert_eq!(
+        resolved.default_backend(),
+        "local",
+        "a refused value never takes effect"
+    );
+}

@@ -1030,3 +1030,70 @@ fn an_output_object_without_a_label_is_rejected_with_the_state() {
         "names the state: {message}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Image overrides (U6, R15)
+// ---------------------------------------------------------------------------
+
+const PINNED: &str =
+    "ghcr.io/acme/dev@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+#[test]
+fn workflow_and_step_images_load_in_both_spellings_and_stay_separate() {
+    let yaml = format!(
+        r#"
+name: images
+version: 1
+globals:
+  image: "{PINNED}"
+states:
+  build:
+    image:
+      reference: ghcr.io/acme/builder:2026.10
+      digest_policy: resolve
+    action:
+      type: script
+      command: make
+    outputs: [success]
+    transitions:
+      success: done
+  done:
+    description: finished
+terminal_states: [done]
+"#
+    );
+    let definition = load_from_str(&yaml).expect("loads");
+
+    let workflow_image = definition.globals.image.as_ref().expect("globals.image");
+    assert_eq!(workflow_image, &narsor::domain::ImageSpec::pinned(PINNED));
+    let step = state(&definition, "build")
+        .image
+        .as_ref()
+        .expect("step image");
+    assert_eq!(
+        step,
+        &narsor::domain::ImageSpec::resolve("ghcr.io/acme/builder:2026.10")
+    );
+    assert!(
+        state(&definition, "done").image.is_none(),
+        "the workflow image is not copied into the states: provenance needs both"
+    );
+    assert!(definition.validate().is_ok());
+}
+
+#[test]
+fn a_misspelled_image_policy_key_does_not_load() {
+    let yaml = r#"
+name: images
+version: 1
+globals:
+  image:
+    reference: ubuntu:24.04
+    digest_polcy: resolve
+states:
+  done:
+    description: finished
+terminal_states: [done]
+"#;
+    assert!(load_from_str(yaml).is_err());
+}

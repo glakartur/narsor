@@ -219,6 +219,12 @@ pub struct GlobalsSchema {
     /// Default workspace for the execution.
     #[serde(default)]
     pub workspace: Option<WorkspaceSchema>,
+
+    /// Base image for every step of a remote task, overriding the
+    /// repository's own (R15). A reference string, or a mapping with
+    /// `reference` and `digest_policy` — see [`crate::domain::ImageSpec`].
+    #[serde(default)]
+    pub image: Option<crate::domain::ImageSpec>,
 }
 
 /// Retry policy, both globally and per state (§3.2, §3.3).
@@ -335,6 +341,11 @@ pub struct StateSchema {
     /// Allows the operator to force an arbitrary transition out of this state.
     #[serde(default)]
     pub allow_manual_override: bool,
+
+    /// Base image for this step only, overriding `globals.image` and the
+    /// repository's (R15).
+    #[serde(default)]
+    pub image: Option<crate::domain::ImageSpec>,
 }
 
 /// One entry of a state's `outputs` list (§3.3), in either of its two forms.

@@ -12,6 +12,7 @@ pub mod controller_protocol;
 pub mod daemon;
 pub mod domain;
 pub mod engine;
+pub mod environment;
 pub mod orchestration;
 pub mod persistence;
 pub mod registry;

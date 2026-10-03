@@ -209,6 +209,7 @@ mod tests {
             terminal: false,
             terminal_status: None,
             allow_manual_override: false,
+            image: None,
         }
     }
 

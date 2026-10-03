@@ -134,6 +134,7 @@ fn compile_globals(globals: &GlobalsSchema) -> GlobalsConfig {
     GlobalsConfig {
         timeout_secs: globals.timeout.map(|d| d.as_secs()),
         retry_policy: globals.retry_policy.as_ref().map(compile_retry_policy),
+        image: globals.image.clone(),
     }
 }
 
@@ -223,6 +224,7 @@ fn compile_state(
         terminal,
         terminal_status,
         allow_manual_override: state.allow_manual_override,
+        image: state.image,
     }
 }
 

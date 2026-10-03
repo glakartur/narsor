@@ -1,0 +1,816 @@
+//! Resolving a create-task request into a backend and a sealed launch spec.
+//!
+//! [`CatalogLaunchResolver`] is the one place configuration, the repository
+//! registry, the workflow and the owner's request meet. It only *reads*:
+//! every check runs before the control plane is asked to store anything, so
+//! a refused request leaves no task, no assignment and no command behind
+//! (U6: "without persisting a partial assignment").
+//!
+//! # Precedence
+//!
+//! * **Backend** — the request's explicit `backend`, else the owner default
+//!   (`default_backend`, R10). An existing task never re-resolves, so
+//!   changing the default moves no task.
+//! * **Base image** — a step's `image` wins over the workflow's
+//!   `globals.image`, which wins over the repository's `base_image` (R15).
+//!   The step overrides are recorded separately, each with its
+//!   [`ImageSource`].
+//! * **Harness** — the request, else the profile, else the live default
+//!   harness selection; pinned per task (R42).
+//! * **Profile** — the request, else `default_profile`.
+//! * **Resources** — the request, else the backend's default, never above
+//!   the backend's maximum.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use serde_json::Value;
+use thiserror::Error;
+
+use crate::domain::{
+    ActionConfig, BackendId, Context, DecisionConfig, GitIdentity, GitIdentityError, ImageError,
+    ImageSource, ImageSpec, InvalidIdentifier, ResolvedEnvironment, ResolvedImage, ResourceProfile,
+    SecretReference, TaskLaunchSpec, TaskWorkspace, WorkflowDefinition, WorkspaceSpec,
+};
+use crate::persistence::{DefaultHarnessSelector, HarnessSelectionSnapshot};
+use crate::registry::{RegistryError, RepositoryEntry, RepositoryRegistry};
+use crate::workflow::TemplateScope;
+use crate::workflows::WorkflowResolver;
+
+use super::backend::BackendRecord;
+use super::catalog::{CatalogError, EnvironmentCatalog};
+use super::image::{ImageResolver, NoTagResolution};
+use super::profile::{ProfileRecord, RuntimeCatalog, DEFAULT_PROFILE};
+
+/// What the owner asked for, before anything is resolved.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LaunchIntent {
+    /// Explicit backend; the owner default when `None`.
+    pub backend: Option<String>,
+    /// Workflow to run.
+    pub workflow_id: String,
+    /// The workflow version the owner expects.
+    pub workflow_version: u32,
+    /// Workflow inputs.
+    pub inputs: Value,
+    /// Registered repository; the workflow's `globals.workspace` when
+    /// `None`.
+    pub repository: Option<String>,
+    /// The pinned commit to clone (R39).
+    pub commit: Option<String>,
+    /// Explicit profile.
+    pub profile: Option<String>,
+    /// Explicit harness.
+    pub harness: Option<String>,
+    /// Explicit resources.
+    pub resources: Option<ResourceProfile>,
+}
+
+/// A request that resolved: where the task goes and what it runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedLaunch {
+    /// The backend the task is pinned to.
+    pub backend_id: BackendId,
+    /// The sealed launch spec.
+    pub spec: TaskLaunchSpec,
+}
+
+/// Why a request did not resolve. Every message is free of secret values —
+/// there are none to leak: only references are ever read.
+#[derive(Debug, Error)]
+pub enum LaunchError {
+    /// A malformed backend id.
+    #[error(transparent)]
+    InvalidBackendId(#[from] InvalidIdentifier),
+    /// No backend with that id is registered.
+    #[error("backend '{0}' is not registered")]
+    UnknownBackend(String),
+    /// The backend record is unusable (limits, secrets, harnesses…).
+    #[error("backend '{id}' is misconfigured: {}", problems.join("; "))]
+    InvalidBackend {
+        /// Backend id.
+        id: String,
+        /// Every problem.
+        problems: Vec<String>,
+    },
+    /// The workflow cannot be found or loaded.
+    #[error("workflow '{workflow}' cannot be loaded: {message}")]
+    UnknownWorkflow {
+        /// Workflow id.
+        workflow: String,
+        /// Why not.
+        message: String,
+    },
+    /// The workflow does not validate.
+    #[error("workflow '{workflow}' is invalid: {}", problems.join("; "))]
+    InvalidWorkflow {
+        /// Workflow id.
+        workflow: String,
+        /// Every validation error.
+        problems: Vec<String>,
+    },
+    /// The catalogue holds another version of the workflow.
+    #[error("workflow '{workflow}' is at version {available}, not the requested {requested}")]
+    WorkflowVersionMismatch {
+        /// Workflow id.
+        workflow: String,
+        /// Requested version.
+        requested: u32,
+        /// Version the catalogue has.
+        available: u32,
+    },
+    /// The inputs are not an object, or a template over them fails.
+    #[error("invalid inputs: {0}")]
+    InvalidInputs(String),
+    /// The workspace names a repository nobody registered.
+    #[error("repository '{0}' is not registered; a remote task needs a registered repository")]
+    UnknownRepository(String),
+    /// The workspace cannot travel to the backend.
+    #[error("unsupported workspace: {0}")]
+    UnsupportedWorkspace(String),
+    /// A Git workspace without a pinned commit.
+    #[error("repository '{0}' needs a pinned commit: pass the full commit id to clone")]
+    MissingCommit(String),
+    /// A commit that is not a full object id.
+    #[error(transparent)]
+    InvalidCommit(#[from] GitIdentityError),
+    /// No base image anywhere, on a backend that runs images (R15, AE11).
+    #[error(
+        "no base image for backend '{backend}': register one on repository {} or set \
+         'globals.image' in workflow '{workflow}'",
+        repository.as_deref().map(|id| format!("'{id}'")).unwrap_or_else(|| "(none)".to_string())
+    )]
+    MissingBaseImage {
+        /// Backend.
+        backend: String,
+        /// Repository, when there is one.
+        repository: Option<String>,
+        /// Workflow.
+        workflow: String,
+    },
+    /// An image reference is malformed or breaks its digest policy.
+    #[error("{field}: {error}")]
+    InvalidImage {
+        /// Where it is configured.
+        field: String,
+        /// What is wrong.
+        error: ImageError,
+    },
+    /// A `resolve`-policy tag did not resolve.
+    #[error("{field}: image '{reference}' could not be resolved to a digest: {reason}")]
+    UnresolvedImage {
+        /// Where it is configured.
+        field: String,
+        /// The reference.
+        reference: String,
+        /// Why not.
+        reason: String,
+    },
+    /// A backend that runs images needs the runtime bundle (R20).
+    #[error("backend '{0}' runs images, but no runtime bundle is configured in runtime.yaml")]
+    MissingRuntimeBundle(String),
+    /// The runtime catalogue is unusable.
+    #[error("runtime.yaml is invalid: {}", .0.join("; "))]
+    InvalidRuntime(Vec<String>),
+    /// The profile does not exist.
+    #[error("profile '{0}' is not defined")]
+    UnknownProfile(String),
+    /// The profile is unusable.
+    #[error("profile '{id}' is invalid: {}", problems.join("; "))]
+    InvalidProfile {
+        /// Profile id.
+        id: String,
+        /// Every problem.
+        problems: Vec<String>,
+    },
+    /// A profile names a tool the runtime catalogue does not have.
+    #[error("profile '{profile}' needs tool '{tool}', which runtime.yaml does not provide")]
+    UnknownTool {
+        /// Profile id.
+        profile: String,
+        /// Tool name.
+        tool: String,
+    },
+    /// The harness is unknown to this build or to the backend.
+    #[error("unsupported harness '{harness}': {reason}")]
+    UnsupportedHarness {
+        /// Harness name.
+        harness: String,
+        /// Why.
+        reason: String,
+    },
+    /// A secret reference not on the backend's allow list (R19).
+    #[error(
+        "{wanted_by} needs secret reference '{secret}', which backend '{backend}' does not \
+         register"
+    )]
+    UnregisteredSecret {
+        /// Reference name.
+        secret: String,
+        /// Backend.
+        backend: String,
+        /// Who asked for it.
+        wanted_by: String,
+    },
+    /// The requested resources are unusable or above the backend's limit.
+    #[error("invalid resources: {0}")]
+    InvalidResources(String),
+    /// A catalogue file is broken.
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
+    /// A repository entry is broken.
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+}
+
+impl LaunchError {
+    /// Stable machine-readable reason code for the API.
+    pub fn code(&self) -> &'static str {
+        match self {
+            LaunchError::InvalidBackendId(_) => "invalid_identifier",
+            LaunchError::UnknownBackend(_) => "unknown_backend",
+            LaunchError::InvalidBackend { .. } => "invalid_backend",
+            LaunchError::UnknownWorkflow { .. } => "unknown_workflow",
+            LaunchError::InvalidWorkflow { .. } => "invalid_workflow",
+            LaunchError::WorkflowVersionMismatch { .. } => "workflow_version_mismatch",
+            LaunchError::InvalidInputs(_) => "invalid_inputs",
+            LaunchError::UnknownRepository(_) => "unknown_repository",
+            LaunchError::UnsupportedWorkspace(_) => "unsupported_workspace",
+            LaunchError::MissingCommit(_) => "missing_commit",
+            LaunchError::InvalidCommit(_) => "invalid_commit",
+            LaunchError::MissingBaseImage { .. } => "missing_base_image",
+            LaunchError::InvalidImage { .. } => "invalid_image",
+            LaunchError::UnresolvedImage { .. } => "unresolved_image",
+            LaunchError::MissingRuntimeBundle(_) => "missing_runtime_bundle",
+            LaunchError::InvalidRuntime(_) => "invalid_runtime",
+            LaunchError::UnknownProfile(_) => "unknown_profile",
+            LaunchError::InvalidProfile { .. } => "invalid_profile",
+            LaunchError::UnknownTool { .. } => "unknown_tool",
+            LaunchError::UnsupportedHarness { .. } => "unsupported_harness",
+            LaunchError::UnregisteredSecret { .. } => "unregistered_secret",
+            LaunchError::InvalidResources(_) => "invalid_resources",
+            LaunchError::Catalog(_) | LaunchError::Registry(_) => "invalid_configuration",
+        }
+    }
+
+    /// Whether this is a server-side storage failure rather than something
+    /// the owner or operator can fix by changing a request or a file.
+    pub fn is_internal(&self) -> bool {
+        matches!(
+            self,
+            LaunchError::Catalog(CatalogError::Storage { .. })
+                | LaunchError::Registry(RegistryError::Storage { .. })
+        )
+    }
+}
+
+/// Turns a create-task request into a backend and a launch spec.
+pub trait LaunchResolver: Send + Sync {
+    /// Resolves and validates `intent`, reading but never writing.
+    fn resolve(&self, intent: &LaunchIntent) -> Result<ResolvedLaunch, LaunchError>;
+}
+
+/// The harness registry and the live default harness (R42).
+pub trait HarnessDefaults: Send + Sync {
+    /// Harnesses this build can run.
+    fn supported(&self) -> Vec<String>;
+    /// The default for agent steps that name none, right now.
+    fn default_harness(&self) -> String;
+}
+
+/// Fixed harness defaults.
+#[derive(Debug, Clone)]
+pub struct StaticHarnessDefaults {
+    supported: Vec<String>,
+    default: String,
+}
+
+impl StaticHarnessDefaults {
+    /// Fixed `supported` and `default`.
+    pub fn new(supported: Vec<String>, default: impl Into<String>) -> Self {
+        Self {
+            supported,
+            default: default.into(),
+        }
+    }
+
+    /// This build's registry with `default` as the default.
+    pub fn builtin(default: impl Into<String>) -> Self {
+        let supported = crate::engine::HarnessRegistry::defaults()
+            .supported()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        Self::new(supported, default)
+    }
+}
+
+impl HarnessDefaults for StaticHarnessDefaults {
+    fn supported(&self) -> Vec<String> {
+        self.supported.clone()
+    }
+
+    fn default_harness(&self) -> String {
+        self.default.clone()
+    }
+}
+
+impl HarnessDefaults for DefaultHarnessSelector {
+    fn supported(&self) -> Vec<String> {
+        self.current().supported
+    }
+
+    fn default_harness(&self) -> String {
+        let HarnessSelectionSnapshot { effective, .. } = self.current();
+        effective
+    }
+}
+
+/// The owner's configured defaults (R10, R16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerDefaults {
+    /// Backend of a task that names none.
+    pub default_backend: String,
+    /// Profile of a task that names none.
+    pub default_profile: String,
+}
+
+impl OwnerDefaults {
+    /// The defaults from resolved configuration.
+    pub fn from_config(config: &crate::config::Resolved) -> Self {
+        Self {
+            default_backend: config.default_backend().to_string(),
+            default_profile: config.default_profile().to_string(),
+        }
+    }
+}
+
+/// The resolver over the on-disk catalogue.
+pub struct CatalogLaunchResolver {
+    catalog_root: PathBuf,
+    catalog: EnvironmentCatalog,
+    registry: RepositoryRegistry,
+    workflows: WorkflowResolver,
+    owner: OwnerDefaults,
+    harness: Arc<dyn HarnessDefaults>,
+    images: Arc<dyn ImageResolver>,
+}
+
+impl fmt::Debug for CatalogLaunchResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CatalogLaunchResolver")
+            .field("catalog_root", &self.catalog_root)
+            .field("owner", &self.owner)
+            .field("images", &self.images)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatalogLaunchResolver {
+    /// A resolver over `catalog_root`, finding workflows through
+    /// `workflows`. Image tags are not resolved until
+    /// [`Self::with_image_resolver`] says how.
+    pub fn new(
+        catalog_root: impl Into<PathBuf>,
+        workflows: WorkflowResolver,
+        owner: OwnerDefaults,
+        harness: Arc<dyn HarnessDefaults>,
+    ) -> Self {
+        let catalog_root = catalog_root.into();
+        Self {
+            catalog: EnvironmentCatalog::new(catalog_root.clone()),
+            registry: RepositoryRegistry::new(&catalog_root),
+            catalog_root,
+            workflows,
+            owner,
+            harness,
+            images: Arc::new(NoTagResolution),
+        }
+    }
+
+    /// Resolves `resolve`-policy tags through `images`.
+    pub fn with_image_resolver(mut self, images: Arc<dyn ImageResolver>) -> Self {
+        self.images = images;
+        self
+    }
+
+    fn backend(&self, intent: &LaunchIntent) -> Result<(BackendId, BackendRecord), LaunchError> {
+        let requested = intent
+            .backend
+            .clone()
+            .unwrap_or_else(|| self.owner.default_backend.clone());
+        let backend_id = BackendId::parse(requested)?;
+        let record = self
+            .catalog
+            .backend(backend_id.as_str())?
+            .ok_or_else(|| LaunchError::UnknownBackend(backend_id.to_string()))?;
+        let problems = record.problems();
+        if !problems.is_empty() {
+            return Err(LaunchError::InvalidBackend {
+                id: backend_id.to_string(),
+                problems,
+            });
+        }
+        Ok((backend_id, record))
+    }
+
+    fn workflow(&self, intent: &LaunchIntent) -> Result<WorkflowDefinition, LaunchError> {
+        let unknown = |message: String| LaunchError::UnknownWorkflow {
+            workflow: intent.workflow_id.clone(),
+            message,
+        };
+        let resolved = self
+            .workflows
+            .resolve_name(&intent.workflow_id)
+            .map_err(|error| unknown(error.to_string()))?;
+        let problems = resolved
+            .validate()
+            .map_err(|error| unknown(error.to_string()))?;
+        if !problems.is_empty() {
+            return Err(LaunchError::InvalidWorkflow {
+                workflow: intent.workflow_id.clone(),
+                problems: problems.iter().map(ToString::to_string).collect(),
+            });
+        }
+        let definition = resolved
+            .load()
+            .map_err(|error| unknown(error.to_string()))?;
+        if definition.version != intent.workflow_version {
+            return Err(LaunchError::WorkflowVersionMismatch {
+                workflow: intent.workflow_id.clone(),
+                requested: intent.workflow_version,
+                available: definition.version,
+            });
+        }
+        Ok(definition)
+    }
+
+    fn profile(&self, intent: &LaunchIntent) -> Result<ProfileRecord, LaunchError> {
+        let id = intent
+            .profile
+            .clone()
+            .unwrap_or_else(|| self.owner.default_profile.clone());
+        let record = match self.catalog.profile(&id)? {
+            Some(record) => record,
+            // Only the implicit default may be absent: a fresh installation
+            // runs without any profile file, but a profile someone *named*
+            // and nobody defined is a mistake worth reporting.
+            None if intent.profile.is_none() && id == DEFAULT_PROFILE => {
+                ProfileRecord::empty(id.clone())
+            }
+            None => return Err(LaunchError::UnknownProfile(id)),
+        };
+        let problems = record.problems();
+        if !problems.is_empty() {
+            return Err(LaunchError::InvalidProfile { id, problems });
+        }
+        Ok(record)
+    }
+
+    fn runtime(&self) -> Result<Option<RuntimeCatalog>, LaunchError> {
+        let runtime = self.catalog.runtime()?;
+        if let Some(runtime) = &runtime {
+            let problems = runtime.problems();
+            if !problems.is_empty() {
+                return Err(LaunchError::InvalidRuntime(problems));
+            }
+        }
+        Ok(runtime)
+    }
+
+    fn resolve_image(
+        &self,
+        field: &str,
+        spec: &ImageSpec,
+        source: ImageSource,
+    ) -> Result<ResolvedImage, LaunchError> {
+        let reference = spec.check().map_err(|error| LaunchError::InvalidImage {
+            field: field.to_string(),
+            error,
+        })?;
+        let (digest, tag_resolved) = match &reference.digest {
+            Some(digest) => (digest.clone(), false),
+            None => {
+                let digest = self.images.resolve_tag(&reference).map_err(|reason| {
+                    LaunchError::UnresolvedImage {
+                        field: field.to_string(),
+                        reference: spec.reference.clone(),
+                        reason,
+                    }
+                })?;
+                (digest, true)
+            }
+        };
+        Ok(ResolvedImage {
+            reference: spec.reference.clone(),
+            pinned: reference.pinned(&digest),
+            digest,
+            tag_resolved,
+            source,
+        })
+    }
+
+    /// The repository the task works on and the workspace it clones.
+    fn workspace(
+        &self,
+        intent: &LaunchIntent,
+        definition: &WorkflowDefinition,
+        backend_id: &BackendId,
+        backend: &BackendRecord,
+        secrets: &mut SecretSet,
+    ) -> Result<(Option<RepositoryEntry>, TaskWorkspace), LaunchError> {
+        let inputs = match &intent.inputs {
+            Value::Null => Value::Object(Default::default()),
+            other => other.clone(),
+        };
+        let context = Context::new();
+        let scope = TemplateScope::from_execution(&inputs, &context)
+            .map_err(|error| LaunchError::InvalidInputs(error.to_string()))?;
+        let render = |template: &str, field: &str| {
+            scope
+                .render(template, field)
+                .map_err(|error| LaunchError::InvalidInputs(error.to_string()))
+        };
+
+        let (repository, workflow_ref) = match (&intent.repository, &definition.workspace) {
+            (Some(repository), _) => (Some(repository.clone()), None),
+            (
+                None,
+                Some(WorkspaceSpec::Git {
+                    repository,
+                    git_ref,
+                    ..
+                }),
+            ) => {
+                let git_ref = match git_ref {
+                    Some(git_ref) => Some(render(git_ref, "globals.workspace.ref")?),
+                    None => None,
+                };
+                (
+                    Some(render(repository, "globals.workspace.repository")?),
+                    git_ref,
+                )
+            }
+            (None, Some(WorkspaceSpec::Local { .. })) => {
+                if backend.kind.runs_container_images() {
+                    return Err(LaunchError::UnsupportedWorkspace(format!(
+                        "workflow '{}' works on a local folder, which cannot travel to backend \
+                         '{backend_id}'",
+                        definition.id
+                    )));
+                }
+                (None, None)
+            }
+            (None, None) => (None, None),
+        };
+
+        let Some(repository) = repository else {
+            if intent.commit.is_some() {
+                return Err(LaunchError::UnsupportedWorkspace(
+                    "a commit was given but no repository to clone it from".to_string(),
+                ));
+            }
+            return Ok((None, TaskWorkspace::None));
+        };
+
+        let entry = self
+            .registry
+            .get(&repository)?
+            .ok_or_else(|| LaunchError::UnknownRepository(repository.clone()))?;
+        // A workflow `ref` that already is a full commit pins the workspace;
+        // a branch or tag never does — it would move under a resumed task.
+        let commit = match (&intent.commit, workflow_ref) {
+            (Some(commit), _) => commit.clone(),
+            (None, Some(git_ref)) if GitIdentity::check_commit(&git_ref).is_ok() => git_ref,
+            (None, _) => return Err(LaunchError::MissingCommit(repository)),
+        };
+        GitIdentity::check_commit(&commit)?;
+        let credential = match &entry.git_credential {
+            Some(name) => Some(secrets.require(
+                backend_id,
+                backend,
+                name,
+                &format!("repository '{}'", entry.id),
+            )?),
+            None => None,
+        };
+        let workspace = TaskWorkspace::Git(GitIdentity {
+            repository: Some(entry.id.clone()),
+            remote_url: entry.remote.clone(),
+            commit,
+            credential,
+        });
+        Ok((Some(entry), workspace))
+    }
+
+    fn harness(
+        &self,
+        intent: &LaunchIntent,
+        profile: &ProfileRecord,
+        definition: &WorkflowDefinition,
+        backend_id: &BackendId,
+        backend: &BackendRecord,
+    ) -> Result<String, LaunchError> {
+        let supported = self.harness.supported();
+        let selected = intent
+            .harness
+            .clone()
+            .or_else(|| profile.harness.clone())
+            .unwrap_or_else(|| self.harness.default_harness());
+        // Every harness the task may run: the pinned default plus each one a
+        // step names literally (a templated one is only known at run time).
+        let mut needed = BTreeSet::from([selected.clone()]);
+        for state in definition.states.values() {
+            if let Some(ActionConfig::Agent(agent)) = &state.action {
+                needed.extend(agent.harness.iter().filter(|h| !h.contains("{{")).cloned());
+            }
+            if let Some(DecisionConfig::Agent(agent)) = &state.decision {
+                needed.extend(agent.harness.iter().filter(|h| !h.contains("{{")).cloned());
+            }
+        }
+        for harness in needed {
+            if !supported.contains(&harness) {
+                return Err(LaunchError::UnsupportedHarness {
+                    reason: format!("this build supports {}", supported.join(", ")),
+                    harness,
+                });
+            }
+            if !backend.allows_harness(&harness) {
+                return Err(LaunchError::UnsupportedHarness {
+                    reason: format!(
+                        "backend '{backend_id}' runs only {}",
+                        backend.harnesses.join(", ")
+                    ),
+                    harness,
+                });
+            }
+        }
+        Ok(selected)
+    }
+
+    fn resources(
+        &self,
+        intent: &LaunchIntent,
+        backend_id: &BackendId,
+        backend: &BackendRecord,
+    ) -> Result<ResourceProfile, LaunchError> {
+        let resources = intent.resources.unwrap_or(backend.limits.default_resources);
+        let problems = resources.problems();
+        if !problems.is_empty() {
+            return Err(LaunchError::InvalidResources(problems.join("; ")));
+        }
+        let max = backend.limits.max_resources();
+        if !resources.fits_within(&max) {
+            return Err(LaunchError::InvalidResources(format!(
+                "{resources} exceed backend '{backend_id}''s limit of {max}"
+            )));
+        }
+        Ok(resources)
+    }
+}
+
+/// The secret references a task collects, deduplicated by name.
+#[derive(Default)]
+struct SecretSet(BTreeMap<String, SecretReference>);
+
+impl SecretSet {
+    fn require(
+        &mut self,
+        backend_id: &BackendId,
+        backend: &BackendRecord,
+        name: &str,
+        wanted_by: &str,
+    ) -> Result<SecretReference, LaunchError> {
+        let reference = backend.secret_reference(backend_id, name).ok_or_else(|| {
+            LaunchError::UnregisteredSecret {
+                secret: name.to_string(),
+                backend: backend_id.to_string(),
+                wanted_by: wanted_by.to_string(),
+            }
+        })?;
+        self.0.insert(reference.name.clone(), reference.clone());
+        Ok(reference)
+    }
+}
+
+impl LaunchResolver for CatalogLaunchResolver {
+    fn resolve(&self, intent: &LaunchIntent) -> Result<ResolvedLaunch, LaunchError> {
+        let (backend_id, backend) = self.backend(intent)?;
+        let definition = self.workflow(intent)?;
+        let mut secrets = SecretSet::default();
+        let (repository, workspace) =
+            self.workspace(intent, &definition, &backend_id, &backend, &mut secrets)?;
+
+        let base_image = match (&definition.globals.image, &repository) {
+            (Some(image), _) => Some(self.resolve_image(
+                "globals.image",
+                image,
+                ImageSource::Workflow {
+                    workflow: definition.id.clone(),
+                },
+            )?),
+            (None, Some(entry)) => match &entry.base_image {
+                Some(image) => Some(self.resolve_image(
+                    &format!("repository '{}' base_image", entry.id),
+                    image,
+                    ImageSource::Repository {
+                        repository: entry.id.clone(),
+                    },
+                )?),
+                None => None,
+            },
+            (None, None) => None,
+        };
+        if base_image.is_none() && backend.kind.runs_container_images() {
+            return Err(LaunchError::MissingBaseImage {
+                backend: backend_id.to_string(),
+                repository: repository.as_ref().map(|entry| entry.id.clone()),
+                workflow: definition.id.clone(),
+            });
+        }
+
+        let mut state_ids: Vec<_> = definition.states.keys().collect();
+        state_ids.sort();
+        let mut step_images = BTreeMap::new();
+        for state_id in state_ids {
+            if let Some(image) = &definition.states[state_id].image {
+                let resolved = self.resolve_image(
+                    &format!("states.{state_id}.image"),
+                    image,
+                    ImageSource::Step {
+                        workflow: definition.id.clone(),
+                        state: state_id.clone(),
+                    },
+                )?;
+                step_images.insert(state_id.clone(), resolved);
+            }
+        }
+
+        let profile = self.profile(intent)?;
+        let runtime = self.runtime()?;
+        let runtime_bundle = match (&runtime, backend.kind.runs_container_images()) {
+            (Some(runtime), true) => Some(self.resolve_image(
+                "runtime.yaml bundle",
+                &runtime.bundle,
+                ImageSource::RuntimeBundle,
+            )?),
+            (None, true) => return Err(LaunchError::MissingRuntimeBundle(backend_id.to_string())),
+            // The local adapter runs this very binary; it materializes no
+            // bundle, so none is pinned.
+            (_, false) => None,
+        };
+        let mut tools = BTreeMap::new();
+        for tool in &profile.tools {
+            let spec = runtime
+                .as_ref()
+                .and_then(|runtime| runtime.tools.get(tool))
+                .ok_or_else(|| LaunchError::UnknownTool {
+                    profile: profile.id.clone(),
+                    tool: tool.clone(),
+                })?;
+            let resolved = self.resolve_image(
+                &format!("runtime.yaml tools.{tool}"),
+                spec,
+                ImageSource::Tool { tool: tool.clone() },
+            )?;
+            tools.insert(tool.clone(), resolved);
+        }
+        for name in &profile.secrets {
+            secrets.require(
+                &backend_id,
+                &backend,
+                name,
+                &format!("profile '{}'", profile.id),
+            )?;
+        }
+
+        let harness = self.harness(intent, &profile, &definition, &backend_id, &backend)?;
+        let resources = self.resources(intent, &backend_id, &backend)?;
+
+        let environment = ResolvedEnvironment {
+            base_image,
+            step_images,
+            runtime_bundle,
+            tools,
+            profile: profile.resolve(),
+            harness,
+            secrets: secrets.0.into_values().collect(),
+            identity: String::new(),
+        };
+        let inputs = match &intent.inputs {
+            Value::Null => Value::Object(Default::default()),
+            other => other.clone(),
+        };
+        let spec = TaskLaunchSpec::new(
+            definition.id.clone(),
+            definition.version,
+            inputs,
+            workspace,
+            environment,
+            resources,
+        );
+        Ok(ResolvedLaunch { backend_id, spec })
+    }
+}

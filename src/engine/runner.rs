@@ -3425,6 +3425,7 @@ mod tests {
             terminal: true,
             terminal_status: declared,
             allow_manual_override: false,
+            image: None,
         }
     }
 

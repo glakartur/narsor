@@ -815,7 +815,9 @@ fn sample_launch_spec(feature: &str) -> narsor::domain::TaskLaunchSpec {
         "implement-feature",
         3,
         serde_json::json!({ "feature": feature }),
-        serde_json::json!({ "repository": "narsor" }),
+        narsor::domain::TaskWorkspace::None,
+        narsor::domain::ResolvedEnvironment::harness_only("claude-code"),
+        narsor::domain::ResourceProfile::new(1000, 2048),
     )
 }
 

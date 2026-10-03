@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
 
+use super::environment::{canonical_sha256, ResolvedEnvironment, ResourceProfile, TaskWorkspace};
+
 /// Longest identifier accepted for a task or a backend.
 ///
 /// Both end up as a single path component under the state root and, later,
@@ -113,16 +115,26 @@ identifier!(
 );
 
 /// Current schema version of [`TaskLaunchSpec`].
-pub const TASK_LAUNCH_SPEC_VERSION: u32 = 1;
+///
+/// Version 2 replaced version 1's opaque `workspace` with a typed
+/// [`TaskWorkspace`], added the pinned [`ResolvedEnvironment`] and the
+/// [`ResourceProfile`], and moved the digest from FNV-1a to SHA-256.
+pub const TASK_LAUNCH_SPEC_VERSION: u32 = 2;
 
 /// Immutable, versioned input a task is launched from.
 ///
 /// Built once when the task is created and copied to task storage once
 /// (R18, KTD5): a resumed or reconnected runner reads this record, never the
-/// mutable defaults it was originally resolved from. `workspace` is kept
-/// opaque here on purpose — U3/U6 give the Git identity and the resolved
-/// environment their own types and bump [`TASK_LAUNCH_SPEC_VERSION`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// mutable defaults it was originally resolved from.
+///
+/// # Older versions fail clearly
+///
+/// Deserialization reads `version` first and refuses anything but
+/// [`TASK_LAUNCH_SPEC_VERSION`] with a message naming both versions. A
+/// version-1 record has no environment to run in, so there is nothing
+/// faithful to upgrade it to: guessing one from today's configuration would
+/// be exactly the silent re-resolution R18 forbids.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct TaskLaunchSpec {
     /// Schema version of this record.
     pub version: u32,
@@ -132,20 +144,70 @@ pub struct TaskLaunchSpec {
     pub workflow_version: u32,
     /// Workflow inputs, exactly as validated at creation.
     pub inputs: serde_json::Value,
-    /// Workspace source (repository, pinned commit…), opaque until U3.
-    pub workspace: serde_json::Value,
-    /// Digest of every other field, see [`TaskLaunchSpec::compute_digest`].
+    /// What the task clones into its empty storage (R39).
+    pub workspace: TaskWorkspace,
+    /// The pinned runner environment (KTD5).
+    pub environment: ResolvedEnvironment,
+    /// CPU and memory of the task workload, within the backend's limits.
+    pub resources: ResourceProfile,
+    /// `sha256:` digest of every other field, see
+    /// [`TaskLaunchSpec::compute_digest`].
     pub digest: String,
+}
+
+/// The fields of a current-version spec, for the version-checked read.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskLaunchSpecFields {
+    version: u32,
+    workflow_id: String,
+    workflow_version: u32,
+    inputs: serde_json::Value,
+    workspace: TaskWorkspace,
+    environment: ResolvedEnvironment,
+    resources: ResourceProfile,
+    digest: String,
+}
+
+impl<'de> Deserialize<'de> for TaskLaunchSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let version = value
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| serde::de::Error::custom("task launch spec has no version"))?;
+        if version != u64::from(TASK_LAUNCH_SPEC_VERSION) {
+            return Err(serde::de::Error::custom(format!(
+                "task launch spec version {version} is not supported by this build (expected \
+                 {TASK_LAUNCH_SPEC_VERSION}); a version-1 spec predates pinned environments \
+                 and cannot be upgraded — archive the task and create it again"
+            )));
+        }
+        let fields: TaskLaunchSpecFields =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            version: fields.version,
+            workflow_id: fields.workflow_id,
+            workflow_version: fields.workflow_version,
+            inputs: fields.inputs,
+            workspace: fields.workspace,
+            environment: fields.environment,
+            resources: fields.resources,
+            digest: fields.digest,
+        })
+    }
 }
 
 impl TaskLaunchSpec {
     /// Builds a spec at the current schema version and seals it with its
-    /// digest.
+    /// digest. `environment` is sealed too, so its identity always matches.
     pub fn new(
         workflow_id: impl Into<String>,
         workflow_version: u32,
         inputs: serde_json::Value,
-        workspace: serde_json::Value,
+        workspace: TaskWorkspace,
+        environment: ResolvedEnvironment,
+        resources: ResourceProfile,
     ) -> Self {
         let mut spec = Self {
             version: TASK_LAUNCH_SPEC_VERSION,
@@ -153,6 +215,8 @@ impl TaskLaunchSpec {
             workflow_version,
             inputs,
             workspace,
+            environment: environment.sealed(),
+            resources,
             digest: String::new(),
         };
         spec.digest = spec.compute_digest();
@@ -161,13 +225,11 @@ impl TaskLaunchSpec {
 
     /// Recomputes the digest from the content fields.
     ///
-    /// The content is serialized through `serde_json::Value`, whose objects
-    /// are key-sorted maps in this build, so the bytes — and the digest — do
-    /// not depend on the order the caller inserted keys in. FNV-1a is used
-    /// rather than `DefaultHasher` because the value is persisted and must be
-    /// identical across processes and Rust releases. It is an integrity and
-    /// identity check against accidents, not a cryptographic commitment;
-    /// equality checks below compare full content as well.
+    /// SHA-256 over the canonical JSON rendering (see
+    /// [`canonical_sha256`]): stable across processes, Rust releases and
+    /// key insertion order, and — unlike the FNV-1a of version 1 — not
+    /// forgeable by a party that can write the record but wants it to keep
+    /// matching the digest a controller already accepted.
     pub fn compute_digest(&self) -> String {
         let content = serde_json::json!({
             "version": self.version,
@@ -175,21 +237,15 @@ impl TaskLaunchSpec {
             "workflow_version": self.workflow_version,
             "inputs": self.inputs,
             "workspace": self.workspace,
+            "environment": self.environment,
+            "resources": self.resources,
         });
-        let bytes = serde_json::to_vec(&content).expect("a JSON value always serializes");
-        fnv1a64(&bytes)
+        canonical_sha256(&content)
     }
 
-    /// True when the stored digest matches the content.
+    /// True when the stored digest matches the content and the environment
+    /// identity matches the environment.
     pub fn digest_is_valid(&self) -> bool {
-        self.digest == self.compute_digest()
+        self.digest == self.compute_digest() && self.environment.identity_is_valid()
     }
-}
-
-fn fnv1a64(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("fnv1a64-{hash:016x}")
 }

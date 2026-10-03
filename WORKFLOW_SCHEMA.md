@@ -41,6 +41,7 @@ globals:                    # Ustawienia globalne dla całego workflow (opcjonal
     path: <string>          # Ścieżka względna w folderze taska
     preserve_paths:         # Ścieżki ignorowane przez repo, które mimo to mają przetrwać do checkpointu (git i local); nie może to być plik z sekretami/poświadczeniami (checkpoint jest niezaszyfrowany)
       - <string>
+  image: <image>            # Obraz bazowy zdalnego taska, nadpisuje obraz repozytorium (opcjonalne)
 
 states:                     # Graf stanów (wymagane)
   <state_id>:
@@ -116,6 +117,15 @@ Opcjonalna sekcja określająca domyślne zachowanie dla całego workflow.
         checkpointu bez szyfrowania — **nie wolno** wskazywać w `preserve_paths` pliku
         zawierającego sekrety lub poświadczenia (np. `.env`), bo to właśnie ten plik trafi w
         jawnej postaci do checkpointu (R33).
+*   `image`: Obraz bazowy, w którym zdalny backend uruchamia task; nadpisuje `base_image`
+    repozytorium z registry. Krok może go nadpisać własnym polem `image` (pierwszeństwo:
+    krok > workflow > repozytorium). Zapis jako referencja z digestem
+    (`ghcr.io/acme/dev@sha256:…`) albo jako mapa
+    `{ reference: ghcr.io/acme/dev:2026.10, digest_policy: resolve }` — wtedy tag jest
+    zamieniany na digest raz, przy tworzeniu taska. Domyślna polityka `pinned` wymaga
+    digestu; sam tag (lub niejawne `latest`) jest błędem walidacji. Wybrany obraz, jego
+    digest i źródło trafiają do `ResolvedEnvironment` taska i nie zmieniają się po późniejszej
+    zmianie definicji.
 
 ### 3.3. States (Stany)
 
@@ -145,6 +155,7 @@ Serce definicji workflow. Każdy klucz w sekcji `states` to unikalny identyfikat
   retry_policy:                       # Nadpisanie globalnej polityki retry
     max_attempts: 3
     backoff: 5s
+  image: <image>                      # Nadpisanie obrazu bazowego dla tego kroku (§3.2)
 ```
 
 #### Etykiety wyjścia (`outputs`)
@@ -558,6 +569,10 @@ Przed uruchomieniem workflow, definicja musi przejść walidację:
 
 4.  **Zmienne i Kontekst:**
     *   Odwołania do zmiennych (np. `{{ inputs.xxx }}`) muszą dotyczyć zdefiniowanych wejść lub pól kontekstu.
+
+5.  **Obrazy:**
+    *   `globals.image` i `image` kroku muszą być poprawną referencją OCI z jawnym tagiem lub digestem; przy polityce `pinned` digest jest obowiązkowy.
+    *   Stan terminalny nie może nadpisywać obrazu — niczego nie uruchamia.
 
 Walidacja odbywa się statycznie przed utworzeniem `WorkflowExecution`. Błędy walidacji uniemożliwiają start workflow.
 

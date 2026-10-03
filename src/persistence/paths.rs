@@ -45,6 +45,16 @@ pub const WORKFLOWS_DIR: &str = "workflows";
 /// Directory holding registry entries, under the catalogue root.
 pub const REPOSITORIES_DIR: &str = "repositories";
 
+/// Directory holding execution backend records, under the catalogue root.
+pub const BACKENDS_DIR: &str = "backends";
+
+/// Directory holding user profiles, under the catalogue root.
+pub const PROFILES_DIR: &str = "profiles";
+
+/// The runtime catalogue (runtime bundle and tool packages), under the
+/// catalogue root.
+pub const RUNTIME_FILE: &str = "runtime.yaml";
+
 /// Directory holding every execution workspace, under the work root.
 pub const TASKS_DIR: &str = "tasks";
 
@@ -486,6 +496,21 @@ impl CatalogPaths {
     /// `{root}/repositories`
     pub fn repositories_dir(&self) -> PathBuf {
         self.root.join(REPOSITORIES_DIR)
+    }
+
+    /// `{root}/backends`
+    pub fn backends_dir(&self) -> PathBuf {
+        self.root.join(BACKENDS_DIR)
+    }
+
+    /// `{root}/profiles`
+    pub fn profiles_dir(&self) -> PathBuf {
+        self.root.join(PROFILES_DIR)
+    }
+
+    /// `{root}/runtime.yaml`
+    pub fn runtime_file(&self) -> PathBuf {
+        self.root.join(RUNTIME_FILE)
     }
 }
 

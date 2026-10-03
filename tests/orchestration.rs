@@ -141,12 +141,23 @@ fn backend_id(id: &str) -> BackendId {
     BackendId::parse(id).expect("valid backend id")
 }
 
+fn git_workspace() -> narsor::domain::TaskWorkspace {
+    narsor::domain::TaskWorkspace::Git(narsor::domain::GitIdentity {
+        repository: Some("narsor".to_string()),
+        remote_url: "https://example.com/narsor.git".to_string(),
+        commit: "614c3a8".repeat(5) + "abcde",
+        credential: None,
+    })
+}
+
 fn launch_spec() -> TaskLaunchSpec {
     TaskLaunchSpec::new(
         "implement-feature",
         3,
         serde_json::json!({ "feature": "remote backends" }),
-        serde_json::json!({ "repository": "narsor", "commit": "614c3a8" }),
+        git_workspace(),
+        narsor::domain::ResolvedEnvironment::harness_only("claude-code"),
+        narsor::domain::ResourceProfile::new(1000, 2048),
     )
 }
 
@@ -713,7 +724,9 @@ fn creating_a_task_is_idempotent_but_a_different_request_conflicts() {
             "implement-feature",
             3,
             serde_json::json!({ "feature": "something else" }),
-            serde_json::json!({ "repository": "narsor", "commit": "614c3a8" }),
+            git_workspace(),
+            narsor::domain::ResolvedEnvironment::harness_only("claude-code"),
+            narsor::domain::ResourceProfile::new(1000, 2048),
         ),
         ..new_task("task-1", "k8s")
     };

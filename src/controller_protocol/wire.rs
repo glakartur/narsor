@@ -23,7 +23,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
+use crate::domain::{BackendId, ExecutionStatus, ResourceProfile, TaskId, TaskLaunchSpec};
 use crate::engine::{HumanInputDelivery, Timeline};
 use crate::orchestration::{
     ArchiveTombstone, CommandReceipt, ConversationAttemptSummary, ExecutionCursor, InputStatus,
@@ -38,30 +38,66 @@ pub const PROTOCOL_VERSION: u32 = 1;
 // Owner side (KTD4)
 // ---------------------------------------------------------------------------
 
-/// The immutable launch input of a new task.
+/// What a new task runs. Everything here is *intent*: the control plane
+/// resolves it against its configuration into a sealed
+/// [`TaskLaunchSpec`] before anything is stored (U6), and refuses the
+/// request — with nothing persisted — when it does not resolve.
+///
+/// Unknown fields are refused, so a client that tries to hand the control
+/// plane a credential value under some new key is told no instead of having
+/// it silently dropped or, worse, stored.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchRequest {
     /// Workflow to run.
     pub workflow_id: String,
-    /// Its version.
+    /// The version the client expects; another version in the catalogue is
+    /// a refusal, not a silent upgrade.
     pub workflow_version: u32,
     /// Workflow inputs.
     #[serde(default)]
     pub inputs: Value,
-    /// Workspace source (repository, pinned commit…).
-    #[serde(default)]
-    pub workspace: Value,
+    /// The repository and pinned commit to clone (R39); the workflow's own
+    /// `globals.workspace` names the repository when this does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceRequest>,
+    /// Profile (R16); the owner default when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Harness for agent steps that name none (R42); the profile's, else the
+    /// live default, when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// CPU and memory; the backend's default when absent, never above its
+    /// maximum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceProfile>,
+}
+
+/// The workspace part of a [`LaunchRequest`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRequest {
+    /// Registered repository id; the workflow's when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// Full commit id to clone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
 }
 
 /// `POST /control/v1/tasks`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CreateTaskRequest {
-    /// Client-chosen id; repeating the same request with it is idempotent.
+    /// Client-chosen id; repeating the same request with it is idempotent
+    /// while the configuration it resolves against is unchanged.
     /// Generated when absent — but then a retry creates a second task.
     #[serde(default)]
     pub task_id: Option<String>,
-    /// Backend to pin the task to (R10).
-    pub backend_id: String,
+    /// Backend to pin the task to (R10); the owner's `default_backend` when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_id: Option<String>,
     /// Queue priority (R11), higher first.
     #[serde(default)]
     pub priority: i32,
@@ -198,6 +234,9 @@ pub struct TaskSummary {
     pub workflow_version: u32,
     /// Digest of its immutable launch spec.
     pub launch_digest: String,
+    /// Identity of its pinned environment (R21): equal for two tasks that
+    /// run on exactly the same images, bundle, tools, profile and harness.
+    pub environment_identity: String,
     /// Archive tombstone, once archived.
     pub archive: Option<ArchiveTombstone>,
     /// Last controller observation.

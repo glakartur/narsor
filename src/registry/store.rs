@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::domain::{RepositoryInfo, RepositoryReference};
+use crate::domain::{ImageError, ImageSpec, RepositoryInfo, RepositoryReference};
 use crate::persistence::{write_atomic, write_atomic_exclusive, PersistenceError};
 use crate::workspace::provisioner::{check_remote, is_usable_directory_name};
 
@@ -125,6 +125,23 @@ pub enum RegistryError {
         #[source]
         source: crate::workspace::WorkspaceError,
     },
+
+    /// The base image is malformed or breaks its digest policy.
+    #[error("repository '{id}' has an unusable base image: {source}")]
+    InvalidBaseImage {
+        /// The entry that was rejected.
+        id: String,
+        /// What is wrong with the image.
+        #[source]
+        source: ImageError,
+    },
+
+    /// The Git credential reference is blank.
+    #[error("repository '{id}' names a blank git credential reference")]
+    InvalidGitCredential {
+        /// The entry that was rejected.
+        id: String,
+    },
 }
 
 /// One registered repository.
@@ -160,6 +177,19 @@ pub struct RepositoryEntry {
     /// Free-form note about what the repository is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// The image a remote task's main container runs (R15), with its digest
+    /// policy: a pinned `name@sha256:…`, or a tag resolved to a digest at
+    /// task creation. Optional in the registry because a local task needs
+    /// none; a backend that runs images refuses a task without one before
+    /// anything is created (AE11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_image: Option<ImageSpec>,
+
+    /// Name of the backend secret reference a remote task clones with
+    /// (R39) — a reference, never a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_credential: Option<String>,
 }
 
 /// Guesses the provider from the shape of a remote.
@@ -195,6 +225,8 @@ impl RepositoryEntry {
             remote,
             default_branch: None,
             description: None,
+            base_image: None,
+            git_credential: None,
         }
     }
 
@@ -222,6 +254,18 @@ impl RepositoryEntry {
         self
     }
 
+    /// Sets the base image of remote tasks.
+    pub fn with_base_image(mut self, image: ImageSpec) -> Self {
+        self.base_image = Some(image);
+        self
+    }
+
+    /// Sets the secret reference remote tasks clone with.
+    pub fn with_git_credential(mut self, reference: impl Into<String>) -> Self {
+        self.git_credential = Some(reference.into());
+        self
+    }
+
     /// Checks the entry with the provisioner's own rules.
     ///
     /// Called by every mutating operation, and public so that a caller which
@@ -232,7 +276,26 @@ impl RepositoryEntry {
         check_remote(&self.id, &self.remote).map_err(|source| RegistryError::InvalidRemote {
             id: self.id.clone(),
             source,
-        })
+        })?;
+        // The image is checked when it is registered, like the remote: a
+        // malformed reference, or a tag under the `pinned` policy, would
+        // otherwise surface only when someone tries to start a task.
+        if let Some(image) = &self.base_image {
+            image
+                .check()
+                .map_err(|source| RegistryError::InvalidBaseImage {
+                    id: self.id.clone(),
+                    source,
+                })?;
+        }
+        if let Some(reference) = &self.git_credential {
+            if reference.trim().is_empty() {
+                return Err(RegistryError::InvalidGitCredential {
+                    id: self.id.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The context-level reference to this repository.

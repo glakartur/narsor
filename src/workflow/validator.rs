@@ -22,8 +22,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use crate::domain::{
-    ActionConfig, DecisionConfig, OutputLabel, State, StateId, ValidationError, WorkflowDefinition,
-    WorkspaceSpec,
+    ActionConfig, DecisionConfig, ImageSpec, OutputLabel, State, StateId, ValidationError,
+    WorkflowDefinition, WorkspaceSpec,
 };
 
 use super::loader::{compile, LoadError};
@@ -42,8 +42,12 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
         validate_action(state, &mut errors);
         validate_decision(state, &mut errors);
         validate_state_templates(definition, state, &mut errors);
+        validate_state_image(state, &mut errors);
     }
     validate_workflow_templates(definition, &mut errors);
+    if let Some(image) = &definition.globals.image {
+        validate_image("globals.image", image, &mut errors);
+    }
 
     if errors.is_empty() {
         Ok(())
@@ -364,6 +368,37 @@ fn validate_decision(state: &State, errors: &mut Vec<ValidationError>) {
 
 fn is_blank(value: Option<&str>) -> bool {
     value.map(str::trim).unwrap_or("").is_empty()
+}
+
+// ---------------------------------------------------------------------------
+// Environment: image overrides (R15)
+// ---------------------------------------------------------------------------
+
+/// A step image must parse and satisfy its digest policy, and only a state
+/// that runs something may carry one.
+///
+/// Checked here rather than when the file is deserialized so that a bad
+/// reference is one entry in the full report, beside every other problem,
+/// instead of a file that does not load. Whether a `resolve`-policy tag
+/// actually resolves is a question for task creation, not for the file.
+fn validate_state_image(state: &State, errors: &mut Vec<ValidationError>) {
+    let Some(image) = &state.image else {
+        return;
+    };
+    if state.terminal {
+        errors.push(ValidationError::ImageOnTerminalState(state.id.clone()));
+        return;
+    }
+    validate_image(&format!("states.{}.image", state.id), image, errors);
+}
+
+fn validate_image(field: &str, image: &ImageSpec, errors: &mut Vec<ValidationError>) {
+    if let Err(error) = image.check() {
+        errors.push(ValidationError::InvalidImage {
+            field: field.to_string(),
+            reason: error.to_string(),
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------

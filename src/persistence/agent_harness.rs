@@ -87,6 +87,11 @@ pub struct DefaultHarnessSelector {
     supported: Vec<String>,
     configured: String,
     state: Mutex<SelectionState>,
+    /// A copy of the last published snapshot for synchronous readers (the
+    /// control plane pins a task's harness inside a synchronous resolver).
+    /// Written only after `state`'s snapshot, under `state`'s lock, so it
+    /// never shows a value that did not reach disk.
+    published: std::sync::RwLock<HarnessSelectionSnapshot>,
 }
 
 impl DefaultHarnessSelector {
@@ -127,6 +132,7 @@ impl DefaultHarnessSelector {
             path,
             supported,
             configured,
+            published: std::sync::RwLock::new(snapshot.clone()),
             state: Mutex::new(SelectionState { snapshot }),
         })
     }
@@ -134,6 +140,14 @@ impl DefaultHarnessSelector {
     /// Returns an immutable point-in-time selection view.
     pub async fn snapshot(&self) -> HarnessSelectionSnapshot {
         self.state.lock().await.snapshot.clone()
+    }
+
+    /// The last published selection, readable without an async context.
+    pub fn current(&self) -> HarnessSelectionSnapshot {
+        self.published
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Durably changes the default. Repeating the active override is a no-op.
@@ -184,6 +198,10 @@ impl DefaultHarnessSelector {
             revision,
         );
         state.snapshot = next.clone();
+        *self
+            .published
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next.clone();
         Ok(next)
     }
 }

@@ -83,7 +83,9 @@ impl Flags {
             SettingKey::AgentHarness
             | SettingKey::AgentTimeout
             | SettingKey::LogLevel
-            | SettingKey::TuiRefreshInterval => None,
+            | SettingKey::TuiRefreshInterval
+            | SettingKey::DefaultBackend
+            | SettingKey::DefaultProfile => None,
         }
     }
 }
@@ -260,6 +262,20 @@ impl Resolved {
         self.value(SettingKey::TuiRefreshInterval)
             .as_duration()
             .expect("the refresh interval is a duration")
+    }
+
+    /// The backend a remote task goes to when its request names none (R10).
+    pub fn default_backend(&self) -> &str {
+        self.value(SettingKey::DefaultBackend)
+            .as_text()
+            .expect("the default backend is text")
+    }
+
+    /// The profile a remote task uses when its request names none (R16).
+    pub fn default_profile(&self) -> &str {
+        self.value(SettingKey::DefaultProfile)
+            .as_text()
+            .expect("the default profile is text")
     }
 
     /// What the engine needs from the configuration for an `agent` action.

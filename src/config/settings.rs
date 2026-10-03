@@ -62,6 +62,11 @@ pub const NO_LIMIT: &str = "none";
 /// `r`, rarely enough that an idle interface does not hammer the daemon.
 pub const DEFAULT_TUI_REFRESH_SECS: u64 = 10;
 
+/// The backend a task goes to when neither its request nor the operator names
+/// one: the existing local daemon path (U4's local adapter), which is what an
+/// installation without any remote backend has always used.
+pub const DEFAULT_BACKEND: &str = "local";
+
 // ---------------------------------------------------------------------------
 // The registry
 // ---------------------------------------------------------------------------
@@ -89,11 +94,17 @@ pub enum SettingKey {
     /// How often the terminal interface re-reads the daemon on its own
     /// (KTD16), on top of the refreshes the live stream triggers.
     TuiRefreshInterval,
+    /// The execution backend a new remote task is pinned to when its request
+    /// names none (R10). Changing it never moves an existing task.
+    DefaultBackend,
+    /// The user profile a new remote task uses when its request names none
+    /// (R16).
+    DefaultProfile,
 }
 
 impl SettingKey {
     /// Every setting, in the order `config show` prints them.
-    pub const ALL: [SettingKey; 7] = [
+    pub const ALL: [SettingKey; 9] = [
         SettingKey::CatalogDir,
         SettingKey::StateDir,
         SettingKey::WorkDir,
@@ -101,6 +112,8 @@ impl SettingKey {
         SettingKey::AgentTimeout,
         SettingKey::LogLevel,
         SettingKey::TuiRefreshInterval,
+        SettingKey::DefaultBackend,
+        SettingKey::DefaultProfile,
     ];
 
     /// The three roots, in the order `config show` prints them.
@@ -120,6 +133,8 @@ impl SettingKey {
             SettingKey::AgentTimeout => "agent_timeout",
             SettingKey::LogLevel => "log_level",
             SettingKey::TuiRefreshInterval => "tui_refresh_interval",
+            SettingKey::DefaultBackend => "default_backend",
+            SettingKey::DefaultProfile => "default_profile",
         }
     }
 
@@ -149,7 +164,9 @@ impl SettingKey {
             | SettingKey::AgentHarness
             | SettingKey::AgentTimeout
             | SettingKey::LogLevel
-            | SettingKey::TuiRefreshInterval => false,
+            | SettingKey::TuiRefreshInterval
+            | SettingKey::DefaultBackend
+            | SettingKey::DefaultProfile => false,
         }
     }
 
@@ -172,6 +189,10 @@ impl SettingKey {
             SettingKey::LogLevel => SettingValue::Text(LOG_OFF.to_string()),
             SettingKey::TuiRefreshInterval => {
                 SettingValue::Duration(Some(DEFAULT_TUI_REFRESH_SECS))
+            }
+            SettingKey::DefaultBackend => SettingValue::Text(DEFAULT_BACKEND.to_string()),
+            SettingKey::DefaultProfile => {
+                SettingValue::Text(crate::environment::DEFAULT_PROFILE.to_string())
             }
         }
     }
@@ -400,7 +421,9 @@ mod tests {
                 "agent_harness",
                 "agent_timeout",
                 "log_level",
-                "tui_refresh_interval"
+                "tui_refresh_interval",
+                "default_backend",
+                "default_profile"
             ],
             "the registry is the one place the settings live, and the three \
              roots lead because that is the order `config show` prints"

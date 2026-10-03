@@ -456,6 +456,15 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             duration_value(setting, seconds)
         }
 
+        SettingKey::DefaultBackend => crate::domain::BackendId::parse(text)
+            .map(|id| SettingValue::Text(id.to_string()))
+            .map_err(|error| error.to_string()),
+
+        SettingKey::DefaultProfile => crate::domain::BackendId::parse(text)
+            .map(|_| SettingValue::Text(text.to_string()))
+            // The same character set as a backend id; only the word differs.
+            .map_err(|error| error.to_string().replacen("backend", "profile", 1)),
+
         SettingKey::LogLevel => {
             let level = text.trim().to_lowercase();
             if LOG_LEVELS.contains(&level.as_str()) {

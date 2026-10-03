@@ -16,6 +16,8 @@
 //! handlers here call, over a deliberately tiny broadcast channel, which
 //! exercises the `Err(Lagged(_))` branch deterministically instead.
 
+mod environment_support;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -468,7 +470,10 @@ async fn start_control_plane_server(root: &TempRoot) -> api::ApiHandle {
         root.path().to_path_buf(),
         root.path().to_path_buf(),
         api::ApiServices {
-            control: Some(Arc::new(ProtocolService::new(control))),
+            control: Some(Arc::new(ProtocolService::new(
+                control,
+                environment_support::seeded_resolver(root.path()),
+            ))),
             ..api::ApiServices::default()
         },
     )
@@ -480,13 +485,16 @@ async fn create_remote(client: &api::ApiClient, task_id: &str) {
     client
         .create_control_task(&CreateTaskRequest {
             task_id: Some(task_id.to_string()),
-            backend_id: "k8s".to_string(),
+            backend_id: Some("k8s".to_string()),
             priority: 0,
             launch: LaunchRequest {
                 workflow_id: "wf".to_string(),
                 workflow_version: 1,
                 inputs: serde_json::json!({}),
-                workspace: serde_json::json!({}),
+                workspace: None,
+                profile: None,
+                harness: None,
+                resources: None,
             },
         })
         .await

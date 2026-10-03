@@ -19,12 +19,23 @@ use super::credentials::{
 };
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
-use crate::domain::{BackendId, TaskId, TaskLaunchSpec};
+use crate::domain::{BackendId, TaskId};
+use crate::environment::{LaunchError, LaunchIntent, LaunchResolver};
 use crate::orchestration::{
     BackendLease, CommandRequest, ControlPlane, ControllerReport, ConversationAvailability,
     InputRequest, LeaseToken, NewTask, Observation, OwnerRef, RunnerObservation, TaskEvent,
     TaskLifecycle, TaskRecord,
 };
+
+/// A launch that did not resolve, as the owner sees it: a `400` naming the
+/// reason, or a bare `500` when the catalogue could not even be read.
+fn launch_refusal(error: LaunchError) -> ProtocolError {
+    if error.is_internal() {
+        ProtocolError::Internal(error.to_string())
+    } else {
+        ProtocolError::bad_request(error.code(), error.to_string())
+    }
+}
 
 /// The owner every request authenticated by the local daemon token acts
 /// as. Trusted loopback mode has exactly one owner; U7's OIDC mode puts the
@@ -82,6 +93,7 @@ pub struct ProtocolService {
     runner_auth: Arc<dyn RunnerAuthenticator>,
     config: ProtocolConfig,
     changes: broadcast::Sender<TaskId>,
+    launch: Arc<dyn LaunchResolver>,
 }
 
 impl std::fmt::Debug for ProtocolService {
@@ -95,12 +107,20 @@ impl std::fmt::Debug for ProtocolService {
 
 impl ProtocolService {
     /// A service with the default policy and file-backed bearer credentials.
-    pub fn new(control: ControlPlane) -> Self {
-        Self::with_config(control, ProtocolConfig::default())
+    ///
+    /// `launch` turns every create request into a backend and a sealed
+    /// launch spec (U6); there is no default, because a control plane that
+    /// accepted unresolved launches would pin tasks to nothing.
+    pub fn new(control: ControlPlane, launch: Arc<dyn LaunchResolver>) -> Self {
+        Self::with_config(control, launch, ProtocolConfig::default())
     }
 
     /// A service with an explicit policy.
-    pub fn with_config(control: ControlPlane, config: ProtocolConfig) -> Self {
+    pub fn with_config(
+        control: ControlPlane,
+        launch: Arc<dyn LaunchResolver>,
+        config: ProtocolConfig,
+    ) -> Self {
         let credentials = CredentialStore::new(control.clone());
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
         Self {
@@ -110,6 +130,7 @@ impl ProtocolService {
             credentials,
             config,
             changes,
+            launch,
         }
     }
 
@@ -183,16 +204,29 @@ impl ProtocolService {
             None => TaskId::parse(format!("task-{}", uuid::Uuid::new_v4().simple()))
                 .expect("a generated task id is always valid"),
         };
-        let backend_id = parse_identifier(BackendId::parse(request.backend_id))?;
+        // Resolution reads configuration only; a refusal here returns before
+        // the control plane is asked to store anything, so an invalid backend
+        // limit, an unregistered secret, an unsupported harness or a missing
+        // image leaves no task and no assignment behind (U6).
         let launch = request.launch;
-        let spec = TaskLaunchSpec::new(
-            launch.workflow_id,
-            launch.workflow_version,
-            launch.inputs,
-            launch.workspace,
-        );
+        let workspace = launch.workspace.unwrap_or_default();
+        let resolved = self
+            .launch
+            .resolve(&LaunchIntent {
+                backend: request.backend_id,
+                workflow_id: launch.workflow_id,
+                workflow_version: launch.workflow_version,
+                inputs: launch.inputs,
+                repository: workspace.repository,
+                commit: workspace.commit,
+                profile: launch.profile,
+                harness: launch.harness,
+                resources: launch.resources,
+            })
+            .map_err(launch_refusal)?;
         let record = self.control.create_task(
-            NewTask::new(task_id, owner.clone(), backend_id, spec).with_priority(request.priority),
+            NewTask::new(task_id, owner.clone(), resolved.backend_id, resolved.spec)
+                .with_priority(request.priority),
         )?;
         self.notify(&record.task_id);
         self.summarize(&record)
@@ -908,6 +942,7 @@ impl ProtocolService {
             workflow_id: record.launch_spec.workflow_id.clone(),
             workflow_version: record.launch_spec.workflow_version,
             launch_digest: record.launch_spec.digest.clone(),
+            environment_identity: record.launch_spec.environment.identity.clone(),
             archive: record.archive.clone(),
             observation: record.observed.as_ref().map(|observed| ObservationView {
                 observation: observed.observation,
