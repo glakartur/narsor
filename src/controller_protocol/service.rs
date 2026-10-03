@@ -7,11 +7,13 @@
 //! views, and announces every accepted mutation on an in-process channel —
 //! which is what wakes long-polls and live event streams.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::oneshot;
 
 use super::credentials::{
     ControllerAuthenticator, ControllerIdentity, ControllerRecord, CredentialStore,
@@ -49,6 +51,28 @@ const CHANGE_CHANNEL_CAPACITY: usize = 256;
 /// Longest incarnation identifier accepted (a Pod UID is 36 characters).
 const MAX_INCARNATION_LEN: usize = 256;
 
+/// Raw bytes a relayed conversation page holds when the owner asks for no
+/// particular budget, and the most it may ask for. Smaller than the local
+/// API's budget: every page crosses two network hops.
+const DEFAULT_PAGE_BUDGET: u64 = 256 * 1024;
+const MAX_PAGE_BUDGET: u64 = 1024 * 1024;
+
+/// Conversation page requests owners are waiting on (KTD4's relay).
+///
+/// Memory only, by design: a request outlives neither the owner's wait nor
+/// the process, and a page passes through without being stored.
+#[derive(Default)]
+struct PageRelay {
+    next_id: u64,
+    waiting: HashMap<String, WaitingPage>,
+}
+
+struct WaitingPage {
+    task_id: TaskId,
+    request: ConversationPageRequest,
+    reply: oneshot::Sender<ConversationPage>,
+}
+
 /// Timing policy of the protocol.
 #[derive(Debug, Clone)]
 pub struct ProtocolConfig {
@@ -68,6 +92,9 @@ pub struct ProtocolConfig {
     pub controller_stale_after: Duration,
     /// Longest long-poll a controller or runner may ask for.
     pub max_long_poll: std::time::Duration,
+    /// How long an owner waits for the live runner to upload a requested
+    /// conversation page before the relay gives up.
+    pub conversation_page_timeout: std::time::Duration,
 }
 
 impl Default for ProtocolConfig {
@@ -81,6 +108,7 @@ impl Default for ProtocolConfig {
             runner_stale_after: Duration::seconds(90),
             controller_stale_after: Duration::seconds(90),
             max_long_poll: std::time::Duration::from_secs(30),
+            conversation_page_timeout: std::time::Duration::from_secs(20),
         }
     }
 }
@@ -94,6 +122,7 @@ pub struct ProtocolService {
     config: ProtocolConfig,
     changes: broadcast::Sender<TaskId>,
     launch: Arc<dyn LaunchResolver>,
+    pages: Mutex<PageRelay>,
 }
 
 impl std::fmt::Debug for ProtocolService {
@@ -131,6 +160,7 @@ impl ProtocolService {
             config,
             changes,
             launch,
+            pages: Mutex::new(PageRelay::default()),
         }
     }
 
@@ -358,6 +388,73 @@ impl ProtocolService {
                 observed_at,
             },
         })
+    }
+
+    /// One bounded page of an attempt's raw conversation, fetched from the
+    /// live runner (KTD4).
+    ///
+    /// The request waits in memory until the runner's next poll picks it up
+    /// and uploads the page, which is handed to this caller and kept
+    /// nowhere. Refused at once when the conversation is not live (a paused,
+    /// interrupted or unreachable runner), and after
+    /// [`ProtocolConfig::conversation_page_timeout`] when the runner does
+    /// not answer.
+    pub async fn conversation_page(
+        &self,
+        owner: &OwnerRef,
+        task_id: &str,
+        attempt_id: &str,
+        query: ConversationPageQuery,
+    ) -> ProtocolResult<ConversationPage> {
+        if let ConversationResponse::Unavailable { reason, .. } =
+            self.conversation(owner, task_id)?
+        {
+            return Err(ProtocolError::conflict(
+                "conversation_unavailable",
+                format!("the task's conversation cannot be read right now ({reason:?})"),
+            ));
+        }
+        if !is_attempt_id(attempt_id) {
+            return Err(ProtocolError::bad_request(
+                "invalid_attempt",
+                "an attempt id is 1-128 characters of [A-Za-z0-9._-], not starting with '.'",
+            ));
+        }
+        let task_id = parse_identifier(TaskId::parse(task_id))?;
+        let (reply, answer) = oneshot::channel();
+        let request_id = {
+            let mut relay = self.lock_pages();
+            relay.next_id += 1;
+            let request_id = format!("page-{}", relay.next_id);
+            relay.waiting.insert(
+                request_id.clone(),
+                WaitingPage {
+                    task_id: task_id.clone(),
+                    request: ConversationPageRequest {
+                        request_id: request_id.clone(),
+                        attempt_id: attempt_id.to_string(),
+                        from_entry: query.from,
+                        byte_budget: query
+                            .byte_budget
+                            .unwrap_or(DEFAULT_PAGE_BUDGET)
+                            .clamp(1, MAX_PAGE_BUDGET),
+                    },
+                    reply,
+                },
+            );
+            request_id
+        };
+        // Wakes the runner's long-poll, which then sees the request.
+        self.notify(&task_id);
+        let page = tokio::time::timeout(self.config.conversation_page_timeout, answer).await;
+        self.lock_pages().waiting.remove(&request_id);
+        match page {
+            Ok(Ok(page)) => Ok(page),
+            _ => Err(ProtocolError::conflict(
+                "conversation_unavailable",
+                "the runner did not upload the conversation page in time",
+            )),
+        }
     }
 
     /// Queues an owner answer for the runner's pending input request.
@@ -803,6 +900,7 @@ impl ProtocolService {
             directive: directive(outcome.task.lifecycle),
             generation: outcome.task.generation,
             lifecycle: outcome.task.lifecycle,
+            launch: launch_view(identity, &outcome.task),
         })
     }
 
@@ -844,14 +942,17 @@ impl ProtocolService {
                     })
                     .collect(),
                 credential_expires_at: session.expires_at,
+                launch: launch_view(identity, &record),
+                conversation_pages: self.page_requests(&identity.task_id),
             })
         };
         let wait = self.long_poll(query.wait_secs);
         let found = self
             .wait_for(wait, || {
                 let response = poll()?;
-                let actionable =
-                    !response.inputs.is_empty() || response.directive != RunnerDirective::Continue;
+                let actionable = !response.inputs.is_empty()
+                    || !response.conversation_pages.is_empty()
+                    || response.directive != RunnerDirective::Continue;
                 Ok(actionable.then_some(response))
             })
             .await?;
@@ -861,6 +962,49 @@ impl ProtocolService {
         };
         self.credentials.touch_runner(identity, None)?;
         Ok(response)
+    }
+
+    /// A conversation page the runner uploads for a waiting owner. Only a
+    /// request of the runner's own task can be answered.
+    pub fn runner_conversation_page(
+        &self,
+        identity: &RunnerIdentity,
+        request_id: &str,
+        page: ConversationPage,
+    ) -> ProtocolResult<ConversationPageAccepted> {
+        self.credentials
+            .touch_runner(identity, None)?
+            .ok_or(ProtocolError::Unauthorized)?;
+        let waiting = {
+            let mut relay = self.lock_pages();
+            match relay.waiting.get(request_id) {
+                Some(waiting) if waiting.task_id == identity.task_id => {
+                    relay.waiting.remove(request_id)
+                }
+                _ => None,
+            }
+        };
+        let delivered = waiting.is_some_and(|waiting| waiting.reply.send(page).is_ok());
+        Ok(ConversationPageAccepted { delivered })
+    }
+
+    /// Page requests of `task_id` owners are waiting on right now.
+    fn page_requests(&self, task_id: &TaskId) -> Vec<ConversationPageRequest> {
+        let mut requests: Vec<_> = self
+            .lock_pages()
+            .waiting
+            .values()
+            .filter(|waiting| &waiting.task_id == task_id)
+            .map(|waiting| waiting.request.clone())
+            .collect();
+        requests.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+        requests
+    }
+
+    fn lock_pages(&self) -> std::sync::MutexGuard<'_, PageRelay> {
+        self.pages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Extends the runner's credential.
@@ -922,6 +1066,7 @@ impl ProtocolService {
                     event_cursor: runner.snapshot.event_cursor,
                     pending_input: runner.snapshot.pending_input.clone(),
                     safe_point: runner.snapshot.safe_point,
+                    problem: runner.snapshot.problem.clone(),
                     observed_at: runner.snapshot.observed_at,
                     received_at: runner.received_at,
                     last_contact_at,
@@ -1149,6 +1294,26 @@ fn safe_point_acknowledged(record: &TaskRecord) -> bool {
         .runner
         .as_ref()
         .is_some_and(|runner| runner.safe_point_generation == Some(record.generation))
+}
+
+/// Whether `value` can name an attempt: the Engine's ids are UUIDs, and
+/// nothing outside this conservative set is ever forwarded to a runner.
+fn is_attempt_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with('.')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// The calling runner's launch, as the record knows it.
+fn launch_view(identity: &RunnerIdentity, record: &TaskRecord) -> RunnerLaunchView {
+    RunnerLaunchView {
+        incarnation: identity.incarnation.clone(),
+        launch_generation: identity.launch_generation,
+        authorized_by: record.launch_command(identity.launch_generation),
+    }
 }
 
 /// What a runner should do while the task is in `lifecycle`.

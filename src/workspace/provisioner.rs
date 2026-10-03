@@ -641,6 +641,122 @@ impl WorkspaceProvisioner {
     }
 }
 
+/// Clones `remote` into `target` and leaves it on `commit`, detached (R39).
+///
+/// The remote-task counterpart of [`WorkspaceProvisioner::provision`]: a task
+/// pins a full commit id rather than a moving ref, so what lands in the work
+/// tree is exactly what the owner pinned, whenever the clone happens. The
+/// checkout is verified afterwards — a commit that is not in the remote's
+/// history is an error, never a silent fallback to the default branch.
+///
+/// `credential_file` is a read-only file holding an HTTPS token (mounted
+/// outside task storage, R19). It reaches `git` only through a one-shot
+/// credential helper given on the command line, which reads the file
+/// itself: the token is never an argument, an environment variable or a
+/// line of `.git/config`, so nothing about it survives into the work tree.
+/// The helper answers with the user name `x-access-token`, which GitHub and
+/// GitLab both accept for a token.
+///
+/// `target` must not exist yet; the caller decides where a half-finished
+/// clone may live (see `crate::runner::storage`).
+pub fn clone_pinned_commit(
+    repository: &str,
+    remote: &str,
+    commit: &str,
+    target: &Path,
+    credential_file: Option<&Path>,
+) -> Result<()> {
+    check_remote(repository, remote)?;
+    check_ref(repository, commit)?;
+    if target.exists() {
+        return Err(WorkspaceError::io(
+            target,
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a pinned clone only ever goes into a directory that does not exist yet",
+            ),
+        ));
+    }
+
+    let helper = match credential_file {
+        Some(file) => {
+            let file = file.to_string_lossy();
+            if file.contains('\'') || file.contains('\n') {
+                return Err(WorkspaceError::io(
+                    file.as_ref(),
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a credential file path may not contain a quote or a newline",
+                    ),
+                ));
+            }
+            Some(format!(
+                "credential.helper=!f() {{ test \"$1\" = get || exit 0; \
+                 printf 'username=x-access-token\\n'; \
+                 printf 'password=%s\\n' \"$(cat '{file}')\"; }}; f"
+            ))
+        }
+        None => None,
+    };
+
+    let target_arg = target.to_string_lossy().into_owned();
+    let mut clone: Vec<&str> = Vec::new();
+    if let Some(helper) = &helper {
+        // The empty value first drops every helper the image configured, so
+        // the pinned credential is the only one git asks.
+        clone.extend(["-c", "credential.helper=", "-c", helper.as_str()]);
+    }
+    clone.extend([
+        "clone",
+        "--no-checkout",
+        "--quiet",
+        "--",
+        remote,
+        &target_arg,
+    ]);
+    run_git(repository, &clone)?;
+
+    run_git(
+        repository,
+        &[
+            "-C",
+            &target_arg,
+            "checkout",
+            "--quiet",
+            "--detach",
+            &format!("{commit}^{{commit}}"),
+        ],
+    )
+    .map_err(|error| match error {
+        WorkspaceError::Git { stderr, .. } => WorkspaceError::RefNotFound {
+            git_ref: commit.to_string(),
+            repository: repository.to_string(),
+            detail: stderr,
+        },
+        other => other,
+    })?;
+
+    match head_commit(target, repository)? {
+        Some(head) if head == commit => Ok(()),
+        head => Err(WorkspaceError::RefNotFound {
+            git_ref: commit.to_string(),
+            repository: repository.to_string(),
+            detail: format!(
+                "the checkout is at {} instead",
+                head.as_deref().unwrap_or("no commit")
+            ),
+        }),
+    }
+}
+
+/// The commit `path` is checked out at, when it is a git work tree with one.
+///
+/// What a resumed runner uses to recognise its own finished clone.
+pub fn checked_out_commit(path: &Path) -> Option<String> {
+    let dir = path.to_string_lossy().into_owned();
+    git_stdout(&["-C", &dir, "rev-parse", "--verify", "HEAD^{commit}"])
+}
+
 /// One completed `git` invocation, with both streams already decoded.
 struct GitRun {
     /// Whether git exited with status 0.

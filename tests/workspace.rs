@@ -7,8 +7,8 @@
 
 use narsor::domain::{WorkflowExecution, WorkspaceType};
 use narsor::workspace::{
-    CleanupOutcome, CleanupPolicy, RepositorySpec, WorkspaceError, WorkspaceProvisioner,
-    WorkspaceRequest,
+    checked_out_commit, clone_pinned_commit, CleanupOutcome, CleanupPolicy, RepositorySpec,
+    WorkspaceError, WorkspaceProvisioner, WorkspaceRequest,
 };
 use std::fs;
 use std::io;
@@ -769,5 +769,107 @@ fn a_password_embedded_in_a_remote_never_reaches_the_error_message() {
     assert!(
         rendered.contains("***"),
         "the redaction marker is missing: {rendered}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pinned clones of a remote task (U3, R39)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_pinned_clone_checks_out_exactly_the_pinned_commit() {
+    let root = TempRoot::new();
+    let origin = init_repo(&root.join("origin"));
+    commit_file(&origin, "a.txt", "one\n", "first");
+    let pinned = git(&origin, &["rev-parse", "HEAD"]);
+    // The branch moves on after the task pinned its commit.
+    commit_file(&origin, "a.txt", "two\n", "second");
+
+    let target = root.join("clone");
+    clone_pinned_commit(
+        "origin",
+        &origin.display().to_string(),
+        &pinned,
+        &target,
+        None,
+    )
+    .expect("clone the pinned commit");
+
+    assert_eq!(
+        checked_out_commit(&target).as_deref(),
+        Some(pinned.as_str())
+    );
+    assert_eq!(fs::read_to_string(target.join("a.txt")).unwrap(), "one\n");
+}
+
+#[test]
+fn a_pinned_clone_never_writes_into_an_existing_directory() {
+    let root = TempRoot::new();
+    let origin = init_repo(&root.join("origin"));
+    commit_file(&origin, "a.txt", "one\n", "first");
+    let pinned = git(&origin, &["rev-parse", "HEAD"]);
+    let target = root.join("clone");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("work.txt"), "an agent's work").unwrap();
+
+    let error = clone_pinned_commit(
+        "origin",
+        &origin.display().to_string(),
+        &pinned,
+        &target,
+        None,
+    )
+    .expect_err("an existing directory is never cloned into");
+    assert!(matches!(error, WorkspaceError::Io { .. }), "{error:?}");
+    assert_eq!(
+        fs::read_to_string(target.join("work.txt")).unwrap(),
+        "an agent's work"
+    );
+}
+
+#[test]
+fn a_commit_missing_from_the_remote_is_a_named_error() {
+    let root = TempRoot::new();
+    let origin = init_repo(&root.join("origin"));
+    commit_file(&origin, "a.txt", "one\n", "first");
+
+    let error = clone_pinned_commit(
+        "origin",
+        &origin.display().to_string(),
+        &"0".repeat(40),
+        &root.join("clone"),
+        None,
+    )
+    .expect_err("an unknown commit fails");
+    assert!(
+        matches!(error, WorkspaceError::RefNotFound { .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_clone_credential_is_read_from_its_file_and_never_lands_in_the_clone() {
+    let root = TempRoot::new();
+    let origin = init_repo(&root.join("origin"));
+    commit_file(&origin, "a.txt", "one\n", "first");
+    let pinned = git(&origin, &["rev-parse", "HEAD"]);
+    let secret = root.join("token");
+    fs::write(&secret, "s3cr3t-token-value\n").unwrap();
+
+    let target = root.join("clone");
+    clone_pinned_commit(
+        "origin",
+        &origin.display().to_string(),
+        &pinned,
+        &target,
+        Some(&secret),
+    )
+    .expect("clone with a credential file");
+
+    let config = fs::read_to_string(target.join(".git/config")).unwrap();
+    assert!(!config.contains("s3cr3t"), "{config}");
+    assert!(
+        !config.contains("credential"),
+        "no helper persists: {config}"
     );
 }

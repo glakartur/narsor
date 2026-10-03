@@ -810,7 +810,14 @@ impl LaunchResolver for CatalogLaunchResolver {
             workspace,
             environment,
             resources,
-        );
+        )
+        // The definition travels with the task (R18): a runner never looks
+        // the workflow up again in a catalogue that may have changed since.
+        .with_definition(&definition)
+        .map_err(|error| LaunchError::InvalidWorkflow {
+            workflow: definition.id.clone(),
+            problems: vec![format!("the definition cannot be snapshotted: {error}")],
+        })?;
         Ok(ResolvedLaunch { backend_id, spec })
     }
 }

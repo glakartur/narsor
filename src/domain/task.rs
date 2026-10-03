@@ -10,6 +10,7 @@ use std::fmt;
 use thiserror::Error;
 
 use super::environment::{canonical_sha256, ResolvedEnvironment, ResourceProfile, TaskWorkspace};
+use super::WorkflowDefinition;
 
 /// Longest identifier accepted for a task or a backend.
 ///
@@ -119,7 +120,10 @@ identifier!(
 /// Version 2 replaced version 1's opaque `workspace` with a typed
 /// [`TaskWorkspace`], added the pinned [`ResolvedEnvironment`] and the
 /// [`ResourceProfile`], and moved the digest from FNV-1a to SHA-256.
-pub const TASK_LAUNCH_SPEC_VERSION: u32 = 2;
+/// Version 3 added the [`TaskLaunchSpec::definition`] snapshot, so a runner
+/// never has to find the workflow again in a catalogue that may have changed
+/// (or that it cannot even see) since the task was created.
+pub const TASK_LAUNCH_SPEC_VERSION: u32 = 3;
 
 /// Immutable, versioned input a task is launched from.
 ///
@@ -150,9 +154,50 @@ pub struct TaskLaunchSpec {
     pub environment: ResolvedEnvironment,
     /// CPU and memory of the task workload, within the backend's limits.
     pub resources: ResourceProfile,
+    /// The loaded and validated [`WorkflowDefinition`] the task runs, as
+    /// JSON (see [`TaskLaunchSpec::with_definition`]).
+    ///
+    /// Snapshotted at creation like everything else here (R18): a runner
+    /// resumed months later runs exactly the graph its task started with,
+    /// never whatever the catalogue now holds under the same name. `None`
+    /// only for specs built for orchestration bookkeeping alone; a runner
+    /// refuses one ([`TaskLaunchSpec::definition`]).
+    pub definition: Option<serde_json::Value>,
     /// `sha256:` digest of every other field, see
     /// [`TaskLaunchSpec::compute_digest`].
     pub digest: String,
+}
+
+/// Why a launch spec's workflow definition snapshot cannot be used.
+#[derive(Debug, Error)]
+pub enum LaunchDefinitionError {
+    /// The spec was built without a definition snapshot.
+    #[error("the launch spec of workflow '{0}' carries no workflow definition snapshot")]
+    Missing(String),
+    /// The snapshot does not deserialize into a definition.
+    #[error("the workflow definition snapshot of '{workflow}' is unreadable: {source}")]
+    Unreadable {
+        /// Workflow id of the spec.
+        workflow: String,
+        /// What serde said.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// The snapshot is of another workflow than the spec names.
+    #[error(
+        "the workflow definition snapshot is '{found}' v{found_version}, \
+         but the launch spec names '{expected}' v{expected_version}"
+    )]
+    Mismatch {
+        /// Workflow the spec names.
+        expected: String,
+        /// Its version.
+        expected_version: u32,
+        /// Workflow the snapshot holds.
+        found: String,
+        /// Its version.
+        found_version: u32,
+    },
 }
 
 /// The fields of a current-version spec, for the version-checked read.
@@ -166,6 +211,7 @@ struct TaskLaunchSpecFields {
     workspace: TaskWorkspace,
     environment: ResolvedEnvironment,
     resources: ResourceProfile,
+    definition: Option<serde_json::Value>,
     digest: String,
 }
 
@@ -179,8 +225,9 @@ impl<'de> Deserialize<'de> for TaskLaunchSpec {
         if version != u64::from(TASK_LAUNCH_SPEC_VERSION) {
             return Err(serde::de::Error::custom(format!(
                 "task launch spec version {version} is not supported by this build (expected \
-                 {TASK_LAUNCH_SPEC_VERSION}); a version-1 spec predates pinned environments \
-                 and cannot be upgraded — archive the task and create it again"
+                 {TASK_LAUNCH_SPEC_VERSION}); an older spec predates pinned environments or \
+                 the workflow definition snapshot and cannot be upgraded faithfully — archive \
+                 the task and create it again"
             )));
         }
         let fields: TaskLaunchSpecFields =
@@ -193,6 +240,7 @@ impl<'de> Deserialize<'de> for TaskLaunchSpec {
             workspace: fields.workspace,
             environment: fields.environment,
             resources: fields.resources,
+            definition: fields.definition,
             digest: fields.digest,
         })
     }
@@ -217,10 +265,50 @@ impl TaskLaunchSpec {
             workspace,
             environment: environment.sealed(),
             resources,
+            definition: None,
             digest: String::new(),
         };
         spec.digest = spec.compute_digest();
         spec
+    }
+
+    /// Returns the spec with `definition` snapshotted into it, resealed.
+    ///
+    /// Stored as JSON rather than as the typed definition so the record stays
+    /// a plain, comparable value; [`Self::definition`] turns it back.
+    pub fn with_definition(
+        mut self,
+        definition: &WorkflowDefinition,
+    ) -> Result<Self, serde_json::Error> {
+        self.definition = Some(serde_json::to_value(definition)?);
+        self.digest = self.compute_digest();
+        Ok(self)
+    }
+
+    /// The workflow definition this task runs, from its snapshot.
+    ///
+    /// Refuses a spec without one and a snapshot of another workflow than
+    /// the spec names: a runner must never fall back to looking the
+    /// workflow up by name.
+    pub fn definition(&self) -> Result<WorkflowDefinition, LaunchDefinitionError> {
+        let value = self
+            .definition
+            .clone()
+            .ok_or_else(|| LaunchDefinitionError::Missing(self.workflow_id.clone()))?;
+        let definition: WorkflowDefinition =
+            serde_json::from_value(value).map_err(|source| LaunchDefinitionError::Unreadable {
+                workflow: self.workflow_id.clone(),
+                source,
+            })?;
+        if definition.id != self.workflow_id || definition.version != self.workflow_version {
+            return Err(LaunchDefinitionError::Mismatch {
+                expected: self.workflow_id.clone(),
+                expected_version: self.workflow_version,
+                found: definition.id,
+                found_version: definition.version,
+            });
+        }
+        Ok(definition)
     }
 
     /// Recomputes the digest from the content fields.
@@ -239,6 +327,7 @@ impl TaskLaunchSpec {
             "workspace": self.workspace,
             "environment": self.environment,
             "resources": self.resources,
+            "definition": self.definition,
         });
         canonical_sha256(&content)
     }

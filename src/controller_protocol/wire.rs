@@ -28,7 +28,7 @@ use crate::engine::{HumanInputDelivery, Timeline};
 use crate::orchestration::{
     ArchiveTombstone, CommandReceipt, ConversationAttemptSummary, ExecutionCursor, InputStatus,
     Observation, ObservedSummary, OwnerCommand, PendingInputRef, QueuedInput, ResourceIdentity,
-    RunnerSnapshot, TaskEvent, TaskLifecycle,
+    RunnerProblem, RunnerSnapshot, TaskEvent, TaskLifecycle,
 };
 
 /// Version of this protocol; part of every path (`…/v1/…`).
@@ -151,6 +151,9 @@ pub struct RunnerView {
     pub pending_input: Option<PendingInputRef>,
     /// Whether it stood at a safe point.
     pub safe_point: bool,
+    /// Why it could not work, when it said so.
+    #[serde(default)]
+    pub problem: Option<RunnerProblem>,
     /// When the runner took the snapshot.
     pub observed_at: DateTime<Utc>,
     /// When the control plane accepted it.
@@ -681,6 +684,26 @@ pub enum RunnerDirective {
     Stop,
 }
 
+/// What the control plane knows about the launch of the calling runner.
+///
+/// A runner learns its own launch generation here, and — through
+/// `authorized_by` — whether its owner explicitly started or resumed it.
+/// That is how a runner that finds its task storage left behind by an
+/// unexpected stop knows it may run ordinary recovery (R13): only an owner
+/// decision taken *after* the loss launches a new incarnation at a newer
+/// generation, so the decision is a fact on the control plane, never an
+/// inference of the runner's.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunnerLaunchView {
+    /// The incarnation the credential is bound to.
+    pub incarnation: String,
+    /// The generation it was launched at.
+    pub launch_generation: u64,
+    /// The owner command that produced that generation (`start` or
+    /// `resume`); `None` for the first launch out of the queue.
+    pub authorized_by: Option<OwnerCommand>,
+}
+
 /// `POST /runner/v1/snapshots` response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerSnapshotResponse {
@@ -692,6 +715,8 @@ pub struct RunnerSnapshotResponse {
     pub generation: u64,
     /// Orchestration state.
     pub lifecycle: TaskLifecycle,
+    /// The calling runner's launch.
+    pub launch: RunnerLaunchView,
 }
 
 /// `GET /runner/v1/poll` query.
@@ -731,6 +756,53 @@ pub struct RunnerPollResponse {
     pub inputs: Vec<DeliveredInput>,
     /// When the runner's credential runs out.
     pub credential_expires_at: DateTime<Utc>,
+    /// The calling runner's launch.
+    pub launch: RunnerLaunchView,
+    /// Conversation pages owners are waiting for right now; answer each
+    /// with `POST /runner/v1/conversation-pages/:request_id`.
+    #[serde(default)]
+    pub conversation_pages: Vec<ConversationPageRequest>,
+}
+
+/// An owner's request for one bounded page of one attempt's raw
+/// conversation, relayed to the live runner (KTD4).
+///
+/// The relay keeps nothing: the request lives in memory only while the
+/// owner waits, and the page the runner uploads is handed straight to that
+/// owner. Raw transcripts therefore never become a central replica.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationPageRequest {
+    /// Relay id; upload the page under it.
+    pub request_id: String,
+    /// The attempt whose conversation is asked for.
+    pub attempt_id: String,
+    /// First entry number wanted.
+    pub from_entry: u64,
+    /// Soft cap on the raw bytes of the page.
+    pub byte_budget: u64,
+}
+
+/// One page of an attempt's raw conversation — the shape the local API
+/// serves, so a client renders a remote page exactly like a local one.
+pub type ConversationPage = crate::api::ConversationResponse;
+
+/// `GET /control/v1/tasks/:task_id/attempts/:attempt_id/conversation` query.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationPageQuery {
+    /// First entry number wanted (default 0: from the start).
+    #[serde(default)]
+    pub from: u64,
+    /// Soft cap on the raw bytes; bounded by the server.
+    #[serde(default)]
+    pub byte_budget: Option<u64>,
+}
+
+/// `POST /runner/v1/conversation-pages/:request_id` response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationPageAccepted {
+    /// False when no owner waits for that request any more (it timed out
+    /// or was answered already); the runner simply moves on.
+    pub delivered: bool,
 }
 
 /// `POST /runner/v1/renew` response.

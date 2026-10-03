@@ -56,10 +56,11 @@ use super::dto::{
 };
 use super::routes::ConversationResponse;
 use crate::controller_protocol::{
-    ControlEventEnvelope, ControllerListResponse, ControllerView,
-    ConversationResponse as RemoteConversationResponse, CreateEnrollmentRequest, CreateTaskRequest,
-    EnrollmentResponse, OwnerCommandRequest, OwnerCommandResponse, SubmitInputRequest,
-    SubmitInputResponse, TaskListResponse, TaskSummary, TimelineResponse,
+    ControlEventEnvelope, ControllerListResponse, ControllerView, ConversationPage,
+    ConversationPageQuery, ConversationResponse as RemoteConversationResponse,
+    CreateEnrollmentRequest, CreateTaskRequest, EnrollmentResponse, OwnerCommandRequest,
+    OwnerCommandResponse, SubmitInputRequest, SubmitInputResponse, TaskListResponse, TaskSummary,
+    TimelineResponse,
 };
 use crate::orchestration::TaskEvent;
 
@@ -455,6 +456,31 @@ impl ApiClient {
     ) -> Result<RemoteConversationResponse, ClientError> {
         let url = format!("{}/control/v1/tasks/{task_id}/conversation", self.base_url);
         self.get_json(&url).await
+    }
+
+    /// One page of an attempt's raw conversation, relayed from the live
+    /// runner (KTD4). Waits for the runner, so it uses the client without
+    /// the short loopback timeout, bounded by its own.
+    pub async fn control_conversation_page(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+        query: &ConversationPageQuery,
+    ) -> Result<ConversationPage, ClientError> {
+        let url = format!(
+            "{}/control/v1/tasks/{task_id}/attempts/{attempt_id}/conversation",
+            self.base_url
+        );
+        let response = self
+            .stream_http
+            .get(url)
+            .bearer_auth(&self.token)
+            .query(query)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|error| ClientError::Unavailable(error.to_string()))?;
+        handle_json_response(response).await
     }
 
     /// Submits an answer to the remote runner's pending input request.

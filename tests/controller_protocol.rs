@@ -314,6 +314,7 @@ fn snapshot(
             ..Timeline::default()
         }),
         safe_point: false,
+        problem: None,
         observed_at: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 5).unwrap(),
     }
 }

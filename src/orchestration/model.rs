@@ -411,6 +411,24 @@ impl TaskRecord {
         })
     }
 
+    /// The owner command that launched the runner of `launch_generation`,
+    /// when an owner command did (KTD3, R13).
+    ///
+    /// `None` for the first launch out of `Queued`, which no owner command
+    /// produces. A runner that finds its task storage left behind by an
+    /// unexpected stop reads this to learn that its owner explicitly chose
+    /// to resume or retry — the only thing that lets it run ordinary
+    /// recovery on that storage.
+    pub fn launch_command(&self, launch_generation: u64) -> Option<OwnerCommand> {
+        self.commands
+            .iter()
+            .find(|receipt| {
+                matches!(receipt.command, OwnerCommand::Start | OwnerCommand::Resume)
+                    && receipt.generation_after == launch_generation
+            })
+            .map(|receipt| receipt.command)
+    }
+
     /// The pending-input id of the last accepted runner snapshot.
     pub fn pending_input_id(&self) -> Option<&str> {
         self.runner
@@ -523,8 +541,24 @@ pub struct RunnerSnapshot {
     /// compute without losing work (the acknowledgement a pause waits for).
     #[serde(default)]
     pub safe_point: bool,
+    /// Why the runner cannot do its work, when it cannot — for instance a
+    /// base image that breaks the runner contract (R22), or a storage it
+    /// will not touch before its owner decides (R13). Diagnosable text, never
+    /// a secret.
+    #[serde(default)]
+    pub problem: Option<RunnerProblem>,
     /// When the runner took this snapshot.
     pub observed_at: DateTime<Utc>,
+}
+
+/// A condition that keeps a runner from doing its work.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunnerProblem {
+    /// Stable machine-readable code (`base_image_contract`,
+    /// `owner_decision_required`, `initialization_failed`…).
+    pub code: String,
+    /// What exactly is wrong, for the owner.
+    pub message: String,
 }
 
 /// The last accepted runner snapshot with its provenance.

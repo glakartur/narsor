@@ -1206,3 +1206,87 @@ async fn a_recovery_names_the_failure_it_answers() {
     );
     assert!(matches!(again, Err(EngineError::StaleEpisode { .. })));
 }
+
+// ---------------------------------------------------------------------------
+// Characterization for the portable runner (U3)
+//
+// The remote runner reuses exactly these rules after an unexpected loss of
+// its workload, and only once the owner decided: nothing reconciles by
+// itself, reconciliation alone never re-runs anything, and an explicit
+// recovery starts the interrupted action as a new attempt while the event
+// log simply continues.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn loading_a_crashed_execution_does_not_reconcile_it() {
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let definition = workflow("two_steps");
+    let execution = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    interrupt_during_action(&harness, &execution);
+
+    // A fresh engine over the same store — what a new process sees.
+    let reopened = Engine::new(harness.store());
+    let loaded = reopened
+        .store()
+        .load_execution(&execution.id)
+        .expect("load");
+    assert_eq!(loaded.status, ExecutionStatus::Running);
+    assert!(
+        !harness
+            .event_types(&execution.id)
+            .iter()
+            .any(|kind| kind == "error"),
+        "opening the store wrote nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_recovery_runs_the_interrupted_action_again_as_a_new_attempt() {
+    let harness = Harness::new();
+    let engine = Arc::new(harness.engine());
+    let definition = workflow("two_steps");
+    let execution = engine
+        .start(&definition, json!({}), harness.workspace())
+        .expect("start");
+    let interrupted = interrupt_during_action(&harness, &execution);
+    let before = harness.events(&execution.id).len() as u64;
+
+    let reconciliation = reconcile(&harness.store(), &execution.id).expect("reconcile");
+    assert_eq!(reconciliation.status, ExecutionStatus::Unknown);
+
+    let finished = engine
+        .try_begin_recover_with(
+            &execution.id,
+            Recovery::with_comment(Some("owner resumed".to_string())),
+        )
+        .expect("an unknown execution can be recovered explicitly")
+        .run_to_completion(&definition)
+        .await
+        .expect("the recovered execution runs on");
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+
+    let events = harness.events(&execution.id);
+    let first_attempts: Vec<String> = events
+        .iter()
+        .filter_map(|event| match &event.data {
+            EventData::ActionStarted {
+                action_execution_id,
+                state_id,
+                ..
+            } if state_id == "first" => Some(action_execution_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(first_attempts.len(), 2, "exactly one more attempt");
+    assert_eq!(first_attempts[0], interrupted);
+    assert_ne!(first_attempts[1], interrupted, "a new idempotency key");
+
+    // The log only grew, without gaps: a cursor taken before the loss is
+    // still a valid position after it.
+    let sequences: Vec<u64> = events.iter().map(|event| event.sequence).collect();
+    assert!(sequences.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    assert!(*sequences.last().unwrap() > before);
+}

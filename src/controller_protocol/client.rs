@@ -258,6 +258,17 @@ impl RunnerClient {
             .await
     }
 
+    /// `POST /runner/v1/conversation-pages/:request_id`.
+    pub async fn upload_conversation_page(
+        &self,
+        request_id: &str,
+        page: &ConversationPage,
+    ) -> Result<ConversationPageAccepted, ClientError> {
+        self.transport
+            .post(&format!("/runner/v1/conversation-pages/{request_id}"), page)
+            .await
+    }
+
     /// `POST /runner/v1/inputs/:input_id/ack`.
     pub async fn ack_input(
         &self,

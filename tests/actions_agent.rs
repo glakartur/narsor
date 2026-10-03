@@ -2918,3 +2918,51 @@ async fn the_session_event_records_the_harness_that_ran_not_the_absence_of_one()
         "the event carries the harness that ran, not 'unspecified'"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Characterization for the portable runner (U3)
+// ---------------------------------------------------------------------------
+
+/// A harness process inherits the environment of the process that runs the
+/// executor. The remote runner relies on exactly that to give every harness
+/// the task's private `HOME` and its `env`-delivered credentials, without
+/// the executor knowing about either.
+#[tokio::test]
+async fn the_harness_inherits_the_environment_of_the_runner_process() {
+    let root = TempRoot::new();
+    let bin = root.dir("bin");
+    let program = bin.join("env_harness.sh");
+    let temp = bin.join(format!(".env_harness.{}.tmp", uuid::Uuid::new_v4()));
+    fs::write(
+        &temp,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$HOME\" > '{}'\nprintf '%s\\n' '{}'\n",
+            bin.join("home.out").display(),
+            envelope("{\"output\": \"done\"}")
+        ),
+    )
+    .expect("write the harness");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    fs::rename(&temp, &program).expect("move the harness into place");
+
+    let executor =
+        AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(Arc::new(
+            ClaudeCodeAdapter::with_program(program.display().to_string()),
+        )));
+    let outcome = execute(
+        &executor,
+        agent_action("do the thing"),
+        &root.workspace(),
+        None,
+    )
+    .await
+    .expect("the harness runs");
+    assert!(matches!(outcome, ActionOutcome::Completed(_)));
+    assert_eq!(
+        fs::read_to_string(bin.join("home.out")).expect("the harness wrote HOME"),
+        std::env::var("HOME").unwrap_or_default()
+    );
+}

@@ -56,6 +56,10 @@ where
             "/control/v1/tasks/:task_id/conversation",
             get(get_conversation),
         )
+        .route(
+            "/control/v1/tasks/:task_id/attempts/:attempt_id/conversation",
+            get(get_conversation_page),
+        )
         .route("/control/v1/tasks/:task_id/input", post(post_input))
         .route("/control/v1/tasks/:task_id/events", get(get_events))
         .route("/control/v1/events/stream", get(get_stream))
@@ -109,6 +113,10 @@ where
         .route("/runner/v1/poll", get(get_poll))
         .route("/runner/v1/renew", post(post_renew))
         .route("/runner/v1/inputs/:input_id/ack", post(post_input_ack))
+        .route(
+            "/runner/v1/conversation-pages/:request_id",
+            post(post_conversation_page),
+        )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&service),
             require_runner,
@@ -207,6 +215,19 @@ async fn get_conversation(
     Path(task_id): Path<String>,
 ) -> ProtocolResult<Json<ConversationResponse>> {
     Ok(Json(service.conversation(&owner, &task_id)?))
+}
+
+async fn get_conversation_page(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path((task_id, attempt_id)): Path<(String, String)>,
+    Query(query): Query<ConversationPageQuery>,
+) -> ProtocolResult<Json<ConversationPage>> {
+    Ok(Json(
+        service
+            .conversation_page(&owner, &task_id, &attempt_id, query)
+            .await?,
+    ))
 }
 
 async fn post_input(
@@ -473,4 +494,17 @@ async fn post_input_ack(
     Ok(Json(
         service.runner_ack_input(&identity, &input_id, request)?,
     ))
+}
+
+async fn post_conversation_page(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Path(request_id): Path<String>,
+    Json(page): Json<ConversationPage>,
+) -> ProtocolResult<Json<ConversationPageAccepted>> {
+    Ok(Json(service.runner_conversation_page(
+        &identity,
+        &request_id,
+        page,
+    )?))
 }

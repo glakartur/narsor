@@ -16,6 +16,7 @@ pub mod environment;
 pub mod orchestration;
 pub mod persistence;
 pub mod registry;
+pub mod runner;
 pub mod tasks;
 pub mod tui;
 pub mod workflow;

@@ -661,6 +661,31 @@ fn a_launch_spec_round_trips_and_detects_a_tampered_environment() {
 }
 
 #[test]
+fn a_launch_spec_carries_the_definition_it_was_resolved_with() {
+    let root = TempRoot::new();
+    let spec = root.resolve(&intent("wf")).unwrap().spec;
+    let definition = spec.definition().expect("the snapshot reads back");
+    assert_eq!(definition.id, "wf");
+    assert_eq!(definition.version, spec.workflow_version);
+    assert!(definition.states.contains_key(&definition.initial_state));
+
+    // The snapshot is sealed with everything else: editing it breaks the
+    // digest, and a snapshot of another workflow is refused on read.
+    let mut tampered = spec.clone();
+    tampered.definition.as_mut().unwrap()["name"] = serde_json::json!("other");
+    assert!(!tampered.digest_is_valid());
+    let mut other = definition.clone();
+    other.id = "other".to_string();
+    let mismatched = spec.clone().with_definition(&other).unwrap();
+    assert!(mismatched.definition().is_err());
+    let without = TaskLaunchSpec {
+        definition: None,
+        ..spec
+    };
+    assert!(without.definition().is_err(), "a runner never looks it up");
+}
+
+#[test]
 fn a_version_one_launch_spec_fails_clearly() {
     let v1 = serde_json::json!({
         "version": 1,

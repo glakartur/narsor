@@ -255,6 +255,13 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<DaemonCommand>,
     },
+
+    /// Runs one remote task inside its isolated workload (U3).
+    ///
+    /// Started by a backend controller, not by hand: it works on the
+    /// mounted task storage and reports to the control plane. See
+    /// [`crate::runner::cli`] for the invocation and exit-code contract.
+    Runner(crate::runner::cli::RunnerArgs),
 }
 
 /// The daemon half of the command line.
@@ -455,6 +462,10 @@ impl Command {
             | Command::Repo { .. }
             | Command::Tui
             | Command::Daemon { .. } => false,
+            // The runner reads no configuration at all — everything it runs
+            // is in its launch spec — so whatever file a base image happens
+            // to carry must not keep a task from starting.
+            Command::Runner(_) => true,
         }
     }
 }
@@ -506,7 +517,12 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
     };
     let catalog = config.catalog_dir().to_path_buf();
     let state = config.state_dir().to_path_buf();
-    let outcome = match cli.command {
+    // The runner has its own exit-code contract (see `crate::runner::cli`).
+    let command = match cli.command {
+        Command::Runner(args) => return crate::runner::cli::run_command(args).await,
+        command => command,
+    };
+    let outcome = match command {
         Command::Validate { workflow } => commands::validate(&catalog, &workflow),
         Command::Run { workflow, inputs } => {
             commands::run(&config, &flags, &workflow, &inputs).await
@@ -608,6 +624,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             None => daemon::run_daemon(&config).await,
             Some(DaemonCommand::Stop) => daemon::stop_daemon(&config),
         },
+        Command::Runner(_) => unreachable!("the runner returned above"),
     };
 
     match outcome {
