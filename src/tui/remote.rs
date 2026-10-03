@@ -580,6 +580,12 @@ pub struct PageView {
     pub closed: bool,
     /// The runner holds no record for the attempt.
     pub no_record: bool,
+    /// The runner reported an unfinished final record, so the displayed
+    /// buffer must not claim to be the complete diagnostic history.
+    pub truncated_tail: bool,
+    /// Every readable forward page was collected before this page was made
+    /// visible.
+    pub complete: bool,
 }
 
 /// What is loaded about the selected task beyond its summary.
@@ -1212,50 +1218,80 @@ impl RemoteApp {
             self.set_notice(ToneLine::new("No conversation recorded yet.", Tone::Muted));
             return;
         };
-        let from = match self.detail().and_then(|detail| detail.page.as_ref()) {
-            Some(page) if next && page.attempt_id == attempt_id => page.next_entry,
-            _ => 0,
-        };
-        let query = ConversationPageQuery {
-            from,
-            byte_budget: Some(PAGE_BYTE_BUDGET),
-        };
-        let page = match self
-            .client
-            .control_conversation_page(&task_id, &attempt_id, &query)
-            .await
-        {
-            Ok(PageResponse::Recorded {
-                entries,
-                next_entry,
-                closed,
-                ..
-            }) => PageView {
-                attempt_id,
-                entries: entries.iter().map(classify).collect(),
-                next_entry,
-                closed,
-                no_record: false,
-            },
-            Ok(PageResponse::NoRecord) => PageView {
-                attempt_id,
-                entries: Vec::new(),
-                next_entry: 0,
-                closed: true,
-                no_record: true,
-            },
-            Err(ClientError::Refused { code, message }) if code == "conversation_unavailable" => {
-                self.set_notice(ToneLine::new(
-                    format!("Conversation unavailable: {message}"),
-                    Tone::Warning,
-                ));
-                // The summary may have turned unavailable meanwhile.
-                self.load_detail().await;
-                return;
-            }
-            Err(error) => {
-                self.error("Could not read the conversation", &error);
-                return;
+        // The relay is byte-paged too.  Build the complete readable prefix
+        // off-screen so opening a remote conversation has the same newest-end
+        // semantics as local history and does not present a first page as an
+        // end of record.
+        let _ = next;
+        let mut from = 0;
+        let mut entries = Vec::new();
+        let page = loop {
+            let query = ConversationPageQuery {
+                from,
+                byte_budget: Some(PAGE_BYTE_BUDGET),
+            };
+            match self
+                .client
+                .control_conversation_page(&task_id, &attempt_id, &query)
+                .await
+            {
+                Ok(PageResponse::Recorded {
+                    entries: page_entries,
+                    next_entry,
+                    closed: page_closed,
+                    truncated_tail: page_truncated_tail,
+                }) => {
+                    if page_entries.is_empty() {
+                        break PageView {
+                            attempt_id,
+                            entries,
+                            next_entry,
+                            closed: page_closed,
+                            no_record: false,
+                            truncated_tail: page_truncated_tail,
+                            complete: !page_truncated_tail,
+                        };
+                    }
+                    entries.extend(page_entries.iter().map(classify));
+                    if page_truncated_tail || next_entry <= from {
+                        break PageView {
+                            attempt_id,
+                            entries,
+                            next_entry,
+                            closed: page_closed,
+                            no_record: false,
+                            truncated_tail: page_truncated_tail,
+                            complete: false,
+                        };
+                    }
+                    from = next_entry;
+                }
+                Ok(PageResponse::NoRecord) => {
+                    break PageView {
+                        attempt_id,
+                        entries: Vec::new(),
+                        next_entry: 0,
+                        closed: true,
+                        no_record: true,
+                        truncated_tail: false,
+                        complete: true,
+                    }
+                }
+                Err(ClientError::Refused { code, message })
+                    if code == "conversation_unavailable" =>
+                {
+                    self.set_notice(ToneLine::new(
+                        format!("Conversation unavailable: {message}"),
+                        Tone::Warning,
+                    ));
+                    // The summary may have turned unavailable meanwhile.
+                    self.load_detail().await;
+                    return;
+                }
+                Err(error) => {
+                    self.error("Could not read the conversation", &error);
+                    return;
+                }
             }
         };
         if let Some(detail) = self.detail.as_mut() {

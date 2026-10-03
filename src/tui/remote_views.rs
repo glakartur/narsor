@@ -186,10 +186,14 @@ fn page_lines(page: &PageView) -> Vec<Line<'static>> {
         })
         .collect();
     lines.push(Line::from(Span::styled(
-        if page.closed {
+        if page.truncated_tail {
+            "— incomplete trailing record; retained entries shown —".to_string()
+        } else if !page.complete {
+            "— loading retained history… —".to_string()
+        } else if page.closed {
             "— end of the attempt —".to_string()
         } else {
-            format!("— n: continue from entry {} —", page.next_entry)
+            "— current end of this open attempt —".to_string()
         },
         Style::default().fg(Color::DarkGray),
     )));

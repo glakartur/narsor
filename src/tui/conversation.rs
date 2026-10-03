@@ -95,6 +95,10 @@ pub struct ClassifiedEntry {
     pub source: ConversationSource,
     /// This entry's kind.
     pub kind: EntryKind,
+    /// Exact source bytes retained by the API.  Display code must use this
+    /// for diagnostic/raw mode rather than attempting to reconstruct it from
+    /// the readable projection below.
+    pub raw: Vec<u8>,
     /// The decoded raw content, as text. Not yet sanitized — the task view's
     /// rendering path runs [`crate::tui::scroll::sanitize`] on it, the same
     /// as every other window (R10), right before it reaches the terminal.
@@ -113,10 +117,10 @@ pub fn classify(entry: &ConversationEntryDto) -> ClassifiedEntry {
         .unwrap_or_default();
     let text = String::from_utf8_lossy(&raw).into_owned();
 
-    let kind = match entry.source {
-        ConversationSource::Narsor => EntryKind::Narsor,
-        ConversationSource::Stderr => EntryKind::Stderr,
-        ConversationSource::Stdout => classify_stdout_line(&text),
+    let (kind, text) = match entry.source {
+        ConversationSource::Narsor => (EntryKind::Narsor, text),
+        ConversationSource::Stderr => (EntryKind::Stderr, text),
+        ConversationSource::Stdout => project_stdout_line(&text),
     };
 
     ClassifiedEntry {
@@ -124,8 +128,78 @@ pub fn classify(entry: &ConversationEntryDto) -> ClassifiedEntry {
         timestamp: entry.timestamp,
         source: entry.source,
         kind,
+        raw,
         text,
     }
+}
+
+/// Produces the primary, readable body while preserving the raw envelope in
+/// [`ClassifiedEntry::raw`].  Technical forms deliberately retain a concise
+/// summary here; their full arguments/results are still available verbatim in
+/// raw mode.
+fn project_stdout_line(text: &str) -> (EntryKind, String) {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return (EntryKind::Raw, text.to_owned());
+    };
+    let kind = classify_stdout_line(text);
+    let projected = match kind {
+        EntryKind::Assistant => value
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .and_then(|blocks| {
+                blocks.iter().find_map(|block| {
+                    (block.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| block.get("text").and_then(Value::as_str))
+                        .flatten()
+                })
+            })
+            .or_else(|| value.get("text").and_then(Value::as_str))
+            .or_else(|| value.pointer("/item/text").and_then(Value::as_str))
+            .unwrap_or(text)
+            .to_owned(),
+        EntryKind::Thinking => value
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .and_then(|blocks| {
+                blocks.iter().find_map(|block| {
+                    (block.get("type").and_then(Value::as_str) == Some("thinking"))
+                        .then(|| block.get("thinking").and_then(Value::as_str))
+                        .flatten()
+                })
+            })
+            .or_else(|| value.get("text").and_then(Value::as_str))
+            .or_else(|| value.pointer("/item/summary").and_then(Value::as_str))
+            .unwrap_or("thinking")
+            .to_owned(),
+        EntryKind::Result => value
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("completed")
+            .to_owned(),
+        EntryKind::System => value
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("type").and_then(Value::as_str))
+            .unwrap_or("system event")
+            .to_owned(),
+        EntryKind::ToolCall => value
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .and_then(|blocks| {
+                blocks.iter().find_map(|block| {
+                    (block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                        .then(|| block.get("name").and_then(Value::as_str))
+                        .flatten()
+                })
+            })
+            .or_else(|| value.get("name").and_then(Value::as_str))
+            .or_else(|| value.pointer("/item/type").and_then(Value::as_str))
+            .map(|name| format!("calling {name}"))
+            .unwrap_or_else(|| "tool call".to_owned()),
+        EntryKind::ToolResult => "tool result".to_owned(),
+        _ => text.to_owned(),
+    };
+    (kind, projected)
 }
 
 /// Sniffs the shape of one stdout line by its top-level `type` field.
@@ -321,5 +395,38 @@ mod tests {
         let classified = classify(&entry(ConversationSource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::Raw);
         assert_eq!(classified.text, raw);
+    }
+
+    #[test]
+    fn assistant_projection_uses_message_text_while_retaining_exact_source_bytes() {
+        let raw = br#"{"type":"assistant","message":{"content":[{"type":"text","text":"A readable reply"}]}}"#;
+        let entry = ConversationEntryDto {
+            entry_number: 7,
+            timestamp: Utc::now(),
+            source: ConversationSource::Stdout,
+            raw_base64: BASE64.encode(raw),
+        };
+
+        let classified = classify(&entry);
+
+        assert_eq!(classified.kind, EntryKind::Assistant);
+        assert_eq!(classified.text, "A readable reply");
+        assert_eq!(classified.raw, raw);
+    }
+
+    #[test]
+    fn malformed_binary_source_is_retained_byte_for_byte() {
+        let raw = b"unknown\x00\x1b[31m\xff";
+        let entry = ConversationEntryDto {
+            entry_number: 8,
+            timestamp: Utc::now(),
+            source: ConversationSource::Stdout,
+            raw_base64: BASE64.encode(raw),
+        };
+
+        let classified = classify(&entry);
+
+        assert_eq!(classified.kind, EntryKind::Raw);
+        assert_eq!(classified.raw, raw);
     }
 }

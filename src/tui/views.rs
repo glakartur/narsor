@@ -328,8 +328,17 @@ fn render_task_axis(frame: &mut Frame, app: &App, view: &TaskView, area: Rect) {
 fn render_task_content(frame: &mut Frame, view: &TaskView, area: Rect) {
     let focused = view.focus == TaskFocus::Content;
     let title = match &view.content {
-        TaskContent::Conversation { closed, .. } => {
-            if *closed {
+        TaskContent::Conversation {
+            closed,
+            truncated_tail,
+            complete,
+            ..
+        } => {
+            if *truncated_tail {
+                " Conversation — incomplete trailing record ".to_string()
+            } else if !*complete {
+                " Conversation — loading history… ".to_string()
+            } else if *closed {
                 " Conversation ".to_string()
             } else {
                 " Conversation — attempt in progress ".to_string()

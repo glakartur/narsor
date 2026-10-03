@@ -97,7 +97,7 @@ use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
 use crate::tasks;
 use crate::tui::chat::{ChatFocus, ChatPanel};
-use crate::tui::conversation::{classify, ClassifiedEntry};
+use crate::tui::conversation::{classify, ClassifiedEntry, EntryKind};
 use crate::tui::failure_form::{FailureAction, FailureForm};
 use crate::tui::refresh::{RefreshSchedule, DEBOUNCE};
 use crate::tui::scroll::{sanitize, ScrollState};
@@ -1170,6 +1170,10 @@ pub enum TaskContent {
         closed: bool,
         /// Whether the on-disk file's last line was incomplete when read.
         truncated_tail: bool,
+        /// All currently readable forward pages were fetched.  A truncated
+        /// tail is deliberately not called complete: its final record is not
+        /// yet safe to show as retained history.
+        complete: bool,
     },
     /// No conversation to show — a script step, an agent step whose
     /// conversation never started, or an old-format log (R11) — so the
@@ -2522,45 +2526,72 @@ impl App {
                     1
                 };
 
-                match self
-                    .client
-                    .conversation(&execution_id, &attempt_id, from, CONVERSATION_BYTE_BUDGET)
-                    .await
-                {
-                    Ok(ConversationResponse::Recorded {
+                // Fetch through the current forward end before exposing the
+                // attempt.  A byte-bounded response cannot itself say it was
+                // the final page, so an empty continuation establishes that
+                // boundary.  An incomplete tail stops the walk and remains
+                // visibly incomplete rather than being mislabeled complete.
+                let mut cursor = from;
+                let mut fresh = Vec::new();
+                let (next_entry, closed, truncated_tail, complete) = loop {
+                    match self
+                        .client
+                        .conversation(&execution_id, &attempt_id, cursor, CONVERSATION_BYTE_BUDGET)
+                        .await
+                    {
+                        Ok(ConversationResponse::Recorded {
+                            entries,
+                            next_entry: page_next_entry,
+                            closed: page_closed,
+                            truncated_tail: page_truncated_tail,
+                        }) => {
+                            if entries.is_empty() {
+                                break (
+                                    page_next_entry,
+                                    page_closed,
+                                    page_truncated_tail,
+                                    !page_truncated_tail,
+                                );
+                            }
+                            fresh.extend(entries.iter().map(classify));
+                            if page_truncated_tail || page_next_entry <= cursor {
+                                break (page_next_entry, page_closed, page_truncated_tail, false);
+                            }
+                            cursor = page_next_entry;
+                        }
+                        Ok(ConversationResponse::NoRecord) => {
+                            self.set_task_events_fallback(
+                                &label,
+                                "no conversation record".to_string(),
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            self.notice = Some(Notice::error(format!(
+                                "Could not load the conversation: {error}"
+                            )));
+                            return;
+                        }
+                    }
+                };
+                if let Screen::Task(view) = &mut self.screen {
+                    let existing = if append {
+                        match std::mem::replace(&mut view.content, TaskContent::Empty) {
+                            TaskContent::Conversation { entries, .. } => entries,
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let mut entries = existing;
+                    entries.extend(fresh);
+                    view.content = TaskContent::Conversation {
                         entries,
                         next_entry,
                         closed,
                         truncated_tail,
-                    }) => {
-                        let fresh: Vec<ClassifiedEntry> = entries.iter().map(classify).collect();
-                        if let Screen::Task(view) = &mut self.screen {
-                            let existing = if append {
-                                match std::mem::replace(&mut view.content, TaskContent::Empty) {
-                                    TaskContent::Conversation { entries, .. } => entries,
-                                    _ => Vec::new(),
-                                }
-                            } else {
-                                Vec::new()
-                            };
-                            let mut entries = existing;
-                            entries.extend(fresh);
-                            view.content = TaskContent::Conversation {
-                                entries,
-                                next_entry,
-                                closed,
-                                truncated_tail,
-                            };
-                        }
-                    }
-                    Ok(ConversationResponse::NoRecord) => {
-                        self.set_task_events_fallback(&label, "no conversation record".to_string());
-                    }
-                    Err(error) => {
-                        self.notice = Some(Notice::error(format!(
-                            "Could not load the conversation: {error}"
-                        )));
-                    }
+                        complete,
+                    };
                 }
             }
             PositionConversationState::NotCreated { reason } => {
@@ -4925,20 +4956,36 @@ pub fn task_conversation_lines(
             entry.source
         ));
 
-        let body: Vec<String> = sanitize(&entry.text).lines().map(str::to_string).collect();
         let is_expanded = expanded.contains(&entry.entry_number);
-        if is_expanded || body.len() <= TASK_ENTRY_COLLAPSE_LINES {
+        let technical = matches!(
+            entry.kind,
+            EntryKind::Thinking
+                | EntryKind::ToolCall
+                | EntryKind::ToolResult
+                | EntryKind::System
+                | EntryKind::Stderr
+                | EntryKind::Raw
+        );
+        let body_text = if is_expanded && technical {
+            String::from_utf8_lossy(&entry.raw).into_owned()
+        } else {
+            entry.text.clone()
+        };
+        let body: Vec<String> = sanitize(&body_text).lines().map(str::to_string).collect();
+        if is_expanded || (!technical && body.len() <= TASK_ENTRY_COLLAPSE_LINES) {
             for line in &body {
                 lines.push(format!("    {line}"));
             }
         } else {
-            for line in &body[..TASK_ENTRY_COLLAPSE_LINES] {
+            for line in body.iter().take(TASK_ENTRY_COLLAPSE_LINES) {
                 lines.push(format!("    {line}"));
             }
-            lines.push(format!(
-                "    … {} more lines — Enter/space to expand",
-                body.len() - TASK_ENTRY_COLLAPSE_LINES
-            ));
+            let hidden = body.len().saturating_sub(TASK_ENTRY_COLLAPSE_LINES);
+            lines.push(if hidden == 0 {
+                "    … Enter/space to expand diagnostic detail".to_string()
+            } else {
+                format!("    … {hidden} more lines — Enter/space to expand")
+            });
         }
     }
     lines
