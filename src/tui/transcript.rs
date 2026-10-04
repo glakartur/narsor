@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 
-use super::scroll::ScrollState;
+use super::scroll::{wrap_line, ScrollState};
 
 /// Stable identity of a conversation, normally an attempt or chat id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -49,6 +49,19 @@ pub enum DisplayMode {
     Raw,
 }
 
+/// Semantic treatment chosen by a source adapter.  This is presentation data,
+/// not terminal control text, so untrusted conversation content never carries
+/// its own style instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptPresentation {
+    Neutral,
+    Operator,
+    Conductor,
+    Agent,
+    Technical,
+    Error,
+}
+
 /// One source-neutral chronological entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptEntry {
@@ -56,6 +69,8 @@ pub struct TranscriptEntry {
     /// Semantic lines supplied by the adapter. They are logical, not wrapped
     /// terminal rows.
     pub rendered_lines: Vec<String>,
+    /// Role/type treatment shared by every renderer in rendered mode.
+    pub presentation: TranscriptPresentation,
     /// Optional technical detail included only when expanded in rendered mode.
     pub technical_lines: Vec<String>,
     /// Exact retained source bytes. This is never replaced by decoded text.
@@ -67,6 +82,7 @@ impl TranscriptEntry {
         Self {
             id,
             rendered_lines,
+            presentation: TranscriptPresentation::Neutral,
             technical_lines: Vec::new(),
             raw,
         }
@@ -74,6 +90,11 @@ impl TranscriptEntry {
 
     pub fn with_technical_lines(mut self, technical_lines: Vec<String>) -> Self {
         self.technical_lines = technical_lines;
+        self
+    }
+
+    pub fn with_presentation(mut self, presentation: TranscriptPresentation) -> Self {
+        self.presentation = presentation;
         self
     }
 }
@@ -84,6 +105,36 @@ pub struct TranscriptLine {
     pub entry_id: TranscriptEntryId,
     pub logical_line: usize,
     pub text: String,
+    pub presentation: TranscriptPresentation,
+}
+
+/// Wraps only the visible transcript slice while retaining its semantic
+/// presentation.  Keeping this alongside the logical-line model means a
+/// narrow pane cannot turn styled entries back into unstyled strings.
+pub fn wrap_visible_lines(
+    lines: &[TranscriptLine],
+    width: usize,
+    offset: usize,
+    height: usize,
+) -> Vec<TranscriptLine> {
+    if height == 0 || offset >= lines.len() {
+        return Vec::new();
+    }
+    let mut window = Vec::with_capacity(height);
+    'lines: for line in &lines[offset..] {
+        for text in wrap_line(&line.text, width.max(1)) {
+            if window.len() >= height {
+                break 'lines;
+            }
+            window.push(TranscriptLine {
+                entry_id: line.entry_id.clone(),
+                logical_line: line.logical_line,
+                text,
+                presentation: line.presentation,
+            });
+        }
+    }
+    window
 }
 
 /// Restorable reading location independent of a wrapped terminal width.
@@ -322,25 +373,38 @@ impl TranscriptState {
     }
 
     fn lines_for(&self, entry: &TranscriptEntry) -> Vec<TranscriptLine> {
-        let text = match self.mode {
-            DisplayMode::Raw => vec![raw_display(&entry.raw)],
+        let lines = match self.mode {
+            DisplayMode::Raw => vec![(raw_display(&entry.raw), TranscriptPresentation::Neutral)],
             DisplayMode::Rendered => {
-                let mut text = entry.rendered_lines.clone();
-                if text.is_empty() {
-                    text.push(String::new());
+                let mut lines = entry
+                    .rendered_lines
+                    .iter()
+                    .cloned()
+                    .map(|text| (text, entry.presentation))
+                    .collect::<Vec<_>>();
+                if lines.is_empty() {
+                    lines.push((String::new(), entry.presentation));
                 }
                 if self.is_expanded(&entry.id) {
-                    text.extend(entry.technical_lines.clone());
+                    lines.extend(
+                        entry
+                            .technical_lines
+                            .iter()
+                            .cloned()
+                            .map(|text| (text, TranscriptPresentation::Technical)),
+                    );
                 }
-                text
+                lines
             }
         };
-        text.into_iter()
+        lines
+            .into_iter()
             .enumerate()
-            .map(|(logical_line, text)| TranscriptLine {
+            .map(|(logical_line, (text, presentation))| TranscriptLine {
                 entry_id: entry.id.clone(),
                 logical_line,
                 text,
+                presentation,
             })
             .collect()
     }

@@ -269,6 +269,7 @@ mod conductor_chat {
     use narsor::tui::chat::{
         chat_item_lines, chat_items, ChatActionTarget, ChatPanel, ProposalState, UndoState,
     };
+    use narsor::tui::transcript::TranscriptPresentation;
     use serde_json::{json, Value};
 
     fn entry(
@@ -391,6 +392,36 @@ mod conductor_chat {
         panel.undo = None;
         panel.selected = 0;
         assert!(!panel.ask_undo(), "a proposal is no decision to undo");
+    }
+
+    #[test]
+    fn conductor_transcript_keeps_operator_and_conductor_presentation() {
+        let mut panel = ChatPanel::default();
+        panel.append(vec![
+            entry(
+                1,
+                ChatAuthor::Operator,
+                ChatEntryKind::Message,
+                "please check",
+                json!({}),
+            ),
+            entry(
+                2,
+                ChatAuthor::Conductor,
+                ChatEntryKind::Message,
+                "checking",
+                json!({}),
+            ),
+        ]);
+
+        assert_eq!(
+            panel.transcript.entries()[0].presentation,
+            TranscriptPresentation::Operator
+        );
+        assert_eq!(
+            panel.transcript.entries()[1].presentation,
+            TranscriptPresentation::Conductor
+        );
     }
 
     #[test]

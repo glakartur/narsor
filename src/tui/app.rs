@@ -101,7 +101,9 @@ use crate::tui::conversation::{classify, ClassifiedEntry, EntryKind};
 use crate::tui::failure_form::{FailureAction, FailureForm};
 use crate::tui::refresh::{RefreshSchedule, DEBOUNCE};
 use crate::tui::scroll::{sanitize, ScrollState};
-use crate::tui::transcript::{TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptState};
+use crate::tui::transcript::{
+    TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptPresentation, TranscriptState,
+};
 use crate::workflows::{ResolvedWorkflow, WorkflowEntry, WorkflowResolver};
 
 pub use crate::tui::input_form::{
@@ -5192,12 +5194,24 @@ pub(crate) fn agent_transcript_entry(entry: &ClassifiedEntry) -> TranscriptEntry
         lines
     };
     let technical_lines = if technical { body } else { Vec::new() };
+    let presentation = match entry.kind {
+        EntryKind::User => TranscriptPresentation::Operator,
+        EntryKind::Assistant | EntryKind::Result => TranscriptPresentation::Agent,
+        EntryKind::Stderr => TranscriptPresentation::Error,
+        EntryKind::Narsor
+        | EntryKind::Thinking
+        | EntryKind::ToolCall
+        | EntryKind::ToolResult
+        | EntryKind::System
+        | EntryKind::Raw => TranscriptPresentation::Technical,
+    };
     TranscriptEntry::new(
         TranscriptEntryId::from(entry.entry_number.to_string()),
         rendered_lines,
         entry.raw.clone(),
     )
     .with_technical_lines(technical_lines)
+    .with_presentation(presentation)
 }
 
 /// The task view's content pane, for a step with no conversation (R11): its

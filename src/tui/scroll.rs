@@ -305,7 +305,7 @@ pub fn wrap_visible(lines: &[String], width: usize, offset: usize, height: usize
 }
 
 /// Breaks one logical line into rows of at most `width` characters.
-fn wrap_line(line: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_line(line: &str, width: usize) -> Vec<String> {
     if line.is_empty() {
         return vec![String::new()];
     }

@@ -37,6 +37,7 @@ use super::app::{
 use super::chat::{ChatFocus, ChatPanel};
 use super::failure_form::FailureRow;
 use super::scroll::wrap_visible;
+use super::transcript::{wrap_visible_lines, TranscriptLine, TranscriptPresentation};
 use crate::domain::{ExecutionStatus, HumanInputType};
 
 /// The colour of an execution waiting on a question.
@@ -47,6 +48,19 @@ const PROBLEM_COLOUR: Color = Color::LightRed;
 
 /// The colour of what the conductor does or proposes.
 const CONDUCTOR_COLOUR: Color = Color::LightMagenta;
+
+pub(crate) fn transcript_style(presentation: TranscriptPresentation) -> Style {
+    match presentation {
+        TranscriptPresentation::Neutral => Style::default(),
+        TranscriptPresentation::Operator => Style::default().fg(Color::White).bg(Color::Blue),
+        TranscriptPresentation::Conductor => Style::default().fg(Color::Black).bg(CONDUCTOR_COLOUR),
+        TranscriptPresentation::Agent => Style::default(),
+        TranscriptPresentation::Technical => Style::default().fg(Color::DarkGray),
+        TranscriptPresentation::Error => Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD),
+    }
+}
 
 /// Height of the shortcut bar, borders included.
 const SHORTCUT_BAR_HEIGHT: u16 = 3;
@@ -239,12 +253,17 @@ fn render_chat_panel(frame: &mut Frame, chat: &ChatPanel, area: Rect) {
         footer.push(format!("{marker} message: {}", chat.draft));
     }
 
-    let mut lines: Vec<String> = Vec::new();
+    let mut lines: Vec<TranscriptLine> = Vec::new();
     if chat.transcript.entries().is_empty() {
-        lines.push(if chat.loaded {
-            "No messages yet: write to the conductor below.".to_string()
-        } else {
-            "Loading the chat…".to_string()
+        lines.push(TranscriptLine {
+            entry_id: super::transcript::TranscriptEntryId::from("chat-status"),
+            logical_line: 0,
+            text: if chat.loaded {
+                "No messages yet: write to the conductor below.".to_string()
+            } else {
+                "Loading the chat…".to_string()
+            },
+            presentation: TranscriptPresentation::Neutral,
         });
     } else {
         let action_entry = chat
@@ -256,16 +275,21 @@ fn render_chat_panel(frame: &mut Frame, chat: &ChatPanel, area: Rect) {
             let marked = chat.focus == ChatFocus::Action
                 && starts_entry
                 && action_entry.as_ref() == Some(&line.entry_id);
-            lines.push(format!("{}{}", if marked { "› " } else { "  " }, line.text));
-            last_entry = Some(line.entry_id);
+            last_entry = Some(line.entry_id.clone());
+            lines.push(TranscriptLine {
+                text: format!("{}{}", if marked { "› " } else { "  " }, line.text),
+                ..line
+            });
         }
     }
 
     let history_height = inner_height.saturating_sub(footer.len()).max(1);
     let offset = chat.transcript.scroll_offset();
-    let mut visible = wrap_visible(&lines, inner_width, offset, history_height);
-    visible.extend(footer);
-    let visible: Vec<Line> = visible.into_iter().map(Line::from).collect();
+    let mut visible: Vec<Line> = wrap_visible_lines(&lines, inner_width, offset, history_height)
+        .into_iter()
+        .map(|line| Line::styled(line.text, transcript_style(line.presentation)))
+        .collect();
+    visible.extend(footer.into_iter().map(Line::from));
     frame.render_widget(Paragraph::new(visible).block(block), area);
 }
 
@@ -371,17 +395,27 @@ fn render_task_content(frame: &mut Frame, view: &TaskView, area: Rect) {
         }))
         .title(title);
 
-    let lines: Vec<String> = match &view.content {
-        TaskContent::Conversation { transcript, .. } => transcript
-            .logical_lines()
-            .into_iter()
-            .map(|line| line.text)
-            .collect(),
+    let lines: Vec<TranscriptLine> = match &view.content {
+        TaskContent::Conversation { transcript, .. } => transcript.logical_lines(),
         TaskContent::Events { message, events } => {
             let start = view.content_scroll.offset().min(events.len());
             task_events_lines(message, &events[start..], 0)
+                .into_iter()
+                .enumerate()
+                .map(|(logical_line, text)| TranscriptLine {
+                    entry_id: super::transcript::TranscriptEntryId::from("events"),
+                    logical_line,
+                    text,
+                    presentation: TranscriptPresentation::Neutral,
+                })
+                .collect()
         }
-        TaskContent::Empty => vec!["Loading…".to_string()],
+        TaskContent::Empty => vec![TranscriptLine {
+            entry_id: super::transcript::TranscriptEntryId::from("loading"),
+            logical_line: 0,
+            text: "Loading…".to_string(),
+            presentation: TranscriptPresentation::Neutral,
+        }],
     };
 
     let inner_width = area.width.saturating_sub(2).max(1) as usize;
@@ -390,9 +424,9 @@ fn render_task_content(frame: &mut Frame, view: &TaskView, area: Rect) {
         TaskContent::Conversation { transcript, .. } => transcript.scroll_offset(),
         _ => view.content_scroll.offset(),
     };
-    let visible: Vec<Line> = wrap_visible(&lines, inner_width, offset, inner_height)
+    let visible: Vec<Line> = wrap_visible_lines(&lines, inner_width, offset, inner_height)
         .into_iter()
-        .map(Line::from)
+        .map(|line| Line::styled(line.text, transcript_style(line.presentation)))
         .collect();
 
     frame.render_widget(Paragraph::new(visible).block(block), area);

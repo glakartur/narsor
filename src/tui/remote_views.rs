@@ -29,6 +29,7 @@ use super::remote::{
 };
 use super::scroll::sanitize;
 use super::views::centered;
+use super::views::transcript_style;
 
 /// Height of the shortcut bar, borders included.
 const SHORTCUT_BAR_HEIGHT: u16 = 3;
@@ -182,7 +183,7 @@ fn page_lines(page: &PageView) -> Vec<Line<'static>> {
         .transcript
         .logical_lines()
         .into_iter()
-        .map(|line| Line::from(sanitize(&line.text)))
+        .map(|line| Line::styled(line.text, transcript_style(line.presentation)))
         .collect();
     lines.push(Line::from(Span::styled(
         if page.truncated_tail {

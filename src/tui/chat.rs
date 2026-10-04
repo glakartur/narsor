@@ -18,7 +18,9 @@ use serde_json::Value;
 
 use crate::conductor::{ChatAuthor, ChatEntry, ChatEntryKind};
 use crate::domain::{ConductorDecisionKind, Confidence};
-use crate::tui::transcript::{TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptState};
+use crate::tui::transcript::{
+    TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptPresentation, TranscriptState,
+};
 
 /// The `kind` a chat decision entry records for a carried-out proposal.
 const EXECUTED: &str = "execute_proposal";
@@ -454,10 +456,19 @@ fn chat_transcript_entry(item: &ChatItem) -> TranscriptEntry {
                 .map(|line| format!("   {line}"))
                 .collect()
         });
+    let presentation = if item.entry.kind == ChatEntryKind::Error {
+        TranscriptPresentation::Error
+    } else {
+        match item.entry.author {
+            ChatAuthor::Operator => TranscriptPresentation::Operator,
+            ChatAuthor::Conductor => TranscriptPresentation::Conductor,
+        }
+    };
     TranscriptEntry::new(
         TranscriptEntryId::from(item.entry.id.clone()),
         chat_item_lines(item),
         raw,
     )
     .with_technical_lines(technical_lines)
+    .with_presentation(presentation)
 }
