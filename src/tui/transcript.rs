@@ -69,6 +69,8 @@ pub struct TranscriptEntry {
     pub presentation: TranscriptPresentation,
     /// Optional technical detail included only when expanded in rendered mode.
     pub technical_lines: Vec<String>,
+    /// Whether expanding this entry reveals its retained raw diagnostic source.
+    pub raw_detail: bool,
     /// Exact retained source bytes. This is never replaced by decoded text.
     pub raw: Vec<u8>,
 }
@@ -80,12 +82,19 @@ impl TranscriptEntry {
             rendered_lines,
             presentation: TranscriptPresentation::Neutral,
             technical_lines: Vec::new(),
+            raw_detail: false,
             raw,
         }
     }
 
     pub fn with_technical_lines(mut self, technical_lines: Vec<String>) -> Self {
         self.technical_lines = technical_lines;
+        self
+    }
+
+    /// Reveals the terminal-safe raw source only when the entry is expanded.
+    pub fn with_raw_detail(mut self, raw_detail: bool) -> Self {
+        self.raw_detail = raw_detail;
         self
     }
 
@@ -397,6 +406,13 @@ impl TranscriptState {
                             .cloned()
                             .map(|text| (text, TranscriptPresentation::Technical)),
                     );
+                    if entry.raw_detail {
+                        lines.extend(
+                            raw_display(&entry.raw)
+                                .lines()
+                                .map(|text| (text.to_owned(), TranscriptPresentation::Technical)),
+                        );
+                    }
                 }
                 lines
             }

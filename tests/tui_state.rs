@@ -2960,7 +2960,9 @@ async fn c_on_a_second_attempt_event_opens_its_position_and_conversation() {
     assert_eq!(view.selected.as_deref(), Some("plan #2"));
     match &view.content {
         TaskContent::Conversation {
-            entries, transcript, ..
+            entries,
+            transcript,
+            ..
         } => {
             assert!(
                 entries.iter().any(|entry| entry.text.contains("done")),
@@ -2976,7 +2978,9 @@ async fn c_on_a_second_attempt_event_opens_its_position_and_conversation() {
                 "readable Codex lifecycle text is visible without expansion: {rendered:?}"
             );
             assert!(
-                !rendered.iter().any(|line| line.contains("system diagnostic")),
+                !rendered
+                    .iter()
+                    .any(|line| line.contains("system diagnostic")),
                 "technical entries should not be replaced by diagnostic placeholders: {rendered:?}"
             );
         }
