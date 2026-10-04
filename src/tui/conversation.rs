@@ -204,7 +204,11 @@ fn project_stdout_line(text: &str) -> (EntryKind, String) {
 
 fn classify_stdout_value(value: &Value) -> EntryKind {
     let Some(type_field) = value.get("type").and_then(Value::as_str) else {
-        return EntryKind::Raw;
+        return if is_codex_direct_response(value) {
+            EntryKind::Assistant
+        } else {
+            EntryKind::Raw
+        };
     };
 
     match type_field {
@@ -232,6 +236,16 @@ fn classify_stdout_value(value: &Value) -> EntryKind {
 
         _ => EntryKind::Raw,
     }
+}
+
+/// Codex's final answer can be a direct workflow output object instead of an
+/// `exec --json` event envelope. It has no `type`, but still belongs to the
+/// assistant turn and therefore must receive the normal agent presentation.
+fn is_codex_direct_response(value: &Value) -> bool {
+    value.get("output").and_then(Value::as_str).is_some()
+        && value.get("data").is_some()
+        && value.get("variables").is_some()
+        && value.get("artifacts").is_some()
 }
 
 /// Classifies Codex's nested `item` payload without altering the raw JSON
