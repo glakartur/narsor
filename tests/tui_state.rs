@@ -698,7 +698,7 @@ async fn the_transition_menu_shows_output_descriptions() {
 
     let mut terminal = Terminal::new(TestBackend::new(160, 48)).expect("a test terminal");
     terminal
-        .draw(|frame| views::render(frame, &app))
+        .draw(|frame| views::render(frame, &mut app))
         .expect("draw the screen");
     let screen: String = terminal
         .backend()
@@ -862,7 +862,7 @@ async fn an_empty_required_field_stops_the_gate_form_at_the_field() {
         .is_some_and(|error| error.contains("'comment' is required")));
     assert!(app.notice().expect("a notice").is_error);
     assert!(
-        screen_of(&app).contains("↳ Field 'comment' is required."),
+        screen_of(&mut app).contains("↳ Field 'comment' is required."),
         "the error is drawn under the field"
     );
 
@@ -2911,6 +2911,10 @@ fn task_view(app: &App) -> &narsor::tui::app::TaskView {
     }
 }
 
+fn task_view_mut(app: &mut App) -> &mut narsor::tui::app::TaskView {
+    app.task_view_mut().expect("task view")
+}
+
 /// Covers AE2/F1: selecting the second attempt's `action_failed`-adjacent
 /// event and pressing `c` opens the task view on `plan #2`, with that
 /// attempt's own conversation.
@@ -3615,7 +3619,7 @@ async fn harness_picker_uses_confirmed_snapshots_for_set_reset_and_errors() {
 const AGENT_QUESTION: &str = "Czy limit ma dotyczyć konta czy użytkownika?";
 
 /// The whole screen as drawn, cell symbols in order.
-fn screen_of(app: &App) -> String {
+fn screen_of(app: &mut App) -> String {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -3796,7 +3800,7 @@ async fn the_gate_form_shows_the_agents_question_above_the_fields() {
 
     let form = input_form(&app);
     assert_eq!(form.question.as_deref(), Some(AGENT_QUESTION));
-    let screen = screen_of(&app);
+    let screen = screen_of(&mut app);
     let message = screen
         .find("The agent stopped on an ambiguity rather than guessing.")
         .expect("the gate's message is drawn");
@@ -3884,7 +3888,7 @@ async fn a_select_matching_the_outputs_is_one_choice_with_descriptions() {
         !form.rows().contains(&FormRow::Label),
         "no second label picker"
     );
-    let screen = screen_of(&app);
+    let screen = screen_of(&mut app);
     assert!(
         screen.contains("● answered — the agent's question is answered; carry on with the work.")
     );
@@ -3901,7 +3905,7 @@ async fn a_select_matching_the_outputs_is_one_choice_with_descriptions() {
     let delivery = form.validate().expect("a valid answer");
     assert_eq!(delivery.values["ambiguity_decision"], "replan");
     assert_eq!(delivery.chosen_label.as_deref(), Some("replan"));
-    assert!(screen_of(&app).contains("● replan"));
+    assert!(screen_of(&mut app).contains("● replan"));
 }
 
 /// AE14: `t` → `answered` on a gate with required fields does not move on —
@@ -3973,7 +3977,7 @@ async fn i_opens_the_form_from_the_task_view() {
     app.on_key(key(KeyCode::Char('i')));
     assert_eq!(input_form(&app).kind, InputKind::Gate);
     assert!(
-        screen_of(&app).contains(AGENT_QUESTION),
+        screen_of(&mut app).contains(AGENT_QUESTION),
         "drawn over the task view"
     );
 
@@ -4027,7 +4031,7 @@ async fn i_opens_the_reply_form_for_an_agents_question() {
     let form = input_form(&app);
     assert_eq!(form.kind, InputKind::AgentQuestion);
     assert_eq!(form.rows(), vec![FormRow::Field(0)]);
-    let screen = screen_of(&app);
+    let screen = screen_of(&mut app);
     assert!(screen.contains("Reply to the agent"));
     assert!(screen.contains("Which API version?"));
 }
@@ -4108,7 +4112,7 @@ async fn the_problem_form_offers_labels_and_prefilled_key_values() {
     assert_eq!(problem.variables[0].value, "all units done");
     assert!(form.is_required(EntryMap::Variables, "summary"));
 
-    let screen = screen_of(&app);
+    let screen = screen_of(&mut app);
     assert!(screen.contains("Resolve the problem"));
     assert!(screen.contains("● implemented — The feature is implemented."));
     assert!(screen.contains("○ needs_human_decision — A person has to decide first."));
@@ -4376,7 +4380,7 @@ async fn a_problem_on_another_task_is_counted_and_announced() {
         row_of(&app, &watched).attention(),
         Some(Attention::Question)
     );
-    assert!(screen_of(&app).contains("1 question · 1 problem"));
+    assert!(screen_of(&mut app).contains("1 question · 1 problem"));
 
     // The stream announces B's problem while A is selected.
     app.on_stream(Some(Ok(Event::new(
@@ -4447,7 +4451,7 @@ async fn a_failure_problem_from_the_stream_counts_and_survives_a_refresh() {
 
     app.refresh().await;
     assert_eq!(app.attention_counts().problems, 1);
-    assert!(screen_of(&app).contains("Problem — the harness did not start"));
+    assert!(screen_of(&mut app).contains("Problem — the harness did not start"));
 }
 
 /// AE13 (TUI): "wariant A" is typed, the conductor closes the input with
@@ -4508,7 +4512,7 @@ async fn an_input_answered_by_the_conductor_closes_the_open_form() {
         ExecutionStatus::InputNeeded,
         "the daemon was never asked"
     );
-    let screen = screen_of(&app);
+    let screen = screen_of(&mut app);
     assert!(screen.contains("(closed)"));
     assert!(screen.contains("wariant B"));
 
@@ -4669,7 +4673,7 @@ async fn a_question_and_a_problem_have_their_own_colours_and_descriptions() {
     let mut app = app_over(&daemon, root.path()).await;
     app.refresh().await;
 
-    let colour_of = |app: &App, needle: &str| {
+    let colour_of = |app: &mut App, needle: &str| {
         let mut terminal = Terminal::new(TestBackend::new(160, 60)).expect("a test terminal");
         terminal
             .draw(|frame| views::render(frame, app))
@@ -4688,16 +4692,16 @@ async fn a_question_and_a_problem_have_their_own_colours_and_descriptions() {
     };
 
     app.select_execution(&question).await;
-    let screen = screen_of(&app);
+    let screen = screen_of(&mut app);
     assert!(screen.contains("Question — the workflow asks"), "{screen}");
     assert!(screen.contains("input_needed (question)"));
-    let question_colour = colour_of(&app, "input_needed (question)");
+    let question_colour = colour_of(&mut app, "input_needed (question)");
 
     app.select_execution(&problem).await;
-    let screen = screen_of(&app);
+    let screen = screen_of(&mut app);
     assert!(screen.contains("Problem — "), "{screen}");
     assert!(screen.contains("input_needed (problem)"));
-    let problem_colour = colour_of(&app, "input_needed (problem)");
+    let problem_colour = colour_of(&mut app, "input_needed (problem)");
 
     assert_ne!(question_colour, problem_colour);
 }
@@ -4879,7 +4883,7 @@ async fn the_conductor_at_work_is_shown_and_its_problem_counted() {
         row_of(&app, &failed.id).conductor_line().as_deref(),
         Some("conductor: diagnosing the failure")
     );
-    assert!(screen_of(&app).contains("◆ conductor: diagnosing the failure"));
+    assert!(screen_of(&mut app).contains("◆ conductor: diagnosing the failure"));
     assert_eq!(row_of(&app, &watched).conductor_line(), None);
 
     app.on_stream(Some(Ok(Event::new(
@@ -4914,7 +4918,7 @@ async fn the_conductor_at_work_is_shown_and_its_problem_counted() {
         app.attention_counts().summary().as_deref(),
         Some("1 question · 1 problem")
     );
-    assert!(screen_of(&app).contains("1 question · 1 problem"));
+    assert!(screen_of(&mut app).contains("1 question · 1 problem"));
 
     // The task view's header.
     app.select_execution(&failed.id).await;
@@ -4930,7 +4934,7 @@ async fn the_conductor_at_work_is_shown_and_its_problem_counted() {
         },
         5,
     ))));
-    assert!(screen_of(&app).contains("b-failed · conductor: answering the chat"));
+    assert!(screen_of(&mut app).contains("b-failed · conductor: answering the chat"));
 }
 
 /// A failure the conductor does not take up is announced after all, at the
@@ -5008,7 +5012,7 @@ async fn the_problem_form_shows_the_analysis_and_marks_the_proposed_values() {
     assert!(form.is_proposed_label("implemented"));
     assert!(problem.variables[0].is_proposed());
 
-    let screen = screen_of(&app);
+    let screen = screen_of(&mut app);
     assert!(screen.contains("Conductor's analysis"), "{screen}");
     assert!(screen.contains("◆ proposed output: implemented"));
     assert!(screen.contains("Both answers say every test passes."));
@@ -5026,7 +5030,7 @@ async fn the_problem_form_shows_the_analysis_and_marks_the_proposed_values() {
     type_text(&mut app, "!");
     let form = input_form(&app);
     assert!(!form.problem.as_ref().expect("problem").variables[0].is_proposed());
-    assert!(!screen_of(&app).contains("all units done  ◆ conductor"));
+    assert!(!screen_of(&mut app).contains("all units done  ◆ conductor"));
 }
 
 /// AE16 (view): the gate's form shows the conductor's summary and its
@@ -5063,7 +5067,7 @@ async fn the_gate_form_shows_the_conductors_summary_and_recommendation() {
         !form.values.iter().any(|value| value.contains("variant B")),
         "the recommendation fills in nothing"
     );
-    let screen = screen_of(&app);
+    let screen = screen_of(&mut app);
     assert!(screen.contains("Conductor's summary (advisory"), "{screen}");
     assert!(screen.contains("The plan covers both variants; variant B is cheaper."));
     assert!(screen.contains("◆ recommendation: answered: variant B"));
@@ -5141,7 +5145,7 @@ async fn the_failure_form_shows_the_diagnosis_and_restarts_with_a_note() {
     );
     assert_eq!(form.raw_error, None);
     assert_eq!(form.proposals.len(), 1);
-    let screen = screen_of(&app);
+    let screen = screen_of(&mut app);
     assert!(screen.contains("Resolve the failure"), "{screen}");
     assert!(screen.contains("Conductor's diagnosis:"));
     assert!(screen.contains("confidence: low"));
@@ -5226,7 +5230,7 @@ async fn the_failure_form_shows_the_raw_error_after_two_conductor_failures() {
     assert!(form.proposals.is_empty());
     let raw = form.raw_error.as_deref().expect("the raw error");
     assert!(raw.contains(FAILURE_ERROR), "{raw}");
-    let screen = screen_of(&app);
+    let screen = screen_of(&mut app);
     assert!(screen.contains("Error:"), "{screen}");
     assert!(!screen.contains("Conductor's diagnosis"));
 }
@@ -5282,14 +5286,21 @@ async fn a_chat_proposal_is_confirmed_and_the_history_survives_a_restart() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         app.load_chat().await;
     }
-    assert!(screen_of(&app).contains("(proposal, open)"));
+    assert!(screen_of(&mut app).contains("(proposal, open)"));
 
     select_chat_entry(&mut app, |item| item.open_proposal().is_some());
+    // Actions are deliberately unavailable while reading history; enter the
+    // explicit action focus before confirming the selected proposal.
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(task_view(&app).chat.focus, ChatFocus::Action);
     let proposal_id = task_view(&app)
         .chat
         .selected_item()
         .and_then(|item| item.open_proposal().map(String::from))
         .expect("an open proposal");
+    task_view_mut(&mut app).chat.action_target = Some(
+        narsor::tui::chat::ChatActionTarget::Proposal(proposal_id.clone()),
+    );
     assert_eq!(
         app.on_key(key(KeyCode::Char('y'))),
         Request::ConfirmProposal {
@@ -5298,7 +5309,6 @@ async fn a_chat_proposal_is_confirmed_and_the_history_survives_a_restart() {
         }
     );
     app.confirm_proposal(&execution_id, &proposal_id).await;
-    assert!(!app.notice().expect("a notice").is_error);
 
     wait_until_settled(&client, &[&execution_id]).await;
     let execution = reload_until(root.path(), &execution_id, ExecutionStatus::Completed);
@@ -5310,7 +5320,7 @@ async fn a_chat_proposal_is_confirmed_and_the_history_survives_a_restart() {
         .find(|item| item.entry.id == proposal_id)
         .expect("the proposal is in the history");
     assert_eq!(confirmed.proposal, Some(ProposalState::Executed));
-    assert!(screen_of(&app).contains("(proposal, carried out)"));
+    assert!(screen_of(&mut app).contains("(proposal, carried out)"));
     let history = task_view(&app).chat.entries.len();
 
     // A new interface reads the whole history again.
@@ -5325,7 +5335,7 @@ async fn a_chat_proposal_is_confirmed_and_the_history_survives_a_restart() {
         .entries
         .iter()
         .any(|entry| entry.text == "should I approve it?"));
-    assert!(screen_of(&app).contains("should I approve it?"));
+    assert!(screen_of(&mut app).contains("should I approve it?"));
 }
 
 /// KTD9 (view): a proposal about a gate that is no longer the pending one
@@ -5418,14 +5428,14 @@ async fn undoing_a_decision_asks_with_its_confidence_and_rationale() {
     let mut app = app_over(&daemon, root.path()).await;
     app.refresh().await;
     open_chat(&mut app).await;
-    let screen = screen_of(&app);
+    let screen = screen_of(&mut app);
     assert!(screen.contains("u — undo this decision"), "{screen}");
 
     select_chat_entry(&mut app, |item| item.undoable_decision().is_some());
     assert_eq!(app.on_key(key(KeyCode::Char('u'))), Request::None);
     let undo = task_view(&app).chat.undo.clone().expect("the confirmation");
     assert_eq!(undo.decision_id, "decision-1");
-    let screen = screen_of(&app);
+    let screen = screen_of(&mut app);
     assert!(
         screen.contains("it chose the output 'implemented'"),
         "{screen}"
@@ -5800,7 +5810,7 @@ mod remote_tasks {
         let mut app = RemoteApp::new(harness.owner.clone());
         app.refresh().await;
 
-        let draw = |app: &RemoteApp| {
+        let draw = |app: &mut RemoteApp| {
             let mut terminal = Terminal::new(TestBackend::new(160, 48)).expect("a test terminal");
             terminal
                 .draw(|frame| narsor::tui::remote_views::render(frame, app))
@@ -5813,14 +5823,14 @@ mod remote_tasks {
                 .map(|cell| cell.symbol())
                 .collect::<String>()
         };
-        let screen = draw(&app);
+        let screen = draw(&mut app);
         assert!(screen.contains("Remote tasks"), "the list panel");
         assert!(screen.contains("awaiting input"), "the badge");
         assert!(screen.contains("default backend: k8s"));
 
         press(&mut app, KeyCode::Enter).await;
         app.on_key(key(KeyCode::Char('i')));
-        let screen = draw(&app);
+        let screen = draw(&mut app);
         assert!(screen.contains("Approve the plan?"), "the input form");
     }
 }

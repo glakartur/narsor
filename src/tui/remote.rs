@@ -783,6 +783,13 @@ impl RemoteApp {
         self.screen
     }
 
+    /// Records the resolved conversation pane height for logical navigation.
+    pub fn set_conversation_viewport(&mut self, height: usize) {
+        if let Some(page) = self.detail.as_mut().and_then(|detail| detail.page.as_mut()) {
+            page.transcript.set_viewport(height);
+        }
+    }
+
     /// The loaded detail of the selected task.
     pub fn detail(&self) -> Option<&TaskDetail> {
         self.detail

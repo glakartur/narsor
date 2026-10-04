@@ -1425,6 +1425,31 @@ impl App {
         &self.screen
     }
 
+    /// Mutable task-view access for terminal integration tests and render setup.
+    pub fn task_view_mut(&mut self) -> Option<&mut TaskView> {
+        match &mut self.screen {
+            Screen::Task(view) => Some(view),
+            Screen::Main => None,
+        }
+    }
+
+    /// Updates transcript viewports from the renderer's resolved pane sizes.
+    pub fn set_task_transcript_viewports(
+        &mut self,
+        content_height: usize,
+        chat_height: Option<usize>,
+    ) {
+        let Screen::Task(view) = &mut self.screen else {
+            return;
+        };
+        if let TaskContent::Conversation { transcript, .. } = &mut view.content {
+            transcript.set_viewport(content_height);
+        }
+        if let Some(height) = chat_height {
+            view.chat.transcript.set_viewport(height);
+        }
+    }
+
     /// The health of the live channel.
     pub fn stream_status(&self) -> &StreamStatus {
         &self.stream

@@ -59,7 +59,7 @@ fn panel(title: String) -> Block<'static> {
 }
 
 /// Draws the whole remote mode.
-pub fn render(frame: &mut Frame, app: &RemoteApp) {
+pub fn render(frame: &mut Frame, app: &mut RemoteApp) {
     let [body, shortcuts] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(SHORTCUT_BAR_HEIGHT)])
             .areas(frame.area());
@@ -76,6 +76,7 @@ pub fn render(frame: &mut Frame, app: &RemoteApp) {
             let [detail, conversation] =
                 Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
                     .areas(body);
+            app.set_conversation_viewport(conversation.height.saturating_sub(2).max(1) as usize);
             render_detail(frame, app, detail);
             render_conversation(frame, app, conversation);
         }

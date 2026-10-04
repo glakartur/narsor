@@ -119,9 +119,9 @@ pub fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
 }
 
 /// Draws the whole interface.
-pub fn render(frame: &mut Frame, app: &App) {
-    if let Screen::Task(view) = app.screen() {
-        render_task_view(frame, app, view);
+pub fn render(frame: &mut Frame, app: &mut App) {
+    if matches!(app.screen(), Screen::Task(_)) {
+        render_task_view(frame, app);
         return;
     }
 
@@ -152,23 +152,39 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 /// The full-screen task view (U7): the step timeline on the left, the
 /// selected step's content on the right.
-fn render_task_view(frame: &mut Frame, app: &App, view: &TaskView) {
+fn render_task_view(frame: &mut Frame, app: &mut App) {
     let [body, shortcuts] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(SHORTCUT_BAR_HEIGHT)])
             .areas(frame.area());
     let [axis_area, content_area] =
         Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(body);
 
-    render_task_axis(frame, app, view, axis_area);
-    if view.chat.open {
+    let chat_open = matches!(app.screen(), Screen::Task(view) if view.chat.open);
+    if chat_open {
         // The chat shares the right column with the step's content, so the
         // conversation it talks about stays in sight.
         let [content_area, chat_area] =
             Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(60)])
                 .areas(content_area);
+        app.set_task_transcript_viewports(
+            content_area.height.saturating_sub(2).max(1) as usize,
+            Some(chat_area.height.saturating_sub(2).max(1) as usize),
+        );
+        let Screen::Task(view) = app.screen() else {
+            return;
+        };
+        render_task_axis(frame, app, view, axis_area);
         render_task_content(frame, view, content_area);
         render_chat_panel(frame, &view.chat, chat_area);
     } else {
+        app.set_task_transcript_viewports(
+            content_area.height.saturating_sub(2).max(1) as usize,
+            None,
+        );
+        let Screen::Task(view) = app.screen() else {
+            return;
+        };
+        render_task_axis(frame, app, view, axis_area);
         render_task_content(frame, view, content_area);
     }
     render_shortcuts(frame, app, shortcuts);

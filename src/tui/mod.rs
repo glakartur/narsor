@@ -234,7 +234,9 @@ pub async fn run(
     let reader = std::thread::spawn(move || read_terminal_events(&keys_tx, &reader_stop));
 
     while !app.should_quit() {
-        guard.terminal().draw(|frame| views::render(frame, &app))?;
+        guard
+            .terminal()
+            .draw(|frame| views::render(frame, &mut app))?;
 
         tokio::select! {
             incoming = keys_rx.recv() => match incoming {
@@ -361,7 +363,7 @@ pub async fn run_remote(
     while !app.should_quit() {
         guard
             .terminal()
-            .draw(|frame| remote_views::render(frame, &app))?;
+            .draw(|frame| remote_views::render(frame, &mut app))?;
 
         tokio::select! {
             incoming = keys_rx.recv() => match incoming {
