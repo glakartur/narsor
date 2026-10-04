@@ -2893,6 +2893,12 @@ fn seed_retried_agent_execution(store: &ExecutionStore, execution_id: &str) {
     second
         .append(
             ConversationSource::Stdout,
+            br#"{"type":"thread.started","thread_id":"thread-1"}"#,
+        )
+        .expect("append lifecycle event 2");
+    second
+        .append(
+            ConversationSource::Stdout,
             br#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"done"}]}}"#,
         )
         .expect("append stdout 2");
@@ -2953,10 +2959,25 @@ async fn c_on_a_second_attempt_event_opens_its_position_and_conversation() {
     let view = task_view(&app);
     assert_eq!(view.selected.as_deref(), Some("plan #2"));
     match &view.content {
-        TaskContent::Conversation { entries, .. } => {
+        TaskContent::Conversation {
+            entries, transcript, ..
+        } => {
             assert!(
                 entries.iter().any(|entry| entry.text.contains("done")),
                 "attempt-2's own conversation was loaded: {entries:?}"
+            );
+            let rendered = transcript
+                .logical_lines()
+                .into_iter()
+                .map(|line| line.text)
+                .collect::<Vec<_>>();
+            assert!(
+                rendered.iter().any(|line| line == "thread started"),
+                "readable Codex lifecycle text is visible without expansion: {rendered:?}"
+            );
+            assert!(
+                !rendered.iter().any(|line| line.contains("system diagnostic")),
+                "technical entries should not be replaced by diagnostic placeholders: {rendered:?}"
             );
         }
         other => panic!("expected a loaded conversation, got {other:?}"),

@@ -5183,17 +5183,14 @@ pub(crate) fn agent_transcript_entry(entry: &ClassifiedEntry) -> TranscriptEntry
             | EntryKind::Raw
     );
     let body: Vec<String> = sanitize(&entry.text).lines().map(str::to_owned).collect();
-    let rendered_lines = if technical {
-        vec![
-            header,
-            format!("  {} diagnostic — e/Enter to expand", entry.kind.label()),
-        ]
+    let mut rendered_lines = vec![header];
+    rendered_lines.extend(body.clone());
+    let raw = sanitize(&String::from_utf8_lossy(&entry.raw));
+    let technical_lines = if technical && raw != entry.text {
+        raw.lines().map(str::to_owned).collect()
     } else {
-        let mut lines = vec![header];
-        lines.extend(body.clone());
-        lines
+        Vec::new()
     };
-    let technical_lines = if technical { body } else { Vec::new() };
     let presentation = match entry.kind {
         EntryKind::User => TranscriptPresentation::Operator,
         EntryKind::Assistant | EntryKind::Result => TranscriptPresentation::Agent,
