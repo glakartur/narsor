@@ -56,7 +56,6 @@ pub enum DisplayMode {
 pub enum TranscriptPresentation {
     Neutral,
     Operator,
-    Conductor,
     Agent,
     Technical,
     Error,

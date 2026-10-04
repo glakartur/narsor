@@ -395,7 +395,7 @@ mod conductor_chat {
     }
 
     #[test]
-    fn conductor_transcript_keeps_operator_and_conductor_presentation() {
+    fn conductor_transcript_keeps_operator_and_agent_presentation() {
         let mut panel = ChatPanel::default();
         panel.append(vec![
             entry(
@@ -420,7 +420,7 @@ mod conductor_chat {
         );
         assert_eq!(
             panel.transcript.entries()[1].presentation,
-            TranscriptPresentation::Conductor
+            TranscriptPresentation::Agent
         );
     }
 

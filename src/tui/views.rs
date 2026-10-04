@@ -53,7 +53,6 @@ pub(crate) fn transcript_style(presentation: TranscriptPresentation) -> Style {
     match presentation {
         TranscriptPresentation::Neutral => Style::default(),
         TranscriptPresentation::Operator => Style::default().fg(Color::White).bg(Color::Blue),
-        TranscriptPresentation::Conductor => Style::default().fg(Color::Black).bg(CONDUCTOR_COLOUR),
         TranscriptPresentation::Agent => Style::default(),
         TranscriptPresentation::Technical => Style::default().fg(Color::DarkGray),
         TranscriptPresentation::Error => Style::default()

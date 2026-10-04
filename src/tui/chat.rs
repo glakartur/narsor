@@ -461,7 +461,7 @@ fn chat_transcript_entry(item: &ChatItem) -> TranscriptEntry {
     } else {
         match item.entry.author {
             ChatAuthor::Operator => TranscriptPresentation::Operator,
-            ChatAuthor::Conductor => TranscriptPresentation::Conductor,
+            ChatAuthor::Conductor => TranscriptPresentation::Agent,
         }
     };
     TranscriptEntry::new(
