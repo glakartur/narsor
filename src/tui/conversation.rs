@@ -144,10 +144,10 @@ fn project_stdout_line(text: &str) -> (EntryKind, String) {
     let kind = classify_stdout_value(&value);
     let projected = match kind {
         EntryKind::System | EntryKind::Result if is_codex_event(&value) => {
-            project_codex_event(&value).unwrap_or_else(|| text.to_owned())
+            project_codex_event(&value)
         }
         EntryKind::ToolCall | EntryKind::ToolResult if is_codex_item_event(&value) => {
-            project_codex_item(&value).unwrap_or_else(|| text.to_owned())
+            project_codex_item(&value)
         }
         EntryKind::Assistant => value
             .pointer("/message/content")
@@ -203,6 +203,7 @@ fn project_stdout_line(text: &str) -> (EntryKind, String) {
             .map(|name| format!("calling {name}"))
             .unwrap_or_else(|| "tool call".to_owned()),
         EntryKind::ToolResult => "tool result".to_owned(),
+        EntryKind::Raw => generic_json_summary(&value),
         _ => text.to_owned(),
     };
     (kind, projected)
@@ -225,75 +226,110 @@ fn is_codex_item_event(value: &Value) -> bool {
 
 /// Turn a Codex lifecycle event into a small statement which is useful in a
 /// transcript without making the event's JSON its primary presentation.
-fn project_codex_event(value: &Value) -> Option<String> {
-    match value.get("type").and_then(Value::as_str)? {
-        "thread.started" => Some("thread started".to_owned()),
-        "turn.started" => Some("turn started".to_owned()),
-        "turn.completed" => Some("turn completed".to_owned()),
-        "turn.failed" => error_message(value).map(|message| format!("turn failed: {message}")),
-        _ => None,
+fn project_codex_event(value: &Value) -> String {
+    match value.get("type").and_then(Value::as_str) {
+        Some("thread.started") => "thread started".to_owned(),
+        Some("turn.started") => "turn started".to_owned(),
+        Some("turn.completed") => "turn completed".to_owned(),
+        Some("turn.failed") => error_message(value)
+            .map(|message| format!("turn failed: {message}"))
+            .unwrap_or_else(|| "turn failed".to_owned()),
+        _ => "session event".to_owned(),
     }
 }
 
 /// Projects Codex tool items at the classification boundary.  Returning
 /// `None` is deliberate: incomplete or new item variants must retain their
 /// decoded envelope rather than receiving a plausible but misleading label.
-fn project_codex_item(value: &Value) -> Option<String> {
-    let item = value.get("item")?;
-    let event_type = value.get("type").and_then(Value::as_str)?;
+fn project_codex_item(value: &Value) -> String {
+    let Some(item) = value.get("item") else {
+        return "tool event".to_owned();
+    };
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let completed = event_type == "item.completed";
 
-    match item.get("type").and_then(Value::as_str)? {
-        "agent_message" => item.get("text").and_then(Value::as_str).map(str::to_owned),
+    match item.get("type").and_then(Value::as_str).unwrap_or("tool") {
+        "agent_message" => item
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("agent message")
+            .to_owned(),
         "reasoning" => item
             .get("summary")
             .and_then(Value::as_str)
             .or_else(|| item.get("text").and_then(Value::as_str))
-            .map(str::to_owned),
+            .unwrap_or("thinking")
+            .to_owned(),
         "command_execution" => {
-            let command = item.get("command").and_then(Value::as_str)?;
+            let command = item
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("command");
             if completed {
                 let exit_code = item.get("exit_code").and_then(Value::as_i64);
-                Some(match exit_code {
+                match exit_code {
                     Some(code) => format!("command completed: {command} (exit {code})"),
                     None => format!("command completed: {command}"),
-                })
+                }
             } else {
-                Some(format!("running command: {command}"))
+                format!("running command: {command}")
             }
         }
         "mcp_tool_call" => {
             let tool = item
                 .get("tool_name")
                 .or_else(|| item.get("name"))
-                .and_then(Value::as_str)?;
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
             let name = item
                 .get("server")
                 .and_then(Value::as_str)
                 .map(|server| format!("{server}/{tool}"))
                 .unwrap_or_else(|| tool.to_owned());
-            Some(if completed {
+            if completed {
                 format!("MCP tool completed: {name}")
             } else {
                 format!("calling MCP tool: {name}")
-            })
+            }
         }
         "web_search" => {
-            let query = item.get("query").and_then(Value::as_str)?;
-            Some(if completed {
+            let query = item.get("query").and_then(Value::as_str).unwrap_or("query");
+            if completed {
                 format!("web search completed: {query}")
             } else {
                 format!("searching web: {query}")
-            })
+            }
         }
-        "file_change" => Some(if completed {
-            "file changes completed".to_owned()
-        } else {
-            "applying file changes".to_owned()
-        }),
-        "error" => error_message(item).map(|message| format!("error: {message}")),
-        _ => None,
+        "file_change" => {
+            if completed {
+                "file changes completed".to_owned()
+            } else {
+                "applying file changes".to_owned()
+            }
+        }
+        "error" => error_message(item)
+            .map(|message| format!("error: {message}"))
+            .unwrap_or_else(|| "tool error".to_owned()),
+        other => format!("tool event: {other}"),
     }
+}
+
+fn generic_json_summary(value: &Value) -> String {
+    value
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("error").and_then(Value::as_str))
+        .map(str::to_owned)
+        .or_else(|| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|kind| format!("event: {kind}"))
+        })
+        .unwrap_or_else(|| "unrecognized event".to_owned())
 }
 
 fn error_message(value: &Value) -> Option<&str> {

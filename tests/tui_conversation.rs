@@ -264,25 +264,25 @@ fn codex_tool_events_have_distinct_readable_projections() {
 /// KTD3: a malformed known envelope stays visible as its original decoded
 /// content instead of being replaced with an invented technical description.
 #[test]
-fn incomplete_codex_items_fall_back_to_the_decoded_source() {
+fn incomplete_codex_items_keep_a_standard_tool_summary() {
     let raw = r#"{"type":"item.started","item":{"type":"command_execution"}}"#;
     let classified = classify(&entry(ConversationSource::Stdout, raw));
 
     assert_eq!(classified.kind, EntryKind::ToolCall);
-    assert_eq!(classified.text, raw);
+    assert_eq!(classified.text, "running command: command");
     assert_eq!(classified.raw, raw.as_bytes());
 }
 
 // --- fallback ----------------------------------------------------------------
 
 #[test]
-fn an_unrecognized_type_is_raw_with_full_content_preserved() {
+fn an_unrecognized_type_has_a_readable_summary_with_full_content_preserved() {
     let raw = r#"{"type":"api_retry","detail":"backing off"}"#;
     let classified = classify(&entry(ConversationSource::Stdout, raw));
     assert_eq!(classified.kind, EntryKind::Raw);
     assert_eq!(
-        classified.text, raw,
-        "R9: nothing is dropped, even unrecognized"
+        classified.text, "event: api_retry",
+        "R9: raw retains the original while the transcript remains readable"
     );
 }
 
@@ -334,7 +334,7 @@ fn semantic_projection_keeps_the_complete_source_for_diagnostics() {
         (
             r#"{"type":"api_retry","detail":"backing off"}"#,
             EntryKind::Raw,
-            r#"{"type":"api_retry","detail":"backing off"}"#,
+            "event: api_retry",
         ),
     ];
 
