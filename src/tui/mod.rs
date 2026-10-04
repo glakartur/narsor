@@ -84,7 +84,9 @@ pub mod scroll;
 pub mod transcript;
 pub mod views;
 
+use std::future::Future;
 use std::io::{self, Stdout};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
@@ -214,9 +216,10 @@ pub async fn run(
     // `Engine`/`ExecutionStore` regardless (dual ownership U2 deliberately
     // left in place, narrow in scope to what it asked for) — that
     // construction is what this unit removes for good.
-    let client = ensure_daemon_running(&state, &flags)
-        .await
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let client = connect_local_daemon(&state, &flags, |state, flags| {
+        Box::pin(ensure_daemon_running(state, flags))
+    })
+    .await?;
 
     // Built before `app.refresh()`'s first read, not after — see the module
     // doc's "SSE replay gap" section for what this ordering does and does
@@ -311,6 +314,26 @@ pub async fn run(
     Ok(())
 }
 
+/// Enters the local daemon discovery-or-launch phase before the TUI touches
+/// terminal state. Keeping this boundary separate lets its routing be tested
+/// without spawning a detached process or claiming a terminal.
+type DaemonConnectionFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<crate::api::ApiClient, crate::api::DiscoveryError>> + Send + 'a>,
+>;
+
+async fn connect_local_daemon<F>(
+    state: &StatePaths,
+    flags: &Flags,
+    connect: F,
+) -> io::Result<crate::api::ApiClient>
+where
+    F: for<'a> FnOnce(&'a StatePaths, &'a Flags) -> DaemonConnectionFuture<'a>,
+{
+    connect(state, flags)
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
 /// Forwards terminal events until the loop asks it to stop.
 fn read_terminal_events(sender: &mpsc::UnboundedSender<TerminalEvent>, stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
@@ -397,4 +420,40 @@ pub async fn run_remote(
     drop(guard);
     let _ = reader.join();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    #[tokio::test]
+    async fn local_startup_enters_daemon_connection_phase_without_starting_a_process() {
+        let state = StatePaths::new("/tmp/narsor-tui-startup-state");
+        let flags = Flags {
+            root: Some(PathBuf::from("/tmp/narsor-tui-startup-root")),
+            config: None,
+        };
+        let called = AtomicBool::new(false);
+
+        let result = connect_local_daemon(&state, &flags, |received_state, received_flags| {
+            assert_eq!(received_state, &state);
+            assert_eq!(received_flags.root, flags.root);
+            assert_eq!(received_flags.config, flags.config);
+            called.store(true, Ordering::SeqCst);
+            Box::pin(async {
+                Err::<crate::api::ApiClient, _>(crate::api::DiscoveryError::NetworkMode)
+            })
+        })
+        .await;
+
+        assert!(called.load(Ordering::SeqCst));
+        assert_eq!(
+            result
+                .expect_err("the fake connector must stop startup")
+                .kind(),
+            io::ErrorKind::Other
+        );
+    }
 }
