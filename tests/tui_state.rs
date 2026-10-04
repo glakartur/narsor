@@ -77,8 +77,7 @@ use narsor::tui::app::{
 };
 use narsor::tui::chat::{ChatFocus, ChatItem, ProposalState};
 use narsor::tui::transcript::{
-    decode_raw_display, raw_display, DisplayMode, TranscriptEntry, TranscriptEntryId, TranscriptId,
-    TranscriptState,
+    raw_display, DisplayMode, TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptState,
 };
 use narsor::tui::views;
 use narsor::workflow::load_from_file;
@@ -3386,11 +3385,11 @@ fn transcript_opens_at_end_and_preserves_an_older_anchor_on_append() {
         transcript_entry("one", &["one-a", "one-b"]),
         transcript_entry("two", &["two-a", "two-b"]),
     ]);
-    assert_eq!(transcript.scroll_offset(), 2);
+    assert_eq!(transcript.scroll_offset(), 3);
     assert!(transcript.is_following_end());
 
     transcript.append(vec![transcript_entry("three", &["three-a"])]);
-    assert_eq!(transcript.scroll_offset(), 3);
+    assert_eq!(transcript.scroll_offset(), 5);
     assert!(transcript.is_following_end());
 
     transcript.to_top();
@@ -3456,12 +3455,30 @@ fn transcript_expansion_is_scoped_to_its_conversation() {
 }
 
 #[test]
-fn transcript_raw_display_is_terminal_safe_and_reversible() {
+fn transcript_raw_display_is_terminal_safe_and_readable() {
     let raw = b"before\x1b[31m\0after\xff";
     let shown = raw_display(raw);
     assert!(!shown.contains('\x1b'));
     assert!(!shown.contains('\0'));
-    assert_eq!(decode_raw_display(&shown).unwrap(), raw);
+    assert!(!shown.starts_with("base64:"));
+    assert!(shown.contains("before"));
+    assert!(shown.contains("after"));
+}
+
+#[test]
+fn transcript_separates_adjacent_entries() {
+    let mut transcript = TranscriptState::new(TranscriptId::from("attempt-a"));
+    transcript.load(vec![
+        transcript_entry("one", &["first"]),
+        transcript_entry("two", &["second"]),
+    ]);
+
+    let lines: Vec<String> = transcript
+        .logical_lines()
+        .into_iter()
+        .map(|line| line.text)
+        .collect();
+    assert_eq!(lines, vec!["first", "", "second"]);
 }
 
 // ---------------------------------------------------------------------------

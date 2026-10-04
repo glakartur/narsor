@@ -53,10 +53,11 @@ pub(crate) fn transcript_style(presentation: TranscriptPresentation) -> Style {
     match presentation {
         TranscriptPresentation::Neutral => Style::default(),
         TranscriptPresentation::Operator => Style::default().fg(Color::White).bg(Color::Blue),
-        TranscriptPresentation::Agent => Style::default(),
-        TranscriptPresentation::Technical => Style::default().fg(Color::DarkGray),
+        TranscriptPresentation::Agent => Style::default().fg(Color::White).bg(Color::DarkGray),
+        TranscriptPresentation::Technical => Style::default().fg(Color::Gray).bg(Color::Black),
         TranscriptPresentation::Error => Style::default()
-            .fg(Color::LightRed)
+            .fg(Color::White)
+            .bg(Color::Red)
             .add_modifier(Modifier::BOLD),
     }
 }
@@ -1881,4 +1882,25 @@ fn render_help_modal(frame: &mut Frame) {
         .title(" Key map ");
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_roles_have_distinct_backgrounds() {
+        assert_eq!(
+            transcript_style(TranscriptPresentation::Operator).bg,
+            Some(Color::Blue)
+        );
+        assert_eq!(
+            transcript_style(TranscriptPresentation::Agent).bg,
+            Some(Color::DarkGray)
+        );
+        assert_eq!(
+            transcript_style(TranscriptPresentation::Error).bg,
+            Some(Color::Red)
+        );
+    }
 }

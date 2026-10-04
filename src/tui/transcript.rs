@@ -5,10 +5,7 @@
 
 use std::collections::HashSet;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
-
-use super::scroll::{wrap_line, ScrollState};
+use super::scroll::{sanitize, wrap_line, ScrollState};
 
 /// Stable identity of a conversation, normally an attempt or chat id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -305,10 +302,21 @@ impl TranscriptState {
     }
 
     pub fn logical_lines(&self) -> Vec<TranscriptLine> {
-        self.entries
-            .iter()
-            .flat_map(|entry| self.lines_for(entry))
-            .collect()
+        let mut lines = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            let entry_lines = self.lines_for(entry);
+            let next_logical_line = entry_lines.len();
+            lines.extend(entry_lines);
+            if index + 1 < self.entries.len() {
+                lines.push(TranscriptLine {
+                    entry_id: entry.id.clone(),
+                    logical_line: next_logical_line,
+                    text: String::new(),
+                    presentation: TranscriptPresentation::Neutral,
+                });
+            }
+        }
+        lines
     }
 
     pub fn anchor(&self) -> Option<TranscriptAnchor> {
@@ -358,17 +366,14 @@ impl TranscriptState {
             .min(self.lines_for(entry).len().saturating_sub(1));
         let preceding = self.entries[..index]
             .iter()
-            .map(|item| self.lines_for(item).len())
+            .map(|item| self.lines_for(item).len() + 1)
             .sum::<usize>();
         self.scroll
             .set_offset(preceding + local_line, self.total_lines());
     }
 
     fn total_lines(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|entry| self.lines_for(entry).len())
-            .sum()
+        self.logical_lines().len()
     }
 
     fn lines_for(&self, entry: &TranscriptEntry) -> Vec<TranscriptLine> {
@@ -420,15 +425,10 @@ impl TranscriptState {
     }
 }
 
-/// Encodes arbitrary retained bytes as printable terminal-safe text.
+/// Shows retained bytes as readable, terminal-safe text.
 ///
-/// Base64 is reversible and contains no control characters or terminal escape
-/// introducers, unlike rendering a lossy decoded string.
+/// The original bytes remain in [`TranscriptEntry::raw`], while this view
+/// decodes them lossily and removes terminal controls for human inspection.
 pub fn raw_display(raw: &[u8]) -> String {
-    format!("base64:{}", BASE64.encode(raw))
-}
-
-/// Decodes a value produced by [`raw_display`].
-pub fn decode_raw_display(display: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    BASE64.decode(display.strip_prefix("base64:").unwrap_or_default())
+    sanitize(&String::from_utf8_lossy(raw))
 }
