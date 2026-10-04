@@ -5367,6 +5367,8 @@ async fn a_stale_proposal_is_refused_with_a_message() {
     app.refresh().await;
     open_chat(&mut app).await;
     select_chat_entry(&mut app, |item| item.open_proposal().is_some());
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(task_view(&app).chat.focus, ChatFocus::Action);
     let Request::ConfirmProposal {
         execution_id: id,
         proposal_id,
@@ -5432,6 +5434,8 @@ async fn undoing_a_decision_asks_with_its_confidence_and_rationale() {
     assert!(screen.contains("u — undo this decision"), "{screen}");
 
     select_chat_entry(&mut app, |item| item.undoable_decision().is_some());
+    app.on_key(key(KeyCode::Tab));
+    assert_eq!(task_view(&app).chat.focus, ChatFocus::Action);
     assert_eq!(app.on_key(key(KeyCode::Char('u'))), Request::None);
     let undo = task_view(&app).chat.undo.clone().expect("the confirmation");
     assert_eq!(undo.decision_id, "decision-1");
