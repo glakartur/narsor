@@ -97,7 +97,7 @@ use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
 use crate::tasks;
 use crate::tui::chat::{ChatActionTarget, ChatFocus, ChatPanel};
-use crate::tui::conversation::{classify, ClassifiedEntry, EntryKind};
+use crate::tui::conversation::{classify, EntryKind, TranscriptEvent};
 use crate::tui::failure_form::{FailureAction, FailureForm};
 use crate::tui::refresh::{RefreshSchedule, DEBOUNCE};
 use crate::tui::scroll::{sanitize, ScrollState};
@@ -1166,7 +1166,7 @@ pub enum TaskContent {
     /// module).
     Conversation {
         /// Entries read so far, oldest first.
-        entries: Vec<ClassifiedEntry>,
+        entries: Vec<TranscriptEvent>,
         /// The cursor to continue from on the next manual refresh (R8).
         next_entry: u64,
         /// Whether the attempt's conversation is closed (compressed).
@@ -5112,7 +5112,7 @@ pub fn task_position_line(position: &crate::engine::Position) -> String {
 /// body — collapsed otherwise to [`TASK_ENTRY_COLLAPSE_LINES`] with a hint
 /// that `Enter`/space expands it (R10).
 pub fn task_conversation_lines(
-    entries: &[ClassifiedEntry],
+    entries: &[TranscriptEvent],
     cursor: usize,
     expanded: &HashSet<u64>,
 ) -> Vec<String> {
@@ -5137,12 +5137,8 @@ pub fn task_conversation_lines(
                 | EntryKind::Stderr
                 | EntryKind::Raw
         );
-        let body_text = if is_expanded && technical {
-            String::from_utf8_lossy(&entry.raw).into_owned()
-        } else {
-            entry.text.clone()
-        };
-        let body: Vec<String> = sanitize(&body_text).lines().map(str::to_string).collect();
+        let sanitized = sanitize(&entry.summary);
+        let body: Vec<String> = sanitized.lines().map(str::to_string).collect();
         if is_expanded || (!technical && body.len() <= TASK_ENTRY_COLLAPSE_LINES) {
             for line in &body {
                 lines.push(format!("    {line}"));
@@ -5158,6 +5154,11 @@ pub fn task_conversation_lines(
                 format!("    … {hidden} more lines — Enter/space to expand")
             });
         }
+        if is_expanded {
+            for detail in entry.detail_lines() {
+                lines.push(format!("    {}", sanitize(&detail)));
+            }
+        }
     }
     lines
 }
@@ -5165,7 +5166,7 @@ pub fn task_conversation_lines(
 /// Adapts one retained agent record into the presentation model shared with
 /// conductor and remote conversations. The readable projection remains the
 /// default while raw mode can always return to the exact retained bytes.
-pub(crate) fn agent_transcript_entry(entry: &ClassifiedEntry) -> TranscriptEntry {
+pub(crate) fn agent_transcript_entry(entry: &TranscriptEvent) -> TranscriptEntry {
     let header = format!(
         "[{}] {}  {}  ({:?})",
         entry.entry_number,
@@ -5173,16 +5174,10 @@ pub(crate) fn agent_transcript_entry(entry: &ClassifiedEntry) -> TranscriptEntry
         entry.kind.label(),
         entry.source
     );
-    let technical = matches!(
-        entry.kind,
-        EntryKind::Thinking
-            | EntryKind::ToolCall
-            | EntryKind::ToolResult
-            | EntryKind::System
-            | EntryKind::Stderr
-            | EntryKind::Raw
-    );
-    let body: Vec<String> = sanitize(&entry.text).lines().map(str::to_owned).collect();
+    let body: Vec<String> = sanitize(&entry.summary)
+        .lines()
+        .map(str::to_owned)
+        .collect();
     let mut rendered_lines = vec![header];
     rendered_lines.extend(body);
     let presentation = match entry.kind {
@@ -5201,7 +5196,7 @@ pub(crate) fn agent_transcript_entry(entry: &ClassifiedEntry) -> TranscriptEntry
         rendered_lines,
         entry.raw.clone(),
     )
-    .with_raw_detail(technical && entry.raw != entry.text.as_bytes())
+    .with_details(entry.details.clone())
     .with_presentation(presentation)
 }
 

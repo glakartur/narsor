@@ -570,12 +570,20 @@ pub async fn conversation(
 /// One conversation entry: number, timestamp, source/kind, decoded content.
 fn print_conversation_entry(entry: &crate::api::ConversationEntryDto) {
     let classified = classify(entry);
+    let body = if matches!(
+        entry.source,
+        crate::persistence::conversation::ConversationSource::Narsor
+    ) {
+        String::from_utf8_lossy(&classified.raw).into_owned()
+    } else {
+        classified.summary
+    };
     println!(
         "{:>5}  {}  {:<10} {}",
         classified.entry_number,
         classified.timestamp.to_rfc3339(),
         classified.kind.label(),
-        classified.text
+        body
     );
 }
 

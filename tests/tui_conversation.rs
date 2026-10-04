@@ -189,7 +189,9 @@ fn codex_direct_json_response_is_an_assistant_message() {
     let classified = classify(&entry(ConversationSource::Stdout, raw));
 
     assert_eq!(classified.kind, EntryKind::Assistant);
-    assert_eq!(classified.text, raw);
+    assert_eq!(classified.summary, "clean");
+    assert_eq!(classified.raw, raw.as_bytes());
+    assert_eq!(classified.details["message.content"], "clean");
 }
 
 /// R16: Codex lifecycle envelopes must describe the session stage, rather
@@ -222,7 +224,7 @@ fn codex_lifecycle_events_have_distinct_readable_projections() {
     for (raw, kind, text) in cases {
         let classified = classify(&entry(ConversationSource::Stdout, raw));
         assert_eq!(classified.kind, kind, "{raw}");
-        assert_eq!(classified.text, text, "{raw}");
+        assert_eq!(classified.summary, text, "{raw}");
         assert_eq!(classified.raw, raw.as_bytes(), "{raw}");
     }
 }
@@ -256,7 +258,7 @@ fn codex_tool_events_have_distinct_readable_projections() {
     for (raw, kind, text) in cases {
         let classified = classify(&entry(ConversationSource::Stdout, raw));
         assert_eq!(classified.kind, kind, "{raw}");
-        assert_eq!(classified.text, text, "{raw}");
+        assert_eq!(classified.summary, text, "{raw}");
         assert_eq!(classified.raw, raw.as_bytes(), "{raw}");
     }
 }
@@ -269,8 +271,13 @@ fn incomplete_codex_items_keep_a_standard_tool_summary() {
     let classified = classify(&entry(ConversationSource::Stdout, raw));
 
     assert_eq!(classified.kind, EntryKind::ToolCall);
-    assert_eq!(classified.text, "running command: command");
+    assert_eq!(classified.summary, "running command: command");
     assert_eq!(classified.raw, raw.as_bytes());
+    assert_eq!(classified.as_json()["summary"], "running command: command");
+    assert_eq!(
+        classified.as_json()["raw"],
+        serde_json::json!(raw.as_bytes())
+    );
 }
 
 // --- fallback ----------------------------------------------------------------
@@ -281,7 +288,7 @@ fn an_unrecognized_type_has_a_readable_summary_with_full_content_preserved() {
     let classified = classify(&entry(ConversationSource::Stdout, raw));
     assert_eq!(classified.kind, EntryKind::Raw);
     assert_eq!(
-        classified.text, "event: api_retry",
+        classified.summary, "event: api_retry",
         "R9: raw retains the original while the transcript remains readable"
     );
 }
@@ -291,7 +298,7 @@ fn non_json_content_is_raw_with_full_content_preserved() {
     let raw = "Traceback (most recent call last): boom";
     let classified = classify(&entry(ConversationSource::Stdout, raw));
     assert_eq!(classified.kind, EntryKind::Raw);
-    assert_eq!(classified.text, raw);
+    assert_eq!(classified.summary, raw);
 }
 
 #[test]
@@ -341,12 +348,198 @@ fn semantic_projection_keeps_the_complete_source_for_diagnostics() {
     for (raw, kind, rendered) in cases {
         let classified = classify(&entry(ConversationSource::Stdout, raw));
         assert_eq!(classified.kind, kind, "{raw}");
-        assert_eq!(classified.text, rendered, "{raw}");
+        assert_eq!(classified.summary, rendered, "{raw}");
         assert_eq!(
             classified.raw,
             raw.as_bytes(),
             "raw mode must remain lossless"
         );
+    }
+}
+
+#[test]
+fn unified_events_have_lossless_raw_and_normalized_details() {
+    let cases = [
+        (
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"shell","input":{"command":"pwd"}}]}}"#,
+            EntryKind::ToolCall,
+            "tool.name",
+            "shell",
+        ),
+        (
+            r#"{"type":"tool_use","name":"shell","state":{"input":{"command":"pwd"},"output":"ok"}}"#,
+            EntryKind::ToolCall,
+            "tool.name",
+            "shell",
+        ),
+        (
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"pwd","exit_code":0}}"#,
+            EntryKind::ToolResult,
+            "tool.command",
+            "pwd",
+        ),
+    ];
+    for (raw, kind, key, expected) in cases {
+        let event = classify(&entry(ConversationSource::Stdout, raw));
+        assert_eq!(event.kind, kind);
+        assert!(!event.summary.is_empty());
+        assert_eq!(event.details[key], expected);
+        assert_eq!(event.raw, raw.as_bytes());
+        let serialized = event.as_json();
+        assert!(serialized.get("kind").is_some());
+        assert!(serialized.get("summary").is_some());
+        assert!(serialized.get("details").is_some());
+        assert_eq!(serialized["raw"], serde_json::json!(raw.as_bytes()));
+    }
+
+    let bytes = [0xff, b'\n', 0x00];
+    let binary_entry = ConversationEntryDto {
+        entry_number: 2,
+        timestamp: Utc::now(),
+        source: ConversationSource::Stdout,
+        raw_base64: BASE64.encode(bytes),
+    };
+    let event = classify(&binary_entry);
+    assert_eq!(event.raw, bytes);
+    assert_eq!(event.as_json()["raw"], serde_json::json!([255, 10, 0]));
+
+    let formatted = "{ \"b\": 2, \"a\": 1 }";
+    let event = classify(&entry(ConversationSource::Stdout, formatted));
+    assert_eq!(
+        event.as_json()["raw"],
+        serde_json::json!(formatted.as_bytes())
+    );
+}
+
+#[test]
+fn claude_expansion_retains_each_content_block_in_order() {
+    let raw = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"first"},{"type":"text","text":"second"},{"type":"tool_use","name":"shell","input":{"command":"pwd"}},{"type":"tool_use","name":"search","input":{"query":"docs"}}]}}"#;
+    let event = classify(&entry(ConversationSource::Stdout, raw));
+
+    assert_eq!(event.summary, "first");
+    assert_eq!(
+        event.details["message.blocks"][0]["message.content"],
+        "first"
+    );
+    assert_eq!(
+        event.details["message.blocks"][1]["message.content"],
+        "second"
+    );
+    assert_eq!(event.details["message.blocks"][2]["tool.name"], "shell");
+    assert_eq!(event.details["message.blocks"][3]["tool.name"], "search");
+    assert_eq!(
+        event.details["message.blocks"][3]["tool.input"]["query"],
+        "docs"
+    );
+}
+
+#[test]
+fn codex_message_and_command_do_not_invent_tool_names() {
+    for raw in [
+        r#"{"type":"item.completed","item":{"type":"agent_message","text":"Hello"}}"#,
+        r#"{"type":"item.completed","item":{"type":"command_execution","command":"pwd","exit_code":0}}"#,
+    ] {
+        let event = classify(&entry(ConversationSource::Stdout, raw));
+        assert!(event.details.get("tool.name").is_none(), "{raw}");
+    }
+
+    let raw =
+        r#"{"type":"item.started","item":{"type":"mcp_tool_call","tool_name":"search_issues"}}"#;
+    let event = classify(&entry(ConversationSource::Stdout, raw));
+    assert_eq!(event.details["tool.name"], "search_issues");
+}
+
+#[test]
+fn incomplete_harness_events_stay_semantic() {
+    let cases = [
+        (
+            r#"{"type":"assistant","message":{}}"#,
+            EntryKind::Assistant,
+            "assistant message",
+        ),
+        (
+            r#"{"type":"user","message":{}}"#,
+            EntryKind::User,
+            "user message",
+        ),
+        (r#"{"type":"reasoning"}"#, EntryKind::Thinking, "thinking"),
+        (r#"{"type":"tool_use"}"#, EntryKind::ToolCall, "tool call"),
+        (
+            r#"{"type":"item.started"}"#,
+            EntryKind::ToolCall,
+            "tool event",
+        ),
+        (
+            r#"{"type":"item.completed","item":{"type":"unknown"}}"#,
+            EntryKind::ToolResult,
+            "tool event: unknown",
+        ),
+    ];
+    for (raw, kind, summary) in cases {
+        let event = classify(&entry(ConversationSource::Stdout, raw));
+        assert_eq!(event.kind, kind, "{raw}");
+        assert_eq!(event.summary, summary, "{raw}");
+        assert_eq!(event.raw, raw.as_bytes());
+    }
+}
+
+#[test]
+fn narsor_events_use_workflow_vocabulary() {
+    let cases = [
+        (
+            r#"{"event":"prompt","harness":"codex","prompt":"Fix it"}"#,
+            "agent_input",
+            "Workflow sends input to agent",
+        ),
+        ("step started", "step_started", "Workflow step started"),
+        (
+            "step completed",
+            "step_completed",
+            "Workflow step completed",
+        ),
+        (
+            "harness run failed: boom",
+            "step_failed",
+            "Workflow step failed",
+        ),
+        ("retry requested", "retry", "Workflow retries agent step"),
+        (
+            "waiting for input",
+            "waiting_for_input",
+            "Workflow waits for input",
+        ),
+    ];
+    for (raw, event_name, summary) in cases {
+        let event = classify(&entry(ConversationSource::Narsor, raw));
+        assert_eq!(event.kind, EntryKind::Narsor);
+        assert_eq!(event.summary, summary);
+        assert_eq!(event.details["workflow.event"], event_name);
+        assert_eq!(event.raw, raw.as_bytes());
+    }
+}
+
+#[test]
+fn equivalent_harness_messages_have_the_same_rendered_contract() {
+    let claude = classify(&entry(
+        ConversationSource::Stdout,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}"#,
+    ));
+    let opencode = classify(&entry(
+        ConversationSource::Stdout,
+        r#"{"type":"text","text":"Hello"}"#,
+    ));
+    let codex = classify(&entry(
+        ConversationSource::Stdout,
+        r#"{"type":"item.completed","item":{"type":"agent_message","text":"Hello"}}"#,
+    ));
+    for event in [&opencode, &codex] {
+        assert_eq!(event.kind, claude.kind);
+        assert_eq!(event.summary, claude.summary);
+        assert_eq!(
+            event.details["message.content"],
+            claude.details["message.content"]
+        );
+        assert_ne!(event.raw, claude.raw);
     }
 }
 

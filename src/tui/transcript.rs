@@ -3,6 +3,7 @@
 //! Source adapters own their records and actions. This module only keeps the
 //! reading position stable while a conversation grows or changes presentation.
 
+use serde_json::Value;
 use std::collections::HashSet;
 
 use super::scroll::{sanitize, wrap_line, ScrollState};
@@ -69,6 +70,8 @@ pub struct TranscriptEntry {
     pub presentation: TranscriptPresentation,
     /// Optional technical detail included only when expanded in rendered mode.
     pub technical_lines: Vec<String>,
+    /// Normalized adapter fields, formatted only while this entry is expanded.
+    pub details: Option<Value>,
     /// Whether expanding this entry reveals its retained raw diagnostic source.
     pub raw_detail: bool,
     /// Exact retained source bytes. This is never replaced by decoded text.
@@ -82,6 +85,7 @@ impl TranscriptEntry {
             rendered_lines,
             presentation: TranscriptPresentation::Neutral,
             technical_lines: Vec::new(),
+            details: None,
             raw_detail: false,
             raw,
         }
@@ -89,6 +93,11 @@ impl TranscriptEntry {
 
     pub fn with_technical_lines(mut self, technical_lines: Vec<String>) -> Self {
         self.technical_lines = technical_lines;
+        self
+    }
+
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
         self
     }
 
@@ -386,37 +395,49 @@ impl TranscriptState {
     }
 
     fn lines_for(&self, entry: &TranscriptEntry) -> Vec<TranscriptLine> {
-        let lines = match self.mode {
-            DisplayMode::Raw => vec![(raw_display(&entry.raw), TranscriptPresentation::Neutral)],
-            DisplayMode::Rendered => {
-                let mut lines = entry
-                    .rendered_lines
-                    .iter()
-                    .cloned()
-                    .map(|text| (text, entry.presentation))
-                    .collect::<Vec<_>>();
-                if lines.is_empty() {
-                    lines.push((String::new(), entry.presentation));
+        let lines =
+            match self.mode {
+                DisplayMode::Raw => {
+                    vec![(raw_display(&entry.raw), TranscriptPresentation::Neutral)]
                 }
-                if self.is_expanded(&entry.id) {
-                    lines.extend(
-                        entry
-                            .technical_lines
-                            .iter()
-                            .cloned()
-                            .map(|text| (text, TranscriptPresentation::Technical)),
-                    );
-                    if entry.raw_detail {
-                        lines.extend(
-                            raw_display(&entry.raw)
-                                .lines()
-                                .map(|text| (text.to_owned(), TranscriptPresentation::Technical)),
-                        );
+                DisplayMode::Rendered => {
+                    let mut lines = entry
+                        .rendered_lines
+                        .iter()
+                        .cloned()
+                        .map(|text| (text, entry.presentation))
+                        .collect::<Vec<_>>();
+                    if lines.is_empty() {
+                        lines.push((String::new(), entry.presentation));
                     }
+                    if self.is_expanded(&entry.id) {
+                        if let Some(details) = entry.details.as_ref().filter(|value| {
+                            value.as_object().is_some_and(|object| !object.is_empty())
+                        }) {
+                            if let Ok(pretty) = serde_json::to_string_pretty(details) {
+                                lines.extend(pretty.lines().map(|text| {
+                                    (sanitize(text), TranscriptPresentation::Technical)
+                                }));
+                            }
+                        }
+                        lines.extend(
+                            entry
+                                .technical_lines
+                                .iter()
+                                .cloned()
+                                .map(|text| (text, TranscriptPresentation::Technical)),
+                        );
+                        if entry.raw_detail {
+                            lines.extend(
+                                raw_display(&entry.raw).lines().map(|text| {
+                                    (text.to_owned(), TranscriptPresentation::Technical)
+                                }),
+                            );
+                        }
+                    }
+                    lines
                 }
-                lines
-            }
-        };
+            };
         lines
             .into_iter()
             .enumerate()

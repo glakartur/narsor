@@ -42,7 +42,7 @@ use crate::orchestration::{
 };
 
 use super::app::agent_transcript_entry;
-use super::conversation::{classify, ClassifiedEntry};
+use super::conversation::{classify, TranscriptEvent};
 use super::input_form::{FormAction, InputForm};
 use super::transcript::{TranscriptId, TranscriptState};
 
@@ -575,7 +575,7 @@ pub struct PageView {
     /// Attempt the page belongs to.
     pub attempt_id: String,
     /// Entries, classified for display.
-    pub entries: Vec<ClassifiedEntry>,
+    pub entries: Vec<TranscriptEvent>,
     /// Entry number to continue from.
     pub next_entry: u64,
     /// Whether the attempt's record is closed.

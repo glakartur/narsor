@@ -2965,7 +2965,7 @@ async fn c_on_a_second_attempt_event_opens_its_position_and_conversation() {
             ..
         } => {
             assert!(
-                entries.iter().any(|entry| entry.text.contains("done")),
+                entries.iter().any(|entry| entry.summary.contains("done")),
                 "attempt-2's own conversation was loaded: {entries:?}"
             );
             let rendered = transcript
@@ -3029,6 +3029,21 @@ async fn expanding_a_conversation_entry_toggles_and_collapses_again() {
         matches!(&task_view(&app).content, TaskContent::Conversation { transcript, .. } if transcript.is_expanded(&entry_id)),
         "first Enter should expand the transcript entry"
     );
+    if let TaskContent::Conversation { transcript, .. } = &task_view(&app).content {
+        let expanded = transcript
+            .logical_lines()
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        assert!(expanded.iter().any(|line| {
+            line.contains("message.content")
+                || line.contains("event.type")
+                || line.contains("workflow.event")
+        }));
+        assert!(!expanded
+            .iter()
+            .any(|line| line.contains("\"type\":\"assistant\"")));
+    }
 
     app.on_key(key(KeyCode::Enter));
     assert!(
@@ -3041,6 +3056,16 @@ async fn expanding_a_conversation_entry_toggles_and_collapses_again() {
         matches!(&task_view(&app).content, TaskContent::Conversation { transcript, .. } if transcript.mode() == DisplayMode::Raw),
         "content focus switches the same transcript to diagnostic raw mode"
     );
+    if let TaskContent::Conversation { transcript, .. } = &task_view(&app).content {
+        let raw = transcript
+            .logical_lines()
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        assert!(raw
+            .iter()
+            .any(|line| line.contains("\"type\":\"assistant\"")));
+    }
     assert!(
         app.shortcuts()
             .iter()

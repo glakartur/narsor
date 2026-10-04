@@ -1,12 +1,11 @@
-//! Classifies conversation entries by kind, per harness (U7, R10).
+//! Translates retained conversation records into one transcript event model.
 //!
 //! [`crate::persistence::conversation`] and the API's
 //! [`crate::api::ConversationEntryDto`] deliberately keep the raw harness line
 //! untouched — "the raw line stays, so a harness format change never breaks
 //! the record" (the plan's Key Technical Decisions). This module is where
-//! that raw line is finally turned into something an operator can tell apart
-//! at a glance: a kind ([`EntryKind`]) the task view (U7) styles differently,
-//! and a decoded, sanitized text to show.
+//! that raw line becomes a semantic kind, summary, and normalized details.
+//! The renderer sanitizes these fields before terminal display.
 //!
 //! # Why sniffing the shape instead of asking which harness wrote it
 //!
@@ -18,8 +17,8 @@
 //! every call site, keeps this module a pure function of one entry and still
 //! tells the two harnesses' lines apart correctly — and degrades safely
 //! (→ [`EntryKind::Raw`]) for whatever a future harness or a future harness
-//! version sends that neither shape recognizes, per R9's "raw content is
-//! always available".
+//! version sends that neither shape recognizes. Every event retains its exact
+//! source bytes for raw mode.
 //!
 //! # Where `Narsor`/`Stderr` fit in
 //!
@@ -62,7 +61,7 @@ pub enum EntryKind {
     /// `step_finish` and `error` lines — none of them a conversational turn.
     System,
     /// Not valid JSON, or JSON this module does not recognize the shape of.
-    /// The decoded text is always the full raw content regardless (R9).
+    /// The source bytes remain available in raw mode.
     Raw,
 }
 
@@ -84,9 +83,9 @@ impl EntryKind {
     }
 }
 
-/// One conversation entry, decoded and classified, ready for the task view.
+/// One retained record translated into the shared transcript vocabulary.
 #[derive(Debug, Clone)]
-pub struct ClassifiedEntry {
+pub struct TranscriptEvent {
     /// Sequential entry number, starting at 1.
     pub entry_number: u64,
     /// When narsor observed (or produced) this line.
@@ -99,56 +98,331 @@ pub struct ClassifiedEntry {
     /// for diagnostic/raw mode rather than attempting to reconstruct it from
     /// the readable projection below.
     pub raw: Vec<u8>,
-    /// The decoded raw content, as text. Not yet sanitized — the task view's
-    /// rendering path runs [`crate::tui::scroll::sanitize`] on it, the same
-    /// as every other window (R10), right before it reaches the terminal.
-    pub text: String,
+    /// Short semantic presentation. Terminal sanitization happens at display.
+    pub summary: String,
+    /// Adapter-neutral fields, including longer content for expansion.
+    pub details: Value,
+}
+
+impl TranscriptEvent {
+    /// A JSON view of the event. Exact bytes remain in [`Self::raw`].
+    pub fn as_json(&self) -> Value {
+        serde_json::json!({
+            "kind": self.kind.label(),
+            "summary": self.summary,
+            "details": self.details,
+            "raw": self.raw,
+        })
+    }
+
+    /// Complete normalized fields for rendered expansion; raw mode owns the
+    /// source payload and is the only view that displays it.
+    pub fn detail_lines(&self) -> Vec<String> {
+        if self
+            .details
+            .as_object()
+            .is_none_or(serde_json::Map::is_empty)
+        {
+            return Vec::new();
+        }
+        serde_json::to_string_pretty(&self.details)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 /// Decodes and classifies one entry off the wire.
 ///
-/// Never drops content: a payload that is not valid UTF-8 falls back to a
-/// lossy decode rather than being discarded, and a payload that is not valid
-/// JSON (or does not match a recognized shape) becomes [`EntryKind::Raw`]
-/// with its text unchanged.
-pub fn classify(entry: &ConversationEntryDto) -> ClassifiedEntry {
+/// Never drops content: invalid UTF-8 is decoded lossily for presentation,
+/// while [`TranscriptEvent::raw`] always retains the original bytes. Unknown
+/// JSON receives a generic summary and [`EntryKind::Raw`].
+pub fn classify(entry: &ConversationEntryDto) -> TranscriptEvent {
     let raw = BASE64
         .decode(entry.raw_base64.as_bytes())
         .unwrap_or_default();
     let text = String::from_utf8_lossy(&raw).into_owned();
 
-    let (kind, text) = match entry.source {
-        ConversationSource::Narsor => (EntryKind::Narsor, text),
-        ConversationSource::Stderr => (EntryKind::Stderr, text),
-        ConversationSource::Stdout => project_stdout_line(&text),
+    let (kind, summary, details) = match entry.source {
+        ConversationSource::Narsor => adapt_narsor(&text),
+        ConversationSource::Stderr => (
+            EntryKind::Stderr,
+            text.clone(),
+            serde_json::json!({"error.message": text}),
+        ),
+        ConversationSource::Stdout => adapt_stdout(&text),
     };
 
-    ClassifiedEntry {
+    TranscriptEvent {
         entry_number: entry.entry_number,
         timestamp: entry.timestamp,
         source: entry.source,
         kind,
         raw,
-        text,
+        summary,
+        details,
     }
 }
 
-/// Produces the primary, readable body while preserving the raw envelope in
-/// [`ClassifiedEntry::raw`].  Technical forms deliberately retain a concise
-/// summary here; their full arguments/results are still available verbatim in
-/// raw mode.
-fn project_stdout_line(text: &str) -> (EntryKind, String) {
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return (EntryKind::Raw, text.to_owned());
+fn adapt_narsor(text: &str) -> (EntryKind, String, Value) {
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        if let Some(event) = value.get("event").and_then(Value::as_str) {
+            let (normalized, summary) = match event {
+                "prompt" | "agent_input" => ("agent_input", "Workflow sends input to agent"),
+                "step_started" | "step_start" => ("step_started", "Workflow step started"),
+                "step_completed" | "step_finish" => ("step_completed", "Workflow step completed"),
+                "step_failed" => ("step_failed", "Workflow step failed"),
+                "retry" => ("retry", "Workflow retries agent step"),
+                "waiting_for_input" => ("waiting_for_input", "Workflow waits for input"),
+                _ => ("message", "Workflow message"),
+            };
+            let mut details = serde_json::json!({"workflow.event": normalized});
+            insert_detail(&mut details, "workflow.harness", value.get("harness"));
+            insert_detail(
+                &mut details,
+                "workflow.session",
+                value.get("resumed_session"),
+            );
+            insert_detail(&mut details, "workflow.step", value.get("step"));
+            insert_detail(&mut details, "workflow.attempt", value.get("attempt"));
+            insert_detail(
+                &mut details,
+                "message.content",
+                value.get("prompt").or_else(|| value.get("message")),
+            );
+            insert_detail(&mut details, "error.message", value.get("error"));
+            return (EntryKind::Narsor, summary.into(), details);
+        }
+    }
+    let lower = text.to_ascii_lowercase();
+    let (event, summary) = if lower.starts_with("prompt:") {
+        ("agent_input", "Workflow sends input to agent")
+    } else if lower.contains("waiting") && lower.contains("input") {
+        ("waiting_for_input", "Workflow waits for input")
+    } else if lower.contains("retry") {
+        ("retry", "Workflow retries agent step")
+    } else if lower.contains("failed")
+        || lower.contains("error")
+        || lower.contains("timed out")
+        || lower.contains("did not start")
+        || lower.starts_with("harness exited with code ") && !lower.ends_with("code 0")
+    {
+        ("step_failed", "Workflow step failed")
+    } else if lower.contains("completed")
+        || lower.contains("success")
+        || lower.contains("exited with code 0")
+    {
+        ("step_completed", "Workflow step completed")
+    } else if lower.contains("started") || lower.contains("running") {
+        ("step_started", "Workflow step started")
+    } else {
+        ("message", "Workflow message")
     };
-    let kind = classify_stdout_value(&value);
-    let projected = match kind {
-        EntryKind::System | EntryKind::Result if is_codex_event(&value) => {
-            project_codex_event(&value)
+    (
+        EntryKind::Narsor,
+        summary.into(),
+        serde_json::json!({"workflow.event": event, "workflow.message": text}),
+    )
+}
+
+fn adapt_stdout(text: &str) -> (EntryKind, String, Value) {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return (
+            EntryKind::Raw,
+            text.to_owned(),
+            serde_json::json!({"message.content": text}),
+        );
+    };
+    if is_codex_event(&value) || is_codex_item_event(&value) || is_codex_direct_response(&value) {
+        return adapt_codex(&value);
+    }
+    match value.get("type").and_then(Value::as_str) {
+        Some("assistant" | "user" | "system" | "result") => adapt_claude(&value),
+        Some("text" | "reasoning" | "tool_use" | "step_start" | "step_finish" | "error") => {
+            adapt_opencode(&value)
         }
-        EntryKind::ToolCall | EntryKind::ToolResult if is_codex_item_event(&value) => {
-            project_codex_item(&value)
+        _ => {
+            let mut details = serde_json::json!({});
+            insert_detail(&mut details, "event.type", value.get("type"));
+            (EntryKind::Raw, generic_json_summary(&value), details)
         }
+    }
+}
+
+fn adapt_claude(value: &Value) -> (EntryKind, String, Value) {
+    let kind = classify_stdout_value(value);
+    let block = value
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .and_then(|blocks| {
+            blocks.iter().find(|block| match kind {
+                EntryKind::Thinking => block["type"] == "thinking",
+                EntryKind::ToolCall => block["type"] == "tool_use",
+                EntryKind::ToolResult => block["type"] == "tool_result",
+                _ => block["type"] == "text",
+            })
+        });
+    let summary = if kind == EntryKind::User {
+        block
+            .and_then(|b| b.get("text"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("user message")
+            .to_owned()
+    } else {
+        project_claude_summary(value, kind)
+    };
+    let mut details = serde_json::json!({});
+    insert_detail(
+        &mut details,
+        "message.content",
+        block
+            .and_then(|b| {
+                b.get("text")
+                    .or_else(|| b.get("thinking"))
+                    .or_else(|| b.get("content"))
+            })
+            .or_else(|| value.get("result")),
+    );
+    insert_detail(&mut details, "tool.name", block.and_then(|b| b.get("name")));
+    insert_detail(
+        &mut details,
+        "tool.input",
+        block.and_then(|b| b.get("input")),
+    );
+    insert_detail(
+        &mut details,
+        "tool.output",
+        block.and_then(|b| b.get("content")),
+    );
+    if let Some(blocks) = value
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .filter(|blocks| blocks.len() > 1)
+    {
+        let normalized = blocks
+            .iter()
+            .map(|block| {
+                let mut fields = serde_json::json!({});
+                let kind = match block.get("type").and_then(Value::as_str) {
+                    Some("text") => "message",
+                    Some("thinking") => "thinking",
+                    Some("tool_use") => "tool_call",
+                    Some("tool_result") => "tool_result",
+                    _ => "other",
+                };
+                fields["kind"] = Value::String(kind.into());
+                insert_detail(
+                    &mut fields,
+                    "message.content",
+                    block
+                        .get("text")
+                        .or_else(|| block.get("thinking"))
+                        .or_else(|| block.get("content")),
+                );
+                insert_detail(&mut fields, "tool.name", block.get("name"));
+                insert_detail(&mut fields, "tool.input", block.get("input"));
+                insert_detail(&mut fields, "tool.output", block.get("content"));
+                fields
+            })
+            .collect();
+        let detail_fields = details.as_object_mut().expect("details object");
+        for key in ["message.content", "tool.name", "tool.input", "tool.output"] {
+            detail_fields.remove(key);
+        }
+        detail_fields.insert("message.blocks".into(), Value::Array(normalized));
+    }
+    insert_detail(&mut details, "event.type", value.get("subtype"));
+    insert_detail(&mut details, "error.message", value.get("error"));
+    (kind, summary, details)
+}
+
+fn adapt_opencode(value: &Value) -> (EntryKind, String, Value) {
+    let kind = classify_stdout_value(value);
+    let summary = project_opencode_summary(value, kind);
+    let mut details = serde_json::json!({});
+    insert_detail(&mut details, "message.content", value.get("text"));
+    insert_detail(&mut details, "tool.name", value.get("name"));
+    insert_detail(&mut details, "tool.input", value.pointer("/state/input"));
+    insert_detail(&mut details, "tool.output", value.pointer("/state/output"));
+    insert_detail(&mut details, "event.type", value.get("type"));
+    insert_detail(
+        &mut details,
+        "error.message",
+        value
+            .get("message")
+            .or_else(|| value.pointer("/error/message")),
+    );
+    (kind, summary, details)
+}
+
+fn adapt_codex(value: &Value) -> (EntryKind, String, Value) {
+    let kind = classify_stdout_value(value);
+    let summary = if is_codex_direct_response(value) {
+        value
+            .get("output")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("agent reply")
+            .to_owned()
+    } else if is_codex_item_event(value) {
+        project_codex_item(value)
+    } else {
+        project_codex_event(value)
+    };
+    let item = value.get("item");
+    let mut details = serde_json::json!({});
+    insert_detail(
+        &mut details,
+        "message.content",
+        item.and_then(|i| i.get("text").or_else(|| i.get("summary")))
+            .or_else(|| value.get("output")),
+    );
+    if matches!(kind, EntryKind::ToolCall | EntryKind::ToolResult) {
+        insert_detail(
+            &mut details,
+            "tool.name",
+            item.and_then(|i| i.get("tool_name").or_else(|| i.get("name"))),
+        );
+    }
+    insert_detail(
+        &mut details,
+        "tool.command",
+        item.and_then(|i| i.get("command")),
+    );
+    insert_detail(
+        &mut details,
+        "tool.exit_code",
+        item.and_then(|i| i.get("exit_code")),
+    );
+    insert_detail(
+        &mut details,
+        "tool.output",
+        item.and_then(|i| i.get("aggregated_output").or_else(|| i.get("result"))),
+    );
+    insert_detail(&mut details, "event.type", value.get("type"));
+    insert_detail(
+        &mut details,
+        "error.message",
+        item.and_then(|i| i.get("message"))
+            .or_else(|| value.pointer("/error/message"))
+            .or_else(|| value.get("error")),
+    );
+    (kind, summary, details)
+}
+
+fn insert_detail(details: &mut Value, key: &str, value: Option<&Value>) {
+    if let Some(value) = value.filter(|value| !value.is_null()) {
+        details
+            .as_object_mut()
+            .expect("details object")
+            .insert(key.into(), value.clone());
+    }
+}
+
+fn project_claude_summary(value: &Value, kind: EntryKind) -> String {
+    match kind {
         EntryKind::Assistant => value
             .pointer("/message/content")
             .and_then(Value::as_array)
@@ -160,8 +434,7 @@ fn project_stdout_line(text: &str) -> (EntryKind, String) {
                 })
             })
             .or_else(|| value.get("text").and_then(Value::as_str))
-            .or_else(|| value.pointer("/item/text").and_then(Value::as_str))
-            .unwrap_or(text)
+            .unwrap_or("assistant message")
             .to_owned(),
         EntryKind::Thinking => value
             .pointer("/message/content")
@@ -174,7 +447,6 @@ fn project_stdout_line(text: &str) -> (EntryKind, String) {
                 })
             })
             .or_else(|| value.get("text").and_then(Value::as_str))
-            .or_else(|| value.pointer("/item/summary").and_then(Value::as_str))
             .unwrap_or("thinking")
             .to_owned(),
         EntryKind::Result => value
@@ -199,14 +471,39 @@ fn project_stdout_line(text: &str) -> (EntryKind, String) {
                 })
             })
             .or_else(|| value.get("name").and_then(Value::as_str))
-            .or_else(|| value.pointer("/item/type").and_then(Value::as_str))
             .map(|name| format!("calling {name}"))
             .unwrap_or_else(|| "tool call".to_owned()),
         EntryKind::ToolResult => "tool result".to_owned(),
-        EntryKind::Raw => generic_json_summary(&value),
-        _ => text.to_owned(),
-    };
-    (kind, projected)
+        EntryKind::User => "user message".to_owned(),
+        _ => "event".to_owned(),
+    }
+}
+
+fn project_opencode_summary(value: &Value, kind: EntryKind) -> String {
+    match kind {
+        EntryKind::Assistant => value
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("assistant message")
+            .to_owned(),
+        EntryKind::Thinking => value
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("thinking")
+            .to_owned(),
+        EntryKind::ToolCall => value
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| format!("calling {name}"))
+            .unwrap_or_else(|| "tool call".to_owned()),
+        EntryKind::System => value
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("type").and_then(Value::as_str))
+            .unwrap_or("system event")
+            .to_owned(),
+        _ => "event".to_owned(),
+    }
 }
 
 /// True for the outer JSONL envelopes written by `codex exec --json`.
@@ -238,9 +535,7 @@ fn project_codex_event(value: &Value) -> String {
     }
 }
 
-/// Projects Codex tool items at the classification boundary.  Returning
-/// `None` is deliberate: incomplete or new item variants must retain their
-/// decoded envelope rather than receiving a plausible but misleading label.
+/// Projects Codex items to readable summaries, including sparse items.
 fn project_codex_item(value: &Value) -> String {
     let Some(item) = value.get("item") else {
         return "tool event".to_owned();
@@ -353,7 +648,10 @@ fn classify_stdout_value(value: &Value) -> EntryKind {
         // Claude Code: one full message envelope per line; the message's own
         // content blocks (grouped by `message.id`) carry the finer kind.
         "assistant" => classify_message_content(value).unwrap_or(EntryKind::Assistant),
-        "user" => classify_message_content(value).unwrap_or(EntryKind::User),
+        "user" => match classify_message_content(value) {
+            Some(EntryKind::ToolResult) => EntryKind::ToolResult,
+            _ => EntryKind::User,
+        },
         "system" => EntryKind::System,
         "result" => EntryKind::Result,
 
@@ -369,7 +667,11 @@ fn classify_stdout_value(value: &Value) -> EntryKind {
         "turn.completed" => EntryKind::Result,
         "turn.failed" => EntryKind::System,
         "item.started" | "item.updated" | "item.completed" => {
-            classify_codex_item(value, type_field).unwrap_or(EntryKind::Raw)
+            classify_codex_item(value, type_field).unwrap_or(if type_field == "item.completed" {
+                EntryKind::ToolResult
+            } else {
+                EntryKind::ToolCall
+            })
         }
 
         _ => EntryKind::Raw,
@@ -441,7 +743,8 @@ mod tests {
     fn narsor_lines_are_always_the_narsor_kind() {
         let classified = classify(&entry(ConversationSource::Narsor, "prompt: do the thing"));
         assert_eq!(classified.kind, EntryKind::Narsor);
-        assert_eq!(classified.text, "prompt: do the thing");
+        assert_eq!(classified.summary, "Workflow sends input to agent");
+        assert_eq!(classified.details["workflow.event"], "agent_input");
     }
 
     #[test]
@@ -534,7 +837,8 @@ mod tests {
         let raw = r#"{"type":"api_retry","detail":"..."}"#;
         let classified = classify(&entry(ConversationSource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::Raw);
-        assert_eq!(classified.text, raw);
+        assert_eq!(classified.summary, "event: api_retry");
+        assert_eq!(classified.raw, raw.as_bytes());
     }
 
     #[test]
@@ -542,7 +846,7 @@ mod tests {
         let raw = "not json at all";
         let classified = classify(&entry(ConversationSource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::Raw);
-        assert_eq!(classified.text, raw);
+        assert_eq!(classified.summary, raw);
     }
 
     #[test]
@@ -558,7 +862,7 @@ mod tests {
         let classified = classify(&entry);
 
         assert_eq!(classified.kind, EntryKind::Assistant);
-        assert_eq!(classified.text, "A readable reply");
+        assert_eq!(classified.summary, "A readable reply");
         assert_eq!(classified.raw, raw);
     }
 
