@@ -192,6 +192,87 @@ fn codex_direct_json_response_is_an_assistant_message() {
     assert_eq!(classified.text, raw);
 }
 
+/// R16: Codex lifecycle envelopes must describe the session stage, rather
+/// than exposing their shared JSONL event names as diagnostic placeholders.
+#[test]
+fn codex_lifecycle_events_have_distinct_readable_projections() {
+    let cases = [
+        (
+            r#"{"type":"thread.started","thread_id":"thread-1"}"#,
+            EntryKind::System,
+            "thread started",
+        ),
+        (
+            r#"{"type":"turn.started","turn":{"id":"turn-1"}}"#,
+            EntryKind::System,
+            "turn started",
+        ),
+        (
+            r#"{"type":"turn.completed","usage":{}}"#,
+            EntryKind::Result,
+            "turn completed",
+        ),
+        (
+            r#"{"type":"turn.failed","error":{"message":"rate limited"}}"#,
+            EntryKind::System,
+            "turn failed: rate limited",
+        ),
+    ];
+
+    for (raw, kind, text) in cases {
+        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        assert_eq!(classified.kind, kind, "{raw}");
+        assert_eq!(classified.text, text, "{raw}");
+        assert_eq!(classified.raw, raw.as_bytes(), "{raw}");
+    }
+}
+
+/// R16: tool calls and completions use the available tool-specific context.
+#[test]
+fn codex_tool_events_have_distinct_readable_projections() {
+    let cases = [
+        (
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"git status"}}"#,
+            EntryKind::ToolCall,
+            "running command: git status",
+        ),
+        (
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"git status","exit_code":0}}"#,
+            EntryKind::ToolResult,
+            "command completed: git status (exit 0)",
+        ),
+        (
+            r#"{"type":"item.started","item":{"type":"mcp_tool_call","server":"github","tool_name":"search_issues"}}"#,
+            EntryKind::ToolCall,
+            "calling MCP tool: github/search_issues",
+        ),
+        (
+            r#"{"type":"item.completed","item":{"type":"web_search","query":"Rust docs"}}"#,
+            EntryKind::ToolResult,
+            "web search completed: Rust docs",
+        ),
+    ];
+
+    for (raw, kind, text) in cases {
+        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        assert_eq!(classified.kind, kind, "{raw}");
+        assert_eq!(classified.text, text, "{raw}");
+        assert_eq!(classified.raw, raw.as_bytes(), "{raw}");
+    }
+}
+
+/// KTD3: a malformed known envelope stays visible as its original decoded
+/// content instead of being replaced with an invented technical description.
+#[test]
+fn incomplete_codex_items_fall_back_to_the_decoded_source() {
+    let raw = r#"{"type":"item.started","item":{"type":"command_execution"}}"#;
+    let classified = classify(&entry(ConversationSource::Stdout, raw));
+
+    assert_eq!(classified.kind, EntryKind::ToolCall);
+    assert_eq!(classified.text, raw);
+    assert_eq!(classified.raw, raw.as_bytes());
+}
+
 // --- fallback ----------------------------------------------------------------
 
 #[test]
