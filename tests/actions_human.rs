@@ -797,6 +797,8 @@ fn raise_problem(store: &ExecutionStore, execution: &mut WorkflowExecution) -> P
         fields: Vec::new(),
         question: None,
         answer_tail: Some("All done, tests pass.".to_string()),
+        agent_harness: None,
+        agent_session_id: None,
     };
     let problem = OutputProblem {
         reason: "no output label".to_string(),

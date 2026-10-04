@@ -94,6 +94,8 @@ impl ActionExecutor for HumanExecutor {
                     fields: config.inputs.clone(),
                     question: None,
                     answer_tail: None,
+                    agent_harness: None,
+                    agent_session_id: None,
                 }),
             ))
         })
@@ -152,6 +154,17 @@ pub struct HumanInputRequest {
     /// it stated no question.
     #[serde(default)]
     pub answer_tail: Option<String>,
+
+    /// The harness that produced an agent question. It is durable because
+    /// changing a default while the operator types must not move a
+    /// continuation to another harness.
+    #[serde(default)]
+    pub agent_harness: Option<String>,
+
+    /// The harness-native session that can be resumed. Old pending records
+    /// deserialize without one and therefore fall back to a fresh attempt.
+    #[serde(default)]
+    pub agent_session_id: Option<String>,
 }
 
 /// The durable record of a question awaiting an answer — `pending_input.json`.

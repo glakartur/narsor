@@ -145,6 +145,15 @@ const ANSWER_TAIL_BYTES: usize = 2 * 1024;
 const METADATA_OPERATOR_RECOVERY_NOTE_KEY: &str = "operator_recovery_note";
 const METADATA_AGENT_INPUT_KEY: &str = "agent_input";
 
+/// The one-shot instruction delivered by an operator to an agent step.
+/// `harness` and `session` are optional for records written before
+/// continuation metadata was persisted.
+struct AgentInput {
+    answer: String,
+    harness: Option<String>,
+    session: Option<String>,
+}
+
 /// How an execution ends when it enters the terminal state `state`.
 ///
 /// The answer comes from the workflow's own declaration (`WORKFLOW_SCHEMA.md`
@@ -1407,7 +1416,13 @@ impl Engine {
                     field: "answer or option".to_string(),
                 })
             })?;
-            self.store_agent_input(&mut execution, &state_id, &answer)?;
+            self.store_agent_input(
+                &mut execution,
+                &state_id,
+                &answer,
+                resumed.pending.request.agent_harness.as_deref(),
+                resumed.pending.request.agent_session_id.as_deref(),
+            )?;
             return Ok(HandleState::Ready(execution));
         }
 
@@ -1817,11 +1832,17 @@ impl Engine {
         // explicit recovery. It remains durable until this point, so a daemon
         // restart before the attempt begins cannot silently discard it.
         if let ActionConfig::Agent(config) = &mut rendered {
-            if let Some(answer) = self.take_agent_input(execution, state)? {
-                config
-                    .prompt
-                    .push_str("\n\nHuman answer to your question:\n");
-                config.prompt.push_str(&answer);
+            if let Some(input) = self.take_agent_input(execution, state)? {
+                if let (Some(harness), Some(session)) =
+                    (input.harness.as_deref(), input.session.as_deref())
+                {
+                    *config = agent::continuation_config(config, harness, session, &input.answer);
+                } else {
+                    config
+                        .prompt
+                        .push_str("\n\nHuman answer to your question:\n");
+                    config.prompt.push_str(&input.answer);
+                }
             }
             if let Some(note) = self.take_operator_recovery_note(execution)? {
                 config.prompt.push_str("\n\nOperator recovery note:\n");
@@ -2268,6 +2289,8 @@ impl Engine {
             fields: Vec::new(),
             question: None,
             answer_tail,
+            agent_harness: None,
+            agent_session_id: None,
         };
         let pending = PendingHumanInput::for_problem(
             execution.id.clone(),
@@ -2383,6 +2406,8 @@ impl Engine {
                     fields: Vec::new(),
                     question,
                     answer_tail,
+                    agent_harness: None,
+                    agent_session_id: None,
                 };
                 self.suspend_for_input(
                     execution,
@@ -2858,10 +2883,17 @@ impl Engine {
         execution: &mut WorkflowExecution,
         state_id: &str,
         answer: &str,
+        harness: Option<&str>,
+        session: Option<&str>,
     ) -> Result<(), EngineError> {
         engine_metadata_mut(execution).insert(
             METADATA_AGENT_INPUT_KEY.to_string(),
-            json!({ "state_id": state_id, "answer": answer }),
+            json!({
+                "state_id": state_id,
+                "answer": answer,
+                "harness": harness,
+                "session": session,
+            }),
         );
         self.store.save_execution(execution)?;
         Ok(())
@@ -2874,7 +2906,7 @@ impl Engine {
         &self,
         execution: &mut WorkflowExecution,
         state: &State,
-    ) -> Result<Option<String>, AttemptFailure> {
+    ) -> Result<Option<AgentInput>, AttemptFailure> {
         let Some(engine) = execution
             .metadata
             .get_mut("engine")
@@ -2895,13 +2927,24 @@ impl Engine {
             .get("answer")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        if answer.is_some() {
+        let input = answer.map(|answer| AgentInput {
+            answer,
+            harness: record
+                .get("harness")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            session: record
+                .get("session")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        });
+        if input.is_some() {
             engine.remove(METADATA_AGENT_INPUT_KEY);
             self.store
                 .save_execution(execution)
                 .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
         }
-        Ok(answer)
+        Ok(input)
     }
 
     /// Consumes a pending pause request, if there is one.

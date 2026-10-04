@@ -186,6 +186,26 @@ pub const BUILT_IN_HARNESS: &str = super::harness::claude_code::CLAUDE_CODE;
 /// The `parameters` key that continues an existing harness session (D18).
 pub const RESUME_SESSION_PARAMETER: &str = "resume_session";
 
+/// Configures the next normal attempt as a continuation of an operator-facing
+/// conversation. Unlike [`reprompt_config`], this preserves the action's
+/// workspace permission: the operator is explicitly asking the agent to keep
+/// working, not merely to repair an output envelope.
+pub fn continuation_config(
+    original: &AgentActionConfig,
+    harness: &str,
+    harness_session: &str,
+    message: &str,
+) -> AgentActionConfig {
+    let mut config = original.clone();
+    config.harness = Some(harness.to_string());
+    config.parameters.insert(
+        RESUME_SESSION_PARAMETER.to_string(),
+        Value::String(harness_session.to_string()),
+    );
+    config.prompt = message.to_string();
+    config
+}
+
 /// The variable the harness session id is published as, when there is one.
 pub const SESSION_ID_VARIABLE: &str = "agent_session_id";
 
@@ -658,6 +678,8 @@ impl AgentExecutor {
                     fields: agent_input_fields(options),
                     question: None,
                     answer_tail: None,
+                    agent_harness: Some(harness.to_string()),
+                    agent_session_id: run.session_id.clone(),
                 }),
             )),
         }

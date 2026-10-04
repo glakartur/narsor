@@ -502,6 +502,8 @@ async fn an_agent_question_suspends_the_same_action_for_human_input() {
     };
     assert_eq!(request.instruction, "Which API version should I target?");
     assert_eq!(request.fields[0].name, "answer");
+    assert_eq!(request.agent_harness.as_deref(), Some("claude-code"));
+    assert_eq!(request.agent_session_id.as_deref(), Some("fake-session-1"));
 }
 
 #[tokio::test]

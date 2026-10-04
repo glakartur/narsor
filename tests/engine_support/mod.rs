@@ -377,6 +377,8 @@ impl ActionExecutor for QuestioningAgentExecutor {
                         }],
                         question: None,
                         answer_tail: None,
+                        agent_harness: None,
+                        agent_session_id: None,
                     }),
                 ));
             }

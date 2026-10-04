@@ -2230,6 +2230,8 @@ impl ActionExecutor for AgentReply {
                         fields: Vec::new(),
                         question: None,
                         answer_tail: None,
+                        agent_harness: None,
+                        agent_session_id: None,
                     },
                 )),
             })
