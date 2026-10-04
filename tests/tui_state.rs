@@ -4101,6 +4101,18 @@ async fn i_opens_the_reply_form_for_an_agents_question() {
     let screen = screen_of(&mut app);
     assert!(screen.contains("Reply to the agent"));
     assert!(screen.contains("Which API version?"));
+
+    // Conversation text is an editor, not an append-only line: Alt+Enter
+    // inserts a newline and arrows place the next character in the middle.
+    app.on_key(key(KeyCode::Char('a')));
+    app.on_key(key(KeyCode::Char('b')));
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+    app.on_key(key(KeyCode::Char('c')));
+    app.on_key(key(KeyCode::Char('d')));
+    app.on_key(key(KeyCode::Left));
+    app.on_key(key(KeyCode::Left));
+    app.on_key(key(KeyCode::Char('X')));
+    assert_eq!(input_form(&app).values[0], "ab\nXcd");
 }
 
 /// A server-side refusal keeps the form open with what was typed: here the

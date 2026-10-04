@@ -336,6 +336,9 @@ pub struct InputForm {
     pub fields: Vec<HumanInputField>,
     /// The current value of each field, by index.
     pub values: Vec<String>,
+    /// Character offsets of text-field cursors. Kept separately from values
+    /// so a reply can be edited at any point rather than only appended to.
+    pub text_cursors: Vec<usize>,
     /// The state's outputs, with their descriptions.
     pub outputs: Vec<OutputDefinition>,
     /// The label choices: `None` means "let the engine infer it".
@@ -465,7 +468,7 @@ impl InputForm {
     pub fn new(pending: &PendingHumanInput, context: &[(String, Value)]) -> Self {
         let kind = InputKind::of(pending.continuation);
         let fields = pending.fields().to_vec();
-        let values = fields
+        let values: Vec<String> = fields
             .iter()
             .map(|field| match field.field_type {
                 // A select starts on its first option, so the common case is
@@ -477,6 +480,7 @@ impl InputForm {
                 HumanInputType::Text => String::new(),
             })
             .collect();
+        let text_cursors = values.iter().map(|value| value.chars().count()).collect();
 
         let label_field = fields
             .iter()
@@ -535,6 +539,7 @@ impl InputForm {
             answer_tail: pending.request.answer_tail.clone(),
             fields,
             values,
+            text_cursors,
             outputs: pending.outputs.clone(),
             label_choices,
             label_index,
@@ -633,6 +638,9 @@ impl InputForm {
         let rows = self.rows();
         match key.code {
             KeyCode::Esc => return FormAction::Cancel,
+            KeyCode::Enter if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
+                self.insert_newline();
+            }
             KeyCode::Enter => return FormAction::Submit,
             KeyCode::Tab | KeyCode::Down => {
                 if !rows.is_empty() {
@@ -777,7 +785,14 @@ impl InputForm {
         match self.current_row() {
             Some(FormRow::Field(index)) => {
                 let field = &self.fields[index];
-                if field.field_type != HumanInputType::Select || field.options.is_empty() {
+                if field.field_type == HumanInputType::Text {
+                    let cursor = &mut self.text_cursors[index];
+                    *cursor = ((*cursor as isize + delta)
+                        .clamp(0, self.values[index].chars().count() as isize))
+                        as usize;
+                    return;
+                }
+                if field.options.is_empty() {
                     return;
                 }
                 let next = match field
@@ -815,7 +830,11 @@ impl InputForm {
         match self.current_row() {
             Some(FormRow::Field(index)) => {
                 if self.fields[index].field_type == HumanInputType::Text {
-                    self.values[index].pop();
+                    let cursor = self.text_cursors[index];
+                    if cursor > 0 {
+                        remove_char(&mut self.values[index], cursor - 1);
+                        self.text_cursors[index] -= 1;
+                    }
                 }
             }
             Some(FormRow::Entry(map, index)) => {
@@ -850,7 +869,9 @@ impl InputForm {
             Some(FormRow::Field(index))
                 if self.fields[index].field_type == HumanInputType::Text =>
             {
-                self.values[index].push(character);
+                let cursor = self.text_cursors[index];
+                insert_char(&mut self.values[index], cursor, character);
+                self.text_cursors[index] += 1;
             }
             Some(FormRow::Entry(map, index)) => {
                 if let Some(entry) = self.entry_mut(map, index) {
@@ -897,6 +918,17 @@ impl InputForm {
         }
     }
 
+    fn insert_newline(&mut self) {
+        let Some(FormRow::Field(index)) = self.current_row() else {
+            return;
+        };
+        if self.fields[index].field_type == HumanInputType::Text {
+            let cursor = self.text_cursors[index];
+            insert_char(&mut self.values[index], cursor, '\n');
+            self.text_cursors[index] += 1;
+        }
+    }
+
     fn entry_mut(&mut self, map: EntryMap, index: usize) -> Option<&mut Entry> {
         self.problem
             .as_mut()
@@ -909,6 +941,23 @@ impl InputForm {
             .and_then(|problem| problem.entries(map).get(index))
             .is_some_and(|entry| self.is_required(map, &entry.key))
     }
+}
+
+fn char_byte_index(text: &str, character: usize) -> usize {
+    text.char_indices()
+        .nth(character)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
+fn insert_char(text: &mut String, character: usize, inserted: char) {
+    text.insert(char_byte_index(text, character), inserted);
+}
+
+fn remove_char(text: &mut String, character: usize) {
+    let start = char_byte_index(text, character);
+    let end = char_byte_index(text, character + 1);
+    text.replace_range(start..end, "");
 }
 
 /// Whether a single `select` field lets the engine infer the output label.
