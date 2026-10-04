@@ -1,9 +1,17 @@
-# Admission control for the task namespace (KTD6). The controller may create
-# Pods, and creating a Pod is a secret-injection capability; these policies
-# admit exactly the shape src/backends/kubernetes/manifest.rs generates
-# (`check_pod_shape` there mirrors every rule) and refuse anything else, so a
-# compromised controller cannot run a foreign image, mount an unapproved
-# Secret, reach the host or borrow another identity.
+# Admission control for task objects (KTD6). Controller and task Pods share a
+# dedicated user namespace. The bindings cover that namespace, while each
+# policy is evaluated only for requests authenticated as this namespace's
+# `narsor-controller` ServiceAccount. This includes a compromised controller
+# even if it omits its normal Narsor labels, but leaves the Deployment
+# controller and the namespace owner able to create the controller Pod and its
+# state PVC.
+#
+# The controller may create Pods, and creating a Pod is a secret-injection
+# capability. These policies admit exactly the shape
+# src/backends/kubernetes/manifest.rs generates (`check_pod_shape` there
+# mirrors every Pod rule) and refuse anything else, so a compromised
+# controller cannot run a foreign image, mount an unapproved Secret, reach
+# the host or borrow another identity.
 #
 # Requires Kubernetes 1.30+ (ValidatingAdmissionPolicy v1). Pod Security
 # Admission "restricted" on the namespace (namespaces.yaml) covers the rest of
@@ -14,7 +22,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: narsor-admission
-  namespace: narsor-tasks
+  namespace: narsor-user
 data:
   workloadServiceAccount: narsor-task
   storageClass: narsor-delete
@@ -26,6 +34,8 @@ data:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
+  # Install this policy once per cluster. Per-user bindings below carry the
+  # namespace-specific configuration.
   name: narsor-task-pods
 spec:
   failurePolicy: Fail
@@ -38,6 +48,11 @@ spec:
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]
         resources: ["pods", "pods/ephemeralcontainers"]
+  matchConditions:
+    - name: controller-created-pods
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:' + request.namespace + ':narsor-controller'
   variables:
     - name: containers
       expression: >-
@@ -123,18 +138,19 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: narsor-task-pods
+  # The binding name must be unique per user namespace.
+  name: narsor-user-task-pods
 spec:
   policyName: narsor-task-pods
   validationActions: [Deny]
   paramRef:
     name: narsor-admission
-    namespace: narsor-tasks
+    namespace: narsor-user
     parameterNotFoundAction: Deny
   matchResources:
     namespaceSelector:
       matchLabels:
-        kubernetes.io/metadata.name: narsor-tasks
+        kubernetes.io/metadata.name: narsor-user
 ---
 # Task storage: only the configured storage class (whose reclaim policy makes
 # archive destroy the data), only Narsor's names, and never a copy of — or a
@@ -143,6 +159,8 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
+  # Install this policy once per cluster. Per-user bindings below carry the
+  # namespace-specific configuration.
   name: narsor-task-storage
 spec:
   failurePolicy: Fail
@@ -155,6 +173,11 @@ spec:
         apiVersions: ["v1"]
         operations: ["CREATE"]
         resources: ["persistentvolumeclaims"]
+  matchConditions:
+    - name: controller-created-pvcs
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:' + request.namespace + ':narsor-controller'
   validations:
     - expression: >-
         has(object.spec.storageClassName) &&
@@ -171,15 +194,62 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: narsor-task-storage
+  # The binding name must be unique per user namespace.
+  name: narsor-user-task-storage
 spec:
   policyName: narsor-task-storage
   validationActions: [Deny]
   paramRef:
     name: narsor-admission
-    namespace: narsor-tasks
+    namespace: narsor-user
     parameterNotFoundAction: Deny
   matchResources:
     namespaceSelector:
       matchLabels:
-        kubernetes.io/metadata.name: narsor-tasks
+        kubernetes.io/metadata.name: narsor-user
+---
+# The controller needs delete to archive task Pods/PVCs. In the shared
+# namespace, prevent that grant from deleting the controller's own state PVC
+# (or controller Pod). The old object is checked, so the controller cannot
+# change a control-plane object into a task object just before deletion: it
+# has no update/patch permission.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  # Install this policy once per cluster. Per-user bindings below scope it.
+  name: narsor-controller-delete-guard
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["pods", "persistentvolumeclaims"]
+  matchConditions:
+    - name: controller-initiated-delete
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:' + request.namespace + ':narsor-controller'
+  validations:
+    - expression: >-
+        (request.resource.resource == 'pods' &&
+        'narsor.dev/component' in oldObject.metadata.labels &&
+        oldObject.metadata.labels['narsor.dev/component'] == 'workload') ||
+        (request.resource.resource == 'persistentvolumeclaims' &&
+        'narsor.dev/component' in oldObject.metadata.labels &&
+        oldObject.metadata.labels['narsor.dev/component'] == 'storage')
+      message: "the controller may delete only Narsor task Pods and task PVCs"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  # The binding name must be unique per user namespace.
+  name: narsor-user-controller-delete-guard
+spec:
+  policyName: narsor-controller-delete-guard
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: narsor-user

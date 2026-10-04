@@ -240,11 +240,11 @@ images, bundle, tools, profile and harness have the same
 * Delivery is either an environment variable of the runner process
   (`!env NAME`; `PATH`, `HOME`, `USER`, `SHELL` are reserved) or a file under
   the task's private `$HOME` (`!file relative/path`).
-* On Kubernetes the values are ordinary Secrets in the **task namespace**
-  (the backend's trust namespace, `narsor-tasks` in the samples). The
-  controller can *create* only its per-incarnation launch Secrets and can
-  neither read nor list Secrets; which Secrets a task Pod may mount is fixed
-  by the admission policy's `allowedSecrets` (`secret-name/key` pairs).
+* On Kubernetes the values are ordinary Secrets in the user's dedicated
+  Narsor namespace (`narsor-user` in the samples). The controller can
+  *create* only its per-incarnation launch Secrets and can neither read nor
+  list Secrets; which Secrets a task Pod may mount is fixed by the admission
+  policy's `allowedSecrets` (`secret-name/key` pairs).
 * Secrets are mounted read-only and recreated on every Pod start; they are
   never copied into the workspace, the task storage or the control plane.
   Their validity and rotation are the owner's and the tool provider's
@@ -257,18 +257,41 @@ Pod Security Admission, a StorageClass dedicated to task volumes with
 `reclaimPolicy: Delete`, and egress from task Pods and from the controller to
 the control plane over HTTPS.
 
-Manifests are in `deploy/kubernetes/`. Apply them **in this order**:
+The sample manifests install one independent Narsor instance into one
+namespace, `narsor-user`. Before each installation, replace every occurrence
+of `narsor-user` with a unique namespace identifier; this changes the
+namespace, each binding's immutable namespace selector and parameter
+namespace, and the four per-instance cluster-scoped binding names
+(`narsor-user-task-pods`, `narsor-user-task-storage`,
+`narsor-user-controller-delete-guard` and
+`narsor-user-controller-storageclasses`). Do not make multiple people Rancher
+Project Owners of a single Project containing these namespaces: that grants
+them access across the Project. Use one Rancher Project per user, or
+namespace-scoped RBAC instead.
+
+The three `ValidatingAdmissionPolicy` objects are shared cluster policy and
+must be installed by a cluster administrator once. Each instance's
+cluster-scoped bindings are also installed by that administrator. A binding
+covers its user namespace, but its policy is evaluated only for requests made
+by that namespace's `narsor-controller` ServiceAccount. Thus the controller
+and its state PVC can share the namespace with tasks without trusting labels
+that a compromised controller could omit.
+
+Apply the sample instance **in this order**:
 
 ```bash
-kubectl apply -f deploy/kubernetes/namespaces.yaml            # narsor-system, narsor-tasks (PSA restricted)
-kubectl apply -f deploy/kubernetes/workload-serviceaccount.yaml   # narsor-task: no token, no RBAC
-kubectl apply -f deploy/kubernetes/controller-rbac.yaml       # namespaced, no exec/attach/port-forward
-kubectl apply -f deploy/kubernetes/admission-policy.yaml      # the narsor-admission ConfigMap first, then policies + bindings
-kubectl apply -f deploy/kubernetes/controller.yaml            # ConfigMap backend.yaml, state PVC, Deployment
+kubectl apply -f deploy/kubernetes/namespaces.yaml
+kubectl apply -f deploy/kubernetes/workload-serviceaccount.yaml # narsor-task: no token, no RBAC
+kubectl apply -f deploy/kubernetes/controller-rbac.yaml        # namespaced; no exec/attach/port-forward
+kubectl apply -f deploy/kubernetes/admission-policy.yaml       # parameters, policies and per-instance bindings
+kubectl apply -f deploy/kubernetes/controller.yaml             # backend config, state PVC and Deployment
 ```
 
-The admission parameters must exist before the bindings reference them, and
-the controller must start only once the policies are enforced.
+The admission parameter ConfigMap must exist before the bindings reference
+it, and the controller must start only once the policies are enforced. An
+operator who is only a Rancher Project Owner needs the cluster administrator
+to create the shared policies, the per-user admission bindings and the
+StorageClass read binding.
 
 **One StorageClass name everywhere.** The dedicated class (here
 `narsor-delete`) must have `reclaimPolicy: Delete`, because archive must
@@ -314,7 +337,7 @@ Each controller has its own identity scoped to one backend.
 3. Hand it to the controller (first start only):
 
    ```bash
-   kubectl -n narsor-system create secret generic narsor-controller-enrollment \
+   kubectl -n narsor-user create secret generic narsor-controller-enrollment \
      --from-literal=code=<code>
    kubectl apply -f deploy/kubernetes/controller.yaml
    ```
@@ -326,7 +349,7 @@ Each controller has its own identity scoped to one backend.
 5. Delete the enrollment Secret, then check:
 
    ```bash
-   kubectl -n narsor-system delete secret narsor-controller-enrollment
+   kubectl -n narsor-user delete secret narsor-controller-enrollment
    narsor controller list        # the identity holds the backend's lease
    ```
 

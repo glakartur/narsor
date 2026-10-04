@@ -1,21 +1,18 @@
-# Two namespaces keep the trust planes apart (KTD6):
+# One Narsor installation belongs to one user and runs in one dedicated
+# namespace. The user owns the controller, task Pods, task PVCs and tool
+# Secrets in this namespace. Give that user no Kubernetes access to another
+# user's namespace; a Rancher Project Owner shared across those namespaces is
+# not an isolation boundary.
 #
-# * narsor-system — the environment controller. Nothing else runs here.
-# * narsor-tasks  — task Pods, their PVCs and launch Secrets, and the tool
-#   credentials tasks may mount (the backend's trust namespace). Pod Security
-#   Admission enforces the "restricted" profile on top of Narsor's own
-#   admission policy (admission-policy.yaml).
+# The per-instance admission bindings in admission-policy.yaml select the
+# API-server-maintained namespace name. They enforce constraints only for
+# requests authenticated as this namespace's controller ServiceAccount.
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: narsor-system
-  labels:
-    pod-security.kubernetes.io/enforce: restricted
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: narsor-tasks
+  # Replace this name before installing another user's independent Narsor
+  # instance.
+  name: narsor-user
   labels:
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/enforce-version: latest

@@ -7,7 +7,7 @@
 #   * keep backend.yaml in step with the admission parameters
 #     (admission-policy.yaml, ConfigMap narsor-admission);
 #   * create the one-time enrollment code Secret (first start only):
-#       kubectl -n narsor-system create secret generic \
+#       kubectl -n narsor-user create secret generic \
 #         narsor-controller-enrollment --from-literal=code=<code>
 #     On its first start the controller enrolls, writes its `nsk.` credential
 #     (0600) to its state volume and from then on ignores the code; delete
@@ -16,10 +16,10 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: narsor-controller-config
-  namespace: narsor-system
+  namespace: narsor-user
 data:
   backend.yaml: |
-    namespace: narsor-tasks
+    namespace: narsor-user
     # Must have reclaimPolicy: Delete — archive destroys the task storage.
     storage_class: narsor-delete
     storage_mib: 10240
@@ -39,7 +39,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: narsor-controller-state
-  namespace: narsor-system
+  namespace: narsor-user
 spec:
   accessModes: ["ReadWriteOnce"]
   resources:
@@ -50,7 +50,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: narsor-controller
-  namespace: narsor-system
+  namespace: narsor-user
   labels:
     app.kubernetes.io/name: narsor-controller
 spec:

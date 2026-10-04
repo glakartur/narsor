@@ -52,7 +52,7 @@ use narsor::backends::kubernetes::client::{ClusterAccess, TokenSource};
 use narsor::backends::kubernetes::manifest::RUNNER_CONTAINER;
 
 /// Namespace of the mock cluster.
-pub const NAMESPACE: &str = "narsor-tasks";
+pub const NAMESPACE: &str = "narsor-user";
 
 /// The bearer token the mock expects.
 pub const TOKEN: &str = "mock-service-account-token";

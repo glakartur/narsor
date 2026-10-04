@@ -1,5 +1,5 @@
-# The controller's permissions: namespaced, and only what the adapter calls
-# (src/backends/kubernetes). In particular:
+# The controller's permissions in its owner's dedicated namespace, and only
+# what the adapter calls (src/backends/kubernetes). In particular:
 #
 # * no pods/exec, pods/attach, pods/portforward or pods/ephemeralcontainers —
 #   the controller never enters a workload (KTD3);
@@ -13,13 +13,13 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: narsor-controller
-  namespace: narsor-system
+  namespace: narsor-user
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: narsor-controller
-  namespace: narsor-tasks
+  namespace: narsor-user
 rules:
   - apiGroups: [""]
     resources: ["pods"]
@@ -39,7 +39,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: narsor-controller
-  namespace: narsor-tasks
+  namespace: narsor-user
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -47,7 +47,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: narsor-controller
-    namespace: narsor-system
+    namespace: narsor-user
 ---
 # The one cluster-scoped read: the controller checks that the task storage
 # class deletes volumes with their claims before it creates or deletes a PVC
@@ -64,7 +64,8 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: narsor-controller-storageclasses
+  # The binding name must be unique per user namespace.
+  name: narsor-user-controller-storageclasses
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -72,4 +73,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: narsor-controller
-    namespace: narsor-system
+    namespace: narsor-user

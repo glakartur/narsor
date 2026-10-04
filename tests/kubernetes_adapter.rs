@@ -1379,7 +1379,7 @@ fn of_kind<'a>(documents: &'a [Value], kind: &str) -> Vec<&'a Value> {
     documents.iter().filter(|d| d["kind"] == kind).collect()
 }
 
-/// The controller's RBAC stays inside the task namespace, grants only what
+/// The controller's RBAC stays inside its user's namespace, grants only what
 /// the adapter uses, and never exec, attach, port-forward or ephemeral
 /// containers; the task service account has no permissions at all.
 #[test]
@@ -1481,8 +1481,10 @@ fn controller_rbac_is_namespaced_and_minimal() {
 
 /// The admission policy rejects every Pod shape but the generated one:
 /// foreign image or registry, privilege and host fields, a foreign service
-/// account, unapproved volumes, claims and secret mappings — and it is
-/// bound in deny mode to the task namespace.
+/// account, unapproved volumes, claims and secret mappings. Its bindings
+/// cover the dedicated user namespace, but each policy matches only requests
+/// authenticated as the Narsor controller, so a compromised controller cannot
+/// evade the policy by dropping its labels.
 #[test]
 fn the_admission_policy_covers_the_pod_contract() {
     let documents = deploy_documents();
@@ -1569,10 +1571,55 @@ fn the_admission_policy_covers_the_pod_contract() {
             binding["spec"]["paramRef"]["parameterNotFoundAction"],
             "Deny"
         );
+        assert_eq!(binding["spec"]["paramRef"]["namespace"], NAMESPACE);
+        assert_eq!(
+            binding["spec"]["matchResources"]["namespaceSelector"]["matchLabels"]
+                ["kubernetes.io/metadata.name"],
+            NAMESPACE
+        );
         assert!(binding["spec"]["matchResources"]
-            .to_string()
-            .contains(NAMESPACE));
+            .get("objectSelector")
+            .is_none());
+
+        let policy = policies
+            .iter()
+            .find(|p| p["metadata"]["name"] == policy)
+            .unwrap_or_else(|| panic!("the {policy} policy"));
+        let conditions = policy["spec"]["matchConditions"]
+            .as_array()
+            .expect("controller identity match condition");
+        assert!(conditions.iter().any(|condition| {
+            condition["expression"].as_str().is_some_and(|expression| {
+                expression.contains("request.userInfo.username")
+                    && expression.contains("request.namespace")
+                    && expression.contains("narsor-controller")
+            })
+        }));
     }
+
+    let delete_guard = policies
+        .iter()
+        .find(|p| p["metadata"]["name"] == "narsor-controller-delete-guard")
+        .expect("the controller delete guard");
+    assert!(delete_guard["spec"]["matchConstraints"]["resourceRules"]
+        .to_string()
+        .contains("DELETE"));
+    let delete_expression = delete_guard["spec"]["validations"].to_string();
+    for needle in ["oldObject", "workload", "storage"] {
+        assert!(
+            delete_expression.contains(needle),
+            "delete guard misses {needle}"
+        );
+    }
+    let delete_binding = bindings
+        .iter()
+        .find(|b| b["spec"]["policyName"] == "narsor-controller-delete-guard")
+        .expect("a delete-guard binding");
+    assert_eq!(
+        delete_binding["spec"]["matchResources"]["namespaceSelector"]["matchLabels"]
+            ["kubernetes.io/metadata.name"],
+        NAMESPACE
+    );
 
     // The policy's parameters and the controller's configuration agree.
     let params = of_kind(&documents, "ConfigMap")
