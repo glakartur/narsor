@@ -45,6 +45,7 @@ pub enum InputKind {
     /// An agent step ended without a usable output label (KTD3): the answer
     /// is the output it did not give.
     Problem,
+    Approval,
 }
 
 impl InputKind {
@@ -54,6 +55,7 @@ impl InputKind {
             InputContinuation::CompleteStep => Self::Gate,
             InputContinuation::ResumeAgent => Self::AgentQuestion,
             InputContinuation::ResolveOutput => Self::Problem,
+            InputContinuation::ApproveOutput => Self::Approval,
         }
     }
 
@@ -63,6 +65,7 @@ impl InputKind {
             Self::Gate => " Human input ",
             Self::AgentQuestion => " Reply to the agent ",
             Self::Problem => " Resolve the problem ",
+            Self::Approval => " Approve agent output ",
         }
     }
 }
@@ -568,7 +571,11 @@ impl InputForm {
             label_index,
             label_field,
             problem,
-            problem_mode: (kind == InputKind::Problem).then_some(ProblemMode::Conversation),
+            problem_mode: match kind {
+                InputKind::Problem => Some(ProblemMode::Conversation),
+                InputKind::Approval => Some(ProblemMode::ManualOutput),
+                _ => None,
+            },
             agent_message: pending.request.prefilled_answer.clone().unwrap_or_default(),
             agent_message_cursor: pending
                 .request
@@ -753,6 +760,26 @@ impl InputForm {
     /// same delivery, but only after a round trip, and the operator deserves
     /// the complaint next to the row that caused it.
     pub fn validate(&self) -> Result<HumanInputDelivery, FormError> {
+        if self.kind == InputKind::Approval {
+            return match self.problem_mode {
+                Some(ProblemMode::ManualOutput) => Ok(HumanInputDelivery::default()
+                    .with_action(crate::engine::actions::human::HumanInputAction::Approve)
+                    .for_episode(&self.episode)),
+                Some(ProblemMode::Conversation) => {
+                    if self.agent_message.trim().is_empty() {
+                        Err(FormError::general(
+                            "Write a comment before returning this to the agent.",
+                        ))
+                    } else {
+                        Ok(HumanInputDelivery::default()
+                            .with_comment(self.agent_message.clone())
+                            .with_action(crate::engine::actions::human::HumanInputAction::Resume)
+                            .for_episode(&self.episode))
+                    }
+                }
+                None => unreachable!("approval forms always select an action mode"),
+            };
+        }
         if self.problem_mode == Some(ProblemMode::Conversation) {
             if self.agent_message.trim().is_empty() {
                 return Err(FormError::general("Write a message for the agent."));

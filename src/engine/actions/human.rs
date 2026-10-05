@@ -50,6 +50,7 @@
 //! harmless. The other order would leave an execution needing input with no record of
 //! what it is waiting for, which nothing could repair.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -60,9 +61,9 @@ use thiserror::Error;
 
 use super::{ActionExecutor, ActionOutcome, ActionRequest, SuspendedAction};
 use crate::domain::{
-    ActionConfig, ActionError, ActionExecutionId, ActionResult, AnsweredBy, EventData, ExecutionId,
-    ExecutionStatus, HumanActionConfig, HumanInputField, HumanInputType, InputCloseReason,
-    OutputDefinition, OutputLabel, StateId, WorkflowExecution,
+    ActionConfig, ActionError, ActionExecutionId, ActionResult, AnsweredBy, Artifact, EventData,
+    ExecutionId, ExecutionStatus, HumanActionConfig, HumanInputField, HumanInputType,
+    InputCloseReason, OutputDefinition, OutputLabel, StateId, WorkflowExecution,
 };
 use crate::persistence::{ExecutionStore, PersistenceError};
 
@@ -220,6 +221,13 @@ pub struct PendingHumanInput {
     #[serde(default)]
     pub problem: Option<OutputProblem>,
 
+    /// The completed agent result held for an explicit approval decision.
+    #[serde(default)]
+    pub approval: Option<ApprovalCandidate>,
+
+    #[serde(default)]
+    pub resume_targets: BTreeMap<String, AgentSessionProvenance>,
+
     /// When the request was raised.
     pub requested_at: DateTime<Utc>,
 }
@@ -327,6 +335,26 @@ pub enum InputContinuation {
     /// give — a label with its `data` and `variables` — and completes the
     /// step as if the agent had kept to its output contract.
     ResolveOutput,
+    ApproveOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalCandidate {
+    pub action_execution_id: String,
+    pub result: ActionResult,
+    #[serde(default)]
+    pub artifacts: Vec<Artifact>,
+    #[serde(default)]
+    pub agent_harness: Option<String>,
+    #[serde(default)]
+    pub agent_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionProvenance {
+    pub action_execution_id: String,
+    pub harness: String,
+    pub session_id: String,
 }
 
 impl PendingHumanInput {
@@ -346,6 +374,8 @@ impl PendingHumanInput {
             continuation: InputContinuation::CompleteStep,
             episode: new_episode(),
             problem: None,
+            approval: None,
+            resume_targets: BTreeMap::new(),
             requested_at: Utc::now(),
         }
     }
@@ -364,6 +394,8 @@ impl PendingHumanInput {
             continuation: InputContinuation::ResumeAgent,
             episode: new_episode(),
             problem: None,
+            approval: None,
+            resume_targets: BTreeMap::new(),
             requested_at: Utc::now(),
         }
     }
@@ -385,6 +417,28 @@ impl PendingHumanInput {
             continuation: InputContinuation::ResolveOutput,
             episode: new_episode(),
             problem: Some(problem),
+            approval: None,
+            resume_targets: BTreeMap::new(),
+            requested_at: Utc::now(),
+        }
+    }
+
+    pub fn for_approval(
+        execution_id: impl Into<ExecutionId>,
+        state_id: impl Into<StateId>,
+        request: HumanInputRequest,
+        candidate: ApprovalCandidate,
+    ) -> Self {
+        Self {
+            execution_id: execution_id.into(),
+            state_id: state_id.into(),
+            request,
+            outputs: Vec::new(),
+            continuation: InputContinuation::ApproveOutput,
+            episode: new_episode(),
+            problem: None,
+            approval: Some(candidate),
+            resume_targets: BTreeMap::new(),
             requested_at: Utc::now(),
         }
     }
@@ -499,6 +553,9 @@ pub struct HumanInputDelivery {
     #[serde(default)]
     pub agent_message: Option<String>,
 
+    #[serde(default)]
+    pub action: Option<HumanInputAction>,
+
     /// The key of the request this answers ([`PendingHumanInput::episode_key`]).
     /// When given, a delivery to any other request is refused.
     #[serde(default)]
@@ -509,6 +566,16 @@ pub struct HumanInputDelivery {
     #[serde(skip)]
     pub answered_by: AnsweredBy,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanInputAction {
+    Approve,
+    Resume,
+    StartNewSession,
+}
+
+pub const APPROVE_OUTPUT_LABEL: &str = "__approve_output";
 
 impl HumanInputDelivery {
     /// A delivery carrying filled-in field values.
@@ -554,6 +621,11 @@ impl HumanInputDelivery {
     /// The same delivery carrying a follow-up message for an agent step.
     pub fn with_agent_message(mut self, message: impl Into<String>) -> Self {
         self.agent_message = Some(message.into());
+        self
+    }
+
+    pub fn with_action(mut self, action: HumanInputAction) -> Self {
+        self.action = Some(action);
         self
     }
 
@@ -889,6 +961,37 @@ pub fn resume(
                 delivery.variables.clone(),
             )
         }
+        InputContinuation::ApproveOutput => {
+            reject_step_values(delivery)?;
+            match delivery.action {
+                Some(HumanInputAction::Approve) => (
+                    APPROVE_OUTPUT_LABEL.to_string(),
+                    Value::Object(Map::new()),
+                    Map::new(),
+                ),
+                Some(HumanInputAction::Resume) => {
+                    let comment = delivery.comment.as_deref().map(str::trim).unwrap_or("");
+                    if comment.is_empty() {
+                        return Err(HumanActionError::MissingRequiredField {
+                            field: "comment".to_string(),
+                        });
+                    }
+                    (
+                        RESUME_AGENT_LABEL.to_string(),
+                        Value::Object(Map::new()),
+                        Map::from_iter([(
+                            "answer".to_string(),
+                            Value::String(comment.to_string()),
+                        )]),
+                    )
+                }
+                _ => {
+                    return Err(HumanActionError::MissingRequiredField {
+                        field: "action".to_string(),
+                    })
+                }
+            }
+        }
     };
 
     let resolves_output = pending.continuation == InputContinuation::ResolveOutput;
@@ -899,8 +1002,11 @@ pub fn resume(
             answered_by: Some(delivery.answered_by),
             close_reason: Some(InputCloseReason::Answered),
             episode: Some(pending.episode_key().to_string()),
-            output_label: (pending.continuation != InputContinuation::ResumeAgent)
-                .then(|| label.clone()),
+            output_label: (!matches!(
+                pending.continuation,
+                InputContinuation::ResumeAgent | InputContinuation::ApproveOutput
+            ))
+            .then(|| label.clone()),
             data: resolves_output.then(|| data.clone()),
             variables: resolves_output.then(|| Value::Object(variables.clone())),
             comment: delivery

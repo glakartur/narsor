@@ -146,7 +146,7 @@ pub struct ActionExecution {
 }
 
 /// Result from an action execution
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActionResult {
     /// The output label (determines transition)
     pub output_label: String,

@@ -40,6 +40,7 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
     for state_id in sorted_state_ids(definition) {
         let state = &definition.states[state_id];
         validate_action(state, &mut errors);
+        validate_output_behavior(definition, state, &mut errors);
         validate_decision(state, &mut errors);
         validate_state_templates(definition, state, &mut errors);
         validate_state_image(state, &mut errors);
@@ -53,6 +54,44 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+fn validate_output_behavior(
+    definition: &WorkflowDefinition,
+    state: &State,
+    errors: &mut Vec<ValidationError>,
+) {
+    for output in &state.outputs {
+        if output.requires_human_approval && !matches!(state.action, Some(ActionConfig::Agent(_))) {
+            errors.push(ValidationError::InvalidOutputBehavior {
+                state: state.id.clone(),
+                label: output.label.clone(),
+                reason: "requires_human_approval is only valid on an agent output".to_string(),
+            });
+        }
+        let Some(field_name) = output.resume_comment_field.as_deref() else {
+            continue;
+        };
+        let valid_field = match &state.action {
+            Some(ActionConfig::Human(human)) => human.inputs.iter().any(|field| {
+                field.name == field_name
+                    && field.required
+                    && field.field_type == crate::domain::HumanInputType::Text
+            }),
+            _ => false,
+        };
+        let valid_target = state.transitions.get(&output.label).is_some_and(|target| {
+            definition.states.get(target).is_some_and(|target_state| {
+                matches!(target_state.action, Some(ActionConfig::Agent(_)))
+            })
+        });
+        if !valid_field || !valid_target {
+            errors.push(ValidationError::InvalidOutputBehavior {
+                state: state.id.clone(), label: output.label.clone(),
+                reason: "resume_comment_field requires a required text input and an agent transition target".to_string(),
+            });
+        }
     }
 }
 

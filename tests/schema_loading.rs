@@ -58,6 +58,43 @@ fn terminal_states_have_no_action() {
 }
 
 #[test]
+fn output_approval_and_resume_metadata_loads() {
+    let yaml = r#"
+name: approval-demo
+version: 1
+states:
+  agent:
+    action: { type: agent, prompt: do it }
+    outputs:
+      - label: reviewed
+        requires_human_approval: true
+    transitions: { reviewed: gate }
+  gate:
+    action:
+      type: human
+      message: review
+      inputs:
+        - { name: note, type: text, required: true }
+    outputs:
+      - label: revise
+        resume_comment_field: note
+      - done
+    transitions: { revise: agent, done: finished }
+  finished: { description: done }
+terminal_states: [finished]
+"#;
+    let definition = load_from_str(yaml).expect("metadata is valid");
+    let output = &state(&definition, "agent").outputs[0];
+    assert!(output.requires_human_approval);
+    assert_eq!(
+        state(&definition, "gate").outputs[0]
+            .resume_comment_field
+            .as_deref(),
+        Some("note")
+    );
+}
+
+#[test]
 fn inputs_keep_their_declared_types() {
     let definition = load_reference();
 

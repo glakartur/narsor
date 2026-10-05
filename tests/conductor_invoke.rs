@@ -878,6 +878,8 @@ fn a_long_tasks_snapshot_fits_its_budget_with_the_definition_and_pending_input_w
         state_outputs: vec![OutputDefinition {
             label: "implemented".to_string(),
             description: Some("The work is done.".to_string()),
+            requires_human_approval: false,
+            resume_comment_field: None,
         }],
         definition: Ok(definition.clone()),
         pending_input: Some(pending.clone()),

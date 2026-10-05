@@ -701,6 +701,11 @@ fn waiting_lines(app: &App) -> Vec<Line<'static>> {
                 problem,
                 Some("Press i to settle it."),
             ),
+            InputKind::Approval => (
+                "Approval — review the agent output.".to_string(),
+                question,
+                Some("Press i to review it."),
+            ),
         },
         (None, Some(active)) if app.selected_attention() == Some(Attention::Problem) => (
             format!("Problem — {}", active.reason),
@@ -967,6 +972,7 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
         (true, _) => Color::DarkGray,
         (false, InputKind::Problem) => PROBLEM_COLOUR,
         (false, InputKind::Gate | InputKind::AgentQuestion) => QUESTION_COLOUR,
+        (false, InputKind::Approval) => QUESTION_COLOUR,
     };
     let title = if form.closed.is_some() {
         format!("{}(closed) ", form.kind.title())
@@ -1000,11 +1006,17 @@ fn input_context_lines(form: &InputForm) -> Vec<Line<'static>> {
 
     if let Some(mode) = form.problem_mode {
         lines.push(Line::from(""));
-        let action = match mode {
-            crate::tui::input_form::ProblemMode::Conversation => {
+        let action = match (form.kind, mode) {
+            (InputKind::Approval, crate::tui::input_form::ProblemMode::Conversation) => {
+                "Return-to-agent mode — Enter sends the required comment (Tab: accept)."
+            }
+            (InputKind::Approval, crate::tui::input_form::ProblemMode::ManualOutput) => {
+                "Accept mode — Enter accepts this output (Tab: return to agent)."
+            }
+            (_, crate::tui::input_form::ProblemMode::Conversation) => {
                 "Conversation mode — Enter sends this message to the agent (Tab: manual output)."
             }
-            crate::tui::input_form::ProblemMode::ManualOutput => {
+            (_, crate::tui::input_form::ProblemMode::ManualOutput) => {
                 "Manual-output mode — Enter chooses the selected output (Tab: conversation)."
             }
         };

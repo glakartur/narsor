@@ -112,6 +112,7 @@ states:
     outputs:
       - label: reviewed
         description: the document was reviewed and the findings recorded.
+        requires_human_approval: true
     transitions:
       reviewed: approve_scope
     timeout: 30m
@@ -149,6 +150,7 @@ states:
         description: the scope is right; plan against it.
       - label: revise
         description: send the requirements back for another brainstorm.
+        resume_comment_field: scope_notes
       - label: abandon
         description: stop the pipeline here.
     transitions:

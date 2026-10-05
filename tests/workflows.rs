@@ -135,6 +135,7 @@ impl FakeHarness {
 struct Answer {
     state: &'static str,
     values: Vec<(&'static str, &'static str)>,
+    approve: bool,
 }
 
 impl Answer {
@@ -142,6 +143,7 @@ impl Answer {
         Self {
             state,
             values: values.to_vec(),
+            approve: false,
         }
     }
 
@@ -150,7 +152,20 @@ impl Answer {
         for (name, value) in &self.values {
             values.insert((*name).to_string(), Value::String((*value).to_string()));
         }
-        HumanInputDelivery::with_values(values)
+        let delivery = HumanInputDelivery::with_values(values);
+        if self.approve {
+            delivery.with_action(narsor::engine::actions::human::HumanInputAction::Approve)
+        } else {
+            delivery
+        }
+    }
+
+    fn approval(state: &'static str) -> Self {
+        Self {
+            state,
+            values: Vec::new(),
+            approve: true,
+        }
     }
 }
 
@@ -544,6 +559,7 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
         }),
         root.workspace(),
         &[
+            Answer::approval("doc_review"),
             Answer::new(
                 "approve_scope",
                 &[

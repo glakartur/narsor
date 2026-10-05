@@ -389,6 +389,14 @@ pub struct OutputDefinition {
     /// (the agent's output contract, the input form, the transition menu).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Stops an agent result for an explicit operator decision before its
+    /// ordinary transition is applied.
+    #[serde(default)]
+    pub requires_human_approval: bool,
+    /// A required text input whose value continues the transition target
+    /// agent's prior session after this human output is selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_comment_field: Option<String>,
 }
 
 impl OutputDefinition {
@@ -397,6 +405,8 @@ impl OutputDefinition {
         Self {
             label: label.into(),
             description: None,
+            requires_human_approval: false,
+            resume_comment_field: None,
         }
     }
 }
@@ -529,6 +539,13 @@ pub enum ValidationError {
     EmptyOutputs {
         state: StateId,
         action_type: &'static str,
+    },
+
+    #[error("Output '{label}' in state '{state}' has invalid approval/resume behavior: {reason}")]
+    InvalidOutputBehavior {
+        state: StateId,
+        label: OutputLabel,
+        reason: String,
     },
 
     // --- Decision correctness (§5.3) ---

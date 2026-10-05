@@ -499,6 +499,13 @@ fn answer_delivery(
         InputContinuation::CompleteStep | InputContinuation::ResumeAgent => {
             HumanInputDelivery::with_values(values)
         }
+        // Approval is an operator-only commitment; a proposal may describe it
+        // but never selects accept/resume on the operator's behalf.
+        InputContinuation::ApproveOutput => {
+            return Err(EngineError::HumanInput(
+                crate::engine::actions::human::HumanActionError::UnexpectedStepValues,
+            ))
+        }
     };
     if pending.continuation != InputContinuation::ResumeAgent {
         if let Some(label) = &proposal.label {

@@ -367,6 +367,8 @@ pub struct StateSchema {
 pub struct OutputSchema {
     pub label: String,
     pub description: Option<String>,
+    pub requires_human_approval: bool,
+    pub resume_comment_field: Option<String>,
 }
 
 /// The object form of an [`OutputSchema`]. `deny_unknown_fields` keeps a
@@ -377,6 +379,10 @@ struct OutputObjectSchema {
     label: String,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    requires_human_approval: bool,
+    #[serde(default)]
+    resume_comment_field: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for OutputSchema {
@@ -399,6 +405,8 @@ impl<'de> Deserialize<'de> for OutputSchema {
                 Ok(OutputSchema {
                     label: value.to_string(),
                     description: None,
+                    requires_human_approval: false,
+                    resume_comment_field: None,
                 })
             }
 
@@ -411,6 +419,8 @@ impl<'de> Deserialize<'de> for OutputSchema {
                 Ok(OutputSchema {
                     label: object.label,
                     description: object.description,
+                    requires_human_approval: object.requires_human_approval,
+                    resume_comment_field: object.resume_comment_field,
                 })
             }
         }

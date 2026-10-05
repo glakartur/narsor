@@ -670,6 +670,8 @@ async fn output_descriptions_survive_in_the_pending_record() {
         OutputDefinition {
             label: "ignore".to_string(),
             description: Some("The failures are known and harmless.".to_string()),
+            requires_human_approval: false,
+            resume_comment_field: None,
         },
         OutputDefinition::new("fix_it"),
     ];

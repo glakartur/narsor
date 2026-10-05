@@ -1175,6 +1175,8 @@ async fn the_output_contract_lists_the_declared_labels_with_their_descriptions()
         OutputDefinition {
             label: "ready".to_string(),
             description: Some("The plan is written and nothing is unclear.".to_string()),
+            requires_human_approval: false,
+            resume_comment_field: None,
         },
         OutputDefinition::new("ambiguous"),
     ];
@@ -1203,6 +1205,8 @@ fn a_contract_without_descriptions_lists_bare_labels_only() {
             label: "rejected".to_string(),
             // Blank is treated as no description at all.
             description: Some("   ".to_string()),
+            requires_human_approval: false,
+            resume_comment_field: None,
         },
     ]);
 

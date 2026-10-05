@@ -144,6 +144,7 @@ Serce definicji workflow. Każdy klucz w sekcji `states` to unikalny identyfikat
     - failure
     - label: needs_human               # Etykieta z opisem (opcjonalnym)
       description: Agent potrzebuje decyzji człowieka, zanim pójdzie dalej.
+      requires_human_approval: true    # tylko wyjście akcji agent
   transitions:                        # Mapowanie: etykieta -> następny stan
     success: next_state
     failure: error_handler
@@ -173,6 +174,16 @@ go wszędzie tam, gdzie etykieta jest do wyboru: w kontrakcie wyjścia doklejany
 do promptu agenta (§3.3.A), w oczekującym inpucie (`pending_input.json`) i w
 menu ręcznego przejścia TUI (`t`). Pusty opis znaczy tyle co jego brak.
 Etykieta może wystąpić w `outputs` tylko raz, niezależnie od formy (§5).
+
+Obiekt wyjścia może też wyrażać dwa opcjonalne zachowania sterujące:
+
+* `requires_human_approval: true` zatrzymuje wynik `agent` przed jego zwykłym
+  przejściem. Operator jawnie go akceptuje albo odsyła do tej samej sesji agenta
+  z wymaganym komentarzem.
+* `resume_comment_field: <nazwa>` jest dostępne wyłącznie na wyjściu akcji
+  `human`. Nazwany input musi być wymaganym polem `text`, a przejście tego
+  wyjścia musi prowadzić do stanu `agent`; jego tekst jest wiadomością przy
+  wznowieniu ostatniej sesji docelowego agenta.
 
 #### Typy Akcji (Action Types):
 

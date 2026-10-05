@@ -1573,6 +1573,7 @@ impl App {
                 InputKind::Gate => "answer",
                 InputKind::AgentQuestion => "reply to agent",
                 InputKind::Problem => "resolve problem",
+                InputKind::Approval => "review agent output",
             })
     }
 

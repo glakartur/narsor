@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub type ArtifactId = String;
 
 /// An artifact produced during workflow execution
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
     /// Unique identifier
     pub id: ArtifactId,

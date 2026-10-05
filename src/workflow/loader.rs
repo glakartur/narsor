@@ -215,6 +215,11 @@ fn compile_state(
                     .description
                     .map(|text| text.trim().to_string())
                     .filter(|text| !text.is_empty()),
+                requires_human_approval: output.requires_human_approval,
+                resume_comment_field: output
+                    .resume_comment_field
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty()),
             })
             .collect(),
         transitions: state.transitions,

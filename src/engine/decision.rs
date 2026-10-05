@@ -196,10 +196,14 @@ mod tests {
                 OutputDefinition {
                     label: "success".to_string(),
                     description: None,
+                    requires_human_approval: false,
+                    resume_comment_field: None,
                 },
                 OutputDefinition {
                     label: "orphan".to_string(),
                     description: None,
+                    requires_human_approval: false,
+                    resume_comment_field: None,
                 },
             ],
             transitions,

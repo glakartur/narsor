@@ -70,7 +70,7 @@
 //! status ends the execution as [`ExecutionStatus::Completed`]. See
 //! [`terminal_status`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -93,9 +93,9 @@ use crate::engine::actions::agent::{
 };
 use crate::engine::actions::harness;
 use crate::engine::actions::human::{
-    self, ConductorAnalysis, HumanActionError, HumanInputDelivery, HumanInputRequest,
-    InputContinuation, OutputProblem, OutputRequirement, PendingHumanInput, RejectedAnswer,
-    RESUME_AGENT_LABEL,
+    self, AgentSessionProvenance, ApprovalCandidate, ConductorAnalysis, HumanActionError,
+    HumanInputDelivery, HumanInputRequest, InputContinuation, OutputProblem, OutputRequirement,
+    PendingHumanInput, RejectedAnswer, APPROVE_OUTPUT_LABEL, RESUME_AGENT_LABEL,
 };
 use crate::engine::actions::{
     ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
@@ -145,6 +145,7 @@ const ANSWER_TAIL_BYTES: usize = 2 * 1024;
 /// A one-shot operator note to attach to the next recovered agent attempt.
 const METADATA_OPERATOR_RECOVERY_NOTE_KEY: &str = "operator_recovery_note";
 const METADATA_AGENT_INPUT_KEY: &str = "agent_input";
+const METADATA_AGENT_SESSIONS_KEY: &str = "completed_agent_sessions";
 
 /// The one-shot instruction delivered by an operator to an agent step.
 /// `harness` and `session` are optional for records written before
@@ -1411,6 +1412,53 @@ impl Engine {
         let state_id = self.current_state_id(&execution)?;
         let state = self.state_of(definition, &execution, &state_id)?;
 
+        if resumed.pending.continuation == InputContinuation::ApproveOutput {
+            let candidate = resumed.pending.approval.ok_or_else(|| {
+                EngineError::HumanInput(HumanActionError::NoPendingRequest {
+                    execution_id: execution_id.to_string(),
+                })
+            })?;
+            if resumed.result.output_label == APPROVE_OUTPUT_LABEL {
+                let output_label = candidate.result.output_label.clone();
+                let pending = PendingStep {
+                    state_id: state_id.clone(),
+                    action_execution_id: candidate.action_execution_id,
+                    result: candidate.result,
+                    artifacts: candidate.artifacts,
+                };
+                let flow = self.apply_decision(
+                    definition,
+                    &mut execution,
+                    state,
+                    pending,
+                    DecisionOutcome {
+                        label: output_label,
+                        provider: DecisionProviderType::Human,
+                        reasoning: None,
+                    },
+                )?;
+                return Ok(match flow {
+                    Flow::Stop => HandleState::Done(execution),
+                    Flow::Continue => HandleState::Ready(execution),
+                });
+            }
+            let answer = agent_reply(&resumed.result.variables).ok_or_else(|| {
+                EngineError::HumanInput(HumanActionError::MissingRequiredField {
+                    field: "comment".to_string(),
+                })
+            })?;
+            clear_engine_metadata(&mut execution, METADATA_OUTPUT_REJECTION_KEY);
+            clear_engine_metadata(&mut execution, METADATA_OUTPUT_RESCUE_KEY);
+            self.store_agent_input(
+                &mut execution,
+                &state_id,
+                &answer,
+                candidate.agent_harness.as_deref(),
+                candidate.agent_session_id.as_deref(),
+            )?;
+            return Ok(HandleState::Ready(execution));
+        }
+
         if resumed.pending.continuation == InputContinuation::ResumeAgent {
             let answer = agent_reply(&resumed.result.variables).ok_or_else(|| {
                 EngineError::HumanInput(HumanActionError::MissingRequiredField {
@@ -1499,6 +1547,89 @@ impl Engine {
                 Flow::Stop => HandleState::Done(execution),
                 Flow::Continue => HandleState::Ready(execution),
             });
+        }
+
+        // A marked human output still completes its own step and records the
+        // declared transition.  The only difference is how the target agent
+        // starts: its required text field becomes one-shot continuation input
+        // instead of an ordinary fresh prompt with no operator context.
+        if resumed.pending.continuation == InputContinuation::CompleteStep {
+            if let Some(field) = state
+                .outputs
+                .iter()
+                .find(|output| output.label == resumed.result.output_label)
+                .and_then(|output| output.resume_comment_field.as_deref())
+            {
+                let comment = resumed
+                    .result
+                    .variables
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let target = state
+                    .transitions
+                    .get(&resumed.result.output_label)
+                    .cloned()
+                    .ok_or_else(|| {
+                        EngineError::HumanInput(HumanActionError::NoLabelChosen {
+                            outputs: state
+                                .outputs
+                                .iter()
+                                .map(|output| output.label.clone())
+                                .collect(),
+                        })
+                    })?;
+                let provenance = resumed
+                    .pending
+                    .resume_targets
+                    .get(&resumed.result.output_label)
+                    .cloned();
+                let flow = self.record_completion(
+                    definition,
+                    &mut execution,
+                    state,
+                    resumed.pending.action_execution_id().to_string(),
+                    resumed.result,
+                )?;
+                if matches!(flow, Flow::Continue) {
+                    if provenance.is_none() {
+                        let request = HumanInputRequest {
+                            action_execution_id: execution
+                                .current_action_execution
+                                .clone()
+                                .unwrap_or_default(),
+                            instruction: "The saved agent session is unavailable. Review the preserved comment, then press Enter to start a new session.".to_string(),
+                            fields: vec![HumanInputField {
+                                name: "answer".to_string(),
+                                field_type: HumanInputType::Text,
+                                required: true,
+                                description: None,
+                                options: Vec::new(),
+                            }],
+                            question: None,
+                            answer_tail: None,
+                            agent_harness: None,
+                            agent_session_id: None,
+                            prefilled_answer: Some(comment),
+                        };
+                        let target_state = self.state_of(definition, &execution, &target)?;
+                        self.suspend_for_agent_input(&mut execution, target_state, request)?;
+                        return Ok(HandleState::Done(execution));
+                    }
+                    self.store_agent_input(
+                        &mut execution,
+                        &target,
+                        &comment,
+                        provenance.as_ref().map(|session| session.harness.as_str()),
+                        provenance
+                            .as_ref()
+                            .map(|session| session.session_id.as_str()),
+                    )?;
+                    return Ok(HandleState::Ready(execution));
+                }
+                return Ok(HandleState::Done(execution));
+            }
         }
 
         let flow = match self.pending_step(&execution, &state_id)? {
@@ -2423,6 +2554,14 @@ impl Engine {
             result,
             artifacts,
         };
+        if is_agent(state) {
+            if let Some(provenance) = agent_session_provenance(&pending) {
+                let mut sessions: BTreeMap<String, AgentSessionProvenance> =
+                    read_engine_record(execution, METADATA_AGENT_SESSIONS_KEY)?.unwrap_or_default();
+                sessions.insert(state.id.clone(), provenance);
+                write_engine_record(execution, METADATA_AGENT_SESSIONS_KEY, &sessions)?;
+            }
+        }
         self.write_pending_step(execution, &pending)?;
         self.store.save_execution(execution)?;
 
@@ -2437,6 +2576,46 @@ impl Engine {
         state: &State,
         pending: PendingStep,
     ) -> Result<Flow, EngineError> {
+        if is_agent(state)
+            && state.outputs.iter().any(|output| {
+                output.label == pending.result.output_label && output.requires_human_approval
+            })
+        {
+            let provenance = agent_session_provenance(&pending);
+            let agent_harness = provenance.as_ref().map(|session| session.harness.clone());
+            let agent_session_id = provenance
+                .as_ref()
+                .map(|session| session.session_id.clone());
+            let request = HumanInputRequest {
+                action_execution_id: pending.action_execution_id.clone(),
+                instruction:
+                    "Review the agent output: accept it, or return it to the agent with a comment."
+                        .to_string(),
+                fields: Vec::new(),
+                question: None,
+                answer_tail: Some(pending.result.stdout.clone()),
+                agent_harness: agent_harness.clone(),
+                agent_session_id: agent_session_id.clone(),
+                prefilled_answer: None,
+            };
+            let approval = ApprovalCandidate {
+                action_execution_id: pending.action_execution_id,
+                result: pending.result,
+                artifacts: pending.artifacts,
+                agent_harness,
+                agent_session_id,
+            };
+            let request = PendingHumanInput::for_approval(
+                execution.id.clone(),
+                state.id.clone(),
+                request,
+                approval,
+            );
+            let from = self.store.event_log(&execution.id).next_sequence()?;
+            human::suspend(&self.store, execution, &request)?;
+            self.publish_from(&execution.id, from)?;
+            return Ok(Flow::Stop);
+        }
         let request = match decision::decide(state, &pending.result) {
             Ok(request) => request,
             Err(error) => {
@@ -2760,8 +2939,21 @@ impl Engine {
         request: HumanInputRequest,
         outputs: Vec<OutputDefinition>,
     ) -> Result<(), EngineError> {
-        let pending =
+        let mut pending =
             PendingHumanInput::new(execution.id.clone(), state.id.clone(), request, outputs);
+        let sessions: BTreeMap<String, AgentSessionProvenance> =
+            read_engine_record(execution, METADATA_AGENT_SESSIONS_KEY)?.unwrap_or_default();
+        for output in &pending.outputs {
+            if output.resume_comment_field.is_some() {
+                if let Some(target) = state.transitions.get(&output.label) {
+                    if let Some(session) = sessions.get(target) {
+                        pending
+                            .resume_targets
+                            .insert(output.label.clone(), session.clone());
+                    }
+                }
+            }
+        }
         let from = self.store.event_log(&execution.id).next_sequence()?;
         human::suspend(&self.store, execution, &pending)?;
         self.publish_from(&execution.id, from)?;
@@ -3374,6 +3566,20 @@ fn agent_answer(result: &ActionResult) -> (Option<String>, Option<String>) {
     (question, answer_tail)
 }
 
+fn agent_session_provenance(pending: &PendingStep) -> Option<AgentSessionProvenance> {
+    let session = pending.result.data.get(SESSION_DATA_KEY)?;
+    let harness = session.pointer("/harness")?.as_str()?.to_string();
+    let session_id = session
+        .pointer("/config/harness_session_id")?
+        .as_str()?
+        .to_string();
+    Some(AgentSessionProvenance {
+        action_execution_id: pending.action_execution_id.clone(),
+        harness,
+        session_id,
+    })
+}
+
 /// Replaces the record of the agent step behind the latest transition, or
 /// drops it when that transition did not leave an agent.
 fn set_last_agent_step(
@@ -3472,6 +3678,7 @@ pub fn record_manual_transition(
                         answer_tail: input.request.answer_tail.clone(),
                     }),
                     InputContinuation::CompleteStep => None,
+                    InputContinuation::ApproveOutput => None,
                 })
         }
     } else {
