@@ -1447,6 +1447,9 @@ impl Engine {
                     field: "comment".to_string(),
                 })
             })?;
+            // The held result must not be completed on the next loop pass:
+            // this delivery explicitly rejects it and re-enters the agent.
+            self.clear_pending_step(&mut execution);
             clear_engine_metadata(&mut execution, METADATA_OUTPUT_REJECTION_KEY);
             clear_engine_metadata(&mut execution, METADATA_OUTPUT_RESCUE_KEY);
             self.store_agent_input(
