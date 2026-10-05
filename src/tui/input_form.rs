@@ -704,6 +704,17 @@ impl InputForm {
                     self.insert_agent_character('\n');
                     return FormAction::None;
                 }
+                // An approval form opens in accept mode. Alt+Enter is the
+                // explicit shortcut into the return-to-agent editor, never a
+                // hidden submit action.
+                KeyCode::Enter
+                    if key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+                        && self.kind == InputKind::Approval =>
+                {
+                    self.problem_mode = Some(ProblemMode::Conversation);
+                    self.insert_agent_character('\n');
+                    return FormAction::None;
+                }
                 KeyCode::Enter => return FormAction::Submit,
                 KeyCode::Backspace if mode == ProblemMode::Conversation => {
                     self.backspace_agent_message();
