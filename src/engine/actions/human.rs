@@ -913,7 +913,19 @@ pub fn resume(
 
     // Validation first, and before any write: a rejected delivery must leave
     // the execution exactly as paused as it was.
-    let values = validate_values(pending.fields(), &delivery.values)?;
+    let optional_resume_fields: Vec<&str> = delivery
+        .chosen_label
+        .as_deref()
+        .map(|label| {
+            pending
+                .outputs
+                .iter()
+                .filter(|output| output.label != label)
+                .filter_map(|output| output.resume_comment_field.as_deref())
+                .collect()
+        })
+        .unwrap_or_default();
+    let values = validate_values(pending.fields(), &delivery.values, &optional_resume_fields)?;
     let agent_message = delivery
         .agent_message
         .as_deref()
@@ -1166,6 +1178,7 @@ fn resolve_output(
 fn validate_values(
     fields: &[HumanInputField],
     delivered: &Map<String, Value>,
+    optional_resume_fields: &[&str],
 ) -> Result<Map<String, Value>, HumanActionError> {
     let declared: Vec<String> = fields.iter().map(|field| field.name.clone()).collect();
 
@@ -1182,7 +1195,7 @@ fn validate_values(
 
     for field in fields {
         let Some(value) = delivered.get(&field.name).filter(|value| !is_blank(value)) else {
-            if field.required {
+            if field.required && !optional_resume_fields.contains(&field.name.as_str()) {
                 return Err(HumanActionError::MissingRequiredField {
                     field: field.name.clone(),
                 });

@@ -652,6 +652,21 @@ impl InputForm {
         self.label_choices.get(self.label_index).cloned().flatten()
     }
 
+    /// A resume comment is required only for the output that resumes an
+    /// agent; the same text field stays optional for all other choices.
+    pub fn field_is_required(&self, field: &HumanInputField) -> bool {
+        if !field.required {
+            return false;
+        }
+        match self.chosen_label().as_deref() {
+            Some(label) => !self.outputs.iter().any(|output| {
+                output.label != label
+                    && output.resume_comment_field.as_deref() == Some(field.name.as_str())
+            }),
+            None => field.required,
+        }
+    }
+
     /// The description of an output, when the workflow gives one.
     pub fn description_of(&self, label: &str) -> Option<&str> {
         self.outputs
@@ -788,12 +803,25 @@ impl InputForm {
                 .with_agent_message(self.agent_message.clone())
                 .for_episode(&self.episode));
         }
+        let chosen_label = self.chosen_label();
+        let optional_resume_fields: Vec<&str> = chosen_label
+            .as_deref()
+            .map(|label| {
+                self.outputs
+                    .iter()
+                    .filter(|output| output.label != label)
+                    .filter_map(|output| output.resume_comment_field.as_deref())
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut values = Map::new();
 
         for (index, field) in self.fields.iter().enumerate() {
             let raw = self.values.get(index).map(String::as_str).unwrap_or("");
             if raw.trim().is_empty() {
-                if field.required {
+                if self.field_is_required(field)
+                    && !optional_resume_fields.contains(&field.name.as_str())
+                {
                     return Err(FormError::at(
                         FormRow::Field(index),
                         format!("Field '{}' is required.", field.name),

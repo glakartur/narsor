@@ -832,7 +832,11 @@ fn render_input_modal(frame: &mut Frame, app: &App) {
         let text = match row {
             FormRow::Field(field_index) => {
                 let field = &form.fields[*field_index];
-                let requirement = if field.required { "*" } else { " " };
+                let requirement = if form.field_is_required(field) {
+                    "*"
+                } else {
+                    " "
+                };
                 let value = form.values[*field_index].clone();
                 let hint = match field.field_type {
                     _ if form.label_field == Some(*field_index) => {
@@ -1003,6 +1007,19 @@ fn input_context_lines(form: &InputForm) -> Vec<Line<'static>> {
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
     let mut lines = vec![Line::from(Span::styled(form.instruction.clone(), bold))];
+
+    if let Some(label) = form.chosen_label() {
+        if form
+            .outputs
+            .iter()
+            .any(|output| output.label == label && output.resume_comment_field.is_some())
+        {
+            lines.push(Line::from(Span::styled(
+                "This choice resumes the target agent; the marked comment is required.",
+                Style::default().fg(Color::Cyan),
+            )));
+        }
+    }
 
     if let Some(mode) = form.problem_mode {
         lines.push(Line::from(""));
