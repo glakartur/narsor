@@ -487,6 +487,12 @@ pub struct HumanInputDelivery {
     #[serde(default)]
     pub comment: Option<String>,
 
+    /// A message that restarts the same agent step instead of choosing its
+    /// output. It is deliberately distinct from `comment`: comments explain a
+    /// manual output decision, while this text is prompt input for an agent.
+    #[serde(default)]
+    pub agent_message: Option<String>,
+
     /// The key of the request this answers ([`PendingHumanInput::episode_key`]).
     /// When given, a delivery to any other request is refused.
     #[serde(default)]
@@ -536,6 +542,12 @@ impl HumanInputDelivery {
     /// The same delivery with a remark attached.
     pub fn with_comment(mut self, comment: impl Into<String>) -> Self {
         self.comment = Some(comment.into());
+        self
+    }
+
+    /// The same delivery carrying a follow-up message for an agent step.
+    pub fn with_agent_message(mut self, message: impl Into<String>) -> Self {
+        self.agent_message = Some(message.into());
         self
     }
 
@@ -824,6 +836,20 @@ pub fn resume(
     // Validation first, and before any write: a rejected delivery must leave
     // the execution exactly as paused as it was.
     let values = validate_values(pending.fields(), &delivery.values)?;
+    let agent_message = delivery
+        .agent_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty());
+    if agent_message.is_some()
+        && (pending.continuation != InputContinuation::ResolveOutput
+            || delivery.chosen_label.is_some()
+            || !delivery.data.is_empty()
+            || !delivery.variables.is_empty()
+            || !values.is_empty())
+    {
+        return Err(HumanActionError::UnexpectedStepValues);
+    }
     validate_agent_answer(&pending, &values)?;
     let (label, data, variables) = match pending.continuation {
         InputContinuation::CompleteStep => {
@@ -841,6 +867,14 @@ pub fn resume(
                 values.clone(),
             )
         }
+        InputContinuation::ResolveOutput if agent_message.is_some() => (
+            RESUME_AGENT_LABEL.to_string(),
+            Value::Object(Map::new()),
+            Map::from_iter([(
+                "answer".to_string(),
+                Value::String(agent_message.unwrap_or_default().to_string()),
+            )]),
+        ),
         InputContinuation::ResolveOutput => {
             let label = resolve_output(&pending, delivery, &execution)?;
             (
@@ -940,7 +974,7 @@ pub fn close_pending(
 
 /// The label [`resume`] reports for an agent's answer to its own question:
 /// internal only, never checked against a state or taken as a transition.
-const RESUME_AGENT_LABEL: &str = "__resume_agent__";
+pub(crate) const RESUME_AGENT_LABEL: &str = "__resume_agent__";
 
 /// Refuses `data`/`variables` on a request that is not a problem: nothing
 /// would read them, and silently dropping an operator's values is worse than

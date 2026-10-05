@@ -896,6 +896,29 @@ fn a_problem_is_answered_with_a_label_its_data_and_its_variables() {
 }
 
 #[test]
+fn a_problem_can_be_returned_to_the_agent_without_choosing_an_output() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = start_execution(&store, root.path());
+    let pending = raise_problem(&store, &mut execution);
+
+    let resumed = human::resume(
+        &store,
+        &execution.id,
+        &HumanInputDelivery::default()
+            .with_agent_message("Please use the documented API version.")
+            .for_episode(pending.episode_key()),
+    )
+    .expect("message returns to the agent");
+
+    assert_eq!(resumed.result.output_label, "__resume_agent__");
+    assert_eq!(
+        resumed.result.variables.get("answer"),
+        Some(&json!("Please use the documented API version."))
+    );
+}
+
+#[test]
 fn a_problem_answer_without_a_required_key_names_the_key_and_changes_nothing() {
     let root = TempRoot::new();
     let store = root.store();

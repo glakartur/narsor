@@ -95,6 +95,7 @@ use crate::engine::actions::harness;
 use crate::engine::actions::human::{
     self, ConductorAnalysis, HumanActionError, HumanInputDelivery, HumanInputRequest,
     InputContinuation, OutputProblem, OutputRequirement, PendingHumanInput, RejectedAnswer,
+    RESUME_AGENT_LABEL,
 };
 use crate::engine::actions::{
     ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
@@ -1426,6 +1427,30 @@ impl Engine {
             return Ok(HandleState::Ready(execution));
         }
 
+        // A problem form can explicitly return to the agent instead of
+        // settling its output. This is a fresh lifecycle entry: a previously
+        // exhausted reprompt or conductor rescue must not be inherited by the
+        // next attempt.
+        if resumed.pending.continuation == InputContinuation::ResolveOutput
+            && resumed.result.output_label == RESUME_AGENT_LABEL
+        {
+            let answer = agent_reply(&resumed.result.variables).ok_or_else(|| {
+                EngineError::HumanInput(HumanActionError::MissingRequiredField {
+                    field: "agent_message".to_string(),
+                })
+            })?;
+            clear_engine_metadata(&mut execution, METADATA_OUTPUT_REJECTION_KEY);
+            clear_engine_metadata(&mut execution, METADATA_OUTPUT_RESCUE_KEY);
+            self.store_agent_input(
+                &mut execution,
+                &state_id,
+                &answer,
+                resumed.pending.request.agent_harness.as_deref(),
+                resumed.pending.request.agent_session_id.as_deref(),
+            )?;
+            return Ok(HandleState::Ready(execution));
+        }
+
         if resumed.pending.continuation == InputContinuation::ResolveOutput {
             // The answer is the output the agent did not give: recorded as
             // the step's result, and the label it names is the decision,
@@ -2261,6 +2286,11 @@ impl Engine {
         reason: String,
         analysis: Option<ConductorAnalysis>,
     ) -> Result<(), EngineError> {
+        // Keep the historical harness/session on the durable input record.
+        // `OutputRescue` is about to be cleared, but the operator may choose
+        // conversation rather than the manual output that originally ended it.
+        let session = stored_output_rescue(execution, &state.id)?
+            .map(|rescue| (rescue.harness, rescue.harness_session_id));
         clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
         clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
 
@@ -2289,8 +2319,8 @@ impl Engine {
             fields: Vec::new(),
             question: None,
             answer_tail,
-            agent_harness: None,
-            agent_session_id: None,
+            agent_harness: session.as_ref().and_then(|(harness, _)| harness.clone()),
+            agent_session_id: session.and_then(|(_, session)| session),
         };
         let pending = PendingHumanInput::for_problem(
             execution.id.clone(),

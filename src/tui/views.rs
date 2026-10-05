@@ -998,6 +998,29 @@ fn input_context_lines(form: &InputForm) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let mut lines = vec![Line::from(Span::styled(form.instruction.clone(), bold))];
 
+    if let Some(mode) = form.problem_mode {
+        lines.push(Line::from(""));
+        let action = match mode {
+            crate::tui::input_form::ProblemMode::Conversation => {
+                "Conversation mode — Enter sends this message to the agent (Tab: manual output)."
+            }
+            crate::tui::input_form::ProblemMode::ManualOutput => {
+                "Manual-output mode — Enter chooses the selected output (Tab: conversation)."
+            }
+        };
+        lines.push(Line::from(Span::styled(
+            action,
+            Style::default().fg(Color::Cyan),
+        )));
+        if mode == crate::tui::input_form::ProblemMode::Conversation {
+            lines.extend(
+                form.agent_message
+                    .lines()
+                    .map(|line| Line::from(format!("  {line}"))),
+            );
+        }
+    }
+
     if let Some(question) = &form.question {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(

@@ -313,6 +313,13 @@ pub enum FormAction {
     Cancel,
 }
 
+/// The explicit action an output-problem form will take on Enter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProblemMode {
+    Conversation,
+    ManualOutput,
+}
+
 /// The human-input form, generated from a [`PendingHumanInput`].
 ///
 /// A `text` field is an editable line, a `select` field cycles its `options`.
@@ -350,6 +357,10 @@ pub struct InputForm {
     pub label_field: Option<usize>,
     /// What a problem adds: its answers, requirements and key–value maps.
     pub problem: Option<ProblemForm>,
+    /// Problem forms start by talking to the agent; choosing an output is an
+    /// explicit alternate mode so typed text can never change Enter's action.
+    pub problem_mode: Option<ProblemMode>,
+    pub agent_message: String,
     /// The conductor's summary of the gate, when it made one (R30, AE16):
     /// advisory only, the answer is still the operator's.
     pub annotation: Option<Annotation>,
@@ -545,6 +556,8 @@ impl InputForm {
             label_index,
             label_field,
             problem,
+            problem_mode: (kind == InputKind::Problem).then_some(ProblemMode::Conversation),
+            agent_message: String::new(),
             annotation: None,
             row: 0,
             error: None,
@@ -635,6 +648,36 @@ impl InputForm {
 
     /// Folds one key press into the form.
     pub fn on_key(&mut self, key: KeyEvent) -> FormAction {
+        if let Some(mode) = self.problem_mode {
+            match key.code {
+                KeyCode::Esc => return FormAction::Cancel,
+                KeyCode::Tab => {
+                    self.problem_mode = Some(match mode {
+                        ProblemMode::Conversation => ProblemMode::ManualOutput,
+                        ProblemMode::ManualOutput => ProblemMode::Conversation,
+                    });
+                    return FormAction::None;
+                }
+                KeyCode::Enter
+                    if key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+                        && mode == ProblemMode::Conversation =>
+                {
+                    self.agent_message.push('\n');
+                    return FormAction::None;
+                }
+                KeyCode::Enter => return FormAction::Submit,
+                KeyCode::Backspace if mode == ProblemMode::Conversation => {
+                    self.agent_message.pop();
+                    return FormAction::None;
+                }
+                KeyCode::Char(character) if mode == ProblemMode::Conversation => {
+                    self.agent_message.push(character);
+                    return FormAction::None;
+                }
+                _ if mode == ProblemMode::Conversation => return FormAction::None,
+                _ => {}
+            }
+        }
         let rows = self.rows();
         match key.code {
             KeyCode::Esc => return FormAction::Cancel,
@@ -668,6 +711,14 @@ impl InputForm {
     /// same delivery, but only after a round trip, and the operator deserves
     /// the complaint next to the row that caused it.
     pub fn validate(&self) -> Result<HumanInputDelivery, FormError> {
+        if self.problem_mode == Some(ProblemMode::Conversation) {
+            if self.agent_message.trim().is_empty() {
+                return Err(FormError::general("Write a message for the agent."));
+            }
+            return Ok(HumanInputDelivery::default()
+                .with_agent_message(self.agent_message.clone())
+                .for_episode(&self.episode));
+        }
         let mut values = Map::new();
 
         for (index, field) in self.fields.iter().enumerate() {

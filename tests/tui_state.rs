@@ -482,7 +482,7 @@ fn fill_repository_field(app: &mut App, field: RepositoryField, value: &str) {
     let steps =
         (field.index() + RepositoryField::ALL.len() - form.row) % RepositoryField::ALL.len();
     for _ in 0..steps {
-        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Down));
     }
     type_text(app, value);
 }
@@ -3848,7 +3848,7 @@ fn focus_row(app: &mut App, row: FormRow) {
         if input_form(app).current_row() == Some(row) {
             return;
         }
-        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Down));
     }
     panic!("the form has no row {row:?}");
 }
@@ -4237,8 +4237,9 @@ async fn a_problem_label_needing_a_key_is_refused_until_it_is_given() {
     let mut app = app_over(&daemon, root.path()).await;
     app.refresh().await;
     app.on_key(key(KeyCode::Char('i')));
+    app.on_key(key(KeyCode::Tab));
 
-    // No analysis: the form starts on the first label.
+    // Manual-output mode starts on the first label.
     assert_eq!(
         input_form(&app).chosen_label().as_deref(),
         Some("implemented")
