@@ -84,9 +84,9 @@ use uuid::Uuid;
 use crate::conductor::ConductorRegistry;
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, AnsweredBy, Artifact, ArtifactReference,
-    DecisionProviderType, Event, EventData, ExecutionId, ExecutionStatus, InputCloseReason,
-    OutputDefinition, ProblemKind, RepromptedBy, State, StateId, WorkflowDefinition,
-    WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
+    DecisionProviderType, Event, EventData, ExecutionId, ExecutionStatus, HumanInputField,
+    HumanInputType, InputCloseReason, OutputDefinition, ProblemKind, RepromptedBy, State, StateId,
+    WorkflowDefinition, WorkflowExecution, Workspace, WorkspaceInfo, WorkspaceSpec,
 };
 use crate::engine::actions::agent::{
     self, BUILT_IN_HARNESS, MISSING_OUTPUT_LABEL, SESSION_DATA_KEY,
@@ -1856,6 +1856,7 @@ impl Engine {
         // A comment is consumed only by the first agent attempt following an
         // explicit recovery. It remains durable until this point, so a daemon
         // restart before the attempt begins cannot silently discard it.
+        let mut resumed_input = None;
         if let ActionConfig::Agent(config) = &mut rendered {
             if let Some(input) = self.take_agent_input(execution, state)? {
                 if let (Some(harness), Some(session)) =
@@ -1868,6 +1869,7 @@ impl Engine {
                         .push_str("\n\nHuman answer to your question:\n");
                     config.prompt.push_str(&input.answer);
                 }
+                resumed_input = Some(input);
             }
             if let Some(note) = self.take_operator_recovery_note(execution)? {
                 config.prompt.push_str("\n\nOperator recovery note:\n");
@@ -1910,6 +1912,30 @@ impl Engine {
                 Ok(AttemptOutcome::AwaitingAgentInput(request))
             }
 
+            Err(error)
+                if resumed_input
+                    .as_ref()
+                    .is_some_and(|input| input.session.is_some())
+                    && error.error_type.as_deref() == Some(agent::RESUME_SESSION_REJECTED) =>
+            {
+                let input = resumed_input.expect("guarded above");
+                Ok(AttemptOutcome::AwaitingAgentInput(HumanInputRequest {
+                    action_execution_id: action_execution_id.to_string(),
+                    instruction: "The saved agent session could not be resumed. Review the message below, then press Enter to start a new session.".to_string(),
+                    fields: vec![HumanInputField {
+                        name: "answer".to_string(),
+                        field_type: HumanInputType::Text,
+                        required: true,
+                        description: None,
+                        options: Vec::new(),
+                    }],
+                    question: None,
+                    answer_tail: None,
+                    agent_harness: None,
+                    agent_session_id: None,
+                    prefilled_answer: Some(input.answer),
+                }))
+            }
             Err(error) => match OutputRejection::from_error(state, action_execution_id, &error) {
                 Some(rejection) => Ok(AttemptOutcome::OutputRejected(rejection)),
                 None => {
@@ -2321,6 +2347,7 @@ impl Engine {
             answer_tail,
             agent_harness: session.as_ref().and_then(|(harness, _)| harness.clone()),
             agent_session_id: session.and_then(|(_, session)| session),
+            prefilled_answer: None,
         };
         let pending = PendingHumanInput::for_problem(
             execution.id.clone(),
@@ -2438,6 +2465,7 @@ impl Engine {
                     answer_tail,
                     agent_harness: None,
                     agent_session_id: None,
+                    prefilled_answer: None,
                 };
                 self.suspend_for_input(
                     execution,

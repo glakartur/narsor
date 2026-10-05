@@ -2232,6 +2232,7 @@ impl ActionExecutor for AgentReply {
                         answer_tail: None,
                         agent_harness: None,
                         agent_session_id: None,
+                        prefilled_answer: None,
                     },
                 )),
             })

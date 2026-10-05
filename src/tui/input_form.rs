@@ -361,6 +361,9 @@ pub struct InputForm {
     /// explicit alternate mode so typed text can never change Enter's action.
     pub problem_mode: Option<ProblemMode>,
     pub agent_message: String,
+    /// Character offset in the conversation message, independent of field
+    /// cursors because this editor is active while no form row is focused.
+    pub agent_message_cursor: usize,
     /// The conductor's summary of the gate, when it made one (R30, AE16):
     /// advisory only, the answer is still the operator's.
     pub annotation: Option<Annotation>,
@@ -491,6 +494,15 @@ impl InputForm {
                 HumanInputType::Text => String::new(),
             })
             .collect();
+        let mut values = values;
+        if kind == InputKind::AgentQuestion {
+            if let (Some(answer), Some(index)) = (
+                pending.request.prefilled_answer.as_ref(),
+                fields.iter().position(|field| field.name == "answer"),
+            ) {
+                values[index] = answer.clone();
+            }
+        }
         let text_cursors = values.iter().map(|value| value.chars().count()).collect();
 
         let label_field = fields
@@ -557,7 +569,12 @@ impl InputForm {
             label_field,
             problem,
             problem_mode: (kind == InputKind::Problem).then_some(ProblemMode::Conversation),
-            agent_message: String::new(),
+            agent_message: pending.request.prefilled_answer.clone().unwrap_or_default(),
+            agent_message_cursor: pending
+                .request
+                .prefilled_answer
+                .as_ref()
+                .map_or(0, |message| message.chars().count()),
             annotation: None,
             row: 0,
             error: None,
@@ -662,16 +679,25 @@ impl InputForm {
                     if key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
                         && mode == ProblemMode::Conversation =>
                 {
-                    self.agent_message.push('\n');
+                    self.insert_agent_character('\n');
                     return FormAction::None;
                 }
                 KeyCode::Enter => return FormAction::Submit,
                 KeyCode::Backspace if mode == ProblemMode::Conversation => {
-                    self.agent_message.pop();
+                    self.backspace_agent_message();
+                    return FormAction::None;
+                }
+                KeyCode::Left if mode == ProblemMode::Conversation => {
+                    self.agent_message_cursor = self.agent_message_cursor.saturating_sub(1);
+                    return FormAction::None;
+                }
+                KeyCode::Right if mode == ProblemMode::Conversation => {
+                    self.agent_message_cursor =
+                        (self.agent_message_cursor + 1).min(self.agent_message.chars().count());
                     return FormAction::None;
                 }
                 KeyCode::Char(character) if mode == ProblemMode::Conversation => {
-                    self.agent_message.push(character);
+                    self.insert_agent_character(character);
                     return FormAction::None;
                 }
                 _ if mode == ProblemMode::Conversation => return FormAction::None,
@@ -702,6 +728,22 @@ impl InputForm {
             _ => {}
         }
         FormAction::None
+    }
+
+    fn insert_agent_character(&mut self, character: char) {
+        let byte = char_byte_index(&self.agent_message, self.agent_message_cursor);
+        self.agent_message.insert(byte, character);
+        self.agent_message_cursor += 1;
+    }
+
+    fn backspace_agent_message(&mut self) {
+        if self.agent_message_cursor == 0 {
+            return;
+        }
+        let end = char_byte_index(&self.agent_message, self.agent_message_cursor);
+        let start = char_byte_index(&self.agent_message, self.agent_message_cursor - 1);
+        self.agent_message.replace_range(start..end, "");
+        self.agent_message_cursor -= 1;
     }
 
     /// Validates by the same rules the engine applies and builds the

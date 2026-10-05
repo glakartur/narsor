@@ -96,6 +96,7 @@ impl ActionExecutor for HumanExecutor {
                     answer_tail: None,
                     agent_harness: None,
                     agent_session_id: None,
+                    prefilled_answer: None,
                 }),
             ))
         })
@@ -165,6 +166,11 @@ pub struct HumanInputRequest {
     /// deserialize without one and therefore fall back to a fresh attempt.
     #[serde(default)]
     pub agent_session_id: Option<String>,
+
+    /// Text to restore in the form after a saved session could not be
+    /// resumed. Older records simply have no prefilled answer.
+    #[serde(default)]
+    pub prefilled_answer: Option<String>,
 }
 
 /// The durable record of a question awaiting an answer — `pending_input.json`.

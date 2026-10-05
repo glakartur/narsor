@@ -799,6 +799,7 @@ fn raise_problem(store: &ExecutionStore, execution: &mut WorkflowExecution) -> P
         answer_tail: Some("All done, tests pass.".to_string()),
         agent_harness: None,
         agent_session_id: None,
+        prefilled_answer: None,
     };
     let problem = OutputProblem {
         reason: "no output label".to_string(),

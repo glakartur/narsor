@@ -186,6 +186,10 @@ pub const BUILT_IN_HARNESS: &str = super::harness::claude_code::CLAUDE_CODE;
 /// The `parameters` key that continues an existing harness session (D18).
 pub const RESUME_SESSION_PARAMETER: &str = "resume_session";
 
+/// The harness refused a saved session id. The runner turns this into a new
+/// operator choice instead of retrying it or discarding the drafted message.
+pub const RESUME_SESSION_REJECTED: &str = "resume_session_rejected";
+
 /// Configures the next normal attempt as a continuation of an operator-facing
 /// conversation. Unlike [`reprompt_config`], this preserves the action's
 /// workspace permission: the operator is explicitly asking the agent to keep
@@ -636,7 +640,13 @@ impl AgentExecutor {
                 run.session_id.clone(),
                 failure.clone(),
             );
-            return Err(harness_error(adapter.as_ref(), failure, &finished, &run));
+            return Err(harness_error(
+                adapter.as_ref(),
+                failure,
+                &finished,
+                &run,
+                resume,
+            ));
         }
 
         let output = match extract_response(&run.text) {
@@ -680,6 +690,7 @@ impl AgentExecutor {
                     answer_tail: None,
                     agent_harness: Some(harness.to_string()),
                     agent_session_id: run.session_id.clone(),
+                    prefilled_answer: None,
                 }),
             )),
         }
@@ -1102,16 +1113,25 @@ fn harness_error(
     failure: &str,
     finished: &FinishedRun,
     run: &HarnessRun,
+    resumed_session: Option<&str>,
 ) -> ActionError {
     ActionError {
         message: format!("the agent harness '{}' failed: {failure}", adapter.name()),
-        error_type: Some("harness_failed".to_string()),
+        error_type: Some(
+            if resumed_session.is_some() {
+                RESUME_SESSION_REJECTED
+            } else {
+                "harness_failed"
+            }
+            .to_string(),
+        ),
         details: Some(serde_json::json!({
             "harness": adapter.name(),
             "program": adapter.program(),
             "exit_code": finished.exit_code,
             "session_id": run.session_id,
             "stderr": truncate(&finished.stderr),
+            "resumed_session": resumed_session,
         })),
     }
 }

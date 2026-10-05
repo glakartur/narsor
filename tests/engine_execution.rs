@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use engine_support::{
     event_type, workflow, workflow_file, AnsweringAgentExecutor, Harness, LabellessAgentExecutor,
-    QuestioningAgentExecutor, StubAgentExecutor, TimeoutRecorder,
+    QuestioningAgentExecutor, ResumeRejectingAgentExecutor, StubAgentExecutor, TimeoutRecorder,
 };
 use narsor::domain::{EventData, ExecutionStatus};
 use narsor::engine::{
@@ -177,6 +177,46 @@ async fn an_agent_question_pauses_and_resumes_the_same_workflow_state() {
         1,
         "the answer itself must not take a transition"
     );
+}
+
+#[tokio::test]
+async fn a_rejected_agent_resume_restores_the_message_for_a_new_session() {
+    let harness = Harness::new();
+    let engine = Engine::new(harness.store()).with_executor(
+        ActionKind::Agent,
+        Arc::new(ResumeRejectingAgentExecutor::new()),
+    );
+    let definition = workflow("agent_question");
+    let paused = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("initial question");
+
+    let rejected = engine
+        .deliver_human_input(
+            &definition,
+            &paused.id,
+            &HumanInputDelivery::with_values(Map::from_iter([("answer".to_string(), json!("v2"))])),
+        )
+        .await
+        .expect("resume rejection becomes a new prompt");
+    assert_eq!(rejected.status, ExecutionStatus::InputNeeded);
+    let pending = engine
+        .pending_input(&paused.id)
+        .expect("pending")
+        .expect("form");
+    assert_eq!(pending.request.agent_session_id, None);
+    assert_eq!(pending.request.prefilled_answer.as_deref(), Some("v2"));
+
+    let finished = engine
+        .deliver_human_input(
+            &definition,
+            &paused.id,
+            &HumanInputDelivery::with_values(Map::from_iter([("answer".to_string(), json!("v2"))])),
+        )
+        .await
+        .expect("fresh session starts");
+    assert_eq!(finished.status, ExecutionStatus::Completed);
 }
 
 #[tokio::test]

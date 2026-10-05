@@ -325,6 +325,69 @@ pub struct QuestioningAgentExecutor {
     prompts: Mutex<Vec<String>>,
 }
 
+/// Asks once, then reports that its recorded session is gone; the next fresh
+/// attempt succeeds. It exercises the runner's operator-facing fallback.
+pub struct ResumeRejectingAgentExecutor {
+    calls: Mutex<usize>,
+}
+
+impl ResumeRejectingAgentExecutor {
+    pub fn new() -> Self {
+        Self {
+            calls: Mutex::new(0),
+        }
+    }
+}
+
+impl ActionExecutor for ResumeRejectingAgentExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: ActionRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
+        let call = {
+            let mut calls = self.calls.lock().expect("calls");
+            *calls += 1;
+            *calls
+        };
+        let action_execution_id = request.action_execution_id.to_string();
+        Box::pin(async move {
+            match call {
+                1 => Ok(ActionOutcome::Suspended(
+                    SuspendedAction::AwaitingAgentInput(HumanInputRequest {
+                        action_execution_id,
+                        instruction: "Which API version?".to_string(),
+                        fields: vec![HumanInputField {
+                            name: "answer".to_string(),
+                            field_type: HumanInputType::Text,
+                            required: true,
+                            description: None,
+                            options: Vec::new(),
+                        }],
+                        question: None,
+                        answer_tail: None,
+                        agent_harness: Some("fake".to_string()),
+                        agent_session_id: Some("gone-session".to_string()),
+                        prefilled_answer: None,
+                    }),
+                )),
+                2 => Err(ActionError {
+                    message: "saved session does not exist".to_string(),
+                    error_type: Some("resume_session_rejected".to_string()),
+                    details: None,
+                }),
+                _ => Ok(ActionOutcome::Completed(ActionResult {
+                    output_label: "done".to_string(),
+                    data: json!({}),
+                    variables: Map::new(),
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })),
+            }
+        })
+    }
+}
+
 impl QuestioningAgentExecutor {
     pub fn new() -> Self {
         Self {
@@ -379,6 +442,7 @@ impl ActionExecutor for QuestioningAgentExecutor {
                         answer_tail: None,
                         agent_harness: None,
                         agent_session_id: None,
+                        prefilled_answer: None,
                     }),
                 ));
             }
