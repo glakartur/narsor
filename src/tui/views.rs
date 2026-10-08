@@ -177,15 +177,16 @@ fn render_queued_task(
     let [body, footer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(SHORTCUT_BAR_HEIGHT)])
             .areas(frame.area());
+    let status = super::remote::status_badge(task);
     let mut lines = vec![
         Line::from(format!("Task: {}", task.task_id)),
         Line::from(format!("Workflow: {}", task.workflow_id)),
         Line::from(format!("Backend: {}", task.backend_id)),
-        Line::from(format!("Lifecycle: {:?}", task.lifecycle)),
+        Line::from(format!("Status: {}", status.text)),
         Line::from(format!("Priority: {}", task.priority)),
     ];
-    if let Some(queue) = &task.queue {
-        lines.push(Line::from(format!("Queue: {}", queue.message)));
+    if let Some(hint) = super::remote::lifecycle_hint(task) {
+        lines.push(Line::from(hint.text));
     }
     if let Some(runner) = &task.runner {
         lines.push(Line::from(format!(

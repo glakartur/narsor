@@ -2243,6 +2243,227 @@ async fn starting_a_valid_new_task_is_queued_without_selecting_an_execution() {
     assert!(screen.contains(task.task_id.as_str()));
 }
 
+/// Parks a task on its human state, which keeps the local backend's only slot
+/// busy, and returns once the scheduler has admitted it.
+async fn hold_the_slot(client: &ApiClient) {
+    use narsor::orchestration::TaskLifecycle;
+
+    let inputs = json!({ "ticket": "HOLD" })
+        .as_object()
+        .cloned()
+        .expect("an object");
+    client
+        .start_task(
+            "slot-holder",
+            &new_task_definition_path().display().to_string(),
+            inputs,
+        )
+        .await
+        .expect("queue the slot holder");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let task = client.control_task("slot-holder").await.expect("holder");
+        if task.lifecycle == TaskLifecycle::Running {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slot holder never started: {:?}",
+            task.lifecycle
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Queues the `new_task` fixture through the form, as an operator would.
+async fn queue_through_the_form(app: &mut App, ticket: &str) {
+    open_new_task(app, &new_task_definition_path());
+    focus_input(app, "ticket");
+    type_text(app, ticket);
+    app.on_key(key(KeyCode::Enter));
+    app.start_new_task().await;
+    assert!(app.queued_task().is_some(), "the queued task is on screen");
+}
+
+/// R3, R5, AE2: behind a full backend the task waits with its place in line
+/// on screen, and its priority can be raised and lowered — then it follows
+/// the daemon, not a guess.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_task_waiting_behind_a_full_backend_shows_its_place_and_takes_priority_changes() {
+    let root = TempRoot::new();
+    let (daemon, client) = Daemon::start(root.path()).await;
+    hold_the_slot(&client).await;
+    let mut app = app_over(&daemon, root.path()).await;
+
+    queue_through_the_form(&mut app, "ORC-21").await;
+    let id = app.queued_task().unwrap().task_id.to_string();
+
+    let screen = screen_of(&mut app);
+    assert!(screen.contains("Status: queued"), "{screen}");
+    assert!(screen.contains("Priority: 0"), "{screen}");
+    assert!(
+        app.shortcuts().iter().any(|(key, _)| *key == "+/-"),
+        "a queued task offers its priority"
+    );
+
+    assert_eq!(
+        app.on_key(key(KeyCode::Char('+'))),
+        Request::AdjustQueuedPriority(1)
+    );
+    app.adjust_queued_priority(1).await;
+    app.adjust_queued_priority(1).await;
+    assert_eq!(client.control_task(&id).await.unwrap().priority, 2);
+    assert!(screen_of(&mut app).contains("Priority: 2"));
+
+    assert_eq!(
+        app.on_key(key(KeyCode::Char('-'))),
+        Request::AdjustQueuedPriority(-1)
+    );
+    app.adjust_queued_priority(-1).await;
+    assert_eq!(client.control_task(&id).await.unwrap().priority, 1);
+    assert!(screen_of(&mut app).contains("Priority: 1"));
+}
+
+/// R8: the same screen follows the task from queued to running, names its
+/// execution only once the runner has one, and stops offering a priority the
+/// scheduler no longer honours.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_task_screen_follows_the_lifecycle_and_stops_offering_priority_once_admitted() {
+    use narsor::orchestration::TaskLifecycle;
+
+    let root = TempRoot::new();
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+
+    queue_through_the_form(&mut app, "ORC-22").await;
+    let id = app.queued_task().unwrap().task_id.to_string();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        app.refresh().await;
+        let task = app.queued_task().expect("still on the task screen");
+        let has_execution = task
+            .runner
+            .as_ref()
+            .and_then(|runner| runner.execution_cursor.execution_id.as_ref())
+            .is_some();
+        if task.lifecycle == TaskLifecycle::Running && has_execution {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the task never reached a runner-backed execution: {:?}",
+            task.lifecycle
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let screen = screen_of(&mut app);
+    assert!(screen.contains("Status: running") || screen.contains("Status: running ·"));
+    assert!(!screen.contains("Execution: not created yet"), "{screen}");
+    let shortcuts = app.shortcuts();
+    assert!(shortcuts.iter().any(|(_, what)| *what == "open execution"));
+    assert!(
+        !shortcuts.iter().any(|(key, _)| *key == "+/-"),
+        "an admitted task is not reordered"
+    );
+
+    app.adjust_queued_priority(1).await;
+    assert!(app
+        .notice()
+        .is_some_and(|notice| notice.text.contains("waiting tasks only")));
+    assert_eq!(client.control_task(&id).await.unwrap().priority, 0);
+}
+
+/// R7, F3, AE3: the create went through but its answer was lost, so the
+/// operator submits again. The form's retained submission id makes that a
+/// replay — the original task is selected and nothing is queued twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn submitting_again_after_a_lost_acknowledgement_selects_the_original_task() {
+    let root = TempRoot::new();
+    let (daemon, client) = Daemon::start(root.path()).await;
+    let mut app = app_over(&daemon, root.path()).await;
+
+    open_new_task(&mut app, &new_task_definition_path());
+    focus_input(&mut app, "ticket");
+    type_text(&mut app, "ORC-24");
+    app.on_key(key(KeyCode::Enter));
+
+    // The attempt whose answer never arrived, made with exactly what the form
+    // would have sent.
+    let Modal::NewTask(form) = app.modal() else {
+        panic!("the form is open");
+    };
+    let (submission_id, reference, inputs) = (
+        form.submission_id.clone(),
+        form.reference.clone().expect("a resolved reference"),
+        form.inputs().expect("valid inputs"),
+    );
+    client
+        .start_task(&submission_id, &reference, inputs)
+        .await
+        .expect("the lost attempt");
+
+    app.start_new_task().await;
+
+    assert!(
+        matches!(app.modal(), Modal::None),
+        "the replay was acknowledged, not refused"
+    );
+    assert_eq!(
+        app.queued_task().map(|task| task.task_id.to_string()),
+        Some(submission_id),
+        "the original task is the one on screen"
+    );
+    assert_eq!(
+        client.control_tasks().await.unwrap().tasks.len(),
+        1,
+        "no second task was queued"
+    );
+}
+
+/// AE2/R2: a task belongs to the backend that accepted it. Connecting the
+/// interface to another daemon neither moves it there nor shows it there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_task_stays_with_the_backend_that_accepted_it_when_the_interface_connects_elsewhere() {
+    use narsor::tui::remote::RemoteApp;
+
+    let first_root = TempRoot::new();
+    let second_root = TempRoot::new();
+    let (first, first_client) = Daemon::start(first_root.path()).await;
+    let (_second, second_client) = Daemon::start(second_root.path()).await;
+
+    let mut app = app_over(&first, first_root.path()).await;
+    queue_through_the_form(&mut app, "ORC-23").await;
+    let id = app.queued_task().unwrap().task_id.to_string();
+
+    let mut elsewhere = RemoteApp::new(second_client.clone());
+    elsewhere.refresh().await;
+    assert!(
+        elsewhere.tasks().is_empty(),
+        "the other backend does not show a task it never accepted"
+    );
+    assert!(matches!(
+        second_client.control_task(&id).await,
+        Err(ClientError::NotFound)
+    ));
+
+    let mut back = RemoteApp::new(first_client.clone());
+    back.refresh().await;
+    let task = back
+        .tasks()
+        .iter()
+        .find(|task| task.task_id.as_str() == id)
+        .expect("the task is still on its own backend");
+    assert_eq!(task.backend_id.as_str(), "local");
+    assert!(second_client
+        .control_tasks()
+        .await
+        .unwrap()
+        .tasks
+        .is_empty());
+}
+
 /// A definition declaring `globals.workspace` starts from the modal, and its
 /// workspace is provisioned — the interface no longer sends the operator to
 /// `narsor run` for it (now: the daemon provisions it, on the other end of

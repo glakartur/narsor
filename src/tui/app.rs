@@ -396,6 +396,8 @@ pub enum Request {
     SelectExecution,
     /// Validate and deliver the open input form.
     SubmitInput,
+    /// Raise (+) or lower (−) the priority of the queued task on screen.
+    AdjustQueuedPriority(i32),
     /// Carry out the transition the operator picked.
     ApplyTransition,
     /// Run or resume the selected execution.
@@ -1635,6 +1637,12 @@ impl App {
             let mut keys = vec![("r", "refresh task")];
             if self
                 .queued_task()
+                .is_some_and(|task| task.lifecycle == crate::orchestration::TaskLifecycle::Queued)
+            {
+                keys.push(("+/-", "raise/lower priority"));
+            }
+            if self
+                .queued_task()
                 .and_then(|task| task.runner.as_ref())
                 .and_then(|runner| runner.execution_cursor.execution_id.as_ref())
                 .is_some()
@@ -1806,6 +1814,45 @@ impl App {
         self.reload_selection().await;
         self.refresh_queued_task().await;
         self.refresh.done(Instant::now());
+    }
+
+    /// Raises or lowers the priority of the queued task on screen.
+    ///
+    /// Priority orders waiting tasks only: once the scheduler has admitted
+    /// the task the daemon refuses the change, and the screen is refreshed
+    /// to say where the task stands now. The stored generation guards
+    /// against moving a task that changed state meanwhile.
+    pub async fn adjust_queued_priority(&mut self, delta: i32) {
+        let Some(task) = self.queued_task() else {
+            return;
+        };
+        if task.lifecycle != crate::orchestration::TaskLifecycle::Queued {
+            self.notice = Some(Notice::info(
+                "Priority orders waiting tasks only; this task is no longer queued.".to_string(),
+            ));
+            return;
+        }
+        let task_id = task.task_id.to_string();
+        let request = crate::controller_protocol::SetPriorityRequest {
+            priority: task.priority.saturating_add(delta),
+            expected_generation: Some(task.generation),
+        };
+        match self.client.control_set_priority(&task_id, &request).await {
+            Ok(task) => {
+                self.notice = Some(Notice::info(format!(
+                    "Priority of {} is now {}.",
+                    task.task_id, task.priority
+                )));
+                self.screen = Screen::Queued(Box::new(task));
+            }
+            Err(ClientError::Refused { message, .. }) => {
+                self.notice = Some(Notice::error(format!("Priority not changed: {message}")));
+                self.refresh_queued_task().await;
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!("Priority not changed: {error}")));
+            }
+        }
     }
 
     /// Refreshes task-first state independently of the legacy execution
@@ -2170,6 +2217,8 @@ impl App {
         if matches!(self.screen, Screen::Queued(_)) {
             return match key.code {
                 KeyCode::Char('r') => Request::Refresh,
+                KeyCode::Char('+') => Request::AdjustQueuedPriority(1),
+                KeyCode::Char('-') => Request::AdjustQueuedPriority(-1),
                 KeyCode::Enter => {
                     let Some(execution_id) = self
                         .queued_task()
