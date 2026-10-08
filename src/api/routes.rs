@@ -48,7 +48,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -77,10 +77,14 @@ use crate::conductor::{
     UndoError, UndoOutcome,
 };
 use crate::controller_protocol::http as protocol_http;
+use crate::controller_protocol::ProtocolError;
+use crate::domain::TaskId;
 use crate::domain::{AnsweredBy, Event, ExecutionStatus};
 use crate::engine::{
     build_timeline, Engine, EngineError, HumanInputDelivery, ManualTransition, Recovery, Timeline,
 };
+use crate::environment::{CatalogLaunchResolver, LaunchIntent};
+use crate::orchestration::OwnerRef;
 use crate::persistence::{
     ConversationSource, DefaultHarnessSelector, ExecutionStore, HarnessSelectionError,
     HarnessSelectionSnapshot as PersistenceHarnessSelectionSnapshot, PersistenceError,
@@ -130,6 +134,8 @@ struct AppState {
     harness_selector: Option<Arc<DefaultHarnessSelector>>,
     active_tasks: ActiveTasks,
     conductor: Option<Arc<ConductorRegistry>>,
+    control: Option<Arc<crate::controller_protocol::ProtocolService>>,
+    local_launch: Option<Arc<CatalogLaunchResolver>>,
 }
 
 /// Builds the router: the three original read-only endpoints (U5/U2) plus
@@ -169,6 +175,8 @@ pub fn router(
         harness_selector: services.harness_selector,
         active_tasks: services.active_tasks,
         conductor: services.conductor,
+        control: control.clone(),
+        local_launch: services.local_launch,
     };
     let mut owner = Router::new()
         .route("/executions/:execution_id/events", get(get_events))
@@ -428,9 +436,140 @@ impl From<TaskError> for ApiError {
     }
 }
 
+fn protocol_error_as_api(error: ProtocolError) -> ApiError {
+    match error {
+        ProtocolError::NotFound => ApiError::ExecutionNotFound,
+        ProtocolError::BadRequest { code, message } => ApiError::Request { code, message },
+        ProtocolError::Conflict { code, message } => ApiError::Refused { code, message },
+        ProtocolError::Unauthorized | ProtocolError::Forbidden => ApiError::ExecutionNotFound,
+        ProtocolError::Internal(message) => ApiError::Internal(message),
+    }
+}
+
+/// Where the daemon-owned local backend keeps its task storages — under the
+/// configured work root, which is where task workspaces have always lived.
+fn local_storage_root(state: &AppState) -> PathBuf {
+    state.work_dir.join("local-controller").join("storage")
+}
+
+fn execution_store_for(state: &AppState, execution_id: &str) -> Result<ExecutionStore, ApiError> {
+    if !is_safe_id(execution_id) {
+        return Err(ApiError::ExecutionNotFound);
+    }
+    let matches = execution_stores(state)?
+        .into_iter()
+        .filter(|store| store.exists(execution_id))
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => Err(ApiError::ExecutionNotFound),
+        1 => Ok(matches
+            .into_iter()
+            .next()
+            .expect("one execution store match")),
+        _ => Err(ApiError::Conflict(format!(
+            "execution '{execution_id}' is ambiguous across backend storage"
+        ))),
+    }
+}
+
+/// Resolves an execution visible to one owner.  Runner storage is never
+/// enumerated as a tenant-visible namespace: the task projection is the
+/// authority linking an execution id to its backend-owned storage.
+fn owner_execution_store_for(
+    state: &AppState,
+    owner: &OwnerRef,
+    execution_id: &str,
+) -> Result<ExecutionStore, ApiError> {
+    if !is_safe_id(execution_id) {
+        return Err(ApiError::ExecutionNotFound);
+    }
+    let mut matches = Vec::new();
+    if state.store.exists(execution_id) {
+        matches.push(state.store.clone());
+    }
+    let Some(control) = &state.control else {
+        return match matches.len() {
+            0 => Err(ApiError::ExecutionNotFound),
+            1 => Ok(matches.pop().expect("one legacy execution store")),
+            _ => unreachable!("one legacy store can contribute at most once"),
+        };
+    };
+    let tasks = control.list_tasks(owner).map_err(|error| {
+        ApiError::Internal(format!("could not resolve task projection: {error}"))
+    })?;
+    for task in tasks.tasks {
+        let is_execution = task
+            .runner
+            .as_ref()
+            .and_then(|runner| runner.execution_cursor.execution_id.as_deref())
+            == Some(execution_id);
+        // The embedded local API can read only the daemon-owned local
+        // backend. Other backends keep their storage behind their own API.
+        if is_execution && task.backend_id.as_str() == "local" {
+            let store = ExecutionStore::new(
+                local_storage_root(state)
+                    .join(task.task_id.as_str())
+                    .join("state"),
+            );
+            if store.exists(execution_id) {
+                matches.push(store);
+            }
+        }
+    }
+    match matches.len() {
+        0 => Err(ApiError::ExecutionNotFound),
+        1 => Ok(matches.pop().expect("one owner-visible execution store")),
+        _ => Err(ApiError::Conflict(format!(
+            "execution '{execution_id}' is ambiguous across legacy and backend storage"
+        ))),
+    }
+}
+
+/// Every local execution store the compatibility routes may inspect.
+///
+/// Runner storage is deliberately discovered from the backend's durable root:
+/// a queued task has no execution storage yet.  A missing local backend is
+/// normal for a fresh installation; any other directory-read error is not
+/// silently mistaken for a missing execution.
+fn execution_stores(state: &AppState) -> Result<Vec<ExecutionStore>, ApiError> {
+    let mut stores = vec![state.store.clone()];
+    let storage_root = local_storage_root(state);
+    let entries = match std::fs::read_dir(&storage_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(stores),
+        Err(error) => {
+            return Err(ApiError::Internal(format!(
+                "could not read runner storage '{}': {error}",
+                storage_root.display()
+            )))
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            ApiError::Internal(format!(
+                "could not enumerate runner storage '{}': {error}",
+                storage_root.display()
+            ))
+        })?;
+        stores.push(ExecutionStore::new(entry.path().join("state")));
+    }
+    Ok(stores)
+}
+
 fn require_execution(state: &AppState, execution_id: &str) -> Result<(), ApiError> {
+    execution_store_for(state, execution_id).map(|_| ())
+}
+
+/// Legacy execution mutations are driven by the daemon's in-process engine.
+/// Runner-owned executions must instead be controlled through their task
+/// protocol; accepting them here would read a different store and fail later.
+fn require_legacy_execution(state: &AppState, execution_id: &str) -> Result<(), ApiError> {
     if is_safe_id(execution_id) && state.store.exists(execution_id) {
         Ok(())
+    } else if execution_store_for(state, execution_id).is_ok() {
+        Err(ApiError::Conflict(format!(
+            "execution '{execution_id}' is runner-owned; use its task lifecycle operation"
+        )))
     } else {
         Err(ApiError::ExecutionNotFound)
     }
@@ -465,11 +604,12 @@ struct EventsQuery {
 /// itself — the transport changes, the contract does not.
 async fn get_events(
     State(state): State<AppState>,
+    Extension(owner): Extension<OwnerRef>,
     Path(execution_id): Path<String>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<Vec<Event>>, ApiError> {
-    require_execution(&state, &execution_id)?;
-    let events = state.store.event_log(&execution_id).read_all()?;
+    let store = owner_execution_store_for(&state, &owner, &execution_id)?;
+    let events = store.event_log(&execution_id).read_all()?;
     let events = events
         .into_iter()
         .filter(|event| event.sequence > query.after)
@@ -487,7 +627,7 @@ async fn get_conductor_state(
     State(state): State<AppState>,
     Path(execution_id): Path<String>,
 ) -> Result<Json<ConductorStateResponse>, ApiError> {
-    require_execution(&state, &execution_id)?;
+    require_legacy_execution(&state, &execution_id)?;
     let conductor = ConductorStore::new(state.store.paths(), &execution_id);
     let unanswered = conductor
         .unanswered_chat()?
@@ -508,7 +648,7 @@ async fn get_conductor_chat(
     Path(execution_id): Path<String>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<ConductorChatResponse>, ApiError> {
-    require_execution(&state, &execution_id)?;
+    require_legacy_execution(&state, &execution_id)?;
     let conductor = ConductorStore::new(state.store.paths(), &execution_id);
     Ok(Json(ConductorChatResponse {
         entries: conductor.read_chat_after(query.after)?,
@@ -534,7 +674,7 @@ async fn post_conductor_chat(
     Path(execution_id): Path<String>,
     Json(body): Json<ChatMessageRequest>,
 ) -> Result<(StatusCode, Json<ChatEntry>), ApiError> {
-    require_execution(&state, &execution_id)?;
+    require_legacy_execution(&state, &execution_id)?;
     let conductor = require_conductor(&state)?;
     let text = body.text.trim();
     if text.is_empty() {
@@ -559,7 +699,7 @@ async fn post_confirm_proposal(
     State(state): State<AppState>,
     Path((execution_id, proposal_id)): Path<(String, String)>,
 ) -> Result<Json<ProposalOutcome>, ApiError> {
-    require_execution(&state, &execution_id)?;
+    require_legacy_execution(&state, &execution_id)?;
     let conductor = require_conductor(&state)?;
     let execution = state.store.load_execution(&execution_id)?;
     let definition = load_definition_for(&state, &execution)?;
@@ -579,7 +719,7 @@ async fn post_reject_proposal(
     State(state): State<AppState>,
     Path((execution_id, proposal_id)): Path<(String, String)>,
 ) -> Result<Json<ProposalOutcome>, ApiError> {
-    require_execution(&state, &execution_id)?;
+    require_legacy_execution(&state, &execution_id)?;
     let conductor = require_conductor(&state)?;
     Ok(Json(
         conductor.reject_proposal(&execution_id, &proposal_id)?,
@@ -596,7 +736,7 @@ async fn post_undo_decision(
     State(state): State<AppState>,
     Path((execution_id, decision_id)): Path<(String, String)>,
 ) -> Result<Json<UndoOutcome>, ApiError> {
-    require_execution(&state, &execution_id)?;
+    require_legacy_execution(&state, &execution_id)?;
     let conductor = require_conductor(&state)?;
     let execution = state.store.load_execution(&execution_id)?;
     let definition = load_definition_for(&state, &execution)?;
@@ -674,12 +814,13 @@ impl From<UndoError> for ApiError {
 /// wiring U4's pure function was left waiting for.
 async fn get_timeline(
     State(state): State<AppState>,
+    Extension(owner): Extension<OwnerRef>,
     Path(execution_id): Path<String>,
 ) -> Result<Json<Timeline>, ApiError> {
-    require_execution(&state, &execution_id)?;
-    let execution = state.store.load_execution(&execution_id)?;
-    let events = state.store.event_log(&execution_id).read_all()?;
-    let presence = conversation_presence(&state.store, &execution_id)?;
+    let store = owner_execution_store_for(&state, &owner, &execution_id)?;
+    let execution = store.load_execution(&execution_id)?;
+    let events = store.event_log(&execution_id).read_all()?;
+    let presence = conversation_presence(&store, &execution_id)?;
     let timeline = build_timeline(&events, execution.status, &presence);
     Ok(Json(timeline))
 }
@@ -762,14 +903,15 @@ pub enum ConversationResponse {
 /// `GET /executions/:execution_id/attempts/:attempt_id/conversation?from=<n>&byte_budget=<bytes>`
 async fn get_conversation(
     State(state): State<AppState>,
+    Extension(owner): Extension<OwnerRef>,
     Path((execution_id, attempt_id)): Path<(String, String)>,
     Query(query): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, ApiError> {
-    require_execution(&state, &execution_id)?;
+    let execution_store = owner_execution_store_for(&state, &owner, &execution_id)?;
     if !is_safe_id(&attempt_id) {
         return Ok(Json(ConversationResponse::NoRecord));
     }
-    let store = state.store.conversation_store(&execution_id);
+    let store = execution_store.conversation_store(&execution_id);
     let snapshot = store.read(&attempt_id, query.from, query.byte_budget)?;
 
     let response = match snapshot {
@@ -830,34 +972,54 @@ fn load_definition_for(
 /// finishes — a workflow can run for as long as its longest human gate.
 async fn post_start_task(
     State(state): State<AppState>,
+    Extension(owner): Extension<OwnerRef>,
     Json(body): Json<StartTaskRequest>,
-) -> Result<(StatusCode, Json<StartTaskResponse>), ApiError> {
+) -> Result<(StatusCode, Json<StartTaskResponse>), ProtocolError> {
+    let control = state.control.as_ref().ok_or_else(|| {
+        ProtocolError::Internal("local task scheduler is not configured".to_string())
+    })?;
+    let launch = state.local_launch.as_ref().ok_or_else(|| {
+        ProtocolError::Internal("local task resolver is not configured".to_string())
+    })?;
+    let task_id = TaskId::parse(&body.task_id).map_err(|error| ProtocolError::BadRequest {
+        code: "invalid_identifier",
+        message: error.to_string(),
+    })?;
+    let digest = crate::domain::canonical_sha256(
+        &serde_json::to_value(&body).map_err(|error| ProtocolError::Internal(error.to_string()))?,
+    );
+    if let Some(task) = control.replay_sealed_task(&owner, &task_id, &digest)? {
+        return Ok((StatusCode::ACCEPTED, Json(StartTaskResponse { task })));
+    }
     let resolved = WorkflowResolver::new(state.catalog_dir.clone())
         .resolve(&body.workflow)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let definition = tasks::load_resolved(&resolved)?;
+        .map_err(|error| ProtocolError::BadRequest {
+            code: "invalid_workflow",
+            message: error.to_string(),
+        })?;
+    let definition =
+        tasks::load_resolved(&resolved).map_err(|error| ProtocolError::BadRequest {
+            code: "invalid_workflow",
+            message: error.to_string(),
+        })?;
+    let inputs = Value::Object(body.inputs.clone());
+    let sealed = launch
+        .resolve_definition(
+            &LaunchIntent {
+                workflow_id: definition.id.clone(),
+                workflow_version: definition.version,
+                inputs,
+                ..LaunchIntent::default()
+            },
+            definition,
+        )
+        .map_err(|error| ProtocolError::BadRequest {
+            code: error.code(),
+            message: error.to_string(),
+        })?;
+    let task = control.create_sealed_task(&owner, task_id, 0, digest, sealed)?;
 
-    let execution = tasks::start_task(
-        &state.catalog_dir,
-        &state.work_dir,
-        &state.engine,
-        &definition,
-        &resolved,
-        body.inputs,
-    )?;
-
-    let execution_id = execution.id.clone();
-    let engine = Arc::clone(&state.engine);
-    spawn_active(&state, execution_id.clone(), async move {
-        let _ = engine.run(&definition, &execution_id).await;
-    });
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(StartTaskResponse {
-            execution_id: execution.id,
-        }),
-    ))
+    Ok((StatusCode::ACCEPTED, Json(StartTaskResponse { task })))
 }
 
 /// `POST /executions/:execution_id/resume` — resumes a paused execution.
@@ -871,7 +1033,7 @@ async fn post_resume(
     State(state): State<AppState>,
     Path(execution_id): Path<String>,
 ) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
-    require_execution(&state, &execution_id)?;
+    require_legacy_execution(&state, &execution_id)?;
     let execution = state.store.load_execution(&execution_id)?;
     let definition = load_definition_for(&state, &execution)?;
 
@@ -894,7 +1056,7 @@ async fn post_recover(
     Path(execution_id): Path<String>,
     Json(request): Json<RecoveryRequest>,
 ) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
-    require_execution(&state, &execution_id)?;
+    require_legacy_execution(&state, &execution_id)?;
     let execution = state.store.load_execution(&execution_id)?;
     let definition = load_definition_for(&state, &execution)?;
 
@@ -923,7 +1085,7 @@ async fn post_operator_note(
     Path(execution_id): Path<String>,
     Json(body): Json<OperatorNoteRequest>,
 ) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
-    require_execution(&state, &execution_id)?;
+    require_legacy_execution(&state, &execution_id)?;
     if state.engine.is_active(&execution_id) {
         return Err(ApiError::Conflict(format!(
             "execution '{execution_id}' is being driven in the background right now"
@@ -961,7 +1123,7 @@ async fn post_interrupt(
     State(state): State<AppState>,
     Path(execution_id): Path<String>,
 ) -> Result<Json<AcceptedResponse>, ApiError> {
-    require_execution(&state, &execution_id)?;
+    require_legacy_execution(&state, &execution_id)?;
     if !state.engine.is_active(&execution_id) {
         return Err(ApiError::Conflict(format!(
             "execution '{execution_id}' is not being processed"
@@ -995,10 +1157,45 @@ where
 /// invalid answer is `400` with the reason.
 async fn post_input(
     State(state): State<AppState>,
+    Extension(owner): Extension<OwnerRef>,
     Path(execution_id): Path<String>,
     Json(delivery): Json<HumanInputDelivery>,
 ) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
-    require_execution(&state, &execution_id)?;
+    // Runner-owned executions live on backend storage. Route their answer
+    // through the task protocol so the runner consumes it on its next poll;
+    // the legacy in-process engine path below remains for historic work.
+    if let Some(control) = &state.control {
+        let tasks = control.list_tasks(&owner).map_err(protocol_error_as_api)?;
+        if let Some(task) = tasks.tasks.into_iter().find(|task| {
+            task.runner
+                .as_ref()
+                .and_then(|runner| runner.execution_cursor.execution_id.as_deref())
+                == Some(execution_id.as_str())
+        }) {
+            let pending_input_id = task
+                .runner
+                .as_ref()
+                .and_then(|runner| runner.pending_input.as_ref())
+                .map(|input| input.id.clone())
+                .ok_or_else(|| ApiError::Conflict("execution is not waiting for input".into()))?;
+            control
+                .submit_input(
+                    &owner,
+                    task.task_id.as_str(),
+                    crate::controller_protocol::SubmitInputRequest {
+                        pending_input_id,
+                        idempotency_key: uuid::Uuid::new_v4().to_string(),
+                        delivery,
+                    },
+                )
+                .map_err(protocol_error_as_api)?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(AcceptedResponse { execution_id }),
+            ));
+        }
+    }
+    require_legacy_execution(&state, &execution_id)?;
     let execution = state.store.load_execution(&execution_id)?;
     let definition = load_definition_for(&state, &execution)?;
 
@@ -1041,7 +1238,7 @@ async fn post_transition(
     Path(execution_id): Path<String>,
     Json(body): Json<TransitionRequest>,
 ) -> Result<Json<ExecutionSummary>, ApiError> {
-    require_execution(&state, &execution_id)?;
+    require_legacy_execution(&state, &execution_id)?;
     let execution = state.store.load_execution(&execution_id)?;
     let definition = load_definition_for(&state, &execution)?;
 
@@ -1080,14 +1277,53 @@ async fn post_transition(
 /// authoritative selves.
 async fn get_executions(
     State(state): State<AppState>,
+    Extension(owner): Extension<OwnerRef>,
 ) -> Result<Json<ExecutionListResponse>, ApiError> {
-    let ids = state.store.list_execution_ids()?;
-    let mut executions = Vec::with_capacity(ids.len());
-    for id in ids {
-        let execution = state.store.load_execution(&id)?;
-        executions.push(build_summary(&state.store, &execution)?);
+    let mut executions = std::collections::BTreeMap::new();
+    let mut ambiguous = std::collections::BTreeSet::new();
+    for store in std::iter::once(state.store.clone()) {
+        for id in store.list_execution_ids()? {
+            // An execution URL names no backend. Do not advertise an ID for
+            // which a later direct read would be ambiguous.
+            if !ambiguous.insert(id.clone()) {
+                executions.remove(&id);
+                continue;
+            }
+            let execution = store.load_execution(&id)?;
+            executions.insert(id, build_summary(&store, &execution)?);
+        }
     }
-    Ok(Json(ExecutionListResponse { executions }))
+    if let Some(control) = &state.control {
+        let tasks = control.list_tasks(&owner).map_err(|error| {
+            ApiError::Internal(format!("could not resolve task projection: {error}"))
+        })?;
+        for task in tasks.tasks {
+            let Some(execution_id) = task
+                .runner
+                .as_ref()
+                .and_then(|runner| runner.execution_cursor.execution_id.as_deref())
+            else {
+                continue;
+            };
+            if task.backend_id.as_str() != "local" || !ambiguous.insert(execution_id.to_string()) {
+                executions.remove(execution_id);
+                continue;
+            }
+            let store = ExecutionStore::new(
+                local_storage_root(&state)
+                    .join(task.task_id.as_str())
+                    .join("state"),
+            );
+            if !store.exists(execution_id) {
+                continue;
+            }
+            let execution = store.load_execution(execution_id)?;
+            executions.insert(execution_id.to_string(), build_summary(&store, &execution)?);
+        }
+    }
+    Ok(Json(ExecutionListResponse {
+        executions: executions.into_values().collect(),
+    }))
 }
 
 /// An [`ExecutionSummary`] carrying the freshest context variables

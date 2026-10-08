@@ -672,12 +672,28 @@ pub struct GitIdentity {
     /// Remote URL handed to `git clone`.
     pub remote_url: String,
     /// The pinned commit (full SHA-1 or SHA-256 object id).
+    ///
+    /// Empty only for a workspace pinned at scheduler admission (see
+    /// [`GitIdentity::git_ref`]); the runner then resolves the commit while
+    /// cloning and records it in the task storage.
     pub commit: String,
+    /// The branch or tag to resolve when `commit` is empty; the remote's
+    /// `HEAD` when that is `None` too. Ignored once a commit is pinned.
+    ///
+    /// Resolving needs the network, so it is deliberately left to admitted
+    /// provisioning rather than to task creation (R4, R6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
     /// The credential used to clone, as a reference.
     pub credential: Option<SecretReference>,
 }
 
 impl GitIdentity {
+    /// Whether the commit was fixed when the task was created.
+    pub fn is_pinned(&self) -> bool {
+        !self.commit.is_empty()
+    }
+
     /// Checks that `commit` is a full object id.
     pub fn check_commit(commit: &str) -> Result<(), GitIdentityError> {
         if matches!(commit.len(), 40 | 64) && is_lower_hex(commit) {
@@ -694,6 +710,10 @@ impl GitIdentity {
 pub enum TaskWorkspace {
     /// The workflow declares no workspace.
     None,
+    /// A host-local directory copied into a local backend's task storage at
+    /// admitted runner initialization. It is never valid for an image-based
+    /// backend, where a host path would not be portable.
+    Local { path: String },
     /// A pinned Git commit.
     Git(GitIdentity),
 }

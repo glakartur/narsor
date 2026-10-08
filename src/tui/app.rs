@@ -83,6 +83,7 @@ use crate::api::{
     ExecutionSummary, HarnessSelectionSnapshot, TransitionRequest,
 };
 use crate::config::DEFAULT_TUI_REFRESH_SECS;
+use crate::controller_protocol::TaskSummary;
 use crate::domain::{
     ConductorDecisionKind, ConductorPurpose, Context, Event, EventData, ExecutionStatus,
     InputCloseReason, InputParameter, ParamType, ProblemKind, State, WorkflowDefinition,
@@ -718,6 +719,9 @@ pub enum InputEditor {
 /// is submitted.
 #[derive(Debug, Clone)]
 pub struct NewTaskForm {
+    /// Stable client-chosen id for this submission.  Retrying the open form
+    /// therefore replays the original task rather than creating a duplicate.
+    pub submission_id: String,
     /// The stage currently shown.
     pub stage: NewTaskStage,
     /// Every workflow that can be picked, plus the "enter a path…" row.
@@ -766,6 +770,7 @@ impl NewTaskForm {
     /// An empty form, waiting for a definition path.
     pub fn new() -> Self {
         Self {
+            submission_id: format!("task-{}", uuid::Uuid::new_v4().simple()),
             stage: NewTaskStage::Definition,
             choices: Vec::new(),
             choice: 0,
@@ -1117,6 +1122,12 @@ const CONVERSATION_BYTE_BUDGET: usize = 1024 * 1024;
 pub enum Screen {
     /// The four-panel main interface, with whatever [`Modal`] is open.
     Main,
+    /// A task has been durably accepted but may not have a runner-backed
+    /// execution yet. This is deliberately separate from [`Screen::Task`],
+    /// whose timeline needs a real execution id.
+    ///
+    /// Boxed for the same reason as [`Screen::Task`].
+    Queued(Box<TaskSummary>),
     /// The full-screen task view: step timeline and step content (R6).
     ///
     /// Boxed: [`TaskView`] carries a whole [`Timeline`], and [`Screen::Main`]
@@ -1427,11 +1438,19 @@ impl App {
         &self.screen
     }
 
+    /// The task selected by the local task-first acknowledgement screen.
+    pub fn queued_task(&self) -> Option<&TaskSummary> {
+        match &self.screen {
+            Screen::Queued(task) => Some(task),
+            Screen::Main | Screen::Task(_) => None,
+        }
+    }
+
     /// Mutable task-view access for terminal integration tests and render setup.
     pub fn task_view_mut(&mut self) -> Option<&mut TaskView> {
         match &mut self.screen {
             Screen::Task(view) => Some(view),
-            Screen::Main => None,
+            Screen::Main | Screen::Queued(_) => None,
         }
     }
 
@@ -1612,6 +1631,19 @@ impl App {
             keys.push(("Esc", "back"));
             return keys;
         }
+        if matches!(self.screen, Screen::Queued(_)) {
+            let mut keys = vec![("r", "refresh task")];
+            if self
+                .queued_task()
+                .and_then(|task| task.runner.as_ref())
+                .and_then(|runner| runner.execution_cursor.execution_id.as_ref())
+                .is_some()
+            {
+                keys.push(("Enter", "open execution"));
+            }
+            keys.push(("Esc", "back to executions"));
+            return keys;
+        }
         match &self.modal {
             Modal::Input(form) => form_shortcuts(form),
             Modal::Failure(form) => failure_shortcuts(form),
@@ -1772,7 +1804,24 @@ impl App {
         }
 
         self.reload_selection().await;
+        self.refresh_queued_task().await;
         self.refresh.done(Instant::now());
+    }
+
+    /// Refreshes task-first state independently of the legacy execution
+    /// list. A queued task has no execution to select or reload yet.
+    async fn refresh_queued_task(&mut self) {
+        let Some(task_id) = self.queued_task().map(|task| task.task_id.to_string()) else {
+            return;
+        };
+        match self.client.control_task(&task_id).await {
+            Ok(task) => self.screen = Screen::Queued(Box::new(task)),
+            Err(error) => {
+                self.notice = Some(Notice::error(format!(
+                    "Could not refresh queued task {task_id}: {error}"
+                )))
+            }
+        }
     }
 
     /// Decides what became of each held `WorkflowFailed` notice, now that
@@ -2117,6 +2166,37 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) -> Request {
         if matches!(self.screen, Screen::Task(_)) {
             return self.on_key_task(key);
+        }
+        if matches!(self.screen, Screen::Queued(_)) {
+            return match key.code {
+                KeyCode::Char('r') => Request::Refresh,
+                KeyCode::Enter => {
+                    let Some(execution_id) = self
+                        .queued_task()
+                        .and_then(|task| task.runner.as_ref())
+                        .and_then(|runner| runner.execution_cursor.execution_id.as_ref())
+                    else {
+                        return Request::None;
+                    };
+                    let Some(index) = self
+                        .executions
+                        .iter()
+                        .position(|execution| execution.id == *execution_id)
+                    else {
+                        self.notice = Some(Notice::error(format!(
+                            "Execution {execution_id} is not available yet. Refresh the task."
+                        )));
+                        return Request::None;
+                    };
+                    self.selected = index;
+                    Request::OpenTaskView
+                }
+                KeyCode::Esc => {
+                    self.screen = Screen::Main;
+                    Request::None
+                }
+                _ => Request::None,
+            };
         }
         match &mut self.modal {
             Modal::None => self.on_key_panels(key),
@@ -2535,7 +2615,7 @@ impl App {
     fn current_task_label(&self) -> Option<String> {
         match &self.screen {
             Screen::Task(view) => view.selected.clone(),
-            Screen::Main => None,
+            Screen::Main | Screen::Queued(_) => None,
         }
     }
 
@@ -2677,7 +2757,7 @@ impl App {
                 })
                 .cloned()
                 .collect(),
-            Screen::Main => Vec::new(),
+            Screen::Main | Screen::Queued(_) => Vec::new(),
         };
 
         if let Screen::Task(view) = &mut self.screen {
@@ -4030,15 +4110,19 @@ impl App {
             }
         };
 
-        match self.client.start_task(&reference, inputs).await {
+        let submission_id = form.submission_id.clone();
+        match self
+            .client
+            .start_task(&submission_id, &reference, inputs)
+            .await
+        {
             Ok(started) => {
                 self.modal = Modal::None;
+                self.screen = Screen::Queued(Box::new(started.task.clone()));
                 self.notice = Some(Notice::info(format!(
-                    "Started execution {}; running in the background.",
-                    started.execution_id
+                    "Queued task {}; waiting for scheduler admission.",
+                    started.task.task_id
                 )));
-                self.refresh().await;
-                self.select_execution(&started.execution_id).await;
             }
             Err(error) => {
                 let message = client_error_message(&reference, error);

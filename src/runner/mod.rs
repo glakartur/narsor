@@ -1139,11 +1139,18 @@ fn workspace(storage: &TaskStorage, spec: &TaskLaunchSpec) -> Workspace {
     let path = storage.workspace_dir().display().to_string();
     match &spec.workspace {
         TaskWorkspace::None => Workspace::local_folder(path),
+        TaskWorkspace::Local { .. } => Workspace::local_folder(path),
         TaskWorkspace::Git(identity) => {
             let name = identity
                 .repository
                 .clone()
                 .unwrap_or_else(|| crate::tasks::repository_name(&identity.remote_url));
+            // A workspace pinned at admission is known only from its checkout.
+            let commit = if identity.is_pinned() {
+                Some(identity.commit.clone())
+            } else {
+                crate::workspace::checked_out_commit(&storage.workspace_dir())
+            };
             let mut workspace = Workspace::git_checkout(
                 path,
                 RepositoryInfo {
@@ -1152,9 +1159,9 @@ fn workspace(storage: &TaskStorage, spec: &TaskLaunchSpec) -> Workspace {
                     provider: "git".to_string(),
                     remote: identity.remote_url.clone(),
                 },
-                Some(identity.commit.clone()),
+                commit.clone(),
             );
-            workspace.base_commit = Some(identity.commit.clone());
+            workspace.base_commit = commit;
             workspace
         }
     }

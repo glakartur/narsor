@@ -495,7 +495,11 @@ async fn new_mutating_requests_are_refused_once_shutdown_begins_not_only_after_t
     let start = http
         .post(format!("http://{}/tasks", info.addr))
         .bearer_auth(&info.token)
-        .json(&serde_json::json!({ "workflow": long_workflow.display().to_string(), "inputs": {} }))
+        .json(&serde_json::json!({
+            "task_id": "shutdown-long-task",
+            "workflow": long_workflow.display().to_string(),
+            "inputs": {}
+        }))
         .send()
         .await
         .expect("start the long-running task");
@@ -517,9 +521,11 @@ async fn new_mutating_requests_are_refused_once_shutdown_begins_not_only_after_t
     let second = http
         .post(format!("http://{}/tasks", info.addr))
         .bearer_auth(&info.token)
-        .json(
-            &serde_json::json!({ "workflow": short_workflow.display().to_string(), "inputs": {} }),
-        )
+        .json(&serde_json::json!({
+            "task_id": "shutdown-short-task",
+            "workflow": short_workflow.display().to_string(),
+            "inputs": {}
+        }))
         .send()
         .await;
 

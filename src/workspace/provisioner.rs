@@ -659,15 +659,13 @@ impl WorkspaceProvisioner {
 ///
 /// `target` must not exist yet; the caller decides where a half-finished
 /// clone may live (see `crate::runner::storage`).
-pub fn clone_pinned_commit(
+fn clone_without_checkout(
     repository: &str,
     remote: &str,
-    commit: &str,
     target: &Path,
     credential_file: Option<&Path>,
-) -> Result<()> {
+) -> Result<String> {
     check_remote(repository, remote)?;
-    check_ref(repository, commit)?;
     if target.exists() {
         return Err(WorkspaceError::io(
             target,
@@ -715,7 +713,18 @@ pub fn clone_pinned_commit(
         &target_arg,
     ]);
     run_git(repository, &clone)?;
+    Ok(target_arg)
+}
 
+pub fn clone_pinned_commit(
+    repository: &str,
+    remote: &str,
+    commit: &str,
+    target: &Path,
+    credential_file: Option<&Path>,
+) -> Result<()> {
+    check_ref(repository, commit)?;
+    let target_arg = clone_without_checkout(repository, remote, target, credential_file)?;
     run_git(
         repository,
         &[
@@ -747,6 +756,69 @@ pub fn clone_pinned_commit(
             ),
         }),
     }
+}
+
+/// Clones `remote` into `target` and leaves it detached on whatever
+/// `git_ref` (a branch or a tag; the remote's `HEAD` when `None`) names right
+/// now, returning that commit.
+///
+/// The admission-time counterpart of [`clone_pinned_commit`]: the commit is
+/// not known when the task is created, so it is pinned here, by the one
+/// clone that provisions the workspace. The caller records the returned
+/// commit so a resumed task never resolves the ref again.
+pub fn clone_resolving_ref(
+    repository: &str,
+    remote: &str,
+    git_ref: Option<&str>,
+    target: &Path,
+    credential_file: Option<&Path>,
+) -> Result<String> {
+    if let Some(git_ref) = git_ref {
+        check_ref(repository, git_ref)?;
+    }
+    let target_arg = clone_without_checkout(repository, remote, target, credential_file)?;
+    let wanted = git_ref.unwrap_or("HEAD");
+    // A fresh clone has only the default branch locally; any other branch is
+    // reachable as `origin/<branch>`, and a tag by its own name.
+    let candidates = if git_ref.is_some() {
+        vec![wanted.to_string(), format!("origin/{wanted}")]
+    } else {
+        vec!["HEAD".to_string()]
+    };
+    let mut last_error = None;
+    for candidate in candidates {
+        match run_git(
+            repository,
+            &[
+                "-C",
+                &target_arg,
+                "checkout",
+                "--quiet",
+                "--detach",
+                &format!("{candidate}^{{commit}}"),
+            ],
+        ) {
+            Ok(_) => {
+                return head_commit(target, repository)?.ok_or_else(|| {
+                    WorkspaceError::RefNotFound {
+                        git_ref: wanted.to_string(),
+                        repository: repository.to_string(),
+                        detail: "the checkout has no commit".to_string(),
+                    }
+                })
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(match last_error {
+        Some(WorkspaceError::Git { stderr, .. }) => WorkspaceError::RefNotFound {
+            git_ref: wanted.to_string(),
+            repository: repository.to_string(),
+            detail: stderr,
+        },
+        Some(other) => other,
+        None => unreachable!("at least one candidate is always tried"),
+    })
 }
 
 /// The commit `path` is checked out at, when it is a git work tree with one.

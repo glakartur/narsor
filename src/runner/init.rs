@@ -22,10 +22,11 @@
 //! into.
 
 use std::fs;
+use std::path::Path;
 
 use crate::domain::{TaskId, TaskLaunchSpec, TaskWorkspace};
 use crate::persistence::ExecutionStore;
-use crate::workspace::{checked_out_commit, clone_pinned_commit};
+use crate::workspace::{checked_out_commit, clone_pinned_commit, clone_resolving_ref};
 
 use super::secrets::MountedSecrets;
 use super::storage::{InitializationMarker, TaskStorage};
@@ -76,21 +77,37 @@ pub fn initialize(
             fs::create_dir_all(&workspace).map_err(|source| RunnerError::io(&workspace, source))?;
             None
         }
+        TaskWorkspace::Local { path } => {
+            copy_local_directory(Path::new(path), &workspace)?;
+            None
+        }
         TaskWorkspace::Git(identity) => {
             let partial = storage.partial_clone_dir();
             if partial.exists() {
                 fs::remove_dir_all(&partial).map_err(|source| RunnerError::io(&partial, source))?;
             }
-            if workspace.exists() {
+            let pinned = if workspace.exists() {
                 // A clone that finished but whose marker was not written.
-                if checked_out_commit(&workspace).as_deref() != Some(identity.commit.as_str()) {
+                let found = checked_out_commit(&workspace);
+                let matches = if identity.is_pinned() {
+                    found.as_deref() == Some(identity.commit.as_str())
+                } else {
+                    // Pinned at admission by that earlier clone: adopt it.
+                    found.is_some()
+                };
+                if !matches {
                     return Err(RunnerError::ForeignStorage(format!(
                         "'{}' exists without an initialization marker and is not a checkout \
                          of {}",
                         workspace.display(),
-                        identity.commit
+                        if identity.is_pinned() {
+                            identity.commit.as_str()
+                        } else {
+                            "a git repository"
+                        }
                     )));
                 }
+                found.expect("a matching checkout has a commit")
             } else {
                 let credential = identity
                     .credential
@@ -101,17 +118,29 @@ pub fn initialize(
                     .repository
                     .clone()
                     .unwrap_or_else(|| crate::tasks::repository_name(&identity.remote_url));
-                clone_pinned_commit(
-                    &repository,
-                    &identity.remote_url,
-                    &identity.commit,
-                    &partial,
-                    credential.as_deref(),
-                )?;
+                let pinned = if identity.is_pinned() {
+                    clone_pinned_commit(
+                        &repository,
+                        &identity.remote_url,
+                        &identity.commit,
+                        &partial,
+                        credential.as_deref(),
+                    )?;
+                    identity.commit.clone()
+                } else {
+                    clone_resolving_ref(
+                        &repository,
+                        &identity.remote_url,
+                        identity.git_ref.as_deref(),
+                        &partial,
+                        credential.as_deref(),
+                    )?
+                };
                 fs::rename(&partial, &workspace)
                     .map_err(|source| RunnerError::io(&workspace, source))?;
-            }
-            Some(identity.commit.clone())
+                pinned
+            };
+            Some(pinned)
         }
     };
 
@@ -121,4 +150,31 @@ pub fn initialize(
         commit,
     ))?;
     Ok(Initialization::Fresh)
+}
+
+/// Copies a sealed host-local workspace only after admission.  This lives at
+/// the runner boundary so create acknowledgement never touches the source or
+/// creates task storage.
+fn copy_local_directory(source: &Path, target: &Path) -> Result<(), RunnerError> {
+    if !source.is_dir() {
+        return Err(RunnerError::ForeignStorage(format!(
+            "local workspace '{}' is not a directory",
+            source.display()
+        )));
+    }
+    fs::create_dir_all(target).map_err(|error| RunnerError::io(target, error))?;
+    for entry in fs::read_dir(source).map_err(|error| RunnerError::io(source, error))? {
+        let entry = entry.map_err(|error| RunnerError::io(source, error))?;
+        let destination = target.join(entry.file_name());
+        let kind = entry
+            .file_type()
+            .map_err(|error| RunnerError::io(entry.path(), error))?;
+        if kind.is_dir() {
+            copy_local_directory(&entry.path(), &destination)?;
+        } else {
+            fs::copy(entry.path(), &destination)
+                .map_err(|error| RunnerError::io(&destination, error))?;
+        }
+    }
+    Ok(())
 }

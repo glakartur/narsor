@@ -107,8 +107,10 @@ Definition 'tests/fixtures/invalid/five_violations.yaml' is invalid — 5 violat
 
 ### `run <FILE> [--input NAME=VALUE]…`
 
-Creates an execution and drives it until it reaches a terminal state, pauses, or
-fails. The execution id is printed on the first line.
+Durably queues a task, then stays attached while the scheduler admits it,
+the backend provisions its workspace, and its execution reaches a stopping
+point or fails. The task id is acknowledged first; an execution id is printed
+only after the admitted runner has created a real execution.
 
 `--input` values are parsed **according to the type declared in the
 definition**: `string` and `repository` as text, `integer` as a whole number,
@@ -121,11 +123,11 @@ $ narsor run tests/fixtures/cli/greet.yaml \
       --input "greeting=Good morning" \
       --input "script_path=$PWD/tests/fixtures/cli/announce.sh" \
       --input is_experimental=true
+Queued task: task-…
 Created execution: 4f1c8f0e-...-9b21
-Status: paused
-Current state: approve
 Human input expected: Is the announcement all right?
   --field approval_status=…  (Select, required, allowed values: approved, rejected)
+Status: input_needed
 ```
 
 **Where the workspace comes from.** In this order:
@@ -138,19 +140,19 @@ Human input expected: Is the announcement all right?
    path).
 2. `globals.workspace: { type: local, path: … }` — the contents of that
    directory are copied into the workspace.
-3. No `workspace` section — an empty directory
-   `{root}/tasks/{execution_id}/code/workspace` is created. That is enough for
+3. No `workspace` section — an empty runner workspace is created after
+   admission. That is enough for
    workflows whose scripts live outside the repository.
 
 Everything checkable without touching the disk (a well-formed remote, the
-existence of a local path) is checked **before** the execution is created. The
-clone itself happens afterwards, because the task directory is named for the
-execution id. If the clone fails the execution is marked `failed` rather than
-left `running`.
+existence of a local path) is checked before the task is queued. The clone or
+copy happens only after scheduler admission, in storage owned by that task's
+backend. If provisioning fails before an execution exists, the task records
+the failure; no synthetic execution is created.
 
-The path of the definition file is recorded in `state.json`
-(`metadata.cli.definition_path`), so `input` and `resume` do not have to be
-given it again.
+The admitted runner uses the sealed workflow snapshot stored with the task,
+not a mutable definition path, so later `input` and `resume` do not need the
+original file.
 
 ### `list`
 
@@ -173,6 +175,11 @@ failure's key and the `recover` command to answer it, the conductor's summary
 and recommendation of the `human` gate the execution waits on, and what the
 conductor is working on right now. `run`, `input`, `resume` and `recover` print
 the same when they return.
+
+> **Known limitation.** Executions started through the task scheduler run in a
+> separate runner process. The conductor (summaries, chat, proposals) and
+> `recover`/`resume` through the legacy execution routes are not yet wired to
+> them; only executions that predate the scheduler have them.
 
 ```console
 $ narsor show 4f1c8f0e-...-9b21
@@ -593,18 +600,18 @@ left open. Nothing invalid reaches `repositories.json`.
 `n` opens the new-task modal: type the path of a definition and press Enter to
 validate and load it — *every* violation is listed, the same verdict
 `narsor validate` gives, not just the first — then fill in the declared
-inputs and press Enter to start it. The declared `type` decides what a value
+inputs and press Enter to queue it. The declared `type` decides what a value
 becomes: a `boolean` is a `true`/`false` pick list and reaches the context as a
 JSON boolean rather than the string `"true"`, an `integer` is parsed, and a
 `repository` input is a pick list of the registered ids, so an id already in the
-registry is chosen instead of retyped. The execution is created, run and
-selected, so it is watched from the moment it starts.
+registry is chosen instead of retyped. The queued task is selected immediately;
+the view follows its queued, provisioning, and running lifecycle and links to
+execution detail only once the runner projects a real execution.
 
 Any definition can be started this way, including one that declares
-`globals.workspace`. The interface and `narsor run` call the same shared
-module (`src/tasks`), so the workspace is expanded, resolved registry-first and
-cloned identically whichever started the task, and an execution started here is
-resumable from the command line and vice versa.
+`globals.workspace`. The interface and `narsor run` seal the same launch
+request before queueing it, so workspace resolution is identical whichever
+surface created the task; the backend provisions it only after admission.
 
 **The conductor in the interface.** Everything the conductor does is visible
 and settled from here (see [The conductor](#the-conductor)):
@@ -1087,7 +1094,7 @@ Under the `--root` directory (`./.narsor` by default):
 ```text
 {root}/
 ├── repositories.json               # the repository registry (`repo add` …)
-├── executions/{execution_id}/
+├── executions/{execution_id}/      # executions created before the task scheduler
 │   ├── state.json                  # WorkflowExecution: status, current state, context
 │   ├── context.json                # the context projection (variables, artifacts, workspace)
 │   ├── pending_input.json          # the question an input-needed execution is waiting on
@@ -1097,10 +1104,11 @@ Under the `--root` directory (`./.narsor` by default):
 │   ├── events/{sequence:08}.json   # append-only event log
 │   ├── conversations/{action_execution_id}.jsonl(.zst)  # per-attempt agent conversation record
 │   └── artifacts/{artifact_id}/    # files produced by actions
-├── tasks/{execution_id}/
-│   └── code/
-│       ├── {primary_repository}/   # writable
-│       └── {secondary_repository}/ # read-only
+├── orchestration/                  # durable queued tasks, ordering, leases and priorities
+├── local-controller/credential     # the daemon-owned local controller's identity
+├── local-controller/storage/{task_id}/   # under `work_dir` (same as {root} by default)
+│   ├── state/                      # execution history once the runner initializes it
+│   └── workspace/                  # provisioned only after scheduler admission
 └── narsor.log                # only written by `tui`, and only with RUST_LOG set
 ```
 

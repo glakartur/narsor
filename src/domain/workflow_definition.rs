@@ -304,12 +304,48 @@ pub struct ScriptActionConfig {
 
     /// Mapping of process exit codes to output labels.
     /// Empty means the default mapping: 0 -> success, anything else -> failure.
-    #[serde(default)]
+    #[serde(default, with = "exit_code_map")]
     pub exit_codes: HashMap<i32, OutputLabel>,
 
     /// Timeout in seconds
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+/// JSON object keys are strings, while workflow exit codes are integers.
+/// This adapter keeps the ergonomic typed map and makes sealed JSON workflow
+/// snapshots round-trip faithfully.
+mod exit_code_map {
+    use std::collections::HashMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::OutputLabel;
+
+    pub fn serialize<S>(map: &HashMap<i32, OutputLabel>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        map.iter()
+            .map(|(code, label)| (code.to_string(), label))
+            .collect::<HashMap<_, _>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<i32, OutputLabel>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let values = HashMap::<String, OutputLabel>::deserialize(deserializer)?;
+        values
+            .into_iter()
+            .map(|(code, label)| {
+                code.parse::<i32>()
+                    .map(|code| (code, label))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
 }
 
 /// Human action configuration

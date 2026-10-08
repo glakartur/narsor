@@ -282,6 +282,51 @@ fn a_local_backend_needs_no_image_and_no_runtime_bundle() {
     assert_eq!(error.code(), "missing_base_image");
 }
 
+#[test]
+fn a_local_workspace_is_sealed_only_for_the_local_backend() {
+    let root = TempRoot::new();
+    let source = root.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("README.md"), "local source\n").unwrap();
+
+    let local = BackendRecord::new(
+        "local",
+        BackendKind::Local,
+        TrustScope::Workstation,
+        backend("x").limits,
+    );
+    root.catalog().save_backend(&local).unwrap();
+    root.write_workflow(
+        "local-folder",
+        &format!(
+            "name: local-folder\nversion: 1\nglobals:\n  workspace:\n    type: local\n    \
+             path: {}\nstates:\n  done:\n    description: done\nterminal_states: [done]\n",
+            source.display()
+        ),
+    );
+
+    let launch = root
+        .resolve(&LaunchIntent {
+            backend: Some("local".to_string()),
+            ..intent("local-folder")
+        })
+        .expect("local workspace seals on the local backend");
+    assert_eq!(
+        launch.spec.workspace,
+        TaskWorkspace::Local {
+            path: source.display().to_string()
+        }
+    );
+
+    let error = root
+        .resolve(&LaunchIntent {
+            backend: Some("k8s".to_string()),
+            ..intent("local-folder")
+        })
+        .expect_err("a host directory cannot travel to k8s");
+    assert_eq!(error.code(), "unsupported_workspace");
+}
+
 // ---------------------------------------------------------------------------
 // Backend selection and limits (R3, R10)
 // ---------------------------------------------------------------------------
@@ -493,6 +538,46 @@ fn an_unsupported_harness_is_refused() {
 // ---------------------------------------------------------------------------
 // Git identity (R39)
 // ---------------------------------------------------------------------------
+
+#[test]
+fn a_local_backend_pins_an_unpinned_workspace_at_admission_not_creation() {
+    let root = TempRoot::new();
+    root.registry()
+        .add(RepositoryEntry::new(
+            "app",
+            "https://example.invalid/app.git",
+        ))
+        .unwrap();
+    root.write_workflow("on-app", &repository_workflow("", ""));
+
+    // No commit, and a remote that cannot even be reached: creation must not
+    // touch the network, so it still succeeds and leaves the commit open.
+    let launch = root
+        .resolve(&LaunchIntent {
+            backend: Some("local".to_string()),
+            ..intent("on-app")
+        })
+        .unwrap();
+    let TaskWorkspace::Git(git) = &launch.spec.workspace else {
+        panic!("git workspace expected");
+    };
+    assert!(!git.is_pinned(), "the commit is resolved at admission");
+    assert_eq!(git.git_ref, None);
+    assert_eq!(git.remote_url, "https://example.invalid/app.git");
+
+    // An explicit commit still pins at creation.
+    let pinned = root
+        .resolve(&LaunchIntent {
+            backend: Some("local".to_string()),
+            ..on_app()
+        })
+        .unwrap();
+    let TaskWorkspace::Git(git) = &pinned.spec.workspace else {
+        panic!("git workspace expected");
+    };
+    assert!(git.is_pinned());
+    assert_eq!(git.commit, COMMIT);
+}
 
 #[test]
 fn a_git_workspace_needs_a_full_pinned_commit() {

@@ -292,8 +292,8 @@ fn the_state_directory_from_the_file_is_the_one_the_command_works_in() {
 
     assert_eq!(invocation.code, EXIT_SUCCESS, "{}", invocation.stderr);
     assert!(
-        store.join("executions").exists(),
-        "the execution must be stored under the configured directory, not ./.narsor"
+        store.join("local-controller").exists(),
+        "the task must be stored under the configured directory, not ./.narsor"
     );
     assert!(
         !root.path().join(".narsor").exists(),
@@ -328,7 +328,7 @@ fn the_flag_still_beats_the_file_for_the_state_directory() {
     );
 
     assert_eq!(invocation.code, EXIT_SUCCESS, "{}", invocation.stderr);
-    assert!(from_the_flag.join("executions").exists());
+    assert!(from_the_flag.join("local-controller").exists());
     assert!(!root.path().join("from-the-file").exists());
 }
 
@@ -512,20 +512,25 @@ fn three_roots_pointed_apart_each_hold_only_what_belongs_to_them() {
          mounted read-only and shared between pods"
     );
 
-    // The state root holds executions, and — since U6 — the daemon `run`
-    // transparently discovered-or-launched (AE2) also left its discovery
-    // file and its detached log there; nothing else.
+    // The state root holds the local controller's task storage (executions
+    // and workspaces of admitted tasks live inside it), the control plane's
+    // queue (`orchestration`) and task materials, and — since U6 — the
+    // daemon `run` transparently discovered-or-launched (AE2) also left its
+    // discovery file and its detached log there; nothing else.
     assert_eq!(
         entries_of(&state),
         vec![
             "daemon.json".to_string(),
-            "executions".to_string(),
+            "local-controller".to_string(),
+            "materials".to_string(),
             "narsor.log".to_string(),
+            "orchestration".to_string(),
         ]
     );
 
-    // The work root holds checkouts and nothing else.
-    assert_eq!(entries_of(&work), vec!["tasks".to_string()]);
+    // The work root holds the local backend's task storage — the checkouts —
+    // and nothing else.
+    assert_eq!(entries_of(&work), vec!["local-controller".to_string()]);
 
     // And the built-in root is never touched when all three are configured.
     assert!(!root.path().join(".narsor").exists());

@@ -66,6 +66,7 @@ use narsor::engine::actions::script::TRUNCATION_MARKER;
 use narsor::engine::{
     ActionKind, ConductorAnalysis, Engine, HumanInputDelivery, InputContinuation, PendingHumanInput,
 };
+use narsor::orchestration::ControlPlane;
 use narsor::persistence::conversation::ConversationSource;
 use narsor::persistence::{CatalogPaths, DaemonInfo, ExecutionStore, StatePaths, WorkPaths};
 use narsor::registry::{RepositoryEntry, RepositoryRegistry};
@@ -1886,7 +1887,7 @@ async fn an_override_appears_once_and_says_what_it_overrides() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_path_route_starts_a_definition_that_is_in_no_search_location() {
     let root = TempRoot::new();
-    let (daemon, _) = Daemon::start(root.path()).await;
+    let (daemon, client) = Daemon::start(root.path()).await;
     let mut app = app_for(&daemon, root.path()).await;
 
     app.on_key(key(KeyCode::Char('n')));
@@ -1916,14 +1917,14 @@ async fn the_path_route_starts_a_definition_that_is_in_no_search_location() {
     app.start_new_task().await;
 
     assert!(matches!(app.modal(), Modal::None), "the task started");
-    let store = store_of(root.path());
-    let ids = store.list_execution_ids().expect("list the store");
-    assert_eq!(ids.len(), 1, "one execution was created");
-
-    let execution = store.load_execution(&ids[0]).expect("load the execution");
-    let resolved = narsor::tasks::resolve_definition(root.path(), store.paths(), &execution)
-        .expect("the definition resolves again");
-    assert_eq!(resolved.origin.label(), "file");
+    let listing = client.control_tasks().await.expect("list tasks");
+    assert_eq!(listing.tasks.len(), 1, "one task was queued");
+    assert_eq!(listing.tasks[0].workflow_id, "tui-new-task");
+    assert!(
+        app.notice()
+            .is_some_and(|notice| notice.text.contains("Queued task")),
+        "the path submission was acknowledged before execution admission"
+    );
 }
 
 /// Esc on the text line returns to the list rather than closing the modal.
@@ -1983,30 +1984,15 @@ fn git(path: &Path, args: &[&str]) {
     );
 }
 
-/// Starting a **built-in** from the pick list leaves an execution whose
-/// recorded metadata resolves the definition again by name alone — the trap
-/// this whole search path exists for.
+/// Starting a **built-in** from the pick list queues a task using its stable
+/// catalogue identity rather than making the local UI manufacture an
+/// execution first.
 ///
-/// Simplified from its pre-U7 form: that version ran the workflow through a
-/// real `compound-engineering` agent step, using a fake `claude` binary the
-/// *test's own* `Engine` was built with (`AgentExecutor::with_harnesses`).
-/// Since U7, the execution actually runs inside the daemon subprocess's own
-/// `Engine`, which resolves its harness the way a real `narsor daemon`
-/// always does (no override this test controls) — safely faking that would
-/// need a way to point the *daemon's* harness at a stand-in binary (e.g. a
-/// `PATH` override on the spawned process), which is more plumbing than this
-/// unit's stated scope covers. So this only proves the part U7 actually
-/// changed: `client.start_task` records the same `metadata.cli.definition_name`
-/// a locally-run `tasks::start_task` did, and a *second* `App` — a fresh
-/// process, as far as the daemon is concerned — resolves the definition from
-/// that name alone, with no path recorded at all. The workspace still needs a
-/// real (if trivial) git repository to clone: `tasks::start_task` provisions
-/// it synchronously, before `POST /tasks` ever answers.
 #[tokio::test(flavor = "multi_thread")]
-async fn starting_a_picked_builtin_leaves_an_execution_that_resolves_its_definition() {
+async fn starting_a_picked_builtin_queues_its_catalogue_identity() {
     let root = TempRoot::new();
     let repository = source_repository(root.path());
-    let (daemon, _) = Daemon::start(root.path()).await;
+    let (daemon, client) = Daemon::start(root.path()).await;
     let mut app = app_for(&daemon, root.path()).await;
     app.on_key(key(KeyCode::Char('n')));
     pick_workflow(&mut app, "compound-engineering");
@@ -2019,45 +2005,15 @@ async fn starting_a_picked_builtin_leaves_an_execution_that_resolves_its_definit
     assert_eq!(app.on_key(key(KeyCode::Enter)), Request::StartNewTask);
     app.start_new_task().await;
 
-    let selected = app
-        .selected()
-        .expect("the new execution is selected")
-        .clone();
-    assert_eq!(selected.workflow_id, "compound-engineering");
-
-    let store = store_of(root.path());
-    let execution = reload_until(root.path(), &selected.id, ExecutionStatus::Running);
-    let _ = execution; // status is not the point here; metadata is.
-    let execution = store
-        .load_execution(&selected.id)
-        .expect("reload the execution");
+    let listing = client.control_tasks().await.expect("list tasks");
     assert_eq!(
-        execution.metadata["cli"]["definition_name"], "compound-engineering",
-        "the workflow name is recorded: {}",
-        execution.metadata
+        listing.tasks.len(),
+        1,
+        "submission notice: {:?}",
+        app.notice()
     );
-    assert!(
-        execution.metadata["cli"].get("definition_path").is_none(),
-        "a built-in records no path, because it has none: {}",
-        execution.metadata
-    );
-
-    // A second interface over the same daemon: it has to resolve the
-    // definition from the recorded name alone.
-    let mut reopened = app_for(&daemon, root.path()).await;
-    reopened.select_execution(&selected.id).await;
-    assert!(
-        reopened.definition_error().is_none(),
-        "the definition resolved: {:?}",
-        reopened.definition_error()
-    );
-    assert_eq!(
-        reopened
-            .definition()
-            .expect("the definition is available")
-            .name,
-        "compound-engineering"
-    );
+    assert_eq!(listing.tasks[0].workflow_id, "compound-engineering");
+    assert!(listing.tasks[0].launch_digest.len() > 10);
 }
 
 /// A definition that fails validation is refused with every violation.
@@ -2185,11 +2141,12 @@ async fn a_repository_input_offers_the_registered_ids() {
     assert_eq!(form.values[row], "acme", "it starts on the first id");
 }
 
-/// A boolean input reaches the created execution's context as a JSON boolean.
+/// A boolean input is accepted into the queued task submission without
+/// forcing the local execution-first UI to invent an execution id.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_boolean_input_reaches_the_context_as_a_json_boolean() {
     let root = TempRoot::new();
-    let (daemon, client) = Daemon::start(root.path()).await;
+    let (daemon, _client) = Daemon::start(root.path()).await;
     let mut app = app_over(&daemon, root.path()).await;
     app.refresh().await;
 
@@ -2212,35 +2169,27 @@ async fn a_boolean_input_reaches_the_context_as_a_json_boolean() {
     app.on_key(key(KeyCode::Enter));
     app.start_new_task().await;
 
-    let execution_id = app
-        .selected()
-        .expect("the new execution is selected")
-        .id
-        .clone();
-    // The daemon needs a moment to have actually created the execution's
-    // context on disk (`202` fires before the background pass has run) —
-    // list_executions() (which already exists once `tasks::start_task`
-    // returns, before the run is even spawned) is enough of a wait here.
-    wait_until_settled(&client, &[&execution_id]).await;
-
-    let store = store_of(root.path());
-    let context = store.load_context(&execution_id).expect("read the context");
-    assert_eq!(
-        context.variables.get("is_experimental"),
-        Some(&json!(true)),
-        "a boolean input is a JSON boolean, never the string \"true\""
+    assert!(
+        app.notice()
+            .is_some_and(|notice| notice.text.contains("Queued task")),
+        "creation acknowledges a task before an execution exists"
     );
-    assert_eq!(context.variables.get("ticket"), Some(&json!("ORC-9")));
-
-    let execution = store
-        .load_execution(&execution_id)
-        .expect("reload the execution");
-    assert_eq!(execution.inputs.get("is_experimental"), Some(&json!(true)));
+    let task_id = app
+        .queued_task()
+        .expect("the submitted task remains selected")
+        .task_id
+        .clone();
+    let task = ControlPlane::new(StatePaths::new(root.path()))
+        .task(&task_id)
+        .expect("read sealed task");
+    assert_eq!(task.launch_spec.inputs["ticket"], json!("ORC-9"));
+    assert_eq!(task.launch_spec.inputs["is_experimental"], json!(true));
 }
 
-/// A valid new task becomes an execution that is listed, selected and running.
+/// A valid new task is immediately selected in the task-first screen without
+/// inventing an execution row in the legacy execution-only panel.
 #[tokio::test(flavor = "multi_thread")]
-async fn starting_a_valid_new_task_creates_an_execution_that_is_listed_and_selected() {
+async fn starting_a_valid_new_task_is_queued_without_selecting_an_execution() {
     let root = TempRoot::new();
     // An unrelated execution, so "selected" means something.
     let existing = {
@@ -2261,50 +2210,31 @@ async fn starting_a_valid_new_task_creates_an_execution_that_is_listed_and_selec
 
     assert!(
         matches!(app.modal(), Modal::None),
-        "the modal closed once the execution was created"
+        "the modal closed on acknowledgement"
     );
-    assert_eq!(app.executions().len(), 2, "the new execution is listed");
-
-    let selected = app.selected().expect("a selection").clone();
-    assert_ne!(
-        selected.id, existing.id,
-        "the new execution is the selected one"
+    assert_eq!(
+        app.executions().len(),
+        1,
+        "no queued execution placeholder exists"
     );
-    assert_eq!(selected.workflow_id, "tui-new-task");
+    assert_eq!(app.selected().expect("existing selection").id, existing.id);
     assert_eq!(app.focus(), Panel::Executions);
+    assert!(app
+        .notice()
+        .is_some_and(|notice| notice.text.contains("Queued task")));
 
-    wait_until_settled(&client, &[&selected.id]).await;
-    app.refresh().await;
-    let selected = app.selected().expect("a selection").clone();
-
-    // It ran: the workflow stopped on its human state, and the question is
-    // answerable from the interface straight away.
-    assert_eq!(selected.status, ExecutionStatus::InputNeeded);
-    assert_eq!(selected.current_state.as_deref(), Some("review"));
-    assert!(app.pending().is_some(), "the question is visible");
-    // The definition resolved, which is what makes `i`, `t` and `s` work on it.
-    assert!(app.definition().is_some());
-    assert!(app.definition_error().is_none());
-    assert!(!app.notice().expect("a notice").is_error);
-
-    // The workspace is the empty directory the CLI falls back to as well, and
-    // it lives under the temporary root — never in the repository.
-    let execution = store_of(root.path())
-        .load_execution(&selected.id)
-        .expect("reload the execution");
-    assert!(
-        Path::new(&execution.workspace.path).is_dir(),
-        "the workspace directory exists: {}",
-        execution.workspace.path
+    let listing = client.control_tasks().await.expect("list queued tasks");
+    let task = listing.tasks.first().expect("one durable task");
+    assert_eq!(task.workflow_id, "tui-new-task");
+    assert_eq!(task.priority, 0);
+    assert_eq!(
+        app.queued_task().map(|task| task.task_id.as_str()),
+        Some(task.task_id.as_str()),
+        "the acknowledgement selects its task identity"
     );
-    assert!(
-        execution
-            .workspace
-            .path
-            .starts_with(&root.path().display().to_string()),
-        "and it lives under the root: {}",
-        execution.workspace.path
-    );
+    let screen = screen_of(&mut app);
+    assert!(screen.contains("Queued task"));
+    assert!(screen.contains(task.task_id.as_str()));
 }
 
 /// A definition declaring `globals.workspace` starts from the modal, and its
@@ -2336,32 +2266,60 @@ async fn a_definition_declaring_a_workspace_starts_from_the_modal_and_is_provisi
     let notice = app.notice().expect("a notice");
     assert!(!notice.is_error, "and it started: {}", notice.text);
 
-    let selected = app
-        .selected()
-        .expect("the new execution is selected")
-        .clone();
-    assert_eq!(selected.workflow_id, "tui-new-task-workspace");
+    let task = client
+        .control_tasks()
+        .await
+        .expect("list queued tasks")
+        .tasks
+        .into_iter()
+        .next()
+        .expect("the task was queued");
+    assert_eq!(task.workflow_id, "tui-new-task-workspace");
 
-    wait_until_settled(&client, &[&selected.id]).await;
-
-    // The workspace holds the source directory's contents, under the root.
-    let execution = store_of(root.path())
-        .load_execution(&selected.id)
-        .expect("reload the execution");
-    let workspace = Path::new(&execution.workspace.path);
-    assert_eq!(
-        workspace,
-        root.path()
-            .join("tasks")
-            .join(&selected.id)
-            .join("code")
-            .join("source"),
-        "the checkout is the one `narsor run` would have made"
-    );
+    // The runner receives the sealed local path only after scheduler
+    // admission. Its backend-owned storage, rather than a synthetic legacy
+    // execution, is the authoritative workspace location.
+    let workspace = root
+        .path()
+        .join("local-controller")
+        .join("storage")
+        .join(task.task_id.as_str())
+        .join("workspace");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !workspace.join("README.md").is_file() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "local runner did not provision {}",
+            workspace.display(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(
         fs::read_to_string(workspace.join("README.md")).expect("read the copy"),
         "hello\n"
     );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let projected = client
+            .control_task(task.task_id.as_str())
+            .await
+            .expect("read task projection")
+            .runner
+            .and_then(|runner| runner.execution_cursor.execution_id);
+        if projected.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "runner never projected an execution"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    app.refresh().await;
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Request::OpenTaskView);
+    app.open_task_for_execution().await;
+    assert!(matches!(app.screen(), Screen::Task(_)));
 }
 
 /// Esc leaves every new modal without writing anything.
@@ -2912,7 +2870,7 @@ fn seed_retried_agent_execution(store: &ExecutionStore, execution_id: &str) {
 fn task_view(app: &App) -> &narsor::tui::app::TaskView {
     match app.screen() {
         Screen::Task(view) => view,
-        Screen::Main => panic!("expected the task view to be open"),
+        Screen::Main | Screen::Queued(_) => panic!("expected the task view to be open"),
     }
 }
 

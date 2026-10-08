@@ -320,14 +320,21 @@ impl ApiClient {
     // Mutating calls (U5)
     // -----------------------------------------------------------------
 
-    /// Starts a new execution of `workflow` with `inputs` — `POST /tasks`.
+    /// Queues `workflow` with `inputs` — `POST /tasks`.
+    ///
+    /// `task_id` belongs to the caller's submission lifetime.  In
+    /// particular, a caller retrying after an uncertain transport failure
+    /// must reuse it with the same body so the control plane can replay the
+    /// durable acknowledgement instead of enqueueing another task.
     pub async fn start_task(
         &self,
+        task_id: &str,
         workflow: &str,
         inputs: Map<String, Value>,
     ) -> Result<StartTaskResponse, ClientError> {
         let url = format!("{}/tasks", self.base_url);
         let body = StartTaskRequest {
+            task_id: task_id.to_string(),
             workflow: workflow.to_string(),
             inputs,
         };

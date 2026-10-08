@@ -112,7 +112,11 @@ pub fn resolver(root: &Path) -> CatalogLaunchResolver {
 }
 
 /// Seeds `root` and returns its resolver, ready for `ProtocolService::new`.
-pub fn seeded_resolver(root: &Path) -> Arc<dyn LaunchResolver> {
+pub fn seeded_catalog_resolver(root: &Path) -> Arc<CatalogLaunchResolver> {
     seed_catalog(root);
     Arc::new(resolver(root))
+}
+
+pub fn seeded_resolver(root: &Path) -> Arc<dyn LaunchResolver> {
+    seeded_catalog_resolver(root)
 }

@@ -298,6 +298,34 @@ impl ProtocolService {
                 resources: launch.resources,
             })
             .map_err(launch_refusal)?;
+        self.create_sealed_task(owner, task_id, request.priority, request_digest, resolved)
+    }
+
+    /// Persists an already-resolved task through the same idempotent
+    /// admission path as [`Self::create_task`].
+    ///
+    /// The local API resolves workflow references before they become a
+    /// generic control-plane request: local file paths are meaningful to the
+    /// daemon, but must never be stored as remote launch input.  The caller
+    /// supplies the digest of its stable submission envelope, while this
+    /// method retains all task-id ownership, replay, queueing, and scheduler
+    /// semantics in one place.
+    pub fn create_sealed_task(
+        &self,
+        owner: &OwnerRef,
+        task_id: TaskId,
+        priority: i32,
+        request_digest: String,
+        resolved: crate::environment::ResolvedLaunch,
+    ) -> ProtocolResult<TaskSummary> {
+        match self.control.task(&task_id) {
+            Ok(existing) if existing.owner != *owner => return Err(ProtocolError::NotFound),
+            Ok(existing) if existing.request_digest.as_deref() == Some(&request_digest) => {
+                return self.summarize(&existing);
+            }
+            Ok(_) | Err(crate::orchestration::OrchestrationError::TaskNotFound(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
         let record = self
             .control
             .create_task(
@@ -307,7 +335,7 @@ impl ProtocolService {
                     resolved.backend_id,
                     resolved.spec,
                 )
-                .with_priority(request.priority)
+                .with_priority(priority)
                 .with_request_digest(request_digest),
             )
             .map_err(|error| match error {
@@ -322,6 +350,32 @@ impl ProtocolService {
         self.notify(&record.task_id);
         self.reschedule(&record.assignment.backend_id);
         self.owned_summary(owner, &record.task_id)
+    }
+
+    /// Returns an existing sealed submission before a local caller performs
+    /// any current workflow or environment resolution.  The submission
+    /// envelope, not today's catalogue, defines replay identity.
+    pub fn replay_sealed_task(
+        &self,
+        owner: &OwnerRef,
+        task_id: &TaskId,
+        request_digest: &str,
+    ) -> ProtocolResult<Option<TaskSummary>> {
+        match self.control.task(task_id) {
+            Ok(existing) if existing.owner != *owner => Err(ProtocolError::NotFound),
+            Ok(existing) if existing.request_digest.as_deref() == Some(request_digest) => {
+                self.summarize(&existing).map(Some)
+            }
+            Ok(existing) => Err(ProtocolError::conflict(
+                "task_conflict",
+                format!(
+                    "task '{}' already exists with a different submission",
+                    existing.task_id
+                ),
+            )),
+            Err(crate::orchestration::OrchestrationError::TaskNotFound(_)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// The owner's tasks and the stream cursor at exactly that state.

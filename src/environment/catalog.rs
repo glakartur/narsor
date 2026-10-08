@@ -74,13 +74,17 @@ impl EnvironmentCatalog {
     }
 
     /// The backend record `id`, or `None` when none is registered.
+    ///
+    /// The daemon-owned `local` backend needs no declaration: when the
+    /// catalogue defines none, a built-in record stands in. The catalogue
+    /// stays declaration-only, so it can be mounted read-only.
     pub fn backend(&self, id: &str) -> Result<Option<BackendRecord>, CatalogError> {
-        Ok(
+        let declared =
             read_entry::<BackendRecord>(&self.paths.backends_dir(), id)?.map(|mut record| {
                 record.id = id.to_string();
                 record
-            }),
-        )
+            });
+        Ok(declared.or_else(|| (id == BackendRecord::LOCAL_ID).then(BackendRecord::builtin_local)))
     }
 
     /// Stores a backend record after validating it.

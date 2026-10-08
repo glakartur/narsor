@@ -17,6 +17,7 @@ use crate::conductor::{
     Annotation, ChatEntry, ConductorState, FailureReport, PendingInvocation, QueuedRequest,
     SavedDecision,
 };
+use crate::controller_protocol::TaskSummary;
 use crate::domain::{
     ConductorPurpose, ConductorTrigger, ExecutionStatus, ProblemKind, WorkflowExecution,
 };
@@ -63,6 +64,9 @@ pub struct RequestErrorResponse {
 /// the caller is expected to already have resolved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartTaskRequest {
+    /// Client-chosen submission id. Repeating the same id and body returns
+    /// the original queued task instead of creating another one.
+    pub task_id: String,
     /// The workflow to start.
     pub workflow: String,
     /// Values for the workflow's declared inputs.
@@ -73,8 +77,9 @@ pub struct StartTaskRequest {
 /// `POST /tasks` response body: `202 Accepted`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartTaskResponse {
-    /// The id of the execution that was created.
-    pub execution_id: String,
+    /// The durable task acknowledgement. An execution relationship appears
+    /// only after scheduler admission and runner initialization.
+    pub task: TaskSummary,
 }
 
 /// `POST /executions/:id/resume`, `/input`, and `/recover` response

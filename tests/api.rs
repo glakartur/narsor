@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use narsor::api;
-use narsor::api::{ClientError, ExecutionListResponse, ExecutionSummary, StartTaskResponse};
+use narsor::api::{ClientError, ExecutionSummary, StartTaskResponse};
 use narsor::conductor::{
     ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, PendingInvocation,
     QueuedRequest,
@@ -870,24 +870,15 @@ fn url(handle: &api::ApiHandle, path: &str) -> String {
 }
 
 #[tokio::test]
-async fn post_tasks_creates_an_execution_and_it_appears_in_the_list() {
+async fn post_tasks_creates_a_queued_task_without_an_execution() {
     let root = TempRoot::new();
-    let store = root.store();
-    let engine = Arc::new(Engine::new(store.clone()));
-    let handle = start_server_with_engine(
-        Arc::clone(&engine),
-        root.path().to_path_buf(),
-        root.path().to_path_buf(),
-    )
-    .await;
+    let (handle, service) = start_scheduling_server(&root).await;
     let raw = raw_client();
 
     let body = serde_json::json!({
-        "workflow": pipeline_definition_path().display().to_string(),
-        "inputs": {
-            "script_path": prepare_script_path().display().to_string(),
-            "ticket": "ORC-1",
-        }
+        "task_id": "local-create-contract",
+        "workflow": "implement-feature",
+        "inputs": {}
     });
 
     let response = raw
@@ -899,70 +890,22 @@ async fn post_tasks_creates_an_execution_and_it_appears_in_the_list() {
         .expect("post /tasks");
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
     let parsed: StartTaskResponse = response.json().await.expect("parse start-task response");
-    let execution_id = parsed.execution_id;
-    assert!(store.exists(&execution_id));
-
-    let listing = raw
-        .get(url(&handle, "/executions"))
-        .bearer_auth(handle.token())
-        .send()
-        .await
-        .expect("get /executions");
-    assert_eq!(listing.status(), reqwest::StatusCode::OK);
-    let listing: ExecutionListResponse = listing.json().await.expect("parse listing");
-    assert!(listing
-        .executions
-        .iter()
-        .any(|execution| execution.id == execution_id));
-
-    // The workflow's script state always succeeds, so the run reaches the
-    // human gate at `review` and stops there — proof the background
-    // `tokio::spawn(engine.run(...))` actually ran.
-    wait_for_status(
-        &store,
-        &execution_id,
-        ExecutionStatus::InputNeeded,
-        Duration::from_secs(5),
-    )
-    .await;
+    assert_eq!(parsed.task.task_id.as_str(), "local-create-contract");
+    assert!(root.store().list_execution_ids().unwrap().is_empty());
+    assert_eq!(service.control_plane().list_tasks().unwrap().len(), 1);
 }
 
-/// U8: proves `POST /tasks` is not a divergent reimplementation of
-/// `tasks::start_task` but a thin wrapper calling the very same function.
-///
-/// The handler's source shows a single call to `tasks::start_task` (see
-/// `src/api/routes.rs::post_start_task`), but that alone would not catch a
-/// future edit that swapped in a lookalike. This test instead proves it
-/// behaviourally, by relying on a side effect only the real `start_task`
-/// performs and that no other test in this file lets happen on its own:
-/// recording `metadata.cli.definition_path` (`record_definition_source`).
-/// Every other paused-execution test here calls the `pin_definition_path`
-/// test helper to fake that recording by hand; this test never does, and
-/// instead lets `POST /tasks` alone create the execution, then drives it
-/// straight through the human gate (`POST /input`) to completion. If the
-/// handler ever stopped calling the real `start_task` — or called a
-/// reimplementation that skipped pinning the definition source — resolving
-/// the definition for `/input` would fail with `DefinitionLookupError` and
-/// this test would fail closed.
+/// A task holds its workflow definition snapshot before a runner exists.
 #[tokio::test]
-async fn post_tasks_calls_the_real_start_task_and_records_a_resolvable_definition() {
+async fn post_tasks_seals_a_resolvable_definition_before_admission() {
     let root = TempRoot::new();
-    let store = root.store();
-    let engine = Arc::new(Engine::new(store.clone()));
-    let handle = start_server_with_engine(
-        Arc::clone(&engine),
-        root.path().to_path_buf(),
-        root.path().to_path_buf(),
-    )
-    .await;
+    let (handle, service) = start_scheduling_server(&root).await;
     let raw = raw_client();
 
     let body = serde_json::json!({
-        "workflow": pipeline_definition_path().display().to_string(),
-        "inputs": {
-            "script_path": prepare_script_path().display().to_string(),
-            "ticket": "ORC-3",
-        }
+        "task_id": "local-sealed-definition",
+        "workflow": "implement-feature",
+        "inputs": {}
     });
 
     let response = raw
@@ -973,48 +916,18 @@ async fn post_tasks_calls_the_real_start_task_and_records_a_resolvable_definitio
         .await
         .expect("post /tasks");
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
-    let execution_id = response
+    let task_id = response
         .json::<StartTaskResponse>()
         .await
         .expect("parse start-task response")
-        .execution_id;
-
-    wait_for_status(
-        &store,
-        &execution_id,
-        ExecutionStatus::InputNeeded,
-        Duration::from_secs(5),
-    )
-    .await;
-
-    // No `pin_definition_path` call anywhere above: the definition path this
-    // resolves through below can only have come from `start_task` itself.
-    let delivery = HumanInputDelivery::with_values(
-        serde_json::json!({
-            "approval_status": "approved",
-            "comment": "confirms start_task recorded the definition source",
-        })
-        .as_object()
-        .cloned()
-        .expect("object"),
+        .task
+        .task_id;
+    let record = service.control_plane().task(&task_id).unwrap();
+    assert_eq!(
+        record.launch_spec.definition().unwrap().id,
+        "implement-feature"
     );
-
-    let response = raw
-        .post(url(&handle, &format!("/executions/{execution_id}/input")))
-        .bearer_auth(handle.token())
-        .json(&delivery)
-        .send()
-        .await
-        .expect("post input");
-    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
-
-    wait_for_status(
-        &store,
-        &execution_id,
-        ExecutionStatus::Completed,
-        Duration::from_secs(5),
-    )
-    .await;
+    assert!(root.store().list_execution_ids().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1630,39 +1543,21 @@ use futures::StreamExt as _;
 use narsor::api::TransitionRequest;
 
 #[tokio::test]
-async fn client_start_task_creates_an_execution_that_reaches_the_human_gate() {
+async fn client_start_task_returns_a_queued_task() {
     let root = TempRoot::new();
-    let store = root.store();
-    let engine = Arc::new(Engine::new(store.clone()));
-    let handle = start_server_with_engine(
-        Arc::clone(&engine),
-        root.path().to_path_buf(),
-        root.path().to_path_buf(),
-    )
-    .await;
+    let (handle, service) = start_scheduling_server(&root).await;
     let client = handle.client();
 
-    let inputs = serde_json::json!({
-        "script_path": prepare_script_path().display().to_string(),
-        "ticket": "ORC-CLIENT-1",
-    })
-    .as_object()
-    .cloned()
-    .expect("object");
-
     let response = client
-        .start_task(&pipeline_definition_path().display().to_string(), inputs)
+        .start_task("task-client-start", "implement-feature", Default::default())
         .await
         .expect("start_task");
-    assert!(store.exists(&response.execution_id));
-
-    wait_for_status(
-        &store,
-        &response.execution_id,
-        ExecutionStatus::InputNeeded,
-        Duration::from_secs(5),
-    )
-    .await;
+    assert_eq!(
+        response.task.lifecycle,
+        narsor::orchestration::TaskLifecycle::Queued
+    );
+    assert!(root.store().list_execution_ids().unwrap().is_empty());
+    assert_eq!(service.control_plane().list_tasks().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1831,6 +1726,33 @@ async fn client_list_executions_reports_every_stored_execution() {
         .collect();
     assert!(ids.contains(&"exec-list-1"));
     assert!(ids.contains(&"exec-list-2"));
+}
+
+/// A server without a control plane has no owner-scoped task projection, so
+/// runner storage must not become visible merely because a directory exists.
+/// It continues to serve only its historic root-store execution.
+#[tokio::test]
+async fn runner_storage_is_not_discovered_without_a_control_plane_projection() {
+    let root = TempRoot::new();
+    let legacy = root.store();
+    seed_execution_with_retry(&legacy, "exec-collision");
+    let runner = ExecutionStore::new(root.join("local-controller/storage/task-other/state"));
+    seed_execution_with_retry(&runner, "exec-collision");
+
+    let handle = start_server(legacy).await;
+    let client = handle.client();
+
+    let listing = client.list_executions().await.expect("list executions");
+    assert_eq!(
+        listing
+            .executions
+            .iter()
+            .filter(|execution| execution.id == "exec-collision")
+            .count(),
+        1,
+        "the historic root execution remains visible"
+    );
+    assert!(client.events("exec-collision", 0).await.is_ok());
 }
 
 /// A `409` from a mutating endpoint maps to [`ClientError::Conflict`], not a
@@ -3441,9 +3363,10 @@ async fn start_scheduling_server(
     Arc<narsor::controller_protocol::ProtocolService>,
 ) {
     let control = narsor::orchestration::ControlPlane::new(StatePaths::new(root.path()));
+    let launch = environment_support::seeded_catalog_resolver(root.path());
     let service = Arc::new(narsor::controller_protocol::ProtocolService::new(
         control,
-        environment_support::seeded_resolver(root.path()),
+        launch.clone(),
     ));
     let handle = api::start_with_services(
         Arc::new(Engine::new(root.store())),
@@ -3451,12 +3374,143 @@ async fn start_scheduling_server(
         root.path().to_path_buf(),
         api::ApiServices {
             control: Some(Arc::clone(&service)),
+            local_launch: Some(launch),
             ..api::ApiServices::default()
         },
     )
     .await
     .expect("server starts");
     (handle, service)
+}
+
+#[tokio::test]
+async fn post_tasks_acknowledges_a_queued_task_without_creating_an_execution() {
+    use narsor::orchestration::TaskLifecycle;
+
+    let root = TempRoot::new();
+    let (handle, _service) = start_scheduling_server(&root).await;
+    let response = raw_client()
+        .post(url(&handle, "/tasks"))
+        .bearer_auth(handle.token())
+        .json(&serde_json::json!({
+            "task_id": "local-create-1",
+            "workflow": "implement-feature",
+            "inputs": {}
+        }))
+        .send()
+        .await
+        .expect("post task");
+
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let created: StartTaskResponse = response.json().await.expect("task acknowledgement");
+    assert_eq!(created.task.task_id.as_str(), "local-create-1");
+    assert_eq!(created.task.lifecycle, TaskLifecycle::Queued);
+    assert!(root.store().list_execution_ids().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn post_tasks_replays_the_same_submission_without_a_second_task() {
+    let root = TempRoot::new();
+    let (handle, service) = start_scheduling_server(&root).await;
+    let body = serde_json::json!({
+        "task_id": "local-replay-1",
+        "workflow": "implement-feature",
+        "inputs": {}
+    });
+
+    let submit = || async {
+        raw_client()
+            .post(url(&handle, "/tasks"))
+            .bearer_auth(handle.token())
+            .json(&body)
+            .send()
+            .await
+            .expect("post task")
+    };
+    let first = submit().await;
+    let second = submit().await;
+    assert_eq!(first.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(second.status(), reqwest::StatusCode::ACCEPTED);
+    let first: StartTaskResponse = first.json().await.expect("first acknowledgement");
+    let second: StartTaskResponse = second.json().await.expect("replay acknowledgement");
+    assert_eq!(first.task.task_id, second.task.task_id);
+    assert_eq!(first.task.revision, second.task.revision);
+    assert_eq!(service.control_plane().list_tasks().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn post_tasks_refuses_a_reused_submission_id_with_different_intent() {
+    let root = TempRoot::new();
+    let (handle, service) = start_scheduling_server(&root).await;
+    let post = |body: serde_json::Value| {
+        let handle = &handle;
+        async move {
+            raw_client()
+                .post(url(handle, "/tasks"))
+                .bearer_auth(handle.token())
+                .json(&body)
+                .send()
+                .await
+                .expect("post task")
+        }
+    };
+
+    let first = post(serde_json::json!({
+        "task_id": "local-conflict-1",
+        "workflow": "implement-feature",
+        "inputs": {}
+    }))
+    .await;
+    assert_eq!(first.status(), reqwest::StatusCode::ACCEPTED);
+
+    let divergent = post(serde_json::json!({
+        "task_id": "local-conflict-1",
+        "workflow": "implement-feature",
+        "inputs": { "note": "a different intent" }
+    }))
+    .await;
+    assert_eq!(divergent.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        service.control_plane().list_tasks().unwrap().len(),
+        1,
+        "the conflicting reuse must not queue a second task"
+    );
+}
+
+#[tokio::test]
+async fn post_tasks_rejects_an_invalid_submission_without_queueing_anything() {
+    let root = TempRoot::new();
+    let (handle, service) = start_scheduling_server(&root).await;
+    let post = |body: serde_json::Value| {
+        let handle = &handle;
+        async move {
+            raw_client()
+                .post(url(handle, "/tasks"))
+                .bearer_auth(handle.token())
+                .json(&body)
+                .send()
+                .await
+                .expect("post task")
+        }
+    };
+
+    let malformed_id = post(serde_json::json!({
+        "task_id": "../not an id",
+        "workflow": "implement-feature",
+        "inputs": {}
+    }))
+    .await;
+    assert_eq!(malformed_id.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let unknown_workflow = post(serde_json::json!({
+        "task_id": "local-invalid-1",
+        "workflow": "no-such-workflow",
+        "inputs": {}
+    }))
+    .await;
+    assert_eq!(unknown_workflow.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    assert!(service.control_plane().list_tasks().unwrap().is_empty());
 }
 
 /// One enrolled controller holding `backend`'s lease, called in-process.

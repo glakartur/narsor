@@ -104,6 +104,7 @@ use crate::auth::{CorsPolicy, ProxyPolicy};
 use crate::conductor::ConductorRegistry;
 use crate::controller_protocol::ProtocolService;
 use crate::engine::Engine;
+use crate::environment::CatalogLaunchResolver;
 use crate::persistence::DefaultHarnessSelector;
 use std::fmt;
 use std::net::SocketAddr;
@@ -260,6 +261,7 @@ pub async fn start_with_harness_selector(
             active_tasks: ActiveTasks::new(),
             conductor: None,
             control: None,
+            local_launch: None,
         },
     )
     .await
@@ -279,6 +281,9 @@ pub struct ApiServices {
     /// The remote-task control plane (U2): its owner, controller and runner
     /// routes are served only when there is one.
     pub control: Option<Arc<ProtocolService>>,
+    /// Resolver shared with the local create facade. It accepts daemon-local
+    /// workflow references before sealing them into a control-plane task.
+    pub local_launch: Option<Arc<CatalogLaunchResolver>>,
 }
 
 impl fmt::Debug for ApiServices {
@@ -288,6 +293,7 @@ impl fmt::Debug for ApiServices {
             .field("active_tasks", &self.active_tasks)
             .field("conductor", &self.conductor.is_some())
             .field("control", &self.control.is_some())
+            .field("local_launch", &self.local_launch.is_some())
             .finish()
     }
 }

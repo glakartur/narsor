@@ -138,6 +138,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_task_view(frame, app);
         return;
     }
+    if let Some(task) = app.queued_task() {
+        render_queued_task(frame, task, app.shortcuts());
+        return;
+    }
 
     let areas = layout(frame.area());
 
@@ -162,6 +166,58 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Modal::HarnessSelection(_) => render_harness_selection_modal(frame, app),
         Modal::Help => render_help_modal(frame),
     }
+}
+
+/// The task-first acknowledgement surface used before an execution exists.
+fn render_queued_task(
+    frame: &mut Frame,
+    task: &crate::controller_protocol::TaskSummary,
+    shortcuts: Vec<(&'static str, &'static str)>,
+) {
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(SHORTCUT_BAR_HEIGHT)])
+            .areas(frame.area());
+    let mut lines = vec![
+        Line::from(format!("Task: {}", task.task_id)),
+        Line::from(format!("Workflow: {}", task.workflow_id)),
+        Line::from(format!("Backend: {}", task.backend_id)),
+        Line::from(format!("Lifecycle: {:?}", task.lifecycle)),
+        Line::from(format!("Priority: {}", task.priority)),
+    ];
+    if let Some(queue) = &task.queue {
+        lines.push(Line::from(format!("Queue: {}", queue.message)));
+    }
+    if let Some(runner) = &task.runner {
+        lines.push(Line::from(format!(
+            "Execution: {}",
+            runner
+                .execution_cursor
+                .execution_id
+                .as_deref()
+                .unwrap_or("initializing")
+        )));
+    } else {
+        lines.push(Line::from("Execution: not created yet"));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Queued task "),
+            )
+            .wrap(Wrap { trim: false }),
+        body,
+    );
+    let labels = shortcuts
+        .into_iter()
+        .map(|(key, meaning)| format!("{key} — {meaning}"))
+        .collect::<Vec<_>>()
+        .join("   ");
+    frame.render_widget(
+        Paragraph::new(labels).block(Block::default().borders(Borders::ALL)),
+        footer,
+    );
 }
 
 /// The full-screen task view (U7): the step timeline on the left, the

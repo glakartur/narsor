@@ -532,6 +532,46 @@ terminal_states:
 // Pause, resume, input, conversation relay (R12, R17, R39, R41, R42)
 // ---------------------------------------------------------------------------
 
+/// A workspace left unpinned at creation is pinned by the admitted clone: the
+/// runner resolves the remote's HEAD once, and that commit is the workspace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpinned_workspace_is_pinned_by_the_admitted_clone() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let (bare, head) = origin(&fixture.root);
+    let bin = fake_claude(&fixture.root);
+    let spec = spec(
+        GATED_WORKFLOW,
+        TaskWorkspace::Git(GitIdentity {
+            repository: Some("demo".to_string()),
+            remote_url: bare.display().to_string(),
+            commit: String::new(),
+            git_ref: None,
+            credential: None,
+        }),
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    fixture.report("task-1", Observation::StartAccepted);
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    let credential = fixture.credential("task-1", "pod-1");
+    let _runner = fixture.spawn(&launch, "pod-1", &credential);
+
+    wait_until_async(Duration::from_secs(30), "the gate", || {
+        fixture.record("task-1").pending_input_id().is_some()
+    })
+    .await;
+
+    assert_eq!(git(&launch.workspace(), &["rev-parse", "HEAD"]), head);
+    let marker = fs::read_to_string(launch.storage.join("narsor/initialized.json")).unwrap();
+    assert!(
+        marker.contains(&head),
+        "the marker records the commit pinned at admission: {marker}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
     if running_as_root() {
@@ -546,6 +586,7 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
             repository: Some("demo".to_string()),
             remote_url: bare.display().to_string(),
             commit: pinned.clone(),
+            git_ref: None,
             credential: None,
         }),
         ResolvedEnvironment::harness_only("claude-code"),
@@ -934,6 +975,7 @@ async fn a_base_image_without_git_fails_before_any_work() {
             repository: None,
             remote_url: bare.display().to_string(),
             commit: pinned,
+            git_ref: None,
             credential: None,
         }),
         ResolvedEnvironment::harness_only("claude-code"),

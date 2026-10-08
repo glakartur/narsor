@@ -192,16 +192,41 @@ fn execution_id(stdout: &str) -> String {
         .to_string()
 }
 
-/// The metadata an execution recorded, as it is on disk.
-fn stored_metadata(root: &TempRoot, execution_id: &str) -> serde_json::Value {
-    let path = root
-        .root()
-        .join("executions")
-        .join(execution_id)
-        .join("state.json");
-    let text = fs::read_to_string(&path).expect("read the stored execution");
-    let state: serde_json::Value = serde_json::from_str(&text).expect("parse the stored execution");
-    state["metadata"]["cli"].clone()
+/// The state directory of the runner storage that holds `execution_id`.
+///
+/// Tasks admitted through the scheduler keep their executions in the local
+/// backend's per-task storage, not in the daemon's own `executions` directory.
+fn runner_state_dir(root: &TempRoot, execution_id: &str) -> PathBuf {
+    let storage = root.root().join("local-controller/storage");
+    fs::read_dir(&storage)
+        .expect("local task storage")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("state"))
+        .find(|state| state.join("executions").join(execution_id).is_dir())
+        .unwrap_or_else(|| panic!("no runner storage contains execution {execution_id}"))
+}
+
+/// The launch spec sealed for the task that owns `execution_id`.
+fn sealed_spec(root: &TempRoot, execution_id: &str) -> serde_json::Value {
+    let specs = runner_state_dir(root, execution_id).join("launch-specs");
+    let path = fs::read_dir(specs)
+        .expect("runner launch specs")
+        .find_map(Result::ok)
+        .expect("one sealed spec")
+        .path();
+    let text = fs::read_to_string(path).expect("read the sealed spec");
+    serde_json::from_str(&text).expect("parse the sealed spec")
+}
+
+/// The execution state a runner recorded, as raw text.
+fn stored_state(root: &TempRoot, execution_id: &str) -> String {
+    fs::read_to_string(
+        runner_state_dir(root, execution_id)
+            .join("executions")
+            .join(execution_id)
+            .join("state.json"),
+    )
+    .expect("read the stored execution")
 }
 
 // ---------------------------------------------------------------------------
@@ -847,15 +872,15 @@ fn an_execution_started_from_a_builtin_by_name_is_resumable_in_a_fresh_process()
         started.stdout
     );
 
-    // What was recorded: the name, and no path — because there is none.
-    let recorded = stored_metadata(&root, &id);
+    // What was sealed: the workflow identity, and no path — because there is none.
     assert_eq!(
-        recorded["definition_name"], "compound-engineering",
-        "the workflow name is recorded: {recorded}"
+        sealed_spec(&root, &id)["workflow_id"],
+        "compound-engineering",
+        "the sealed spec names the workflow"
     );
     assert!(
-        recorded.get("definition_path").is_none(),
-        "a built-in records no path, because it has none: {recorded}"
+        !stored_state(&root, &id).contains("definition_path"),
+        "a built-in records no path, because it has none"
     );
 
     // A fresh process: it has to re-resolve the definition from that name.
@@ -916,17 +941,13 @@ fn an_execution_started_from_a_file_path_is_still_resumable_in_a_fresh_process()
     );
     let id = execution_id(&started.stdout);
 
-    let recorded = stored_metadata(&root, &id);
-    assert_eq!(
-        recorded["definition_path"],
-        serde_json::Value::String(
-            definition
-                .canonicalize()
-                .expect("canonicalize the fixture")
-                .display()
-                .to_string()
-        ),
-        "the path is recorded exactly as it always was: {recorded}"
+    assert!(
+        !stored_state(&root, &id).contains("definition_path"),
+        "runner executions rely on the sealed definition, not a mutable path"
+    );
+    assert!(
+        sealed_spec(&root, &id)["definition"]["id"].is_string(),
+        "the definition travels inside the sealed spec"
     );
 
     let answered = cli(
@@ -944,51 +965,4 @@ fn an_execution_started_from_a_file_path_is_still_resumable_in_a_fresh_process()
         "the execution finished:\n{}",
         answered.stdout
     );
-}
-
-/// An execution written before `definition_name` existed still resolves.
-///
-/// Its metadata carries `metadata.cli.definition_path` and nothing else, which
-/// is exactly what is on disk for every execution created so far.
-#[test]
-fn an_execution_recording_only_a_path_still_resolves() {
-    let root = TempRoot::new();
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cli");
-
-    let started = cli(
-        &root,
-        &[
-            "run",
-            &fixtures.join("greet.yaml").display().to_string(),
-            "--input",
-            "greeting=Hello",
-            "--input",
-            &format!("script_path={}", fixtures.join("announce.sh").display()),
-        ],
-    );
-    let id = execution_id(&started.stdout);
-
-    // Rewrite the record the way an older binary wrote it: the path alone.
-    let state_path = root.root().join("executions").join(&id).join("state.json");
-    let text = fs::read_to_string(&state_path).expect("read the stored execution");
-    let mut state: serde_json::Value = serde_json::from_str(&text).expect("parse it");
-    let path = state["metadata"]["cli"]["definition_path"].clone();
-    state["metadata"]["cli"] = serde_json::json!({ "definition_path": path });
-    fs::write(
-        &state_path,
-        serde_json::to_string_pretty(&state).expect("serialize it"),
-    )
-    .expect("write the stored execution back");
-
-    let answered = cli(
-        &root,
-        &["input", &id, "--field", "approval_status=approved"],
-    );
-    assert_eq!(
-        answered.code,
-        EXIT_SUCCESS,
-        "an execution carrying only the old key still resumes: {}",
-        answered.output()
-    );
-    assert!(answered.stdout.contains("Status: completed"));
 }

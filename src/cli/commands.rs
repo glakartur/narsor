@@ -180,24 +180,30 @@ pub async fn run(
     let inputs = collect_inputs(&definition, inputs)?;
 
     let client = daemon_client(config.state_dir(), flags).await?;
+    let submission_id = format!("task-{}", uuid::Uuid::new_v4().simple());
 
-    let started = client
-        .start_task(reference, inputs)
+    let started = submit_task(&client, &submission_id, reference, inputs)
         .await
         .map_err(|error| CliError::failure(format!("Could not start the workflow: {error}")))?;
-    // The new id is announced the moment it exists, so that a failing clone
-    // still tells the operator which execution to look at.
-    println!("Created execution: {}", started.execution_id);
-
-    let summary = wait_until_stopped(&client, &started.execution_id).await?;
-    print_summary(&summary);
-    print_open_matters(&summary);
-
-    if summary.status == ExecutionStatus::Failed {
-        return Err(CliError::failure(format!(
-            "Execution {} failed.",
-            summary.id
-        )));
+    println!("Queued task: {}", started.task.task_id);
+    let task_id = started.task.task_id.to_string();
+    let final_task = wait_until_task_terminal(&client, &task_id).await?;
+    if let Some(runner) = &final_task.runner {
+        if let Some(execution_id) = runner.execution_cursor.execution_id.as_deref() {
+            // A task may have been queued and provisioned before this point,
+            // but once its runner projects a real execution the established
+            // attached-run output (including a human-input form) remains
+            // useful and is read through the backend-aware execution route.
+            let summary = load_execution_summary(&client, execution_id).await?;
+            print_open_matters(&summary);
+        }
+        println!("Status: {}", runner.execution_status.as_str());
+        if matches!(
+            runner.execution_status,
+            ExecutionStatus::Failed | ExecutionStatus::Cancelled
+        ) {
+            return Err(CliError::failure(format!("Task {task_id} failed.")));
+        }
     }
     Ok(())
 }
@@ -689,7 +695,7 @@ pub async fn input(
             other => client_error(execution_id, other),
         })?;
 
-    let summary = wait_until_stopped(&client, execution_id).await?;
+    let summary = wait_until_stopped(&client, execution_id, current.status.clone()).await?;
 
     println!("Input delivered to execution {}.", summary.id);
     print_summary(&summary);
@@ -761,7 +767,7 @@ pub async fn resume(
         .await
         .map_err(|error| client_error(execution_id, error))?;
 
-    let summary = wait_until_stopped(&client, execution_id).await?;
+    let summary = wait_until_stopped(&client, execution_id, ExecutionStatus::Running).await?;
 
     println!("Resumed execution {}.", summary.id);
     print_summary(&summary);
@@ -822,7 +828,7 @@ pub async fn recover(
         other => client_error(execution_id, other),
     })?;
 
-    let summary = wait_until_stopped(&client, execution_id).await?;
+    let summary = wait_until_stopped(&client, execution_id, ExecutionStatus::Running).await?;
 
     println!("Recovered execution {}.", summary.id);
     print_summary(&summary);
@@ -1562,11 +1568,15 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// the connection dropped — this falls back to a plain, bounded sleep for
 /// the rest of the wait. Either way, the wait can never exceed
 /// [`STATUS_POLL_INTERVAL`] past the moment the execution actually stopped.
-async fn wait_until_stopped(client: &ApiClient, execution_id: &str) -> Result<ExecutionSummary> {
+async fn wait_until_stopped(
+    client: &ApiClient,
+    execution_id: &str,
+    before: ExecutionStatus,
+) -> Result<ExecutionSummary> {
     let mut stream = Some(Box::pin(client.stream_execution(execution_id)));
     loop {
         if let Some(summary) = find_execution(client, execution_id).await? {
-            if summary.status != ExecutionStatus::Running {
+            if summary.status != ExecutionStatus::Running && summary.status != before {
                 return Ok(summary);
             }
         }
@@ -1585,6 +1595,76 @@ async fn wait_until_stopped(client: &ApiClient, execution_id: &str) -> Result<Ex
             }
             None => tokio::time::sleep(STATUS_POLL_INTERVAL).await,
         }
+    }
+}
+
+/// How many times an uncertain submission is repeated before giving up.
+const SUBMIT_ATTEMPTS: u32 = 3;
+
+/// Submits a task, repeating the identical request when the outcome is
+/// uncertain.
+///
+/// A transport failure says nothing about whether the daemon recorded the
+/// task. The id and body are kept byte-equivalent across attempts, so a
+/// repeat returns the already-queued task instead of creating another.
+async fn submit_task(
+    client: &ApiClient,
+    task_id: &str,
+    workflow: &str,
+    inputs: Map<String, Value>,
+) -> std::result::Result<crate::api::StartTaskResponse, ClientError> {
+    let mut attempt = 1;
+    loop {
+        match client.start_task(task_id, workflow, inputs.clone()).await {
+            Err(ClientError::Unavailable(_)) if attempt < SUBMIT_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(STATUS_POLL_INTERVAL).await;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// Waits on the task identity returned by local creation.  A task can be
+/// queued or provisioning before a runner has an execution at all, so the
+/// legacy execution stream is not a valid acknowledgement boundary here.
+async fn wait_until_task_terminal(
+    client: &ApiClient,
+    task_id: &str,
+) -> Result<crate::controller_protocol::TaskSummary> {
+    let mut announced_execution = false;
+    loop {
+        let task = client.control_task(task_id).await.map_err(|error| {
+            CliError::failure(format!("Could not load task '{task_id}': {error}"))
+        })?;
+        if let Some(runner) = &task.runner {
+            if !announced_execution {
+                if let Some(execution_id) = runner.execution_cursor.execution_id.as_deref() {
+                    // Retain the long-standing machine-readable hand-off
+                    // line, but only once the task projection names a real
+                    // execution. Creation itself remains task-first.
+                    println!("Created execution: {execution_id}");
+                    announced_execution = true;
+                }
+            }
+            if let Some(problem) = &runner.problem {
+                return Err(CliError::failure(format!(
+                    "Task {task_id} failed: {}",
+                    problem.message
+                )));
+            }
+            // `run` has always returned when a real execution reaches an
+            // operator-visible stopping point (not only when it is terminal).
+            // Before task-first admission that fell out of the in-process
+            // engine pass; preserve it once the runner projection exists.
+            // A pre-execution provisioning failure is handled above: its
+            // honest `Unknown` snapshot must be a nonzero outcome, not an
+            // apparently successful stop.
+            if !matches!(runner.execution_status, ExecutionStatus::Running) {
+                return Ok(task);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 }
 

@@ -570,7 +570,7 @@ impl CatalogLaunchResolver {
                     git_ref,
                 )
             }
-            (None, Some(WorkspaceSpec::Local { .. })) => {
+            (None, Some(WorkspaceSpec::Local { path, .. })) => {
                 if backend.kind.runs_container_images() {
                     return Err(LaunchError::UnsupportedWorkspace(format!(
                         "workflow '{}' works on a local folder, which cannot travel to backend \
@@ -578,7 +578,13 @@ impl CatalogLaunchResolver {
                         definition.id
                     )));
                 }
-                (None, None)
+                let path = render(path, "globals.workspace.path")?;
+                if !std::path::Path::new(&path).is_dir() {
+                    return Err(LaunchError::UnsupportedWorkspace(format!(
+                        "local workspace '{path}' is not a directory"
+                    )));
+                }
+                return Ok((None, TaskWorkspace::Local { path }));
             }
             (None, None) => (None, None),
         };
@@ -592,18 +598,53 @@ impl CatalogLaunchResolver {
             return Ok((None, TaskWorkspace::None));
         };
 
-        let entry = self
-            .registry
-            .get(&repository)?
-            .ok_or_else(|| LaunchError::UnknownRepository(repository.clone()))?;
-        // A workflow `ref` that already is a full commit pins the workspace;
-        // a branch or tag never does — it would move under a resumed task.
-        let commit = match (&intent.commit, workflow_ref) {
-            (Some(commit), _) => commit.clone(),
-            (None, Some(git_ref)) if GitIdentity::check_commit(&git_ref).is_ok() => git_ref,
+        let entry = match self.registry.get(&repository)? {
+            Some(entry) => entry,
+            None if !backend.kind.runs_container_images()
+                && std::path::Path::new(&repository).is_dir() =>
+            {
+                let output = std::process::Command::new("git")
+                    .args(["-C", &repository, "rev-parse", "HEAD"])
+                    .output()
+                    .map_err(|error| {
+                        LaunchError::UnsupportedWorkspace(format!(
+                            "could not read local Git workspace '{repository}': {error}"
+                        ))
+                    })?;
+                if !output.status.success() {
+                    return Err(LaunchError::UnsupportedWorkspace(format!(
+                        "local workspace '{repository}' is not a Git repository"
+                    )));
+                }
+                let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                GitIdentity::check_commit(&commit)?;
+                return Ok((
+                    None,
+                    TaskWorkspace::Git(GitIdentity {
+                        repository: None,
+                        remote_url: repository,
+                        commit,
+                        git_ref: None,
+                        credential: None,
+                    }),
+                ));
+            }
+            None => return Err(LaunchError::UnknownRepository(repository.clone())),
+        };
+        // A commit — explicit, or a workflow `ref` that already is one —
+        // pins the workspace now. Otherwise a backend that clones for itself
+        // pins it at admission: resolving a branch, a tag or `HEAD` needs the
+        // network, which creation must not wait for (R6). A backend running
+        // images always needs the commit up front.
+        let (commit, git_ref) = match (&intent.commit, workflow_ref) {
+            (Some(commit), _) => (commit.clone(), None),
+            (None, Some(git_ref)) if GitIdentity::check_commit(&git_ref).is_ok() => (git_ref, None),
+            (None, git_ref) if !backend.kind.runs_container_images() => (String::new(), git_ref),
             (None, _) => return Err(LaunchError::MissingCommit(repository)),
         };
-        GitIdentity::check_commit(&commit)?;
+        if !commit.is_empty() {
+            GitIdentity::check_commit(&commit)?;
+        }
         let credential = match &entry.git_credential {
             Some(name) => Some(secrets.require(
                 backend_id,
@@ -617,6 +658,7 @@ impl CatalogLaunchResolver {
             repository: Some(entry.id.clone()),
             remote_url: entry.remote.clone(),
             commit,
+            git_ref,
             credential,
         });
         Ok((Some(entry), workspace))
@@ -686,44 +728,20 @@ impl CatalogLaunchResolver {
         }
         Ok(resources)
     }
-}
 
-/// The secret references a task collects, deduplicated by name.
-#[derive(Default)]
-struct SecretSet(BTreeMap<String, SecretReference>);
-
-impl SecretSet {
-    fn require(
-        &mut self,
-        backend_id: &BackendId,
-        backend: &BackendRecord,
-        name: &str,
-        wanted_by: &str,
-    ) -> Result<SecretReference, LaunchError> {
-        let reference = backend.secret_reference(backend_id, name).ok_or_else(|| {
-            LaunchError::UnregisteredSecret {
-                secret: name.to_string(),
-                backend: backend_id.to_string(),
-                wanted_by: wanted_by.to_string(),
-            }
-        })?;
-        self.0.insert(reference.name.clone(), reference.clone());
-        Ok(reference)
-    }
-}
-
-impl LaunchResolver for CatalogLaunchResolver {
-    fn backend_limit(&self, backend: &BackendId) -> Result<u32, LaunchError> {
-        Ok(self.usable_backend(backend)?.limits.max_concurrent_tasks)
-    }
-
-    fn configured_default_backend(&self) -> String {
-        self.owner.default_backend.clone()
-    }
-
-    fn resolve(&self, intent: &LaunchIntent) -> Result<ResolvedLaunch, LaunchError> {
+    /// Resolves an already-loaded workflow definition into a sealed launch.
+    ///
+    /// The local daemon uses this path after resolving a workflow reference
+    /// (which may be a local file rather than a catalogue name).  It keeps
+    /// that compatibility at the API boundary while applying exactly the
+    /// same backend, environment, workspace, and snapshot rules as a
+    /// control-plane create request.
+    pub fn resolve_definition(
+        &self,
+        intent: &LaunchIntent,
+        definition: WorkflowDefinition,
+    ) -> Result<ResolvedLaunch, LaunchError> {
         let (backend_id, backend) = self.backend(intent)?;
-        let definition = self.workflow(intent)?;
         let mut secrets = SecretSet::default();
         let (repository, workspace) =
             self.workspace(intent, &definition, &backend_id, &backend, &mut secrets)?;
@@ -782,8 +800,6 @@ impl LaunchResolver for CatalogLaunchResolver {
                 ImageSource::RuntimeBundle,
             )?),
             (None, true) => return Err(LaunchError::MissingRuntimeBundle(backend_id.to_string())),
-            // The local adapter runs this very binary; it materializes no
-            // bundle, so none is pinned.
             (_, false) => None,
         };
         let mut tools = BTreeMap::new();
@@ -813,7 +829,6 @@ impl LaunchResolver for CatalogLaunchResolver {
 
         let harness = self.harness(intent, &profile, &definition, &backend_id, &backend)?;
         let resources = self.resources(intent, &backend_id, &backend)?;
-
         let environment = ResolvedEnvironment {
             base_image,
             step_images,
@@ -836,13 +851,50 @@ impl LaunchResolver for CatalogLaunchResolver {
             environment,
             resources,
         )
-        // The definition travels with the task (R18): a runner never looks
-        // the workflow up again in a catalogue that may have changed since.
         .with_definition(&definition)
         .map_err(|error| LaunchError::InvalidWorkflow {
             workflow: definition.id.clone(),
             problems: vec![format!("the definition cannot be snapshotted: {error}")],
         })?;
         Ok(ResolvedLaunch { backend_id, spec })
+    }
+}
+
+/// The secret references a task collects, deduplicated by name.
+#[derive(Default)]
+struct SecretSet(BTreeMap<String, SecretReference>);
+
+impl SecretSet {
+    fn require(
+        &mut self,
+        backend_id: &BackendId,
+        backend: &BackendRecord,
+        name: &str,
+        wanted_by: &str,
+    ) -> Result<SecretReference, LaunchError> {
+        let reference = backend.secret_reference(backend_id, name).ok_or_else(|| {
+            LaunchError::UnregisteredSecret {
+                secret: name.to_string(),
+                backend: backend_id.to_string(),
+                wanted_by: wanted_by.to_string(),
+            }
+        })?;
+        self.0.insert(reference.name.clone(), reference.clone());
+        Ok(reference)
+    }
+}
+
+impl LaunchResolver for CatalogLaunchResolver {
+    fn backend_limit(&self, backend: &BackendId) -> Result<u32, LaunchError> {
+        Ok(self.usable_backend(backend)?.limits.max_concurrent_tasks)
+    }
+
+    fn configured_default_backend(&self) -> String {
+        self.owner.default_backend.clone()
+    }
+
+    fn resolve(&self, intent: &LaunchIntent) -> Result<ResolvedLaunch, LaunchError> {
+        let definition = self.workflow(intent)?;
+        self.resolve_definition(intent, definition)
     }
 }

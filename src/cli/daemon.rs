@@ -59,16 +59,20 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use tokio::signal::unix::{signal, SignalKind};
 
-use crate::api::{ActiveTasks, ApiServices, ServerSecurity};
+use crate::api::{ActiveTasks, ApiHandle, ApiServices, ServerSecurity};
 use crate::auth::{
     NetworkAuth, OidcVerifier, OwnerStore, SecurityPlan, SecuritySettings, StartupOwnership,
 };
+use crate::backends::{Controller, ControllerConfig, LocalBackend, LocalBackendConfig};
 use crate::conductor::{ConductorRegistry, HarnessInvoker, PassLauncher};
 use crate::config::Resolved;
-use crate::controller_protocol::ProtocolService;
+use crate::controller_protocol::{CreateEnrollmentRequest, ProtocolService};
 use crate::domain::{ExecutionStatus, WorkflowDefinition, WorkflowExecution};
 use crate::engine::{owed_output_rescue, owed_reprompt, Engine, HarnessRegistry};
-use crate::environment::{CatalogLaunchResolver, HarnessDefaults, OwnerDefaults};
+use crate::environment::{
+    BackendKind, BackendRecord, CatalogLaunchResolver, EnvironmentCatalog, HarnessDefaults,
+    OwnerDefaults,
+};
 use crate::orchestration::ControlPlane;
 use crate::persistence::{
     DaemonInfo, DefaultHarnessSelector, ExecutionStore, ReconciliationOutcome, RecoveryReport,
@@ -134,6 +138,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     let recovery = recover_at_startup(&store);
     let control_plane = recover_orchestration_at_startup(ControlPlane::new(paths.clone()));
 
+    ensure_local_backend(config.catalog_dir())?;
     let defaults = config.agent_defaults();
     let supported = HarnessRegistry::defaults()
         .supported()
@@ -150,13 +155,13 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     // Remote tasks resolve against the same catalogue and pin the same live
     // default harness a local harnessless step would use (R42), read when
     // each task is created — never re-read for an existing one (U6).
-    let launch = CatalogLaunchResolver::new(
+    let launch = Arc::new(CatalogLaunchResolver::new(
         config.catalog_dir(),
         WorkflowResolver::new(config.catalog_dir()),
         OwnerDefaults::from_config(config),
         Arc::clone(&selector) as Arc<dyn HarnessDefaults>,
-    );
-    let control = Arc::new(ProtocolService::new(control_plane, Arc::new(launch)));
+    ));
+    let control = Arc::new(ProtocolService::new(control_plane, launch.clone()));
     let _scheduler = spawn_periodic_admission(Arc::clone(&control));
     let agent_timeout_secs = defaults.timeout_secs;
     let engine = Arc::new(
@@ -210,7 +215,8 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
             harness_selector: Some(selector),
             active_tasks,
             conductor: Some(Arc::clone(&conductor)),
-            control: Some(control),
+            control: Some(Arc::clone(&control)),
+            local_launch: Some(launch),
         },
         security,
     )
@@ -225,6 +231,13 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         token: api_handle.token().to_string(),
         started_at: Utc::now(),
     };
+    // The listener must be ready before the controller enrolls: both the
+    // controller and the runner it later starts reach the same local control
+    // plane URL.  Do not make the daemon discoverable until this loop is
+    // running: otherwise a freshly connected local client can create work in
+    // the gap before any controller can acquire its lease.
+    let (controller_stop, controller_task) =
+        start_local_controller(config, &api_handle, Arc::clone(&control)).await?;
     info.write(&paths.daemon_file()).map_err(|error| {
         CliError::failure(format!(
             "could not write the daemon discovery file: {error}"
@@ -241,6 +254,14 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     })?;
     terminate.recv().await;
     tracing::info!("daemon: received SIGTERM, shutting down");
+
+    // Release the controller lease while the API is still accepting its
+    // signed request.  A successor can then acquire it immediately rather
+    // than waiting for expiry.
+    let _ = controller_stop.send(());
+    if let Err(error) = controller_task.await {
+        tracing::warn!(%error, "daemon: local controller task stopped unexpectedly");
+    }
 
     // Stop accepting new connections *before* draining active runs, not
     // after: `Engine::active_run_ids()` is a snapshot the instant
@@ -274,6 +295,71 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     cleanup_discovery_file(&paths.daemon_file());
 
     Ok(())
+}
+
+const LOCAL_BACKEND_ID: &str = BackendRecord::LOCAL_ID;
+
+/// Refuses to start when the catalogue declares a `local` backend that is
+/// not a local one. An undeclared `local` backend is built in and is never
+/// written to the (declaration-only) catalogue.
+fn ensure_local_backend(catalog_dir: &Path) -> Result<()> {
+    let record = EnvironmentCatalog::new(catalog_dir)
+        .backend(LOCAL_BACKEND_ID)
+        .map_err(|error| CliError::failure(format!("could not load local backend: {error}")))?
+        .unwrap_or_else(BackendRecord::builtin_local);
+    if record.kind == BackendKind::Local {
+        Ok(())
+    } else {
+        Err(CliError::failure(format!(
+            "backend '{LOCAL_BACKEND_ID}' is configured as {:?}, not a local backend",
+            record.kind
+        )))
+    }
+}
+
+async fn start_local_controller(
+    config: &Resolved,
+    api: &ApiHandle,
+    control: Arc<ProtocolService>,
+) -> Result<(
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let control_url = format!("http://{}", api.addr());
+    let controller_dir = config.state_dir().join("local-controller");
+    let credential_file = controller_dir.join("credential");
+    let enrollment = if credential_file.exists() {
+        None
+    } else {
+        Some(
+            control
+                .create_enrollment(LOCAL_BACKEND_ID, CreateEnrollmentRequest::default())
+                .map_err(|error| {
+                    CliError::failure(format!("could not enroll local controller: {error}"))
+                })?
+                .enrollment_code,
+        )
+    };
+    let client = crate::cli::controller::load_or_enroll(
+        &control_url,
+        &credential_file,
+        enrollment.as_deref(),
+    )
+    .await
+    .map_err(|error| CliError::failure(error.message))?;
+    let backend = LocalBackend::new(
+        LocalBackendConfig::new(config.work_dir().join("local-controller")).map_err(|error| {
+            CliError::failure(format!("could not configure local backend: {error}"))
+        })?,
+    );
+    let controller = Controller::new(backend, client, ControllerConfig::new(control_url));
+    let (stop, shutdown) = tokio::sync::oneshot::channel();
+    Ok((
+        stop,
+        tokio::spawn(controller.run(async move {
+            let _ = shutdown.await;
+        })),
+    ))
 }
 
 /// How often the daemon re-evaluates queue admission on its own (U10).

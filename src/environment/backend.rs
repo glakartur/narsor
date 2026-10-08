@@ -177,6 +177,24 @@ pub struct BackendRecord {
 }
 
 impl BackendRecord {
+    /// The id of the backend the local daemon owns.
+    pub const LOCAL_ID: &'static str = "local";
+
+    /// The local backend as the daemon provides it when the catalogue does
+    /// not declare one: one task at a time on this workstation.
+    pub fn builtin_local() -> Self {
+        Self::new(
+            Self::LOCAL_ID,
+            BackendKind::Local,
+            TrustScope::Workstation,
+            BackendLimits {
+                max_concurrent_tasks: 1,
+                default_resources: ResourceProfile::new(1000, 2048),
+                max_resources: None,
+            },
+        )
+    }
+
     /// A record with the given limits and nothing else configured.
     pub fn new(
         id: impl Into<String>,
