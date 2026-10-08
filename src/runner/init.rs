@@ -158,12 +158,24 @@ pub fn initialize(
 ///
 /// Symlinks are recreated as symlinks, never followed: a link inside the
 /// workspace must not turn a file outside it into content of the copy. A link
-/// that resolves outside the source tree, or that cannot be resolved, is
-/// refused.
+/// that resolves outside the source tree, that cannot be resolved, or that is
+/// absolute (it would keep pointing into the host's original) is refused, and
+/// so is anything that is not a regular file or a directory.
+///
+/// The sealed path was canonical when the task was created. It must still be
+/// exactly that: a path (or one of its parents) turned into a symlink since
+/// would redirect the copy to a directory nobody approved.
 fn copy_local_directory(source: &Path, target: &Path) -> Result<(), RunnerError> {
     let root = source
         .canonicalize()
         .map_err(|error| RunnerError::io(source, error))?;
+    if root != source {
+        return Err(RunnerError::ForeignStorage(format!(
+            "local workspace '{}' now resolves to '{}'; it changed since the task was created",
+            source.display(),
+            root.display()
+        )));
+    }
     copy_tree(&root, &root, target)
 }
 
@@ -193,11 +205,23 @@ fn copy_tree(root: &Path, source: &Path, target: &Path) -> Result<(), RunnerErro
                 )));
             }
             let link = fs::read_link(&from).map_err(|error| RunnerError::io(&from, error))?;
+            if link.is_absolute() {
+                return Err(RunnerError::ForeignStorage(format!(
+                    "symlink '{}' is absolute; it would keep pointing into the original \
+                     workspace",
+                    from.display()
+                )));
+            }
             std::os::unix::fs::symlink(&link, &to).map_err(|error| RunnerError::io(&to, error))?;
         } else if kind.is_dir() {
             copy_tree(root, &from, &to)?;
-        } else {
+        } else if kind.is_file() {
             fs::copy(&from, &to).map_err(|error| RunnerError::io(&to, error))?;
+        } else {
+            return Err(RunnerError::ForeignStorage(format!(
+                "'{}' is neither a regular file, a directory nor a symlink",
+                from.display()
+            )));
         }
     }
     Ok(())
@@ -256,6 +280,54 @@ mod tests {
         assert!(
             !target.join("secret").exists(),
             "nothing of the target was copied"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_workspace_path_turned_into_a_symlink_since_sealing_is_refused() {
+        let base = temp("swapped");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("secret.txt"), "secret\n").unwrap();
+        let sealed = base.join("sealed");
+        std::os::unix::fs::symlink(&elsewhere, &sealed).unwrap();
+
+        let target = base.join("target");
+        let error = copy_local_directory(&sealed, &target).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("changed since the task was created"),
+            "{error}"
+        );
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn an_absolute_symlink_and_a_special_file_are_refused() {
+        let base = temp("special");
+        let source = base.join("source");
+        fs::create_dir_all(source.join("dir")).unwrap();
+        fs::write(source.join("dir/file.txt"), "x\n").unwrap();
+        let source = source.canonicalize().unwrap();
+        std::os::unix::fs::symlink(source.join("dir/file.txt"), source.join("abs")).unwrap();
+        let error = copy_local_directory(&source, &base.join("t1")).unwrap_err();
+        assert!(error.to_string().contains("is absolute"), "{error}");
+        fs::remove_file(source.join("abs")).unwrap();
+
+        let fifo = source.join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let error = copy_local_directory(&source, &base.join("t2")).unwrap_err();
+        assert!(
+            error.to_string().contains("neither a regular file"),
+            "{error}"
         );
         let _ = fs::remove_dir_all(base);
     }
