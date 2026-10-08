@@ -247,7 +247,15 @@ impl Drop for Daemon {
 
 fn pid_alive(pid: u32) -> bool {
     // SAFETY: signal 0 sends nothing; it only probes existence/visibility.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return false;
+    }
+    // An exited daemon this process spawned and never reaped stays a zombie,
+    // which `kill(pid, 0)` still sees. A zombie has stopped running.
+    !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.trim_start().starts_with('Z')))
+        .unwrap_or(false)
 }
 
 /// An `App` over a daemon this test already spawned — the REST-client
@@ -4366,6 +4374,9 @@ async fn the_problem_form_offers_labels_and_prefilled_key_values() {
     app.refresh().await;
     assert!(app.shortcuts().contains(&("i", "resolve problem")));
     app.on_key(key(KeyCode::Char('i')));
+    // The form opens in conversation mode; the key–value rows belong to the
+    // manual output.
+    app.on_key(key(KeyCode::Tab));
 
     let form = input_form(&app);
     assert_eq!(form.kind, InputKind::Problem);
@@ -5270,6 +5281,9 @@ async fn the_problem_form_shows_the_analysis_and_marks_the_proposed_values() {
     let mut app = app_over(&daemon, root.path()).await;
     app.refresh().await;
     app.on_key(key(KeyCode::Char('i')));
+    // The form opens in conversation mode; the key–value rows belong to the
+    // manual output.
+    app.on_key(key(KeyCode::Tab));
 
     let form = input_form(&app);
     let problem = form.problem.as_ref().expect("the problem's part");

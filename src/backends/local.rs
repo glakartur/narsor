@@ -212,7 +212,14 @@ impl LocalBackend {
         if let Some(exit) = learned {
             record.exited = Some(exit);
             record.resource_generation += 1;
-            self.write_record(task, &record)?;
+            if let Err(error) = self.write_record(task, &record) {
+                // A concurrent removal took the workload while its exit was
+                // being written back: it is gone, not unobservable.
+                if !self.workload_dir(task).exists() {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
         }
         Ok(Some(WorkloadState {
             uid: record.uid,

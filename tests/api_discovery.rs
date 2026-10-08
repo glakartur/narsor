@@ -85,7 +85,18 @@ fn state_paths(root: &TempRoot) -> StatePaths {
 /// `tests/daemon_lifecycle.rs`'s own helper of the same shape.
 fn pid_alive(pid: u32) -> bool {
     // SAFETY: signal 0 sends nothing; it only probes existence/visibility.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return false;
+    }
+    // An exited daemon this process spawned and never reaped stays a zombie,
+    // which `kill(pid, 0)` still sees. A zombie has stopped running.
+    !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
+        .unwrap_or(false)
 }
 
 /// Sends `SIGTERM` to `pid` and waits (bounded) for it to actually die —
