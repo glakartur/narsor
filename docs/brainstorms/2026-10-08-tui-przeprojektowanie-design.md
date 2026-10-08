@@ -332,7 +332,47 @@ nagłówku oraz daje powiadomienie; lista się nie przestawia.
 | provisioning nieudany przed startem execution | `!✗` w wierszu, oczekiwanie „Nieudany provisioning” w panelu |
 | mały terminal | układ pełnoekranowy poniżej 100 kolumn, komunikat poniżej ok. 60×20 |
 
-## 5. Architektura
+## 5. Kolorystyka
+
+### Zasady
+
+1. **Kolor ma znaczenie, nie zdobi.** Mocny kolor dostaje tylko to, co wymaga
+   uwagi albo dzieje się teraz. Stany spokojne (w kolejce, wstrzymane,
+   zakończone) są w kolorze tekstu albo przygaszone.
+2. **Tylko 16 kolorów ANSI**, bez RGB — TUI dziedziczy motyw terminala i działa
+   na jasnym i ciemnym tle. Tło tylko dla zaznaczenia (odwrócenie) i klawiszy
+   na pasku.
+3. **Kolor nigdy nie niesie informacji sam** — zawsze z ikoną i tekstem. Przy
+   ustawionej zmiennej `NO_COLOR` lub na terminalu monochromatycznym TUI
+   używa wyłącznie pogrubienia, przygaszenia i odwrócenia, bez utraty
+   informacji.
+4. **Jeden akcent — cyjan** — oznacza fokus i interakcję.
+
+### Role
+
+| Rola | Kolor | Gdzie |
+|---|---|---|
+| Wymaga operatora | żółty, pogrubiony | `?`, ramka panelu „Czeka na Ciebie”, licznik `? n`, `◌ ponawiam` |
+| Problem / błąd / nieodwracalne | czerwony | `!`, `✗`, licznik `! n`, `✖ brak połączenia`, akcje `!`, błędy pól |
+| Dzieje się teraz | zielony | `●` running, `⟳` provisioning, `● live`, powiadomienie o sukcesie |
+| Spokojne | kolor tekstu | `◷` w kolejce, `‖` wstrzymane |
+| Zakończone / tło | przygaszony (dark grey) | `✓` done, ramki nieaktywnych paneli, opisy drugiego planu, wiek, dane nieaktualne bez połączenia, akcje niedostępne |
+| Fokus / akcent | cyjan | ramka aktywnego panelu, aktywna zakładka, kursor `▸`, klawisze na pasku (czarne na cyjanie) |
+| Dyrygent | magenta | `◆` rekomendacje i zaproponowane wartości, autor wpisów dyrygenta |
+| Linki | niebieski, podkreślony | linki z `display.links` |
+| Zaznaczony wiersz | odwrócenie | lista; znaczniki `?` / `!` zachowują swój kolor |
+
+Kolor znacznika uwagi mówi, co zrobić; kolor ikony stanu — co się dzieje
+(running z approvalem: żółte `?`, zielone `●`). Problem ma pierwszeństwo przed
+pytaniem w kolumnie uwagi.
+
+Kolory rodzajów wpisów rozmowy (zakładki *Przebieg* i *Rozmowa*) pozostają jak
+dziś — to osobna skala w osobnym panelu.
+
+Role są zdefiniowane w jednym module stylów; widoki odwołują się do ról, nie
+do kolorów.
+
+## 6. Architektura
 
 - Jeden `App` na modelu `TaskSummary` zastępuje lokalny `App` i `RemoteApp`.
   Bazą jest `src/tui/remote.rs` (lifecycle, kolejka, ponawianie strumienia,
@@ -370,7 +410,7 @@ nagłówku oraz daje powiadomienie; lista się nie przestawia.
    formularz nieudanego kroku, przejścia ręczne i override, przerwanie kroku,
    oś kroków i zdarzenia, odczyt starych executions dla Historii.
 
-## 6. Testy
+## 7. Testy
 
 - **Stan (`tests/tui_state.rs`):**
   - stabilność kolejności przy strumieniu zdarzeń zmieniających stan;
@@ -384,6 +424,8 @@ nagłówku oraz daje powiadomienie; lista się nie przestawia.
 - **Render** (`TestBackend`, szeroki i wąski terminal): ekran główny, panel
   odpowiedzi z opisem, menu akcji, formularz nowego zadania, stan bez
   połączenia, zadanie w kolejce bez execution.
+- **Kolorystyka:** render z `NO_COLOR` zachowuje wszystkie znaczniki i
+  rozróżnienia; widoki nie używają kolorów poza modułem ról.
 - **Spójność mapy klawiszy:** żaden klawisz nie ma dwóch znaczeń w jednym
   kontekście; pomoc `?` zgadza się z obsługą.
 
