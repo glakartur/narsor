@@ -530,6 +530,18 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             Ok(SettingValue::Text(items.join(",")))
         }
 
+        SettingKey::LocalWorkspaceRoots => {
+            let items = split_list(text);
+            for item in &items {
+                if !std::path::Path::new(item).is_absolute() {
+                    return Err(format!(
+                        "'{item}' is not an absolute path; list absolute directories"
+                    ));
+                }
+            }
+            Ok(SettingValue::Text(items.join(",")))
+        }
+
         SettingKey::LogLevel => {
             let level = text.trim().to_lowercase();
             if LOG_LEVELS.contains(&level.as_str()) {

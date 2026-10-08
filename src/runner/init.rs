@@ -155,7 +155,19 @@ pub fn initialize(
 /// Copies a sealed host-local workspace only after admission.  This lives at
 /// the runner boundary so create acknowledgement never touches the source or
 /// creates task storage.
+///
+/// Symlinks are recreated as symlinks, never followed: a link inside the
+/// workspace must not turn a file outside it into content of the copy. A link
+/// that resolves outside the source tree, or that cannot be resolved, is
+/// refused.
 fn copy_local_directory(source: &Path, target: &Path) -> Result<(), RunnerError> {
+    let root = source
+        .canonicalize()
+        .map_err(|error| RunnerError::io(source, error))?;
+    copy_tree(&root, &root, target)
+}
+
+fn copy_tree(root: &Path, source: &Path, target: &Path) -> Result<(), RunnerError> {
     if !source.is_dir() {
         return Err(RunnerError::ForeignStorage(format!(
             "local workspace '{}' is not a directory",
@@ -165,16 +177,86 @@ fn copy_local_directory(source: &Path, target: &Path) -> Result<(), RunnerError>
     fs::create_dir_all(target).map_err(|error| RunnerError::io(target, error))?;
     for entry in fs::read_dir(source).map_err(|error| RunnerError::io(source, error))? {
         let entry = entry.map_err(|error| RunnerError::io(source, error))?;
-        let destination = target.join(entry.file_name());
+        let from = entry.path();
+        let to = target.join(entry.file_name());
         let kind = entry
             .file_type()
-            .map_err(|error| RunnerError::io(entry.path(), error))?;
-        if kind.is_dir() {
-            copy_local_directory(&entry.path(), &destination)?;
+            .map_err(|error| RunnerError::io(&from, error))?;
+        if kind.is_symlink() {
+            let resolved = from
+                .canonicalize()
+                .map_err(|error| RunnerError::io(&from, error))?;
+            if !resolved.starts_with(root) {
+                return Err(RunnerError::ForeignStorage(format!(
+                    "symlink '{}' leads outside the local workspace",
+                    from.display()
+                )));
+            }
+            let link = fs::read_link(&from).map_err(|error| RunnerError::io(&from, error))?;
+            std::os::unix::fs::symlink(&link, &to).map_err(|error| RunnerError::io(&to, error))?;
+        } else if kind.is_dir() {
+            copy_tree(root, &from, &to)?;
         } else {
-            fs::copy(entry.path(), &destination)
-                .map_err(|error| RunnerError::io(&destination, error))?;
+            fs::copy(&from, &to).map_err(|error| RunnerError::io(&to, error))?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("narsor-copy-{name}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_local_workspace_is_copied_with_its_internal_symlinks_kept_as_links() {
+        let base = temp("inside");
+        let source = base.join("source");
+        fs::create_dir_all(source.join("dir")).unwrap();
+        fs::write(source.join("dir/file.txt"), "content\n").unwrap();
+        std::os::unix::fs::symlink("dir/file.txt", source.join("link")).unwrap();
+
+        let target = base.join("target");
+        copy_local_directory(&source, &target).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target.join("dir/file.txt")).unwrap(),
+            "content\n"
+        );
+        assert!(
+            fs::symlink_metadata(target.join("link"))
+                .unwrap()
+                .is_symlink(),
+            "an internal link stays a link instead of becoming a copy of its target"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_symlink_leading_outside_the_workspace_is_refused_not_dereferenced() {
+        let base = temp("escape");
+        let source = base.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(base.join("secret.txt"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(base.join("secret.txt"), source.join("secret")).unwrap();
+
+        let target = base.join("target");
+        let error = copy_local_directory(&source, &target).unwrap_err();
+
+        assert!(
+            error.to_string().contains("outside the local workspace"),
+            "{error}"
+        );
+        assert!(
+            !target.join("secret").exists(),
+            "nothing of the target was copied"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
 }

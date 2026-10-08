@@ -100,12 +100,22 @@ pub fn seed_catalog(root: &Path) {
 
 /// The catalogue resolver over `root`, defaulting to backend `k8s`.
 pub fn resolver(root: &Path) -> CatalogLaunchResolver {
+    resolver_with_local_roots(root, vec![root.to_path_buf()])
+}
+
+/// Like [`resolver`], with an explicit allow-list of host directories a
+/// local workspace may be taken from.
+pub fn resolver_with_local_roots(
+    root: &Path,
+    local_workspace_roots: Vec<std::path::PathBuf>,
+) -> CatalogLaunchResolver {
     CatalogLaunchResolver::new(
         root,
         WorkflowResolver::with_user_dir(root, None),
         OwnerDefaults {
             default_backend: "k8s".to_string(),
             default_profile: "default".to_string(),
+            local_workspace_roots,
         },
         Arc::new(StaticHarnessDefaults::builtin("claude-code")),
     )

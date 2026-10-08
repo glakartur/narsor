@@ -129,6 +129,9 @@ fn init_exe_override() {
         // Every daemon spawned from here inherits it: its conductor runs on
         // the fake harness, never a real `claude`.
         engine_support::fake_claude_first_on_path();
+        // ... and may take a local workspace from the temporary directory the
+        // tests' roots live in, and from nowhere else.
+        std::env::set_var("NARSOR_LOCAL_WORKSPACE_ROOTS", std::env::temp_dir());
     });
 }
 
@@ -171,6 +174,9 @@ impl Daemon {
             .arg(root)
             .arg("daemon")
             .env("PATH", path)
+            // Fixture workspaces live under the test root, the one directory
+            // a local task may take its workspace from.
+            .env("NARSOR_LOCAL_WORKSPACE_ROOTS", root)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()

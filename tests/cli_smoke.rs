@@ -98,6 +98,9 @@ fn cli_on_path(root: &Path, args: &[&str], path: &str) -> Invocation {
         .current_dir(root)
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("HOME", root)
+        // Local workspaces (the fixtures' source repositories) live under the
+        // test root, which is the one directory they may be taken from.
+        .env("NARSOR_LOCAL_WORKSPACE_ROOTS", root)
         // The daemon this spawns runs the conductor at every human gate: on
         // the fake harness, never a real `claude`.
         .env("PATH", path)

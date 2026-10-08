@@ -346,6 +346,9 @@ pub struct OwnerDefaults {
     pub default_backend: String,
     /// Profile of a task that names none.
     pub default_profile: String,
+    /// Host directories a local task may take as its workspace. Empty
+    /// refuses them all.
+    pub local_workspace_roots: Vec<PathBuf>,
 }
 
 impl OwnerDefaults {
@@ -354,6 +357,11 @@ impl OwnerDefaults {
         Self {
             default_backend: config.default_backend().to_string(),
             default_profile: config.default_profile().to_string(),
+            local_workspace_roots: config
+                .list(crate::config::SettingKey::LocalWorkspaceRoots)
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
         }
     }
 }
@@ -431,6 +439,47 @@ impl CatalogLaunchResolver {
             });
         }
         Ok(record)
+    }
+
+    /// The canonical form of a host directory a local task may work on.
+    ///
+    /// A local workspace is copied into the task's storage, so a path chosen
+    /// by a workflow definition (or built from its inputs) must not be able
+    /// to name any directory of the host: it has to be absolute and, once
+    /// symlinks and `..` are resolved, lie inside one of the owner's
+    /// `local_workspace_roots`. The sealed spec keeps the canonical path, so
+    /// nothing is re-resolved later.
+    fn allowed_local_directory(&self, path: &str) -> Result<String, LaunchError> {
+        let refuse = |reason: String| LaunchError::UnsupportedWorkspace(reason);
+        let requested = std::path::Path::new(path);
+        if !requested.is_absolute() {
+            return Err(refuse(format!(
+                "local workspace '{path}' is not an absolute path"
+            )));
+        }
+        let canonical = requested
+            .canonicalize()
+            .map_err(|error| refuse(format!("local workspace '{path}' cannot be used: {error}")))?;
+        if !canonical.is_dir() {
+            return Err(refuse(format!(
+                "local workspace '{path}' is not a directory"
+            )));
+        }
+        let allowed = self.owner.local_workspace_roots.iter().any(|root| {
+            root.canonicalize()
+                .is_ok_and(|root| canonical.starts_with(root))
+        });
+        if !allowed {
+            return Err(refuse(format!(
+                "local workspace '{}' is outside every directory listed in \
+                 'local_workspace_roots'",
+                canonical.display()
+            )));
+        }
+        canonical
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| refuse("local workspace path is not valid UTF-8".to_string()))
     }
 
     fn workflow(&self, intent: &LaunchIntent) -> Result<WorkflowDefinition, LaunchError> {
@@ -578,12 +627,8 @@ impl CatalogLaunchResolver {
                         definition.id
                     )));
                 }
-                let path = render(path, "globals.workspace.path")?;
-                if !std::path::Path::new(&path).is_dir() {
-                    return Err(LaunchError::UnsupportedWorkspace(format!(
-                        "local workspace '{path}' is not a directory"
-                    )));
-                }
+                let path =
+                    self.allowed_local_directory(&render(path, "globals.workspace.path")?)?;
                 return Ok((None, TaskWorkspace::Local { path }));
             }
             (None, None) => (None, None),
@@ -603,6 +648,7 @@ impl CatalogLaunchResolver {
             None if !backend.kind.runs_container_images()
                 && std::path::Path::new(&repository).is_dir() =>
             {
+                let repository = self.allowed_local_directory(&repository)?;
                 let output = std::process::Command::new("git")
                     .args(["-C", &repository, "rev-parse", "HEAD"])
                     .output()

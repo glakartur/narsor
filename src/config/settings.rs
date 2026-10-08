@@ -140,11 +140,16 @@ pub enum SettingKey {
     /// Browser origins allowed to call the API; empty denies every
     /// cross-origin request.
     CorsAllowedOrigins,
+    /// Host directories a local-backend task may use as its workspace
+    /// (absolute paths). Empty refuses every local workspace: a task is
+    /// copied into its own storage, so which host directories it may read is
+    /// the owner's decision.
+    LocalWorkspaceRoots,
 }
 
 impl SettingKey {
     /// Every setting, in the order `config show` prints them.
-    pub const ALL: [SettingKey; 17] = [
+    pub const ALL: [SettingKey; 18] = [
         SettingKey::CatalogDir,
         SettingKey::StateDir,
         SettingKey::WorkDir,
@@ -162,6 +167,7 @@ impl SettingKey {
         SettingKey::TlsTermination,
         SettingKey::TrustedProxies,
         SettingKey::CorsAllowedOrigins,
+        SettingKey::LocalWorkspaceRoots,
     ];
 
     /// The three roots, in the order `config show` prints them.
@@ -191,6 +197,7 @@ impl SettingKey {
             SettingKey::TlsTermination => "tls_termination",
             SettingKey::TrustedProxies => "trusted_proxies",
             SettingKey::CorsAllowedOrigins => "cors_allowed_origins",
+            SettingKey::LocalWorkspaceRoots => "local_workspace_roots",
         }
     }
 
@@ -230,7 +237,8 @@ impl SettingKey {
             | SettingKey::OwnerSubject
             | SettingKey::TlsTermination
             | SettingKey::TrustedProxies
-            | SettingKey::CorsAllowedOrigins => false,
+            | SettingKey::CorsAllowedOrigins
+            | SettingKey::LocalWorkspaceRoots => false,
         }
     }
 
@@ -267,7 +275,8 @@ impl SettingKey {
             | SettingKey::OidcAudience
             | SettingKey::OwnerSubject
             | SettingKey::TrustedProxies
-            | SettingKey::CorsAllowedOrigins => SettingValue::Text(String::new()),
+            | SettingKey::CorsAllowedOrigins
+            | SettingKey::LocalWorkspaceRoots => SettingValue::Text(String::new()),
         }
     }
 
@@ -276,7 +285,9 @@ impl SettingKey {
     pub fn is_list(self) -> bool {
         matches!(
             self,
-            SettingKey::TrustedProxies | SettingKey::CorsAllowedOrigins
+            SettingKey::TrustedProxies
+                | SettingKey::CorsAllowedOrigins
+                | SettingKey::LocalWorkspaceRoots
         )
     }
 
@@ -514,7 +525,8 @@ mod tests {
                 "owner_subject",
                 "tls_termination",
                 "trusted_proxies",
-                "cors_allowed_origins"
+                "cors_allowed_origins",
+                "local_workspace_roots"
             ],
             "the registry is the one place the settings live, and the three \
              roots lead because that is the order `config show` prints"

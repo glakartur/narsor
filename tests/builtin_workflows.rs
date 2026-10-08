@@ -162,6 +162,7 @@ fn cli_with_path(root: &TempRoot, args: &[&str], bin: Option<&Path>) -> Invocati
         .current_dir(root.path())
         .env("XDG_CONFIG_HOME", root.config())
         .env("HOME", root.path())
+        .env("NARSOR_LOCAL_WORKSPACE_ROOTS", root.path())
         .arg("--root")
         .arg(root.root())
         .args(args);

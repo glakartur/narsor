@@ -105,7 +105,8 @@ fn cli(root: &TempRoot, environment: &[(&str, &str)], args: &[&str]) -> Invocati
         .env_clear()
         .env("PATH", engine_support::fake_claude_first_on_path())
         .env("HOME", root.path())
-        .env("XDG_CONFIG_HOME", root.path().join("config"));
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("NARSOR_LOCAL_WORKSPACE_ROOTS", root.path());
     for (name, value) in environment {
         command.env(name, value);
     }

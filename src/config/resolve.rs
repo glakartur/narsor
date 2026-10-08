@@ -93,7 +93,8 @@ impl Flags {
             | SettingKey::OwnerSubject
             | SettingKey::TlsTermination
             | SettingKey::TrustedProxies
-            | SettingKey::CorsAllowedOrigins => None,
+            | SettingKey::CorsAllowedOrigins
+            | SettingKey::LocalWorkspaceRoots => None,
         }
     }
 }

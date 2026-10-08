@@ -139,7 +139,13 @@ Status: input_needed
    anything else is handed to `git clone` as a raw remote (a URL or a local
    path).
 2. `globals.workspace: { type: local, path: … }` — the contents of that
-   directory are copied into the workspace.
+   directory are copied into the workspace. The path must be absolute and, once
+   symlinks and `..` are resolved, lie inside a directory listed in the
+   `local_workspace_roots` setting (a list; `NARSOR_LOCAL_WORKSPACE_ROOTS`,
+   comma-separated). **It is empty by default, which refuses every local
+   directory** — and the same applies to a `type: git` repository that is a
+   plain local path. Symlinks are copied as links; one that leads outside the
+   directory fails the task's provisioning instead of copying its target.
 3. No `workspace` section — an empty runner workspace is created after
    admission. That is enough for
    workflows whose scripts live outside the repository.

@@ -11,7 +11,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use environment_support::{backend, digest, resolver, seed_catalog, workflow_image, workflow_yaml};
+use environment_support::{
+    backend, digest, resolver, resolver_with_local_roots, seed_catalog, workflow_image,
+    workflow_yaml,
+};
 use narsor::domain::{
     ImageDigest, ImageSource, ImageSpec, ResolvedEnvironment, ResourceProfile, SecretDelivery,
     TaskLaunchSpec, TaskWorkspace, TASK_LAUNCH_SPEC_VERSION,
@@ -314,7 +317,7 @@ fn a_local_workspace_is_sealed_only_for_the_local_backend() {
     assert_eq!(
         launch.spec.workspace,
         TaskWorkspace::Local {
-            path: source.display().to_string()
+            path: source.canonicalize().unwrap().display().to_string()
         }
     );
 
@@ -325,6 +328,84 @@ fn a_local_workspace_is_sealed_only_for_the_local_backend() {
         })
         .expect_err("a host directory cannot travel to k8s");
     assert_eq!(error.code(), "unsupported_workspace");
+}
+
+/// A workflow on a local backend whose workspace is `path`.
+fn local_folder_task(root: &TempRoot, path: &str) {
+    let local = BackendRecord::new(
+        "local",
+        BackendKind::Local,
+        TrustScope::Workstation,
+        backend("x").limits,
+    );
+    root.catalog().save_backend(&local).unwrap();
+    root.write_workflow(
+        "local-folder",
+        &format!(
+            "name: local-folder\nversion: 1\nglobals:\n  workspace:\n    type: local\n    \
+             path: {path}\nstates:\n  done:\n    description: done\nterminal_states: [done]\n"
+        ),
+    );
+}
+
+fn resolve_local(root: &TempRoot, roots: Vec<PathBuf>) -> Result<ResolvedLaunch, LaunchError> {
+    resolver_with_local_roots(&root.path, roots).resolve(&LaunchIntent {
+        backend: Some("local".to_string()),
+        ..intent("local-folder")
+    })
+}
+
+#[test]
+fn a_local_workspace_must_lie_inside_a_listed_root() {
+    let root = TempRoot::new();
+    let allowed = root.path.join("allowed");
+    let outside = root.path.join("outside");
+    fs::create_dir_all(allowed.join("project")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+
+    // Inside a listed root: sealed, in canonical form.
+    local_folder_task(&root, &allowed.join("project").display().to_string());
+    let launch = resolve_local(&root, vec![allowed.clone()]).expect("inside the root");
+    assert_eq!(
+        launch.spec.workspace,
+        TaskWorkspace::Local {
+            path: allowed
+                .join("project")
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        }
+    );
+
+    // The default — no roots — refuses every host directory.
+    let refused = resolve_local(&root, Vec::new()).unwrap_err();
+    assert_eq!(refused.code(), "unsupported_workspace");
+    assert!(refused.to_string().contains("local_workspace_roots"));
+
+    // Outside every listed root.
+    local_folder_task(&root, &outside.display().to_string());
+    let refused = resolve_local(&root, vec![allowed.clone()]).unwrap_err();
+    assert_eq!(refused.code(), "unsupported_workspace");
+
+    // `..` cannot climb out of the root it starts in.
+    local_folder_task(
+        &root,
+        &allowed.join("project/../../outside").display().to_string(),
+    );
+    let refused = resolve_local(&root, vec![allowed.clone()]).unwrap_err();
+    assert_eq!(refused.code(), "unsupported_workspace");
+
+    // Nor can a symlink inside the root lead out of it.
+    std::os::unix::fs::symlink(&outside, allowed.join("escape")).unwrap();
+    local_folder_task(&root, &allowed.join("escape").display().to_string());
+    let refused = resolve_local(&root, vec![allowed.clone()]).unwrap_err();
+    assert_eq!(refused.code(), "unsupported_workspace");
+
+    // A relative path names nothing definite.
+    local_folder_task(&root, "project");
+    let refused = resolve_local(&root, vec![allowed]).unwrap_err();
+    assert_eq!(refused.code(), "unsupported_workspace");
 }
 
 // ---------------------------------------------------------------------------
