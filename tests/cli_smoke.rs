@@ -853,6 +853,96 @@ fn a_workflow_naming_an_unregistered_raw_path_still_provisions_as_before() {
     );
 }
 
+/// AE1: a checkout slower than the API client's 800 ms request timeout is
+/// no longer on the request path, so `run` acknowledges the queued task and
+/// finishes normally instead of reporting a lost daemon.
+#[test]
+fn a_checkout_slower_than_the_request_timeout_is_not_a_lost_daemon() {
+    let root = TempRoot::new();
+    let raw = source_repo(&root, "slow-repo", "from the slow checkout");
+
+    // A `git` that stalls only while cloning, then hands over to the real one.
+    let real_git = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("locate git");
+    let real_git = String::from_utf8_lossy(&real_git.stdout).trim().to_string();
+    let shim_dir = root.path().join("shim");
+    fs::create_dir_all(&shim_dir).expect("create the shim dir");
+    let shim = shim_dir.join("git");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *\" clone \"*) sleep 2;; esac\nexec {real_git} \"$@\"\n"
+        ),
+    )
+    .expect("write the git shim");
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).expect("make the shim runnable");
+    let path = format!(
+        "{}:{}",
+        shim_dir.display(),
+        engine_support::fake_claude_first_on_path()
+    );
+
+    let invocation = cli_on_path(
+        root.path(),
+        &[
+            "run",
+            &clone_workflow(),
+            "--input",
+            &format!("repository={}", raw.display()),
+            "--input",
+            &announce_script(),
+        ],
+        &path,
+    );
+
+    assert_eq!(
+        invocation.code, EXIT_SUCCESS,
+        "stdout: {}\nstderr: {}",
+        invocation.stdout, invocation.stderr
+    );
+    assert!(
+        !invocation.output().to_lowercase().contains("unreachable"),
+        "a slow checkout is not a lost daemon; output:\n{}",
+        invocation.output()
+    );
+    let _id = execution_id(&invocation.stdout);
+}
+
+/// An admitted task whose workspace cannot be provisioned fails before any
+/// execution exists: `run` must end nonzero from the task-side failure
+/// instead of waiting for an execution projection that cannot arrive.
+#[test]
+fn run_ends_nonzero_when_admitted_provisioning_fails_before_an_execution_exists() {
+    let root = TempRoot::new();
+    let missing = root.path().join("sources").join("does-not-exist");
+
+    let invocation = cli(
+        &root,
+        &[
+            "run",
+            &clone_workflow(),
+            "--input",
+            &format!("repository={}", missing.display()),
+            "--input",
+            &announce_script(),
+        ],
+    );
+
+    assert_eq!(
+        invocation.code, EXIT_FAILURE,
+        "stdout: {}\nstderr: {}",
+        invocation.stdout, invocation.stderr
+    );
+    assert!(
+        !invocation.stdout.contains("Created execution:"),
+        "no execution may be invented; stdout:\n{}",
+        invocation.stdout
+    );
+}
+
 fn task_workspace_with_marker(root: &TempRoot, marker: &str) -> PathBuf {
     let storage = root.path().join("local-controller/storage");
     fs::read_dir(&storage)
