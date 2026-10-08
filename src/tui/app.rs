@@ -103,7 +103,8 @@ use crate::tui::failure_form::{FailureAction, FailureForm};
 use crate::tui::refresh::{RefreshSchedule, DEBOUNCE};
 use crate::tui::scroll::{sanitize, ScrollState};
 use crate::tui::transcript::{
-    TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptPresentation, TranscriptState,
+    utterance_header, TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptPresentation,
+    TranscriptState,
 };
 use crate::workflows::{ResolvedWorkflow, WorkflowEntry, WorkflowResolver};
 
@@ -1460,16 +1461,22 @@ impl App {
     pub fn set_task_transcript_viewports(
         &mut self,
         content_height: usize,
+        content_width: usize,
         chat_height: Option<usize>,
+        chat_width: Option<usize>,
     ) {
         let Screen::Task(view) = &mut self.screen else {
             return;
         };
         if let TaskContent::Conversation { transcript, .. } = &mut view.content {
             transcript.set_viewport(content_height);
+            transcript.set_width(content_width);
         }
         if let Some(height) = chat_height {
             view.chat.transcript.set_viewport(height);
+        }
+        if let Some(width) = chat_width {
+            view.chat.transcript.set_width(width);
         }
     }
 
@@ -1621,7 +1628,7 @@ impl App {
                 if matches!(view.content, TaskContent::Conversation { .. }) {
                     keys[1] = ("j/k", "scroll history");
                     keys.push(("Enter/space/e", "expand detail"));
-                    keys.push(("v", "raw/rendered"));
+                    keys.push(("v / Ctrl+v", "entry / conversation RAW"));
                 } else {
                     keys.push(("Enter/space", "expand/collapse"));
                 }
@@ -2857,8 +2864,15 @@ impl App {
             KeyCode::PageUp => self.page_task_cursor(-1),
             KeyCode::Char('g') | KeyCode::Home => self.jump_task_cursor(false),
             KeyCode::Char('G') | KeyCode::End => self.jump_task_cursor(true),
-            KeyCode::Char('v') if self.task_transcript_focused() => {
+            KeyCode::Char('v')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.task_transcript_focused() =>
+            {
                 self.toggle_task_raw();
+                Request::None
+            }
+            KeyCode::Char('v') if self.task_transcript_focused() => {
+                self.toggle_task_entry_raw();
                 Request::None
             }
             KeyCode::Char('e') if self.task_transcript_focused() => {
@@ -3029,6 +3043,16 @@ impl App {
         transcript.toggle_mode();
     }
 
+    fn toggle_task_entry_raw(&mut self) {
+        let Screen::Task(view) = &mut self.screen else {
+            return;
+        };
+        let TaskContent::Conversation { transcript, .. } = &mut view.content else {
+            return;
+        };
+        transcript.toggle_selected_raw();
+    }
+
     fn toggle_task_transcript_detail(&mut self) {
         let Screen::Task(view) = &mut self.screen else {
             return;
@@ -3184,8 +3208,13 @@ impl App {
             (KeyCode::Char('G') | KeyCode::End, ChatFocus::Reading) => chat.to_bottom(),
             (KeyCode::Char('['), ChatFocus::Action) => chat.cycle_action_target(-1),
             (KeyCode::Char(']'), ChatFocus::Action) => chat.cycle_action_target(1),
-            (KeyCode::Char('v'), ChatFocus::Reading) => chat.toggle_raw(),
-            (KeyCode::Char('e'), ChatFocus::Reading) => {
+            (KeyCode::Char('v'), ChatFocus::Reading)
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                chat.toggle_raw()
+            }
+            (KeyCode::Char('v'), ChatFocus::Reading) => chat.transcript.toggle_selected_raw(),
+            (KeyCode::Char('e') | KeyCode::Enter | KeyCode::Char(' '), ChatFocus::Reading) => {
                 if let Some(anchor) = chat.transcript.anchor() {
                     chat.transcript.toggle_expanded(&anchor.entry_id);
                 }
@@ -4619,7 +4648,7 @@ fn chat_shortcuts(chat: &ChatPanel) -> Vec<(&'static str, &'static str)> {
             ("PgUp/PgDn", "page"),
             ("g/G", "top/bottom"),
             ("e", "detail"),
-            ("v", "raw/rendered"),
+            ("v / Ctrl+v", "entry / conversation RAW"),
             ("Tab", "actions"),
             ("Esc", "close the chat"),
         ],
@@ -5301,37 +5330,105 @@ pub fn task_conversation_lines(
 /// conductor and remote conversations. The readable projection remains the
 /// default while raw mode can always return to the exact retained bytes.
 pub(crate) fn agent_transcript_entry(entry: &TranscriptEvent) -> TranscriptEntry {
-    let header = format!(
-        "[{}] {}  {}  ({:?})",
-        entry.entry_number,
-        entry.timestamp.format("%H:%M:%S"),
-        entry.kind.label(),
-        entry.source
-    );
-    let body: Vec<String> = sanitize(&entry.summary)
+    // Narsor's own words are its input to the agent (the user turn) or a
+    // workflow event; everything else is named by what the harness sent.
+    let workflow_event = entry
+        .details
+        .get("workflow.event")
+        .and_then(serde_json::Value::as_str);
+    let (presentation, speaker) = match entry.kind {
+        EntryKind::Narsor if workflow_event.is_some_and(|event| event != "agent_input") => {
+            (TranscriptPresentation::System, "Narsor")
+        }
+        EntryKind::Narsor => (TranscriptPresentation::Operator, "Narsor"),
+        EntryKind::User => (TranscriptPresentation::Operator, "Operator"),
+        EntryKind::Assistant | EntryKind::Result => (TranscriptPresentation::Agent, "Agent"),
+        // Stderr frequently contains benign harness progress. It is technical
+        // by default; explicit failures are still projected as error events.
+        EntryKind::Stderr => (TranscriptPresentation::Technical, "stderr"),
+        EntryKind::Thinking | EntryKind::ToolCall | EntryKind::ToolResult | EntryKind::Raw => {
+            (TranscriptPresentation::Technical, "Harness")
+        }
+        EntryKind::System => (TranscriptPresentation::System, "Harness"),
+    };
+    let mut body: Vec<String> = sanitize(&entry.summary)
         .lines()
         .map(str::to_owned)
         .collect();
-    let mut rendered_lines = vec![header];
-    rendered_lines.extend(body);
-    let presentation = match entry.kind {
-        EntryKind::User => TranscriptPresentation::Operator,
-        EntryKind::Assistant | EntryKind::Result => TranscriptPresentation::Agent,
-        EntryKind::Stderr => TranscriptPresentation::Error,
-        EntryKind::Narsor
-        | EntryKind::Thinking
-        | EntryKind::ToolCall
-        | EntryKind::ToolResult
-        | EntryKind::System
-        | EntryKind::Raw => TranscriptPresentation::Technical,
-    };
+    if matches!(
+        presentation,
+        TranscriptPresentation::Technical | TranscriptPresentation::Error
+    ) {
+        body.truncate(1);
+    }
     TranscriptEntry::new(
         TranscriptEntryId::from(entry.entry_number.to_string()),
-        rendered_lines,
+        body,
         entry.raw.clone(),
     )
-    .with_details(entry.details.clone())
+    .with_header(utterance_header(presentation, speaker, entry.timestamp))
+    .with_technical_lines(semantic_detail_lines(&entry.details, &entry.summary))
     .with_presentation(presentation)
+}
+
+/// What expanding an entry adds to its summary, as readable text: content
+/// fields as their own lines and the identifying fields as `label: value`.
+/// Normalized keys and the source payload never appear here — only RAW shows
+/// those.
+fn semantic_detail_lines(details: &serde_json::Value, summary: &str) -> Vec<String> {
+    const CONTENT: [&str; 5] = [
+        "message.content",
+        "tool.output",
+        "error.message",
+        "workflow.message",
+        "message.blocks",
+    ];
+    const LABELLED: [(&str, &str); 7] = [
+        ("tool.name", "tool"),
+        ("tool.command", "command"),
+        ("tool.input", "input"),
+        ("tool.exit_code", "exit code"),
+        ("workflow.step", "step"),
+        ("workflow.attempt", "attempt"),
+        ("workflow.session", "session"),
+    ];
+    fn text(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(values) => {
+                values.iter().map(text).collect::<Vec<_>>().join("\n")
+            }
+            serde_json::Value::Object(values) => {
+                values.values().map(text).collect::<Vec<_>>().join("\n")
+            }
+            serde_json::Value::Null => String::new(),
+            other => other.to_string(),
+        }
+    }
+    let mut lines = Vec::new();
+    let mut labelled = Vec::new();
+    for (key, label) in LABELLED {
+        if let Some(value) = details.get(key) {
+            let value = text(value);
+            if !value.is_empty() {
+                labelled.push(format!("{label}: {}", sanitize(&value).replace('\n', " ")));
+            }
+        }
+    }
+    lines.extend(labelled);
+    for key in CONTENT {
+        let Some(value) = details.get(key) else {
+            continue;
+        };
+        let sanitized = sanitize(&text(value));
+        let mut content = sanitized.lines().peekable();
+        // The summary already shows a content's first line.
+        if content.peek() == Some(&summary) {
+            content.next();
+        }
+        lines.extend(content.map(str::to_owned));
+    }
+    lines
 }
 
 /// The task view's content pane, for a step with no conversation (R11): its
@@ -5343,4 +5440,96 @@ pub fn task_events_lines(message: &str, events: &[Event], cursor: usize) -> Vec<
         lines.push(format!("{marker} {}", event_line(event)));
     }
     lines
+}
+
+#[cfg(test)]
+mod utterance_tests {
+    use super::*;
+    use crate::api::ConversationEntryDto;
+    use crate::persistence::conversation::ConversationSource;
+    use crate::tui::conversation::classify;
+    use crate::tui::transcript::{DisplayMode, TranscriptId, TranscriptState};
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+
+    fn entry_from(source: ConversationSource, raw: &str) -> TranscriptEntry {
+        agent_transcript_entry(&classify(&ConversationEntryDto {
+            entry_number: 1,
+            timestamp: chrono::Utc::now(),
+            source,
+            raw_base64: BASE64.encode(raw.as_bytes()),
+        }))
+    }
+
+    fn lines_of(entry: TranscriptEntry, expanded: bool) -> Vec<String> {
+        let mut transcript = TranscriptState::new(TranscriptId::from("t"));
+        let id = entry.id.clone();
+        transcript.load(vec![entry]);
+        if expanded {
+            transcript.toggle_expanded(&id);
+        }
+        assert_eq!(transcript.mode(), DisplayMode::Rendered);
+        transcript
+            .logical_lines()
+            .into_iter()
+            .map(|line| line.text)
+            .collect()
+    }
+
+    /// AE1: each role gets its own header naming role, speaker and date.
+    #[test]
+    fn every_role_names_itself_the_speaker_and_the_full_date() {
+        let cases = [
+            (
+                ConversationSource::Narsor,
+                r#"{"event":"prompt","prompt":"Fix it"}"#,
+                "USER · Narsor · ",
+            ),
+            (
+                ConversationSource::Narsor,
+                "step started",
+                "SYSTEM · Narsor · ",
+            ),
+            (
+                ConversationSource::Stdout,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done"}]}}"#,
+                "AGENT · Agent · ",
+            ),
+            (
+                ConversationSource::Stdout,
+                r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hm"}]}}"#,
+                "TECHNICZNE · Harness · ",
+            ),
+        ];
+        for (source, raw, prefix) in cases {
+            let header = lines_of(entry_from(source, raw), false).remove(0);
+            assert!(header.starts_with(prefix), "{header}");
+            // `YYYY-MM-DD HH:MM:SS`
+            let date = &header[prefix.len()..];
+            assert_eq!(date.len(), 19, "{header}");
+            assert_eq!(&date[4..5], "-", "{header}");
+            assert_eq!(&date[13..14], ":", "{header}");
+        }
+    }
+
+    /// AE3: a long Narsor prompt shows its beginning, and expanding shows all
+    /// of it with the line breaks — as text, not as the JSON envelope.
+    #[test]
+    fn a_narsor_prompt_shows_its_start_and_expands_to_the_whole_text() {
+        let raw = r#"{"event":"agent_input","prompt":"Implement the feature\nthen run the tests\nand report"}"#;
+
+        let collapsed = lines_of(entry_from(ConversationSource::Narsor, raw), false);
+        assert_eq!(collapsed.len(), 2, "{collapsed:?}");
+        assert_eq!(collapsed[1], "Implement the feature");
+
+        let expanded = lines_of(entry_from(ConversationSource::Narsor, raw), true);
+        assert_eq!(
+            expanded[1..],
+            ["Implement the feature", "then run the tests", "and report"]
+        );
+        assert!(
+            !expanded.iter().any(|line| line.contains('{')),
+            "{expanded:?}"
+        );
+    }
 }

@@ -52,14 +52,50 @@ const CONDUCTOR_COLOUR: Color = Color::LightMagenta;
 pub(crate) fn transcript_style(presentation: TranscriptPresentation) -> Style {
     match presentation {
         TranscriptPresentation::Neutral => Style::default(),
-        TranscriptPresentation::Operator => Style::default().fg(Color::White).bg(Color::Blue),
-        TranscriptPresentation::Agent => Style::default().fg(Color::White).bg(Color::DarkGray),
-        TranscriptPresentation::Technical => Style::default().fg(Color::Gray).bg(Color::Black),
+        TranscriptPresentation::Operator => Style::default()
+            .fg(Color::Rgb(213, 240, 255))
+            .bg(Color::Rgb(33, 71, 93)),
+        TranscriptPresentation::Agent => Style::default()
+            .fg(Color::Rgb(220, 245, 215))
+            .bg(Color::Rgb(48, 67, 52)),
+        TranscriptPresentation::Conductor => Style::default()
+            .fg(Color::Rgb(255, 233, 182))
+            .bg(Color::Rgb(75, 59, 34)),
+        TranscriptPresentation::System => Style::default()
+            .fg(Color::Rgb(150, 170, 188))
+            .bg(Color::Rgb(31, 43, 56)),
+        TranscriptPresentation::Technical => Style::default()
+            .fg(Color::Rgb(158, 150, 171))
+            .bg(Color::Rgb(43, 39, 53)),
         TranscriptPresentation::Error => Style::default()
             .fg(Color::White)
             .bg(Color::Red)
             .add_modifier(Modifier::BOLD),
     }
+}
+
+/// Gives every entry one role-coloured, full-width header while keeping the
+/// body neutral. The left marker belongs to the entry, not to wrapped rows.
+pub(crate) fn transcript_line(line: TranscriptLine, width: usize) -> Line<'static> {
+    let marker = if line.selected { "┃ " } else { "  " };
+    let text = if line.header {
+        let mut text = format!("{marker}{}", line.text);
+        text.truncate(width);
+        format!("{text:<width$}")
+    } else {
+        format!("{marker}{}", line.text)
+    };
+    let style = if line.header {
+        transcript_style(line.presentation)
+    } else {
+        match line.presentation {
+            TranscriptPresentation::System => Style::default().fg(Color::Rgb(135, 150, 164)),
+            TranscriptPresentation::Technical => Style::default().fg(Color::Rgb(142, 134, 153)),
+            TranscriptPresentation::Error => Style::default().fg(Color::LightRed),
+            _ => Style::default(),
+        }
+    };
+    Line::styled(text, style)
 }
 
 /// Height of the shortcut bar, borders included.
@@ -239,7 +275,9 @@ fn render_task_view(frame: &mut Frame, app: &mut App) {
                 .areas(content_area);
         app.set_task_transcript_viewports(
             content_area.height.saturating_sub(2).max(1) as usize,
+            content_area.width.saturating_sub(2).max(1) as usize,
             Some(chat_area.height.saturating_sub(2).max(1) as usize),
+            Some(chat_area.width.saturating_sub(2).max(1) as usize),
         );
         let Screen::Task(view) = app.screen() else {
             return;
@@ -250,6 +288,8 @@ fn render_task_view(frame: &mut Frame, app: &mut App) {
     } else {
         app.set_task_transcript_viewports(
             content_area.height.saturating_sub(2).max(1) as usize,
+            content_area.width.saturating_sub(2).max(1) as usize,
+            None,
             None,
         );
         let Screen::Task(view) = app.screen() else {
@@ -321,6 +361,8 @@ fn render_chat_panel(frame: &mut Frame, chat: &ChatPanel, area: Rect) {
                 "Loading the chat…".to_string()
             },
             presentation: TranscriptPresentation::Neutral,
+            header: false,
+            selected: false,
         });
     } else {
         let action_entry = chat
@@ -344,7 +386,7 @@ fn render_chat_panel(frame: &mut Frame, chat: &ChatPanel, area: Rect) {
     let offset = chat.transcript.scroll_offset();
     let mut visible: Vec<Line> = wrap_visible_lines(&lines, inner_width, offset, history_height)
         .into_iter()
-        .map(|line| Line::styled(line.text, transcript_style(line.presentation)))
+        .map(|line| transcript_line(line, inner_width))
         .collect();
     visible.extend(footer.into_iter().map(Line::from));
     frame.render_widget(Paragraph::new(visible).block(block), area);
@@ -464,6 +506,8 @@ fn render_task_content(frame: &mut Frame, view: &TaskView, area: Rect) {
                     logical_line,
                     text,
                     presentation: TranscriptPresentation::Neutral,
+                    header: false,
+                    selected: false,
                 })
                 .collect()
         }
@@ -472,6 +516,8 @@ fn render_task_content(frame: &mut Frame, view: &TaskView, area: Rect) {
             logical_line: 0,
             text: "Loading…".to_string(),
             presentation: TranscriptPresentation::Neutral,
+            header: false,
+            selected: false,
         }],
     };
 
@@ -483,7 +529,7 @@ fn render_task_content(frame: &mut Frame, view: &TaskView, area: Rect) {
     };
     let visible: Vec<Line> = wrap_visible_lines(&lines, inner_width, offset, inner_height)
         .into_iter()
-        .map(|line| Line::styled(line.text, transcript_style(line.presentation)))
+        .map(|line| transcript_line(line, inner_width))
         .collect();
 
     frame.render_widget(Paragraph::new(visible).block(block), area);
@@ -1960,9 +2006,9 @@ fn render_help_modal(frame: &mut Frame) {
             "Task view",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from("  Content focus     j/k, PgUp/PgDn, g/G read transcript history; e/Enter expands detail; v toggles raw"),
+        Line::from("  Content focus     j/k, PgUp/PgDn, g/G read transcript history; e/Enter expands detail; v entry RAW; Ctrl+v conversation RAW"),
         Line::from("  c                 conductor chat: Tab cycles draft / history / action target"),
-        Line::from("                    draft types and Enter sends; history uses navigation, e detail, v raw; [/] chooses actions"),
+        Line::from("                    draft types and Enter sends; history uses navigation, e detail, v entry RAW / Ctrl+v conversation RAW; [/] chooses actions"),
         Line::from("                    y / n confirm / reject a proposal, u undoes a decision"),
         Line::from(""),
         Line::from(Span::styled(
@@ -2001,15 +2047,67 @@ mod tests {
     fn transcript_roles_have_distinct_backgrounds() {
         assert_eq!(
             transcript_style(TranscriptPresentation::Operator).bg,
-            Some(Color::Blue)
+            Some(Color::Rgb(33, 71, 93))
         );
         assert_eq!(
             transcript_style(TranscriptPresentation::Agent).bg,
-            Some(Color::DarkGray)
+            Some(Color::Rgb(48, 67, 52))
         );
         assert_eq!(
             transcript_style(TranscriptPresentation::Error).bg,
             Some(Color::Red)
         );
+    }
+
+    fn line(text: &str, header: bool, selected: bool) -> TranscriptLine {
+        TranscriptLine {
+            entry_id: "e".into(),
+            logical_line: 0,
+            text: text.to_string(),
+            presentation: TranscriptPresentation::Agent,
+            header,
+            selected,
+        }
+    }
+
+    /// AE1/AE2: the role colour covers the whole header row and nothing else;
+    /// the left marker is drawn on the selected entry only.
+    #[test]
+    fn a_header_fills_the_width_in_its_role_colour_and_the_body_stays_neutral() {
+        let header = transcript_line(line("AGENT · Agent · 2026-10-09 10:00:00", true, true), 60);
+        let text: String = header
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text.chars().count(), 60);
+        assert!(text.starts_with("┃ AGENT"));
+        assert_eq!(
+            header.style.bg,
+            transcript_style(TranscriptPresentation::Agent).bg
+        );
+
+        let body = transcript_line(line("the answer", false, true), 60);
+        assert_eq!(body.style.bg, None);
+        assert!(body.spans[0].content.starts_with("┃ "));
+
+        let other = transcript_line(line("not selected", false, false), 60);
+        assert!(other.spans[0].content.starts_with("  "));
+    }
+
+    #[test]
+    fn the_five_roles_have_five_distinct_header_styles() {
+        let styles = [
+            TranscriptPresentation::Operator,
+            TranscriptPresentation::Agent,
+            TranscriptPresentation::Conductor,
+            TranscriptPresentation::System,
+            TranscriptPresentation::Technical,
+        ]
+        .map(|presentation| transcript_style(presentation).bg);
+        for (index, style) in styles.iter().enumerate() {
+            assert!(style.is_some());
+            assert!(!styles[..index].contains(style), "{styles:?}");
+        }
     }
 }

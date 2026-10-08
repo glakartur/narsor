@@ -169,7 +169,16 @@ fn adapt_narsor(text: &str) -> (EntryKind, String, Value) {
     if let Ok(value) = serde_json::from_str::<Value>(text) {
         if let Some(event) = value.get("event").and_then(Value::as_str) {
             let (normalized, summary) = match event {
-                "prompt" | "agent_input" => ("agent_input", "Workflow sends input to agent"),
+                "prompt" | "agent_input" => (
+                    "agent_input",
+                    value
+                        .get("prompt")
+                        .or_else(|| value.get("message"))
+                        .and_then(Value::as_str)
+                        .and_then(|prompt| prompt.lines().next())
+                        .filter(|prompt| !prompt.is_empty())
+                        .unwrap_or("Workflow sends input to agent"),
+                ),
                 "step_started" | "step_start" => ("step_started", "Workflow step started"),
                 "step_completed" | "step_finish" => ("step_completed", "Workflow step completed"),
                 "step_failed" => ("step_failed", "Workflow step failed"),

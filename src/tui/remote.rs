@@ -784,9 +784,10 @@ impl RemoteApp {
     }
 
     /// Records the resolved conversation pane height for logical navigation.
-    pub fn set_conversation_viewport(&mut self, height: usize) {
+    pub fn set_conversation_viewport(&mut self, height: usize, width: usize) {
         if let Some(page) = self.detail.as_mut().and_then(|detail| detail.page.as_mut()) {
             page.transcript.set_viewport(height);
+            page.transcript.set_width(width);
         }
     }
 
@@ -853,7 +854,7 @@ impl RemoteApp {
                     ("PgUp/PgDn", "page history"),
                     ("g/G", "history top/bottom"),
                     ("e", "detail"),
-                    ("v", "raw/rendered"),
+                    ("v / Ctrl+v", "entry / conversation RAW"),
                     ("[/]", "other attempt"),
                 ]);
             }
@@ -1000,8 +1001,12 @@ impl RemoteApp {
                     transcript.to_bottom();
                     return RemoteRequest::None;
                 }
-                KeyCode::Char('v') => {
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     transcript.toggle_mode();
+                    return RemoteRequest::None;
+                }
+                KeyCode::Char('v') => {
+                    transcript.toggle_selected_raw();
                     return RemoteRequest::None;
                 }
                 KeyCode::Char('e') | KeyCode::Enter | KeyCode::Char(' ') => {

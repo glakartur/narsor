@@ -250,11 +250,15 @@ fn pid_alive(pid: u32) -> bool {
     if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
         return false;
     }
-    // An exited daemon this process spawned and never reaped stays a zombie,
-    // which `kill(pid, 0)` still sees. A zombie has stopped running.
+    // A daemon that `ensure_daemon_running` spawned is this process's own
+    // child and nobody reaps it: once it exits it stays a zombie, which
+    // `kill(pid, 0)` still sees. A zombie has stopped running.
     !std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
-        .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.trim_start().starts_with('Z')))
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
         .unwrap_or(false)
 }
 
@@ -3228,14 +3232,19 @@ async fn expanding_a_conversation_entry_toggles_and_collapses_again() {
             .into_iter()
             .map(|line| line.text)
             .collect::<Vec<_>>();
-        assert!(expanded.iter().any(|line| {
-            line.contains("message.content")
+        assert!(
+            expanded
+                .iter()
+                .any(|line| line.starts_with("AGENT · Agent · ")),
+            "the header names the role, the speaker and the date: {expanded:?}"
+        );
+        assert!(
+            !expanded.iter().any(|line| line.contains('{')
+                || line.contains("message.content")
                 || line.contains("event.type")
-                || line.contains("workflow.event")
-        }));
-        assert!(!expanded
-            .iter()
-            .any(|line| line.contains("\"type\":\"assistant\"")));
+                || line.contains("workflow.event")),
+            "the expanded entry is readable text, not JSON or field names: {expanded:?}"
+        );
     }
 
     app.on_key(key(KeyCode::Enter));
@@ -3244,12 +3253,29 @@ async fn expanding_a_conversation_entry_toggles_and_collapses_again() {
         "second Enter should collapse the transcript entry"
     );
 
+    // `v` shows the source of the selected entry only; `Ctrl+v` switches the
+    // whole conversation.
     app.on_key(key(KeyCode::Char('v')));
-    assert!(
-        matches!(&task_view(&app).content, TaskContent::Conversation { transcript, .. } if transcript.mode() == DisplayMode::Raw),
-        "content focus switches the same transcript to diagnostic raw mode"
-    );
     if let TaskContent::Conversation { transcript, .. } = &task_view(&app).content {
+        assert_eq!(transcript.mode(), DisplayMode::Rendered);
+        assert!(transcript.is_raw(&entry_id), "the selected entry is raw");
+        let lines = transcript
+            .logical_lines()
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("\"type\":\"assistant\"")));
+        assert!(
+            lines.iter().any(|line| line.contains("thread started")),
+            "the other entries stay rendered: {lines:?}"
+        );
+    }
+    app.on_key(key(KeyCode::Char('v')));
+    app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+    if let TaskContent::Conversation { transcript, .. } = &task_view(&app).content {
+        assert_eq!(transcript.mode(), DisplayMode::Raw);
         let raw = transcript
             .logical_lines()
             .into_iter()
@@ -3262,8 +3288,9 @@ async fn expanding_a_conversation_entry_toggles_and_collapses_again() {
     assert!(
         app.shortcuts()
             .iter()
-            .any(|(key, description)| *key == "v" && *description == "raw/rendered"),
-        "the focused content bar documents raw mode"
+            .any(|(key, description)| *key == "v / Ctrl+v"
+                && *description == "entry / conversation RAW"),
+        "the focused content bar documents both RAW scopes"
     );
 }
 
@@ -3589,28 +3616,29 @@ fn transcript_entry(id: &str, lines: &[&str]) -> TranscriptEntry {
 }
 
 #[test]
-fn transcript_scrolls_logical_lines_without_selecting_entries() {
+fn transcript_cursor_moves_between_entries_not_wrapped_lines() {
     let mut transcript = TranscriptState::new(TranscriptId::from("attempt-a"));
-    transcript.load(vec![transcript_entry(
-        "one",
-        &[
-            "line 0", "line 1", "line 2", "line 3", "line 4", "line 5", "line 6", "line 7",
-            "line 8", "line 9",
-        ],
-    )]);
+    transcript.load(vec![
+        transcript_entry("one", &["line 0", "line 1", "line 2", "line 3"]),
+        transcript_entry("two", &["next entry"]),
+    ]);
     transcript.set_viewport(3);
 
     transcript.to_top();
+    assert_eq!(
+        transcript.selected_entry(),
+        Some(&TranscriptEntryId::from("one"))
+    );
     transcript.line_down();
-    assert_eq!(transcript.scroll_offset(), 1);
-    transcript.page_down();
-    assert_eq!(transcript.scroll_offset(), 4);
-    transcript.to_bottom();
-    assert_eq!(transcript.scroll_offset(), 7);
-    transcript.page_up();
-    assert_eq!(transcript.scroll_offset(), 4);
-    transcript.to_top();
-    assert_eq!(transcript.scroll_offset(), 0);
+    assert_eq!(
+        transcript.selected_entry(),
+        Some(&TranscriptEntryId::from("two"))
+    );
+    transcript.line_up();
+    assert_eq!(
+        transcript.selected_entry(),
+        Some(&TranscriptEntryId::from("one"))
+    );
 }
 
 #[test]
@@ -3636,15 +3664,14 @@ fn transcript_opens_at_end_and_preserves_an_older_anchor_on_append() {
     assert!(transcript.is_following_end());
 
     transcript.to_top();
-    transcript.line_down();
     let anchor = transcript.anchor().expect("anchor while reading");
     assert_eq!(anchor.entry_id, TranscriptEntryId::from("one"));
-    assert_eq!(anchor.logical_line, 1);
+    assert_eq!(anchor.logical_line, 0);
     assert!(!transcript.is_following_end());
 
     transcript.append(vec![transcript_entry("four", &["four-a"])]);
     assert_eq!(transcript.anchor(), Some(anchor));
-    assert_eq!(transcript.scroll_offset(), 1);
+    assert_eq!(transcript.scroll_offset(), 0);
 }
 
 #[test]
@@ -3665,12 +3692,12 @@ fn transcript_reanchors_across_detail_mode_resize_and_missing_entry() {
     transcript.set_mode(DisplayMode::Raw);
     assert_eq!(
         transcript.anchor().unwrap().entry_id,
-        TranscriptEntryId::from("one")
+        TranscriptEntryId::from("two")
     );
     transcript.set_viewport(1);
     assert_eq!(
         transcript.anchor().unwrap().entry_id,
-        TranscriptEntryId::from("one")
+        TranscriptEntryId::from("two")
     );
 
     transcript.replace_entries(vec![transcript_entry("two", &["replacement"])]);
@@ -3699,13 +3726,32 @@ fn transcript_expansion_is_scoped_to_its_conversation() {
 
 #[test]
 fn transcript_raw_display_is_terminal_safe_and_readable() {
-    let raw = b"before\x1b[31m\0after\xff";
+    let raw = b"before\x1b[31m\0\r\tafter\xff";
     let shown = raw_display(raw);
-    assert!(!shown.contains('\x1b'));
-    assert!(!shown.contains('\0'));
-    assert!(!shown.starts_with("base64:"));
+    assert!(shown.contains("\\x1b"));
+    assert!(shown.contains("\\x00"));
+    assert!(shown.contains("\\r"));
+    assert!(shown.contains("\\t"));
+    assert!(!shown.contains('\r'));
+    assert!(!shown.contains('\t'));
     assert!(shown.contains("before"));
     assert!(shown.contains("after"));
+}
+
+#[test]
+fn transcript_keeps_entry_raw_separate_from_global_raw() {
+    let mut transcript = TranscriptState::new(TranscriptId::from("attempt-a"));
+    transcript.load(vec![transcript_entry("one", &["readable"])]);
+    transcript.toggle_selected_raw();
+    assert!(transcript.is_raw(&TranscriptEntryId::from("one")));
+    assert_eq!(transcript.mode(), DisplayMode::Rendered);
+    transcript.toggle_mode();
+    assert_eq!(transcript.mode(), DisplayMode::Raw);
+    transcript.toggle_selected_raw();
+    assert!(
+        transcript.is_raw(&TranscriptEntryId::from("one")),
+        "global raw must not mutate hidden entry state"
+    );
 }
 
 #[test]

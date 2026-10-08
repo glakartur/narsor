@@ -489,7 +489,7 @@ fn narsor_events_use_workflow_vocabulary() {
         (
             r#"{"event":"prompt","harness":"codex","prompt":"Fix it"}"#,
             "agent_input",
-            "Workflow sends input to agent",
+            "Fix it",
         ),
         ("step started", "step_started", "Workflow step started"),
         (
@@ -702,7 +702,7 @@ mod conductor_chat {
         );
         assert_eq!(
             panel.transcript.entries()[1].presentation,
-            TranscriptPresentation::Agent
+            TranscriptPresentation::Conductor
         );
     }
 

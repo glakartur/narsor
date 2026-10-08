@@ -29,7 +29,7 @@ use super::remote::{
 };
 use super::scroll::sanitize;
 use super::views::centered;
-use super::views::transcript_style;
+use super::views::transcript_line;
 
 /// Height of the shortcut bar, borders included.
 const SHORTCUT_BAR_HEIGHT: u16 = 3;
@@ -77,7 +77,10 @@ pub fn render(frame: &mut Frame, app: &mut RemoteApp) {
             let [detail, conversation] =
                 Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
                     .areas(body);
-            app.set_conversation_viewport(conversation.height.saturating_sub(2).max(1) as usize);
+            app.set_conversation_viewport(
+                conversation.height.saturating_sub(2).max(1) as usize,
+                conversation.width.saturating_sub(2).max(1) as usize,
+            );
             render_detail(frame, app, detail);
             render_conversation(frame, app, conversation);
         }
@@ -150,7 +153,7 @@ fn render_conversation(frame: &mut Frame, app: &RemoteApp, area: Rect) {
         (None, None) => " Conversation ".to_string(),
     };
     let lines = match page {
-        Some(page) => page_lines(page),
+        Some(page) => page_lines(page, area.width.saturating_sub(2) as usize),
         None => vec![Line::from(Span::styled(
             "c: read the latest attempt through the control plane · [ ]: other attempts",
             Style::default().fg(Color::DarkGray),
@@ -172,7 +175,7 @@ fn render_conversation(frame: &mut Frame, app: &RemoteApp, area: Rect) {
     );
 }
 
-fn page_lines(page: &PageView) -> Vec<Line<'static>> {
+fn page_lines(page: &PageView, width: usize) -> Vec<Line<'static>> {
     if page.no_record {
         return vec![Line::from(Span::styled(
             "The runner holds no conversation record for this attempt.",
@@ -183,7 +186,7 @@ fn page_lines(page: &PageView) -> Vec<Line<'static>> {
         .transcript
         .logical_lines()
         .into_iter()
-        .map(|line| Line::styled(line.text, transcript_style(line.presentation)))
+        .map(|line| transcript_line(line, width))
         .collect();
     lines.push(Line::from(Span::styled(
         if page.truncated_tail {

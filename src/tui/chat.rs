@@ -19,7 +19,8 @@ use serde_json::Value;
 use crate::conductor::{ChatAuthor, ChatEntry, ChatEntryKind};
 use crate::domain::{ConductorDecisionKind, Confidence};
 use crate::tui::transcript::{
-    TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptPresentation, TranscriptState,
+    utterance_header, TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptPresentation,
+    TranscriptState,
 };
 
 /// The `kind` a chat decision entry records for a carried-out proposal.
@@ -445,30 +446,81 @@ impl ChatPanel {
 fn chat_transcript_entry(item: &ChatItem) -> TranscriptEntry {
     let raw =
         serde_json::to_vec(&item.entry).unwrap_or_else(|_| item.entry.text.as_bytes().to_vec());
-    let technical_lines = item
+    let mut rendered_lines = item
         .entry
-        .payload
-        .as_ref()
-        .map_or_else(Vec::new, |payload| {
-            serde_json::to_string_pretty(payload)
-                .unwrap_or_else(|_| payload.to_string())
-                .lines()
-                .map(|line| format!("   {line}"))
-                .collect()
-        });
+        .text
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if rendered_lines.is_empty() {
+        rendered_lines.push(String::new());
+    }
+
+    // A proposal's state and the action it offers are not diagnostics: an
+    // operator needs both before expanding a transcript entry.  Confidence,
+    // rationale, and payload remain progressive detail below.
+    match item.entry.kind {
+        ChatEntryKind::Proposal => {
+            rendered_lines.push(format!(
+                "(proposal, {})",
+                item.proposal.unwrap_or(ProposalState::Open).label()
+            ));
+            if item.open_proposal().is_some() {
+                rendered_lines.push("y — confirm,  n — reject".to_string());
+            }
+        }
+        ChatEntryKind::Decision => {
+            rendered_lines.push("(decision)".to_string());
+            if item.undoable_decision().is_some() {
+                rendered_lines.push("u — undo this decision".to_string());
+            }
+        }
+        ChatEntryKind::Message | ChatEntryKind::Error => {}
+    }
+
+    let mut technical_lines = chat_item_lines(item)
+        .into_iter()
+        .skip(1)
+        .filter(|line| {
+            !matches!(
+                line.as_str(),
+                "   y — confirm,  n — reject" | "   u — undo this decision"
+            )
+        })
+        .collect::<Vec<_>>();
+    technical_lines.extend(
+        item.entry
+            .payload
+            .as_ref()
+            .map_or_else(Vec::new, |payload| {
+                payload.as_str().map_or_else(
+                    || vec!["Conductor payload available in RAW.".to_string()],
+                    |text| text.lines().map(str::to_owned).collect(),
+                )
+            }),
+    );
     let presentation = if item.entry.kind == ChatEntryKind::Error {
         TranscriptPresentation::Error
     } else {
         match item.entry.author {
             ChatAuthor::Operator => TranscriptPresentation::Operator,
-            ChatAuthor::Conductor => TranscriptPresentation::Agent,
+            ChatAuthor::Conductor => TranscriptPresentation::Conductor,
         }
     };
     TranscriptEntry::new(
         TranscriptEntryId::from(item.entry.id.clone()),
-        chat_item_lines(item),
+        rendered_lines,
         raw,
     )
+    .with_header(utterance_header(
+        presentation,
+        if item.entry.author == ChatAuthor::Operator {
+            "Operator"
+        } else {
+            "Konduktor"
+        },
+        item.entry.at,
+    ))
     .with_technical_lines(technical_lines)
     .with_presentation(presentation)
 }
