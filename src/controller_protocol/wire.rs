@@ -23,7 +23,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::domain::{BackendId, ExecutionStatus, ResourceProfile, TaskId, TaskLaunchSpec};
+use crate::domain::{
+    BackendId, ExecutionStatus, ResourceProfile, TaskDisplay, TaskId, TaskLaunchSpec,
+};
 use crate::engine::{HumanInputDelivery, Timeline};
 use crate::orchestration::{
     ArchiveTombstone, CommandReceipt, ConversationAttemptSummary, ExecutionCursor, InputStatus,
@@ -254,6 +256,11 @@ pub struct TaskSummary {
     /// `None` outside `Queued`.
     #[serde(default)]
     pub queue: Option<QueueView>,
+    /// Title and links the workflow declares: rendered from the sealed
+    /// inputs when the task is created, replaced by the runner's latest
+    /// report. Empty when the workflow declares none.
+    #[serde(default)]
+    pub display: TaskDisplay,
     /// The control plane's "now" this summary was computed at, so a client
     /// can show the age of every timestamp above.
     pub as_of: DateTime<Utc>,

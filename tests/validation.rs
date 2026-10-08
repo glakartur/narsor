@@ -306,6 +306,7 @@ fn initial_state_that_does_not_exist_is_rejected() {
         inputs: Vec::new(),
         globals: Default::default(),
         workspace: None,
+        display: None,
         states,
         initial_state: "missing".to_string(),
     };
@@ -707,4 +708,143 @@ fn a_tag_under_the_resolve_policy_is_valid_until_task_creation() {
     );
     let errors = narsor::workflow::validate_source(&yaml).expect("the file loads");
     assert!(errors.is_empty(), "{}", describe(&errors));
+}
+
+// ---------------------------------------------------------------------------
+// Display (§3.6)
+// ---------------------------------------------------------------------------
+
+/// A valid workflow with `display` and `extra` spliced in.
+fn with_display(display: &str, extra: &str) -> String {
+    format!(
+        "name: shown\nversion: 1\ninputs:\n  - name: ticket\n    type: string\n    required: true\n\
+         {display}\n{extra}states:\n  work:\n    action:\n      type: script\n      command: \"true\"\n\
+         \x20   outputs: [ok]\n    transitions:\n      ok: done\n  done:\n    description: end\n\
+         terminal_states: [done]\n"
+    )
+}
+
+fn display_errors(display: &str) -> Vec<ValidationError> {
+    narsor::workflow::validate_source(&with_display(display, "")).expect("the YAML loads")
+}
+
+#[test]
+fn a_valid_display_section_passes() {
+    let errors = display_errors(
+        "display:\n  title: \"{{ inputs.ticket }}\"\n  links:\n    - label: Jira\n      \
+         text: \"{{ inputs.ticket }}\"\n      url: \"https://j.example/{{ inputs.ticket }}\"\n    \
+         - label: PR\n      text: \"!{{ context.variables.pr_number }}\"\n      \
+         url: \"{{ context.variables.pr_url }}\"",
+    );
+
+    assert!(errors.is_empty(), "got: {}", describe(&errors));
+}
+
+#[test]
+fn display_may_be_absent_or_empty() {
+    assert!(display_errors("").is_empty());
+    assert!(display_errors("display: {}").is_empty());
+}
+
+#[test]
+fn display_referencing_an_undeclared_input_is_a_violation() {
+    let errors = display_errors(
+        "display:\n  title: \"{{ inputs.nieistnieje }}\"\n  links:\n    - label: L\n      \
+         url: \"https://x.example/{{ inputs.tez_nie }}\"",
+    );
+
+    let unknown: Vec<_> = errors
+        .iter()
+        .filter_map(|error| match error {
+            ValidationError::UnknownInputReferenceInDisplay { field, variable } => {
+                Some((field.as_str(), variable.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        unknown,
+        vec![
+            ("display.title", "nieistnieje"),
+            ("display.links[0].url", "tez_nie")
+        ],
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn display_violations_are_reported_together_with_the_others() {
+    let source = with_display(
+        "display:\n  title: \"{{ inputs.nieistnieje }}\"",
+        "globals:\n  workspace:\n    type: local\n    path: \"{{ inputs.brak }}\"\n",
+    );
+
+    let errors = narsor::workflow::validate_source(&source).unwrap();
+
+    assert!(errors
+        .iter()
+        .any(|e| matches!(e, ValidationError::UnknownInputReferenceInDisplay { .. })));
+    assert!(errors
+        .iter()
+        .any(|e| matches!(e, ValidationError::UnknownInputReferenceInGlobals { .. })));
+}
+
+#[test]
+fn a_duplicate_or_empty_link_label_is_a_violation() {
+    let errors = display_errors(
+        "display:\n  links:\n    - label: PR\n      url: \"https://a.example\"\n    \
+         - label: PR\n      url: \"https://b.example\"\n    - label: \" \"\n      \
+         url: \"https://c.example\"",
+    );
+
+    let fields: Vec<_> = errors
+        .iter()
+        .filter_map(|error| match error {
+            ValidationError::InvalidDisplay { field, .. } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        vec!["display.links[1].label", "display.links[2].label"],
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_filter_or_unclosed_placeholder_in_display_is_a_violation() {
+    let errors = display_errors(
+        "display:\n  title: \"{{ context.x | default('y') }}\"\n  links:\n    - label: L\n      \
+         url: \"https://x.example/{{ inputs.ticket\"",
+    );
+
+    let fields: Vec<_> = errors
+        .iter()
+        .filter_map(|error| match error {
+            ValidationError::InvalidDisplay { field, .. } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fields, vec!["display.title", "display.links[0].url"]);
+}
+
+#[test]
+fn an_unset_context_variable_in_display_is_not_a_violation() {
+    let errors = display_errors("display:\n  title: \"{{ context.variables.never_set }}\"");
+
+    assert!(errors.is_empty(), "got: {}", describe(&errors));
+}
+
+#[test]
+fn an_unknown_field_in_display_is_rejected_at_load() {
+    for display in [
+        "display:\n  subtitle: x",
+        "display:\n  links:\n    - label: L\n      url: \"https://x.example\"\n      icon: i",
+        "display:\n  links:\n    - label: L",
+    ] {
+        let result = narsor::workflow::validate_source(&with_display(display, ""));
+        assert!(result.is_err(), "{display:?} must not load");
+    }
 }

@@ -29,6 +29,13 @@ inputs:                     # Definica wejść wymaganych do uruchomienia (opcjo
     required: <boolean>
     default: <any>          # Wartość domyślna (opcjonalne)
 
+display:                    # Nagłówek zadania w TUI i CLI (opcjonalne, §3.6)
+  title: <template>         # Np. "{{ inputs.ticket_id }}"
+  links:
+    - label: <string>       # Niepusta, unikalna w sekcji
+      text: <template>      # Widoczny tekst (opcjonalne)
+      url: <template>       # Tylko http/https po wyrenderowaniu
+
 globals:                    # Ustawienia globalne dla całego workflow (opcjonalne)
   timeout: <duration>       # Np. "1h", "30m"
   retry_policy:             # Domyślna polityka retry dla akcji
@@ -409,6 +416,33 @@ Identyfikatory wymienione w `terminal_states` muszą odpowiadać istniejącym st
 
 ---
 
+### 3.6. Display (Nagłówek Zadania)
+
+Opcjonalna sekcja mówi, jak zadanie przedstawia się operatorowi: tytuł i linki (zgłoszenie, pull request).
+
+```yaml
+display:
+  title: "{{ inputs.ticket_id }}"
+  links:
+    - label: Jira
+      text: "{{ inputs.ticket_id }}"
+      url: "https://jira.example/browse/{{ inputs.ticket_id }}"
+    - label: PR
+      text: "!{{ context.variables.pr_number }}"
+      url: "{{ context.variables.pr_url }}"
+```
+
+*   `title`, `links[].text` i `links[].url` są szablonami z tej samej składni co reszta workflow: `{{ inputs.NAZWA }}` i `{{ context.variables.NAZWA }}` (skrót `{{ context.NAZWA }}`). Nie ma filtrów.
+*   **Łagodne renderowanie.** Inaczej niż w akcjach, nieznana albo jeszcze nieustawiona zmienna nie jest błędem: cały tekst, który ją zawiera, jest pusty. Tytuł pojawia się, gdy zadanie czeka w kolejce, a zmienne kontekstu (np. `pr_url`) powstają dopiero w trakcie pracy.
+    *   Pusty `title` — klient pokazuje identyfikator zadania.
+    *   Pusty `text` — link pokazuje `—`. Brak pola `text` — link pokazuje swój adres, a gdy go nie ma, `—`.
+    *   Pusty `url` — link bez adresu (pokazany, ale nieaktywny).
+*   **Adres.** Po wyrenderowaniu musi być bezwzględnym adresem `http` albo `https` z hostem. Inny schemat (`javascript:`, `file:` itd.) albo znaki białe i sterujące dają link bez adresu. Ze wszystkich tekstów są usuwane znaki sterujące.
+*   **Dwa miejsca renderowania.** Control plane renderuje sekcję z zapieczętowanych `inputs` przy tworzeniu zadania (zmienne są wtedy puste). Runner renderuje ją ponownie z `context.variables` i raportuje w snapshocie; ostatni raport wygrywa.
+*   `label` jest niepusty i unikalny w sekcji; nieznane pole w `display` albo w linku jest błędem wczytania.
+
+---
+
 ## 4. Przykładowe Workflow
 
 Poniżej kompletny przykład workflow realizującego prosty proces implementacji funkcji, testowania i tworzenia PR.
@@ -581,7 +615,12 @@ Przed uruchomieniem workflow, definicja musi przejść walidację:
 4.  **Zmienne i Kontekst:**
     *   Odwołania do zmiennych (np. `{{ inputs.xxx }}`) muszą dotyczyć zdefiniowanych wejść lub pól kontekstu.
 
-5.  **Obrazy:**
+5.  **Display (§3.6):**
+    *   `{{ inputs.xxx }}` w `title`, `text` i `url` musi dotyczyć zdefiniowanego wejścia; zmienna kontekstu bez wartości nie jest błędem.
+    *   Filtr albo niedomknięte `{{` w tych szablonach jest błędem.
+    *   `label` jest niepusty i unikalny.
+
+6.  **Obrazy:**
     *   `globals.image` i `image` kroku muszą być poprawną referencją OCI z jawnym tagiem lub digestem; przy polityce `pinned` digest jest obowiązkowy.
     *   Stan terminalny nie może nadpisywać obrazu — niczego nie uruchamia.
 

@@ -20,14 +20,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::domain::{
-    ActionConfig, AgentActionConfig, AgentDecisionConfig, DecisionConfig, GlobalsConfig,
-    HumanActionConfig, HumanDecisionConfig, HumanInputField, HumanInputType, InputParameter,
-    OutputDefinition, ParamType, RetryPolicy, ScriptActionConfig, State, TerminalStatus,
-    WaitActionConfig, WorkflowDefinition, WorkspaceSpec,
+    ActionConfig, AgentActionConfig, AgentDecisionConfig, DecisionConfig, DisplayLinkSpec,
+    DisplaySpec, GlobalsConfig, HumanActionConfig, HumanDecisionConfig, HumanInputField,
+    HumanInputType, InputParameter, OutputDefinition, ParamType, RetryPolicy, ScriptActionConfig,
+    State, TerminalStatus, WaitActionConfig, WorkflowDefinition, WorkspaceSpec,
 };
 
 use super::schema::{
-    ActionSchema, DecisionSchema, GlobalsSchema, HumanInputTypeSchema, InputSchema,
+    ActionSchema, DecisionSchema, DisplaySchema, GlobalsSchema, HumanInputTypeSchema, InputSchema,
     ParamTypeSchema, RetryPolicySchema, StateSchema, TerminalStatusSchema, WorkflowFile,
     WorkspaceSchema,
 };
@@ -125,6 +125,7 @@ pub fn compile(file: WorkflowFile) -> Result<WorkflowDefinition, LoadError> {
         inputs: file.inputs.into_iter().map(compile_input).collect(),
         globals: compile_globals(&globals),
         workspace,
+        display: file.display.map(compile_display),
         states,
         initial_state,
     })
@@ -135,6 +136,21 @@ fn compile_globals(globals: &GlobalsSchema) -> GlobalsConfig {
         timeout_secs: globals.timeout.map(|d| d.as_secs()),
         retry_policy: globals.retry_policy.as_ref().map(compile_retry_policy),
         image: globals.image.clone(),
+    }
+}
+
+fn compile_display(display: DisplaySchema) -> DisplaySpec {
+    DisplaySpec {
+        title: display.title,
+        links: display
+            .links
+            .into_iter()
+            .map(|link| DisplayLinkSpec {
+                label: link.label,
+                text: link.text,
+                url: link.url,
+            })
+            .collect(),
     }
 }
 

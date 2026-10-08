@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::domain::{ExecutionStatus, ImageSpec};
+use crate::domain::{DisplaySpec, ExecutionStatus, ImageSpec};
 
 /// Unique identifier for a workflow definition
 pub type WorkflowDefinitionId = String;
@@ -50,6 +50,11 @@ pub struct WorkflowDefinition {
     /// per state.
     #[serde(default)]
     pub workspace: Option<WorkspaceSpec>,
+
+    /// How a task of this workflow introduces itself: title and links, still
+    /// templated (`display` in YAML).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DisplaySpec>,
 
     /// States in the workflow graph
     pub states: HashMap<StateId, State>,
@@ -601,6 +606,13 @@ pub enum ValidationError {
         field: &'static str,
         variable: String,
     },
+
+    // --- Display (§3.6) ---
+    #[error("Field '{field}' references unknown input '{variable}'")]
+    UnknownInputReferenceInDisplay { field: String, variable: String },
+
+    #[error("Field '{field}' is invalid: {reason}")]
+    InvalidDisplay { field: String, reason: String },
 
     // --- Environment (R15) ---
     #[error("Field '{field}' has an unusable image: {reason}")]

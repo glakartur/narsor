@@ -269,6 +269,12 @@ fn every_builtin_is_embedded_and_validates_without_a_single_violation() {
             definition.name, entry.name,
             "the embedded definition is the one it is filed under"
         );
+        let display = definition
+            .display
+            .as_ref()
+            .unwrap_or_else(|| panic!("the embedded '{}' declares a display", entry.name));
+        assert!(display.title.is_some(), "'{}' has a title", entry.name);
+        assert!(!display.links.is_empty(), "'{}' has a link", entry.name);
         assert!(
             !definition.states.is_empty(),
             "the embedded '{}' declares states",

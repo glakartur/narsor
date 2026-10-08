@@ -359,3 +359,195 @@ fn an_actions_references_cover_every_rendered_field() {
     .expect("a human action");
     assert_eq!(action_context_references(&human), vec!["question"]);
 }
+
+// ---------------------------------------------------------------------------
+// `display` (U2): lenient rendering, URL allow-list, sanitising
+// ---------------------------------------------------------------------------
+
+use narsor::domain::{DisplayLinkSpec, DisplaySpec, TaskDisplay};
+
+fn link(label: &str, text: Option<&str>, url: &str) -> DisplayLinkSpec {
+    DisplayLinkSpec {
+        label: label.to_string(),
+        text: text.map(str::to_string),
+        url: url.to_string(),
+    }
+}
+
+fn render_display(
+    display: &DisplaySpec,
+    inputs: &Map<String, Value>,
+    context: &Context,
+) -> TaskDisplay {
+    TemplateScope::new(inputs, context).render_display(display)
+}
+
+fn pr_display() -> DisplaySpec {
+    DisplaySpec {
+        title: Some("{{ inputs.ticket_id }}".to_string()),
+        links: vec![
+            link(
+                "Jira",
+                Some("{{ inputs.ticket_id }}"),
+                "https://jira.example/browse/{{ inputs.ticket_id }}",
+            ),
+            link(
+                "PR",
+                Some("!{{ context.variables.pr_number }}"),
+                "{{ context.variables.pr_url }}",
+            ),
+        ],
+    }
+}
+
+#[test]
+fn display_renders_inputs_and_leaves_unset_variables_without_a_value() {
+    let rendered = render_display(
+        &pr_display(),
+        &inputs(&[("ticket_id", json!("NAR-12"))]),
+        &Context::new(),
+    );
+
+    assert_eq!(rendered.title, "NAR-12");
+    assert_eq!(rendered.links[0].text, "NAR-12");
+    assert_eq!(
+        rendered.links[0].url.as_deref(),
+        Some("https://jira.example/browse/NAR-12")
+    );
+    assert_eq!(rendered.links[1].label, "PR");
+    assert_eq!(rendered.links[1].text, "—", "no value yet: the dash");
+    assert_eq!(rendered.links[1].url, None);
+}
+
+#[test]
+fn display_picks_up_a_variable_once_it_is_set() {
+    let context = context(&[
+        ("pr_number", json!(42)),
+        ("pr_url", json!("https://git.example/pr/42")),
+    ]);
+
+    let rendered = render_display(
+        &pr_display(),
+        &inputs(&[("ticket_id", json!("NAR-12"))]),
+        &context,
+    );
+
+    assert_eq!(rendered.links[1].text, "!42");
+    assert_eq!(
+        rendered.links[1].url.as_deref(),
+        Some("https://git.example/pr/42")
+    );
+}
+
+#[test]
+fn display_with_a_missing_input_renders_empty_instead_of_failing() {
+    let rendered = render_display(&pr_display(), &Map::new(), &Context::new());
+
+    assert_eq!(rendered.title, "");
+    assert_eq!(rendered.links[0].url, None, "no half-built URL");
+}
+
+#[test]
+fn display_drops_urls_that_are_not_http_or_https() {
+    for url in [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "data:text/html,x",
+        "https://",
+        "",
+    ] {
+        let display = DisplaySpec {
+            title: None,
+            links: vec![link("L", Some("t"), url)],
+        };
+        let rendered = render_display(&display, &Map::new(), &Context::new());
+        assert_eq!(rendered.links[0].url, None, "{url:?}");
+        assert_eq!(rendered.links[0].text, "t");
+    }
+}
+
+#[test]
+fn display_drops_a_url_a_variable_turned_into_javascript() {
+    let display = DisplaySpec {
+        title: None,
+        links: vec![link("PR", None, "{{ context.variables.pr_url }}")],
+    };
+    let context = context(&[("pr_url", json!("javascript:alert(1)"))]);
+
+    let rendered = render_display(&display, &Map::new(), &context);
+
+    assert_eq!(rendered.links[0].url, None);
+    assert_eq!(rendered.links[0].text, "—");
+}
+
+#[test]
+fn display_link_without_text_shows_its_url() {
+    let display = DisplaySpec {
+        title: None,
+        links: vec![link("Docs", None, "https://docs.example")],
+    };
+
+    let rendered = render_display(&display, &Map::new(), &Context::new());
+
+    assert_eq!(rendered.links[0].text, "https://docs.example");
+}
+
+#[test]
+fn display_strips_control_characters_from_rendered_text() {
+    let display = DisplaySpec {
+        title: Some("{{ inputs.title }}".to_string()),
+        links: vec![link(
+            "Bad\u{1b}Label",
+            Some("{{ inputs.title }}"),
+            "https://x.example",
+        )],
+    };
+
+    let rendered = render_display(
+        &display,
+        &inputs(&[("title", json!("\u{1b}[31mred\u{7}\nline"))]),
+        &Context::new(),
+    );
+
+    assert_eq!(rendered.title, "[31mredline");
+    assert_eq!(rendered.links[0].label, "BadLabel");
+    assert!(!rendered.links[0].text.chars().any(char::is_control));
+}
+
+#[test]
+fn display_with_a_filter_renders_empty_rather_than_failing() {
+    let display = DisplaySpec {
+        title: Some("{{ context.x | default(\"y\") }}".to_string()),
+        links: Vec::new(),
+    };
+
+    let rendered = render_display(&display, &Map::new(), &Context::new());
+
+    assert_eq!(rendered.title, "");
+}
+
+#[test]
+fn strict_rendering_still_refuses_an_unknown_variable() {
+    let error = render_error("{{ context.variables.nope }}", &Map::new(), &Context::new());
+
+    assert!(matches!(error, TemplateError::UnknownVariable { .. }));
+}
+
+#[test]
+fn check_syntax_ignores_unset_variables_but_reports_broken_syntax() {
+    use narsor::workflow::template::check_syntax;
+
+    assert!(check_syntax("{{ context.variables.later }} {{ inputs.x }}", "f").is_ok());
+    assert!(matches!(
+        check_syntax("{{ context.a | upper }}", "f"),
+        Err(TemplateError::FilterUnsupported { .. })
+    ));
+    assert!(matches!(
+        check_syntax("{{ inputs.x", "f"),
+        Err(TemplateError::UnterminatedPlaceholder { .. })
+    ));
+    assert!(matches!(
+        check_syntax("{{ nope.x }}", "f"),
+        Err(TemplateError::UnsupportedReference { .. })
+    ));
+}

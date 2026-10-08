@@ -352,6 +352,7 @@ impl SimulatedRunner {
             timeline: None,
             safe_point,
             problem: None,
+            display: None,
             observed_at: Utc::now(),
         };
         self.client

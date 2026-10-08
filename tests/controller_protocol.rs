@@ -23,7 +23,7 @@ use narsor::controller_protocol::{
     OwnerCommandRequest, ProtocolService, ReportRequest, RunnerClient, RunnerCredentialRequest,
     RunnerDirective, SubmitInputRequest, TaskSummary,
 };
-use narsor::domain::{ExecutionStatus, TaskId};
+use narsor::domain::{DisplayLink, ExecutionStatus, TaskDisplay, TaskId};
 use narsor::engine::{Engine, HumanInputDelivery, PendingHumanInput, Timeline};
 use narsor::orchestration::{
     Clock, CommandRequest, ControlPlane, ConversationAttemptSummary, ConversationAvailability,
@@ -315,6 +315,7 @@ fn snapshot(
         }),
         safe_point: false,
         problem: None,
+        display: None,
         observed_at: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 5).unwrap(),
     }
 }
@@ -1495,4 +1496,117 @@ async fn a_launch_request_with_an_unknown_field_is_refused() {
         .unwrap()
         .tasks
         .is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Task display (U2)
+// ---------------------------------------------------------------------------
+
+/// Replaces the seeded `implement-feature` with one that declares a display.
+fn write_display_workflow(harness: &Harness) {
+    let yaml = environment_support::workflow_yaml(
+        "implement-feature",
+        Some(&environment_support::workflow_image()),
+    )
+    .replacen(
+        "states:",
+        "inputs:\n  - name: ticket\n    type: string\n    required: true\n\
+         display:\n  title: \"{{ inputs.ticket }}\"\n  links:\n    - label: Jira\n      \
+         text: \"{{ inputs.ticket }}\"\n      url: \"https://jira.example/browse/{{ inputs.ticket }}\"\n    \
+         - label: PR\n      text: \"!{{ context.variables.pr_number }}\"\n      \
+         url: \"{{ context.variables.pr_url }}\"\nstates:",
+        1,
+    );
+    fs::write(
+        harness.root.path().join("workflows/implement-feature.yaml"),
+        yaml,
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_new_task_shows_the_display_rendered_from_its_sealed_inputs() {
+    let harness = Harness::start().await;
+    write_display_workflow(&harness);
+
+    let task = harness.create("task-1", "k8s").await;
+
+    assert_eq!(task.display.title, "NAR-1");
+    assert_eq!(task.display.links.len(), 2);
+    assert_eq!(
+        task.display.links[0].url.as_deref(),
+        Some("https://jira.example/browse/NAR-1")
+    );
+    assert_eq!(task.display.links[1].text, "—");
+    assert_eq!(task.display.links[1].url, None, "no PR yet");
+}
+
+#[tokio::test]
+async fn a_task_of_a_workflow_without_display_has_an_empty_one() {
+    let harness = Harness::start().await;
+
+    let task = harness.create("task-1", "k8s").await;
+
+    assert_eq!(task.display, TaskDisplay::default());
+}
+
+#[tokio::test]
+async fn the_runners_display_report_replaces_the_creation_rendering_and_is_sanitised() {
+    let harness = Harness::start().await;
+    write_display_workflow(&harness);
+    let running = harness.running("task-1", "k8s").await;
+    // The runner's first snapshot carried no display: creation's stays.
+    assert_eq!(harness.task("task-1").await.display.title, "NAR-1");
+
+    let mut reported = snapshot(2, ExecutionStatus::Running, 4, None);
+    reported.display = Some(TaskDisplay {
+        title: "NAR-1 \u{1b}]8;;https://evil.example\u{7}click\u{1b}]8;;\u{7}".to_string(),
+        links: vec![
+            DisplayLink {
+                label: "PR\u{1b}[31m".to_string(),
+                text: "!42".to_string(),
+                url: Some("https://git.example/pr/42".to_string()),
+            },
+            DisplayLink {
+                label: "Evil".to_string(),
+                text: "x\u{1b}[2J".to_string(),
+                url: Some("javascript:alert(1)".to_string()),
+            },
+            DisplayLink {
+                label: "File".to_string(),
+                text: "f".to_string(),
+                url: Some("file:///etc/passwd".to_string()),
+            },
+        ],
+    });
+    running.runner.snapshot(&reported).await.expect("snapshot");
+
+    let display = harness.task("task-1").await.display;
+    assert_eq!(display.title, "NAR-1 ]8;;https://evil.exampleclick]8;;");
+    assert!(!display.title.chars().any(char::is_control));
+    assert_eq!(display.links[0].label, "PR[31m");
+    assert_eq!(
+        display.links[0].url.as_deref(),
+        Some("https://git.example/pr/42")
+    );
+    assert_eq!(display.links[1].url, None, "javascript: is dropped");
+    assert_eq!(display.links[1].text, "x[2J");
+    assert_eq!(display.links[2].url, None, "file: is dropped");
+}
+
+#[tokio::test]
+async fn a_title_with_an_escape_sequence_from_the_inputs_is_stripped() {
+    let harness = Harness::start().await;
+    write_display_workflow(&harness);
+    let mut request = create_request("task-1", "k8s");
+    request.launch.inputs = serde_json::json!({ "ticket": "\u{1b}[31mNAR-9\u{1b}[0m" });
+
+    let task = harness
+        .owner
+        .create_control_task(&request)
+        .await
+        .expect("create task");
+
+    assert_eq!(task.display.title, "[31mNAR-9[0m");
+    assert!(!task.display.links[0].text.chars().any(char::is_control));
 }

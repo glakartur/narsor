@@ -4,7 +4,7 @@
 //! [`super::lifecycle`] and the durable mutation protocol in
 //! [`super::control_plane`].
 
-use crate::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
+use crate::domain::{BackendId, ExecutionStatus, TaskDisplay, TaskId, TaskLaunchSpec};
 use crate::engine::{HumanInputDelivery, PendingHumanInput, Timeline};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -763,6 +763,12 @@ pub struct RunnerSnapshot {
     /// a secret.
     #[serde(default)]
     pub problem: Option<RunnerProblem>,
+    /// The workflow's `display` rendered against the execution's inputs and
+    /// current variables. `None` when the runner could not render one (no
+    /// execution yet), which leaves what the control plane rendered at
+    /// creation in place; the last report that has one wins.
+    #[serde(default)]
+    pub display: Option<TaskDisplay>,
     /// When the runner took this snapshot.
     pub observed_at: DateTime<Utc>,
 }

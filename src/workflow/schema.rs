@@ -38,6 +38,10 @@ pub struct WorkflowFile {
     #[serde(default)]
     pub globals: Option<GlobalsSchema>,
 
+    /// How a task introduces itself: title and links (§3.6).
+    #[serde(default)]
+    pub display: Option<DisplaySchema>,
+
     /// The state graph. Order is significant: without an explicit
     /// `initial: true` flag the first state is the entry point, so the mapping
     /// is kept as a vector of pairs instead of a `HashMap`.
@@ -48,6 +52,35 @@ pub struct WorkflowFile {
     /// produces. Accepts both forms of §3.5 — see [`TerminalStatesSchema`].
     #[serde(default)]
     pub terminal_states: TerminalStatesSchema,
+}
+
+/// The `display` section (§3.6): templates for a task's title and links.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplaySchema {
+    /// Template of the task title.
+    #[serde(default)]
+    pub title: Option<String>,
+
+    /// Links shown next to the title.
+    #[serde(default)]
+    pub links: Vec<DisplayLinkSchema>,
+}
+
+/// One entry of `display.links`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplayLinkSchema {
+    /// What the link is; unique within the section.
+    pub label: String,
+
+    /// Template of the visible text.
+    #[serde(default)]
+    pub text: Option<String>,
+
+    /// Template of the target; rendered values other than `http(s)` URLs are
+    /// dropped.
+    pub url: String,
 }
 
 /// The `terminal_states` section (§3.5), in either of its two forms.

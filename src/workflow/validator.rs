@@ -13,6 +13,9 @@
 //! §4 is legal because `test` also has an edge to `create_pr`, so the rule is
 //! "a path to some terminal state exists", not "there are no cycles".
 //!
+//! The `display` section (§3.6) is checked with the same rules, apart from
+//! its labels, which must be non-empty and unique.
+//!
 //! Template references are only checked where they can be checked statically.
 //! `{{ inputs.x }}` must name a declared input; `{{ context.* }}` and anything
 //! with filters or other expression syntax is passed through untouched and
@@ -28,6 +31,7 @@ use crate::domain::{
 
 use super::loader::{compile, LoadError};
 use super::schema::WorkflowFile;
+use super::template::check_syntax;
 
 /// Validates a compiled workflow definition.
 ///
@@ -46,6 +50,7 @@ pub fn validate(definition: &WorkflowDefinition) -> Result<(), Vec<ValidationErr
         validate_state_image(state, &mut errors);
     }
     validate_workflow_templates(definition, &mut errors);
+    validate_display(definition, &mut errors);
     if let Some(image) = &definition.globals.image {
         validate_image("globals.image", image, &mut errors);
     }
@@ -531,6 +536,60 @@ fn validate_workflow_templates(definition: &WorkflowDefinition, errors: &mut Vec
     for variable in extract_input_references(text) {
         if !declares_input(definition, &variable) {
             errors.push(ValidationError::UnknownInputReferenceInGlobals { field, variable });
+        }
+    }
+}
+
+/// The `display` section (§3.6): its templates, and that its labels are
+/// usable and distinct.
+///
+/// `{{ inputs.x }}` must be declared like anywhere else, but a variable
+/// without a value is *not* an error here — a display is rendered before
+/// the variables it shows exist — so only what rendering could never make
+/// sense of (a filter, an unclosed `{{`) is reported besides.
+fn validate_display(definition: &WorkflowDefinition, errors: &mut Vec<ValidationError>) {
+    let Some(display) = &definition.display else {
+        return;
+    };
+
+    let mut templated: Vec<(String, &str)> = Vec::new();
+    if let Some(title) = &display.title {
+        templated.push(("display.title".to_string(), title.as_str()));
+    }
+    let mut labels = HashSet::new();
+    for (index, link) in display.links.iter().enumerate() {
+        let field = format!("display.links[{index}]");
+        if link.label.trim().is_empty() {
+            errors.push(ValidationError::InvalidDisplay {
+                field: format!("{field}.label"),
+                reason: "the label must not be empty".to_string(),
+            });
+        } else if !labels.insert(link.label.as_str()) {
+            errors.push(ValidationError::InvalidDisplay {
+                field: format!("{field}.label"),
+                reason: format!("the label '{}' is used more than once", link.label),
+            });
+        }
+        if let Some(text) = &link.text {
+            templated.push((format!("{field}.text"), text.as_str()));
+        }
+        templated.push((format!("{field}.url"), link.url.as_str()));
+    }
+
+    for (field, text) in templated {
+        if let Err(error) = check_syntax(text, &field) {
+            errors.push(ValidationError::InvalidDisplay {
+                field: field.clone(),
+                reason: error.to_string(),
+            });
+        }
+        for variable in extract_input_references(text) {
+            if !declares_input(definition, &variable) {
+                errors.push(ValidationError::UnknownInputReferenceInDisplay {
+                    field: field.clone(),
+                    variable,
+                });
+            }
         }
     }
 }

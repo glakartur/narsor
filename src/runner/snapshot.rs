@@ -16,13 +16,14 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
 
-use crate::domain::ExecutionStatus;
+use crate::domain::{ExecutionStatus, TaskDisplay, WorkflowDefinition, WorkflowExecution};
 use crate::engine::{build_timeline, Engine, InputContinuation, Timeline};
 use crate::orchestration::{
     ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, PendingInputRef,
     RunnerProblem, RunnerSnapshot,
 };
 use crate::persistence::ConversationStore;
+use crate::workflow::TemplateScope;
 
 use super::RunnerError;
 
@@ -35,6 +36,8 @@ pub(crate) struct ConversationCache {
 
 /// What the runner knows beyond the files.
 pub(crate) struct SnapshotContext<'a> {
+    /// The workflow the task runs, for its `display`.
+    pub definition: &'a WorkflowDefinition,
     /// The execution on this storage, once it exists.
     pub execution_id: Option<&'a str>,
     /// Whether an Engine pass is driving it right now.
@@ -69,6 +72,9 @@ pub(crate) fn build(
             timeline: None,
             safe_point: context.stopping && !context.pass_active,
             problem: context.problem,
+            // Nothing to render against yet; the control plane's own
+            // rendering from the sealed inputs stays in force.
+            display: None,
             observed_at: Utc::now(),
         });
     };
@@ -118,8 +124,20 @@ pub(crate) fn build(
         timeline: Some(timeline),
         safe_point: context.stopping && !context.pass_active,
         problem: context.problem,
+        display: render_display(context.definition, &execution),
         observed_at: Utc::now(),
     })
+}
+
+/// The workflow's `display` against what the execution knows now: its inputs
+/// and the variables its steps have set so far.
+fn render_display(
+    definition: &WorkflowDefinition,
+    execution: &WorkflowExecution,
+) -> Option<TaskDisplay> {
+    let spec = definition.display.as_ref()?;
+    let scope = TemplateScope::from_execution(&execution.inputs, &execution.context).ok()?;
+    Some(scope.render_display(spec))
 }
 
 /// One summary per attempt with a conversation record, in timeline order.

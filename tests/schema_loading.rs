@@ -1134,3 +1134,33 @@ terminal_states: [done]
 "#;
     assert!(load_from_str(yaml).is_err());
 }
+
+#[test]
+fn display_section_compiles_into_the_definition() {
+    let definition = load_from_str(
+        "name: shown\nversion: 1\ndisplay:\n  title: T\n  links:\n    - label: A\n      \
+         text: a\n      url: \"https://a.example\"\n    - label: B\n      url: \"{{ inputs.u }}\"\n\
+         states:\n  work:\n    action:\n      type: script\n      command: \"true\"\n    \
+         outputs: [ok]\n    transitions:\n      ok: done\n  done:\n    description: end\n\
+         terminal_states: [done]\n",
+    )
+    .expect("loads");
+
+    let display = definition.display.expect("a display section");
+    assert_eq!(display.title.as_deref(), Some("T"));
+    assert_eq!(display.links.len(), 2);
+    assert_eq!(display.links[0].text.as_deref(), Some("a"));
+    assert_eq!(display.links[1].text, None);
+}
+
+#[test]
+fn a_definition_without_display_has_none_and_serialises_without_the_key() {
+    let definition = load_reference();
+
+    assert!(definition.display.is_none());
+    let json = serde_json::to_value(&definition).unwrap();
+    assert!(
+        json.get("display").is_none(),
+        "an absent display must not change the sealed snapshot or its digest"
+    );
+}

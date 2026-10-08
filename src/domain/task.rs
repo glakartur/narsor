@@ -10,7 +10,7 @@ use std::fmt;
 use thiserror::Error;
 
 use super::environment::{canonical_sha256, ResolvedEnvironment, ResourceProfile, TaskWorkspace};
-use super::WorkflowDefinition;
+use super::{DisplaySpec, WorkflowDefinition};
 
 /// Longest identifier accepted for a task or a backend.
 ///
@@ -309,6 +309,14 @@ impl TaskLaunchSpec {
             });
         }
         Ok(definition)
+    }
+
+    /// The `display` section of the sealed definition, without reading the
+    /// rest of it: every task summary asks, and the display is cosmetic, so
+    /// a snapshot that has none or cannot be read simply shows nothing.
+    pub fn display_spec(&self) -> Option<DisplaySpec> {
+        let display = self.definition.as_ref()?.get("display")?;
+        serde_json::from_value(display.clone()).ok()
     }
 
     /// Recomputes the digest from the content fields.

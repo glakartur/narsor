@@ -401,10 +401,10 @@ do kolorów.
          text: "{{ inputs.ticket_id }}"
          url: "https://jira.example/browse/{{ inputs.ticket_id }}"
        - label: PR
-         text: "!{{ variables.pr_number }}"
-         url: "{{ variables.pr_url }}"
+         text: "!{{ context.variables.pr_number }}"
+         url: "{{ context.variables.pr_url }}"
    ```
-   Szablony odwołują się do `inputs` i `variables`; nierozwiązana wartość daje
+   Szablony odwołują się do `inputs` i `context.variables`; nierozwiązana wartość daje
    pusty link (`—`), nie błąd. Schemat URL ograniczony do `http`/`https`.
 4. **Parytet `/control/v1` z lokalnym API** — czat i decyzje dyrygenta,
    formularz nieudanego kroku, przejścia ręczne i override, przerwanie kroku,

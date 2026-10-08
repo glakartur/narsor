@@ -447,6 +447,7 @@ async fn report_problem(
         timeline: None,
         safe_point: true,
         problem: Some(problem.clone()),
+        display: None,
         observed_at: Utc::now(),
     };
     send_until(link, timing, &snapshot).await;
@@ -758,6 +759,7 @@ impl Session {
             &self.engine,
             &mut self.cache,
             snapshot::SnapshotContext {
+                definition: &self.definition,
                 execution_id: self.execution_id.as_deref(),
                 pass_active,
                 problem,

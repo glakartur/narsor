@@ -12,6 +12,10 @@
 //! * An unknown variable is an error, never an empty string. A prompt handed
 //!   to an agent with half a sentence missing is far harder to diagnose than
 //!   a failed action naming the variable and the place it was used.
+//! * The `display` section is the one exception to the first rule
+//!   ([`TemplateScope::render_display`]): a title or link is shown while the
+//!   task is still queued, before the variables it names exist, so there an
+//!   unknown variable makes the whole string empty instead of an error.
 //! * Substitution is single-pass. The rendered result is never rescanned, so
 //!   a variable whose value itself contains `{{ ... }}` cannot cause
 //!   recursion.
@@ -25,14 +29,23 @@ use std::collections::HashMap;
 use serde_json::{Map, Value};
 
 use crate::domain::{
-    ActionConfig, AgentActionConfig, Context, HumanActionConfig, ScriptActionConfig,
-    WaitActionConfig,
+    safe_link_url, ActionConfig, AgentActionConfig, Context, DisplayLink, DisplaySpec,
+    HumanActionConfig, ScriptActionConfig, TaskDisplay, WaitActionConfig, EMPTY_LINK_TEXT,
 };
 
 /// Opening delimiter of a template placeholder.
 const OPEN: &str = "{{";
 /// Closing delimiter of a template placeholder.
 const CLOSE: &str = "}}";
+
+/// What rendering does about a variable that has no value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unknown {
+    /// An [`TemplateError::UnknownVariable`].
+    Error,
+    /// An empty result for the whole template.
+    Blank,
+}
 
 /// A failure encountered while rendering a template.
 ///
@@ -112,6 +125,15 @@ impl<'a> TemplateScope<'a> {
         }
     }
 
+    /// Builds a scope from an inputs object and a bare variable map, for a
+    /// caller that has no [`Context`] (a task that has not started).
+    pub fn from_parts(
+        inputs: &'a Map<String, Value>,
+        variables: &'a HashMap<String, Value>,
+    ) -> Self {
+        Self { inputs, variables }
+    }
+
     /// Builds a scope from `WorkflowExecution::inputs`, which is stored as an
     /// untyped [`Value`] and must therefore be checked to be an object.
     pub fn from_execution(inputs: &'a Value, context: &'a Context) -> Result<Self, TemplateError> {
@@ -129,13 +151,69 @@ impl<'a> TemplateScope<'a> {
     /// error, so it should be specific enough to find the offending line in
     /// the workflow file (for example `state 'create_pr', arg #1`).
     pub fn render(&self, template: &str, location: &str) -> Result<String, TemplateError> {
+        self.render_with(template, location, Unknown::Error)
+            .map(|rendered| rendered.unwrap_or_default())
+    }
+
+    /// Renders every template of a `display` section against this scope.
+    ///
+    /// Lenient, and infallible: a string that mentions a variable with no
+    /// value yet, or cannot be rendered at all (a filter, an unclosed `{{`
+    /// — the validator reports those), renders as empty. An empty title
+    /// leaves the task's id to stand in for it; a link without a usable
+    /// target has no URL, and one without text shows [`EMPTY_LINK_TEXT`].
+    /// A URL that is not an `http(s)` one is dropped ([`safe_link_url`]), and
+    /// control characters are stripped from the text ([`TaskDisplay::sanitized`]).
+    pub fn render_display(&self, display: &DisplaySpec) -> TaskDisplay {
+        let lenient = |template: &str| {
+            self.render_with(template, "display", Unknown::Blank)
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        };
+        let links = display
+            .links
+            .iter()
+            .map(|link| {
+                let url = safe_link_url(&lenient(&link.url));
+                let text = match &link.text {
+                    Some(text) => lenient(text),
+                    None => url.clone().unwrap_or_default(),
+                };
+                DisplayLink {
+                    label: link.label.clone(),
+                    text: if text.is_empty() {
+                        EMPTY_LINK_TEXT.to_string()
+                    } else {
+                        text
+                    },
+                    url,
+                }
+            })
+            .collect();
+        TaskDisplay {
+            title: display.title.as_deref().map(lenient).unwrap_or_default(),
+            links,
+        }
+        .sanitized()
+    }
+
+    /// The one renderer. `None` means [`Unknown::Blank`] met a variable
+    /// without a value, so the whole result is empty.
+    fn render_with(
+        &self,
+        template: &str,
+        location: &str,
+        unknown: Unknown,
+    ) -> Result<Option<String>, TemplateError> {
         // Fast path: the overwhelming majority of strings carry no template.
         if !template.contains(OPEN) {
-            return Ok(template.to_string());
+            return Ok(Some(template.to_string()));
         }
 
         let mut rendered = String::with_capacity(template.len());
         let mut rest = template;
+        let mut complete = true;
 
         while let Some(start) = rest.find(OPEN) {
             rendered.push_str(&rest[..start]);
@@ -149,7 +227,13 @@ impl<'a> TemplateScope<'a> {
                     })?;
 
             let expression = &after_open[..end];
-            rendered.push_str(&self.resolve(expression, location)?);
+            match self.resolve(expression, location) {
+                Ok(value) => rendered.push_str(&value),
+                Err(TemplateError::UnknownVariable { .. }) if unknown == Unknown::Blank => {
+                    complete = false;
+                }
+                Err(error) => return Err(error),
+            }
 
             // Continue after the closing delimiter. What was just written is
             // never rescanned, which is what makes substitution single-pass.
@@ -157,7 +241,7 @@ impl<'a> TemplateScope<'a> {
         }
 
         rendered.push_str(rest);
-        Ok(rendered)
+        Ok(complete.then_some(rendered))
     }
 
     /// Renders every templated field of an action configuration, returning a
@@ -302,6 +386,17 @@ impl<'a> TemplateScope<'a> {
             _ => Err(unsupported()),
         }
     }
+}
+
+/// Checks the syntax of a template without resolving anything: the errors
+/// rendering would give for a filter, an unclosed `{{` or an unsupported
+/// reference, and none for a variable that merely has no value (yet).
+pub fn check_syntax(template: &str, location: &str) -> Result<(), TemplateError> {
+    let inputs = Map::new();
+    let variables = HashMap::new();
+    TemplateScope::from_parts(&inputs, &variables)
+        .render_with(template, location, Unknown::Blank)
+        .map(|_| ())
 }
 
 /// The context variables a template refers to, in first-use order and

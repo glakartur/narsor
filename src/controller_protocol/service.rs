@@ -23,7 +23,7 @@ use super::credentials::{
 };
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
-use crate::domain::{BackendId, TaskId};
+use crate::domain::{BackendId, TaskDisplay, TaskId};
 use crate::environment::{LaunchError, LaunchIntent, LaunchResolver};
 use crate::materials::{MaterialLimits, MaterialStore};
 use crate::orchestration::{
@@ -31,6 +31,7 @@ use crate::orchestration::{
     ConversationAvailability, InputRequest, LeaseToken, MoveTarget, NewTask, Observation, OwnerRef,
     RunnerObservation, TaskEvent, TaskLifecycle, TaskRecord,
 };
+use crate::workflow::TemplateScope;
 
 /// A launch that did not resolve, as the owner sees it: a `400` naming the
 /// reason, or a bare `500` when the catalogue could not even be read.
@@ -1417,6 +1418,7 @@ impl ProtocolService {
             controller,
             inputs: record.inputs.iter().map(InputView::from).collect(),
             queue: record.queue.as_ref().map(QueueView::from),
+            display: task_display(record),
             as_of: now,
         })
     }
@@ -1577,6 +1579,31 @@ impl ProtocolService {
 }
 
 /// The desired command of a task, `None` once it is archived for good.
+/// What a task shows as its title and links: the runner's latest rendering,
+/// else the workflow's `display` rendered from the sealed inputs alone —
+/// which is all there is to go on while the task still waits in the queue.
+fn task_display(record: &TaskRecord) -> TaskDisplay {
+    if let Some(reported) = record
+        .runner
+        .as_ref()
+        .and_then(|runner| runner.snapshot.display.clone())
+    {
+        // A remote runner's word is not trusted with a terminal.
+        return reported.sanitized();
+    }
+    let Some(spec) = record.launch_spec.display_spec() else {
+        return TaskDisplay::default();
+    };
+    let no_variables = HashMap::new();
+    let inputs = record
+        .launch_spec
+        .inputs
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    TemplateScope::from_parts(&inputs, &no_variables).render_display(&spec)
+}
+
 fn desired_command(record: &TaskRecord) -> Option<DesiredCommand> {
     let action = match record.lifecycle {
         TaskLifecycle::Queued => DesiredAction::Start,

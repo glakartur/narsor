@@ -20,6 +20,13 @@ inputs:
     required: true
     description: The repository the work happens in.
 
+display:
+  title: "{{ inputs.feature_description }}"
+  links:
+    - label: PR
+      text: "{{ context.variables.pr_url }}"
+      url: "{{ context.variables.pr_url }}"
+
 globals:
   timeout: 4h
   workspace:

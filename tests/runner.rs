@@ -958,6 +958,73 @@ async fn an_offline_runner_keeps_working_and_reports_the_latest_cursor_later() {
     );
 }
 
+const DISPLAY_WORKFLOW: &str = r#"
+name: shown-task
+version: 1
+display:
+  title: Shown
+  links:
+    - label: PR
+      text: "!{{ context.variables.pr_number }}"
+      url: "{{ context.variables.pr_url }}"
+states:
+  open_pr:
+    action:
+      type: script
+      command: sh
+      args:
+        - -c
+        - |
+          printf '{"output": "done", "variables": {"pr_number": 42, "pr_url": "https://git.example/pr/42"}}'
+    outputs: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+/// The runner renders `display` against the variables its steps set and
+/// reports it; the control plane serves that rendering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_runner_reports_its_display_rendered_from_context_variables() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let spec = spec(
+        DISPLAY_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-d", spec.clone());
+    fixture.report("task-d", Observation::StartAccepted);
+    let launch = Launch::new(&fixture, "task-d", &spec);
+    let credential = fixture.credential("task-d", "pod-1");
+    fixture.spawn(&launch, "pod-1", &credential);
+
+    wait_until_async(Duration::from_secs(30), "the display report", || {
+        fixture
+            .record("task-d")
+            .runner
+            .and_then(|runner| runner.snapshot.display)
+            .is_some_and(|display| display.links[0].url.is_some())
+    })
+    .await;
+
+    let display = fixture
+        .record("task-d")
+        .runner
+        .and_then(|runner| runner.snapshot.display)
+        .unwrap();
+    assert_eq!(display.title, "Shown");
+    assert_eq!(display.links[0].text, "!42");
+    assert_eq!(
+        display.links[0].url.as_deref(),
+        Some("https://git.example/pr/42")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Base-image contract (R22)
 // ---------------------------------------------------------------------------
