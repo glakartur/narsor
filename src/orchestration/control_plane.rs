@@ -104,7 +104,7 @@ impl ControlPlane {
     /// Creates a queued task, idempotently.
     ///
     /// Repeating the same request returns the existing record unchanged; the
-    /// same task id with a different launch spec, owner, backend or priority
+    /// same task id with a different launch spec, owner or backend
     /// is a [`OrchestrationError::TaskConflict`] — a retry must never
     /// silently re-point an existing task.
     pub fn create_task(&self, request: NewTask) -> Result<TaskRecord> {
@@ -124,11 +124,20 @@ impl ControlPlane {
         // Records are never deleted (archive keeps a tombstone), so the
         // maximum over all of them only ever grows: no separate counter file
         // that could drift from the records it numbers.
-        let queue_sequence = self
-            .store
-            .list_tasks()?
+        let _schedule = self.store.lock_schedule(&request.backend_id)?;
+        let tasks = self.store.list_tasks()?;
+        let queue_sequence = tasks
             .iter()
             .map(|task| task.queue_sequence)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        // A new task joins the end of its backend's queue; the schedule
+        // lock keeps a concurrent move from renumbering under it.
+        let rank = tasks
+            .iter()
+            .filter(|task| task.assignment.backend_id == request.backend_id)
+            .map(|task| task.rank)
             .max()
             .unwrap_or(0)
             + 1;
@@ -141,7 +150,8 @@ impl ControlPlane {
                 resource_key: request.task_id.to_string(),
             },
             launch_spec: request.launch_spec,
-            priority: request.priority,
+            rank,
+            legacy_priority: None,
             created_at: now,
             queue_sequence,
             lifecycle: TaskLifecycle::Queued,
@@ -671,7 +681,6 @@ fn same_creation(record: &TaskRecord, request: &NewTask) -> bool {
     record.launch_spec == request.launch_spec
         && record.owner == request.owner
         && record.assignment.backend_id == request.backend_id
-        && record.priority == request.priority
 }
 
 /// Whether the stored record was created from a request with the same

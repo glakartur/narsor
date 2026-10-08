@@ -7,9 +7,9 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
 use narsor::orchestration::{
-    BackendCapacity, BackendLease, Clock, CommandRequest, ControlPlane, ControllerReport, NewTask,
-    Observation, ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef, QueueReason,
-    ResourceIdentity, RunnerSnapshot, TaskEventKind, TaskLifecycle, TaskRecord,
+    BackendCapacity, BackendLease, Clock, CommandRequest, ControlPlane, ControllerReport,
+    MoveTarget, NewTask, Observation, ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef,
+    QueueReason, ResourceIdentity, RunnerSnapshot, TaskEventKind, TaskLifecycle, TaskRecord,
 };
 use narsor::persistence::paths::{temp_path_for, StatePaths};
 use narsor::persistence::ExecutionStore;
@@ -264,20 +264,17 @@ fn resource(uid: &str, generation: u64) -> Option<ResourceIdentity> {
 fn creating_a_task_records_a_queued_assignment_with_generation_and_queue_order() {
     let fx = Fixture::new();
     let first = fx.create("task-a");
-    let second = fx
-        .control
-        .create_task(new_task("task-b", "k8s").with_priority(5))
-        .unwrap();
+    let second = fx.control.create_task(new_task("task-b", "k8s")).unwrap();
 
     assert_eq!(first.lifecycle, TaskLifecycle::Queued);
     assert_eq!(first.generation, 1);
     assert_eq!(first.revision, 1);
-    assert_eq!(first.priority, 0, "priority defaults to 0");
+    assert_eq!(first.rank, 1, "the first task is first in the queue");
     assert_eq!(first.assignment.backend_id, backend_id("k8s"));
     assert_eq!(first.assignment.resource_key, "task-a");
     assert_eq!(first.owner, OwnerRef::new("oidc:https://issuer|artur"));
     assert!(first.observed.is_none());
-    assert_eq!(second.priority, 5);
+    assert_eq!(second.rank, 2, "a new task joins the end of the queue");
     assert!(second.queue_sequence > first.queue_sequence);
 
     let events = fx.control.events_since(&task("task-a"), 0).unwrap();
@@ -793,7 +790,6 @@ fn creating_a_task_is_idempotent_but_a_different_request_conflicts() {
     let conflicting = [
         different_spec,
         new_task("task-1", "docker"),
-        new_task("task-1", "k8s").with_priority(9),
         NewTask {
             owner: OwnerRef::new("someone-else"),
             ..new_task("task-1", "k8s")
@@ -1180,10 +1176,44 @@ fn reason(fx: &Fixture, id: &str) -> Option<QueueReason> {
         .map(|queue| queue.reason)
 }
 
-fn create_with_priority(fx: &Fixture, id: &str, priority: i32) {
+/// The ids of the backend's tasks in queue order, as the control plane lists
+/// them.
+fn queue_order(fx: &Fixture, backend: &str) -> Vec<String> {
     fx.control
-        .create_task(new_task(id, "k8s").with_priority(priority))
-        .expect("create task");
+        .list_tasks()
+        .unwrap()
+        .into_iter()
+        .filter(|task| task.assignment.backend_id == backend_id(backend))
+        .map(|task| task.task_id.to_string())
+        .collect()
+}
+
+fn move_to(
+    fx: &Fixture,
+    id: &str,
+    target: MoveTarget,
+) -> Result<(TaskRecord, bool), OrchestrationError> {
+    fx.control.move_task(&task(id), &target, None)
+}
+
+fn before(id: &str) -> MoveTarget {
+    MoveTarget::Before(task(id))
+}
+
+fn after(id: &str) -> MoveTarget {
+    MoveTarget::After(task(id))
+}
+
+/// Rewrites a task's record on disk the way a version 1 build stored it: a
+/// `priority`, no `rank`.
+fn downgrade_to_v1(fx: &Fixture, id: &str, priority: i32) {
+    let path = fx.root.paths().orchestration_task_file(id);
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let record = value.as_object_mut().unwrap();
+    record.insert("record_version".into(), 1.into());
+    record.remove("rank");
+    record.insert("priority".into(), priority.into());
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
 }
 
 /// Reports straight to the control plane, without the fixture's admission.
@@ -1223,7 +1253,7 @@ fn a_controller_cannot_start_a_task_the_scheduler_did_not_admit() {
 }
 
 #[test]
-fn at_capacity_priority_orders_the_waiting_and_fifo_breaks_ties_without_preemption() {
+fn at_capacity_rank_orders_the_waiting_and_a_move_reorders_them_without_preemption() {
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
     fx.create("running");
@@ -1231,9 +1261,9 @@ fn at_capacity_priority_orders_the_waiting_and_fifo_breaks_ties_without_preempti
     report_now(&fx, "running", &lease, Observation::StartAccepted).unwrap();
     report_now(&fx, "running", &lease, Observation::RunnerReady).unwrap();
 
-    create_with_priority(&fx, "low", 0);
-    create_with_priority(&fx, "high-first", 5);
-    create_with_priority(&fx, "high-second", 5);
+    fx.create("first");
+    fx.create("second");
+    fx.create("third");
     fx.control.schedule(&k8s(), &limit(1)).unwrap();
 
     let waiting = |position| QueueReason::WaitingForCapacity {
@@ -1241,9 +1271,9 @@ fn at_capacity_priority_orders_the_waiting_and_fifo_breaks_ties_without_preempti
         running: 1,
         limit: 1,
     };
-    assert_eq!(reason(&fx, "high-first"), Some(waiting(1)));
-    assert_eq!(reason(&fx, "high-second"), Some(waiting(2)));
-    assert_eq!(reason(&fx, "low"), Some(waiting(3)));
+    assert_eq!(reason(&fx, "first"), Some(waiting(1)));
+    assert_eq!(reason(&fx, "second"), Some(waiting(2)));
+    assert_eq!(reason(&fx, "third"), Some(waiting(3)));
     // A full backend never stops what runs (R11).
     let running = fx.control.task(&task("running")).unwrap();
     assert_eq!(running.lifecycle, TaskLifecycle::Running);
@@ -1252,22 +1282,20 @@ fn at_capacity_priority_orders_the_waiting_and_fifo_breaks_ties_without_preempti
     // A repeated pass over an unchanged backend writes nothing.
     assert!(fx.control.schedule(&k8s(), &limit(1)).unwrap().is_empty());
 
-    // Raising the low task above the others moves it to the front.
-    let (_, changed) = fx
-        .control
-        .set_priority(&task("low"), 9, None)
-        .expect("set priority");
+    // Moving the last task to the top puts it at the front of the waiting.
+    let (_, changed) = move_to(&fx, "third", MoveTarget::Top).expect("move");
     assert!(changed);
     fx.control.schedule(&k8s(), &limit(1)).unwrap();
-    assert_eq!(reason(&fx, "low"), Some(waiting(1)));
-    assert_eq!(reason(&fx, "high-first"), Some(waiting(2)));
+    assert_eq!(reason(&fx, "third"), Some(waiting(1)));
+    assert_eq!(reason(&fx, "first"), Some(waiting(2)));
+    assert_eq!(reason(&fx, "second"), Some(waiting(3)));
 
     // One more slot: exactly the first in line is admitted.
     let admitted = fx.control.schedule(&k8s(), &limit(2)).unwrap();
-    assert!(admitted.contains(&task("low")));
-    assert_eq!(reason(&fx, "low"), Some(QueueReason::Admitted));
+    assert!(admitted.contains(&task("third")));
+    assert_eq!(reason(&fx, "third"), Some(QueueReason::Admitted));
     assert_eq!(
-        reason(&fx, "high-first"),
+        reason(&fx, "first"),
         Some(QueueReason::WaitingForCapacity {
             position: 1,
             running: 2,
@@ -1277,10 +1305,10 @@ fn at_capacity_priority_orders_the_waiting_and_fifo_breaks_ties_without_preempti
 
     // Lowering the limit again takes no reservation back.
     fx.control.schedule(&k8s(), &limit(1)).unwrap();
-    assert_eq!(reason(&fx, "low"), Some(QueueReason::Admitted));
+    assert_eq!(reason(&fx, "third"), Some(QueueReason::Admitted));
     assert_eq!(fx.control.capacity_in_use(&k8s()).unwrap(), 2);
     assert!(matches!(
-        report_now(&fx, "high-first", &lease, Observation::StartAccepted),
+        report_now(&fx, "first", &lease, Observation::StartAccepted),
         Err(OrchestrationError::NotAdmitted(_))
     ));
 }
@@ -1437,40 +1465,146 @@ fn concurrent_creation_and_admission_never_exceed_the_limit() {
 }
 
 #[test]
-fn a_priority_change_is_idempotent_generation_checked_and_only_for_the_queued() {
+fn a_move_places_a_queued_task_before_after_at_the_top_or_at_the_bottom() {
+    let fx = Fixture::new();
+    for id in ["a", "b", "c"] {
+        fx.create(id);
+    }
+    assert_eq!(queue_order(&fx, "k8s"), ["a", "b", "c"]);
+
+    let (record, changed) = move_to(&fx, "c", MoveTarget::Top).unwrap();
+    assert!(changed);
+    assert_eq!((record.rank, record.generation), (1, 1));
+    assert_eq!(queue_order(&fx, "k8s"), ["c", "a", "b"]);
+    assert_eq!(
+        record.last_event.kind,
+        TaskEventKind::Moved {
+            rank: 1,
+            order: vec![task("c"), task("a"), task("b")],
+        },
+        "the event carries the whole new order"
+    );
+
+    move_to(&fx, "a", after("b")).unwrap();
+    assert_eq!(queue_order(&fx, "k8s"), ["c", "b", "a"]);
+    move_to(&fx, "a", before("b")).unwrap();
+    assert_eq!(queue_order(&fx, "k8s"), ["c", "a", "b"]);
+    move_to(&fx, "c", MoveTarget::Bottom).unwrap();
+    assert_eq!(queue_order(&fx, "k8s"), ["a", "b", "c"]);
+
+    // Ranks stay dense and agree with the listing.
+    let ranks: Vec<u32> = fx
+        .control
+        .list_tasks()
+        .unwrap()
+        .iter()
+        .map(|task| task.rank)
+        .collect();
+    assert_eq!(ranks, [1, 2, 3]);
+}
+
+#[test]
+fn a_move_that_changes_nothing_writes_and_announces_nothing() {
+    let fx = Fixture::new();
+    fx.create("a");
+    fx.create("b");
+    let revision = fx.control.task(&task("b")).unwrap().revision;
+
+    for target in [MoveTarget::Bottom, after("a")] {
+        let (record, changed) = move_to(&fx, "b", target).unwrap();
+        assert!(!changed);
+        assert_eq!(record.revision, revision);
+    }
+    let (_, changed) = move_to(&fx, "a", MoveTarget::Top).unwrap();
+    assert!(!changed);
+    assert_eq!(fx.control.events_since(&task("b"), 0).unwrap().len(), 1);
+}
+
+#[test]
+fn a_new_task_joins_the_end_of_its_own_backends_queue() {
+    let fx = Fixture::new();
+    fx.create("a");
+    fx.control.create_task(new_task("other", "docker")).unwrap();
+    let b = fx.create("b");
+
+    assert_eq!(b.rank, 2, "ranks count per backend");
+    assert_eq!(fx.control.task(&task("other")).unwrap().rank, 1);
+    let waiting = |fx: &Fixture, id: &str| match reason(fx, id) {
+        Some(QueueReason::WaitingForCapacity { position, .. }) => position,
+        other => panic!("{id} should wait, got {other:?}"),
+    };
+    let _lease = fx.lease("k8s", "controller-a");
+    fx.control.schedule(&k8s(), &limit(0)).unwrap();
+    assert_eq!(waiting(&fx, "b"), 2, "a new task waits at place #2");
+}
+
+#[test]
+fn tasks_that_hold_a_slot_or_finished_keep_their_place_when_a_queued_one_passes_them() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.running("running", &lease);
+    fx.create("queued");
+    fx.create("late");
+    fx.command("running", OwnerCommand::Archive, "archive-1");
+    fx.observe("running", &lease, Observation::ResourcesDeleted)
+        .unwrap();
+    assert_eq!(queue_order(&fx, "k8s"), ["running", "queued", "late"]);
+    let archived = fx.control.task(&task("running")).unwrap();
+
+    move_to(&fx, "late", MoveTarget::Top).unwrap();
+    assert_eq!(queue_order(&fx, "k8s"), ["late", "running", "queued"]);
+    move_to(&fx, "late", MoveTarget::Bottom).unwrap();
+    assert_eq!(queue_order(&fx, "k8s"), ["running", "queued", "late"]);
+    let finished = fx.control.task(&task("running")).unwrap();
+    assert_eq!(finished.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(
+        finished.revision, archived.revision,
+        "a task that was passed gets no event"
+    );
+}
+
+#[test]
+fn the_waiting_position_counts_only_queued_tasks() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.running("running", &lease);
+    fx.create("queued");
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    assert_eq!(
+        reason(&fx, "queued"),
+        Some(QueueReason::WaitingForCapacity {
+            position: 1,
+            running: 1,
+            limit: 1
+        }),
+        "the running task ranks first but is not in line"
+    );
+}
+
+#[test]
+fn a_move_is_generation_checked_and_only_for_the_queued() {
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
     fx.create("queued");
+    fx.create("other");
 
     let stale = fx
         .control
-        .set_priority(&task("queued"), 3, Some(7))
+        .move_task(&task("queued"), &MoveTarget::Bottom, Some(7))
         .unwrap_err();
     assert!(matches!(stale, OrchestrationError::StaleGeneration { .. }));
+    assert_eq!(queue_order(&fx, "k8s"), ["queued", "other"]);
 
     let (record, changed) = fx
         .control
-        .set_priority(&task("queued"), 3, Some(1))
+        .move_task(&task("queued"), &MoveTarget::Bottom, Some(1))
         .unwrap();
     assert!(changed);
-    assert_eq!((record.priority, record.generation), (3, 1));
-    assert_eq!(
-        record.last_event.kind,
-        TaskEventKind::PriorityChanged { priority: 3 }
-    );
-    let (again, changed) = fx
-        .control
-        .set_priority(&task("queued"), 3, Some(1))
-        .unwrap();
-    assert!(!changed);
-    assert_eq!(again.revision, record.revision);
+    assert_eq!(record.generation, 1, "the desired generation does not move");
 
     // AE3: a running task is never reordered, let alone stopped.
     let running = fx.running("running", &lease);
-    let refused = fx
-        .control
-        .set_priority(&task("running"), 10, None)
-        .unwrap_err();
+    let refused = move_to(&fx, "running", MoveTarget::Top).unwrap_err();
     assert!(matches!(
         refused,
         OrchestrationError::TaskNotQueued {
@@ -1479,6 +1613,174 @@ fn a_priority_change_is_idempotent_generation_checked_and_only_for_the_queued() 
         }
     ));
     assert_eq!(fx.control.task(&task("running")).unwrap(), running);
+    assert_eq!(queue_order(&fx, "k8s"), ["other", "queued", "running"]);
+}
+
+#[test]
+fn a_move_refuses_an_anchor_that_is_missing_foreign_or_the_task_itself() {
+    let fx = Fixture::new();
+    fx.create("a");
+    fx.create("b");
+    fx.control
+        .create_task(new_task("elsewhere", "docker"))
+        .unwrap();
+
+    for anchor in ["missing", "elsewhere", "a"] {
+        let error = move_to(&fx, "a", before(anchor)).unwrap_err();
+        assert!(
+            matches!(error, OrchestrationError::InvalidMoveAnchor { .. }),
+            "{anchor}: {error:?}"
+        );
+    }
+    let error = move_to(&fx, "missing", MoveTarget::Top).unwrap_err();
+    assert!(matches!(error, OrchestrationError::TaskNotFound(_)));
+    assert_eq!(queue_order(&fx, "k8s"), ["a", "b"]);
+    assert_eq!(fx.control.task(&task("a")).unwrap().revision, 1);
+}
+
+#[test]
+fn concurrent_moves_are_serialized_and_leave_one_consistent_order() {
+    let fx = Fixture::new();
+    for id in ["a", "b", "c", "d"] {
+        fx.create(id);
+    }
+    let handles: Vec<_> = [("d", MoveTarget::Top), ("a", MoveTarget::Bottom)]
+        .into_iter()
+        .map(|(id, target)| {
+            let control = fx.reopen();
+            std::thread::spawn(move || control.move_task(&task(id), &target, None).unwrap())
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let order = queue_order(&fx, "k8s");
+    assert_eq!(order, ["d", "b", "c", "a"]);
+    let mut ranks: Vec<u32> = fx
+        .control
+        .list_tasks()
+        .unwrap()
+        .iter()
+        .map(|t| t.rank)
+        .collect();
+    ranks.sort_unstable();
+    assert_eq!(ranks, [1, 2, 3, 4], "the ranks stay dense");
+    // Each move announced the order it produced; the later one is final.
+    let events: Vec<_> = ["d", "a"]
+        .iter()
+        .map(|id| fx.control.task(&task(id)).unwrap().last_event.kind)
+        .collect();
+    let finals = events.iter().filter(|kind| {
+        matches!(kind, TaskEventKind::Moved { order, .. } if order.iter().map(ToString::to_string).collect::<Vec<_>>() == ["d", "b", "c", "a"])
+    });
+    assert_eq!(finals.count(), 1, "{events:?}");
+}
+
+#[test]
+fn version_one_records_are_numbered_once_by_priority_then_arrival() {
+    let fx = Fixture::new();
+    for id in ["first", "second", "third"] {
+        fx.create(id);
+    }
+    // Priorities 5, 0, 0 become: the high one leads, the rest keep FIFO.
+    downgrade_to_v1(&fx, "first", 0);
+    downgrade_to_v1(&fx, "second", 0);
+    downgrade_to_v1(&fx, "third", 5);
+
+    let reopened = fx.reopen();
+    let order: Vec<(String, u32)> = reopened
+        .list_tasks()
+        .unwrap()
+        .iter()
+        .map(|task| (task.task_id.to_string(), task.rank))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            ("third".into(), 1),
+            ("first".into(), 2),
+            ("second".into(), 3)
+        ]
+    );
+    let record = reopened.task(&task("third")).unwrap();
+    assert_eq!(record.record_version, 2);
+
+    // A second read changes nothing, on disk or in memory.
+    let path = fx.root.paths().orchestration_task_file("third");
+    let stored = fs::read(&path).unwrap();
+    assert_eq!(fx.reopen().list_tasks().unwrap().len(), 3);
+    assert_eq!(fs::read(&path).unwrap(), stored);
+    let json: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+    assert!(
+        json.get("priority").is_none(),
+        "priority is never written back"
+    );
+
+    // The migrated queue admits by the new rank, and takes new tasks last.
+    let _lease = reopened
+        .acquire_lease(&k8s(), "controller-a", Duration::minutes(5))
+        .unwrap();
+    reopened.schedule(&k8s(), &limit(1)).unwrap();
+    assert_eq!(
+        reopened.task(&task("third")).unwrap().queue.unwrap().reason,
+        QueueReason::Admitted
+    );
+    assert_eq!(
+        reopened
+            .create_task(new_task("fourth", "k8s"))
+            .unwrap()
+            .rank,
+        4
+    );
+}
+
+#[test]
+fn a_task_started_under_version_one_is_migrated_before_it_is_mutated() {
+    let fx = Fixture::new();
+    fx.create("old");
+    downgrade_to_v1(&fx, "old", 3);
+
+    let reopened = fx.reopen();
+    let record = reopened
+        .command(
+            &task("old"),
+            CommandRequest::new(OwnerCommand::Archive, "archive-1"),
+        )
+        .unwrap()
+        .task;
+    assert_eq!((record.record_version, record.rank), (2, 1));
+}
+
+#[test]
+fn a_priority_changed_event_from_an_old_log_still_reads() {
+    let fx = Fixture::new();
+    fx.create("old");
+    let kind: TaskEventKind =
+        serde_json::from_value(serde_json::json!({ "type": "priority_changed", "priority": 3 }))
+            .expect("an old event deserializes");
+    assert_eq!(kind, TaskEventKind::PriorityChanged { priority: 3 });
+
+    // The same event inside a stored log does not break reading it.
+    for path in [
+        fx.root.paths().orchestration_task_file("old"),
+        fx.root.paths().orchestration_task_event_file("old", 1),
+    ] {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let event = if path.ends_with("task.json") {
+            &mut value["last_event"]
+        } else {
+            &mut value
+        };
+        event["kind"] = serde_json::json!({ "type": "priority_changed", "priority": 3 });
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    let events = fx.reopen().events_since(&task("old"), 0).unwrap();
+    assert_eq!(
+        events[0].kind,
+        TaskEventKind::PriorityChanged { priority: 3 }
+    );
 }
 
 #[test]

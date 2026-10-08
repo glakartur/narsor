@@ -1815,7 +1815,7 @@ mod remote_cli {
     use std::process::Command;
 
     use super::remote_support::RemoteHarness;
-    use super::{Invocation, EXIT_FAILURE, EXIT_SUCCESS};
+    use super::{Invocation, EXIT_FAILURE, EXIT_SUCCESS, EXIT_USAGE};
 
     /// Runs the binary against the control plane at `server`, with `token`
     /// in `NARSOR_TOKEN` when given — never on the command line.
@@ -1944,14 +1944,74 @@ mod remote_cli {
             archive.stdout
         );
 
-        let priority = remote(&harness, token, &["task", "priority", "t-1", "5"]).await;
-        assert_eq!(priority.code, EXIT_SUCCESS, "{}", priority.output());
-        assert!(priority.stdout.contains("is now 5"));
+        // A second queued task on k8s, moved ahead of t-1: `move` and the
+        // owner API are one operation, and `list` shows the queue position.
+        let third = remote(
+            &harness,
+            token,
+            &[
+                "task",
+                "create",
+                "implement-feature",
+                "--workflow-version",
+                "1",
+                "--backend",
+                "k8s",
+                "--task-id",
+                "t-3",
+            ],
+        )
+        .await;
+        assert_eq!(third.code, EXIT_SUCCESS, "{}", third.output());
+        let moved = remote(&harness, token, &["task", "move", "t-3", "--before", "t-1"]).await;
+        assert_eq!(moved.code, EXIT_SUCCESS, "{}", moved.output());
+        assert!(moved.stdout.contains("t-3 is now #1"), "{}", moved.stdout);
+        let list = remote(&harness, token, &["task", "list"]).await;
+        let position = |id: &str| list.stdout.lines().position(|line| line.starts_with(id));
+        assert!(position("t-3") < position("t-1"), "{}", list.stdout);
+        assert!(
+            list.stdout
+                .lines()
+                .any(|line| line.starts_with("t-3") && line.contains("#1")),
+            "{}",
+            list.stdout
+        );
+        let bottom = remote(&harness, token, &["task", "move", "t-3", "--bottom"]).await;
+        assert_eq!(bottom.code, EXIT_SUCCESS, "{}", bottom.output());
+        assert!(bottom.stdout.contains("t-3 is now #2"), "{}", bottom.stdout);
 
-        let events = remote(&harness, token, &["task", "events", "t-1"]).await;
+        // Exactly one target is required; an unknown anchor is refused.
+        let conflicting = remote(
+            &harness,
+            token,
+            &["task", "move", "t-3", "--top", "--after", "t-1"],
+        )
+        .await;
+        assert_eq!(conflicting.code, EXIT_USAGE, "{}", conflicting.output());
+        let nothing = remote(&harness, token, &["task", "move", "t-3"]).await;
+        assert_eq!(nothing.code, EXIT_USAGE, "{}", nothing.output());
+        let unknown = remote(
+            &harness,
+            token,
+            &["task", "move", "t-3", "--before", "nope"],
+        )
+        .await;
+        assert_eq!(unknown.code, EXIT_FAILURE, "{}", unknown.output());
+        // Priority is gone from the CLI.
+        let priority = remote(&harness, token, &["task", "priority", "t-1", "5"]).await;
+        assert_eq!(priority.code, EXIT_USAGE, "{}", priority.output());
+        let flag = remote(
+            &harness,
+            token,
+            &["task", "create", "implement-feature", "--priority", "5"],
+        )
+        .await;
+        assert_eq!(flag.code, EXIT_USAGE, "{}", flag.output());
+
+        let events = remote(&harness, token, &["task", "events", "t-3"]).await;
         assert_eq!(events.code, EXIT_SUCCESS, "{}", events.output());
         assert!(events.stdout.contains("created"), "{}", events.stdout);
-        assert!(events.stdout.contains("priority 5"), "{}", events.stdout);
+        assert!(events.stdout.contains("moved to #1"), "{}", events.stdout);
 
         let who = remote(&harness, token, &["auth", "whoami"]).await;
         assert_eq!(who.code, EXIT_SUCCESS, "{}", who.output());

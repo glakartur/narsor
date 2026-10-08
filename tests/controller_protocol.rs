@@ -230,7 +230,6 @@ fn create_request(task: &str, backend: &str) -> CreateTaskRequest {
     CreateTaskRequest {
         task_id: Some(task.to_string()),
         backend_id: Some(backend.to_string()),
-        priority: 0,
         launch: LaunchRequest {
             workflow_id: "implement-feature".to_string(),
             workflow_version: 1,

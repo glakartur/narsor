@@ -2244,7 +2244,7 @@ async fn starting_a_valid_new_task_is_queued_without_selecting_an_execution() {
     let listing = client.control_tasks().await.expect("list queued tasks");
     let task = listing.tasks.first().expect("one durable task");
     assert_eq!(task.workflow_id, "tui-new-task");
-    assert_eq!(task.priority, 0);
+    assert_ne!(task.rank, 0, "a task has a place in the queue");
     assert_eq!(
         app.queued_task().map(|task| task.task_id.as_str()),
         Some(task.task_id.as_str()),
@@ -2298,10 +2298,9 @@ async fn queue_through_the_form(app: &mut App, ticket: &str) {
 }
 
 /// R3, R5, AE2: behind a full backend the task waits with its place in line
-/// on screen, and its priority can be raised and lowered — then it follows
-/// the daemon, not a guess.
+/// on screen. The task screen does not reorder it: that is `move`, not a key.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_task_waiting_behind_a_full_backend_shows_its_place_and_takes_priority_changes() {
+async fn a_task_waiting_behind_a_full_backend_shows_its_place_in_the_queue() {
     let root = TempRoot::new();
     let (daemon, client) = Daemon::start(root.path()).await;
     hold_the_slot(&client).await;
@@ -2312,43 +2311,26 @@ async fn a_task_waiting_behind_a_full_backend_shows_its_place_and_takes_priority
 
     let screen = screen_of(&mut app);
     assert!(screen.contains("Status: queued"), "{screen}");
-    assert!(screen.contains("Priority: 0"), "{screen}");
+    assert!(screen.contains("Queue position: #2"), "{screen}");
+    assert_eq!(client.control_task(&id).await.unwrap().rank, 2);
     assert!(
-        app.shortcuts().iter().any(|(key, _)| *key == "+/-"),
-        "a queued task offers its priority"
+        !app.shortcuts().iter().any(|(key, _)| *key == "+/-"),
+        "a queued task is no longer reordered by priority keys"
     );
-
-    assert_eq!(
-        app.on_key(key(KeyCode::Char('+'))),
-        Request::AdjustQueuedPriority(1)
-    );
-    app.adjust_queued_priority(1).await;
-    app.adjust_queued_priority(1).await;
-    assert_eq!(client.control_task(&id).await.unwrap().priority, 2);
-    assert!(screen_of(&mut app).contains("Priority: 2"));
-
-    assert_eq!(
-        app.on_key(key(KeyCode::Char('-'))),
-        Request::AdjustQueuedPriority(-1)
-    );
-    app.adjust_queued_priority(-1).await;
-    assert_eq!(client.control_task(&id).await.unwrap().priority, 1);
-    assert!(screen_of(&mut app).contains("Priority: 1"));
+    assert_eq!(app.on_key(key(KeyCode::Char('+'))), Request::None);
 }
 
 /// R8: the same screen follows the task from queued to running, names its
-/// execution only once the runner has one, and stops offering a priority the
-/// scheduler no longer honours.
+/// execution only once the runner has one.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_task_screen_follows_the_lifecycle_and_stops_offering_priority_once_admitted() {
+async fn the_task_screen_follows_the_lifecycle_once_admitted() {
     use narsor::orchestration::TaskLifecycle;
 
     let root = TempRoot::new();
-    let (daemon, client) = Daemon::start(root.path()).await;
+    let (daemon, _client) = Daemon::start(root.path()).await;
     let mut app = app_over(&daemon, root.path()).await;
 
     queue_through_the_form(&mut app, "ORC-22").await;
-    let id = app.queued_task().unwrap().task_id.to_string();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -2375,16 +2357,6 @@ async fn the_task_screen_follows_the_lifecycle_and_stops_offering_priority_once_
     assert!(!screen.contains("Execution: not created yet"), "{screen}");
     let shortcuts = app.shortcuts();
     assert!(shortcuts.iter().any(|(_, what)| *what == "open execution"));
-    assert!(
-        !shortcuts.iter().any(|(key, _)| *key == "+/-"),
-        "an admitted task is not reordered"
-    );
-
-    app.adjust_queued_priority(1).await;
-    assert!(app
-        .notice()
-        .is_some_and(|notice| notice.text.contains("waiting tasks only")));
-    assert_eq!(client.control_task(&id).await.unwrap().priority, 0);
 }
 
 /// R7, F3, AE3: the create went through but its answer was lost, so the
@@ -6051,31 +6023,50 @@ mod remote_tasks {
     }
 
     #[tokio::test]
-    async fn priority_is_edited_for_queued_tasks_only() {
+    async fn a_queued_task_without_a_controller_says_so_and_offers_no_priority() {
         let harness = RemoteHarness::start().await;
-        harness.running("task-1", "k8s", snapshot(1, None)).await;
         // Another backend without a controller: task-2 stays queued.
         harness.create("task-2", Some("backend-b")).await;
         let mut app = RemoteApp::new(harness.owner.clone());
         app.refresh().await;
 
-        assert_eq!(app.on_key(key(KeyCode::Char('P'))), RemoteRequest::None);
-        assert!(matches!(app.modal(), RemoteModal::None));
-        assert!(app.notice().unwrap().text.contains("not queued"));
-
         assert!(app.select("task-2"));
-        let queued = &app.tasks()[1];
+        let queued = &app.tasks()[0];
         assert_eq!(queued.lifecycle, TaskLifecycle::Queued);
         let badge = status_badge(queued);
         assert_eq!(badge.tone, Tone::Warning, "{}", badge.text);
         assert!(badge.text.contains("controller offline"));
 
-        app.on_key(key(KeyCode::Char('P')));
-        assert!(matches!(app.modal(), RemoteModal::Priority { .. }));
-        app.on_key(key(KeyCode::Backspace));
-        app.on_key(key(KeyCode::Char('7')));
-        press(&mut app, KeyCode::Enter).await;
-        assert_eq!(app.tasks()[1].priority, 7);
+        assert_eq!(app.on_key(key(KeyCode::Char('P'))), RemoteRequest::None);
+        assert!(matches!(app.modal(), RemoteModal::None));
+    }
+
+    #[tokio::test]
+    async fn a_move_in_the_stream_asks_for_the_list_to_be_read_again() {
+        let harness = RemoteHarness::start().await;
+        harness.create("task-1", Some("backend-b")).await;
+        let mut app = RemoteApp::new(harness.owner.clone());
+        app.refresh().await;
+        assert!(!app.refresh_wanted());
+
+        app.on_stream(Some(Ok(ControlEventEnvelope {
+            cursor: "c-2".into(),
+            event: TaskEvent {
+                sequence: 2,
+                task_id: TaskId::parse("task-1").unwrap(),
+                at: Utc::now(),
+                lifecycle: TaskLifecycle::Queued,
+                generation: 1,
+                kind: TaskEventKind::Moved {
+                    rank: 1,
+                    order: vec![TaskId::parse("task-1").unwrap()],
+                },
+            },
+        })));
+        assert!(
+            app.refresh_wanted(),
+            "the server's order is read, not guessed"
+        );
     }
 
     #[tokio::test]
@@ -6107,11 +6098,6 @@ mod remote_tasks {
         assert_eq!(app.cursor(), Some("c-9"));
         assert_eq!(status_badge(&app.tasks()[0]).text, "queued · #1 · 3/3");
         assert!(!app.refresh_wanted());
-
-        app.on_stream(Some(Ok(event(TaskEventKind::PriorityChanged {
-            priority: 4,
-        }))));
-        assert_eq!(app.tasks()[0].priority, 4);
 
         app.on_stream(Some(Ok(event(TaskEventKind::InputsUpdated {
             updates: vec![],

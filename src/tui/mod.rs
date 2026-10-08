@@ -249,9 +249,6 @@ pub async fn run(
                         Request::Refresh => app.refresh().await,
                         Request::SelectExecution => app.reload_selection().await,
                         Request::SubmitInput => app.submit_input().await,
-                        Request::AdjustQueuedPriority(delta) => {
-                            app.adjust_queued_priority(delta).await
-                        }
                         Request::ApplyTransition => app.apply_transition().await,
                         Request::RunSelected => app.run_selected().await,
                         Request::RecoverSelected { comment } => app.recover_selected(comment).await,

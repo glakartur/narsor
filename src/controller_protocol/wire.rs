@@ -27,8 +27,9 @@ use crate::domain::{BackendId, ExecutionStatus, ResourceProfile, TaskId, TaskLau
 use crate::engine::{HumanInputDelivery, Timeline};
 use crate::orchestration::{
     ArchiveTombstone, CommandReceipt, ConversationAttemptSummary, ExecutionCursor, InputStatus,
-    Observation, ObservedSummary, OwnerCommand, PendingInputRef, QueueReason, QueueStatus,
-    QueuedInput, ResourceIdentity, RunnerProblem, RunnerSnapshot, TaskEvent, TaskLifecycle,
+    MoveTarget, Observation, ObservedSummary, OwnerCommand, PendingInputRef, QueueReason,
+    QueueStatus, QueuedInput, ResourceIdentity, RunnerProblem, RunnerSnapshot, TaskEvent,
+    TaskLifecycle,
 };
 
 /// Version of this protocol; part of every path (`…/v1/…`).
@@ -100,9 +101,6 @@ pub struct CreateTaskRequest {
     /// absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_id: Option<String>,
-    /// Queue priority (R11), higher first.
-    #[serde(default)]
-    pub priority: i32,
     /// What to run.
     pub launch: LaunchRequest,
 }
@@ -227,11 +225,11 @@ pub struct TaskSummary {
     pub generation: u64,
     /// Record revision — the task's position in the event stream.
     pub revision: u64,
-    /// Queue priority.
-    pub priority: i32,
+    /// 1-based position in the backend's queue; the list is in this order.
+    pub rank: u32,
     /// Creation time.
     pub created_at: DateTime<Utc>,
-    /// FIFO position.
+    /// Creation order across all tasks.
     pub queue_sequence: u64,
     /// Workflow it runs.
     pub workflow_id: String,
@@ -282,12 +280,12 @@ impl From<&QueueStatus> for QueueView {
     }
 }
 
-/// `POST /control/v1/tasks/:task_id/priority`.
+/// `POST /control/v1/tasks/:task_id/move`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SetPriorityRequest {
-    /// The new priority, higher first (R11). Repeating the current value
-    /// is a no-op, which makes a retry safe without a key.
-    pub priority: i32,
+pub struct MoveTaskRequest {
+    /// Where the queued task goes. Repeating a move that already holds is
+    /// a no-op, which makes a retry safe without a key.
+    pub target: MoveTarget,
     /// Refuse unless the task is still at this desired generation.
     #[serde(default)]
     pub expected_generation: Option<u64>,

@@ -242,7 +242,6 @@ fn render_modal(frame: &mut Frame, app: &RemoteApp) {
                 "u          resume a paused or interrupted task",
                 "s          start an interrupted task afresh",
                 "a          archive: delete the workload and its storage",
-                "P          change the priority of a queued task",
                 "i          answer the input the runner waits for",
                 "c, n, [ ]  read the conversation, next page, other attempt",
                 "b          default backend of new tasks",
@@ -264,20 +263,6 @@ fn render_modal(frame: &mut Frame, app: &RemoteApp) {
                 )),
                 Line::from(""),
                 Line::from("y: archive · any other key: cancel"),
-            ],
-            50,
-            30,
-        ),
-        RemoteModal::Priority { task_id, value, .. } => (
-            " Priority ".into(),
-            vec![
-                Line::from(format!("Priority of queued task {task_id} (higher first):")),
-                Line::from(Span::styled(
-                    format!("> {value}_"),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from("Enter: apply · Esc: cancel"),
             ],
             50,
             30,

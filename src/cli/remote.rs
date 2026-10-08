@@ -26,12 +26,13 @@ use crate::api::{
 use crate::config::Flags;
 use crate::controller_protocol::{
     ConversationPageQuery, CreateEnrollmentRequest, CreateTaskRequest, LaunchRequest,
-    OwnerCommandRequest, SetDefaultBackendRequest, SetPriorityRequest, SubmitInputRequest,
+    MoveTaskRequest, OwnerCommandRequest, SetDefaultBackendRequest, SubmitInputRequest,
     TaskSummary, WorkspaceRequest,
 };
+use crate::domain::TaskId;
 use crate::engine::HumanInputDelivery;
 use crate::materials::{snapshot_paths, write_files, MaterialLimits, MaterialOrigin, WriteMode};
-use crate::orchestration::{OwnerCommand, TaskEvent, TaskEventKind};
+use crate::orchestration::{MoveTarget, OwnerCommand, TaskEvent, TaskEventKind};
 use crate::persistence::StatePaths;
 use crate::tui::conversation::classify;
 use crate::tui::remote::{
@@ -63,9 +64,6 @@ pub enum TaskCommand {
         /// Backend to pin the task to; the default backend when omitted.
         #[arg(long, value_name = "BACKEND")]
         backend: Option<String>,
-        /// Queue priority, higher first.
-        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
-        priority: i32,
         /// Environment profile; the owner default when omitted.
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
@@ -100,14 +98,24 @@ pub enum TaskCommand {
     Start(CommandArgs),
     /// Deletes the task's workload and storage. Cannot be undone.
     Archive(CommandArgs),
-    /// Changes the priority of a queued task.
-    Priority {
+    /// Moves a queued task within its backend's queue.
+    #[command(group(clap::ArgGroup::new("target").required(true).multiple(false)))]
+    Move {
         /// The task id.
         #[arg(value_name = "TASK_ID")]
         task_id: String,
-        /// The new priority, higher first.
-        #[arg(value_name = "PRIORITY", allow_hyphen_values = true)]
-        priority: i32,
+        /// Put it directly before this task.
+        #[arg(long, value_name = "TASK_ID", group = "target")]
+        before: Option<String>,
+        /// Put it directly after this task.
+        #[arg(long, value_name = "TASK_ID", group = "target")]
+        after: Option<String>,
+        /// Put it first.
+        #[arg(long, group = "target")]
+        top: bool,
+        /// Put it last.
+        #[arg(long, group = "target")]
+        bottom: bool,
     },
     /// Answers the input request the task's runner waits on.
     Input {
@@ -370,7 +378,6 @@ pub async fn task(
             workflow_version,
             inputs,
             backend,
-            priority,
             profile,
             harness,
             repository,
@@ -379,7 +386,6 @@ pub async fn task(
         } => Some(CreateTaskRequest {
             task_id: task_id.clone(),
             backend_id: backend.clone(),
-            priority: *priority,
             launch: LaunchRequest {
                 workflow_id: workflow.clone(),
                 workflow_version: match workflow_version {
@@ -425,7 +431,7 @@ pub async fn task(
                     "{:<28} {:<14} {:<10} {}",
                     task.task_id,
                     task.backend_id,
-                    format!("p{}", task.priority),
+                    format!("#{}", task.rank),
                     status_badge(task).text
                 );
             }
@@ -447,22 +453,32 @@ pub async fn task(
         TaskCommand::Resume(args) => owner_command(&client, OwnerCommand::Resume, args).await,
         TaskCommand::Start(args) => owner_command(&client, OwnerCommand::Start, args).await,
         TaskCommand::Archive(args) => owner_command(&client, OwnerCommand::Archive, args).await,
-        TaskCommand::Priority { task_id, priority } => {
+        TaskCommand::Move {
+            task_id,
+            before,
+            after,
+            top,
+            bottom,
+        } => {
+            let target = move_target(before, after, top, bottom)?;
             let current = client
                 .control_task(&task_id)
                 .await
                 .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
             let task = client
-                .control_set_priority(
+                .control_move_task(
                     &task_id,
-                    &SetPriorityRequest {
-                        priority,
+                    &MoveTaskRequest {
+                        target,
                         expected_generation: Some(current.generation),
                     },
                 )
                 .await
-                .map_err(|error| failure("Priority not changed", error))?;
-            println!("Priority of {} is now {}.", task.task_id, task.priority);
+                .map_err(|error| failure("Task not moved", error))?;
+            println!(
+                "{} is now #{} in its backend's queue.",
+                task.task_id, task.rank
+            );
             Ok(())
         }
         TaskCommand::Input {
@@ -797,6 +813,27 @@ async fn owner_command(client: &ApiClient, command: OwnerCommand, args: CommandA
     }
 }
 
+/// The move the flags of `task move` ask for; clap guarantees exactly one.
+fn move_target(
+    before: Option<String>,
+    after: Option<String>,
+    top: bool,
+    bottom: bool,
+) -> Result<MoveTarget> {
+    let anchor = |id: String| {
+        TaskId::parse(id).map_err(|error| CliError::failure(format!("Invalid task id: {error}")))
+    };
+    match (before, after, top, bottom) {
+        (Some(id), None, false, false) => Ok(MoveTarget::Before(anchor(id)?)),
+        (None, Some(id), false, false) => Ok(MoveTarget::After(anchor(id)?)),
+        (None, None, true, false) => Ok(MoveTarget::Top),
+        (None, None, false, true) => Ok(MoveTarget::Bottom),
+        _ => Err(CliError::usage(
+            "Give exactly one of --before, --after, --top and --bottom.",
+        )),
+    }
+}
+
 fn print_status(task: &TaskSummary) {
     println!("Lifecycle: {}", status_badge(task).text);
     if let Some(queue) = &task.queue {
@@ -825,7 +862,8 @@ fn print_event(event: &TaskEvent) {
             None => format!("runner reported {}", execution_status.as_str()),
         },
         TaskEventKind::InputQueued { input_id, .. } => format!("input {input_id} queued"),
-        TaskEventKind::PriorityChanged { priority } => format!("priority {priority}"),
+        TaskEventKind::PriorityChanged { priority } => format!("priority {priority} (obsolete)"),
+        TaskEventKind::Moved { rank, .. } => format!("moved to #{rank}"),
         TaskEventKind::QueueChanged { reason } => format!("queue: {}", reason.describe()),
         TaskEventKind::InputsUpdated { updates } => format!("{} input(s) updated", updates.len()),
         TaskEventKind::MaterialChanged {

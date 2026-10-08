@@ -445,10 +445,14 @@ any state ─▶ Archiving ─▶ Archived
   `Archiving`, and by an admitted `Queued` task. `Paused` and `Archived` hold
   none — so an interrupted task still blocks a slot until the owner resumes or
   archives it.
-* Waiting tasks are ordered by priority (higher first), then creation order.
-  Priority can be changed only while a task is queued
-  (`narsor task priority`), conditional on its generation. Nothing running
-  is ever preempted.
+* Every task has a position (`rank`) in its backend's queue, shown as `#n` by
+  `narsor task list`. A new task joins the end; waiting tasks are admitted in
+  that order. A queued task is reordered with `narsor task move <task>
+  --before <other> | --after <other> | --top | --bottom`, only while it is
+  queued and conditional on its generation. Admitted and finished tasks keep
+  their place in the list. Nothing running is ever preempted. Tasks stored by
+  an older version, which had a `priority`, are numbered once from the old
+  order (priority, then creation) the first time the control plane reads them.
 * A queued task shows why it waits: `waiting for capacity` (position,
   slots in use / limit), `controller offline` (no controller holds the lease),
   `backend unknown`, or `admitted` (starting).
@@ -466,12 +470,12 @@ plane and a token (section 2).
 ```bash
 narsor backend default                       # get; also: set <backend>, reset
 narsor task create implement-feature --input ticket=NAR-1 \
-  [--backend k8s] [--priority 5] [--profile default] [--harness codex] \
+  [--backend k8s] [--profile default] [--harness codex] \
   [--repository api --commit <sha>] [--workflow-version 1] [--task-id my-id]
 narsor task list
 narsor task show <task>
 narsor task pause|resume|start|archive <task> [--expected-generation N]
-narsor task priority <task> <n>
+narsor task move <task> --before <other> | --after <other> | --top | --bottom
 narsor task input <task> --field reason=ok [--label approved] [--comment …]
 narsor task conversation <task> [<attempt>] [--from N]
 narsor task events <task> [--follow]
@@ -486,8 +490,7 @@ narsor tui --remote                          # implied by --server
 ```
 
 In the TUI's remote mode: `j/k` move, `Enter` opens a task, `p` pause, `u`
-resume, `s` start afresh, `a` archive (asks first), `P` priority (queued
-tasks), `i` answer the pending input, `c`/`n`/`[`/`]` read the conversation
+resume, `s` start afresh, `a` archive (asks first), `i` answer the pending input, `c`/`n`/`[`/`]` read the conversation
 through the control plane, `b` default backend, `r` refresh, `?` help.
 
 ### Task materials

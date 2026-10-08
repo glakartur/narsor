@@ -219,7 +219,7 @@ fn render_queued_task(
         Line::from(format!("Workflow: {}", task.workflow_id)),
         Line::from(format!("Backend: {}", task.backend_id)),
         Line::from(format!("Status: {}", status.text)),
-        Line::from(format!("Priority: {}", task.priority)),
+        Line::from(format!("Queue position: #{}", task.rank)),
     ];
     if let Some(hint) = super::remote::lifecycle_hint(task) {
         lines.push(Line::from(hint.text));

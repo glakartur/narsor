@@ -10,7 +10,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Current schema version of [`TaskRecord`].
-pub const TASK_RECORD_VERSION: u32 = 1;
+///
+/// Version 2 replaced the owner `priority` with the queue position
+/// [`TaskRecord::rank`]; the store migrates a version 1 record when it first
+/// reads it (see [`super::store`]).
+pub const TASK_RECORD_VERSION: u32 = 2;
 
 /// Current schema version of [`BackendLease`].
 pub const BACKEND_LEASE_VERSION: u32 = 1;
@@ -296,10 +300,20 @@ pub enum TaskEventKind {
         /// The runner's pending-input id it answers.
         pending_input_id: String,
     },
-    /// The owner changed the queue priority of a queued task (R11).
+    /// The owner changed the queue priority of a queued task. No longer
+    /// written — `rank` and [`Self::Moved`] replaced it — and kept only so
+    /// that a log written by an older version still reads.
     PriorityChanged {
-        /// The new priority.
+        /// The priority it was changed to.
         priority: i32,
+    },
+    /// The owner moved a queued task within its backend's queue.
+    Moved {
+        /// The task's new 1-based position.
+        rank: u32,
+        /// The backend's whole order after the move, first to last, so a
+        /// client patches its list without reading it again.
+        order: Vec<TaskId>,
     },
     /// The scheduler's verdict on a queued task changed: it was admitted,
     /// or why it waits changed (U10). Carried in the stream so a client
@@ -391,12 +405,20 @@ pub struct TaskRecord {
     pub assignment: TaskAssignment,
     /// The immutable launch input (R18).
     pub launch_spec: TaskLaunchSpec,
-    /// Owner priority for queue ordering (R11); higher first. Default 0.
-    pub priority: i32,
+    /// 1-based position among the tasks of the backend, the queue order:
+    /// the scheduler admits waiting tasks by it, lowest first. Dense —
+    /// renumbered under the backend's schedule lock on every move — and
+    /// kept by a task once it is admitted or finished.
+    #[serde(default)]
+    pub rank: u32,
+    /// The priority a version 1 record carried, read only to number such a
+    /// record once and never written back.
+    #[serde(default, rename = "priority", skip_serializing)]
+    pub(crate) legacy_priority: Option<i32>,
     /// When the task was created.
     pub created_at: DateTime<Utc>,
-    /// Creation order across all tasks, the FIFO tie-breaker among equal
-    /// priorities (U10). Strictly increasing, never reused.
+    /// Creation order across all tasks, the tie-breaker among equal ranks
+    /// (U10). Strictly increasing, never reused.
     pub queue_sequence: u64,
     /// Current orchestration state.
     pub lifecycle: TaskLifecycle,
@@ -553,8 +575,7 @@ pub enum QueueReason {
     Admitted,
     /// Every slot of the backend is taken.
     WaitingForCapacity {
-        /// 1-based place among the backend's waiting tasks: higher priority
-        /// first, creation order among equals.
+        /// 1-based place among the backend's waiting tasks, by `rank`.
         position: u32,
         /// Slots in use: tasks holding compute plus admitted tasks whose
         /// start was not accepted yet.
@@ -859,15 +880,13 @@ pub struct NewTask {
     pub backend_id: BackendId,
     /// Immutable launch input.
     pub launch_spec: TaskLaunchSpec,
-    /// Queue priority, default 0.
-    pub priority: i32,
     /// Digest of the owner request it came from, if any (see
     /// [`TaskRecord::request_digest`]).
     pub request_digest: Option<String>,
 }
 
 impl NewTask {
-    /// A task request with the default priority.
+    /// A task request; the task joins the end of its backend's queue.
     pub fn new(
         task_id: TaskId,
         owner: OwnerRef,
@@ -879,7 +898,6 @@ impl NewTask {
             owner,
             backend_id,
             launch_spec,
-            priority: 0,
             request_digest: None,
         }
     }
@@ -887,12 +905,6 @@ impl NewTask {
     /// Records the digest of the owner request.
     pub fn with_request_digest(mut self, digest: impl Into<String>) -> Self {
         self.request_digest = Some(digest.into());
-        self
-    }
-
-    /// Sets the queue priority.
-    pub fn with_priority(mut self, priority: i32) -> Self {
-        self.priority = priority;
         self
     }
 }
@@ -963,4 +975,18 @@ pub struct ReportOutcome {
     pub task: TaskRecord,
     /// False when the report was a duplicate and changed nothing.
     pub applied: bool,
+}
+
+/// Where [`super::ControlPlane::move_task`] puts a queued task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "to", content = "task_id")]
+pub enum MoveTarget {
+    /// Directly before the named task.
+    Before(TaskId),
+    /// Directly after the named task.
+    After(TaskId),
+    /// First of the backend's tasks.
+    Top,
+    /// Last of the backend's tasks.
+    Bottom,
 }

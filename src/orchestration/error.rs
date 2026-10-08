@@ -25,7 +25,7 @@ pub enum OrchestrationError {
     TaskNotFound(TaskId),
 
     /// A task with this identifier exists, created from a different request.
-    #[error("task '{0}' already exists with a different launch specification, owner, backend or priority")]
+    #[error("task '{0}' already exists with a different launch specification, owner or backend")]
     TaskConflict(TaskId),
 
     /// The launch specification does not match its own digest.
@@ -270,14 +270,26 @@ pub enum OrchestrationError {
         detail: String,
     },
 
-    /// Only a queued task's priority can change (R11): priority orders the
-    /// waiting, it never moves a task that already holds compute.
-    #[error("task '{task_id}' is {lifecycle:?}; only a queued task's priority can change")]
+    /// Only a queued task can be moved: the queue order decides who is
+    /// admitted next, it never touches a task that already holds compute.
+    #[error("task '{task_id}' is {lifecycle:?}; only a queued task can be moved")]
     TaskNotQueued {
         /// The task.
         task_id: TaskId,
         /// Its lifecycle.
         lifecycle: TaskLifecycle,
+    },
+
+    /// A move names a task that is not on the same backend, or the moved
+    /// task itself, as its anchor.
+    #[error("task '{task_id}' cannot be moved relative to '{anchor}': {reason}")]
+    InvalidMoveAnchor {
+        /// The task being moved.
+        task_id: TaskId,
+        /// The anchor the request named.
+        anchor: TaskId,
+        /// Why it is refused.
+        reason: &'static str,
     },
 
     /// The advisory lock could not be taken.

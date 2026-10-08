@@ -28,7 +28,7 @@ use crate::environment::{LaunchError, LaunchIntent, LaunchResolver};
 use crate::materials::{MaterialLimits, MaterialStore};
 use crate::orchestration::{
     BackendCapacity, BackendLease, CommandRequest, ControlPlane, ControllerReport,
-    ConversationAvailability, InputRequest, LeaseToken, NewTask, Observation, OwnerRef,
+    ConversationAvailability, InputRequest, LeaseToken, MoveTarget, NewTask, Observation, OwnerRef,
     RunnerObservation, TaskEvent, TaskLifecycle, TaskRecord,
 };
 
@@ -298,7 +298,7 @@ impl ProtocolService {
                 resources: launch.resources,
             })
             .map_err(launch_refusal)?;
-        self.create_sealed_task(owner, task_id, request.priority, request_digest, resolved)
+        self.create_sealed_task(owner, task_id, request_digest, resolved)
     }
 
     /// Persists an already-resolved task through the same idempotent
@@ -314,7 +314,6 @@ impl ProtocolService {
         &self,
         owner: &OwnerRef,
         task_id: TaskId,
-        priority: i32,
         request_digest: String,
         resolved: crate::environment::ResolvedLaunch,
     ) -> ProtocolResult<TaskSummary> {
@@ -335,7 +334,6 @@ impl ProtocolService {
                     resolved.backend_id,
                     resolved.spec,
                 )
-                .with_priority(priority)
                 .with_request_digest(request_digest),
             )
             .map_err(|error| match error {
@@ -445,18 +443,32 @@ impl ProtocolService {
         })
     }
 
-    /// Changes a queued task's priority and re-evaluates its backend's
-    /// queue (R11). Never stops or reorders anything holding compute.
-    pub fn set_priority(
+    /// Moves a queued task within its backend's queue and re-evaluates
+    /// the queue (R1). Never stops or reorders anything holding compute.
+    pub fn move_task(
         &self,
         owner: &OwnerRef,
         task_id: &str,
-        request: SetPriorityRequest,
+        request: MoveTaskRequest,
     ) -> ProtocolResult<TaskSummary> {
         let record = self.owned_task(owner, task_id)?;
-        let (_, changed) = self.control.set_priority(
+        if let MoveTarget::Before(anchor) | MoveTarget::After(anchor) = &request.target {
+            // An anchor of another owner is refused like one that does not
+            // exist: its existence is not the caller's to learn.
+            if self.owned_task(owner, anchor.as_str()).is_err() {
+                return Err(
+                    crate::orchestration::OrchestrationError::InvalidMoveAnchor {
+                        task_id: record.task_id.clone(),
+                        anchor: anchor.clone(),
+                        reason: "the anchor is not one of your tasks",
+                    }
+                    .into(),
+                );
+            }
+        }
+        let (_, changed) = self.control.move_task(
             &record.task_id,
-            request.priority,
+            &request.target,
             request.expected_generation,
         )?;
         if changed {
@@ -1385,7 +1397,7 @@ impl ProtocolService {
             lifecycle: record.lifecycle,
             generation: record.generation,
             revision: record.revision,
-            priority: record.priority,
+            rank: record.rank,
             created_at: record.created_at,
             queue_sequence: record.queue_sequence,
             workflow_id: record.launch_spec.workflow_id.clone(),

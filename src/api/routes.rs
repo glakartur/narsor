@@ -1017,7 +1017,7 @@ async fn post_start_task(
             code: error.code(),
             message: error.to_string(),
         })?;
-    let task = control.create_sealed_task(&owner, task_id, 0, digest, sealed)?;
+    let task = control.create_sealed_task(&owner, task_id, digest, sealed)?;
 
     Ok((StatusCode::ACCEPTED, Json(StartTaskResponse { task })))
 }

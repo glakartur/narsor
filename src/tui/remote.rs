@@ -33,8 +33,8 @@ use crate::api::{ApiClient, ClientError, ConversationResponse as PageResponse};
 use crate::controller_protocol::{
     ControlEventEnvelope, ConversationPageQuery, ConversationResponse,
     ConversationUnavailableReason, DefaultBackendView, Freshness, OwnerCommandRequest,
-    OwnerCommandResponse, QueueView, SetDefaultBackendRequest, SetPriorityRequest,
-    SubmitInputRequest, TaskSummary, TimelineResponse,
+    OwnerCommandResponse, QueueView, SetDefaultBackendRequest, SubmitInputRequest, TaskSummary,
+    TimelineResponse,
 };
 use crate::orchestration::{
     ConversationAttemptSummary, InputStatus, OwnerCommand, PendingInputRef, QueueReason,
@@ -258,8 +258,8 @@ pub fn detail_lines(
         ),
         ToneLine::new(
             format!(
-                "Workflow   {} v{} · priority {}",
-                task.workflow_id, task.workflow_version, task.priority
+                "Workflow   {} v{} · #{}",
+                task.workflow_id, task.workflow_version, task.rank
             ),
             Tone::Normal,
         ),
@@ -641,15 +641,6 @@ pub enum RemoteModal {
         /// The task.
         task_id: String,
     },
-    /// Editing a queued task's priority.
-    Priority {
-        /// The task.
-        task_id: String,
-        /// The generation the edit was opened at.
-        generation: u64,
-        /// What was typed.
-        value: String,
-    },
     /// Choosing the default backend of new tasks.
     DefaultBackend(BackendPicker),
     /// The key list.
@@ -682,8 +673,6 @@ pub enum RemoteRequest {
     Command(OwnerCommand),
     /// Send the open input form.
     SubmitInput,
-    /// Apply the priority being edited.
-    SetPriority,
     /// Load the default backend and open the picker.
     OpenBackendPicker,
     /// Apply the picker's choice.
@@ -867,7 +856,6 @@ impl RemoteApp {
                     keys.push(("u", "resume"));
                     keys.push(("s", "start afresh"));
                 }
-                TaskLifecycle::Queued => keys.push(("P", "priority")),
                 _ => {}
             }
             if !task.lifecycle.is_archival() {
@@ -928,20 +916,6 @@ impl RemoteApp {
                     self.set_notice(ToneLine::new("Archive cancelled.", Tone::Muted));
                     RemoteRequest::None
                 };
-            }
-            RemoteModal::Priority { value, .. } => {
-                match key.code {
-                    KeyCode::Esc => self.modal = RemoteModal::None,
-                    KeyCode::Enter => return RemoteRequest::SetPriority,
-                    KeyCode::Backspace => {
-                        value.pop();
-                    }
-                    KeyCode::Char(c) if c.is_ascii_digit() || (c == '-' && value.is_empty()) => {
-                        value.push(c)
-                    }
-                    _ => {}
-                }
-                return RemoteRequest::None;
             }
             RemoteModal::DefaultBackend(picker) => {
                 match key.code {
@@ -1058,10 +1032,6 @@ impl RemoteApp {
                 }
                 RemoteRequest::None
             }
-            KeyCode::Char('P') => {
-                self.open_priority();
-                RemoteRequest::None
-            }
             KeyCode::Char('i') => {
                 self.open_input();
                 RemoteRequest::None
@@ -1128,25 +1098,6 @@ impl RemoteApp {
         }
     }
 
-    fn open_priority(&mut self) {
-        let Some(task) = self.selected() else {
-            return;
-        };
-        if task.lifecycle != TaskLifecycle::Queued {
-            let line = ToneLine::new(
-                "Priority orders waiting tasks only; this task is not queued.",
-                Tone::Muted,
-            );
-            self.set_notice(line);
-            return;
-        }
-        self.modal = RemoteModal::Priority {
-            task_id: task.task_id.to_string(),
-            generation: task.generation,
-            value: task.priority.to_string(),
-        };
-    }
-
     /// Opens the form for the selected task's pending input, if it waits.
     pub fn open_input(&mut self) {
         let Some(task) = self.selected() else {
@@ -1205,7 +1156,6 @@ impl RemoteApp {
             RemoteRequest::OpenDetail => self.load_detail().await,
             RemoteRequest::Command(command) => self.command(command).await,
             RemoteRequest::SubmitInput => self.submit_input().await,
-            RemoteRequest::SetPriority => self.set_priority().await,
             RemoteRequest::OpenBackendPicker => self.open_backend_picker().await,
             RemoteRequest::ApplyDefaultBackend => self.apply_default_backend().await,
             RemoteRequest::LoadConversation { next } => self.load_conversation(next).await,
@@ -1465,42 +1415,6 @@ impl RemoteApp {
         }
     }
 
-    /// Applies the edited priority of a queued task.
-    pub async fn set_priority(&mut self) {
-        let RemoteModal::Priority {
-            task_id,
-            generation,
-            value,
-        } = &self.modal
-        else {
-            return;
-        };
-        let Ok(priority) = value.parse::<i32>() else {
-            self.set_notice(ToneLine::new("A priority is a whole number.", Tone::Error));
-            return;
-        };
-        let task_id = task_id.clone();
-        let request = SetPriorityRequest {
-            priority,
-            expected_generation: Some(*generation),
-        };
-        self.modal = RemoteModal::None;
-        match self.client.control_set_priority(&task_id, &request).await {
-            Ok(task) => self.set_notice(ToneLine::new(
-                format!("Priority of {} is now {}.", task.task_id, task.priority),
-                Tone::Good,
-            )),
-            Err(ClientError::Refused { message, .. }) => {
-                self.set_notice(ToneLine::new(
-                    format!("Priority not changed: {message}"),
-                    Tone::Error,
-                ));
-            }
-            Err(error) => self.error("Priority not changed", &error),
-        }
-        self.refresh().await;
-    }
-
     /// Reads the default backend and opens the picker on it.
     pub async fn open_backend_picker(&mut self) {
         match self.client.control_default_backend().await {
@@ -1563,7 +1477,7 @@ impl RemoteApp {
 
     /// Folds one item of the control-plane stream in.
     ///
-    /// Lifecycle, generation, priority and queue verdict are applied to the
+    /// Lifecycle, generation and queue verdict are applied to the
     /// listed summary at once — that is what the list shows. Anything else
     /// (a runner or controller report, an input changing status, a task this
     /// list does not know) asks for a re-read, which the loop debounces.
@@ -1597,7 +1511,6 @@ impl RemoteApp {
                             });
                         }
                     }
-                    TaskEventKind::PriorityChanged { priority } => task.priority = priority,
                     _ => self.refresh_wanted = true,
                 }
             }

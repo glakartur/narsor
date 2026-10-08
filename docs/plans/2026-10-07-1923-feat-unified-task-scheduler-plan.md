@@ -38,7 +38,7 @@ The same path bypasses the scheduler that already owns queue order and capacity 
 
 - **One admission authority.** The existing scheduler governs every task creation path rather than a second local queue. (session-settled: user-directed — chosen over a separate local queue: ordering and capacity must be shared.) Governs R1, R2, R3.
 - **Queued creation is the acknowledgement boundary.** A task is accepted when it is durably queued, not when its workspace is ready. Governs R1, R4, R6.
-- **Priority starts at zero.** The operator may change it later from the queue. (session-settled: user-directed — chosen over choosing priority in the creation form: creation stays simple.) Governs R3, R5.
+- **Priority starts at zero.** *(Superseded by `docs/plans/2026-10-09-001-feat-tui-przeprojektowanie-plan.md` U1: priority was replaced by an explicit queue position `rank` and an atomic `move`; a new task joins the end of the queue.)* The operator may change it later from the queue. (session-settled: user-directed — chosen over choosing priority in the creation form: creation stays simple.) Governs R3, R5.
 - **Backends remain independent.** A task stays with the backend that accepted it; changing the TUI connection changes neither its storage nor its execution. (session-settled: user-directed — chosen over migrating queued tasks: each backend has independent storage and process ownership.) Governs R2.
 
 ### Requirements
@@ -47,12 +47,12 @@ The same path bypasses the scheduler that already owns queue order and capacity 
 
 - R1. TUI, CLI, and local API task creation must create the same durable queued-task record and must not directly start an execution.
 - R2. Each task must be associated with exactly one backend when created, and later connection changes must not move it to another backend.
-- R3. The scheduler must admit queued tasks by descending priority and FIFO order for equal priority, subject to that backend's capacity.
+- R3. The scheduler must admit queued tasks by descending priority and FIFO order for equal priority, subject to that backend's capacity. *(Superseded: admission is by queue position `rank`, lowest first; see the TUI redesign plan U1.)*
 - R4. Workspace provisioning and execution must begin only after scheduler admission grants a slot.
 
 **Operator experience and safety**
 
-- R5. A newly created task must use priority `0`, and an operator must be able to change the priority while it remains queued.
+- R5. A newly created task must use priority `0`, and an operator must be able to change the priority while it remains queued. *(Superseded: a new task joins the end of the queue and an operator reorders a queued task with `move`; `priority` no longer exists.)*
 - R6. Creation must return a stable task identity promptly enough that a slow checkout cannot be reported as a lost daemon connection.
 - R7. Retrying an uncertain create request must identify the already-created task instead of creating a duplicate.
 - R8. The TUI must show whether a task is queued, provisioning, or running, and must select the newly queued task after creation.
@@ -80,7 +80,7 @@ The same path bypasses the scheduler that already owns queue order and capacity 
 ### Acceptance Examples
 
 - AE1. **Given** a workflow whose Git checkout takes longer than 800 ms, **when** an operator creates it, **then** the client promptly shows one queued task and does not claim that the daemon is unreachable. **Covers R1, R4, R6, R8.**
-- AE2. **Given** a full backend with queued tasks at different priorities, **when** a slot becomes free, **then** the highest-priority task starts first and equal-priority tasks retain FIFO order. **Covers R3, R4.**
+- AE2. **Given** a full backend with queued tasks at different priorities, **when** a slot becomes free, **then** the highest-priority task starts first and equal-priority tasks retain FIFO order. **Covers R3, R4.** *(Superseded: the first task in queue order, by `rank`, starts first.)*
 - AE3. **Given** a lost create response, **when** the client retries the same submission, **then** the queue contains one task for that submission. **Covers R7.**
 - AE4. **Given** a task queued on backend A, **when** the operator connects TUI to backend B, **then** the task remains owned and visible through backend A only. **Covers R2.**
 

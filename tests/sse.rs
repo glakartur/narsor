@@ -486,7 +486,6 @@ async fn create_remote(client: &api::ApiClient, task_id: &str) {
         .create_control_task(&CreateTaskRequest {
             task_id: Some(task_id.to_string()),
             backend_id: Some("k8s".to_string()),
-            priority: 0,
             launch: LaunchRequest {
                 workflow_id: "wf".to_string(),
                 workflow_version: 1,

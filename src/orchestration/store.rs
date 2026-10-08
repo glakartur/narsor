@@ -18,6 +18,18 @@
 //! The last three belong to `crate::controller_protocol`, which uses this
 //! store's locks and atomic writes but owns their shapes.
 //!
+//! # Queue order and record versions
+//!
+//! A task's `rank` is its position among the tasks of its backend and is
+//! only ever renumbered under that backend's `schedule.lock`. Version 1
+//! records carried a `priority` instead; the first read of one numbers the
+//! whole backend from the old order (priority, highest first, then creation
+//! order), under the same lock, and rewrites each record at version 2.
+//! [`OrchestrationStore::lock_task`] and
+//! [`OrchestrationStore::lock_schedule`] migrate *before* they lock, so code
+//! that holds either lock never meets a version 1 record and the migration
+//! never waits on a lock its own caller holds.
+//!
 //! # Commit protocol
 //!
 //! The record is the commit point. A mutation replaces `task.json`
@@ -72,8 +84,19 @@ impl OrchestrationStore {
             .exists()
     }
 
-    /// Loads a task record.
+    /// Loads a task record, migrating it first when it is a version 1 one.
     pub fn load_task(&self, task_id: &TaskId) -> Result<TaskRecord> {
+        let record = self.load_task_unmigrated(task_id)?;
+        if record.record_version >= TASK_RECORD_VERSION {
+            return Ok(record);
+        }
+        self.migrate_backend(&record.assignment.backend_id)?;
+        self.load_task_unmigrated(task_id)
+    }
+
+    /// Loads a record as stored, refusing only a version this build does
+    /// not know.
+    fn load_task_unmigrated(&self, task_id: &TaskId) -> Result<TaskRecord> {
         let path = self.paths.orchestration_task_file(task_id.as_str());
         if !path.exists() {
             return Err(OrchestrationError::TaskNotFound(task_id.clone()));
@@ -155,15 +178,90 @@ impl OrchestrationStore {
         Ok(ids)
     }
 
-    /// Every task record, in creation order (`queue_sequence`).
+    /// Every task record, grouped by backend and in queue order (`rank`;
+    /// creation order among equal ranks, which only a crash in the middle
+    /// of a renumbering can leave) within each.
     pub fn list_tasks(&self) -> Result<Vec<TaskRecord>> {
         let mut tasks = self
             .list_task_ids()?
             .iter()
             .map(|task_id| self.load_task(task_id))
             .collect::<Result<Vec<_>>>()?;
-        tasks.sort_by_key(|task| task.queue_sequence);
+        // Backends in the order their oldest task was created — stable, so
+        // a new task never reorders another backend's rows — and each
+        // backend's tasks in queue order.
+        let mut first_seen: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        for task in &tasks {
+            let seen = first_seen
+                .entry(task.assignment.backend_id.as_str())
+                .or_insert(task.queue_sequence);
+            *seen = (*seen).min(task.queue_sequence);
+        }
+        let group: std::collections::HashMap<String, u64> = first_seen
+            .into_iter()
+            .map(|(backend, seen)| (backend.to_string(), seen))
+            .collect();
+        tasks.sort_by(|left, right| {
+            group[left.assignment.backend_id.as_str()]
+                .cmp(&group[right.assignment.backend_id.as_str()])
+                .then_with(|| queue_order(left, right))
+        });
         Ok(tasks)
+    }
+
+    /// Numbers a backend whose records are not all at the current version.
+    ///
+    /// Version 1 records come first, in the order they used to be admitted
+    /// in; records that already have a rank follow in theirs, so a backend
+    /// that somehow holds both keeps the newer tasks at the end. Idempotent:
+    /// once every record is at version 2 a second call writes nothing.
+    fn migrate_backend(&self, backend_id: &BackendId) -> Result<()> {
+        let _schedule =
+            FileLock::acquire(self.paths.backend_schedule_lock_file(backend_id.as_str()))?;
+        let (mut legacy, mut current): (Vec<_>, Vec<_>) = self
+            .list_task_ids()?
+            .iter()
+            .map(|task_id| self.load_task_unmigrated(task_id))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|record| record.assignment.backend_id == *backend_id)
+            .partition(|record| record.record_version < TASK_RECORD_VERSION);
+        legacy.sort_by_key(|record| {
+            (
+                std::cmp::Reverse(record.legacy_priority.unwrap_or(0)),
+                record.queue_sequence,
+            )
+        });
+        current.sort_by(queue_order);
+        for (index, record) in legacy.into_iter().chain(current).enumerate() {
+            let rank = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            if record.record_version == TASK_RECORD_VERSION && record.rank == rank {
+                continue;
+            }
+            let _task = FileLock::acquire(
+                self.paths
+                    .orchestration_task_lock_file(record.task_id.as_str()),
+            )?;
+            let mut record = self.load_task_unmigrated(&record.task_id)?;
+            record.rank = rank;
+            record.record_version = TASK_RECORD_VERSION;
+            record.legacy_priority = None;
+            self.save_task(&record)?;
+        }
+        Ok(())
+    }
+
+    /// Migrates `backend_id` if any of its records is still at version 1.
+    fn migrate_backend_if_legacy(&self, backend_id: &BackendId) -> Result<()> {
+        for task_id in self.list_task_ids()? {
+            let record = self.load_task_unmigrated(&task_id)?;
+            if record.assignment.backend_id == *backend_id
+                && record.record_version < TASK_RECORD_VERSION
+            {
+                return self.migrate_backend(backend_id);
+            }
+        }
+        Ok(())
     }
 
     /// The events of a task with a sequence greater than `after`, in order.
@@ -302,6 +400,10 @@ impl OrchestrationStore {
 
     /// Exclusive lock for mutating one existing task.
     pub(crate) fn lock_task(&self, task_id: &TaskId) -> Result<FileLock> {
+        if self.task_exists(task_id) {
+            // Migrates a version 1 record before this lock is held.
+            self.load_task(task_id)?;
+        }
         FileLock::acquire(self.paths.orchestration_task_lock_file(task_id.as_str()))
     }
 
@@ -317,6 +419,7 @@ impl OrchestrationStore {
 
     /// Exclusive lock for one backend's scheduling decisions (U10).
     pub(crate) fn lock_schedule(&self, backend_id: &BackendId) -> Result<FileLock> {
+        self.migrate_backend_if_legacy(backend_id)?;
         FileLock::acquire(self.paths.backend_schedule_lock_file(backend_id.as_str()))
     }
 
@@ -334,6 +437,13 @@ impl OrchestrationStore {
     pub(crate) fn lock_enrollments(&self) -> Result<FileLock> {
         FileLock::acquire(self.paths.enrollments_lock_file())
     }
+}
+
+/// Queue order within one backend: by `rank`, creation order among equal ranks.
+fn queue_order(left: &TaskRecord, right: &TaskRecord) -> std::cmp::Ordering {
+    left.rank
+        .cmp(&right.rank)
+        .then(left.queue_sequence.cmp(&right.queue_sequence))
 }
 
 /// Sequence numbers of the event files in `dir`, ascending; `.tmp` leftovers

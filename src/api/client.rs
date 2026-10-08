@@ -75,7 +75,7 @@ use crate::controller_protocol::{
     ControlEventEnvelope, ControllerListResponse, ControllerView, ConversationPage,
     ConversationPageQuery, ConversationResponse as RemoteConversationResponse,
     CreateEnrollmentRequest, CreateTaskRequest, DefaultBackendView, EnrollmentResponse,
-    OwnerCommandRequest, OwnerCommandResponse, SetDefaultBackendRequest, SetPriorityRequest,
+    MoveTaskRequest, OwnerCommandRequest, OwnerCommandResponse, SetDefaultBackendRequest,
     SubmitInputRequest, SubmitInputResponse, TaskListResponse, TaskSummary, TimelineResponse,
 };
 use crate::materials::{
@@ -550,14 +550,14 @@ impl ApiClient {
         self.post_json(&url, request).await
     }
 
-    /// Changes a queued remote task's priority (R11); repeating the
-    /// current value is a no-op.
-    pub async fn control_set_priority(
+    /// Moves a queued remote task within its backend's queue (R1);
+    /// repeating a move that already holds is a no-op.
+    pub async fn control_move_task(
         &self,
         task_id: &str,
-        request: &SetPriorityRequest,
+        request: &MoveTaskRequest,
     ) -> Result<TaskSummary, ClientError> {
-        let url = format!("{}/control/v1/tasks/{task_id}/priority", self.base_url);
+        let url = format!("{}/control/v1/tasks/{task_id}/move", self.base_url);
         self.post_json(&url, request).await
     }
 

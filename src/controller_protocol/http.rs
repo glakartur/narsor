@@ -72,7 +72,7 @@ where
         .route("/control/v1/tasks", get(list_tasks).post(create_task))
         .route("/control/v1/tasks/:task_id", get(get_task))
         .route("/control/v1/tasks/:task_id/commands", post(post_command))
-        .route("/control/v1/tasks/:task_id/priority", post(post_priority))
+        .route("/control/v1/tasks/:task_id/move", post(post_move))
         .route(
             "/control/v1/default-backend",
             get(get_default_backend).put(put_default_backend),
@@ -278,13 +278,13 @@ async fn post_command(
     Ok(Json(service.command(&owner, &task_id, request)?))
 }
 
-async fn post_priority(
+async fn post_move(
     State(service): State<Service>,
     Extension(owner): Extension<OwnerRef>,
     Path(task_id): Path<String>,
-    Json(request): Json<SetPriorityRequest>,
+    Json(request): Json<MoveTaskRequest>,
 ) -> ProtocolResult<Json<TaskSummary>> {
-    Ok(Json(service.set_priority(&owner, &task_id, request)?))
+    Ok(Json(service.move_task(&owner, &task_id, request)?))
 }
 
 async fn get_default_backend(

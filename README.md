@@ -671,8 +671,9 @@ or a runner directly.
 
 ```bash
 narsor backend default                        # which backend new tasks get (set/reset to change)
-narsor task create implement-feature --input ticket=NAR-1 [--backend k8s] [--priority 5]
-narsor task list                              # backend, lifecycle, queue reason, staleness
+narsor task create implement-feature --input ticket=NAR-1 [--backend k8s]
+narsor task list                              # queue position (#n), backend, lifecycle, queue reason, staleness
+narsor task move <task> --before|--after <other> | --top | --bottom   # reorder a queued task
 narsor task show <task>                       # observations with their age, timeline, conversation
 narsor task pause|resume|start|archive <task> # archive deletes the workload and its storage
 narsor task input <task> --field reason=ok    # answer the input the runner waits for

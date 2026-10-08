@@ -20,11 +20,13 @@
 //!
 //! # Order and non-preemption
 //!
-//! Waiting tasks are admitted by priority, higher first, and by creation
-//! order (`queue_sequence`) among equal priorities. A reservation, once
-//! granted, is never taken back — not by a higher-priority arrival, a
-//! lowered limit or a controller going away — and nothing here ever stops
-//! a task that holds compute (R11).
+//! Waiting tasks are admitted by `rank`, lowest first, and by creation
+//! order (`queue_sequence`) among equal ranks, which only a crash in the
+//! middle of a renumbering can leave. The owner reorders them with
+//! [`ControlPlane::move_task`]. A reservation, once granted, is never taken
+//! back — not by a task moved ahead of it, a lowered limit or a controller
+//! going away — and nothing here ever stops a task that holds compute
+//! (R11).
 //!
 //! # What holds a slot
 //!
@@ -40,14 +42,14 @@
 //! [`QueueReason::ControllerOffline`]. Tasks already admitted keep their
 //! reservation: they are first in line when a controller returns, and the
 //! owner can still archive them. Withholding instead of granting keeps the
-//! decision as late as possible, so a priority change made meanwhile still
+//! decision as late as possible, so a move made meanwhile still
 //! counts.
 
 use super::error::{OrchestrationError, Result};
 use super::lifecycle::{command_effect, CommandEffect};
 use super::model::{
     BackendCapacity, CapacityReservation, CommandOutcome, CommandRequest, DefaultBackendSelection,
-    OwnerCommand, QueueReason, QueueStatus, TaskEventKind, TaskLifecycle, TaskRecord,
+    MoveTarget, OwnerCommand, QueueReason, QueueStatus, TaskEventKind, TaskLifecycle, TaskRecord,
     DEFAULT_BACKEND_SELECTION_VERSION,
 };
 use super::{control_plane::Mutation, ControlPlane};
@@ -83,12 +85,7 @@ impl ControlPlane {
             .iter()
             .filter(|task| task.lifecycle == TaskLifecycle::Queued && task.reservation.is_none())
             .collect();
-        waiting.sort_by(|left, right| {
-            right
-                .priority
-                .cmp(&left.priority)
-                .then(left.queue_sequence.cmp(&right.queue_sequence))
-        });
+        waiting.sort_by_key(|task| (task.rank, task.queue_sequence));
 
         let mut verdicts: Vec<(TaskId, Verdict)> = tasks
             .iter()
@@ -204,47 +201,71 @@ impl ControlPlane {
         self.command(task_id, request)
     }
 
-    /// Changes a queued task's priority (R11).
+    /// Moves a queued task within its backend's queue.
     ///
-    /// Idempotent: the priority the task already has is answered without a
-    /// write — whatever its lifecycle, so a retry after the task started is
-    /// not an error. Any other value is accepted only while the task is
-    /// `Queued`: priority orders waiting tasks and never touches one that
-    /// holds compute. `expected_generation` makes the change conditional,
-    /// like an owner command; the desired generation itself does not move,
-    /// because nothing a controller acts on changed. Returns the record and
-    /// whether it changed; the caller re-evaluates admission.
-    pub fn set_priority(
+    /// The queue is the backend's tasks in `rank` order; the move takes the
+    /// task out and puts it at `target`, then renumbers whoever shifted, all
+    /// under the backend's schedule lock so a concurrent admission, creation
+    /// or move sees either the old order or the new one. Admitted and
+    /// finished tasks keep their place in the list: only the moved task and
+    /// those it passed change rank, so the order they hold relative to each
+    /// other never changes.
+    ///
+    /// Only a `Queued` task can be moved — admission order never touches a
+    /// task that holds compute. A move that leaves the order as it is
+    /// (`Bottom` for the last task, say) writes and announces nothing.
+    /// `expected_generation` makes the move conditional, like an owner
+    /// command; the desired generation itself does not move, because nothing
+    /// a controller acts on changed. Returns the record and whether the
+    /// order changed; the caller re-evaluates admission.
+    pub fn move_task(
         &self,
         task_id: &TaskId,
-        priority: i32,
+        target: &MoveTarget,
         expected_generation: Option<u64>,
     ) -> Result<(TaskRecord, bool)> {
-        self.mutate(task_id, |record, _now| {
-            if let Some(expected) = expected_generation {
-                if expected != record.generation {
-                    return Err(OrchestrationError::StaleGeneration {
-                        task_id: record.task_id.clone(),
-                        current: record.generation,
-                        presented: expected,
-                    });
-                }
-            }
-            if record.priority == priority {
-                return Ok(Mutation::Unchanged(false));
-            }
-            if record.lifecycle != TaskLifecycle::Queued {
-                return Err(OrchestrationError::TaskNotQueued {
-                    task_id: record.task_id.clone(),
-                    lifecycle: record.lifecycle,
-                });
-            }
-            record.priority = priority;
+        let backend_id = self.task(task_id)?.assignment.backend_id;
+        let _lock = self.store().lock_schedule(&backend_id)?;
+        let tasks = self.backend_tasks(&backend_id)?;
+        let moved = tasks
+            .iter()
+            .find(|task| task.task_id == *task_id)
+            .ok_or_else(|| OrchestrationError::TaskNotFound(task_id.clone()))?;
+        check_movable(moved, expected_generation)?;
+
+        let before: Vec<&TaskId> = tasks.iter().map(|task| &task.task_id).collect();
+        let after = reordered(&before, task_id, target)?;
+        if after == before {
+            return Ok((moved.clone(), false));
+        }
+        let rank_of = |id: &TaskId| {
+            let position = after.iter().position(|candidate| *candidate == id);
+            u32::try_from(position.unwrap_or(0) + 1).unwrap_or(u32::MAX)
+        };
+        let order: Vec<TaskId> = after.iter().map(|id| (*id).clone()).collect();
+
+        // The moved task first: it is the one that can still be refused
+        // (a command raced in), and a crash after it leaves only equal
+        // ranks, which queue order breaks by creation.
+        let rank = rank_of(task_id);
+        let (record, _) = self.mutate(task_id, |record, _now| {
+            check_movable(record, expected_generation)?;
+            record.rank = rank;
             Ok(Mutation::Changed(
-                TaskEventKind::PriorityChanged { priority },
-                true,
+                TaskEventKind::Moved {
+                    rank,
+                    order: order.clone(),
+                },
+                (),
             ))
-        })
+        })?;
+        for task in tasks.iter().filter(|task| task.task_id != *task_id) {
+            let rank = rank_of(&task.task_id);
+            if task.rank != rank {
+                self.set_rank(&task.task_id, rank)?;
+            }
+        }
+        Ok((record, true))
     }
 
     /// The owner's default-backend override, if one was ever set (R10).
@@ -278,7 +299,16 @@ impl ControlPlane {
         Ok(selection)
     }
 
-    /// Every task of `backend_id`.
+    /// Writes a task's new rank without an event: the move that caused it
+    /// announced the whole order already.
+    fn set_rank(&self, task_id: &TaskId, rank: u32) -> Result<()> {
+        let _lock = self.store().lock_task(task_id)?;
+        let mut record = self.store().load_task(task_id)?;
+        record.rank = rank;
+        self.store().save_task(&record)
+    }
+
+    /// Every task of `backend_id`, in queue order.
     fn backend_tasks(&self, backend_id: &BackendId) -> Result<Vec<TaskRecord>> {
         Ok(self
             .list_tasks()?
@@ -323,6 +353,56 @@ impl ControlPlane {
         })?;
         Ok(changed)
     }
+}
+
+/// Whether `record` may be moved now.
+fn check_movable(record: &TaskRecord, expected_generation: Option<u64>) -> Result<()> {
+    if let Some(expected) = expected_generation {
+        if expected != record.generation {
+            return Err(OrchestrationError::StaleGeneration {
+                task_id: record.task_id.clone(),
+                current: record.generation,
+                presented: expected,
+            });
+        }
+    }
+    if record.lifecycle != TaskLifecycle::Queued {
+        return Err(OrchestrationError::TaskNotQueued {
+            task_id: record.task_id.clone(),
+            lifecycle: record.lifecycle,
+        });
+    }
+    Ok(())
+}
+
+/// `order` with `task_id` taken out and put at `target`.
+fn reordered<'a>(
+    order: &[&'a TaskId],
+    task_id: &'a TaskId,
+    target: &'a MoveTarget,
+) -> Result<Vec<&'a TaskId>> {
+    let mut rest: Vec<&TaskId> = order.iter().copied().filter(|id| *id != task_id).collect();
+    let index = match target {
+        MoveTarget::Top => 0,
+        MoveTarget::Bottom => rest.len(),
+        MoveTarget::Before(anchor) | MoveTarget::After(anchor) => {
+            let reason = if anchor == task_id {
+                "a task cannot be moved relative to itself"
+            } else {
+                "the anchor is not a task of the same backend"
+            };
+            let position = rest.iter().position(|id| *id == anchor).ok_or_else(|| {
+                OrchestrationError::InvalidMoveAnchor {
+                    task_id: task_id.clone(),
+                    anchor: anchor.clone(),
+                    reason,
+                }
+            })?;
+            position + usize::from(matches!(target, MoveTarget::After(_)))
+        }
+    };
+    rest.insert(index, task_id);
+    Ok(rest)
 }
 
 fn slots_in_use(tasks: &[TaskRecord]) -> u32 {

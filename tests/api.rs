@@ -3228,7 +3228,6 @@ fn remote_task(task_id: &str, backend_id: &str) -> narsor::controller_protocol::
     narsor::controller_protocol::CreateTaskRequest {
         task_id: Some(task_id.to_string()),
         backend_id: Some(backend_id.to_string()),
-        priority: 0,
         launch: narsor::controller_protocol::LaunchRequest {
             workflow_id: "implement-feature".to_string(),
             workflow_version: 1,
@@ -3603,12 +3602,14 @@ impl InProcessController {
 }
 
 /// AE2 across entry points: the local `/tasks` facade and the control-plane
-/// create share one queue — priority first, FIFO within a priority — and a
+/// create share one queue — arrival order until the owner moves a task — and a
 /// task submitted while no controller holds the lease waits with its offline
 /// reason, with no execution behind it.
 #[tokio::test]
-async fn local_and_control_plane_creates_share_one_priority_and_fifo_queue() {
-    use narsor::orchestration::{Observation, QueueReason, TaskLifecycle};
+async fn local_and_control_plane_creates_share_one_ranked_queue() {
+    use narsor::controller_protocol::MoveTaskRequest;
+    use narsor::domain::TaskId;
+    use narsor::orchestration::{MoveTarget, Observation, QueueReason, TaskLifecycle};
 
     let root = TempRoot::new();
     let (handle, service) = start_scheduling_server(&root).await;
@@ -3640,7 +3641,7 @@ async fn local_and_control_plane_creates_share_one_priority_and_fifo_queue() {
     // No controller yet: queued, offline, and nothing was started.
     let first = submit_local("first").await;
     assert_eq!(first.lifecycle, TaskLifecycle::Queued);
-    assert_eq!(first.priority, 0, "a local task starts at priority zero");
+    assert_eq!(first.rank, 1, "a local task joins the end of the queue");
     assert_eq!(
         reason(first.clone()),
         Some(QueueReason::ControllerOffline),
@@ -3661,10 +3662,22 @@ async fn local_and_control_plane_creates_share_one_priority_and_fifo_queue() {
         .create_control_task(&remote_task("remote-c", "k8s"))
         .await
         .expect("create");
-    let mut urgent = remote_task("remote-d", "k8s");
-    urgent.priority = 5;
-    client.create_control_task(&urgent).await.expect("create");
+    client
+        .create_control_task(&remote_task("remote-d", "k8s"))
+        .await
+        .expect("create");
     submit_local("local-e").await;
+    // The owner moves the fourth arrival to the head of the waiting.
+    client
+        .control_move_task(
+            "remote-d",
+            &MoveTaskRequest {
+                target: MoveTarget::Before(TaskId::parse("local-b").expect("id")),
+                expected_generation: Some(1),
+            },
+        )
+        .await
+        .expect("move");
 
     let position = |id: &'static str| {
         let client = &client;
@@ -3675,7 +3688,7 @@ async fn local_and_control_plane_creates_share_one_priority_and_fifo_queue() {
             }
         }
     };
-    assert_eq!(position("remote-d").await, 1, "priority first");
+    assert_eq!(position("remote-d").await, 1, "moved to the head");
     assert_eq!(position("local-b").await, 2, "then arrival order");
     assert_eq!(position("remote-c").await, 3);
     assert_eq!(position("local-e").await, 4);
@@ -3799,9 +3812,11 @@ async fn new_tasks_inherit_the_owner_default_backend_and_existing_tasks_never_mo
 }
 
 #[tokio::test]
-async fn queued_tasks_wait_for_capacity_in_priority_order_with_a_visible_reason() {
-    use narsor::controller_protocol::SetPriorityRequest;
-    use narsor::orchestration::{Observation, QueueReason, TaskEventKind, TaskLifecycle};
+async fn queued_tasks_wait_for_capacity_in_rank_order_with_a_visible_reason() {
+    use narsor::controller_protocol::MoveTaskRequest;
+    use narsor::orchestration::{
+        MoveTarget, Observation, QueueReason, TaskEventKind, TaskLifecycle,
+    };
     let root = TempRoot::new();
     let (handle, service) = start_scheduling_server(&root).await;
     // Read fresh by every decision: no restart needed.
@@ -3821,10 +3836,11 @@ async fn queued_tasks_wait_for_capacity_in_priority_order_with_a_visible_reason(
     assert_eq!(controller.offered_starts(), ["first"]);
     controller.run("first");
 
-    for (id, priority) in [("low", 0), ("high", 5)] {
-        let mut request = remote_task(id, "k8s");
-        request.priority = priority;
-        client.create_control_task(&request).await.expect("create");
+    for id in ["high", "low"] {
+        client
+            .create_control_task(&remote_task(id, "k8s"))
+            .await
+            .expect("create");
     }
     let reason =
         |summary: narsor::controller_protocol::TaskSummary| summary.queue.map(|queue| queue.reason);
@@ -3849,16 +3865,16 @@ async fn queued_tasks_wait_for_capacity_in_priority_order_with_a_visible_reason(
 
     // The owner reorders the waiting; the running task is untouched (AE3).
     let raised = client
-        .control_set_priority(
+        .control_move_task(
             "low",
-            &SetPriorityRequest {
-                priority: 9,
+            &MoveTaskRequest {
+                target: MoveTarget::Top,
                 expected_generation: Some(1),
             },
         )
         .await
-        .expect("raise priority");
-    assert_eq!(raised.priority, 9);
+        .expect("move to the top");
+    assert_eq!(raised.rank, 1);
     assert_eq!(
         reason(raised),
         Some(QueueReason::WaitingForCapacity {
@@ -3875,23 +3891,23 @@ async fn queued_tasks_wait_for_capacity_in_priority_order_with_a_visible_reason(
         }
     )));
     match client
-        .control_set_priority(
+        .control_move_task(
             "first",
-            &SetPriorityRequest {
-                priority: -1,
+            &MoveTaskRequest {
+                target: MoveTarget::Bottom,
                 expected_generation: None,
             },
         )
         .await
     {
         Err(ClientError::Refused { code, .. }) => assert_eq!(code, "task_not_queued"),
-        other => panic!("a running task's priority is not queue order, got {other:?}"),
+        other => panic!("a running task cannot be moved, got {other:?}"),
     }
     match client
-        .control_set_priority(
+        .control_move_task(
             "low",
-            &SetPriorityRequest {
-                priority: 1,
+            &MoveTaskRequest {
+                target: MoveTarget::Bottom,
                 expected_generation: Some(4),
             },
         )
