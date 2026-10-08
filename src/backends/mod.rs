@@ -51,7 +51,10 @@ use std::future::Future;
 use crate::domain::{TaskId, TaskLaunchSpec};
 use crate::environment::{BackendCapabilities, BackendKind};
 
-pub use controller::{Controller, ControllerConfig, ControllerLink, ControllerStatus, StepOutcome};
+pub use controller::{
+    supervise, Controller, ControllerConfig, ControllerLink, ControllerStatus, StepOutcome,
+    Supervision,
+};
 pub use fake::FakeBackend;
 pub use kubernetes::{KubernetesBackend, KubernetesBackendConfig};
 pub use local::{LocalBackend, LocalBackendConfig};

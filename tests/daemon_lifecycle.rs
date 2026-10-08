@@ -202,6 +202,180 @@ async fn daemon_starts_writes_discovery_file_and_serves_a_request() {
 }
 
 // ---------------------------------------------------------------------------
+// The daemon-owned local controller (U2, KTD4)
+// ---------------------------------------------------------------------------
+
+/// The `local` backend's lease as the control plane stores it, read from the
+/// outside the way an operator's tooling would.
+fn local_lease(root: &Path) -> Option<narsor::orchestration::BackendLease> {
+    narsor::orchestration::ControlPlane::new(narsor::persistence::StatePaths::new(root))
+        .lease(&narsor::domain::BackendId::parse("local").unwrap())
+        .expect("read the lease")
+}
+
+fn wait_for_lease(
+    root: &Path,
+    what: &str,
+    mut accept: impl FnMut(&Option<narsor::orchestration::BackendLease>) -> bool,
+) -> Option<narsor::orchestration::BackendLease> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let lease = local_lease(root);
+        if accept(&lease) {
+            return lease;
+        }
+        assert!(Instant::now() < deadline, "the local lease never {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A fresh daemon enrolls a controller for its built-in `local` backend and
+/// takes the lease before it is discoverable; a graceful stop releases the
+/// lease at once, and the next daemon reuses the same identity, taking the
+/// lease at a later epoch.
+#[test]
+fn the_local_controller_holds_the_lease_and_a_restart_reuses_its_identity() {
+    let root = TempRoot::new();
+    let credential = root.path().join("local-controller/credential");
+
+    let mut first = spawn_daemon(root.path());
+    wait_for_daemon_info(root.path(), Duration::from_secs(15));
+    assert!(
+        credential.is_file(),
+        "the controller was enrolled at startup"
+    );
+    let enrolled = fs::read_to_string(&credential).expect("read the credential");
+    let held = wait_for_lease(root.path(), "became active", |lease| {
+        lease
+            .as_ref()
+            .is_some_and(|lease| lease.expires_at > chrono::Utc::now())
+    })
+    .expect("a lease");
+
+    send_sigterm(first.id());
+    assert!(wait_for_exit(&mut first, Duration::from_secs(20)).success());
+    let released = local_lease(root.path());
+    assert!(
+        released
+            .as_ref()
+            .is_none_or(|lease| lease.expires_at <= chrono::Utc::now()),
+        "the lease is given up on a clean shutdown, not left to expire: {released:?}"
+    );
+
+    let mut second = spawn_daemon(root.path());
+    wait_for_daemon_info(root.path(), Duration::from_secs(15));
+    let reacquired = wait_for_lease(root.path(), "was reacquired", |lease| {
+        lease
+            .as_ref()
+            .is_some_and(|lease| lease.expires_at > chrono::Utc::now())
+    })
+    .expect("a lease");
+    assert_eq!(
+        fs::read_to_string(&credential).expect("read the credential"),
+        enrolled,
+        "the restarted daemon reuses its controller credential"
+    );
+    assert_eq!(reacquired.controller_id, held.controller_id);
+    assert!(
+        reacquired.epoch > held.epoch,
+        "a new epoch fences the old one"
+    );
+
+    send_sigterm(second.id());
+    assert!(wait_for_exit(&mut second, Duration::from_secs(20)).success());
+}
+
+/// Queued and admitted local tasks survive a daemon restart without a second
+/// copy of anything: the same task ids, one storage each, and no task that
+/// the first daemon accepted is created again.
+#[tokio::test]
+async fn a_restart_keeps_queued_and_admitted_tasks_without_duplicating_them() {
+    let root = TempRoot::new();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cli");
+    let workflow = fixtures.join("greet.yaml").display().to_string();
+    let script = fixtures.join("announce.sh").display().to_string();
+    let http = reqwest::Client::new();
+
+    let mut first = spawn_daemon(root.path());
+    let info = wait_for_daemon_info(root.path(), Duration::from_secs(15));
+    // The workflow stops at a human gate, so the first task keeps the only
+    // slot and the second one stays queued behind it.
+    for task_id in ["restart-one", "restart-two"] {
+        let response = http
+            .post(format!("http://{}/tasks", info.addr))
+            .bearer_auth(&info.token)
+            .json(&serde_json::json!({
+                "task_id": task_id,
+                "workflow": workflow,
+                "inputs": { "greeting": "hello", "script_path": script }
+            }))
+            .send()
+            .await
+            .expect("create a task");
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    }
+
+    let storage = root.path().join("local-controller/storage");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !storage.join("restart-one/state").is_dir() {
+        assert!(
+            Instant::now() < deadline,
+            "the first task was never admitted"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    send_sigterm(first.id());
+    assert!(wait_for_exit(&mut first, Duration::from_secs(30)).success());
+
+    let mut second = spawn_daemon(root.path());
+    let info = wait_for_daemon_info(root.path(), Duration::from_secs(15));
+    let client = narsor::api::ApiClient::new(info.addr, info.token.clone());
+    let tasks = client.control_tasks().await.expect("list tasks").tasks;
+    let mut ids = tasks
+        .iter()
+        .map(|task| task.task_id.to_string())
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(
+        ids,
+        ["restart-one", "restart-two"],
+        "no task appeared or vanished"
+    );
+
+    // Replaying a create the first daemon already answered returns that task.
+    let replay = http
+        .post(format!("http://{}/tasks", info.addr))
+        .bearer_auth(&info.token)
+        .json(&serde_json::json!({
+            "task_id": "restart-one",
+            "workflow": workflow,
+            "inputs": { "greeting": "hello", "script_path": script }
+        }))
+        .send()
+        .await
+        .expect("replay the create");
+    assert_eq!(replay.status(), reqwest::StatusCode::ACCEPTED);
+    let after = client.control_tasks().await.expect("list tasks").tasks;
+    assert_eq!(after.len(), 2, "the replay created nothing");
+
+    // One storage per task that was ever admitted — never two for one task.
+    let mut storages = fs::read_dir(&storage)
+        .expect("task storages")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    storages.sort();
+    assert!(
+        storages.iter().all(|name| name.starts_with("restart-")) && storages.len() <= 2,
+        "unexpected task storages: {storages:?}"
+    );
+
+    send_sigterm(second.id());
+    assert!(wait_for_exit(&mut second, Duration::from_secs(30)).success());
+}
+
+// ---------------------------------------------------------------------------
 // `daemon stop`
 // ---------------------------------------------------------------------------
 

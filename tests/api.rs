@@ -3602,6 +3602,103 @@ impl InProcessController {
     }
 }
 
+/// AE2 across entry points: the local `/tasks` facade and the control-plane
+/// create share one queue — priority first, FIFO within a priority — and a
+/// task submitted while no controller holds the lease waits with its offline
+/// reason, with no execution behind it.
+#[tokio::test]
+async fn local_and_control_plane_creates_share_one_priority_and_fifo_queue() {
+    use narsor::orchestration::{Observation, QueueReason, TaskLifecycle};
+
+    let root = TempRoot::new();
+    let (handle, service) = start_scheduling_server(&root).await;
+    set_backend_limit(&root, "k8s", 1);
+    let client = handle.client();
+    let reason =
+        |summary: narsor::controller_protocol::TaskSummary| summary.queue.map(|queue| queue.reason);
+
+    let submit_local = |task_id: &'static str| {
+        let handle = &handle;
+        async move {
+            let response = raw_client()
+                .post(url(handle, "/tasks"))
+                .bearer_auth(handle.token())
+                .json(&serde_json::json!({
+                    "task_id": task_id,
+                    "workflow": "implement-feature",
+                    "inputs": {}
+                }))
+                .send()
+                .await
+                .expect("post task");
+            assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+            let created: StartTaskResponse = response.json().await.expect("acknowledgement");
+            created.task
+        }
+    };
+
+    // No controller yet: queued, offline, and nothing was started.
+    let first = submit_local("first").await;
+    assert_eq!(first.lifecycle, TaskLifecycle::Queued);
+    assert_eq!(first.priority, 0, "a local task starts at priority zero");
+    assert_eq!(
+        reason(first.clone()),
+        Some(QueueReason::ControllerOffline),
+        "an unadmitted local task says why it waits"
+    );
+    assert!(
+        first.runner.is_none(),
+        "no execution exists before admission"
+    );
+
+    let controller = InProcessController::online(&service, "k8s");
+    assert_eq!(controller.offered_starts(), ["first"]);
+    controller.run("first");
+
+    // Three more, from both surfaces, while the only slot is taken.
+    submit_local("local-b").await;
+    client
+        .create_control_task(&remote_task("remote-c", "k8s"))
+        .await
+        .expect("create");
+    let mut urgent = remote_task("remote-d", "k8s");
+    urgent.priority = 5;
+    client.create_control_task(&urgent).await.expect("create");
+    submit_local("local-e").await;
+
+    let position = |id: &'static str| {
+        let client = &client;
+        async move {
+            match reason(client.control_task(id).await.unwrap()) {
+                Some(QueueReason::WaitingForCapacity { position, .. }) => position,
+                other => panic!("{id} should wait for capacity, got {other:?}"),
+            }
+        }
+    };
+    assert_eq!(position("remote-d").await, 1, "priority first");
+    assert_eq!(position("local-b").await, 2, "then arrival order");
+    assert_eq!(position("remote-c").await, 3);
+    assert_eq!(position("local-e").await, 4);
+    assert!(controller.offered_starts().is_empty(), "no preemption");
+
+    // Freeing the slot admits exactly the head of that single queue.
+    client
+        .control_command(
+            "first",
+            &narsor::controller_protocol::OwnerCommandRequest {
+                command: narsor::orchestration::OwnerCommand::Archive,
+                idempotency_key: "archive-first".to_string(),
+                expected_generation: None,
+            },
+        )
+        .await
+        .expect("archive");
+    controller
+        .report("first", Observation::ResourcesDeleted)
+        .expect("deleted");
+    assert_eq!(controller.offered_starts(), ["remote-d"]);
+}
+
 fn set_backend_limit(root: &TempRoot, backend: &str, limit: u32) {
     let mut record = environment_support::backend(backend);
     record.limits.max_concurrent_tasks = limit;

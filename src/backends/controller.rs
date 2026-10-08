@@ -210,6 +210,77 @@ impl ControllerConfig {
     }
 }
 
+/// Policy of [`supervise`].
+#[derive(Debug, Clone, Copy)]
+pub struct Supervision {
+    /// Pause before a controller loop that died is started again.
+    pub restart_after: Duration,
+    /// Longest wait for a stopping loop to give its lease up. Past it the
+    /// loop is aborted and the lease lapses on its own, like after a crash.
+    pub stop_timeout: Duration,
+}
+
+impl Default for Supervision {
+    fn default() -> Self {
+        Self {
+            restart_after: Duration::from_secs(1),
+            stop_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Keeps one controller loop running until `shutdown` resolves.
+///
+/// `start` builds a loop from a stop signal — normally
+/// `Controller::run(async { let _ = stop.await; })`. A loop that panics or
+/// ends on its own is logged and started again after a pause: the backend's
+/// own state (workloads, storage) survives the loop, and the new one
+/// re-acquires the lease and reconciles, so nothing is requeued or started
+/// twice. On shutdown the loop is asked to stop and given
+/// [`Supervision::stop_timeout`] to release its lease.
+pub async fn supervise<F, Fut>(
+    mut start: F,
+    shutdown: impl Future<Output = ()> + Send,
+    policy: Supervision,
+) where
+    F: FnMut(tokio::sync::oneshot::Receiver<()>) -> Fut + Send,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    tokio::pin!(shutdown);
+    loop {
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let mut run = tokio::spawn(start(stopped));
+        tokio::select! {
+            _ = &mut shutdown => {
+                let _ = stop.send(());
+                match tokio::time::timeout(policy.stop_timeout, &mut run).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "controller: loop failed while stopping");
+                    }
+                    Err(_) => {
+                        run.abort();
+                        tracing::warn!(
+                            "controller: loop did not stop in time; its lease will lapse"
+                        );
+                    }
+                }
+                return;
+            }
+            outcome = &mut run => {
+                match outcome {
+                    Err(error) => tracing::error!(%error, "controller: loop died; restarting"),
+                    Ok(()) => tracing::warn!("controller: loop ended unexpectedly; restarting"),
+                }
+                tokio::select! {
+                    _ = &mut shutdown => return,
+                    _ = tokio::time::sleep(policy.restart_after) => {}
+                }
+            }
+        }
+    }
+}
+
 /// What one [`Controller::step`] ended in, which decides how long to wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepOutcome {

@@ -63,7 +63,9 @@ use crate::api::{ActiveTasks, ApiHandle, ApiServices, ServerSecurity};
 use crate::auth::{
     NetworkAuth, OidcVerifier, OwnerStore, SecurityPlan, SecuritySettings, StartupOwnership,
 };
-use crate::backends::{Controller, ControllerConfig, LocalBackend, LocalBackendConfig};
+use crate::backends::{
+    supervise, Controller, ControllerConfig, LocalBackend, LocalBackendConfig, Supervision,
+};
 use crate::conductor::{ConductorRegistry, HarnessInvoker, PassLauncher};
 use crate::config::Resolved;
 use crate::controller_protocol::{CreateEnrollmentRequest, ProtocolService};
@@ -352,13 +354,23 @@ async fn start_local_controller(
             CliError::failure(format!("could not configure local backend: {error}"))
         })?,
     );
-    let controller = Controller::new(backend, client, ControllerConfig::new(control_url));
+    let config = ControllerConfig::new(control_url);
     let (stop, shutdown) = tokio::sync::oneshot::channel();
     Ok((
         stop,
-        tokio::spawn(controller.run(async move {
-            let _ = shutdown.await;
-        })),
+        tokio::spawn(supervise(
+            move |stopped| {
+                // A fresh loop over the same backend (which keeps its process
+                // table and storage) and the same enrolled identity.
+                Controller::new(backend.clone(), client.clone(), config.clone()).run(async move {
+                    let _ = stopped.await;
+                })
+            },
+            async move {
+                let _ = shutdown.await;
+            },
+            Supervision::default(),
+        )),
     ))
 }
 
