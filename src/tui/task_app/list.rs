@@ -20,13 +20,15 @@
 //! # A row
 //!
 //! ```text
-//! ?● NAR-12  approval        attention · state · title · label
+//! ? ●  Refactor parser       attention · state · title
+//!      approval              label, under the title
 //! ```
 //!
-//! The first column says what the operator must do (`?` answer, `!` problem —
-//! a problem wins over a question), the second what is happening (`●` running,
-//! `◷` queued, `⟳` provisioning, `‖` paused, `✗` failed, `✓` done), the third
-//! is the title (`display.title`, else the task id) and the last a short label:
+//! A row is two lines, so that the title has the whole width (R7). The first
+//! column says what the operator must do (`?` answer, `!` problem — a problem
+//! wins over a question), the second what is happening (`●` running, `◷`
+//! queued, `⟳` provisioning, `‖` paused, `✗` failed, `✓` done), then the title
+//! (`display.title`, else the task id); the second line holds a short label:
 //! the current step, `#n` for a queued task, `offline` when no controller holds
 //! the backend. Everything that comes from the server is passed through
 //! [`one_line`] before it is drawn.
@@ -34,7 +36,7 @@
 use std::collections::HashMap;
 
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{List, ListItem, ListState};
 use ratatui::Frame;
 
@@ -190,7 +192,7 @@ fn controller_offline(task: &TaskSummary) -> bool {
         .is_none_or(|controller| controller.freshness != Freshness::Live)
 }
 
-/// The label of a row (column 4). `queue_position` is the 1-based place among
+/// The label of a row (its second line). `queue_position` is the 1-based place among
 /// the queued tasks of the backend, in list order.
 pub fn label_of(task: &TaskSummary, queue_position: Option<usize>) -> String {
     let runner_status = task
@@ -233,9 +235,9 @@ pub struct RowText {
     pub attention: Attention,
     /// Column 2.
     pub icon: StateIcon,
-    /// Column 3.
+    /// The title, first line.
     pub title: String,
-    /// Column 4.
+    /// The label, second line.
     pub label: String,
 }
 
@@ -1097,23 +1099,14 @@ impl TaskList {
                     .map(|row| (row.task_id.clone(), row.text())),
             )
             .collect();
-        let label_width = rows
-            .iter()
-            .map(|(_, row)| row.label.chars().count())
-            .max()
-            .unwrap_or(0)
-            .min(10)
-            .min(usize::from(inner.width) * 2 / 5);
-
         let selected = self.selected.clone();
         let items: Vec<ListItem> = rows
             .iter()
             .map(|(id, row)| {
                 let is_selected = selected.as_deref() == Some(id.as_str());
-                ListItem::new(row_line(
+                ListItem::new(row_text(
                     row,
                     usize::from(inner.width),
-                    label_width,
                     styles,
                     stale,
                     is_selected,
@@ -1304,18 +1297,21 @@ pub fn fit(text: &str, width: usize) -> String {
     }
 }
 
-/// One row as a styled line of exactly `width` columns.
-pub(super) fn row_line(
+/// The columns before the title (and under it, before the label): attention,
+/// a space, state, two spaces.
+const ROW_PREFIX: usize = 5;
+
+/// One row as two styled lines of exactly `width` columns: the markers and
+/// the title, then the label under the title. The second line is there even
+/// when the label is empty, so every row is as tall as the next.
+pub(super) fn row_text(
     row: &RowText,
     width: usize,
-    label_width: usize,
     styles: &Styles,
     stale: bool,
     selected: bool,
-) -> Line<'static> {
-    // attention, state, a space, the title, a space, the label.
-    let fixed = 2 + 1 + usize::from(label_width > 0) * (1 + label_width);
-    let title_width = width.saturating_sub(fixed);
+) -> Text<'static> {
+    let text_width = width.saturating_sub(ROW_PREFIX);
     let grey = |role: Role| if stale { Role::Done } else { role };
     let label_role = match row.label.as_str() {
         "offline" => Role::Attention,
@@ -1324,34 +1320,32 @@ pub(super) fn row_line(
         _ => Role::Done,
     };
 
-    let mut spans = vec![
+    let first = vec![
         Span::styled(
             row.attention.glyph().to_string(),
             styles.of(grey(row.attention.role())),
         ),
+        Span::raw(" "),
         Span::styled(
             row.icon.glyph().to_string(),
             styles.of(grey(row.icon.role())),
         ),
-        Span::raw(" "),
-        Span::styled(
-            format!("{:<title_width$}", fit(&row.title, title_width)),
-            styles.of(grey(Role::Calm)),
-        ),
+        Span::raw("  "),
+        Span::styled(fit(&row.title, text_width), styles.of(grey(Role::Calm))),
     ];
-    if label_width > 0 {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("{:<label_width$}", fit(&row.label, label_width)),
-            styles.of(grey(label_role)),
-        ));
-    }
-    let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
-    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-    if selected {
-        for span in &mut spans {
-            span.style = styles.selected(span.style);
+    let second = vec![
+        Span::raw(" ".repeat(ROW_PREFIX.min(width))),
+        Span::styled(fit(&row.label, text_width), styles.of(grey(label_role))),
+    ];
+    let finish = |mut spans: Vec<Span<'static>>| {
+        let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+        if selected {
+            for span in &mut spans {
+                span.style = styles.selected(span.style);
+            }
         }
-    }
-    Line::from(spans)
+        Line::from(spans)
+    };
+    Text::from(vec![finish(first), finish(second)])
 }

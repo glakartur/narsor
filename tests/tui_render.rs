@@ -588,17 +588,18 @@ mod task_app_render {
                 .unwrap()
         };
         assert!(
-            list_rows[find("NAR-14")].starts_with(" ●"),
+            list_rows[find("NAR-14")].starts_with("  ●  NAR-14"),
             "{:?}",
             list_rows[find("NAR-14")]
         );
-        assert!(list_rows[find("NAR-12")].starts_with("?●"));
-        assert!(list_rows[find("NAR-9 ")].starts_with("!✗"));
-        assert!(list_rows[find("NAR-16")].starts_with(" ◷"));
-        assert!(list_rows[find("NAR-16")].contains("#1"));
-        assert!(list_rows[find("NAR-17")].contains("#2"));
-        assert!(list_rows[find("NAR-8 ")].starts_with(" ✓"));
-        assert!(list_rows[find("NAR-12")].contains("approval"));
+        assert!(list_rows[find("NAR-12")].starts_with("? ●  NAR-12"));
+        assert!(list_rows[find("NAR-9 ")].starts_with("! ✗  NAR-9"));
+        assert!(list_rows[find("NAR-16")].starts_with("  ◷  NAR-16"));
+        // The label is on the second line, under the title.
+        assert!(list_rows[find("NAR-16") + 1].starts_with("     #1"));
+        assert!(list_rows[find("NAR-17") + 1].starts_with("     #2"));
+        assert!(list_rows[find("NAR-8 ")].starts_with("  ✓  NAR-8"));
+        assert!(list_rows[find("NAR-12") + 1].starts_with("     approval"));
         assert!(
             find("NAR-14") < find("NAR-12")
                 && find("NAR-12") < find("NAR-9 ")
@@ -798,13 +799,20 @@ mod task_app_render {
             Color::Yellow,
             "the marker keeps its role colour"
         );
-        assert_eq!(cells[2].symbol(), "●");
-        assert_eq!(cells[2].fg, Color::Green);
-        assert!(cells[1].modifier.contains(Modifier::REVERSED));
+        assert_eq!(cells[3].symbol(), "●");
+        assert_eq!(cells[3].fg, Color::Green);
+        let reversed = |row: usize, column: usize| {
+            buffer.content()[row * width + column]
+                .modifier
+                .contains(Modifier::REVERSED)
+        };
+        // AE2: both lines of the selected task are reversed, across the column.
+        for column in 1..usize::from(layout::LIST_WIDTH) - 1 {
+            assert!(reversed(row, column), "line 1, column {column}");
+            assert!(reversed(row + 1, column), "line 2, column {column}");
+        }
         let other = list_row(&buffer, "NAR-14");
-        assert!(!buffer.content()[other * width + 4]
-            .modifier
-            .contains(Modifier::REVERSED));
+        assert!(!reversed(other, 4) && !reversed(other + 1, 4));
     }
 
     #[test]
@@ -813,7 +821,7 @@ mod task_app_render {
         press(&mut app, KeyCode::Char('j'));
         let buffer = render(120, 30, &mut app, &Styles::new(true));
         let screen = screen(&buffer);
-        for marker in ["?●", "!✗", "◷", "✓", "● live", "? 1", "! 1"] {
+        for marker in ["? ●", "! ✗", "◷", "✓", "● live", "? 1", "! 1"] {
             assert!(screen.contains(marker), "{marker:?} lost:\n{screen}");
         }
         assert!(
@@ -825,9 +833,11 @@ mod task_app_render {
         );
         let width = usize::from(buffer.area.width);
         let row = list_row(&buffer, "NAR-12");
-        assert!(buffer.content()[row * width + 4]
-            .modifier
-            .contains(Modifier::REVERSED));
+        for line in [row, row + 1] {
+            assert!(buffer.content()[line * width + 4]
+                .modifier
+                .contains(Modifier::REVERSED));
+        }
     }
 
     #[test]
@@ -885,7 +895,7 @@ mod task_app_render {
     }
 
     #[test]
-    fn a_long_title_is_cut_with_an_ellipsis_and_the_label_stays() {
+    fn a_long_title_is_cut_with_an_ellipsis_and_the_label_goes_under_it() {
         let mut app = app();
         let long = titled(
             with_runner(
@@ -897,12 +907,225 @@ mod task_app_render {
         );
         app.load(listing(vec![long], "c"));
         let buffer = render(120, 30, &mut app, &Styles::new(true));
-        let row: String = rows(&buffer)[list_row(&buffer, "Bardzo")]
-            .chars()
-            .take(usize::from(layout::LIST_WIDTH))
+        let line = |at: usize| -> String {
+            rows(&buffer)[at]
+                .chars()
+                .take(usize::from(layout::LIST_WIDTH))
+                .collect()
+        };
+        let row = list_row(&buffer, "Bardzo");
+        assert!(line(row).contains('…'), "{:?}", line(row));
+        assert!(line(row + 1).contains("implement"), "{:?}", line(row + 1));
+        assert!(
+            !line(row + 2).contains("mieści"),
+            "the title does not wrap to a third line:\n{}",
+            screen(&buffer)
+        );
+    }
+
+    /// The cells of the list column (inside its frame) of screen row `row`.
+    fn list_cells(buffer: &Buffer, row: usize) -> &[ratatui::buffer::Cell] {
+        let width = usize::from(buffer.area.width);
+        &buffer.content()[row * width + 1..row * width + usize::from(layout::LIST_WIDTH) - 1]
+    }
+
+    fn list_text(buffer: &Buffer, row: usize) -> String {
+        list_cells(buffer, row)
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn all_reversed(buffer: &Buffer, row: usize) -> bool {
+        list_cells(buffer, row)
+            .iter()
+            .all(|cell| cell.modifier.contains(Modifier::REVERSED))
+    }
+
+    fn none_reversed(buffer: &Buffer, row: usize) -> bool {
+        list_cells(buffer, row)
+            .iter()
+            .all(|cell| !cell.modifier.contains(Modifier::REVERSED))
+    }
+
+    /// AE2: a task takes two lines, `j` takes the selection to the whole next
+    /// task.
+    #[test]
+    fn a_task_takes_two_lines_and_the_selection_covers_both() {
+        let mut app = app();
+        let running = |id: &str, rank, step: &str, title: &str| {
+            titled(
+                with_runner(
+                    with_controller(crate::task_app_support::task(id, "local", "running", rank)),
+                    ExecutionStatus::Running,
+                    step,
+                ),
+                title,
+            )
+        };
+        app.load(listing(
+            vec![
+                running("a", 1, "implement", "Refactor parser"),
+                running("b", 2, "review", "Fix the lexer"),
+            ],
+            "c",
+        ));
+        let buffer = render(120, 30, &mut app, &Styles::new(false));
+        let first = list_row(&buffer, "Refactor parser");
+        assert!(
+            list_text(&buffer, first).starts_with("  ●  Refactor parser"),
+            "{:?}",
+            list_text(&buffer, first)
+        );
+        assert!(
+            list_text(&buffer, first + 1).starts_with("     implement"),
+            "{:?}",
+            list_text(&buffer, first + 1)
+        );
+        let second = list_row(&buffer, "Fix the lexer");
+        assert_eq!(second, first + 2, "the next task begins right below");
+        assert!(all_reversed(&buffer, first) && all_reversed(&buffer, first + 1));
+        assert!(none_reversed(&buffer, second) && none_reversed(&buffer, second + 1));
+
+        press(&mut app, KeyCode::Char('j'));
+        let buffer = render(120, 30, &mut app, &Styles::new(false));
+        assert!(all_reversed(&buffer, second) && all_reversed(&buffer, second + 1));
+        assert!(none_reversed(&buffer, first) && none_reversed(&buffer, first + 1));
+    }
+
+    /// R8: the label keeps its role on the second line.
+    #[test]
+    fn the_labels_keep_their_roles_on_the_second_line() {
+        let mut app = app();
+        let offline = titled(
+            with_runner(
+                crate::task_app_support::task("a", "local", "running", 1),
+                ExecutionStatus::Running,
+                "implement",
+            ),
+            "Offline task",
+        );
+        let step = titled(
+            with_runner(
+                with_controller(crate::task_app_support::task("b", "local", "running", 2)),
+                ExecutionStatus::Running,
+                "review",
+            ),
+            "Step task",
+        );
+        let queued_tasks: Vec<_> = (3..=5)
+            .map(|rank| titled(queued(&format!("q{rank}"), rank), &format!("Queued {rank}")))
             .collect();
-        assert!(row.contains('…'), "{row:?}");
-        assert!(row.contains("implement"), "{row:?}");
+        let mut tasks = vec![offline, step];
+        tasks.extend(queued_tasks);
+        app.load(listing(tasks, "c"));
+        // The selection stays on the first row; look at the others unreversed.
+        press(&mut app, KeyCode::Char('G'));
+        let buffer = render(120, 30, &mut app, &Styles::new(false));
+        let label = |title: &str, text: &str| {
+            let row = list_row(&buffer, title) + 1;
+            let line = list_text(&buffer, row);
+            assert!(line.starts_with(&format!("     {text}")), "{line:?}");
+            list_cells(&buffer, row)[5].fg
+        };
+        assert_eq!(label("Offline task", "offline"), Color::Yellow);
+        assert_eq!(label("Step task", "review"), Color::DarkGray);
+        assert_eq!(label("Queued 4", "#2"), Color::Reset);
+    }
+
+    /// R9: scrolling goes by whole tasks.
+    #[test]
+    fn a_long_list_scrolls_by_whole_tasks() {
+        let mut app = app();
+        let tasks = (1..=20)
+            .map(|rank| {
+                titled(
+                    with_runner(
+                        with_controller(crate::task_app_support::task(
+                            &format!("t{rank}"),
+                            "local",
+                            "running",
+                            rank,
+                        )),
+                        ExecutionStatus::Running,
+                        "implement",
+                    ),
+                    &format!("T-{rank:02}"),
+                )
+            })
+            .collect();
+        app.load(listing(tasks, "c"));
+        press(&mut app, KeyCode::Char('G'));
+        // An odd number of rows inside the frame: one is left over.
+        let buffer = render(120, 31, &mut app, &Styles::new(true));
+        let last = list_row(&buffer, "T-20");
+        assert!(
+            list_text(&buffer, last + 1).starts_with("     implement"),
+            "the last task shows both lines:\n{}",
+            screen(&buffer)
+        );
+        assert!(all_reversed(&buffer, last) && all_reversed(&buffer, last + 1));
+        // The first row inside the frame begins a task, not half of one.
+        assert!(
+            list_text(&buffer, 2).starts_with("  ●  T-"),
+            "{:?}\n{}",
+            list_text(&buffer, 2),
+            screen(&buffer)
+        );
+    }
+
+    /// R10: the rows of tasks being sent have the same two lines, and
+    /// `nie wysłano` is a problem.
+    #[test]
+    fn pending_rows_take_two_lines_and_not_sent_is_a_problem() {
+        use narsor::tui::task_app::list::{PendingRow, PendingState, TaskList};
+        let mut list = TaskList::new();
+        for (id, state) in [("p1", PendingState::Sending), ("p2", PendingState::NotSent)] {
+            list.push_pending(PendingRow {
+                task_id: id.to_string(),
+                title: format!("Pending {id}"),
+                state,
+                reason: None,
+            });
+        }
+        let buffer = draw(layout::LIST_WIDTH, 10, |frame| {
+            let area = frame.area();
+            list.render(frame, area, &Styles::new(false), true, false)
+        });
+        let width = usize::from(buffer.area.width);
+        let line =
+            |row: usize| -> String { rows(&buffer)[row].chars().skip(1).take(width - 2).collect() };
+        assert!(line(1).starts_with("  ↻  Pending p1"), "{:?}", line(1));
+        assert!(line(2).starts_with("     wysyłanie…"), "{:?}", line(2));
+        assert!(line(3).starts_with("  ✗  Pending p2"), "{:?}", line(3));
+        assert!(line(4).starts_with("     nie wysłano"), "{:?}", line(4));
+        assert_eq!(buffer.content()[4 * width + 6].fg, Color::Red);
+        // The last pushed row is selected: both its lines are reversed.
+        for row in [3, 4] {
+            assert!(buffer.content()[row * width + 6]
+                .modifier
+                .contains(Modifier::REVERSED));
+        }
+    }
+
+    /// R8: the move preview takes the place of the label.
+    #[test]
+    fn the_move_preview_is_on_the_second_line() {
+        let mut app = app();
+        let tasks = (1..=5)
+            .map(|rank| titled(queued(&format!("q{rank}"), rank), &format!("Queued {rank}")))
+            .collect();
+        app.load(listing(tasks, "c"));
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('j'));
+        let buffer = render(120, 30, &mut app, &Styles::new(true));
+        let moved = list_row(&buffer, "Queued 1");
+        assert!(
+            list_text(&buffer, moved + 1).starts_with("     ↕ 2/5"),
+            "{}",
+            screen(&buffer)
+        );
+        assert!(list_row(&buffer, "Queued 2") < moved);
     }
 }
 
@@ -2427,8 +2650,9 @@ mod task_app_create_render {
             panic!("a send was expected");
         };
         let sending = draw_app(&mut app, 130, 30, false);
+        assert_two_lines(&sending, "↻  NAR-18", "     wysyłanie…");
         for expected in [
-            "↻ NAR-18",
+            "↻  NAR-18",
             "wysyłanie…",
             "Serwer jeszcze nie potwierdził zadania",
         ] {
@@ -2449,7 +2673,8 @@ mod task_app_create_render {
                 .await;
         });
         let unsent = draw_app(&mut app, 130, 30, false);
-        for expected in ["✗ NAR-18", "nie wysłano", "Dane zostały zachowane", &id] {
+        assert_two_lines(&unsent, "✗  NAR-18", "     nie wysłano");
+        for expected in ["✗  NAR-18", "nie wysłano", "Dane zostały zachowane", &id] {
             assert!(unsent.contains(expected), "{expected}:\n{unsent}");
         }
     }
@@ -2480,6 +2705,57 @@ mod task_app_create_render {
         assert!(
             !screen.contains("NAR-14"),
             "the task list gives way:\n{screen}"
+        );
+        assert_two_lines(&screen, "✓  NAR-9", "     archiwum");
+        assert_two_lines(&screen, "fix-bug exec-1", "     failed");
+
+        // The selection covers both lines of the entry, and only of it.
+        let buffer = draw_buffer(&mut app, 130, 30);
+        let width = usize::from(buffer.area.width);
+        let all = rows(&buffer);
+        let at = |needle: &str| {
+            all.iter()
+                .position(|row| {
+                    row.chars()
+                        .take(usize::from(layout::LIST_WIDTH))
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .unwrap()
+        };
+        let reversed = |row: usize| {
+            buffer.content()[row * width + 6]
+                .modifier
+                .contains(Modifier::REVERSED)
+        };
+        let (selected, other) = if reversed(at("NAR-9")) {
+            (at("NAR-9"), at("fix-bug"))
+        } else {
+            (at("fix-bug"), at("NAR-9"))
+        };
+        assert!(reversed(selected) && reversed(selected + 1));
+        assert!(!reversed(other) && !reversed(other + 1));
+    }
+
+    /// The list line holding `first` is followed by one that starts with
+    /// `second` (inside the frame of the list column).
+    fn assert_two_lines(screen: &str, first: &str, second: &str) {
+        let lines: Vec<String> = screen
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .skip(1)
+                    .take(usize::from(layout::LIST_WIDTH) - 2)
+                    .collect()
+            })
+            .collect();
+        let at = lines
+            .iter()
+            .position(|line| line.contains(first))
+            .unwrap_or_else(|| panic!("{first:?} is not in the list:\n{screen}"));
+        assert!(
+            lines[at + 1].starts_with(second),
+            "{second:?} under {first:?}:\n{screen}"
         );
     }
 
@@ -2677,18 +2953,29 @@ mod task_app_main_screen {
                 .find(|row| row.contains(title))
                 .unwrap_or_else(|| panic!("no row for {title}:\n{screen}"))
         };
+        let under = |title: &str| {
+            let at = rows
+                .iter()
+                .position(|row| list_part(row).contains(title))
+                .unwrap_or_else(|| panic!("no row for {title}:\n{screen}"));
+            list_part(&rows[at + 1])
+        };
         assert!(
-            row_of("NAR-14").starts_with("│ ● NAR-14"),
+            row_of("NAR-14").starts_with("│  ●  NAR-14"),
             "{}",
             row_of("NAR-14")
         );
         assert!(
-            row_of("NAR-12").starts_with("│?● NAR-12"),
+            row_of("NAR-12").starts_with("│? ●  NAR-12"),
             "{}",
             row_of("NAR-12")
         );
-        assert!(row_of("NAR-16").starts_with("│ ◷ NAR-16") && row_of("NAR-16").contains("#1"));
-        assert!(row_of("NAR-17").starts_with("│ ◷ NAR-17") && row_of("NAR-17").contains("#2"));
+        assert!(
+            row_of("NAR-16").starts_with("│  ◷  NAR-16") && under("NAR-16").starts_with("│     #1")
+        );
+        assert!(
+            row_of("NAR-17").starts_with("│  ◷  NAR-17") && under("NAR-17").starts_with("│     #2")
+        );
         let order: Vec<usize> = ["NAR-14", "NAR-12", "NAR-16", "NAR-17"]
             .iter()
             .map(|title| {

@@ -51,7 +51,7 @@ use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 use super::detail::TaskDetail;
 use super::detail::{panel_title, recorded_attempt, render_view, ViewOptions};
-use super::list::{fit, row_line, title_of, Attention, RowText, StateIcon};
+use super::list::{fit, row_text, title_of, Attention, RowText, StateIcon};
 use super::notify::Severity;
 use super::tabs::conversation::{read_history_attempt, AttemptRead};
 use super::tabs::events;
@@ -801,22 +801,14 @@ pub fn render_list(
     let block = styles.panel(" Historia ", focused);
     let inner = block.inner(area);
     let rows = history.rows();
-    let label_width = rows
-        .iter()
-        .map(|row| row.label.chars().count())
-        .max()
-        .unwrap_or(0)
-        .min(10)
-        .min(usize::from(inner.width) * 2 / 5);
     let selected = history.selected;
     let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
         .map(|(index, row)| {
-            ListItem::new(row_line(
+            ListItem::new(row_text(
                 row,
                 usize::from(inner.width),
-                label_width,
                 styles,
                 stale,
                 index == selected,
