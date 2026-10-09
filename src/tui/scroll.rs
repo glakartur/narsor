@@ -18,6 +18,8 @@
 //! full and wrapped up front the moment it grows to a few megabytes is
 //! exactly the cost this split avoids.
 
+use crate::domain::display::is_invisible_format;
+
 /// How many logical lines a freshly opened window is assumed to show, before
 /// the first real render tells it otherwise.
 ///
@@ -223,6 +225,9 @@ pub fn sanitize(text: &str) -> String {
                 out.push(control_picture(c));
                 column += 1;
             }
+            // Invisible format characters (bidi overrides, zero-width marks)
+            // would reorder or hide what follows; they are dropped.
+            c if is_invisible_format(c) => {}
             c => {
                 out.push(c);
                 column += 1;
@@ -324,6 +329,11 @@ mod tests {
     fn sanitize_keeps_newlines_and_expands_tabs() {
         assert_eq!(sanitize("a\nb"), "a\nb");
         assert_eq!(sanitize("a\tb"), "a   b");
+    }
+
+    #[test]
+    fn sanitize_drops_invisible_format_characters() {
+        assert_eq!(sanitize("a\u{202E}b\u{200B}c\u{2066}d\u{FEFF}"), "abcd");
     }
 
     #[test]

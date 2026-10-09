@@ -114,16 +114,23 @@ pub fn without_unsafe_chars_multiline(text: &str) -> String {
 /// directional marks, bidi overrides and isolates, line and paragraph
 /// separators, the byte order mark) that `char::is_control` does not flag.
 fn is_unsafe_char(ch: char) -> bool {
-    ch.is_control()
-        || matches!(
-            ch,
-            '\u{00AD}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{206F}'
-                | '\u{FEFF}'
-        )
+    ch.is_control() || is_invisible_format(ch)
+}
+
+/// Whether `ch` is an invisible Unicode format character: zero-width and
+/// directional marks, bidi overrides and isolates, line and paragraph
+/// separators, the soft hyphen and the byte order mark. `char::is_control`
+/// does not flag them, yet they can reorder or hide what a terminal shows.
+pub fn is_invisible_format(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
 }
 
 /// Accepts `value` as a link target only when it is an absolute `http` or
