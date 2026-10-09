@@ -1051,8 +1051,8 @@ pub static BINDINGS: &[Binding] = &[
         Context::Form,
         Key::code(KeyCode::Esc),
         Action::Cancel,
-        "anuluj",
-        "zamknij formularz; wpisane dane zostają",
+        "wstecz",
+        "wróć z pola formularza nowego zadania do listy albo zamknij formularz; wpisane dane zostają",
     ),
     // Moving a queued task.
     bind(

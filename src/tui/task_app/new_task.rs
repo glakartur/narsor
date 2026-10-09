@@ -177,7 +177,9 @@ impl NewTaskForm {
             .chain(std::iter::once(Entry::Path))
             .collect();
         let first = form.first_available();
-        form.chooser = Chooser::new(form.items()).selecting(first);
+        form.chooser = Chooser::new(form.items())
+            .with_inputs_layout()
+            .selecting(first);
         form
     }
 
@@ -1003,6 +1005,9 @@ impl TaskApp {
         form.rebuild();
         if let (Some(complaint), Some(index)) = (complaint, form.path_index()) {
             form.chooser.set_field_error(index, PATH_FIELD, complaint);
+            // The full list of violations is in the description, which the
+            // layout of the inputs folds away: show the list again.
+            form.chooser.leave_fields();
         }
         self.sync_new_task_draft();
     }

@@ -45,6 +45,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+mod inputs;
+
 use super::input_form::{cycle_option, text_backspace, text_insert, text_step};
 use super::keymap::{digit_of, lookup, Action, Context};
 use super::scroll::{one_line, sanitize, wrap_visible, ScrollState};
@@ -191,6 +193,11 @@ impl ChooserField {
     /// The complaint about the field, if the last send found one.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    /// Whether the field takes several lines.
+    fn is_long(&self) -> bool {
+        matches!(self.kind, FieldKind::Text { multiline: true })
     }
 
     fn is_blank(&self) -> bool {
@@ -393,6 +400,9 @@ pub struct Chooser {
     focus: ChooserFocus,
     field: usize,
     description_scroll: ScrollState,
+    /// The layout of a form of inputs: with the focus in the fields, the list
+    /// folds into a strip and the fields take the screen.
+    inputs_layout: bool,
 }
 
 impl Chooser {
@@ -404,7 +414,17 @@ impl Chooser {
             focus: ChooserFocus::Actions,
             field: 0,
             description_scroll: ScrollState::new(),
+            inputs_layout: false,
         }
+    }
+
+    /// The same chooser in the layout of a form of inputs: `Enter` on an entry
+    /// with fields goes into them; there the short fields make a bar, the
+    /// multi-line ones fill the screen, `Esc` and `Shift+Tab` from the first
+    /// field return to the list.
+    pub fn with_inputs_layout(mut self) -> Self {
+        self.inputs_layout = true;
+        self
     }
 
     /// The same chooser, on entry `index` (the recommended or the safest one).
@@ -627,7 +647,9 @@ impl Chooser {
         if let Some(reason) = &item.unavailable {
             return ChooserAction::Blocked(reason.clone());
         }
-        if item.fields.iter().any(|field| field.required) {
+        if self.inputs_layout && !item.fields.is_empty()
+            || item.fields.iter().any(|field| field.required)
+        {
             self.focus_fields();
             return ChooserAction::None;
         }
@@ -640,11 +662,67 @@ impl Chooser {
             .is_some_and(|item| !item.fields.is_empty())
         {
             self.focus = ChooserFocus::Fields;
-            self.field = self.field.min(self.field_count().saturating_sub(1));
+            self.field = if self.inputs_layout {
+                self.start_field()
+            } else {
+                self.field.min(self.field_count().saturating_sub(1))
+            };
         }
     }
 
+    /// The indices of the highlighted entry's fields in the order the focus
+    /// walks them: in a form of inputs the short fields first, then the
+    /// multi-line ones; otherwise as declared.
+    fn focus_order(&self) -> Vec<usize> {
+        let Some(item) = self.selected_item() else {
+            return Vec::new();
+        };
+        focus_order_of(item, self.inputs_layout)
+    }
+
+    /// Where the focus starts in a form of inputs: the first required
+    /// multi-line field, else the first multi-line one, else the first field.
+    fn start_field(&self) -> usize {
+        let order = self.focus_order();
+        let Some(item) = self.selected_item() else {
+            return 0;
+        };
+        order
+            .iter()
+            .copied()
+            .find(|&index| item.fields[index].is_long() && item.fields[index].required)
+            .or_else(|| {
+                order
+                    .iter()
+                    .copied()
+                    .find(|&index| item.fields[index].is_long())
+            })
+            .or_else(|| order.first().copied())
+            .unwrap_or(0)
+    }
+
     fn on_fields_key(&mut self, event: KeyEvent) -> ChooserAction {
+        if self.inputs_layout {
+            match event.code {
+                KeyCode::Esc => {
+                    self.leave_fields();
+                    return ChooserAction::None;
+                }
+                KeyCode::BackTab => {
+                    if self.focus_order().first() == Some(&self.field) {
+                        self.leave_fields();
+                    } else {
+                        self.move_field(-1);
+                    }
+                    return ChooserAction::None;
+                }
+                KeyCode::Tab => {
+                    self.step_field_wrapping();
+                    return ChooserAction::None;
+                }
+                _ => {}
+            }
+        }
         match lookup(Context::Panel, &event) {
             Some(Action::SwitchFocus) => {
                 self.focus = ChooserFocus::Actions;
@@ -678,9 +756,19 @@ impl Chooser {
     }
 
     fn move_field(&mut self, delta: isize) {
-        let count = self.field_count();
-        if count > 0 {
-            self.field = (self.field as isize + delta).clamp(0, count as isize - 1) as usize;
+        let order = self.focus_order();
+        let Some(position) = order.iter().position(|&index| index == self.field) else {
+            return;
+        };
+        let target = (position as isize + delta).clamp(0, order.len() as isize - 1);
+        self.field = order[target as usize];
+    }
+
+    /// `Tab` in a form of inputs: the next field, the first after the last.
+    fn step_field_wrapping(&mut self) {
+        let order = self.focus_order();
+        if let Some(position) = order.iter().position(|&index| index == self.field) {
+            self.field = order[(position + 1) % order.len()];
         }
     }
 
@@ -701,11 +789,10 @@ impl Chooser {
         for field in &mut item.fields {
             field.error = None;
         }
-        if let Some((index, message)) = item
-            .fields
-            .iter()
-            .enumerate()
-            .find_map(|(index, field)| field.problem().map(|message| (index, message)))
+        let order = focus_order_of(item, self.inputs_layout);
+        if let Some((index, message)) = order
+            .into_iter()
+            .find_map(|index| item.fields[index].problem().map(|message| (index, message)))
         {
             item.fields[index].error = Some(message);
             self.field = index;
@@ -747,6 +834,18 @@ impl Chooser {
     fn description_lines(&self) -> usize {
         self.description_text().len()
     }
+}
+
+/// The order the focus walks the fields of `item`; see [`Chooser::focus_order`].
+fn focus_order_of(item: &ChooserItem, inputs_layout: bool) -> Vec<usize> {
+    let all = 0..item.fields.len();
+    if !inputs_layout {
+        return all.collect();
+    }
+    let long = |index: &usize| item.fields[*index].is_long();
+    let mut order: Vec<usize> = all.clone().filter(|index| !long(index)).collect();
+    order.extend(all.filter(long));
+    order
 }
 
 /// How wide the list needs to be for its longest line.
@@ -888,6 +987,10 @@ fn field_value_rows(field: &ChooserField, value: &str, focused: bool) -> Vec<Str
 /// Draws `chooser` into `area`: the list and the description (side by side,
 /// or stacked when the area is narrow) and the fields under them.
 pub fn render(frame: &mut Frame, area: Rect, chooser: &mut Chooser, styles: &Styles) {
+    if chooser.inputs_layout && chooser.focus == ChooserFocus::Fields {
+        inputs::render(frame, area, chooser, styles);
+        return;
+    }
     let (fields, focus_line) = field_lines(chooser, styles);
     let fields_height = (fields.len() as u16).min(area.height.saturating_sub(5));
     let [top, bottom] =

@@ -697,6 +697,25 @@ mod foundations {
         }
 
         #[test]
+        fn a_form_of_inputs_starts_on_the_required_text_and_esc_goes_back_to_the_list() {
+            let mut chooser = Chooser::new(vec![ChooserItem::new("ship", "Wysyła.")
+                .with_field(ChooserField::text("ticket"))
+                .with_field(ChooserField::multiline("notes"))
+                .with_field(ChooserField::multiline("prompt").required())])
+            .with_inputs_layout();
+            assert_eq!(chooser.on_key(press(KeyCode::Enter)), ChooserAction::None);
+            type_text(&mut chooser, "p");
+            assert_eq!(chooser.fields_of(0)[2].value(), "p");
+            // Short fields come first in the walk; after the last, `Tab` wraps.
+            chooser.on_key(press(KeyCode::Tab));
+            type_text(&mut chooser, "t");
+            assert_eq!(chooser.fields_of(0)[0].value(), "t");
+            assert_eq!(chooser.on_key(press(KeyCode::Esc)), ChooserAction::None);
+            assert_eq!(chooser.focus(), ChooserFocus::Actions);
+            assert_eq!(chooser.on_key(press(KeyCode::Esc)), ChooserAction::Cancel);
+        }
+
+        #[test]
         fn ctrl_j_in_a_one_line_or_choice_field_changes_nothing() {
             let mut chooser = Chooser::new(vec![ChooserItem::new("go", "Start.")
                 .with_field(ChooserField::text("title").required())
@@ -7120,6 +7139,53 @@ mod task_app_create {
         }
 
         #[test]
+        fn going_back_to_the_list_and_into_the_workflow_again_keeps_what_was_typed() {
+            let mut app = app_with(vec![titled(queued("a", 1), "NAR-1")]);
+            open_form(&mut app);
+            fill_ticket(&mut app, "NAR-18");
+            // `Shift+Tab` from the first field, like `Esc`, is the way back.
+            press(&mut app, KeyCode::BackTab);
+            assert_eq!(app.view_kind(), ViewKind::NewTask);
+            assert_eq!(
+                app.new_task_form().unwrap().chooser().focus(),
+                narsor::tui::chooser::ChooserFocus::Actions
+            );
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(
+                app.new_task_form().unwrap().chooser().focus(),
+                narsor::tui::chooser::ChooserFocus::Fields,
+                "Enter on a workflow goes into its fields"
+            );
+            assert_eq!(
+                field_value(&app, "implement-feature", "ticket_id"),
+                "NAR-18"
+            );
+        }
+
+        #[test]
+        fn tab_walks_the_fields_and_wraps_and_a_failed_send_lands_on_the_bad_field() {
+            let mut app = app_with(vec![titled(queued("a", 1), "NAR-1")]);
+            open_form(&mut app);
+            fill_ticket(&mut app, "NAR-18");
+            press(&mut app, KeyCode::Down);
+            typed(&mut app, "1-2");
+            let request = press(&mut app, KeyCode::Enter);
+            assert_eq!(request, Request::None, "attempts is not a number");
+            // The error is on `attempts`, which has the focus: typing goes there.
+            typed(&mut app, "x");
+            assert_eq!(
+                field_value(&app, "implement-feature", "attempts"),
+                "1-2",
+                "a letter is no part of a number"
+            );
+            press(&mut app, KeyCode::Backspace);
+            press(&mut app, KeyCode::Backspace);
+            press(&mut app, KeyCode::Backspace);
+            typed(&mut app, "3");
+            assert_eq!(field_value(&app, "implement-feature", "attempts"), "3");
+        }
+
+        #[test]
         fn esc_gives_the_selected_task_back_and_the_next_n_brings_the_data_back() {
             let mut app = app_with(vec![
                 titled(queued("a", 1), "NAR-1"),
@@ -7134,6 +7200,12 @@ mod task_app_create {
                 .draft(DRAFT_KEY)
                 .is_some_and(|text| text.contains("NAR-18")));
 
+            assert_eq!(
+                press(&mut app, KeyCode::Esc),
+                Request::None,
+                "from a field Esc goes back to the list of workflows"
+            );
+            assert_eq!(app.view_kind(), ViewKind::NewTask);
             assert_eq!(press(&mut app, KeyCode::Esc), Request::None);
             assert_eq!(app.view_kind(), ViewKind::Tasks);
             assert_eq!(
@@ -8400,6 +8472,7 @@ mod task_app_create {
             );
 
             // A good file: first checked, then created from.
+            press(&mut app, KeyCode::Enter);
             for _ in 0..bad_path.to_str().unwrap().len() {
                 press(&mut app, KeyCode::Backspace);
             }

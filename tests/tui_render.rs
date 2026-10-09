@@ -2017,7 +2017,7 @@ mod task_app_create_render {
     }
 
     #[test]
-    fn the_wide_form_has_the_list_the_description_and_the_fields_beside_the_untouched_task_list() {
+    fn the_wide_form_folds_the_list_into_a_strip_and_keeps_the_untouched_task_list() {
         let mut app = app();
         open_form(&mut app);
         press(&mut app, KeyCode::Tab);
@@ -2026,19 +2026,13 @@ mod task_app_create_render {
         for expected in [
             "Nowe zadanie → trafi na koniec kolejki (#3)",
             "implement-feature",
-            "fix-bug",
-            "ścieżka…",
-            "Opis",
             "Pełny cykl",
-            "wbudowany · wersja 1",
-            "ticket_id",
-            "(wymagane)",
-            "numer zgłoszenia",
-            "> NAR-18▏",
-            "attempts",
-            "liczba całkowita · ile razy ponawiać",
-            "‹ false ›",
-            "‹ narsor ›",
+            "ticket_id: NAR-18▏",
+            "attempts: ",
+            "dry_run: ‹ false ›",
+            "target_repo: ‹ narsor ›",
+            "ticket_id (wymagane) · numer zgłoszenia",
+            "brak pola tekstowego w tym workflow",
             // The list of tasks is where it was.
             "Zadania",
             "NAR-14",
@@ -2049,7 +2043,7 @@ mod task_app_create_render {
     }
 
     #[test]
-    fn the_narrow_form_takes_the_whole_screen_and_stacks_the_description_under_the_list() {
+    fn the_narrow_form_takes_the_whole_screen_and_folds_the_list_into_a_strip() {
         let mut app = app();
         open_form(&mut app);
         press(&mut app, KeyCode::Tab);
@@ -2058,9 +2052,7 @@ mod task_app_create_render {
         for expected in [
             "Nowe zadanie → trafi na koniec kolejki (#3)",
             "implement-feature",
-            "Opis",
-            "ticket_id",
-            "> NAR-18▏",
+            "ticket_id: NAR-18▏",
         ] {
             assert!(screen.contains(expected), "{expected}:\n{screen}");
         }
@@ -2068,6 +2060,129 @@ mod task_app_create_render {
         for row in screen.lines() {
             assert!(row.chars().count() <= 72, "{row}");
         }
+    }
+
+    fn open_prompt_form(app: &mut TaskApp, texts: &[&str]) {
+        keys(app, "n");
+        let mut inputs = vec![
+            workflow_input("ticket_id", ParamType::String, false, None),
+            workflow_input("dry_run", ParamType::Boolean, false, None),
+            workflow_input("target_repo", ParamType::Repository, false, None),
+        ];
+        for (position, name) in texts.iter().enumerate() {
+            inputs.push(workflow_input(name, ParamType::Text, position == 0, None));
+        }
+        app.open_new_task(
+            catalogue(vec![catalogue_workflow("ship", "Wysyła zmianę.", inputs)]),
+            registry(vec![repository("narsor", "git@github.com:acme/narsor.git")]),
+        );
+    }
+
+    #[test]
+    fn choosing_a_workflow_folds_the_list_and_gives_the_prompt_the_rest_of_the_screen() {
+        for (width, height) in [(120, 30), (60, 20)] {
+            let mut app = app();
+            open_prompt_form(&mut app, &["prompt"]);
+            let listed = draw_app(&mut app, width, height, false);
+            assert!(
+                listed.contains("Opis") && listed.contains("Akcje"),
+                "{listed}"
+            );
+
+            press(&mut app, KeyCode::Enter);
+            keys(&mut app, "pierwsza");
+            app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+            keys(&mut app, "druga");
+            let screen = draw_app(&mut app, width, height, false);
+            for expected in [
+                "ship",
+                "Wysyła zmianę.",
+                "ticket_id:",
+                "dry_run: ‹ false ›",
+                "target_repo: ‹ narsor ›",
+                "prompt (wymagane)",
+                "> pierwsza",
+                "  druga▏",
+            ] {
+                assert!(
+                    screen.contains(expected),
+                    "{width}x{height} {expected}:\n{screen}"
+                );
+            }
+            assert!(
+                !screen.contains("Akcje") && !screen.contains("Opis"),
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_line_of_the_prompt_wraps_and_the_cursor_stays_in_view() {
+        let mut app = app();
+        open_prompt_form(&mut app, &["prompt"]);
+        press(&mut app, KeyCode::Enter);
+        keys(&mut app, &"ab ".repeat(60));
+        let screen = draw_app(&mut app, 60, 20, false);
+        assert!(screen.contains('▏'), "{screen}");
+        assert!(
+            screen.lines().all(|row| row.chars().count() <= 60),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn with_two_text_fields_the_focused_one_stretches_and_the_other_folds() {
+        let mut app = app();
+        open_prompt_form(&mut app, &["prompt", "notatki"]);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Tab);
+        for line in ["1", "2", "3", "4", "5"] {
+            keys(&mut app, line);
+            app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        }
+        press(&mut app, KeyCode::Tab);
+        // Tab went on; the short fields come first, so the order is ticket,
+        // dry_run, repo, prompt, notes, and back round to the ticket.
+        let screen = draw_app(&mut app, 100, 30, false);
+        assert!(
+            screen.contains("notatki") && screen.contains("prompt (wymagane)"),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains("  4"),
+            "a folded field shows three lines at most:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_form_without_a_text_field_shows_the_bar_and_says_so() {
+        let mut app = app();
+        open_form(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let screen = draw_app(&mut app, 100, 24, false);
+        assert!(
+            screen.contains("brak pola tekstowego w tym workflow"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn three_text_fields_leave_the_focused_one_at_least_four_rows_at_60x20() {
+        let mut app = app();
+        open_prompt_form(&mut app, &["prompt", "notatki", "dodatki"]);
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..3 {
+            keys(&mut app, "x");
+            app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        }
+        let screen = draw_app(&mut app, 60, 20, false);
+        let rows: Vec<&str> = screen.lines().collect();
+        let header = rows
+            .iter()
+            .position(|row| row.contains("prompt (wymagane)"))
+            .unwrap();
+        let next = rows.iter().position(|row| row.contains("notatki")).unwrap();
+        assert!(next - header > 4, "{screen}");
     }
 
     #[test]

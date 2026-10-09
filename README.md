@@ -557,10 +557,10 @@ the current step or a draft.
 | Everywhere | `?` help, `q` quit (asks when a draft would be lost) |
 | List | `j` / `k` (`↓` / `↑`), `g` / `G`, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `r` |
 | Details | `Esc` list, `←` / `→` tabs, `Tab` content ↔ panel, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` follow the current step |
-| Panel | `Tab` actions ↔ fields, `Enter` send, `Alt+Enter` new line, `Esc` fold, `1`–`9` choose, `[` / `]` previous / next waiting |
+| Panel | `Tab` actions ↔ fields, `Enter` send, `Ctrl+J` new line (also `Shift+Enter` / `Alt+Enter` where the terminal reports modifiers), `Esc` fold, `1`–`9` choose, `[` / `]` previous / next waiting |
 | Menu | `j` / `k`, `1`–`9`, `Enter`, `Esc` and the shortcuts above |
 | Confirmation | `y` confirm, `n` / `Esc` take it back |
-| Forms | `Tab` / `Shift+Tab`, `←` / `→`, `Enter` send, `Esc` close (what was typed stays) |
+| Forms | `Tab` / `Shift+Tab`, `←` / `→`, `Enter` send, `Ctrl+J` new line, `Esc` back (from a new-task field to the list, then close; what was typed stays) |
 
 Colour means something: yellow what needs you, red what is wrong or cannot be
 undone, green what happens now, grey what is done or unavailable, cyan focus.
@@ -1112,7 +1112,13 @@ your version.
 `narsor tui`, then `n`: the catalogue opens as a list, each row naming its
 source (`built-in`, `user`, `root`, and `overrides: …` where a copy shadows a
 built-in). `j` / `k` change the selection and the inputs of the highlighted
-workflow are the form beside it; `Enter` queues the task. The last row, *Enter
+workflow are described beside it. `Enter` on a workflow goes into its inputs and
+the list folds to a strip with the workflow's name: the short inputs (`string`,
+`integer`, `boolean`, `repository`) make a bar, and each `text` input is a
+multi-line field — the one with the focus takes the rest of the screen, the
+others fold to their first lines. `Enter` queues the task, `Ctrl+J` starts a new
+line, `Esc` or `Shift+Tab` from the first field returns to the list with what
+was typed kept. A workflow without a `text` input gets the bar and nothing else. The last row, *Enter
 a path…*, takes an arbitrary path for a definition you are writing (a local
 daemon only; the path is validated first and every violation is listed).
 
