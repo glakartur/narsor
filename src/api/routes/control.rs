@@ -413,21 +413,40 @@ fn repository_view(entry: &RepositoryEntry) -> RepositoryView {
 /// Whether `remote` names a git server rather than the server's own disk:
 /// an `https`/`ssh`/`git` URL or an scp-like `[user@]host:path`.
 fn is_remote_git_url(remote: &str) -> bool {
-    let remote = remote.trim();
+    // Checked as given, not trimmed: what is validated is what gets stored.
+    // Whitespace, control characters and backslashes are where parsers
+    // disagree about where a URL ends.
+    if remote.is_empty()
+        || remote.chars().any(|ch| ch.is_whitespace() || ch == '\\')
+        || without_unsafe_chars(remote) != remote
+    {
+        return false;
+    }
+    // `ext::cmd` and `fd::n` are git transports that run commands, and
+    // `file:` is the server's own disk; none is a git server.
+    if remote.contains("::") {
+        return false;
+    }
     if let Some((scheme, rest)) = remote.split_once("://") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let host = authority.rsplit('@').next().unwrap_or_default();
         return matches!(
             scheme.to_ascii_lowercase().as_str(),
             "https" | "ssh" | "git"
-        ) && !rest.is_empty()
-            && !rest.starts_with('/');
+        ) && !host.is_empty()
+            && !host.starts_with(['-', ':']);
     }
     if remote.starts_with(['/', '.', '~', '-']) {
         return false;
     }
     // scp-like: a host, then a colon before any slash.
-    remote
-        .split_once(':')
-        .is_some_and(|(host, path)| !host.is_empty() && !host.contains('/') && !path.is_empty())
+    remote.split_once(':').is_some_and(|(host, path)| {
+        !host.is_empty()
+            && !host.contains('/')
+            && !path.is_empty()
+            && !host.eq_ignore_ascii_case("file")
+            && !host.rsplit('@').next().unwrap_or_default().starts_with('-')
+    })
 }
 
 /// A remote URL without the credentials it may embed

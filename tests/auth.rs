@@ -1728,6 +1728,16 @@ async fn a_network_server_serves_no_disk_paths_but_still_manages_remote_reposito
         ("file", "file:///srv/git/repo.git"),
         ("file-upper", "FILE:///srv/git/repo.git"),
         ("bare", "repo.git"),
+        ("ext", "ext::sh -c touch% /tmp/pwned"),
+        ("ext-bare", "ext::sh"),
+        ("fd", "fd::3"),
+        ("file-scp", "file:/srv/git/repo.git"),
+        ("padded", " https://example.com/acme.git"),
+        ("spaced", "https://example.com/acme.git --upload-pack=x"),
+        ("dash-host", "ssh://-oProxyCommand=x/acme.git"),
+        ("dash-scp", "-oProxyCommand=x:acme.git"),
+        ("backslash", "https://example.com\\@evil/acme.git"),
+        ("bidi", "https://example.com/\u{202E}acme.git"),
     ] {
         let (status, body) = server
             .call(
