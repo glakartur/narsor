@@ -28,6 +28,13 @@ impl From<String> for TranscriptId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TranscriptEntryId(String);
 
+impl TranscriptEntryId {
+    /// The id as text, for an adapter that has to derive another from it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl From<&str> for TranscriptEntryId {
     fn from(value: &str) -> Self {
         Self(value.to_owned())

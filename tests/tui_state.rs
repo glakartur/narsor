@@ -7563,3 +7563,697 @@ mod task_app_list {
         }
     }
 }
+
+mod task_app_detail {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use narsor::api::{ApiClient, ClientError, ConversationEntryDto, ConversationResponse};
+    use narsor::controller_protocol::{
+        ConversationUnavailableReason, ExecutionEventsResponse, ExecutionEventsSource, RunnerClient,
+    };
+    use narsor::domain::{Event, ExecutionStatus};
+    use narsor::engine::{ConversationState, PositionStatus, Timeline};
+    use narsor::orchestration::{Observation, QueueReason, TaskEventKind, TaskLifecycle};
+    use narsor::persistence::conversation::ConversationSource;
+    use narsor::tui::style::Styles;
+    use narsor::tui::task_app::detail::{
+        self, hyperlinks_supported, queue_text, readiness, short_age, unstarted_message,
+        DetailRead, Readiness,
+    };
+    use narsor::tui::task_app::tabs::conversation::{AttemptRead, Attempts, Conversation};
+    use narsor::tui::task_app::tabs::events::Availability;
+    use narsor::tui::task_app::tabs::info;
+    use narsor::tui::task_app::{DetailTab, Focus, TaskApp};
+    use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
+
+    use super::remote_support::{report, snapshot, RemoteHarness};
+    use super::task_app_support::{
+        event, execution_events, listing, position, queued, task, timeline, titled, with_controller,
+        with_runner,
+    };
+
+    fn offline_client() -> ApiClient {
+        ApiClient::new("127.0.0.1:9".parse().unwrap(), "token")
+    }
+
+    fn app() -> TaskApp {
+        TaskApp::new(offline_client(), "local", None)
+    }
+
+    fn press(app: &mut TaskApp, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn ch(app: &mut TaskApp, character: char) {
+        press(app, KeyCode::Char(character));
+    }
+
+    fn running(id: &str, rank: u32) -> narsor::controller_protocol::TaskSummary {
+        with_runner(
+            with_controller(task(id, "local", "running", rank)),
+            ExecutionStatus::Running,
+            "review",
+        )
+    }
+
+    /// An app over running `a` and `b`, with the details of `a` open.
+    fn details_app() -> TaskApp {
+        let mut app = app();
+        app.load(listing(
+            vec![titled(running("a", 1), "NAR-1"), titled(running("b", 2), "NAR-2")],
+            "c",
+        ));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Details);
+        app
+    }
+
+    fn read_timeline(app: &mut TaskApp, id: &str, revision: u64, steps: &[&str], current: &str) {
+        let positions = steps
+            .iter()
+            .map(|state| {
+                let status = if format!("{state} #1") == current {
+                    PositionStatus::InProgress
+                } else {
+                    PositionStatus::Succeeded
+                };
+                position(state, status)
+            })
+            .collect();
+        app.on_detail_read(
+            id,
+            revision,
+            DetailRead::Timeline(Ok(timeline(id, positions, Some(current)))),
+        );
+    }
+
+    fn selected_step(app: &TaskApp, id: &str) -> Option<String> {
+        app.detail()
+            .view(id)
+            .and_then(|view| view.progress().selected_label().map(str::to_string))
+    }
+
+    mod progress {
+        use super::*;
+
+        #[test]
+        fn follows_a_new_step_after_an_event() {
+            let mut app = details_app();
+            read_timeline(&mut app, "a", 1, &["plan", "edit", "review"], "review #1");
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("review #1"));
+            assert_eq!(app.detail().view("a").unwrap().progress().step_count(), Some((3, 3)));
+
+            // The runner moves on: the event bumps the row's revision, which makes the
+            // details due, and the new timeline takes the selection with it.
+            app.on_stream(event("e", "a", 2, TaskLifecycle::Running, TaskEventKind::Created));
+            assert!(app.detail().view("a").unwrap().progress().needs_read(2));
+            read_timeline(&mut app, "a", 2, &["plan", "edit", "review", "test"], "test #1");
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("test #1"));
+            assert_eq!(app.detail().view("a").unwrap().progress().step_count(), Some((4, 4)));
+        }
+
+        #[test]
+        fn f_stops_following_and_the_cursor_stays_on_its_step() {
+            let mut app = details_app();
+            read_timeline(&mut app, "a", 1, &["plan", "edit", "review"], "review #1");
+            assert!(app.detail().view("a").unwrap().progress().follows());
+
+            ch(&mut app, 'f');
+            assert!(!app.detail().view("a").unwrap().progress().follows());
+            read_timeline(&mut app, "a", 2, &["plan", "edit", "review", "test"], "test #1");
+            assert_eq!(
+                selected_step(&app, "a").as_deref(),
+                Some("review #1"),
+                "the cursor stays where it is"
+            );
+
+            ch(&mut app, 'f');
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("test #1"), "following again picks the running step up");
+        }
+
+        #[test]
+        fn moving_by_hand_ends_the_following_and_a_refresh_changes_neither() {
+            let mut app = details_app();
+            read_timeline(&mut app, "a", 1, &["plan", "edit", "review"], "review #1");
+            ch(&mut app, 'k');
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("edit #1"));
+            assert!(!app.detail().view("a").unwrap().progress().follows());
+
+            let tasks = vec![titled(running("a", 1), "NAR-1"), titled(running("b", 2), "NAR-2")];
+            app.load(listing(tasks, "d"));
+            read_timeline(&mut app, "a", 1, &["plan", "edit", "review"], "review #1");
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("edit #1"));
+            assert!(!app.detail().view("a").unwrap().progress().follows());
+            assert_eq!(app.detail().tab(), DetailTab::Progress);
+            assert_eq!(app.focus(), Focus::Details);
+
+            ch(&mut app, 'g');
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("plan #1"));
+            ch(&mut app, 'G');
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("review #1"));
+        }
+
+        #[test]
+        fn coming_back_to_a_task_finds_its_tab_and_cursor() {
+            let mut app = details_app();
+            read_timeline(&mut app, "a", 1, &["plan", "edit", "review"], "review #1");
+            ch(&mut app, 'k');
+            ch(&mut app, 'k');
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("plan #1"));
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.detail().tab(), DetailTab::Events);
+            app.on_detail_read(
+                "a",
+                1,
+                DetailRead::Events {
+                    after: 0,
+                    result: Ok(ExecutionEventsResponse::Available {
+                        events: execution_events(5),
+                        has_more: false,
+                        source: ExecutionEventsSource::Runner,
+                    }),
+                },
+            );
+            ch(&mut app, 'k');
+            ch(&mut app, 'k');
+            assert_eq!(app.detail().view("a").unwrap().events().cursor(), 2);
+
+            // Away to b and back.
+            press(&mut app, KeyCode::Esc);
+            ch(&mut app, 'j');
+            assert_eq!(app.list().selected_id(), Some("b"));
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.detail().tab(), DetailTab::Events, "the tab is the operator's, not the task's");
+            assert!(app.detail().view("b").is_none_or(|view| view.events().events().is_empty()));
+            press(&mut app, KeyCode::Esc);
+            ch(&mut app, 'k');
+            press(&mut app, KeyCode::Enter);
+
+            assert_eq!(app.list().selected_id(), Some("a"));
+            assert_eq!(app.detail().view("a").unwrap().events().cursor(), 2);
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("plan #1"));
+            assert!(!app.detail().view("a").unwrap().progress().follows());
+        }
+
+        #[test]
+        fn a_failed_timeline_read_is_a_message_in_the_tab_and_the_rest_works() {
+            let mut app = details_app();
+            app.on_detail_read(
+                "a",
+                1,
+                DetailRead::Timeline(Err(ClientError::Degraded {
+                    code: "runner_timeout".into(),
+                    message: "the runner did not answer".into(),
+                })),
+            );
+            let view = app.detail().view("a").unwrap();
+            assert_eq!(view.progress().failure(), Some("the runner did not answer"));
+            assert!(app.connection().is_live(), "a 503 with a reason is not a lost connection");
+
+            // The other tabs still work.
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.detail().tab(), DetailTab::Info);
+            let lines = info::lines(app.list().selected().unwrap(), &Styles::new(false), false);
+            assert!(!lines.is_empty());
+
+            // The next good read clears the message.
+            read_timeline(&mut app, "a", 1, &["plan"], "plan #1");
+            assert_eq!(app.detail().view("a").unwrap().progress().failure(), None);
+        }
+    }
+
+    mod not_started {
+        use super::*;
+
+        fn flatten(lines: &[ratatui::text::Line<'_>]) -> String {
+            lines
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        #[test]
+        fn a_queued_task_says_it_has_not_started_and_info_shows_what_it_was_sealed_with() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1), queued("b", 2)], "c"));
+            app.list_mut().select("b");
+            let task = app.list().selected().unwrap().clone();
+            let place = app.list().queue_position("b");
+            assert_eq!(place, Some(2));
+            assert_eq!(readiness(&task), Readiness::NotStarted);
+            assert_eq!(
+                unstarted_message(&task, place).as_deref(),
+                Some("jeszcze nie wystartowało, #2 w kolejce")
+            );
+
+            let text = flatten(&info::lines(&task, &Styles::new(false), false));
+            for expected in ["Zapieczętowane wejścia", "launch digest", "digest", "środowisko", "implement-feature v3"] {
+                assert!(text.contains(expected), "{expected:?} in\n{text}");
+            }
+        }
+
+        #[tokio::test]
+        async fn nothing_is_read_for_a_task_without_an_execution() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1)], "c"));
+            app.sync_detail().await;
+            assert!(app.connection().is_live(), "no request was made, so none failed");
+            assert!(app.detail().view("a").is_none_or(|view| view.progress().timeline().is_none()));
+        }
+
+        #[test]
+        fn an_archived_task_says_its_storage_went_with_the_archiving() {
+            let archived = task("a", "local", "archived", 1);
+            assert_eq!(readiness(&archived), Readiness::Archived);
+            assert_eq!(
+                unstarted_message(&archived, None).as_deref(),
+                Some("storage usunięty przy archiwizacji")
+            );
+            let provisioning = task("b", "local", "provisioning", 2);
+            assert_eq!(
+                unstarted_message(&provisioning, None).as_deref(),
+                Some("jeszcze nie wystartowało, provisioning")
+            );
+            assert_eq!(unstarted_message(&running("c", 3), None), None);
+        }
+
+        #[test]
+        fn the_queue_line_says_why_a_task_waits() {
+            let waiting = super::super::task_app_support::waiting_for_capacity(queued("a", 1), 2, 2, 3);
+            assert_eq!(queue_text(&waiting, Some(2)), "#2 · czeka na slot (2/3)");
+            let mut offline = queued("b", 2);
+            offline.queue = Some(narsor::controller_protocol::QueueView {
+                reason: QueueReason::ControllerOffline,
+                message: String::new(),
+                since: offline.as_of - chrono::Duration::minutes(4),
+            });
+            assert_eq!(queue_text(&offline, Some(1)), "kontroler offline 4m");
+            assert_eq!(queue_text(&queued("c", 3), Some(3)), "#3 · w kolejce");
+        }
+    }
+
+    mod events_and_conversation {
+        use super::*;
+
+        fn open_tab(app: &mut TaskApp, tab: DetailTab) {
+            while app.detail().tab() != tab {
+                press(app, KeyCode::Right);
+            }
+        }
+
+        #[test]
+        fn a_failed_events_read_is_a_message_in_the_tab_and_not_a_lost_connection() {
+            let mut app = details_app();
+            open_tab(&mut app, DetailTab::Events);
+            app.on_detail_read(
+                "a",
+                1,
+                DetailRead::Events {
+                    after: 0,
+                    result: Err(ClientError::Degraded {
+                        code: "runner_timeout".into(),
+                        message: "the runner did not answer in time".into(),
+                    }),
+                },
+            );
+            let events = app.detail().view("a").unwrap().events();
+            assert_eq!(events.failure(), Some("the runner did not answer in time"));
+            assert!(app.connection().is_live());
+            assert!(app.mutation_allowed());
+
+            // An unreachable server is another matter.
+            app.on_detail_read(
+                "a",
+                1,
+                DetailRead::Events {
+                    after: 0,
+                    result: Err(ClientError::Unavailable("refused".into())),
+                },
+            );
+            assert!(!app.connection().is_live());
+        }
+
+        #[test]
+        fn unavailable_events_keep_the_reason_and_what_was_read_before() {
+            let mut app = details_app();
+            let available = |events| {
+                Ok(ExecutionEventsResponse::Available {
+                    events,
+                    has_more: false,
+                    source: ExecutionEventsSource::Runner,
+                })
+            };
+            app.on_detail_read("a", 1, DetailRead::Events { after: 0, result: available(execution_events(3)) });
+            app.on_detail_read(
+                "a",
+                2,
+                DetailRead::Events {
+                    after: 3,
+                    result: Ok(ExecutionEventsResponse::Unavailable {
+                        reason: ConversationUnavailableReason::RunnerUnreachable,
+                        message: "the runner has not been heard from lately".into(),
+                    }),
+                },
+            );
+            let events = app.detail().view("a").unwrap().events();
+            assert_eq!(events.events().len(), 3);
+            assert!(matches!(
+                events.availability(),
+                Availability::Unavailable { reason: ConversationUnavailableReason::RunnerUnreachable, .. }
+            ));
+        }
+
+        #[test]
+        fn events_are_appended_after_the_last_sequence_and_the_cursor_follows_the_end() {
+            let mut app = details_app();
+            let page = |events: Vec<Event>, has_more| {
+                Ok(ExecutionEventsResponse::Available {
+                    events,
+                    has_more,
+                    source: ExecutionEventsSource::Storage,
+                })
+            };
+            app.on_detail_read("a", 1, DetailRead::Events { after: 0, result: page(execution_events(3), true) });
+            let events = app.detail().view("a").unwrap().events();
+            assert!(events.has_more());
+            assert_eq!(events.after(), 3);
+            assert_eq!(events.cursor(), 2);
+            app.on_detail_read("a", 1, DetailRead::Events { after: 3, result: page(execution_events(6)[3..].to_vec(), false) });
+            let events = app.detail().view("a").unwrap().events();
+            assert_eq!(events.events().len(), 6);
+            assert_eq!(events.cursor(), 5, "a cursor on the last event stays on the last");
+        }
+
+        #[test]
+        fn v_opens_the_detail_of_the_event_and_ctrl_v_the_raw_rows() {
+            let mut app = details_app();
+            open_tab(&mut app, DetailTab::Events);
+            app.on_detail_read(
+                "a",
+                1,
+                DetailRead::Events {
+                    after: 0,
+                    result: Ok(ExecutionEventsResponse::Available {
+                        events: execution_events(3),
+                        has_more: false,
+                        source: ExecutionEventsSource::Runner,
+                    }),
+                },
+            );
+            ch(&mut app, 'v');
+            assert!(app.detail().view("a").unwrap().events().is_detail_open());
+            ch(&mut app, 'v');
+            assert!(!app.detail().view("a").unwrap().events().is_detail_open());
+            app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+            assert!(app.detail().view("a").unwrap().events().is_raw());
+            ch(&mut app, 'g');
+            assert_eq!(app.detail().view("a").unwrap().events().cursor(), 0);
+        }
+
+        fn entry(id: &str, text: &str) -> TranscriptEntry {
+            TranscriptEntry::new(TranscriptEntryId::from(id), vec![text.to_string()], text.as_bytes().to_vec())
+                .with_header(format!("AGENT · {id}"))
+        }
+
+        fn read(entries: Vec<TranscriptEntry>) -> AttemptRead {
+            AttemptRead {
+                entries,
+                next_entry: 3,
+                closed: true,
+                truncated_tail: false,
+                complete: true,
+                no_record: false,
+            }
+        }
+
+        #[test]
+        fn the_conversation_is_every_attempt_in_the_order_of_the_steps() {
+            let recorded = |state: &str| {
+                let mut step = position(state, PositionStatus::Succeeded);
+                step.conversation = ConversationState::Recorded;
+                step
+            };
+            let positions = vec![recorded("plan"), position("script", PositionStatus::Succeeded), recorded("edit")];
+            let mut attempts = Attempts::default();
+            attempts.apply("act-plan", 1, 0, Ok(read(vec![entry("1", "plan one"), entry("2", "plan two")])));
+            let mut conversation = Conversation::new("a");
+            conversation.rebuild(&positions, &attempts);
+            assert!(conversation.is_loading(), "act-edit was not read yet");
+            assert_eq!(conversation.transcript().entries().len(), 3, "a heading and two entries");
+
+            attempts.apply("act-edit", 1, 0, Ok(read(vec![entry("1", "edit one")])));
+            conversation.rebuild(&positions, &attempts);
+            assert!(!conversation.is_loading());
+            let lines: Vec<String> = conversation
+                .transcript()
+                .logical_lines()
+                .into_iter()
+                .map(|line| line.text)
+                .collect();
+            let at = |needle: &str| lines.iter().position(|line| line.contains(needle)).unwrap();
+            assert!(at("plan #1") < at("plan one") && at("plan two") < at("edit #1") && at("edit #1") < at("edit one"), "{lines:?}");
+
+            attempts.apply("act-plan", 2, 3, Err("the runner did not answer".into()));
+            conversation.rebuild(&positions, &attempts);
+            assert_eq!(conversation.failure(), Some("plan #1: the runner did not answer"));
+            assert_eq!(conversation.transcript().entries().len(), 5, "what was read stays");
+        }
+
+        #[test]
+        fn keys_scroll_expand_and_switch_to_the_raw_view_of_the_conversation() {
+            let mut app = details_app();
+            open_tab(&mut app, DetailTab::Conversation);
+            // No transcript yet: keys are harmless.
+            ch(&mut app, 'j');
+            press(&mut app, KeyCode::PageDown);
+            ch(&mut app, 'G');
+            ch(&mut app, 'v');
+            assert_eq!(app.detail().tab(), DetailTab::Conversation);
+        }
+    }
+
+    mod relay {
+        use super::*;
+
+        /// The runner's side of one relayed events read.
+        async fn answer_events(runner: &RunnerClient, events: Vec<Event>, has_more: bool) {
+            loop {
+                let poll = runner.poll(None, 5).await.expect("poll");
+                if let Some(request) = poll.execution_events.first() {
+                    let page = narsor::controller_protocol::ExecutionEventsPage { events, has_more };
+                    runner
+                        .upload_execution_events(&request.request_id, &page)
+                        .await
+                        .expect("upload");
+                    return;
+                }
+            }
+        }
+
+        /// The runner's side of one relayed conversation page.
+        async fn answer_page(runner: &RunnerClient, page: ConversationResponse) {
+            loop {
+                let poll = runner.poll(None, 5).await.expect("poll");
+                if let Some(request) = poll.conversation_pages.first() {
+                    runner
+                        .upload_conversation_page(&request.request_id, &page)
+                        .await
+                        .expect("upload");
+                    return;
+                }
+            }
+        }
+
+        fn live_snapshot() -> narsor::orchestration::RunnerSnapshot {
+            let mut recorded = position("plan", PositionStatus::Succeeded);
+            recorded.conversation = ConversationState::Recorded;
+            let current = position("review", PositionStatus::InProgress);
+            let mut first = snapshot(1, None);
+            first.timeline = Some(Timeline {
+                default_position: Some(current.label.clone()),
+                positions: vec![recorded, current],
+                ..Timeline::default()
+            });
+            first
+        }
+
+        async fn app_over(harness: &RemoteHarness) -> TaskApp {
+            let client = harness.owner.clone();
+            let mut app = TaskApp::new(client, "remote", None);
+            app.refresh().await;
+            assert_eq!(app.list().tasks().len(), 1);
+            press(&mut app, KeyCode::Enter);
+            app
+        }
+
+        #[tokio::test]
+        async fn the_timeline_of_a_remote_task_is_read_and_followed() {
+            let harness = RemoteHarness::start().await;
+            harness.running("task-1", "k8s", live_snapshot()).await;
+            let mut app = app_over(&harness).await;
+
+            app.sync_detail().await;
+            let view = app.detail().view("task-1").unwrap();
+            assert_eq!(view.progress().positions().len(), 2);
+            assert_eq!(view.progress().selected_label(), Some("review #1"));
+            assert!(app.connection().is_live());
+        }
+
+        #[tokio::test]
+        async fn events_of_a_live_runner_travel_through_the_relay() {
+            let harness = RemoteHarness::start().await;
+            let running = harness.running("task-1", "k8s", live_snapshot()).await;
+            let mut app = app_over(&harness).await;
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.detail().tab(), DetailTab::Events);
+
+            let (_, ()) = tokio::join!(
+                app.sync_detail(),
+                answer_events(&running.runner, execution_events(4), false)
+            );
+            let events = app.detail().view("task-1").unwrap().events();
+            assert_eq!(events.events().len(), 4);
+            assert_eq!(*events.availability(), Availability::Available(ExecutionEventsSource::Runner));
+        }
+
+        #[tokio::test]
+        async fn a_remote_task_without_a_live_runner_says_why_in_the_events_tab() {
+            let harness = RemoteHarness::start().await;
+            let running = harness.running("task-1", "k8s", live_snapshot()).await;
+            running
+                .controller
+                .report(&report(
+                    "task-1",
+                    running.epoch,
+                    1,
+                    Observation::WorkloadLost { state_known: true },
+                    Some(1),
+                ))
+                .await
+                .expect("lost");
+            let mut app = app_over(&harness).await;
+            assert_eq!(app.list().selected().unwrap().lifecycle, TaskLifecycle::Interrupted);
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Right);
+
+            app.sync_detail().await;
+            match app.detail().view("task-1").unwrap().events().availability() {
+                Availability::Unavailable { reason, message } => {
+                    assert_eq!(*reason, ConversationUnavailableReason::Interrupted);
+                    assert!(message.contains("runner is not running"), "{message}");
+                }
+                other => panic!("expected the reason, got {other:?}"),
+            }
+            assert!(app.connection().is_live());
+        }
+
+        #[tokio::test]
+        async fn the_conversation_pages_of_a_recorded_step_come_through_the_relay() {
+            let harness = RemoteHarness::start().await;
+            let running = harness.running("task-1", "k8s", live_snapshot()).await;
+            let mut app = app_over(&harness).await;
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.detail().tab(), DetailTab::Conversation);
+
+            let page = ConversationResponse::Recorded {
+                entries: vec![ConversationEntryDto {
+                    entry_number: 1,
+                    timestamp: chrono::Utc::now(),
+                    source: ConversationSource::Narsor,
+                    raw_base64: {
+                        use base64::Engine as _;
+                        base64::engine::general_purpose::STANDARD
+                            .encode(r#"{"event":"prompt","prompt":"Fix it"}"#)
+                    },
+                }],
+                next_entry: 2,
+                closed: true,
+                truncated_tail: false,
+            };
+            let (_, ()) = tokio::join!(app.sync_detail(), answer_page(&running.runner, page));
+            let view = app.detail().view("task-1").unwrap();
+            let lines: Vec<String> = view
+                .conversation()
+                .transcript()
+                .logical_lines()
+                .into_iter()
+                .map(|line| line.text)
+                .collect();
+            assert!(lines.iter().any(|line| line.contains("plan #1")), "{lines:?}");
+            assert!(lines.iter().any(|line| line.contains("Fix it")), "{lines:?}");
+            assert!(view.attempts().get("act-plan").is_some());
+        }
+    }
+
+    mod odds_and_ends {
+        use super::*;
+
+        #[test]
+        fn ages_use_the_largest_whole_unit() {
+            assert_eq!(short_age(-5), "0s");
+            assert_eq!(short_age(45), "45s");
+            assert_eq!(short_age(240), "4m");
+            assert_eq!(short_age(3 * 3600 + 59), "3h");
+            assert_eq!(short_age(2 * 86400), "2d");
+        }
+
+        #[test]
+        fn hyperlinks_are_only_for_terminals_known_to_draw_them() {
+            let env = |pairs: &'static [(&'static str, &'static str)]| {
+                move |name: &str| {
+                    pairs
+                        .iter()
+                        .find(|(key, _)| *key == name)
+                        .map(|(_, value)| (*value).to_string())
+                }
+            };
+            assert!(hyperlinks_supported(env(&[("TERM_PROGRAM", "iTerm.app")])));
+            assert!(hyperlinks_supported(env(&[("WT_SESSION", "x")])));
+            assert!(hyperlinks_supported(env(&[("VTE_VERSION", "6800")])));
+            assert!(hyperlinks_supported(env(&[("TERM", "xterm-kitty")])));
+            assert!(!hyperlinks_supported(env(&[("VTE_VERSION", "4000")])));
+            assert!(!hyperlinks_supported(env(&[("TERM", "xterm-256color")])));
+            assert!(!hyperlinks_supported(env(&[("TERM", "dumb"), ("WT_SESSION", "x")])));
+        }
+
+        #[test]
+        fn the_areas_leave_room_for_a_panel_at_the_bottom() {
+            let area = ratatui::layout::Rect::new(10, 2, 80, 20);
+            let plain = detail::areas(area, 0);
+            assert_eq!(plain.header.height, 2);
+            assert_eq!(plain.tabs.y, area.y + 2);
+            assert_eq!(plain.content.y, area.y + 3);
+            assert_eq!(plain.content.height, 17);
+            assert_eq!(plain.panel, None);
+
+            let with_panel = detail::areas(area, 6);
+            assert_eq!(with_panel.content.height, 11);
+            let panel = with_panel.panel.expect("a panel");
+            assert_eq!((panel.y, panel.height), (area.y + 14, 6));
+            assert_eq!(detail::areas(area, 40).content.height, 1, "the content keeps a row");
+        }
+
+        #[test]
+        fn the_details_of_a_task_that_left_the_list_are_forgotten() {
+            let mut app = details_app();
+            read_timeline_for(&mut app, "b");
+            assert!(app.detail().view("b").is_some());
+            app.load(listing(vec![titled(running("a", 1), "NAR-1")], "d"));
+            assert!(app.detail().view("b").is_none());
+        }
+
+        fn read_timeline_for(app: &mut TaskApp, id: &str) {
+            app.on_detail_read(
+                id,
+                1,
+                DetailRead::Timeline(Ok(timeline(id, vec![position("plan", PositionStatus::Succeeded)], None))),
+            );
+        }
+    }
+}

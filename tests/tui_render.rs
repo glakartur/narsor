@@ -21,6 +21,8 @@ use narsor::tui::connection::Connection;
 use narsor::tui::keymap::{self, Context};
 use narsor::tui::style::Styles;
 
+mod environment_support;
+mod remote_support;
 mod task_app_support;
 
 fn draw(width: u16, height: u16, paint: impl FnOnce(&mut ratatui::Frame)) -> Buffer {
@@ -334,10 +336,16 @@ mod colour_discipline {
         "chooser.rs",
         "connection.rs",
         "keymap.rs",
+        "task_app/detail.rs",
         "task_app/layout.rs",
         "task_app/list.rs",
         "task_app/mod.rs",
         "task_app/notify.rs",
+        "task_app/tabs.rs",
+        "task_app/tabs/conversation.rs",
+        "task_app/tabs/events.rs",
+        "task_app/tabs/info.rs",
+        "task_app/tabs/progress.rs",
     ];
 
     /// The one module that may name a colour.
@@ -513,7 +521,7 @@ mod task_app_render {
         let bar = rows(&buffer).last().cloned().unwrap();
         let _ = bar;
         assert!(screen.contains("następny czekający"), "the bar shows the list keys:\n{screen}");
-        assert!(screen.contains("szczegóły zadania"));
+        assert!(screen.contains("Przebieg") && screen.contains("Zdarzenia"), "the details have their tabs:\n{screen}");
     }
 
     #[test]
@@ -536,12 +544,12 @@ mod task_app_render {
         let mut app = busy_app();
         let list = render(90, 30, &mut app, &Styles::new(false));
         assert!(screen(&list).contains("NAR-17"));
-        assert!(!screen(&list).contains("szczegóły zadania"));
+        assert!(!screen(&list).contains("Przebieg"));
         assert!(screen(&list).contains("Zadania"));
 
         press(&mut app, KeyCode::Enter);
         let details = render(90, 30, &mut app, &Styles::new(false));
-        assert!(screen(&details).contains("szczegóły zadania"));
+        assert!(screen(&details).contains("Przebieg"));
         assert!(!screen(&details).contains("NAR-17"));
         assert!(screen(&details).contains("lista"), "the bar offers the way back");
     }
@@ -681,5 +689,315 @@ mod task_app_render {
             .collect();
         assert!(row.contains('…'), "{row:?}");
         assert!(row.contains("implement"), "{row:?}");
+    }
+}
+
+mod task_app_detail_render {
+    use super::*;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use narsor::api::ApiClient;
+    use narsor::controller_protocol::{ExecutionEventsResponse, QueueView};
+    use narsor::domain::ExecutionStatus;
+    use narsor::engine::{ConversationState, PositionStatus, Timeline};
+    use narsor::orchestration::QueueReason;
+    use narsor::tui::task_app::detail::DetailRead;
+    use narsor::tui::task_app::{layout, TaskApp};
+
+    use crate::remote_support::{snapshot, RemoteHarness};
+    use crate::task_app_support::{
+        displayed, execution_events, listing, position, queued, task, timeline, with_controller,
+        with_runner,
+    };
+
+    fn app() -> TaskApp {
+        let client = ApiClient::new("127.0.0.1:9".parse().unwrap(), "token");
+        TaskApp::new(client, "local", None)
+    }
+
+    fn press(app: &mut TaskApp, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn render(app: &mut TaskApp, styles: &Styles) -> Buffer {
+        draw(120, 30, |frame| {
+            layout::render(frame, app, styles, Instant::now())
+        })
+    }
+
+    /// `NAR-12`: running at the third of five steps, with a Jira link and a PR
+    /// link that has no value.
+    fn running_app() -> TaskApp {
+        let mut app = app();
+        let running = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        );
+        app.load(listing(
+            vec![displayed(
+                running,
+                "NAR-12 Zmiana API zamówień",
+                &[
+                    ("Jira", "NAR-12", Some("https://jira.example/browse/NAR-12")),
+                    ("PR", "—", None),
+                ],
+            )],
+            "c",
+        ));
+        let steps = ["plan", "edit", "review", "test", "ship"];
+        let positions = steps
+            .iter()
+            .map(|state| {
+                let status = match *state {
+                    "review" => PositionStatus::InProgress,
+                    "plan" | "edit" => PositionStatus::Succeeded,
+                    _ => PositionStatus::Succeeded,
+                };
+                position(state, status)
+            })
+            .collect();
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline("a", positions, Some("review #1")))),
+        );
+        press(&mut app, KeyCode::Enter);
+        app
+    }
+
+    #[test]
+    fn the_header_of_a_running_task_shows_the_display_the_step_and_the_state() {
+        let mut app = running_app();
+        let buffer = render(&mut app, &Styles::new(false));
+        let rows = rows(&buffer);
+        // Row 0 is the frame; the details start on row 1.
+        assert!(rows[1].contains("NAR-12 Zmiana API zamówień"), "{}", rows[1]);
+        assert!(rows[1].contains("implement-feature v3"), "{}", rows[1]);
+        assert!(rows[2].contains("Jira NAR-12 ↗"), "{}", rows[2]);
+        assert!(rows[2].contains("PR: —"), "a link without a value: {}", rows[2]);
+        assert!(!rows[2].contains("PR — ↗"));
+        assert!(rows[2].contains("● running"), "{}", rows[2]);
+        assert!(rows[2].contains("krok 3/5"), "{}", rows[2]);
+        for tab in ["Przebieg", "Rozmowa", "Zdarzenia", "Dyrygent", "Info"] {
+            assert!(rows[3].contains(tab), "{tab} in {}", rows[3]);
+        }
+        assert!(rows[3].contains("podąża"), "{}", rows[3]);
+    }
+
+    #[test]
+    fn the_axis_has_a_row_per_step_and_marks_the_selected_one() {
+        let mut app = running_app();
+        let buffer = render(&mut app, &Styles::new(false));
+        let screen = screen(&buffer);
+        for expected in ["✓ plan #1", "✓ edit #1", "● review #1", "▸● review #1", "w toku"] {
+            assert!(screen.contains(expected), "{expected:?} in\n{screen}");
+        }
+        // The axis is the left part of the details: the selected step's own heading is on the right.
+        let row = |needle: &str| {
+            rows(&buffer)
+                .iter()
+                .position(|row| row.chars().skip(30).take(30).collect::<String>().contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} is not on the axis"))
+        };
+        assert!(row("plan #1") < row("edit #1") && row("edit #1") < row("review #1") && row("review #1") < row("test #1"));
+        // Without colour the same is said in words and glyphs.
+        let plain = render(&mut app, &Styles::new(true));
+        assert!(super::screen(&plain).contains("▸● review #1"));
+    }
+
+    #[test]
+    fn hyperlinks_are_written_only_when_the_terminal_draws_them() {
+        let mut app = running_app();
+        let plain = screen(&render(&mut app, &Styles::new(false)));
+        assert!(!plain.contains('\u{1b}'));
+
+        app.detail_mut().set_hyperlinks(true);
+        let buffer = render(&mut app, &Styles::new(false));
+        let screen = screen(&buffer);
+        assert!(
+            screen.contains("\u{1b}]8;;https://jira.example/browse/NAR-12\u{1b}\\Jira NAR-12 ↗\u{1b}]8;;\u{1b}\\"),
+            "{:?}",
+            rows(&buffer)[2]
+        );
+        assert_eq!(screen.matches("\u{1b}]8;;https").count(), 1, "only the link with a target");
+    }
+
+    #[test]
+    fn a_queued_task_says_it_has_not_started_and_where_it_waits() {
+        let mut app = app();
+        let waiting = narsor_waiting(queued("b", 2), 2, 2, 3);
+        app.load(listing(vec![queued("a", 1), displayed(waiting, "NAR-17", &[])], "c"));
+        app.list_mut().select("b");
+        press(&mut app, KeyCode::Enter);
+
+        let buffer = render(&mut app, &Styles::new(false));
+        let rows = rows(&buffer);
+        assert!(rows[2].contains("#2 · czeka na slot (2/3)"), "{}", rows[2]);
+        let screen = screen(&buffer);
+        assert!(screen.contains("jeszcze nie wystartowało, #2 w kolejce"), "{screen}");
+
+        // The other execution tabs say the same; Info shows what is there.
+        press(&mut app, KeyCode::Right);
+        assert!(super::screen(&render(&mut app, &Styles::new(false))).contains("jeszcze nie wystartowało"));
+        press(&mut app, KeyCode::Right);
+        assert!(super::screen(&render(&mut app, &Styles::new(false))).contains("jeszcze nie wystartowało"));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        let info = super::screen(&render(&mut app, &Styles::new(false)));
+        assert!(info.contains("Zapieczętowane wejścia") && info.contains("launch digest"), "{info}");
+    }
+
+    fn narsor_waiting(
+        mut task: narsor::controller_protocol::TaskSummary,
+        position: u32,
+        running: u32,
+        limit: u32,
+    ) -> narsor::controller_protocol::TaskSummary {
+        let reason = QueueReason::WaitingForCapacity { position, running, limit };
+        task.queue = Some(QueueView {
+            message: reason.describe(),
+            reason,
+            since: task.as_of,
+        });
+        task
+    }
+
+    #[test]
+    fn a_controller_that_is_gone_shows_in_the_queue_line() {
+        let mut app = app();
+        let mut waiting = queued("a", 1);
+        waiting.queue = Some(QueueView {
+            reason: QueueReason::ControllerOffline,
+            message: String::new(),
+            since: waiting.as_of - chrono::Duration::minutes(4),
+        });
+        app.load(listing(vec![waiting], "c"));
+        let buffer = render(&mut app, &Styles::new(false));
+        assert!(rows(&buffer)[2].contains("kontroler offline 4m"), "{}", rows(&buffer)[2]);
+    }
+
+    #[test]
+    fn an_archived_task_says_its_storage_is_gone() {
+        let mut app = app();
+        app.load(listing(vec![task("a", "local", "archived", 1)], "c"));
+        press(&mut app, KeyCode::Enter);
+        let screen = screen(&render(&mut app, &Styles::new(false)));
+        assert!(screen.contains("storage usunięty przy archiwizacji"), "{screen}");
+    }
+
+    #[test]
+    fn events_that_cannot_be_read_say_why_in_their_tab() {
+        let mut app = running_app();
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Events {
+                after: 0,
+                result: Ok(ExecutionEventsResponse::Unavailable {
+                    reason: narsor::controller_protocol::ConversationUnavailableReason::RunnerUnreachable,
+                    message: "the runner has not been heard from lately".into(),
+                }),
+            },
+        );
+        let screen = screen(&render(&mut app, &Styles::new(false)));
+        assert!(screen.contains("zdarzenia niedostępne: the runner has not been heard from lately"), "{screen}");
+        // The rest of the screen is intact.
+        assert!(screen.contains("NAR-12 Zmiana API zamówień"));
+    }
+
+    #[test]
+    fn events_are_listed_with_the_detail_of_the_selected_one() {
+        let mut app = running_app();
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Events {
+                after: 0,
+                result: Ok(ExecutionEventsResponse::Available {
+                    events: execution_events(4),
+                    has_more: false,
+                    source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                }),
+            },
+        );
+        let list = screen(&render(&mut app, &Styles::new(false)));
+        assert!(list.contains("state_entered") && list.contains("state-4"), "{list}");
+        assert!(!list.contains("szczegóły zdarzenia"));
+        press(&mut app, KeyCode::Char('v'));
+        let detail = screen(&render(&mut app, &Styles::new(false)));
+        assert!(detail.contains("szczegóły zdarzenia 4"), "{detail}");
+        assert!(detail.contains("\"sequence\": 4"), "{detail}");
+    }
+
+    #[test]
+    fn the_conversation_tab_shows_a_message_for_a_task_without_one() {
+        let mut app = running_app();
+        press(&mut app, KeyCode::Right);
+        let screen = screen(&render(&mut app, &Styles::new(false)));
+        assert!(screen.contains("brak rozmowy"), "{screen}");
+    }
+
+    #[test]
+    fn text_from_the_workflow_and_the_runner_never_carries_terminal_controls() {
+        let mut app = app();
+        let hostile = |text: &str| text.replace('@', "\u{1b}[31m\u{202e}");
+        let running = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        );
+        app.load(listing(
+            vec![displayed(
+                running,
+                &hostile("T@itle"),
+                &[(&hostile("La@bel"), &hostile("Te@xt"), Some("https://x.example/"))],
+            )],
+            "c",
+        ));
+        let mut step = position("st@ep", PositionStatus::Failed);
+        step.label = hostile("st@ep #1");
+        step.error = Some(hostile("bo@om"));
+        app.on_detail_read("a", 1, DetailRead::Timeline(Ok(timeline("a", vec![step], None))));
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..5 {
+            let screen = screen(&render(&mut app, &Styles::new(false)));
+            assert!(!screen.contains('\u{1b}') && !screen.contains('\u{202e}'), "{screen}");
+            press(&mut app, KeyCode::Right);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_wide_screen_with_a_remote_task_shows_the_header_the_tabs_and_the_axis() {
+        let harness = RemoteHarness::start().await;
+        let mut recorded = position("plan", PositionStatus::Succeeded);
+        recorded.conversation = ConversationState::NotCreated { reason: "script".into() };
+        let current = position("review", PositionStatus::InProgress);
+        let mut first = snapshot(1, None);
+        first.timeline = Some(Timeline {
+            default_position: Some(current.label.clone()),
+            positions: vec![recorded, current],
+            ..Timeline::default()
+        });
+        harness.running("task-1", "k8s", first).await;
+
+        let mut app = TaskApp::new(harness.owner.clone(), "remote", None);
+        app.refresh().await;
+        press(&mut app, KeyCode::Enter);
+        app.sync_detail().await;
+
+        let buffer = render(&mut app, &Styles::new(false));
+        let screen = screen(&buffer);
+        let rows = rows(&buffer);
+        assert!(rows[1].contains("task-1") && rows[1].contains("implement-feature v1"), "{}", rows[1]);
+        assert!(rows[2].contains("● running") && rows[2].contains("krok 2/2"), "{}", rows[2]);
+        assert!(rows[3].contains("Przebieg") && rows[3].contains("Info"), "{}", rows[3]);
+        assert!(screen.contains("✓ plan #1") && screen.contains("▸● review #1"), "{screen}");
+        assert!(screen.contains("brak rozmowy: script") || screen.contains("review #1 · w toku"), "{screen}");
+        assert!(screen.contains("● live"));
     }
 }

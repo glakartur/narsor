@@ -7,9 +7,12 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 use narsor::controller_protocol::{
-    ControlEventEnvelope, QueueView, RunnerView, TaskListResponse, TaskSummary,
+    ControlEventEnvelope, Freshness, QueueView, RunnerView, TaskListResponse, TaskSummary,
+    TimelineResponse,
 };
-use narsor::domain::{ExecutionStatus, TaskId};
+use narsor::domain::display::DisplayLink;
+use narsor::domain::{Event, EventData, ExecutionStatus, TaskId};
+use narsor::engine::{ConversationState, Position, PositionStatus, Timeline};
 use narsor::orchestration::{
     AttentionItem, AttentionKind, ExecutionCursor, QueueReason, TaskEvent, TaskEventKind,
     TaskLifecycle,
@@ -152,4 +155,75 @@ pub fn event(
 
 pub fn ids(list: &[&str]) -> Vec<TaskId> {
     list.iter().map(|id| TaskId::parse(*id).unwrap()).collect()
+}
+
+/// The task shows `title` and these links: `(label, text, url)`.
+pub fn displayed(
+    mut task: TaskSummary,
+    title: &str,
+    links: &[(&str, &str, Option<&str>)],
+) -> TaskSummary {
+    task.display.title = title.to_string();
+    task.display.links = links
+        .iter()
+        .map(|(label, text, url)| DisplayLink {
+            label: (*label).to_string(),
+            text: (*text).to_string(),
+            url: url.map(str::to_string),
+        })
+        .collect();
+    task
+}
+
+/// An attempt `"<state> #1"` of an agent action with `status`, and no
+/// conversation record.
+pub fn position(state: &str, status: PositionStatus) -> Position {
+    Position {
+        label: format!("{state} #1"),
+        state_id: state.to_string(),
+        visit: 1,
+        action_execution_id: Some(format!("act-{state}")),
+        action_type: Some("agent".to_string()),
+        status,
+        started_at: Some(at()),
+        ended_at: None,
+        error: None,
+        resumed_harness_session: None,
+        harness_session_interrupted: false,
+        retry_pending: false,
+        conversation: ConversationState::NoRecord,
+    }
+}
+
+/// What the runner reported as the timeline of `task`: `positions`, and the
+/// step it is at.
+pub fn timeline(task: &str, positions: Vec<Position>, current: Option<&str>) -> TimelineResponse {
+    TimelineResponse {
+        task_id: TaskId::parse(task).expect("a task id"),
+        freshness: Freshness::Live,
+        observed_at: Some(at()),
+        timeline: Some(Timeline {
+            default_position: positions.last().map(|position| position.label.clone()),
+            positions,
+            ..Timeline::default()
+        }),
+        execution_status: Some(ExecutionStatus::Running),
+        current_state: None,
+        current_position: current.map(str::to_string),
+    }
+}
+
+/// `n` events of an execution, sequences `1..=n`.
+pub fn execution_events(n: u64) -> Vec<Event> {
+    (1..=n)
+        .map(|sequence| {
+            Event::new(
+                "exec-1".to_string(),
+                EventData::StateEntered {
+                    state_id: format!("state-{sequence}"),
+                },
+                sequence,
+            )
+        })
+        .collect()
 }

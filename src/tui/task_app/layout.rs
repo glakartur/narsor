@@ -22,9 +22,7 @@
 //! without drawing anything. [`render`] draws one frame of a
 //! [`super::TaskApp`]: the header, the list, the details and the bar.
 //!
-//! The details are a placeholder until U9 puts the tabs there. What is
-//! already settled is where they go ([`Areas::detail`]) and who holds the
-//! focus.
+//! The details are [`super::detail`]: they draw into [`Areas::detail`].
 
 use std::time::Instant;
 
@@ -35,8 +33,9 @@ use ratatui::Frame;
 
 use super::super::keymap::{self, Context};
 use super::super::style::{Role, Styles};
-use super::list::{lifecycle_word, one_line, title_of, Counters, Slots, TaskList};
-use super::{DetailTab, Focus, TaskApp};
+use super::detail;
+use super::list::{Counters, Slots, TaskList};
+use super::{Focus, TaskApp};
 
 /// The narrowest terminal that shows anything but a request for more room.
 pub const MIN_WIDTH: u16 = 60;
@@ -161,7 +160,7 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
         } else {
             detail_area
         };
-        render_detail_placeholder(frame, detail_area, app, styles, stale);
+        detail::render(frame, detail_area, app, styles, stale);
     }
     render_bar(frame, areas.bar, app, styles, now);
     if app.is_help_open() {
@@ -277,62 +276,6 @@ fn render_bar(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles, now
             ),
         );
     }
-}
-
-/// The right-hand pane until U9: the selected task's identity and the tabs
-/// that will fill it.
-fn render_detail_placeholder(
-    frame: &mut Frame,
-    area: Rect,
-    app: &TaskApp,
-    styles: &Styles,
-    stale: bool,
-) {
-    let frame_role = if app.focus() == Focus::Details {
-        Role::Focus
-    } else {
-        Role::Done
-    };
-    let Some(task) = app.list().selected() else {
-        frame.render_widget(
-            Paragraph::new(Line::styled("brak zaznaczonego zadania", styles.of(Role::Done))),
-            area,
-        );
-        return;
-    };
-    let body = if stale { Role::Done } else { Role::Calm };
-    let tabs: Vec<Span> = DetailTab::ALL
-        .iter()
-        .flat_map(|tab| {
-            let role = if *tab == app.detail().tab() {
-                frame_role
-            } else {
-                Role::Done
-            };
-            [Span::styled(format!(" {} ", tab.title()), styles.of(role)), Span::raw(" ")]
-        })
-        .collect();
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(title_of(task), styles.of(body)),
-            Span::styled(
-                format!(
-                    "   {} v{}",
-                    one_line(&task.workflow_id),
-                    task.workflow_version
-                ),
-                styles.of(Role::Done),
-            ),
-        ]),
-        Line::styled(
-            format!("{} · {}", lifecycle_word(task.lifecycle), task.task_id),
-            styles.of(Role::Done),
-        ),
-        Line::from(tabs),
-        Line::raw(""),
-        Line::styled("szczegóły zadania pojawią się tutaj", styles.of(Role::Done)),
-    ];
-    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// The context whose keys the bar and help describe.

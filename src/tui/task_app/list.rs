@@ -111,7 +111,8 @@ impl StateIcon {
         }
     }
 
-    fn role(self) -> Role {
+    /// The role the icon is drawn in.
+    pub fn role(self) -> Role {
         match self {
             Self::Running | Self::Provisioning => Role::Live,
             Self::Queued | Self::Paused | Self::Sending => Role::Calm,
@@ -188,7 +189,7 @@ pub fn title_of(task: &TaskSummary) -> String {
 
 /// Server text on one line, safe for a terminal.
 pub fn one_line(text: &str) -> String {
-    sanitize(text).replace('\n', " ")
+    crate::domain::display::without_unsafe_chars(&sanitize(text).replace('\n', " "))
 }
 
 /// Whether the task's backend has no controller holding its lease right now:
@@ -461,6 +462,16 @@ impl TaskList {
             }
         }
         positions
+    }
+
+    /// The place of `task_id` in the queue of its backend (1-based, in list
+    /// order), when it is queued.
+    pub fn queue_position(&self, task_id: &str) -> Option<usize> {
+        let index = self
+            .tasks
+            .iter()
+            .position(|task| task.task_id.as_str() == task_id)?;
+        self.queue_positions().get(&index).copied()
     }
 
     /// What the row of `tasks[index]` shows.
@@ -996,7 +1007,7 @@ fn replace_reported_attention(
 }
 
 /// Fits `text` into `width` characters, ending in `…` when it is cut.
-fn fit(text: &str, width: usize) -> String {
+pub fn fit(text: &str, width: usize) -> String {
     let length = text.chars().count();
     if length <= width {
         return text.to_string();

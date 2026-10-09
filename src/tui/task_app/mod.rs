@@ -15,8 +15,9 @@
 //!   never touches a terminal, which is why `tests/tui_state.rs` drives it.
 //! * [`list`] — the tasks in server order, how events patch a row, how a row
 //!   reads, the move mode.
-//! * [`layout`] — the three layouts and the frame (header, details
-//!   placeholder, bar).
+//! * [`layout`] — the three layouts and the frame (header, details, bar).
+//! * [`detail`] and [`tabs`] — the details of the selected task: the `display`
+//!   header and the tabs, what they remember per task and how they read.
 //! * [`notify`] — the notification on the bar.
 //! * [`EventFeed`] — the control-plane event stream, resumed from the cursor
 //!   of the last event applied.
@@ -35,19 +36,29 @@
 //! }
 //! feed.ensure_open(&app);            // once a read gave it a cursor
 //! app.refresh_if_due(Instant::now()).await;
+//! app.sync_detail().await;           // what the visible tab of the selected task lacks
 //! terminal.draw(|frame| layout::render(frame, &mut app, &styles, Instant::now()))
 //! ```
 //!
 //! # For U9–U13
 //!
-//! * **Tabs and details (U9)** replace `render_detail_placeholder` in
-//!   [`layout`] with `detail::render` into [`layout::Areas::detail`]; the
-//!   selected task is [`TaskApp::list`]`.selected()`, the tab and the
-//!   per-task drafts live in [`DetailState`], and keys reach the details by
-//!   the `Context::Details` arm of [`TaskApp::on_key`].
+//! * **Tabs and details (U9)** are in: [`detail::render`] draws into
+//!   [`layout::Areas::detail`], the selected task is
+//!   [`TaskApp::list`]`.selected()`, and the tab and what each task's tabs
+//!   remember (cursors, the followed step, scroll, what was read) are in
+//!   [`DetailState`] ([`DetailState::view`]). Keys reach the tabs by the
+//!   `Context::Details` arm of [`TaskApp::on_key`]. *Dyrygent* (U12) is a tab
+//!   that says it is coming: give it a state in [`detail::TaskDetail`], a
+//!   module in [`tabs`], and replace its arm in [`detail::render`], its arm in
+//!   [`detail::TaskDetail::on_action`] and its read in
+//!   [`TaskApp::sync_detail`].
 //! * **The answer panel (U10)** is a part of the details; the list already
 //!   leads to it (`Space` → [`list::TaskList::select_next_waiting`], `Enter`
-//!   → [`Focus::Details`]). A draft belongs in [`DetailState::set_draft`].
+//!   → [`Focus::Details`]). A draft belongs in [`DetailState::set_draft`]. The
+//!   panel's place is [`detail::areas`]`(area, panel_height).panel`: pass its
+//!   height from [`detail::render`] and the tab content gives up the rows; the
+//!   keys of [`keymap::Context::Panel`] apply while it has the focus (`Tab` is
+//!   [`Action::SwitchFocus`], ignored until then).
 //! * **The action menu (U11)** is an overlay like the help: a new field next
 //!   to `help_open`, a new arm in [`TaskApp::key_context`]. A mutation must
 //!   first pass [`TaskApp::mutation_allowed`], and send its own
@@ -55,9 +66,11 @@
 //! * **The new-task form (U13)** takes [`layout::Areas::detail`]; a task it
 //!   sent shows as an [`list::StateIcon::Sending`] row.
 
+pub mod detail;
 pub mod layout;
 pub mod list;
 pub mod notify;
+pub mod tabs;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -75,6 +88,7 @@ use super::connection::Connection;
 use super::keymap::{self, Action, Context};
 use super::refresh::RefreshSchedule;
 use super::scroll::sanitize;
+use detail::TaskDetail;
 use list::{title_of, MoveRequest, Removal, TaskList};
 use notify::{Notifier, Severity};
 
@@ -137,6 +151,8 @@ impl DetailTab {
 pub struct DetailState {
     tab: DetailTab,
     drafts: BTreeMap<String, String>,
+    views: BTreeMap<String, TaskDetail>,
+    hyperlinks: bool,
 }
 
 impl DetailState {
@@ -144,7 +160,49 @@ impl DetailState {
         Self {
             tab: DetailTab::Progress,
             drafts: BTreeMap::new(),
+            views: BTreeMap::new(),
+            hyperlinks: false,
         }
+    }
+
+    /// What the details of `task_id` remember, once they were shown or read.
+    pub fn view(&self, task_id: &str) -> Option<&TaskDetail> {
+        self.views.get(task_id)
+    }
+
+    /// What the details of `task_id` remember, created empty when there is
+    /// nothing yet. The cursors, the tab state and the following of every task
+    /// live here, so they come back with the task.
+    pub fn view_mut(&mut self, task_id: &str) -> &mut TaskDetail {
+        self.views
+            .entry(task_id.to_string())
+            .or_insert_with(|| TaskDetail::new(task_id))
+    }
+
+    /// Whether links in the header are written as OSC 8 hyperlinks.
+    pub fn hyperlinks(&self) -> bool {
+        self.hyperlinks
+    }
+
+    /// Writes the header's links as OSC 8 hyperlinks (or stops doing it). Off
+    /// until the loop has asked the terminal's environment
+    /// ([`detail::hyperlinks_supported`]).
+    pub fn set_hyperlinks(&mut self, enabled: bool) {
+        self.hyperlinks = enabled;
+    }
+
+    /// Makes what every task's details hold due for a new read; what is shown,
+    /// and every cursor, stays.
+    fn invalidate(&mut self) {
+        for view in self.views.values_mut() {
+            view.invalidate();
+        }
+    }
+
+    /// Forgets the details of tasks that are no longer on the list.
+    fn retain(&mut self, tasks: &[crate::controller_protocol::TaskSummary]) {
+        self.views
+            .retain(|id, _| tasks.iter().any(|task| task.task_id.as_str() == id));
     }
 
     /// The tab shown.
@@ -176,6 +234,14 @@ impl DetailState {
     pub fn has_drafts(&self) -> bool {
         !self.drafts.is_empty()
     }
+}
+
+/// What drawing the details needs, borrowed from the application.
+pub(super) struct DetailView<'a> {
+    pub(super) task: &'a crate::controller_protocol::TaskSummary,
+    pub(super) queue_place: Option<usize>,
+    pub(super) tab: DetailTab,
+    pub(super) detail: &'a mut TaskDetail,
 }
 
 /// What a key asked for that needs the API.
@@ -355,6 +421,16 @@ impl TaskApp {
             Action::Down | Action::Up | Action::Top | Action::Bottom => {
                 self.on_cursor(context, action)
             }
+            Action::PageDown
+            | Action::PageUp
+            | Action::Expand
+            | Action::RawEntry
+            | Action::RawAll
+            | Action::Follow
+                if context == Context::Details =>
+            {
+                self.on_detail_action(action)
+            }
             Action::NextWaiting => {
                 if !self.list.select_next_waiting() {
                     self.notify(Severity::Warning, "żadne zadanie nie czeka na Ciebie");
@@ -388,8 +464,38 @@ impl TaskApp {
             (Context::List, Action::Up) => self.list.step(-1),
             (Context::List, Action::Top) => self.list.first(),
             (Context::List, Action::Bottom) => self.list.last(),
+            (Context::Details, _) => self.on_detail_action(action),
             _ => {}
         }
+    }
+
+    /// A key in the details: handed to the tab shown, with the task's own
+    /// remembered state.
+    fn on_detail_action(&mut self, action: Action) {
+        let Some(id) = self.list.selected_id().map(str::to_string) else {
+            return;
+        };
+        let tab = self.detail.tab;
+        self.detail.view_mut(&id).on_action(tab, action);
+    }
+
+    /// The selected task with the state its details remember, split so that
+    /// drawing can change the one while it reads the other.
+    pub(super) fn detail_view(&mut self) -> Option<DetailView<'_>> {
+        let task = self.list.selected()?;
+        let queue_place = self.list.queue_position(task.task_id.as_str());
+        let tab = self.detail.tab;
+        let detail = self
+            .detail
+            .views
+            .entry(task.task_id.to_string())
+            .or_insert_with(|| TaskDetail::new(task.task_id.as_str()));
+        Some(DetailView {
+            task,
+            queue_place,
+            tab,
+            detail,
+        })
     }
 
     /// Whether the selected task can be moved; otherwise says why.
@@ -554,6 +660,8 @@ impl TaskApp {
         self.schedule.done(now);
         self.stream_failures = 0;
         let removal = self.list.replace(listing.tasks);
+        self.detail.retain(self.list.tasks());
+        self.detail.invalidate();
         self.announce(removal);
     }
 
