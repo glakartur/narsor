@@ -1,7 +1,7 @@
 ---
 title: "feat: Przeprojektowanie TUI na modelu tasków control plane"
 type: feat
-status: active
+status: completed
 date: 2026-10-09
 origin: docs/brainstorms/2026-10-08-tui-przeprojektowanie-design.md
 ---
