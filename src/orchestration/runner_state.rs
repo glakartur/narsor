@@ -18,7 +18,8 @@ use super::model::{
     InputOutcome, InputRequest, InputStatus, InputUpdate, QueuedInput, RunnerObservation,
     RunnerReportOutcome, RunnerSnapshot, TaskEventKind, TaskLifecycle, TaskRecord,
 };
-use crate::domain::TaskId;
+use crate::domain::{without_unsafe_chars, TaskId};
+use crate::engine::{ConversationState, EventLink, Timeline};
 use chrono::{DateTime, Utc};
 
 impl ControlPlane {
@@ -37,8 +38,17 @@ impl ControlPlane {
         task_id: &TaskId,
         incarnation: &str,
         launch_generation: u64,
-        snapshot: RunnerSnapshot,
+        mut snapshot: RunnerSnapshot,
     ) -> Result<RunnerReportOutcome> {
+        // A remote runner's word is not trusted with a terminal: what the
+        // attention carries is cleaned before it is stored or announced.
+        for item in &mut snapshot.attention {
+            item.state_id = item.state_id.as_deref().map(without_unsafe_chars);
+            item.waiting_id = without_unsafe_chars(&item.waiting_id);
+        }
+        if let Some(timeline) = &mut snapshot.timeline {
+            clean_timeline(timeline);
+        }
         let (task, applied) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
             if let Some(previous) = &record.runner {
@@ -80,6 +90,7 @@ impl ControlPlane {
                 event_cursor: snapshot.event_cursor,
                 execution_status: snapshot.execution_status.clone(),
                 pending_input_id: pending,
+                attention: snapshot.attention.clone(),
             };
             record.runner = Some(RunnerObservation {
                 incarnation: incarnation.to_string(),
@@ -336,5 +347,35 @@ fn stale_snapshot(
             "event cursor {} / sequence {}",
             incoming.event_cursor, incoming.snapshot_sequence
         ),
+    }
+}
+
+/// Strips terminal-unsafe characters from every text of a runner's timeline.
+/// Labels and the links that name them are cleaned alike, so they still
+/// match each other.
+fn clean_timeline(timeline: &mut Timeline) {
+    let clean = |text: &mut String| *text = without_unsafe_chars(text);
+    let clean_opt = |text: &mut Option<String>| {
+        if let Some(text) = text {
+            *text = without_unsafe_chars(text);
+        }
+    };
+    for position in &mut timeline.positions {
+        clean(&mut position.label);
+        clean(&mut position.state_id);
+        clean_opt(&mut position.action_execution_id);
+        clean_opt(&mut position.action_type);
+        clean_opt(&mut position.error);
+        clean_opt(&mut position.resumed_harness_session);
+        if let ConversationState::NotCreated { reason } = &mut position.conversation {
+            clean(reason);
+        }
+    }
+    clean_opt(&mut timeline.default_position);
+    for link in timeline.links.values_mut() {
+        match link {
+            EventLink::Position(label) => clean(label),
+            EventLink::NoLink { reason } => clean(reason),
+        }
     }
 }

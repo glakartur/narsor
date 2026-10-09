@@ -39,6 +39,14 @@ pub enum ProtocolError {
         /// Explanation without secrets.
         message: String,
     },
+    /// Something that should answer did not (a live runner that missed its
+    /// deadline). `503` with a reason; the caller may retry.
+    Unavailable {
+        /// Stable reason code.
+        code: &'static str,
+        /// Explanation without secrets.
+        message: String,
+    },
     /// The server failed. Bare `500`, details in the log only.
     Internal(String),
 }
@@ -46,6 +54,13 @@ pub enum ProtocolError {
 impl ProtocolError {
     pub(crate) fn conflict(code: &'static str, message: impl Into<String>) -> Self {
         Self::Conflict {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn unavailable(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Unavailable {
             code,
             message: message.into(),
         }
@@ -65,7 +80,9 @@ impl std::fmt::Display for ProtocolError {
             Self::Unauthorized => f.write_str("unauthorized"),
             Self::Forbidden => f.write_str("forbidden"),
             Self::NotFound => f.write_str("not found"),
-            Self::BadRequest { code, message } | Self::Conflict { code, message } => {
+            Self::BadRequest { code, message }
+            | Self::Conflict { code, message }
+            | Self::Unavailable { code, message } => {
                 write!(f, "{code}: {message}")
             }
             Self::Internal(message) => write!(f, "internal error: {message}"),
@@ -163,6 +180,14 @@ impl IntoResponse for ProtocolError {
                 .into_response(),
             Self::Conflict { code, message } => (
                 StatusCode::CONFLICT,
+                Json(RequestErrorResponse {
+                    code: code.to_owned(),
+                    message,
+                }),
+            )
+                .into_response(),
+            Self::Unavailable { code, message } => (
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(RequestErrorResponse {
                     code: code.to_owned(),
                     message,

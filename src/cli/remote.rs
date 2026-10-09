@@ -25,11 +25,12 @@ use crate::api::{
 };
 use crate::config::Flags;
 use crate::controller_protocol::{
-    ConversationPageQuery, CreateEnrollmentRequest, CreateTaskRequest, LaunchRequest,
-    MoveTaskRequest, OwnerCommandRequest, SetDefaultBackendRequest, SubmitInputRequest,
-    SubmitOperatorCommandRequest, TaskSummary, WorkspaceRequest,
+    ConversationPageQuery, CreateEnrollmentRequest, CreateTaskRequest, ExecutionEventsQuery,
+    ExecutionEventsResponse, LaunchRequest, MoveTaskRequest, OwnerCommandRequest,
+    SetDefaultBackendRequest, SubmitInputRequest, SubmitOperatorCommandRequest, TaskSummary,
+    WorkspaceRequest,
 };
-use crate::domain::TaskId;
+use crate::domain::{without_unsafe_chars, TaskId};
 use crate::engine::HumanInputDelivery;
 use crate::materials::{snapshot_paths, write_files, MaterialLimits, MaterialOrigin, WriteMode};
 use crate::orchestration::{
@@ -181,14 +182,26 @@ pub enum TaskCommand {
         #[arg(long, default_value_t = 0)]
         from: u64,
     },
-    /// Prints the task's control-plane events.
+    /// Prints the task's step timeline, one entry per attempt, marking the
+    /// one under way.
+    Steps {
+        /// The task id.
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+    },
+    /// Prints the task's control-plane events, or with `--execution` the
+    /// raw events of its workflow execution (read from the live runner, or
+    /// from the task's storage when this host holds it).
     Events {
         /// The task id.
         #[arg(value_name = "TASK_ID")]
         task_id: String,
         /// Keeps following new events (reconnecting as needed).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "execution")]
         follow: bool,
+        /// The execution's own events instead of the control plane's.
+        #[arg(long)]
+        execution: bool,
     },
     /// Follows the events of every task, from now or from `--cursor`.
     Watch {
@@ -677,7 +690,31 @@ pub async fn task(
                 ))),
             }
         }
-        TaskCommand::Events { task_id, follow } => {
+        TaskCommand::Steps { task_id } => {
+            let response = client
+                .control_timeline(&task_id)
+                .await
+                .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
+            let Some(timeline) = response.timeline.filter(|t| !t.positions.is_empty()) else {
+                println!("No steps.");
+                return Ok(());
+            };
+            if let Some(current) = &response.current_position {
+                println!("Under way: {}", without_unsafe_chars(current));
+            }
+            for position in &timeline.positions {
+                crate::cli::commands::print_position(position);
+            }
+            Ok(())
+        }
+        TaskCommand::Events {
+            task_id,
+            execution: true,
+            ..
+        } => execution_events(&client, &task_id).await,
+        TaskCommand::Events {
+            task_id, follow, ..
+        } => {
             let events = client
                 .control_events(&task_id, 0)
                 .await
@@ -709,6 +746,39 @@ pub async fn task(
                 }
             };
             follow_events(&client, Some(cursor), None).await
+        }
+    }
+}
+
+/// Prints every event of the task's execution, page by page. A task whose
+/// runner is not running (and whose storage this host does not hold) is
+/// answered with the reason, which is a failure of the command, not of the
+/// server.
+async fn execution_events(client: &ApiClient, task_id: &str) -> Result<()> {
+    let mut query = ExecutionEventsQuery::default();
+    loop {
+        let response = client
+            .control_execution_events(task_id, &query)
+            .await
+            .map_err(|error| failure("The execution's events cannot be read", error))?;
+        match response {
+            ExecutionEventsResponse::Available {
+                events, has_more, ..
+            } => {
+                for event in &events {
+                    crate::cli::commands::print_event(event);
+                }
+                match events.last() {
+                    Some(last) if has_more => query.after = last.sequence,
+                    _ => return Ok(()),
+                }
+            }
+            ExecutionEventsResponse::Unavailable { message, .. } => {
+                return Err(CliError::failure(format!(
+                    "The execution's events are not available: {}",
+                    without_unsafe_chars(&message)
+                )));
+            }
         }
     }
 }
@@ -1033,6 +1103,9 @@ fn print_event(event: &TaskEvent) {
             total_bytes,
         } => format!("material {material_id} {change:?} ({files} file(s), {total_bytes} bytes)"),
     };
+    // Notes, reasons and details come from operators and runners: nothing a
+    // terminal would act on gets through.
+    let kind = without_unsafe_chars(&kind);
     println!(
         "{:>4}  {}  {:<24} {:<12} {kind}",
         event.sequence,

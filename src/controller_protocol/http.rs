@@ -79,6 +79,10 @@ where
         )
         .route("/control/v1/tasks/:task_id/timeline", get(get_timeline))
         .route(
+            "/control/v1/tasks/:task_id/execution-events",
+            get(get_execution_events),
+        )
+        .route(
             "/control/v1/tasks/:task_id/conversation",
             get(get_conversation),
         )
@@ -163,6 +167,10 @@ where
         .route(
             "/runner/v1/conversation-pages/:request_id",
             post(post_conversation_page),
+        )
+        .route(
+            "/runner/v1/execution-events/:request_id",
+            post(post_execution_events),
         )
         .route("/runner/v1/materials", post(post_runner_material))
         .route(
@@ -316,6 +324,17 @@ async fn get_timeline(
     Path(task_id): Path<String>,
 ) -> ProtocolResult<Json<TimelineResponse>> {
     Ok(Json(service.timeline(&owner, &task_id)?))
+}
+
+async fn get_execution_events(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(task_id): Path<String>,
+    Query(query): Query<ExecutionEventsQuery>,
+) -> ProtocolResult<Json<ExecutionEventsResponse>> {
+    Ok(Json(
+        service.execution_events(&owner, &task_id, query).await?,
+    ))
 }
 
 async fn get_conversation(
@@ -649,6 +668,19 @@ async fn post_conversation_page(
     Json(page): Json<ConversationPage>,
 ) -> ProtocolResult<Json<ConversationPageAccepted>> {
     Ok(Json(service.runner_conversation_page(
+        &identity,
+        &request_id,
+        page,
+    )?))
+}
+
+async fn post_execution_events(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Path(request_id): Path<String>,
+    Json(page): Json<ExecutionEventsPage>,
+) -> ProtocolResult<Json<ConversationPageAccepted>> {
+    Ok(Json(service.runner_execution_events(
         &identity,
         &request_id,
         page,

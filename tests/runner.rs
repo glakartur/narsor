@@ -670,6 +670,44 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
         other => panic!("no record: {other:?}"),
     }
 
+    // The gate is a wait on the owner, and the raw events come through the
+    // same relay from the real runner.
+    let summary = fixture
+        .service
+        .task(&fixture.owner(), "task-1")
+        .expect("summary");
+    assert_eq!(summary.attention.len(), 1, "{:?}", summary.attention);
+    assert_eq!(
+        summary.attention[0].kind,
+        narsor::orchestration::AttentionKind::Question
+    );
+    assert_eq!(
+        Some(summary.attention[0].waiting_id.as_str()),
+        record.pending_input_id()
+    );
+    match fixture
+        .service
+        .execution_events(
+            &fixture.owner(),
+            "task-1",
+            narsor::controller_protocol::ExecutionEventsQuery::default(),
+        )
+        .await
+        .expect("events from the runner")
+    {
+        narsor::controller_protocol::ExecutionEventsResponse::Available {
+            events, source, ..
+        } => {
+            assert_eq!(
+                source,
+                narsor::controller_protocol::ExecutionEventsSource::Runner
+            );
+            assert!(events.len() as u64 >= 1);
+            assert_eq!(events.last().unwrap().sequence, cursor_at_gate);
+        }
+        other => panic!("expected events, got {other:?}"),
+    }
+
     // Work in the workspace, and a remote that moves on: neither may be
     // touched by a resume.
     fs::write(launch.workspace().join("agent-work.txt"), "keep me").unwrap();
@@ -1095,6 +1133,17 @@ async fn a_base_image_without_git_fails_before_any_work() {
         .expect("the problem reached the control plane");
     assert_eq!(problem.code, "base_image_contract");
     assert!(problem.message.contains("git"), "{}", problem.message);
+    let waiting = fixture
+        .service
+        .task(&fixture.owner(), "task-4")
+        .expect("summary")
+        .attention;
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(
+        waiting[0].kind,
+        narsor::orchestration::AttentionKind::Problem
+    );
+    assert_eq!(waiting[0].waiting_id, "base_image_contract");
     assert!(!launch.workspace().exists(), "nothing was cloned");
     assert!(launch.execution_id().is_none(), "no work started");
 }

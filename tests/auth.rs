@@ -1144,6 +1144,7 @@ fn snapshot() -> RunnerSnapshot {
         timeline: None,
         safe_point: false,
         problem: None,
+        attention: Vec::new(),
         display: None,
         observed_at: Utc::now(),
     }

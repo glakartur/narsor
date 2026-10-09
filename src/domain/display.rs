@@ -59,7 +59,7 @@ impl TaskDisplay {
     /// is dropped. Applied wherever a display comes from outside the
     /// control plane's own rendering — a remote runner reports one.
     pub fn sanitized(self) -> Self {
-        let plain = |text: String| text.chars().filter(|ch| !is_unsafe_char(*ch)).collect();
+        let plain = |text: String| without_unsafe_chars(&text);
         Self {
             title: plain(self.title),
             links: self
@@ -87,6 +87,12 @@ pub struct DisplayLink {
     /// Target, or `None` while it is unknown or not an `http(s)` URL.
     #[serde(default)]
     pub url: Option<String>,
+}
+
+/// `text` without the characters a terminal must never be handed from an
+/// untrusted source (see `is_unsafe_char`).
+pub fn without_unsafe_chars(text: &str) -> String {
+    text.chars().filter(|ch| !is_unsafe_char(*ch)).collect()
 }
 
 /// Whether `ch` could spoof or disturb what a terminal shows: a control

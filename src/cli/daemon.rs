@@ -69,7 +69,7 @@ use crate::backends::{
 use crate::conductor::{ConductorRegistry, HarnessInvoker, PassLauncher};
 use crate::config::Resolved;
 use crate::controller_protocol::{CreateEnrollmentRequest, ProtocolService};
-use crate::domain::{ExecutionStatus, WorkflowDefinition, WorkflowExecution};
+use crate::domain::{BackendId, ExecutionStatus, WorkflowDefinition, WorkflowExecution};
 use crate::engine::{owed_output_rescue, owed_reprompt, Engine, HarnessRegistry};
 use crate::environment::{
     BackendKind, BackendRecord, CatalogLaunchResolver, EnvironmentCatalog, HarnessDefaults,
@@ -163,7 +163,14 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         OwnerDefaults::from_config(config),
         Arc::clone(&selector) as Arc<dyn HarnessDefaults>,
     ));
-    let control = Arc::new(ProtocolService::new(control_plane, launch.clone()));
+    // The local backend's task storages are on this host: a task of it
+    // whose runner is not running can still be read from its storage.
+    let control = Arc::new(
+        ProtocolService::new(control_plane, launch.clone()).with_local_storage(
+            BackendId::parse("local").expect("'local' is a valid backend id"),
+            crate::api::local_task_storage_root(config.work_dir()),
+        ),
+    );
     let _scheduler = spawn_periodic_admission(Arc::clone(&control));
     let agent_timeout_secs = defaults.timeout_secs;
     let engine = Arc::new(

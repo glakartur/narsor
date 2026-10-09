@@ -75,9 +75,10 @@ use crate::controller_protocol::{
     ControlEventEnvelope, ControllerListResponse, ControllerView, ConversationPage,
     ConversationPageQuery, ConversationResponse as RemoteConversationResponse,
     CreateEnrollmentRequest, CreateTaskRequest, DefaultBackendView, EnrollmentResponse,
-    MoveTaskRequest, OwnerCommandRequest, OwnerCommandResponse, SetDefaultBackendRequest,
-    SubmitInputRequest, SubmitInputResponse, SubmitOperatorCommandRequest,
-    SubmitOperatorCommandResponse, TaskListResponse, TaskSummary, TimelineResponse,
+    ExecutionEventsQuery, ExecutionEventsResponse, MoveTaskRequest, OwnerCommandRequest,
+    OwnerCommandResponse, SetDefaultBackendRequest, SubmitInputRequest, SubmitInputResponse,
+    SubmitOperatorCommandRequest, SubmitOperatorCommandResponse, TaskListResponse, TaskSummary,
+    TimelineResponse,
 };
 use crate::materials::{
     MaterialListResponse, MaterialSummary, MaterialUploadResponse, MaterialView,
@@ -149,6 +150,10 @@ pub enum ClientError {
     /// decision already undone: the request conflicts with the execution's
     /// state, and `message` says how, for the operator to read.
     Refused { code: String, message: String },
+    /// A `503` with a reason: something that should have answered did not
+    /// (a live runner that missed its deadline). The connection is fine;
+    /// asking again may work.
+    Degraded { code: String, message: String },
     /// The server rejected a validly decoded request and supplied a safe,
     /// typed reason suitable for an operator-facing UI.
     Request { code: String, message: String },
@@ -172,6 +177,9 @@ impl std::fmt::Display for ClientError {
             ClientError::Conflict => write!(f, "API: conflict (409)"),
             ClientError::Refused { code, message } => {
                 write!(f, "API refused the request ({code}): {message}")
+            }
+            ClientError::Degraded { code, message } => {
+                write!(f, "API could not answer ({code}): {message}")
             }
             ClientError::Request { code, message } => {
                 write!(f, "API request rejected ({code}): {message}")
@@ -604,6 +612,29 @@ impl ApiClient {
     ) -> Result<ConversationPage, ClientError> {
         let url = format!(
             "{}/control/v1/tasks/{task_id}/attempts/{attempt_id}/conversation",
+            self.base_url
+        );
+        let response = self
+            .send(&self.stream_http, |http, token| {
+                http.get(&url)
+                    .bearer_auth(token)
+                    .query(query)
+                    .timeout(CONVERSATION_PAGE_TIMEOUT)
+            })
+            .await?;
+        handle_json_response(response).await
+    }
+
+    /// The raw events of a task's execution after `query.after`: from the
+    /// live runner through the relay, or from the task's storage. Waits for
+    /// the runner like a conversation page, so it shares its timeout.
+    pub async fn control_execution_events(
+        &self,
+        task_id: &str,
+        query: &ExecutionEventsQuery,
+    ) -> Result<ExecutionEventsResponse, ClientError> {
+        let url = format!(
+            "{}/control/v1/tasks/{task_id}/execution-events",
             self.base_url
         );
         let response = self
@@ -1180,6 +1211,13 @@ pub(crate) async fn handle_json_response<T: DeserializeOwned>(
                 message: error.message,
             }),
             Err(_) => Err(ClientError::Conflict),
+        },
+        StatusCode::SERVICE_UNAVAILABLE => match response.json::<RequestErrorResponse>().await {
+            Ok(error) => Err(ClientError::Degraded {
+                code: error.code,
+                message: error.message,
+            }),
+            Err(_) => Err(ClientError::Server("unexpected status 503".to_string())),
         },
         StatusCode::BAD_REQUEST => {
             let error = response

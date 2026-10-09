@@ -83,8 +83,8 @@ use tokio::time::Instant;
 
 use crate::api::{ClientError, ConversationEntryDto, ConversationResponse};
 use crate::controller_protocol::{
-    ConversationPageRequest, DeliveredInput, RunnerClient, RunnerDirective, RunnerLaunchView,
-    RunnerPollQuery, RunnerPollResponse,
+    ConversationPageRequest, DeliveredInput, ExecutionEventsPage, ExecutionEventsRequest,
+    RunnerClient, RunnerDirective, RunnerLaunchView, RunnerPollQuery, RunnerPollResponse,
 };
 use crate::domain::{
     ExecutionStatus, LaunchDefinitionError, RepositoryInfo, TaskId, TaskLaunchSpec, TaskWorkspace,
@@ -428,6 +428,7 @@ async fn report_problem(
         })
         .unwrap_or(0)
         .max(storage.reported_cursor().unwrap_or(0));
+    let observed_at = Utc::now();
     let snapshot = RunnerSnapshot {
         snapshot_sequence: storage.next_snapshot_sequence().unwrap_or(1),
         execution_status: existing
@@ -447,9 +448,10 @@ async fn report_problem(
         },
         timeline: None,
         safe_point: true,
+        attention: snapshot::attention_items(None, Some(&problem), observed_at),
         problem: Some(problem.clone()),
         display: None,
-        observed_at: Utc::now(),
+        observed_at,
     };
     send_until(link, timing, &snapshot).await;
     RunnerExit::Problem(problem)
@@ -978,6 +980,9 @@ impl Session {
         for request in response.conversation_pages {
             self.serve_page(request).await;
         }
+        for request in response.execution_events {
+            self.serve_events(request).await;
+        }
         if !response.materials.is_empty() && !self.materials_deferred() {
             self.receive_materials(response.materials).await;
         }
@@ -1059,6 +1064,37 @@ impl Session {
         };
         if let Err(error) = client
             .upload_conversation_page(&request.request_id, &page)
+            .await
+        {
+            self.link.failed(&error, &self.timing);
+        }
+    }
+
+    /// Uploads the execution's events an owner waits for: those after the
+    /// requested sequence, at most the requested number.
+    async fn serve_events(&mut self, request: ExecutionEventsRequest) {
+        let (Some(client), Some(execution_id)) = (self.link.client(), self.execution_id.clone())
+        else {
+            return;
+        };
+        let events = match self.engine.store().event_log(&execution_id).read_all() {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::warn!(%error, "cannot read the execution events");
+                return;
+            }
+        };
+        let limit = request.limit as usize;
+        let mut events: Vec<_> = events
+            .into_iter()
+            .filter(|event| event.sequence > request.after)
+            .take(limit.saturating_add(1))
+            .collect();
+        let has_more = events.len() > limit;
+        events.truncate(limit);
+        let page = ExecutionEventsPage { events, has_more };
+        if let Err(error) = client
+            .upload_execution_events(&request.request_id, &page)
             .await
         {
             self.link.failed(&error, &self.timing);

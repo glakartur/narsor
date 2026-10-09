@@ -1973,6 +1973,19 @@ fn task_interrupt_restart_and_override_steer_the_runner_of_a_local_task() {
         "{}",
         events.stdout
     );
+
+    // The execution's own events and its step timeline, read for a task
+    // whose runner is done: from the task's storage.
+    wait_for("the task's runner to finish", || {
+        !cli(&root, &["task", "steps", "t-slow"])
+            .stdout
+            .contains("No steps.")
+    });
+    let steps = cli(&root, &["task", "steps", "t-slow"]);
+    assert_eq!(steps.code, EXIT_SUCCESS, "{}", steps.output());
+    let execution = cli(&root, &["task", "events", "t-slow", "--execution"]);
+    assert_eq!(execution.code, EXIT_SUCCESS, "{}", execution.output());
+    assert!(execution.stdout.lines().count() > 1, "{}", execution.stdout);
 }
 
 // ---------------------------------------------------------------------------
@@ -2340,6 +2353,111 @@ mod remote_cli {
             wrong.stderr.contains("rejected the token"),
             "{}",
             wrong.stderr
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn text_a_runner_sends_never_reaches_the_terminal_raw() {
+        use narsor::controller_protocol::SubmitOperatorCommandRequest;
+        use narsor::orchestration::OperatorCommand;
+
+        let harness = RemoteHarness::start().await;
+        let token = harness.handle.token().to_string();
+        let token = Some(token.as_str());
+        let running = harness
+            .running("t-esc", "k8s", super::remote_support::snapshot(1, None))
+            .await;
+        harness
+            .owner
+            .control_operator_command(
+                "t-esc",
+                &SubmitOperatorCommandRequest {
+                    command: OperatorCommand::Interrupt,
+                    idempotency_key: "k-1".to_string(),
+                    expected_generation: None,
+                },
+            )
+            .await
+            .expect("queued");
+        let polled = running.runner.poll(None, 0).await.expect("poll");
+        running
+            .runner
+            .ack_command(
+                &polled.commands[0].command_id,
+                false,
+                Some("boom\u{1b}[2J\u{1b}]8;;http://evil\u{7}x\u{202e}".to_string()),
+            )
+            .await
+            .expect("ack");
+
+        let events = remote(&harness, token, &["task", "events", "t-esc"]).await;
+        assert_eq!(events.code, EXIT_SUCCESS, "{}", events.output());
+        assert!(
+            events.stdout.contains("boom[2J]8;;http://evilx"),
+            "{}",
+            events.stdout
+        );
+        assert!(
+            !events.stdout.contains('\u{1b}') && !events.stdout.contains('\u{202e}'),
+            "{:?}",
+            events.stdout
+        );
+
+        // A timeline whose texts carry escapes prints without them.
+        let mut with_step = super::remote_support::snapshot(2, None);
+        with_step.timeline = Some(narsor::engine::Timeline {
+            positions: vec![narsor::engine::Position {
+                label: "plan\u{1b}[2J#1".to_string(),
+                state_id: "plan".to_string(),
+                visit: 1,
+                action_execution_id: None,
+                action_type: Some("ag\u{1b}]8;;x\u{7}ent\u{202e}".to_string()),
+                status: narsor::engine::PositionStatus::Failed,
+                started_at: None,
+                ended_at: None,
+                error: Some("bad\u{1b}[31m".to_string()),
+                resumed_harness_session: None,
+                harness_session_interrupted: false,
+                retry_pending: false,
+                conversation: narsor::engine::ConversationState::NoRecord,
+            }],
+            ..Default::default()
+        });
+        running.runner.snapshot(&with_step).await.expect("snapshot");
+        let printed = remote(&harness, token, &["task", "steps", "t-esc"]).await;
+        assert_eq!(printed.code, EXIT_SUCCESS, "{}", printed.output());
+        assert!(printed.stdout.contains("plan[2J#1"), "{}", printed.stdout);
+        assert!(
+            !printed.stdout.contains('\u{1b}') && !printed.stdout.contains('\u{202e}'),
+            "{:?}",
+            printed.stdout
+        );
+        let mut empty = super::remote_support::snapshot(3, None);
+        empty.timeline = None;
+        running.runner.snapshot(&empty).await.expect("snapshot");
+
+        // The timeline of a task with no steps yet, and the reason an
+        // execution cannot be read once the workload is gone.
+        let steps = remote(&harness, token, &["task", "steps", "t-esc"]).await;
+        assert_eq!(steps.code, EXIT_SUCCESS, "{}", steps.output());
+        assert!(steps.stdout.contains("No steps."), "{}", steps.stdout);
+        running
+            .controller
+            .report(&super::remote_support::report(
+                "t-esc",
+                running.epoch,
+                1,
+                narsor::orchestration::Observation::WorkloadLost { state_known: true },
+                Some(1),
+            ))
+            .await
+            .expect("lost");
+        let execution = remote(&harness, token, &["task", "events", "t-esc", "--execution"]).await;
+        assert_eq!(execution.code, EXIT_FAILURE, "{}", execution.output());
+        assert!(
+            execution.stderr.contains("runner is not running"),
+            "{}",
+            execution.stderr
         );
     }
 }

@@ -292,6 +292,10 @@ pub enum TaskEventKind {
         execution_status: ExecutionStatus,
         /// The input request the runner waits on, if any.
         pending_input_id: Option<String>,
+        /// What the runner says waits on the owner (U4). A change of this
+        /// list is what a client patches a list row with, without a read.
+        #[serde(default)]
+        attention: Vec<AttentionItem>,
     },
     /// The owner queued an answer for a pending input request.
     InputQueued {
@@ -744,6 +748,45 @@ pub struct PendingInputRef {
     pub form: PendingHumanInput,
 }
 
+/// What a task waits on its owner for.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionKind {
+    /// A question to answer: an agent asked, or a human step waits.
+    Question,
+    /// An agent result held for an approval decision.
+    Approval,
+    /// A step ended without a usable output the owner must settle, or the
+    /// runner reports a condition that keeps it from working.
+    Problem,
+    /// A failed step waiting for the conductor or the owner (filled by the
+    /// runner's conductor, U5).
+    FailedStep,
+    /// A conductor proposal waiting for confirmation (filled by U5).
+    ConductorProposal,
+    /// The backend could not provision the task; no execution exists
+    /// (added by the control plane, never by a runner).
+    ProvisioningFailed,
+}
+
+/// One thing a task waits on its owner for — metadata only; the content
+/// (question text, proposal) is read with the task's details.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttentionItem {
+    /// What kind of waiting it is.
+    pub kind: AttentionKind,
+    /// The workflow state it concerns, when it concerns one.
+    #[serde(default)]
+    pub state_id: Option<String>,
+    /// Since when it waits.
+    pub since: DateTime<Utc>,
+    /// Identity of the wait: the pending-input id for a question, approval
+    /// or settle-the-step problem, the problem code for a runner problem,
+    /// the proposal or failure key for the conductor's. Stable while the
+    /// same wait lasts; an answer names it.
+    pub waiting_id: String,
+}
+
 /// One attempt's conversation, summarized: never its content (KTD4).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationAttemptSummary {
@@ -824,6 +867,12 @@ pub struct RunnerSnapshot {
     /// a secret.
     #[serde(default)]
     pub problem: Option<RunnerProblem>,
+    /// What waits on the owner, oldest first (U4). Computed by the runner
+    /// from its pending input and problem; the conductor's items (U5) join
+    /// it. Provisioning failures are not here: only the control plane knows
+    /// them.
+    #[serde(default)]
+    pub attention: Vec<AttentionItem>,
     /// The workflow's `display` rendered against the execution's inputs and
     /// current variables. `None` when the runner could not render one (no
     /// execution yet), which leaves what the control plane rendered at

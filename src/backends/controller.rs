@@ -337,7 +337,9 @@ impl From<ClientError> for CallError {
             ClientError::Refused { code, message } if LEASE_CODES.contains(&code.as_str()) => {
                 Self::Interrupt(Interrupt::Fenced(format!("{code}: {message}")))
             }
-            ClientError::Refused { code, message } | ClientError::Request { code, message } => {
+            ClientError::Refused { code, message }
+            | ClientError::Request { code, message }
+            | ClientError::Degraded { code, message } => {
                 Self::Refused(format!("{code}: {message}"))
             }
             ClientError::Conflict => Self::Refused("conflict".into()),

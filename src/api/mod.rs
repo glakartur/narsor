@@ -96,7 +96,7 @@ pub use dto::{
     OperatorNoteRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
     StartTaskResponse, TransitionRequest,
 };
-pub use routes::{ConversationEntryDto, ConversationResponse};
+pub use routes::{local_task_storage_root, ConversationEntryDto, ConversationResponse};
 pub use token::TokenSource;
 
 use crate::auth::gate::{self, NetworkAuth, OwnerAuth};

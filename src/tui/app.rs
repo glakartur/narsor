@@ -4656,7 +4656,9 @@ fn client_error_message(execution_id: &str, error: ClientError) -> String {
         ClientError::Unavailable(detail) => {
             format!("Could not reach the narsor daemon: {detail}")
         }
-        ClientError::Request { message, .. } | ClientError::Refused { message, .. } => message,
+        ClientError::Request { message, .. }
+        | ClientError::Refused { message, .. }
+        | ClientError::Degraded { message, .. } => message,
         ClientError::Server(detail) => {
             format!("The narsor daemon reported an error: {detail}")
         }

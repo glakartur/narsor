@@ -13,9 +13,10 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::oneshot;
 
+mod events;
 mod materials;
+mod relay;
 
 use super::credentials::{
     ControllerAuthenticator, ControllerIdentity, ControllerRecord, CredentialStore,
@@ -24,16 +25,18 @@ use super::credentials::{
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
 use crate::domain::{BackendId, LaunchDefinitionError, TaskDisplay, TaskId};
-use crate::engine::{plan_operator_transition, EngineError};
+use crate::engine::{plan_operator_transition, EngineError, PositionStatus, Timeline};
 use crate::environment::{LaunchError, LaunchIntent, LaunchResolver};
 use crate::materials::{MaterialLimits, MaterialStore};
 use crate::orchestration::{
-    BackendCapacity, BackendLease, CommandRequest, ControlPlane, ControllerReport,
-    ConversationAvailability, InputRequest, LeaseToken, MoveTarget, NewTask, Observation,
-    OperatorCommand, OperatorCommandRequest, OwnerRef, RunnerObservation, TaskEvent, TaskLifecycle,
-    TaskRecord,
+    AttentionItem, AttentionKind, BackendCapacity, BackendLease, CommandRequest, ControlPlane,
+    ControllerReport, ConversationAvailability, InputRequest, InputStatus, LeaseToken, MoveTarget,
+    NewTask, Observation, OperatorCommand, OperatorCommandRequest, OwnerRef, RunnerObservation,
+    TaskEvent, TaskLifecycle, TaskRecord,
 };
 use crate::workflow::TemplateScope;
+use events::LocalTaskStorage;
+use relay::Relay;
 
 /// A launch that did not resolve, as the owner sees it: a `400` naming the
 /// reason, or a bare `500` when the catalogue could not even be read.
@@ -64,21 +67,16 @@ const MAX_INCARNATION_LEN: usize = 256;
 const DEFAULT_PAGE_BUDGET: u64 = 256 * 1024;
 const MAX_PAGE_BUDGET: u64 = 1024 * 1024;
 
-/// Conversation page requests owners are waiting on (KTD4's relay).
-///
-/// Memory only, by design: a request outlives neither the owner's wait nor
-/// the process, and a page passes through without being stored.
-#[derive(Default)]
-struct PageRelay {
-    next_id: u64,
-    waiting: HashMap<String, WaitingPage>,
-}
+/// Events a relayed or stored read returns when the owner asks for no
+/// particular number, and the most it may ask for.
+const DEFAULT_EVENTS_LIMIT: u32 = 500;
+const MAX_EVENTS_LIMIT: u32 = 2000;
 
-struct WaitingPage {
-    task_id: TaskId,
-    request: ConversationPageRequest,
-    reply: oneshot::Sender<ConversationPage>,
-}
+/// Conversation page requests owners are waiting on (KTD4's relay).
+type PageRelay = Relay<ConversationPageRequest, ConversationPage>;
+
+/// Execution event requests owners are waiting on (U4), relayed the same way.
+type EventsRelay = Relay<ExecutionEventsRequest, ExecutionEventsPage>;
 
 /// Timing policy of the protocol.
 #[derive(Debug, Clone)]
@@ -100,7 +98,7 @@ pub struct ProtocolConfig {
     /// Longest long-poll a controller or runner may ask for.
     pub max_long_poll: std::time::Duration,
     /// How long an owner waits for the live runner to upload a requested
-    /// conversation page before the relay gives up.
+    /// conversation page or events page before the relay gives up.
     pub conversation_page_timeout: std::time::Duration,
 }
 
@@ -130,6 +128,8 @@ pub struct ProtocolService {
     changes: broadcast::Sender<TaskId>,
     launch: Arc<dyn LaunchResolver>,
     pages: Mutex<PageRelay>,
+    event_reads: Mutex<EventsRelay>,
+    local_storage: Option<LocalTaskStorage>,
     materials: MaterialStore,
 }
 
@@ -171,7 +171,18 @@ impl ProtocolService {
             changes,
             launch,
             pages: Mutex::new(PageRelay::default()),
+            event_reads: Mutex::new(EventsRelay::default()),
+            local_storage: None,
         }
+    }
+
+    /// Tells the service where a backend's task storages live on this host,
+    /// so a task of that backend whose runner is not running can still be
+    /// read from its own storage (U4). Only the daemon that owns the local
+    /// backend knows; a service without it answers such reads "unavailable".
+    pub fn with_local_storage(mut self, backend_id: BackendId, root: std::path::PathBuf) -> Self {
+        self.local_storage = Some(LocalTaskStorage { backend_id, root });
+        self
     }
 
     /// Replaces how controller requests are verified (the default checks
@@ -590,6 +601,12 @@ impl ProtocolService {
                 None => Freshness::Stale,
             },
             observed_at: runner.map(|runner| runner.snapshot.observed_at),
+            execution_status: runner.map(|runner| runner.snapshot.execution_status.clone()),
+            current_state: runner
+                .and_then(|runner| runner.snapshot.execution_cursor.current_state.clone()),
+            current_position: runner
+                .and_then(|runner| runner.snapshot.timeline.as_ref())
+                .and_then(current_position),
             timeline: runner.and_then(|runner| runner.snapshot.timeline.clone()),
             task_id: record.task_id,
         })
@@ -613,7 +630,31 @@ impl ProtocolService {
             _ => Vec::new(),
         };
         let observed_at = runner.map(|runner| runner.snapshot.observed_at);
-        let reason = match record.lifecycle {
+        let reason = self.live_read_blocker(&record, now)?;
+        Ok(match (reason, observed_at) {
+            (None, Some(observed_at)) => ConversationResponse::Available {
+                attempts: last_attempts,
+                observed_at,
+            },
+            (reason, observed_at) => ConversationResponse::Unavailable {
+                reason: reason.unwrap_or(ConversationUnavailableReason::NotStarted),
+                last_attempts,
+                observed_at,
+            },
+        })
+    }
+
+    /// Why the task's runner cannot be asked for content right now (a
+    /// conversation page, execution events), or `None` when it is live.
+    /// Archived, paused, interrupted, not yet started, unreachable, or
+    /// saying so itself — never by recreating compute (KTD4).
+    fn live_read_blocker(
+        &self,
+        record: &TaskRecord,
+        now: DateTime<Utc>,
+    ) -> ProtocolResult<Option<ConversationUnavailableReason>> {
+        let runner = record.runner.as_ref();
+        Ok(match record.lifecycle {
             TaskLifecycle::Archiving | TaskLifecycle::Archived => {
                 Some(ConversationUnavailableReason::Archived)
             }
@@ -626,9 +667,7 @@ impl ProtocolService {
             | TaskLifecycle::Running
             | TaskLifecycle::PauseRequested => match runner {
                 None => Some(ConversationUnavailableReason::NotStarted),
-                Some(runner)
-                    if self.runner_freshness(&record, runner, now)? == Freshness::Stale =>
-                {
+                Some(runner) if self.runner_freshness(record, runner, now)? == Freshness::Stale => {
                     Some(ConversationUnavailableReason::RunnerUnreachable)
                 }
                 Some(runner) => match &runner.snapshot.conversation {
@@ -637,17 +676,6 @@ impl ProtocolService {
                         Some(ConversationUnavailableReason::RunnerReported)
                     }
                 },
-            },
-        };
-        Ok(match (reason, observed_at) {
-            (None, Some(observed_at)) => ConversationResponse::Available {
-                attempts: last_attempts,
-                observed_at,
-            },
-            (reason, observed_at) => ConversationResponse::Unavailable {
-                reason: reason.unwrap_or(ConversationUnavailableReason::NotStarted),
-                last_attempts,
-                observed_at,
             },
         })
     }
@@ -683,33 +711,23 @@ impl ProtocolService {
             ));
         }
         let task_id = parse_identifier(TaskId::parse(task_id))?;
-        let (reply, answer) = oneshot::channel();
-        let request_id = {
-            let mut relay = self.lock_pages();
-            relay.next_id += 1;
-            let request_id = format!("page-{}", relay.next_id);
-            relay.waiting.insert(
-                request_id.clone(),
-                WaitingPage {
-                    task_id: task_id.clone(),
-                    request: ConversationPageRequest {
-                        request_id: request_id.clone(),
-                        attempt_id: attempt_id.to_string(),
-                        from_entry: query.from,
-                        byte_budget: query
-                            .byte_budget
-                            .unwrap_or(DEFAULT_PAGE_BUDGET)
-                            .clamp(1, MAX_PAGE_BUDGET),
-                    },
-                    reply,
-                },
-            );
-            request_id
-        };
+        let (request_id, answer) = self
+            .lock_pages()
+            .open("page", task_id.clone(), |request_id| {
+                ConversationPageRequest {
+                    request_id,
+                    attempt_id: attempt_id.to_string(),
+                    from_entry: query.from,
+                    byte_budget: query
+                        .byte_budget
+                        .unwrap_or(DEFAULT_PAGE_BUDGET)
+                        .clamp(1, MAX_PAGE_BUDGET),
+                }
+            });
         // Wakes the runner's long-poll, which then sees the request.
         self.notify(&task_id);
         let page = tokio::time::timeout(self.config.conversation_page_timeout, answer).await;
-        self.lock_pages().waiting.remove(&request_id);
+        self.lock_pages().close(&request_id);
         match page {
             Ok(Ok(page)) => Ok(page),
             _ => Err(ProtocolError::conflict(
@@ -1410,7 +1428,8 @@ impl ProtocolService {
                     .collect(),
                 credential_expires_at: session.expires_at,
                 launch: launch_view(identity, &record),
-                conversation_pages: self.page_requests(&identity.task_id),
+                conversation_pages: self.lock_pages().requests_of(&identity.task_id),
+                execution_events: self.lock_event_reads().requests_of(&identity.task_id),
                 materials: self.material_announcements(&identity.task_id),
             })
         };
@@ -1421,6 +1440,7 @@ impl ProtocolService {
                 let actionable = !response.inputs.is_empty()
                     || !response.commands.is_empty()
                     || !response.conversation_pages.is_empty()
+                    || !response.execution_events.is_empty()
                     || (!defer_materials && !response.materials.is_empty())
                     || response.directive != RunnerDirective::Continue;
                 Ok(actionable.then_some(response))
@@ -1445,34 +1465,19 @@ impl ProtocolService {
         self.credentials
             .touch_runner(identity, None)?
             .ok_or(ProtocolError::Unauthorized)?;
-        let waiting = {
-            let mut relay = self.lock_pages();
-            match relay.waiting.get(request_id) {
-                Some(waiting) if waiting.task_id == identity.task_id => {
-                    relay.waiting.remove(request_id)
-                }
-                _ => None,
-            }
-        };
-        let delivered = waiting.is_some_and(|waiting| waiting.reply.send(page).is_ok());
+        let waiting = self.lock_pages().take(request_id, &identity.task_id);
+        let delivered = waiting.is_some_and(|(_, reply)| reply.send(page).is_ok());
         Ok(ConversationPageAccepted { delivered })
-    }
-
-    /// Page requests of `task_id` owners are waiting on right now.
-    fn page_requests(&self, task_id: &TaskId) -> Vec<ConversationPageRequest> {
-        let mut requests: Vec<_> = self
-            .lock_pages()
-            .waiting
-            .values()
-            .filter(|waiting| &waiting.task_id == task_id)
-            .map(|waiting| waiting.request.clone())
-            .collect();
-        requests.sort_by(|a, b| a.request_id.cmp(&b.request_id));
-        requests
     }
 
     fn lock_pages(&self) -> std::sync::MutexGuard<'_, PageRelay> {
         self.pages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_event_reads(&self) -> std::sync::MutexGuard<'_, EventsRelay> {
+        self.event_reads
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -1598,6 +1603,7 @@ impl ProtocolService {
                 .iter()
                 .map(OperatorCommandView::from)
                 .collect(),
+            attention: task_attention(record),
             queue: record.queue.as_ref().map(QueueView::from),
             display: task_display(record),
             as_of: now,
@@ -1760,6 +1766,71 @@ impl ProtocolService {
 }
 
 /// The desired command of a task, `None` once it is archived for good.
+/// What waits on the owner: the runner's last report — minus the requests
+/// the owner has answered since (an answer queued, delivered or consumed)
+/// — plus a provisioning that failed. Oldest first.
+fn task_attention(record: &TaskRecord) -> Vec<AttentionItem> {
+    if record.lifecycle.is_archival() {
+        return Vec::new();
+    }
+    let answered = |waiting_id: &str| {
+        record.inputs.iter().any(|input| {
+            input.pending_input_id == waiting_id
+                && matches!(
+                    input.status,
+                    InputStatus::Queued | InputStatus::Delivered | InputStatus::Consumed
+                )
+        })
+    };
+    // Already cleaned when the snapshot was accepted.
+    let mut items: Vec<AttentionItem> = record
+        .runner
+        .iter()
+        .flat_map(|runner| &runner.snapshot.attention)
+        .filter(|item| !answered(&item.waiting_id))
+        .cloned()
+        .collect();
+    // The backend gave up before any execution existed: the runner (if one
+    // ever reported) never got as far as creating one.
+    let has_execution = record
+        .runner
+        .as_ref()
+        .is_some_and(|runner| runner.snapshot.execution_cursor.execution_id.is_some());
+    if matches!(
+        record.lifecycle,
+        TaskLifecycle::Interrupted | TaskLifecycle::Unknown
+    ) && !has_execution
+    {
+        items.push(AttentionItem {
+            kind: AttentionKind::ProvisioningFailed,
+            state_id: None,
+            since: record
+                .observed
+                .as_ref()
+                .map_or(record.created_at, |observed| observed.received_at),
+            waiting_id: format!("provisioning-{}", record.generation),
+        });
+    }
+    items.sort_by_key(|item| item.since);
+    items
+}
+
+/// The label of the attempt under way — in progress or awaiting a decision
+/// — the last one if several.
+fn current_position(timeline: &Timeline) -> Option<String> {
+    timeline
+        .positions
+        .iter()
+        .rev()
+        .find(|position| {
+            matches!(
+                position.status,
+                PositionStatus::InProgress | PositionStatus::AwaitingDecision
+            )
+        })
+        .map(|position| position.label.clone())
+}
+
 /// What a task shows as its title and links: the runner's latest rendering,
 /// else the workflow's `display` rendered from the sealed inputs alone —
 /// which is all there is to go on while the task still waits in the queue.

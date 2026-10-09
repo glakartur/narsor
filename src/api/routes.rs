@@ -283,6 +283,11 @@ enum ApiError {
         code: &'static str,
         message: String,
     },
+    /// Something that should have answered did not: `503` with a reason.
+    Unavailable {
+        code: &'static str,
+        message: String,
+    },
     Storage(PersistenceError),
     /// Anything else that stops a handler from completing — mirrors
     /// `Storage`'s `500`, kept distinct only so the log line names the right
@@ -312,6 +317,14 @@ impl IntoResponse for ApiError {
             }
             ApiError::Refused { code, message } => (
                 StatusCode::CONFLICT,
+                Json(RequestErrorResponse {
+                    code: code.to_owned(),
+                    message,
+                }),
+            )
+                .into_response(),
+            ApiError::Unavailable { code, message } => (
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(RequestErrorResponse {
                     code: code.to_owned(),
                     message,
@@ -419,6 +432,7 @@ fn protocol_error_as_api(error: ProtocolError) -> ApiError {
         ProtocolError::NotFound => ApiError::ExecutionNotFound,
         ProtocolError::BadRequest { code, message } => ApiError::Request { code, message },
         ProtocolError::Conflict { code, message } => ApiError::Refused { code, message },
+        ProtocolError::Unavailable { code, message } => ApiError::Unavailable { code, message },
         ProtocolError::Unauthorized | ProtocolError::Forbidden => ApiError::ExecutionNotFound,
         ProtocolError::Internal(message) => ApiError::Internal(message),
     }
@@ -427,7 +441,13 @@ fn protocol_error_as_api(error: ProtocolError) -> ApiError {
 /// Where the daemon-owned local backend keeps its task storages — under the
 /// configured work root, which is where task workspaces have always lived.
 fn local_storage_root(state: &AppState) -> PathBuf {
-    state.work_dir.join("local-controller").join("storage")
+    local_task_storage_root(&state.work_dir)
+}
+
+/// The same root from the work root alone, for whoever wires the control
+/// plane before any request state exists.
+pub fn local_task_storage_root(work_dir: &std::path::Path) -> PathBuf {
+    work_dir.join("local-controller").join("storage")
 }
 
 fn execution_store_for(state: &AppState, execution_id: &str) -> Result<ExecutionStore, ApiError> {

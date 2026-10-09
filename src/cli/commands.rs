@@ -38,7 +38,8 @@ use serde_json::{Map, Value};
 use crate::api::{ApiClient, ClientError, ConversationResponse, ExecutionSummary};
 use crate::conductor::{ChatAuthor, ChatEntry, ChatEntryKind};
 use crate::domain::{
-    Event, ExecutionStatus, InputParameter, ParamType, ProblemKind, WorkflowDefinition,
+    without_unsafe_chars, Event, ExecutionStatus, InputParameter, ParamType, ProblemKind,
+    WorkflowDefinition,
 };
 use crate::engine::{
     ConversationState, HumanInputDelivery, PendingHumanInput, Position, PositionStatus,
@@ -419,13 +420,16 @@ pub async fn events(state: &Path, flags: &Flags, execution_id: &str, follow: boo
 }
 
 /// One event line: sequence, timestamp, type, description.
-fn print_event(event: &Event) {
+///
+/// The description may quote an agent or a remote runner, so it is cleaned
+/// of anything a terminal would act on before it is printed.
+pub(crate) fn print_event(event: &Event) {
     println!(
         "{:>5}  {}  {:<22} {}",
         event.sequence,
         event.timestamp.to_rfc3339(),
         event_type(event),
-        event.description()
+        without_unsafe_chars(&event.description())
     );
 }
 
@@ -474,12 +478,12 @@ pub async fn steps(state: &Path, flags: &Flags, execution_id: &str) -> Result<()
 /// One position: label, status, action type, start/end, and — when they
 /// apply — the error, the retry-pending and harness-interrupted flags, and
 /// why the conversation cannot be read.
-fn print_position(position: &Position) {
+pub(crate) fn print_position(position: &Position) {
     println!(
         "{:<14} {:<18} {:<10} {}  ->  {}",
-        position.label,
+        without_unsafe_chars(&position.label),
         position_status_name(position.status),
-        position.action_type.as_deref().unwrap_or("-"),
+        without_unsafe_chars(position.action_type.as_deref().unwrap_or("-")),
         position
             .started_at
             .map(|time| time.to_rfc3339())
@@ -490,7 +494,7 @@ fn print_position(position: &Position) {
             .unwrap_or_else(|| "-".to_string()),
     );
     if let Some(error) = &position.error {
-        println!("    error: {error}");
+        println!("    error: {}", without_unsafe_chars(error));
     }
     if position.retry_pending {
         println!("    waiting to retry");
@@ -499,16 +503,22 @@ fn print_position(position: &Position) {
         println!("    harness session interrupted");
     }
     if let Some(resumed) = &position.resumed_harness_session {
-        println!("    resumed harness session: {resumed}");
+        println!(
+            "    resumed harness session: {}",
+            without_unsafe_chars(resumed)
+        );
     }
     match &position.conversation {
         ConversationState::Recorded => {
             if let Some(attempt_id) = &position.action_execution_id {
-                println!("    attempt id: {attempt_id}");
+                println!("    attempt id: {}", without_unsafe_chars(attempt_id));
             }
         }
         ConversationState::NotCreated { reason } => {
-            println!("    conversation not created: {reason}")
+            println!(
+                "    conversation not created: {}",
+                without_unsafe_chars(reason)
+            )
         }
         ConversationState::NoRecord => println!("    no conversation record (old log)"),
     }
@@ -1491,9 +1501,9 @@ fn client_error(execution_id: &str, error: ClientError) -> CliError {
         ClientError::Unavailable(detail) => {
             CliError::failure(format!("Could not reach the narsor daemon: {detail}"))
         }
-        ClientError::Request { message, .. } | ClientError::Refused { message, .. } => {
-            CliError::failure(message)
-        }
+        ClientError::Request { message, .. }
+        | ClientError::Refused { message, .. }
+        | ClientError::Degraded { message, .. } => CliError::failure(message),
         ClientError::Server(detail) => {
             CliError::failure(format!("The narsor daemon reported an error: {detail}"))
         }

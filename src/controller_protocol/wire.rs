@@ -24,13 +24,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::domain::{
-    BackendId, ExecutionStatus, ResourceProfile, TaskDisplay, TaskId, TaskLaunchSpec,
+    BackendId, Event, ExecutionStatus, ResourceProfile, TaskDisplay, TaskId, TaskLaunchSpec,
 };
 use crate::engine::{HumanInputDelivery, Timeline};
 use crate::orchestration::{
-    ArchiveTombstone, CommandReceipt, ConversationAttemptSummary, ExecutionCursor, InputStatus,
-    MoveTarget, Observation, ObservedSummary, OperatorCommand, OperatorCommandStatus, OwnerCommand,
-    PendingInputRef, QueueReason, QueueStatus, QueuedInput, QueuedOperatorCommand,
+    ArchiveTombstone, AttentionItem, CommandReceipt, ConversationAttemptSummary, ExecutionCursor,
+    InputStatus, MoveTarget, Observation, ObservedSummary, OperatorCommand, OperatorCommandStatus,
+    OwnerCommand, PendingInputRef, QueueReason, QueueStatus, QueuedInput, QueuedOperatorCommand,
     ResourceIdentity, RunnerProblem, RunnerSnapshot, TaskEvent, TaskLifecycle,
 };
 
@@ -285,6 +285,11 @@ pub struct TaskSummary {
     /// Operator commands (interrupt, transition, restart), oldest first.
     #[serde(default)]
     pub operator_commands: Vec<OperatorCommandView>,
+    /// What waits on the owner, oldest first (U4): the runner's report
+    /// minus what the owner has answered already, plus a failed
+    /// provisioning. Metadata only; the content comes with the details.
+    #[serde(default)]
+    pub attention: Vec<AttentionItem>,
     /// While queued: whether the task was admitted, or why it waits (U10).
     /// `None` outside `Queued`.
     #[serde(default)]
@@ -425,6 +430,16 @@ pub struct TimelineResponse {
     pub observed_at: Option<DateTime<Utc>>,
     /// The timeline; `None` before the runner reported one.
     pub timeline: Option<Timeline>,
+    /// The runner's execution status at that time.
+    #[serde(default)]
+    pub execution_status: Option<ExecutionStatus>,
+    /// The workflow state the execution was in.
+    #[serde(default)]
+    pub current_state: Option<String>,
+    /// The label of the position (attempt) under way — in progress or
+    /// awaiting a decision — when there is one: the step a client follows.
+    #[serde(default)]
+    pub current_position: Option<String>,
 }
 
 /// Why a task's conversation cannot be served right now.
@@ -956,6 +971,10 @@ pub struct RunnerPollResponse {
     /// with `POST /runner/v1/conversation-pages/:request_id`.
     #[serde(default)]
     pub conversation_pages: Vec<ConversationPageRequest>,
+    /// Execution-event requests owners are waiting for right now (U4);
+    /// answer each with `POST /runner/v1/execution-events/:request_id`.
+    #[serde(default)]
+    pub execution_events: Vec<ExecutionEventsRequest>,
     /// Owner materials not yet acknowledged (U9): fetch each manifest and
     /// its blobs, write them onto task storage, then acknowledge with
     /// `POST /runner/v1/materials/:material_id/ack`. Redelivered until
@@ -995,6 +1014,77 @@ pub struct ConversationPageQuery {
     /// Soft cap on the raw bytes; bounded by the server.
     #[serde(default)]
     pub byte_budget: Option<u64>,
+}
+
+/// An owner's request for the execution's raw events after a sequence,
+/// relayed to the live runner the way a conversation page is (KTD4): in
+/// memory only, answered straight to the waiting owner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionEventsRequest {
+    /// Relay id; upload the page under it.
+    pub request_id: String,
+    /// Events with a greater `sequence` are wanted.
+    pub after: u64,
+    /// Most events to return.
+    pub limit: u32,
+}
+
+/// One bounded run of the execution's events, in sequence order — what the
+/// runner uploads for an [`ExecutionEventsRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionEventsPage {
+    /// The events, oldest first.
+    pub events: Vec<Event>,
+    /// True when more events follow the last one returned.
+    pub has_more: bool,
+}
+
+/// `GET /control/v1/tasks/:task_id/execution-events` query.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionEventsQuery {
+    /// Events with a greater `sequence` (default 0: from the start).
+    #[serde(default)]
+    pub after: u64,
+    /// Most events to return; bounded by the server.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Where an events answer was read from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEventsSource {
+    /// The live runner, through the relay.
+    Runner,
+    /// The task's own storage, by the daemon that owns it (local backend
+    /// without a live runner).
+    Storage,
+}
+
+/// `GET /control/v1/tasks/:task_id/execution-events`.
+///
+/// A task whose runner is not running is a normal answer, not a failure:
+/// `Unavailable` says why. Only a runner that should answer and does not is
+/// an error (`503`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ExecutionEventsResponse {
+    /// The events after the requested sequence.
+    Available {
+        /// The events, oldest first.
+        events: Vec<Event>,
+        /// True when more follow; ask again `after` the last one.
+        has_more: bool,
+        /// Where they were read from.
+        source: ExecutionEventsSource,
+    },
+    /// Not readable right now.
+    Unavailable {
+        /// Why, in the conversation's vocabulary.
+        reason: ConversationUnavailableReason,
+        /// The same, for people.
+        message: String,
+    },
 }
 
 /// `POST /runner/v1/conversation-pages/:request_id` response.

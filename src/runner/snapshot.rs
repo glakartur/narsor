@@ -14,13 +14,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::domain::{ExecutionStatus, TaskDisplay, WorkflowDefinition, WorkflowExecution};
-use crate::engine::{build_timeline, Engine, InputContinuation, Timeline};
+use crate::engine::{build_timeline, Engine, InputContinuation, PendingHumanInput, Timeline};
 use crate::orchestration::{
-    ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, PendingInputRef,
-    RunnerProblem, RunnerSnapshot,
+    AttentionItem, AttentionKind, ConversationAttemptSummary, ConversationAvailability,
+    ExecutionCursor, PendingInputRef, RunnerProblem, RunnerSnapshot,
 };
 use crate::persistence::ConversationStore;
 use crate::workflow::TemplateScope;
@@ -60,6 +60,7 @@ pub(crate) fn build(
     context: SnapshotContext<'_>,
 ) -> Result<RunnerSnapshot, RunnerError> {
     let Some(execution_id) = context.execution_id else {
+        let observed_at = Utc::now();
         return Ok(RunnerSnapshot {
             snapshot_sequence: 0,
             // Nothing exists to have a status yet; `Unknown` is the honest
@@ -71,11 +72,12 @@ pub(crate) fn build(
             conversation: ConversationAvailability::default(),
             timeline: None,
             safe_point: context.stopping && !context.pass_active,
+            attention: attention_items(None, context.problem.as_ref(), observed_at),
             problem: context.problem,
             // Nothing to render against yet; the control plane's own
             // rendering from the sealed inputs stays in force.
             display: None,
-            observed_at: Utc::now(),
+            observed_at,
         });
     };
 
@@ -87,14 +89,15 @@ pub(crate) fn build(
     let recorded = conversations.recorded_attempt_ids()?;
     let timeline = build_timeline(&events, execution.status.clone(), &recorded);
 
-    let pending_input = engine
-        .pending_input(execution_id)?
-        .map(|pending| PendingInputRef {
-            id: pending.episode_key().to_string(),
-            attempt_id: (pending.continuation == InputContinuation::ResumeAgent)
-                .then(|| pending.action_execution_id().to_string()),
-            form: pending,
-        });
+    let observed_at = Utc::now();
+    let pending = engine.pending_input(execution_id)?;
+    let attention = attention_items(pending.as_ref(), context.problem.as_ref(), observed_at);
+    let pending_input = pending.map(|pending| PendingInputRef {
+        id: pending.episode_key().to_string(),
+        attempt_id: (pending.continuation == InputContinuation::ResumeAgent)
+            .then(|| pending.action_execution_id().to_string()),
+        form: pending,
+    });
 
     let conversation = if !context.stopping {
         ConversationAvailability::Live {
@@ -123,10 +126,47 @@ pub(crate) fn build(
         conversation,
         timeline: Some(timeline),
         safe_point: context.stopping && !context.pass_active,
+        attention,
         problem: context.problem,
         display: render_display(context.definition, &execution),
-        observed_at: Utc::now(),
+        observed_at,
     })
+}
+
+/// What waits on the owner, oldest first: the request the engine holds
+/// (classified by what answering it does) and the runner's own problem.
+///
+/// Metadata only. A problem has no age of its own — it is reported again
+/// by every snapshot of the same incarnation — so it counts from the
+/// snapshot that says it.
+pub(crate) fn attention_items(
+    pending: Option<&PendingHumanInput>,
+    problem: Option<&RunnerProblem>,
+    observed_at: DateTime<Utc>,
+) -> Vec<AttentionItem> {
+    let mut items: Vec<AttentionItem> = pending
+        .map(|pending| AttentionItem {
+            kind: match pending.continuation {
+                InputContinuation::CompleteStep | InputContinuation::ResumeAgent => {
+                    AttentionKind::Question
+                }
+                InputContinuation::ResolveOutput => AttentionKind::Problem,
+                InputContinuation::ApproveOutput => AttentionKind::Approval,
+            },
+            state_id: Some(pending.state_id.to_string()),
+            since: pending.requested_at,
+            waiting_id: pending.episode_key().to_string(),
+        })
+        .into_iter()
+        .collect();
+    items.extend(problem.map(|problem| AttentionItem {
+        kind: AttentionKind::Problem,
+        state_id: None,
+        since: observed_at,
+        waiting_id: problem.code.clone(),
+    }));
+    items.sort_by_key(|item| item.since);
+    items
 }
 
 /// The workflow's `display` against what the execution knows now: its inputs

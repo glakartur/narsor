@@ -367,6 +367,7 @@ impl SimulatedRunner {
             timeline: None,
             safe_point,
             problem: None,
+            attention: Vec::new(),
             display: None,
             observed_at: Utc::now(),
         };
