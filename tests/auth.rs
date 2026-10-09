@@ -635,6 +635,27 @@ async fn a_second_identity_cannot_read_or_mutate_the_owners_tasks() {
             Some(serde_json::json!({})),
         ),
         (Method::GET, "/control/v1/controllers", None),
+        (Method::GET, "/control/v1/capabilities", None),
+        (Method::GET, "/control/v1/workflows", None),
+        (
+            Method::POST,
+            "/control/v1/workflows/validate",
+            Some(serde_json::json!({ "path": "/etc/passwd.yaml" })),
+        ),
+        (Method::GET, "/control/v1/repositories", None),
+        (
+            Method::POST,
+            "/control/v1/repositories",
+            Some(serde_json::json!({ "id": "x", "remote": "https://example.com/x.git" })),
+        ),
+        (Method::DELETE, "/control/v1/repositories/x", None),
+        (Method::GET, "/control/v1/tasks?archived=true", None),
+        (Method::GET, "/control/v1/executions", None),
+        (
+            Method::POST,
+            "/control/v1/executions/exec-1/recover",
+            Some(serde_json::json!({})),
+        ),
         (Method::GET, "/executions", None),
         (Method::GET, "/events/stream", None),
     ];
@@ -1647,4 +1668,114 @@ fn url_encode(text: &str) -> String {
         .unwrap()
         .trim_start_matches("c=")
         .to_string()
+}
+
+#[tokio::test]
+async fn a_network_server_serves_no_disk_paths_but_still_manages_remote_repositories() {
+    let key = IssuerKey::es256("key-1");
+    let issuer = MockIssuer::start(&[&key]).await;
+    let server = NetworkServer::owned_by(&issuer, "alice").await;
+    let alice = issuer.token(&key, "alice");
+
+    let (status, body) = server
+        .call(Method::GET, "/control/v1/capabilities", Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let capabilities: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(capabilities["workflow_paths"], false);
+    assert_eq!(capabilities["local_repository_paths"], false);
+    assert_eq!(capabilities["legacy_executions"], false);
+    assert_eq!(capabilities["connection_name"], "remote");
+    assert!(capabilities["workflow_paths_reason"].is_string());
+
+    // Reading a file of the server's disk is refused, whatever the file.
+    let (status, body) = server
+        .call(
+            Method::POST,
+            "/control/v1/workflows/validate",
+            Some(&alice),
+            Some(serde_json::json!({ "path": "/etc/hostname.yaml" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("workflow_paths_unavailable"), "{body}");
+
+    // The catalogue is still served; the Historia has no old executions.
+    let (status, _) = server
+        .call(Method::GET, "/control/v1/workflows", Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = server
+        .call(Method::GET, "/control/v1/executions", Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"executions\":[]"), "{body}");
+    let (status, _) = server
+        .call(
+            Method::POST,
+            "/control/v1/executions/exec-1/recover",
+            Some(&alice),
+            Some(serde_json::json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Repositories: remote git URLs only.
+    for (id, remote) in [
+        ("path", "/srv/git/repo.git"),
+        ("relative", "../repo"),
+        ("home", "~/repo"),
+        ("file", "file:///srv/git/repo.git"),
+        ("file-upper", "FILE:///srv/git/repo.git"),
+        ("bare", "repo.git"),
+    ] {
+        let (status, body) = server
+            .call(
+                Method::POST,
+                "/control/v1/repositories",
+                Some(&alice),
+                Some(serde_json::json!({ "id": id, "remote": remote })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{remote}: {body}");
+        assert!(body.contains("invalid_repository"), "{remote}: {body}");
+    }
+    for (id, remote) in [
+        ("https", "https://example.com/acme.git"),
+        ("ssh", "ssh://git@example.com/acme.git"),
+        ("scp", "git@example.com:team/acme.git"),
+    ] {
+        let (status, body) = server
+            .call(
+                Method::POST,
+                "/control/v1/repositories",
+                Some(&alice),
+                Some(serde_json::json!({ "id": id, "remote": remote })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{remote}: {body}");
+    }
+    let (status, body) = server
+        .call(Method::GET, "/control/v1/repositories", Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"id\":\"scp\""), "{body}");
+    let (status, _) = server
+        .call(
+            Method::DELETE,
+            "/control/v1/repositories/https",
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = server
+        .call(
+            Method::DELETE,
+            "/control/v1/repositories/https",
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

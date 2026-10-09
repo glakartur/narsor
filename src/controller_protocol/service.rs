@@ -51,6 +51,15 @@ fn launch_refusal(error: LaunchError) -> ProtocolError {
     }
 }
 
+/// When the owner archived the task, or created it when no tombstone
+/// exists yet — the order of the Historia.
+fn archived_at(record: &TaskRecord) -> DateTime<Utc> {
+    record
+        .archive
+        .as_ref()
+        .map_or(record.created_at, |tombstone| tombstone.requested_at)
+}
+
 /// The owner every request authenticated by the local daemon token acts
 /// as. Trusted loopback mode has exactly one owner; network mode uses the
 /// verified OIDC `(issuer, subject)` instead
@@ -400,15 +409,43 @@ impl ProtocolService {
 
     /// The owner's tasks and the stream cursor at exactly that state.
     pub fn list_tasks(&self, owner: &OwnerRef) -> ProtocolResult<TaskListResponse> {
+        self.list_tasks_where(owner, None)
+    }
+
+    /// The owner's tasks, narrowed by `archived` (see [`TaskListQuery`]).
+    ///
+    /// The cursor is the stream's position over *all* the owner's tasks,
+    /// whatever the filter: a client that opens the stream with it misses
+    /// nothing, and a task that archives later simply arrives as an event.
+    /// Archived tasks come newest archive first (the Historia); the others
+    /// keep the control plane's own order.
+    pub fn list_tasks_where(
+        &self,
+        owner: &OwnerRef,
+        archived: Option<bool>,
+    ) -> ProtocolResult<TaskListResponse> {
         let mut cursor = StreamCursor::default();
-        let mut tasks = Vec::new();
+        let mut kept = Vec::new();
         for record in self.control.list_tasks()? {
             if record.owner != *owner {
                 continue;
             }
             cursor.advance(&record.task_id, record.revision);
-            tasks.push(self.summarize(&record)?);
+            if archived.is_none_or(|wanted| wanted == record.lifecycle.is_archival()) {
+                kept.push(record);
+            }
         }
+        if archived == Some(true) {
+            kept.sort_by(|a, b| {
+                archived_at(b)
+                    .cmp(&archived_at(a))
+                    .then_with(|| b.task_id.as_str().cmp(a.task_id.as_str()))
+            });
+        }
+        let tasks = kept
+            .iter()
+            .map(|record| self.summarize(record))
+            .collect::<ProtocolResult<Vec<_>>>()?;
         Ok(TaskListResponse {
             tasks,
             cursor: cursor.to_string(),

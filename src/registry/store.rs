@@ -230,6 +230,28 @@ impl RepositoryEntry {
         }
     }
 
+    /// An entry from the optional parts an operator types (`narsor repo
+    /// add`, the control API's `POST /control/v1/repositories`): the name
+    /// defaults to the id and the provider to what the remote looks like.
+    ///
+    /// Not validated here — [`RepositoryRegistry::add`] does that, so both
+    /// front ends refuse exactly what the provisioner would.
+    pub fn described(
+        id: &str,
+        remote: &str,
+        name: Option<String>,
+        provider: Option<String>,
+        default_branch: Option<String>,
+        description: Option<String>,
+    ) -> Self {
+        let mut entry = Self::new(id, remote)
+            .with_name(name.unwrap_or_else(|| id.to_string()))
+            .with_provider(provider.unwrap_or_else(|| infer_provider(remote).to_string()));
+        entry.default_branch = default_branch;
+        entry.description = description;
+        entry
+    }
+
     /// Sets the display name.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();

@@ -226,6 +226,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
             conductor: Some(Arc::clone(&conductor)),
             control: Some(Arc::clone(&control)),
             local_launch: Some(launch),
+            ..ApiServices::default()
         },
         security,
     )

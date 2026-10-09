@@ -72,13 +72,16 @@ use super::dto::{
 use super::routes::ConversationResponse;
 use crate::auth::{ClaimRequest, OwnerView, WhoAmIResponse};
 use crate::controller_protocol::{
-    ConductorReadQuery, ConductorReadResponse, ControlEventEnvelope, ControllerListResponse,
-    ControllerView, ConversationPage, ConversationPageQuery,
-    ConversationResponse as RemoteConversationResponse, CreateEnrollmentRequest, CreateTaskRequest,
-    DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery, ExecutionEventsResponse,
-    MoveTaskRequest, OwnerCommandRequest, OwnerCommandResponse, SetDefaultBackendRequest,
-    SubmitInputRequest, SubmitInputResponse, SubmitOperatorCommandRequest,
-    SubmitOperatorCommandResponse, TaskListResponse, TaskSummary, TimelineResponse,
+    CapabilitiesView, ConductorReadQuery, ConductorReadResponse, ControlEventEnvelope,
+    ControllerListResponse, ControllerView, ConversationPage, ConversationPageQuery,
+    ConversationResponse as RemoteConversationResponse, CreateEnrollmentRequest,
+    CreateRepositoryRequest, CreateTaskRequest, DefaultBackendView, EnrollmentResponse,
+    ExecutionEventsQuery, ExecutionEventsResponse, LegacyExecutionListResponse,
+    LegacyExecutionView, MoveTaskRequest, OwnerCommandRequest, OwnerCommandResponse,
+    RepositoryListResponse, RepositoryView, SetDefaultBackendRequest, SubmitInputRequest,
+    SubmitInputResponse, SubmitOperatorCommandRequest, SubmitOperatorCommandResponse,
+    TaskListResponse, TaskSummary, TimelineResponse, ValidateWorkflowRequest,
+    ValidateWorkflowResponse, WorkflowListResponse,
 };
 use crate::materials::{
     MaterialListResponse, MaterialSummary, MaterialUploadResponse, MaterialView,
@@ -541,6 +544,166 @@ impl ApiClient {
     pub async fn control_tasks(&self) -> Result<TaskListResponse, ClientError> {
         let url = format!("{}/control/v1/tasks", self.base_url);
         self.get_json(&url).await
+    }
+
+    /// Only the archived tasks, newest archive first (the Historia), or
+    /// only the others when `archived` is `false`.
+    pub async fn control_tasks_archived(
+        &self,
+        archived: bool,
+    ) -> Result<TaskListResponse, ClientError> {
+        let url = format!("{}/control/v1/tasks?archived={archived}", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// What the server offers: path validation, old executions, the name of
+    /// the connection (U6).
+    pub async fn control_capabilities(&self) -> Result<CapabilitiesView, ClientError> {
+        let url = format!("{}/control/v1/capabilities", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// The workflows a task can be created from.
+    pub async fn control_workflows(&self) -> Result<WorkflowListResponse, ClientError> {
+        let url = format!("{}/control/v1/workflows", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// Every violation of a workflow file on the server's disk; refused
+    /// (`400`) by a server whose capabilities say `workflow_paths: false`.
+    pub async fn control_validate_workflow(
+        &self,
+        path: &str,
+    ) -> Result<ValidateWorkflowResponse, ClientError> {
+        let url = format!("{}/control/v1/workflows/validate", self.base_url);
+        self.post_json(
+            &url,
+            &ValidateWorkflowRequest {
+                path: path.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// The registered repositories.
+    pub async fn control_repositories(&self) -> Result<RepositoryListResponse, ClientError> {
+        let url = format!("{}/control/v1/repositories", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// Registers a repository.
+    pub async fn control_add_repository(
+        &self,
+        request: &CreateRepositoryRequest,
+    ) -> Result<RepositoryView, ClientError> {
+        let url = format!("{}/control/v1/repositories", self.base_url);
+        self.post_json(&url, request).await
+    }
+
+    /// Removes a repository; [`ClientError::NotFound`] for an unknown id.
+    pub async fn control_remove_repository(&self, id: &str) -> Result<RepositoryView, ClientError> {
+        let url = format!("{}/control/v1/repositories/{id}", self.base_url);
+        self.delete_json(&url).await
+    }
+
+    /// Executions from before the task scheduler, newest first.
+    pub async fn control_history(&self) -> Result<LegacyExecutionListResponse, ClientError> {
+        let url = format!("{}/control/v1/executions", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// One old execution.
+    pub async fn control_history_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<LegacyExecutionView, ClientError> {
+        let url = format!("{}/control/v1/executions/{execution_id}", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// An old execution's events after `after`.
+    pub async fn control_history_events(
+        &self,
+        execution_id: &str,
+        after: u64,
+    ) -> Result<Vec<Event>, ClientError> {
+        let url = format!(
+            "{}/control/v1/executions/{execution_id}/events?after={after}",
+            self.base_url
+        );
+        self.get_json(&url).await
+    }
+
+    /// An old execution's step timeline.
+    pub async fn control_history_timeline(
+        &self,
+        execution_id: &str,
+    ) -> Result<Timeline, ClientError> {
+        let url = format!(
+            "{}/control/v1/executions/{execution_id}/timeline",
+            self.base_url
+        );
+        self.get_json(&url).await
+    }
+
+    /// One attempt's conversation of an old execution, from entry `from`.
+    pub async fn control_history_conversation(
+        &self,
+        execution_id: &str,
+        attempt_id: &str,
+        from: u64,
+    ) -> Result<ConversationResponse, ClientError> {
+        let url = format!(
+            "{}/control/v1/executions/{execution_id}/attempts/{attempt_id}/conversation?from={from}",
+            self.base_url
+        );
+        self.get_json(&url).await
+    }
+
+    /// What the conductor of an old execution kept.
+    pub async fn control_history_conductor(
+        &self,
+        execution_id: &str,
+    ) -> Result<ConductorStateResponse, ClientError> {
+        let url = format!(
+            "{}/control/v1/executions/{execution_id}/conductor",
+            self.base_url
+        );
+        self.get_json(&url).await
+    }
+
+    /// The conductor's chat of an old execution after sequence `after`.
+    pub async fn control_history_conductor_chat(
+        &self,
+        execution_id: &str,
+        after: u64,
+    ) -> Result<ConductorChatResponse, ClientError> {
+        let url = format!(
+            "{}/control/v1/executions/{execution_id}/conductor/chat?after={after}",
+            self.base_url
+        );
+        self.get_json(&url).await
+    }
+
+    /// Recovers a failed old execution; refused with `409`
+    /// ([`ClientError::Refused`] carries the reason) when it cannot be.
+    pub async fn control_recover_execution(
+        &self,
+        execution_id: &str,
+        comment: Option<String>,
+    ) -> Result<AcceptedResponse, ClientError> {
+        let url = format!(
+            "{}/control/v1/executions/{execution_id}/recover",
+            self.base_url
+        );
+        self.post_json(
+            &url,
+            &RecoveryRequest {
+                comment,
+                episode: None,
+            },
+        )
+        .await
     }
 
     /// One remote task's normalized summary.

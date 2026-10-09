@@ -2670,12 +2670,22 @@ mod failures {
             })
             .expect("save the conductor's report");
 
-        let handle = start_server_with_engine(
+        // With a control plane, so `/control/v1/executions` (the Historia)
+        // is served beside the legacy routes.
+        let handle = api::start_with_services(
             Arc::clone(&engine),
             root.path().to_path_buf(),
             root.path().to_path_buf(),
+            api::ApiServices {
+                control: Some(Arc::new(narsor::controller_protocol::ProtocolService::new(
+                    narsor::orchestration::ControlPlane::new(StatePaths::new(root.path())),
+                    environment_support::seeded_resolver(root.path()),
+                ))),
+                ..api::ApiServices::default()
+            },
         )
-        .await;
+        .await
+        .expect("server starts");
         Failed {
             _root: root,
             store,
@@ -2730,6 +2740,40 @@ mod failures {
             state.failure.map(|report| report.key).as_deref(),
             Some("attempt-2")
         );
+    }
+
+    /// U6: the Historia shows a failed old execution as recoverable, with
+    /// its problem, and recovering it through `/control/v1` starts it again.
+    #[tokio::test]
+    async fn history_recovers_a_failed_execution() {
+        let failed = failed_over_http().await;
+        let client = failed.handle.client();
+
+        let history = client.control_history().await.expect("history");
+        let row = history
+            .executions
+            .iter()
+            .find(|row| row.id == failed.execution_id)
+            .expect("listed");
+        assert_eq!(row.status, ExecutionStatus::Failed);
+        assert!(row.recoverable, "{row:?}");
+        assert_eq!(
+            row.problem.as_ref().map(|problem| problem.reason.as_str()),
+            Some("A dependency is missing.")
+        );
+        let capabilities = client.control_capabilities().await.expect("capabilities");
+        assert!(capabilities.legacy_executions);
+
+        let accepted = client
+            .control_recover_execution(&failed.execution_id, None)
+            .await
+            .expect("recovered");
+        assert_eq!(accepted.execution_id, failed.execution_id);
+        let stored = failed
+            .store
+            .load_execution(&failed.execution_id)
+            .expect("load");
+        assert!(stored.metadata["engine"].get("step_failure").is_none());
     }
 
     /// KTD9: a recovery naming a failure the execution is no longer failed
@@ -3957,4 +4001,447 @@ async fn queued_tasks_wait_for_capacity_in_rank_order_with_a_visible_reason() {
         Some(QueueReason::Admitted),
         "an admitted task keeps its reservation"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Catalogue, repositories, history and capabilities (U6)
+// ---------------------------------------------------------------------------
+
+mod control_catalog {
+    use super::*;
+
+    use narsor::controller_protocol::{
+        ConversationResponse, CreateRepositoryRequest, OwnerCommandRequest, WorkflowSource,
+    };
+    use narsor::orchestration::{ControlPlane, OwnerCommand, TaskLifecycle};
+    use narsor::registry::RepositoryRegistry;
+    use narsor::workflows::WorkflowResolver;
+
+    async fn start(root: &TempRoot) -> api::ApiHandle {
+        api::start_with_services(
+            Arc::new(Engine::new(root.store())),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            api::ApiServices {
+                control: Some(Arc::new(narsor::controller_protocol::ProtocolService::new(
+                    ControlPlane::new(StatePaths::new(root.path())),
+                    environment_support::seeded_resolver(root.path()),
+                ))),
+                workflows: Some(WorkflowResolver::with_user_dir(root.path(), None)),
+                ..api::ApiServices::default()
+            },
+        )
+        .await
+        .expect("server starts")
+    }
+
+    fn all_fixtures() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    fn repository(id: &str, remote: &str) -> CreateRepositoryRequest {
+        CreateRepositoryRequest {
+            id: id.to_string(),
+            remote: remote.to_string(),
+            name: None,
+            provider: None,
+            default_branch: None,
+            description: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_catalogue_lists_built_ins_with_description_and_inputs() {
+        let root = TempRoot::new();
+        let handle = start(&root).await;
+        let list = handle.client().control_workflows().await.expect("list");
+        let workflow = list
+            .workflows
+            .iter()
+            .find(|workflow| workflow.name == "compound-engineering")
+            .expect("built-in listed");
+        assert_eq!(workflow.source, WorkflowSource::BuiltIn);
+        assert!(workflow.valid, "{:?}", workflow.violations);
+        assert_eq!(workflow.version, Some(1));
+        assert!(workflow
+            .description
+            .as_deref()
+            .is_some_and(|text| text.starts_with("The compound engineering chain")));
+        let input = workflow
+            .inputs
+            .iter()
+            .find(|input| input.name == "feature_description")
+            .expect("input declared");
+        assert!(input.required);
+        assert!(input.description.is_some());
+        assert_eq!(workflow.inputs.len(), 2);
+        // Never a path of the server.
+        assert!(!serde_json::to_string(&list)
+            .unwrap()
+            .contains(root.path().to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_catalogue_workflow_that_does_not_load_stays_listed_with_its_violations() {
+        let root = TempRoot::new();
+        fs::create_dir_all(root.join("workflows")).unwrap();
+        fs::copy(
+            all_fixtures().join("invalid/five_violations.yaml"),
+            root.join("workflows/broken.yaml"),
+        )
+        .unwrap();
+        let handle = start(&root).await;
+        let list = handle.client().control_workflows().await.expect("list");
+        let broken = list
+            .workflows
+            .iter()
+            .find(|workflow| workflow.name == "broken")
+            .expect("listed");
+        assert_eq!(broken.source, WorkflowSource::Catalog);
+        assert!(!broken.valid);
+        assert_eq!(broken.violations.len(), 5);
+        assert!(broken.inputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validating_a_path_reports_every_violation() {
+        let root = TempRoot::new();
+        let handle = start(&root).await;
+        let client = handle.client();
+        let verdict = client
+            .control_validate_workflow(
+                all_fixtures()
+                    .join("invalid/five_violations.yaml")
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .expect("verdict");
+        assert!(!verdict.valid);
+        assert_eq!(verdict.violations.len(), 5, "{:?}", verdict.violations);
+
+        let valid = client
+            .control_validate_workflow(
+                all_fixtures()
+                    .join("implement_feature.yaml")
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .expect("verdict");
+        assert!(valid.valid, "{:?}", valid.violations);
+        assert!(valid.name.is_some());
+
+        for (path, code) in [
+            (root.join("missing.yaml"), "workflow_not_found"),
+            (root.path().to_path_buf(), "workflow_not_yaml"),
+            (root.join("notes.txt"), "workflow_not_yaml"),
+        ] {
+            match client
+                .control_validate_workflow(path.to_str().unwrap())
+                .await
+            {
+                Err(ClientError::Request { code: got, .. }) => assert_eq!(got, code),
+                other => panic!("{path:?}: {other:?}"),
+            }
+        }
+        fs::create_dir_all(root.join("dir.yaml")).unwrap();
+        match client
+            .control_validate_workflow(root.join("dir.yaml").to_str().unwrap())
+            .await
+        {
+            Err(ClientError::Request { code, .. }) => assert_eq!(code, "workflow_not_a_file"),
+            other => panic!("{other:?}"),
+        }
+        fs::write(root.join("big.yaml"), vec![b' '; 2 * 1024 * 1024]).unwrap();
+        match client
+            .control_validate_workflow(root.join("big.yaml").to_str().unwrap())
+            .await
+        {
+            Err(ClientError::Request { code, .. }) => assert_eq!(code, "workflow_too_large"),
+            other => panic!("{other:?}"),
+        }
+        fs::write(root.join("garbage.yaml"), "not: [a workflow").unwrap();
+        let garbage = client
+            .control_validate_workflow(root.join("garbage.yaml").to_str().unwrap())
+            .await
+            .expect("a verdict, not an error");
+        assert!(!garbage.valid && garbage.violations.len() == 1);
+    }
+
+    #[tokio::test]
+    async fn repositories_are_added_listed_and_removed_through_the_api() {
+        let root = TempRoot::new();
+        let handle = start(&root).await;
+        let client = handle.client();
+        assert!(client
+            .control_repositories()
+            .await
+            .unwrap()
+            .repositories
+            .is_empty());
+
+        let added = client
+            .control_add_repository(&repository(
+                "acme",
+                "https://user:secret@example.com/acme.git",
+            ))
+            .await
+            .expect("added");
+        assert_eq!(added.provider, "git");
+        assert_eq!(
+            added.remote, "https://example.com/acme.git",
+            "no credentials"
+        );
+        client
+            .control_add_repository(&repository("local-one", "/srv/git/local.git"))
+            .await
+            .expect("a path is fine on the local daemon");
+
+        // What `narsor repo list` reads.
+        let registered = RepositoryRegistry::new(root.path()).list().unwrap();
+        assert_eq!(registered.entries.len(), 2);
+        let listed = client.control_repositories().await.unwrap();
+        assert_eq!(
+            listed
+                .repositories
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["acme", "local-one"]
+        );
+
+        match client
+            .control_add_repository(&repository("acme", "https://example.com/other.git"))
+            .await
+        {
+            Err(ClientError::Refused { code, .. }) => assert_eq!(code, "repository_exists"),
+            other => panic!("{other:?}"),
+        }
+        for bad in [
+            repository("bad", "--upload-pack=evil"),
+            repository("bad", "ext::sh -c evil"),
+            repository("../escape", "https://example.com/x.git"),
+            repository("bad\u{1b}", "https://example.com/x.git"),
+        ] {
+            assert!(
+                matches!(
+                    client.control_add_repository(&bad).await,
+                    Err(ClientError::Request { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+
+        let removed = client.control_remove_repository("acme").await.unwrap();
+        assert_eq!(removed.id, "acme");
+        assert!(matches!(
+            client.control_remove_repository("acme").await,
+            Err(ClientError::NotFound)
+        ));
+        assert!(matches!(
+            client.control_remove_repository("never-registered").await,
+            Err(ClientError::NotFound)
+        ));
+        assert_eq!(
+            RepositoryRegistry::new(root.path())
+                .list()
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_registry_file_does_not_hide_the_other_repositories() {
+        let root = TempRoot::new();
+        let handle = start(&root).await;
+        let client = handle.client();
+        client
+            .control_add_repository(&repository("fine", "https://example.com/f.git"))
+            .await
+            .unwrap();
+        fs::write(root.join("repositories/broken.yaml"), ": : :").unwrap();
+        let listed = client.control_repositories().await.unwrap();
+        assert_eq!(listed.repositories.len(), 1);
+        assert_eq!(listed.unreadable.len(), 1);
+        assert!(listed.unreadable[0].starts_with("broken.yaml"));
+    }
+
+    #[tokio::test]
+    async fn history_lists_archived_tasks_newest_first_and_says_their_storage_is_gone() {
+        let root = TempRoot::new();
+        let handle = start(&root).await;
+        let client = handle.client();
+        assert!(client
+            .control_tasks_archived(true)
+            .await
+            .unwrap()
+            .tasks
+            .is_empty());
+
+        for id in ["task-a", "task-b", "task-live"] {
+            client
+                .create_control_task(&remote_task(id, "k8s"))
+                .await
+                .expect("created");
+        }
+        for id in ["task-a", "task-b"] {
+            client
+                .control_command(
+                    id,
+                    &OwnerCommandRequest {
+                        command: OwnerCommand::Archive,
+                        idempotency_key: format!("archive-{id}"),
+                        expected_generation: None,
+                    },
+                )
+                .await
+                .expect("archived");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let archived = client.control_tasks_archived(true).await.unwrap();
+        let ids: Vec<_> = archived.tasks.iter().map(|t| t.task_id.as_str()).collect();
+        assert_eq!(ids, ["task-b", "task-a"], "newest archive first");
+        assert!(archived
+            .tasks
+            .iter()
+            .all(|task| task.lifecycle == TaskLifecycle::Archived));
+        let rest = client.control_tasks_archived(false).await.unwrap();
+        assert_eq!(rest.tasks.len(), 1);
+        assert_eq!(rest.tasks[0].task_id.as_str(), "task-live");
+        assert_eq!(
+            client.control_tasks().await.unwrap().tasks.len(),
+            3,
+            "unfiltered as before"
+        );
+
+        // The record and the control-plane log remain; the storage-backed
+        // tabs say why they are empty.
+        assert!(!client.control_events("task-a", 0).await.unwrap().is_empty());
+        match client.control_conversation("task-a").await.unwrap() {
+            ConversationResponse::Unavailable { reason, .. } => {
+                assert_eq!(
+                    reason,
+                    narsor::controller_protocol::ConversationUnavailableReason::Archived
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn history_reads_an_old_execution_and_refuses_to_recover_a_finished_one() {
+        let root = TempRoot::new();
+        seed_execution_with_retry(&root.store(), "exec-old");
+        let handle = start(&root).await;
+        let client = handle.client();
+
+        let capabilities = client.control_capabilities().await.unwrap();
+        assert_eq!(capabilities.connection_name, "local");
+        assert!(capabilities.workflow_paths);
+        assert!(capabilities.workflow_paths_reason.is_none());
+        assert!(capabilities.legacy_executions);
+        assert!(capabilities.local_repository_paths);
+
+        let history = client.control_history().await.unwrap();
+        assert_eq!(history.executions.len(), 1);
+        let row = client.control_history_execution("exec-old").await.unwrap();
+        assert_eq!(row.status, ExecutionStatus::Completed);
+        assert!(!row.recoverable);
+        let json = serde_json::to_string(&history).unwrap();
+        assert!(!json.contains("definition_path") && !json.contains("workspace"));
+
+        assert_eq!(
+            client
+                .control_history_events("exec-old", 4)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(!client
+            .control_history_timeline("exec-old")
+            .await
+            .unwrap()
+            .positions
+            .is_empty());
+        assert!(matches!(
+            client
+                .control_history_conversation("exec-old", "attempt-1", 1)
+                .await
+                .unwrap(),
+            narsor::api::ConversationResponse::Recorded { .. }
+        ));
+        assert!(client.control_history_conductor("exec-old").await.is_ok());
+        assert!(client
+            .control_history_conductor_chat("exec-old", 0)
+            .await
+            .unwrap()
+            .entries
+            .is_empty());
+
+        match client.control_recover_execution("exec-old", None).await {
+            Err(ClientError::Refused { code, message }) => {
+                assert_eq!(code, "not_recoverable");
+                assert!(message.contains("completed"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        for unknown in ["nope", "exec-old-x"] {
+            assert!(matches!(
+                client.control_history_execution(unknown).await,
+                Err(ClientError::NotFound)
+            ));
+            assert!(matches!(
+                client.control_recover_execution(unknown, None).await,
+                Err(ClientError::NotFound)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_history_is_an_empty_list() {
+        let root = TempRoot::new();
+        let handle = start(&root).await;
+        let client = handle.client();
+        assert!(client
+            .control_history()
+            .await
+            .unwrap()
+            .executions
+            .is_empty());
+        assert!(
+            !client
+                .control_capabilities()
+                .await
+                .unwrap()
+                .legacy_executions
+        );
+    }
+
+    #[tokio::test]
+    async fn the_new_routes_refuse_a_missing_or_wrong_token() {
+        let root = TempRoot::new();
+        let handle = start(&root).await;
+        let raw = raw_client();
+        for path in [
+            "/control/v1/capabilities",
+            "/control/v1/workflows",
+            "/control/v1/repositories",
+            "/control/v1/executions",
+            "/control/v1/tasks?archived=true",
+        ] {
+            let bare = raw.get(url(&handle, path)).send().await.unwrap();
+            assert_eq!(bare.status(), reqwest::StatusCode::UNAUTHORIZED, "{path}");
+            let wrong = raw
+                .get(url(&handle, path))
+                .bearer_auth("wrong")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED, "{path}");
+        }
+    }
 }

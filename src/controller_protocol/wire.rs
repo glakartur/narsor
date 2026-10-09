@@ -1281,3 +1281,223 @@ pub struct EventsAfterQuery {
     #[serde(default)]
     pub after: u64,
 }
+
+// ---------------------------------------------------------------------------
+// Catalogue, repositories, history and capabilities (U6)
+// ---------------------------------------------------------------------------
+
+/// `GET /control/v1/tasks` query.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskListQuery {
+    /// `true`: only archived tasks (archiving or archived), newest archive
+    /// first — the Historia. `false`: only the others, in queue order.
+    /// Absent: every task, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+}
+
+/// One declared input of a workflow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowInputView {
+    /// The key the value is given under.
+    pub name: String,
+    /// Declared type (`type` on the wire).
+    #[serde(rename = "type")]
+    pub input_type: crate::domain::ParamType,
+    /// Whether a task cannot be created without it.
+    pub required: bool,
+    /// What it is for, when the workflow says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The value used when none is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+}
+
+/// Where the copy of a workflow that wins comes from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSource {
+    /// Compiled into the server's binary.
+    BuiltIn,
+    /// The catalogue's own `workflows/` directory.
+    Catalog,
+    /// The server user's own workflow directory.
+    User,
+}
+
+/// One workflow a task can be created from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowView {
+    /// The reference to create a task with (`launch.workflow_id`).
+    pub name: String,
+    /// Where it comes from; never a file path.
+    pub source: WorkflowSource,
+    /// What it does, on one line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The version to create a task with (`launch.workflow_version`);
+    /// absent when the definition does not load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    /// Declared inputs, in declaration order; empty when it does not load.
+    pub inputs: Vec<WorkflowInputView>,
+    /// Whether a task can be created from it right now.
+    pub valid: bool,
+    /// Every violation when it is not valid.
+    #[serde(default)]
+    pub violations: Vec<String>,
+    /// Whether it hides another copy of the same name.
+    pub overrides: bool,
+}
+
+/// `GET /control/v1/workflows`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowListResponse {
+    /// Built-in and catalogue workflows, ordered by name.
+    pub workflows: Vec<WorkflowView>,
+}
+
+/// `POST /control/v1/workflows/validate`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidateWorkflowRequest {
+    /// A workflow file on the server's disk.
+    pub path: String,
+}
+
+/// The verdict of a validation: every violation at once, like
+/// `narsor validate`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidateWorkflowResponse {
+    /// No violation and the definition loads.
+    pub valid: bool,
+    /// The definition's name, when it loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Its version, when it loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    /// Its declared inputs, when it loads.
+    #[serde(default)]
+    pub inputs: Vec<WorkflowInputView>,
+    /// Every violation (or the reason the file cannot be read as a
+    /// definition).
+    #[serde(default)]
+    pub violations: Vec<String>,
+}
+
+/// One registered repository.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryView {
+    /// The id a workflow names it by.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// `github`, `gitlab`, `local`, …
+    pub provider: String,
+    /// Where it is hosted.
+    pub remote: String,
+    /// Branch used when a workflow declares no `ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    /// Free-form note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// `GET /control/v1/repositories`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryListResponse {
+    /// Registered repositories, ordered by id.
+    pub repositories: Vec<RepositoryView>,
+    /// Registry files that could not be read, one line each (file name and
+    /// reason): the list never hides the entries that did load.
+    #[serde(default)]
+    pub unreadable: Vec<String>,
+}
+
+/// `POST /control/v1/repositories`: the parts `narsor repo add` takes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CreateRepositoryRequest {
+    /// The id a workflow will name it by.
+    pub id: String,
+    /// Anything `git clone` accepts, checked like the provisioner does.
+    pub remote: String,
+    /// Display name; the id when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Provider; inferred from the remote when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Branch used when a workflow declares no `ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    /// Free-form note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// `GET /control/v1/capabilities`: what this server offers, so a client
+/// greys out what it cannot do instead of failing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilitiesView {
+    /// What to call this connection in a client's header.
+    pub connection_name: String,
+    /// Whether `POST /control/v1/workflows/validate` (and so a workflow
+    /// *path* for a new task) is accepted: only a trusted local daemon
+    /// reads files from its own disk for its owner.
+    pub workflow_paths: bool,
+    /// Why not, when it is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_paths_reason: Option<String>,
+    /// Whether executions from before the task scheduler exist here
+    /// (`/control/v1/executions`).
+    pub legacy_executions: bool,
+    /// Whether a repository may be registered by a path on the server's
+    /// disk (`/srv/x`, `file://…`). Only a trusted local daemon accepts
+    /// one; any other server takes remote git URLs only (https, ssh,
+    /// `user@host:path`).
+    pub local_repository_paths: bool,
+}
+
+/// An execution from before the task scheduler, as the Historia shows it.
+///
+/// Texts are made terminal-safe, and nothing of the server's disk (the
+/// definition path in the execution's metadata, its variables) is part of
+/// it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LegacyExecutionView {
+    /// The execution's id.
+    pub id: String,
+    /// The workflow it is an execution of.
+    pub workflow_id: String,
+    /// The version it was started with.
+    pub workflow_version: u32,
+    /// Its status.
+    pub status: ExecutionStatus,
+    /// The state it stopped at, if any.
+    #[serde(default)]
+    pub current_state: Option<String>,
+    /// When it started.
+    pub started_at: DateTime<Utc>,
+    /// When it finished, if it has.
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+    /// What it is stopped on, if it is stopped on a problem.
+    #[serde(default)]
+    pub problem: Option<crate::api::ActiveProblem>,
+    /// Whether `POST …/recover` can start it again right now.
+    pub recoverable: bool,
+    /// Why not, when it cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_recoverable_reason: Option<String>,
+}
+
+/// `GET /control/v1/executions`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LegacyExecutionListResponse {
+    /// Newest first; empty when there are none (or this is not a local
+    /// daemon).
+    pub executions: Vec<LegacyExecutionView>,
+}

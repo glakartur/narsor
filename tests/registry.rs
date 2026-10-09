@@ -865,3 +865,27 @@ fn an_entry_written_before_base_images_still_reads() {
     assert_eq!(entry.base_image, None);
     assert_eq!(entry.git_credential, None);
 }
+
+#[test]
+fn a_described_entry_defaults_the_name_and_the_provider_and_is_validated_on_add() {
+    let entry = RepositoryEntry::described(
+        "acme",
+        "https://github.com/acme/api.git",
+        None,
+        None,
+        Some("main".to_string()),
+        None,
+    );
+    assert_eq!(entry.name, "acme");
+    assert_eq!(entry.provider, "github");
+    assert_eq!(entry.default_branch.as_deref(), Some("main"));
+
+    let root = TempRoot::new();
+    let registry = RepositoryRegistry::new(root.path());
+    let hostile = RepositoryEntry::described("evil", "--upload-pack=x", None, None, None, None);
+    assert!(matches!(
+        registry.add(hostile),
+        Err(RegistryError::InvalidRemote { .. })
+    ));
+    registry.add(entry).expect("registered");
+}

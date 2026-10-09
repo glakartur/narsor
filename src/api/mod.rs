@@ -106,6 +106,7 @@ use crate::controller_protocol::ProtocolService;
 use crate::engine::Engine;
 use crate::environment::CatalogLaunchResolver;
 use crate::persistence::DefaultHarnessSelector;
+use crate::workflows::WorkflowResolver;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -262,6 +263,8 @@ pub async fn start_with_harness_selector(
             conductor: None,
             control: None,
             local_launch: None,
+            workflows: None,
+            connection_name: None,
         },
     )
     .await
@@ -284,6 +287,13 @@ pub struct ApiServices {
     /// Resolver shared with the local create facade. It accepts daemon-local
     /// workflow references before sealing them into a control-plane task.
     pub local_launch: Option<Arc<CatalogLaunchResolver>>,
+    /// The workflows the owner API lists (U6). Defaults to the resolver of
+    /// the catalogue directory and the server user's own directory; a test
+    /// names its own so it never reads the developer's `~/.config`.
+    pub workflows: Option<WorkflowResolver>,
+    /// What a client shows as the name of this connection (U6); `local` for
+    /// a trusted daemon and `remote` for a network-mode server by default.
+    pub connection_name: Option<String>,
 }
 
 impl fmt::Debug for ApiServices {
@@ -294,6 +304,8 @@ impl fmt::Debug for ApiServices {
             .field("conductor", &self.conductor.is_some())
             .field("control", &self.control.is_some())
             .field("local_launch", &self.local_launch.is_some())
+            .field("workflows", &self.workflows)
+            .field("connection_name", &self.connection_name)
             .finish()
     }
 }

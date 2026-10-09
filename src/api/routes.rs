@@ -92,6 +92,8 @@ use crate::persistence::{
 use crate::tasks::{self, TaskError};
 use crate::workflows::WorkflowResolver;
 
+mod control;
+
 /// Default byte budget for a conversation read when the caller does not ask
 /// for a specific one.
 ///
@@ -114,6 +116,13 @@ struct AppState {
     conductor: Option<Arc<ConductorRegistry>>,
     control: Option<Arc<crate::controller_protocol::ProtocolService>>,
     local_launch: Option<Arc<CatalogLaunchResolver>>,
+    /// The workflows `GET /control/v1/workflows` lists.
+    workflows: WorkflowResolver,
+    /// Whether this is the trusted local daemon: only it serves the files
+    /// and the executions of its own disk to its owner (U6).
+    local: bool,
+    /// What a client calls this connection.
+    connection_name: String,
 }
 
 /// Builds the router: the three original read-only endpoints (U5/U2) plus
@@ -145,9 +154,17 @@ pub fn router(
     services: ApiServices,
 ) -> Router {
     let control = services.control.clone();
+    let local = matches!(auth, OwnerAuth::Trusted { .. });
     let state = AppState {
         engine,
         store,
+        workflows: services
+            .workflows
+            .unwrap_or_else(|| WorkflowResolver::new(catalog_dir.clone())),
+        local,
+        connection_name: services
+            .connection_name
+            .unwrap_or_else(|| if local { "local" } else { "remote" }.to_string()),
         catalog_dir,
         work_dir,
         harness_selector: services.harness_selector,
@@ -209,7 +226,9 @@ pub fn router(
             post(post_transition),
         );
     if let Some(control) = &control {
-        owner = owner.merge(protocol_http::owner_routes(Arc::clone(control)));
+        owner = owner
+            .merge(protocol_http::owner_routes(Arc::clone(control)))
+            .merge(control::routes());
     }
     // The owner gate covers everything above; controllers and runners are
     // not owners and pass their own credential gates instead (U2).
@@ -607,12 +626,21 @@ async fn get_events(
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<Vec<Event>>, ApiError> {
     let store = owner_execution_store_for(&state, &owner, &execution_id)?;
-    let events = store.event_log(&execution_id).read_all()?;
-    let events = events
+    Ok(Json(read_events(&store, &execution_id, query.after)?))
+}
+
+/// The events of `execution_id` with `sequence > after` — shared by
+/// `/executions/:id/events` and the history route of the control API.
+fn read_events(
+    store: &ExecutionStore,
+    execution_id: &str,
+    after: u64,
+) -> Result<Vec<Event>, ApiError> {
+    let events = store.event_log(execution_id).read_all()?;
+    Ok(events
         .into_iter()
-        .filter(|event| event.sequence > query.after)
-        .collect();
-    Ok(Json(events))
+        .filter(|event| event.sequence > after)
+        .collect())
 }
 
 /// `GET /executions/:execution_id/conductor`
@@ -626,16 +654,24 @@ async fn get_conductor_state(
     Path(execution_id): Path<String>,
 ) -> Result<Json<ConductorStateResponse>, ApiError> {
     require_legacy_execution(&state, &execution_id)?;
-    let conductor = ConductorStore::new(state.store.paths(), &execution_id);
+    Ok(Json(read_conductor_state(&state.store, &execution_id)?))
+}
+
+/// What the conductor of `execution_id` keeps, from its store.
+fn read_conductor_state(
+    store: &ExecutionStore,
+    execution_id: &str,
+) -> Result<ConductorStateResponse, ApiError> {
+    let conductor = ConductorStore::new(store.paths(), execution_id);
     let unanswered = conductor
         .unanswered_chat()?
         .into_iter()
         .map(|entry| entry.id)
         .collect();
-    Ok(Json(ConductorStateResponse::new(
+    Ok(ConductorStateResponse::new(
         conductor.load_state()?,
         unanswered,
-    )))
+    ))
 }
 
 /// `GET /executions/:execution_id/conductor/chat?after=<sequence>`
@@ -647,10 +683,23 @@ async fn get_conductor_chat(
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<ConductorChatResponse>, ApiError> {
     require_legacy_execution(&state, &execution_id)?;
-    let conductor = ConductorStore::new(state.store.paths(), &execution_id);
-    Ok(Json(ConductorChatResponse {
-        entries: conductor.read_chat_after(query.after)?,
-    }))
+    Ok(Json(read_conductor_chat(
+        &state.store,
+        &execution_id,
+        query.after,
+    )?))
+}
+
+/// The conductor's chat of `execution_id` after sequence `after`.
+fn read_conductor_chat(
+    store: &ExecutionStore,
+    execution_id: &str,
+    after: u64,
+) -> Result<ConductorChatResponse, ApiError> {
+    let conductor = ConductorStore::new(store.paths(), execution_id);
+    Ok(ConductorChatResponse {
+        entries: conductor.read_chat_after(after)?,
+    })
 }
 
 /// The conductor of this daemon, for the endpoints only it can serve.
@@ -816,11 +865,15 @@ async fn get_timeline(
     Path(execution_id): Path<String>,
 ) -> Result<Json<Timeline>, ApiError> {
     let store = owner_execution_store_for(&state, &owner, &execution_id)?;
-    let execution = store.load_execution(&execution_id)?;
-    let events = store.event_log(&execution_id).read_all()?;
-    let presence = conversation_presence(&store, &execution_id)?;
-    let timeline = build_timeline(&events, execution.status, &presence);
-    Ok(Json(timeline))
+    Ok(Json(read_timeline(&store, &execution_id)?))
+}
+
+/// The step timeline of `execution_id`, computed from its own store.
+fn read_timeline(store: &ExecutionStore, execution_id: &str) -> Result<Timeline, ApiError> {
+    let execution = store.load_execution(execution_id)?;
+    let events = store.event_log(execution_id).read_all()?;
+    let presence = conversation_presence(store, execution_id)?;
+    Ok(build_timeline(&events, execution.status, &presence))
 }
 
 /// Every attempt id with a conversation record on disk, open or closed —
@@ -906,13 +959,31 @@ async fn get_conversation(
     Query(query): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, ApiError> {
     let execution_store = owner_execution_store_for(&state, &owner, &execution_id)?;
-    if !is_safe_id(&attempt_id) {
-        return Ok(Json(ConversationResponse::NoRecord));
-    }
-    let store = execution_store.conversation_store(&execution_id);
-    let snapshot = store.read(&attempt_id, query.from, query.byte_budget)?;
+    Ok(Json(read_conversation(
+        &execution_store,
+        &execution_id,
+        &attempt_id,
+        query.from,
+        query.byte_budget,
+    )?))
+}
 
-    let response = match snapshot {
+/// One attempt's conversation from `from` on, within `byte_budget` — shared
+/// by `/executions/…/conversation` and the control API's history route.
+fn read_conversation(
+    execution_store: &ExecutionStore,
+    execution_id: &str,
+    attempt_id: &str,
+    from: u64,
+    byte_budget: usize,
+) -> Result<ConversationResponse, ApiError> {
+    if !is_safe_id(attempt_id) {
+        return Ok(ConversationResponse::NoRecord);
+    }
+    let store = execution_store.conversation_store(execution_id);
+    let snapshot = store.read(attempt_id, from, byte_budget)?;
+
+    Ok(match snapshot {
         Some(snapshot) => ConversationResponse::Recorded {
             entries: snapshot
                 .entries
@@ -929,9 +1000,7 @@ async fn get_conversation(
             truncated_tail: snapshot.truncated_tail,
         },
         None => ConversationResponse::NoRecord,
-    };
-
-    Ok(Json(response))
+    })
 }
 
 fn base64_encode(raw: &[u8]) -> String {
@@ -1055,21 +1124,31 @@ async fn post_recover(
     Json(request): Json<RecoveryRequest>,
 ) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
     require_legacy_execution(&state, &execution_id)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(begin_recovery(&state, execution_id, request)?),
+    ))
+}
+
+/// Starts the recovery of a legacy execution and drives it in the
+/// background — the one body of `/executions/:id/recover` and the control
+/// API's recover.
+fn begin_recovery(
+    state: &AppState,
+    execution_id: String,
+    request: RecoveryRequest,
+) -> Result<AcceptedResponse, ApiError> {
     let execution = state.store.load_execution(&execution_id)?;
-    let definition = load_definition_for(&state, &execution)?;
+    let definition = load_definition_for(state, &execution)?;
 
     let handle = state.engine.try_begin_recover_with(
         &execution_id,
         Recovery::by_operator(request.comment, request.episode),
     )?;
-    spawn_active(&state, execution_id.clone(), async move {
+    spawn_active(state, execution_id.clone(), async move {
         let _ = handle.run_to_completion(&definition).await;
     });
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(AcceptedResponse { execution_id }),
-    ))
+    Ok(AcceptedResponse { execution_id })
 }
 
 /// Stores an operator instruction for the next agent attempt. Terminal

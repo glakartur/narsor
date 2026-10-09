@@ -45,7 +45,7 @@ use crate::engine::{
     ConversationState, HumanInputDelivery, PendingHumanInput, Position, PositionStatus,
 };
 use crate::persistence::StatePaths;
-use crate::registry::{infer_provider, RepositoryEntry, RepositoryRegistry};
+use crate::registry::{RepositoryEntry, RepositoryRegistry};
 use crate::tasks::{self, TaskError};
 use crate::tui::conversation::classify;
 use crate::workflows::{builtin, builtin_names, ResolvedWorkflow, WorkflowResolver};
@@ -1132,11 +1132,7 @@ pub fn repo_add(
     default_branch: Option<String>,
     description: Option<String>,
 ) -> Result<()> {
-    let mut entry = RepositoryEntry::new(id, remote)
-        .with_name(name.unwrap_or_else(|| id.to_string()))
-        .with_provider(provider.unwrap_or_else(|| infer_provider(remote).to_string()));
-    entry.default_branch = default_branch;
-    entry.description = description;
+    let entry = RepositoryEntry::described(id, remote, name, provider, default_branch, description);
 
     let registry = RepositoryRegistry::new(catalog);
     registry.add(entry).map_err(|error| {

@@ -278,8 +278,9 @@ async fn create_task(
 async fn list_tasks(
     State(service): State<Service>,
     Extension(owner): Extension<OwnerRef>,
+    Query(query): Query<TaskListQuery>,
 ) -> ProtocolResult<Json<TaskListResponse>> {
-    Ok(Json(service.list_tasks(&owner)?))
+    Ok(Json(service.list_tasks_where(&owner, query.archived)?))
 }
 
 async fn get_task(
