@@ -59,7 +59,7 @@ impl TaskDisplay {
     /// is dropped. Applied wherever a display comes from outside the
     /// control plane's own rendering — a remote runner reports one.
     pub fn sanitized(self) -> Self {
-        let plain = |text: String| text.chars().filter(|ch| !ch.is_control()).collect();
+        let plain = |text: String| text.chars().filter(|ch| !is_unsafe_char(*ch)).collect();
         Self {
             title: plain(self.title),
             links: self
@@ -89,6 +89,23 @@ pub struct DisplayLink {
     pub url: Option<String>,
 }
 
+/// Whether `ch` could spoof or disturb what a terminal shows: a control
+/// character, or an invisible Unicode format character (zero-width and
+/// directional marks, bidi overrides and isolates, line and paragraph
+/// separators, the byte order mark) that `char::is_control` does not flag.
+fn is_unsafe_char(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{00AD}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+        )
+}
+
 /// Accepts `value` as a link target only when it is an absolute `http` or
 /// `https` URL with a host and nothing a terminal or a shell could misread.
 ///
@@ -99,7 +116,7 @@ pub fn safe_link_url(value: &str) -> Option<String> {
     let value = value.trim();
     if value
         .chars()
-        .any(|ch| ch.is_control() || ch.is_whitespace())
+        .any(|ch| is_unsafe_char(ch) || ch.is_whitespace())
     {
         return None;
     }
@@ -114,7 +131,24 @@ pub fn safe_link_url(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_link_url;
+    use super::{safe_link_url, DisplayLink, TaskDisplay};
+
+    #[test]
+    fn sanitizing_strips_invisible_format_characters() {
+        let display = TaskDisplay {
+            title: "NAR-1\u{202E}gnp.exe\u{200B}\u{2028}".into(),
+            links: vec![DisplayLink {
+                label: "PR\u{2066}".into(),
+                text: "go\u{FEFF}".into(),
+                url: Some("https://x.example/\u{202E}a".into()),
+            }],
+        }
+        .sanitized();
+        assert_eq!(display.title, "NAR-1gnp.exe");
+        assert_eq!(display.links[0].label, "PR");
+        assert_eq!(display.links[0].text, "go");
+        assert_eq!(display.links[0].url, None);
+    }
 
     #[test]
     fn keeps_http_and_https() {
