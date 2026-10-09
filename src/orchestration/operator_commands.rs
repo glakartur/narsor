@@ -144,6 +144,16 @@ impl ControlPlane {
         incarnation: &str,
         launch_generation: u64,
     ) -> Result<(Vec<QueuedOperatorCommand>, bool)> {
+        // Every wake of a runner's long-poll lands here, and almost always
+        // there is nothing to reject: look first, without a lock or a write.
+        let record = self.task(task_id)?;
+        fence_runner(&record, incarnation, launch_generation)?;
+        if !record.operator_commands.iter().any(|command| {
+            !command.status.is_settled()
+                && obsolete_reason(command, record.lifecycle, launch_generation).is_some()
+        }) {
+            return Ok((open_commands(&record), false));
+        }
         let mut changed = false;
         loop {
             let (record, rejected) = self.mutate(task_id, |record, now| {

@@ -1246,7 +1246,7 @@ impl ProtocolService {
     ) -> ProtocolResult<CommandsResponse> {
         let wait = self.long_poll(query.wait_secs);
         let found = self
-            .wait_for(wait, || {
+            .wait_for(wait, None, || {
                 let response = self.commands(identity, query.all)?;
                 Ok((!response.commands.is_empty()).then_some(response))
             })
@@ -1497,7 +1497,7 @@ impl ProtocolService {
         };
         let wait = self.long_poll(query.wait_secs);
         let found = self
-            .wait_for(wait, || {
+            .wait_for(wait, Some(&identity.task_id), || {
                 let response = poll()?;
                 let actionable = !response.inputs.is_empty()
                     || !response.commands.is_empty()
@@ -1850,26 +1850,34 @@ impl ProtocolService {
     }
 
     /// Re-runs `check` after every change notification until it finds
-    /// something or `wait` elapses.
+    /// something or `wait` elapses. With `only`, a notification of another
+    /// task is ignored: the check reads that one task, so another's change
+    /// cannot have given it anything to find.
     ///
     /// Subscribes *before* the first check, so a change landing between the
     /// check and the wait is never missed.
     async fn wait_for<T>(
         &self,
         wait: std::time::Duration,
+        only: Option<&TaskId>,
         mut check: impl FnMut() -> ProtocolResult<Option<T>>,
     ) -> ProtocolResult<Option<T>> {
         let mut changes = self.changes.subscribe();
         let deadline = tokio::time::Instant::now() + wait;
+        let mut relevant = true;
         loop {
-            if let Some(found) = check()? {
-                return Ok(Some(found));
+            if relevant {
+                if let Some(found) = check()? {
+                    return Ok(Some(found));
+                }
             }
-            match tokio::time::timeout_at(deadline, changes.recv()).await {
+            relevant = match tokio::time::timeout_at(deadline, changes.recv()).await {
                 Err(_elapsed) => return Ok(None),
-                Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => continue,
+                Ok(Ok(changed)) => only.is_none_or(|task_id| *task_id == changed),
+                // Some notifications were missed: any of them may matter.
+                Ok(Err(RecvError::Lagged(_))) => true,
                 Ok(Err(RecvError::Closed)) => return Ok(None),
-            }
+            };
         }
     }
 }

@@ -2376,3 +2376,25 @@ fn command_ids_of_a_record_without_a_counter_continue_above_its_highest() {
 
     assert_eq!(queue_chat(&fx, "chat-4", "hi").unwrap(), "command-4");
 }
+
+#[test]
+fn a_runner_poll_with_nothing_to_reject_reads_and_never_writes() {
+    let fx = running_task_for_commands();
+    let id = queue_chat(&fx, "chat-1", "hello").unwrap();
+    // A write would need the task's lock, which is made unobtainable: the
+    // wake of a runner by someone else's change must not reach for it.
+    break_task_lock(&fx, "task-1");
+    let revision = fx.control.task(&task("task-1")).unwrap().revision;
+
+    for _ in 0..3 {
+        let (commands, changed) = fx
+            .control
+            .deliver_operator_commands(&task("task-1"), "pod-1", 1)
+            .expect("a read-only poll");
+        assert!(!changed);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command_id, id);
+    }
+    assert_eq!(fx.control.task(&task("task-1")).unwrap().revision, revision);
+
+}
