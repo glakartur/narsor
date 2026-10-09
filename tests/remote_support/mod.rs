@@ -265,6 +265,8 @@ pub fn snapshot(sequence: u64, pending_input: Option<&str>) -> RunnerSnapshot {
         safe_point: false,
         problem: None,
         attention: Vec::new(),
+        conductor_available: false,
+        conductor_unavailable_reason: None,
         display: None,
         observed_at: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 5).unwrap(),
     }

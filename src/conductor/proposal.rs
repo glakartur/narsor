@@ -43,10 +43,10 @@ use crate::engine::{
 };
 
 /// The `kind` of a chat decision entry that records a carried-out proposal.
-const EXECUTED: &str = "execute_proposal";
+pub(super) const EXECUTED: &str = "execute_proposal";
 
 /// The `kind` of a chat entry that records a rejected proposal.
-const REJECTED: &str = "proposal_rejected";
+pub(super) const REJECTED: &str = "proposal_rejected";
 
 /// The provider `DecisionMade` records for a transition the conductor took
 /// on a confirmed proposal.

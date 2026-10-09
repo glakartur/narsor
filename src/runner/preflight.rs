@@ -176,12 +176,12 @@ impl BaseImageContract {
     }
 }
 
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
-fn find_on_path(tool: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+pub(crate) fn find_on_path(tool: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
         .map(|dir| dir.join(tool))
         .find(|candidate| is_executable(candidate))

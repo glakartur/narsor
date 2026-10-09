@@ -9,9 +9,7 @@
 
 use std::sync::Arc;
 
-use crate::conductor::{
-    ConductorInvoker, ConductorRegistry, ConductorRestore, PassLauncher,
-};
+use crate::conductor::{ConductorInvoker, ConductorRegistry, ConductorRestore, PassLauncher};
 use crate::domain::ExecutionId;
 use crate::engine::Engine;
 

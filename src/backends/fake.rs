@@ -368,6 +368,8 @@ impl SimulatedRunner {
             safe_point,
             problem: None,
             attention: Vec::new(),
+            conductor_available: false,
+            conductor_unavailable_reason: None,
             display: None,
             observed_at: Utc::now(),
         };

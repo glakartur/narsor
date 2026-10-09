@@ -19,8 +19,14 @@
 //! A failure while the conductor rescues a step's output label (F1) — its
 //! invocation, its reprompt, the application of its decision — originates
 //! from the conductor and gets no record. So does a workflow that simply
-//! ends in a terminal state declared as failed: nothing failed there. And
-//! without a conductor attached, no failure is recorded at all.
+//! ends in a terminal state declared as failed: nothing failed there.
+//!
+//! # Without a conductor
+//!
+//! The failure is recorded all the same, and handed to nobody: the record
+//! is also the key an operator's restart names ([`Recovery::episode`]) and
+//! what a task runner reports as a failed step waiting for its owner, with
+//! or without a conductor to diagnose it.
 //!
 //! # The conductor's one retry (R21, KTD14)
 //!
@@ -145,10 +151,10 @@ pub(super) fn conductor_retry_of(
 
 impl Engine {
     /// Records the step failure the execution is about to be saved with,
-    /// for the conductor to diagnose, and returns the conductor to hand it
-    /// to once it is saved — or clears what an earlier failure left and
-    /// returns `None`, for a failure that is not a trigger (see the module
-    /// documentation).
+    /// and returns the conductor to hand it to once it is saved — `None`
+    /// when no conductor is attached — or clears what an earlier failure
+    /// left and returns `None`, for a failure that is not a trigger (see
+    /// the module documentation).
     ///
     /// Must run before the rescue record is cleared: it is what says the
     /// failure came from the conductor.
@@ -163,9 +169,7 @@ impl Engine {
         clear_engine_metadata(execution, METADATA_CONDUCTOR_RETRY_KEY);
         clear_engine_metadata(execution, METADATA_STEP_FAILURE_KEY);
 
-        let Some(conductor) = self.conductor() else {
-            return Ok(None);
-        };
+        let conductor = self.conductor();
         let Some(state_id) = execution.current_state.clone() else {
             return Ok(None);
         };
@@ -191,7 +195,7 @@ impl Engine {
             side_effect_free,
         };
         write_engine_record(execution, METADATA_STEP_FAILURE_KEY, &failure)?;
-        Ok(Some(conductor))
+        Ok(conductor)
     }
 
     /// The part of a recovery [`Engine::prepare_recover`] adds for a step

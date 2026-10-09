@@ -21,7 +21,7 @@ pub(super) struct LocalTaskStorage {
 }
 
 impl LocalTaskStorage {
-    fn store_of(&self, task_id: &TaskId) -> ExecutionStore {
+    pub(super) fn store_of(&self, task_id: &TaskId) -> ExecutionStore {
         ExecutionStore::new(self.root.join(task_id.as_str()).join("state"))
     }
 }
@@ -194,7 +194,7 @@ fn unavailable(
 }
 
 /// Why nothing can be read, for people.
-fn not_running(reason: ConversationUnavailableReason) -> &'static str {
+pub(super) fn not_running(reason: ConversationUnavailableReason) -> &'static str {
     match reason {
         ConversationUnavailableReason::NotStarted => "the task has not started yet",
         ConversationUnavailableReason::Paused => "the runner is not running: the task is paused",
@@ -210,7 +210,7 @@ fn not_running(reason: ConversationUnavailableReason) -> &'static str {
 }
 
 /// A single path component: no separators, no traversal.
-fn is_safe_component(id: &str) -> bool {
+pub(super) fn is_safe_component(id: &str) -> bool {
     !id.is_empty()
         && id != "."
         && id != ".."

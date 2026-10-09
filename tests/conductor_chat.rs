@@ -1549,3 +1549,191 @@ async fn a_confirmed_retry_recovers_a_failed_step_without_a_failure_record() {
 async fn a_confirmed_retry_recovers_an_unknown_execution() {
     retry_confirmed_without_a_failure_record(ExecutionStatus::Unknown).await;
 }
+
+// ---------------------------------------------------------------------------
+// What an owner reads of the conductor (U5)
+// ---------------------------------------------------------------------------
+
+/// The owner's view of the conductor tells each proposal's fate: waiting,
+/// rejected, carried out — and stale, once the execution has moved on from
+/// the moment it is about. Only an unsettled proposal of the chat counts as
+/// waiting.
+#[tokio::test]
+async fn the_view_tells_what_became_of_every_proposal() {
+    use narsor::conductor::{pending_chat_proposals, ConductorView, ProposalState};
+
+    let fixture = Fixture::new(
+        "human_decision",
+        None,
+        vec![
+            propose_answer("ok"),
+            propose_answer("rejected"),
+            propose_answer("ok"),
+        ],
+    );
+    let (execution, _) = at_the_gate(&fixture).await;
+    let first = proposal_of(&fixture.ask(&execution.id, "answer ok?").await).0;
+    let second = proposal_of(&fixture.ask(&execution.id, "or reject it?").await).0;
+    let third = proposal_of(&fixture.ask(&execution.id, "ok again?").await).0;
+    fixture.wait_until_idle(&execution.id).await;
+    let store = fixture.harness.store();
+    let state_of = |view: &ConductorView, id: &str| {
+        view.proposals
+            .iter()
+            .find(|proposal| proposal.proposal_id == id)
+            .map(|proposal| proposal.state)
+            .expect("the proposal in the view")
+    };
+
+    let view = ConductorView::read(&store, &execution.id, 0, 100).expect("read the view");
+    for entry in [&first, &second, &third] {
+        assert_eq!(state_of(&view, &entry.id), ProposalState::Pending);
+    }
+    assert!(view.proposals.iter().all(|p| p.in_reply_to.is_some()));
+    assert_eq!(
+        pending_chat_proposals(&store, &execution.id)
+            .expect("the waiting ones")
+            .len(),
+        3
+    );
+
+    fixture
+        .registry
+        .reject_proposal(&execution.id, &second.id)
+        .expect("reject the second");
+    let confirmed = fixture
+        .registry
+        .confirm_proposal(&fixture.definition, &execution.id, &first.id)
+        .expect("confirm the first");
+    let finished = confirmed
+        .pass
+        .expect("answering the gate runs it on")
+        .run_to_completion(&fixture.definition)
+        .await
+        .expect("run on");
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+
+    let view = ConductorView::read(&store, &execution.id, 0, 100).expect("read the view");
+    assert_eq!(state_of(&view, &first.id), ProposalState::Executed);
+    assert_eq!(state_of(&view, &second.id), ProposalState::Rejected);
+    assert_eq!(
+        state_of(&view, &third.id),
+        ProposalState::Stale,
+        "the gate it is about was answered"
+    );
+    assert!(pending_chat_proposals(&store, &execution.id)
+        .expect("the waiting ones")
+        .is_empty());
+}
+
+/// The view pages the chat, and knows which messages wait for an answer
+/// without the caller reading the whole history.
+#[tokio::test]
+async fn the_view_pages_the_chat_and_names_the_unanswered_messages() {
+    use narsor::conductor::ConductorView;
+
+    let fixture = Fixture::new("human_decision", None, Vec::new());
+    let (execution, _) = at_the_gate(&fixture).await;
+    let store = fixture.harness.store();
+    let conductor = fixture.conductor_store(&execution.id);
+    let mut messages = Vec::new();
+    for text in ["one", "two", "three"] {
+        messages.push(
+            conductor
+                .append_chat(ChatEntry::new(
+                    ChatAuthor::Operator,
+                    ChatEntryKind::Message,
+                    text,
+                ))
+                .expect("append"),
+        );
+    }
+
+    let first = ConductorView::read(&store, &execution.id, 0, 2).expect("first page");
+    let texts: Vec<_> = first.chat.iter().map(|entry| entry.text.as_str()).collect();
+    assert_eq!(texts, vec!["one", "two"]);
+    assert!(first.chat_has_more);
+    let rest =
+        ConductorView::read(&store, &execution.id, first.chat[1].sequence, 2).expect("second page");
+    assert_eq!(rest.chat.len(), 1);
+    assert!(!rest.chat_has_more);
+    let ids: Vec<_> = messages.iter().map(|entry| entry.id.clone()).collect();
+    assert_eq!(first.unanswered_chat, ids);
+
+    // An execution the conductor never worked on has the empty view.
+    let empty = ConductorView::read(&store, "no-such-execution", 0, 10).expect("an empty view");
+    assert!(empty.chat.is_empty() && empty.proposals.is_empty() && empty.failure.is_none());
+}
+
+/// A decision of the conductor's is shown with whether the owner may still
+/// take it back; once taken back, that is shown too.
+#[tokio::test]
+async fn the_view_tells_whether_a_decision_can_still_be_undone() {
+    use narsor::conductor::ConductorView;
+
+    let fixture = Fixture::new(
+        "agent_problem",
+        Some(Arc::new(LabellessAgentExecutor::answering(
+            "Done: three units.",
+        ))),
+        vec![(
+            ConductorPurpose::ChooseOutputAfterReprompt,
+            Script::Answer(json!({
+                "decision": "choose_output",
+                "label": "implemented",
+                "data": {"units_completed": 3},
+                "variables": {"summary": "three units"},
+                "confidence": "high",
+                "rationale": "the agent said it finished three units",
+            })),
+        )],
+    );
+    let execution = fixture.run(json!({})).await;
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let store = fixture.harness.store();
+
+    let view = ConductorView::read(&store, &execution.id, 0, 100).expect("read the view");
+    assert_eq!(view.decisions.len(), 1, "{view:?}");
+    let decision = &view.decisions[0];
+    assert_eq!(decision.kind, "choose_output");
+    assert_eq!(decision.state_id.as_deref(), Some("work"));
+    assert_eq!(decision.confidence, Some(Confidence::High));
+    assert!(decision.undoable && !decision.undone);
+
+    fixture
+        .registry
+        .undo_decision(
+            &fixture.definition,
+            &execution.id,
+            &decision.decision_id,
+            || {},
+        )
+        .await
+        .expect("undo the decision");
+    let view = ConductorView::read(&store, &execution.id, 0, 100).expect("read the view");
+    assert!(view.decisions[0].undone && !view.decisions[0].undoable);
+}
+
+/// What a terminal must not be handed is stripped from every text of a
+/// view; the line breaks of a diagnosis stay.
+#[test]
+fn a_cleaned_view_keeps_line_breaks_and_loses_what_a_terminal_acts_on() {
+    use narsor::conductor::ConductorView;
+
+    let mut view = ConductorView::unavailable("no\u{1b}[2J harness");
+    let mut entry = ChatEntry::new(
+        ChatAuthor::Conductor,
+        ChatEntryKind::Message,
+        "one\ntwo\u{202e}\u{7}\tthree\r",
+    );
+    entry.payload = Some(json!({"diagnosis": "a\u{1b}[31mb\nc", "n": 3}));
+    view.chat.push(entry);
+
+    let cleaned = view.cleaned();
+    assert_eq!(cleaned.unavailable_reason.as_deref(), Some("no[2J harness"));
+    assert_eq!(cleaned.chat[0].text, "one\ntwo three");
+    assert_eq!(
+        cleaned.chat[0].payload,
+        Some(json!({"diagnosis": "a[31mb\nc", "n": 3}))
+    );
+}

@@ -95,6 +95,20 @@ pub fn without_unsafe_chars(text: &str) -> String {
     text.chars().filter(|ch| !is_unsafe_char(*ch)).collect()
 }
 
+/// Like [`without_unsafe_chars`] for text that is meant to span lines (a
+/// chat message, a diagnosis): line feeds stay, tabs become a space, and
+/// carriage returns go with the other control characters.
+pub fn without_unsafe_chars_multiline(text: &str) -> String {
+    text.chars()
+        .filter_map(|ch| match ch {
+            '\n' => Some('\n'),
+            '\t' => Some(' '),
+            _ if is_unsafe_char(ch) => None,
+            _ => Some(ch),
+        })
+        .collect()
+}
+
 /// Whether `ch` could spoof or disturb what a terminal shows: a control
 /// character, or an invisible Unicode format character (zero-width and
 /// directional marks, bidi overrides and isolates, line and paragraph
@@ -137,7 +151,7 @@ pub fn safe_link_url(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{safe_link_url, DisplayLink, TaskDisplay};
+    use super::{safe_link_url, without_unsafe_chars_multiline, DisplayLink, TaskDisplay};
 
     #[test]
     fn sanitizing_strips_invisible_format_characters() {
@@ -154,6 +168,14 @@ mod tests {
         assert_eq!(display.links[0].label, "PR");
         assert_eq!(display.links[0].text, "go");
         assert_eq!(display.links[0].url, None);
+    }
+
+    #[test]
+    fn multiline_text_keeps_its_line_feeds_and_nothing_a_terminal_acts_on() {
+        assert_eq!(
+            without_unsafe_chars_multiline("a\nb\tc\r\n\u{1b}[31md\u{202E}e\u{200B}"),
+            "a\nb c\n[31mde"
+        );
     }
 
     #[test]

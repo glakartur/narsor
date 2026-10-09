@@ -32,6 +32,8 @@
 //! * [`proposal`] — what the conductor proposed, carried out once the
 //!   operator confirms it (R28).
 //! * [`undo`] — undoing a chosen output of the conductor's (KTD13).
+//! * [`view`] — what an owner reads of it: chat, decisions, proposals,
+//!   the diagnosis of a failed step.
 //! * [`ConductorRegistry`] — the actors the daemon started, and the
 //!   interrupts of advisory invocations (KTD10).
 //!
@@ -61,6 +63,7 @@ pub mod response;
 pub mod snapshot;
 pub mod store;
 pub mod undo;
+pub mod view;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -71,7 +74,7 @@ pub use actor::{
 };
 pub use chat::{annotation_of, ProposalContext, ProposalRecord};
 pub use failure::{active_failure_problem, agent_attempt_left_traces, PassLauncher};
-pub use invoke::{ConductorAccess, HarnessInvoker, DEFAULT_CONDUCTOR_TIMEOUT};
+pub use invoke::{ConductorAccess, HarnessInvoker, LiveHarness, DEFAULT_CONDUCTOR_TIMEOUT};
 pub use proposal::{ConfirmedProposal, ProposalError, ProposalOutcome, ProposalStatus};
 pub use response::{
     allowed_decisions, proposals_allowed, ConductorResponse, Decision, DecisionKind, ProposalKind,
@@ -84,6 +87,10 @@ pub use store::{
     CONDUCTOR_STATE_VERSION,
 };
 pub use undo::{UndoError, UndoOutcome};
+pub use view::{
+    pending_chat_proposals, ConductorView, ConductorWork, DecisionView, ProposalState,
+    ProposalView, DEFAULT_CHAT_PAGE, MAX_CHAT_PAGE,
+};
 
 use crate::domain::{ConductorTrigger, ExecutionId, ExecutionStatus};
 use crate::engine::{owed_output_rescue, Engine};

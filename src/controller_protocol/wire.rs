@@ -23,6 +23,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::conductor::ConductorView;
 use crate::domain::{
     BackendId, Event, ExecutionStatus, ResourceProfile, TaskDisplay, TaskId, TaskLaunchSpec,
 };
@@ -156,6 +157,12 @@ pub struct RunnerView {
     /// Why it could not work, when it said so.
     #[serde(default)]
     pub problem: Option<RunnerProblem>,
+    /// Whether the runner hosts a conductor (U5).
+    #[serde(default)]
+    pub conductor_available: bool,
+    /// Why it hosts none, when it does not.
+    #[serde(default)]
+    pub conductor_unavailable_reason: Option<String>,
     /// When the runner took the snapshot.
     pub observed_at: DateTime<Utc>,
     /// When the control plane accepted it.
@@ -975,6 +982,10 @@ pub struct RunnerPollResponse {
     /// answer each with `POST /runner/v1/execution-events/:request_id`.
     #[serde(default)]
     pub execution_events: Vec<ExecutionEventsRequest>,
+    /// Conductor-state requests owners are waiting for right now (U5);
+    /// answer each with `POST /runner/v1/conductor-reads/:request_id`.
+    #[serde(default)]
+    pub conductor_reads: Vec<ConductorReadRequest>,
     /// Owner materials not yet acknowledged (U9): fetch each manifest and
     /// its blobs, write them onto task storage, then acknowledge with
     /// `POST /runner/v1/materials/:material_id/ack`. Redelivered until
@@ -1076,6 +1087,55 @@ pub enum ExecutionEventsResponse {
         /// True when more follow; ask again `after` the last one.
         has_more: bool,
         /// Where they were read from.
+        source: ExecutionEventsSource,
+    },
+    /// Not readable right now.
+    Unavailable {
+        /// Why, in the conversation's vocabulary.
+        reason: ConversationUnavailableReason,
+        /// The same, for people.
+        message: String,
+    },
+}
+
+/// An owner's request for the state of the task's conductor, relayed to the
+/// live runner like an events page (KTD4): in memory only, answered
+/// straight to the waiting owner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConductorReadRequest {
+    /// Relay id; upload the view under it.
+    pub request_id: String,
+    /// Chat entries with a greater `sequence` are wanted.
+    pub after: u64,
+    /// Most chat entries to return.
+    pub limit: u32,
+}
+
+/// `GET /control/v1/tasks/:task_id/conductor` query.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConductorReadQuery {
+    /// Chat entries with a greater `sequence` (default 0: from the start).
+    #[serde(default)]
+    pub after: u64,
+    /// Most chat entries to return; bounded by the server.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// `GET /control/v1/tasks/:task_id/conductor`.
+///
+/// Answered like the execution events: by the live runner through the
+/// relay, or — for the daemon's local backend, while its runner is not
+/// running — from the task's own storage, with the conductor marked
+/// unavailable. A task whose storage this server cannot read says why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ConductorReadResponse {
+    /// The conductor's state.
+    Available {
+        /// What there is to read.
+        conductor: Box<ConductorView>,
+        /// Where it was read from.
         source: ExecutionEventsSource,
     },
     /// Not readable right now.

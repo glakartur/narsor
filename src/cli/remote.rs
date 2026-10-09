@@ -23,12 +23,13 @@ use serde_json::{Map, Value};
 use crate::api::{
     ApiClient, ClientError, ConversationResponse as PageResponse, ServerTarget, TokenSource,
 };
+use crate::conductor::{ChatAuthor, ChatEntry, ConductorView};
 use crate::config::Flags;
 use crate::controller_protocol::{
-    ConversationPageQuery, CreateEnrollmentRequest, CreateTaskRequest, ExecutionEventsQuery,
-    ExecutionEventsResponse, LaunchRequest, MoveTaskRequest, OwnerCommandRequest,
-    SetDefaultBackendRequest, SubmitInputRequest, SubmitOperatorCommandRequest, TaskSummary,
-    WorkspaceRequest,
+    ConductorReadQuery, ConductorReadResponse, ConversationPageQuery, CreateEnrollmentRequest,
+    CreateTaskRequest, ExecutionEventsQuery, ExecutionEventsResponse, LaunchRequest,
+    MoveTaskRequest, OwnerCommandRequest, SetDefaultBackendRequest, SubmitInputRequest,
+    SubmitOperatorCommandRequest, TaskSummary, WorkspaceRequest,
 };
 use crate::domain::{without_unsafe_chars, TaskId};
 use crate::engine::HumanInputDelivery;
@@ -209,6 +210,13 @@ pub enum TaskCommand {
         #[arg(long, value_name = "CURSOR")]
         cursor: Option<String>,
     },
+    /// The task's conductor: chat with it, read its history, confirm or
+    /// reject its proposals, undo a decision, choose its harness.
+    Conductor {
+        /// What to do.
+        #[command(subcommand)]
+        action: ConductorCommand,
+    },
     /// Bounded one-off files for a task: upload, list, download, delete.
     Materials {
         /// What to do.
@@ -297,6 +305,62 @@ pub struct CommandArgs {
     /// Idempotency key; reuse it to retry safely. Generated when omitted.
     #[arg(long = "idempotency-key", value_name = "KEY")]
     pub idempotency_key: Option<String>,
+}
+
+/// `narsor task conductor …`.
+#[derive(Debug, Subcommand)]
+pub enum ConductorCommand {
+    /// Writes a message to the conductor. Its answer arrives in the chat
+    /// (see `history`).
+    Chat {
+        #[command(flatten)]
+        args: OperatorCommandArgs,
+        /// What to say.
+        #[arg(value_name = "TEXT")]
+        text: String,
+    },
+    /// Prints the conductor's state: what it works on, its diagnosis of a
+    /// failed step, its proposals and decisions, and the chat.
+    History {
+        /// The task id.
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+        /// Only the chat entries after this sequence number.
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+    },
+    /// Carries out a proposal of the conductor's.
+    Confirm {
+        #[command(flatten)]
+        args: OperatorCommandArgs,
+        /// The proposal's id (see `history`).
+        #[arg(value_name = "PROPOSAL_ID")]
+        proposal_id: String,
+    },
+    /// Turns a proposal of the conductor's down.
+    Reject {
+        #[command(flatten)]
+        args: OperatorCommandArgs,
+        /// The proposal's id (see `history`).
+        #[arg(value_name = "PROPOSAL_ID")]
+        proposal_id: String,
+    },
+    /// Takes back a chosen output of the conductor's (only the latest one).
+    Undo {
+        #[command(flatten)]
+        args: OperatorCommandArgs,
+        /// The decision's id (see `history`).
+        #[arg(value_name = "DECISION_ID")]
+        decision_id: String,
+    },
+    /// Runs the conductor on another harness, from its next invocation on.
+    Harness {
+        #[command(flatten)]
+        args: OperatorCommandArgs,
+        /// The harness name (`claude-code`, `codex`, `opencode`).
+        #[arg(value_name = "HARNESS")]
+        harness: String,
+    },
 }
 
 /// Arguments shared by the commands that act on a task's runner.
@@ -733,6 +797,7 @@ pub async fn task(
             }
             Ok(())
         }
+        TaskCommand::Conductor { action } => conductor(&client, action).await,
         TaskCommand::Materials { action } => materials(&client, action).await,
         TaskCommand::Watch { cursor } => {
             let cursor = match cursor {
@@ -748,6 +813,119 @@ pub async fn task(
             follow_events(&client, Some(cursor), None).await
         }
     }
+}
+
+/// Runs one `narsor task conductor` command.
+async fn conductor(client: &ApiClient, command: ConductorCommand) -> Result<()> {
+    let (args, command) = match command {
+        ConductorCommand::History { task_id, after } => {
+            return conductor_history(client, &task_id, after).await
+        }
+        ConductorCommand::Chat { args, text } => (args, OperatorCommand::ConductorChat { text }),
+        ConductorCommand::Confirm { args, proposal_id } => {
+            (args, OperatorCommand::ConfirmProposal { proposal_id })
+        }
+        ConductorCommand::Reject { args, proposal_id } => {
+            (args, OperatorCommand::RejectProposal { proposal_id })
+        }
+        ConductorCommand::Undo { args, decision_id } => {
+            (args, OperatorCommand::UndoDecision { decision_id })
+        }
+        ConductorCommand::Harness { args, harness } => {
+            (args, OperatorCommand::SetConductorHarness { harness })
+        }
+    };
+    operator_command(client, command, args).await
+}
+
+/// Prints the conductor's state, then its chat page by page. A task whose
+/// runner is not running is answered with what its storage holds when this
+/// host has it, and with the reason when it has not.
+async fn conductor_history(client: &ApiClient, task_id: &str, after: u64) -> Result<()> {
+    let mut query = ConductorReadQuery { after, limit: None };
+    let mut first = true;
+    loop {
+        let response = client
+            .control_conductor(task_id, &query)
+            .await
+            .map_err(|error| failure("The conductor's state cannot be read", error))?;
+        let ConductorReadResponse::Available { conductor, .. } = response else {
+            let ConductorReadResponse::Unavailable { message, .. } = response else {
+                unreachable!("the other variant was matched above");
+            };
+            return Err(CliError::failure(format!(
+                "The conductor's state is not available: {}",
+                without_unsafe_chars(&message)
+            )));
+        };
+        // What the runner or the conductor wrote is not trusted with the
+        // terminal, whoever served it.
+        let view = conductor.cleaned();
+        if first {
+            print_conductor_overview(&view);
+            first = false;
+        }
+        for entry in &view.chat {
+            print_chat_entry(entry);
+        }
+        match view.chat.last() {
+            Some(last) if view.chat_has_more => query.after = last.sequence,
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn print_conductor_overview(view: &ConductorView) {
+    match (&view.harness, &view.unavailable_reason) {
+        (Some(harness), _) if view.available => println!("Conductor: running on {harness}"),
+        (_, Some(reason)) => println!("Conductor: not running ({reason})"),
+        _ => println!("Conductor: not running"),
+    }
+    for work in &view.working {
+        println!(
+            "Working: {:?} ({:?}){}",
+            work.purpose,
+            work.trigger,
+            if work.running { "" } else { ", queued" }
+        );
+    }
+    if let Some(failure) = &view.failure {
+        println!(
+            "Failed step {}: {}",
+            failure.state_id,
+            failure.reason.replace('\n', " ")
+        );
+    }
+    for proposal in &view.proposals {
+        println!(
+            "Proposal {}  [{:?}]  {}",
+            proposal.proposal_id, proposal.state, proposal.text
+        );
+    }
+    for decision in &view.decisions {
+        let note = match (decision.undone, decision.undoable) {
+            (true, _) => " (undone)",
+            (false, true) => " (can be undone)",
+            (false, false) => "",
+        };
+        println!(
+            "Decision {}  {}  {}{note}",
+            decision.decision_id, decision.kind, decision.text
+        );
+    }
+}
+
+fn print_chat_entry(entry: &ChatEntry) {
+    let author = match entry.author {
+        ChatAuthor::Operator => "you",
+        ChatAuthor::Conductor => "conductor",
+    };
+    println!(
+        "#{:<4} {}  {author}: {}",
+        entry.sequence,
+        entry.at.to_rfc3339(),
+        entry.text
+    );
 }
 
 /// Prints every event of the task's execution, page by page. A task whose
@@ -1141,6 +1319,21 @@ fn describe_operator_command(command: &OperatorCommand) -> String {
                 .map(|key| format!(" (failure {key})"))
                 .unwrap_or_default()
         ),
+        // The chat text is the owner's own words and the event log is no
+        // place for them twice: only the length is told.
+        OperatorCommand::ConductorChat { text } => {
+            format!("conductor chat ({} characters)", text.chars().count())
+        }
+        OperatorCommand::ConfirmProposal { proposal_id } => {
+            format!("confirm proposal {proposal_id}")
+        }
+        OperatorCommand::RejectProposal { proposal_id } => {
+            format!("reject proposal {proposal_id}")
+        }
+        OperatorCommand::UndoDecision { decision_id } => format!("undo decision {decision_id}"),
+        OperatorCommand::SetConductorHarness { harness } => {
+            format!("conductor harness {harness}")
+        }
     }
 }
 

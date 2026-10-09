@@ -5,7 +5,9 @@
 //!
 //! The conductor runs on the daemon's default harness, snapshotted from
 //! [`DefaultHarnessSelector`] at every invocation, the same way an agent
-//! step picks it. It never writes, and how that is enforced depends on the
+//! step picks it. A task runner has no selector: its conductor runs on the
+//! harness its task pinned, or on the one its owner chose since
+//! ([`LiveHarness`]), read at every invocation too. It never writes, and how that is enforced depends on the
 //! harness:
 //!
 //! * **claude-code, codex** enforce it themselves: the conductor runs in the
@@ -43,7 +45,7 @@ use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::conductor::actor::{ConductorAnswer, ConductorInvoker, Invocation, InvocationOutcome};
@@ -51,7 +53,9 @@ use crate::conductor::prompt::conductor_prompt;
 use crate::conductor::response::ConductorResponse;
 use crate::conductor::snapshot::{render, SnapshotBudget, SnapshotInput};
 use crate::conductor::store::ConductorStore;
-use crate::domain::{AgentActionConfig, OutputDefinition, WorkflowExecution, WorkspaceAccess};
+use crate::domain::{
+    AgentActionConfig, OutputDefinition, WorkflowDefinition, WorkflowExecution, WorkspaceAccess,
+};
 use crate::engine::actions::agent::{run_harness_process, SpawnEnding, BUILT_IN_HARNESS};
 use crate::engine::actions::harness::{HarnessRegistry, HarnessRequest, CLAUDE_CODE, CODEX};
 use crate::persistence::{DefaultHarnessSelector, ExecutionStore, WorkPaths};
@@ -82,6 +86,34 @@ impl ConductorAccess {
     }
 }
 
+/// The harness a conductor runs on, changeable while it works: the next
+/// invocation reads it, the one under way is not touched.
+#[derive(Debug)]
+pub struct LiveHarness(Mutex<String>);
+
+impl LiveHarness {
+    /// A handle holding `harness`.
+    pub fn new(harness: impl Into<String>) -> Self {
+        Self(Mutex::new(harness.into()))
+    }
+
+    /// The harness the next invocation runs on.
+    pub fn get(&self) -> String {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Chooses the harness of the invocations to come.
+    pub fn set(&self, harness: impl Into<String>) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = harness.into();
+    }
+}
+
 /// The conductor, run on the default harness (U9).
 #[derive(Debug, Clone)]
 pub struct HarnessInvoker {
@@ -91,6 +123,8 @@ pub struct HarnessInvoker {
     harnesses: HarnessRegistry,
     default_harness: String,
     selector: Option<Arc<DefaultHarnessSelector>>,
+    live_harness: Option<Arc<LiveHarness>>,
+    pinned_definition: Option<Arc<WorkflowDefinition>>,
     timeout: Duration,
     budget: SnapshotBudget,
 }
@@ -112,6 +146,8 @@ impl HarnessInvoker {
             harnesses: HarnessRegistry::defaults(),
             default_harness: BUILT_IN_HARNESS.to_string(),
             selector: None,
+            live_harness: None,
+            pinned_definition: None,
             timeout: DEFAULT_CONDUCTOR_TIMEOUT,
             budget: SnapshotBudget::default(),
         }
@@ -134,6 +170,21 @@ impl HarnessInvoker {
     /// snapshotted at every invocation.
     pub fn with_default_harness_selector(mut self, selector: Arc<DefaultHarnessSelector>) -> Self {
         self.selector = Some(selector);
+        self
+    }
+
+    /// Returns the invoker with a harness its owner can change while it
+    /// runs, read at every invocation; used when there is no selector.
+    pub fn with_live_harness(mut self, harness: Arc<LiveHarness>) -> Self {
+        self.live_harness = Some(harness);
+        self
+    }
+
+    /// Returns the invoker with the one definition every execution of its
+    /// store runs: a task runner holds its workflow snapshot, not a
+    /// catalogue to resolve names against.
+    pub fn with_pinned_definition(mut self, definition: Arc<WorkflowDefinition>) -> Self {
+        self.pinned_definition = Some(definition);
         self
     }
 
@@ -173,9 +224,10 @@ impl HarnessInvoker {
     }
 
     async fn try_invoke(&self, invocation: &Invocation) -> Result<ConductorAnswer, String> {
-        let harness = match &self.selector {
-            Some(selector) => selector.snapshot().await.effective,
-            None => self.default_harness.clone(),
+        let harness = match (&self.selector, &self.live_harness) {
+            (Some(selector), _) => selector.snapshot().await.effective,
+            (None, Some(live)) => live.get(),
+            (None, None) => self.default_harness.clone(),
         };
         let adapter = self
             .harnesses
@@ -262,6 +314,9 @@ impl HarnessInvoker {
         &self,
         execution: &WorkflowExecution,
     ) -> Result<(String, Vec<OutputDefinition>), String> {
+        if let Some(definition) = &self.pinned_definition {
+            return Ok(pinned_source(definition, execution));
+        }
         let resolved =
             crate::tasks::resolve_definition(&self.catalog_dir, self.store.paths(), execution)
                 .map_err(|error| error.to_string())?;
@@ -310,6 +365,24 @@ impl ConductorInvoker for HarnessInvoker {
     ) -> Pin<Box<dyn Future<Output = InvocationOutcome> + Send + 'a>> {
         Box::pin(self.invoke_once(invocation))
     }
+}
+
+/// The pinned `definition` as text for the snapshot, and the outputs of the
+/// state `execution` is in.
+fn pinned_source(
+    definition: &WorkflowDefinition,
+    execution: &WorkflowExecution,
+) -> (String, Vec<OutputDefinition>) {
+    let source = serde_yaml::to_string(definition)
+        .or_else(|_| serde_json::to_string_pretty(definition))
+        .unwrap_or_default();
+    let outputs = execution
+        .current_state
+        .as_ref()
+        .and_then(|state| definition.states.get(state))
+        .map(|state| state.outputs.clone())
+        .unwrap_or_default();
+    (source, outputs)
 }
 
 /// The action configuration the adapters build the conductor's command line

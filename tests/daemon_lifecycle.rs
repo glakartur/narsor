@@ -1358,3 +1358,213 @@ async fn a_fresh_daemon_applies_a_saved_choice_without_invoking_the_conductor() 
     send_sigterm(child.id());
     wait_for_exit(&mut child, Duration::from_secs(10));
 }
+
+// ---------------------------------------------------------------------------
+// The conductor of a task, hosted by its runner (U5)
+// ---------------------------------------------------------------------------
+
+/// Stops whatever a test left running under its root: the daemon, and the
+/// runner of a task, which outlives it by design.
+struct ProcessesUnder {
+    root: PathBuf,
+}
+
+impl Drop for ProcessesUnder {
+    fn drop(&mut self) {
+        let root = self.root.display().to_string();
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let command = fs::read(entry.path().join("cmdline")).unwrap_or_default();
+            let command = String::from_utf8_lossy(&command).replace('\0', " ");
+            if pid != std::process::id() && command.contains("narsor") && command.contains(&root) {
+                // SAFETY: a process of this test's own root; a runner leads
+                // its process group, which takes its harness with it.
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+/// `narsor --root <root> <args>` run to completion, as an operator's
+/// shell would.
+fn narsor(root: &Path, bin: &Path, args: &[&str]) -> (i32, String) {
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_narsor"))
+        .current_dir(root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("HOME", root)
+        .env("PATH", path)
+        .arg("--root")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("run the narsor binary");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    (output.status.code().expect("normal exit"), text)
+}
+
+const GATE_WORKFLOW: &str = r#"
+name: gate
+version: 1
+states:
+  gate:
+    action:
+      type: script
+      command: sh
+      args: [-c, "printf '{\"output\": \"ok\"}'"]
+    outputs: [ok, rejected]
+    transitions:
+      ok: completed
+      rejected: failed
+    decision:
+      type: human
+      message: Ship it?
+  completed:
+    description: Done.
+  failed:
+    description: Rejected.
+terminal_states:
+  completed: completed
+  failed: failed
+"#;
+
+/// Restart matrix, for a task: a chat message its conductor had not
+/// answered when the runner stopped is answered after the runner is started
+/// again — by the real `narsor runner` the daemon's local backend starts on
+/// `task resume`, on the (fake) harness of its environment.
+#[tokio::test]
+async fn a_restarted_runner_answers_a_chat_message_left_unanswered() {
+    let root = TempRoot::new();
+    let _processes = ProcessesUnder {
+        root: root.path().to_path_buf(),
+    };
+    // The first call is the summary of the human gate; every later one
+    // answers the chat.
+    let bin = fake_claude(
+        &root.path().join("bin"),
+        r#"{"decision": "reply", "message": "It waits at the gate."}"#,
+    );
+    fs::write(
+        bin.join("stdout.1"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "result", "subtype": "success", "is_error": false,
+                "session_id": "gate-summary",
+                "result": r#"{"decision": "annotate", "summary": "Ship it?"}"#,
+            })
+        ),
+    )
+    .expect("write the summary of the gate");
+    fs::create_dir_all(root.path().join("workflows")).unwrap();
+    fs::write(root.path().join("workflows/gate.yaml"), GATE_WORKFLOW).unwrap();
+
+    let mut daemon = spawn_daemon_with_path(root.path(), &bin);
+    wait_for_daemon_info(root.path(), Duration::from_secs(10));
+    let (code, text) = narsor(
+        root.path(),
+        &bin,
+        &["task", "create", "gate", "--task-id", "t-gate"],
+    );
+    assert_eq!(code, 0, "{text}");
+
+    // The runner is its own process; its storage is where the daemon's
+    // local backend keeps it.
+    let state = root.path().join("local-controller/storage/t-gate/state");
+    let store = ExecutionStore::new(&state);
+    let execution_id = {
+        let mut id = None;
+        wait_for("the task's execution", Duration::from_secs(30), || {
+            id = store
+                .list_execution_ids()
+                .ok()
+                .and_then(|ids| ids.into_iter().next());
+            id.is_some()
+        })
+        .await;
+        id.unwrap()
+    };
+    wait_for("the gate", Duration::from_secs(30), || {
+        wait_for_status(&store, &execution_id, ExecutionStatus::InputNeeded)
+    })
+    .await;
+
+    wait_for("the task to be running", Duration::from_secs(30), || {
+        let (_, shown) = narsor(root.path(), &bin, &["task", "show", "t-gate"]);
+        shown.contains("Lifecycle  running")
+    })
+    .await;
+
+    // The runner stops at a safe point; what it left is a message nobody
+    // answered, as a runner killed mid-answer leaves it.
+    let (code, text) = narsor(root.path(), &bin, &["task", "pause", "t-gate"]);
+    assert_eq!(code, 0, "{text}");
+    wait_for("the task to be paused", Duration::from_secs(30), || {
+        let (_, shown) = narsor(root.path(), &bin, &["task", "show", "t-gate"]);
+        shown.contains("Lifecycle  paused")
+    })
+    .await;
+    let conductor = ConductorStore::new(store.paths(), &execution_id);
+    let message = conductor
+        .append_chat(ChatEntry::new(
+            ChatAuthor::Operator,
+            ChatEntryKind::Message,
+            "what is the task doing?",
+        ))
+        .expect("leave an unanswered message");
+
+    let (code, text) = narsor(root.path(), &bin, &["task", "resume", "t-gate"]);
+    assert_eq!(code, 0, "{text}");
+    wait_for(
+        "the restarted runner's answer",
+        Duration::from_secs(30),
+        || {
+            conductor.read_chat().is_ok_and(|chat| {
+                chat.iter().any(|entry| {
+                    entry.author == ChatAuthor::Conductor
+                        && entry.in_reply_to.as_deref() == Some(message.id.as_str())
+                })
+            })
+        },
+    )
+    .await;
+    let chat = conductor.read_chat().expect("read the chat");
+    let answer = chat
+        .iter()
+        .find(|entry| entry.in_reply_to.as_deref() == Some(message.id.as_str()))
+        .expect("an answer");
+    assert_eq!(answer.kind, ChatEntryKind::Message, "{answer:?}");
+    assert_eq!(answer.text, "It waits at the gate.");
+    assert!(conductor.unanswered_chat().unwrap().is_empty());
+
+    // The operator reads the same through the control plane.
+    let (code, text) = narsor(
+        root.path(),
+        &bin,
+        &["task", "conductor", "history", "t-gate"],
+    );
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Conductor: running on claude-code"), "{text}");
+    assert!(text.contains("what is the task doing?"), "{text}");
+    assert!(text.contains("It waits at the gate."), "{text}");
+
+    send_sigterm(daemon.id());
+    wait_for_exit(&mut daemon, Duration::from_secs(10));
+}

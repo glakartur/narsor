@@ -1988,6 +1988,105 @@ fn task_interrupt_restart_and_override_steer_the_runner_of_a_local_task() {
     assert!(execution.stdout.lines().count() > 1, "{}", execution.stdout);
 }
 
+/// The CLI half of the conductor of a local task (U5): chat, read what it
+/// said and proposed, reject a proposal, and what is refused and why.
+#[test]
+fn task_conductor_commands_talk_to_the_conductor_in_the_tasks_runner() {
+    let root = TempRoot::new();
+    let _processes = LocalProcesses {
+        root: root.path().to_path_buf(),
+    };
+    let path = conductor_answering(
+        &root,
+        serde_json::json!({
+            "decision": "reply",
+            "message": "Still sleeping.",
+            "confidence": "high",
+            "rationale": "The step has not ended.",
+            "proposals": [{"kind": "abort", "summary": "Cancel the task"}],
+        }),
+    );
+    let run = |args: &[&str]| cli_on_path(root.path(), args, &path);
+    fs::create_dir_all(root.path().join("workflows")).unwrap();
+    fs::write(root.path().join("workflows/slow.yaml"), SLOW_STEP_WORKFLOW).unwrap();
+    let created = run(&["task", "create", "slow", "--task-id", "t-slow"]);
+    assert_eq!(created.code, EXIT_SUCCESS, "{}", created.output());
+    wait_for("the task to be running", || {
+        run(&["task", "show", "t-slow"])
+            .stdout
+            .contains("Lifecycle  running")
+    });
+
+    let sent = run(&["task", "conductor", "chat", "t-slow", "how is it going?"]);
+    assert_eq!(sent.code, EXIT_SUCCESS, "{}", sent.output());
+    assert!(sent.stdout.contains("carried out"), "{}", sent.stdout);
+    wait_for("the conductor's answer", || {
+        run(&["task", "conductor", "history", "t-slow"])
+            .stdout
+            .contains("Still sleeping.")
+    });
+    let history = run(&["task", "conductor", "history", "t-slow"]);
+    assert_eq!(history.code, EXIT_SUCCESS, "{}", history.output());
+    assert!(
+        history.stdout.contains("Conductor: running on claude-code"),
+        "{}",
+        history.stdout
+    );
+    assert!(
+        history.stdout.contains("you: how is it going?"),
+        "{}",
+        history.stdout
+    );
+    let proposal = history
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Proposal "))
+        .expect("the proposal is listed");
+    assert!(
+        proposal.contains("[Pending]  Cancel the task"),
+        "{proposal}"
+    );
+    let proposal_id = proposal.split_whitespace().next().unwrap().to_string();
+
+    // The proposal is carried out or rejected once, whoever asks.
+    let rejected = run(&["task", "conductor", "reject", "t-slow", &proposal_id]);
+    assert_eq!(rejected.code, EXIT_SUCCESS, "{}", rejected.output());
+    let history = run(&["task", "conductor", "history", "t-slow"]);
+    assert!(history.stdout.contains("[Rejected]"), "{}", history.stdout);
+    let confirmed = run(&["task", "conductor", "confirm", "t-slow", &proposal_id]);
+    assert_eq!(confirmed.code, EXIT_FAILURE, "{}", confirmed.output());
+    assert!(
+        confirmed.output().contains("was rejected"),
+        "{}",
+        confirmed.output()
+    );
+
+    // What cannot be done is said so, by the control plane or the runner.
+    let undone = run(&["task", "conductor", "undo", "t-slow", "no-such-decision"]);
+    assert_eq!(undone.code, EXIT_FAILURE, "{}", undone.output());
+    assert!(
+        undone.output().contains("no decision"),
+        "{}",
+        undone.output()
+    );
+    let harness = run(&["task", "conductor", "harness", "t-slow", "emacs"]);
+    assert_eq!(harness.code, EXIT_FAILURE, "{}", harness.output());
+    assert!(
+        harness.output().contains("unknown agent harness"),
+        "{}",
+        harness.output()
+    );
+    let empty = run(&["task", "conductor", "chat", "t-slow", "  "]);
+    assert_eq!(empty.code, EXIT_FAILURE, "{}", empty.output());
+    assert!(
+        empty.output().contains("cannot be empty"),
+        "{}",
+        empty.output()
+    );
+    let unknown = run(&["task", "conductor", "history", "no-such-task"]);
+    assert_eq!(unknown.code, EXIT_FAILURE, "{}", unknown.output());
+}
+
 // ---------------------------------------------------------------------------
 // Remote tasks through the control plane (U8)
 // ---------------------------------------------------------------------------

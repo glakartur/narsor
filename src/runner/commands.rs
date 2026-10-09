@@ -1,5 +1,6 @@
 //! Operator commands the control plane hands the runner: interrupt a step,
-//! take a transition, restart a failed step (U3).
+//! take a transition, restart a failed step (U3), and the conductor's
+//! chat, proposals, undo and harness (U5, see [`super::conductor`]).
 //!
 //! The runner is the only writer of its execution, so it is also where a
 //! command is decided. Every operation goes through the Engine's own claim
@@ -86,6 +87,19 @@ impl Session {
             OperatorCommand::RestartStep { note, failure_key } => {
                 self.restart_step(&execution_id, note, failure_key)
             }
+            OperatorCommand::ConductorChat { text } => self.conductor_chat(&execution_id, &text),
+            OperatorCommand::ConfirmProposal { proposal_id } => {
+                self.confirm_proposal(&execution_id, &proposal_id)
+            }
+            OperatorCommand::RejectProposal { proposal_id } => {
+                self.reject_proposal(&execution_id, &proposal_id)
+            }
+            OperatorCommand::UndoDecision { decision_id } => {
+                self.undo_decision(&execution_id, &decision_id).await
+            }
+            OperatorCommand::SetConductorHarness { harness } => {
+                self.set_conductor_harness(&harness)
+            }
         };
         match outcome {
             Ok(()) => CommandVerdict::applied(),
@@ -99,14 +113,34 @@ impl Session {
         if !self.pass_active() {
             return Err("no step is running, so there is nothing to interrupt".to_string());
         }
-        let pass = self.pass.take().expect("an active pass exists");
-        pass.abort();
+        // The runner's own pass and one the conductor started both drive
+        // the execution; whichever runs is dropped, its harness with it.
+        let own = self.pass.take();
+        let conductor = self.conductor.passes().take();
+        if let Some(pass) = &own {
+            pass.abort();
+        }
+        if let Some(pass) = &conductor {
+            pass.abort();
+        }
+        let mut finished = false;
         // The claim goes with the dropped pass; settling takes it.
-        if let Ok(finished) = pass.await {
-            tracing::info!(
-                ok = finished.is_ok(),
-                "the pass finished before the interrupt reached it"
-            );
+        if let Some(pass) = own {
+            if let Ok(result) = pass.await {
+                tracing::info!(
+                    ok = result.is_ok(),
+                    "the pass finished before the interrupt reached it"
+                );
+                finished = true;
+            }
+        }
+        if let Some(pass) = conductor {
+            if pass.await.is_ok() {
+                tracing::info!("the conductor's pass finished before the interrupt reached it");
+                finished = true;
+            }
+        }
+        if finished {
             return Err("the step finished before it could be interrupted".to_string());
         }
         self.engine

@@ -82,6 +82,7 @@ where
             "/control/v1/tasks/:task_id/execution-events",
             get(get_execution_events),
         )
+        .route("/control/v1/tasks/:task_id/conductor", get(get_conductor))
         .route(
             "/control/v1/tasks/:task_id/conversation",
             get(get_conversation),
@@ -171,6 +172,10 @@ where
         .route(
             "/runner/v1/execution-events/:request_id",
             post(post_execution_events),
+        )
+        .route(
+            "/runner/v1/conductor-reads/:request_id",
+            post(post_conductor_read),
         )
         .route("/runner/v1/materials", post(post_runner_material))
         .route(
@@ -335,6 +340,15 @@ async fn get_execution_events(
     Ok(Json(
         service.execution_events(&owner, &task_id, query).await?,
     ))
+}
+
+async fn get_conductor(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(task_id): Path<String>,
+    Query(query): Query<ConductorReadQuery>,
+) -> ProtocolResult<Json<ConductorReadResponse>> {
+    Ok(Json(service.conductor(&owner, &task_id, query).await?))
 }
 
 async fn get_conversation(
@@ -671,6 +685,19 @@ async fn post_conversation_page(
         &identity,
         &request_id,
         page,
+    )?))
+}
+
+async fn post_conductor_read(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Path(request_id): Path<String>,
+    Json(view): Json<crate::conductor::ConductorView>,
+) -> ProtocolResult<Json<ConversationPageAccepted>> {
+    Ok(Json(service.runner_conductor_read(
+        &identity,
+        &request_id,
+        view,
     )?))
 }
 

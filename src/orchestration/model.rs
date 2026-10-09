@@ -759,10 +759,12 @@ pub enum AttentionKind {
     /// A step ended without a usable output the owner must settle, or the
     /// runner reports a condition that keeps it from working.
     Problem,
-    /// A failed step waiting for the conductor or the owner (filled by the
-    /// runner's conductor, U5).
+    /// A step that failed for good and waits for the owner (the waiting id
+    /// is the failure's key). With a conductor it comes with a diagnosis
+    /// and proposals, without one it is the bare failure.
     FailedStep,
-    /// A conductor proposal waiting for confirmation (filled by U5).
+    /// A proposal of the conductor's from the chat, waiting for the owner's
+    /// confirmation (the waiting id is the proposal's id).
     ConductorProposal,
     /// The backend could not provision the task; no execution exists
     /// (added by the control plane, never by a runner).
@@ -873,6 +875,14 @@ pub struct RunnerSnapshot {
     /// them.
     #[serde(default)]
     pub attention: Vec<AttentionItem>,
+    /// Whether the runner hosts a conductor (U5): its harness is usable in
+    /// this task's environment. Without one a failed step goes to the
+    /// owner as it is, with no diagnosis and no proposals.
+    #[serde(default)]
+    pub conductor_available: bool,
+    /// Why there is no conductor, when there is none.
+    #[serde(default)]
+    pub conductor_unavailable_reason: Option<String>,
     /// The workflow's `display` rendered against the execution's inputs and
     /// current variables. `None` when the runner could not render one (no
     /// execution yet), which leaves what the control plane rendered at
@@ -978,9 +988,8 @@ pub struct InputOutcome {
 
 /// What an owner asks the runner of a running task to do (U3).
 ///
-/// The list is open: the conductor's commands (chat, proposals, undo)
-/// arrive with U5 as further variants, through the same queue, delivery and
-/// acknowledgement.
+/// The conductor's commands (chat, proposals, undo, harness) ride the same
+/// queue, delivery and acknowledgement as the step commands.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum OperatorCommand {
@@ -1009,6 +1018,31 @@ pub enum OperatorCommand {
         #[serde(default)]
         failure_key: Option<String>,
     },
+    /// Write to the conductor; its answer follows as further chat entries.
+    ConductorChat {
+        /// What the owner writes.
+        text: String,
+    },
+    /// Carry out a proposal of the conductor's.
+    ConfirmProposal {
+        /// The proposal: the id of its chat entry.
+        proposal_id: String,
+    },
+    /// Turn a proposal of the conductor's down.
+    RejectProposal {
+        /// The proposal: the id of its chat entry.
+        proposal_id: String,
+    },
+    /// Take back a chosen output of the conductor's.
+    UndoDecision {
+        /// The decision to undo.
+        decision_id: String,
+    },
+    /// Run the conductor on another harness, from its next invocation on.
+    SetConductorHarness {
+        /// The harness name.
+        harness: String,
+    },
 }
 
 impl OperatorCommand {
@@ -1019,6 +1053,11 @@ impl OperatorCommand {
             Self::Transition { forced: false, .. } => "transition",
             Self::Transition { forced: true, .. } => "override transition",
             Self::RestartStep { .. } => "restart step",
+            Self::ConductorChat { .. } => "conductor chat",
+            Self::ConfirmProposal { .. } => "confirm proposal",
+            Self::RejectProposal { .. } => "reject proposal",
+            Self::UndoDecision { .. } => "undo decision",
+            Self::SetConductorHarness { .. } => "set conductor harness",
         }
     }
 }

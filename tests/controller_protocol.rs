@@ -18,12 +18,12 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor::api::{self, ApiClient, ApiServices, ClientError};
 use narsor::controller_protocol::{
-    CommandAck, ControllerClient, ConversationResponse, ConversationUnavailableReason,
-    CreateEnrollmentRequest, CreateTaskRequest, DesiredAction, ExecutionEventsPage,
-    ExecutionEventsQuery, ExecutionEventsResponse, ExecutionEventsSource, Freshness, LaunchRequest,
-    OwnerCommandRequest, ProtocolConfig, ProtocolService, ReportRequest, RunnerClient,
-    RunnerCredentialRequest, RunnerDirective, SubmitInputRequest, SubmitOperatorCommandRequest,
-    TaskSummary,
+    CommandAck, ConductorReadQuery, ConductorReadResponse, ControllerClient, ConversationResponse,
+    ConversationUnavailableReason, CreateEnrollmentRequest, CreateTaskRequest, DesiredAction,
+    ExecutionEventsPage, ExecutionEventsQuery, ExecutionEventsResponse, ExecutionEventsSource,
+    Freshness, LaunchRequest, OwnerCommandRequest, ProtocolConfig, ProtocolService, ReportRequest,
+    RunnerClient, RunnerCredentialRequest, RunnerDirective, SubmitInputRequest,
+    SubmitOperatorCommandRequest, TaskSummary,
 };
 use narsor::domain::{
     BackendId, DisplayLink, Event, EventData, ExecutionStatus, TaskDisplay, TaskId,
@@ -334,6 +334,8 @@ fn snapshot(
         safe_point: false,
         problem: None,
         attention: Vec::new(),
+        conductor_available: false,
+        conductor_unavailable_reason: None,
         display: None,
         observed_at: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 5).unwrap(),
     }
@@ -2601,5 +2603,351 @@ async fn timeline_text_from_a_runner_is_cleaned_before_it_is_stored() {
     assert!(
         !raw.contains("\\u001b") && !raw.contains("\\u202e"),
         "{raw}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The conductor's state and commands (U5)
+// ---------------------------------------------------------------------------
+
+fn conductor_entry(
+    sequence: u64,
+    author: narsor::conductor::ChatAuthor,
+    text: &str,
+) -> narsor::conductor::ChatEntry {
+    let mut entry =
+        narsor::conductor::ChatEntry::new(author, narsor::conductor::ChatEntryKind::Message, text);
+    entry.sequence = sequence;
+    entry
+}
+
+/// The runner side of one relayed conductor read: wait for the request,
+/// upload `view`.
+async fn answer_conductor(runner: &RunnerClient, view: narsor::conductor::ConductorView) {
+    loop {
+        let poll = runner.poll(None, 5).await.expect("poll");
+        if let Some(request) = poll.conductor_reads.first() {
+            let accepted = runner
+                .upload_conductor_read(&request.request_id, &view)
+                .await
+                .expect("upload");
+            assert!(accepted.delivered);
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_conductor_of_a_live_runner_travels_through_the_relay_and_is_cleaned() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    let read = {
+        let owner = harness.owner.clone();
+        tokio::spawn(async move {
+            owner
+                .control_conductor(
+                    "task-1",
+                    &ConductorReadQuery {
+                        after: 4,
+                        limit: Some(10),
+                    },
+                )
+                .await
+        })
+    };
+    let mut view = narsor::conductor::ConductorView::unavailable("unused").available_on("codex");
+    view.chat = vec![conductor_entry(
+        5,
+        narsor::conductor::ChatAuthor::Conductor,
+        "line one\nline\u{1b}[31m two\u{202e}",
+    )];
+    view.unavailable_reason = None;
+    answer_conductor(&runner, view).await;
+
+    match read.await.unwrap().expect("the conductor") {
+        ConductorReadResponse::Available { conductor, source } => {
+            assert_eq!(source, ExecutionEventsSource::Runner);
+            assert!(conductor.available);
+            assert_eq!(conductor.harness.as_deref(), Some("codex"));
+            assert_eq!(
+                conductor.chat[0].text, "line one\nline[31m two",
+                "line breaks stay, what a terminal acts on goes"
+            );
+        }
+        other => panic!("expected the conductor, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_runner_that_does_not_answer_the_conductor_request_is_a_503() {
+    let config = ProtocolConfig {
+        conversation_page_timeout: StdDuration::from_millis(200),
+        ..ProtocolConfig::default()
+    };
+    let harness = Harness::start_with(config, None).await;
+    harness.running("task-1", "k8s").await;
+    match harness
+        .owner
+        .control_conductor("task-1", &ConductorReadQuery::default())
+        .await
+    {
+        Err(ClientError::Degraded { code, message }) => {
+            assert_eq!(code, "runner_timeout");
+            assert!(message.contains("conductor"), "{message}");
+        }
+        other => panic!("expected a 503, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_remote_task_without_a_running_runner_has_no_conductor_to_read() {
+    let harness = Harness::start().await;
+    harness.create("task-0", "k8s").await;
+    assert!(matches!(
+        harness
+            .owner
+            .control_conductor("task-0", &ConductorReadQuery::default())
+            .await
+            .expect("an answer"),
+        ConductorReadResponse::Unavailable {
+            reason: ConversationUnavailableReason::NotStarted,
+            ..
+        }
+    ));
+    let Running {
+        controller, epoch, ..
+    } = harness.running("task-1", "k8s").await;
+    controller
+        .report(&report(
+            "task-1",
+            epoch,
+            1,
+            Observation::WorkloadLost { state_known: true },
+            Some(1),
+        ))
+        .await
+        .expect("lost");
+    match harness
+        .owner
+        .control_conductor("task-1", &ConductorReadQuery::default())
+        .await
+        .expect("an answer")
+    {
+        ConductorReadResponse::Unavailable { reason, message } => {
+            assert_eq!(reason, ConversationUnavailableReason::Interrupted);
+            assert!(message.contains("runner is not running"), "{message}");
+        }
+        other => panic!("expected unavailable, got {other:?}"),
+    }
+    assert!(matches!(
+        harness
+            .owner
+            .control_conductor("nobody", &ConductorReadQuery::default())
+            .await,
+        Err(ClientError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn the_conductor_of_a_stopped_local_task_is_read_from_its_own_storage() {
+    let storage = TempRoot::new();
+    let harness = Harness::start_with(
+        ProtocolConfig::default(),
+        Some(("k8s", storage.path().to_path_buf())),
+    )
+    .await;
+    let Running {
+        controller, epoch, ..
+    } = harness.running("task-1", "k8s").await;
+    controller
+        .report(&report(
+            "task-1",
+            epoch,
+            1,
+            Observation::WorkloadLost { state_known: true },
+            Some(1),
+        ))
+        .await
+        .expect("lost");
+
+    let store = ExecutionStore::new(storage.path().join("task-1").join("state"));
+    store
+        .save_execution(&WorkflowExecution {
+            id: "exec-1".to_string(),
+            workflow_id: "wf".to_string(),
+            workflow_version: 1,
+            status: ExecutionStatus::Running,
+            current_state: Some("review".to_string()),
+            started_at: Utc::now(),
+            completed_at: None,
+            inputs: serde_json::json!({}),
+            context: narsor::domain::Context::new(),
+            workspace: Workspace::local_folder("/tmp/none".to_string()),
+            current_action_execution: None,
+            metadata: serde_json::json!({}),
+        })
+        .expect("execution");
+    let conductor = narsor::conductor::ConductorStore::new(store.paths(), "exec-1");
+    for text in ["first", "second\u{1b}[2J", "third"] {
+        conductor
+            .append_chat(conductor_entry(
+                0,
+                narsor::conductor::ChatAuthor::Operator,
+                text,
+            ))
+            .expect("chat");
+    }
+
+    let read = |after| {
+        let owner = harness.owner.clone();
+        async move {
+            match owner
+                .control_conductor(
+                    "task-1",
+                    &ConductorReadQuery {
+                        after,
+                        limit: Some(2),
+                    },
+                )
+                .await
+                .expect("the conductor")
+            {
+                ConductorReadResponse::Available { conductor, source } => (*conductor, source),
+                other => panic!("expected the conductor, got {other:?}"),
+            }
+        }
+    };
+    let (first, source) = read(0).await;
+    assert_eq!(source, ExecutionEventsSource::Storage);
+    assert!(!first.available, "nothing runs it now");
+    assert!(
+        first
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("runner is not running")),
+        "{first:?}"
+    );
+    let texts: Vec<_> = first.chat.iter().map(|entry| entry.text.as_str()).collect();
+    assert_eq!(texts, vec!["first", "second[2J"], "cleaned and bounded");
+    assert!(first.chat_has_more);
+    assert_eq!(first.unanswered_chat.len(), 3);
+    let (rest, _) = read(2).await;
+    assert_eq!(rest.chat.len(), 1);
+    assert!(!rest.chat_has_more);
+}
+
+#[tokio::test]
+async fn conductor_commands_are_checked_for_what_they_name() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+    let refused = |command: OperatorCommand, key: &'static str| {
+        let owner = harness.owner.clone();
+        async move {
+            bad_request_code(
+                owner
+                    .control_operator_command("task-1", &operator_request(command, key))
+                    .await,
+            )
+        }
+    };
+    assert_eq!(
+        refused(
+            OperatorCommand::ConductorChat {
+                text: "   ".to_string()
+            },
+            "c-1"
+        )
+        .await,
+        "empty_message"
+    );
+    assert_eq!(
+        refused(
+            OperatorCommand::ConductorChat {
+                text: "x".repeat(4_001)
+            },
+            "c-2"
+        )
+        .await,
+        "message_too_long"
+    );
+    assert_eq!(
+        refused(
+            OperatorCommand::ConfirmProposal {
+                proposal_id: " ".to_string()
+            },
+            "c-3"
+        )
+        .await,
+        "missing_proposal"
+    );
+    assert_eq!(
+        refused(
+            OperatorCommand::RejectProposal {
+                proposal_id: String::new()
+            },
+            "c-4"
+        )
+        .await,
+        "missing_proposal"
+    );
+    assert_eq!(
+        refused(
+            OperatorCommand::UndoDecision {
+                decision_id: String::new()
+            },
+            "c-5"
+        )
+        .await,
+        "missing_decision"
+    );
+    assert_eq!(
+        refused(
+            OperatorCommand::SetConductorHarness {
+                harness: "emacs".to_string()
+            },
+            "c-6"
+        )
+        .await,
+        "unsupported_harness"
+    );
+
+    // A well-formed one is queued for the runner, like any other.
+    let accepted = harness
+        .owner
+        .control_operator_command(
+            "task-1",
+            &operator_request(
+                OperatorCommand::ConductorChat {
+                    text: "hello".to_string(),
+                },
+                "c-ok",
+            ),
+        )
+        .await
+        .expect("queued");
+    assert_eq!(accepted.command.status, OperatorCommandStatus::Queued);
+}
+
+#[tokio::test]
+async fn what_a_runner_says_of_its_problem_and_its_conductor_is_cleaned() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    let mut report = snapshot(2, ExecutionStatus::Running, 4, None);
+    report.problem = Some(narsor::orchestration::RunnerProblem {
+        code: "base\u{1b}_image".to_string(),
+        message: "no git\u{1b}[2J\u{202e} here".to_string(),
+    });
+    report.conductor_unavailable_reason = Some("harness\u{7} missing".to_string());
+    runner.snapshot(&report).await.expect("snapshot");
+
+    let summary = harness.task("task-1").await;
+    let runner = summary.runner.expect("a runner view");
+    let problem = runner.problem.expect("the problem");
+    assert_eq!(problem.code, "base_image");
+    assert_eq!(problem.message, "no git[2J here");
+    assert!(!runner.conductor_available);
+    assert_eq!(
+        runner.conductor_unavailable_reason.as_deref(),
+        Some("harness missing")
     );
 }

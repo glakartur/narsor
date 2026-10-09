@@ -34,8 +34,8 @@ use narsor::domain::{
     ProblemKind, WorkflowDefinition, WorkflowExecution, Workspace,
 };
 use narsor::engine::{
-    step_failure, ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry,
-    LoggingEventSink, StepFailure,
+    step_failure, ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, EngineError,
+    HarnessRegistry, LoggingEventSink, Recovery, StepFailure,
 };
 use narsor::persistence::{sweep_orphaned_workspaces, DaemonInfo, ExecutionStore};
 use narsor::workspace::{CleanupPolicy, WorkspaceProvisioner};
@@ -823,18 +823,47 @@ async fn a_failure_terminal_is_not_a_step_failure() {
     assert!(fixture.conductor.calls().is_empty());
 }
 
-/// Without a conductor attached, a failure is recorded as it always was,
-/// and nothing is left for one.
+/// Without a conductor attached the failure is recorded all the same — it
+/// is the key an operator's restart names, and what a task runner reports
+/// as a failed step waiting for its owner — and handed to nobody.
 #[tokio::test]
-async fn without_a_conductor_a_failure_leaves_no_record() {
+async fn without_a_conductor_the_failure_is_recorded_and_keys_a_restart() {
     let harness = Harness::new();
-    let execution = harness
-        .engine()
+    let engine = Arc::new(harness.engine());
+    let execution = engine
         .start_and_run(&workflow("retry_exhausted"), json!({}), harness.workspace())
         .await
         .expect("run");
     assert_eq!(execution.status, ExecutionStatus::Failed);
-    assert_eq!(step_failure(&execution).expect("read"), None);
+    let failure = step_failure(&execution)
+        .expect("read the record")
+        .expect("the failure is recorded");
+    assert_eq!(failure.state_id, "build");
+    assert!(!failure.conductor_retry);
+    assert!(!harness
+        .store()
+        .paths()
+        .conductor_dir(&execution.id)
+        .exists());
+
+    // A restart naming another failure is refused, the one naming this is not.
+    let stale = engine
+        .try_begin_recover_with(
+            &execution.id,
+            Recovery::by_operator(None, Some("another-failure".to_string())),
+        )
+        .err()
+        .expect("a stale key is refused");
+    assert!(
+        matches!(stale, EngineError::StaleEpisode { .. }),
+        "{stale:?}"
+    );
+    engine
+        .try_begin_recover_with(
+            &execution.id,
+            Recovery::by_operator(None, Some(failure.key().to_string())),
+        )
+        .expect("the failure's own key is accepted");
 }
 
 // ---------------------------------------------------------------------------

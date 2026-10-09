@@ -72,13 +72,13 @@ use super::dto::{
 use super::routes::ConversationResponse;
 use crate::auth::{ClaimRequest, OwnerView, WhoAmIResponse};
 use crate::controller_protocol::{
-    ControlEventEnvelope, ControllerListResponse, ControllerView, ConversationPage,
-    ConversationPageQuery, ConversationResponse as RemoteConversationResponse,
-    CreateEnrollmentRequest, CreateTaskRequest, DefaultBackendView, EnrollmentResponse,
-    ExecutionEventsQuery, ExecutionEventsResponse, MoveTaskRequest, OwnerCommandRequest,
-    OwnerCommandResponse, SetDefaultBackendRequest, SubmitInputRequest, SubmitInputResponse,
-    SubmitOperatorCommandRequest, SubmitOperatorCommandResponse, TaskListResponse, TaskSummary,
-    TimelineResponse,
+    ConductorReadQuery, ConductorReadResponse, ControlEventEnvelope, ControllerListResponse,
+    ControllerView, ConversationPage, ConversationPageQuery,
+    ConversationResponse as RemoteConversationResponse, CreateEnrollmentRequest, CreateTaskRequest,
+    DefaultBackendView, EnrollmentResponse, ExecutionEventsQuery, ExecutionEventsResponse,
+    MoveTaskRequest, OwnerCommandRequest, OwnerCommandResponse, SetDefaultBackendRequest,
+    SubmitInputRequest, SubmitInputResponse, SubmitOperatorCommandRequest,
+    SubmitOperatorCommandResponse, TaskListResponse, TaskSummary, TimelineResponse,
 };
 use crate::materials::{
     MaterialListResponse, MaterialSummary, MaterialUploadResponse, MaterialView,
@@ -637,6 +637,27 @@ impl ApiClient {
             "{}/control/v1/tasks/{task_id}/execution-events",
             self.base_url
         );
+        let response = self
+            .send(&self.stream_http, |http, token| {
+                http.get(&url)
+                    .bearer_auth(token)
+                    .query(query)
+                    .timeout(CONVERSATION_PAGE_TIMEOUT)
+            })
+            .await?;
+        handle_json_response(response).await
+    }
+
+    /// The state of a task's conductor — chat after `query.after`,
+    /// decisions, proposals, the diagnosis of a failed step: from the live
+    /// runner through the relay, or from the task's storage. Waits for the
+    /// runner like an events page, so it shares its timeout.
+    pub async fn control_conductor(
+        &self,
+        task_id: &str,
+        query: &ConductorReadQuery,
+    ) -> Result<ConductorReadResponse, ClientError> {
+        let url = format!("{}/control/v1/tasks/{task_id}/conductor", self.base_url);
         let response = self
             .send(&self.stream_http, |http, token| {
                 http.get(&url)

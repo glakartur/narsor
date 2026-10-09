@@ -428,6 +428,17 @@ impl RunnerClient {
             .await
     }
 
+    /// `POST /runner/v1/conductor-reads/:request_id`.
+    pub async fn upload_conductor_read(
+        &self,
+        request_id: &str,
+        view: &crate::conductor::ConductorView,
+    ) -> Result<ConversationPageAccepted, ClientError> {
+        self.transport
+            .post(&format!("/runner/v1/conductor-reads/{request_id}"), view)
+            .await
+    }
+
     /// `GET /runner/v1/materials/:material_id` — a material of this
     /// runner's task, with its manifest.
     pub async fn material(&self, material_id: &str) -> Result<MaterialView, ClientError> {

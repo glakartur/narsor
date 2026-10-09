@@ -14,6 +14,7 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
+mod conductor;
 mod events;
 mod materials;
 mod relay;
@@ -25,7 +26,9 @@ use super::credentials::{
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
 use crate::domain::{BackendId, LaunchDefinitionError, TaskDisplay, TaskId};
-use crate::engine::{plan_operator_transition, EngineError, PositionStatus, Timeline};
+use crate::engine::{
+    plan_operator_transition, EngineError, HarnessRegistry, PositionStatus, Timeline,
+};
 use crate::environment::{LaunchError, LaunchIntent, LaunchResolver};
 use crate::materials::{MaterialLimits, MaterialStore};
 use crate::orchestration::{
@@ -78,6 +81,9 @@ type PageRelay = Relay<ConversationPageRequest, ConversationPage>;
 /// Execution event requests owners are waiting on (U4), relayed the same way.
 type EventsRelay = Relay<ExecutionEventsRequest, ExecutionEventsPage>;
 
+/// Conductor-state requests owners are waiting on (U5), relayed the same way.
+type ConductorRelay = Relay<ConductorReadRequest, crate::conductor::ConductorView>;
+
 /// Timing policy of the protocol.
 #[derive(Debug, Clone)]
 pub struct ProtocolConfig {
@@ -129,6 +135,7 @@ pub struct ProtocolService {
     launch: Arc<dyn LaunchResolver>,
     pages: Mutex<PageRelay>,
     event_reads: Mutex<EventsRelay>,
+    conductor_reads: Mutex<ConductorRelay>,
     local_storage: Option<LocalTaskStorage>,
     materials: MaterialStore,
 }
@@ -172,6 +179,7 @@ impl ProtocolService {
             launch,
             pages: Mutex::new(PageRelay::default()),
             event_reads: Mutex::new(EventsRelay::default()),
+            conductor_reads: Mutex::new(ConductorRelay::default()),
             local_storage: None,
         }
     }
@@ -858,7 +866,7 @@ impl ProtocolService {
             }
             self.check_transition_legal(record, target, *forced)?;
         }
-        Ok(())
+        check_conductor_command(command)
     }
 
     /// Checks a transition against the workflow snapshot and the state the
@@ -1430,6 +1438,7 @@ impl ProtocolService {
                 launch: launch_view(identity, &record),
                 conversation_pages: self.lock_pages().requests_of(&identity.task_id),
                 execution_events: self.lock_event_reads().requests_of(&identity.task_id),
+                conductor_reads: self.lock_conductor_reads().requests_of(&identity.task_id),
                 materials: self.material_announcements(&identity.task_id),
             })
         };
@@ -1441,6 +1450,7 @@ impl ProtocolService {
                     || !response.commands.is_empty()
                     || !response.conversation_pages.is_empty()
                     || !response.execution_events.is_empty()
+                    || !response.conductor_reads.is_empty()
                     || (!defer_materials && !response.materials.is_empty())
                     || response.directive != RunnerDirective::Continue;
                 Ok(actionable.then_some(response))
@@ -1472,6 +1482,12 @@ impl ProtocolService {
 
     fn lock_pages(&self) -> std::sync::MutexGuard<'_, PageRelay> {
         self.pages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_conductor_reads(&self) -> std::sync::MutexGuard<'_, ConductorRelay> {
+        self.conductor_reads
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -1565,6 +1581,11 @@ impl ProtocolService {
                     pending_input: runner.snapshot.pending_input.clone(),
                     safe_point: runner.snapshot.safe_point,
                     problem: runner.snapshot.problem.clone(),
+                    conductor_available: runner.snapshot.conductor_available,
+                    conductor_unavailable_reason: runner
+                        .snapshot
+                        .conductor_unavailable_reason
+                        .clone(),
                     observed_at: runner.snapshot.observed_at,
                     received_at: runner.received_at,
                     last_contact_at,
@@ -1762,6 +1783,48 @@ impl ProtocolService {
                 Ok(Err(RecvError::Closed)) => return Ok(None),
             }
         }
+    }
+}
+
+/// Most characters of one chat message to the conductor: the text is kept
+/// in the task's event stream, which is not the place for a document.
+const MAX_CHAT_CHARS: usize = 4_000;
+
+/// What can be said about a conductor command without the runner: that it
+/// names what it needs.
+fn check_conductor_command(command: &OperatorCommand) -> ProtocolResult<()> {
+    let blank = |text: &str| text.trim().is_empty();
+    match command {
+        OperatorCommand::ConductorChat { text } if blank(text) => Err(ProtocolError::bad_request(
+            "empty_message",
+            "a chat message cannot be empty",
+        )),
+        OperatorCommand::ConductorChat { text } if text.chars().count() > MAX_CHAT_CHARS => {
+            Err(ProtocolError::bad_request(
+                "message_too_long",
+                format!("a chat message holds at most {MAX_CHAT_CHARS} characters"),
+            ))
+        }
+        OperatorCommand::ConfirmProposal { proposal_id }
+        | OperatorCommand::RejectProposal { proposal_id }
+            if blank(proposal_id) =>
+        {
+            Err(ProtocolError::bad_request(
+                "missing_proposal",
+                "a proposal command needs the proposal's id",
+            ))
+        }
+        OperatorCommand::UndoDecision { decision_id } if blank(decision_id) => {
+            Err(ProtocolError::bad_request(
+                "missing_decision",
+                "undoing a decision needs the decision's id",
+            ))
+        }
+        OperatorCommand::SetConductorHarness { harness } => HarnessRegistry::defaults()
+            .get(harness)
+            .map(|_| ())
+            .map_err(|error| ProtocolError::bad_request("unsupported_harness", error.message)),
+        _ => Ok(()),
     }
 }
 

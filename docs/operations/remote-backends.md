@@ -465,6 +465,25 @@ any state ─▶ Archiving ─▶ Archived
   `--reason`, which is recorded with the owner in the task's events. The CLI
   waits for the verdict and, past `--wait-secs`, reports the command as
   queued.
+* The runner hosts the task's **conductor** when the task's harness can run
+  in its environment: the harness binary (`claude`, `codex`, `opencode`) must
+  be on the runner's `PATH`, which on Kubernetes means the base image or a
+  tool package brings it — the adapter configures nothing for it. The
+  conductor runs on the harness the task pinned, or on the one the owner
+  chose with `narsor task conductor harness`, from its next invocation on;
+  it summarizes `human` gates, rescues a step's missing output label,
+  diagnoses a failed step and answers the chat, always read-only. Without a
+  usable harness there is no conductor: the runner reports
+  `conductor_available = false` with the reason (`narsor task conductor
+  history`), a
+  failed step waits for the owner as it is, without a diagnosis or
+  proposals, and the conductor commands are refused with that reason. The
+  conductor's state — chat, proposals, decisions, the diagnosis — is read
+  through the control plane from the live runner
+  (`GET /control/v1/tasks/:id/conductor`), or from the task's storage for a
+  local task whose runner is not running. A runner restarted on its storage
+  answers the chat messages it left unanswered and diagnoses again a failed
+  step it had not concluded about.
 * A queued task shows why it waits: `waiting for capacity` (position,
   slots in use / limit), `controller offline` (no controller holds the lease),
   `backend unknown`, or `admitted` (starting).
@@ -492,6 +511,9 @@ narsor task input <task> --field reason=ok [--label approved] [--comment …]
 narsor task interrupt <task> [--wait-secs N]
 narsor task transition <task> <state> [--override --reason <why>] [--wait-secs N]
 narsor task restart-step <task> [--note <text>] [--failure-key K] [--wait-secs N]
+narsor task conductor chat <task> <text> | history <task> [--after N]
+narsor task conductor confirm|reject <task> <proposal> | undo <task> <decision>
+narsor task conductor harness <task> <claude-code|codex|opencode>
 narsor task conversation <task> [<attempt>] [--from N]
 narsor task events <task> [--follow]
 narsor task watch [--cursor C]               # every task, reconnecting from the cursor

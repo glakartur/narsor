@@ -49,6 +49,14 @@ impl ControlPlane {
         if let Some(timeline) = &mut snapshot.timeline {
             clean_timeline(timeline);
         }
+        // Nor is its explanation of why it cannot work, or has no conductor.
+        if let Some(problem) = &mut snapshot.problem {
+            problem.code = without_unsafe_chars(&problem.code);
+            problem.message = without_unsafe_chars(&problem.message);
+        }
+        if let Some(reason) = &mut snapshot.conductor_unavailable_reason {
+            *reason = without_unsafe_chars(reason);
+        }
         let (task, applied) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
             if let Some(previous) = &record.runner {

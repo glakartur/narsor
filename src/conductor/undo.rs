@@ -25,7 +25,7 @@ use crate::domain::{ConductorDecisionKind, ExecutionStatus, WorkflowDefinition};
 use crate::engine::{ConductorAnalysis, EngineError, OutputDecisionUndo};
 
 /// The `kind` of the chat entry that records an undone decision.
-const UNDONE: &str = "decision_undone";
+pub(super) const UNDONE: &str = "decision_undone";
 
 /// How long an undo waits for an interrupted pass to let go of the claim.
 const CLAIM_WAIT: Duration = Duration::from_secs(10);
@@ -213,54 +213,63 @@ impl ConductorRegistry {
         decision_id: &str,
     ) -> Result<SavedDecision, UndoError> {
         let chat = self.store(execution_id).read_chat()?;
-        let names = |entry: &ChatEntry| {
-            entry.kind == ChatEntryKind::Decision
-                && payload_str(entry, "decision_id") == Some(decision_id)
-        };
-        if chat.iter().any(|entry| names(entry) && is_undo(entry)) {
-            return Err(UndoError::AlreadyUndone(format!(
-                "The decision '{decision_id}' was already undone."
-            )));
-        }
-        let position = chat
-            .iter()
-            .position(|entry| names(entry) && entry.author == ChatAuthor::Conductor)
-            .ok_or_else(|| {
-                UndoError::NotFound(format!(
-                    "Execution '{execution_id}' has no decision '{decision_id}' of the \
-                     conductor's."
-                ))
-            })?;
-        let entry = &chat[position];
-        let not_undoable = || {
-            UndoError::NotUndoable(format!(
-                "The decision '{decision_id}' cannot be undone: only the conductor's choice of \
-                 an output completes a step in the operator's place and can be taken back."
-            ))
-        };
-        let decision = entry
-            .payload
-            .clone()
-            .and_then(|payload| serde_json::from_value::<SavedDecision>(payload).ok())
-            .ok_or_else(not_undoable)?;
-        if decision.kind != ConductorDecisionKind::ChooseOutput
-            || !decision.context_before.is_object()
-        {
-            return Err(not_undoable());
-        }
-        let superseded = chat[position + 1..]
-            .iter()
-            .filter(|later| later.kind == ChatEntryKind::Decision)
-            .any(|later| is_undo(later) || is_chosen_output(later));
-        if superseded {
-            return Err(UndoError::Superseded(format!(
-                "The decision '{decision_id}' cannot be undone any more: a later choice of the \
-                 conductor's, or an undo, came after it. Only the latest choice can be taken \
-                 back."
-            )));
-        }
-        Ok(decision)
+        undoable_in(&chat, execution_id, decision_id)
     }
+}
+
+/// The saved decision `decision_id` of `chat`, if it is one an undo takes
+/// back (see [`ConductorRegistry::undo_decision`]).
+pub(super) fn undoable_in(
+    chat: &[ChatEntry],
+    execution_id: &str,
+    decision_id: &str,
+) -> Result<SavedDecision, UndoError> {
+    let names = |entry: &ChatEntry| {
+        entry.kind == ChatEntryKind::Decision
+            && payload_str(entry, "decision_id") == Some(decision_id)
+    };
+    if chat.iter().any(|entry| names(entry) && is_undo(entry)) {
+        return Err(UndoError::AlreadyUndone(format!(
+            "The decision '{decision_id}' was already undone."
+        )));
+    }
+    let position = chat
+        .iter()
+        .position(|entry| names(entry) && entry.author == ChatAuthor::Conductor)
+        .ok_or_else(|| {
+            UndoError::NotFound(format!(
+                "Execution '{execution_id}' has no decision '{decision_id}' of the \
+                 conductor's."
+            ))
+        })?;
+    let entry = &chat[position];
+    let not_undoable = || {
+        UndoError::NotUndoable(format!(
+            "The decision '{decision_id}' cannot be undone: only the conductor's choice of \
+             an output completes a step in the operator's place and can be taken back."
+        ))
+    };
+    let decision = entry
+        .payload
+        .clone()
+        .and_then(|payload| serde_json::from_value::<SavedDecision>(payload).ok())
+        .ok_or_else(not_undoable)?;
+    if decision.kind != ConductorDecisionKind::ChooseOutput || !decision.context_before.is_object()
+    {
+        return Err(not_undoable());
+    }
+    let superseded = chat[position + 1..]
+        .iter()
+        .filter(|later| later.kind == ChatEntryKind::Decision)
+        .any(|later| is_undo(later) || is_chosen_output(later));
+    if superseded {
+        return Err(UndoError::Superseded(format!(
+            "The decision '{decision_id}' cannot be undone any more: a later choice of the \
+             conductor's, or an undo, came after it. Only the latest choice can be taken \
+             back."
+        )));
+    }
+    Ok(decision)
 }
 
 /// The string `key` of `entry`'s payload, if it has one.

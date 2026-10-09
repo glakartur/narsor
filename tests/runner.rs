@@ -26,9 +26,9 @@ use axum::Router;
 use chrono::Utc;
 use narsor::controller_protocol::http::runner_routes;
 use narsor::controller_protocol::{
-    AcquireLeaseRequest, ConversationPageQuery, CreateEnrollmentRequest, EnrollRequest,
-    OwnerCommandRequest, ProtocolService, ReportRequest, RunnerCredentialRequest,
-    SubmitInputRequest, SubmitOperatorCommandRequest, LOCAL_OWNER,
+    AcquireLeaseRequest, ConductorReadQuery, ConductorReadResponse, ConversationPageQuery,
+    CreateEnrollmentRequest, EnrollRequest, OwnerCommandRequest, ProtocolService, ReportRequest,
+    RunnerCredentialRequest, SubmitInputRequest, SubmitOperatorCommandRequest, LOCAL_OWNER,
 };
 use narsor::domain::{
     BackendId, EventData, ExecutionStatus, GitIdentity, ResolvedEnvironment, ResourceProfile,
@@ -36,8 +36,9 @@ use narsor::domain::{
 };
 use narsor::engine::HumanInputDelivery;
 use narsor::orchestration::{
-    ControlPlane, NewTask, Observation, ObservedSummary, OperatorCommand, OperatorCommandStatus,
-    OwnerCommand, OwnerRef, QueuedOperatorCommand, TaskEventKind, TaskRecord,
+    AttentionKind, ControlPlane, NewTask, Observation, ObservedSummary, OperatorCommand,
+    OperatorCommandStatus, OwnerCommand, OwnerRef, QueuedOperatorCommand, TaskEventKind,
+    TaskRecord,
 };
 use narsor::persistence::paths::StatePaths;
 use narsor::persistence::ExecutionStore;
@@ -810,11 +811,14 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
         "first\n"
     );
     // Both agent steps ran with the same private HOME and the harness the
-    // task pinned at creation.
+    // task pinned at creation. The conductor, which runs on that harness
+    // too, may have been asked beside them (it summarizes the human gate),
+    // and it shares the HOME as well.
     let homes = fs::read_to_string(home.join("claude-homes")).unwrap();
-    assert_eq!(
-        homes.lines().collect::<Vec<_>>(),
-        vec![home.display().to_string(); 2]
+    assert!(homes.lines().count() >= 2, "{homes}");
+    assert!(
+        homes.lines().all(|line| line == home.display().to_string()),
+        "{homes}"
     );
     let harnesses: Vec<String> = launch
         .events()
@@ -1804,4 +1808,651 @@ async fn a_declared_transition_carries_on_from_the_state_it_leads_to() {
         &event.data,
         EventData::DecisionMade { provider, .. } if provider == "human"
     )));
+}
+
+// ---------------------------------------------------------------------------
+// The conductor in the runner (U5)
+// ---------------------------------------------------------------------------
+
+/// A fake `claude` that answers by what it is asked: an agent step with
+/// `agent`, the conductor by its purpose (`diagnose`, `reply`, `annotate`,
+/// `choose`). Each answer is the reply text; the fake wraps it the way the
+/// harness does. It records the HOME of every call and which answer it gave.
+fn conductor_claude(root: &TempRoot, answers: &[(&str, String)]) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.dir("bin");
+    let dir = root.dir("claude-answers");
+    for (key, text) in answers {
+        let line = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "session_id": "fake",
+            "result": text,
+        });
+        fs::write(dir.join(key), format!("{line}\n")).unwrap();
+    }
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$HOME\" >> \"$HOME/claude-homes\"\n\
+         case \"$*\" in\n\
+         *'You are the conductor of a narsor'*)\n\
+           case \"$*\" in\n\
+           *'Diagnose why'*) key=diagnose ;;\n\
+           *\"Answer the operator's message\"*) key=reply ;;\n\
+           *'Summarize what the operator'*) key=annotate ;;\n\
+           *) key=choose ;;\n\
+           esac ;;\n\
+         *) key=agent ;;\n\
+         esac\n\
+         echo \"$key\" >> \"$HOME/claude-calls\"\n\
+         cat '{}'/\"$key\"\n",
+        dir.display()
+    );
+    let temp = bin.join(".claude.tmp");
+    fs::write(&temp, script).unwrap();
+    fs::set_permissions(&temp, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&temp, bin.join("claude")).unwrap();
+    bin
+}
+
+/// A conductor's reply: some words, then the JSON object it ends with.
+fn conductor_says(answer: serde_json::Value) -> String {
+    format!("Understood.\n{answer}")
+}
+
+/// A script step that fails on its first run and succeeds on the next.
+const FLAKY_WORKFLOW: &str = r#"
+name: flaky-task
+version: 1
+states:
+  build:
+    action:
+      type: script
+      command: sh
+      args:
+        - -c
+        - |
+          if [ -f retried ]; then printf '{"output": "done"}'; else touch retried; echo boom >&2; exit 3; fi
+    outputs: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+/// A script step that takes long enough for a test to talk to the
+/// conductor meanwhile.
+const LONG_STEP_WORKFLOW: &str = r#"
+name: long-task
+version: 1
+states:
+  wait:
+    action:
+      type: script
+      command: sh
+      args: [-c, "sleep 60; printf '{\"output\": \"done\"}'"]
+    outputs: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+/// An agent step that answers without its output label.
+const LABELLESS_WORKFLOW: &str = r#"
+name: labelless-task
+version: 1
+states:
+  work:
+    action:
+      type: agent
+      prompt: Do the work.
+    outputs: [implemented]
+    transitions:
+      implemented: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+/// What the owner reads of the task's conductor, once the runner answers.
+async fn conductor_view(fixture: &Fixture, task: &str) -> narsor::conductor::ConductorView {
+    match fixture
+        .service
+        .conductor(&fixture.owner(), task, ConductorReadQuery::default())
+        .await
+        .expect("read the conductor")
+    {
+        ConductorReadResponse::Available { conductor, .. } => *conductor,
+        ConductorReadResponse::Unavailable { message, .. } => {
+            panic!("the conductor is not readable: {message}")
+        }
+    }
+}
+
+async fn wait_for_view(
+    fixture: &Fixture,
+    task: &str,
+    what: &str,
+    mut ready: impl FnMut(&narsor::conductor::ConductorView) -> bool,
+) -> narsor::conductor::ConductorView {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let view = conductor_view(fixture, task).await;
+        if ready(&view) {
+            return view;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn attention_of(fixture: &Fixture, task: &str) -> Vec<narsor::orchestration::AttentionItem> {
+    fixture
+        .record(task)
+        .runner
+        .map(|runner| runner.snapshot.attention)
+        .unwrap_or_default()
+}
+
+fn attention_kinds(fixture: &Fixture, task: &str) -> Vec<AttentionKind> {
+    attention_of(fixture, task)
+        .into_iter()
+        .map(|item| item.kind)
+        .collect()
+}
+
+async fn applied(fixture: &Fixture, task: &str, command: OperatorCommand, key: &str) {
+    let id = submit(fixture, task, command, key);
+    let settled = settled(fixture, task, &id).await;
+    assert_eq!(
+        settled.status,
+        OperatorCommandStatus::Applied,
+        "{settled:?}"
+    );
+}
+
+async fn rejected(
+    fixture: &Fixture,
+    task: &str,
+    command: OperatorCommand,
+    key: &str,
+) -> QueuedOperatorCommand {
+    let id = submit(fixture, task, command, key);
+    let settled = settled(fixture, task, &id).await;
+    assert_eq!(
+        settled.status,
+        OperatorCommandStatus::Rejected,
+        "{settled:?}"
+    );
+    settled
+}
+
+/// A failed step with a conductor: it is diagnosed, the failed step waits
+/// for the owner with the diagnosis and its proposals, and confirming the
+/// proposal restarts the step and clears the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_step_is_diagnosed_and_its_confirmed_proposal_restarts_it() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let bin = conductor_claude(
+        &fixture.root,
+        &[(
+            "diagnose",
+            conductor_says(serde_json::json!({
+                "decision": "diagnose",
+                "confidence": "high",
+                "rationale": "the script exits with 3 on its first run",
+                "message": "The build failed.",
+                "diagnosis": "the script exited with 3",
+                "proposals": [
+                    {"kind": "retry", "summary": "Run the build again", "text": "run it again"}
+                ],
+            })),
+        )],
+    );
+    let spec = spec(
+        FLAKY_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    running_runner(&mut fixture, "task-1", &launch).await;
+
+    let view = wait_for_view(&fixture, "task-1", "the diagnosis", |view| {
+        view.failure.is_some() && !view.proposals.is_empty()
+    })
+    .await;
+    assert!(view.available, "{view:?}");
+    assert_eq!(view.harness.as_deref(), Some("claude-code"));
+    let failure = view.failure.as_ref().unwrap();
+    assert!(failure.reason.contains("exited with 3"), "{failure:?}");
+    let proposal = &view.proposals[0];
+    assert_eq!(proposal.state, narsor::conductor::ProposalState::Pending);
+    assert_eq!(proposal.in_reply_to, None, "it came with the diagnosis");
+
+    // The failed step waits, named by the key a restart of it names; the
+    // diagnosis' proposal is part of it, not a second wait.
+    let execution = launch
+        .store()
+        .load_execution(&launch.execution_id().unwrap())
+        .unwrap();
+    let key = narsor::engine::step_failure(&execution)
+        .unwrap()
+        .expect("the failure is recorded")
+        .key()
+        .to_string();
+    wait_until_async(
+        Duration::from_secs(30),
+        "the failed step's attention",
+        || !attention_of(&fixture, "task-1").is_empty(),
+    )
+    .await;
+    let attention = attention_of(&fixture, "task-1");
+    assert_eq!(attention.len(), 1, "{attention:?}");
+    assert_eq!(attention[0].kind, AttentionKind::FailedStep);
+    assert_eq!(attention[0].waiting_id, key);
+    assert_eq!(attention[0].state_id.as_deref(), Some("build"));
+    let summary = fixture.service.task(&fixture.owner(), "task-1").unwrap();
+    let runner = summary.runner.expect("the runner reported");
+    assert!(runner.conductor_available);
+    assert_eq!(runner.conductor_unavailable_reason, None);
+
+    applied(
+        &fixture,
+        "task-1",
+        OperatorCommand::ConfirmProposal {
+            proposal_id: proposal.proposal_id.clone(),
+        },
+        "confirm-1",
+    )
+    .await;
+    wait_until_async(Duration::from_secs(30), "completion", || {
+        runner_status(&fixture, "task-1") == Some(ExecutionStatus::Completed)
+    })
+    .await;
+    wait_until_async(Duration::from_secs(30), "the wait to clear", || {
+        attention_of(&fixture, "task-1").is_empty()
+    })
+    .await;
+    let view = conductor_view(&fixture, "task-1").await;
+    assert_eq!(
+        view.proposals[0].state,
+        narsor::conductor::ProposalState::Executed
+    );
+
+    // Settled once: confirming it again is refused, with the reason.
+    let again = rejected(
+        &fixture,
+        "task-1",
+        OperatorCommand::ConfirmProposal {
+            proposal_id: proposal.proposal_id.clone(),
+        },
+        "confirm-2",
+    )
+    .await;
+    assert!(
+        again
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("already settled")),
+        "{again:?}"
+    );
+}
+
+/// A runner whose harness cannot run here has no conductor and says why: a
+/// failed step goes to the owner as it is, without a diagnosis, and a
+/// restart naming its key carries it on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_conductor_a_failed_step_waits_for_the_owner_without_proposals() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let spec = spec(
+        FLAKY_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("no-such-harness"),
+    );
+    fixture.create("task-1", spec.clone());
+    let launch = Launch::new(&fixture, "task-1", &spec);
+    running_runner(&mut fixture, "task-1", &launch).await;
+
+    wait_until_async(
+        Duration::from_secs(30),
+        "the failed step's attention",
+        || attention_kinds(&fixture, "task-1") == vec![AttentionKind::FailedStep],
+    )
+    .await;
+    let summary = fixture.service.task(&fixture.owner(), "task-1").unwrap();
+    let runner = summary.runner.expect("the runner reported");
+    assert!(!runner.conductor_available);
+    assert!(
+        runner
+            .conductor_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no-such-harness")),
+        "{:?}",
+        runner.conductor_unavailable_reason
+    );
+
+    let view = conductor_view(&fixture, "task-1").await;
+    assert!(!view.available);
+    assert!(view.unavailable_reason.is_some());
+    assert!(view.failure.is_none(), "nobody diagnosed it: {view:?}");
+    assert!(view.proposals.is_empty());
+
+    for (command, key) in [
+        (
+            OperatorCommand::ConductorChat {
+                text: "anyone there?".to_string(),
+            },
+            "chat-1",
+        ),
+        (
+            OperatorCommand::ConfirmProposal {
+                proposal_id: "p".to_string(),
+            },
+            "confirm-1",
+        ),
+    ] {
+        let refused = rejected(&fixture, "task-1", command, key).await;
+        assert!(
+            refused
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("no conductor")),
+            "{refused:?}"
+        );
+    }
+
+    // The owner's own restart, naming the failure the wait names.
+    let key = attention_of(&fixture, "task-1")[0].waiting_id.clone();
+    applied(
+        &fixture,
+        "task-1",
+        restart(Some("once more"), Some(&key)),
+        "restart-1",
+    )
+    .await;
+    wait_until_async(Duration::from_secs(30), "completion", || {
+        runner_status(&fixture, "task-1") == Some(ExecutionStatus::Completed)
+    })
+    .await;
+}
+
+/// The owner writes to the conductor while the step runs: the answer is
+/// read back, its proposal waits for the owner as a conductor proposal, and
+/// rejecting it settles it for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chat_answer_and_its_proposal_are_read_back_and_a_rejection_settles_it() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let bin = conductor_claude(
+        &fixture.root,
+        &[(
+            "reply",
+            conductor_says(serde_json::json!({
+                "decision": "reply",
+                "confidence": "high",
+                "rationale": "it is waiting",
+                "message": "The step is still sleeping.",
+                "proposals": [{"kind": "abort", "summary": "Cancel the task"}],
+            })),
+        )],
+    );
+    let spec = spec(
+        LONG_STEP_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    running_runner(&mut fixture, "task-1", &launch).await;
+
+    applied(
+        &fixture,
+        "task-1",
+        OperatorCommand::ConductorChat {
+            text: "  how is it going?  ".to_string(),
+        },
+        "chat-1",
+    )
+    .await;
+    let view = wait_for_view(&fixture, "task-1", "the answer", |view| {
+        view.chat.iter().any(|entry| {
+            entry.author == narsor::conductor::ChatAuthor::Conductor
+                && entry.text == "The step is still sleeping."
+        })
+    })
+    .await;
+    assert_eq!(view.chat[0].text, "how is it going?", "the text is trimmed");
+    assert!(view.unanswered_chat.is_empty(), "{view:?}");
+    let proposal = view.proposals[0].clone();
+    assert_eq!(proposal.state, narsor::conductor::ProposalState::Pending);
+    assert!(proposal.in_reply_to.is_some(), "it answers the message");
+
+    wait_until_async(Duration::from_secs(30), "the proposal's attention", || {
+        attention_of(&fixture, "task-1")
+            .iter()
+            .any(|item| item.kind == AttentionKind::ConductorProposal)
+    })
+    .await;
+    let waiting: Vec<_> = attention_of(&fixture, "task-1")
+        .into_iter()
+        .filter(|item| item.kind == AttentionKind::ConductorProposal)
+        .collect();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].waiting_id, proposal.proposal_id);
+
+    applied(
+        &fixture,
+        "task-1",
+        OperatorCommand::RejectProposal {
+            proposal_id: proposal.proposal_id.clone(),
+        },
+        "reject-1",
+    )
+    .await;
+    wait_until_async(Duration::from_secs(30), "the wait to clear", || {
+        attention_kinds(&fixture, "task-1").is_empty()
+    })
+    .await;
+    let view = conductor_view(&fixture, "task-1").await;
+    assert_eq!(
+        view.proposals[0].state,
+        narsor::conductor::ProposalState::Rejected
+    );
+
+    // A rejected proposal can neither be rejected again nor confirmed.
+    for (command, key) in [
+        (
+            OperatorCommand::RejectProposal {
+                proposal_id: proposal.proposal_id.clone(),
+            },
+            "reject-2",
+        ),
+        (
+            OperatorCommand::ConfirmProposal {
+                proposal_id: proposal.proposal_id.clone(),
+            },
+            "confirm-1",
+        ),
+    ] {
+        rejected(&fixture, "task-1", command, key).await;
+    }
+    assert_eq!(
+        runner_status(&fixture, "task-1"),
+        Some(ExecutionStatus::Running),
+        "nothing was carried out"
+    );
+}
+
+/// The conductor completed a step with its own choice of an output; the
+/// owner takes it back and the step is a problem again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chosen_output_is_undone_and_the_step_is_a_problem_again() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let bin = conductor_claude(
+        &fixture.root,
+        &[
+            ("agent", "Done: three units.".to_string()),
+            (
+                "choose",
+                conductor_says(serde_json::json!({
+                    "decision": "choose_output",
+                    "label": "implemented",
+                    "data": {},
+                    "variables": {},
+                    "confidence": "high",
+                    "rationale": "the agent said it finished three units",
+                })),
+            ),
+        ],
+    );
+    let spec = spec(
+        LABELLESS_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    running_runner(&mut fixture, "task-1", &launch).await;
+    wait_until_async(Duration::from_secs(60), "the conductor's choice", || {
+        runner_status(&fixture, "task-1") == Some(ExecutionStatus::Completed)
+    })
+    .await;
+
+    let view = conductor_view(&fixture, "task-1").await;
+    assert_eq!(view.decisions.len(), 1, "{view:?}");
+    let decision = &view.decisions[0];
+    assert_eq!(decision.kind, "choose_output");
+    assert!(decision.undoable && !decision.undone);
+
+    applied(
+        &fixture,
+        "task-1",
+        OperatorCommand::UndoDecision {
+            decision_id: decision.decision_id.clone(),
+        },
+        "undo-1",
+    )
+    .await;
+    wait_until_async(Duration::from_secs(30), "the problem to come back", || {
+        runner_status(&fixture, "task-1") == Some(ExecutionStatus::InputNeeded)
+    })
+    .await;
+    let view = conductor_view(&fixture, "task-1").await;
+    assert!(view.decisions[0].undone && !view.decisions[0].undoable);
+    assert!(
+        view.chat.iter().any(
+            |entry| entry.author == narsor::conductor::ChatAuthor::Operator
+                && entry.text.contains("Undid the conductor's choice")
+        ),
+        "the undo is in the history: {:?}",
+        view.chat
+    );
+    wait_until_async(Duration::from_secs(30), "the problem's attention", || {
+        attention_kinds(&fixture, "task-1").contains(&AttentionKind::Problem)
+    })
+    .await;
+
+    let again = rejected(
+        &fixture,
+        "task-1",
+        OperatorCommand::UndoDecision {
+            decision_id: decision.decision_id.clone(),
+        },
+        "undo-2",
+    )
+    .await;
+    assert!(
+        again
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("already undone")),
+        "{again:?}"
+    );
+}
+
+/// A harness chosen for the conductor is kept on the storage and used from
+/// the conductor's next invocation on, not before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chosen_conductor_harness_applies_from_the_next_invocation() {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let bin = conductor_claude(
+        &fixture.root,
+        &[(
+            "reply",
+            conductor_says(serde_json::json!({
+                "decision": "reply", "message": "From claude.",
+            })),
+        )],
+    );
+    // A `codex` that only notes it was run: its answer is no answer at all.
+    let codex = bin.join("codex");
+    fs::write(&codex, "#!/bin/sh\necho called >> \"$HOME/codex-calls\"\n").unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+    let spec = spec(
+        LONG_STEP_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    running_runner(&mut fixture, "task-1", &launch).await;
+
+    let chat = |text: &str, key: &str| {
+        submit(
+            &fixture,
+            "task-1",
+            OperatorCommand::ConductorChat {
+                text: text.to_string(),
+            },
+            key,
+        )
+    };
+    let first = chat("first", "chat-1");
+    settled(&fixture, "task-1", &first).await;
+    wait_for_view(&fixture, "task-1", "claude's answer", |view| {
+        view.chat.iter().any(|entry| entry.text == "From claude.")
+    })
+    .await;
+    assert!(!launch.home().join("codex-calls").exists());
+
+    applied(
+        &fixture,
+        "task-1",
+        OperatorCommand::SetConductorHarness {
+            harness: "codex".to_string(),
+        },
+        "harness-1",
+    )
+    .await;
+    let remembered = fs::read_to_string(launch.storage.join("narsor/conductor.json")).unwrap();
+    assert!(remembered.contains("codex"), "{remembered}");
+
+    let second = chat("second", "chat-2");
+    settled(&fixture, "task-1", &second).await;
+    wait_until_async(Duration::from_secs(30), "the new harness", || {
+        launch.home().join("codex-calls").exists()
+    })
+    .await;
+    let view = conductor_view(&fixture, "task-1").await;
+    assert_eq!(view.harness.as_deref(), Some("codex"));
 }

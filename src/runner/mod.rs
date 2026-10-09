@@ -21,7 +21,10 @@
 //! 4. **Initialize** the storage once ([`init`], R39): copy the spec, clone
 //!    the pinned commit into empty storage, write the marker. A resumed
 //!    storage is never cloned again.
-//! 5. **Decide how to continue** (below), then run the Engine with the
+//! 5. **Assemble the conductor** when the task's harness is usable in this
+//!    environment ([`conductor`]); without one, a failed step goes to the
+//!    owner as it is.
+//! 6. **Decide how to continue** (below), then run the Engine with the
 //!    harness pinned in the launch spec (R42) while a control loop reports
 //!    snapshots, long-polls for directives, input, page requests and
 //!    materials (U9), and renews the credential.
@@ -64,6 +67,7 @@
 
 pub mod cli;
 mod commands;
+mod conductor;
 pub mod init;
 mod materials;
 pub mod preflight;
@@ -347,9 +351,16 @@ pub async fn run(
         timeout_secs: None,
     }));
 
+    let conductor = conductor::ConductorHost::assemble(
+        &engine,
+        &storage,
+        &spec.environment.harness,
+        &definition,
+    );
     let mut session = Session {
         storage,
         engine,
+        conductor,
         definition,
         incarnation: config.incarnation.clone(),
         timing: config.timing.clone(),
@@ -450,6 +461,8 @@ async fn report_problem(
         safe_point: true,
         attention: snapshot::attention_items(None, Some(&problem), observed_at),
         problem: Some(problem.clone()),
+        conductor_available: false,
+        conductor_unavailable_reason: Some("the runner cannot work".to_string()),
         display: None,
         observed_at,
     };
@@ -566,6 +579,7 @@ impl Link {
 struct Session {
     storage: TaskStorage,
     engine: Arc<Engine>,
+    conductor: conductor::ConductorHost,
     definition: Arc<WorkflowDefinition>,
     incarnation: String,
     timing: RunnerTiming,
@@ -638,6 +652,8 @@ impl Session {
             Continuation::Clean => self.resume_pass()?,
             Continuation::Recover(command) => self.recover(command)?,
         }
+        // After the runner's own recovery, like the daemon's startup hook.
+        self.conductor.restore_at_startup();
         self.drive().await
     }
 
@@ -748,8 +764,11 @@ impl Session {
         }));
     }
 
+    /// Whether a pass is driving the execution: the runner's own, or one
+    /// the conductor started.
     fn pass_active(&self) -> bool {
         self.pass.as_ref().is_some_and(|pass| !pass.is_finished())
+            || self.conductor.passes().active()
     }
 
     fn snapshot(
@@ -767,6 +786,7 @@ impl Session {
                 pass_active,
                 problem,
                 stopping,
+                conductor_unavailable: self.conductor.unavailable_reason(),
             },
         )
     }
@@ -856,8 +876,13 @@ impl Session {
                     match finished {
                         Ok(Ok(execution)) => tracing::info!(status = ?execution.status, "the engine pass stopped"),
                         Ok(Err(error)) => tracing::warn!(%error, "the engine pass ended with an error"),
+                        Err(error) if error.is_cancelled() => tracing::info!("the engine pass was stopped"),
                         Err(error) => tracing::error!(%error, "the engine pass panicked"),
                     }
+                }
+                _ = self.conductor.passes().ended() => {
+                    dirty = true;
+                    self.outbox_due = true;
                 }
                 answered = wait_for_poll(&mut poll) => {
                     poll = None;
@@ -982,6 +1007,9 @@ impl Session {
         }
         for request in response.execution_events {
             self.serve_events(request).await;
+        }
+        for request in response.conductor_reads {
+            self.serve_conductor_read(request).await;
         }
         if !response.materials.is_empty() && !self.materials_deferred() {
             self.receive_materials(response.materials).await;

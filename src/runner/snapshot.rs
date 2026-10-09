@@ -16,13 +16,16 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
+use crate::conductor::pending_chat_proposals;
 use crate::domain::{ExecutionStatus, TaskDisplay, WorkflowDefinition, WorkflowExecution};
-use crate::engine::{build_timeline, Engine, InputContinuation, PendingHumanInput, Timeline};
+use crate::engine::{
+    build_timeline, step_failure, Engine, InputContinuation, PendingHumanInput, Timeline,
+};
 use crate::orchestration::{
     AttentionItem, AttentionKind, ConversationAttemptSummary, ConversationAvailability,
     ExecutionCursor, PendingInputRef, RunnerProblem, RunnerSnapshot,
 };
-use crate::persistence::ConversationStore;
+use crate::persistence::{ConversationStore, ExecutionStore};
 use crate::workflow::TemplateScope;
 
 use super::RunnerError;
@@ -50,6 +53,8 @@ pub(crate) struct SnapshotContext<'a> {
     /// during a pause (KTD2), so the claim must never run ahead of the
     /// runner's own durable record of stopping.
     pub stopping: bool,
+    /// Why the runner hosts no conductor; `None` while it hosts one.
+    pub conductor_unavailable: Option<&'a str>,
 }
 
 /// Builds the snapshot of the storage's execution, without a sequence (the
@@ -74,6 +79,8 @@ pub(crate) fn build(
             safe_point: context.stopping && !context.pass_active,
             attention: attention_items(None, context.problem.as_ref(), observed_at),
             problem: context.problem,
+            conductor_available: context.conductor_unavailable.is_none(),
+            conductor_unavailable_reason: context.conductor_unavailable.map(str::to_string),
             // Nothing to render against yet; the control plane's own
             // rendering from the sealed inputs stays in force.
             display: None,
@@ -91,7 +98,13 @@ pub(crate) fn build(
 
     let observed_at = Utc::now();
     let pending = engine.pending_input(execution_id)?;
-    let attention = attention_items(pending.as_ref(), context.problem.as_ref(), observed_at);
+    let mut attention = attention_items(pending.as_ref(), context.problem.as_ref(), observed_at);
+    attention.extend(conductor_attention(
+        store,
+        &execution,
+        context.conductor_unavailable.is_none(),
+    )?);
+    attention.sort_by_key(|item| item.since);
     let pending_input = pending.map(|pending| PendingInputRef {
         id: pending.episode_key().to_string(),
         attempt_id: (pending.continuation == InputContinuation::ResumeAgent)
@@ -128,6 +141,8 @@ pub(crate) fn build(
         safe_point: context.stopping && !context.pass_active,
         attention,
         problem: context.problem,
+        conductor_available: context.conductor_unavailable.is_none(),
+        conductor_unavailable_reason: context.conductor_unavailable.map(str::to_string),
         display: render_display(context.definition, &execution),
         observed_at,
     })
@@ -167,6 +182,43 @@ pub(crate) fn attention_items(
     }));
     items.sort_by_key(|item| item.since);
     items
+}
+
+/// What waits on the owner because of a step that failed or a proposal of
+/// the conductor's (U5).
+///
+/// A failed step is waiting whether or not a conductor looks at it: with
+/// one the owner finds its diagnosis and proposals in the conductor's
+/// state, without one the bare failure. Its identity is the failure's key,
+/// the one a restart of the step names. A proposal from the chat counts
+/// only while a conductor runs to carry it out.
+fn conductor_attention(
+    store: &ExecutionStore,
+    execution: &WorkflowExecution,
+    conductor_available: bool,
+) -> Result<Vec<AttentionItem>, RunnerError> {
+    let mut items = Vec::new();
+    if execution.status == ExecutionStatus::Failed {
+        if let Ok(Some(failure)) = step_failure(execution) {
+            items.push(AttentionItem {
+                kind: AttentionKind::FailedStep,
+                state_id: Some(failure.state_id.to_string()),
+                since: execution.completed_at.unwrap_or(execution.started_at),
+                waiting_id: failure.key().to_string(),
+            });
+        }
+    }
+    if conductor_available {
+        for proposal in pending_chat_proposals(store, &execution.id)? {
+            items.push(AttentionItem {
+                kind: AttentionKind::ConductorProposal,
+                state_id: proposal.record.state_id.clone(),
+                since: proposal.at,
+                waiting_id: proposal.proposal_id,
+            });
+        }
+    }
+    Ok(items)
 }
 
 /// The workflow's `display` against what the execution knows now: its inputs
