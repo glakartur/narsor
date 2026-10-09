@@ -77,7 +77,7 @@ impl ControlPlane {
         capacity: &BackendCapacity,
     ) -> Result<Vec<TaskId>> {
         let _lock = self.store().lock_schedule(backend_id)?;
-        let tasks = self.backend_tasks(backend_id)?;
+        let tasks = self.dense_backend_tasks(backend_id)?;
         let online = self.controller_online(backend_id)?;
         let mut in_use = slots_in_use(&tasks);
 
@@ -226,7 +226,7 @@ impl ControlPlane {
     ) -> Result<(TaskRecord, bool)> {
         let backend_id = self.task(task_id)?.assignment.backend_id;
         let _lock = self.store().lock_schedule(&backend_id)?;
-        let tasks = self.backend_tasks(&backend_id)?;
+        let tasks = self.dense_backend_tasks(&backend_id)?;
         let moved = tasks
             .iter()
             .find(|task| task.task_id == *task_id)
@@ -242,13 +242,36 @@ impl ControlPlane {
             let position = after.iter().position(|candidate| *candidate == id);
             u32::try_from(position.unwrap_or(0) + 1).unwrap_or(u32::MAX)
         };
-        let order: Vec<TaskId> = after.iter().map(|id| (*id).clone()).collect();
+        // The event goes to the mover's own stream, so it names only the
+        // mover's tasks: the ids of another owner's tasks on a shared
+        // backend are not theirs to learn. Ranks are still those of the
+        // whole queue.
+        let order: Vec<TaskId> = after
+            .iter()
+            .filter(|id| {
+                tasks
+                    .iter()
+                    .any(|task| &task.task_id == **id && task.owner == moved.owner)
+            })
+            .map(|id| (*id).clone())
+            .collect();
 
-        // The moved task first: it is the one that can still be refused
-        // (a command raced in), and a crash after it leaves only equal
-        // ranks, which queue order breaks by creation.
+        // The neighbours first, the moved task last: its `Moved` event is
+        // the one commit point. A crash or failure before it announces
+        // nothing and leaves at worst equal ranks, which the next pass under
+        // this lock renumbers; one after it leaves the order announced.
+        let neighbours: Vec<&TaskRecord> = tasks
+            .iter()
+            .filter(|task| task.task_id != *task_id && task.rank != rank_of(&task.task_id))
+            .collect();
+        for (written, task) in neighbours.iter().enumerate() {
+            if let Err(error) = self.set_rank(&task.task_id, rank_of(&task.task_id)) {
+                self.restore_ranks(&neighbours[..written]);
+                return Err(error);
+            }
+        }
         let rank = rank_of(task_id);
-        let (record, _) = self.mutate(task_id, |record, _now| {
+        let committed = self.mutate(task_id, |record, _now| {
             check_movable(record, expected_generation)?;
             record.rank = rank;
             Ok(Mutation::Changed(
@@ -258,14 +281,26 @@ impl ControlPlane {
                 },
                 (),
             ))
-        })?;
-        for task in tasks.iter().filter(|task| task.task_id != *task_id) {
-            let rank = rank_of(&task.task_id);
-            if task.rank != rank {
-                self.set_rank(&task.task_id, rank)?;
+        });
+        match committed {
+            Ok((record, ())) => Ok((record, true)),
+            Err(error) => {
+                // Refused (a command raced in): the queue stays as it was.
+                self.restore_ranks(&neighbours);
+                Err(error)
             }
         }
-        Ok((record, true))
+    }
+
+    /// Puts `tasks` back to the ranks they were read with, as far as that
+    /// works: the caller already has an error to report, and whatever stays
+    /// unrestored is equal ranks the next pass renumbers.
+    fn restore_ranks(&self, tasks: &[&TaskRecord]) {
+        for task in tasks {
+            if let Err(error) = self.set_rank(&task.task_id, task.rank) {
+                tracing::warn!(task_id = %task.task_id, %error, "could not restore a rank");
+            }
+        }
     }
 
     /// The owner's default-backend override, if one was ever set (R10).
@@ -306,6 +341,43 @@ impl ControlPlane {
         let mut record = self.store().load_task(task_id)?;
         record.rank = rank;
         self.store().save_task(&record)
+    }
+
+    /// Renumbers equal ranks of every backend (see
+    /// [`Self::dense_backend_tasks`]), each under its own schedule lock.
+    pub(crate) fn normalise_ranks(&self) -> Result<()> {
+        let mut backends: Vec<BackendId> = Vec::new();
+        for task in self.list_tasks()? {
+            if !backends.contains(&task.assignment.backend_id) {
+                backends.push(task.assignment.backend_id);
+            }
+        }
+        for backend_id in backends {
+            let _lock = self.store().lock_schedule(&backend_id)?;
+            self.dense_backend_tasks(&backend_id)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::backend_tasks`] with equal ranks renumbered to 1, 2, 3, ...
+    /// in queue order (creation order among the equal ones).
+    ///
+    /// Equal ranks are what a renumbering interrupted by a crash leaves.
+    /// Call under the backend's schedule lock. Renumbering announces
+    /// nothing, like the moves it repairs; the clients' next read sees it.
+    pub(crate) fn dense_backend_tasks(&self, backend_id: &BackendId) -> Result<Vec<TaskRecord>> {
+        let mut tasks = self.backend_tasks(backend_id)?;
+        let has_equal_ranks = tasks.windows(2).any(|pair| pair[0].rank == pair[1].rank);
+        if has_equal_ranks {
+            for (index, task) in tasks.iter_mut().enumerate() {
+                let rank = u32::try_from(index + 1).unwrap_or(u32::MAX);
+                if task.rank != rank {
+                    self.set_rank(&task.task_id, rank)?;
+                    task.rank = rank;
+                }
+            }
+        }
+        Ok(tasks)
     }
 
     /// Every task of `backend_id`, in queue order.

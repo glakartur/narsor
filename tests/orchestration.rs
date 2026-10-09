@@ -86,6 +86,13 @@ impl Fixture {
         }
     }
 
+    /// One scheduling pass on the `k8s` backend.
+    fn schedule_once(&self) {
+        self.control
+            .schedule(&backend_id("k8s"), &BackendCapacity::Limit(1))
+            .expect("schedule");
+    }
+
     /// A second, independent handle on the same state root.
     fn reopen(&self) -> ControlPlane {
         ControlPlane::with_clock(self.root.paths(), self.clock.clone())
@@ -1679,6 +1686,146 @@ fn concurrent_moves_are_serialized_and_leave_one_consistent_order() {
         matches!(kind, TaskEventKind::Moved { order, .. } if order.iter().map(ToString::to_string).collect::<Vec<_>>() == ["d", "b", "c", "a"])
     });
     assert_eq!(finals.count(), 1, "{events:?}");
+}
+
+/// Makes writing `id`'s rank fail: its lock file is a directory.
+fn break_task_lock(fx: &Fixture, id: &str) {
+    let lock = fx.root.paths().orchestration_task_lock_file(id);
+    let _ = fs::remove_file(&lock);
+    fs::create_dir(&lock).unwrap();
+}
+
+fn stored_ranks(fx: &Fixture) -> Vec<(String, u32)> {
+    let mut ranks: Vec<(String, u32)> = fx
+        .control
+        .list_tasks()
+        .unwrap()
+        .iter()
+        .map(|task| (task.task_id.to_string(), task.rank))
+        .collect();
+    ranks.sort();
+    ranks
+}
+
+#[test]
+fn a_move_that_fails_after_renumbering_a_neighbour_restores_the_queue() {
+    let fx = Fixture::new();
+    for id in ["a", "b", "c"] {
+        fx.create(id);
+    }
+    // `a` is renumbered first, then writing `b` fails.
+    break_task_lock(&fx, "b");
+    move_to(&fx, "c", MoveTarget::Top).unwrap_err();
+
+    assert_eq!(queue_order(&fx, "k8s"), ["a", "b", "c"]);
+    assert_eq!(
+        stored_ranks(&fx),
+        [("a".into(), 1), ("b".into(), 2), ("c".into(), 3)]
+    );
+    assert_eq!(
+        fx.control.events_since(&task("c"), 0).unwrap().len(),
+        1,
+        "nothing was announced"
+    );
+
+    // The same move goes through once the fault is gone.
+    fs::remove_dir(fx.root.paths().orchestration_task_lock_file("b")).unwrap();
+    move_to(&fx, "c", MoveTarget::Top).unwrap();
+    assert_eq!(queue_order(&fx, "k8s"), ["c", "a", "b"]);
+}
+
+#[test]
+fn equal_ranks_left_by_an_interrupted_renumbering_are_made_dense_by_the_next_pass() {
+    let fx = Fixture::new();
+    for id in ["a", "b", "c"] {
+        fx.create(id);
+    }
+    // What a crash in the middle of a renumbering leaves: c and b tie.
+    for (id, rank) in [("a", 1), ("b", 2), ("c", 2)] {
+        let path = fx.root.paths().orchestration_task_file(id);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["rank"] = rank.into();
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    fx.schedule_once();
+    assert_eq!(
+        stored_ranks(&fx),
+        [("a".into(), 1), ("b".into(), 2), ("c".into(), 3)]
+    );
+    assert_eq!(queue_order(&fx, "k8s"), ["a", "b", "c"]);
+}
+
+#[test]
+fn recovery_makes_equal_ranks_dense() {
+    let fx = Fixture::new();
+    for id in ["a", "b"] {
+        fx.create(id);
+    }
+    let path = fx.root.paths().orchestration_task_file("b");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["rank"] = 1.into();
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    fx.reopen().recover().unwrap();
+    assert_eq!(stored_ranks(&fx), [("a".into(), 1), ("b".into(), 2)]);
+}
+
+#[test]
+fn a_read_between_the_neighbour_writes_and_the_commit_never_ends_in_another_order() {
+    let fx = Fixture::new();
+    for id in ["a", "b", "c"] {
+        fx.create(id);
+    }
+    // The state a reader can meet mid-move: the neighbours renumbered, the
+    // moved task not yet committed.
+    for (id, rank) in [("a", 2), ("b", 3)] {
+        let path = fx.root.paths().orchestration_task_file(id);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["rank"] = rank.into();
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    let _ = fx.control.list_tasks().unwrap();
+    move_to(&fx, "c", MoveTarget::Top).unwrap();
+    assert_eq!(queue_order(&fx, "k8s"), ["c", "a", "b"]);
+    assert_eq!(
+        stored_ranks(&fx),
+        [("a".into(), 2), ("b".into(), 3), ("c".into(), 1)]
+    );
+}
+
+#[test]
+fn a_move_event_names_only_the_movers_tasks_but_ranks_the_whole_queue() {
+    let fx = Fixture::new();
+    fx.create("mine-1");
+    fx.control
+        .create_task(NewTask {
+            owner: OwnerRef::new("someone-else"),
+            ..new_task("theirs", "k8s")
+        })
+        .unwrap();
+    fx.create("mine-2");
+
+    let (record, _) = move_to(&fx, "mine-2", MoveTarget::Top).unwrap();
+    assert_eq!(
+        record.last_event.kind,
+        TaskEventKind::Moved {
+            rank: 1,
+            order: vec![task("mine-2"), task("mine-1")],
+        }
+    );
+    assert_eq!(queue_order(&fx, "k8s"), ["mine-2", "mine-1", "theirs"]);
+    let (record, _) = move_to(&fx, "mine-1", MoveTarget::Top).unwrap();
+    assert!(matches!(
+        record.last_event.kind,
+        TaskEventKind::Moved { rank: 1, .. }
+    ));
+    let (record, _) = move_to(&fx, "mine-2", after("theirs")).unwrap();
+    assert!(matches!(
+        record.last_event.kind,
+        TaskEventKind::Moved { rank: 3, .. }
+    ));
 }
 
 #[test]

@@ -1068,6 +1068,43 @@ mod task_app_list {
         app.list().rows().into_iter().map(|row| row.title).collect()
     }
 
+    #[test]
+    fn a_moved_event_at_the_revision_a_read_already_showed_still_reorders_the_neighbours() {
+        let mut app = app();
+        // A read that landed between the renumbering of the neighbours and
+        // the commit: the moved row is at the event's revision already, the
+        // others are still in the old order.
+        let mut moved = queued("c", 3);
+        moved.revision = 2;
+        app.load(listing(vec![queued("a", 1), queued("b", 2), moved], "c0"));
+        assert_eq!(titles(&app), ["a", "b", "c"]);
+
+        app.on_stream(event(
+            "c1",
+            "c",
+            2,
+            TaskLifecycle::Queued,
+            TaskEventKind::Moved {
+                rank: 1,
+                order: ids(&["c", "a", "b"]),
+            },
+        ));
+        assert_eq!(titles(&app), ["c", "a", "b"]);
+
+        // The same event again, or an older one, changes nothing.
+        app.on_stream(event(
+            "c1",
+            "c",
+            1,
+            TaskLifecycle::Queued,
+            TaskEventKind::Moved {
+                rank: 3,
+                order: ids(&["a", "b", "c"]),
+            },
+        ));
+        assert_eq!(titles(&app), ["c", "a", "b"]);
+    }
+
     fn row(app: &TaskApp, title: &str) -> (Attention, StateIcon, String) {
         let row = app
             .list()

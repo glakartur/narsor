@@ -545,6 +545,7 @@ impl ControlPlane {
                 republished_events.push((task_id, record.revision));
             }
         }
+        self.normalise_ranks()?;
         let materials = crate::materials::MaterialStore::new(
             self.store.paths(),
             crate::materials::MaterialLimits::default(),

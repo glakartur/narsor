@@ -797,7 +797,11 @@ impl TaskList {
     ///   runner's current step or a task this list does not know — asks for a
     ///   read, which the caller debounces.
     ///
-    /// An event that is not newer than the row's revision is dropped.
+    /// An event that is not newer than the row's revision is dropped — except
+    /// a `Moved` at exactly that revision: a read that came in between the
+    /// renumbering of the neighbours and the commit shows the moved row at
+    /// the event's revision with the neighbours still in the old order, and
+    /// only the event's order puts them right.
     pub fn apply_event(&mut self, event: &TaskEvent) -> EventEffect {
         let Some(index) = self
             .tasks
@@ -809,7 +813,18 @@ impl TaskList {
                 ..EventEffect::default()
             };
         };
-        if event.sequence <= self.tasks[index].revision {
+        let revision = self.tasks[index].revision;
+        if event.sequence < revision {
+            return EventEffect::default();
+        }
+        if event.sequence == revision {
+            if let TaskEventKind::Moved { order, .. } = &event.kind {
+                self.apply_order(index, order);
+                return EventEffect {
+                    applied: true,
+                    ..EventEffect::default()
+                };
+            }
             return EventEffect::default();
         }
         {
