@@ -523,12 +523,20 @@ narsor task materials download <task> <material> <dest-dir> [--force]
 narsor task materials delete <task> <material>
 narsor auth whoami | claim <code>
 narsor controller enroll-code <backend> | list | revoke <id>
-narsor tui --remote                          # implied by --server
+narsor tui                                   # the interface; over --server when given
 ```
 
-In the TUI's remote mode: `j/k` move, `Enter` opens a task, `p` pause, `u`
-resume, `s` start afresh, `a` archive (asks first), `i` answer the pending input, `c`/`n`/`[`/`]` read the conversation
-through the control plane, `b` default backend, `r` refresh, `?` help.
+`narsor tui` is one interface for every backend: it talks to the control plane
+only (`/control/v1`) — the local daemon without `--server`, the remote one with
+it — and the backend is whatever the configuration names. It opens even when
+the server cannot be reached and keeps trying; without a connection the data is
+greyed with its age and actions that change state are blocked with the reason.
+`narsor tui --remote` is an ignored alias that warns on stderr. Every action of
+the interface is a `narsor task …` command: `move` (`K` / `J` / `m`), `pause` /
+`resume` (`p`), `interrupt` (`x`), `transition` (`t`, with `--override` for a
+reasoned override), `start` (`s`), `archive` (`a`), `input` and
+`restart-step` (the answer panel), `conductor …` (the *Dyrygent* tab), `create`
+(`n`). `?` shows the keys, README.md ("`tui`") describes the screens.
 
 ### Task materials
 
@@ -643,5 +651,6 @@ The ordinary test suite needs no cluster. Against a real cluster:
   cleanup — both are owner decisions by design.
 * OIDC device-code login is not built in: use a token helper that writes a
   file or prints a token.
-* The TUI's remote mode is a separate mode (`narsor tui --remote`); the local
-  `/executions` interface is unchanged.
+* Old executions (from before the scheduler) are only read, and a failed one
+  recovered, from the TUI's history (`H`) over the same control plane; the
+  local `/executions` routes remain for the CLI.

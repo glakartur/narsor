@@ -77,7 +77,7 @@ narsor tui
 |---|---|---|
 | `--root <DIRECTORY>` | `./.narsor` | The data directory: executions and workspaces. Applies to every subcommand, `tui` included. |
 | `--config <FILE>` | searched for | The configuration file to read instead of searching. A path that is not there is a usage error, not a fall-through. |
-| `--server <URL>` | `NARSOR_SERVER`, else the local daemon | The control plane for `task`, `backend`, `auth`, `controller` and `tui --remote`: `https://` (plain `http://` only for loopback). See [Remote tasks](#remote-tasks-and-backends). |
+| `--server <URL>` | `NARSOR_SERVER`, else the local daemon | The control plane for `task`, `backend`, `auth`, `controller` and `tui`: `https://` (plain `http://` only for loopback). See [Remote tasks](#remote-tasks-and-backends). |
 | `--token-file <FILE>`, `--token-command <CMD>` | `NARSOR_TOKEN_FILE`, `NARSOR_TOKEN_COMMAND`, `NARSOR_TOKEN` | Where the OIDC token for `--server` comes from; a file or command is read again after a `401`. Never a command-line value. |
 | `--help`, `--version` | — | Help and version. |
 
@@ -217,8 +217,8 @@ $ narsor events 4f1c8f0e-...-9b21
 ### `steps <EXECUTION_ID>`
 
 The step timeline: one line per action attempt, computed from the event log
-alone (not stored separately) — the CLI counterpart of the TUI's task view
-axis. A state visited twice, or retried once, produces two or three lines,
+alone (not stored separately) — the CLI counterpart of the *Przebieg* tab of the
+TUI. A state visited twice, or retried once, produces two or three lines,
 never one line mutated in place: `<state> #n` counts attempts of that state
 across the whole execution, so a retried step shows up as `plan #1` (failed)
 followed by `plan #2` (succeeded), and a loop's second visit continues the
@@ -244,7 +244,7 @@ plan #2        succeeded          agent      2026-09-26T10:00:02+00:00  ->  2026
 One agent attempt's conversation, in order, in full — nothing is truncated
 (unlike the `AgentMessage` event, which is). `ATTEMPT_ID` is the attempt's
 `action_execution_id`, as printed by `steps` or `events`. Every entry is
-classified the same way the TUI's task view classifies it (user, assistant,
+classified the same way the TUI's *Rozmowa* tab classifies it (user, assistant,
 thinking, tool call, tool result, the harness's final result, system,
 `stderr`, or a narsor-written line — the prompt sent, or the attempt's
 outcome) and printed with its full decoded content; an entry this module does
@@ -444,213 +444,118 @@ $ narsor run pipeline.yaml --input repository=/srv/git/other   # raw remote
 
 ### `tui`
 
-The full-screen terminal interface: a `lazygit`-shaped console over the same
-engine the CLI drives. It honours the global `--root`, so
-`narsor --root /srv/data tui` shows that data directory.
+The full-screen terminal interface: a `lazygit`-shaped console over the
+control plane (`/control/v1`). There is one mode. The backend is the one the
+configuration names: the local daemon of `--root` (started when none runs, as
+for every other command), or a remote control plane with `--server` /
+`NARSOR_SERVER` and a token (see [Remote tasks](#remote-tasks-and-backends)).
+`narsor tui --remote` is an ignored alias — it prints a warning on stderr and
+starts the same interface.
 
 ```text
-┌ Executions ────────┬ State and context ─────────┐
-│ the execution list │ id, workflow, status,      │
-│ (id, status,       │ current state, permitted   │
-│  state, workflow)  │ outputs, override, context │
-│                    │ variables                  │
-│                    ├ Events ────────────────────┤
-│                    │ the live event stream, with│
-│                    │ the channel's health and a │
-│                    │ follow indicator in the    │
-│                    │ panel title                │
-├────────────────────┴────────────────────────────┤
-│ context-sensitive shortcut bar                  │
-└─────────────────────────────────────────────────┘
+┌ narsor · local ● live ──────────────────────────────── sloty 2/3 · ? 1 · ! 1 ┐
+│ Zadania            │ NAR-12  Zmiana API zamówień             implement v3    │
+│ ● NAR-14  edit     │ Jira NAR-12 ↗   PR !482 ↗   running · krok 3/5 · 14m    │
+│?● NAR-12  approval │ Przebieg  Rozmowa  Zdarzenia  Dyrygent  Info           │
+│!✗ NAR-9   failed   │ ✓ plan            │ ▸ Read src/api.rs                  │
+│ ◷ NAR-16  #1       │ ✓ implement (2)   │ ▸ Edit src/api.rs  +12 −3          │
+│ ✓ NAR-8   done     │ ● review_api      │ assistant: Zmieniam sygnaturę…     │
+│                    │┌ ? Czeka na Ciebie: approval · 3m ────────────────────┐│
+│                    ││ the answer panel                                     ││
+│                    │└──────────────────────────────────────────────────────┘│
+├────────────────────┴────────────────────────────────────────────────────────┤
+│ Enter szczegóły  Space następny czekający  . akcje  n nowe  ?  │ powiadom. │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The split is proportional, so a resize preserves the arrangement; only the
-shortcut bar has a fixed height. Modals (the input form, the transition menu,
-the override confirmation, the key map) are centred overlays drawn on top.
+**The list** is the queue: tasks stand in the order of the scheduler (`rank`),
+are never grouped or sorted by state, and change place only by an explicit
+action (`K` / `J` / `m`, the TUI's `narsor task move`). A row is the attention
+mark (`?` a question or an approval, `!` a problem, a failed step or a failed
+provisioning), the state icon (`●` running, `◷` queued, `⟳` provisioning, `‖`
+paused, `✗` failed or interrupted, `✓` done, `↻` being sent), the title from
+the workflow's `display` (the task id when there is none) and a label: the
+current step, `#n` in the queue, `offline` when no controller holds the
+backend. `z` hides finished tasks as a filter; `a` archives one. The selection
+follows the task, not the row, through every refresh.
 
-Updates come from the daemon's live event stream; the event log is read once,
-to backfill the history of a newly selected execution. A stream that lags or
-closes is shown as an explicit indicator in the Events panel title rather than
-a view that silently stops moving. On top of the stream, the interface re-reads
-the daemon on its own: every `tui_refresh_interval` (10 s by default, `none`
-turns it off; see [Configuration](#configuration)), and shortly after any event
-that changes a status, a pending input, a problem or what the conductor is
-doing. A refresh never resets what is on screen: the selection, the cursors,
-the follow mode, an open form with what was typed into it and a half-written
-chat message all stay.
+**The details** show the header (title and links from `display`, lifecycle,
+step, duration) and five tabs: *Przebieg* (the steps and the selected one),
+*Rozmowa* (the agent's conversation), *Zdarzenia*, *Dyrygent* (the conductor's
+chat, decisions and harness) and *Info* (the sealed inputs, the observations
+with their age, the runner and the controller). A task that has not started
+says so and where it stands in the queue.
 
-The header counts what waits for an operator — `2 questions · 1 problem` — and
-a question or a problem on a task other than the selected one is announced on
-the status bar. A **question** (yellow) is a `human` gate or an agent's
-question; a **problem** (red) is a step the engine and the conductor could not
-settle: an agent answer without a usable output label, or a step that failed
-and stays `failed` with the conductor's report beside it.
+**What waits for you** is one panel at the bottom of the details, whatever the
+kind of waiting: a question or a `human` gate, an approval, a problem, a failed
+step (with the conductor's diagnosis and proposals, or the raw error), a
+proposal of the conductor's, a failed provisioning. Every choice is a list with
+a description of its effect next to it; `Tab` moves between the choices and
+their fields, `Enter` sends, `Esc` folds the panel and keeps what was typed.
+`Space` on the list jumps to the next task that waits, `[` / `]` move between
+several waitings of one task. The header counts them (`? 1 · ! 1`).
 
-**Key map** (also available in the interface itself, under `?`):
+**The action menu** (`.`) lists everything that can be done with the selected
+task, each with its shortcut, and greys out what cannot be done with the
+reason. An action marked `!` asks `y` / `n` first.
 
-| Context | Key | Action |
+| Key | Action | The CLI it stands for |
 |---|---|---|
-| Panels | `Tab` / `Shift+Tab` | next / previous panel |
-| Panels | `j` / `↓`, `k` / `↑` | move the focused panel's cursor |
-| Panels | `g` / `Home`, `G` / `End` | first / last entry |
-| Panels | `r` | reload the list and the selection from the store |
-| Panels | `s` | run or resume the selected execution |
-| Panels | `i` | open the human-input form |
-| Panels | `t` | open the manual transition menu |
-| Executions panel | `Enter` | open the task view for the selected execution |
-| Events panel | `f` | toggle following the stream |
-| Events panel | `Enter` | open the event detail window |
-| Events panel, detail window | `c` | jump to the conversation of the event's attempt (a message on the status bar if it has none) |
-| Panels | `?` | open the key map |
-| Panels | `q`, `Esc` | quit |
-| Task view | `Tab` | switch focus between the step axis and the step's content |
-| Task view | `j` / `↓`, `k` / `↑` | move the focused pane's cursor |
-| Task view | `PgUp` / `PgDn` | page the focused pane |
-| Task view | `g` / `Home`, `G` / `End` | first / last entry of the focused pane |
-| Task view | `r` | reload the step axis and re-read the selected step's content |
-| Task view | `Enter`, `space` (content pane) | expand or collapse a conversation entry |
-| Task view | `i` | the same input form as on the panels, or the failure form of a failed step |
-| Task view | `c` | open the conductor's chat (below the step's content) |
-| Task view | `Esc` | back to where the task view was opened from, selection preserved |
-| Conductor chat | printable keys, `Backspace`, `Enter` | write a message, send it |
-| Conductor chat | `Tab` | switch between the message and the history |
-| Conductor chat (history) | `j` / `↓`, `k` / `↑`, `g` / `G` | select an entry |
-| Conductor chat (history) | `y` / `Enter`, `n` | confirm, reject the selected proposal |
-| Conductor chat (history) | `u` | undo the selected decision (then `y` to confirm, `n` / `Esc` to keep it) |
-| Conductor chat (history) | `r` | read the chat again |
-| Conductor chat | `Esc` | close the chat; the message being written is kept |
-| Failure form | `Tab` / `↓`, `Shift+Tab` / `↑` | next / previous row |
-| Failure form | `y` / `Enter`, `n` (on a proposal) | confirm, reject the proposal |
-| Failure form | printable keys, `Enter` (on the note) | write the note, restart the step with it |
-| Failure form | `Esc` | close |
-| Event detail window | `j` / `↓`, `k` / `↑`, `PgUp` / `PgDn`, `g` / `G` | scroll |
-| Event detail window | `Esc` | close |
-| Input form | `Tab` / `↓`, `Shift+Tab` / `↑` | next / previous field |
-| Input form | `←` / `→` | cycle a `select` value or the output label |
-| Input form | `space` | same, on a `select` row or the label row |
-| Input form | printable keys, `Backspace` | type into a `text` field |
-| Input form | `Enter`, `Esc` | submit, cancel |
-| Transition menu | `j` / `↓`, `k` / `↑` | pick an entry |
-| Transition menu | `o` | toggle override mode (only when the state declares `allow_manual_override`) |
-| Transition menu | `Enter` | apply the choice (in override mode: ask for confirmation first) |
-| Transition menu | `Esc` | cancel |
-| Override confirmation | `y`, `n` / `Esc` | confirm, cancel |
-| Key map | `Esc`, `?`, `Enter` | close |
+| `K` / `J` / `m` | move in the queue (a place preview, `Enter` confirms) | `narsor task move` |
+| `p` | pause or resume | `narsor task pause` / `resume` |
+| `x` | interrupt the running step (`!`) | `narsor task interrupt` |
+| `t` | manual transition; with a reason, an override where the state allows it | `narsor task transition [--override --reason]` |
+| `s` | start again an interrupted task or a failed provisioning | `narsor task start` |
+| `a` | archive (`!`) | `narsor task archive` |
+| `o` | open a link of the task (`display.links`) in the browser | — |
+| `c` (*Dyrygent*) | write to the conductor | `narsor task conductor chat` |
+| `u` (*Dyrygent*) | undo a decision of the conductor (`!`) | `narsor task conductor undo` |
+| `h` (*Dyrygent*) | choose the conductor's harness | `narsor task conductor harness` |
+| the panel | confirm / reject a proposal, restart a failed step with a note | `narsor task conductor confirm` / `reject`, `narsor task restart-step` |
+| `n` | new task | `narsor task create` |
+| `H` | history: archived tasks and executions from before the scheduler (`w` recovers a failed one) | `narsor recover` (the archived tasks have no listing in the CLI yet) |
+| `R` | repositories: `a` registers, `d` removes (`!`) | `narsor repo list` / `add` / `remove` |
 
-**What it can do.** Browse every execution in the data directory and its
-context; watch the live event stream; run a `running` execution on or resume a
-`paused` one (`s`); fill in and submit a human-input form (`i`), which goes
-through `Engine::deliver_human_input` exactly as `narsor input` does;
-choose a declared output of the current state, or — with `o`, and only where the
-state declares `allow_manual_override` — **force a transition to an arbitrary
-state** after a separate `y`/`n` confirmation. A forced transition is written to
-the log so it can be audited: a `DecisionMade` naming the `human_override`
-provider and carrying the reason, then `HumanTransitionSelected`, `StateExited`
-and `TransitionTaken`. The execution is parked `Paused` at the target state (or
-finished, when the target is terminal) and the operator resumes it explicitly.
+`n` opens the catalogue of workflows (built-in, user and root ones, with the
+source of each and what a copy overrides) with the inputs of the highlighted
+one as the form: the declared `type` decides what a value is (`boolean` and
+`repository` are choices, `integer` is checked) and a missing required input
+is reported next to the field. The last entry takes the path of a definition
+you are writing — validated first, every violation listed, as
+`narsor validate` does — which only a local daemon accepts. A new task is a
+row at the end of the list (`↻ wysyłanie…`) until the server lists it; one
+whose answer was lost is sent again with the same id, and `r` sends one that
+did not arrive.
 
-**Event detail window.** `Enter` on the Events panel opens every field of the
-selected event, wrapped and scrollable, with structural values (`inputs`,
-`payload`, `input`, `context`, `result`) shown as indented JSON — nothing is
-squeezed onto the one line the Events panel shows. An `AgentMessage`'s content
-is truncated in the log itself (it is not a place for megabytes of harness
-chatter); the window says so and points at `c`. Control characters and ANSI
-escapes in any event's content are replaced with visible substitutes before
-rendering, the same as everywhere else text reaches the terminal.
+**Connection.** The interface opens even when the server cannot be reached
+(`łączę z … ◌`) and goes on trying. The header shows the state of the stream
+(`● live`, `◌ ponawiam (12s)`, `✖ brak połączenia`); without a connection the
+data is greyed and marked with its age (`stan sprzed 40s`), actions that change
+state are blocked with the reason, and drafts and forms stay. The stream always
+resumes from the last event applied. Events of a task patch its row at once, the
+rest is read again after a short delay, and every `tui_refresh_interval` (10 s
+by default, `none` turns it off; see [Configuration](#configuration)). A read
+never changes the selection, the focus, the tab, the cursors, the following of
+the current step or a draft.
 
-**Task view.** `Enter` on an execution, or `c` on an event (from the Events
-panel or from its detail window) tied to an agent attempt, opens a full-screen
-view: a step axis on the left (one line per action attempt, the same fold
-`narsor steps` prints — a retried or revisited state shows every attempt
-separately, never one line mutated in place) and, on the right, that step's
-content — the attempt's conversation record for an agent step, or its raw
-events for anything else. Selecting a step by `c` jumps straight to it; `Enter`
-on an execution selects the step currently running, or the last one when
-nothing is. Conversation entries are shown by kind (user, assistant, thinking,
-tool call, tool result, the harness's final result, system, `stderr`, narsor)
-and long ones are collapsed to a few lines by default — `Enter`/`space`
-expands or collapses the one under the content cursor. The view is refreshed
-with the rest of the interface, and `r` re-reads the step axis and the
-selected step's content on demand, including a step that is still running. `Esc` returns to wherever the task view was opened from — the
-execution list, the Events panel, or the detail window — with that view's
-selection exactly as it was, even if new events arrived while the task view
-was open.
+**Keys.** One key map serves the handling, the shortcut bar and the help under
+`?`, and one key means one thing in a context.
 
-The task view, and only the task view, reads through a small embedded,
-read-only HTTP API the TUI process starts on `127.0.0.1` at a random port,
-guarded by a bearer token generated fresh per process (D52) — the same
-boundary a later standalone `narsor serve` (M2) will sit behind, without the
-task view changing how it asks for a step axis or a conversation. `narsor
-steps` and `narsor conversation` are its CLI equivalents (parity principle):
-they read the same underlying functions directly against the store, without
-going through that API or needing a TUI running at all.
+| Where | Keys |
+|---|---|
+| Everywhere | `?` help, `q` quit (asks when a draft would be lost) |
+| List | `j` / `k` (`↓` / `↑`), `g` / `G`, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `r` |
+| Details | `Esc` list, `←` / `→` tabs, `Tab` content ↔ panel, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+v` raw all, `f` follow the current step |
+| Panel | `Tab` actions ↔ fields, `Enter` send, `Alt+Enter` new line, `Esc` fold, `1`–`9` choose, `[` / `]` previous / next waiting |
+| Menu | `j` / `k`, `1`–`9`, `Enter`, `Esc` and the shortcuts above |
+| Confirmation | `y` confirm, `n` / `Esc` take it back |
+| Forms | `Tab` / `Shift+Tab`, `←` / `→`, `Enter` send, `Esc` close (what was typed stays) |
 
-**Creating things.** Two keys create rather than inspect, and each is the CLI
-operation of the same name with a form in front of it — nothing is reachable
-here that the command line cannot do.
-
-| Key | Opens | The CLI it stands for |
-|-----|-------|------------------------|
-| `n` | New task | `narsor run <file> --input k=v` |
-| `R` | Repositories | `narsor repo list` / `add` / `remove` |
-
-`R` lists the registry in the same order `narsor repo list` prints. Inside
-it, `a` opens a registration form (*id* and *remote* required, plus *name*,
-*provider*, *default branch* and *description*), and `d` removes the selected
-entry behind a separate `y`/`n` confirmation — `d` alone writes nothing. The
-form is checked with the registry's own rules **before** anything is stored, so
-an unusable id, a remote starting with `-`, a remote using the `ext::` transport
-and an already-registered id are each reported next to the field with the form
-left open. Nothing invalid reaches `repositories.json`.
-
-`n` opens the new-task modal: type the path of a definition and press Enter to
-validate and load it — *every* violation is listed, the same verdict
-`narsor validate` gives, not just the first — then fill in the declared
-inputs and press Enter to queue it. The declared `type` decides what a value
-becomes: a `boolean` is a `true`/`false` pick list and reaches the context as a
-JSON boolean rather than the string `"true"`, an `integer` is parsed, and a
-`repository` input is a pick list of the registered ids, so an id already in the
-registry is chosen instead of retyped. The queued task is selected immediately;
-the view follows its queued, provisioning, and running lifecycle and links to
-execution detail only once the runner projects a real execution.
-
-Any definition can be started this way, including one that declares
-`globals.workspace`. The interface and `narsor run` seal the same launch
-request before queueing it, so workspace resolution is identical whichever
-surface created the task; the backend provisions it only after admission.
-
-**The conductor in the interface.** Everything the conductor does is visible
-and settled from here (see [The conductor](#the-conductor)):
-
-* while it works on a task, the list row, the details panel and the task
-  view's header say what it is doing — `◆ conductor: diagnosing the failure`,
-  `conductor: choosing the output after a reprompt`, `conductor: answering the
-  chat`;
-* `i` on a **problem** shows the agent's answers, the conductor's analysis and
-  each output label with its description; the label and the `data`/`variables`
-  values the conductor proposed are marked `◆` until edited;
-* `i` on a **gate** the conductor summarized shows its summary and
-  recommendation above the fields — advisory only, the answer stays yours;
-* `i` on a **failed step** opens the failure form: the conductor's diagnosis
-  with its confidence and rationale, the actions it proposed (each confirmed
-  or rejected there), and a restart of the step with a note for its next
-  attempt. The restart names the failure, so it is refused if the execution
-  has moved on meanwhile. When the conductor could not answer — twice — the
-  form shows the raw error and no analysis;
-* `c` in the task view opens the chat: the whole history (it lives in the
-  daemon, so it is there after the interface restarts), each proposal with
-  its state, each decision with its confidence and rationale. A proposal is
-  carried out only when you confirm it; one about a moment the execution has
-  moved on from is refused with a message, and the view is read again. The
-  conductor's own choice of a step's output can be undone: the confirmation
-  shows what it chose, how sure it was and why, and the step becomes a
-  problem again — a step after it that already started keeps its side
-  effects;
-* a failure the conductor takes up is not announced on the status bar as
-  `failed`; the problem it raises, or its one restart of the step, is.
-
-**The one thing only the TUI can do** is the forced transition to an arbitrary
-state; there is no CLI equivalent for it yet.
+Colour means something: yellow what needs you, red what is wrong or cannot be
+undone, green what happens now, grey what is done or unavailable, cyan focus.
+Only the 16 ANSI colours are used, so the interface follows the terminal's
+theme; with `NO_COLOR` set it uses bold, dim and reverse only, and every state
+is still told by its icon and its word.
 
 **Logging.** `tui` takes over the alternate screen, so a log line on stderr
 would be written over the panels. With `RUST_LOG` set, the interface's logs are
@@ -682,7 +587,7 @@ narsor task transition <task> <state> [--override --reason <why>]   # manual tra
 narsor task restart-step <task> [--note <text>] [--failure-key K]   # run the failed or interrupted step again
 narsor task conversation <task> [<attempt>]   # read through the control plane
 narsor task watch                             # follow every task's events
-narsor tui --remote                           # the remote tasks mode of the interface
+narsor tui                                    # the interface over the same control plane (`--server` for a remote one)
 ```
 
 Without `--server` these use the local daemon (trusted mode). For a network
@@ -876,7 +781,7 @@ still carries only the harness's final text — the event log is not a place
 for megabytes of tool chatter — but nothing said over the stream is lost: the
 conversation record is the byte-for-byte source of truth for what the harness
 actually said, in order, prompt included. `narsor conversation <id> <attempt>`
-(and the TUI's task view) read it; nothing else in narsor reads it. A conversation
+(and the TUI's *Rozmowa* tab) read it; nothing else in narsor reads it. A conversation
 record's key is the attempt's `action_execution_id` — the same idempotency key
 D24 already assigns fresh on every attempt — so a retried step never shares
 one record between its attempts, and the record survives a local takeover
@@ -1114,7 +1019,7 @@ Under the `--root` directory (`./.narsor` by default):
 │   ├── events/{sequence:08}.json   # append-only event log
 │   ├── conversations/{action_execution_id}.jsonl(.zst)  # per-attempt agent conversation record
 │   └── artifacts/{artifact_id}/    # files produced by actions
-├── orchestration/                  # durable queued tasks, ordering, leases and priorities
+├── orchestration/                  # durable queued tasks, their order (rank), leases
 ├── local-controller/credential     # the daemon-owned local controller's identity
 ├── local-controller/storage/{task_id}/   # under `work_dir` (same as {root} by default)
 │   ├── state/                      # execution history once the runner initializes it
@@ -1189,11 +1094,12 @@ your version.
 
 ### Starting one from the interface
 
-`narsor tui`, then `n`: the modal opens on the same list, each row naming
-its source (`built-in`, `user`, `root`, and `overrides: …` where a copy shadows a
-built-in). `←` / `→` — and `space`, `j` / `k`, `↑` / `↓` — change the selection,
-`Enter` loads and validates it, and the last row, *Enter a path…*, still takes an
-arbitrary path for a definition you are writing.
+`narsor tui`, then `n`: the catalogue opens as a list, each row naming its
+source (`built-in`, `user`, `root`, and `overrides: …` where a copy shadows a
+built-in). `j` / `k` change the selection and the inputs of the highlighted
+workflow are the form beside it; `Enter` queues the task. The last row, *Enter
+a path…*, takes an arbitrary path for a definition you are writing (a local
+daemon only; the path is validated first and every violation is listed).
 
 ### Resuming what a built-in started
 
@@ -1264,12 +1170,6 @@ Deliberately deferred to Phase 3 — each item needs a plan of its own:
 - **`WaitAction`** and the service that polls for external events.
 - **Agent decisions** (`decision: { type: agent }`) — they return an explicit
   "not available" error instead of quietly behaving like a rule-based decision.
-- **A REST API and SSE for driving executions** (run, input, transitions, a
-  live event stream) — the TUI and the CLI still talk to the engine
-  in-process for all of that. What exists today is narrower: a read-only HTTP
-  API embedded in the TUI process, loopback-only and token-protected (D52),
-  serving only the step timeline and conversation reads the task view needs —
-  the first step toward D36–D38, not the whole of it.
 - **Containerisation (Docker)** — isolation rests today on filesystem
   permissions, which protects against a mistake and not against a malicious
   agent. Do not run untrusted workflows.
