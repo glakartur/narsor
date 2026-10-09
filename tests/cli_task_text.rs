@@ -6,10 +6,10 @@
 
 use chrono::{Duration, TimeZone, Utc};
 
-use narsor::api::ClientError;
+use narsor::api::{ClientError, HarnessSelectionSnapshot};
 use narsor::cli::task_text::{
-    age, attention_lines, command_outcome, detail_lines, display_lines, list_line, next_waiting,
-    queue_badge, safe_json, Tone,
+    age, attention_lines, command_outcome, default_harness_line, detail_lines, display_lines,
+    list_line, next_waiting, queue_badge, safe_json, Tone,
 };
 use narsor::controller_protocol::QueueView;
 use narsor::domain::display::DisplayLink;
@@ -243,4 +243,35 @@ fn json_output_is_valid_and_free_of_invisible_characters() {
     assert_eq!(parsed[0]["task_id"], "t-1");
     assert_eq!(parsed[0]["display"]["title"], "abc");
     assert!(!text.contains('\u{202e}'));
+}
+
+fn selection(override_harness: Option<&str>) -> HarnessSelectionSnapshot {
+    HarnessSelectionSnapshot {
+        supported: vec!["claude-code".into(), "codex".into(), "opencode".into()],
+        configured: "claude-code".into(),
+        override_harness: override_harness.map(str::to_string),
+        effective: override_harness.unwrap_or("claude-code").to_string(),
+        revision: 0,
+    }
+}
+
+#[test]
+fn the_default_harness_line_says_where_the_harness_comes_from() {
+    assert_eq!(
+        default_harness_line(&selection(None)),
+        "default harness: claude-code (configured)"
+    );
+    assert_eq!(
+        default_harness_line(&selection(Some("opencode"))),
+        "default harness: opencode (override; configured claude-code)"
+    );
+}
+
+#[test]
+fn the_default_harness_line_drops_invisible_characters() {
+    let line = default_harness_line(&selection(Some("open\u{1b}[2Jcode\u{202e}")));
+    assert!(
+        !line.contains('\u{1b}') && !line.contains('\u{202e}'),
+        "{line:?}"
+    );
 }

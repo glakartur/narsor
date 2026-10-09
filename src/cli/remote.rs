@@ -21,9 +21,9 @@ use futures::StreamExt as _;
 use serde_json::{Map, Value};
 
 use super::task_text::{
-    age, awaiting_input, command_outcome, conversation_lines, default_backend_line, detail_lines,
-    lifecycle_name, list_line, next_waiting, safe_json, status_badge, waiting_summary,
-    PAGE_BYTE_BUDGET,
+    age, awaiting_input, command_outcome, conversation_lines, default_backend_line,
+    default_harness_line, detail_lines, lifecycle_name, list_line, next_waiting, safe_json,
+    status_badge, waiting_summary, PAGE_BYTE_BUDGET,
 };
 use crate::api::{
     ApiClient, ClientError, ConversationResponse as PageResponse, ServerTarget, TokenSource,
@@ -470,6 +470,33 @@ pub enum DefaultBackendAction {
         backend: String,
     },
     /// Removes the override: the configured default applies again.
+    Reset,
+}
+
+/// `narsor harness …`.
+#[derive(Debug, Subcommand)]
+pub enum HarnessCommand {
+    /// Shows or changes the default agent harness of the daemon.
+    Default {
+        /// What to do; `get` when omitted.
+        #[command(subcommand)]
+        action: Option<DefaultHarnessAction>,
+    },
+}
+
+/// `narsor harness default …`.
+#[derive(Debug, Subcommand)]
+pub enum DefaultHarnessAction {
+    /// Prints the effective default, the configured fallback, the override
+    /// and the harnesses this daemon supports.
+    Get,
+    /// Makes `HARNESS` the default of agent steps from now on.
+    Set {
+        /// A harness the daemon supports (see `get`).
+        #[arg(value_name = "HARNESS")]
+        harness: String,
+    },
+    /// Removes the override: the configured harness applies again.
     Reset,
 }
 
@@ -1593,6 +1620,41 @@ pub async fn backend(
             .map_or("-".to_string(), ToString::to_string)
     );
     println!("Applies to tasks created from now on; existing tasks never move.");
+    Ok(())
+}
+
+/// Runs one `narsor harness` command.
+pub async fn harness(
+    command: HarnessCommand,
+    target: &ServerTarget,
+    state: &Path,
+    flags: &Flags,
+) -> Result<()> {
+    let client = client(target, state, flags).await?;
+    let HarnessCommand::Default { action } = command;
+    let selection = match action.unwrap_or(DefaultHarnessAction::Get) {
+        DefaultHarnessAction::Get => client.harness_selection().await,
+        DefaultHarnessAction::Set { harness } => client.set_harness_selection(&harness).await,
+        DefaultHarnessAction::Reset => client.reset_harness_selection().await,
+    }
+    .map_err(|error| failure("Default harness", error))?;
+    println!("{}", default_harness_line(&selection));
+    println!("Effective: {}", without_unsafe_chars(&selection.effective));
+    println!(
+        "Configured: {}",
+        without_unsafe_chars(&selection.configured)
+    );
+    println!(
+        "Override: {}",
+        selection
+            .override_harness
+            .as_deref()
+            .map_or("-".to_string(), without_unsafe_chars)
+    );
+    println!(
+        "Supported: {}",
+        without_unsafe_chars(&selection.supported.join(", "))
+    );
     Ok(())
 }
 

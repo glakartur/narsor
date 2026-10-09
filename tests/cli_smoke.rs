@@ -3000,6 +3000,70 @@ mod remote_cli {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn the_default_harness_is_read_set_and_reset_through_the_control_plane() {
+        let harness = RemoteHarness::start().await;
+        let token = harness.handle.token().to_string();
+        let token = Some(token.as_str());
+
+        // Without an override the configured harness applies, marked so;
+        // `default` alone is `get`.
+        for args in [&["harness", "default"][..], &["harness", "default", "get"]] {
+            let get = remote(&harness, token, args).await;
+            assert_eq!(get.code, EXIT_SUCCESS, "{}", get.output());
+            assert!(
+                get.stdout
+                    .contains("default harness: claude-code (configured)"),
+                "{}",
+                get.stdout
+            );
+            assert!(get.stdout.contains("Override: -"), "{}", get.stdout);
+            assert!(
+                get.stdout
+                    .contains("Supported: claude-code, codex, opencode"),
+                "{}",
+                get.stdout
+            );
+        }
+
+        let set = remote(&harness, token, &["harness", "default", "set", "opencode"]).await;
+        assert_eq!(set.code, EXIT_SUCCESS, "{}", set.output());
+        assert!(
+            set.stdout
+                .contains("default harness: opencode (override; configured claude-code)"),
+            "{}",
+            set.stdout
+        );
+        assert!(set.stdout.contains("Effective: opencode"), "{}", set.stdout);
+        let get = remote(&harness, token, &["harness", "default", "get"]).await;
+        assert!(get.stdout.contains("Effective: opencode"), "{}", get.stdout);
+        assert!(get.stdout.contains("Override: opencode"), "{}", get.stdout);
+
+        // An unknown harness is refused with the supported ones; the
+        // override stays.
+        let unknown = remote(&harness, token, &["harness", "default", "set", "nieznany"]).await;
+        assert_eq!(unknown.code, EXIT_FAILURE, "{}", unknown.output());
+        assert!(
+            unknown.stderr.contains("unsupported_harness")
+                && unknown.stderr.contains("claude-code, codex, opencode"),
+            "{}",
+            unknown.stderr
+        );
+        let get = remote(&harness, token, &["harness", "default", "get"]).await;
+        assert!(get.stdout.contains("Effective: opencode"), "{}", get.stdout);
+
+        let reset = remote(&harness, token, &["harness", "default", "reset"]).await;
+        assert_eq!(reset.code, EXIT_SUCCESS, "{}", reset.output());
+        assert!(
+            reset
+                .stdout
+                .contains("default harness: claude-code (configured)"),
+            "{}",
+            reset.stdout
+        );
+        assert!(reset.stdout.contains("Override: -"), "{}", reset.stdout);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_remote_server_needs_a_token_and_a_good_one() {
         let harness = RemoteHarness::start().await;
         let missing = remote(&harness, None, &["task", "list"]).await;
@@ -3011,6 +3075,27 @@ mod remote_cli {
         );
 
         let wrong = remote(&harness, Some("not-the-token"), &["task", "list"]).await;
+        assert_eq!(wrong.code, EXIT_FAILURE);
+        assert!(
+            wrong.stderr.contains("rejected the token"),
+            "{}",
+            wrong.stderr
+        );
+
+        // The default harness sits behind the same owner gate.
+        let missing = remote(&harness, None, &["harness", "default", "get"]).await;
+        assert_eq!(missing.code, EXIT_FAILURE);
+        assert!(
+            missing.stderr.contains("NARSOR_TOKEN"),
+            "{}",
+            missing.stderr
+        );
+        let wrong = remote(
+            &harness,
+            Some("not-the-token"),
+            &["harness", "default", "set", "codex"],
+        )
+        .await;
         assert_eq!(wrong.code, EXIT_FAILURE);
         assert!(
             wrong.stderr.contains("rejected the token"),

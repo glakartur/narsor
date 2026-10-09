@@ -25,7 +25,7 @@ use narsor::orchestration::{
     Observation, ObservedSummary, PendingInputRef, ResourceIdentity, RunnerSnapshot,
 };
 use narsor::persistence::paths::StatePaths;
-use narsor::persistence::ExecutionStore;
+use narsor::persistence::{DefaultHarnessSelector, ExecutionStore};
 use narsor::workflows::WorkflowResolver;
 
 use super::environment_support;
@@ -100,7 +100,17 @@ impl RemoteHarness {
         let catalog = environment_support::seeded_catalog_resolver(root.path());
         prepare(root.path());
         let resolver: Arc<dyn narsor::environment::LaunchResolver> = catalog.clone();
+        // The daemon's default agent harness: configured `claude-code`,
+        // no override until a test sets one.
+        let harness_selector = DefaultHarnessSelector::load(
+            StatePaths::new(root.path()),
+            vec!["claude-code".into(), "codex".into(), "opencode".into()],
+            "claude-code",
+        )
+        .await
+        .expect("load the harness selector");
         let services = ApiServices {
+            harness_selector: Some(Arc::new(harness_selector)),
             control: Some(Arc::new(ProtocolService::new(control, resolver))),
             local_launch: Some(catalog),
             workflows: Some(WorkflowResolver::with_user_dir(root.path(), None)),

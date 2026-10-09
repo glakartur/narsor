@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 
 use serde::Serialize;
 
-use crate::api::ClientError;
+use crate::api::{ClientError, HarnessSelectionSnapshot};
 use crate::controller_protocol::{
     ConversationResponse, ConversationUnavailableReason, DefaultBackendView, Freshness,
     OwnerCommandResponse, QueueView, TaskSummary, TimelineResponse,
@@ -668,5 +668,21 @@ pub fn default_backend_line(view: &DefaultBackendView) -> String {
             view.configured
         ),
         None => format!("default backend: {} (configured)", view.effective),
+    }
+}
+
+/// The one-line state of the daemon's default agent harness: the effective
+/// value and where it comes from, like [`default_backend_line`].
+pub fn default_harness_line(selection: &HarnessSelectionSnapshot) -> String {
+    match &selection.override_harness {
+        Some(harness) => format!(
+            "default harness: {} (override; configured {})",
+            without_unsafe_chars(harness),
+            without_unsafe_chars(&selection.configured)
+        ),
+        None => format!(
+            "default harness: {} (configured)",
+            without_unsafe_chars(&selection.effective)
+        ),
     }
 }

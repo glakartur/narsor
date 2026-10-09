@@ -287,6 +287,14 @@ pub enum Command {
         command: remote::BackendCommand,
     },
 
+    /// The default agent harness of the daemon: which agent CLI runs new
+    /// agent steps.
+    Harness {
+        /// What to do.
+        #[command(subcommand)]
+        command: remote::HarnessCommand,
+    },
+
     /// Network-mode identity: claim the installation, see who you are.
     Auth {
         /// What to do.
@@ -536,6 +544,7 @@ impl Command {
             | Command::Tui { .. }
             | Command::Task { .. }
             | Command::Backend { .. }
+            | Command::Harness { .. }
             | Command::Auth { .. }
             | Command::Daemon { .. } => false,
             // The runner reads no configuration at all — everything it runs
@@ -721,6 +730,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         }
         Command::Task { command } => remote::task(command, &target, &state, &catalog, &flags).await,
         Command::Backend { command } => remote::backend(command, &target, &state, &flags).await,
+        Command::Harness { command } => remote::harness(command, &target, &state, &flags).await,
         Command::Auth { command } => remote::auth(command, &target, &state, &flags).await,
         Command::Controller(ControllerCli { admin, .. }) => match admin {
             Some(command) => remote::controller_admin(command, &target, &state, &flags).await,
