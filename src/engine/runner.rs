@@ -114,7 +114,8 @@ pub use failure::{
     step_failure, Recovery, StepFailure, METADATA_CONDUCTOR_RETRY_KEY, METADATA_STEP_FAILURE_KEY,
 };
 pub use operations::{
-    execution_episode, ManualTransition, OutputDecisionUndo, UndoneOutputDecision,
+    execution_episode, plan_operator_transition, ManualTransition, OperatorTransition,
+    OutputDecisionUndo, TransitionPlan, UndoneOutputDecision,
 };
 
 /// How many events the in-process broadcast channel buffers per receiver.

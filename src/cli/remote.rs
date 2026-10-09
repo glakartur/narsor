@@ -27,12 +27,14 @@ use crate::config::Flags;
 use crate::controller_protocol::{
     ConversationPageQuery, CreateEnrollmentRequest, CreateTaskRequest, LaunchRequest,
     MoveTaskRequest, OwnerCommandRequest, SetDefaultBackendRequest, SubmitInputRequest,
-    TaskSummary, WorkspaceRequest,
+    SubmitOperatorCommandRequest, TaskSummary, WorkspaceRequest,
 };
 use crate::domain::TaskId;
 use crate::engine::HumanInputDelivery;
 use crate::materials::{snapshot_paths, write_files, MaterialLimits, MaterialOrigin, WriteMode};
-use crate::orchestration::{MoveTarget, OwnerCommand, TaskEvent, TaskEventKind};
+use crate::orchestration::{
+    MoveTarget, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskEvent, TaskEventKind,
+};
 use crate::persistence::StatePaths;
 use crate::tui::conversation::classify;
 use crate::tui::remote::{
@@ -116,6 +118,40 @@ pub enum TaskCommand {
         /// Put it last.
         #[arg(long, group = "target")]
         bottom: bool,
+    },
+    /// Cuts short the step the task's runner is working on; the execution
+    /// is left recoverable (see `restart-step`).
+    Interrupt(OperatorCommandArgs),
+    /// Takes a manual transition out of the task's current state, to a
+    /// state one of its declared transitions leads to — or, with
+    /// `--override`, to any state its workflow has.
+    Transition {
+        #[command(flatten)]
+        args: OperatorCommandArgs,
+        /// The state to go to.
+        #[arg(value_name = "TARGET")]
+        target: String,
+        /// Override the declared transitions. Needs a state that allows it
+        /// (`allow_manual_override`) and a `--reason`, which is recorded in
+        /// the task's audit trail.
+        #[arg(long = "override")]
+        forced: bool,
+        /// Why the transition is overridden.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+    },
+    /// Starts the task's failed or interrupted step again, with a note for
+    /// the agent's next attempt.
+    RestartStep {
+        #[command(flatten)]
+        args: OperatorCommandArgs,
+        /// An instruction for the agent's next attempt.
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+        /// Only restart the step failure with this key; refused when the
+        /// task has moved on from it.
+        #[arg(long = "failure-key", value_name = "KEY")]
+        failure_key: Option<String>,
     },
     /// Answers the input request the task's runner waits on.
     Input {
@@ -248,6 +284,24 @@ pub struct CommandArgs {
     /// Idempotency key; reuse it to retry safely. Generated when omitted.
     #[arg(long = "idempotency-key", value_name = "KEY")]
     pub idempotency_key: Option<String>,
+}
+
+/// Arguments shared by the commands that act on a task's runner.
+#[derive(Debug, clap::Args)]
+pub struct OperatorCommandArgs {
+    /// The task id.
+    #[arg(value_name = "TASK_ID")]
+    pub task_id: String,
+    /// Refuse unless the task is still at this generation.
+    #[arg(long = "expected-generation", value_name = "N")]
+    pub expected_generation: Option<u64>,
+    /// Idempotency key; reuse it to retry safely. Generated when omitted.
+    #[arg(long = "idempotency-key", value_name = "KEY")]
+    pub idempotency_key: Option<String>,
+    /// How long to wait for the runner to carry the command out before
+    /// leaving it queued.
+    #[arg(long = "wait-secs", value_name = "SECONDS", default_value_t = 30)]
+    pub wait_secs: u64,
 }
 
 /// `narsor backend …`.
@@ -480,6 +534,30 @@ pub async fn task(
                 task.task_id, task.rank
             );
             Ok(())
+        }
+        TaskCommand::Interrupt(args) => {
+            operator_command(&client, OperatorCommand::Interrupt, args).await
+        }
+        TaskCommand::Transition {
+            args,
+            target,
+            forced,
+            reason,
+        } => {
+            let command = OperatorCommand::Transition {
+                target,
+                forced,
+                reason,
+            };
+            operator_command(&client, command, args).await
+        }
+        TaskCommand::RestartStep {
+            args,
+            note,
+            failure_key,
+        } => {
+            let command = OperatorCommand::RestartStep { note, failure_key };
+            operator_command(&client, command, args).await
         }
         TaskCommand::Input {
             task_id,
@@ -813,6 +891,71 @@ async fn owner_command(client: &ApiClient, command: OwnerCommand, args: CommandA
     }
 }
 
+/// How often a command waiting for its runner looks at the task again.
+const COMMAND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Sends an operator command to the task's runner and waits up to
+/// `wait_secs` for its verdict. A command the runner has not settled by
+/// then stays queued — it is delivered on the runner's next poll — and the
+/// answer says so; a command the runner rejected is a failure.
+async fn operator_command(
+    client: &ApiClient,
+    command: OperatorCommand,
+    args: OperatorCommandArgs,
+) -> Result<()> {
+    let request = SubmitOperatorCommandRequest {
+        command,
+        idempotency_key: args
+            .idempotency_key
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        expected_generation: args.expected_generation,
+    };
+    let task_id = args.task_id;
+    let accepted = client
+        .control_operator_command(&task_id, &request)
+        .await
+        .map_err(|error| failure("The command was not accepted", error))?;
+    let mut status = accepted.command;
+    let command_id = status.command_id.clone();
+    let name = status.command.describe();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(args.wait_secs);
+    loop {
+        match status.status {
+            OperatorCommandStatus::Applied => {
+                println!("The runner carried out the {name} ({command_id}).");
+                return Ok(());
+            }
+            OperatorCommandStatus::Rejected => {
+                return Err(CliError::failure(format!(
+                    "The runner rejected the {name} ({command_id}): {}",
+                    status.detail.as_deref().unwrap_or("no reason given")
+                )));
+            }
+            OperatorCommandStatus::Queued => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            println!(
+                "The {name} ({command_id}) is queued: the runner has not confirmed it yet. \
+                 It is delivered on the runner's next poll; follow it with `narsor task events \
+                 {task_id}`."
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(COMMAND_POLL_INTERVAL).await;
+        let task = client
+            .control_task(&task_id)
+            .await
+            .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
+        if let Some(current) = task
+            .operator_commands
+            .into_iter()
+            .find(|view| view.command_id == command_id)
+        {
+            status = current;
+        }
+    }
+}
+
 /// The move the flags of `task move` ask for; clap guarantees exactly one.
 fn move_target(
     before: Option<String>,
@@ -862,6 +1005,23 @@ fn print_event(event: &TaskEvent) {
             None => format!("runner reported {}", execution_status.as_str()),
         },
         TaskEventKind::InputQueued { input_id, .. } => format!("input {input_id} queued"),
+        TaskEventKind::OperatorCommandQueued {
+            command_id,
+            command,
+            requested_by,
+        } => format!(
+            "operator command {command_id} queued by {}: {}",
+            requested_by.0,
+            describe_operator_command(command)
+        ),
+        TaskEventKind::OperatorCommandResolved {
+            command_id,
+            status,
+            detail,
+        } => match detail {
+            Some(detail) => format!("operator command {command_id} {status:?}: {detail}"),
+            None => format!("operator command {command_id} {status:?}"),
+        },
         TaskEventKind::PriorityChanged { priority } => format!("priority {priority} (obsolete)"),
         TaskEventKind::Moved { rank, .. } => format!("moved to #{rank}"),
         TaskEventKind::QueueChanged { reason } => format!("queue: {}", reason.describe()),
@@ -880,6 +1040,35 @@ fn print_event(event: &TaskEvent) {
         event.task_id,
         lifecycle_name(event.lifecycle)
     );
+}
+
+/// An operator command with its parameters, for the event log — an
+/// override with the reason it was audited under.
+fn describe_operator_command(command: &OperatorCommand) -> String {
+    match command {
+        OperatorCommand::Interrupt => "interrupt".to_string(),
+        OperatorCommand::Transition {
+            target,
+            forced: false,
+            ..
+        } => format!("transition to '{target}'"),
+        OperatorCommand::Transition {
+            target,
+            forced: true,
+            reason,
+        } => format!(
+            "override transition to '{target}' (reason: {})",
+            reason.as_deref().unwrap_or("none")
+        ),
+        OperatorCommand::RestartStep { note, failure_key } => format!(
+            "restart step{}{}",
+            if note.is_some() { " with a note" } else { "" },
+            failure_key
+                .as_deref()
+                .map(|key| format!(" (failure {key})"))
+                .unwrap_or_default()
+        ),
+    }
 }
 
 /// `name=value` pairs into a JSON object; a value that reads as JSON is

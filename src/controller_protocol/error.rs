@@ -81,11 +81,16 @@ impl From<OrchestrationError> for ProtocolError {
         let message = error.to_string();
         match error {
             // A task of another backend is indistinguishable from none.
-            E::TaskNotFound(_) | E::WrongBackend { .. } | E::InputNotFound { .. } => Self::NotFound,
+            E::TaskNotFound(_)
+            | E::WrongBackend { .. }
+            | E::InputNotFound { .. }
+            | E::OperatorCommandNotFound { .. } => Self::NotFound,
             E::InvalidIdentifier(_) => Self::bad_request("invalid_identifier", message),
             E::InvalidLaunchSpec(_) => Self::bad_request("invalid_launch_spec", message),
             E::TaskConflict(_) => Self::conflict("task_conflict", message),
-            E::IdempotencyKeyReused { .. } | E::InputKeyReused { .. } => {
+            E::IdempotencyKeyReused { .. }
+            | E::InputKeyReused { .. }
+            | E::OperatorCommandKeyReused { .. } => {
                 Self::conflict("idempotency_key_reused", message)
             }
             E::StaleGeneration { .. } => Self::conflict("stale_generation", message),
@@ -106,6 +111,10 @@ impl From<OrchestrationError> for ProtocolError {
             E::InputAlreadyQueued { .. } => Self::conflict("input_already_queued", message),
             E::InputAlreadySettled { .. } => Self::conflict("input_already_settled", message),
             E::TaskNotAcceptingInput { .. } => Self::conflict("task_not_accepting_input", message),
+            E::OperatorCommandRefused { .. } => Self::conflict("operator_command_refused", message),
+            E::OperatorCommandAlreadySettled { .. } => {
+                Self::conflict("operator_command_already_settled", message)
+            }
             E::NotAdmitted(_) => Self::conflict("not_admitted", message),
             E::BackendAtCapacity { .. } => Self::conflict("backend_at_capacity", message),
             E::BackendUnavailable { .. } => Self::conflict("backend_unavailable", message),

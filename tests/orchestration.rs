@@ -1873,3 +1873,131 @@ fn an_identical_create_request_returns_the_task_by_its_digest() {
         .unwrap_err();
     assert!(matches!(conflict, OrchestrationError::TaskConflict(_)));
 }
+
+// ---------------------------------------------------------------------------
+// Operator commands (U3)
+// ---------------------------------------------------------------------------
+
+fn operator_request(
+    command: narsor::orchestration::OperatorCommand,
+    key: &str,
+) -> narsor::orchestration::OperatorCommandRequest {
+    narsor::orchestration::OperatorCommandRequest {
+        command,
+        idempotency_key: key.to_string(),
+        expected_generation: None,
+        requested_by: OwnerRef::new("oidc:https://issuer|artur"),
+    }
+}
+
+/// A running task whose runner `pod-1` of launch generation 1 has reported.
+fn running_with_runner(fx: &Fixture, id: &str, lease: &BackendLease) {
+    fx.running(id, lease);
+    fx.control
+        .record_runner_snapshot(&task(id), "pod-1", 1, safe_point_snapshot(1))
+        .expect("the runner's first snapshot");
+}
+
+#[test]
+fn an_operator_command_is_bound_to_the_launch_it_was_queued_for() {
+    use narsor::orchestration::{OperatorCommand, OperatorCommandStatus};
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    running_with_runner(&fx, "task-1", &lease);
+
+    let queued = fx
+        .control
+        .queue_operator_command(
+            &task("task-1"),
+            operator_request(OperatorCommand::Interrupt, "i-1"),
+        )
+        .expect("queued");
+    assert_eq!(queued.command.launch_generation, 1);
+
+    // The runner is paused away and a new launch takes over before anyone
+    // delivered the command.
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    fx.command("task-1", OwnerCommand::Resume, "resume-1");
+    fx.observe("task-1", &lease, Observation::RunnerReady)
+        .unwrap();
+    let generation = fx.control.task(&task("task-1")).unwrap().generation;
+    assert!(generation > 1);
+
+    let (delivered, changed) = fx
+        .control
+        .deliver_operator_commands(&task("task-1"), "pod-2", generation)
+        .expect("poll of the new launch");
+
+    assert!(delivered.is_empty(), "a command never crosses launches");
+    assert!(changed);
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(
+        record.operator_commands[0].status,
+        OperatorCommandStatus::Rejected
+    );
+}
+
+#[test]
+fn a_superseded_runner_can_neither_poll_nor_settle_operator_commands() {
+    use narsor::orchestration::OperatorCommand;
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    running_with_runner(&fx, "task-1", &lease);
+    let queued = fx
+        .control
+        .queue_operator_command(
+            &task("task-1"),
+            operator_request(OperatorCommand::Interrupt, "i-1"),
+        )
+        .expect("queued");
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    fx.observe("task-1", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    fx.command("task-1", OwnerCommand::Resume, "resume-1");
+
+    let poll = fx
+        .control
+        .deliver_operator_commands(&task("task-1"), "pod-1", 1);
+    let settle = fx.control.settle_operator_command(
+        &task("task-1"),
+        "pod-1",
+        1,
+        &queued.command.command_id,
+        true,
+        None,
+    );
+
+    assert!(matches!(
+        poll,
+        Err(OrchestrationError::RunnerSuperseded { .. })
+    ));
+    assert!(matches!(
+        settle,
+        Err(OrchestrationError::RunnerSuperseded { .. })
+    ));
+}
+
+#[test]
+fn a_task_record_written_before_operator_commands_still_reads() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.running("task-1", &lease);
+    let path = fx.root.paths().orchestration_task_file("task-1");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("operator_commands")
+        .expect("the field is written");
+    fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+    let record = fx
+        .control
+        .task(&task("task-1"))
+        .expect("an older record reads");
+
+    assert!(record.operator_commands.is_empty());
+}

@@ -21,6 +21,7 @@ pub mod control_plane;
 pub mod error;
 pub(crate) mod lifecycle;
 pub mod model;
+mod operator_commands;
 mod runner_state;
 pub mod scheduler;
 pub mod store;

@@ -21,6 +21,7 @@
 //!                            whether it stopped cleanly (R13)
 //!         report.json        the last snapshot sequence handed out
 //!         inputs.json        owner inputs this storage already consumed
+//!         commands.json      operator commands this storage already carried out
 //!         workspace.partial/ a clone under way, never a workspace
 //!         materials.partial/ a material delivery under way
 //! ```
@@ -148,6 +149,10 @@ impl TaskStorage {
 
     fn inputs_file(&self) -> PathBuf {
         self.bookkeeping_dir().join("inputs.json")
+    }
+
+    fn commands_file(&self) -> PathBuf {
+        self.bookkeeping_dir().join("commands.json")
     }
 
     /// The Engine store rooted on this storage.
@@ -286,6 +291,86 @@ impl TaskStorage {
         inputs.consumed.insert(input_id.to_string());
         write_json_atomic(&self.inputs_file(), &inputs).map_err(RunnerError::from)
     }
+
+    /// How far an operator command got here (U3).
+    pub fn command_progress(&self, command_id: &str) -> Result<CommandProgress, RunnerError> {
+        let commands: Option<CarriedOutCommands> = read_optional(&self.commands_file())?;
+        Ok(
+            match commands.and_then(|commands| commands.progress.get(command_id).cloned()) {
+                None => CommandProgress::Unseen,
+                Some(None) => CommandProgress::Begun,
+                Some(Some(verdict)) => CommandProgress::Done(verdict),
+            },
+        )
+    }
+
+    /// Records that an operator command is about to be carried out, before
+    /// the Engine is touched: a runner that dies halfway finds the mark and
+    /// refuses to carry the command out a second time.
+    pub fn begin_command(&self, command_id: &str) -> Result<(), RunnerError> {
+        self.write_command_progress(command_id, None)
+    }
+
+    /// Records the verdict on an operator command, before the control plane
+    /// hears of it: a redelivery after a lost acknowledgement is then
+    /// answered from here without reaching the Engine again.
+    pub fn finish_command(
+        &self,
+        command_id: &str,
+        verdict: &CommandVerdict,
+    ) -> Result<(), RunnerError> {
+        self.write_command_progress(command_id, Some(verdict.clone()))
+    }
+
+    fn write_command_progress(
+        &self,
+        command_id: &str,
+        verdict: Option<CommandVerdict>,
+    ) -> Result<(), RunnerError> {
+        let mut commands: CarriedOutCommands =
+            read_optional(&self.commands_file())?.unwrap_or_default();
+        commands.version = RECORD_VERSION;
+        commands.progress.insert(command_id.to_string(), verdict);
+        write_json_atomic(&self.commands_file(), &commands).map_err(RunnerError::from)
+    }
+}
+
+/// How far an operator command got on a storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandProgress {
+    /// Never seen here.
+    Unseen,
+    /// Started, with no verdict: whoever started it did not survive.
+    Begun,
+    /// Carried out, or refused, with this verdict.
+    Done(CommandVerdict),
+}
+
+/// The runner's verdict on an operator command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandVerdict {
+    /// Whether the command was carried out.
+    pub applied: bool,
+    /// Why it was not.
+    pub detail: Option<String>,
+}
+
+impl CommandVerdict {
+    /// The command was carried out.
+    pub fn applied() -> Self {
+        Self {
+            applied: true,
+            detail: None,
+        }
+    }
+
+    /// The command was refused, for this reason.
+    pub fn rejected(reason: impl Into<String>) -> Self {
+        Self {
+            applied: false,
+            detail: Some(reason.into()),
+        }
+    }
 }
 
 /// The exclusive runner lock of a storage, released on drop (and by the
@@ -378,6 +463,13 @@ struct ReportState {
 struct ConsumedInputs {
     version: u32,
     consumed: BTreeSet<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CarriedOutCommands {
+    version: u32,
+    /// Command id to its verdict; `None` while it is being carried out.
+    progress: std::collections::BTreeMap<String, Option<CommandVerdict>>,
 }
 
 fn create_dir(path: &Path) -> Result<(), RunnerError> {

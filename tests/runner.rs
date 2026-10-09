@@ -16,16 +16,19 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::Router;
 use chrono::Utc;
 use narsor::controller_protocol::http::runner_routes;
 use narsor::controller_protocol::{
     AcquireLeaseRequest, ConversationPageQuery, CreateEnrollmentRequest, EnrollRequest,
     OwnerCommandRequest, ProtocolService, ReportRequest, RunnerCredentialRequest,
-    SubmitInputRequest, LOCAL_OWNER,
+    SubmitInputRequest, SubmitOperatorCommandRequest, LOCAL_OWNER,
 };
 use narsor::domain::{
     BackendId, EventData, ExecutionStatus, GitIdentity, ResolvedEnvironment, ResourceProfile,
@@ -33,7 +36,8 @@ use narsor::domain::{
 };
 use narsor::engine::HumanInputDelivery;
 use narsor::orchestration::{
-    ControlPlane, NewTask, Observation, ObservedSummary, OwnerCommand, OwnerRef, TaskRecord,
+    ControlPlane, NewTask, Observation, ObservedSummary, OperatorCommand, OperatorCommandStatus,
+    OwnerCommand, OwnerRef, QueuedOperatorCommand, TaskEventKind, TaskRecord,
 };
 use narsor::persistence::paths::StatePaths;
 use narsor::persistence::ExecutionStore;
@@ -90,6 +94,9 @@ struct Fixture {
     addr: SocketAddr,
     server: Option<tokio::task::JoinHandle<()>>,
     runners: Vec<Child>,
+    /// While set, the served routes refuse every operator command
+    /// acknowledgement, as a network that drops the answers would.
+    block_command_acks: Arc<AtomicBool>,
 }
 
 impl Fixture {
@@ -151,6 +158,7 @@ impl Fixture {
             addr,
             server: None,
             runners: Vec::new(),
+            block_command_acks: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -163,7 +171,20 @@ impl Fixture {
     }
 
     fn serve_on(&mut self, listener: tokio::net::TcpListener) {
-        let router: Router = runner_routes(Arc::clone(&self.service));
+        let block = Arc::clone(&self.block_command_acks);
+        let router: Router =
+            runner_routes(Arc::clone(&self.service)).layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let block = Arc::clone(&block);
+                    async move {
+                        let ack = request.uri().path().starts_with("/runner/v1/commands/");
+                        if ack && block.load(Ordering::SeqCst) {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
         self.server = Some(tokio::spawn(async move {
             axum::serve(listener, router).await.expect("serve");
         }));
@@ -1222,4 +1243,516 @@ async fn a_storage_that_is_not_empty_is_never_initialized() {
         problem.message
     );
     assert!(launch.execution_id().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Operator commands (U3)
+// ---------------------------------------------------------------------------
+
+/// A one-step agent workflow whose step allows overrides.
+const AGENT_WORKFLOW: &str = r#"
+name: agent-task
+version: 1
+states:
+  think:
+    allow_manual_override: true
+    action:
+      type: agent
+      prompt: Think about it.
+    outputs: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+/// A fake `claude` that hangs on its first invocation and answers `done` on
+/// every later one, recording its pid and its arguments (the prompt, with
+/// any operator note) under `$HOME`.
+fn hanging_claude(root: &TempRoot) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.dir("bin");
+    let script = "#!/bin/sh\n\
+        tries=$(cat \"$HOME/claude-tries\" 2>/dev/null | wc -l)\n\
+        echo try >> \"$HOME/claude-tries\"\n\
+        echo $$ >> \"$HOME/claude-pids\"\n\
+        printf '%s\\n' \"$@\" >> \"$HOME/claude-args\"\n\
+        if [ \"$tries\" -eq 0 ]; then sleep 60; fi\n\
+        printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
+        \"session_id\":\"fake\",\"result\":\"Done.\\n{\\\"output\\\": \\\"done\\\"}\"}'\n";
+    let temp = bin.join(".claude.tmp");
+    fs::write(&temp, script).unwrap();
+    fs::set_permissions(&temp, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&temp, bin.join("claude")).unwrap();
+    bin
+}
+
+/// Starts a runner for `task` and brings the task to `Running` once the
+/// runner has reported, the way a controller would.
+async fn running_runner(fixture: &mut Fixture, task: &str, launch: &Launch) -> usize {
+    fixture.report(task, Observation::StartAccepted);
+    let credential = fixture.credential(task, "pod-1");
+    let runner = fixture.spawn(launch, "pod-1", &credential);
+    wait_until_async(Duration::from_secs(30), "the runner's first report", || {
+        fixture.record(task).runner.is_some()
+    })
+    .await;
+    fixture.report(task, Observation::RunnerReady);
+    runner
+}
+
+fn submit(fixture: &Fixture, task: &str, command: OperatorCommand, key: &str) -> String {
+    fixture
+        .service
+        .submit_operator_command(
+            &fixture.owner(),
+            task,
+            SubmitOperatorCommandRequest {
+                command,
+                idempotency_key: key.to_string(),
+                expected_generation: None,
+            },
+        )
+        .unwrap_or_else(|error| panic!("submit {key}: {error}"))
+        .command
+        .command_id
+}
+
+async fn settled(fixture: &Fixture, task: &str, command_id: &str) -> QueuedOperatorCommand {
+    wait_until_async(Duration::from_secs(30), "the runner's verdict", || {
+        fixture
+            .record(task)
+            .operator_command(command_id)
+            .is_some_and(|command| command.status.is_settled())
+    })
+    .await;
+    fixture
+        .record(task)
+        .operator_command(command_id)
+        .cloned()
+        .expect("the command")
+}
+
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only probes for the process.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interrupted_step_is_dropped_and_restarted_with_the_owners_note() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let bin = hanging_claude(&fixture.root);
+    let spec = spec(
+        AGENT_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    running_runner(&mut fixture, "task-1", &launch).await;
+    let pids = launch.home().join("claude-pids");
+    wait_until_async(Duration::from_secs(30), "the hanging agent", || {
+        pids.is_file()
+    })
+    .await;
+    let hanging: u32 = fs::read_to_string(&pids)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("the agent's pid");
+
+    // A restart while the step runs is refused by the Engine's own claim.
+    let early = submit(&fixture, "task-1", restart(None, None), "restart-early");
+    let early = settled(&fixture, "task-1", &early).await;
+    assert_eq!(early.status, OperatorCommandStatus::Rejected);
+    assert!(
+        early
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("interrupt it first")),
+        "{early:?}"
+    );
+
+    let interrupt = submit(
+        &fixture,
+        "task-1",
+        OperatorCommand::Interrupt,
+        "interrupt-1",
+    );
+    let interrupt = settled(&fixture, "task-1", &interrupt).await;
+    assert_eq!(
+        interrupt.status,
+        OperatorCommandStatus::Applied,
+        "{interrupt:?}"
+    );
+    assert_eq!(launch.status(), Some(ExecutionStatus::Unknown));
+    wait_until_async(Duration::from_secs(10), "the hanging agent to die", || {
+        !process_alive(hanging)
+    })
+    .await;
+    assert!(launch.events().iter().any(|event| matches!(
+        &event.data,
+        EventData::Error { message, .. } if message.contains("will not be replayed")
+    )));
+
+    // Nothing is running any more, so a second interrupt has nothing to cut.
+    let again = submit(
+        &fixture,
+        "task-1",
+        OperatorCommand::Interrupt,
+        "interrupt-2",
+    );
+    let again = settled(&fixture, "task-1", &again).await;
+    assert_eq!(again.status, OperatorCommandStatus::Rejected);
+
+    let restart_id = submit(
+        &fixture,
+        "task-1",
+        restart(Some("Mind the edge cases."), None),
+        "restart-1",
+    );
+    let restarted = settled(&fixture, "task-1", &restart_id).await;
+    assert_eq!(
+        restarted.status,
+        OperatorCommandStatus::Applied,
+        "{restarted:?}"
+    );
+    wait_until_async(Duration::from_secs(30), "the restarted step", || {
+        runner_status(&fixture, "task-1") == Some(ExecutionStatus::Completed)
+    })
+    .await;
+    let args = fs::read_to_string(launch.home().join("claude-args")).unwrap();
+    assert_eq!(
+        args.matches("Operator recovery note:").count(),
+        1,
+        "only the restarted attempt got the note: {args}"
+    );
+    assert!(args.contains("Mind the edge cases."));
+
+    // The control plane's log tells the whole story in order.
+    let verdicts: Vec<_> = fixture
+        .service
+        .events(&fixture.owner(), "task-1", 0)
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            TaskEventKind::OperatorCommandQueued { command_id, .. } => Some((command_id, "queued")),
+            TaskEventKind::OperatorCommandResolved { command_id, .. } => {
+                Some((command_id, "resolved"))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        verdicts.len(),
+        8,
+        "four commands, queued and resolved: {verdicts:?}"
+    );
+}
+
+fn restart(note: Option<&str>, failure_key: Option<&str>) -> OperatorCommand {
+    OperatorCommand::RestartStep {
+        note: note.map(str::to_string),
+        failure_key: failure_key.map(str::to_string),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_acknowledgement_never_carries_a_command_out_twice() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let bin = hanging_claude(&fixture.root);
+    let spec = spec(
+        AGENT_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    running_runner(&mut fixture, "task-1", &launch).await;
+    wait_until_async(Duration::from_secs(30), "the hanging agent", || {
+        launch.home().join("claude-pids").is_file()
+    })
+    .await;
+
+    fixture.block_command_acks.store(true, Ordering::SeqCst);
+    let command_id = submit(
+        &fixture,
+        "task-1",
+        OperatorCommand::Interrupt,
+        "interrupt-1",
+    );
+    wait_until_async(
+        Duration::from_secs(30),
+        "the interrupt to be carried out",
+        || launch.status() == Some(ExecutionStatus::Unknown),
+    )
+    .await;
+    // Redelivered on every poll, still unacknowledged.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        fixture
+            .record("task-1")
+            .operator_command(&command_id)
+            .unwrap()
+            .status,
+        OperatorCommandStatus::Queued
+    );
+
+    fixture.block_command_acks.store(false, Ordering::SeqCst);
+    let command = settled(&fixture, "task-1", &command_id).await;
+
+    // Carried out again, an interrupt would find nothing to cut and be
+    // rejected: the verdict is the first one's, from the runner's record.
+    assert_eq!(
+        command.status,
+        OperatorCommandStatus::Applied,
+        "{command:?}"
+    );
+    let interruptions = launch
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.data,
+                EventData::Error { message, .. } if message.contains("will not be replayed")
+            )
+        })
+        .count();
+    assert_eq!(interruptions, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_naming_a_failure_the_task_has_moved_on_from_is_rejected_with_the_reason() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let bin = hanging_claude(&fixture.root);
+    let spec = spec(
+        AGENT_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    running_runner(&mut fixture, "task-1", &launch).await;
+    wait_until_async(Duration::from_secs(30), "the hanging agent", || {
+        launch.home().join("claude-pids").is_file()
+    })
+    .await;
+    let interrupt = submit(
+        &fixture,
+        "task-1",
+        OperatorCommand::Interrupt,
+        "interrupt-1",
+    );
+    settled(&fixture, "task-1", &interrupt).await;
+    let execution_id = launch.execution_id().unwrap();
+    let events_before = launch.events().len();
+
+    let id = submit(
+        &fixture,
+        "task-1",
+        restart(Some("again"), Some("failure-of-another-time")),
+        "restart-1",
+    );
+    let rejected = settled(&fixture, "task-1", &id).await;
+
+    assert_eq!(rejected.status, OperatorCommandStatus::Rejected);
+    assert!(
+        rejected
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("failure-of-another-time")),
+        "{rejected:?}"
+    );
+    assert_eq!(
+        launch.store().load_execution(&execution_id).unwrap().status,
+        ExecutionStatus::Unknown,
+        "the execution was not touched"
+    );
+    assert_eq!(launch.events().len(), events_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_override_transition_is_taken_under_the_claim_and_audited_with_its_reason() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let bin = hanging_claude(&fixture.root);
+    let spec = spec(
+        AGENT_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    running_runner(&mut fixture, "task-1", &launch).await;
+    wait_until_async(Duration::from_secs(30), "the hanging agent", || {
+        launch.home().join("claude-pids").is_file()
+    })
+    .await;
+
+    // While the agent step runs, no transition can be taken.
+    let busy = submit(
+        &fixture,
+        "task-1",
+        OperatorCommand::Transition {
+            target: "completed".to_string(),
+            forced: true,
+            reason: Some("early".to_string()),
+        },
+        "transition-early",
+    );
+    let busy = settled(&fixture, "task-1", &busy).await;
+    assert_eq!(busy.status, OperatorCommandStatus::Rejected);
+    assert!(busy
+        .detail
+        .as_deref()
+        .is_some_and(|d| d.contains("interrupt it first")));
+    assert_eq!(launch.status(), Some(ExecutionStatus::Running));
+
+    let interrupt = submit(
+        &fixture,
+        "task-1",
+        OperatorCommand::Interrupt,
+        "interrupt-1",
+    );
+    settled(&fixture, "task-1", &interrupt).await;
+    let id = submit(
+        &fixture,
+        "task-1",
+        OperatorCommand::Transition {
+            target: "completed".to_string(),
+            forced: true,
+            reason: Some("the ticket was closed upstream".to_string()),
+        },
+        "transition-1",
+    );
+    let taken = settled(&fixture, "task-1", &id).await;
+
+    assert_eq!(taken.status, OperatorCommandStatus::Applied, "{taken:?}");
+    assert_eq!(launch.status(), Some(ExecutionStatus::Completed));
+    // The execution's own log records the override with its reason and
+    // the owner who asked, under the override provider.
+    assert!(launch.events().iter().any(|event| matches!(
+        &event.data,
+        EventData::DecisionMade { provider, reasoning: Some(reasoning), .. }
+            if provider == "human_override"
+                && reasoning.contains("the ticket was closed upstream")
+                && reasoning.contains(LOCAL_OWNER)
+    )));
+}
+
+const TWO_STATE_AGENT_WORKFLOW: &str = r#"
+name: agent-then-script
+version: 1
+states:
+  think:
+    action:
+      type: agent
+      prompt: Think about it.
+    outputs: [done]
+    transitions:
+      done: next
+  next:
+    action:
+      type: script
+      command: sh
+      args: [-c, "echo ran >> \"$HOME/next-ran\"; printf '{\"output\": \"done\"}'"]
+    outputs: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_transition_carries_on_from_the_state_it_leads_to() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let bin = hanging_claude(&fixture.root);
+    let spec = spec(
+        TWO_STATE_AGENT_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    running_runner(&mut fixture, "task-1", &launch).await;
+    wait_until_async(Duration::from_secs(30), "the hanging agent", || {
+        launch.home().join("claude-pids").is_file()
+    })
+    .await;
+    let interrupt = submit(
+        &fixture,
+        "task-1",
+        OperatorCommand::Interrupt,
+        "interrupt-1",
+    );
+    settled(&fixture, "task-1", &interrupt).await;
+
+    // Not an exit of `think`, and no override: refused by the runner too,
+    // whatever the control plane let through.
+    // (Queued past the control plane's own check, as a stale view of the
+    // task's state would.)
+    let id = fixture
+        .service
+        .control_plane()
+        .queue_operator_command(
+            &TaskId::parse("task-1").unwrap(),
+            narsor::orchestration::OperatorCommandRequest {
+                command: OperatorCommand::Transition {
+                    target: "completed".to_string(),
+                    forced: false,
+                    reason: None,
+                },
+                idempotency_key: "transition-bad".to_string(),
+                expected_generation: None,
+                requested_by: fixture.owner(),
+            },
+        )
+        .expect("queued")
+        .command
+        .command_id;
+    let refused = settled(&fixture, "task-1", &id).await;
+    assert_eq!(refused.status, OperatorCommandStatus::Rejected);
+    assert_eq!(launch.status(), Some(ExecutionStatus::Unknown));
+
+    let id = submit(
+        &fixture,
+        "task-1",
+        OperatorCommand::Transition {
+            target: "next".to_string(),
+            forced: false,
+            reason: None,
+        },
+        "transition-1",
+    );
+    let taken = settled(&fixture, "task-1", &id).await;
+
+    assert_eq!(taken.status, OperatorCommandStatus::Applied, "{taken:?}");
+    wait_until_async(Duration::from_secs(30), "the next state's work", || {
+        runner_status(&fixture, "task-1") == Some(ExecutionStatus::Completed)
+    })
+    .await;
+    assert_eq!(
+        fs::read_to_string(launch.home().join("next-ran")).unwrap(),
+        "ran\n"
+    );
+    assert!(launch.events().iter().any(|event| matches!(
+        &event.data,
+        EventData::DecisionMade { provider, .. } if provider == "human"
+    )));
 }

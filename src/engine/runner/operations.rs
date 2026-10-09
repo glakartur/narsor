@@ -64,6 +64,120 @@ pub struct ManualTransition {
     pub episode: Option<String>,
 }
 
+/// The decision provider recorded for an operator's ordinary manual choice.
+///
+/// Deliberately the same literal `src/tui/app.rs`'s `MANUAL_PROVIDER`
+/// writes: both are alternative front doors to the same append-only event
+/// log, and an operator reading it later must not be able to tell which one
+/// wrote a given manual transition from the provider string alone.
+pub const MANUAL_PROVIDER: &str = "human";
+
+/// The decision provider recorded for a forced override (D30). Distinct
+/// from [`MANUAL_PROVIDER`] so an override stands out in the log.
+pub const OVERRIDE_PROVIDER: &str = "human_override";
+
+/// The reason recorded on a forced transition that came with none.
+pub const OVERRIDE_REASON: &str =
+    "Forced manual transition (override): the target state was picked by the operator.";
+
+/// The reason recorded on an ordinary manual transition.
+pub const MANUAL_REASON: &str = "Manual transition picked by the operator.";
+
+impl ManualTransition {
+    /// An operator's transition, recorded the way every front door records
+    /// it: the manual or override provider with its stock reason.
+    pub fn by_operator(label: Option<String>, target: Option<String>, force: bool) -> Self {
+        let (provider, reason) = if force {
+            (OVERRIDE_PROVIDER, OVERRIDE_REASON)
+        } else {
+            (MANUAL_PROVIDER, MANUAL_REASON)
+        };
+        Self {
+            label,
+            target,
+            force,
+            provider: provider.to_string(),
+            reason: reason.to_string(),
+            by: AnsweredBy::Operator,
+            episode: None,
+        }
+    }
+}
+
+/// A transition an owner asked a runner for through the control plane (U3),
+/// as [`Engine::take_operator_transition`] carries it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorTransition {
+    /// The state to go to: one a declared transition of the current state
+    /// leads to, or — with `forced` — any state of the workflow.
+    pub target: String,
+    /// Whether this overrides the declared transitions (D30).
+    pub forced: bool,
+    /// Why the owner overrides; required — and recorded in the log — when
+    /// `forced`.
+    pub reason: Option<String>,
+    /// Who asked, for the audit.
+    pub requested_by: String,
+}
+
+/// How a transition out of a state is taken: through which declared output
+/// label, into which state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionPlan {
+    /// The output label recorded for the transition.
+    pub label: Option<String>,
+    /// The state it leads to.
+    pub target: String,
+}
+
+/// Works out how a transition into `target` leaves `from_state`.
+///
+/// Not forced: `target` must be where a declared transition of the state
+/// leads (the lowest label wins when several do). Forced: the state must
+/// declare `allow_manual_override` (D30) and `target` must exist in the
+/// workflow. The same rules whoever asks, so a control plane can refuse
+/// early on what the runner would refuse later.
+pub fn plan_operator_transition(
+    definition: &WorkflowDefinition,
+    from_state: &State,
+    target: &str,
+    forced: bool,
+) -> Result<TransitionPlan, EngineError> {
+    let invalid = |message: String| EngineError::InvalidTransition { message };
+    if forced {
+        if !from_state.allow_manual_override {
+            return Err(invalid(format!(
+                "state '{}' does not allow a forced transition (allow_manual_override)",
+                from_state.id
+            )));
+        }
+        if !definition.states.contains_key(target) {
+            return Err(invalid(format!("the workflow has no state '{target}'")));
+        }
+        return Ok(TransitionPlan {
+            label: None,
+            target: target.to_string(),
+        });
+    }
+    from_state
+        .transitions
+        .iter()
+        .filter(|(_, leads_to)| leads_to.as_str() == target)
+        .map(|(label, _)| label)
+        .min()
+        .map(|label| TransitionPlan {
+            label: Some(label.clone()),
+            target: target.to_string(),
+        })
+        .ok_or_else(|| {
+            invalid(format!(
+                "state '{}' has no declared transition into '{target}' — this is not a legal \
+                 transition from the current state",
+                from_state.id
+            ))
+        })
+}
+
 /// A chosen output of the conductor's to undo (KTD13), as its saved
 /// decision records it.
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +225,25 @@ impl Engine {
             Value::String(note.to_string()),
         );
         self.store.save_execution(&execution)?;
+        Ok(execution)
+    }
+
+    /// Settles an execution whose pass an operator cut short (U3): what the
+    /// pass left in flight becomes the unknown outcome ordinary recovery
+    /// knows ([`crate::persistence::reconcile`] — `Unknown`, recoverable by
+    /// a restart of the step); an execution cut between two steps is
+    /// `Paused`, ready to be resumed.
+    ///
+    /// Needs the claim, so it waits for nothing: a pass still driving the
+    /// execution is [`EngineError::AlreadyRunning`] — the caller drops the
+    /// pass first, and the claim goes with it.
+    pub fn settle_interrupted(&self, execution_id: &str) -> Result<WorkflowExecution, EngineError> {
+        let _guard = self.begin_run(execution_id)?;
+        crate::persistence::reconcile(&self.store, execution_id)?;
+        let mut execution = self.store.load_execution(execution_id)?;
+        if execution.status == ExecutionStatus::Running {
+            self.pause_execution(&mut execution, "Interrupted by the operator.")?;
+        }
         Ok(execution)
     }
 
@@ -168,7 +301,69 @@ impl Engine {
         transition: &ManualTransition,
     ) -> Result<WorkflowExecution, EngineError> {
         let _guard = self.begin_run(execution_id)?;
-        let mut execution = self.store.load_execution(execution_id)?;
+        let execution = self.store.load_execution(execution_id)?;
+        self.apply_manual_transition(definition, execution, transition)
+    }
+
+    /// Takes a transition an owner asked a runner for (U3): the same
+    /// transition [`Engine::take_manual_transition`] takes, with the rules
+    /// of [`plan_operator_transition`] and an override's reason in the log.
+    ///
+    /// What is checked — the current state, its declared transitions, its
+    /// `allow_manual_override` — is read under the execution's claim, on
+    /// the very read the transition is then written from: a command that
+    /// raced a pass or another transition is refused, never applied to a
+    /// moment it was not meant for.
+    pub fn take_operator_transition(
+        &self,
+        definition: &WorkflowDefinition,
+        execution_id: &str,
+        transition: &OperatorTransition,
+    ) -> Result<WorkflowExecution, EngineError> {
+        let _guard = self.begin_run(execution_id)?;
+        let execution = self.store.load_execution(execution_id)?;
+        let from_state_id = execution
+            .current_state
+            .clone()
+            .unwrap_or_else(|| definition.initial_state.clone());
+        let from_state = self.state_of(definition, &execution, &from_state_id)?;
+        let reason = transition
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty());
+        if transition.forced && reason.is_none() {
+            return Err(EngineError::InvalidTransition {
+                message: "a forced transition needs a reason".to_string(),
+            });
+        }
+        let plan = plan_operator_transition(
+            definition,
+            from_state,
+            &transition.target,
+            transition.forced,
+        )?;
+        let mut manual =
+            ManualTransition::by_operator(plan.label, Some(plan.target), transition.forced);
+        if let Some(reason) = reason.filter(|_| transition.forced) {
+            manual.reason = format!(
+                "Forced manual transition (override) by {}: {reason}",
+                transition.requested_by
+            );
+        }
+        self.apply_manual_transition(definition, execution, &manual)
+    }
+
+    /// The body of a manual transition, once the claim is held and the
+    /// execution loaded from under it.
+    fn apply_manual_transition(
+        &self,
+        definition: &WorkflowDefinition,
+        mut execution: WorkflowExecution,
+        transition: &ManualTransition,
+    ) -> Result<WorkflowExecution, EngineError> {
+        let execution_id = execution.id.clone();
+        let execution_id = execution_id.as_str();
         self.check_episode(&execution, transition.episode.as_deref())?;
 
         let from_state_id = execution

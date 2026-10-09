@@ -164,6 +164,7 @@ impl ControlPlane {
             commands: Vec::new(),
             runner: None,
             inputs: Vec::new(),
+            operator_commands: Vec::new(),
             reservation: None,
             queue: None,
             request_digest: request.request_digest,

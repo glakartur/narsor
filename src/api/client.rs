@@ -76,7 +76,8 @@ use crate::controller_protocol::{
     ConversationPageQuery, ConversationResponse as RemoteConversationResponse,
     CreateEnrollmentRequest, CreateTaskRequest, DefaultBackendView, EnrollmentResponse,
     MoveTaskRequest, OwnerCommandRequest, OwnerCommandResponse, SetDefaultBackendRequest,
-    SubmitInputRequest, SubmitInputResponse, TaskListResponse, TaskSummary, TimelineResponse,
+    SubmitInputRequest, SubmitInputResponse, SubmitOperatorCommandRequest,
+    SubmitOperatorCommandResponse, TaskListResponse, TaskSummary, TimelineResponse,
 };
 use crate::materials::{
     MaterialListResponse, MaterialSummary, MaterialUploadResponse, MaterialView,
@@ -623,6 +624,20 @@ impl ApiClient {
         request: &SubmitInputRequest,
     ) -> Result<SubmitInputResponse, ClientError> {
         let url = format!("{}/control/v1/tasks/{task_id}/input", self.base_url);
+        self.post_json(&url, request).await
+    }
+
+    /// Queues an operator command (interrupt, transition, restart) for the
+    /// remote task's runner; its verdict follows in the task's events.
+    pub async fn control_operator_command(
+        &self,
+        task_id: &str,
+        request: &SubmitOperatorCommandRequest,
+    ) -> Result<SubmitOperatorCommandResponse, ClientError> {
+        let url = format!(
+            "{}/control/v1/tasks/{task_id}/operator-commands",
+            self.base_url
+        );
         self.post_json(&url, request).await
     }
 

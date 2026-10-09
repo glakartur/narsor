@@ -23,13 +23,15 @@ use super::credentials::{
 };
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
-use crate::domain::{BackendId, TaskDisplay, TaskId};
+use crate::domain::{BackendId, LaunchDefinitionError, TaskDisplay, TaskId};
+use crate::engine::{plan_operator_transition, EngineError};
 use crate::environment::{LaunchError, LaunchIntent, LaunchResolver};
 use crate::materials::{MaterialLimits, MaterialStore};
 use crate::orchestration::{
     BackendCapacity, BackendLease, CommandRequest, ControlPlane, ControllerReport,
-    ConversationAvailability, InputRequest, LeaseToken, MoveTarget, NewTask, Observation, OwnerRef,
-    RunnerObservation, TaskEvent, TaskLifecycle, TaskRecord,
+    ConversationAvailability, InputRequest, LeaseToken, MoveTarget, NewTask, Observation,
+    OperatorCommand, OperatorCommandRequest, OwnerRef, RunnerObservation, TaskEvent, TaskLifecycle,
+    TaskRecord,
 };
 use crate::workflow::TemplateScope;
 
@@ -748,6 +750,143 @@ impl ProtocolService {
         })
     }
 
+    /// Queues an operator command (interrupt, transition, restart) for the
+    /// runner of a running task.
+    ///
+    /// Refused at once, with the reason and nothing written, when the task
+    /// is not running, its runner is gone or silent, the generation moved
+    /// on, or the command can be seen to be illegal from the runner's last
+    /// snapshot (an override without a reason or without
+    /// `allow_manual_override`, a target no declared transition leads to).
+    /// The runner checks the same again under the Engine's own claim, on
+    /// what it then finds: this early refusal only spares the owner a
+    /// round trip.
+    pub fn submit_operator_command(
+        &self,
+        owner: &OwnerRef,
+        task_id: &str,
+        request: SubmitOperatorCommandRequest,
+    ) -> ProtocolResult<SubmitOperatorCommandResponse> {
+        let record = self.owned_task(owner, task_id)?;
+        if request.idempotency_key.trim().is_empty() {
+            return Err(ProtocolError::bad_request(
+                "missing_idempotency_key",
+                "an operator command needs an idempotency key",
+            ));
+        }
+        let is_retry = record
+            .operator_commands
+            .iter()
+            .any(|queued| queued.idempotency_key == request.idempotency_key);
+        if !is_retry {
+            self.check_operator_command(&record, &request.command)?;
+        }
+        let outcome = self.control.queue_operator_command(
+            &record.task_id,
+            OperatorCommandRequest {
+                command: request.command,
+                idempotency_key: request.idempotency_key,
+                expected_generation: request.expected_generation,
+                requested_by: owner.clone(),
+            },
+        )?;
+        if !outcome.replayed {
+            self.notify(&record.task_id);
+        }
+        Ok(SubmitOperatorCommandResponse {
+            command: OperatorCommandView::from(&outcome.command),
+            replayed: outcome.replayed,
+        })
+    }
+
+    /// What the control plane can tell about `command` without the runner.
+    fn check_operator_command(
+        &self,
+        record: &TaskRecord,
+        command: &OperatorCommand,
+    ) -> ProtocolResult<()> {
+        if let Some(reason) = record.operator_command_refusal() {
+            return Err(ProtocolError::conflict("operator_command_refused", reason));
+        }
+        let runner = record.runner.as_ref().ok_or(ProtocolError::NotFound)?;
+        if self.runner_freshness(record, runner, self.control.now())? == Freshness::Stale {
+            return Err(ProtocolError::conflict(
+                "operator_command_refused",
+                "the task's runner has not been heard from lately; the command would wait for \
+                 a runner that may be gone",
+            ));
+        }
+        if let OperatorCommand::Transition {
+            target,
+            forced,
+            reason,
+        } = command
+        {
+            if target.trim().is_empty() {
+                return Err(ProtocolError::bad_request(
+                    "missing_target",
+                    "a transition needs a target state",
+                ));
+            }
+            if *forced
+                && reason
+                    .as_deref()
+                    .is_none_or(|reason| reason.trim().is_empty())
+            {
+                return Err(ProtocolError::bad_request(
+                    "override_reason_required",
+                    "an override needs a reason; it is recorded in the task's audit trail",
+                ));
+            }
+            self.check_transition_legal(record, target, *forced)?;
+        }
+        Ok(())
+    }
+
+    /// Checks a transition against the workflow snapshot and the state the
+    /// runner last reported; silent when the runner has reported no state
+    /// yet — it decides then.
+    fn check_transition_legal(
+        &self,
+        record: &TaskRecord,
+        target: &str,
+        forced: bool,
+    ) -> ProtocolResult<()> {
+        let Some(current) = record
+            .runner
+            .as_ref()
+            .and_then(|runner| runner.snapshot.execution_cursor.current_state.as_deref())
+        else {
+            return Ok(());
+        };
+        let definition = match record.launch_spec.definition() {
+            Ok(definition) => definition,
+            // Bookkeeping-only spec: there is nothing to check against.
+            Err(LaunchDefinitionError::Missing(_)) => return Ok(()),
+            Err(error) => {
+                return Err(ProtocolError::Internal(format!(
+                    "the task's workflow snapshot is unusable: {error}"
+                )))
+            }
+        };
+        let Some(state) = definition.states.get(current) else {
+            return Ok(());
+        };
+        plan_operator_transition(&definition, state, target, forced)
+            .map(|_| ())
+            .map_err(|error| match error {
+                EngineError::InvalidTransition { message } => {
+                    let code = if forced {
+                        "override_not_allowed"
+                    } else {
+                        "illegal_transition"
+                    };
+                    ProtocolError::bad_request(code, message)
+                }
+                other => ProtocolError::Internal(other.to_string()),
+            })
+    }
+
     /// The task's events after `after`.
     pub fn events(
         &self,
@@ -1238,7 +1377,12 @@ impl ProtocolService {
                 identity.launch_generation,
                 pending,
             )?;
-            if changed {
+            let (commands, commands_changed) = self.control.deliver_operator_commands(
+                &identity.task_id,
+                &identity.incarnation,
+                identity.launch_generation,
+            )?;
+            if changed || commands_changed {
                 self.notify(&identity.task_id);
             }
             let record = self.control.task(&identity.task_id)?;
@@ -1256,6 +1400,14 @@ impl ProtocolService {
                         })
                     })
                     .collect(),
+                commands: commands
+                    .into_iter()
+                    .map(|queued| DeliveredOperatorCommand {
+                        command_id: queued.command_id,
+                        requested_by: queued.requested_by.0,
+                        command: queued.command,
+                    })
+                    .collect(),
                 credential_expires_at: session.expires_at,
                 launch: launch_view(identity, &record),
                 conversation_pages: self.page_requests(&identity.task_id),
@@ -1267,6 +1419,7 @@ impl ProtocolService {
             .wait_for(wait, || {
                 let response = poll()?;
                 let actionable = !response.inputs.is_empty()
+                    || !response.commands.is_empty()
                     || !response.conversation_pages.is_empty()
                     || (!defer_materials && !response.materials.is_empty())
                     || response.directive != RunnerDirective::Continue;
@@ -1358,6 +1511,29 @@ impl ProtocolService {
         })
     }
 
+    /// The runner's verdict on a delivered operator command.
+    pub fn runner_ack_command(
+        &self,
+        identity: &RunnerIdentity,
+        command_id: &str,
+        request: OperatorCommandAckRequest,
+    ) -> ProtocolResult<OperatorCommandAckResponse> {
+        let (command, changed) = self.control.settle_operator_command(
+            &identity.task_id,
+            &identity.incarnation,
+            identity.launch_generation,
+            command_id,
+            request.applied,
+            request.detail,
+        )?;
+        if changed {
+            self.notify(&identity.task_id);
+        }
+        Ok(OperatorCommandAckResponse {
+            command: OperatorCommandView::from(&command),
+        })
+    }
+
     // -----------------------------------------------------------------
     // Views
     // -----------------------------------------------------------------
@@ -1417,6 +1593,11 @@ impl ProtocolService {
             runner,
             controller,
             inputs: record.inputs.iter().map(InputView::from).collect(),
+            operator_commands: record
+                .operator_commands
+                .iter()
+                .map(OperatorCommandView::from)
+                .collect(),
             queue: record.queue.as_ref().map(QueueView::from),
             display: task_display(record),
             as_of: now,

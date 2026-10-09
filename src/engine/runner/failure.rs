@@ -103,6 +103,17 @@ pub struct Recovery {
 }
 
 impl Recovery {
+    /// An operator's recovery of the step failure `episode` names (of
+    /// whatever is there when `None`), with an optional note for the
+    /// agent's next attempt.
+    pub fn by_operator(comment: Option<String>, episode: Option<String>) -> Self {
+        Self {
+            comment,
+            episode,
+            conductor_retry: false,
+        }
+    }
+
     /// An operator's recovery with an optional note, of whatever is there.
     pub fn with_comment(comment: Option<String>) -> Self {
         Self {

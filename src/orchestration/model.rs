@@ -300,6 +300,27 @@ pub enum TaskEventKind {
         /// The runner's pending-input id it answers.
         pending_input_id: String,
     },
+    /// The owner queued a command for the runner of a running task (U3).
+    /// Carries the command itself and who sent it: for a forced transition
+    /// that is the audit of the override, its reason included.
+    OperatorCommandQueued {
+        /// Control-plane id of the queued command.
+        command_id: String,
+        /// What it asks the runner to do.
+        command: OperatorCommand,
+        /// The owner who sent it.
+        requested_by: OwnerRef,
+    },
+    /// The runner settled an operator command, or the control plane made
+    /// it obsolete before the runner ever saw it (U3).
+    OperatorCommandResolved {
+        /// The command.
+        command_id: String,
+        /// How it ended.
+        status: OperatorCommandStatus,
+        /// Why it was rejected; `None` when applied.
+        detail: Option<String>,
+    },
     /// The owner changed the queue priority of a queued task. No longer
     /// written — `rank` and [`Self::Moved`] replaced it — and kept only so
     /// that a log written by an older version still reads.
@@ -449,6 +470,11 @@ pub struct TaskRecord {
     /// every answer, whose payload is dropped once it is settled.
     #[serde(default)]
     pub inputs: Vec<QueuedInput>,
+    /// Operator commands queued for the runner, oldest first; the audit
+    /// trail of every interrupt, transition and restart the owner asked for
+    /// (U3).
+    #[serde(default)]
+    pub operator_commands: Vec<QueuedOperatorCommand>,
     /// The capacity slot the scheduler granted while the task is queued
     /// (U10). Only a task holding one is offered `Start`, and only such a
     /// task may be accepted by its controller; cleared once the task leaves
@@ -553,6 +579,41 @@ impl TaskRecord {
     /// Finds a queued input by id.
     pub fn input(&self, input_id: &str) -> Option<&QueuedInput> {
         self.inputs.iter().find(|input| input.input_id == input_id)
+    }
+
+    /// Finds an operator command by id.
+    pub fn operator_command(&self, command_id: &str) -> Option<&QueuedOperatorCommand> {
+        self.operator_commands
+            .iter()
+            .find(|command| command.command_id == command_id)
+    }
+
+    /// Why an operator command cannot be queued for this task's runner
+    /// right now, or `None` when it can: only a running task with a runner
+    /// of its current launch has someone to carry it out.
+    pub fn operator_command_refusal(&self) -> Option<String> {
+        let reason = match self.lifecycle {
+            TaskLifecycle::Running => None,
+            TaskLifecycle::Queued | TaskLifecycle::Provisioning => {
+                Some("the task has not started yet")
+            }
+            TaskLifecycle::PauseRequested => Some("the task is pausing"),
+            TaskLifecycle::Paused => Some("the task is paused; resume it first"),
+            TaskLifecycle::Interrupted | TaskLifecycle::Unknown => {
+                Some("the task's runner is gone; start or resume the task first")
+            }
+            TaskLifecycle::Archiving | TaskLifecycle::Archived => Some("the task is archived"),
+        };
+        if let Some(reason) = reason {
+            return Some(format!("{reason} (lifecycle: {:?})", self.lifecycle));
+        }
+        match &self.runner {
+            None => Some("the task's runner has not reported yet".to_string()),
+            Some(runner) if self.supersedes_launch(runner.launch_generation) => {
+                Some("the task's new runner has not reported yet".to_string())
+            }
+            Some(_) => None,
+        }
     }
 }
 
@@ -863,6 +924,121 @@ pub struct InputOutcome {
     /// The queued input.
     pub input: QueuedInput,
     /// True when this was a retry answered from the existing input.
+    pub replayed: bool,
+}
+
+/// What an owner asks the runner of a running task to do (U3).
+///
+/// The list is open: the conductor's commands (chat, proposals, undo)
+/// arrive with U5 as further variants, through the same queue, delivery and
+/// acknowledgement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum OperatorCommand {
+    /// Cut the step in flight short; the execution is left recoverable.
+    Interrupt,
+    /// A manual transition out of the current state.
+    Transition {
+        /// The state to go to: one a declared transition of the current
+        /// state leads to, or — with `forced` — any state of the workflow.
+        target: String,
+        /// Whether this is an override of the declared transitions; needs
+        /// the current state's `allow_manual_override` and a `reason`.
+        #[serde(default, rename = "override")]
+        forced: bool,
+        /// Why the owner overrides; recorded as the audit of the override.
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// Start the failed or interrupted step again.
+    RestartStep {
+        /// An instruction for the agent's next attempt.
+        #[serde(default)]
+        note: Option<String>,
+        /// The key of the step failure being answered; the runner refuses
+        /// the command when the execution has moved on from it.
+        #[serde(default)]
+        failure_key: Option<String>,
+    },
+}
+
+impl OperatorCommand {
+    /// A short name for people.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Interrupt => "interrupt",
+            Self::Transition { forced: false, .. } => "transition",
+            Self::Transition { forced: true, .. } => "override transition",
+            Self::RestartStep { .. } => "restart step",
+        }
+    }
+}
+
+/// What became of a queued operator command.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCommandStatus {
+    /// Waiting for the runner; handed over on every poll until it settles.
+    Queued,
+    /// The runner carried it out.
+    Applied,
+    /// The runner refused it, or it became obsolete before the runner saw it.
+    Rejected,
+}
+
+impl OperatorCommandStatus {
+    /// True once nothing more can happen to the command.
+    pub fn is_settled(self) -> bool {
+        !matches!(self, Self::Queued)
+    }
+}
+
+/// One operator command queued for a runner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueuedOperatorCommand {
+    /// Control-plane id, unique within the task.
+    pub command_id: String,
+    /// Owner-chosen key; a retry with it returns this command.
+    pub idempotency_key: String,
+    /// What it asks.
+    pub command: OperatorCommand,
+    /// The owner who sent it.
+    pub requested_by: OwnerRef,
+    /// The desired generation the owner expected, if it sent one.
+    pub expected_generation: Option<u64>,
+    /// The launch generation of the runner it is meant for: a runner of
+    /// another launch never carries it out.
+    pub launch_generation: u64,
+    /// Its status.
+    pub status: OperatorCommandStatus,
+    /// When it was queued.
+    pub submitted_at: DateTime<Utc>,
+    /// When its status last changed.
+    pub updated_at: DateTime<Utc>,
+    /// Why it was rejected.
+    pub detail: Option<String>,
+}
+
+/// An operator command as submitted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorCommandRequest {
+    /// What it asks.
+    pub command: OperatorCommand,
+    /// Owner-chosen key; a retry reuses it.
+    pub idempotency_key: String,
+    /// Optimistic concurrency: refused unless the task is still at this
+    /// desired generation.
+    pub expected_generation: Option<u64>,
+    /// The owner sending it.
+    pub requested_by: OwnerRef,
+}
+
+/// The result of queueing an operator command.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorCommandOutcome {
+    /// The queued command.
+    pub command: QueuedOperatorCommand,
+    /// True when this was a retry answered from the existing command.
     pub replayed: bool,
 }
 

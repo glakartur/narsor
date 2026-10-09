@@ -470,6 +470,21 @@ impl RunnerClient {
             .await
     }
 
+    /// `POST /runner/v1/commands/:command_id/ack`.
+    pub async fn ack_command(
+        &self,
+        command_id: &str,
+        applied: bool,
+        detail: Option<String>,
+    ) -> Result<OperatorCommandAckResponse, ClientError> {
+        self.transport
+            .post(
+                &format!("/runner/v1/commands/{command_id}/ack"),
+                &OperatorCommandAckRequest { applied, detail },
+            )
+            .await
+    }
+
     /// `POST /runner/v1/inputs/:input_id/ack`.
     pub async fn ack_input(
         &self,

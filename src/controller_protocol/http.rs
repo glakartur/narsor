@@ -88,6 +88,10 @@ where
         )
         .route("/control/v1/tasks/:task_id/input", post(post_input))
         .route(
+            "/control/v1/tasks/:task_id/operator-commands",
+            post(post_operator_command),
+        )
+        .route(
             "/control/v1/tasks/:task_id/materials",
             get(list_materials).post(post_material),
         )
@@ -152,6 +156,10 @@ where
         .route("/runner/v1/poll", get(get_poll))
         .route("/runner/v1/renew", post(post_renew))
         .route("/runner/v1/inputs/:input_id/ack", post(post_input_ack))
+        .route(
+            "/runner/v1/commands/:command_id/ack",
+            post(post_command_ack),
+        )
         .route(
             "/runner/v1/conversation-pages/:request_id",
             post(post_conversation_page),
@@ -338,6 +346,16 @@ async fn post_input(
     Json(request): Json<SubmitInputRequest>,
 ) -> ProtocolResult<(StatusCode, Json<SubmitInputResponse>)> {
     let response = service.submit_input(&owner, &task_id, request)?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn post_operator_command(
+    State(service): State<Service>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(task_id): Path<String>,
+    Json(request): Json<SubmitOperatorCommandRequest>,
+) -> ProtocolResult<(StatusCode, Json<SubmitOperatorCommandResponse>)> {
+    let response = service.submit_operator_command(&owner, &task_id, request)?;
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
@@ -609,6 +627,19 @@ async fn post_input_ack(
     Ok(Json(
         service.runner_ack_input(&identity, &input_id, request)?,
     ))
+}
+
+async fn post_command_ack(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Path(command_id): Path<String>,
+    Json(request): Json<OperatorCommandAckRequest>,
+) -> ProtocolResult<Json<OperatorCommandAckResponse>> {
+    Ok(Json(service.runner_ack_command(
+        &identity,
+        &command_id,
+        request,
+    )?))
 }
 
 async fn post_conversation_page(

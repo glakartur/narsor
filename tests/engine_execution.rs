@@ -1808,3 +1808,113 @@ mod problems {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Operator transitions (U3)
+// ---------------------------------------------------------------------------
+
+mod operator_transitions {
+    use narsor::engine::{plan_operator_transition, EngineError, ManualTransition};
+
+    fn definition() -> narsor::domain::WorkflowDefinition {
+        narsor::workflow::load_from_str(
+            r#"
+name: operator-plan
+version: 1
+states:
+  open:
+    allow_manual_override: true
+    action:
+      type: script
+      command: "true"
+    outputs: [a, b, c]
+    transitions:
+      a: review
+      b: review
+      c: closed
+  review:
+    action:
+      type: script
+      command: "true"
+    outputs: [done]
+    transitions:
+      done: closed
+  closed:
+    description: Closed.
+terminal_states: [closed]
+"#,
+        )
+        .expect("a valid workflow")
+    }
+
+    fn invalid(error: EngineError) -> String {
+        match error {
+            EngineError::InvalidTransition { message } => message,
+            other => panic!("expected an invalid transition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_declared_exit_is_named_by_the_state_it_leads_to() {
+        let definition = definition();
+        let open = &definition.states["open"];
+
+        let plan = plan_operator_transition(&definition, open, "closed", false).unwrap();
+
+        assert_eq!(plan.label.as_deref(), Some("c"));
+        assert_eq!(plan.target, "closed");
+    }
+
+    #[test]
+    fn several_labels_into_one_state_pick_the_lowest_label() {
+        let definition = definition();
+        let open = &definition.states["open"];
+
+        let plan = plan_operator_transition(&definition, open, "review", false).unwrap();
+
+        assert_eq!(plan.label.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn a_state_no_declared_transition_leads_to_is_refused_without_override() {
+        let definition = definition();
+        let review = &definition.states["review"];
+
+        let message =
+            invalid(plan_operator_transition(&definition, review, "open", false).unwrap_err());
+
+        assert!(
+            message.contains("no declared transition into 'open'"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_override_needs_a_state_that_allows_it_and_a_target_that_exists() {
+        let definition = definition();
+        let open = &definition.states["open"];
+        let review = &definition.states["review"];
+
+        let plan = plan_operator_transition(&definition, open, "closed", true).unwrap();
+        assert_eq!(plan.label, None, "an override has no declared label");
+        assert!(
+            invalid(plan_operator_transition(&definition, open, "nowhere", true).unwrap_err())
+                .contains("no state 'nowhere'")
+        );
+        assert!(invalid(
+            plan_operator_transition(&definition, review, "closed", true).unwrap_err()
+        )
+        .contains("allow_manual_override"));
+    }
+
+    #[test]
+    fn the_operators_ordinary_and_forced_choices_keep_their_audit_providers() {
+        let ordinary = ManualTransition::by_operator(Some("done".into()), None, false);
+        let forced = ManualTransition::by_operator(None, Some("closed".into()), true);
+
+        assert_eq!(ordinary.provider, "human");
+        assert_eq!(forced.provider, "human_override");
+        assert_ne!(ordinary.reason, forced.reason);
+        assert!(forced.force && !ordinary.force);
+    }
+}

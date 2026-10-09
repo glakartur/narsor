@@ -29,9 +29,9 @@ use crate::domain::{
 use crate::engine::{HumanInputDelivery, Timeline};
 use crate::orchestration::{
     ArchiveTombstone, CommandReceipt, ConversationAttemptSummary, ExecutionCursor, InputStatus,
-    MoveTarget, Observation, ObservedSummary, OwnerCommand, PendingInputRef, QueueReason,
-    QueueStatus, QueuedInput, ResourceIdentity, RunnerProblem, RunnerSnapshot, TaskEvent,
-    TaskLifecycle,
+    MoveTarget, Observation, ObservedSummary, OperatorCommand, OperatorCommandStatus, OwnerCommand,
+    PendingInputRef, QueueReason, QueueStatus, QueuedInput, QueuedOperatorCommand,
+    ResourceIdentity, RunnerProblem, RunnerSnapshot, TaskEvent, TaskLifecycle,
 };
 
 /// Version of this protocol; part of every path (`…/v1/…`).
@@ -211,6 +211,36 @@ impl From<&QueuedInput> for InputView {
     }
 }
 
+/// An operator command, as owners see it (U3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperatorCommandView {
+    /// Control-plane id.
+    pub command_id: String,
+    /// What it asks.
+    pub command: OperatorCommand,
+    /// What became of it.
+    pub status: OperatorCommandStatus,
+    /// When it was queued.
+    pub submitted_at: DateTime<Utc>,
+    /// When its status last changed.
+    pub updated_at: DateTime<Utc>,
+    /// Why the runner rejected it, if it did.
+    pub detail: Option<String>,
+}
+
+impl From<&QueuedOperatorCommand> for OperatorCommandView {
+    fn from(queued: &QueuedOperatorCommand) -> Self {
+        Self {
+            command_id: queued.command_id.clone(),
+            command: queued.command.clone(),
+            status: queued.status,
+            submitted_at: queued.submitted_at,
+            updated_at: queued.updated_at,
+            detail: queued.detail.clone(),
+        }
+    }
+}
+
 /// The normalized, backend-neutral summary of one task (KTD4).
 ///
 /// Nothing in it names a Kubernetes object, a runner address or a secret.
@@ -252,6 +282,9 @@ pub struct TaskSummary {
     pub controller: Option<ControllerPresence>,
     /// Owner inputs, oldest first.
     pub inputs: Vec<InputView>,
+    /// Operator commands (interrupt, transition, restart), oldest first.
+    #[serde(default)]
+    pub operator_commands: Vec<OperatorCommandView>,
     /// While queued: whether the task was admitted, or why it waits (U10).
     /// `None` outside `Queued`.
     #[serde(default)]
@@ -285,6 +318,29 @@ impl From<&QueueStatus> for QueueView {
             since: status.since,
         }
     }
+}
+
+/// `POST /control/v1/tasks/:task_id/operator-commands`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubmitOperatorCommandRequest {
+    /// What to ask the runner to do.
+    #[serde(flatten)]
+    pub command: OperatorCommand,
+    /// Client-chosen key; a retry reuses it.
+    pub idempotency_key: String,
+    /// Refuse unless the task is still at this desired generation.
+    #[serde(default)]
+    pub expected_generation: Option<u64>,
+}
+
+/// Response of a submitted operator command: queued, not yet carried out;
+/// its verdict follows in the task's event stream.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubmitOperatorCommandResponse {
+    /// The queued command.
+    pub command: OperatorCommandView,
+    /// True when this was a retry.
+    pub replayed: bool,
 }
 
 /// `POST /control/v1/tasks/:task_id/move`.
@@ -864,6 +920,18 @@ pub struct DeliveredInput {
     pub delivery: HumanInputDelivery,
 }
 
+/// An operator command handed to the runner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeliveredOperatorCommand {
+    /// Control-plane id; acknowledge with it.
+    pub command_id: String,
+    /// The owner who sent it, for the audit the runner's log keeps.
+    pub requested_by: String,
+    /// What to do.
+    #[serde(flatten)]
+    pub command: OperatorCommand,
+}
+
 /// `GET /runner/v1/poll` response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunnerPollResponse {
@@ -876,6 +944,10 @@ pub struct RunnerPollResponse {
     /// Answers to the request the runner waits on; redelivered until
     /// acknowledged.
     pub inputs: Vec<DeliveredInput>,
+    /// Operator commands (U3) for this runner; redelivered until
+    /// acknowledged with `POST /runner/v1/commands/:command_id/ack`.
+    #[serde(default)]
+    pub commands: Vec<DeliveredOperatorCommand>,
     /// When the runner's credential runs out.
     pub credential_expires_at: DateTime<Utc>,
     /// The calling runner's launch.
@@ -955,6 +1027,23 @@ pub struct InputAckRequest {
 pub struct InputAckResponse {
     /// The input afterwards.
     pub input: InputView,
+}
+
+/// `POST /runner/v1/commands/:command_id/ack`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorCommandAckRequest {
+    /// Whether the runner carried the command out.
+    pub applied: bool,
+    /// Its reason when it did not.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// `POST /runner/v1/commands/:command_id/ack` response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperatorCommandAckResponse {
+    /// The command afterwards.
+    pub command: OperatorCommandView,
 }
 
 /// The snapshot body of `POST /runner/v1/snapshots`.

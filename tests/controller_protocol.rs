@@ -21,14 +21,15 @@ use narsor::controller_protocol::{
     CommandAck, ControllerClient, ConversationResponse, ConversationUnavailableReason,
     CreateEnrollmentRequest, CreateTaskRequest, DesiredAction, Freshness, LaunchRequest,
     OwnerCommandRequest, ProtocolService, ReportRequest, RunnerClient, RunnerCredentialRequest,
-    RunnerDirective, SubmitInputRequest, TaskSummary,
+    RunnerDirective, SubmitInputRequest, SubmitOperatorCommandRequest, TaskSummary,
 };
 use narsor::domain::{DisplayLink, ExecutionStatus, TaskDisplay, TaskId};
 use narsor::engine::{Engine, HumanInputDelivery, PendingHumanInput, Timeline};
 use narsor::orchestration::{
     Clock, CommandRequest, ControlPlane, ConversationAttemptSummary, ConversationAvailability,
-    ExecutionCursor, InputStatus, NewTask, Observation, ObservedSummary, OwnerCommand, OwnerRef,
-    PendingInputRef, ResourceIdentity, RunnerSnapshot, TaskLifecycle,
+    ExecutionCursor, InputStatus, NewTask, Observation, ObservedSummary, OperatorCommand,
+    OperatorCommandStatus, OwnerCommand, OwnerRef, PendingInputRef, ResourceIdentity,
+    RunnerSnapshot, TaskEventKind, TaskLifecycle,
 };
 use narsor::persistence::paths::{temp_path_for, StatePaths};
 use narsor::persistence::{DaemonInfo, ExecutionStore};
@@ -1609,4 +1610,536 @@ async fn a_title_with_an_escape_sequence_from_the_inputs_is_stripped() {
 
     assert_eq!(task.display.title, "[31mNAR-9[0m");
     assert!(!task.display.links[0].text.chars().any(char::is_control));
+}
+
+// ---------------------------------------------------------------------------
+// Operator commands (U3)
+// ---------------------------------------------------------------------------
+
+fn operator_request(command: OperatorCommand, key: &str) -> SubmitOperatorCommandRequest {
+    SubmitOperatorCommandRequest {
+        command,
+        idempotency_key: key.to_string(),
+        expected_generation: None,
+    }
+}
+
+fn transition(target: &str, forced: bool, reason: Option<&str>) -> OperatorCommand {
+    OperatorCommand::Transition {
+        target: target.to_string(),
+        forced,
+        reason: reason.map(str::to_string),
+    }
+}
+
+fn restart(note: Option<&str>, failure_key: Option<&str>) -> OperatorCommand {
+    OperatorCommand::RestartStep {
+        note: note.map(str::to_string),
+        failure_key: failure_key.map(str::to_string),
+    }
+}
+
+/// A workflow whose `work` state allows overrides and whose `locked` state
+/// does not, written over the seeded `implement-feature`.
+fn write_override_workflow(harness: &Harness) {
+    let yaml = format!(
+        "name: implement-feature\nversion: 1\nglobals:\n  image: \"{}\"\nstates:\n  \
+         work:\n    allow_manual_override: true\n    action:\n      type: script\n      \
+         command: \"true\"\n    outputs: [success]\n    transitions:\n      success: locked\n  \
+         locked:\n    action:\n      type: script\n      command: \"true\"\n    \
+         outputs: [success]\n    transitions:\n      success: done\n  \
+         done:\n    description: finished\nterminal_states: [done]\n",
+        environment_support::workflow_image()
+    );
+    fs::write(
+        harness.root.path().join("workflows/implement-feature.yaml"),
+        yaml,
+    )
+    .unwrap();
+}
+
+/// A snapshot of an execution standing in `state`.
+fn snapshot_in(sequence: u64, state: &str, event_cursor: u64) -> RunnerSnapshot {
+    let mut snapshot = snapshot(sequence, ExecutionStatus::Running, event_cursor, None);
+    snapshot.execution_cursor.current_state = Some(state.to_string());
+    snapshot
+}
+
+fn bad_request_code(result: Result<impl std::fmt::Debug, ClientError>) -> String {
+    match result {
+        Err(ClientError::Request { code, .. }) => code,
+        other => panic!("expected a 400 with a code, got {other:?}"),
+    }
+}
+
+async fn operator_events(harness: &Harness, task: &str) -> Vec<TaskEventKind> {
+    harness
+        .owner
+        .control_events(task, 0)
+        .await
+        .expect("events")
+        .into_iter()
+        .map(|event| event.kind)
+        .collect()
+}
+
+#[tokio::test]
+async fn an_operator_command_is_queued_once_and_redelivered_until_acknowledged() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+
+    let queued = harness
+        .owner
+        .control_operator_command(
+            "task-1",
+            &operator_request(OperatorCommand::Interrupt, "interrupt-1"),
+        )
+        .await
+        .expect("queued");
+    assert!(!queued.replayed);
+    assert_eq!(queued.command.status, OperatorCommandStatus::Queued);
+    let retried = harness
+        .owner
+        .control_operator_command(
+            "task-1",
+            &operator_request(OperatorCommand::Interrupt, "interrupt-1"),
+        )
+        .await
+        .expect("idempotent retry");
+    assert!(retried.replayed);
+    assert_eq!(retried.command.command_id, queued.command.command_id);
+    assert_eq!(harness.task("task-1").await.operator_commands.len(), 1);
+    assert_eq!(
+        refused_code(
+            harness
+                .owner
+                .control_operator_command(
+                    "task-1",
+                    &operator_request(restart(None, None), "interrupt-1"),
+                )
+                .await
+        ),
+        "idempotency_key_reused"
+    );
+
+    // Handed over by the long-poll, again and again until acknowledged.
+    let polled = runner.poll(None, 0).await.expect("poll");
+    assert_eq!(polled.commands.len(), 1);
+    assert_eq!(polled.commands[0].command, OperatorCommand::Interrupt);
+    assert_eq!(polled.commands[0].requested_by, "local");
+    let redelivered = runner.poll(None, 0).await.expect("redelivery");
+    assert_eq!(redelivered.commands, polled.commands);
+
+    let command_id = polled.commands[0].command_id.clone();
+    let acked = runner
+        .ack_command(&command_id, true, None)
+        .await
+        .expect("ack");
+    assert_eq!(acked.command.status, OperatorCommandStatus::Applied);
+    runner
+        .ack_command(&command_id, true, None)
+        .await
+        .expect("a repeated verdict is harmless");
+    assert_eq!(
+        refused_code(
+            runner
+                .ack_command(&command_id, false, Some("late".to_string()))
+                .await
+        ),
+        "operator_command_already_settled"
+    );
+    assert!(runner
+        .poll(None, 0)
+        .await
+        .expect("poll")
+        .commands
+        .is_empty());
+    assert!(matches!(
+        runner.ack_command("command-99", true, None).await,
+        Err(ClientError::NotFound)
+    ));
+
+    // A settled command still answers its key, whatever became of it.
+    let again = harness
+        .owner
+        .control_operator_command(
+            "task-1",
+            &operator_request(OperatorCommand::Interrupt, "interrupt-1"),
+        )
+        .await
+        .expect("retry after settling");
+    assert!(again.replayed);
+    assert_eq!(again.command.status, OperatorCommandStatus::Applied);
+
+    // Both halves are in the audit log, in order.
+    let kinds = operator_events(&harness, "task-1").await;
+    let queued_at = kinds
+        .iter()
+        .position(|kind| {
+            matches!(
+                kind,
+                TaskEventKind::OperatorCommandQueued { command_id: id, requested_by, .. }
+                    if *id == command_id && requested_by.0 == "local"
+            )
+        })
+        .expect("a queued event");
+    let resolved_at = kinds
+        .iter()
+        .position(|kind| {
+            matches!(
+                kind,
+                TaskEventKind::OperatorCommandResolved {
+                    status: OperatorCommandStatus::Applied,
+                    ..
+                }
+            )
+        })
+        .expect("a resolved event");
+    assert!(queued_at < resolved_at);
+}
+
+#[tokio::test]
+async fn a_rejection_by_the_runner_carries_its_reason() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    harness
+        .owner
+        .control_operator_command(
+            "task-1",
+            &operator_request(restart(Some("try again"), Some("failure-9")), "restart-1"),
+        )
+        .await
+        .expect("queued");
+    let polled = runner.poll(None, 0).await.expect("poll");
+    assert_eq!(
+        polled.commands[0].command,
+        restart(Some("try again"), Some("failure-9"))
+    );
+
+    runner
+        .ack_command(
+            &polled.commands[0].command_id,
+            false,
+            Some("the execution has moved on from that failure".to_string()),
+        )
+        .await
+        .expect("ack");
+
+    let command = harness.task("task-1").await.operator_commands.remove(0);
+    assert_eq!(command.status, OperatorCommandStatus::Rejected);
+    assert_eq!(
+        command.detail.as_deref(),
+        Some("the execution has moved on from that failure")
+    );
+    assert!(operator_events(&harness, "task-1")
+        .await
+        .iter()
+        .any(|kind| matches!(
+            kind,
+            TaskEventKind::OperatorCommandResolved {
+                status: OperatorCommandStatus::Rejected,
+                detail: Some(detail),
+                ..
+            } if detail.contains("moved on")
+        )));
+}
+
+#[tokio::test]
+async fn a_command_for_a_task_that_is_not_running_is_refused_at_once_with_the_reason() {
+    let harness = Harness::start().await;
+    harness.create("task-1", "k8s").await;
+    let revision = harness.task("task-1").await.revision;
+
+    let refusal = harness
+        .owner
+        .control_operator_command(
+            "task-1",
+            &operator_request(OperatorCommand::Interrupt, "interrupt-1"),
+        )
+        .await;
+    match refusal {
+        Err(ClientError::Refused { code, message }) => {
+            assert_eq!(code, "operator_command_refused");
+            assert!(message.contains("not started yet"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let task = harness.task("task-1").await;
+    assert_eq!(task.revision, revision, "nothing was written");
+    assert!(task.operator_commands.is_empty());
+
+    // An interrupted task has no runner to carry anything out, and the
+    // answer says how to get one.
+    let Running {
+        controller, epoch, ..
+    } = harness.running("task-2", "k8s").await;
+    controller
+        .report(&report(
+            "task-2",
+            epoch,
+            1,
+            Observation::WorkloadLost { state_known: true },
+            Some(1),
+        ))
+        .await
+        .expect("lost");
+    match harness
+        .owner
+        .control_operator_command(
+            "task-2",
+            &operator_request(restart(None, None), "restart-1"),
+        )
+        .await
+    {
+        Err(ClientError::Refused { code, message }) => {
+            assert_eq!(code, "operator_command_refused");
+            assert!(message.contains("start or resume"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_command_for_a_runner_that_went_silent_is_refused() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+    harness.clock.advance(Duration::minutes(10));
+
+    match harness
+        .owner
+        .control_operator_command(
+            "task-1",
+            &operator_request(OperatorCommand::Interrupt, "interrupt-1"),
+        )
+        .await
+    {
+        Err(ClientError::Refused { code, message }) => {
+            assert_eq!(code, "operator_command_refused");
+            assert!(message.contains("heard from"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(harness.task("task-1").await.operator_commands.is_empty());
+}
+
+#[tokio::test]
+async fn a_command_expecting_another_generation_is_refused() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+    let generation = harness.task("task-1").await.generation;
+    let mut request = operator_request(OperatorCommand::Interrupt, "interrupt-1");
+    request.expected_generation = Some(generation + 1);
+
+    assert_eq!(
+        refused_code(
+            harness
+                .owner
+                .control_operator_command("task-1", &request)
+                .await
+        ),
+        "stale_generation"
+    );
+
+    request.expected_generation = Some(generation);
+    harness
+        .owner
+        .control_operator_command("task-1", &request)
+        .await
+        .expect("the current generation is accepted");
+}
+
+#[tokio::test]
+async fn an_override_needs_a_reason_and_a_state_that_allows_it() {
+    let harness = Harness::start().await;
+    write_override_workflow(&harness);
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    runner
+        .snapshot(&snapshot_in(2, "locked", 5))
+        .await
+        .expect("in a state that allows no override");
+
+    let revision = harness.task("task-1").await.revision;
+    assert_eq!(
+        bad_request_code(
+            harness
+                .owner
+                .control_operator_command(
+                    "task-1",
+                    &operator_request(transition("done", true, Some("  ")), "t-1"),
+                )
+                .await
+        ),
+        "override_reason_required"
+    );
+    assert_eq!(
+        bad_request_code(
+            harness
+                .owner
+                .control_operator_command(
+                    "task-1",
+                    &operator_request(transition("done", true, None), "t-2"),
+                )
+                .await
+        ),
+        "override_reason_required"
+    );
+    assert_eq!(
+        bad_request_code(
+            harness
+                .owner
+                .control_operator_command(
+                    "task-1",
+                    &operator_request(transition("work", true, Some("go back")), "t-3"),
+                )
+                .await
+        ),
+        "override_not_allowed"
+    );
+    // Not an exit of the state either, and not a state at all.
+    assert_eq!(
+        bad_request_code(
+            harness
+                .owner
+                .control_operator_command(
+                    "task-1",
+                    &operator_request(transition("work", false, None), "t-4"),
+                )
+                .await
+        ),
+        "illegal_transition"
+    );
+    assert_eq!(
+        bad_request_code(
+            harness
+                .owner
+                .control_operator_command(
+                    "task-1",
+                    &operator_request(transition(" ", false, None), "t-5")
+                )
+                .await
+        ),
+        "missing_target"
+    );
+    assert_eq!(
+        harness.task("task-1").await.revision,
+        revision,
+        "none of them was written"
+    );
+
+    // A declared exit of the state is fine without a reason.
+    harness
+        .owner
+        .control_operator_command(
+            "task-1",
+            &operator_request(transition("done", false, None), "t-6"),
+        )
+        .await
+        .expect("a declared exit");
+
+    // In the state that allows overrides, a reason is all it takes, and it
+    // is part of the audit trail with the owner who gave it.
+    runner
+        .snapshot(&snapshot_in(3, "work", 6))
+        .await
+        .expect("in a state that allows an override");
+    harness
+        .owner
+        .control_operator_command(
+            "task-1",
+            &operator_request(
+                transition("done", true, Some("the ticket was closed")),
+                "t-7",
+            ),
+        )
+        .await
+        .expect("an override with a reason");
+    let audit = operator_events(&harness, "task-1").await;
+    assert!(audit.iter().any(|kind| matches!(
+        kind,
+        TaskEventKind::OperatorCommandQueued {
+            command: OperatorCommand::Transition { forced: true, reason: Some(reason), .. },
+            requested_by,
+            ..
+        } if reason == "the ticket was closed" && requested_by.0 == "local"
+    )));
+}
+
+#[tokio::test]
+async fn commands_nobody_took_are_rejected_once_the_task_stops_running() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    harness
+        .owner
+        .control_operator_command(
+            "task-1",
+            &operator_request(OperatorCommand::Interrupt, "interrupt-1"),
+        )
+        .await
+        .expect("queued");
+    harness
+        .command("task-1", OwnerCommand::Pause, "pause-1")
+        .await;
+
+    let polled = runner.poll(None, 0).await.expect("poll");
+
+    assert!(
+        polled.commands.is_empty(),
+        "never handed to a pausing runner"
+    );
+    let command = harness.task("task-1").await.operator_commands.remove(0);
+    assert_eq!(command.status, OperatorCommandStatus::Rejected);
+    assert!(
+        command
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("stopped running")),
+        "{command:?}"
+    );
+    assert!(operator_events(&harness, "task-1")
+        .await
+        .iter()
+        .any(|kind| matches!(
+            kind,
+            TaskEventKind::OperatorCommandResolved {
+                status: OperatorCommandStatus::Rejected,
+                ..
+            }
+        )));
+}
+
+#[tokio::test]
+async fn an_unauthenticated_request_queues_no_operator_command() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+    let raw = reqwest::Client::new()
+        .post(format!(
+            "{}/control/v1/tasks/task-1/operator-commands",
+            harness.base_url()
+        ))
+        .json(&operator_request(OperatorCommand::Interrupt, "interrupt-1"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(raw.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(harness.task("task-1").await.operator_commands.is_empty());
+}
+
+#[test]
+fn operator_commands_keep_their_wire_shape() {
+    let request: SubmitOperatorCommandRequest = serde_json::from_value(serde_json::json!({
+        "kind": "transition",
+        "target": "done",
+        "override": true,
+        "reason": "closed",
+        "idempotency_key": "k",
+        "expected_generation": 3,
+    }))
+    .expect("the documented body");
+    assert_eq!(request.command, transition("done", true, Some("closed")));
+    assert_eq!(request.expected_generation, Some(3));
+    let minimal: SubmitOperatorCommandRequest =
+        serde_json::from_value(serde_json::json!({ "kind": "interrupt", "idempotency_key": "k" }))
+            .expect("an interrupt");
+    assert_eq!(minimal.command, OperatorCommand::Interrupt);
+    assert_eq!(minimal.expected_generation, None);
 }

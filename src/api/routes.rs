@@ -79,7 +79,7 @@ use crate::conductor::{
 use crate::controller_protocol::http as protocol_http;
 use crate::controller_protocol::ProtocolError;
 use crate::domain::TaskId;
-use crate::domain::{AnsweredBy, Event, ExecutionStatus};
+use crate::domain::{Event, ExecutionStatus};
 use crate::engine::{
     build_timeline, Engine, EngineError, HumanInputDelivery, ManualTransition, Recovery, Timeline,
 };
@@ -91,28 +91,6 @@ use crate::persistence::{
 };
 use crate::tasks::{self, TaskError};
 use crate::workflows::WorkflowResolver;
-
-/// The decision provider recorded for an operator's ordinary manual choice.
-///
-/// Deliberately the same literal `src/tui/app.rs`'s `MANUAL_PROVIDER` writes:
-/// both are alternative front doors to the same append-only event log, and an
-/// operator reading it later must not be able to tell which one wrote a given
-/// manual transition from the provider string alone.
-const MANUAL_PROVIDER: &str = "human";
-
-/// The decision provider recorded for a forced override (D30). See
-/// `src/tui/app.rs`'s `OVERRIDE_PROVIDER` for why it is deliberately distinct
-/// from [`MANUAL_PROVIDER`].
-const OVERRIDE_PROVIDER: &str = "human_override";
-
-/// The reason recorded on a forced transition — same text as
-/// `src/tui/app.rs`'s `OVERRIDE_REASON`.
-const OVERRIDE_REASON: &str =
-    "Forced manual transition (override): the target state was picked by the operator.";
-
-/// The reason recorded on an ordinary manual transition — same text as
-/// `src/tui/app.rs`'s `MANUAL_REASON`.
-const MANUAL_REASON: &str = "Manual transition picked by the operator.";
 
 /// Default byte budget for a conversation read when the caller does not ask
 /// for a specific one.
@@ -1062,11 +1040,7 @@ async fn post_recover(
 
     let handle = state.engine.try_begin_recover_with(
         &execution_id,
-        Recovery {
-            comment: request.comment,
-            episode: request.episode,
-            conductor_retry: false,
-        },
+        Recovery::by_operator(request.comment, request.episode),
     )?;
     spawn_active(&state, execution_id.clone(), async move {
         let _ = handle.run_to_completion(&definition).await;
@@ -1245,23 +1219,10 @@ async fn post_transition(
     // The claim the engine takes for the transition is what keeps it from
     // racing a background pass's own appends and saves: an execution being
     // driven right now is `409`.
-    let (provider, reason) = if body.force {
-        (OVERRIDE_PROVIDER, OVERRIDE_REASON)
-    } else {
-        (MANUAL_PROVIDER, MANUAL_REASON)
-    };
     let execution = state.engine.take_manual_transition(
         &definition,
         &execution_id,
-        &ManualTransition {
-            label: body.label,
-            target: body.target,
-            force: body.force,
-            provider: provider.to_string(),
-            reason: reason.to_string(),
-            by: AnsweredBy::Operator,
-            episode: None,
-        },
+        &ManualTransition::by_operator(body.label, body.target, body.force),
     )?;
 
     Ok(Json(ExecutionSummary::from(&execution)))

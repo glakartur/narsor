@@ -63,6 +63,7 @@
 //! once, and nothing is ever re-executed to produce it.
 
 pub mod cli;
+mod commands;
 pub mod init;
 mod materials;
 pub mod preflight;
@@ -962,13 +963,17 @@ impl Session {
         }
     }
 
-    /// Acts on a poll answer: directive, input, page requests.
+    /// Acts on a poll answer: directive, input, operator commands, page
+    /// requests.
     async fn absorb(&mut self, response: RunnerPollResponse) -> Result<(), RunnerError> {
         self.link.expires_at = Some(response.credential_expires_at);
         self.learn_launch(response.launch)?;
         self.directive = response.directive;
         for input in response.inputs {
             self.deliver(input).await?;
+        }
+        for command in response.commands {
+            self.carry_out(command).await?;
         }
         for request in response.conversation_pages {
             self.serve_page(request).await;

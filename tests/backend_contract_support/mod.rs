@@ -44,11 +44,13 @@ use narsor::backends::{
 use narsor::controller_protocol::http::{controller_routes, runner_routes};
 use narsor::controller_protocol::{
     ControllerClient, CreateEnrollmentRequest, EnrollRequest, OwnerCommandRequest,
-    OwnerCommandResponse, ProtocolError, ProtocolService, LOCAL_OWNER,
+    OwnerCommandResponse, ProtocolError, ProtocolService, SubmitOperatorCommandRequest,
+    LOCAL_OWNER,
 };
 use narsor::domain::{BackendId, TaskId, TaskLaunchSpec};
 use narsor::orchestration::{
-    NewTask, Observation, OwnerCommand, OwnerRef, TaskEventKind, TaskLifecycle, TaskRecord,
+    NewTask, Observation, OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef,
+    TaskEventKind, TaskLifecycle, TaskRecord,
 };
 use narsor::persistence::paths::StatePaths;
 use tokio::sync::oneshot;
@@ -348,6 +350,17 @@ impl<T: ContractTarget> Harness<T> {
                 TaskEventKind::ControllerReported { observation, .. } => Some(observation),
                 _ => None,
             })
+            .collect()
+    }
+
+    /// Every event kind in the task's control-plane log.
+    pub fn events(&self, task: &str) -> Vec<TaskEventKind> {
+        self.service
+            .control_plane()
+            .events_since(&TaskId::parse(task).unwrap(), 0)
+            .expect("events")
+            .into_iter()
+            .map(|event| event.kind)
             .collect()
     }
 
@@ -948,6 +961,77 @@ pub async fn the_controller_never_starts_more_than_the_limit<T: ContractTarget>(
     assert_eq!(counters.workloads_created, 3, "{counters:?}");
 }
 
+/// U3: an operator command queued for a running task reaches its runner
+/// through the poll the runner already makes and comes back with the
+/// runner's verdict; a retry of its key is the same command, and a command
+/// for a task whose compute is gone is refused at once.
+pub async fn operator_commands_reach_the_runner_and_come_back_with_a_verdict<T: ContractTarget>() {
+    let Some(mut h) = Harness::<T>::new().await else {
+        return;
+    };
+    h.start_controller();
+    h.running("task-1").await;
+
+    let request = SubmitOperatorCommandRequest {
+        command: OperatorCommand::Interrupt,
+        idempotency_key: "interrupt-1".to_string(),
+        expected_generation: None,
+    };
+    let owner = OwnerRef::new(LOCAL_OWNER);
+    let queued = h
+        .service
+        .submit_operator_command(&owner, "task-1", request.clone())
+        .expect("queued for the running task");
+    let retried = h
+        .service
+        .submit_operator_command(&owner, "task-1", request)
+        .expect("a retry of the key");
+    assert!(retried.replayed);
+    assert_eq!(retried.command.command_id, queued.command.command_id);
+
+    let command_id = queued.command.command_id;
+    h.wait_for("the runner's verdict", |h| {
+        h.record("task-1")
+            .operator_command(&command_id)
+            .is_some_and(|command| command.status.is_settled())
+    })
+    .await;
+    // The contract's workflow may or may not have finished by now, so
+    // either verdict is the runner's own — but a rejection says why.
+    let command = h
+        .record("task-1")
+        .operator_command(&command_id)
+        .cloned()
+        .unwrap();
+    if command.status == OperatorCommandStatus::Rejected {
+        assert!(command.detail.is_some(), "{command:?}");
+    }
+    let events = h.events("task-1");
+    assert!(events.iter().any(|kind| matches!(
+        kind,
+        TaskEventKind::OperatorCommandQueued { command_id: id, .. } if *id == command_id
+    )));
+    assert!(events.iter().any(|kind| matches!(
+        kind,
+        TaskEventKind::OperatorCommandResolved { command_id: id, .. } if *id == command_id
+    )));
+
+    h.must("task-1", OwnerCommand::Pause, "pause-1");
+    h.wait_lifecycle("task-1", TaskLifecycle::Paused).await;
+    match h.service.submit_operator_command(
+        &owner,
+        "task-1",
+        SubmitOperatorCommandRequest {
+            command: OperatorCommand::Interrupt,
+            idempotency_key: "interrupt-2".to_string(),
+            expected_generation: None,
+        },
+    ) {
+        Err(ProtocolError::Conflict { code, .. }) => assert_eq!(code, "operator_command_refused"),
+        other => panic!("a paused task has no runner to command: {other:?}"),
+    }
+}
+
 /// Expands the whole suite for one target into a module of tests.
 macro_rules! contract_suite {
     ($module:ident, $target:ty) => {
@@ -967,7 +1051,8 @@ macro_rules! contract_suite {
                 lease_handoff_between_controllers,
                 archive_racing_start_creates_nothing,
                 parallel_tasks_are_isolated,
-                the_controller_never_starts_more_than_the_limit);
+                the_controller_never_starts_more_than_the_limit,
+                operator_commands_reach_the_runner_and_come_back_with_a_verdict);
         }
     };
     (@tests $target:ty; $($scenario:ident),* $(,)?) => {

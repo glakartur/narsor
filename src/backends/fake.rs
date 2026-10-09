@@ -328,7 +328,22 @@ impl SimulatedRunner {
                 },
             }
             directive = match self.client.poll(None, RUNNER_POLL_SECS).await {
-                Ok(response) => response.directive,
+                Ok(response) => {
+                    // The simulated workflow has long finished and runs no
+                    // engine: every operator command gets the verdict a
+                    // real runner gives one it cannot act on.
+                    for command in response.commands {
+                        let _ = self
+                            .client
+                            .ack_command(
+                                &command.command_id,
+                                false,
+                                Some("the simulated workflow has finished".to_string()),
+                            )
+                            .await;
+                    }
+                    response.directive
+                }
                 Err(ClientError::Unauthorized) => return 1,
                 Err(_) => {
                     tokio::time::sleep(RUNNER_RETRY).await;

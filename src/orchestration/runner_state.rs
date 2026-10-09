@@ -284,7 +284,11 @@ impl ControlPlane {
 }
 
 /// Refuses a runner whose launch is no longer current.
-fn fence_runner(record: &TaskRecord, incarnation: &str, launch_generation: u64) -> Result<()> {
+pub(super) fn fence_runner(
+    record: &TaskRecord,
+    incarnation: &str,
+    launch_generation: u64,
+) -> Result<()> {
     if record.lifecycle == TaskLifecycle::Archived || record.supersedes_launch(launch_generation) {
         return Err(OrchestrationError::RunnerSuperseded {
             task_id: record.task_id.clone(),

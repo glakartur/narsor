@@ -1808,6 +1808,174 @@ fn show_prints_the_conductors_summary_of_a_gate() {
 }
 
 // ---------------------------------------------------------------------------
+// Operator commands on a local task (U3)
+// ---------------------------------------------------------------------------
+
+/// Stops whatever a test left running under its root — the daemon and the
+/// runner of a task that outlives it by design — when the test ends.
+struct LocalProcesses {
+    root: PathBuf,
+}
+
+impl Drop for LocalProcesses {
+    fn drop(&mut self) {
+        let root = self.root.display().to_string();
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let command = fs::read(entry.path().join("cmdline")).unwrap_or_default();
+            let command = String::from_utf8_lossy(&command).replace('\0', " ");
+            if pid != std::process::id() && command.contains("narsor") && command.contains(&root) {
+                // SAFETY: killing a process of this test's own root; the
+                // runner leads its own process group, and so takes its
+                // harness with it.
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+/// A one-step workflow that starts a long script, and allows overrides.
+const SLOW_STEP_WORKFLOW: &str = r#"
+name: slow
+version: 1
+states:
+  slow:
+    allow_manual_override: true
+    action:
+      type: script
+      command: sh
+      args: [-c, "echo started >> \"$HOME/started\"; sleep 60; printf '{\"output\": \"done\"}'"]
+    outputs: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+/// Polls until `check` holds, for up to thirty seconds.
+fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !check() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn task_interrupt_restart_and_override_steer_the_runner_of_a_local_task() {
+    let root = TempRoot::new();
+    let _processes = LocalProcesses {
+        root: root.path().to_path_buf(),
+    };
+    fs::create_dir_all(root.path().join("workflows")).unwrap();
+    fs::write(root.path().join("workflows/slow.yaml"), SLOW_STEP_WORKFLOW).unwrap();
+    let created = cli(&root, &["task", "create", "slow", "--task-id", "t-slow"]);
+    assert_eq!(created.code, EXIT_SUCCESS, "{}", created.output());
+    let started = root
+        .path()
+        .join("local-controller/storage/t-slow/home/started");
+    let started_runs = || {
+        fs::read_to_string(&started)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    };
+    wait_for("the step to start", || started_runs() == 1);
+    wait_for("the task to be running", || {
+        cli(&root, &["task", "show", "t-slow"])
+            .stdout
+            .contains("Lifecycle  running")
+    });
+
+    // The CLI waits for the runner's verdict: success means it was carried out.
+    let interrupted = cli(&root, &["task", "interrupt", "t-slow"]);
+    assert_eq!(interrupted.code, EXIT_SUCCESS, "{}", interrupted.output());
+    assert!(
+        interrupted.stdout.contains("carried out"),
+        "{}",
+        interrupted.stdout
+    );
+
+    // Nothing runs now, and the runner says so as a failure.
+    let again = cli(&root, &["task", "interrupt", "t-slow"]);
+    assert_eq!(again.code, EXIT_FAILURE, "{}", again.output());
+    assert!(
+        again.output().contains("nothing to interrupt"),
+        "{}",
+        again.output()
+    );
+
+    let restarted = cli(
+        &root,
+        &["task", "restart-step", "t-slow", "--note", "be careful"],
+    );
+    assert_eq!(restarted.code, EXIT_SUCCESS, "{}", restarted.output());
+    wait_for("the step to run again", || started_runs() == 2);
+
+    // An override needs its reason, and the audit trail keeps it.
+    let interrupted = cli(&root, &["task", "interrupt", "t-slow"]);
+    assert_eq!(interrupted.code, EXIT_SUCCESS, "{}", interrupted.output());
+    let unexplained = cli(
+        &root,
+        &["task", "transition", "t-slow", "completed", "--override"],
+    );
+    assert_eq!(unexplained.code, EXIT_FAILURE, "{}", unexplained.output());
+    assert!(
+        unexplained.output().contains("reason"),
+        "{}",
+        unexplained.output()
+    );
+    let overridden = cli(
+        &root,
+        &[
+            "task",
+            "transition",
+            "t-slow",
+            "completed",
+            "--override",
+            "--reason",
+            "ticket closed upstream",
+        ],
+    );
+    assert_eq!(overridden.code, EXIT_SUCCESS, "{}", overridden.output());
+
+    let events = cli(&root, &["task", "events", "t-slow"]);
+    assert_eq!(events.code, EXIT_SUCCESS, "{}", events.output());
+    assert!(
+        events
+            .stdout
+            .contains("override transition to 'completed' (reason: ticket closed upstream)"),
+        "{}",
+        events.stdout
+    );
+    assert!(
+        events.stdout.contains("queued by local"),
+        "{}",
+        events.stdout
+    );
+    assert!(
+        events.stdout.contains("command-5 Applied"),
+        "{}",
+        events.stdout
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Remote tasks through the control plane (U8)
 // ---------------------------------------------------------------------------
 

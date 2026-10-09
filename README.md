@@ -677,6 +677,9 @@ narsor task move <task> --before|--after <other> | --top | --bottom   # reorder 
 narsor task show <task>                       # observations with their age, timeline, conversation
 narsor task pause|resume|start|archive <task> # archive deletes the workload and its storage
 narsor task input <task> --field reason=ok    # answer the input the runner waits for
+narsor task interrupt <task>                      # cut short the step the runner works on
+narsor task transition <task> <state> [--override --reason <why>]   # manual transition; an override is audited
+narsor task restart-step <task> [--note <text>] [--failure-key K]   # run the failed or interrupted step again
 narsor task conversation <task> [<attempt>]   # read through the control plane
 narsor task watch                             # follow every task's events
 narsor tui --remote                           # the remote tasks mode of the interface

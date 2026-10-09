@@ -242,6 +242,47 @@ pub enum OrchestrationError {
         lifecycle: TaskLifecycle,
     },
 
+    /// An operator command cannot be queued for the task's runner right now.
+    #[error("task '{task_id}' cannot take an operator command: {reason}")]
+    OperatorCommandRefused {
+        /// The task.
+        task_id: TaskId,
+        /// Why, for the owner.
+        reason: String,
+    },
+
+    /// An operator command idempotency key was reused for another command.
+    #[error(
+        "operator command idempotency key '{key}' of task '{task_id}' was already used for \
+         another command"
+    )]
+    OperatorCommandKeyReused {
+        /// The task.
+        task_id: TaskId,
+        /// The reused key.
+        key: String,
+    },
+
+    /// No operator command with this id exists.
+    #[error("task '{task_id}' has no operator command '{command_id}'")]
+    OperatorCommandNotFound {
+        /// The task.
+        task_id: TaskId,
+        /// The command id.
+        command_id: String,
+    },
+
+    /// The operator command was already settled differently.
+    #[error("operator command '{command_id}' of task '{task_id}' is already {status:?}")]
+    OperatorCommandAlreadySettled {
+        /// The task.
+        task_id: TaskId,
+        /// The command id.
+        command_id: String,
+        /// Its settled status.
+        status: super::model::OperatorCommandStatus,
+    },
+
     /// A controller tried to accept the start of a queued task the
     /// scheduler has not admitted (U10): only a task holding a capacity
     /// reservation may be started.

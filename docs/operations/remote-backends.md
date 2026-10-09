@@ -453,6 +453,18 @@ any state ─▶ Archiving ─▶ Archived
   their place in the list. Nothing running is ever preempted. Tasks stored by
   an older version, which had a `priority`, are numbered once from the old
   order (priority, then creation) the first time the control plane reads them.
+* `interrupt`, `transition` and `restart-step` are operator commands for the
+  runner of a `Running` task (`POST /control/v1/tasks/:id/operator-commands`).
+  They are queued as events (`OperatorCommandQueued`), handed to the runner by
+  its poll until it acknowledges, carried out by the runner under the Engine's
+  own claim on the execution, and settled with `OperatorCommandResolved`
+  (applied, or rejected with the reason). A command for a task that is not
+  `Running`, whose runner is silent, or whose generation moved on is refused
+  at once. A `transition` names a state a declared transition leads to; an
+  override (any state) needs the current state's `allow_manual_override` and a
+  `--reason`, which is recorded with the owner in the task's events. The CLI
+  waits for the verdict and, past `--wait-secs`, reports the command as
+  queued.
 * A queued task shows why it waits: `waiting for capacity` (position,
   slots in use / limit), `controller offline` (no controller holds the lease),
   `backend unknown`, or `admitted` (starting).
@@ -477,6 +489,9 @@ narsor task show <task>
 narsor task pause|resume|start|archive <task> [--expected-generation N]
 narsor task move <task> --before <other> | --after <other> | --top | --bottom
 narsor task input <task> --field reason=ok [--label approved] [--comment …]
+narsor task interrupt <task> [--wait-secs N]
+narsor task transition <task> <state> [--override --reason <why>] [--wait-secs N]
+narsor task restart-step <task> [--note <text>] [--failure-key K] [--wait-secs N]
 narsor task conversation <task> [<attempt>] [--from N]
 narsor task events <task> [--follow]
 narsor task watch [--cursor C]               # every task, reconnecting from the cursor
