@@ -71,6 +71,7 @@ pub mod layout;
 pub mod list;
 pub mod notify;
 pub mod tabs;
+pub mod waiting;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -91,6 +92,7 @@ use super::scroll::sanitize;
 use detail::TaskDetail;
 use list::{title_of, MoveRequest, Removal, TaskList};
 use notify::{Notifier, Severity};
+use waiting::AnswerRequest;
 
 /// Where the keyboard is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,12 +247,14 @@ pub(super) struct DetailView<'a> {
 }
 
 /// What a key asked for that needs the API.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     /// Nothing.
     None,
     /// Put a queued task elsewhere in the queue.
     Move(MoveRequest),
+    /// Send what the answer panel's operator chose.
+    Answer(Box<AnswerRequest>),
 }
 
 /// A fresh key for a command that must not run twice (an owner command, an
@@ -271,7 +275,11 @@ pub struct TaskApp {
     focus: Focus,
     detail: DetailState,
     help_open: bool,
+    /// The keyboard is on the answer panel at the bottom of the details.
+    panel_focus: bool,
     quit: bool,
+    /// `q` found an unsent draft and asked; the next `q` leaves.
+    quit_confirm: bool,
     /// Failed reconnects in a row, to estimate the countdown in the header.
     stream_failures: u32,
     /// The stream ended for good: no reconnect will come.
@@ -297,7 +305,9 @@ impl TaskApp {
             focus: Focus::List,
             detail: DetailState::new(),
             help_open: false,
+            panel_focus: false,
             quit: false,
+            quit_confirm: false,
             stream_failures: 0,
             stream_ended: false,
         }
@@ -382,6 +392,14 @@ impl TaskApp {
 
     /// The context whose keys apply now.
     pub fn key_context(&self) -> Context {
+        if self.panel_focused() {
+            // Typing into a field: `q` and `?` are text, not commands.
+            return if self.panel_typing() {
+                Context::Form
+            } else {
+                Context::Panel
+            };
+        }
         layout::context_of(self.focus, &self.list)
     }
 
@@ -411,13 +429,17 @@ impl TaskApp {
             self.help_open = false;
             return Request::None;
         }
+        let confirming_quit = std::mem::take(&mut self.quit_confirm);
+        if self.panel_focused() {
+            return self.on_panel_key(key, confirming_quit);
+        }
         let context = self.key_context();
         let Some(action) = keymap::lookup(context, &key) else {
             return Request::None;
         };
         match action {
             Action::Help => self.help_open = true,
-            Action::Quit => self.quit = true,
+            Action::Quit => self.on_quit(confirming_quit),
             Action::Down | Action::Up | Action::Top | Action::Bottom => {
                 self.on_cursor(context, action)
             }
@@ -436,12 +458,12 @@ impl TaskApp {
                     self.notify(Severity::Warning, "żadne zadanie nie czeka na Ciebie");
                 }
             }
-            Action::Open => {
-                if self.list.selected().is_some() {
-                    self.focus = Focus::Details;
-                }
+            Action::Open => self.open_selected(),
+            Action::SwitchFocus if context == Context::Details => self.focus_panel(),
+            Action::Back => {
+                self.focus = Focus::List;
+                self.panel_focus = false;
             }
-            Action::Back => self.focus = Focus::List,
             Action::ToggleDone => self.list.toggle_hide_done(),
             Action::PrevTab => self.detail.tab = self.detail.tab.shifted(-1),
             Action::NextTab => self.detail.tab = self.detail.tab.shifted(1),
@@ -454,6 +476,20 @@ impl TaskApp {
             _ => {}
         }
         Request::None
+    }
+
+    /// `q`: leaves, unless an unsent draft asks first — then a second `q`
+    /// leaves and any other key stays.
+    fn on_quit(&mut self, confirmed: bool) {
+        if confirmed || !self.detail.has_drafts() {
+            self.quit = true;
+        } else {
+            self.quit_confirm = true;
+            self.notify(
+                Severity::Warning,
+                "niewysłany szkic — q ponownie wychodzi, inny klawisz zostaje",
+            );
+        }
     }
 
     fn on_cursor(&mut self, context: Context, action: Action) {
@@ -567,6 +603,7 @@ impl TaskApp {
         match request {
             Request::None => {}
             Request::Move(request) => self.move_task(request).await,
+            Request::Answer(request) => self.answer(*request).await,
         }
     }
 
@@ -589,13 +626,13 @@ impl TaskApp {
                 };
                 let anchor = match &request.target {
                     MoveTarget::Before(_) | MoveTarget::After(_) => {
-                        format!(" {}", clean(&request.anchor_title))
+                        format!(" {}", request.anchor_title)
                     }
                     _ => String::new(),
                 };
                 self.notify(
                     Severity::Success,
-                    format!("{}: przesunięto {how}{anchor}", clean(&request.title)),
+                    format!("{}: przesunięto {how}{anchor}", request.title),
                 );
             }
             Err(error) => {
@@ -611,7 +648,7 @@ impl TaskApp {
                     Severity::Error,
                     format!(
                         "{}: przesunięcie odrzucone — {}{tail}",
-                        clean(&request.title),
+                        request.title,
                         move_failure_reason(&error)
                     ),
                 );
@@ -662,6 +699,7 @@ impl TaskApp {
         let removal = self.list.replace(listing.tasks);
         self.detail.retain(self.list.tasks());
         self.detail.invalidate();
+        self.sync_waiting();
         self.announce(removal);
     }
 
@@ -678,13 +716,13 @@ impl TaskApp {
                     .iter()
                     .find(|task| task.task_id.as_str() == id)
             })
-            .map(|task| format!(" — zaznaczono {}", clean(&title_of(task))))
+            .map(|task| format!(" — zaznaczono {}", title_of(task)))
             .unwrap_or_default();
         self.notify(
             Severity::Warning,
             format!(
                 "{}: zniknęło z listy (zarchiwizowane){moved_to}",
-                clean(&removal.title)
+                removal.title
             ),
         );
     }
@@ -734,6 +772,7 @@ impl TaskApp {
                 if effect.refresh {
                     self.schedule.request(now);
                 }
+                self.sync_waiting();
                 self.announce(effect.removal);
             }
             Some(Err(error)) if is_transport(&error) => {

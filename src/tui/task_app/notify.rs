@@ -66,7 +66,7 @@ impl Notifier {
     /// server is made safe and put on one line.
     pub fn push(&mut self, severity: Severity, text: impl AsRef<str>, now: Instant) {
         self.current = Some(Notification {
-            text: sanitize(text.as_ref()).replace('\n', " "),
+            text: crate::domain::display::without_unsafe_chars(&sanitize(text.as_ref()).replace('\n', " ")),
             severity,
             at: now,
         });

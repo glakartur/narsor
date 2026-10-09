@@ -756,6 +756,20 @@ pub static BINDINGS: &[Binding] = &[
         "",
         "następne oczekiwanie zadania",
     ),
+    bind(
+        Context::Panel,
+        Key::char('g'),
+        Action::Top,
+        "",
+        "przewiń kontekst oczekiwania na początek",
+    ),
+    bind(
+        Context::Panel,
+        Key::char('G'),
+        Action::Bottom,
+        "",
+        "przewiń kontekst oczekiwania na koniec",
+    ),
     // The action menu.
     bind(
         Context::Menu,

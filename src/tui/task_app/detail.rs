@@ -28,11 +28,13 @@
 //! error included — without a server. A failed read stays in its tab; only an
 //! unreachable server counts against the connection.
 //!
-//! # For the answer panel (U10)
+//! # The answer panel (U10)
 //!
 //! [`areas`] takes the height of the panel and returns where it goes; the tab
-//! content gives up that many rows at the bottom. [`render`] calls it with no
-//! panel today.
+//! content gives up that many rows at the bottom. [`render`] asks
+//! [`super::waiting::WaitingPanel::preferred_height`] for it and draws the
+//! panel there; the conductor's state, which a failed step and a proposal are
+//! made of, is read with the other tabs' data ([`DetailRead::Conductor`]).
 
 use std::num::NonZeroU16;
 
@@ -45,7 +47,8 @@ use ratatui::Frame;
 
 use crate::api::ClientError;
 use crate::controller_protocol::{
-    ExecutionEventsQuery, ExecutionEventsResponse, TaskSummary, TimelineResponse,
+    ConductorReadResponse, ExecutionEventsQuery, ExecutionEventsResponse, TaskSummary,
+    TimelineResponse,
 };
 use crate::domain::display::{safe_link_url, DisplayLink, EMPTY_LINK_TEXT};
 use crate::domain::ExecutionStatus;
@@ -60,6 +63,7 @@ use super::tabs::events::{self, Events};
 use super::tabs::info::{self, Info};
 use super::tabs::progress::{self, Progress};
 use super::tabs::failure_text;
+use super::waiting::WaitingPanel;
 use super::{DetailTab, Focus, TaskApp};
 
 /// Everything the details of one task remember.
@@ -70,6 +74,8 @@ pub struct TaskDetail {
     conversation: Conversation,
     events: Events,
     info: Info,
+    /// The answer panel at the bottom (U10).
+    pub(super) waiting: WaitingPanel,
 }
 
 impl TaskDetail {
@@ -81,7 +87,13 @@ impl TaskDetail {
             conversation: Conversation::new(task_id),
             events: Events::default(),
             info: Info::default(),
+            waiting: WaitingPanel::default(),
         }
+    }
+
+    /// The answer panel.
+    pub fn waiting(&self) -> &WaitingPanel {
+        &self.waiting
     }
 
     /// *Przebieg*.
@@ -114,6 +126,7 @@ impl TaskDetail {
         self.progress.invalidate();
         self.attempts.invalidate();
         self.events.invalidate();
+        self.waiting.invalidate();
     }
 
     /// What a key does in `tab`. Cursors, scroll positions and modes live
@@ -173,6 +186,8 @@ pub enum DetailRead {
         /// The answer.
         result: Result<AttemptRead, ClientError>,
     },
+    /// The conductor's state: a failed step's diagnosis, the proposals.
+    Conductor(Result<ConductorReadResponse, ClientError>),
 }
 
 /// Where the details of a task can be read from at all.
@@ -306,6 +321,7 @@ impl TaskApp {
             DetailRead::Timeline(result) => {
                 let result = self.settle(result);
                 self.detail.view_mut(task_id).progress.apply(revision, result);
+                self.reread_waiting(task_id);
             }
             DetailRead::Events { after, result } => {
                 let result = self.settle(result);
@@ -322,6 +338,7 @@ impl TaskApp {
                     .attempts
                     .apply(&attempt_id, revision, from, result);
             }
+            DetailRead::Conductor(result) => self.apply_conductor_read(task_id, revision, result),
         }
     }
 
@@ -329,7 +346,7 @@ impl TaskApp {
     /// reached counts against the connection: a `503` with a reason is the
     /// relay missing its deadline (the connection is fine), and a refusal is
     /// an answer.
-    fn settle<T>(&mut self, result: Result<T, ClientError>) -> Result<T, String> {
+    pub(super) fn settle<T>(&mut self, result: Result<T, ClientError>) -> Result<T, String> {
         result.map_err(|error| {
             if matches!(error, ClientError::Unavailable(_) | ClientError::Server(_)) {
                 self.note_transport(&error);
@@ -357,6 +374,7 @@ impl TaskApp {
             let result = client.control_timeline(&id).await;
             self.on_detail_read(&id, revision, DetailRead::Timeline(result));
         }
+        self.sync_conductor(&id, revision).await;
         match tab {
             DetailTab::Progress => {
                 let attempt = self
@@ -465,7 +483,8 @@ struct LinkSpot {
 
 /// Draws the details of the selected task into `area`.
 pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles, stale: bool) {
-    let focused = app.focus() == Focus::Details;
+    let panel_focused = app.panel_focused();
+    let focused = app.focus() == Focus::Details && !panel_focused;
     let hyperlinks = app.detail().hyperlinks();
     let Some(view) = app.detail_view() else {
         frame.render_widget(
@@ -474,7 +493,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         );
         return;
     };
-    let parts = areas(area, 0);
+    let panel_height = view.detail.waiting.preferred_height(area.width, area.height);
+    let parts = areas(area, panel_height);
 
     let (lines, spots) = header(view.task, view.queue_place, &view.detail.progress, styles, stale, area.width);
     frame.render_widget(Paragraph::new(lines), parts.header);
@@ -520,6 +540,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         (DetailTab::Info, _) => {
             info::render(frame, content, styles, &mut view.detail.info, view.task, stale);
         }
+    }
+    if let Some(panel) = parts.panel {
+        view.detail
+            .waiting
+            .render(frame, panel, styles, panel_focused, stale, view.task.as_of);
     }
 }
 

@@ -158,6 +158,26 @@ impl ChooserField {
         self.cursor = self.value.chars().count();
     }
 
+    /// Takes over what the operator did to `from`, the same field of an
+    /// earlier build of the entry: the value as it stands (and whether it is
+    /// still the conductor's), the cursor and the complaint. A field whose
+    /// value the operator never touched is left as the new build has it.
+    pub fn carry_over(&mut self, from: &ChooserField) {
+        if from.proposed {
+            return;
+        }
+        self.value = from.value.clone();
+        self.cursor = from.cursor;
+        self.proposed = false;
+        self.error = from.error.clone();
+    }
+
+    /// Whether the operator wrote something here that is not sent yet: a
+    /// text value that is not blank and not the conductor's untouched one.
+    pub fn is_drafted(&self) -> bool {
+        !matches!(self.kind, FieldKind::Select(_)) && !self.proposed && !self.is_blank()
+    }
+
     /// What is in the field.
     pub fn value(&self) -> &str {
         &self.value
@@ -438,6 +458,82 @@ impl Chooser {
             .get(index)
             .map(|item| item.fields.as_slice())
             .unwrap_or_default()
+    }
+
+    /// The same chooser over new `items`, as when what an entry offers became
+    /// known after it was first built. What the operator typed carries over to
+    /// the fields that are still there (by entry label and field name), the
+    /// highlighted entry is the same one when it still exists, and the focus
+    /// stays where it was.
+    pub fn rebuilt(mut self, mut items: Vec<ChooserItem>) -> Self {
+        let label = self.selected_item().map(|item| item.label.clone());
+        for item in &mut items {
+            let Some(old) = self.items.iter().find(|old| old.label == item.label) else {
+                continue;
+            };
+            for field in &mut item.fields {
+                if let Some(earlier) = old.fields.iter().find(|earlier| earlier.name == field.name) {
+                    field.carry_over(earlier);
+                }
+            }
+        }
+        let selected = label
+            .and_then(|label| items.iter().position(|item| item.label == label))
+            .unwrap_or_else(|| self.selected.min(items.len().saturating_sub(1)));
+        let focus = self.focus;
+        let field = self.field;
+        let scroll = self.description_scroll;
+        self.items = items;
+        self.selected = selected;
+        self.description_scroll = scroll;
+        let kept = self.field.min(self.field_count().saturating_sub(1));
+        self.focus = if self.field_count() == 0 { ChooserFocus::Actions } else { focus };
+        self.field = if self.focus == ChooserFocus::Fields { field.min(kept) } else { 0 };
+        self
+    }
+
+    /// What the operator wrote in any entry and has not sent: `name: value`
+    /// lines, entry by entry. Empty when nothing is drafted.
+    pub fn draft_text(&self) -> String {
+        let mut lines = Vec::new();
+        for item in &self.items {
+            for field in item.fields.iter().filter(|field| field.is_drafted()) {
+                lines.push(format!("{} / {}: {}", item.label, field.name, field.value));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// How many rows [`render`] would like for a `width`-column area: the
+    /// list and the description (beside each other when wide, stacked when
+    /// narrow) and the fields of the highlighted entry under them.
+    pub fn preferred_height(&self, width: u16) -> u16 {
+        let list = self.items.len() as u16 + 2;
+        let top = if width >= SIDE_BY_SIDE_MIN_WIDTH {
+            list.max(5)
+        } else {
+            list + 4
+        };
+        top + self.field_rows()
+    }
+
+    /// The rows the fields of the highlighted entry take.
+    fn field_rows(&self) -> u16 {
+        let Some(item) = self.selected_item() else {
+            return 0;
+        };
+        let rows: usize = item
+            .fields
+            .iter()
+            .map(|field| {
+                let value_rows = match field.kind {
+                    FieldKind::Select(_) => 1,
+                    _ => field.value.split('\n').count().max(1),
+                };
+                1 + value_rows + usize::from(field.error.is_some())
+            })
+            .sum();
+        rows as u16
     }
 
     /// Highlights entry `index`, if there is one. The fields keep their
