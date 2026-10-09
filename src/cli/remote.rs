@@ -39,7 +39,7 @@ use crate::orchestration::{
 };
 use crate::persistence::StatePaths;
 use crate::tui::conversation::classify;
-use crate::tui::remote::{
+use super::task_text::{
     age, awaiting_input, command_outcome, conversation_lines, default_backend_line, detail_lines,
     lifecycle_name, status_badge, PAGE_BYTE_BUDGET,
 };

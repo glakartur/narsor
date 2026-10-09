@@ -22,11 +22,11 @@ pub mod progress;
 
 use crate::api::ClientError;
 
-use super::move_failure_reason;
+use super::failure_reason;
 
 /// A failed read in words for a tab: the server's own reason when it gave
 /// one. A `503` with a reason (`Degraded`) is the relay missing its deadline
 /// and says nothing against the connection, so it lands here and nowhere else.
 pub fn failure_text(error: &ClientError) -> String {
-    move_failure_reason(error)
+    failure_reason(error)
 }

@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::engine::AgentDefaults;
-use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
+use crate::persistence::StatePaths;
 
 use super::cascade::{CascadeError, ConfigCascade, Resolution};
 use super::file::{self, FileError, FileValues};
@@ -229,19 +229,9 @@ impl Resolved {
         self.root_of(SettingKey::WorkDir)
     }
 
-    /// The catalogue layout in force.
-    pub fn catalog_paths(&self) -> CatalogPaths {
-        CatalogPaths::new(self.catalog_dir())
-    }
-
     /// The state layout in force.
     pub fn state_paths(&self) -> StatePaths {
         StatePaths::new(self.state_dir())
-    }
-
-    /// The work layout in force.
-    pub fn work_paths(&self) -> WorkPaths {
-        WorkPaths::new(self.work_dir())
     }
 
     /// One of the three roots, which are all paths.

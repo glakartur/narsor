@@ -112,11 +112,6 @@ impl ScrollState {
         self.set_offset(self.offset, total_lines);
     }
 
-    /// Whether the final logical line is visible at the bottom of the view.
-    pub fn is_at_bottom(&self, total_lines: usize) -> bool {
-        self.offset >= self.max_offset(total_lines)
-    }
-
     /// The last legal offset for `total_lines` lines in the current viewport.
     fn max_offset(&self, total_lines: usize) -> usize {
         total_lines.saturating_sub(self.viewport.max(1))
@@ -130,53 +125,6 @@ impl ScrollState {
         let max_offset = max_offset as isize;
         let next = (self.offset as isize + delta).clamp(0, max_offset.max(0));
         self.offset = next as usize;
-    }
-
-    /// One item down in a list of `total_items` distinct, individually
-    /// addressable items — a **selection cursor**, not a scroll viewport.
-    ///
-    /// Use this (never `line_down`) for a widget that picks one item out of
-    /// a list — the task view's axis (one position per row) and its content
-    /// pane's per-entry cursor (one conversation entry or event per row) —
-    /// rather than scrolls through wrapped text. `line_down`'s clamp is
-    /// `total_lines.saturating_sub(viewport)`, which collapses to `0` the
-    /// moment the list is shorter than the viewport (true for almost every
-    /// real timeline: a handful of positions against a pane many rows
-    /// tall) and freezes the cursor at the first item forever. A selection
-    /// cursor must be able to reach every index, `0` through
-    /// `total_items - 1`, regardless of how much of the pane it fills;
-    /// keeping the selected row on screen as it moves past what currently
-    /// fits is the renderer's job (see `render_task_axis`/
-    /// `render_task_content` in `src/tui/views.rs`), not this state's.
-    pub fn select_down(&mut self, total_items: usize) {
-        self.clamp_to(1, total_items.saturating_sub(1));
-    }
-
-    /// One item up — see [`Self::select_down`].
-    pub fn select_up(&mut self, total_items: usize) {
-        self.clamp_to(-1, total_items.saturating_sub(1));
-    }
-
-    /// A viewport's height of items down — see [`Self::select_down`].
-    pub fn select_page_down(&mut self, total_items: usize) {
-        let step = self.viewport.max(1) as isize;
-        self.clamp_to(step, total_items.saturating_sub(1));
-    }
-
-    /// A viewport's height of items up — see [`Self::select_down`].
-    pub fn select_page_up(&mut self, total_items: usize) {
-        let step = self.viewport.max(1) as isize;
-        self.clamp_to(-step, total_items.saturating_sub(1));
-    }
-
-    /// Selects the first item — see [`Self::select_down`].
-    pub fn select_first(&mut self) {
-        self.offset = 0;
-    }
-
-    /// Selects the last of `total_items` items — see [`Self::select_down`].
-    pub fn select_last(&mut self, total_items: usize) {
-        self.offset = total_items.saturating_sub(1);
     }
 }
 
@@ -372,50 +320,4 @@ mod tests {
         assert_eq!(scroll.offset(), 5);
     }
 
-    /// Reproduces the bug this test was written against: a selection
-    /// cursor over a short list (fewer items than the viewport) must still
-    /// be able to reach every index — `line_down`'s scroll-viewport clamp
-    /// would freeze it at `0` here, since `3 <= viewport`.
-    #[test]
-    fn select_down_reaches_every_index_even_when_the_list_is_shorter_than_the_viewport() {
-        let mut scroll = ScrollState::new(); // default viewport is 20
-        assert_eq!(scroll.offset(), 0);
-
-        scroll.select_down(3);
-        assert_eq!(scroll.offset(), 1);
-        scroll.select_down(3);
-        assert_eq!(scroll.offset(), 2);
-        // Clamped at the last index, not the viewport-relative one.
-        scroll.select_down(3);
-        assert_eq!(scroll.offset(), 2);
-
-        scroll.select_up(3);
-        assert_eq!(scroll.offset(), 1);
-        scroll.select_up(3);
-        assert_eq!(scroll.offset(), 0);
-        scroll.select_up(3);
-        assert_eq!(scroll.offset(), 0, "cannot select before the first item");
-    }
-
-    #[test]
-    fn select_last_and_select_first_jump_to_the_list_bounds() {
-        let mut scroll = ScrollState::new();
-        scroll.select_last(5);
-        assert_eq!(scroll.offset(), 4);
-        scroll.select_first();
-        assert_eq!(scroll.offset(), 0);
-        // An empty list has no last index to jump to.
-        scroll.select_last(0);
-        assert_eq!(scroll.offset(), 0);
-    }
-
-    #[test]
-    fn select_page_down_and_up_step_by_the_viewport_but_still_clamp_to_the_list() {
-        let mut scroll = ScrollState::new();
-        scroll.set_viewport(5);
-        scroll.select_page_down(3);
-        assert_eq!(scroll.offset(), 2, "clamped to the last of only 3 items");
-        scroll.select_page_up(3);
-        assert_eq!(scroll.offset(), 0);
-    }
 }

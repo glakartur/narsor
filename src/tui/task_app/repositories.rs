@@ -34,7 +34,7 @@ use super::super::style::{Role, Styles};
 use super::actions::{chooser_context, Confirmation, Confirmed, Overlay};
 use super::list::one_line;
 use super::notify::Severity;
-use super::{clean, move_failure_reason, Focus, Request, TaskApp, View};
+use super::{clean, failure_reason, Focus, Request, TaskApp, View};
 
 /// The key the unsent data of the form is kept under in
 /// [`DetailState::set_draft`](super::DetailState::set_draft); not a task id.
@@ -247,7 +247,7 @@ impl TaskApp {
                     Severity::Error,
                     format!(
                         "repozytoria: nie udało się wczytać listy ({})",
-                        move_failure_reason(&error)
+                        failure_reason(&error)
                     ),
                 );
             }
@@ -420,7 +420,7 @@ impl TaskApp {
                 if !shown {
                     self.notify(
                         Severity::Error,
-                        format!("dodanie repozytorium: {}", move_failure_reason(&error)),
+                        format!("dodanie repozytorium: {}", failure_reason(&error)),
                     );
                 }
             }
@@ -451,7 +451,7 @@ impl TaskApp {
                     format!(
                         "usunięcie repozytorium {}: {}",
                         clean(id),
-                        move_failure_reason(&error)
+                        failure_reason(&error)
                     ),
                 );
             }

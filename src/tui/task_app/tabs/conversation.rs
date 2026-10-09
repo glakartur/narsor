@@ -7,11 +7,11 @@
 //! in the tab, not in the connection. An attempt is read once and then only
 //! from the entry it stopped at ([`Attempts::from`]).
 //!
-//! Entries are the transcript model of [`crate::tui::transcript`]: the old
-//! task view's entry projection ([`agent_transcript_entry`]), the same
-//! sanitisation, the same raw view. Only the colours differ — they come from
-//! [`Styles::chat_header`] and [`Styles::chat_body`], the conversation scale of
-//! the role module.
+//! Entries are the transcript model of [`crate::tui::transcript`]: an
+//! entry is projected by [`agent_transcript_entry`], with the same
+//! sanitisation and the same raw view as the conductor's chat. The colours come
+//! from [`Styles::chat_header`] and [`Styles::chat_body`], the conversation
+//! scale of the role module.
 
 use std::collections::BTreeMap;
 
@@ -23,8 +23,8 @@ use ratatui::Frame;
 use crate::api::{ApiClient, ClientError, ConversationResponse as Page};
 use crate::controller_protocol::ConversationPageQuery;
 use crate::engine::{ConversationState, Position};
-use crate::tui::app::agent_transcript_entry;
-use crate::tui::conversation::classify;
+
+use crate::tui::conversation::{agent_transcript_entry, classify};
 use crate::tui::keymap::Action;
 use crate::tui::style::{Role, Styles};
 use crate::tui::transcript::{

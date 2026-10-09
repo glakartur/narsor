@@ -23,7 +23,7 @@ use crate::controller_protocol::{
     ConversationUnavailableReason, ExecutionEventsResponse, ExecutionEventsSource,
 };
 use crate::domain::Event;
-use crate::tui::app::{event_detail_lines, event_line};
+use crate::tui::event_text::{event_detail_lines, event_line};
 use crate::tui::keymap::Action;
 use crate::tui::scroll::sanitize;
 use crate::tui::style::{Role, Styles};

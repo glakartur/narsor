@@ -548,9 +548,7 @@ fn equivalent_harness_messages_have_the_same_rendered_contract() {
 mod conductor_chat {
     use narsor::conductor::{ChatAuthor, ChatEntry, ChatEntryKind};
     use narsor::domain::Confidence;
-    use narsor::tui::chat::{
-        chat_item_lines, chat_items, ChatActionTarget, ChatPanel, ProposalState, UndoState,
-    };
+    use narsor::tui::chat::{chat_items, tab_entry, ProposalState, UndoState};
     use narsor::tui::transcript::TranscriptPresentation;
     use serde_json::{json, Value};
 
@@ -606,9 +604,9 @@ mod conductor_chat {
         assert_eq!(items[0].open_proposal(), Some(open.id.as_str()));
         assert_eq!(items[0].label.as_deref(), Some("approved"));
         assert_eq!(items[0].confidence, Some(Confidence::High));
-        let lines = chat_item_lines(&items[0]);
-        assert!(lines.iter().any(|line| line.contains("(proposal, open)")));
-        assert!(lines.iter().any(|line| line.contains("why: It is ready.")));
+        let lines = tab_entry(&items[0], None).rendered_lines;
+        assert!(lines.iter().any(|line| line.contains("(propozycja: czeka na Ciebie")));
+        assert!(lines.iter().any(|line| line.contains("dlaczego: It is ready.")));
 
         let rejected = entry(
             2,
@@ -647,113 +645,36 @@ mod conductor_chat {
         );
         let items = chat_items(&[choice(1), undone]);
         assert_eq!(items[0].undo, Some(UndoState::Undone));
-        assert!(chat_item_lines(&items[0])
+        assert!(tab_entry(&items[0], None)
+            .rendered_lines
             .iter()
-            .any(|line| line.contains("(undone)")));
+            .any(|line| line.contains("(decyzja cofnięta)")));
     }
 
     #[test]
-    fn the_panel_appends_only_newer_entries_and_keeps_its_draft() {
-        let mut panel = ChatPanel {
-            draft: "half a message".to_string(),
-            ..ChatPanel::default()
-        };
-        panel.append(vec![proposal(1), choice(2)]);
-        assert_eq!(panel.selected, 1, "the selection follows the end");
-        panel.append(vec![choice(2), proposal(3)]);
-        assert_eq!(panel.entries.len(), 3, "an entry held already is skipped");
-        assert_eq!(panel.last_sequence(), 3);
-        assert_eq!(panel.draft, "half a message");
-
-        panel.selected = 1;
-        assert!(panel.ask_undo());
-        let undo = panel.undo.as_ref().expect("the confirmation");
-        assert_eq!(undo.label.as_deref(), Some("implemented"));
-        assert_eq!(undo.confidence, Some(Confidence::Low));
-        assert_eq!(undo.rationale.as_deref(), Some("One answer says so."));
-        panel.undo = None;
-        panel.selected = 0;
-        assert!(!panel.ask_undo(), "a proposal is no decision to undo");
-    }
-
-    #[test]
-    fn conductor_transcript_keeps_operator_and_agent_presentation() {
-        let mut panel = ChatPanel::default();
-        panel.append(vec![
-            entry(
-                1,
-                ChatAuthor::Operator,
-                ChatEntryKind::Message,
-                "please check",
-                json!({}),
-            ),
-            entry(
-                2,
-                ChatAuthor::Conductor,
-                ChatEntryKind::Message,
-                "checking",
-                json!({}),
-            ),
-        ]);
+    fn the_tab_gives_the_operator_and_the_conductor_their_own_presentation() {
+        let operator = chat_items(&[entry(
+            1,
+            ChatAuthor::Operator,
+            ChatEntryKind::Message,
+            "please check",
+            json!({}),
+        )]);
+        let conductor = chat_items(&[entry(
+            2,
+            ChatAuthor::Conductor,
+            ChatEntryKind::Message,
+            "checking",
+            json!({}),
+        )]);
 
         assert_eq!(
-            panel.transcript.entries()[0].presentation,
+            tab_entry(&operator[0], None).presentation,
             TranscriptPresentation::Operator
         );
         assert_eq!(
-            panel.transcript.entries()[1].presentation,
+            tab_entry(&conductor[0], None).presentation,
             TranscriptPresentation::Conductor
-        );
-    }
-
-    #[test]
-    fn transcript_reading_and_action_target_survive_new_entries_independently() {
-        let mut panel = ChatPanel::default();
-        let entries = (1..=30).map(proposal).collect();
-        panel.append(entries);
-        assert!(panel.transcript.is_following_end());
-        panel.line_up();
-        let anchor = panel.transcript.anchor().expect("older reading anchor");
-        assert!(!panel.transcript.is_following_end());
-
-        panel.cycle_action_target(0);
-        let target = panel.action_target.clone().expect("open proposal target");
-        assert!(matches!(target, ChatActionTarget::Proposal(_)));
-
-        panel.append(vec![proposal(31)]);
-        assert_eq!(panel.action_target, Some(target));
-        assert_eq!(panel.transcript.anchor().expect("restored anchor"), anchor);
-        assert!(!panel.transcript.is_following_end());
-    }
-
-    #[test]
-    fn refresh_clears_a_settled_action_target_without_moving_older_reading() {
-        let mut panel = ChatPanel::default();
-        panel.append((1..=30).map(proposal).collect());
-        panel.line_up();
-        let anchor = panel.transcript.anchor().expect("older reading anchor");
-        panel.cycle_action_target(0);
-        let ChatActionTarget::Proposal(proposal_id) = panel
-            .action_target
-            .clone()
-            .expect("an open proposal target")
-        else {
-            panic!("the target is a proposal");
-        };
-
-        panel.append(vec![entry(
-            31,
-            ChatAuthor::Operator,
-            ChatEntryKind::Decision,
-            "Rejected the proposal",
-            json!({"kind": "proposal_rejected", "proposal_id": proposal_id}),
-        )]);
-
-        assert!(panel.action_target.is_none(), "a stale target cannot act");
-        assert_eq!(panel.transcript.anchor(), Some(anchor));
-        assert!(
-            !panel.transcript.is_following_end(),
-            "a refresh must not pull an operator out of older context"
         );
     }
 }

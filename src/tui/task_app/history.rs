@@ -362,7 +362,7 @@ impl TaskApp {
                     Severity::Error,
                     format!(
                         "historia: nie udało się wczytać zarchiwizowanych zadań ({})",
-                        super::move_failure_reason(&error)
+                        super::failure_reason(&error)
                     ),
                 );
             }
@@ -381,7 +381,7 @@ impl TaskApp {
                 Vec::new(),
                 Some(format!(
                     "dawne executions niedostępne: {}",
-                    super::move_failure_reason(&error)
+                    super::failure_reason(&error)
                 )),
             ),
         };

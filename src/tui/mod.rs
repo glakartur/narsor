@@ -30,22 +30,19 @@
 //! [`task_app::EventFeed::ensure_open`] only once a read gave the application
 //! a cursor, and resumes from it after every drop.
 
-pub mod app;
 pub mod chat;
 pub mod chooser;
 pub mod connection;
 pub mod conversation;
+pub mod event_text;
 pub mod failure_form;
 pub mod input_form;
 pub mod keymap;
 pub mod refresh;
-pub mod remote;
-pub mod remote_views;
 pub mod scroll;
 pub mod style;
 pub mod task_app;
 pub mod transcript;
-pub mod views;
 
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

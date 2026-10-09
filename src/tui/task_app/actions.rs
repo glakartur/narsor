@@ -70,7 +70,7 @@ use super::super::style::{Role, Styles};
 use super::list::{one_line, title_of, CommandResolved};
 use super::notify::Severity;
 use super::waiting::AnswerRequest;
-use super::{clean, idempotency_key, is_transport, move_failure_reason, Request, TaskApp};
+use super::{clean, idempotency_key, is_transport, failure_reason, Request, TaskApp};
 
 // ---------------------------------------------------------------------
 // What can be done, and when
@@ -1298,7 +1298,7 @@ fn refusal_notice(title: &str, verb: &str, error: &ClientError) -> (Severity, St
     if is_transport(error) {
         return (
             Severity::Error,
-            format!("{title}: nie wysłano ({verb}) — {}", move_failure_reason(error)),
+            format!("{title}: nie wysłano ({verb}) — {}", failure_reason(error)),
         );
     }
     (
@@ -1312,7 +1312,7 @@ fn refusal_notice(title: &str, verb: &str, error: &ClientError) -> (Severity, St
 pub fn refusal_reason(error: &ClientError) -> String {
     let (ClientError::Refused { code, message } | ClientError::Request { code, message }) = error
     else {
-        return move_failure_reason(error);
+        return failure_reason(error);
     };
     let said = clean(message);
     let known = match code.as_str() {

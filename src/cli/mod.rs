@@ -34,6 +34,7 @@ pub mod commands;
 pub mod controller;
 pub mod daemon;
 pub mod remote;
+pub mod task_text;
 
 use std::path::PathBuf;
 

@@ -36,6 +36,11 @@ use serde_json::Value;
 use crate::api::ConversationEntryDto;
 use crate::persistence::conversation::ConversationSource;
 
+use super::scroll::sanitize;
+use super::transcript::{
+    utterance_header, TranscriptEntry, TranscriptEntryId, TranscriptPresentation,
+};
+
 /// The kind of one conversation entry, per the plan's list: user, assistant,
 /// thinking, tool call, tool result, final result, system, stderr, narsor —
 /// plus [`EntryKind::Raw`] for anything that does not fit.
@@ -734,6 +739,111 @@ fn classify_message_content(value: &Value) -> Option<EntryKind> {
     None
 }
 
+/// Adapts one retained agent record into the presentation model shared with
+/// conductor and remote conversations. The readable projection remains the
+/// default while raw mode can always return to the exact retained bytes.
+pub(crate) fn agent_transcript_entry(entry: &TranscriptEvent) -> TranscriptEntry {
+    // Narsor's own words are its input to the agent (the user turn) or a
+    // workflow event; everything else is named by what the harness sent.
+    let workflow_event = entry
+        .details
+        .get("workflow.event")
+        .and_then(serde_json::Value::as_str);
+    let (presentation, speaker) = match entry.kind {
+        EntryKind::Narsor if workflow_event.is_some_and(|event| event != "agent_input") => {
+            (TranscriptPresentation::System, "Narsor")
+        }
+        EntryKind::Narsor => (TranscriptPresentation::Operator, "Narsor"),
+        EntryKind::User => (TranscriptPresentation::Operator, "Operator"),
+        EntryKind::Assistant | EntryKind::Result => (TranscriptPresentation::Agent, "Agent"),
+        // Stderr frequently contains benign harness progress. It is technical
+        // by default; explicit failures are still projected as error events.
+        EntryKind::Stderr => (TranscriptPresentation::Technical, "stderr"),
+        EntryKind::Thinking | EntryKind::ToolCall | EntryKind::ToolResult | EntryKind::Raw => {
+            (TranscriptPresentation::Technical, "Harness")
+        }
+        EntryKind::System => (TranscriptPresentation::System, "Harness"),
+    };
+    let mut body: Vec<String> = sanitize(&entry.summary)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    if matches!(
+        presentation,
+        TranscriptPresentation::Technical | TranscriptPresentation::Error
+    ) {
+        body.truncate(1);
+    }
+    TranscriptEntry::new(
+        TranscriptEntryId::from(entry.entry_number.to_string()),
+        body,
+        entry.raw.clone(),
+    )
+    .with_header(utterance_header(presentation, speaker, entry.timestamp))
+    .with_technical_lines(semantic_detail_lines(&entry.details, &entry.summary))
+    .with_presentation(presentation)
+}
+
+/// What expanding an entry adds to its summary, as readable text: content
+/// fields as their own lines and the identifying fields as `label: value`.
+/// Normalized keys and the source payload never appear here — only RAW shows
+/// those.
+fn semantic_detail_lines(details: &serde_json::Value, summary: &str) -> Vec<String> {
+    const CONTENT: [&str; 5] = [
+        "message.content",
+        "tool.output",
+        "error.message",
+        "workflow.message",
+        "message.blocks",
+    ];
+    const LABELLED: [(&str, &str); 7] = [
+        ("tool.name", "tool"),
+        ("tool.command", "command"),
+        ("tool.input", "input"),
+        ("tool.exit_code", "exit code"),
+        ("workflow.step", "step"),
+        ("workflow.attempt", "attempt"),
+        ("workflow.session", "session"),
+    ];
+    fn text(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(values) => {
+                values.iter().map(text).collect::<Vec<_>>().join("\n")
+            }
+            serde_json::Value::Object(values) => {
+                values.values().map(text).collect::<Vec<_>>().join("\n")
+            }
+            serde_json::Value::Null => String::new(),
+            other => other.to_string(),
+        }
+    }
+    let mut lines = Vec::new();
+    let mut labelled = Vec::new();
+    for (key, label) in LABELLED {
+        if let Some(value) = details.get(key) {
+            let value = text(value);
+            if !value.is_empty() {
+                labelled.push(format!("{label}: {}", sanitize(&value).replace('\n', " ")));
+            }
+        }
+    }
+    lines.extend(labelled);
+    for key in CONTENT {
+        let Some(value) = details.get(key) else {
+            continue;
+        };
+        let sanitized = sanitize(&text(value));
+        let mut content = sanitized.lines().peekable();
+        // The summary already shows a content's first line.
+        if content.peek() == Some(&summary) {
+            content.next();
+        }
+        lines.extend(content.map(str::to_owned));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,5 +999,93 @@ mod tests {
 
         assert_eq!(classified.kind, EntryKind::Raw);
         assert_eq!(classified.raw, raw);
+    }
+}
+
+#[cfg(test)]
+mod utterance_tests {
+    use super::*;
+    use crate::tui::transcript::{DisplayMode, TranscriptId, TranscriptState};
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    fn entry_from(source: ConversationSource, raw: &str) -> TranscriptEntry {
+        agent_transcript_entry(&classify(&ConversationEntryDto {
+            entry_number: 1,
+            timestamp: chrono::Utc::now(),
+            source,
+            raw_base64: BASE64.encode(raw.as_bytes()),
+        }))
+    }
+
+    fn lines_of(entry: TranscriptEntry, expanded: bool) -> Vec<String> {
+        let mut transcript = TranscriptState::new(TranscriptId::from("t"));
+        let id = entry.id.clone();
+        transcript.load(vec![entry]);
+        if expanded {
+            transcript.toggle_expanded(&id);
+        }
+        assert_eq!(transcript.mode(), DisplayMode::Rendered);
+        transcript
+            .logical_lines()
+            .into_iter()
+            .map(|line| line.text)
+            .collect()
+    }
+
+    /// AE1: each role gets its own header naming role, speaker and date.
+    #[test]
+    fn every_role_names_itself_the_speaker_and_the_full_date() {
+        let cases = [
+            (
+                ConversationSource::Narsor,
+                r#"{"event":"prompt","prompt":"Fix it"}"#,
+                "USER · Narsor · ",
+            ),
+            (
+                ConversationSource::Narsor,
+                "step started",
+                "SYSTEM · Narsor · ",
+            ),
+            (
+                ConversationSource::Stdout,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done"}]}}"#,
+                "AGENT · Agent · ",
+            ),
+            (
+                ConversationSource::Stdout,
+                r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hm"}]}}"#,
+                "TECHNICZNE · Harness · ",
+            ),
+        ];
+        for (source, raw, prefix) in cases {
+            let header = lines_of(entry_from(source, raw), false).remove(0);
+            assert!(header.starts_with(prefix), "{header}");
+            // `YYYY-MM-DD HH:MM:SS`
+            let date = &header[prefix.len()..];
+            assert_eq!(date.len(), 19, "{header}");
+            assert_eq!(&date[4..5], "-", "{header}");
+            assert_eq!(&date[13..14], ":", "{header}");
+        }
+    }
+
+    /// AE3: a long Narsor prompt shows its beginning, and expanding shows all
+    /// of it with the line breaks — as text, not as the JSON envelope.
+    #[test]
+    fn a_narsor_prompt_shows_its_start_and_expands_to_the_whole_text() {
+        let raw = r#"{"event":"agent_input","prompt":"Implement the feature\nthen run the tests\nand report"}"#;
+
+        let collapsed = lines_of(entry_from(ConversationSource::Narsor, raw), false);
+        assert_eq!(collapsed.len(), 2, "{collapsed:?}");
+        assert_eq!(collapsed[1], "Implement the feature");
+
+        let expanded = lines_of(entry_from(ConversationSource::Narsor, raw), true);
+        assert_eq!(
+            expanded[1..],
+            ["Implement the feature", "then run the tests", "and report"]
+        );
+        assert!(
+            !expanded.iter().any(|line| line.contains('{')),
+            "{expanded:?}"
+        );
     }
 }

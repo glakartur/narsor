@@ -1,13 +1,12 @@
 //! The new task-based application (U8): the list, the header, the event
 //! stream, refreshing and moving tasks; the action menu (U11).
 //!
-//! It is built next to the old [`super::app`] and [`super::remote`] and takes
-//! the module name over in U14, when `tui::run` switches to it. The state it
-//! holds is what [`super::remote::RemoteApp`] held — the tasks, a selection
-//! that follows a `task_id`, the stream cursor — but the connection is the
-//! [`super::connection::Connection`] of U7 (live / retrying / down, the age of
-//! the data, the gate on mutations) and every key goes through
-//! [`super::keymap`], every colour through [`super::style`].
+//! The only interface of `narsor tui` (U14): the tasks of the control plane
+//! (`/control/v1`) of the backend the configuration names, a selection that
+//! follows a `task_id`, the stream cursor, and the
+//! [`super::connection::Connection`] (live / retrying / down, the age of the
+//! data, the gate on mutations). Every key goes through [`super::keymap`],
+//! every colour through [`super::style`].
 //!
 //! # The pieces
 //!
@@ -24,7 +23,7 @@
 //!
 //! # Keys → request → perform
 //!
-//! Like the old modes: [`TaskApp::on_key`] folds a key into the state and says
+//! [`TaskApp::on_key`] folds a key into the state and says
 //! what needs the API ([`Request`]); [`TaskApp::perform`] does it. A loop,
 //! given a terminal, is this and nothing more:
 //!
@@ -820,7 +819,7 @@ impl TaskApp {
                     format!(
                         "{}: przesunięcie odrzucone — {}{tail}",
                         request.title,
-                        move_failure_reason(&error)
+                        failure_reason(&error)
                     ),
                 );
             }
@@ -988,8 +987,10 @@ fn is_transport(error: &ClientError) -> bool {
     )
 }
 
-/// Why the server refused a move, in words for the notification.
-pub fn move_failure_reason(error: &ClientError) -> String {
+/// Why a call to the server failed, in words for a notification or a tab —
+/// the one mapping of client errors the interface has ([`actions::refusal_reason`]
+/// only adds the codes of operator commands).
+pub fn failure_reason(error: &ClientError) -> String {
     match error {
         ClientError::Refused { message, .. }
         | ClientError::Request { message, .. }

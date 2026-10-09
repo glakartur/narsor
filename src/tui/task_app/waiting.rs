@@ -69,7 +69,7 @@ use super::detail::short_age;
 use super::list::{one_line, title_of};
 use super::notify::Severity;
 use super::tabs::conductor;
-use super::{idempotency_key, move_failure_reason, Request, TaskApp};
+use super::{idempotency_key, failure_reason, Request, TaskApp};
 
 /// The most rows of the context the panel gives itself before it scrolls.
 const MAX_CONTEXT_ROWS: usize = 4;
@@ -1204,7 +1204,7 @@ impl TaskApp {
             }
             Err(error) => {
                 let retryable = super::is_transport(&error);
-                let reason = move_failure_reason(&error);
+                let reason = failure_reason(&error);
                 self.note_transport(&error);
                 self.settle_answer(&task_id, &waiting_id, Err((reason.clone(), retryable)));
                 if !retryable {

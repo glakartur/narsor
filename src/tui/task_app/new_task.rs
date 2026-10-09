@@ -80,7 +80,7 @@ use super::super::style::{Role, Styles};
 use super::actions::chooser_context;
 use super::list::{fit, one_line, PendingRow, PendingState};
 use super::notify::Severity;
-use super::{clean, is_transport, move_failure_reason, Focus, Request, TaskApp, View};
+use super::{clean, is_transport, failure_reason, Focus, Request, TaskApp, View};
 
 /// The key the unsent data of the form is kept under in
 /// [`DetailState::set_draft`](super::DetailState::set_draft); not a task id.
@@ -548,7 +548,7 @@ impl TaskApp {
                         Severity::Warning,
                         format!(
                             "nie udało się wczytać repozytoriów ({}) — pole repository będzie tekstem",
-                            move_failure_reason(&error)
+                            failure_reason(&error)
                         ),
                     );
                     RepositoryListResponse {
@@ -567,7 +567,7 @@ impl TaskApp {
                             Severity::Warning,
                             format!(
                                 "katalog workflow sprzed chwili: nie udało się go wczytać ({})",
-                                move_failure_reason(&error)
+                                failure_reason(&error)
                             ),
                         );
                     }
@@ -575,7 +575,7 @@ impl TaskApp {
                         Severity::Error,
                         format!(
                             "nowe zadanie: nie udało się wczytać katalogu workflow ({})",
-                            move_failure_reason(&error)
+                            failure_reason(&error)
                         ),
                     ),
                 }
@@ -840,7 +840,7 @@ impl TaskApp {
     fn task_lost(&mut self, id: &str, error: &ClientError) {
         self.note_transport(error);
         let now = Instant::now();
-        let reason = move_failure_reason(error);
+        let reason = failure_reason(error);
         let Some(outgoing) = self
             .outbox
             .iter_mut()
@@ -989,7 +989,7 @@ impl TaskApp {
                 _ => PathVerdict::Failed("serwer nie podał nazwy ani wersji definicji".to_string()),
             },
             Ok(response) => PathVerdict::Invalid(response.violations),
-            Err(error) => PathVerdict::Failed(move_failure_reason(&error)),
+            Err(error) => PathVerdict::Failed(failure_reason(&error)),
         };
         let complaint = match &verdict {
             PathVerdict::Valid { .. } => None,

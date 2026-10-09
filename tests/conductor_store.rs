@@ -971,6 +971,6 @@ fn conductor_events_describe_themselves_on_one_line() {
         event.description(),
         "Conductor decided to choose_output 'implemented' (high confidence)"
     );
-    assert!(narsor::tui::app::event_line(&event)
+    assert!(narsor::tui::event_text::event_line(&event)
         .ends_with("conductor_decision  choose_output → implemented (high)"));
 }
