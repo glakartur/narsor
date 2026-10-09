@@ -2198,11 +2198,11 @@ mod task_app_conductor_render {
             "pewność: low",
             "c napisz",
             "u cofnij decyzję",
-            "h harness",
             "M dalsze wpisy",
         ] {
             assert!(text.contains(expected), "{expected:?} is missing:\n{text}");
         }
+        assert!(!text.contains("h harness"), "no per-task choice:\n{text}");
     }
 
     #[test]
@@ -2297,15 +2297,9 @@ mod task_app_conductor_render {
         );
     }
 
-    #[test]
-    fn the_harness_list_fits_a_narrow_terminal() {
-        let mut app = opened(running(), true);
-        press(&mut app, KeyCode::Char('h'));
-        let text = screen(&draw_app(&mut app, 64, 24, false));
-        for expected in ["Harness dyrygenta", "claude-code", "codex", "opencode"] {
-            assert!(text.contains(expected), "{expected:?} is missing:\n{text}");
-        }
-    }
+    // The harness is no longer chosen per task on this tab; the list of
+    // harnesses comes back as the global chooser, with its own
+    // narrow-terminal test.
 
     #[test]
     fn a_tiny_area_does_not_panic() {

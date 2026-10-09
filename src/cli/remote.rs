@@ -426,14 +426,6 @@ pub enum ConductorCommand {
         #[arg(value_name = "DECISION_ID")]
         decision_id: String,
     },
-    /// Runs the conductor on another harness, from its next invocation on.
-    Harness {
-        #[command(flatten)]
-        args: OperatorCommandArgs,
-        /// The harness name (`claude-code`, `codex`, `opencode`).
-        #[arg(value_name = "HARNESS")]
-        harness: String,
-    },
 }
 
 /// Arguments shared by the commands that act on a task's runner.
@@ -1017,9 +1009,6 @@ async fn conductor(client: &ApiClient, command: ConductorCommand) -> Result<()> 
         ConductorCommand::Undo { args, decision_id } => {
             (args, OperatorCommand::UndoDecision { decision_id })
         }
-        ConductorCommand::Harness { args, harness } => {
-            (args, OperatorCommand::SetConductorHarness { harness })
-        }
     };
     operator_command(client, command, args).await
 }
@@ -1517,6 +1506,7 @@ fn describe_operator_command(command: &OperatorCommand) -> String {
             format!("reject proposal {proposal_id}")
         }
         OperatorCommand::UndoDecision { decision_id } => format!("undo decision {decision_id}"),
+        // Historical: no longer accepted, but still in old event logs.
         OperatorCommand::SetConductorHarness { harness } => {
             format!("conductor harness {harness}")
         }

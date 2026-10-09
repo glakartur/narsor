@@ -455,14 +455,6 @@ pub struct LinkList {
     chooser: Chooser,
 }
 
-/// The harnesses the conductor of a task can run on (the *Dyrygent* tab).
-#[derive(Debug, Clone)]
-pub struct HarnessList {
-    pub(super) task_id: String,
-    pub(super) harnesses: Vec<String>,
-    pub(super) chooser: Chooser,
-}
-
 /// What sits over the screen, taking the keys.
 #[derive(Debug, Clone)]
 pub enum Overlay {
@@ -472,8 +464,6 @@ pub enum Overlay {
     Transitions(TransitionList),
     /// The links of the task (`o`).
     Links(LinkList),
-    /// The harnesses of the task's conductor (`h` on its tab).
-    Harness(HarnessList),
     /// The `y` / `n` window.
     Confirm(Confirmation),
 }
@@ -495,7 +485,6 @@ impl Overlay {
             Self::Menu(menu) => &menu.task_id,
             Self::Transitions(list) => &list.task_id,
             Self::Links(list) => &list.task_id,
-            Self::Harness(list) => &list.task_id,
             Self::Confirm(confirmation) => &confirmation.task_id,
         }
     }
@@ -506,7 +495,6 @@ impl Overlay {
             Self::Menu(menu) => Some(&menu.chooser),
             Self::Transitions(list) => Some(&list.chooser),
             Self::Links(list) => Some(&list.chooser),
-            Self::Harness(list) => Some(&list.chooser),
             Self::Confirm(_) => None,
         }
     }
@@ -526,7 +514,6 @@ impl Overlay {
             Self::Confirm(_) => Context::Confirm,
             Self::Transitions(list) => chooser_context(&list.chooser),
             Self::Links(list) => chooser_context(&list.chooser),
-            Self::Harness(list) => chooser_context(&list.chooser),
         }
     }
 }
@@ -792,9 +779,7 @@ impl TaskApp {
         match overlay {
             Overlay::Menu(_) => self.on_menu_key(&key),
             Overlay::Confirm(_) => self.on_confirm_key(&key),
-            Overlay::Transitions(_) | Overlay::Links(_) | Overlay::Harness(_) => {
-                self.on_list_key(key)
-            }
+            Overlay::Transitions(_) | Overlay::Links(_) => self.on_list_key(key),
         }
     }
 
@@ -871,7 +856,6 @@ impl TaskApp {
         let chooser = match &mut self.overlay {
             Some(Overlay::Transitions(list)) => &mut list.chooser,
             Some(Overlay::Links(list)) => &mut list.chooser,
-            Some(Overlay::Harness(list)) => &mut list.chooser,
             _ => return Request::None,
         };
         match chooser.on_key(key) {
@@ -890,7 +874,6 @@ impl TaskApp {
                     Some(link) => Request::OpenLink(link.clone()),
                     None => Request::None,
                 },
-                Some(Overlay::Harness(list)) => self.chosen_harness(&list, &submission),
                 _ => Request::None,
             },
         }
@@ -1236,17 +1219,14 @@ pub(super) enum ConductorSent {
     Chat,
     /// An undone decision.
     Undo,
-    /// Another harness.
-    Harness,
 }
 
-/// Which command of the conductor's `command` is, if it is one of the three
+/// Which command of the conductor's `command` is, if it is one of the two
 /// the tab sends.
 fn conductor_kind(command: &OperatorCommand) -> Option<ConductorSent> {
     match command {
         OperatorCommand::ConductorChat { .. } => Some(ConductorSent::Chat),
         OperatorCommand::UndoDecision { .. } => Some(ConductorSent::Undo),
-        OperatorCommand::SetConductorHarness { .. } => Some(ConductorSent::Harness),
         _ => None,
     }
 }
@@ -1278,6 +1258,7 @@ fn command_name(command: Option<&OperatorCommand>) -> String {
             "decyzja o propozycji dyrygenta".to_string()
         }
         Some(OperatorCommand::UndoDecision { .. }) => "cofnięcie decyzji dyrygenta".to_string(),
+        // Historical: no longer sent, but still in old event logs.
         Some(OperatorCommand::SetConductorHarness { .. }) => {
             "zmiana harnessu dyrygenta".to_string()
         }
@@ -1446,13 +1427,6 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles)
                 styles,
             );
         }
-        Overlay::Harness(list) => render_list(
-            frame,
-            area,
-            &format!("Harness dyrygenta · {title}"),
-            &mut list.chooser,
-            styles,
-        ),
     }
 }
 

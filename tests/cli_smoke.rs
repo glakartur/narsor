@@ -2070,10 +2070,13 @@ fn task_conductor_commands_talk_to_the_conductor_in_the_tasks_runner() {
         "{}",
         undone.output()
     );
-    let harness = run(&["task", "conductor", "harness", "t-slow", "emacs"]);
-    assert_eq!(harness.code, EXIT_FAILURE, "{}", harness.output());
+    // The conductor's harness is no longer chosen per task.
+    let harness = run(&["task", "conductor", "harness", "t-slow", "codex"]);
+    assert_ne!(harness.code, EXIT_SUCCESS, "{}", harness.output());
     assert!(
-        harness.output().contains("unknown agent harness"),
+        harness
+            .output()
+            .contains("unrecognized subcommand 'harness'"),
         "{}",
         harness.output()
     );

@@ -197,8 +197,6 @@ pub enum Action {
     Compose,
     /// Undo the selected decision of the conductor.
     UndoDecision,
-    /// Choose the harness the conductor runs on.
-    ChooseHarness,
     /// Read the next page of the conductor's chat.
     LoadMore,
     /// Send a task again that did not get through (the new-task form).
@@ -733,13 +731,6 @@ pub static BINDINGS: &[Binding] = &[
         Action::UndoDecision,
         "",
         "zakładka Dyrygent: cofnij zaznaczoną decyzję dyrygenta (wymaga potwierdzenia)",
-    ),
-    bind(
-        Context::Details,
-        Key::char('h'),
-        Action::ChooseHarness,
-        "",
-        "zakładka Dyrygent: wybierz harness dyrygenta",
     ),
     bind(
         Context::Details,

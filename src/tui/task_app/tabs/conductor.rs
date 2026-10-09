@@ -1,5 +1,7 @@
-//! *Dyrygent*: the chat with the task's conductor, the history of its
-//! decisions with the undo, and the choice of the harness it runs on (U12).
+//! *Dyrygent*: the chat with the task's conductor and the history of its
+//! decisions with the undo (U12). The status line names the harness the
+//! conductor runs on; it is not chosen per task — the conductor follows the
+//! installation's default harness.
 //!
 //! # What is read
 //!
@@ -31,8 +33,6 @@
 //!   survives a refresh and a move to another task, and counts as a draft when
 //!   the operator quits.
 //! * `u` undoes the selected decision after a `y` / `n` window.
-//! * `h` chooses the harness (`SetConductorHarness`); the control plane and the
-//!   runner refuse when the task has no conductor, and say why on the bar.
 //!
 //! A proposal of the conductor's is *not* answered here: it waits in the panel
 //! "Czeka na Ciebie" (an `AttentionKind::ConductorProposal`), and the tab only
@@ -53,7 +53,6 @@ use ratatui::Frame;
 use crate::conductor::{ChatEntry, ConductorView, ConductorWork};
 use crate::controller_protocol::{ConductorReadResponse, TaskSummary};
 use crate::domain::ConductorPurpose;
-use crate::engine::actions::harness::HarnessRegistry;
 use crate::orchestration::{OperatorCommand, OperatorCommandStatus};
 use crate::tui::chat::{tab_entry, tab_items, undo_lines, ChatItem};
 use crate::tui::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
@@ -62,9 +61,7 @@ use crate::tui::style::{Role, Styles};
 use crate::tui::transcript::{DisplayMode, TranscriptId, TranscriptState};
 
 use super::super::super::scroll::one_line;
-use super::super::actions::{
-    ActionSend, ConductorSent, Confirmation, Confirmed, HarnessList, Overlay,
-};
+use super::super::actions::{ActionSend, ConductorSent, Confirmation, Confirmed, Overlay};
 use super::super::detail::short_age;
 use super::super::layout::first_row;
 use super::super::list::fit;
@@ -539,7 +536,6 @@ fn key_line(conductor: &Conductor, ready: bool, styles: &Styles) -> Line<'static
             parts.extend(named(Action::Compose, "napisz"));
             parts.extend(named(Action::UndoDecision, "cofnij decyzję"));
         }
-        parts.extend(named(Action::ChooseHarness, "harness"));
         if conductor.has_more() {
             parts.extend(named(Action::LoadMore, "dalsze wpisy"));
         }
@@ -687,7 +683,7 @@ impl TaskApp {
         None
     }
 
-    /// A key of the tab that is not about reading: `c`, `u`, `h`, `M`.
+    /// A key of the tab that is not about reading: `c`, `u`, `M`.
     pub(in crate::tui::task_app) fn on_conductor_action(&mut self, action: Action) -> Request {
         let Some(id) = self.list.selected_id().map(str::to_string) else {
             return Request::None;
@@ -710,7 +706,6 @@ impl TaskApp {
                 }
             }
             Action::UndoDecision => self.ask_undo(&id),
-            Action::ChooseHarness => self.open_harnesses(&id),
             Action::LoadMore => self.load_more(&id),
             _ => {}
         }
@@ -758,79 +753,6 @@ impl TaskApp {
             undo_lines(&item),
             Confirmed::Act(Box::new(request)),
         )));
-    }
-
-    /// `h`: the list of harnesses the conductor can run on.
-    fn open_harnesses(&mut self, id: &str) {
-        let Some(task) = self.selected_conductor_task(id, "zmiana harnessu dyrygenta") else {
-            return;
-        };
-        let current = self
-            .detail
-            .view(id)
-            .and_then(|view| view.conductor().view())
-            .and_then(|view| view.harness.clone());
-        let harnesses: Vec<String> = HarnessRegistry::defaults()
-            .supported()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        let items = harnesses
-            .iter()
-            .map(|name| {
-                let item = ChooserItem::new(
-                    name.clone(),
-                    format!(
-                        "Dyrygent zadania {} pójdzie na harnessie „{name}” od następnego \
-                         wywołania; wywołanie, które trwa, kończy na dotychczasowym. Polecenie \
-                         trafia do runnera.",
-                        super::super::list::title_of(&task)
-                    ),
-                );
-                if current.as_deref() == Some(name.as_str()) {
-                    item.unavailable("dyrygent już działa na tym harnessie")
-                } else {
-                    item
-                }
-            })
-            .collect();
-        let first_other = harnesses
-            .iter()
-            .position(|name| current.as_deref() != Some(name.as_str()))
-            .unwrap_or(0);
-        self.overlay = Some(Overlay::Harness(HarnessList {
-            task_id: id.to_string(),
-            harnesses,
-            chooser: Chooser::new(items).selecting(first_other),
-        }));
-    }
-
-    /// A harness was chosen from the list.
-    pub(in crate::tui::task_app) fn chosen_harness(
-        &mut self,
-        list: &HarnessList,
-        submission: &Submission,
-    ) -> Request {
-        let Some(harness) = list.harnesses.get(submission.index).cloned() else {
-            return Request::None;
-        };
-        let Some(task) = self.selected_conductor_task(&list.task_id, "zmiana harnessu dyrygenta")
-        else {
-            return Request::None;
-        };
-        if !self.mutation_allowed() {
-            return Request::None;
-        }
-        let summary = format!(
-            "harness dyrygenta: {} (od następnego wywołania)",
-            one_line(&harness)
-        );
-        Request::Act(Box::new(self.action_request(
-            &task,
-            "zmiana harnessu dyrygenta",
-            summary,
-            ActionSend::Operator(OperatorCommand::SetConductorHarness { harness }),
-        )))
     }
 
     /// The control plane took a command of the conductor's. A message leaves

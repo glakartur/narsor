@@ -2949,15 +2949,24 @@ async fn conductor_commands_are_checked_for_what_they_name() {
         .await,
         "missing_decision"
     );
+    // The conductor's harness is no longer chosen per task: refused, even
+    // for a harness that exists.
     assert_eq!(
         refused(
             OperatorCommand::SetConductorHarness {
-                harness: "emacs".to_string()
+                harness: "codex".to_string()
             },
             "c-6"
         )
         .await,
-        "unsupported_harness"
+        "unsupported_command"
+    );
+    assert!(
+        !operator_events(&harness, "task-1")
+            .await
+            .iter()
+            .any(|kind| matches!(kind, TaskEventKind::OperatorCommandQueued { .. })),
+        "nothing refused was queued"
     );
 
     // A well-formed one is queued for the runner, like any other.

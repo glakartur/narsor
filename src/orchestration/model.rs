@@ -1061,7 +1061,10 @@ pub enum OperatorCommand {
         /// The decision to undo.
         decision_id: String,
     },
-    /// Run the conductor on another harness, from its next invocation on.
+    /// Historical: run the conductor on another harness. No longer accepted
+    /// (the conductor follows the installation's default harness); kept so
+    /// that event logs and queues written before still decode. The control
+    /// plane refuses it, a runner that finds one queued settles it unapplied.
     SetConductorHarness {
         /// The harness name.
         harness: String,

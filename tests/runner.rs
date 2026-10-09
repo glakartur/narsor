@@ -37,8 +37,8 @@ use narsor::domain::{
 use narsor::engine::HumanInputDelivery;
 use narsor::orchestration::{
     AttentionKind, ControlPlane, NewTask, Observation, ObservedSummary, OperatorCommand,
-    OperatorCommandStatus, OwnerCommand, OwnerRef, QueuedOperatorCommand, TaskEventKind,
-    TaskRecord,
+    OperatorCommandRequest, OperatorCommandStatus, OwnerCommand, OwnerRef, QueuedOperatorCommand,
+    TaskEventKind, TaskRecord,
 };
 use narsor::persistence::paths::StatePaths;
 use narsor::persistence::ExecutionStore;
@@ -2412,11 +2412,11 @@ async fn a_chosen_output_is_undone_and_the_step_is_a_problem_again() {
     );
 }
 
-/// A harness chosen for the conductor is kept on the storage and used from
-/// the conductor's next invocation on, not before.
+/// The conductor's harness is no longer chosen per task: a choice an older
+/// version kept on the storage is not read, and a `SetConductorHarness`
+/// queued before the update is settled without changing anything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_chosen_conductor_harness_applies_from_the_next_invocation() {
-    use std::os::unix::fs::PermissionsExt;
+async fn a_per_task_conductor_harness_from_before_is_ignored() {
     if running_as_root() {
         return;
     }
@@ -2430,10 +2430,6 @@ async fn a_chosen_conductor_harness_applies_from_the_next_invocation() {
             })),
         )],
     );
-    // A `codex` that only notes it was run: its answer is no answer at all.
-    let codex = bin.join("codex");
-    fs::write(&codex, "#!/bin/sh\necho called >> \"$HOME/codex-calls\"\n").unwrap();
-    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
     let spec = spec(
         LONG_STEP_WORKFLOW,
         TaskWorkspace::None,
@@ -2441,44 +2437,64 @@ async fn a_chosen_conductor_harness_applies_from_the_next_invocation() {
     );
     fixture.create("task-1", spec.clone());
     let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    // What an older version wrote when the owner chose `opencode`.
+    let remembered = launch.storage.join("narsor/conductor.json");
+    fs::create_dir_all(remembered.parent().unwrap()).unwrap();
+    fs::write(&remembered, r#"{"version":1,"harness":"opencode"}"#).unwrap();
     running_runner(&mut fixture, "task-1", &launch).await;
 
-    let chat = |text: &str, key: &str| {
-        submit(
-            &fixture,
-            "task-1",
-            OperatorCommand::ConductorChat {
-                text: text.to_string(),
+    let view = wait_for_view(&fixture, "task-1", "the conductor", |view| view.available).await;
+    assert_eq!(view.harness.as_deref(), Some("claude-code"));
+
+    // Queued before the control plane stopped taking it.
+    let historical = fixture
+        .service
+        .control_plane()
+        .queue_operator_command(
+            &TaskId::parse("task-1").unwrap(),
+            OperatorCommandRequest {
+                command: OperatorCommand::SetConductorHarness {
+                    harness: "codex".to_string(),
+                },
+                idempotency_key: "harness-1".to_string(),
+                expected_generation: None,
+                requested_by: fixture.owner(),
             },
-            key,
         )
-    };
-    let first = chat("first", "chat-1");
-    settled(&fixture, "task-1", &first).await;
-    wait_for_view(&fixture, "task-1", "claude's answer", |view| {
+        .expect("queue the historical command")
+        .command
+        .command_id;
+    // A command through the service wakes the runner's poll.
+    let chat = submit(
+        &fixture,
+        "task-1",
+        OperatorCommand::ConductorChat {
+            text: "hello".to_string(),
+        },
+        "chat-1",
+    );
+    let settled_harness = settled(&fixture, "task-1", &historical).await;
+    assert_eq!(
+        settled_harness.status,
+        OperatorCommandStatus::Rejected,
+        "{settled_harness:?}"
+    );
+    assert!(
+        settled_harness
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no longer chosen per task")),
+        "{settled_harness:?}"
+    );
+    settled(&fixture, "task-1", &chat).await;
+    let view = wait_for_view(&fixture, "task-1", "claude's answer", |view| {
         view.chat.iter().any(|entry| entry.text == "From claude.")
     })
     .await;
-    assert!(!launch.home().join("codex-calls").exists());
-
-    applied(
-        &fixture,
-        "task-1",
-        OperatorCommand::SetConductorHarness {
-            harness: "codex".to_string(),
-        },
-        "harness-1",
-    )
-    .await;
-    let remembered = fs::read_to_string(launch.storage.join("narsor/conductor.json")).unwrap();
-    assert!(remembered.contains("codex"), "{remembered}");
-
-    let second = chat("second", "chat-2");
-    settled(&fixture, "task-1", &second).await;
-    wait_until_async(Duration::from_secs(30), "the new harness", || {
-        launch.home().join("codex-calls").exists()
-    })
-    .await;
-    let view = conductor_view(&fixture, "task-1").await;
-    assert_eq!(view.harness.as_deref(), Some("codex"));
+    assert_eq!(view.harness.as_deref(), Some("claude-code"));
+    assert_eq!(
+        fs::read_to_string(&remembered).unwrap(),
+        r#"{"version":1,"harness":"opencode"}"#,
+        "the old file is neither read nor removed"
+    );
 }

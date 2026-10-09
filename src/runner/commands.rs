@@ -97,9 +97,13 @@ impl Session {
             OperatorCommand::UndoDecision { decision_id } => {
                 self.undo_decision(&execution_id, &decision_id).await
             }
-            OperatorCommand::SetConductorHarness { harness } => {
-                self.set_conductor_harness(&harness)
-            }
+            // Historical: queued before the harness stopped being chosen
+            // per task. Settled, never applied.
+            OperatorCommand::SetConductorHarness { .. } => Err(
+                "the conductor's harness is no longer chosen per task; the conductor follows \
+                 the installation's default harness"
+                    .to_string(),
+            ),
         };
         match outcome {
             Ok(()) => CommandVerdict::applied(),

@@ -6447,7 +6447,7 @@ mod task_app_conductor {
         fn the_tab_keys_say_they_belong_to_the_tab_elsewhere() {
             let mut app = tab_app();
             app.detail_mut().set_tab(DetailTab::Progress);
-            for key in ['c', 'u', 'h', 'M'] {
+            for key in ['c', 'u', 'M'] {
                 ch(&mut app, key);
                 assert!(
                     note(&app).contains("zakładce Dyrygent"),
@@ -6468,59 +6468,24 @@ mod task_app_conductor {
     mod harness {
         use super::*;
 
-        fn labels(app: &TaskApp) -> Vec<String> {
-            app.overlay()
-                .and_then(Overlay::chooser)
-                .expect("the list of harnesses")
-                .items()
-                .iter()
-                .map(|item| item.label.clone())
-                .collect()
-        }
-
         #[test]
-        fn h_lists_the_harnesses_the_current_one_greyed_and_the_choice_is_sent() {
+        fn the_tab_names_the_harness_and_offers_no_key_to_choose_it() {
             let mut app = tab_app();
             read(&mut app, conductor_view(vec![], json!({})));
-            ch(&mut app, 'h');
-            assert_eq!(labels(&app), ["claude-code", "codex", "opencode"]);
             let text = screen(&mut app, 120, 30);
-            assert!(text.contains("Harness dyrygenta"), "{text}");
-            let chooser = app.overlay().and_then(Overlay::chooser).unwrap();
-            assert!(
-                chooser.items()[0].unavailable.is_some(),
-                "claude-code is the current one"
-            );
-            assert_eq!(chooser.selected(), 1, "the list opens on another harness");
-
-            let request = act(press(&mut app, KeyCode::Enter));
+            assert!(text.contains(" · harness claude-code"), "{text}");
+            assert!(text.contains("c napisz"), "{text}");
+            assert!(!text.contains("h harness"), "{text}");
             assert_eq!(
-                request.send,
-                ActionSend::Operator(OperatorCommand::SetConductorHarness {
-                    harness: "codex".to_string()
-                })
+                keymap::lookup(Context::Details, &KeyEvent::from(KeyCode::Char('h'))),
+                None
             );
-            assert!(request.summary.contains("codex"));
-            assert!(app.overlay().is_none());
-        }
-
-        #[test]
-        fn the_current_harness_cannot_be_chosen_again() {
-            let mut app = tab_app();
-            read(&mut app, conductor_view(vec![], json!({})));
             ch(&mut app, 'h');
-            ch(&mut app, 'k');
-            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
-            assert!(
-                note(&app).contains("już działa na tym harnessie"),
-                "{}",
-                note(&app)
-            );
-            assert!(app.overlay().is_some(), "the list stays to choose again");
-            press(&mut app, KeyCode::Esc);
             assert!(app.overlay().is_none());
         }
 
+        /// A command from before the per-task choice was retired still shows
+        /// its verdict.
         #[test]
         fn a_runner_that_has_no_conductor_refuses_and_the_bar_gives_its_reason() {
             let mut app = tab_app();
@@ -6645,7 +6610,6 @@ mod task_app_conductor {
         for (action, key) in [
             (Action::Compose, "c"),
             (Action::UndoDecision, "u"),
-            (Action::ChooseHarness, "h"),
             (Action::LoadMore, "M"),
         ] {
             assert_eq!(
@@ -6766,32 +6730,6 @@ mod task_app_conductor {
                 "nothing the operator typed was lost"
             );
             assert!(app.detail().has_drafts());
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn an_unknown_harness_is_refused_early_with_the_supported_ones() {
-            let harness = RemoteHarness::start().await;
-            let _running = harness.running("NAR-12", "local", conducting()).await;
-            let mut app = open(&harness).await;
-            let generation = app.list().tasks()[0].generation;
-            let request = ActionRequest {
-                task_id: "NAR-12".to_string(),
-                title: "NAR-12".to_string(),
-                generation,
-                key: "h-1".to_string(),
-                verb: "zmiana harnessu dyrygenta".to_string(),
-                summary: "x".to_string(),
-                send: ActionSend::Operator(OperatorCommand::SetConductorHarness {
-                    harness: "nope".to_string(),
-                }),
-            };
-            app.perform(Request::Act(Box::new(request))).await;
-            let text = note(&app);
-            assert!(
-                text.contains("zmiana harnessu dyrygenta odrzucone"),
-                "{text}"
-            );
-            assert!(text.contains("unknown agent harness 'nope'"), "{text}");
         }
 
         #[tokio::test(flavor = "multi_thread")]

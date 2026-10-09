@@ -22,7 +22,8 @@
 //!         report.json        the last snapshot sequence handed out
 //!         inputs.json        owner inputs this storage already consumed
 //!         commands.json      operator commands this storage already carried out
-//!         conductor.json     the harness the owner chose for the task's conductor
+//!         conductor.json     a per-task conductor harness an older version
+//!                            kept; neither read nor removed any more
 //!         work/              scratch of the conductor's isolated invocations
 //!         workspace.partial/ a clone under way, never a workspace
 //!         materials.partial/ a material delivery under way
@@ -155,10 +156,6 @@ impl TaskStorage {
 
     fn commands_file(&self) -> PathBuf {
         self.bookkeeping_dir().join("commands.json")
-    }
-
-    fn conductor_file(&self) -> PathBuf {
-        self.bookkeeping_dir().join("conductor.json")
     }
 
     /// `{root}/narsor/work`: where the conductor keeps its scratch.
@@ -301,22 +298,6 @@ impl TaskStorage {
         inputs.version = RECORD_VERSION;
         inputs.consumed.insert(input_id.to_string());
         write_json_atomic(&self.inputs_file(), &inputs).map_err(RunnerError::from)
-    }
-
-    /// The harness the owner chose for the conductor, when one did: it
-    /// outlives incarnations, like the choice it records.
-    pub fn conductor_harness(&self) -> Result<Option<String>, RunnerError> {
-        Ok(read_optional::<ConductorSettings>(&self.conductor_file())?
-            .and_then(|settings| settings.harness))
-    }
-
-    /// Records the owner's choice of the conductor's harness.
-    pub fn write_conductor_harness(&self, harness: &str) -> Result<(), RunnerError> {
-        let settings = ConductorSettings {
-            version: RECORD_VERSION,
-            harness: Some(harness.to_string()),
-        };
-        write_json_atomic(&self.conductor_file(), &settings).map_err(RunnerError::from)
     }
 
     /// How far an operator command got here (U3).
@@ -490,12 +471,6 @@ struct ReportState {
 struct ConsumedInputs {
     version: u32,
     consumed: BTreeSet<String>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct ConductorSettings {
-    version: u32,
-    harness: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

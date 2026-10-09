@@ -607,7 +607,7 @@ impl TaskApp {
             {
                 self.on_detail_action(action)
             }
-            Action::Compose | Action::UndoDecision | Action::ChooseHarness | Action::LoadMore
+            Action::Compose | Action::UndoDecision | Action::LoadMore
                 if context == Context::Details =>
             {
                 return self.on_conductor_action(action);

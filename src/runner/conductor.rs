@@ -54,25 +54,18 @@ impl ConductorHost {
     /// Assembles the conductor of the task on `storage` over `engine`, when
     /// its harness can run here.
     ///
-    /// The harness is the owner's choice kept on the storage, else
-    /// `pinned_harness`, the one the task was created with.
+    /// The harness is `pinned_harness`, the one the task was created with. A
+    /// per-task choice an older version kept on the storage is not read.
     pub(super) fn assemble(
         engine: &Arc<Engine>,
         storage: &TaskStorage,
         pinned_harness: &str,
         definition: &Arc<WorkflowDefinition>,
     ) -> Self {
-        let chosen = storage
-            .conductor_harness()
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "the owner's choice of the conductor's harness is unreadable");
-                None
-            })
-            .unwrap_or_else(|| pinned_harness.to_string());
-        let harness = Arc::new(LiveHarness::new(&chosen));
+        let harness = Arc::new(LiveHarness::new(pinned_harness));
         let passes = Arc::new(RunnerPasses::new(Arc::clone(definition)));
 
-        if let Some(reason) = harness_unavailable(&chosen) {
+        if let Some(reason) = harness_unavailable(pinned_harness) {
             tracing::info!(%reason, "no conductor runs for this task");
             return Self {
                 registry: None,
@@ -285,20 +278,6 @@ impl Session {
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
-    }
-
-    /// Runs the conductor on `harness` from its next invocation on, and
-    /// remembers the choice on the storage.
-    pub(super) fn set_conductor_harness(&self, harness: &str) -> Result<(), String> {
-        self.conductor.registry()?;
-        if let Some(reason) = harness_unavailable(harness) {
-            return Err(reason);
-        }
-        self.storage
-            .write_conductor_harness(harness)
-            .map_err(|error| error.to_string())?;
-        self.conductor.harness.set(harness);
-        Ok(())
     }
 
     /// Uploads the conductor's state an owner waits for.

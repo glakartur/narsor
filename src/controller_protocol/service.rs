@@ -26,9 +26,7 @@ use super::credentials::{
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
 use crate::domain::{BackendId, LaunchDefinitionError, TaskDisplay, TaskId};
-use crate::engine::{
-    plan_operator_transition, EngineError, HarnessRegistry, PositionStatus, Timeline,
-};
+use crate::engine::{plan_operator_transition, EngineError, PositionStatus, Timeline};
 use crate::environment::{LaunchError, LaunchIntent, LaunchResolver};
 use crate::materials::{MaterialLimits, MaterialStore};
 use crate::orchestration::{
@@ -884,6 +882,12 @@ impl ProtocolService {
         record: &TaskRecord,
         command: &OperatorCommand,
     ) -> ProtocolResult<()> {
+        if matches!(command, OperatorCommand::SetConductorHarness { .. }) {
+            return Err(ProtocolError::bad_request(
+                "unsupported_command",
+                RETIRED_CONDUCTOR_HARNESS,
+            ));
+        }
         if let Some(reason) = record.operator_command_refusal() {
             return Err(ProtocolError::conflict("operator_command_refused", reason));
         }
@@ -1885,6 +1889,12 @@ impl ProtocolService {
     }
 }
 
+/// Why `SetConductorHarness` is refused: the harness is no longer chosen per
+/// task.
+const RETIRED_CONDUCTOR_HARNESS: &str =
+    "the conductor's harness is no longer chosen per task; the conductor follows the \
+     installation's default harness";
+
 /// Most characters of one chat message to the conductor: the text is kept
 /// in the task's event stream, which is not the place for a document.
 const MAX_CHAT_CHARS: usize = 4_000;
@@ -1919,10 +1929,6 @@ fn check_conductor_command(command: &OperatorCommand) -> ProtocolResult<()> {
                 "undoing a decision needs the decision's id",
             ))
         }
-        OperatorCommand::SetConductorHarness { harness } => HarnessRegistry::defaults()
-            .get(harness)
-            .map(|_| ())
-            .map_err(|error| ProtocolError::bad_request("unsupported_harness", error.message)),
         _ => Ok(()),
     }
 }

@@ -2408,3 +2408,34 @@ fn a_runner_poll_with_nothing_to_reject_reads_and_never_writes() {
     }
     assert_eq!(fx.control.task(&task("task-1")).unwrap().revision, revision);
 }
+
+/// The per-task conductor harness is retired, but an event log written while
+/// it existed still reads.
+#[test]
+fn an_old_event_log_with_a_conductor_harness_command_still_decodes() {
+    let line = r#"{
+        "sequence": 7,
+        "task_id": "task-1",
+        "at": "2026-10-01T12:00:00Z",
+        "lifecycle": "running",
+        "generation": 3,
+        "kind": {
+            "type": "operator_command_queued",
+            "command_id": "command-1",
+            "command": { "kind": "set_conductor_harness", "harness": "codex" },
+            "requested_by": "local"
+        }
+    }"#;
+    let event: narsor::orchestration::TaskEvent =
+        serde_json::from_str(line).expect("an old event decodes");
+    assert_eq!(
+        event.kind,
+        TaskEventKind::OperatorCommandQueued {
+            command_id: "command-1".to_string(),
+            command: narsor::orchestration::OperatorCommand::SetConductorHarness {
+                harness: "codex".to_string(),
+            },
+            requested_by: OwnerRef::new("local"),
+        }
+    );
+}
