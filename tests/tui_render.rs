@@ -824,6 +824,28 @@ mod task_app_detail_render {
     }
 
     #[test]
+    fn hyperlinks_with_unsafe_targets_stay_plain_text() {
+        for url in [
+            "https://x.example/\u{1b}]8;;",
+            "https://x.example/\u{202e}gnp",
+            "https://x.example/\u{7}",
+            "https://x.example/a b",
+            "javascript:alert(1)",
+        ] {
+            let mut app = app();
+            let running = with_runner(
+                with_controller(task("a", "local", "running", 1)),
+                ExecutionStatus::Running,
+                "review",
+            );
+            app.load(listing(vec![displayed(running, "NAR-12", &[("Jira", "NAR-12", Some(url))])], "c"));
+            app.detail_mut().set_hyperlinks(true);
+            let screen = screen(&render(&mut app, &Styles::new(false)));
+            assert!(!screen.contains("\u{1b}]8"), "{url:?} must not become a hyperlink");
+        }
+    }
+
+    #[test]
     fn a_queued_task_says_it_has_not_started_and_where_it_waits() {
         let mut app = app();
         let waiting = narsor_waiting(queued("b", 2), 2, 2, 3);

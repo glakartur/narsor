@@ -724,6 +724,13 @@ pub fn queue_text(task: &TaskSummary, queue_place: Option<usize>) -> String {
     }
 }
 
+/// Whether `url` may be embedded in an OSC 8 sequence: `http(s)` and nothing
+/// but printable ASCII, which rules out ESC, BEL, C1 controls, spaces and
+/// bidirectional overrides that could end the sequence or disguise the target.
+fn is_safe_link_target(url: &str) -> bool {
+    (url.starts_with("http://") || url.starts_with("https://")) && url.chars().all(|c| c.is_ascii_graphic())
+}
+
 /// Makes the links at `spots` clickable by writing OSC 8 into the buffer.
 ///
 /// Each link becomes one cell holding the escape sequences and the whole
@@ -741,10 +748,17 @@ fn link_spots(buffer: &mut Buffer, header: Rect, spots: &[LinkSpot]) {
         let (Some(width), true) = (NonZeroU16::new(spot.width), end <= u32::from(header.width)) else {
             continue;
         };
+        if !is_safe_link_target(&spot.url) {
+            continue;
+        }
         let x = header.x + spot.column;
         let text: String = (0..spot.width)
             .map(|offset| buffer[(x + offset, y)].symbol().to_string())
             .collect();
+        // Last line of defence: nothing but the text itself may sit between the sequences.
+        if one_line(&text) != text {
+            continue;
+        }
         let cell = &mut buffer[(x, y)];
         cell.set_symbol(&format!("\x1b]8;;{}\x1b\\{text}\x1b]8;;\x1b\\", spot.url));
         cell.set_diff_option(CellDiffOption::ForcedWidth(width));
