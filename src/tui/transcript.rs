@@ -137,11 +137,6 @@ impl TranscriptEntry {
         self
     }
 
-    pub fn with_details(mut self, details: Value) -> Self {
-        self.details = Some(details);
-        self
-    }
-
     pub fn with_presentation(mut self, presentation: TranscriptPresentation) -> Self {
         self.presentation = presentation;
         self

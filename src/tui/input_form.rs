@@ -208,7 +208,7 @@ pub fn cycle_option(options: &[String], current: &str, delta: isize) -> Option<S
         return None;
     }
     let next = match options.iter().position(|option| option == current) {
-        Some(index) => wrap(index, delta, options.len()),
+        Some(index) => step_index(index, delta, options.len()),
         None if delta >= 0 => 0,
         None => options.len() - 1,
     };
@@ -267,7 +267,7 @@ fn value_as_text(value: &Value) -> String {
 }
 
 /// Steps `current` by `delta`, wrapping around `length`.
-fn wrap(current: usize, delta: isize, length: usize) -> usize {
+fn step_index(current: usize, delta: isize, length: usize) -> usize {
     ((current as isize + delta).rem_euclid(length as isize)) as usize
 }
 

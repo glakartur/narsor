@@ -61,13 +61,15 @@ use crate::tui::keymap::{key_of, Action, Context};
 use crate::tui::style::{Role, Styles};
 use crate::tui::transcript::{DisplayMode, TranscriptId, TranscriptState};
 
+use super::super::layout::first_row;
+use super::super::super::scroll::one_line;
 use super::super::actions::{
     ActionSend, ConductorSent, Confirmation, Confirmed, HarnessList, Overlay,
 };
 use super::super::detail::short_age;
-use super::super::list::{fit, one_line};
+use super::super::list::fit;
 use super::super::notify::Severity;
-use super::super::{clean, DetailTab, Focus, Request, TaskApp};
+use super::super::{DetailTab, Focus, Request, TaskApp};
 use super::conversation::{render_transcript, transcript_action};
 
 /// Pages of the chat read in one go; a longer history is read on with `M`.
@@ -576,7 +578,7 @@ fn render_history(
                 "widok surowy (Ctrl+v wraca)",
                 styles.of(Role::Attention),
             )),
-            Rect::new(area.x, area.y, area.width, 1),
+            first_row(area),
         );
         body = Rect::new(
             area.x,
@@ -681,7 +683,7 @@ impl TaskApp {
             Standing::Failed(reason) => format!("nie udało się wczytać dyrygenta ({reason})"),
             Standing::Unavailable(reason) => reason,
         };
-        self.notify(Severity::Warning, format!("{what}: {}", clean(&reason)));
+        self.notify(Severity::Warning, format!("{what}: {}", one_line(&reason)));
         None
     }
 

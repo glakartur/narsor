@@ -28,13 +28,13 @@ use ratatui::Frame;
 use crate::api::ClientError;
 use crate::controller_protocol::{CreateRepositoryRequest, RepositoryListResponse, RepositoryView};
 
+use super::super::scroll::one_line;
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
 use super::super::keymap::{self, Action, Context};
 use super::super::style::{Role, Styles};
 use super::actions::{chooser_context, Confirmation, Confirmed, Overlay};
-use super::list::one_line;
 use super::notify::Severity;
-use super::{clean, failure_reason, Focus, Request, TaskApp, View};
+use super::{failure_reason, Focus, Request, TaskApp, View};
 
 /// The key the unsent data of the form is kept under in
 /// [`DetailState::set_draft`](super::DetailState::set_draft); not a task id.
@@ -264,11 +264,10 @@ impl TaskApp {
             repositories.set_listing(listing, None);
             return;
         }
-        self.previous_focus = self.focus;
-        self.focus = Focus::Details;
-        self.panel_focus = false;
-        self.overlay = None;
-        self.view = View::Repositories(Box::new(Repositories::new(listing, local)));
+        self.enter_view(
+            View::Repositories(Box::new(Repositories::new(listing, local))),
+            Focus::Details,
+        );
     }
 
     /// The context whose keys apply while the repositories are open.
@@ -310,7 +309,7 @@ impl TaskApp {
                         Request::None
                     }
                     ChooserAction::Blocked(reason) => {
-                        self.notify(Severity::Warning, clean(&reason));
+                        self.notify(Severity::Warning, one_line(&reason));
                         Request::None
                     }
                     ChooserAction::Submit(submission) => self.submit_repository(&submission),
@@ -398,14 +397,14 @@ impl TaskApp {
                 self.sync_repository_draft();
                 self.notify(
                     Severity::Success,
-                    format!("dodano repozytorium {}", clean(&added.id)),
+                    format!("dodano repozytorium {}", one_line(&added.id)),
                 );
             }
             Err(error) => {
                 self.note_transport(&error);
                 let message = match &error {
                     ClientError::Request { message, .. } | ClientError::Refused { message, .. } => {
-                        Some(clean(message))
+                        Some(one_line(message))
                     }
                     _ => None,
                 };
@@ -434,14 +433,14 @@ impl TaskApp {
                 self.reload_repositories(None).await;
                 self.notify(
                     Severity::Success,
-                    format!("usunięto repozytorium {}", clean(&removed.id)),
+                    format!("usunięto repozytorium {}", one_line(&removed.id)),
                 );
             }
             Err(ClientError::NotFound) => {
                 self.reload_repositories(None).await;
                 self.notify(
                     Severity::Warning,
-                    format!("repozytorium {} już nie istnieje", clean(id)),
+                    format!("repozytorium {} już nie istnieje", one_line(id)),
                 );
             }
             Err(error) => {
@@ -450,7 +449,7 @@ impl TaskApp {
                     Severity::Error,
                     format!(
                         "usunięcie repozytorium {}: {}",
-                        clean(id),
+                        one_line(id),
                         failure_reason(&error)
                     ),
                 );

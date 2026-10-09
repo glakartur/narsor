@@ -17,8 +17,9 @@ use crate::orchestration::QueueReason;
 use crate::tui::keymap::Action;
 use crate::tui::style::{Role, Styles};
 
+use super::super::super::scroll::one_line;
 use super::super::detail::short_age;
-use super::super::list::{lifecycle_word, one_line};
+use super::super::list::lifecycle_word;
 
 /// What the tab remembers per task: how far it is scrolled.
 #[derive(Debug, Clone)]

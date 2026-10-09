@@ -16,7 +16,9 @@ use crate::controller_protocol::TimelineResponse;
 use crate::engine::{ConversationState, Position, PositionStatus};
 use crate::tui::style::{Role, Styles};
 
-use super::super::list::{fit, one_line};
+use super::super::layout::first_row;
+use super::super::super::scroll::one_line;
+use super::super::list::fit;
 use super::conversation::{self, Attempt, Attempts};
 
 /// Widest the axis grows, frame included.
@@ -286,7 +288,7 @@ pub fn render(
                 format!("✗ nie udało się wczytać przebiegu: {}", one_line(failure)),
                 styles.of(Role::Problem),
             )),
-            Rect::new(area.x, area.y, area.width, 1),
+            first_row(area),
         );
         top_rows = 1;
     }
@@ -408,7 +410,7 @@ fn render_attempt(frame: &mut Frame, area: Rect, styles: &Styles, attempt: &mut 
                 format!("✗ nie udało się wczytać rozmowy: {}", one_line(failure)),
                 styles.of(Role::Problem),
             )),
-            Rect::new(area.x, area.y, area.width, 1),
+            first_row(area),
         );
         if attempt.is_empty() {
             return;

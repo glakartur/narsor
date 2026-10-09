@@ -31,8 +31,8 @@ use crate::tui::transcript::{
     wrap_visible_lines, DisplayMode, TranscriptEntry, TranscriptEntryId, TranscriptId,
     TranscriptLine, TranscriptPresentation, TranscriptState,
 };
-
-use super::super::list::one_line;
+use super::super::layout::first_row;
+use super::super::super::scroll::one_line;
 
 /// Soft cap on the raw bytes of one relayed conversation page.
 pub const PAGE_BYTE_BUDGET: u64 = 64 * 1024;
@@ -187,11 +187,6 @@ impl Attempt {
     /// Whether the attempt's conversation is closed.
     pub fn is_closed(&self) -> bool {
         self.closed
-    }
-
-    /// Whether its last line was cut.
-    pub fn is_truncated(&self) -> bool {
-        self.truncated_tail
     }
 
     /// The reader of this attempt, for keys and for drawing.
@@ -440,7 +435,7 @@ pub fn render(
                 format!("✗ nie udało się wczytać rozmowy ({})", one_line(failure)),
                 styles.of(Role::Problem),
             )),
-            Rect::new(area.x, area.y, area.width, 1),
+            first_row(area),
         );
         body = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
     }
@@ -455,7 +450,7 @@ pub fn render(
     }
     let raw = conversation.transcript().mode() == DisplayMode::Raw;
     let (title, rest) = (
-        Rect::new(body.x, body.y, body.width, 1),
+        first_row(body),
         Rect::new(body.x, body.y + 1, body.width, body.height.saturating_sub(1)),
     );
     if raw {

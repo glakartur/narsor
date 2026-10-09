@@ -47,7 +47,7 @@ use ratatui::Frame;
 
 use super::input_form::{cycle_option, text_backspace, text_insert, text_step};
 use super::keymap::{digit_of, lookup, Action, Context};
-use super::scroll::{sanitize, wrap_visible, ScrollState};
+use super::scroll::{one_line, sanitize, wrap_visible, ScrollState};
 use super::style::{Role, Styles};
 
 /// The narrowest area in which the description still sits beside the list.
@@ -431,11 +431,6 @@ impl Chooser {
         self.focus
     }
 
-    /// The index of the focused field of the highlighted entry.
-    pub fn field_index(&self) -> usize {
-        self.field
-    }
-
     /// The key-map context of the chooser. Always the panel's: its hints
     /// and help are the same whichever half has the focus.
     pub fn context(&self) -> Context {
@@ -736,11 +731,6 @@ impl Chooser {
     fn description_lines(&self) -> usize {
         self.description_text().len()
     }
-}
-
-/// A single-line, sanitised version of external text.
-fn one_line(text: &str) -> String {
-    sanitize(text).replace('\n', " ")
 }
 
 /// How wide the list needs to be for its longest line.

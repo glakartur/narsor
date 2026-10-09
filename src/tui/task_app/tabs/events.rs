@@ -28,7 +28,8 @@ use crate::tui::keymap::Action;
 use crate::tui::scroll::sanitize;
 use crate::tui::style::{Role, Styles};
 
-use super::super::list::{fit, one_line};
+use super::super::super::scroll::one_line;
+use super::super::list::fit;
 
 /// Events asked for at once.
 pub const PAGE_LIMIT: u32 = 500;

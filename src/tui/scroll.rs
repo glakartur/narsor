@@ -186,6 +186,12 @@ pub fn sanitize(text: &str) -> String {
     out
 }
 
+/// [`sanitize`]d external text on a single line: every newline becomes a
+/// space.
+pub fn one_line(text: &str) -> String {
+    sanitize(text).replace('\n', " ")
+}
+
 /// The visible stand-in for a control character — the Unicode "control
 /// pictures" block for C0 controls and DEL, and the replacement character
 /// for anything else `char::is_control` flags that this block does not name.
@@ -282,6 +288,14 @@ mod tests {
     #[test]
     fn sanitize_drops_invisible_format_characters() {
         assert_eq!(sanitize("a\u{202E}b\u{200B}c\u{2066}d\u{FEFF}"), "abcd");
+    }
+
+    #[test]
+    fn one_line_is_free_of_newlines_invisible_and_escape_characters() {
+        let out = one_line("a\u{202E}b\u{200B}c\x1b[31md\ne");
+        for forbidden in ['\u{202E}', '\u{200B}', '\u{1b}', '\n'] {
+            assert!(!out.contains(forbidden), "{forbidden:?} in {out:?}");
+        }
     }
 
     #[test]

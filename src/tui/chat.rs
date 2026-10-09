@@ -16,7 +16,7 @@ use crate::conductor::{
 };
 use crate::domain::{ConductorDecisionKind, Confidence};
 use crate::tui::keymap::{key_of, Action, Context};
-use crate::tui::scroll::sanitize;
+use crate::tui::scroll::{one_line, sanitize};
 use crate::tui::transcript::{
     utterance_header, TranscriptEntry, TranscriptEntryId, TranscriptPresentation,
 };
@@ -267,7 +267,7 @@ pub fn tab_entry(item: &ChatItem, proposal: Option<&ProposalView>) -> Transcript
         if let Some(rationale) = &item.rationale {
             why.push(format!(
                 "dlaczego: {}",
-                sanitize(rationale).replace('\n', " ")
+                one_line(rationale)
             ));
         }
         if !why.is_empty() {
@@ -296,12 +296,12 @@ pub fn tab_entry(item: &ChatItem, proposal: Option<&ProposalView>) -> Transcript
 pub fn undo_lines(item: &ChatItem) -> Vec<String> {
     let mut lines = vec![format!(
         "Cofa decyzję dyrygenta: {}",
-        sanitize(&item.entry.text).replace('\n', " ")
+        one_line(&item.entry.text)
     )];
     if let Some(label) = &item.label {
         lines.push(format!(
             "Wybrane wyjście: {}",
-            sanitize(label).replace('\n', " ")
+            one_line(label)
         ));
     }
     if let Some(confidence) = item.confidence {
@@ -310,7 +310,7 @@ pub fn undo_lines(item: &ChatItem) -> Vec<String> {
     if let Some(rationale) = &item.rationale {
         lines.push(format!(
             "Uzasadnienie: {}",
-            sanitize(rationale).replace('\n', " ")
+            one_line(rationale)
         ));
     }
     lines.push("! Krok, który ruszył po tej decyzji, zachowuje swoje skutki uboczne.".to_string());

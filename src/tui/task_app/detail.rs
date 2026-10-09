@@ -43,7 +43,6 @@ use std::num::NonZeroU16;
 
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -58,17 +57,17 @@ use crate::domain::ExecutionStatus;
 use crate::engine::ConversationState;
 use crate::orchestration::{QueueReason, TaskLifecycle};
 
+use super::super::scroll::one_line;
 use super::super::keymap::Action;
 use super::super::style::{Role, Styles};
-use super::list::{fit, lifecycle_word, one_line, state_icon, title_of};
+use super::list::{fit, lifecycle_word, state_icon, title_of};
 use super::tabs::conductor::{self, Conductor};
 use super::tabs::conversation::{self, transcript_action, AttemptRead, Attempts, Conversation};
 use super::tabs::events::{self, Events};
 use super::tabs::info::{self, Info};
 use super::tabs::progress::{self, Progress};
-use super::tabs::failure_text;
 use super::waiting::WaitingPanel;
-use super::{DetailTab, DetailView, Focus, TaskApp};
+use super::{failure_reason, DetailTab, DetailView, Focus, TaskApp};
 
 /// Everything the details of one task remember.
 #[derive(Debug, Clone)]
@@ -146,9 +145,21 @@ impl TaskDetail {
 
     /// Makes everything due for a new read, keeping what is shown.
     pub fn invalidate(&mut self) {
+        self.invalidate_task_reads();
+        self.invalidate_conductor_reads();
+    }
+
+    /// Makes what the task's own revision tells apart (the timeline, the
+    /// attempts' conversations, the events) due for a new read.
+    pub fn invalidate_task_reads(&mut self) {
         self.progress.invalidate();
         self.attempts.invalidate();
         self.events.invalidate();
+    }
+
+    /// Makes the conductor's state due for a new read: its chat grows without
+    /// the task's revision moving.
+    pub fn invalidate_conductor_reads(&mut self) {
         self.conductor.invalidate();
         self.waiting.invalidate();
     }
@@ -375,7 +386,7 @@ impl TaskApp {
             if matches!(error, ClientError::Unavailable(_) | ClientError::Server(_)) {
                 self.note_transport(&error);
             }
-            failure_text(&error)
+            failure_reason(&error)
         })
     }
 
@@ -625,7 +636,7 @@ fn tab_bar(active: DetailTab, progress: &Progress, focused: bool, styles: &Style
     for tab in DetailTab::ALL {
         let style = if tab == active {
             let role = if focused { Role::Focus } else { Role::Calm };
-            styles.of(role).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            styles.selected_tab(role)
         } else {
             styles.of(Role::Done)
         };
@@ -662,7 +673,7 @@ fn header(
     let room = width.saturating_sub(workflow.chars().count() + 3);
     let mut first = vec![Span::styled(
         fit(&title, room),
-        styles.of(grey(Role::Calm)).add_modifier(Modifier::BOLD),
+        styles.strong(grey(Role::Calm)),
     )];
     let mut used = first[0].width();
     if title != identity && used + 2 + identity.chars().count() <= room {

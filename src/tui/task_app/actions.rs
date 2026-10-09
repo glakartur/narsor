@@ -64,13 +64,14 @@ use crate::orchestration::{
     AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskLifecycle,
 };
 
+use super::super::scroll::one_line;
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
 use super::super::keymap::{self, Action, Context};
 use super::super::style::{Role, Styles};
-use super::list::{one_line, title_of, CommandResolved};
+use super::list::{title_of, CommandResolved};
 use super::notify::Severity;
 use super::waiting::AnswerRequest;
-use super::{clean, idempotency_key, is_transport, failure_reason, Request, TaskApp};
+use super::{idempotency_key, is_transport, failure_reason, Request, TaskApp};
 
 // ---------------------------------------------------------------------
 // What can be done, and when
@@ -1275,7 +1276,7 @@ pub fn resolved_notice(resolved: &CommandResolved) -> (Severity, String) {
 
 fn rejection_text(name: &str, detail: Option<&str>) -> String {
     let reason = detail
-        .map(clean)
+        .map(one_line)
         .filter(|reason| !reason.trim().is_empty())
         .unwrap_or_else(|| "bez podania przyczyny".to_string());
     format!("{name} odrzucone przez runnera — {reason}")
@@ -1290,7 +1291,7 @@ fn refusal_notice(title: &str, verb: &str, error: &ClientError) -> (Severity, St
                 format!(
                     "{title}: backend jest pełny — {verb} nie wykonane, zadanie zachowuje stan \
                      ({}); spróbuj, gdy zwolni się slot",
-                    clean(message)
+                    one_line(message)
                 ),
             );
         }
@@ -1314,7 +1315,7 @@ pub fn refusal_reason(error: &ClientError) -> String {
     else {
         return failure_reason(error);
     };
-    let said = clean(message);
+    let said = one_line(message);
     let known = match code.as_str() {
         "operator_command_refused" => return said,
         "override_reason_required" => "override wymaga powodu",
@@ -1415,17 +1416,24 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
-fn render_list(frame: &mut Frame, area: Rect, title: &str, chooser: &mut Chooser, styles: &Styles) {
-    let width = area.width.saturating_sub(4).min(100);
-    let height = chooser.preferred_height(width.saturating_sub(2)) + 2;
-    let place = popup(area, width, height.min(area.height.saturating_sub(2)));
+/// Clears `place`, draws a frame in `role` with `title` on it and returns
+/// what is inside.
+fn framed(frame: &mut Frame, place: Rect, role: Role, title: &str, styles: &Styles) -> Rect {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(styles.of(Role::Focus))
+        .border_style(styles.of(role))
         .title(format!(" {} ", one_line(title)));
     let inner = block.inner(place);
     frame.render_widget(Clear, place);
     frame.render_widget(block, place);
+    inner
+}
+
+fn render_list(frame: &mut Frame, area: Rect, title: &str, chooser: &mut Chooser, styles: &Styles) {
+    let width = area.width.saturating_sub(4).min(100);
+    let height = chooser.preferred_height(width.saturating_sub(2)) + 2;
+    let place = popup(area, width, height.min(area.height.saturating_sub(2)));
+    let inner = framed(frame, place, Role::Focus, title, styles);
     chooser::render(frame, inner, chooser, styles);
 }
 
@@ -1439,13 +1447,7 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
         .sum();
     let height = u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(5);
     let place = popup(area, width, height.min(area.height.saturating_sub(2)));
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(styles.of(Role::Problem))
-        .title(format!(" {} ", one_line(&confirmation.heading)));
-    let inner = block.inner(place);
-    frame.render_widget(Clear, place);
-    frame.render_widget(block, place);
+    let inner = framed(frame, place, Role::Problem, &confirmation.heading, styles);
     let mut lines: Vec<Line> = confirmation
         .lines
         .iter()

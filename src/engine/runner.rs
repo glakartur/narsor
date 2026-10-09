@@ -1138,11 +1138,6 @@ impl Engine {
         self.lock_pause_requests().insert(execution_id.to_string());
     }
 
-    /// Whether a pause has been requested and not yet acted on.
-    pub fn is_pause_requested(&self, execution_id: &str) -> bool {
-        self.lock_pause_requests().contains(execution_id)
-    }
-
     /// Whether a pass is currently driving this execution through
     /// [`Engine::run`], [`Engine::resume`] or [`Engine::deliver_human_input`]
     /// (R7).

@@ -29,12 +29,11 @@
 //! is the title (`display.title`, else the task id) and the last a short label:
 //! the current step, `#n` for a queued task, `offline` when no controller holds
 //! the backend. Everything that comes from the server is passed through
-//! [`sanitize`] before it is drawn.
+//! [`one_line`] before it is drawn.
 
 use std::collections::HashMap;
 
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use ratatui::Frame;
@@ -48,7 +47,7 @@ use crate::orchestration::{
     TaskEvent, TaskEventKind, TaskLifecycle,
 };
 
-use super::super::scroll::sanitize;
+use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 
 /// What a row asks of the operator (column 1).
@@ -188,11 +187,6 @@ pub fn title_of(task: &TaskSummary) -> String {
     } else {
         title
     }
-}
-
-/// Server text on one line, safe for a terminal.
-pub fn one_line(text: &str) -> String {
-    crate::domain::display::without_unsafe_chars(&sanitize(text).replace('\n', " "))
 }
 
 /// Whether the task's backend has no controller holding its lease right now:
@@ -424,11 +418,6 @@ impl TaskList {
         &self.tasks
     }
 
-    /// Whether finished tasks are hidden.
-    pub fn hides_done(&self) -> bool {
-        self.hide_done
-    }
-
     /// The move mode, while it is on.
     pub fn moving(&self) -> Option<&MoveMode> {
         self.moving.as_ref()
@@ -540,8 +529,11 @@ impl TaskList {
 
     /// What the row of `tasks[index]` shows.
     pub fn row_text(&self, index: usize) -> RowText {
+        self.row_text_with(index, &self.queue_positions())
+    }
+
+    fn row_text_with(&self, index: usize, positions: &HashMap<usize, usize>) -> RowText {
         let task = &self.tasks[index];
-        let positions = self.queue_positions();
         RowText {
             attention: attention_of(task),
             icon: state_icon(task),
@@ -552,9 +544,10 @@ impl TaskList {
 
     /// The rows shown, as text, top to bottom.
     pub fn rows(&self) -> Vec<RowText> {
+        let positions = self.queue_positions();
         self.visible()
             .into_iter()
-            .map(|index| self.row_text(index))
+            .map(|index| self.row_text_with(index, &positions))
             .chain(self.pending.iter().map(PendingRow::text))
             .collect()
     }
@@ -833,9 +826,6 @@ impl TaskList {
         if event.sequence <= self.tasks[index].revision {
             return EventEffect::default();
         }
-        let before = self.all_ids();
-        let departed_title = self.selected().map(title_of);
-
         {
             let task = &mut self.tasks[index];
             task.revision = event.sequence;
@@ -851,6 +841,8 @@ impl TaskList {
         };
 
         if event.lifecycle.is_archival() {
+            let before = self.all_ids();
+            let departed_title = self.selected().map(title_of);
             self.tasks.remove(index);
             self.cancel_move_if_gone();
             effect.removal = self.settle_selection_with(&before, departed_title);
@@ -895,20 +887,29 @@ impl TaskList {
     /// already occupy; a task `order` does not name (created since) goes last.
     fn apply_order(&mut self, index: usize, order: &[crate::domain::TaskId]) {
         let backend = self.tasks[index].backend_id.clone();
-        let slots: Vec<usize> = (0..self.tasks.len())
-            .filter(|&at| self.tasks[at].backend_id == backend)
-            .collect();
-        let mut group: Vec<TaskSummary> = slots.iter().map(|&at| self.tasks[at].clone()).collect();
-        let place = |task: &TaskSummary| order.iter().position(|id| *id == task.task_id);
-        group.sort_by_key(|task| place(task).unwrap_or(usize::MAX));
+        let place: HashMap<&crate::domain::TaskId, usize> =
+            order.iter().enumerate().map(|(at, id)| (id, at)).collect();
+        let mut group = Vec::new();
+        let mut layout: Vec<Option<TaskSummary>> = Vec::with_capacity(self.tasks.len());
+        for task in std::mem::take(&mut self.tasks) {
+            if task.backend_id == backend {
+                group.push(task);
+                layout.push(None);
+            } else {
+                layout.push(Some(task));
+            }
+        }
+        group.sort_by_cached_key(|task| place.get(&task.task_id).copied().unwrap_or(usize::MAX));
         for task in &mut group {
-            if let Some(position) = place(task) {
+            if let Some(&position) = place.get(&task.task_id) {
                 task.rank = u32::try_from(position + 1).unwrap_or(u32::MAX);
             }
         }
-        for (slot, task) in slots.into_iter().zip(group) {
-            self.tasks[slot] = task;
-        }
+        let mut ordered = group.into_iter();
+        self.tasks = layout
+            .into_iter()
+            .filter_map(|kept| kept.or_else(|| ordered.next()))
+            .collect();
     }
 
     // -----------------------------------------------------------------
@@ -1298,9 +1299,4 @@ pub(super) fn row_line(
         }
     }
     Line::from(spans)
-}
-
-/// The style the shortcut bar and header use for a count that is zero.
-pub fn count_style(styles: &Styles, count: usize, role: Role) -> Style {
-    styles.of(if count == 0 { Role::Done } else { role })
 }

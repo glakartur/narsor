@@ -46,15 +46,16 @@ use crate::controller_protocol::{
 use crate::domain::{Event, ExecutionStatus, TaskId};
 use crate::engine::Timeline;
 
+use super::super::scroll::one_line;
 use super::super::keymap::{self, Action, Context};
 use super::super::style::{Role, Styles};
 use super::detail::TaskDetail;
 use super::detail::{recorded_attempt, render_view, ViewOptions};
-use super::list::{fit, one_line, row_line, title_of, Attention, RowText, StateIcon};
+use super::list::{fit, row_line, title_of, Attention, RowText, StateIcon};
 use super::notify::Severity;
 use super::tabs::conversation::{read_history_attempt, AttemptRead};
 use super::tabs::events;
-use super::{clean, DetailTab, DetailView, Focus, Request, TaskApp, View};
+use super::{DetailTab, DetailView, Focus, Request, TaskApp, View};
 
 /// Pages of an old conductor's chat read in one go.
 const CHAT_PAGES: usize = 10;
@@ -136,7 +137,7 @@ impl HistoryEntry {
                 .view
                 .not_recoverable_reason
                 .as_deref()
-                .map(clean)
+                .map(one_line)
                 .filter(|reason| !reason.trim().is_empty())
                 .unwrap_or_else(|| "serwer nie podał powodu".to_string())),
         }
@@ -308,11 +309,6 @@ impl History {
         self.tab
     }
 
-    /// What the tabs of `entry` hold, once it was shown or read.
-    pub fn detail_of(&self, entry: &HistoryEntry) -> Option<&TaskDetail> {
-        self.details.get(&entry.key())
-    }
-
     /// Why the old executions are not listed, when they could not be.
     pub fn note(&self) -> Option<&str> {
         self.note.as_deref()
@@ -393,11 +389,10 @@ impl TaskApp {
             history.note = note;
             return;
         }
-        self.previous_focus = self.focus;
-        self.focus = Focus::List;
-        self.panel_focus = false;
-        self.overlay = None;
-        self.view = View::History(Box::new(History::new(archived.tasks, legacy, note)));
+        self.enter_view(
+            View::History(Box::new(History::new(archived.tasks, legacy, note))),
+            Focus::List,
+        );
     }
 
     /// The context whose keys apply while the history is open.
@@ -457,9 +452,7 @@ impl TaskApp {
 
     /// `Esc` from a view that has its own screen: back to the list of tasks.
     pub(super) fn close_view(&mut self) {
-        self.view = View::Tasks;
-        self.focus = self.previous_focus;
-        self.panel_focus = false;
+        self.leave_view();
     }
 
     /// `w`: recovers the selected old execution when it can be, otherwise says
@@ -499,7 +492,7 @@ impl TaskApp {
             Ok(_) => {
                 self.notify(
                     Severity::Success,
-                    format!("execution {} wznawia się w tle", clean(execution_id)),
+                    format!("execution {} wznawia się w tle", one_line(execution_id)),
                 );
                 self.reload_history().await;
             }
@@ -509,7 +502,7 @@ impl TaskApp {
                     Severity::Error,
                     format!(
                         "wznowienie {} odrzucone — {}",
-                        clean(execution_id),
+                        one_line(execution_id),
                         super::actions::refusal_reason(&error)
                     ),
                 );

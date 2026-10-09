@@ -75,6 +75,12 @@ pub struct Areas {
     pub bar: Rect,
 }
 
+/// The first row of `area`: a single line for a notice above a body. Empty
+/// when `area` has no height, so that nothing is drawn outside it.
+pub fn first_row(area: Rect) -> Rect {
+    Rect::new(area.x, area.y, area.width, area.height.min(1))
+}
+
 /// The layout for a terminal of `area`, with the focus on `focus`.
 pub fn areas(area: Rect, focus: Focus) -> Areas {
     let screen = if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {

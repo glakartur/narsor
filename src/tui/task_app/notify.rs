@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::text::Span;
 
-use super::super::scroll::sanitize;
+use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 
 /// How long a notification stays on the bar.
@@ -66,7 +66,7 @@ impl Notifier {
     /// server is made safe and put on one line.
     pub fn push(&mut self, severity: Severity, text: impl AsRef<str>, now: Instant) {
         self.current = Some(Notification {
-            text: crate::domain::display::without_unsafe_chars(&sanitize(text.as_ref()).replace('\n', " ")),
+            text: one_line(text.as_ref()),
             severity,
             at: now,
         });

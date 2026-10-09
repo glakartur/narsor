@@ -96,7 +96,7 @@ pub mod repositories;
 pub mod tabs;
 pub mod waiting;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use crossterm::event::KeyEvent;
@@ -112,7 +112,7 @@ use crate::orchestration::MoveTarget;
 use super::connection::Connection;
 use super::keymap::{self, Action, Context};
 use super::refresh::RefreshSchedule;
-use super::scroll::sanitize;
+use super::scroll::one_line;
 use actions::{availability, ActionRequest, Availability, LinkRequest, Overlay, TaskAction};
 use detail::TaskDetail;
 use history::History;
@@ -221,11 +221,25 @@ impl DetailState {
         self.hyperlinks = enabled;
     }
 
-    /// Makes what every task's details hold due for a new read; what is shown,
-    /// and every cursor, stays.
-    fn invalidate(&mut self) {
-        for view in self.views.values_mut() {
-            view.invalidate();
+    /// Makes the details of every task due for a new read, keeping what is
+    /// shown and every cursor. The task's own reads (timeline, conversation,
+    /// events) are made due only when its revision differs from the one in
+    /// `before`; the conductor's chat can grow without it, so it is always read
+    /// again.
+    fn invalidate_changed(
+        &mut self,
+        tasks: &[crate::controller_protocol::TaskSummary],
+        before: &HashMap<String, u64>,
+    ) {
+        for task in tasks {
+            let id = task.task_id.as_str();
+            let Some(view) = self.views.get_mut(id) else {
+                continue;
+            };
+            if before.get(id) != Some(&task.revision) {
+                view.invalidate_task_reads();
+            }
+            view.invalidate_conductor_reads();
         }
     }
 
@@ -388,7 +402,7 @@ impl TaskApp {
         Self {
             client,
             list: TaskList::new(),
-            connection: Connection::new(clean(&connection_name.into())),
+            connection: Connection::new(one_line(&connection_name.into())),
             notifier: Notifier::default(),
             schedule: RefreshSchedule::new(refresh_interval, Instant::now()),
             cursor: None,
@@ -453,7 +467,7 @@ impl TaskApp {
     /// Takes what the server offers in, as the first read does: the name of
     /// the connection and what the new-task form may offer.
     pub fn set_capabilities(&mut self, capabilities: CapabilitiesView) {
-        self.connection.rename(clean(&capabilities.connection_name));
+        self.connection.rename(one_line(&capabilities.connection_name));
         self.capabilities = Some(capabilities);
     }
 
@@ -865,13 +879,40 @@ impl TaskApp {
         self.connection.on_data(now);
         self.schedule.done(now);
         self.stream_failures = 0;
+        let revisions: HashMap<String, u64> = self
+            .list
+            .tasks()
+            .iter()
+            .map(|task| (task.task_id.to_string(), task.revision))
+            .collect();
         let removal = self.list.replace(listing.tasks);
         self.detail.retain(self.list.tasks());
-        self.detail.invalidate();
+        self.detail.invalidate_changed(self.list.tasks(), &revisions);
         self.sync_waiting();
         self.sync_overlay();
         self.settle_outbox();
         self.announce(removal);
+    }
+
+    /// Shows `view` with `focus`, closing any overlay. The focus to return to
+    /// is remembered unless the same kind of view was already open.
+    fn enter_view(&mut self, view: View, focus: Focus) {
+        if std::mem::discriminant(&self.view) != std::mem::discriminant(&view) {
+            self.previous_focus = self.focus;
+        }
+        self.focus = focus;
+        self.panel_focus = false;
+        self.overlay = None;
+        self.view = view;
+    }
+
+    /// Back to the task list, with the focus the view was entered from.
+    /// Returns the view that was left.
+    fn leave_view(&mut self) -> View {
+        let left = std::mem::replace(&mut self.view, View::Tasks);
+        self.focus = self.previous_focus;
+        self.panel_focus = false;
+        left
     }
 
     fn announce(&mut self, removal: Option<Removal>) {
@@ -994,17 +1035,12 @@ pub fn failure_reason(error: &ClientError) -> String {
     match error {
         ClientError::Refused { message, .. }
         | ClientError::Request { message, .. }
-        | ClientError::Degraded { message, .. } => clean(message),
+        | ClientError::Degraded { message, .. } => one_line(message),
         ClientError::Conflict => "zadanie zmieniło się w międzyczasie (409)".to_string(),
         ClientError::NotFound => "nie ma takiego zadania".to_string(),
         ClientError::Unavailable(_) => "brak połączenia z serwerem".to_string(),
-        other => clean(&other.to_string()),
+        other => one_line(&other.to_string()),
     }
-}
-
-/// Server text on one line, safe for a terminal.
-fn clean(text: &str) -> String {
-    sanitize(text).replace('\n', " ")
 }
 
 /// The control-plane event stream, resumed from the cursor of the last event

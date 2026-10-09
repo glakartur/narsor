@@ -72,15 +72,16 @@ use crate::controller_protocol::{
 };
 use crate::domain::ParamType;
 
+use super::super::scroll::one_line;
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem};
 use super::super::input_form::{workflow_input_fields, workflow_input_values};
 use super::super::keymap::{self, Action, Context};
 use super::super::scroll::sanitize;
 use super::super::style::{Role, Styles};
 use super::actions::chooser_context;
-use super::list::{fit, one_line, PendingRow, PendingState};
+use super::list::{fit, PendingRow, PendingState};
 use super::notify::Severity;
-use super::{clean, is_transport, failure_reason, Focus, Request, TaskApp, View};
+use super::{is_transport, failure_reason, Focus, Request, TaskApp, View};
 
 /// The key the unsent data of the form is kept under in
 /// [`DetailState::set_draft`](super::DetailState::set_draft); not a task id.
@@ -524,13 +525,7 @@ impl TaskApp {
     }
 
     fn show_new_task(&mut self, form: NewTaskForm) {
-        if !matches!(self.view, View::NewTask(_)) {
-            self.previous_focus = self.focus;
-        }
-        self.focus = Focus::Details;
-        self.panel_focus = false;
-        self.overlay = None;
-        self.view = View::NewTask(Box::new(form));
+        self.enter_view(View::NewTask(Box::new(form)), Focus::Details);
     }
 
     /// `n`: reads the catalogue, then opens the form. Without an answer the
@@ -586,10 +581,9 @@ impl TaskApp {
     /// `Esc`: closes the form, remembering what was typed, and gives the
     /// details back to the task that was selected.
     fn close_new_task(&mut self) {
-        let View::NewTask(form) = std::mem::replace(&mut self.view, View::Tasks) else {
+        let View::NewTask(form) = self.leave_view() else {
             return;
         };
-        self.focus = self.previous_focus;
         self.new_task_memory = Some(*form);
         self.sync_new_task_draft();
     }
@@ -633,7 +627,7 @@ impl TaskApp {
                 Request::None
             }
             ChooserAction::Blocked(reason) => {
-                self.notify(Severity::Warning, clean(&reason));
+                self.notify(Severity::Warning, one_line(&reason));
                 Request::None
             }
             ChooserAction::Submit(submission) => self.submit_new_task(&submission),
@@ -735,12 +729,10 @@ impl TaskApp {
     /// what was typed is kept until the server has the task.
     fn begin_sending(&mut self, outgoing: Outgoing) -> Request {
         let id = outgoing.task_id.clone();
-        if let View::NewTask(mut form) = std::mem::replace(&mut self.view, View::Tasks) {
+        if let View::NewTask(mut form) = self.leave_view() {
             form.submitted = Some(id.clone());
             self.new_task_memory = Some(*form);
         }
-        self.focus = self.previous_focus;
-        self.panel_focus = false;
         self.list.push_pending(PendingRow {
             task_id: id.clone(),
             title: outgoing.title.clone(),
@@ -801,7 +793,7 @@ impl TaskApp {
             .map_or_else(String::new, |place| format!(", #{place} w kolejce"));
         self.notify(
             Severity::Success,
-            format!("{}: zadanie utworzone{place}", clean(&outgoing.title)),
+            format!("{}: zadanie utworzone{place}", one_line(&outgoing.title)),
         );
     }
 
@@ -849,7 +841,7 @@ impl TaskApp {
             return;
         };
         outgoing.attempts = outgoing.attempts.saturating_add(1);
-        let title = clean(&outgoing.title);
+        let title = one_line(&outgoing.title);
         if outgoing.attempts < 2 {
             outgoing.retry_at = Some(now + RETRY_AFTER);
             self.list.set_pending(id, PendingState::Sending, None);
@@ -884,7 +876,7 @@ impl TaskApp {
             Severity::Error,
             format!(
                 "{}: serwer odrzucił zadanie — {}",
-                clean(&outgoing.title),
+                one_line(&outgoing.title),
                 super::actions::refusal_reason(error)
             ),
         );
@@ -933,7 +925,7 @@ impl TaskApp {
         if row.state == PendingState::Sending {
             self.notify(
                 Severity::Warning,
-                format!("{}: wysyłanie trwa", clean(&row.title)),
+                format!("{}: wysyłanie trwa", one_line(&row.title)),
             );
             return Request::None;
         }
@@ -997,7 +989,7 @@ impl TaskApp {
                 "definicja jest niepoprawna — naruszeń: {} (pełna lista w opisie)",
                 violations.len()
             )),
-            PathVerdict::Failed(reason) => Some(clean(reason)),
+            PathVerdict::Failed(reason) => Some(one_line(reason)),
         };
         form.check = Some(PathCheck {
             path: path.to_string(),
@@ -1055,9 +1047,7 @@ pub fn render_pending(
     let mut lines = vec![
         Line::styled(
             fit(&one_line(&row.title), usize::from(area.width)),
-            styles
-                .of(Role::Calm)
-                .add_modifier(ratatui::style::Modifier::BOLD),
+            styles.strong(Role::Calm),
         ),
         Line::from(vec![
             Span::styled(

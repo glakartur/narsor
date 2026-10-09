@@ -65,7 +65,7 @@ use crate::conductor::{ChatEntry, ProposalOutcome, UndoOutcome};
 
 use super::dto::{
     AcceptedResponse, ChatMessageRequest, ConductorChatResponse, ConductorStateResponse,
-    ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot, OperatorNoteRequest,
+    ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
     RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
     StartTaskResponse, TransitionRequest,
 };
@@ -393,16 +393,6 @@ impl ApiClient {
             },
         )
         .await
-    }
-
-    /// Stores a one-shot operator instruction for the next agent attempt.
-    pub async fn operator_note(
-        &self,
-        execution_id: &str,
-        note: String,
-    ) -> Result<AcceptedResponse, ClientError> {
-        let url = format!("{}/executions/{execution_id}/operator-note", self.base_url);
-        self.post_json(&url, &OperatorNoteRequest { note }).await
     }
 
     /// Immediately interrupts the daemon task driving an execution.

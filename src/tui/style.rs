@@ -103,11 +103,6 @@ impl Styles {
         Self::new(no_color_requested(std::env::var_os("NO_COLOR")))
     }
 
-    /// Whether colour is off.
-    pub fn is_no_color(&self) -> bool {
-        self.no_color
-    }
-
     /// The look of `role`.
     pub fn of(&self, role: Role) -> Style {
         let bold = Style::default().add_modifier(Modifier::BOLD);
@@ -139,6 +134,16 @@ impl Styles {
     /// so what `base` says is still said.
     pub fn selected(&self, base: Style) -> Style {
         base.patch(self.of(Role::Selected))
+    }
+
+    /// The look of `role`, in bold: a title.
+    pub fn strong(&self, role: Role) -> Style {
+        self.of(role).add_modifier(Modifier::BOLD)
+    }
+
+    /// The look of `role` for the tab that is open: bold and underlined.
+    pub fn selected_tab(&self, role: Role) -> Style {
+        self.strong(role).add_modifier(Modifier::UNDERLINED)
     }
 
     /// A key on the shortcut bar: dark on the accent, or reversed.

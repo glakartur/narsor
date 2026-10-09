@@ -59,6 +59,7 @@ use crate::controller_protocol::{
 use crate::engine::{HumanInputDelivery, Position, PositionStatus};
 use crate::orchestration::{AttentionItem, AttentionKind, OperatorCommand, OwnerCommand};
 
+use super::super::scroll::one_line;
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserFocus, ChooserItem, Submission};
 use super::super::failure_form::OperatorPanel;
 use super::super::input_form::{ContextLine, InputPanel, Tone};
@@ -66,7 +67,7 @@ use super::super::keymap::{self, Action, Context};
 use super::super::scroll::{wrap_line, ScrollState};
 use super::super::style::{Role, Styles};
 use super::detail::short_age;
-use super::list::{one_line, title_of};
+use super::list::title_of;
 use super::notify::Severity;
 use super::tabs::conductor;
 use super::{idempotency_key, failure_reason, Request, TaskApp};
@@ -483,11 +484,6 @@ impl WaitingPanel {
     /// Whether the panel is folded to its one line.
     pub fn is_collapsed(&self) -> bool {
         self.collapsed
-    }
-
-    /// The kind of the waiting shown.
-    pub fn current_kind(&self) -> Option<AttentionKind> {
-        self.entries.get(self.current).map(|entry| entry.item.kind)
     }
 
     /// The identity of the waiting shown.

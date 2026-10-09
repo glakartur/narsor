@@ -36,7 +36,7 @@ use serde_json::Value;
 use crate::api::ConversationEntryDto;
 use crate::persistence::conversation::ConversationSource;
 
-use super::scroll::sanitize;
+use super::scroll::{one_line, sanitize};
 use super::transcript::{
     utterance_header, TranscriptEntry, TranscriptEntryId, TranscriptPresentation,
 };
@@ -824,7 +824,7 @@ fn semantic_detail_lines(details: &serde_json::Value, summary: &str) -> Vec<Stri
         if let Some(value) = details.get(key) {
             let value = text(value);
             if !value.is_empty() {
-                labelled.push(format!("{label}: {}", sanitize(&value).replace('\n', " ")));
+                labelled.push(format!("{label}: {}", one_line(&value)));
             }
         }
     }
