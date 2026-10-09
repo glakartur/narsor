@@ -2247,3 +2247,132 @@ fn a_runner_detail_is_cleaned_and_bounded_when_a_command_is_settled() {
     assert!(!detail.contains('\u{1b}') && !detail.contains('\u{202e}'));
     assert_eq!(detail.chars().count(), 2_000);
 }
+
+/// A running task whose runner holds the commands of launch generation 1.
+fn running_task_for_commands() -> Fixture {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    running_with_runner(&fx, "task-1", &lease);
+    fx
+}
+
+fn queue_chat(fx: &Fixture, key: &str, text: &str) -> Result<String, OrchestrationError> {
+    use narsor::orchestration::OperatorCommand;
+    fx.control
+        .queue_operator_command(
+            &task("task-1"),
+            operator_request(
+                OperatorCommand::ConductorChat {
+                    text: text.to_string(),
+                },
+                key,
+            ),
+        )
+        .map(|outcome| outcome.command.command_id)
+}
+
+fn settle(fx: &Fixture, command_id: &str) {
+    fx.control
+        .settle_operator_command(&task("task-1"), "pod-1", 1, command_id, true, None)
+        .expect("settled");
+}
+
+#[test]
+fn settled_commands_are_pruned_ids_stay_unique_and_chat_text_is_dropped() {
+    let fx = running_task_for_commands();
+    let mut ids = Vec::new();
+    for number in 1..=30 {
+        let id = queue_chat(&fx, &format!("chat-{number}"), "a long message").unwrap();
+        settle(&fx, &id);
+        ids.push(id);
+    }
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 30, "an id is never given twice: {ids:?}");
+    assert_eq!(ids[29], "command-30");
+
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(record.operator_commands.len(), 20, "the last 20 settled ones");
+    assert_eq!(record.operator_commands[0].command_id, "command-11");
+    assert!(record.operator_commands.iter().all(|command| matches!(
+        &command.command,
+        narsor::orchestration::OperatorCommand::ConductorChat { text } if text.is_empty()
+    )));
+
+    // A command still open is never forgotten, and the next id goes on.
+    let open = queue_chat(&fx, "chat-31", "still waiting").unwrap();
+    assert_eq!(open, "command-31");
+    for number in 32..=60 {
+        let id = queue_chat(&fx, &format!("chat-{number}"), "x").unwrap();
+        settle(&fx, &id);
+    }
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert!(record.operator_command("command-31").is_some());
+    assert_eq!(record.operator_command("command-31").unwrap().command_id, open);
+}
+
+#[test]
+fn retrying_a_command_key_is_safe_whether_the_command_was_kept_or_forgotten() {
+    let fx = running_task_for_commands();
+    for number in 1..=25 {
+        let id = queue_chat(&fx, &format!("chat-{number}"), "hello").unwrap();
+        settle(&fx, &id);
+    }
+    // Kept (settled, its text dropped): the retry gets the original back.
+    let again = fx
+        .control
+        .queue_operator_command(
+            &task("task-1"),
+            operator_request(
+                narsor::orchestration::OperatorCommand::ConductorChat {
+                    text: "hello".into(),
+                },
+                "chat-25",
+            ),
+        )
+        .unwrap();
+    assert!(again.replayed);
+    assert_eq!(again.command.command_id, "command-25");
+    // Forgotten: refused, not carried out a second time.
+    let error = queue_chat(&fx, "chat-1", "hello").unwrap_err();
+    assert!(
+        matches!(error, OrchestrationError::OperatorCommandKeyReused { .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        fx.control.task(&task("task-1")).unwrap().operator_commands.len(),
+        20
+    );
+}
+
+#[test]
+fn too_many_unsettled_commands_refuse_a_new_one() {
+    let fx = running_task_for_commands();
+    for number in 1..=20 {
+        queue_chat(&fx, &format!("chat-{number}"), "hello").unwrap();
+    }
+    let error = queue_chat(&fx, "chat-21", "hello").unwrap_err();
+    assert!(
+        matches!(error, OrchestrationError::OperatorCommandRefused { .. }),
+        "{error:?}"
+    );
+    // A retry of one that is queued still gets its answer.
+    assert!(queue_chat(&fx, "chat-3", "hello").is_ok());
+}
+
+#[test]
+fn command_ids_of_a_record_without_a_counter_continue_above_its_highest() {
+    let fx = running_task_for_commands();
+    for number in 1..=3 {
+        let id = queue_chat(&fx, &format!("chat-{number}"), "hi").unwrap();
+        settle(&fx, &id);
+    }
+    // A record written before the counter existed.
+    let path = fx.root.paths().orchestration_task_file("task-1");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("operator_command_counter");
+    object.remove("retired_command_keys");
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    assert_eq!(queue_chat(&fx, "chat-4", "hi").unwrap(), "command-4");
+}

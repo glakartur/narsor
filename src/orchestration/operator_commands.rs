@@ -17,12 +17,23 @@
 use super::control_plane::{ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    OperatorCommandOutcome, OperatorCommandRequest, OperatorCommandStatus, QueuedOperatorCommand,
+    OperatorCommand, OperatorCommandOutcome, OperatorCommandRequest, OperatorCommandStatus, QueuedOperatorCommand,
     TaskEventKind, TaskLifecycle, TaskRecord,
 };
 use super::runner_state::fence_runner;
 use crate::domain::display::bounded_detail;
 use crate::domain::TaskId;
+
+/// Settled commands a record keeps, newest last; older ones are forgotten.
+/// Open commands are never forgotten.
+const SETTLED_COMMANDS_KEPT: usize = 20;
+
+/// Commands that may wait for a verdict at once; a new one is refused
+/// beyond it, so a silent runner cannot make the record grow.
+const MAX_OPEN_COMMANDS: usize = 20;
+
+/// Keys of forgotten commands a record remembers.
+const RETIRED_KEYS_KEPT: usize = 256;
 
 impl ControlPlane {
     /// Queues an operator command for the runner of a running task.
@@ -31,7 +42,16 @@ impl ControlPlane {
     /// became of it meanwhile; the same key for another command is refused.
     /// A new command is refused — without touching the record — unless the
     /// task is `Running` under a runner of its current launch, and when
-    /// `expected_generation` no longer holds.
+    /// `expected_generation` no longer holds or too many commands already
+    /// wait for the runner.
+    ///
+    /// A record keeps its open commands and the last few settled ones,
+    /// the text of a settled conductor message dropped (it is the owner's
+    /// words, and the conductor has answered). A retry of a command that
+    /// was forgotten meanwhile is refused as a reused key — never carried
+    /// out again — for as long as its key is among the last
+    /// [`RETIRED_KEYS_KEPT`] forgotten; a retry that late is not something a
+    /// client does.
     pub fn queue_operator_command(
         &self,
         task_id: &TaskId,
@@ -43,7 +63,7 @@ impl ControlPlane {
                 .iter()
                 .find(|queued| queued.idempotency_key == request.idempotency_key)
             {
-                if existing.command != request.command {
+                if !same_request(existing, &request.command) {
                     return Err(OrchestrationError::OperatorCommandKeyReused {
                         task_id: record.task_id.clone(),
                         key: request.idempotency_key.clone(),
@@ -54,6 +74,12 @@ impl ControlPlane {
                     replayed: true,
                 }));
             }
+            if record.retired_command_keys.contains(&request.idempotency_key) {
+                return Err(OrchestrationError::OperatorCommandKeyReused {
+                    task_id: record.task_id.clone(),
+                    key: request.idempotency_key.clone(),
+                });
+            }
             if let Some(expected) = request.expected_generation {
                 record.check_generation(expected)?;
             }
@@ -63,12 +89,21 @@ impl ControlPlane {
                     reason,
                 });
             }
+            if open_commands(record).len() >= MAX_OPEN_COMMANDS {
+                return Err(OrchestrationError::OperatorCommandRefused {
+                    task_id: record.task_id.clone(),
+                    reason: format!(
+                        "{MAX_OPEN_COMMANDS} commands already wait for the runner; \
+                         wait for it to take them"
+                    ),
+                });
+            }
             let launch_generation = record
                 .runner
                 .as_ref()
                 .map_or(record.generation, |runner| runner.launch_generation);
             let queued = QueuedOperatorCommand {
-                command_id: format!("command-{}", record.operator_commands.len() + 1),
+                command_id: next_command_id(record),
                 idempotency_key: request.idempotency_key.clone(),
                 command: request.command.clone(),
                 requested_by: request.requested_by.clone(),
@@ -79,7 +114,9 @@ impl ControlPlane {
                 updated_at: now,
                 detail: None,
             };
+            record.operator_command_counter = command_number(&queued.command_id);
             record.operator_commands.push(queued.clone());
+            forget_old_commands(record);
             Ok(Mutation::Changed(
                 TaskEventKind::OperatorCommandQueued {
                     command_id: queued.command_id.clone(),
@@ -122,6 +159,7 @@ impl ControlPlane {
                 command.status = OperatorCommandStatus::Rejected;
                 command.updated_at = now;
                 command.detail = detail.clone();
+                command.forget_text();
                 Ok(Mutation::Changed(
                     TaskEventKind::OperatorCommandResolved {
                         command_id: command.command_id.clone(),
@@ -181,7 +219,9 @@ impl ControlPlane {
             command.status = target;
             command.updated_at = now;
             command.detail = detail.clone();
+            command.forget_text();
             let settled = command.clone();
+            forget_old_commands(record);
             Ok(Mutation::Changed(
                 TaskEventKind::OperatorCommandResolved {
                     command_id: settled.command_id.clone(),
@@ -193,6 +233,68 @@ impl ControlPlane {
         })?;
         Ok(settled)
     }
+}
+
+/// Whether `existing` is what a retry offering `requested` repeats. The text
+/// of a settled conductor message is gone, so only the kind can be compared.
+fn same_request(existing: &QueuedOperatorCommand, requested: &OperatorCommand) -> bool {
+    match (&existing.command, requested) {
+        (OperatorCommand::ConductorChat { text }, OperatorCommand::ConductorChat { .. })
+            if text.is_empty() && existing.status.is_settled() =>
+        {
+            true
+        }
+        (command, requested) => command == requested,
+    }
+}
+
+/// The number in a `command-<n>` id; 0 for anything else.
+fn command_number(command_id: &str) -> u64 {
+    command_id
+        .strip_prefix("command-")
+        .and_then(|number| number.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The next id: above every one ever given, whether the counter knew it or
+/// only a command still on the record does (a record from before the
+/// counter).
+fn next_command_id(record: &TaskRecord) -> String {
+    let highest = record
+        .operator_commands
+        .iter()
+        .map(|command| command_number(&command.command_id))
+        .fold(record.operator_command_counter, u64::max);
+    format!("command-{}", highest + 1)
+}
+
+/// Drops all but the last [`SETTLED_COMMANDS_KEPT`] settled commands,
+/// remembering their keys.
+fn forget_old_commands(record: &mut TaskRecord) {
+    let settled = record
+        .operator_commands
+        .iter()
+        .filter(|command| command.status.is_settled())
+        .count();
+    let mut forget = settled.saturating_sub(SETTLED_COMMANDS_KEPT);
+    if forget == 0 {
+        return;
+    }
+    let mut retired = Vec::new();
+    record.operator_commands.retain(|command| {
+        let drop = forget > 0 && command.status.is_settled();
+        if drop {
+            forget -= 1;
+            retired.push(command.idempotency_key.clone());
+        }
+        !drop
+    });
+    record.retired_command_keys.extend(retired);
+    let excess = record
+        .retired_command_keys
+        .len()
+        .saturating_sub(RETIRED_KEYS_KEPT);
+    record.retired_command_keys.drain(..excess);
 }
 
 /// Every command still waiting for a verdict.

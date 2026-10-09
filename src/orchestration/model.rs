@@ -479,6 +479,16 @@ pub struct TaskRecord {
     /// (U3).
     #[serde(default)]
     pub operator_commands: Vec<QueuedOperatorCommand>,
+    /// The highest number a command id was ever given (`command-<n>`), so
+    /// ids stay unique after settled commands are forgotten. Records from
+    /// before it was kept read 0; the highest id still on the record
+    /// covers them.
+    #[serde(default)]
+    pub operator_command_counter: u64,
+    /// Idempotency keys of commands forgotten since, newest last, so that a
+    /// late retry of one is refused rather than carried out a second time.
+    #[serde(default)]
+    pub retired_command_keys: Vec<String>,
     /// The capacity slot the scheduler granted while the task is queued
     /// (U10). Only a task holding one is offered `Start`, and only such a
     /// task may be accepted by its controller; cleared once the task leaves
@@ -1056,6 +1066,17 @@ pub enum OperatorCommand {
         /// The harness name.
         harness: String,
     },
+}
+
+impl QueuedOperatorCommand {
+    /// Drops what a settled command no longer needs: the text of a conductor
+    /// message, which is up to thousands of characters the record, its
+    /// views and its events would carry from then on.
+    pub fn forget_text(&mut self) {
+        if let OperatorCommand::ConductorChat { text } = &mut self.command {
+            text.clear();
+        }
+    }
 }
 
 impl OperatorCommand {
