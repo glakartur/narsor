@@ -340,10 +340,13 @@ mod colour_discipline {
         "keymap.rs",
         "task_app/actions.rs",
         "task_app/detail.rs",
+        "task_app/history.rs",
         "task_app/layout.rs",
         "task_app/list.rs",
         "task_app/mod.rs",
+        "task_app/new_task.rs",
         "task_app/notify.rs",
+        "task_app/repositories.rs",
         "task_app/tabs.rs",
         "task_app/tabs/conductor.rs",
         "task_app/tabs/conversation.rs",
@@ -1627,5 +1630,308 @@ mod task_app_conductor_render {
         }
         press(&mut app, KeyCode::Char('c'));
         draw_app(&mut app, 24, 7, false);
+    }
+}
+
+/// U13: the new-task form, the unsent rows, the history and the repositories.
+mod task_app_create_render {
+    use super::*;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use narsor::api::ApiClient;
+    use narsor::controller_protocol::LegacyExecutionListResponse;
+    use narsor::domain::ParamType;
+    use narsor::tui::task_app::{layout, Request, TaskApp};
+
+    use crate::task_app_support::{
+        archived, capabilities, catalogue, catalogue_workflow, legacy, listing, queued, registry,
+        repository, titled, workflow_input,
+    };
+
+    fn press(app: &mut TaskApp, code: KeyCode) -> Request {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn keys(app: &mut TaskApp, text: &str) {
+        for character in text.chars() {
+            press(app, KeyCode::Char(character));
+        }
+    }
+
+    fn app() -> TaskApp {
+        let mut app = TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        );
+        app.set_capabilities(capabilities(true, None));
+        app.load(listing(
+            vec![titled(queued("a", 1), "NAR-14"), titled(queued("b", 2), "NAR-12")],
+            "c",
+        ));
+        app
+    }
+
+    fn open_form(app: &mut TaskApp) {
+        keys(app, "n");
+        app.open_new_task(
+            catalogue(vec![
+                catalogue_workflow(
+                    "implement-feature",
+                    "Pełny cykl: plan, implementacja, review, testy i PR.",
+                    vec![
+                        workflow_input("ticket_id", ParamType::String, true, Some("numer zgłoszenia")),
+                        workflow_input("attempts", ParamType::Integer, false, Some("ile razy ponawiać")),
+                        workflow_input("dry_run", ParamType::Boolean, false, None),
+                        workflow_input("target_repo", ParamType::Repository, false, None),
+                    ],
+                ),
+                catalogue_workflow("fix-bug", "Poprawka błędu.", vec![]),
+            ]),
+            registry(vec![repository("narsor", "git@github.com:acme/narsor.git")]),
+        );
+    }
+
+    fn draw_app(app: &mut TaskApp, width: u16, height: u16, no_color: bool) -> String {
+        screen(&draw(width, height, |frame| {
+            layout::render(frame, app, &Styles::new(no_color), Instant::now())
+        }))
+    }
+
+    #[test]
+    fn the_wide_form_has_the_list_the_description_and_the_fields_beside_the_untouched_task_list() {
+        let mut app = app();
+        open_form(&mut app);
+        press(&mut app, KeyCode::Tab);
+        keys(&mut app, "NAR-18");
+        let screen = draw_app(&mut app, 130, 34, false);
+        for expected in [
+            "Nowe zadanie → trafi na koniec kolejki (#3)",
+            "implement-feature",
+            "fix-bug",
+            "ścieżka…",
+            "Opis",
+            "Pełny cykl",
+            "wbudowany · wersja 1",
+            "ticket_id",
+            "(wymagane)",
+            "numer zgłoszenia",
+            "> NAR-18▏",
+            "attempts",
+            "liczba całkowita · ile razy ponawiać",
+            "‹ false ›",
+            "‹ narsor ›",
+            // The list of tasks is where it was.
+            "Zadania",
+            "NAR-14",
+            "NAR-12",
+        ] {
+            assert!(screen.contains(expected), "{expected}:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn the_narrow_form_takes_the_whole_screen_and_stacks_the_description_under_the_list() {
+        let mut app = app();
+        open_form(&mut app);
+        press(&mut app, KeyCode::Tab);
+        keys(&mut app, "NAR-18");
+        let screen = draw_app(&mut app, 72, 30, false);
+        for expected in [
+            "Nowe zadanie → trafi na koniec kolejki (#3)",
+            "implement-feature",
+            "Opis",
+            "ticket_id",
+            "> NAR-18▏",
+        ] {
+            assert!(screen.contains(expected), "{expected}:\n{screen}");
+        }
+        assert!(!screen.contains("Zadania"), "the list gives way:\n{screen}");
+        for row in screen.lines() {
+            assert!(row.chars().count() <= 72, "{row}");
+        }
+    }
+
+    #[test]
+    fn the_form_reads_the_same_without_colour() {
+        let mut app = app();
+        open_form(&mut app);
+        let coloured = draw_app(&mut app, 120, 30, false);
+        let plain = draw_app(&mut app, 120, 30, true);
+        assert_eq!(coloured, plain, "colour never carries information alone");
+    }
+
+    #[test]
+    fn a_field_error_is_drawn_under_the_field() {
+        let mut app = app();
+        open_form(&mut app);
+        press(&mut app, KeyCode::Tab);
+        keys(&mut app, "NAR-18");
+        press(&mut app, KeyCode::Down);
+        keys(&mut app, "1-2");
+        press(&mut app, KeyCode::Enter);
+        let screen = draw_app(&mut app, 130, 34, false);
+        assert!(
+            screen.contains("✗ Pole 'attempts' wymaga liczby całkowitej."),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_used_is_grey_and_says_why() {
+        let mut app = app();
+        app.set_capabilities(capabilities(false, Some("serwer zdalny nie czyta plików z dysku")));
+        open_form(&mut app);
+        keys(&mut app, "jj");
+        let screen = draw_app(&mut app, 130, 34, false);
+        assert!(
+            screen.contains("niedostępne: serwer zdalny nie czyta plików z dysku"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn a_path_with_violations_lists_them_all_in_the_description() {
+        let mut app = app();
+        open_form(&mut app);
+        keys(&mut app, "jj");
+        press(&mut app, KeyCode::Tab);
+        keys(&mut app, "/srv/bad.yaml");
+        app.on_path_checked(
+            "/srv/bad.yaml",
+            Ok(narsor::controller_protocol::ValidateWorkflowResponse {
+                valid: false,
+                name: None,
+                version: None,
+                inputs: vec![],
+                violations: vec![
+                    "state 'plan' has no transition".to_string(),
+                    "state 'ship' is not reachable".to_string(),
+                    "input 'ticket' is declared twice".to_string(),
+                ],
+            }),
+        );
+        let screen = draw_app(&mut app, 130, 40, false);
+        for expected in [
+            "naruszeń: 3",
+            "1. state 'plan' has no transition",
+            "2. state 'ship' is not reachable",
+            "3. input 'ticket' is declared twice",
+        ] {
+            assert!(screen.contains(expected), "{expected}:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn a_task_being_sent_and_one_not_sent_are_rows_with_their_own_details() {
+        let mut app = app();
+        open_form(&mut app);
+        press(&mut app, KeyCode::Tab);
+        keys(&mut app, "NAR-18");
+        let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+            panic!("a send was expected");
+        };
+        let sending = draw_app(&mut app, 130, 30, false);
+        for expected in ["↻ NAR-18", "wysyłanie…", "Serwer jeszcze nie potwierdził zadania"] {
+            assert!(sending.contains(expected), "{expected}:\n{sending}");
+        }
+        assert!(sending.contains("NAR-14"), "the rows above stay:\n{sending}");
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            app.perform(Request::SendTask(id.clone())).await;
+            app.retry_outgoing_if_due(Instant::now() + std::time::Duration::from_secs(5)).await;
+        });
+        let unsent = draw_app(&mut app, 130, 30, false);
+        for expected in ["✗ NAR-18", "nie wysłano", "Dane zostały zachowane", &id] {
+            assert!(unsent.contains(expected), "{expected}:\n{unsent}");
+        }
+    }
+
+    #[test]
+    fn the_history_is_a_list_beside_read_only_details() {
+        let mut app = app();
+        keys(&mut app, "H");
+        app.open_history(
+            listing(vec![archived("old", "NAR-9", 5)], "c"),
+            Ok(LegacyExecutionListResponse {
+                executions: vec![legacy("exec-1", "fix-bug", "failed", 3, true, None)],
+            }),
+        );
+        let screen = draw_app(&mut app, 130, 30, false);
+        for expected in [
+            "Historia",
+            "NAR-9",
+            "archiwum",
+            "fix-bug exec-1",
+            "failed",
+            "Przebieg",
+            "storage usunięty przy archiwizacji",
+            "wznów",
+        ] {
+            assert!(screen.contains(expected), "{expected}:\n{screen}");
+        }
+        assert!(!screen.contains("NAR-14"), "the task list gives way:\n{screen}");
+    }
+
+    #[test]
+    fn the_history_in_a_narrow_terminal_switches_between_the_list_and_the_details() {
+        let mut app = app();
+        keys(&mut app, "H");
+        app.open_history(
+            listing(vec![archived("old", "NAR-9", 5)], "c"),
+            Ok(LegacyExecutionListResponse { executions: vec![] }),
+        );
+        let list = draw_app(&mut app, 80, 24, false);
+        assert!(list.contains("Historia") && list.contains("NAR-9"), "{list}");
+        assert!(!list.contains("Przebieg"), "{list}");
+        press(&mut app, KeyCode::Enter);
+        let details = draw_app(&mut app, 80, 24, false);
+        assert!(details.contains("Przebieg"), "{details}");
+        assert!(details.contains("lista"), "the way back is on the bar:\n{details}");
+    }
+
+    #[test]
+    fn the_repositories_are_a_list_and_a_description_and_the_form_shows_its_refusal() {
+        let mut app = app();
+        keys(&mut app, "R");
+        app.open_repositories(registry(vec![
+            repository("docs", "git@github.com:acme/docs.git"),
+            repository("narsor", "git@github.com:acme/narsor.git"),
+        ]));
+        let list = draw_app(&mut app, 130, 30, false);
+        for expected in [
+            "Repozytoria (2)",
+            "docs",
+            "narsor",
+            "git@github.com:acme/docs.git",
+            "github",
+            "gałąź main",
+            "Zadania",
+            "dodaj",
+            "usuń",
+        ] {
+            assert!(list.contains(expected), "{expected}:\n{list}");
+        }
+
+        keys(&mut app, "a");
+        press(&mut app, KeyCode::Enter);
+        keys(&mut app, "evil");
+        let form = draw_app(&mut app, 130, 30, false);
+        for expected in ["nowe repozytorium", "dodaj repozytorium", "id", "remote", "(wymagane)"] {
+            assert!(form.contains(expected), "{expected}:\n{form}");
+        }
+    }
+
+    #[test]
+    fn removing_a_repository_asks_in_the_window_of_every_action_with_a_bang() {
+        let mut app = app();
+        keys(&mut app, "R");
+        app.open_repositories(registry(vec![repository("docs", "git@github.com:acme/docs.git")]));
+        keys(&mut app, "d");
+        let screen = draw_app(&mut app, 130, 30, false);
+        for expected in ["Usuń repozytorium !", "Usuwa repozytorium docs", "potwierdź", "anuluj"] {
+            assert!(screen.contains(expected), "{expected}:\n{screen}");
+        }
     }
 }

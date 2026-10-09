@@ -379,6 +379,8 @@ pub enum Confirmed {
     Act(Box<ActionRequest>),
     /// A chosen action of the answer panel.
     Answer(Box<AnswerRequest>),
+    /// Removing the repository with this id (the repositories, U13).
+    RemoveRepository(String),
 }
 
 // ---------------------------------------------------------------------
@@ -475,6 +477,16 @@ pub enum Overlay {
 }
 
 impl Overlay {
+    /// Whether it is about a task of the list: one that left the list takes it
+    /// away. The window that removes a repository is about none.
+    pub fn is_task_bound(&self) -> bool {
+        !matches!(
+            self,
+            Self::Confirm(confirmation)
+                if matches!(confirmation.confirmed, Confirmed::RemoveRepository(_))
+        )
+    }
+
     /// The task it is about.
     pub fn task_id(&self) -> &str {
         match self {
@@ -519,7 +531,7 @@ impl Overlay {
 
 /// A list typed into is a form (`q` and `?` are text); otherwise it is the
 /// panel's keys.
-fn chooser_context(chooser: &Chooser) -> Context {
+pub(super) fn chooser_context(chooser: &Chooser) -> Context {
     if chooser.is_typing() {
         Context::Form
     } else {
@@ -736,6 +748,9 @@ impl TaskApp {
         let Some(overlay) = &self.overlay else {
             return;
         };
+        if !overlay.is_task_bound() {
+            return;
+        }
         let Some(task) = self
             .list
             .tasks()
@@ -836,6 +851,7 @@ impl TaskApp {
                 match confirmation.confirmed {
                     Confirmed::Act(request) => Request::Act(request),
                     Confirmed::Answer(request) => Request::Answer(request),
+                    Confirmed::RemoveRepository(id) => Request::RemoveRepository(id),
                 }
             }
             Some(Action::Cancel) => {

@@ -36,7 +36,9 @@
 //! }
 //! feed.ensure_open(&app);            // once a read gave it a cursor
 //! app.refresh_if_due(Instant::now()).await;
+//! app.retry_outgoing_if_due(Instant::now()).await; // a new task whose answer was lost
 //! app.sync_detail().await;           // what the visible tab of the selected task lacks
+//! // the tick also wakes at `app.next_refresh_due()` and `app.next_outgoing_due()`
 //! terminal.draw(|frame| layout::render(frame, &mut app, &styles, Instant::now()))
 //! ```
 //!
@@ -71,14 +73,27 @@
 //!   [`idempotency_key`]. What is typed in its text box is a draft
 //!   ([`detail::TaskDetail::draft_text`]), and while typing
 //!   [`TaskApp::key_context`] is [`Context::Form`].
-//! * **The new-task form (U13)** takes [`layout::Areas::detail`]; a task it
-//!   sent shows as an [`list::StateIcon::Sending`] row.
+//! * **The new-task form, the history and the repositories (U13)** are in:
+//!   [`new_task`], [`history`], [`repositories`]. `n`, `H` and `R` ask for a
+//!   read ([`Request::OpenNewTask`], [`Request::OpenHistory`],
+//!   [`Request::OpenRepositories`]) and what they open is the application's
+//!   [`View`]: while one is open it takes the keys ([`TaskApp::key_context`]),
+//!   the details area (the history: the list as well) and `Esc` gives the task
+//!   list back as it was. A task the form sent is a [`list::PendingRow`] —
+//!   `↻ wysyłanie…`, `✗ nie wysłano` — until the server lists it; the loop sends
+//!   again what a lost answer left ([`TaskApp::retry_outgoing_if_due`],
+//!   [`TaskApp::next_outgoing_due`]). A mutation of these views passes
+//!   [`TaskApp::mutation_allowed`] like every other, and what the operator
+//!   typed is a draft ([`DetailState::set_draft`]), so `q` asks first.
 
 pub mod actions;
 pub mod detail;
+pub mod history;
 pub mod layout;
 pub mod list;
+pub mod new_task;
 pub mod notify;
+pub mod repositories;
 pub mod tabs;
 pub mod waiting;
 
@@ -90,7 +105,8 @@ use futures::stream::{BoxStream, StreamExt as _};
 
 use crate::api::{ApiClient, ClientError};
 use crate::controller_protocol::{
-    CapabilitiesView, ControlEventEnvelope, MoveTaskRequest, TaskListResponse,
+    CapabilitiesView, ControlEventEnvelope, CreateRepositoryRequest, MoveTaskRequest,
+    TaskListResponse,
 };
 use crate::orchestration::MoveTarget;
 
@@ -100,7 +116,10 @@ use super::refresh::RefreshSchedule;
 use super::scroll::sanitize;
 use actions::{availability, ActionRequest, Availability, LinkRequest, Overlay, TaskAction};
 use detail::TaskDetail;
+use history::History;
 use list::{title_of, MoveRequest, Removal, TaskList};
+use new_task::{NewTaskForm, Outgoing};
+use repositories::Repositories;
 use notify::{Notifier, Severity};
 use waiting::AnswerRequest;
 
@@ -256,11 +275,56 @@ pub(super) struct DetailView<'a> {
     pub(super) detail: &'a mut TaskDetail,
 }
 
+/// What the details area shows, apart from the selected task: the screens
+/// `n`, `H` and `R` open. Each takes the keys while it is open and `Esc` gives
+/// the list of tasks back as it was.
+#[derive(Debug)]
+pub enum View {
+    /// The list of tasks and the details of the selected one.
+    Tasks,
+    /// The new-task form, over the details.
+    NewTask(Box<NewTaskForm>),
+    /// The history: its own list and its read-only details.
+    History(Box<History>),
+    /// The registered repositories, over the details.
+    Repositories(Box<Repositories>),
+}
+
+/// Which [`View`] is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewKind {
+    /// The tasks.
+    Tasks,
+    /// The new-task form.
+    NewTask,
+    /// The history.
+    History,
+    /// The repositories.
+    Repositories,
+}
+
 /// What a key asked for that needs the API.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     /// Nothing.
     None,
+    /// `n`: read the catalogue and open the new-task form.
+    OpenNewTask,
+    /// `H`: read the archived tasks and old executions and open the history.
+    OpenHistory,
+    /// `R`: read the registry and open the repositories.
+    OpenRepositories,
+    /// Send the task being created under this id (the first attempt, or by
+    /// hand once it was not sent).
+    SendTask(String),
+    /// Check this absolute path of a workflow file with the server.
+    ValidatePath(String),
+    /// Recover this old execution of the history.
+    Recover(String),
+    /// Register a repository.
+    AddRepository(Box<CreateRepositoryRequest>),
+    /// Remove the repository with this id.
+    RemoveRepository(String),
     /// Put a queued task elsewhere in the queue.
     Move(MoveRequest),
     /// Send what the answer panel's operator chose.
@@ -300,6 +364,14 @@ pub struct TaskApp {
     quit: bool,
     /// `q` found an unsent draft and asked; the next `q` leaves.
     quit_confirm: bool,
+    /// What the details area shows (U13).
+    view: View,
+    /// Where the keyboard was when a view opened, to give back on `Esc`.
+    previous_focus: Focus,
+    /// What was typed in the new-task form and left with `Esc`.
+    new_task_memory: Option<NewTaskForm>,
+    /// Tasks being created: what each attempt sends, under the task's id.
+    outbox: Vec<Outgoing>,
     /// Failed reconnects in a row, to estimate the countdown in the header.
     stream_failures: u32,
     /// The stream ended for good: no reconnect will come.
@@ -330,6 +402,10 @@ impl TaskApp {
             panel_focus: false,
             quit: false,
             quit_confirm: false,
+            view: View::Tasks,
+            previous_focus: Focus::List,
+            new_task_memory: None,
+            outbox: Vec::new(),
             stream_failures: 0,
             stream_ended: false,
         }
@@ -375,6 +451,13 @@ impl TaskApp {
         self.capabilities.as_ref()
     }
 
+    /// Takes what the server offers in, as the first read does: the name of
+    /// the connection and what the new-task form may offer.
+    pub fn set_capabilities(&mut self, capabilities: CapabilitiesView) {
+        self.connection.rename(clean(&capabilities.connection_name));
+        self.capabilities = Some(capabilities);
+    }
+
     /// Where the keyboard is.
     pub fn focus(&self) -> Focus {
         self.focus
@@ -412,10 +495,27 @@ impl TaskApp {
         self.schedule.next_due()
     }
 
+    /// Which view is open.
+    pub fn view_kind(&self) -> ViewKind {
+        match self.view {
+            View::Tasks => ViewKind::Tasks,
+            View::NewTask(_) => ViewKind::NewTask,
+            View::History(_) => ViewKind::History,
+            View::Repositories(_) => ViewKind::Repositories,
+        }
+    }
+
     /// The context whose keys apply now.
     pub fn key_context(&self) -> Context {
         if let Some(overlay) = &self.overlay {
             return overlay.context();
+        }
+        if let Some(context) = self
+            .new_task_context()
+            .or_else(|| self.history_context())
+            .or_else(|| self.repositories_context())
+        {
+            return context;
         }
         if self.panel_focused() {
             // Typing into a field: `q` and `?` are text, not commands.
@@ -460,6 +560,12 @@ impl TaskApp {
         let confirming_quit = std::mem::take(&mut self.quit_confirm);
         if self.overlay.is_some() {
             return self.on_overlay_key(key, confirming_quit);
+        }
+        match self.view {
+            View::Tasks => {}
+            View::NewTask(_) => return self.on_new_task_key(key, confirming_quit),
+            View::History(_) => return self.on_history_key(key, confirming_quit),
+            View::Repositories(_) => return self.on_repositories_key(key, confirming_quit),
         }
         if self.panel_focused() {
             return self.on_panel_key(key, confirming_quit);
@@ -512,6 +618,10 @@ impl TaskApp {
             Action::Confirm if context == Context::Move => return self.finish_move_mode(),
             Action::Cancel if context == Context::Move => self.list.cancel_move(),
             Action::ActionMenu => self.open_menu(),
+            Action::NewTask => return Request::OpenNewTask,
+            Action::History => return Request::OpenHistory,
+            Action::Repositories => return Request::OpenRepositories,
+            Action::RetrySend => return self.retry_selected(),
             other => {
                 if let Some(action) = TaskAction::of_key(other) {
                     return self.invoke(action);
@@ -653,6 +763,14 @@ impl TaskApp {
     pub async fn perform(&mut self, request: Request) {
         match request {
             Request::None => {}
+            Request::OpenNewTask => self.read_and_open_new_task().await,
+            Request::OpenHistory => self.read_and_open_history().await,
+            Request::OpenRepositories => self.read_and_open_repositories().await,
+            Request::SendTask(id) => self.send_task(&id).await,
+            Request::ValidatePath(path) => self.validate_path(&path).await,
+            Request::Recover(id) => self.recover_execution(&id).await,
+            Request::AddRepository(request) => self.add_repository(&request).await,
+            Request::RemoveRepository(id) => self.remove_repository(&id).await,
             Request::Move(request) => self.move_task(request).await,
             Request::Answer(request) => self.answer(*request).await,
             Request::Act(request) => self.act(*request).await,
@@ -736,8 +854,7 @@ impl TaskApp {
 
     async fn read_capabilities(&mut self) {
         if let Ok(capabilities) = self.client.control_capabilities().await {
-            self.connection.rename(clean(&capabilities.connection_name));
-            self.capabilities = Some(capabilities);
+            self.set_capabilities(capabilities);
         }
     }
 
@@ -754,6 +871,7 @@ impl TaskApp {
         self.detail.invalidate();
         self.sync_waiting();
         self.sync_overlay();
+        self.settle_outbox();
         self.announce(removal);
     }
 

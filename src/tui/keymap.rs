@@ -10,7 +10,8 @@
 //!
 //! A [`Context`] is "where the operator is": the list, the task details, the
 //! answer panel, the action menu, the confirmation window, a form, the move
-//! mode. [`Context::Global`]
+//! mode, the history (its list and its read-only details) and the
+//! repositories. [`Context::Global`]
 //! holds what works everywhere and is inherited by every context that is not
 //! taking typed text ([`Context::inherits_global`]). A form (or a panel whose
 //! focus is in a field) must be able to type `q` and `?`, so it inherits
@@ -50,11 +51,17 @@ pub enum Context {
     Form,
     /// A queued task is being moved.
     Move,
+    /// The history's list has the focus.
+    History,
+    /// The details of an entry of the history have the focus (read only).
+    HistoryDetails,
+    /// The list of repositories has the focus.
+    Repositories,
 }
 
 impl Context {
     /// Every context, in the order help and tests walk them.
-    pub const ALL: [Context; 8] = [
+    pub const ALL: [Context; 11] = [
         Context::Global,
         Context::List,
         Context::Details,
@@ -63,6 +70,9 @@ impl Context {
         Context::Confirm,
         Context::Form,
         Context::Move,
+        Context::History,
+        Context::HistoryDetails,
+        Context::Repositories,
     ];
 
     /// The name help uses.
@@ -76,6 +86,9 @@ impl Context {
             Self::Confirm => "potwierdzenie",
             Self::Form => "formularz",
             Self::Move => "przesuwanie",
+            Self::History => "historia",
+            Self::HistoryDetails => "historia: szczegóły",
+            Self::Repositories => "repozytoria",
         }
     }
 
@@ -185,6 +198,14 @@ pub enum Action {
     ChooseHarness,
     /// Read the next page of the conductor's chat.
     LoadMore,
+    /// Send a task again that did not get through (the new-task form).
+    RetrySend,
+    /// Recover an old execution of the history.
+    Recover,
+    /// Add a repository.
+    AddRepository,
+    /// Remove the selected repository.
+    RemoveRepository,
 }
 
 /// A key a binding listens to.
@@ -486,6 +507,13 @@ pub static BINDINGS: &[Binding] = &[
         "",
         "otwórz link zadania w przeglądarce",
     ),
+    bind(
+        Context::List,
+        Key::char('r'),
+        Action::RetrySend,
+        "",
+        "ponów wysłanie nowego zadania, które nie dotarło do serwera",
+    ),
     // The task details.
     // `Esc` first: on a narrow screen the details are full screen and the way
     // back must survive a shortened bar, which drops hints from the end.
@@ -677,6 +705,13 @@ pub static BINDINGS: &[Binding] = &[
         Action::OpenLink,
         "",
         "otwórz link zadania w przeglądarce",
+    ),
+    bind(
+        Context::Details,
+        Key::char('r'),
+        Action::RetrySend,
+        "",
+        "ponów wysłanie nowego zadania, które nie dotarło do serwera",
     ),
     // The *Dyrygent* tab. Help only: the tab draws its own line of them.
     bind(
@@ -1055,6 +1090,268 @@ pub static BINDINGS: &[Binding] = &[
         Action::Cancel,
         "anuluj",
         "anuluj przesuwanie",
+    ),
+    // The history: the list, then the details of an entry (read only).
+    bind(
+        Context::History,
+        Key::code(KeyCode::Esc),
+        Action::Back,
+        "zadania",
+        "wróć do listy zadań",
+    ),
+    bind(
+        Context::History,
+        Key::char('j'),
+        Action::Down,
+        "wybór",
+        "kursor w dół",
+    ),
+    bind(
+        Context::History,
+        Key::code(KeyCode::Down),
+        Action::Down,
+        "",
+        "kursor w dół",
+    ),
+    bind(
+        Context::History,
+        Key::char('k'),
+        Action::Up,
+        "",
+        "kursor w górę",
+    ),
+    bind(
+        Context::History,
+        Key::code(KeyCode::Up),
+        Action::Up,
+        "",
+        "kursor w górę",
+    ),
+    bind(
+        Context::History,
+        Key::char('g'),
+        Action::Top,
+        "",
+        "na początek listy",
+    ),
+    bind(
+        Context::History,
+        Key::char('G'),
+        Action::Bottom,
+        "",
+        "na koniec listy",
+    ),
+    bind(
+        Context::History,
+        Key::code(KeyCode::Enter),
+        Action::Open,
+        "szczegóły",
+        "przejdź do szczegółów zaznaczonego wpisu",
+    ),
+    bind(
+        Context::History,
+        Key::char('w'),
+        Action::Recover,
+        "wznów",
+        "wznów stare execution, które na to pozwala (recover)",
+    ),
+    bind(
+        Context::History,
+        Key::code(KeyCode::Left),
+        Action::PrevTab,
+        "",
+        "poprzednia zakładka",
+    ),
+    bind(
+        Context::History,
+        Key::code(KeyCode::Right),
+        Action::NextTab,
+        "",
+        "następna zakładka",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::code(KeyCode::Esc),
+        Action::Back,
+        "lista",
+        "wróć na listę historii",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::code(KeyCode::Left),
+        Action::PrevTab,
+        "zakładki",
+        "poprzednia zakładka",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::code(KeyCode::Right),
+        Action::NextTab,
+        "",
+        "następna zakładka",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::char('j'),
+        Action::Down,
+        "przewijanie",
+        "przewiń w dół",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::code(KeyCode::Down),
+        Action::Down,
+        "",
+        "przewiń w dół",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::char('k'),
+        Action::Up,
+        "",
+        "przewiń w górę",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::code(KeyCode::Up),
+        Action::Up,
+        "",
+        "przewiń w górę",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::code(KeyCode::PageDown),
+        Action::PageDown,
+        "",
+        "strona w dół",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::code(KeyCode::PageUp),
+        Action::PageUp,
+        "",
+        "strona w górę",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::char('g'),
+        Action::Top,
+        "",
+        "na początek",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::char('G'),
+        Action::Bottom,
+        "",
+        "na koniec",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::code(KeyCode::Enter),
+        Action::Expand,
+        "rozwiń",
+        "rozwiń albo zwiń wpis",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::char(' '),
+        Action::Expand,
+        "",
+        "rozwiń albo zwiń wpis",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::char('v'),
+        Action::RawEntry,
+        "",
+        "widok surowy wpisu",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::ctrl('v'),
+        Action::RawAll,
+        "",
+        "widok surowy całości",
+    ),
+    bind(
+        Context::HistoryDetails,
+        Key::char('w'),
+        Action::Recover,
+        "wznów",
+        "wznów stare execution, które na to pozwala (recover)",
+    ),
+    // The repositories: a list and a description, `a` adds, `d` removes. The
+    // list itself is the chooser, which reads the panel's keys for moving.
+    bind(
+        Context::Repositories,
+        Key::code(KeyCode::Esc),
+        Action::Back,
+        "zadania",
+        "wróć do listy zadań",
+    ),
+    bind(
+        Context::Repositories,
+        Key::char('a'),
+        Action::AddRepository,
+        "dodaj",
+        "dodaj repozytorium",
+    ),
+    bind(
+        Context::Repositories,
+        Key::char('d'),
+        Action::RemoveRepository,
+        "usuń",
+        "usuń zaznaczone repozytorium (wymaga potwierdzenia)",
+    ),
+    bind(
+        Context::Repositories,
+        Key::char('j'),
+        Action::Down,
+        "wybór",
+        "następne repozytorium",
+    ),
+    bind(
+        Context::Repositories,
+        Key::code(KeyCode::Down),
+        Action::Down,
+        "",
+        "następne repozytorium",
+    ),
+    bind(
+        Context::Repositories,
+        Key::char('k'),
+        Action::Up,
+        "",
+        "poprzednie repozytorium",
+    ),
+    bind(
+        Context::Repositories,
+        Key::code(KeyCode::Up),
+        Action::Up,
+        "",
+        "poprzednie repozytorium",
+    ),
+    bind(
+        Context::Repositories,
+        Key::Digit,
+        Action::Pick,
+        "",
+        "wybierz repozytorium cyfrą",
+    ),
+    bind(
+        Context::Repositories,
+        Key::code(KeyCode::PageDown),
+        Action::PageDown,
+        "",
+        "przewiń opis w dół",
+    ),
+    bind(
+        Context::Repositories,
+        Key::code(KeyCode::PageUp),
+        Action::PageUp,
+        "",
+        "przewiń opis w górę",
     ),
 ];
 

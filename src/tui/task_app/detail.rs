@@ -68,15 +68,15 @@ use super::tabs::info::{self, Info};
 use super::tabs::progress::{self, Progress};
 use super::tabs::failure_text;
 use super::waiting::WaitingPanel;
-use super::{DetailTab, Focus, TaskApp};
+use super::{DetailTab, DetailView, Focus, TaskApp};
 
 /// Everything the details of one task remember.
 #[derive(Debug, Clone)]
 pub struct TaskDetail {
-    progress: Progress,
-    attempts: Attempts,
-    conversation: Conversation,
-    events: Events,
+    pub(super) progress: Progress,
+    pub(super) attempts: Attempts,
+    pub(super) conversation: Conversation,
+    pub(super) events: Events,
     info: Info,
     pub(super) conductor: Conductor,
     /// The answer panel at the bottom (U10).
@@ -383,6 +383,10 @@ impl TaskApp {
     /// when nothing is due: no request is made. Call it after a key, an event
     /// and a refresh.
     pub async fn sync_detail(&mut self) {
+        if matches!(self.view, super::View::History(_)) {
+            self.sync_history().await;
+            return;
+        }
         let Some(task) = self.list.selected() else {
             return;
         };
@@ -485,7 +489,7 @@ impl TaskApp {
 }
 
 /// The attempt of a position whose conversation can be read.
-fn recorded_attempt(position: &crate::engine::Position) -> Option<String> {
+pub(super) fn recorded_attempt(position: &crate::engine::Position) -> Option<String> {
     match (&position.conversation, &position.action_execution_id) {
         (ConversationState::Recorded, Some(id)) => Some(id.clone()),
         _ => None,
@@ -510,6 +514,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
     let panel_focused = app.panel_focused();
     let focused = app.focus() == Focus::Details && !panel_focused;
     let hyperlinks = app.detail().hyperlinks();
+    // A task created here that the server has not confirmed has no summary
+    // yet: its row says where it stands (the new-task form).
+    if let Some(pending) = app.list().selected_pending().cloned() {
+        super::new_task::render_pending(frame, area, &pending, app.send_data(&pending.task_id), styles);
+        return;
+    }
     let Some(view) = app.detail_view() else {
         frame.render_widget(
             Paragraph::new(Line::styled("brak zaznaczonego zadania", styles.of(Role::Done))),
@@ -517,6 +527,43 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         );
         return;
     };
+    let options = ViewOptions {
+        stale,
+        focused,
+        panel_focused,
+        hyperlinks,
+    };
+    render_view(frame, area, view, styles, options);
+}
+
+/// How the details are drawn, apart from what they show.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ViewOptions {
+    /// No connection: everything is grey.
+    pub(super) stale: bool,
+    /// The keys are in the tab's content.
+    pub(super) focused: bool,
+    /// The keys are in the answer panel.
+    pub(super) panel_focused: bool,
+    /// Links are written as OSC 8 hyperlinks.
+    pub(super) hyperlinks: bool,
+}
+
+/// Draws `view` — the details of a task, or of an entry of the history —
+/// into `area`.
+pub(super) fn render_view(
+    frame: &mut Frame,
+    area: Rect,
+    view: DetailView<'_>,
+    styles: &Styles,
+    options: ViewOptions,
+) {
+    let ViewOptions {
+        stale,
+        focused,
+        panel_focused,
+        hyperlinks,
+    } = options;
     let panel_height = view.detail.waiting.preferred_height(area.width, area.height);
     let parts = areas(area, panel_height);
 

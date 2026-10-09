@@ -9757,7 +9757,7 @@ mod task_app_actions {
                 keymap::lookup(Context::Confirm, &press(KeyCode::Esc)),
                 Some(Action::Cancel)
             );
-            assert_eq!(Context::ALL.len(), 8, "the confirmation is the eighth context");
+            assert!(Context::ALL.contains(&Context::Confirm), "the confirmation is a context of the map");
             keymap::check_consistency(keymap::BINDINGS).expect("the key map stays consistent");
             let hints = keymap::hints(Context::Confirm);
             assert!(hints.iter().any(|(keys, label)| keys == "y" && *label == "potwierdź"));
@@ -11559,6 +11559,1579 @@ mod task_app_conductor {
             assert_eq!(tab.items().len(), 3);
             assert!(!tab.has_more());
             assert!(app.connection().is_live());
+        }
+    }
+}
+
+/// U13: the new-task form, the history and the repositories.
+mod task_app_create {
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::json;
+
+    use narsor::api::{ApiClient, ClientError};
+    use narsor::controller_protocol::{
+        LegacyExecutionListResponse, RepositoryListResponse, TaskSummary, ValidateWorkflowResponse,
+        WorkflowListResponse,
+    };
+    use narsor::domain::ParamType;
+    use narsor::orchestration::TaskLifecycle;
+    use narsor::tui::keymap::{self, Action, Context};
+    use narsor::tui::task_app::history::HistoryEntry;
+    use narsor::tui::task_app::list::PendingState;
+    use narsor::tui::task_app::new_task::{
+        absolute_path, CreateHow, PathVerdict, DRAFT_KEY, PATH_FIELD, PATH_LABEL, RETRY_AFTER,
+    };
+    use narsor::tui::task_app::notify::Severity;
+    use narsor::persistence::ExecutionStore;
+    use narsor::tui::task_app::{DetailTab, Request, TaskApp, ViewKind};
+
+    use super::remote_support::RemoteHarness;
+    use super::task_app_support::{
+        archived, capabilities, catalogue, catalogue_workflow, legacy, listing, queued, registry,
+        repository, titled, workflow_input,
+    };
+
+    fn offline_client() -> ApiClient {
+        ApiClient::new("127.0.0.1:9".parse().unwrap(), "token")
+    }
+
+    /// An application with a live connection to nothing: what it is handed is
+    /// all it knows.
+    fn app_with(tasks: Vec<TaskSummary>) -> TaskApp {
+        let mut app = TaskApp::new(offline_client(), "local", None);
+        app.set_capabilities(capabilities(true, None));
+        app.load(listing(tasks, "c"));
+        app
+    }
+
+    fn press(app: &mut TaskApp, code: KeyCode) -> Request {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn ch(app: &mut TaskApp, character: char) -> Request {
+        press(app, KeyCode::Char(character))
+    }
+
+    fn typed(app: &mut TaskApp, text: &str) {
+        for character in text.chars() {
+            ch(app, character);
+        }
+    }
+
+    fn note(app: &TaskApp) -> String {
+        app.notifier()
+            .latest()
+            .map(|note| note.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn workflows() -> WorkflowListResponse {
+        catalogue(vec![
+            catalogue_workflow(
+                "implement-feature",
+                "Pełny cykl: plan, implementacja, review, testy i PR.",
+                vec![
+                    workflow_input("ticket_id", ParamType::String, true, Some("numer zgłoszenia")),
+                    workflow_input("attempts", ParamType::Integer, false, Some("ile razy ponawiać")),
+                    workflow_input("dry_run", ParamType::Boolean, false, None),
+                    workflow_input("target_repo", ParamType::Repository, false, None),
+                ],
+            ),
+            catalogue_workflow(
+                "fix-bug",
+                "Poprawka błędu.",
+                vec![workflow_input("ticket_id", ParamType::String, true, None)],
+            ),
+        ])
+    }
+
+    fn narsor_registry() -> RepositoryListResponse {
+        registry(vec![
+            repository("docs", "git@github.com:acme/docs.git"),
+            repository("narsor", "git@github.com:acme/narsor.git"),
+        ])
+    }
+
+    /// `n`, with the answers of the server given by hand.
+    fn open_form(app: &mut TaskApp) {
+        assert_eq!(ch(app, 'n'), Request::OpenNewTask);
+        app.open_new_task(workflows(), narsor_registry());
+        assert_eq!(app.view_kind(), ViewKind::NewTask);
+    }
+
+    fn chooser_item<'a>(app: &'a TaskApp, label: &str) -> &'a narsor::tui::chooser::ChooserItem {
+        app.new_task_form()
+            .expect("the form is open")
+            .chooser()
+            .items()
+            .iter()
+            .find(|item| item.label == label)
+            .unwrap_or_else(|| panic!("{label} is not in the form"))
+    }
+
+    /// Moves the highlight of the form's list to `label`.
+    fn choose(app: &mut TaskApp, label: &str) {
+        for _ in 0..12 {
+            let at = app.new_task_form().unwrap().chooser();
+            if at.selected_item().is_some_and(|item| item.label == label) {
+                return;
+            }
+            ch(app, 'j');
+        }
+        panic!("{label} was not reached");
+    }
+
+    fn fill_ticket(app: &mut TaskApp, ticket: &str) {
+        press(app, KeyCode::Tab);
+        typed(app, ticket);
+    }
+
+    fn field_value(app: &TaskApp, label: &str, field: &str) -> String {
+        let chooser = app.new_task_form().unwrap().chooser();
+        let index = chooser.items().iter().position(|item| item.label == label).unwrap();
+        chooser
+            .fields_of(index)
+            .iter()
+            .find(|candidate| candidate.name == field)
+            .unwrap_or_else(|| panic!("{field} is not a field of {label}"))
+            .value()
+            .to_string()
+    }
+
+    fn screen(app: &mut TaskApp, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                narsor::tui::task_app::layout::render(
+                    frame,
+                    app,
+                    &narsor::tui::style::Styles::new(false),
+                    Instant::now(),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        buffer
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn rows(app: &TaskApp) -> Vec<(char, String, String)> {
+        app.list()
+            .rows()
+            .into_iter()
+            .map(|row| (row.icon.glyph(), row.title, row.label))
+            .collect()
+    }
+
+    // -- the form -------------------------------------------------------------
+
+    mod the_form {
+        use super::*;
+
+        #[test]
+        fn n_opens_the_catalogue_with_the_path_last_and_leaves_the_list_alone() {
+            let mut app = app_with(vec![titled(queued("a", 1), "NAR-1"), titled(queued("b", 2), "NAR-2")]);
+            let before = rows(&app);
+            open_form(&mut app);
+            let labels: Vec<&str> = app
+                .new_task_form()
+                .unwrap()
+                .chooser()
+                .items()
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect();
+            assert_eq!(labels, ["implement-feature", "fix-bug", PATH_LABEL]);
+            assert_eq!(rows(&app), before, "the list is not touched");
+            assert_eq!(app.list().selected_id(), Some("a"));
+            assert!(chooser_item(&app, "implement-feature")
+                .description
+                .contains("Pełny cykl"));
+        }
+
+        #[test]
+        fn the_fields_are_the_inputs_of_the_highlighted_workflow_with_their_descriptions() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            let item = chooser_item(&app, "implement-feature");
+            let names: Vec<&str> = item.fields.iter().map(|field| field.name.as_str()).collect();
+            assert_eq!(names, ["ticket_id", "attempts", "dry_run", "target_repo"]);
+            assert!(item.fields[0].required);
+            assert_eq!(item.fields[0].description.as_deref(), Some("numer zgłoszenia"));
+            assert!(!item.fields[1].required);
+            assert_eq!(
+                item.fields[1].description.as_deref(),
+                Some("liczba całkowita · ile razy ponawiać")
+            );
+        }
+
+        #[test]
+        fn a_boolean_is_a_choice_that_starts_on_false_and_a_repository_offers_the_registered_ones() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            let item = chooser_item(&app, "implement-feature");
+            assert_eq!(
+                item.fields[2].kind,
+                narsor::tui::chooser::FieldKind::Select(vec!["true".into(), "false".into()])
+            );
+            assert_eq!(item.fields[2].value(), "false");
+            assert_eq!(
+                item.fields[3].kind,
+                narsor::tui::chooser::FieldKind::Select(vec!["docs".into(), "narsor".into()])
+            );
+            assert_eq!(app.new_task_form().unwrap().repositories(), ["docs", "narsor"]);
+        }
+
+        #[test]
+        fn a_repository_is_a_free_line_while_none_is_registered() {
+            let mut app = app_with(vec![]);
+            ch(&mut app, 'n');
+            app.open_new_task(workflows(), registry(vec![]));
+            let item = chooser_item(&app, "implement-feature");
+            assert!(matches!(
+                item.fields[3].kind,
+                narsor::tui::chooser::FieldKind::Text { .. }
+            ));
+        }
+
+        #[test]
+        fn a_missing_required_input_is_an_error_at_the_field_and_nothing_is_sent() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            let item = chooser_item(&app, "implement-feature");
+            assert!(
+                item.fields[0].error().is_some_and(|error| error.contains("ticket_id")),
+                "{:?}",
+                item.fields[0].error()
+            );
+            assert_eq!(app.view_kind(), ViewKind::NewTask);
+            assert!(app.outgoing().is_empty());
+        }
+
+        #[test]
+        fn a_wrong_integer_is_an_error_at_the_field_and_nothing_is_sent() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            fill_ticket(&mut app, "NAR-18");
+            press(&mut app, KeyCode::Down);
+            typed(&mut app, "1-2");
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            let item = chooser_item(&app, "implement-feature");
+            assert!(
+                item.fields[1]
+                    .error()
+                    .is_some_and(|error| error.contains("attempts") && error.contains("liczby")),
+                "{:?}",
+                item.fields[1].error()
+            );
+            assert!(item.fields[0].error().is_none());
+            assert_eq!(app.view_kind(), ViewKind::NewTask);
+            assert!(app.outgoing().is_empty());
+            assert!(app.list().pending().is_empty());
+        }
+
+        #[test]
+        fn esc_gives_the_selected_task_back_and_the_next_n_brings_the_data_back() {
+            let mut app = app_with(vec![titled(queued("a", 1), "NAR-1"), titled(queued("b", 2), "NAR-2")]);
+            ch(&mut app, 'g');
+            open_form(&mut app);
+            fill_ticket(&mut app, "NAR-18");
+            assert!(app.detail().has_drafts(), "typed data is an unsent draft");
+            assert!(app.detail().draft(DRAFT_KEY).is_some_and(|text| text.contains("NAR-18")));
+
+            assert_eq!(press(&mut app, KeyCode::Esc), Request::None);
+            assert_eq!(app.view_kind(), ViewKind::Tasks);
+            assert_eq!(app.list().selected_id(), Some("a"), "the task selected before is back");
+            assert!(app.remembered_new_task().is_some());
+
+            // `q` asks before throwing the data away.
+            ch(&mut app, 'q');
+            assert!(!app.should_quit());
+            assert!(note(&app).contains("szkic"), "{}", note(&app));
+
+            ch(&mut app, 'n');
+            app.open_new_task(workflows(), narsor_registry());
+            assert_eq!(field_value(&app, "implement-feature", "ticket_id"), "NAR-18");
+            assert!(app.remembered_new_task().is_none(), "it is the open form now");
+        }
+
+        #[test]
+        fn the_form_opens_with_the_focus_on_the_details_and_esc_gives_the_focus_back() {
+            let mut app = app_with(vec![titled(queued("a", 1), "NAR-1")]);
+            open_form(&mut app);
+            assert_eq!(app.focus(), narsor::tui::task_app::Focus::Details);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.focus(), narsor::tui::task_app::Focus::List);
+        }
+
+        #[test]
+        fn keys_in_the_form_are_the_choosers_and_q_is_text_in_a_field() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            assert_eq!(app.key_context(), Context::Panel);
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.key_context(), Context::Form);
+            ch(&mut app, 'q');
+            assert!(!app.should_quit());
+            assert_eq!(field_value(&app, "implement-feature", "ticket_id"), "q");
+        }
+
+        #[test]
+        fn a_closed_catalogue_with_no_answer_says_so_and_opens_nothing() {
+            let mut app = app_with(vec![]);
+            // Nothing listens where the client points.
+            let request = ch(&mut app, 'n');
+            assert_eq!(request, Request::OpenNewTask);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(app.perform(request));
+            assert_eq!(app.view_kind(), ViewKind::Tasks);
+            assert!(note(&app).contains("nie udało się wczytać katalogu"), "{}", note(&app));
+        }
+    }
+
+    // -- a path ----------------------------------------------------------------
+
+    mod a_workflow_path {
+        use super::*;
+
+        #[test]
+        fn a_server_that_does_not_read_files_greys_the_path_out_with_its_reason() {
+            let mut app = app_with(vec![]);
+            app.set_capabilities(capabilities(false, Some("serwer zdalny nie czyta plików z dysku")));
+            open_form(&mut app);
+            let item = chooser_item(&app, PATH_LABEL);
+            assert_eq!(
+                item.unavailable.as_deref(),
+                Some("serwer zdalny nie czyta plików z dysku")
+            );
+            choose(&mut app, PATH_LABEL);
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert!(
+                note(&app).contains("serwer zdalny nie czyta plików z dysku"),
+                "{}",
+                note(&app)
+            );
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Warning);
+        }
+
+        #[test]
+        fn without_a_reason_of_its_own_the_path_still_says_why() {
+            let mut app = app_with(vec![]);
+            app.set_capabilities(capabilities(false, None));
+            open_form(&mut app);
+            assert!(chooser_item(&app, PATH_LABEL)
+                .unavailable
+                .as_deref()
+                .is_some_and(|reason| reason.contains("nie czyta plików")));
+        }
+
+        #[test]
+        fn a_local_daemon_offers_the_path() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            assert_eq!(chooser_item(&app, PATH_LABEL).unavailable, None);
+        }
+
+        #[test]
+        fn a_relative_path_is_sent_as_an_absolute_one() {
+            let absolute = absolute_path("workflows/x.yaml");
+            assert!(std::path::Path::new(&absolute).is_absolute(), "{absolute}");
+            assert!(absolute.ends_with("workflows/x.yaml"));
+            assert_eq!(absolute_path("/srv/x.yaml"), "/srv/x.yaml");
+            let home = std::env::var("HOME").unwrap_or_default();
+            if !home.is_empty() {
+                assert_eq!(absolute_path("~/x.yaml"), format!("{home}/x.yaml"));
+            }
+        }
+
+        #[test]
+        fn enter_on_a_path_asks_the_server_to_check_it_first() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            choose(&mut app, PATH_LABEL);
+            press(&mut app, KeyCode::Tab);
+            typed(&mut app, "/srv/workflows/wf.yaml");
+            assert_eq!(
+                press(&mut app, KeyCode::Enter),
+                Request::ValidatePath("/srv/workflows/wf.yaml".to_string())
+            );
+            assert!(app.outgoing().is_empty(), "nothing is created before the check");
+        }
+
+        #[test]
+        fn every_violation_is_in_the_description_and_none_is_sent() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            choose(&mut app, PATH_LABEL);
+            press(&mut app, KeyCode::Tab);
+            typed(&mut app, "/srv/bad.yaml");
+            app.on_path_checked(
+                "/srv/bad.yaml",
+                Ok(ValidateWorkflowResponse {
+                    valid: false,
+                    name: None,
+                    version: None,
+                    inputs: vec![],
+                    violations: vec![
+                        "state 'plan' has no transition for output 'ok'".to_string(),
+                        "state 'ship' is not reachable".to_string(),
+                        "input 'ticket' is declared twice".to_string(),
+                    ],
+                }),
+            );
+            let description = &chooser_item(&app, PATH_LABEL).description;
+            for violation in [
+                "state 'plan' has no transition for output 'ok'",
+                "state 'ship' is not reachable",
+                "input 'ticket' is declared twice",
+            ] {
+                assert!(description.contains(violation), "{description}");
+            }
+            assert!(description.contains("naruszeń: 3"), "{description}");
+            let error = app
+                .new_task_form()
+                .unwrap()
+                .chooser()
+                .fields_of(2)[0]
+                .error()
+                .map(str::to_string);
+            assert!(error.is_some_and(|error| error.contains('3')));
+            assert!(matches!(
+                app.new_task_form().unwrap().path_check().unwrap().verdict,
+                PathVerdict::Invalid(_)
+            ));
+            assert!(app.outgoing().is_empty());
+        }
+
+        #[test]
+        fn a_definition_that_loads_brings_its_inputs_and_enter_then_creates_the_task() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            choose(&mut app, PATH_LABEL);
+            press(&mut app, KeyCode::Tab);
+            typed(&mut app, "/srv/ok.yaml");
+            app.on_path_checked(
+                "/srv/ok.yaml",
+                Ok(ValidateWorkflowResponse {
+                    valid: true,
+                    name: Some("my-flow".to_string()),
+                    version: Some(4),
+                    inputs: vec![workflow_input("ticket", ParamType::String, true, None)],
+                    violations: vec![],
+                }),
+            );
+            let item = chooser_item(&app, PATH_LABEL);
+            let names: Vec<&str> = item.fields.iter().map(|field| field.name.as_str()).collect();
+            assert_eq!(names, [PATH_FIELD, "ticket"]);
+            assert!(item.description.contains("my-flow v4"));
+            assert_eq!(field_value(&app, PATH_LABEL, PATH_FIELD), "/srv/ok.yaml", "what was typed stays");
+
+            press(&mut app, KeyCode::Down);
+            typed(&mut app, "NAR-3");
+            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+                panic!("the task should be sent");
+            };
+            let outgoing = &app.outgoing()[0];
+            assert_eq!(outgoing.task_id, id);
+            assert_eq!(outgoing.title, "NAR-3");
+            assert_eq!(
+                outgoing.send,
+                CreateHow::Path {
+                    workflow: "/srv/ok.yaml".to_string(),
+                    inputs: json!({ "ticket": "NAR-3" }).as_object().unwrap().clone(),
+                }
+            );
+        }
+
+        #[test]
+        fn a_path_that_could_not_be_checked_says_why_in_the_description() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            choose(&mut app, PATH_LABEL);
+            press(&mut app, KeyCode::Tab);
+            typed(&mut app, "/nope.yaml");
+            app.on_path_checked(
+                "/nope.yaml",
+                Err(ClientError::Request {
+                    code: "workflow_not_found".to_string(),
+                    message: "there is no workflow file at that path".to_string(),
+                }),
+            );
+            assert!(chooser_item(&app, PATH_LABEL)
+                .description
+                .contains("there is no workflow file at that path"));
+        }
+    }
+
+    // -- sending ---------------------------------------------------------------
+
+    mod sending {
+        use super::*;
+
+        fn filled() -> TaskApp {
+            let mut app = app_with(vec![titled(queued("a", 1), "NAR-1"), titled(queued("b", 2), "NAR-2")]);
+            ch(&mut app, 'g');
+            open_form(&mut app);
+            fill_ticket(&mut app, "NAR-18");
+            press(&mut app, KeyCode::Down);
+            typed(&mut app, "3");
+            app
+        }
+
+        #[test]
+        fn enter_makes_the_id_first_and_the_row_goes_last_and_is_selected() {
+            let mut app = filled();
+            let before = rows(&app);
+            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+                panic!("a send was expected");
+            };
+            assert!(id.starts_with("task-"), "{id}");
+            assert_eq!(app.view_kind(), ViewKind::Tasks);
+            assert_eq!(app.list().selected_id(), Some(id.as_str()));
+            let now = rows(&app);
+            assert_eq!(now[..2], before[..], "the rows above are where they were");
+            assert_eq!(now.len(), 3);
+            assert_eq!(now[2], ('↻', "NAR-18".to_string(), "wysyłanie…".to_string()));
+            assert!(app.detail().has_drafts(), "until the server has it, it is unsent");
+        }
+
+        #[test]
+        fn the_request_carries_the_id_the_version_and_the_typed_inputs() {
+            let mut app = filled();
+            ch(&mut app, 'x'); // not a field: ignored once the form closed
+            let _ = app;
+            let mut app = filled();
+            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+                panic!("a send was expected");
+            };
+            let CreateHow::Catalogue(request) = &app.outgoing()[0].send else {
+                panic!("a workflow of the catalogue is created through the control plane");
+            };
+            assert_eq!(request.task_id.as_deref(), Some(id.as_str()));
+            assert_eq!(request.launch.workflow_id, "implement-feature");
+            assert_eq!(request.launch.workflow_version, 1);
+            assert_eq!(
+                request.launch.inputs,
+                json!({
+                    "ticket_id": "NAR-18",
+                    "attempts": 3,
+                    "dry_run": false,
+                    "target_repo": "docs",
+                })
+            );
+        }
+
+        #[test]
+        fn a_boolean_chosen_with_the_arrow_is_sent_as_a_boolean() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            fill_ticket(&mut app, "NAR-1");
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Right);
+            assert_eq!(field_value(&app, "implement-feature", "dry_run"), "true");
+            press(&mut app, KeyCode::Enter);
+            let CreateHow::Catalogue(request) = &app.outgoing()[0].send else {
+                panic!("catalogue");
+            };
+            assert_eq!(request.launch.inputs["dry_run"], json!(true));
+        }
+
+        #[test]
+        fn without_a_connection_nothing_is_sent_and_the_form_keeps_what_was_typed() {
+            let mut app = TaskApp::new(offline_client(), "local", None);
+            app.set_capabilities(capabilities(true, None));
+            open_form(&mut app);
+            fill_ticket(&mut app, "NAR-18");
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert_eq!(app.view_kind(), ViewKind::NewTask, "the form stays");
+            assert_eq!(field_value(&app, "implement-feature", "ticket_id"), "NAR-18");
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Warning);
+            assert!(app.outgoing().is_empty());
+            assert!(app.list().pending().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_lost_answer_is_sent_again_with_the_same_id_and_then_stays_unsent() {
+            let mut app = filled();
+            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+                panic!("a send was expected");
+            };
+            app.perform(Request::SendTask(id.clone())).await;
+            // The first attempt got nothing: the row says it is being sent
+            // again, and the request is waiting to go out again.
+            assert_eq!(rows(&app)[2].0, '↻');
+            assert_eq!(app.list().pending()[0].state, PendingState::Sending);
+            assert!(app.next_outgoing_due().is_some());
+            assert!(note(&app).contains("ponawiam z tym samym id"), "{}", note(&app));
+            let first = app.outgoing()[0].clone();
+
+            // Not yet due.
+            assert!(!app.retry_outgoing_if_due(Instant::now()).await);
+            assert_eq!(app.outgoing()[0].attempts(), 1);
+
+            // Due: the same request goes out and gets nothing again.
+            assert!(app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2).await);
+            assert_eq!(app.outgoing()[0].send, first.send, "the same request");
+            assert_eq!(app.outgoing()[0].task_id, id, "under the same id");
+            assert_eq!(rows(&app)[2], ('✗', "NAR-18".to_string(), "nie wysłano".to_string()));
+            assert_eq!(app.list().pending()[0].state, PendingState::NotSent);
+            assert!(app.next_outgoing_due().is_none(), "no more by itself");
+            assert!(app.detail().has_drafts(), "the data is kept");
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Error);
+        }
+
+        #[test]
+        fn r_on_an_unsent_row_sends_it_again_when_the_connection_allows_and_says_why_not_otherwise() {
+            let mut app = filled();
+            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+                panic!("a send was expected");
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                app.perform(Request::SendTask(id.clone())).await;
+                app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2).await;
+            });
+            assert_eq!(app.list().pending()[0].state, PendingState::NotSent);
+
+            // The connection is down: the reason is on the bar, nothing is sent.
+            assert_eq!(ch(&mut app, 'r'), Request::None);
+            assert!(!note(&app).is_empty());
+            assert_eq!(app.list().pending()[0].state, PendingState::NotSent);
+
+            // It came back.
+            app.load(listing(vec![titled(queued("a", 1), "NAR-1")], "d"));
+            assert_eq!(app.list().selected_id(), Some(id.as_str()), "the row keeps the selection");
+            assert_eq!(ch(&mut app, 'r'), Request::SendTask(id.clone()));
+            assert_eq!(app.list().pending()[0].state, PendingState::Sending);
+            assert_eq!(app.outgoing()[0].task_id, id);
+        }
+
+        #[test]
+        fn r_on_a_task_the_server_has_has_nothing_to_send() {
+            let mut app = app_with(vec![titled(queued("a", 1), "NAR-1")]);
+            assert_eq!(ch(&mut app, 'r'), Request::None);
+            assert!(note(&app).contains("nie ma czego ponawiać"), "{}", note(&app));
+        }
+
+        #[test]
+        fn the_unsent_row_has_details_that_say_where_it_stands() {
+            let mut app = filled();
+            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+                panic!("a send was expected");
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                app.perform(Request::SendTask(id.clone())).await;
+                app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2).await;
+            });
+            let screen = screen(&mut app, 120, 30);
+            for expected in [
+                "✗ nie wysłano",
+                &id,
+                "Dane zostały zachowane",
+                "implement-feature",
+                "ticket_id = NAR-18",
+                "attempts = 3",
+            ] {
+                assert!(screen.contains(expected), "{expected}:\n{screen}");
+            }
+        }
+
+        #[test]
+        fn what_the_server_lists_is_no_longer_waiting_to_be_confirmed() {
+            let mut app = filled();
+            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+                panic!("a send was expected");
+            };
+            // The answer was lost, but the task is there when the list is read.
+            app.load(listing(
+                vec![
+                    titled(queued("a", 1), "NAR-1"),
+                    titled(queued("b", 2), "NAR-2"),
+                    titled(queued(&id, 3), "NAR-18"),
+                ],
+                "d",
+            ));
+            assert!(app.list().pending().is_empty());
+            assert!(app.outgoing().is_empty(), "nothing is left to send again");
+            assert!(!app.detail().has_drafts(), "and nothing is unsent");
+            assert_eq!(rows(&app).len(), 3);
+            assert_eq!(app.list().selected_id(), Some(id.as_str()));
+            assert_eq!(rows(&app)[2].0, '◷');
+        }
+
+        #[test]
+        fn the_pending_row_can_be_moved_over_and_the_selection_stays_on_it() {
+            let mut app = filled();
+            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+                panic!("a send was expected");
+            };
+            ch(&mut app, 'k');
+            assert_eq!(app.list().selected_id(), Some("b"));
+            ch(&mut app, 'j');
+            assert_eq!(app.list().selected_id(), Some(id.as_str()));
+            ch(&mut app, 'G');
+            assert_eq!(app.list().selected_id(), Some(id.as_str()));
+        }
+    }
+
+    // -- the history -----------------------------------------------------------
+
+    mod history {
+        use super::*;
+
+        fn opened() -> TaskApp {
+            let mut app = app_with(vec![titled(queued("a", 1), "NAR-1")]);
+            assert_eq!(ch(&mut app, 'H'), Request::OpenHistory);
+            app.open_history(
+                listing(
+                    vec![archived("old", "NAR-9", 5), archived("older", "NAR-8", 1)],
+                    "c",
+                ),
+                Ok(LegacyExecutionListResponse {
+                    executions: vec![
+                        legacy("exec-failed", "fix-bug", "failed", 3, true, None),
+                        legacy("exec-done", "fix-bug", "completed", 2, false, Some("zakończone — nie ma czego wznawiać")),
+                    ],
+                }),
+            );
+            assert_eq!(app.view_kind(), ViewKind::History);
+            app
+        }
+
+        fn titles(app: &TaskApp) -> Vec<String> {
+            app.history().unwrap().rows().into_iter().map(|row| row.title).collect()
+        }
+
+        #[test]
+        fn it_lists_archived_tasks_and_old_executions_newest_first() {
+            let app = opened();
+            assert_eq!(
+                titles(&app),
+                ["NAR-9", "fix-bug exec-failed", "fix-bug exec-done", "NAR-8"]
+            );
+            assert_eq!(app.history().unwrap().selected(), 0);
+        }
+
+        #[test]
+        fn an_archived_task_has_the_tabs_read_only_and_says_its_storage_is_gone() {
+            let mut app = opened();
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.key_context(), Context::HistoryDetails);
+            for (tab, expected) in [
+                (DetailTab::Progress, "storage usunięty przy archiwizacji"),
+                (DetailTab::Conversation, "storage usunięty przy archiwizacji"),
+                (DetailTab::Events, "storage usunięty przy archiwizacji"),
+                (DetailTab::Conductor, "storage usunięty przy archiwizacji"),
+            ] {
+                while app.history().unwrap().tab() != tab {
+                    press(&mut app, KeyCode::Right);
+                }
+                let screen = screen(&mut app, 130, 30);
+                assert!(screen.contains(expected), "{tab:?}:\n{screen}");
+            }
+            // The details are not the ones of the task list.
+            let screen = screen(&mut app, 130, 30);
+            assert!(screen.contains("NAR-9"), "{screen}");
+            assert!(screen.contains("Historia"), "{screen}");
+        }
+
+        #[test]
+        fn esc_in_the_details_goes_to_the_history_list_and_esc_there_to_the_tasks() {
+            let mut app = opened();
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.focus(), narsor::tui::task_app::Focus::Details);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.view_kind(), ViewKind::History);
+            assert_eq!(app.key_context(), Context::History);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.view_kind(), ViewKind::Tasks);
+            assert_eq!(app.list().selected_id(), Some("a"));
+            assert_eq!(app.focus(), narsor::tui::task_app::Focus::List);
+        }
+
+        #[test]
+        fn recover_is_offered_only_for_an_execution_that_can_be_recovered() {
+            let mut app = opened();
+            // The archived task: nothing to recover, and why.
+            assert_eq!(ch(&mut app, 'w'), Request::None);
+            assert!(note(&app).contains("storage usunięty przy archiwizacji"), "{}", note(&app));
+
+            // The failed execution can be.
+            ch(&mut app, 'j');
+            assert_eq!(ch(&mut app, 'w'), Request::Recover("exec-failed".to_string()));
+
+            // The completed one cannot; the server's reason is on the bar.
+            ch(&mut app, 'j');
+            assert_eq!(ch(&mut app, 'w'), Request::None);
+            assert!(note(&app).contains("zakończone — nie ma czego wznawiać"), "{}", note(&app));
+        }
+
+        #[test]
+        fn recover_is_blocked_without_a_connection() {
+            let mut app = opened();
+            ch(&mut app, 'j');
+            // The connection broke after the history was read.
+            app.on_stream(Some(Err(ClientError::Unavailable("gone".to_string()))));
+            assert_eq!(ch(&mut app, 'w'), Request::None);
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Warning);
+        }
+
+        #[test]
+        fn the_only_action_of_the_history_is_recover_the_task_keys_do_nothing() {
+            let mut app = opened();
+            for key in ['p', 'x', 't', 's', 'a', 'm', 'o', 'n', 'z', '.', 'R', 'H'] {
+                assert_eq!(ch(&mut app, key), Request::None, "{key}");
+            }
+            assert_eq!(app.view_kind(), ViewKind::History);
+            assert!(app.overlay().is_none());
+            assert_eq!(app.list().tasks().len(), 1, "the task list is untouched");
+        }
+
+        #[test]
+        fn an_old_execution_has_a_header_and_tabs_of_its_own() {
+            let mut app = opened();
+            ch(&mut app, 'j');
+            let screen = screen(&mut app, 130, 30);
+            assert!(screen.contains("fix-bug exec-failed"), "{screen}");
+            assert!(screen.contains("failed"), "{screen}");
+            assert!(screen.contains("Przebieg"), "{screen}");
+        }
+
+        #[test]
+        fn what_the_server_could_not_list_is_said_and_the_archived_tasks_are_still_there() {
+            let mut app = app_with(vec![]);
+            ch(&mut app, 'H');
+            app.open_history(
+                listing(vec![archived("old", "NAR-9", 5)], "c"),
+                Err(ClientError::Unavailable("timeout".to_string())),
+            );
+            assert_eq!(titles(&app), ["NAR-9"]);
+            assert!(app.history().unwrap().note().is_some());
+            assert!(note(&app).contains("dawne executions niedostępne"), "{}", note(&app));
+        }
+
+        #[test]
+        fn an_empty_history_is_an_empty_list_not_an_error() {
+            let mut app = app_with(vec![]);
+            ch(&mut app, 'H');
+            app.open_history(listing(vec![], "c"), Ok(LegacyExecutionListResponse { executions: vec![] }));
+            assert!(titles(&app).is_empty());
+            let screen = screen(&mut app, 120, 30);
+            assert!(screen.contains("historia jest pusta"), "{screen}");
+        }
+
+        #[test]
+        fn keys_and_help_of_the_history_come_from_the_map() {
+            let app = opened();
+            assert_eq!(app.key_context(), Context::History);
+            let keys = keymap::hints(Context::History);
+            assert!(keys.iter().any(|(_, label)| *label == "wznów"));
+            assert_eq!(
+                keymap::lookup(Context::History, &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+                Some(Action::Recover)
+            );
+            let entry = app.history().unwrap().selected_entry().unwrap();
+            assert!(matches!(entry, HistoryEntry::Archived(_)));
+        }
+
+        /// An execution from before the task scheduler, with a retried step
+        /// and a conversation per attempt, written under `root`.
+        fn seed_old_execution(root: &std::path::Path, id: &str) {
+            use narsor::domain::{
+                Context as WorkflowContext, EventData, ExecutionStatus, RepositoryInfo,
+                WorkflowExecution, Workspace,
+            };
+            use narsor::persistence::conversation::ConversationSource;
+            let store = ExecutionStore::new(root);
+            store
+                .save_execution(&WorkflowExecution {
+                    id: id.to_string(),
+                    workflow_id: "implement-feature".to_string(),
+                    workflow_version: 1,
+                    status: ExecutionStatus::Completed,
+                    current_state: Some("plan".to_string()),
+                    started_at: chrono::Utc::now(),
+                    completed_at: None,
+                    inputs: json!({}),
+                    context: WorkflowContext::new(),
+                    workspace: Workspace::git_checkout(
+                        "/tmp/workspace".to_string(),
+                        RepositoryInfo {
+                            id: "repo-1".to_string(),
+                            name: "narsor".to_string(),
+                            provider: "gitlab".to_string(),
+                            remote: "git@example.com:team/narsor.git".to_string(),
+                        },
+                        Some("main".to_string()),
+                    ),
+                    current_action_execution: None,
+                    metadata: json!({}),
+                })
+                .expect("save execution");
+            let log = store.event_log(id);
+            let id_string = id.to_string();
+            for data in [
+                EventData::WorkflowStarted {
+                    workflow_id: "implement-feature".to_string(),
+                    workflow_version: 1,
+                    inputs: json!({}),
+                },
+                EventData::StateEntered { state_id: "plan".to_string() },
+                EventData::ActionStarted {
+                    action_execution_id: "attempt-1".to_string(),
+                    state_id: "plan".to_string(),
+                    action_type: "agent".to_string(),
+                },
+                EventData::ActionCompleted {
+                    action_execution_id: "attempt-1".to_string(),
+                    output_label: "success".to_string(),
+                },
+            ] {
+                log.append_next(&id_string, data).expect("append");
+            }
+            let conversations = store.conversation_store(id);
+            let mut writer = conversations.writer("attempt-1").expect("writer");
+            writer.append_narsor("prompt: zaplanuj zmianę").expect("prompt");
+            writer
+                .append(ConversationSource::Stdout, br#"{"type":"assistant"}"#)
+                .expect("stdout");
+            writer.finish().expect("finish");
+            conversations.close_attempt("attempt-1").expect("close");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_old_execution_is_read_through_the_history_routes_in_every_tab_and_recover_is_refused_with_the_reason() {
+            let harness = RemoteHarness::start().await;
+            seed_old_execution(harness.root.path(), "exec-old");
+            let mut app = TaskApp::new(harness.owner.clone(), "test", None);
+            app.refresh().await;
+
+            let request = ch(&mut app, 'H');
+            app.perform(request).await;
+            assert_eq!(titles(&app), ["implement-feature exec-old"]);
+            press(&mut app, KeyCode::Enter);
+
+            app.sync_detail().await;
+            let progress = screen(&mut app, 130, 30);
+            assert!(progress.contains("plan #1"), "the timeline of the old execution:\n{progress}");
+            assert!(progress.contains("completed"), "{progress}");
+
+            press(&mut app, KeyCode::Right);
+            app.sync_detail().await;
+            let conversation = screen(&mut app, 130, 30);
+            assert!(conversation.contains("Workflow sends input to agent"), "{conversation}");
+            assert!(conversation.contains("assistant message"), "{conversation}");
+
+            press(&mut app, KeyCode::Right);
+            app.sync_detail().await;
+            let events = screen(&mut app, 130, 30);
+            assert!(events.contains("WorkflowStarted") || events.contains("workflow"), "{events}");
+            assert!(events.contains("plan"), "{events}");
+
+            press(&mut app, KeyCode::Right);
+            app.sync_detail().await;
+            let conductor = screen(&mut app, 130, 30);
+            assert!(conductor.contains("tylko do odczytu"), "no chat box, only history:\n{conductor}");
+
+            // Nothing of the old execution is a key of the task list: `w` is
+            // refused up front, and the server's refusal is shown if it is asked.
+            assert_eq!(ch(&mut app, 'w'), Request::None);
+            assert!(!note(&app).is_empty());
+            app.perform(Request::Recover("exec-old".to_string())).await;
+            let said = note(&app);
+            assert!(said.contains("wznowienie exec-old odrzucone"), "{said}");
+            assert!(said.contains("completed"), "{said}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_archived_tasks_of_a_server_are_the_history() {
+            let harness = RemoteHarness::start().await;
+            harness.create("NAR-9", Some("k8s")).await;
+            harness.create("NAR-10", Some("k8s")).await;
+            // Archiving a task that never started completes at once.
+            harness
+                .owner
+                .control_command(
+                    "NAR-9",
+                    &narsor::controller_protocol::OwnerCommandRequest {
+                        command: narsor::orchestration::OwnerCommand::Archive,
+                        idempotency_key: "archive-1".to_string(),
+                        expected_generation: None,
+                    },
+                )
+                .await
+                .expect("archive");
+
+            let mut app = TaskApp::new(harness.owner.clone(), "test", None);
+            app.refresh().await;
+            assert_eq!(app.list().tasks().len(), 1, "the archived task left the list");
+
+            let request = ch(&mut app, 'H');
+            app.perform(request).await;
+            assert_eq!(app.view_kind(), ViewKind::History);
+            assert_eq!(titles(&app), ["NAR-9"]);
+            let entry = app.history().unwrap().selected_entry().unwrap();
+            assert_eq!(entry.summary().lifecycle, TaskLifecycle::Archived);
+
+            // The details are read-only and read nothing: the storage is gone.
+            press(&mut app, KeyCode::Enter);
+            app.sync_detail().await;
+            let screen = screen(&mut app, 130, 30);
+            assert!(screen.contains("storage usunięty przy archiwizacji"), "{screen}");
+
+            // `Esc` twice: the task list is where it was.
+            press(&mut app, KeyCode::Esc);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.view_kind(), ViewKind::Tasks);
+            assert_eq!(app.list().selected_id(), Some("NAR-10"));
+        }
+    }
+
+    // -- over the wire ---------------------------------------------------------
+
+    mod over_the_wire {
+        use super::*;
+
+        use tokio::io::AsyncReadExt as _;
+        use tokio::net::{TcpListener, TcpStream};
+
+        use super::super::environment_support::{workflow_image, workflow_yaml};
+
+        /// The workflow the tests create tasks from: a ticket, a number, a
+        /// flag and a repository, and a title made of the ticket.
+        fn implement_feature(version: u32) -> String {
+            let header = format!("name: implement-feature\nversion: {version}\n");
+            let declared = "description: \"Pełny cykl: plan, implementacja, review.\"\n\
+                inputs:\n  - name: ticket_id\n    type: string\n    required: true\n    \
+                description: numer zgłoszenia\n  - name: attempts\n    type: integer\n  \
+                - name: dry_run\n    type: boolean\n  - name: target_repo\n    \
+                type: repository\ndisplay:\n  title: \"{{ inputs.ticket_id }}\"\n";
+            let body = workflow_yaml("implement-feature", Some(&workflow_image()));
+            let rest = body.split_once("version: 1\n").expect("a version").1;
+            format!("{header}{declared}{rest}")
+        }
+
+        fn write_workflow(root: &std::path::Path) {
+            std::fs::write(
+                root.join("workflows/implement-feature.yaml"),
+                implement_feature(1),
+            )
+            .expect("write workflow");
+        }
+
+        /// The served control plane, with a live controller on its backend: a
+        /// queued task shows its place (`#n`), not `offline`. Keep the second
+        /// part alive for as long as the test runs.
+        async fn harness() -> (RemoteHarness, (narsor::controller_protocol::ControllerClient, u64)) {
+            let harness = RemoteHarness::start_with(write_workflow).await;
+            let controller = harness.controller("k8s").await;
+            (harness, controller)
+        }
+
+        /// A task the server already has.
+        async fn existing(harness: &RemoteHarness, id: &str) {
+            let mut request = super::super::remote_support::create_request(id, Some("k8s"));
+            request.launch.inputs = json!({ "ticket_id": id });
+            harness.owner.create_control_task(&request).await.expect("create");
+        }
+
+        async fn open(harness: &RemoteHarness) -> TaskApp {
+            let mut app = TaskApp::new(harness.owner.clone(), "test", None);
+            app.refresh().await;
+            app
+        }
+
+        /// An application whose client reaches the server through a proxy
+        /// that loses the answer of the first `losses` connections.
+        async fn app_behind_a_lossy_proxy(harness: &RemoteHarness, losses: usize) -> TaskApp {
+            let proxy = lossy_proxy(harness.handle.addr(), losses).await;
+            let client = ApiClient::new(proxy, harness.handle.token().to_string());
+            let mut app = TaskApp::new(client, "test", None);
+            // Read through the direct client: the proxy's first connection
+            // must be the creation.
+            app.set_capabilities(harness.owner.control_capabilities().await.unwrap());
+            app.load(harness.owner.control_tasks().await.unwrap());
+            app
+        }
+
+        /// Forwards connections to `upstream`; for the first `losses` of them
+        /// the request goes through and the answer never comes back: the
+        /// server did what it was asked and the client does not know.
+        async fn lossy_proxy(upstream: SocketAddr, losses: usize) -> SocketAddr {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+            let address = listener.local_addr().expect("an address");
+            tokio::spawn(async move {
+                let mut seen = 0usize;
+                while let Ok((client, _)) = listener.accept().await {
+                    let lose = seen < losses;
+                    seen += 1;
+                    tokio::spawn(async move {
+                        let Ok(server) = TcpStream::connect(upstream).await else {
+                            return;
+                        };
+                        if !lose {
+                            let (mut client, mut server) = (client, server);
+                            let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                            return;
+                        }
+                        let (mut from_client, _to_client) = client.into_split();
+                        let (mut from_server, mut to_server) = server.into_split();
+                        let request = tokio::spawn(async move {
+                            let _ = tokio::io::copy(&mut from_client, &mut to_server).await;
+                        });
+                        // The answer started: the server has the task. Hang up.
+                        let mut first = [0u8; 1024];
+                        let _ = from_server.read(&mut first).await;
+                        request.abort();
+                    });
+                }
+            });
+            address
+        }
+
+        async fn open_the_form(app: &mut TaskApp, harness: &RemoteHarness) {
+            let workflows = harness.owner.control_workflows().await.unwrap();
+            let repositories = harness.owner.control_repositories().await.unwrap();
+            ch(app, 'n');
+            app.open_new_task(workflows, repositories);
+            choose(app, "implement-feature");
+            fill_ticket(app, "NAR-18");
+        }
+
+        async fn tasks_on_the_server(harness: &RemoteHarness) -> Vec<String> {
+            harness
+                .owner
+                .control_tasks()
+                .await
+                .unwrap()
+                .tasks
+                .iter()
+                .map(|task| task.task_id.to_string())
+                .collect()
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn n_then_a_workflow_then_a_ticket_then_enter_puts_a_queued_row_last_and_selected() {
+            let (harness, _controller) = harness().await;
+            existing(&harness, "NAR-1").await;
+            existing(&harness, "NAR-2").await;
+            let mut app = open(&harness).await;
+            let before = rows(&app);
+            assert_eq!(before.len(), 2);
+
+            let request = ch(&mut app, 'n');
+            assert_eq!(request, Request::OpenNewTask);
+            app.perform(request).await;
+            assert_eq!(app.view_kind(), ViewKind::NewTask);
+            choose(&mut app, "implement-feature");
+            assert!(
+                chooser_item(&app, "implement-feature")
+                    .description
+                    .contains("Pełny cykl"),
+                "{}",
+                chooser_item(&app, "implement-feature").description
+            );
+            fill_ticket(&mut app, "NAR-18");
+            let request = press(&mut app, KeyCode::Enter);
+            assert!(matches!(request, Request::SendTask(_)), "{request:?}");
+            app.perform(request).await;
+
+            let now = rows(&app);
+            assert_eq!(now.len(), 3);
+            assert_eq!(now[..2], before[..], "the list below is not touched");
+            assert_eq!(now[2], ('◷', "NAR-18".to_string(), "#3".to_string()));
+            let id = app.list().tasks()[2].task_id.to_string();
+            assert_eq!(app.list().selected_id(), Some(id.as_str()));
+            assert!(app.list().pending().is_empty());
+            assert!(app.outgoing().is_empty());
+            assert!(app.remembered_new_task().is_none(), "what was sent is forgotten");
+            assert!(!app.detail().has_drafts());
+            assert!(note(&app).contains("zadanie utworzone"), "{}", note(&app));
+            assert_eq!(tasks_on_the_server(&harness).await.len(), 3);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_lost_answer_is_sent_again_with_the_same_id_and_makes_one_task() {
+            let (harness, _controller) = harness().await;
+            let mut app = app_behind_a_lossy_proxy(&harness, 1).await;
+            open_the_form(&mut app, &harness).await;
+            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+                panic!("a send was expected");
+            };
+            app.perform(Request::SendTask(id.clone())).await;
+
+            // The server has the task, the client does not know.
+            assert_eq!(tasks_on_the_server(&harness).await, std::slice::from_ref(&id));
+            assert_eq!(rows(&app), [('↻', "NAR-18".to_string(), "wysyłanie…".to_string())]);
+
+            assert!(app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2).await);
+            assert_eq!(rows(&app), [('◷', "NAR-18".to_string(), "#1".to_string())]);
+            assert_eq!(app.list().selected_id(), Some(id.as_str()));
+            assert_eq!(
+                tasks_on_the_server(&harness).await,
+                std::slice::from_ref(&id),
+                "the same id made no second task"
+            );
+            assert!(app.list().pending().is_empty());
+            assert!(app.outgoing().is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn when_the_retry_is_lost_too_the_row_is_unsent_and_a_read_that_lists_the_task_settles_it() {
+            let (harness, _controller) = harness().await;
+            let mut app = app_behind_a_lossy_proxy(&harness, 2).await;
+            open_the_form(&mut app, &harness).await;
+            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+                panic!("a send was expected");
+            };
+            app.perform(Request::SendTask(id.clone())).await;
+            assert!(app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2).await);
+            assert_eq!(rows(&app), [('✗', "NAR-18".to_string(), "nie wysłano".to_string())]);
+            assert_eq!(tasks_on_the_server(&harness).await, std::slice::from_ref(&id));
+
+            // The connection is back (a read succeeded), the operator sends again.
+            app.load(harness.owner.control_tasks().await.unwrap());
+            assert_eq!(
+                rows(&app),
+                [('◷', "NAR-18".to_string(), "#1".to_string())],
+                "a read that lists the task is as good as an answer"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn r_on_the_unsent_row_makes_the_same_task_when_the_list_does_not_have_it_yet() {
+            let (harness, _controller) = harness().await;
+            let mut app = app_behind_a_lossy_proxy(&harness, 2).await;
+            open_the_form(&mut app, &harness).await;
+            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+                panic!("a send was expected");
+            };
+            app.perform(Request::SendTask(id.clone())).await;
+            app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2).await;
+            assert_eq!(app.list().pending()[0].state, PendingState::NotSent);
+
+            // A read that does not list it (an older listing) brings the
+            // connection back without settling the row.
+            app.load(listing(vec![], "stale"));
+            assert_eq!(app.list().pending().len(), 1);
+            let request = ch(&mut app, 'r');
+            assert_eq!(request, Request::SendTask(id.clone()));
+            app.perform(request).await;
+            assert_eq!(rows(&app), [('◷', "NAR-18".to_string(), "#1".to_string())]);
+            assert_eq!(tasks_on_the_server(&harness).await, [id], "one task, one id");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_refusal_is_not_a_lost_answer_the_form_comes_back_with_what_was_typed() {
+            let (harness, _controller) = harness().await;
+            let mut app = open(&harness).await;
+            open_the_form(&mut app, &harness).await;
+            // The catalogue moved on after the form was opened.
+            std::fs::write(
+                harness.root.path().join("workflows/implement-feature.yaml"),
+                implement_feature(2),
+            )
+            .unwrap();
+            let request = press(&mut app, KeyCode::Enter);
+            app.perform(request).await;
+
+            assert_eq!(app.view_kind(), ViewKind::NewTask, "the form is back");
+            assert_eq!(field_value(&app, "implement-feature", "ticket_id"), "NAR-18");
+            assert!(app.list().pending().is_empty());
+            assert!(app.outgoing().is_empty());
+            assert!(note(&app).contains("serwer odrzucił"), "{}", note(&app));
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Error);
+            assert!(tasks_on_the_server(&harness).await.is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_path_with_violations_lists_all_of_them_and_a_good_one_creates_a_task() {
+            let (harness, _controller) = harness().await;
+            let broken = "name: broken\nversion: 1\nstates:\n  work:\n    action:\n      type: script\n      \
+                command: \"true\"\n    outputs: [success]\n    transitions:\n      success: nowhere\n  \
+                island:\n    description: nobody comes here\nterminal_states: [done]\n";
+            let expected: Vec<String> = narsor::workflow::validate_source(broken)
+                .expect("the YAML loads")
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            assert!(expected.len() >= 2, "{expected:?}");
+            let bad_path = harness.root.path().join("broken.yaml");
+            std::fs::write(&bad_path, broken).unwrap();
+            let good_path = harness.root.path().join("mine.yaml");
+            std::fs::write(
+                &good_path,
+                implement_feature(1).replace("implement-feature", "mine"),
+            )
+            .unwrap();
+
+            let mut app = open(&harness).await;
+            let request = ch(&mut app, 'n');
+            app.perform(request).await;
+            assert_eq!(chooser_item(&app, PATH_LABEL).unavailable, None, "a local daemon reads files");
+            choose(&mut app, PATH_LABEL);
+            press(&mut app, KeyCode::Tab);
+            typed(&mut app, bad_path.to_str().unwrap());
+            let request = press(&mut app, KeyCode::Enter);
+            assert_eq!(request, Request::ValidatePath(bad_path.to_str().unwrap().to_string()));
+            app.perform(request).await;
+            let description = &chooser_item(&app, PATH_LABEL).description;
+            for violation in &expected {
+                assert!(description.contains(violation.as_str()), "{violation}\n{description}");
+            }
+            assert!(tasks_on_the_server(&harness).await.is_empty(), "nothing was created");
+
+            // A good file: first checked, then created from.
+            for _ in 0..bad_path.to_str().unwrap().len() {
+                press(&mut app, KeyCode::Backspace);
+            }
+            typed(&mut app, good_path.to_str().unwrap());
+            let request = press(&mut app, KeyCode::Enter);
+            app.perform(request).await;
+            assert!(matches!(
+                app.new_task_form().unwrap().path_check().unwrap().verdict,
+                PathVerdict::Valid { version: 1, .. }
+            ));
+            press(&mut app, KeyCode::Down);
+            typed(&mut app, "NAR-77");
+            let request = press(&mut app, KeyCode::Enter);
+            let Request::SendTask(id) = &request else {
+                panic!("{request:?}");
+            };
+            let id = id.clone();
+            app.perform(request).await;
+            assert_eq!(tasks_on_the_server(&harness).await, [id]);
+            assert_eq!(rows(&app)[0].0, '◷');
+            assert_eq!(rows(&app)[0].1, "NAR-77");
+        }
+    }
+
+    // -- the repositories ------------------------------------------------------
+
+    mod repositories {
+        use super::*;
+
+        use super::super::environment_support::{workflow_image, workflow_yaml};
+
+        fn with_a_repository_input(root: &std::path::Path) {
+            let body = workflow_yaml("implement-feature", Some(&workflow_image()));
+            let rest = body.split_once("version: 1\n").unwrap().1;
+            std::fs::write(
+                root.join("workflows/implement-feature.yaml"),
+                format!(
+                    "name: implement-feature\nversion: 1\ninputs:\n  - name: target_repo\n    \
+                     type: repository\n{rest}"
+                ),
+            )
+            .unwrap();
+        }
+
+        fn names(app: &TaskApp) -> Vec<String> {
+            app.repositories()
+                .unwrap()
+                .repositories()
+                .iter()
+                .map(|repository| repository.id.clone())
+                .collect()
+        }
+
+        #[test]
+        fn the_list_shows_what_is_registered_with_a_description_and_a_remote_only_form_for_a_remote_server() {
+            let mut app = app_with(vec![]);
+            app.set_capabilities(capabilities(false, Some("remote")));
+            assert_eq!(ch(&mut app, 'R'), Request::OpenRepositories);
+            app.open_repositories(narsor_registry());
+            assert_eq!(app.view_kind(), ViewKind::Repositories);
+            assert_eq!(names(&app), ["docs", "narsor"]);
+            assert_eq!(app.key_context(), Context::Repositories);
+            let screen = screen(&mut app, 130, 30);
+            for expected in ["Repozytoria (2)", "docs", "narsor", "git@github.com:acme/docs.git", "a dodaj", "d usuń"] {
+                assert!(screen.contains(expected), "{expected}:\n{screen}");
+            }
+
+            ch(&mut app, 'a');
+            let form = app.repositories().unwrap().form().expect("the form");
+            let remote = &form.items()[0].fields[1];
+            assert_eq!(remote.name, "remote");
+            assert!(
+                remote.description.as_deref().is_some_and(|text| text.contains("tylko zdalny URL")),
+                "{:?}",
+                remote.description
+            );
+        }
+
+        #[test]
+        fn d_asks_y_n_and_n_removes_nothing() {
+            let mut app = app_with(vec![]);
+            ch(&mut app, 'R');
+            app.open_repositories(narsor_registry());
+            ch(&mut app, 'j');
+            ch(&mut app, 'd');
+            let window = app.overlay().and_then(|overlay| overlay.confirmation()).expect("the window");
+            assert!(window.heading().contains("Usuń repozytorium"));
+            assert!(window.lines().iter().any(|line| line.contains("narsor")));
+            assert_eq!(app.key_context(), Context::Confirm);
+            assert_eq!(ch(&mut app, 'n'), Request::None);
+            assert!(app.overlay().is_none());
+            // The window survives a re-read of the task list.
+            ch(&mut app, 'd');
+            app.load(listing(vec![], "d"));
+            assert!(app.overlay().is_some(), "it is not about a task of the list");
+            assert_eq!(ch(&mut app, 'y'), Request::RemoveRepository("narsor".to_string()));
+        }
+
+        #[test]
+        fn removing_is_blocked_without_a_connection_and_says_why() {
+            let mut app = app_with(vec![]);
+            ch(&mut app, 'R');
+            app.open_repositories(narsor_registry());
+            ch(&mut app, 'd');
+            app.on_stream(Some(Err(ClientError::Unavailable("gone".to_string()))));
+            assert_eq!(ch(&mut app, 'y'), Request::None);
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Warning);
+        }
+
+        #[test]
+        fn esc_goes_back_to_the_tasks_and_q_asks_while_a_form_holds_text() {
+            let mut app = app_with(vec![titled(queued("a", 1), "NAR-1")]);
+            ch(&mut app, 'R');
+            app.open_repositories(narsor_registry());
+            ch(&mut app, 'a');
+            press(&mut app, KeyCode::Enter);
+            typed(&mut app, "docs-2");
+            assert_eq!(app.key_context(), Context::Form);
+            assert!(app.detail().has_drafts());
+            press(&mut app, KeyCode::Esc);
+            assert!(app.repositories().unwrap().form().is_none());
+            assert!(!app.detail().has_drafts(), "the form was closed");
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.view_kind(), ViewKind::Tasks);
+            assert_eq!(app.list().selected_id(), Some("a"));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_repository_that_is_added_is_listed_and_offered_by_the_repository_field() {
+            let harness = RemoteHarness::start_with(with_a_repository_input).await;
+            let mut app = TaskApp::new(harness.owner.clone(), "test", None);
+            app.refresh().await;
+
+            let request = ch(&mut app, 'R');
+            app.perform(request).await;
+            assert_eq!(app.view_kind(), ViewKind::Repositories);
+            assert!(names(&app).is_empty());
+
+            ch(&mut app, 'a');
+            press(&mut app, KeyCode::Enter); // to the first field
+            typed(&mut app, "narsor");
+            press(&mut app, KeyCode::Down);
+            typed(&mut app, "git@github.com:acme/narsor.git");
+            let request = press(&mut app, KeyCode::Enter);
+            assert!(matches!(request, Request::AddRepository(_)), "{request:?}");
+            app.perform(request).await;
+
+            assert_eq!(names(&app), ["narsor"]);
+            assert!(app.repositories().unwrap().form().is_none());
+            assert!(note(&app).contains("dodano repozytorium narsor"), "{}", note(&app));
+            let screen = screen(&mut app, 130, 30);
+            assert!(screen.contains("git@github.com:acme/narsor.git"), "{screen}");
+
+            // It is in the form of a new task, too.
+            press(&mut app, KeyCode::Esc);
+            let request = ch(&mut app, 'n');
+            app.perform(request).await;
+            choose(&mut app, "implement-feature");
+            let item = chooser_item(&app, "implement-feature");
+            assert_eq!(
+                item.fields[0].kind,
+                narsor::tui::chooser::FieldKind::Select(vec!["narsor".to_string()])
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn what_the_server_refuses_is_shown_next_to_the_field_and_the_form_stays() {
+            let harness = RemoteHarness::start().await;
+            let mut app = TaskApp::new(harness.owner.clone(), "test", None);
+            app.refresh().await;
+            let request = ch(&mut app, 'R');
+            app.perform(request).await;
+
+            ch(&mut app, 'a');
+            press(&mut app, KeyCode::Enter);
+            typed(&mut app, "evil");
+            press(&mut app, KeyCode::Down);
+            typed(&mut app, "ext::sh -c evil");
+            let request = press(&mut app, KeyCode::Enter);
+            app.perform(request).await;
+
+            let form = app.repositories().unwrap().form().expect("the form stays");
+            let remote = &form.items()[0].fields[1];
+            assert!(remote.error().is_some(), "the refusal is at the remote field");
+            assert!(form.items()[0].fields[0].error().is_none());
+            assert_eq!(remote.value(), "ext::sh -c evil", "what was typed stays");
+            assert!(names(&app).is_empty());
+            let screen = screen(&mut app, 130, 30);
+            assert!(screen.contains("✗"), "{screen}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn d_y_removes_the_repository_and_a_removed_one_is_gone_from_the_list() {
+            let harness = RemoteHarness::start().await;
+            for (id, remote) in [("docs", "git@github.com:acme/docs.git"), ("narsor", "git@github.com:acme/narsor.git")] {
+                harness
+                    .owner
+                    .control_add_repository(&narsor::controller_protocol::CreateRepositoryRequest {
+                        id: id.to_string(),
+                        remote: remote.to_string(),
+                        name: None,
+                        provider: None,
+                        default_branch: None,
+                        description: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let mut app = TaskApp::new(harness.owner.clone(), "test", None);
+            app.refresh().await;
+            let request = ch(&mut app, 'R');
+            app.perform(request).await;
+            assert_eq!(names(&app), ["docs", "narsor"]);
+
+            ch(&mut app, 'd');
+            let request = ch(&mut app, 'y');
+            assert_eq!(request, Request::RemoveRepository("docs".to_string()));
+            app.perform(request).await;
+            assert_eq!(names(&app), ["narsor"]);
+            assert!(note(&app).contains("usunięto repozytorium docs"), "{}", note(&app));
+            assert_eq!(harness.owner.control_repositories().await.unwrap().repositories.len(), 1);
+
+            // Gone behind our back: said, and the list is read again.
+            harness.owner.control_remove_repository("narsor").await.unwrap();
+            ch(&mut app, 'd');
+            let request = ch(&mut app, 'y');
+            app.perform(request).await;
+            assert!(names(&app).is_empty());
+            assert!(note(&app).contains("już nie istnieje"), "{}", note(&app));
         }
     }
 }

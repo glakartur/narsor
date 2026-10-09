@@ -40,9 +40,11 @@ use crossterm::event::{KeyCode, KeyEvent};
 use serde_json::{Map, Value};
 
 use crate::conductor::Annotation;
+use crate::controller_protocol::WorkflowInputView;
 use crate::tui::chooser::{ChooserField, ChooserItem, Submission};
 use crate::domain::{
     AnsweredBy, EventData, HumanInputField, HumanInputType, InputCloseReason, OutputDefinition,
+    ParamType,
 };
 use crate::engine::actions::human::is_blank;
 use crate::engine::{
@@ -1794,4 +1796,138 @@ fn declared_fields(
         item = item.with_field(built);
     }
     item
+}
+
+// ---------------------------------------------------------------------------
+// The inputs a workflow declares (the new-task form)
+// ---------------------------------------------------------------------------
+//
+// A workflow's `inputs` are typed (`string`, `integer`, `boolean`,
+// `repository`); the new-task form edits them as fields of the chooser, and
+// the typed values become the task's JSON inputs exactly as `narsor run
+// --input` parses them: `is_experimental=true` reaches the task as a boolean.
+
+/// The two values of a `boolean` input.
+const BOOLEAN_OPTIONS: [&str; 2] = ["true", "false"];
+
+/// One field per declared input, in declaration order.
+///
+/// * `boolean` is a choice between `true` and `false`; with no default it
+///   starts on `false`, the value that changes nothing, so it is never unset
+///   on screen;
+/// * `repository` is a choice among the `repositories` the server has
+///   registered, starting on the default or the first one — with none
+///   registered it is a free line, so a remote the resolver still accepts can
+///   be typed;
+/// * `integer` is a number: the chooser refuses anything else next to the
+///   field, before anything is sent;
+/// * `string` is a free line.
+///
+/// An input is required when the workflow says so and gives no default; a
+/// default is shown as the value the field starts with.
+pub fn workflow_input_fields(
+    inputs: &[WorkflowInputView],
+    repositories: &[String],
+) -> Vec<ChooserField> {
+    inputs
+        .iter()
+        .map(|input| {
+            let mut field = match input.input_type {
+                ParamType::Boolean => ChooserField::select(
+                    input.name.clone(),
+                    BOOLEAN_OPTIONS.iter().map(|option| option.to_string()).collect(),
+                )
+                .with_value(BOOLEAN_OPTIONS[1]),
+                ParamType::Repository if !repositories.is_empty() => {
+                    ChooserField::select(input.name.clone(), repositories.to_vec())
+                }
+                ParamType::Integer => ChooserField::integer(input.name.clone()),
+                ParamType::String | ParamType::Repository => {
+                    ChooserField::text(input.name.clone())
+                }
+            };
+            if let Some(default) = &input.default {
+                field = field.with_value(value_as_text(default));
+            }
+            if input.required && input.default.is_none() {
+                field = field.required();
+            }
+            match input_description(input) {
+                Some(description) => field.described(description),
+                None => field,
+            }
+        })
+        .collect()
+}
+
+/// What the current field is for: its type when that is not obvious, then
+/// what the workflow says of it.
+fn input_description(input: &WorkflowInputView) -> Option<String> {
+    let kind = match input.input_type {
+        ParamType::String => None,
+        ParamType::Integer => Some("liczba całkowita"),
+        ParamType::Boolean => Some("true / false"),
+        ParamType::Repository => Some("repozytorium"),
+    };
+    let said = input
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    match (kind, said) {
+        (Some(kind), Some(said)) => Some(format!("{kind} · {said}")),
+        (Some(kind), None) => Some(kind.to_string()),
+        (None, said) => said.map(str::to_string),
+    }
+}
+
+/// A value of a workflow input that cannot be turned into its declared type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputProblem {
+    /// The input it is about.
+    pub field: String,
+    /// What is wrong, in words for the field.
+    pub message: String,
+}
+
+/// The task's inputs from what the form returned (`(name, value)`, a blank
+/// optional field left out): every declared input that has a value or a
+/// default, typed as declared.
+pub fn workflow_input_values(
+    inputs: &[WorkflowInputView],
+    values: &[(String, String)],
+) -> Result<Map<String, Value>, InputProblem> {
+    let mut typed = Map::new();
+    for input in inputs {
+        let given = values
+            .iter()
+            .find(|(name, _)| *name == input.name)
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty());
+        let Some(raw) = given else {
+            if let Some(default) = &input.default {
+                typed.insert(input.name.clone(), default.clone());
+            }
+            continue;
+        };
+        let value = match input.input_type {
+            ParamType::String | ParamType::Repository => Value::String(raw.to_string()),
+            ParamType::Integer => raw.parse::<i64>().map(Value::from).map_err(|_| InputProblem {
+                field: input.name.clone(),
+                message: format!("Pole '{}' wymaga liczby całkowitej.", input.name),
+            })?,
+            ParamType::Boolean => match raw.to_ascii_lowercase().as_str() {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                other => {
+                    return Err(InputProblem {
+                        field: input.name.clone(),
+                        message: format!("Pole '{}' wymaga true albo false, nie '{other}'.", input.name),
+                    })
+                }
+            },
+        };
+        typed.insert(input.name.clone(), value);
+    }
+    Ok(typed)
 }

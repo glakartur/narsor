@@ -964,7 +964,8 @@ impl TaskApp {
     /// Whether the panel has the keyboard: the focus is in the details, on
     /// the panel, and there is a panel.
     pub fn panel_focused(&self) -> bool {
-        self.focus == super::Focus::Details
+        matches!(self.view, super::View::Tasks)
+            && self.focus == super::Focus::Details
             && self.panel_focus
             && self.selected_panel().is_some_and(WaitingPanel::is_present)
     }

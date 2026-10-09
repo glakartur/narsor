@@ -26,6 +26,7 @@ use narsor::orchestration::{
 };
 use narsor::persistence::paths::StatePaths;
 use narsor::persistence::ExecutionStore;
+use narsor::workflows::WorkflowResolver;
 
 use super::environment_support;
 
@@ -83,16 +84,26 @@ pub struct Running {
 
 impl RemoteHarness {
     pub async fn start() -> Self {
+        Self::start_with(|_| {}).await
+    }
+
+    /// Like [`Self::start`], with `prepare` run on the root after the
+    /// catalogue was seeded: a test writes its own workflows there. The
+    /// workflows the owner API lists are those of the root and the built-in
+    /// ones, never the developer's own directory.
+    pub async fn start_with(prepare: impl FnOnce(&Path)) -> Self {
         let root = TempRoot::new();
         let clock = Arc::new(ManualClock(Mutex::new(
             Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap(),
         )));
         let control = ControlPlane::with_clock(StatePaths::new(root.path()), clock.clone());
+        let catalog = environment_support::seeded_catalog_resolver(root.path());
+        prepare(root.path());
+        let resolver: Arc<dyn narsor::environment::LaunchResolver> = catalog.clone();
         let services = ApiServices {
-            control: Some(Arc::new(ProtocolService::new(
-                control,
-                environment_support::seeded_resolver(root.path()),
-            ))),
+            control: Some(Arc::new(ProtocolService::new(control, resolver))),
+            local_launch: Some(catalog),
+            workflows: Some(WorkflowResolver::with_user_dir(root.path(), None)),
             ..ApiServices::default()
         };
         let handle = api::start_with_services(

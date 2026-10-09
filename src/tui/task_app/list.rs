@@ -347,10 +347,53 @@ pub struct MoveRequest {
     pub anchor_title: String,
 }
 
+/// Where a task the operator created stands while the server has not said it
+/// has it (the new-task form, origin §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingState {
+    /// The request is on its way, or its answer was lost and it is being sent
+    /// again with the same id: `↻ wysyłanie…`.
+    Sending,
+    /// The retry failed too: `✗ nie wysłano`, to be sent again by hand.
+    NotSent,
+}
+
+/// A row for a task that was created here and is not on the server's list
+/// yet. It sits after the server's rows and holds the id the task will have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRow {
+    /// The id the task is created with (and is sent again with).
+    pub task_id: String,
+    /// What the row shows.
+    pub title: String,
+    /// Where it stands.
+    pub state: PendingState,
+    /// Why it was not sent, once it was not.
+    pub reason: Option<String>,
+}
+
+impl PendingRow {
+    /// What the row shows.
+    pub fn text(&self) -> RowText {
+        let (icon, label) = match self.state {
+            PendingState::Sending => (StateIcon::Sending, "wysyłanie…"),
+            PendingState::NotSent => (StateIcon::Failed, "nie wysłano"),
+        };
+        RowText {
+            attention: Attention::None,
+            icon,
+            title: one_line(&self.title),
+            label: label.to_string(),
+        }
+    }
+}
+
 /// The tasks, the selection and the filter.
 #[derive(Debug)]
 pub struct TaskList {
     tasks: Vec<TaskSummary>,
+    /// Tasks created here that the server has not confirmed; shown last.
+    pending: Vec<PendingRow>,
     selected: Option<String>,
     hide_done: bool,
     moving: Option<MoveMode>,
@@ -368,6 +411,7 @@ impl TaskList {
     pub fn new() -> Self {
         Self {
             tasks: Vec::new(),
+            pending: Vec::new(),
             selected: None,
             hide_done: false,
             moving: None,
@@ -403,10 +447,7 @@ impl TaskList {
 
     /// Selects the task with `task_id`, when it is on the list and shown.
     pub fn select(&mut self, task_id: &str) -> bool {
-        let shown = self
-            .visible()
-            .into_iter()
-            .any(|index| self.tasks[index].task_id.as_str() == task_id);
+        let shown = self.visible_ids().iter().any(|id| id == task_id);
         if shown {
             self.selected = Some(task_id.to_string());
         }
@@ -450,11 +491,13 @@ impl TaskList {
         shown
     }
 
-    /// The ids of the rows shown, top to bottom.
+    /// The ids of the rows shown, top to bottom: the tasks, then the ones
+    /// created here that the server has not confirmed.
     pub fn visible_ids(&self) -> Vec<String> {
         self.visible()
             .into_iter()
             .map(|index| self.tasks[index].task_id.to_string())
+            .chain(self.pending.iter().map(|row| row.task_id.clone()))
             .collect()
     }
 
@@ -512,7 +555,77 @@ impl TaskList {
         self.visible()
             .into_iter()
             .map(|index| self.row_text(index))
+            .chain(self.pending.iter().map(PendingRow::text))
             .collect()
+    }
+
+    // -----------------------------------------------------------------
+    // Tasks created here
+    // -----------------------------------------------------------------
+
+    /// The tasks created here that the server has not confirmed.
+    pub fn pending(&self) -> &[PendingRow] {
+        &self.pending
+    }
+
+    /// The selected row, when it is one of those.
+    pub fn selected_pending(&self) -> Option<&PendingRow> {
+        let id = self.selected.as_deref()?;
+        self.pending.iter().find(|row| row.task_id == id)
+    }
+
+    /// Adds `row` at the end and selects it.
+    pub fn push_pending(&mut self, row: PendingRow) {
+        let id = row.task_id.clone();
+        self.pending.retain(|known| known.task_id != id);
+        self.pending.push(row);
+        self.selected = Some(id);
+    }
+
+    /// Changes where a pending row stands. Returns whether there is one.
+    pub fn set_pending(
+        &mut self,
+        task_id: &str,
+        state: PendingState,
+        reason: Option<String>,
+    ) -> bool {
+        let Some(row) = self.pending.iter_mut().find(|row| row.task_id == task_id) else {
+            return false;
+        };
+        row.state = state;
+        row.reason = reason;
+        true
+    }
+
+    /// Forgets a pending row. A selection on it goes to the row above.
+    pub fn remove_pending(&mut self, task_id: &str) {
+        let before = self.all_ids();
+        self.pending.retain(|row| row.task_id != task_id);
+        self.settle_selection_with(&before, None);
+    }
+
+    /// Puts a task the server confirmed at the end of the list and selects it.
+    /// The pending row of the same id, if any, becomes it, so the rows above
+    /// stay where they are. A task the list already holds is replaced.
+    pub fn append(&mut self, task: TaskSummary) {
+        let id = task.task_id.to_string();
+        self.pending.retain(|row| row.task_id != id);
+        match self.tasks.iter_mut().find(|known| known.task_id == task.task_id) {
+            Some(known) => *known = task,
+            None => self.tasks.push(task),
+        }
+        self.selected = Some(id);
+    }
+
+    /// The place a task created now would take in the queue: after every task
+    /// that waits and every one being sent.
+    pub fn next_queue_place(&self) -> usize {
+        let queued = self
+            .tasks
+            .iter()
+            .filter(|task| task.lifecycle == TaskLifecycle::Queued)
+            .count();
+        queued + self.pending.len() + 1
     }
 
     /// The counters of the header.
@@ -628,7 +741,11 @@ impl TaskList {
     // -----------------------------------------------------------------
 
     fn all_ids(&self) -> Vec<String> {
-        self.tasks.iter().map(|task| task.task_id.to_string()).collect()
+        self.tasks
+            .iter()
+            .map(|task| task.task_id.to_string())
+            .chain(self.pending.iter().map(|row| row.task_id.clone()))
+            .collect()
     }
 
     /// Replaces the tasks with a fresh read. The selection stays on its task;
@@ -636,6 +753,9 @@ impl TaskList {
     pub fn replace(&mut self, tasks: Vec<TaskSummary>) -> Option<Removal> {
         let before = self.all_ids();
         let departed_title = self.selected().map(title_of);
+        // What the server lists is no longer waiting to be confirmed.
+        self.pending
+            .retain(|row| tasks.iter().all(|task| task.task_id.as_str() != row.task_id));
         self.tasks = tasks;
         self.cancel_move_if_gone();
         self.settle_selection_with(&before, departed_title)
@@ -939,6 +1059,10 @@ impl TaskList {
                 (task.task_id.to_string(), text)
             })
             .collect();
+        let rows: Vec<(String, RowText)> = rows
+            .into_iter()
+            .chain(self.pending.iter().map(|row| (row.task_id.clone(), row.text())))
+            .collect();
         let label_width = rows
             .iter()
             .map(|(_, row)| row.label.chars().count())
@@ -1131,7 +1255,7 @@ pub fn fit(text: &str, width: usize) -> String {
 }
 
 /// One row as a styled line of exactly `width` columns.
-fn row_line(
+pub(super) fn row_line(
     row: &RowText,
     width: usize,
     label_width: usize,
@@ -1145,6 +1269,7 @@ fn row_line(
     let grey = |role: Role| if stale { Role::Done } else { role };
     let label_role = match row.label.as_str() {
         "offline" => Role::Attention,
+        "nie wysłano" => Role::Problem,
         label if label.starts_with('#') => Role::Calm,
         _ => Role::Done,
     };

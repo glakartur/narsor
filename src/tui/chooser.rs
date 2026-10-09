@@ -460,6 +460,24 @@ impl Chooser {
             .unwrap_or_default()
     }
 
+    /// Puts a complaint next to the field `name` of entry `index` — the
+    /// server's verdict on what was typed there — and the keys on that field.
+    /// Returns whether there is such a field.
+    pub fn set_field_error(&mut self, index: usize, name: &str, message: impl Into<String>) -> bool {
+        let Some(position) = self
+            .items
+            .get(index)
+            .and_then(|item| item.fields.iter().position(|field| field.name == name))
+        else {
+            return false;
+        };
+        self.items[index].fields[position].error = Some(message.into());
+        self.select(index);
+        self.focus = ChooserFocus::Fields;
+        self.field = position;
+        true
+    }
+
     /// The same chooser over new `items`, as when what an entry offers became
     /// known after it was first built. What the operator typed carries over to
     /// the fields that are still there (by entry label and field name), the

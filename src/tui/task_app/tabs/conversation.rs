@@ -62,17 +62,44 @@ pub async fn read_attempt(
     attempt_id: &str,
     from: u64,
 ) -> Result<AttemptRead, ClientError> {
-    let mut cursor = from;
-    let mut entries = Vec::new();
-    loop {
+    read_pages(from, |cursor| async move {
         let query = ConversationPageQuery {
             from: cursor,
             byte_budget: Some(PAGE_BYTE_BUDGET),
         };
-        match client
+        client
             .control_conversation_page(task_id, attempt_id, &query)
-            .await?
-        {
+            .await
+    })
+    .await
+}
+
+/// The same for an execution from before the task scheduler (the Historia):
+/// its conversation is read from the daemon's own storage.
+pub async fn read_history_attempt(
+    client: &ApiClient,
+    execution_id: &str,
+    attempt_id: &str,
+    from: u64,
+) -> Result<AttemptRead, ClientError> {
+    read_pages(from, |cursor| async move {
+        client
+            .control_history_conversation(execution_id, attempt_id, cursor)
+            .await
+    })
+    .await
+}
+
+/// Folds the pages `fetch` returns, from entry `from`, into one read.
+async fn read_pages<F, Fut>(from: u64, mut fetch: F) -> Result<AttemptRead, ClientError>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<Page, ClientError>>,
+{
+    let mut cursor = from;
+    let mut entries = Vec::new();
+    loop {
+        match fetch(cursor).await? {
             Page::Recorded {
                 entries: page,
                 next_entry,

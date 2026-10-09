@@ -596,7 +596,8 @@ impl TaskApp {
     /// Whether keys go into the text box of the *Dyrygent* tab: `q` and `?`
     /// are text then.
     pub(in crate::tui::task_app) fn conductor_typing(&self) -> bool {
-        self.focus == Focus::Details
+        matches!(self.view, super::super::View::Tasks)
+            && self.focus == Focus::Details
             && self.detail.tab == DetailTab::Conductor
             && !self.panel_focused()
             && self.overlay.is_none()

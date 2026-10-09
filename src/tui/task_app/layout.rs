@@ -33,9 +33,9 @@ use ratatui::Frame;
 
 use super::super::keymap::{self, Context};
 use super::super::style::{Role, Styles};
-use super::{actions, detail};
 use super::list::{Counters, Slots, TaskList};
-use super::{Focus, TaskApp};
+use super::{actions, detail, history, new_task, repositories};
+use super::{Focus, TaskApp, View};
 
 /// The narrowest terminal that shows anything but a request for more room.
 pub const MIN_WIDTH: u16 = 60;
@@ -143,10 +143,14 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
 
     let list_focused = app.focus() == Focus::List;
     if let Some(list_area) = areas.list {
-        app.list_mut()
-            .render(frame, list_area, styles, list_focused, stale);
-        if app.list().tasks().is_empty() {
-            render_empty(frame, list_area, app, styles);
+        if let View::History(open) = &mut app.view {
+            history::render_list(frame, list_area, open, styles, list_focused, stale);
+        } else {
+            app.list_mut()
+                .render(frame, list_area, styles, list_focused, stale);
+            if app.list().tasks().is_empty() && app.list().pending().is_empty() {
+                render_empty(frame, list_area, app, styles);
+            }
         }
     }
     if let Some(detail_area) = areas.detail {
@@ -160,7 +164,7 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
         } else {
             detail_area
         };
-        detail::render(frame, detail_area, app, styles, stale);
+        render_view(frame, detail_area, app, styles, stale);
     }
     render_bar(frame, areas.bar, app, styles, now);
     let body = Rect::new(
@@ -172,6 +176,22 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
     actions::render(frame, body, app, styles);
     if app.is_help_open() {
         keymap::render_help(frame, body, app.key_context(), styles);
+    }
+}
+
+/// Draws what the details area shows: the details of the selected task, or
+/// the view `n`, `H` or `R` opened.
+fn render_view(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles, stale: bool) {
+    let place = app.list.next_queue_place();
+    let focused = app.focus == Focus::Details;
+    let hyperlinks = app.detail.hyperlinks();
+    match &mut app.view {
+        View::Tasks => detail::render(frame, area, app, styles, stale),
+        View::NewTask(form) => new_task::render(frame, area, form, place, styles),
+        View::History(open) => {
+            history::render_details(frame, area, open, styles, focused, stale, hyperlinks);
+        }
+        View::Repositories(open) => repositories::render(frame, area, open, styles),
     }
 }
 
