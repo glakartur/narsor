@@ -503,11 +503,13 @@ narsor backend default                       # get; also: set <backend>, reset
 narsor task create implement-feature --input ticket=NAR-1 \
   [--backend k8s] [--profile default] [--harness codex] \
   [--repository api --commit <sha>] [--workflow-version 1] [--task-id my-id]
-narsor task list
-narsor task show <task>
+narsor task create --file ./workflow.yaml --input name=value   # local daemon only
+narsor task list [--archived] [--json]       # the attention mark `?`/`!`, the title; --archived: the history
+narsor task show <task> [--json]             # title, links, what it waits on, observations
 narsor task pause|resume|start|archive <task> [--expected-generation N]
 narsor task move <task> --before <other> | --after <other> | --top | --bottom
-narsor task input <task> --field reason=ok [--label approved] [--comment …]
+narsor task input <task> --field reason=ok [--data k=v] [--variable k=v] \
+  [--label approved] [--comment …] [--waiting-id <id>]
 narsor task interrupt <task> [--wait-secs N]
 narsor task transition <task> <state> [--override --reason <why>] [--wait-secs N]
 narsor task restart-step <task> [--note <text>] [--failure-key K] [--wait-secs N]
@@ -517,6 +519,12 @@ narsor task conductor harness <task> <claude-code|codex|opencode>
 narsor task conversation <task> [<attempt>] [--from N]
 narsor task events <task> [--follow]
 narsor task watch [--cursor C]               # every task, reconnecting from the cursor
+narsor task workflows                        # the catalogue: source, description, inputs
+narsor task validate <path>                  # every violation of a workflow file (local daemon only)
+narsor task capabilities                     # what this server offers
+narsor task repo list | add <id> --remote <url> | remove <id>
+narsor task history list | show|events|steps|conductor <execution> \
+  | conversation <execution> <attempt> | recover <execution> [--comment …]   # local daemon only
 narsor task materials upload <task> <path>... [--id ID] [--label T] [--ttl-secs N]
 narsor task materials list|show <task> [<material>]
 narsor task materials download <task> <material> <dest-dir> [--force]
@@ -536,7 +544,9 @@ the interface is a `narsor task …` command: `move` (`K` / `J` / `m`), `pause` 
 `resume` (`p`), `interrupt` (`x`), `transition` (`t`, with `--override` for a
 reasoned override), `start` (`s`), `archive` (`a`), `input` and
 `restart-step` (the answer panel), `conductor …` (the *Dyrygent* tab), `create`
-(`n`). `?` shows the keys, README.md ("`tui`") describes the screens.
+(`n`, also `create --file` for a path, with `workflows` and `validate` for the
+catalogue and the check), `list --archived` and `history …` (`H`), `repo …`
+(`R`) and `capabilities`. `?` shows the keys, README.md ("`tui`") describes the screens.
 
 ### Task materials
 
@@ -651,6 +661,7 @@ The ordinary test suite needs no cluster. Against a real cluster:
   cleanup — both are owner decisions by design.
 * OIDC device-code login is not built in: use a token helper that writes a
   file or prints a token.
-* Old executions (from before the scheduler) are only read, and a failed one
-  recovered, from the TUI's history (`H`) over the same control plane; the
-  local `/executions` routes remain for the CLI.
+* Old executions (from before the scheduler) are read, and a failed one
+  recovered, from the TUI's history (`H`) or with `narsor task history …`,
+  over the same control plane and only on the local daemon; the local
+  `/executions` routes remain for `narsor list`, `show` and the like.

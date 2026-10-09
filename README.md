@@ -512,9 +512,20 @@ reason. An action marked `!` asks `y` / `n` first.
 | `u` (*Dyrygent*) | undo a decision of the conductor (`!`) | `narsor task conductor undo` |
 | `h` (*Dyrygent*) | choose the conductor's harness | `narsor task conductor harness` |
 | the panel | confirm / reject a proposal, restart a failed step with a note | `narsor task conductor confirm` / `reject`, `narsor task restart-step` |
-| `n` | new task | `narsor task create` |
-| `H` | history: archived tasks and executions from before the scheduler (`w` recovers a failed one) | `narsor recover` (the archived tasks have no listing in the CLI yet) |
-| `R` | repositories: `a` registers, `d` removes (`!`) | `narsor repo list` / `add` / `remove` |
+| `n` | new task (a catalogue workflow, or the path of a definition) | `narsor task create <workflow>`, `narsor task create --file <path>`; the catalogue is `narsor task workflows`, the check of a file `narsor task validate <path>` |
+| `i` / the panel | answer what waits: fields, `data`, `variables`, label, comment | `narsor task input <task> --field … --data … --variable … [--waiting-id ID]` |
+| `Space` | the next task that waits | `narsor task show` ends with `Next       waiting: <task>` |
+| `H` | history: archived tasks, and executions from before the scheduler (`w` recovers a failed one) | `narsor task list --archived`; `narsor task history list` / `show` / `events` / `steps` / `conversation` / `conductor` / `recover` |
+| `R` | repositories: `a` registers, `d` removes (`!`) | `narsor task repo list` / `add` / `remove` (the same registry on any server; `narsor repo …` is the local one) |
+| the header | what the connection offers | `narsor task capabilities` |
+
+The CLI of the remote-aware commands has a machine form too: `narsor task list
+--json` and `narsor task show <task> --json` print the task summaries of the
+control plane as JSON (text an agent or a runner wrote is cleaned of what a
+terminal would act on). A workflow file, a file validation and the old
+executions of the history belong to the local daemon: any other server refuses
+them with the reason `narsor task capabilities` gives, and a repository is
+registered there by a remote git URL only.
 
 `n` opens the catalogue of workflows (built-in, user and root ones, with the
 source of each and what a copy overrides) with the inputs of the highlighted
@@ -577,16 +588,20 @@ or a runner directly.
 ```bash
 narsor backend default                        # which backend new tasks get (set/reset to change)
 narsor task create implement-feature --input ticket=NAR-1 [--backend k8s]
-narsor task list                              # queue position (#n), backend, lifecycle, queue reason, staleness
+narsor task create --file ./my-workflow.yaml --input name=value   # a workflow file of the local daemon, checked first
+narsor task list [--archived] [--json]        # queue position (#n), `?`/`!` attention mark, backend, lifecycle, title; --archived: the history
 narsor task move <task> --before|--after <other> | --top | --bottom   # reorder a queued task
-narsor task show <task>                       # observations with their age, timeline, conversation
+narsor task show <task> [--json]              # title and links, what it waits on, observations with their age, timeline, conversation
 narsor task pause|resume|start|archive <task> # archive deletes the workload and its storage
-narsor task input <task> --field reason=ok    # answer the input the runner waits for
+narsor task input <task> --field reason=ok [--data k=v] [--variable k=v] [--label L] [--waiting-id ID]   # answer the input the runner waits for
 narsor task interrupt <task>                      # cut short the step the runner works on
 narsor task transition <task> <state> [--override --reason <why>]   # manual transition; an override is audited
 narsor task restart-step <task> [--note <text>] [--failure-key K]   # run the failed or interrupted step again
 narsor task conversation <task> [<attempt>]   # read through the control plane
 narsor task watch                             # follow every task's events
+narsor task history list|show|events|steps|conversation|conductor|recover <execution>   # executions from before the scheduler (local daemon)
+narsor task repo list|add|remove              # the control plane's repository registry
+narsor task workflows | validate <path> | capabilities   # the catalogue, a file's violations, what the server offers
 narsor tui                                    # the interface over the same control plane (`--server` for a remote one)
 ```
 
