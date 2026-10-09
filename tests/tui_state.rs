@@ -1679,7 +1679,12 @@ mod task_app_list {
             let areas = layout::areas(Rect::new(0, 0, 120, 30), Focus::List);
             assert_eq!(areas.screen, Screen::Split);
             assert_eq!(areas.list.unwrap().width, layout::LIST_WIDTH);
-            assert_eq!(areas.detail.unwrap().width, 120 - 2 - layout::LIST_WIDTH);
+            assert_eq!(areas.detail.unwrap().width, 120 - layout::LIST_WIDTH);
+            // No frame around the screen: the header is row 0, the bar the
+            // last row, and the panels fill what is between them.
+            assert_eq!(areas.header, Rect::new(0, 0, 120, 1));
+            assert_eq!(areas.bar, Rect::new(0, 29, 120, 1));
+            assert_eq!(areas.list.unwrap(), Rect::new(0, 1, layout::LIST_WIDTH, 28));
         }
 
         #[test]

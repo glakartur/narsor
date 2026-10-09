@@ -21,7 +21,7 @@
 
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
@@ -471,39 +471,45 @@ impl TaskApp {
 // Drawing
 // ---------------------------------------------------------------------
 
-/// Draws the repositories into `area`: the list and the description, or the
+/// Draws the repositories into `area`: a frame titled with how many there
+/// are, lit while `focused`, and in it the list and the description, or the
 /// form that adds one.
-pub fn render(frame: &mut Frame, area: Rect, repositories: &mut Repositories, styles: &Styles) {
-    let unreadable = repositories.unreadable.len();
-    let header_rows = 1 + u16::try_from(unreadable).unwrap_or(u16::MAX).min(2);
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    repositories: &mut Repositories,
+    styles: &Styles,
+    focused: bool,
+) {
+    let mut title = format!(" Repozytoria ({})", repositories.repositories.len());
+    if repositories.adding.is_some() {
+        title.push_str(" · nowe repozytorium");
+    } else if repositories.repositories.is_empty() {
+        title.push_str(" · brak zarejestrowanych — a dodaje");
+    }
+    title.push(' ');
+    let block = styles.panel(title, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let failures: Vec<Line> = repositories
+        .unreadable
+        .iter()
+        .take(2)
+        .map(|failure| {
+            Line::styled(
+                format!("✗ nie wczytano: {}", one_line(failure)),
+                styles.of(Role::Problem),
+            )
+        })
+        .collect();
+    let header_rows = u16::try_from(failures.len()).unwrap_or(0);
     let [header, body] = Layout::vertical([
-        Constraint::Length(header_rows.min(area.height)),
+        Constraint::Length(header_rows.min(inner.height)),
         Constraint::Min(3),
     ])
-    .areas(area);
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            format!("Repozytoria ({})", repositories.repositories.len()),
-            styles.of(Role::Focus),
-        ),
-        Span::styled(
-            if repositories.adding.is_some() {
-                " · nowe repozytorium".to_string()
-            } else if repositories.repositories.is_empty() {
-                " · brak zarejestrowanych — a dodaje".to_string()
-            } else {
-                String::new()
-            },
-            styles.of(Role::Done),
-        ),
-    ])];
-    for failure in repositories.unreadable.iter().take(2) {
-        lines.push(Line::styled(
-            format!("✗ nie wczytano: {}", one_line(failure)),
-            styles.of(Role::Problem),
-        ));
-    }
-    frame.render_widget(Paragraph::new(lines), header);
+    .areas(inner);
+    frame.render_widget(Paragraph::new(failures), header);
     match repositories.adding.as_mut() {
         Some(form) => chooser::render(frame, body, form, styles),
         None => chooser::render(frame, body, &mut repositories.chooser, styles),

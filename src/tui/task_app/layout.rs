@@ -1,20 +1,26 @@
-//! The screen: geometry and the frame around the list and the details.
+//! The screen: geometry, the header line and the shortcut bar.
 //!
 //! ```text
-//! ┌ narsor · local ● live ───────────────────── sloty 2/3 · ? 1 · ! 1 ┐
-//! │ Zadania            │ details                                       │
-//! │ ● NAR-14  edit     │                                               │
-//! │ …                  │                                               │
-//! │ keys …                                          notification       │
-//! └──────────────────────────────────────────────────────────────────┘
+//! narsor · local ● live                            sloty 2/3 · ? 1 · ! 1
+//! ┏ Zadania ━━━━━━━━━━━━━━━━┓┌ NAR-14 Edycja ───────────────────────────┐
+//! ┃ ● NAR-14  edit          ┃│ details                                  │
+//! ┃ …                       ┃│                                          │
+//! ┗━━━━━━━━━━━━━━━━━━━━━━━━━┛└──────────────────────────────────────────┘
+//! keys …                                                    notification
 //! ```
+//!
+//! There is no frame around the screen: the header is the first row, the
+//! bar the last, and each panel between them draws its own frame
+//! ([`Styles::panel`]) — thick in the focus role when it has the keys, thin
+//! and grey when it does not (R1–R3).
 //!
 //! # Three layouts (origin §1)
 //!
 //! * `100` columns or more: the list is a narrow column ([`LIST_WIDTH`]) and
 //!   the details take the rest — [`Screen::Split`];
 //! * fewer than `100`: the list and the details switch full screen, `Enter`
-//!   and `Esc` — [`Screen::Full`], showing whichever has the focus;
+//!   and `Esc` — [`Screen::Full`], showing whichever has the focus (so the
+//!   one panel shown always has the focus frame, R5);
 //! * fewer than [`MIN_WIDTH`]×[`MIN_HEIGHT`]: only a message asking for a
 //!   bigger window — [`Screen::TooSmall`].
 //!
@@ -22,13 +28,14 @@
 //! without drawing anything. [`render`] draws one frame of a
 //! [`super::TaskApp`]: the header, the list, the details and the bar.
 //!
-//! The details are [`super::detail`]: they draw into [`Areas::detail`].
+//! The details are [`super::detail`]: they draw their frame and what is in
+//! it into [`Areas::detail`].
 
 use std::time::Instant;
 
 use ratatui::layout::{Alignment, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use super::super::keymap::{self, Context};
@@ -65,8 +72,10 @@ pub enum Screen {
 pub struct Areas {
     /// Which layout it is.
     pub screen: Screen,
-    /// The frame around everything.
+    /// The whole screen.
     pub outer: Rect,
+    /// The first row: the header.
+    pub header: Rect,
     /// The list, when it is shown.
     pub list: Option<Rect>,
     /// The details, when they are shown.
@@ -94,14 +103,15 @@ pub fn areas(area: Rect, focus: Focus) -> Areas {
         return Areas {
             screen,
             outer: area,
+            header: Rect::default(),
             list: None,
             detail: None,
             bar: Rect::default(),
         };
     }
-    let inner = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
-    let bar = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
-    let body = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
+    let header = Rect::new(area.x, area.y, area.width, 1);
+    let bar = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+    let body = Rect::new(area.x, area.y + 1, area.width, area.height - 2);
     let (list, detail) = match (screen, focus) {
         (Screen::Split, _) => {
             let list = Rect::new(body.x, body.y, LIST_WIDTH, body.height);
@@ -119,6 +129,7 @@ pub fn areas(area: Rect, focus: Focus) -> Areas {
     Areas {
         screen,
         outer: area,
+        header,
         list,
         detail,
         bar,
@@ -135,12 +146,7 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
     }
 
     let stale = app.connection().is_stale();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(styles.of(Role::Done))
-        .title(header_left(app, styles, now))
-        .title(header_right(app, styles, usize::from(areas.outer.width)).right_aligned());
-    frame.render_widget(block, areas.outer);
+    render_header(frame, areas.header, app, styles, now);
 
     let list_focused = app.focus() == Focus::List;
     if let Some(list_area) = areas.list {
@@ -155,29 +161,25 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
         }
     }
     if let Some(detail_area) = areas.detail {
-        let detail_area = if areas.screen == Screen::Split {
-            Rect::new(
-                detail_area.x + 1,
-                detail_area.y,
-                detail_area.width.saturating_sub(1),
-                detail_area.height,
-            )
-        } else {
-            detail_area
-        };
         render_view(frame, detail_area, app, styles, stale);
     }
     render_bar(frame, areas.bar, app, styles, now);
-    let body = Rect::new(
-        areas.outer.x + 2,
-        areas.outer.y + 1,
-        areas.outer.width.saturating_sub(4),
-        areas.outer.height.saturating_sub(3),
-    );
+    let body = overlay_area(areas.outer);
     actions::render(frame, body, app, styles);
     if app.is_help_open() {
         keymap::render_help(frame, body, app.key_context(), styles);
     }
+}
+
+/// Where the overlays go: between the header and the bar, a column in from
+/// either side of the screen.
+fn overlay_area(screen: Rect) -> Rect {
+    Rect::new(
+        screen.x + 1,
+        screen.y + 1,
+        screen.width.saturating_sub(2),
+        screen.height.saturating_sub(2),
+    )
 }
 
 /// Draws what the details area shows: the details of the selected task, or
@@ -188,11 +190,11 @@ fn render_view(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles
     let hyperlinks = app.detail.hyperlinks();
     match &mut app.view {
         View::Tasks => detail::render(frame, area, app, styles, stale),
-        View::NewTask(form) => new_task::render(frame, area, form, place, styles),
+        View::NewTask(form) => new_task::render(frame, area, form, place, styles, focused),
         View::History(open) => {
             history::render_details(frame, area, open, styles, focused, stale, hyperlinks);
         }
-        View::Repositories(open) => repositories::render(frame, area, open, styles),
+        View::Repositories(open) => repositories::render(frame, area, open, styles, focused),
     }
 }
 
@@ -218,6 +220,25 @@ fn render_too_small(frame: &mut Frame, area: Rect, styles: &Styles) {
         area.height.saturating_sub(top - area.y).min(2),
     );
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), centred);
+}
+
+/// The header row: [`header_left`] from the left edge, [`header_right`] at
+/// the right one. A new segment (the harness, U5) goes into one of the two.
+/// The right part wins the room it needs; the left one is cut at it.
+fn render_header(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles, now: Instant) {
+    let right = header_right(app, styles, usize::from(area.width));
+    let right_width = u16::try_from(right.width())
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let left_width = area.width - right_width;
+    frame.render_widget(
+        Paragraph::new(header_left(app, styles, now)),
+        Rect::new(area.x, area.y, left_width, area.height),
+    );
+    frame.render_widget(
+        Paragraph::new(right),
+        Rect::new(area.x + left_width, area.y, right_width, area.height),
+    );
 }
 
 /// `narsor · name ● live`, and how old the data is when it is not live.
@@ -287,9 +308,15 @@ fn render_empty(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles) {
         "brak danych"
     };
     let line = Line::styled(format!(" {text}"), styles.of(Role::Done));
+    // Inside the list's frame, on its first row.
     frame.render_widget(
         Paragraph::new(line),
-        Rect::new(area.x, area.y + 1, area.width.saturating_sub(1), 1),
+        Rect::new(
+            area.x + 1,
+            area.y + 1,
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2).min(1),
+        ),
     );
 }
 

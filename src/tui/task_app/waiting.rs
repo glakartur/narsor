@@ -819,12 +819,14 @@ impl WaitingPanel {
 
     /// Draws the panel into `area`. `as_of` is the server's now, which the age of
     /// the shown waiting is counted to.
+    ///
+    /// The frame is always in the entry's role, focus or not (R4): whether
+    /// the keys are here shows on the frame of the details around it.
     pub fn render(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         styles: &Styles,
-        focused: bool,
         stale: bool,
         as_of: chrono::DateTime<chrono::Utc>,
     ) {
@@ -832,7 +834,7 @@ impl WaitingPanel {
             return;
         }
         if self.entries.is_empty() {
-            self.render_released(frame, area, styles, focused);
+            self.render_released(frame, area, styles);
             return;
         }
         let count = self.entries.len();
@@ -859,10 +861,9 @@ impl WaitingPanel {
             return;
         }
 
-        let border = if focused { Role::Focus } else { role };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(styles.of(border))
+            .border_style(styles.of(role))
             .title(Line::styled(format!(" {heading} "), styles.of(role)))
             .title(
                 Line::styled(
@@ -909,14 +910,10 @@ impl WaitingPanel {
         chooser::render(frame, chooser_area, &mut entry.chooser, styles);
     }
 
-    fn render_released(&self, frame: &mut Frame, area: Rect, styles: &Styles, focused: bool) {
+    fn render_released(&self, frame: &mut Frame, area: Rect, styles: &Styles) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(styles.of(if focused {
-                Role::Focus
-            } else {
-                Role::Attention
-            }))
+            .border_style(styles.of(Role::Attention))
             .title(Line::styled(
                 " Szkic bez oczekiwania — skopiuj; Esc go usuwa ",
                 styles.of(Role::Attention),

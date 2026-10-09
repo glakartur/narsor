@@ -31,8 +31,8 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::text::Line;
+use ratatui::widgets::{List, ListItem, ListState};
 use ratatui::Frame;
 use serde_json::json;
 
@@ -50,7 +50,7 @@ use super::super::keymap::{self, Action, Context};
 use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 use super::detail::TaskDetail;
-use super::detail::{recorded_attempt, render_view, ViewOptions};
+use super::detail::{panel_title, recorded_attempt, render_view, ViewOptions};
 use super::list::{fit, row_line, title_of, Attention, RowText, StateIcon};
 use super::notify::Severity;
 use super::tabs::conversation::{read_history_attempt, AttemptRead};
@@ -798,11 +798,7 @@ pub fn render_list(
     focused: bool,
     stale: bool,
 ) {
-    let frame_role = if focused { Role::Focus } else { Role::Done };
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(styles.of(frame_role))
-        .title(Span::styled(" Historia ", styles.of(frame_role)));
+    let block = styles.panel(" Historia ", focused);
     let inner = block.inner(area);
     let rows = history.rows();
     let label_width = rows
@@ -811,7 +807,7 @@ pub fn render_list(
         .max()
         .unwrap_or(0)
         .min(10)
-        .min(usize::from(inner.width) / 3);
+        .min(usize::from(inner.width) * 2 / 5);
     let selected = history.selected;
     let items: Vec<ListItem> = rows
         .iter()
@@ -858,17 +854,23 @@ pub fn render_details(
 ) {
     let tab = history.tab;
     let Some(entry) = history.entries.get(history.selected) else {
+        let block = styles.panel(" Historia ", focused);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
         frame.render_widget(
             ratatui::widgets::Paragraph::new(Line::styled(
                 "brak zaznaczonego wpisu historii",
                 styles.of(Role::Done),
             )),
-            area,
+            inner,
         );
         return;
     };
     let key = entry.key();
     let task = entry.summary();
+    let block = styles.panel(panel_title(&title_of(task), area.width), focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     let detail = history
         .details
         .entry(key.clone())
@@ -882,8 +884,7 @@ pub fn render_details(
     let options = ViewOptions {
         stale,
         focused,
-        panel_focused: false,
         hyperlinks,
     };
-    render_view(frame, area, view, styles, options);
+    render_view(frame, inner, view, styles, options);
 }

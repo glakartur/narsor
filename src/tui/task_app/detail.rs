@@ -554,17 +554,31 @@ struct LinkSpot {
     url: String,
 }
 
-/// Draws the details of the selected task into `area`.
+/// The title of a panel showing `title`, cut to fit a frame `width` wide.
+pub(super) fn panel_title(title: &str, width: u16) -> String {
+    format!(
+        " {} ",
+        fit(&one_line(title), usize::from(width).saturating_sub(4))
+    )
+}
+
+/// Draws the details of the selected task into `area`: a frame named after
+/// the task, lit while the keys are in the details — in the answer panel too
+/// (R4) — and what it holds inside it.
 pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles, stale: bool) {
     let panel_focused = app.panel_focused();
-    let focused = app.focus() == Focus::Details && !panel_focused;
+    let frame_focused = app.focus() == Focus::Details;
+    let focused = frame_focused && !panel_focused;
     let hyperlinks = app.detail().hyperlinks();
     // A task created here that the server has not confirmed has no summary
     // yet: its row says where it stands (the new-task form).
     if let Some(pending) = app.list().selected_pending().cloned() {
+        let block = styles.panel(panel_title(&pending.title, area.width), frame_focused);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
         super::new_task::render_pending(
             frame,
-            area,
+            inner,
             &pending,
             app.send_data(&pending.task_id),
             styles,
@@ -572,22 +586,27 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         return;
     }
     let Some(view) = app.detail_view() else {
+        let block = styles.panel(" Szczegóły ", frame_focused);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "brak zaznaczonego zadania",
                 styles.of(Role::Done),
             )),
-            area,
+            inner,
         );
         return;
     };
+    let block = styles.panel(panel_title(&title_of(view.task), area.width), frame_focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     let options = ViewOptions {
         stale,
         focused,
-        panel_focused,
         hyperlinks,
     };
-    render_view(frame, area, view, styles, options);
+    render_view(frame, inner, view, styles, options);
 }
 
 /// How the details are drawn, apart from what they show.
@@ -597,8 +616,6 @@ pub(super) struct ViewOptions {
     pub(super) stale: bool,
     /// The keys are in the tab's content.
     pub(super) focused: bool,
-    /// The keys are in the answer panel.
-    pub(super) panel_focused: bool,
     /// Links are written as OSC 8 hyperlinks.
     pub(super) hyperlinks: bool,
 }
@@ -615,7 +632,6 @@ pub(super) fn render_view(
     let ViewOptions {
         stale,
         focused,
-        panel_focused,
         hyperlinks,
     } = options;
     let panel_height = view
@@ -695,7 +711,7 @@ pub(super) fn render_view(
     if let Some(panel) = parts.panel {
         view.detail
             .waiting
-            .render(frame, panel, styles, panel_focused, stale, view.task.as_of);
+            .render(frame, panel, styles, stale, view.task.as_of);
     }
 }
 

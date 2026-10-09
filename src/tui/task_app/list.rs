@@ -35,7 +35,7 @@ use std::collections::HashMap;
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{List, ListItem, ListState};
 use ratatui::Frame;
 
 use crate::cli::task_text::lifecycle_name;
@@ -1055,15 +1055,11 @@ impl TaskList {
         focused: bool,
         stale: bool,
     ) {
-        let frame_role = if focused { Role::Focus } else { Role::Done };
         let title = match self.hidden_count() {
             0 => " Zadania ".to_string(),
             hidden => format!(" Zadania · ✓ ukryte {hidden} "),
         };
-        let block = Block::default()
-            .borders(Borders::RIGHT)
-            .border_style(styles.of(frame_role))
-            .title(Span::styled(title, styles.of(frame_role)));
+        let block = styles.panel(title, focused);
         let inner = block.inner(area);
 
         let shown = self.visible();
@@ -1107,7 +1103,7 @@ impl TaskList {
             .max()
             .unwrap_or(0)
             .min(10)
-            .min(usize::from(inner.width) / 3);
+            .min(usize::from(inner.width) * 2 / 5);
 
         let selected = self.selected.clone();
         let items: Vec<ListItem> = rows

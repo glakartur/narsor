@@ -1023,22 +1023,24 @@ enum Sending {
 // Drawing
 // ---------------------------------------------------------------------
 
-/// Draws the form into `area`: where the task will land, then the chooser.
+/// Draws the form into `area`: a frame titled `Nowe zadanie`, lit while
+/// `focused`, and in it where the task will land, then the chooser.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     form: &mut NewTaskForm,
     place: usize,
     styles: &Styles,
+    focused: bool,
 ) {
-    let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
-    let line = Line::from(vec![
-        Span::styled("Nowe zadanie", styles.of(Role::Focus)),
-        Span::styled(
-            format!(" → trafi na koniec kolejki (#{place})"),
-            styles.of(Role::Done),
-        ),
-    ]);
+    let block = styles.panel(" Nowe zadanie ", focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(inner);
+    let line = Line::styled(
+        format!("→ trafi na koniec kolejki (#{place})"),
+        styles.of(Role::Done),
+    );
     frame.render_widget(Paragraph::new(line), header);
     chooser::render(frame, body, &mut form.chooser, styles);
 }

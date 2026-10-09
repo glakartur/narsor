@@ -33,6 +33,8 @@
 use std::ffi::OsString;
 
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, BorderType};
 
 use super::transcript::TranscriptPresentation;
 
@@ -144,6 +146,27 @@ impl Styles {
     /// The look of `role` for the tab that is open: bold and underlined.
     pub fn selected_tab(&self, role: Role) -> Style {
         self.strong(role).add_modifier(Modifier::UNDERLINED)
+    }
+
+    /// The frame of a panel titled `title` (R1–R3): the panel with the focus
+    /// gets a thick line in the focus role and a bold title, the others a thin
+    /// one in the background role. Without colour the thickness and the bold
+    /// title still tell which panel has the keys.
+    pub fn panel(&self, title: impl Into<String>, focused: bool) -> Block<'static> {
+        let (role, border) = if focused {
+            (Role::Focus, BorderType::Thick)
+        } else {
+            (Role::Done, BorderType::Plain)
+        };
+        let title_style = if focused {
+            self.strong(role)
+        } else {
+            self.of(role)
+        };
+        Block::bordered()
+            .border_type(border)
+            .border_style(self.of(role))
+            .title(Line::styled(title.into(), title_style))
     }
 
     /// A key on the shortcut bar: dark on the accent, or reversed.
