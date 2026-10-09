@@ -74,13 +74,17 @@
 
 pub mod app;
 pub mod chat;
+pub mod chooser;
+pub mod connection;
 pub mod conversation;
 pub mod failure_form;
 pub mod input_form;
+pub mod keymap;
 pub mod refresh;
 pub mod remote;
 pub mod remote_views;
 pub mod scroll;
+pub mod style;
 pub mod transcript;
 pub mod views;
 

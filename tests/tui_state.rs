@@ -6149,3 +6149,556 @@ mod remote_tasks {
         assert!(screen.contains("Approve the plan?"), "the input form");
     }
 }
+
+/// U7: the building blocks of the redesigned interface — key map, colour
+/// roles, the chooser and the connection state. None of it needs a daemon.
+mod foundations {
+    use super::*;
+
+    use narsor::tui::keymap::{
+        self, bind, check_consistency, help_entries, hints, lookup, Action, Binding, Context, Key,
+    };
+
+    fn press(code: KeyCode) -> KeyEvent {
+        key(code)
+    }
+
+    mod key_map {
+        use super::*;
+
+        /// The keys origin §3 gives the list context, plus the global ones.
+        const LIST_KEYS: [&str; 13] = [
+            "?", "q", "j", "k", "g", "G", "Space", "Enter", ".", "n", "z", "H", "R",
+        ];
+
+        fn help_keys(context: Context) -> Vec<String> {
+            help_entries(context)
+                .iter()
+                .flat_map(|entry| entry.keys.split('/').map(str::to_string))
+                .collect()
+        }
+
+        #[test]
+        fn the_table_is_consistent() {
+            assert_eq!(check_consistency(keymap::BINDINGS), Ok(()));
+        }
+
+        #[test]
+        fn a_second_n_in_the_list_context_breaks_the_consistency_check() {
+            let mut table: Vec<Binding> = keymap::BINDINGS.to_vec();
+            table.push(bind(
+                Context::List,
+                Key::char('n'),
+                Action::Quit,
+                "",
+                "a second meaning",
+            ));
+            let problems = check_consistency(&table).expect_err("a doubled key is refused");
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.contains("(lista, n)")),
+                "{problems:?}"
+            );
+        }
+
+        #[test]
+        fn a_context_key_that_shadows_a_global_one_is_refused() {
+            let mut table: Vec<Binding> = keymap::BINDINGS.to_vec();
+            table.push(bind(
+                Context::List,
+                Key::char('q'),
+                Action::Back,
+                "",
+                "shadow",
+            ));
+            assert!(check_consistency(&table).is_err());
+        }
+
+        #[test]
+        fn list_help_names_every_key_of_the_origin_table() {
+            let keys = help_keys(Context::List);
+            for expected in LIST_KEYS {
+                assert!(
+                    keys.iter().any(|key| key == expected),
+                    "{expected} is missing from the list help: {keys:?}"
+                );
+            }
+            assert!(help_entries(Context::List)
+                .iter()
+                .all(|entry| !entry.description.is_empty()));
+        }
+
+        #[test]
+        fn the_panel_bar_offers_tab_enter_alt_enter_and_esc() {
+            let bar: Vec<String> = hints(Context::Panel)
+                .into_iter()
+                .map(|(keys, _)| keys)
+                .collect();
+            for expected in ["Tab", "Enter", "Alt+Enter", "Esc"] {
+                assert!(
+                    bar.iter().any(|keys| keys == expected),
+                    "{expected}: {bar:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn help_agrees_with_the_handling_for_every_row() {
+            for binding in keymap::BINDINGS {
+                let event = binding.key.to_event();
+                assert_eq!(
+                    lookup(binding.context, &event),
+                    Some(binding.action),
+                    "({}, {}) must do what the table says",
+                    binding.context.name(),
+                    binding.key.display()
+                );
+                assert!(
+                    help_keys(binding.context).contains(&binding.key.display()),
+                    "({}, {}) must be in the help",
+                    binding.context.name(),
+                    binding.key.display()
+                );
+            }
+        }
+
+        #[test]
+        fn global_keys_work_where_context_inherits_them_and_not_in_forms() {
+            let help = press(KeyCode::Char('?'));
+            assert_eq!(lookup(Context::List, &help), Some(Action::Help));
+            assert_eq!(lookup(Context::Details, &help), Some(Action::Help));
+            assert_eq!(lookup(Context::Form, &help), None, "a form types a ?");
+            assert_eq!(lookup(Context::Form, &press(KeyCode::Char('q'))), None);
+        }
+
+        #[test]
+        fn digits_pick_and_shift_is_ignored_for_letters() {
+            assert_eq!(
+                lookup(Context::Panel, &press(KeyCode::Char('3'))),
+                Some(Action::Pick)
+            );
+            assert_eq!(keymap::digit_of(&press(KeyCode::Char('3'))), Some(3));
+            assert_eq!(keymap::digit_of(&press(KeyCode::Char('0'))), None);
+            let shifted_g = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
+            assert_eq!(lookup(Context::List, &shifted_g), Some(Action::Bottom));
+        }
+
+        #[test]
+        fn every_context_has_keys_and_the_origin_move_and_menu_shortcuts_exist() {
+            for context in Context::ALL {
+                assert!(
+                    keymap::BINDINGS
+                        .iter()
+                        .any(|binding| binding.context == context),
+                    "{} has no keys",
+                    context.name()
+                );
+            }
+            for (character, action) in [
+                ('K', Action::MoveUp),
+                ('J', Action::MoveDown),
+                ('m', Action::MoveMode),
+                ('p', Action::PauseResume),
+                ('x', Action::Interrupt),
+                ('t', Action::Transition),
+                ('s', Action::Restart),
+                ('a', Action::Archive),
+                ('o', Action::OpenLink),
+            ] {
+                for context in [Context::List, Context::Details, Context::Menu] {
+                    assert_eq!(
+                        lookup(context, &press(KeyCode::Char(character))),
+                        Some(action),
+                        "{character} in {}",
+                        context.name()
+                    );
+                }
+            }
+        }
+    }
+
+    mod chooser_state {
+        use super::*;
+
+        use narsor::tui::chooser::{
+            Chooser, ChooserAction, ChooserField, ChooserFocus, ChooserItem,
+        };
+
+        fn alt_enter() -> KeyEvent {
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
+        }
+
+        fn type_text(chooser: &mut Chooser, text: &str) {
+            for character in text.chars() {
+                chooser.on_key(press(KeyCode::Char(character)));
+            }
+        }
+
+        fn review_chooser() -> Chooser {
+            Chooser::new(vec![
+                ChooserItem::new("approved", "Akceptuje wynik."),
+                ChooserItem::new("revise", "Zwraca do agenta.")
+                    .resuming("plan")
+                    .recommended()
+                    .with_field(ChooserField::multiline("comment").required()),
+            ])
+        }
+
+        #[test]
+        fn fields_keep_their_values_when_the_action_changes_and_comes_back() {
+            let mut chooser = review_chooser().selecting(1);
+            assert_eq!(chooser.on_key(press(KeyCode::Enter)), ChooserAction::None);
+            assert_eq!(
+                chooser.focus(),
+                ChooserFocus::Fields,
+                "required field: Enter goes to it"
+            );
+            type_text(&mut chooser, "migracja");
+            chooser.on_key(alt_enter());
+            type_text(&mut chooser, "orders");
+
+            chooser.on_key(press(KeyCode::Tab));
+            assert_eq!(chooser.focus(), ChooserFocus::Actions);
+            chooser.on_key(press(KeyCode::Char('k')));
+            assert_eq!(chooser.selected(), 0);
+            chooser.on_key(press(KeyCode::Char('2')));
+            assert_eq!(chooser.selected(), 1);
+
+            assert_eq!(chooser.fields_of(1)[0].value(), "migracja\norders");
+        }
+
+        #[test]
+        fn digit_beyond_the_list_changes_nothing() {
+            let mut chooser = review_chooser();
+            chooser.on_key(press(KeyCode::Char('3')));
+            assert_eq!(chooser.selected(), 0);
+            chooser.on_key(press(KeyCode::Char('2')));
+            assert_eq!(chooser.selected(), 1);
+            chooser.on_key(press(KeyCode::Char('3')));
+            assert_eq!(
+                chooser.selected(),
+                1,
+                "3 with two actions leaves the choice"
+            );
+            chooser.on_key(press(KeyCode::Char('9')));
+            assert_eq!(chooser.selected(), 1);
+        }
+
+        #[test]
+        fn enter_sends_an_action_without_required_fields() {
+            let mut chooser = review_chooser();
+            match chooser.on_key(press(KeyCode::Enter)) {
+                ChooserAction::Submit(submission) => {
+                    assert_eq!(submission.index, 0);
+                    assert_eq!(submission.label, "approved");
+                    assert!(submission.values.is_empty());
+                }
+                other => panic!("expected a submission, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_required_field_blocks_the_send_with_a_complaint_on_the_field() {
+            let mut chooser = review_chooser().selecting(1);
+            chooser.on_key(press(KeyCode::Enter));
+            assert_eq!(chooser.on_key(press(KeyCode::Enter)), ChooserAction::None);
+            assert!(chooser.fields_of(1)[0]
+                .error()
+                .is_some_and(|error| error.contains("comment")));
+
+            type_text(&mut chooser, "poprawić");
+            assert_eq!(chooser.fields_of(1)[0].error(), None, "typing clears it");
+            match chooser.on_key(press(KeyCode::Enter)) {
+                ChooserAction::Submit(submission) => {
+                    assert_eq!(
+                        submission.values,
+                        vec![("comment".to_string(), "poprawić".to_string())]
+                    );
+                }
+                other => panic!("expected a submission, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn typing_in_a_field_is_not_a_command_and_q_is_text() {
+            let mut chooser = review_chooser().selecting(1);
+            assert!(!chooser.is_typing());
+            chooser.on_key(press(KeyCode::Enter));
+            assert!(chooser.is_typing());
+            type_text(&mut chooser, "q?j1");
+            assert_eq!(chooser.fields_of(1)[0].value(), "q?j1");
+            assert_eq!(chooser.selected(), 1, "j and 1 were text, not navigation");
+        }
+
+        #[test]
+        fn an_unavailable_action_reports_its_reason() {
+            let mut chooser = Chooser::new(vec![
+                ChooserItem::new("pauza", "Wstrzymuje.").unavailable("zadanie jest w kolejce")
+            ]);
+            assert_eq!(
+                chooser.on_key(press(KeyCode::Enter)),
+                ChooserAction::Blocked("zadanie jest w kolejce".to_string())
+            );
+        }
+
+        #[test]
+        fn esc_collapses_and_leaves_the_draft() {
+            let mut chooser = review_chooser().selecting(1);
+            chooser.on_key(press(KeyCode::Enter));
+            type_text(&mut chooser, "szkic");
+            assert_eq!(chooser.on_key(press(KeyCode::Esc)), ChooserAction::Cancel);
+            assert_eq!(chooser.fields_of(1)[0].value(), "szkic");
+        }
+
+        #[test]
+        fn a_proposed_value_is_marked_until_it_is_edited() {
+            let mut chooser = Chooser::new(vec![ChooserItem::new("restart", "Od nowa.")
+                .with_field(ChooserField::text("note").proposed("sprawdź testy"))]);
+            assert!(chooser.fields_of(0)[0].is_proposed());
+            chooser.on_key(press(KeyCode::Tab));
+            chooser.on_key(press(KeyCode::Backspace));
+            assert!(!chooser.fields_of(0)[0].is_proposed());
+            assert_eq!(chooser.fields_of(0)[0].value(), "sprawdź test");
+        }
+
+        #[test]
+        fn select_and_integer_fields_follow_the_form_rules() {
+            let mut chooser = Chooser::new(vec![ChooserItem::new("nowe", "Tworzy zadanie.")
+                .with_field(ChooserField::select(
+                    "repo",
+                    vec!["narsor".to_string(), "other".to_string()],
+                ))
+                .with_field(ChooserField::integer("count").required())]);
+            chooser.on_key(press(KeyCode::Tab));
+            chooser.on_key(press(KeyCode::Right));
+            assert_eq!(chooser.fields_of(0)[0].value(), "other");
+            chooser.on_key(press(KeyCode::Right));
+            assert_eq!(
+                chooser.fields_of(0)[0].value(),
+                "narsor",
+                "wraps like the form's select"
+            );
+            chooser.on_key(press(KeyCode::Down));
+            type_text(&mut chooser, "1a2-");
+            assert_eq!(
+                chooser.fields_of(0)[1].value(),
+                "12-",
+                "letters are not numbers"
+            );
+            assert_eq!(chooser.on_key(press(KeyCode::Enter)), ChooserAction::None);
+            assert!(
+                chooser.fields_of(0)[1].error().is_some(),
+                "12- is not an integer"
+            );
+        }
+    }
+
+    mod connection_state {
+        use narsor::tui::connection::{Connection, LinkState};
+        use narsor::tui::style::Role;
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn live_to_retrying_to_down_to_live() {
+            let start = Instant::now();
+            let mut connection = Connection::new("local");
+            assert_eq!(connection.state(), LinkState::Connecting);
+            assert!(connection.status(start).text.contains("łączę z local"));
+
+            connection.on_data(start);
+            let status = connection.status(start);
+            assert_eq!(
+                (status.icon, status.text.as_str(), status.role),
+                ("●", "live", Role::Live)
+            );
+            assert_eq!(connection.mutation_gate(start), Ok(()));
+            assert_eq!(connection.age_label(start), None);
+
+            let dropped = start + Duration::from_secs(10);
+            connection.on_failure(dropped, Some(Duration::from_secs(12)));
+            let status = connection.status(dropped);
+            assert_eq!(
+                (status.icon, status.text.as_str(), status.role),
+                ("◌", "ponawiam (12s)", Role::Attention)
+            );
+            assert_eq!(
+                connection
+                    .status(dropped + Duration::from_millis(2500))
+                    .text,
+                "ponawiam (10s)",
+                "the countdown is real and rounds up"
+            );
+            let blocked = connection
+                .mutation_gate(dropped + Duration::from_secs(30))
+                .expect_err("not live: mutations are refused");
+            assert!(blocked.reason.contains("ponawiam"), "{}", blocked.reason);
+            assert!(
+                blocked.reason.contains("stan sprzed 40s"),
+                "{}",
+                blocked.reason
+            );
+
+            let given_up = dropped + Duration::from_secs(40);
+            connection.on_failure(given_up, None);
+            let status = connection.status(given_up);
+            assert_eq!(
+                (status.icon, status.text.as_str(), status.role),
+                ("✖", "brak połączenia", Role::Problem)
+            );
+            assert_eq!(
+                connection.age_label(given_up),
+                Some("stan sprzed 50s".to_string())
+            );
+            assert!(connection.is_stale());
+            assert!(connection.mutation_gate(given_up).is_err());
+
+            let back = given_up + Duration::from_secs(5);
+            connection.on_data(back);
+            assert!(connection.is_live() && !connection.is_stale());
+            assert_eq!(connection.status(back).text, "live");
+            assert_eq!(connection.mutation_gate(back), Ok(()));
+            assert_eq!(connection.age_label(back), None);
+        }
+
+        #[test]
+        fn ages_use_the_largest_short_unit() {
+            let start = Instant::now();
+            let mut connection = Connection::new("local");
+            connection.on_data(start);
+            connection.on_failure(start, None);
+            for (seconds, expected) in [
+                (5, "stan sprzed 5s"),
+                (180, "stan sprzed 3m"),
+                (7300, "stan sprzed 2h"),
+            ] {
+                assert_eq!(
+                    connection.age_label(start + Duration::from_secs(seconds)),
+                    Some(expected.to_string())
+                );
+            }
+        }
+
+        #[test]
+        fn without_any_data_there_is_nothing_to_grey_or_age() {
+            let now = Instant::now();
+            let mut connection = Connection::new("remote");
+            connection.on_failure(now, None);
+            assert!(!connection.is_stale());
+            assert_eq!(connection.age_label(now), None);
+            assert!(connection.mutation_gate(now).is_err());
+        }
+    }
+
+    mod style_roles {
+        use narsor::tui::style::{no_color_requested, Role, Styles};
+        use narsor::tui::transcript::TranscriptPresentation;
+        use ratatui::style::{Color, Modifier, Style};
+
+        const KINDS: [TranscriptPresentation; 7] = [
+            TranscriptPresentation::Neutral,
+            TranscriptPresentation::Operator,
+            TranscriptPresentation::Agent,
+            TranscriptPresentation::Conductor,
+            TranscriptPresentation::System,
+            TranscriptPresentation::Technical,
+            TranscriptPresentation::Error,
+        ];
+
+        fn all_styles(styles: &Styles) -> Vec<Style> {
+            let mut all: Vec<Style> = Role::ALL.iter().map(|role| styles.of(*role)).collect();
+            for kind in KINDS {
+                all.push(styles.chat_header(kind));
+                all.push(styles.chat_body(kind));
+            }
+            all.push(styles.key_cap());
+            all
+        }
+
+        #[test]
+        fn no_color_is_set_and_not_empty() {
+            assert!(!no_color_requested(None));
+            assert!(!no_color_requested(Some("".into())));
+            assert!(no_color_requested(Some("1".into())));
+        }
+
+        #[test]
+        fn colour_mode_uses_only_the_sixteen_ansi_colours() {
+            for style in all_styles(&Styles::new(false)) {
+                for colour in [style.fg, style.bg].into_iter().flatten() {
+                    assert!(
+                        !matches!(colour, Color::Rgb(..) | Color::Indexed(_) | Color::Reset),
+                        "{colour:?} is not one of the 16 ANSI colours"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn no_color_mode_leaves_only_bold_dim_underline_and_reverse() {
+            let allowed =
+                Modifier::BOLD | Modifier::DIM | Modifier::UNDERLINED | Modifier::REVERSED;
+            for style in all_styles(&Styles::new(true)) {
+                assert_eq!((style.fg, style.bg), (None, None), "{style:?}");
+                assert!(allowed.contains(style.add_modifier), "{style:?}");
+            }
+        }
+
+        #[test]
+        fn selection_is_reverse_video_in_both_modes_and_keeps_the_base() {
+            for no_color in [false, true] {
+                let styles = Styles::new(no_color);
+                assert!(styles
+                    .of(Role::Selected)
+                    .add_modifier
+                    .contains(Modifier::REVERSED));
+                let selected = styles.selected(styles.of(Role::Attention));
+                assert!(selected.add_modifier.contains(Modifier::REVERSED));
+                assert!(
+                    selected.add_modifier.contains(Modifier::BOLD),
+                    "the base still speaks"
+                );
+            }
+        }
+
+        #[test]
+        fn roles_follow_the_origin_table() {
+            let styles = Styles::new(false);
+            assert_eq!(styles.of(Role::Attention).fg, Some(Color::Yellow));
+            assert!(styles
+                .of(Role::Attention)
+                .add_modifier
+                .contains(Modifier::BOLD));
+            assert_eq!(styles.of(Role::Problem).fg, Some(Color::Red));
+            assert_eq!(styles.of(Role::Live).fg, Some(Color::Green));
+            assert_eq!(styles.of(Role::Calm), Style::default());
+            assert_eq!(styles.of(Role::Done).fg, Some(Color::DarkGray));
+            assert_eq!(styles.of(Role::Focus).fg, Some(Color::Cyan));
+            assert_eq!(styles.of(Role::Conductor).fg, Some(Color::Magenta));
+            assert_eq!(styles.of(Role::Link).fg, Some(Color::Blue));
+            assert!(styles
+                .of(Role::Link)
+                .add_modifier
+                .contains(Modifier::UNDERLINED));
+        }
+
+        #[test]
+        fn the_conversation_kinds_stay_distinguishable_in_colour() {
+            let styles = Styles::new(false);
+            let headers: Vec<Style> = [
+                TranscriptPresentation::Operator,
+                TranscriptPresentation::Agent,
+                TranscriptPresentation::Conductor,
+                TranscriptPresentation::Error,
+            ]
+            .into_iter()
+            .map(|kind| styles.chat_header(kind))
+            .collect();
+            for (index, header) in headers.iter().enumerate() {
+                assert!(headers[index + 1..]
+                    .iter()
+                    .all(|other| other.fg != header.fg));
+            }
+        }
+    }
+}

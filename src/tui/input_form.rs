@@ -945,25 +945,13 @@ impl InputForm {
             Some(FormRow::Field(index)) => {
                 let field = &self.fields[index];
                 if field.field_type == HumanInputType::Text {
-                    let cursor = &mut self.text_cursors[index];
-                    *cursor = ((*cursor as isize + delta)
-                        .clamp(0, self.values[index].chars().count() as isize))
-                        as usize;
+                    text_step(&self.values[index], &mut self.text_cursors[index], delta);
                     return;
                 }
-                if field.options.is_empty() {
+                let Some(next) = cycle_option(&field.options, &self.values[index], delta) else {
                     return;
-                }
-                let next = match field
-                    .options
-                    .iter()
-                    .position(|option| option == &self.values[index])
-                {
-                    Some(current) => wrap(current, delta, field.options.len()),
-                    None if delta >= 0 => 0,
-                    None => field.options.len() - 1,
                 };
-                self.values[index] = field.options[next].clone();
+                self.values[index] = next;
                 self.sync_required_entries();
             }
             Some(FormRow::Label) => {
@@ -989,11 +977,7 @@ impl InputForm {
         match self.current_row() {
             Some(FormRow::Field(index)) => {
                 if self.fields[index].field_type == HumanInputType::Text {
-                    let cursor = self.text_cursors[index];
-                    if cursor > 0 {
-                        remove_char(&mut self.values[index], cursor - 1);
-                        self.text_cursors[index] -= 1;
-                    }
+                    text_backspace(&mut self.values[index], &mut self.text_cursors[index]);
                 }
             }
             Some(FormRow::Entry(map, index)) => {
@@ -1028,9 +1012,11 @@ impl InputForm {
             Some(FormRow::Field(index))
                 if self.fields[index].field_type == HumanInputType::Text =>
             {
-                let cursor = self.text_cursors[index];
-                insert_char(&mut self.values[index], cursor, character);
-                self.text_cursors[index] += 1;
+                text_insert(
+                    &mut self.values[index],
+                    &mut self.text_cursors[index],
+                    character,
+                );
             }
             Some(FormRow::Entry(map, index)) => {
                 if let Some(entry) = self.entry_mut(map, index) {
@@ -1082,9 +1068,7 @@ impl InputForm {
             return;
         };
         if self.fields[index].field_type == HumanInputType::Text {
-            let cursor = self.text_cursors[index];
-            insert_char(&mut self.values[index], cursor, '\n');
-            self.text_cursors[index] += 1;
+            text_insert(&mut self.values[index], &mut self.text_cursors[index], '\n');
         }
     }
 
@@ -1100,6 +1084,48 @@ impl InputForm {
             .and_then(|problem| problem.entries(map).get(index))
             .is_some_and(|entry| self.is_required(map, &entry.key))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Field editing, shared with the embedded fields of the chooser
+// ---------------------------------------------------------------------------
+//
+// The form edits its fields through these, and so does `super::chooser`, whose
+// fields live inside the answer panel: one set of rules for the cursor, for a
+// newline and for stepping a `select`, whichever surface hosts the field.
+
+/// Inserts `inserted` at the character `cursor` and moves the cursor past it.
+pub fn text_insert(value: &mut String, cursor: &mut usize, inserted: char) {
+    insert_char(value, *cursor, inserted);
+    *cursor += 1;
+}
+
+/// Deletes the character before `cursor`, if there is one.
+pub fn text_backspace(value: &mut String, cursor: &mut usize) {
+    if *cursor > 0 {
+        remove_char(value, *cursor - 1);
+        *cursor -= 1;
+    }
+}
+
+/// Moves `cursor` by `delta` characters, staying inside `value`.
+pub fn text_step(value: &str, cursor: &mut usize, delta: isize) {
+    *cursor = (*cursor as isize + delta).clamp(0, value.chars().count() as isize) as usize;
+}
+
+/// The option `delta` steps from `current`, wrapping around. A `current` that
+/// is not an option starts at the first (forward) or last (backward) one.
+/// `None` when there are no options.
+pub fn cycle_option(options: &[String], current: &str, delta: isize) -> Option<String> {
+    if options.is_empty() {
+        return None;
+    }
+    let next = match options.iter().position(|option| option == current) {
+        Some(index) => wrap(index, delta, options.len()),
+        None if delta >= 0 => 0,
+        None => options.len() - 1,
+    };
+    Some(options[next].clone())
 }
 
 fn char_byte_index(text: &str, character: usize) -> usize {
