@@ -41,6 +41,16 @@ pub enum OrchestrationError {
         version: u32,
     },
 
+    /// A version 1 record appeared in a backend this process had already
+    /// migrated. Nothing was changed; retrying migrates the backend first.
+    #[error("task '{task_id}' of backend '{backend_id}' is a legacy record that appeared after startup; retry")]
+    LegacyRecordAppeared {
+        /// The task.
+        task_id: TaskId,
+        /// Its backend.
+        backend_id: BackendId,
+    },
+
     /// An idempotency key was reused for a different command.
     #[error("idempotency key '{key}' of task '{task_id}' was already used for {original:?}, not {requested:?}")]
     IdempotencyKeyReused {

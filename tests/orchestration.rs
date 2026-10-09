@@ -1887,6 +1887,66 @@ fn version_one_records_are_numbered_once_by_priority_then_arrival() {
 }
 
 #[test]
+fn resuming_an_interrupted_migration_keeps_the_migrated_tasks_in_front() {
+    let fx = Fixture::new();
+    for id in ["first", "second", "third"] {
+        fx.create(id);
+    }
+    // The migration numbered the high priority task first and died: it is at
+    // version 2 with rank 1, the other two are still version 1.
+    downgrade_to_v1(&fx, "first", 0);
+    downgrade_to_v1(&fx, "second", 0);
+    let path = fx.root.paths().orchestration_task_file("third");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["rank"] = 1.into();
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let reopened = fx.reopen();
+    let order: Vec<(String, u32)> = reopened
+        .list_tasks()
+        .unwrap()
+        .iter()
+        .map(|task| (task.task_id.to_string(), task.rank))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            ("third".into(), 1),
+            ("first".into(), 2),
+            ("second".into(), 3)
+        ]
+    );
+}
+
+#[test]
+fn a_version_one_record_that_appears_after_the_backend_was_remembered_does_not_deadlock() {
+    let fx = Fixture::new();
+    fx.create("a");
+    fx.create("b");
+    let control = fx.reopen();
+    // Remembers the backend as migrated.
+    control.schedule(&k8s(), &limit(1)).unwrap();
+    downgrade_to_v1(&fx, "b", 0);
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = control.clone();
+    std::thread::spawn(move || {
+        let first = worker.schedule(&k8s(), &limit(1)).map(|_| ());
+        let second = worker.schedule(&k8s(), &limit(1)).map(|_| ());
+        let _ = sender.send((first, second));
+    });
+    let (first, second) = receiver
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the pass must not wait on a lock it holds");
+    assert!(
+        matches!(first, Err(OrchestrationError::LegacyRecordAppeared { .. })),
+        "{first:?}"
+    );
+    second.expect("the retry migrates the backend first");
+    assert_eq!(control.task(&task("b")).unwrap().record_version, 2);
+}
+
+#[test]
 fn a_task_started_under_version_one_is_migrated_before_it_is_mutated() {
     let fx = Fixture::new();
     fx.create("old");

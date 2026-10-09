@@ -137,7 +137,10 @@ impl From<OrchestrationError> for ProtocolError {
             E::BackendUnavailable { .. } => Self::conflict("backend_unavailable", message),
             E::TaskNotQueued { .. } => Self::conflict("task_not_queued", message),
             E::InvalidMoveAnchor { .. } => Self::bad_request("invalid_move_anchor", message),
-            E::Persistence(_) | E::UnsupportedRecordVersion { .. } | E::Lock { .. } => {
+            E::Persistence(_)
+            | E::UnsupportedRecordVersion { .. }
+            | E::LegacyRecordAppeared { .. }
+            | E::Lock { .. } => {
                 Self::Internal(message)
             }
         }

@@ -28,7 +28,10 @@
 //! [`OrchestrationStore::lock_task`] and
 //! [`OrchestrationStore::lock_schedule`] migrate *before* they lock, so code
 //! that holds either lock never meets a version 1 record and the migration
-//! never waits on a lock its own caller holds.
+//! never waits on a lock its own caller holds. (A version 1 record that
+//! appears behind a backend already declared migrated is refused with
+//! [`OrchestrationError::LegacyRecordAppeared`] rather than migrated under a
+//! lock the caller may hold.)
 //!
 //! # Commit protocol
 //!
@@ -100,7 +103,20 @@ impl OrchestrationStore {
         if record.record_version >= TASK_RECORD_VERSION {
             return Ok(record);
         }
-        self.migrate_backend(&record.assignment.backend_id)?;
+        let backend_id = &record.assignment.backend_id;
+        // A backend this process already declared migrated is one whose
+        // schedule lock the caller may hold, and migrating waits for that
+        // lock. A version 1 record that turned up since (a restored backup,
+        // a copy from another host) is therefore refused instead — and the
+        // backend forgotten, so that the next `lock_schedule` migrates it
+        // before locking.
+        if self.migrated_backends().remove(backend_id) {
+            return Err(OrchestrationError::LegacyRecordAppeared {
+                task_id: task_id.clone(),
+                backend_id: backend_id.clone(),
+            });
+        }
+        self.migrate_backend(backend_id)?;
         self.load_task_unmigrated(task_id)
     }
 
@@ -219,10 +235,12 @@ impl OrchestrationStore {
 
     /// Numbers a backend whose records are not all at the current version.
     ///
-    /// Version 1 records come first, in the order they used to be admitted
-    /// in; records that already have a rank follow in theirs, so a backend
-    /// that somehow holds both keeps the newer tasks at the end. Idempotent:
-    /// once every record is at version 2 a second call writes nothing.
+    /// Records that already have a rank come first, in theirs; version 1
+    /// records follow, in the order they used to be admitted in. A backend
+    /// holds both only when an earlier migration was interrupted, and what
+    /// it had written then is exactly the front of the order it was
+    /// writing, so resuming continues it. Idempotent: once every record is
+    /// at version 2 a second call writes nothing.
     fn migrate_backend(&self, backend_id: &BackendId) -> Result<()> {
         let _schedule =
             FileLock::acquire(self.paths.backend_schedule_lock_file(backend_id.as_str()))?;
@@ -241,7 +259,7 @@ impl OrchestrationStore {
             )
         });
         current.sort_by(queue_order);
-        for (index, record) in legacy.into_iter().chain(current).enumerate() {
+        for (index, record) in current.into_iter().chain(legacy).enumerate() {
             let rank = u32::try_from(index + 1).unwrap_or(u32::MAX);
             if record.record_version == TASK_RECORD_VERSION && record.rank == rank {
                 continue;
