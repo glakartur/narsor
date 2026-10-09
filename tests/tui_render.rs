@@ -324,37 +324,10 @@ mod connection_render {
     }
 }
 
-/// R17: views name roles, not colours. The list holds the sources of the new
-/// views; U14 extends the check to the whole of `src/tui` by listing the
-/// directory instead.
+/// R17: views name roles, not colours. The whole of `src/tui` is checked —
+/// the directory is listed, so a new file is covered the day it appears.
 mod colour_discipline {
     use super::*;
-
-    /// The new views' sources, relative to `src/tui`. Everything that draws
-    /// belongs here; `style.rs` is the one file allowed to name a colour.
-    const NEW_VIEW_SOURCES: &[&str] = &[
-        "chooser.rs",
-        "connection.rs",
-        "failure_form.rs",
-        "input_form.rs",
-        "keymap.rs",
-        "task_app/actions.rs",
-        "task_app/detail.rs",
-        "task_app/history.rs",
-        "task_app/layout.rs",
-        "task_app/list.rs",
-        "task_app/mod.rs",
-        "task_app/new_task.rs",
-        "task_app/notify.rs",
-        "task_app/repositories.rs",
-        "task_app/tabs.rs",
-        "task_app/tabs/conductor.rs",
-        "task_app/tabs/conversation.rs",
-        "task_app/tabs/events.rs",
-        "task_app/tabs/info.rs",
-        "task_app/tabs/progress.rs",
-        "task_app/waiting.rs",
-    ];
 
     /// The one module that may name a colour.
     const ROLE_MODULE: &str = "style.rs";
@@ -381,12 +354,45 @@ mod colour_discipline {
         found
     }
 
+    /// Every `.rs` file under `directory`, relative to it, sorted.
+    fn rust_sources(directory: &std::path::Path) -> Vec<String> {
+        fn walk(directory: &std::path::Path, prefix: &str, found: &mut Vec<String>) {
+            for entry in fs::read_dir(directory).expect("list the directory") {
+                let entry = entry.expect("a directory entry");
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let relative = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if entry.path().is_dir() {
+                    walk(&entry.path(), &relative, found);
+                } else if name.ends_with(".rs") {
+                    found.push(relative);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(directory, "", &mut found);
+        found.sort();
+        found
+    }
+
     #[test]
-    fn new_views_do_not_name_colours_outside_the_role_module() {
-        let sources: Vec<String> = NEW_VIEW_SOURCES
-            .iter()
-            .map(|name| name.to_string())
-            .collect();
+    fn nothing_in_the_tui_names_a_colour_outside_the_role_module() {
+        let sources = rust_sources(&tui_dir());
+        for expected in [
+            "transcript.rs",
+            "conversation.rs",
+            "scroll.rs",
+            "task_app/mod.rs",
+            "task_app/tabs/info.rs",
+        ] {
+            assert!(
+                sources.iter().any(|source| source == expected),
+                "the listing must reach {expected}: {sources:?}"
+            );
+        }
         assert_eq!(
             colour_references(&tui_dir(), &sources),
             Vec::<String>::new()
@@ -1933,5 +1939,88 @@ mod task_app_create_render {
         for expected in ["Usuń repozytorium !", "Usuwa repozytorium docs", "potwierdź", "anuluj"] {
             assert!(screen.contains(expected), "{expected}:\n{screen}");
         }
+    }
+}
+
+/// The main screen of the origin (§1), end to end: tasks of a real control
+/// plane in the list, the header of the connection, the details of the
+/// selected one and the bar.
+mod task_app_main_screen {
+    use super::*;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use narsor::orchestration::{AttentionItem, AttentionKind};
+    use narsor::tui::task_app::{layout, TaskApp};
+
+    use crate::remote_support::{snapshot, RemoteHarness};
+
+    fn render(app: &mut TaskApp, styles: &Styles) -> Buffer {
+        draw(130, 30, |frame| {
+            layout::render(frame, app, styles, Instant::now())
+        })
+    }
+
+    #[tokio::test]
+    async fn the_main_screen_of_the_origin_is_drawn_from_a_real_control_plane() {
+        let harness = RemoteHarness::start().await;
+        harness.running("NAR-14", "backend-b", snapshot(1, None)).await;
+        let mut waiting = snapshot(1, Some("in-1"));
+        waiting.attention = vec![AttentionItem {
+            kind: AttentionKind::Approval,
+            state_id: Some("review".to_string()),
+            since: chrono::Utc::now(),
+            waiting_id: "in-1".to_string(),
+        }];
+        harness.running("NAR-12", "k8s", waiting).await;
+        harness.create("NAR-16", Some("k8s")).await;
+        harness.create("NAR-17", Some("k8s")).await;
+        let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+        app.refresh().await;
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.sync_detail().await;
+        let buffer = render(&mut app, &Styles::new(false));
+        let rows = rows(&buffer);
+        let screen = screen(&buffer);
+
+        // The frame: the connection by name and state, the counters.
+        assert!(rows[0].contains("narsor · local ● live"), "{}", rows[0]);
+        assert!(rows[0].contains("? 1") && rows[0].contains("! 0"), "{}", rows[0]);
+        assert!(rows[0].contains("sloty"), "{}", rows[0]);
+
+        // The list, in the order of the queue, one row per task: attention,
+        // state, title, label.
+        let list_part = |row: &String| -> String {
+            row.chars().take(usize::from(layout::LIST_WIDTH)).collect()
+        };
+        let row_of = |title: &str| {
+            rows.iter()
+                .map(list_part)
+                .find(|row| row.contains(title))
+                .unwrap_or_else(|| panic!("no row for {title}:\n{screen}"))
+        };
+        assert!(row_of("NAR-14").starts_with("│ ● NAR-14"), "{}", row_of("NAR-14"));
+        assert!(row_of("NAR-12").starts_with("│?● NAR-12"), "{}", row_of("NAR-12"));
+        assert!(row_of("NAR-16").starts_with("│ ◷ NAR-16") && row_of("NAR-16").contains("#1"));
+        assert!(row_of("NAR-17").starts_with("│ ◷ NAR-17") && row_of("NAR-17").contains("#2"));
+        let order: Vec<usize> = ["NAR-14", "NAR-12", "NAR-16", "NAR-17"]
+            .iter()
+            .map(|title| {
+                rows.iter()
+                    .position(|row| list_part(row).contains(title))
+                    .unwrap()
+            })
+            .collect();
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+
+        // The details of the selected task: header, tabs, and the panel of
+        // what waits for the operator, with its own keys on the bar.
+        assert!(rows[1].contains("NAR-12") && rows[1].contains("implement-feature v1"), "{}", rows[1]);
+        assert!(rows[2].contains("● running"), "{}", rows[2]);
+        assert!(rows[3].contains("Przebieg") && rows[3].contains("Dyrygent") && rows[3].contains("Info"));
+        assert!(screen.contains("? Approval · review"), "{screen}");
+        assert!(screen.contains("Approve the plan?"), "{screen}");
+        let bar = &rows[rows.len() - 2];
+        assert!(bar.contains("Enter wyślij") && bar.contains("Esc zwiń"), "{bar}");
     }
 }
