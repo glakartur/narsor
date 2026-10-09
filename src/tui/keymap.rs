@@ -9,7 +9,8 @@
 //! # Contexts
 //!
 //! A [`Context`] is "where the operator is": the list, the task details, the
-//! answer panel, the action menu, a form, the move mode. [`Context::Global`]
+//! answer panel, the action menu, the confirmation window, a form, the move
+//! mode. [`Context::Global`]
 //! holds what works everywhere and is inherited by every context that is not
 //! taking typed text ([`Context::inherits_global`]). A form (or a panel whose
 //! focus is in a field) must be able to type `q` and `?`, so it inherits
@@ -43,6 +44,8 @@ pub enum Context {
     Panel,
     /// The action menu is open.
     Menu,
+    /// The `y` / `n` window that shows what an action `!` will do.
+    Confirm,
     /// A form is taking input: new task, repositories, a panel's fields.
     Form,
     /// A queued task is being moved.
@@ -51,12 +54,13 @@ pub enum Context {
 
 impl Context {
     /// Every context, in the order help and tests walk them.
-    pub const ALL: [Context; 7] = [
+    pub const ALL: [Context; 8] = [
         Context::Global,
         Context::List,
         Context::Details,
         Context::Panel,
         Context::Menu,
+        Context::Confirm,
         Context::Form,
         Context::Move,
     ];
@@ -69,6 +73,7 @@ impl Context {
             Self::Details => "szczegóły",
             Self::Panel => "panel",
             Self::Menu => "menu",
+            Self::Confirm => "potwierdzenie",
             Self::Form => "formularz",
             Self::Move => "przesuwanie",
         }
@@ -170,6 +175,8 @@ pub enum Action {
     Step,
     /// Confirm the chosen place or entry.
     Confirm,
+    /// Say yes to what the confirmation window shows.
+    Accept,
 }
 
 /// A key a binding listens to.
@@ -882,6 +889,28 @@ pub static BINDINGS: &[Binding] = &[
         Action::OpenLink,
         "",
         "otwórz link zadania w przeglądarce",
+    ),
+    // The confirmation window of an action `!`: the same for all of them.
+    bind(
+        Context::Confirm,
+        Key::char('y'),
+        Action::Accept,
+        "potwierdź",
+        "potwierdź akcję pokazaną w oknie",
+    ),
+    bind(
+        Context::Confirm,
+        Key::char('n'),
+        Action::Cancel,
+        "anuluj",
+        "nie rób nic i wróć",
+    ),
+    bind(
+        Context::Confirm,
+        Key::code(KeyCode::Esc),
+        Action::Cancel,
+        "",
+        "nie rób nic i wróć",
     ),
     // A form: new task, repositories.
     bind(

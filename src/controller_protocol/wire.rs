@@ -306,9 +306,44 @@ pub struct TaskSummary {
     /// report. Empty when the workflow declares none.
     #[serde(default)]
     pub display: TaskDisplay,
+    /// Where a manual transition can lead from the state the runner reports
+    /// (U11): the declared exits with their descriptions, whether the state
+    /// allows an override and, for one, the states it can go to. `None` when
+    /// the task is not running, the runner has reported no state yet or the
+    /// workflow snapshot cannot be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_transitions: Option<TransitionOffer>,
     /// The control plane's "now" this summary was computed at, so a client
     /// can show the age of every timestamp above.
     pub as_of: DateTime<Utc>,
+}
+
+/// What a manual transition out of a task's current state can be (U11).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransitionOffer {
+    /// The state the runner reports being in.
+    pub from_state: String,
+    /// The declared transitions, one per target (the lowest label wins when
+    /// several lead to the same state, as the runner picks it).
+    pub exits: Vec<TransitionExit>,
+    /// Whether the state declares `allow_manual_override` (D30).
+    pub override_allowed: bool,
+    /// Every other state of the workflow: what an override can go to. Empty
+    /// unless `override_allowed`.
+    #[serde(default)]
+    pub override_targets: Vec<String>,
+}
+
+/// One declared transition out of a state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransitionExit {
+    /// The output label that leads there.
+    pub label: String,
+    /// The state it leads to: what a `Transition` command names.
+    pub target: String,
+    /// What choosing the label means, when the workflow says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// The scheduler's verdict on a queued task, as clients see it (U10).

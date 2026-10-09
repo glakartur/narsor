@@ -264,3 +264,34 @@ pub fn waiting_on(mut task: TaskSummary, kind: AttentionKind, waiting_id: &str, 
     });
     task
 }
+
+/// The state `task`'s runner is in offers `exits` — `(label, target,
+/// description)` — and, when `override_targets` is given, an override to any
+/// of them.
+pub fn with_transitions(
+    mut task: TaskSummary,
+    from: &str,
+    exits: &[(&str, &str, Option<&str>)],
+    override_targets: Option<&[&str]>,
+) -> TaskSummary {
+    task.manual_transitions = Some(narsor::controller_protocol::TransitionOffer {
+        from_state: from.to_string(),
+        exits: exits
+            .iter()
+            .map(
+                |(label, target, description)| narsor::controller_protocol::TransitionExit {
+                    label: (*label).to_string(),
+                    target: (*target).to_string(),
+                    description: description.map(str::to_string),
+                },
+            )
+            .collect(),
+        override_allowed: override_targets.is_some(),
+        override_targets: override_targets
+            .unwrap_or_default()
+            .iter()
+            .map(|target| (*target).to_string())
+            .collect(),
+    });
+    task
+}

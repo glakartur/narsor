@@ -8780,21 +8780,51 @@ mod task_app_waiting {
     }
 
     #[test]
-    fn a_failed_provisioning_starts_again_or_archives_after_a_second_enter() {
-        let failed = waiting_on(task("a", "local", "interrupted", 1), AttentionKind::ProvisioningFailed, "provisioning-1", None);
+    fn a_failed_provisioning_starts_again_or_archives_after_the_confirmation_window() {
+        let failed = waiting_on(
+            task("a", "local", "interrupted", 1),
+            AttentionKind::ProvisioningFailed,
+            "provisioning-1",
+            None,
+        );
         let mut app = opened(failed);
         assert_eq!(selected_label(&app), "Uruchom od nowa");
         assert_eq!(sent(press(&mut app, KeyCode::Enter)).submit, Submit::Owner(OwnerCommand::Start));
 
         ch(&mut app, '2');
         assert!(chooser_of(&app).items()[1].irreversible);
-        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "archiving asks first");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Request::None,
+            "archiving asks first, in the shared window"
+        );
+        let confirmation = app
+            .overlay()
+            .and_then(|overlay| overlay.confirmation())
+            .expect("the confirmation window");
+        assert!(confirmation.heading().contains("Archiwizuj"));
         let text = screen(&mut app, 120, 40);
-        assert!(text.contains("nieodwracalne — Enter potwierdza, Esc anuluje"), "{text}");
-        assert_eq!(press(&mut app, KeyCode::Esc), Request::None);
-        assert!(app.panel_focused(), "Esc took the question back, it did not fold the panel");
+        assert!(
+            text.contains("Usuwa workload i storage") && text.contains("Tego nie da się cofnąć"),
+            "{text}"
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Request::None,
+            "Enter is not the answer to a y / n window"
+        );
+        assert!(app.overlay().is_some());
+        ch(&mut app, 'n');
+        assert!(app.overlay().is_none());
+        assert!(
+            app.panel_focused(),
+            "n took the question back, it did not fold the panel"
+        );
         assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "asks again");
-        assert_eq!(sent(press(&mut app, KeyCode::Enter)).submit, Submit::Owner(OwnerCommand::Archive));
+        assert_eq!(
+            sent(ch(&mut app, 'y')).submit,
+            Submit::Owner(OwnerCommand::Archive)
+        );
     }
 
     #[test]
@@ -9089,5 +9119,1455 @@ mod task_app_waiting {
             !text.chars().any(|c| c.is_control() || c == '\u{202e}'),
             "no control or bidi characters reach the bar: {text:?}"
         );
+    }
+}
+
+/// U11: the action menu, the confirmations and the commands of the operator.
+mod task_app_actions {
+    use std::time::Duration;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use narsor::api::{ApiClient, ClientError};
+    use narsor::controller_protocol::{OperatorCommandView, RunnerClient, TaskSummary};
+    use narsor::domain::ExecutionStatus;
+    use narsor::orchestration::{
+        AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef,
+        TaskEventKind, TaskLifecycle,
+    };
+    use narsor::tui::keymap::{self, Action, Context};
+    use narsor::tui::task_app::actions::{
+        availability, refusal_reason, verb, ActionRequest, ActionSend, Availability, Confirmed,
+        Overlay, TaskAction,
+    };
+    use narsor::tui::task_app::notify::Severity;
+    use narsor::tui::task_app::{EventFeed, Request, TaskApp};
+
+    use super::remote_support::{snapshot, RemoteHarness};
+    use super::task_app_support::{
+        displayed, event, listing, queued, task, titled, waiting_on, with_controller,
+        with_runner, with_transitions,
+    };
+
+    fn offline_client() -> ApiClient {
+        ApiClient::new("127.0.0.1:9".parse().unwrap(), "token")
+    }
+
+    fn app() -> TaskApp {
+        TaskApp::new(offline_client(), "local", None)
+    }
+
+    fn press(app: &mut TaskApp, code: KeyCode) -> Request {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn ch(app: &mut TaskApp, character: char) -> Request {
+        press(app, KeyCode::Char(character))
+    }
+
+    fn typed(app: &mut TaskApp, text: &str) {
+        for character in text.chars() {
+            ch(app, character);
+        }
+    }
+
+    fn note(app: &TaskApp) -> String {
+        app.notifier()
+            .latest()
+            .map(|note| note.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn running(id: &str, rank: u32) -> TaskSummary {
+        with_runner(
+            with_controller(task(id, "local", "running", rank)),
+            ExecutionStatus::Running,
+            "review",
+        )
+    }
+
+    fn finished(id: &str, rank: u32) -> TaskSummary {
+        with_runner(
+            with_controller(task(id, "local", "running", rank)),
+            ExecutionStatus::Completed,
+            "done",
+        )
+    }
+
+    fn lifecycle(word: &str) -> TaskSummary {
+        with_controller(task("a", "local", word, 1))
+    }
+
+    fn loaded(task: TaskSummary) -> TaskApp {
+        let mut app = app();
+        app.load(listing(vec![titled(task, "NAR-12")], "c"));
+        app
+    }
+
+    fn act(request: Request) -> ActionRequest {
+        match request {
+            Request::Act(request) => *request,
+            other => panic!("an action was expected, got {other:?}"),
+        }
+    }
+
+    fn confirmation(app: &TaskApp) -> &narsor::tui::task_app::actions::Confirmation {
+        app.overlay()
+            .and_then(Overlay::confirmation)
+            .expect("the confirmation window")
+    }
+
+    fn unavailable(task: &TaskSummary, action: TaskAction) -> String {
+        match availability(task, action) {
+            Availability::Unavailable(reason) => reason,
+            Availability::Available => panic!("{action:?} should not be available"),
+        }
+    }
+
+    fn available(task: &TaskSummary, action: TaskAction) -> bool {
+        availability(task, action).is_available()
+    }
+
+    fn screen(app: &mut TaskApp, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                narsor::tui::task_app::layout::render(
+                    frame,
+                    app,
+                    &narsor::tui::style::Styles::new(false),
+                    std::time::Instant::now(),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        buffer
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // -- the table of origin §3 --------------------------------------------
+
+    mod availability_table {
+        use super::*;
+
+        #[test]
+        fn move_is_for_queued_tasks_only() {
+            assert!(available(&queued("a", 1), TaskAction::Move));
+            for word in ["running", "paused", "interrupted", "provisioning"] {
+                assert_eq!(
+                    unavailable(&lifecycle(word), TaskAction::Move),
+                    "zadanie nie jest w kolejce",
+                    "{word}"
+                );
+            }
+        }
+
+        #[test]
+        fn pause_for_running_resume_for_paused_and_nothing_else() {
+            let running = running("a", 1);
+            assert!(available(&running, TaskAction::PauseResume));
+            assert_eq!(verb(&running, TaskAction::PauseResume), "pauza");
+            let paused = lifecycle("paused");
+            assert!(available(&paused, TaskAction::PauseResume));
+            assert_eq!(verb(&paused, TaskAction::PauseResume), "wznowienie");
+            assert_eq!(
+                unavailable(&queued("a", 1), TaskAction::PauseResume),
+                "zadanie jest w kolejce"
+            );
+            assert_eq!(
+                unavailable(&lifecycle("provisioning"), TaskAction::PauseResume),
+                "zadanie jest przygotowywane"
+            );
+            assert!(unavailable(&lifecycle("interrupted"), TaskAction::PauseResume)
+                .contains("uruchom je od nowa"));
+            assert!(unavailable(&finished("a", 1), TaskAction::PauseResume).contains("zakończone"));
+            assert!(unavailable(&lifecycle("pause_requested"), TaskAction::PauseResume)
+                .contains("wstrzymywane"));
+        }
+
+        #[test]
+        fn interrupt_needs_a_running_step_and_a_runner_that_answers() {
+            assert!(available(&running("a", 1), TaskAction::Interrupt));
+            assert_eq!(
+                unavailable(&queued("a", 1), TaskAction::Interrupt),
+                "zadanie jest w kolejce"
+            );
+            assert!(unavailable(&lifecycle("paused"), TaskAction::Interrupt).contains("wznów"));
+            assert!(unavailable(&finished("a", 1), TaskAction::Interrupt).contains("zakończone"));
+            assert_eq!(
+                unavailable(&lifecycle("running"), TaskAction::Interrupt),
+                "runner jeszcze się nie zgłosił"
+            );
+            let mut silent = running("a", 1);
+            silent.runner.as_mut().unwrap().freshness = narsor::controller_protocol::Freshness::Stale;
+            assert!(unavailable(&silent, TaskAction::Interrupt).contains("nie odpowiada"));
+        }
+
+        #[test]
+        fn a_transition_needs_exits_or_an_override() {
+            let exits = [("approved", "ship", Some("Wypuszczamy."))];
+            assert!(available(
+                &with_transitions(running("a", 1), "review", &exits, None),
+                TaskAction::Transition
+            ));
+            assert!(available(
+                &with_transitions(running("a", 1), "review", &[], Some(&["plan"])),
+                TaskAction::Transition
+            ));
+            assert!(unavailable(
+                &with_transitions(running("a", 1), "review", &[], None),
+                TaskAction::Transition
+            )
+            .contains("nie ma wyjść"));
+            assert!(unavailable(&running("a", 1), TaskAction::Transition)
+                .contains("serwer nie podał wyjść"));
+            assert_eq!(
+                unavailable(&queued("a", 1), TaskAction::Transition),
+                "zadanie jest w kolejce"
+            );
+        }
+
+        #[test]
+        fn start_again_is_for_interrupted_tasks_and_a_failed_provisioning() {
+            assert!(available(&lifecycle("interrupted"), TaskAction::Restart));
+            assert!(available(&lifecycle("unknown"), TaskAction::Restart));
+            let failed = waiting_on(
+                lifecycle("provisioning"),
+                AttentionKind::ProvisioningFailed,
+                "p-1",
+                None,
+            );
+            assert!(available(&failed, TaskAction::Restart));
+            assert!(unavailable(&running("a", 1), TaskAction::Restart).contains("działa"));
+            assert_eq!(
+                unavailable(&queued("a", 1), TaskAction::Restart),
+                "zadanie jest w kolejce"
+            );
+            assert!(unavailable(&lifecycle("paused"), TaskAction::Restart).contains("wznów"));
+        }
+
+        #[test]
+        fn archive_is_for_finished_and_interrupted_tasks() {
+            assert!(available(&finished("a", 1), TaskAction::Archive));
+            assert!(available(&lifecycle("interrupted"), TaskAction::Archive));
+            let failed = waiting_on(
+                lifecycle("provisioning"),
+                AttentionKind::ProvisioningFailed,
+                "p-1",
+                None,
+            );
+            assert!(available(&failed, TaskAction::Archive));
+            for blocked in [running("a", 1), queued("a", 1), lifecycle("paused")] {
+                assert!(
+                    unavailable(&blocked, TaskAction::Archive).contains("zakończone lub przerwane"),
+                    "{:?}",
+                    blocked.lifecycle
+                );
+            }
+        }
+
+        #[test]
+        fn a_link_needs_a_value() {
+            assert_eq!(
+                unavailable(&running("a", 1), TaskAction::OpenLink),
+                "workflow nie deklaruje linków"
+            );
+            let unresolved = displayed(running("a", 1), "NAR-12", &[("Jira", "—", None)]);
+            assert_eq!(
+                unavailable(&unresolved, TaskAction::OpenLink),
+                "linki zadania nie mają jeszcze wartości"
+            );
+            let unsafe_scheme = displayed(
+                running("a", 1),
+                "NAR-12",
+                &[("Ewil", "x", Some("javascript:alert(1)"))],
+            );
+            assert!(!available(&unsafe_scheme, TaskAction::OpenLink));
+            let ok = displayed(
+                running("a", 1),
+                "NAR-12",
+                &[("Jira", "NAR-12", Some("https://jira.example/browse/NAR-12"))],
+            );
+            assert!(available(&ok, TaskAction::OpenLink));
+        }
+
+        #[test]
+        fn every_row_of_the_origin_table_has_a_key_an_action_and_a_rule() {
+            for (key, action) in [
+                ('m', TaskAction::Move),
+                ('p', TaskAction::PauseResume),
+                ('x', TaskAction::Interrupt),
+                ('t', TaskAction::Transition),
+                ('s', TaskAction::Restart),
+                ('a', TaskAction::Archive),
+                ('o', TaskAction::OpenLink),
+            ] {
+                assert_eq!(action.key(), key);
+                assert!(TaskAction::ALL.contains(&action));
+            }
+            assert!(TaskAction::Interrupt.needs_confirmation());
+            assert!(TaskAction::Archive.needs_confirmation());
+            assert!(!TaskAction::PauseResume.needs_confirmation());
+            assert!(!TaskAction::OpenLink.changes_state());
+        }
+    }
+
+    // -- the menu ----------------------------------------------------------
+
+    mod menu {
+        use super::*;
+
+        #[test]
+        fn dot_on_a_running_task_lists_the_actions_and_greys_out_the_move() {
+            let mut app = loaded(running("a", 1));
+            ch(&mut app, '.');
+            let Some(Overlay::Menu(_)) = app.overlay() else {
+                panic!("the menu should be open");
+            };
+            let chooser = app.overlay().unwrap().chooser().unwrap();
+            let by_label = |needle: &str| {
+                chooser
+                    .items()
+                    .iter()
+                    .find(|item| item.label.contains(needle))
+                    .unwrap_or_else(|| panic!("no entry {needle}"))
+            };
+            assert_eq!(by_label("wstrzymaj").unavailable, None);
+            assert_eq!(by_label("przerwij krok").unavailable, None);
+            assert!(by_label("przerwij krok").label.contains('!'));
+            assert_eq!(
+                by_label("przejście ręczne").unavailable.as_deref(),
+                Some("serwer nie podał wyjść bieżącego stanu"),
+                "no exits known, so the entry is greyed with the reason"
+            );
+            assert_eq!(
+                by_label("przesuń").unavailable.as_deref(),
+                Some("zadanie nie jest w kolejce")
+            );
+            assert!(by_label("archiwizuj").unavailable.is_some());
+            assert!(by_label("otwórz link").unavailable.is_some());
+            assert_eq!(app.key_context(), Context::Menu);
+        }
+
+        #[test]
+        fn the_transition_entry_is_there_when_the_state_has_exits() {
+            let task = with_transitions(running("a", 1), "review", &[("approved", "ship", None)], None);
+            let mut app = loaded(task);
+            ch(&mut app, '.');
+            let chooser = app.overlay().unwrap().chooser().unwrap();
+            let entry = chooser
+                .items()
+                .iter()
+                .find(|item| item.label.contains("przejście ręczne"))
+                .unwrap();
+            assert_eq!(entry.unavailable, None);
+        }
+
+        #[test]
+        fn the_menu_moves_picks_by_digit_and_closes_with_esc() {
+            let mut app = loaded(running("a", 1));
+            ch(&mut app, '.');
+            assert_eq!(app.overlay().unwrap().chooser().unwrap().selected(), 0);
+            ch(&mut app, 'j');
+            ch(&mut app, 'j');
+            assert_eq!(app.overlay().unwrap().chooser().unwrap().selected(), 2);
+            ch(&mut app, 'k');
+            assert_eq!(app.overlay().unwrap().chooser().unwrap().selected(), 1);
+            ch(&mut app, '4');
+            assert_eq!(app.overlay().unwrap().chooser().unwrap().selected(), 3);
+            press(&mut app, KeyCode::Esc);
+            assert!(app.overlay().is_none());
+            assert_eq!(app.key_context(), Context::List);
+        }
+
+        #[test]
+        fn enter_on_a_greyed_entry_says_why_and_keeps_the_menu_open() {
+            let mut app = loaded(running("a", 1));
+            ch(&mut app, '.');
+            // The first entry is the move, which a running task cannot do.
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert_eq!(note(&app), "przesuń: zadanie nie jest w kolejce");
+            assert!(app.overlay().is_some(), "the menu stays");
+        }
+
+        #[test]
+        fn a_shortcut_in_the_menu_runs_the_action_and_closes_it() {
+            let mut app = loaded(running("a", 1));
+            ch(&mut app, '.');
+            let request = act(ch(&mut app, 'p'));
+            assert!(app.overlay().is_none());
+            assert_eq!(request.send, ActionSend::Owner(OwnerCommand::Pause));
+        }
+
+        #[test]
+        fn enter_on_an_available_entry_runs_it() {
+            let mut app = loaded(running("a", 1));
+            ch(&mut app, '.');
+            ch(&mut app, '2');
+            let request = act(press(&mut app, KeyCode::Enter));
+            assert_eq!(request.send, ActionSend::Owner(OwnerCommand::Pause));
+        }
+
+        #[test]
+        fn a_shortcut_to_an_unavailable_action_in_the_menu_gives_the_same_reason() {
+            let mut app = loaded(running("a", 1));
+            ch(&mut app, '.');
+            assert_eq!(ch(&mut app, 'a'), Request::None);
+            assert!(note(&app).starts_with("archiwizacja: zadanie działa"), "{}", note(&app));
+            assert!(app.overlay().is_some());
+        }
+
+        #[test]
+        fn the_move_keys_work_from_the_menu_of_a_queued_task() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1), queued("b", 2)], "c"));
+            ch(&mut app, '.');
+            let request = ch(&mut app, 'J');
+            assert!(matches!(request, Request::Move(_)), "{request:?}");
+            assert!(app.overlay().is_none(), "a move to make closes the menu");
+
+            ch(&mut app, '.');
+            ch(&mut app, 'm');
+            assert!(app.overlay().is_none());
+            assert!(app.list().moving().is_some(), "m enters the move mode");
+        }
+
+        #[test]
+        fn the_menu_is_rebuilt_when_the_task_changes_and_closed_when_it_leaves() {
+            let mut app = loaded(running("a", 1));
+            ch(&mut app, '.');
+            app.on_stream(event(
+                "d",
+                "a",
+                2,
+                TaskLifecycle::Paused,
+                TaskEventKind::Created,
+            ));
+            let chooser = app.overlay().unwrap().chooser().unwrap();
+            assert!(
+                chooser.items().iter().any(|item| item.label.contains("wznów")),
+                "the pause became a resume"
+            );
+            app.on_stream(event(
+                "e",
+                "a",
+                3,
+                TaskLifecycle::Archived,
+                TaskEventKind::Created,
+            ));
+            assert!(app.overlay().is_none(), "the task left the list");
+        }
+
+        #[test]
+        fn the_menu_opens_from_the_details_too() {
+            let mut app = loaded(running("a", 1));
+            press(&mut app, KeyCode::Enter);
+            ch(&mut app, '.');
+            assert!(app.overlay().is_some());
+        }
+
+        #[test]
+        fn nothing_is_opened_without_a_task() {
+            let mut app = app();
+            ch(&mut app, '.');
+            assert!(app.overlay().is_none());
+            assert_eq!(ch(&mut app, 'p'), Request::None);
+        }
+    }
+
+    // -- shortcuts ---------------------------------------------------------
+
+    mod shortcuts {
+        use super::*;
+
+        #[test]
+        fn p_on_a_queued_task_says_why_it_cannot() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1)], "c"));
+            assert_eq!(ch(&mut app, 'p'), Request::None);
+            assert_eq!(note(&app), "pauza: zadanie jest w kolejce");
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Warning);
+        }
+
+        #[test]
+        fn p_pauses_a_running_task_and_resumes_a_paused_one_without_asking() {
+            let mut app = loaded(running("a", 1));
+            let pause = act(ch(&mut app, 'p'));
+            assert_eq!(pause.send, ActionSend::Owner(OwnerCommand::Pause));
+            assert_eq!(pause.generation, 1);
+            assert!(!pause.key.is_empty());
+            assert!(app.overlay().is_none(), "no window for a plain action");
+
+            let mut app = loaded(lifecycle("paused"));
+            let resume = act(ch(&mut app, 'p'));
+            assert_eq!(resume.send, ActionSend::Owner(OwnerCommand::Resume));
+        }
+
+        #[test]
+        fn s_starts_an_interrupted_task_again_and_says_why_for_a_running_one() {
+            let mut app = loaded(lifecycle("interrupted"));
+            let start = act(ch(&mut app, 's'));
+            assert_eq!(start.send, ActionSend::Owner(OwnerCommand::Start));
+
+            let mut app = loaded(running("a", 1));
+            assert_eq!(ch(&mut app, 's'), Request::None);
+            assert!(note(&app).starts_with("uruchomienie od nowa:"), "{}", note(&app));
+        }
+
+        #[test]
+        fn the_shortcuts_work_in_the_details_too() {
+            let mut app = loaded(running("a", 1));
+            press(&mut app, KeyCode::Enter);
+            let pause = act(ch(&mut app, 'p'));
+            assert_eq!(pause.send, ActionSend::Owner(OwnerCommand::Pause));
+        }
+
+        #[test]
+        fn a_retry_of_a_decision_that_got_no_answer_reuses_its_key() {
+            let mut app = loaded(running("a", 1));
+            let first = act(ch(&mut app, 'p'));
+            let again = act(ch(&mut app, 'p'));
+            assert_eq!(first.key, again.key, "the same decision, the same key");
+        }
+
+        #[tokio::test]
+        async fn a_lost_connection_keeps_the_key_for_the_retry() {
+            let mut app = loaded(running("a", 1));
+            let first = act(ch(&mut app, 'p'));
+            app.perform(Request::Act(Box::new(first.clone()))).await;
+            assert!(
+                app.notifier().latest().unwrap().severity == Severity::Error,
+                "{}",
+                note(&app)
+            );
+            // The connection came back.
+            app.load(listing(vec![titled(running("a", 1), "NAR-12")], "d"));
+            let again = act(ch(&mut app, 'p'));
+            assert_eq!(first.key, again.key);
+        }
+    }
+
+    // -- the confirmation window -------------------------------------------
+
+    mod confirmation {
+        use super::*;
+
+        #[test]
+        fn x_asks_with_the_effect_and_y_sends_the_interrupt() {
+            let mut app = loaded(running("a", 1));
+            assert_eq!(ch(&mut app, 'x'), Request::None);
+            let window = confirmation(&app);
+            assert!(window.heading().contains("Przerwij"), "{}", window.heading());
+            let text = window.lines().join(" ");
+            assert!(text.contains("„review”"), "the step it cuts short: {text}");
+            assert!(text.contains("NAR-12"), "{text}");
+            assert_eq!(app.key_context(), Context::Confirm);
+
+            let request = act(ch(&mut app, 'y'));
+            assert_eq!(request.send, ActionSend::Operator(OperatorCommand::Interrupt));
+            assert_eq!(request.task_id, "a");
+            assert_eq!(request.generation, 1);
+            assert!(!request.key.is_empty());
+            assert!(app.overlay().is_none());
+            assert_eq!(app.key_context(), Context::List);
+        }
+
+        #[test]
+        fn n_and_esc_take_it_back_and_other_keys_do_nothing() {
+            let mut app = loaded(running("a", 1));
+            ch(&mut app, 'x');
+            assert_eq!(ch(&mut app, 'j'), Request::None);
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert!(app.overlay().is_some(), "only y and n answer it");
+            assert_eq!(ch(&mut app, 'n'), Request::None);
+            assert!(app.overlay().is_none());
+
+            ch(&mut app, 'x');
+            assert_eq!(press(&mut app, KeyCode::Esc), Request::None);
+            assert!(app.overlay().is_none());
+        }
+
+        #[test]
+        fn a_on_a_finished_task_asks_and_y_archives() {
+            let mut app = loaded(finished("a", 1));
+            assert_eq!(ch(&mut app, 'a'), Request::None);
+            let window = confirmation(&app);
+            assert!(window.heading().contains("Archiwizuj"));
+            let text = window.lines().join(" ");
+            assert!(text.contains("Usuwa workload i storage"), "{text}");
+            assert!(text.contains("nie da się cofnąć"), "{text}");
+            let request = act(ch(&mut app, 'y'));
+            assert_eq!(request.send, ActionSend::Owner(OwnerCommand::Archive));
+        }
+
+        #[test]
+        fn every_action_marked_with_a_bang_asks_the_same_way() {
+            for (key, task) in [('x', running("a", 1)), ('a', finished("a", 1))] {
+                let mut app = loaded(task);
+                ch(&mut app, key);
+                assert_eq!(app.key_context(), Context::Confirm, "{key}");
+                assert!(matches!(
+                    app.overlay().unwrap().confirmation().unwrap().confirmed(),
+                    Confirmed::Act(_)
+                ));
+            }
+        }
+
+        #[test]
+        fn y_does_not_send_without_a_connection() {
+            let mut app = loaded(running("a", 1));
+            ch(&mut app, 'x');
+            app.on_stream(Some(Err(ClientError::Unavailable("down".into()))));
+            assert_eq!(ch(&mut app, 'y'), Request::None);
+            assert!(note(&app).contains("zablokowana"), "{}", note(&app));
+            assert!(app.overlay().is_none());
+        }
+
+        #[test]
+        fn the_window_closes_when_its_task_leaves_the_list() {
+            let mut app = loaded(finished("a", 1));
+            ch(&mut app, 'a');
+            app.on_stream(event(
+                "d",
+                "a",
+                2,
+                TaskLifecycle::Archived,
+                TaskEventKind::Created,
+            ));
+            assert!(app.overlay().is_none());
+        }
+
+        #[test]
+        fn the_keys_of_the_window_are_in_the_key_map() {
+            let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+            assert_eq!(
+                keymap::lookup(Context::Confirm, &press(KeyCode::Char('y'))),
+                Some(Action::Accept)
+            );
+            assert_eq!(
+                keymap::lookup(Context::Confirm, &press(KeyCode::Char('n'))),
+                Some(Action::Cancel)
+            );
+            assert_eq!(
+                keymap::lookup(Context::Confirm, &press(KeyCode::Esc)),
+                Some(Action::Cancel)
+            );
+            assert_eq!(Context::ALL.len(), 8, "the confirmation is the eighth context");
+            keymap::check_consistency(keymap::BINDINGS).expect("the key map stays consistent");
+            let hints = keymap::hints(Context::Confirm);
+            assert!(hints.iter().any(|(keys, label)| keys == "y" && *label == "potwierdź"));
+            assert!(hints.iter().any(|(keys, label)| keys.starts_with('n') && *label == "anuluj"));
+        }
+    }
+
+    // -- manual transitions --------------------------------------------------
+
+    mod transitions {
+        use super::*;
+
+        fn offered(override_targets: Option<&[&str]>) -> TaskSummary {
+            with_transitions(
+                running("a", 1),
+                "review",
+                &[
+                    ("approved", "ship", Some("Zatwierdza i wypuszcza zmianę.")),
+                    ("revise", "implement", None),
+                ],
+                override_targets,
+            )
+        }
+
+        #[test]
+        fn t_lists_the_exits_with_their_descriptions_and_a_choice_sends_the_transition() {
+            let mut app = loaded(offered(None));
+            assert_eq!(ch(&mut app, 't'), Request::None);
+            let Some(Overlay::Transitions(_)) = app.overlay() else {
+                panic!("the list of exits");
+            };
+            let chooser = app.overlay().unwrap().chooser().unwrap();
+            assert_eq!(chooser.items().len(), 2, "no override: only the exits");
+            assert!(chooser.items()[0].label.contains("approved"));
+            assert!(chooser.items()[0].label.contains("ship"));
+            assert!(chooser.items()[0].description.contains("Zatwierdza i wypuszcza"));
+            assert!(
+                chooser.items()[1].description.contains("nie opisuje"),
+                "an exit without a description says so"
+            );
+            let text = screen(&mut app, 120, 40);
+            assert!(text.contains("approved → ship"), "{text}");
+            assert!(text.contains("Zatwierdza i wypuszcza"), "{text}");
+
+            ch(&mut app, '2');
+            let request = act(press(&mut app, KeyCode::Enter));
+            assert_eq!(
+                request.send,
+                ActionSend::Operator(OperatorCommand::Transition {
+                    target: "implement".to_string(),
+                    forced: false,
+                    reason: None,
+                })
+            );
+            assert!(app.overlay().is_none(), "an exit is sent at once");
+        }
+
+        #[test]
+        fn esc_leaves_the_list_of_exits() {
+            let mut app = loaded(offered(None));
+            ch(&mut app, 't');
+            press(&mut app, KeyCode::Esc);
+            assert!(app.overlay().is_none());
+        }
+
+        #[test]
+        fn the_override_is_only_there_when_the_state_allows_it() {
+            let mut app = loaded(offered(None));
+            ch(&mut app, 't');
+            assert!(app
+                .overlay()
+                .unwrap()
+                .chooser()
+                .unwrap()
+                .items()
+                .iter()
+                .all(|item| !item.label.contains("override")));
+
+            let mut app = loaded(offered(Some(&["plan", "ship"])));
+            ch(&mut app, 't');
+            let chooser = app.overlay().unwrap().chooser().unwrap();
+            assert_eq!(chooser.items().len(), 3);
+            assert!(chooser.items()[2].label.contains("override"));
+            assert!(chooser.items()[2].label.starts_with('!'));
+        }
+
+        #[test]
+        fn the_override_needs_a_reason_and_asks_before_it_sends() {
+            let mut app = loaded(offered(Some(&["plan", "ship"])));
+            ch(&mut app, 't');
+            ch(&mut app, '3');
+            // Enter goes to the fields; Enter again with no reason complains.
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert!(app.overlay().is_some(), "no reason, nothing to confirm");
+            let chooser = app.overlay().unwrap().chooser().unwrap();
+            assert!(
+                chooser.fields_of(2)[1].error().is_some(),
+                "the reason is what is missing"
+            );
+
+            // Down to the reason, type it, send.
+            press(&mut app, KeyCode::Down);
+            typed(&mut app, "CI nie ruszy bez tego");
+            assert_eq!(app.key_context(), Context::Form, "typing: q and ? are text");
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            let window = confirmation(&app);
+            assert!(window.heading().contains("Override"));
+            let text = window.lines().join(" ");
+            assert!(text.contains("„review”") && text.contains("„plan”"), "{text}");
+            assert!(text.contains("CI nie ruszy bez tego"), "{text}");
+            assert!(text.contains("audytu"), "{text}");
+
+            let request = act(ch(&mut app, 'y'));
+            assert_eq!(
+                request.send,
+                ActionSend::Operator(OperatorCommand::Transition {
+                    target: "plan".to_string(),
+                    forced: true,
+                    reason: Some("CI nie ruszy bez tego".to_string()),
+                })
+            );
+        }
+
+        #[test]
+        fn n_in_the_override_window_sends_nothing() {
+            let mut app = loaded(offered(Some(&["plan"])));
+            ch(&mut app, 't');
+            ch(&mut app, '3');
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Down);
+            typed(&mut app, "powód");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(ch(&mut app, 'n'), Request::None);
+            assert!(app.overlay().is_none());
+        }
+
+        #[test]
+        fn t_where_the_state_has_no_exits_says_why() {
+            let mut app = loaded(running("a", 1));
+            assert_eq!(ch(&mut app, 't'), Request::None);
+            assert_eq!(
+                note(&app),
+                "przejście: serwer nie podał wyjść bieżącego stanu"
+            );
+            assert!(app.overlay().is_none());
+        }
+
+        #[test]
+        fn server_text_in_the_exits_is_made_safe() {
+            let task = with_transitions(
+                running("a", 1),
+                "review",
+                &[("ok", "ship", Some("Dobrze\u{1b}[31m czerwone"))],
+                None,
+            );
+            let mut app = loaded(task);
+            ch(&mut app, 't');
+            let text = screen(&mut app, 120, 40);
+            assert!(!text.contains('\u{1b}'));
+            assert!(text.contains("Dobrze"));
+        }
+    }
+
+    // -- links -----------------------------------------------------------------
+
+    mod links {
+        use super::*;
+
+        #[test]
+        fn o_without_a_link_value_says_why() {
+            let mut app = loaded(running("a", 1));
+            assert_eq!(ch(&mut app, 'o'), Request::None);
+            assert_eq!(note(&app), "link: workflow nie deklaruje linków");
+            let unresolved = displayed(running("a", 1), "NAR-12", &[("Jira", "—", None)]);
+            let mut app = loaded(unresolved);
+            assert_eq!(ch(&mut app, 'o'), Request::None);
+            assert_eq!(note(&app), "link: linki zadania nie mają jeszcze wartości");
+            assert!(app.overlay().is_none());
+        }
+
+        #[test]
+        fn o_lists_the_links_with_a_value_and_enter_opens_one() {
+            let task = displayed(
+                running("a", 1),
+                "NAR-12",
+                &[
+                    ("Jira", "NAR-12", Some("https://jira.example/browse/NAR-12")),
+                    ("PR", "—", None),
+                    ("Docs", "doc", Some("https://docs.example/x")),
+                ],
+            );
+            let mut app = loaded(task);
+            ch(&mut app, 'o');
+            let chooser = app.overlay().unwrap().chooser().unwrap();
+            assert_eq!(chooser.items().len(), 2, "the unresolved one is not offered");
+            assert!(chooser.items()[0].label.contains("Jira"));
+            ch(&mut app, '2');
+            let request = press(&mut app, KeyCode::Enter);
+            let Request::OpenLink(link) = request else {
+                panic!("a link was expected");
+            };
+            assert_eq!(link.url, "https://docs.example/x");
+            assert_eq!(link.label, "Docs");
+            assert!(app.overlay().is_none());
+        }
+
+        #[tokio::test]
+        async fn a_link_that_is_not_http_is_never_handed_to_a_browser() {
+            let mut app = loaded(running("a", 1));
+            app.perform(Request::OpenLink(
+                narsor::tui::task_app::actions::LinkRequest {
+                    label: "Zły".to_string(),
+                    url: "file:///etc/passwd".to_string(),
+                },
+            ))
+            .await;
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Error);
+            assert!(note(&app).contains("niebezpieczny"), "{}", note(&app));
+        }
+    }
+
+    // -- without a connection -------------------------------------------------
+
+    mod without_a_connection {
+        use super::*;
+
+        fn disconnected(task: TaskSummary) -> TaskApp {
+            let mut app = loaded(task);
+            app.on_stream(Some(Err(ClientError::Unavailable("down".into()))));
+            assert!(!app.connection().is_live());
+            app
+        }
+
+        #[test]
+        fn every_mutation_is_blocked_with_the_reason() {
+            for (key, task) in [
+                ('p', running("a", 1)),
+                ('x', running("a", 1)),
+                ('a', finished("a", 1)),
+                ('s', lifecycle("interrupted")),
+                (
+                    't',
+                    with_transitions(running("a", 1), "review", &[("ok", "ship", None)], None),
+                ),
+            ] {
+                let mut app = disconnected(task);
+                assert_eq!(ch(&mut app, key), Request::None, "{key}");
+                assert!(note(&app).contains("zablokowana"), "{key}: {}", note(&app));
+                assert!(app.overlay().is_none(), "{key}: nothing opens");
+            }
+        }
+
+        #[test]
+        fn the_menu_greys_out_what_changes_state_and_leaves_the_links() {
+            let task = displayed(
+                running("a", 1),
+                "NAR-12",
+                &[("Jira", "NAR-12", Some("https://jira.example/browse/NAR-12"))],
+            );
+            let mut app = disconnected(task);
+            ch(&mut app, '.');
+            let chooser = app.overlay().unwrap().chooser().unwrap();
+            let pause = chooser
+                .items()
+                .iter()
+                .find(|item| item.label.contains("wstrzymaj"))
+                .unwrap();
+            assert!(
+                pause.unavailable.as_deref().is_some_and(|reason| reason.contains("zablokowana")),
+                "{:?}",
+                pause.unavailable
+            );
+            let link = chooser
+                .items()
+                .iter()
+                .find(|item| item.label.contains("otwórz link"))
+                .unwrap();
+            assert_eq!(link.unavailable, None, "opening a link changes nothing");
+
+            // And it comes back with the connection.
+            app.on_stream(event(
+                "d",
+                "a",
+                2,
+                TaskLifecycle::Running,
+                TaskEventKind::Created,
+            ));
+            let chooser = app.overlay().unwrap().chooser().unwrap();
+            assert!(chooser
+                .items()
+                .iter()
+                .find(|item| item.label.contains("wstrzymaj"))
+                .unwrap()
+                .unavailable
+                .is_none());
+        }
+
+        #[test]
+        fn a_task_that_cannot_be_acted_on_says_so_before_the_connection_does() {
+            let mut app = disconnected(queued("a", 1));
+            assert_eq!(ch(&mut app, 'p'), Request::None);
+            assert_eq!(note(&app), "pauza: zadanie jest w kolejce");
+        }
+    }
+
+    // -- the verdict of the runner ---------------------------------------------
+
+    mod verdicts {
+        use super::*;
+
+        fn queued_command(id: &str, command: OperatorCommand) -> OperatorCommandView {
+            OperatorCommandView {
+                command_id: id.to_string(),
+                command,
+                status: OperatorCommandStatus::Queued,
+                submitted_at: super::super::task_app_support::at(),
+                updated_at: super::super::task_app_support::at(),
+                detail: None,
+            }
+        }
+
+        fn command(app: &TaskApp) -> OperatorCommandView {
+            app.list().tasks()[0].operator_commands[0].clone()
+        }
+
+        #[test]
+        fn queued_and_resolved_events_patch_the_row_and_the_bar_tells_the_verdict() {
+            let mut app = loaded(running("a", 1));
+            app.on_stream(event(
+                "d",
+                "a",
+                2,
+                TaskLifecycle::Running,
+                TaskEventKind::OperatorCommandQueued {
+                    command_id: "command-1".to_string(),
+                    command: OperatorCommand::Interrupt,
+                    requested_by: OwnerRef::new("local"),
+                },
+            ));
+            assert_eq!(command(&app).status, OperatorCommandStatus::Queued);
+            assert!(!app.refresh_wanted(), "queueing is patched, not re-read");
+
+            app.on_stream(event(
+                "e",
+                "a",
+                3,
+                TaskLifecycle::Running,
+                TaskEventKind::OperatorCommandResolved {
+                    command_id: "command-1".to_string(),
+                    status: OperatorCommandStatus::Applied,
+                    detail: None,
+                },
+            ));
+            assert_eq!(command(&app).status, OperatorCommandStatus::Applied);
+            assert_eq!(note(&app), "NAR-12: przerwanie kroku wykonane");
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Success);
+            assert_eq!(app.cursor(), Some("e"));
+        }
+
+        #[test]
+        fn a_command_the_runner_rejects_is_reported_with_its_reason() {
+            let mut app = loaded(running("a", 1));
+            app.on_stream(event(
+                "d",
+                "a",
+                2,
+                TaskLifecycle::Running,
+                TaskEventKind::OperatorCommandQueued {
+                    command_id: "command-1".to_string(),
+                    command: OperatorCommand::Transition {
+                        target: "ship".to_string(),
+                        forced: false,
+                        reason: None,
+                    },
+                    requested_by: OwnerRef::new("local"),
+                },
+            ));
+            app.on_stream(event(
+                "e",
+                "a",
+                3,
+                TaskLifecycle::Running,
+                TaskEventKind::OperatorCommandResolved {
+                    command_id: "command-1".to_string(),
+                    status: OperatorCommandStatus::Rejected,
+                    detail: Some("the execution moved on\u{1b}[31m already".to_string()),
+                },
+            ));
+            let text = note(&app);
+            assert!(text.contains("przejście do „ship” odrzucone przez runnera"), "{text}");
+            assert!(text.contains("the execution moved on"), "{text}");
+            assert!(!text.contains('\u{1b}'), "{text:?}");
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Error);
+            let command = command(&app);
+            assert_eq!(command.status, OperatorCommandStatus::Rejected);
+        }
+
+        #[test]
+        fn a_rejection_without_a_reason_says_so() {
+            let mut app = loaded(running("a", 1));
+            app.list_mut().note_operator_command(
+                "a",
+                queued_command("command-1", OperatorCommand::Interrupt),
+            );
+            app.on_stream(event(
+                "d",
+                "a",
+                2,
+                TaskLifecycle::Running,
+                TaskEventKind::OperatorCommandResolved {
+                    command_id: "command-1".to_string(),
+                    status: OperatorCommandStatus::Rejected,
+                    detail: None,
+                },
+            ));
+            assert!(note(&app).contains("bez podania przyczyny"), "{}", note(&app));
+        }
+
+        #[test]
+        fn a_verdict_is_told_once() {
+            let mut app = loaded(running("a", 1));
+            app.list_mut().note_operator_command(
+                "a",
+                queued_command("command-1", OperatorCommand::Interrupt),
+            );
+            let resolved = |cursor: &str, sequence| {
+                event(
+                    cursor,
+                    "a",
+                    sequence,
+                    TaskLifecycle::Running,
+                    TaskEventKind::OperatorCommandResolved {
+                        command_id: "command-1".to_string(),
+                        status: OperatorCommandStatus::Applied,
+                        detail: None,
+                    },
+                )
+            };
+            app.on_stream(resolved("d", 2));
+            app.on_stream(event(
+                "e",
+                "a",
+                3,
+                TaskLifecycle::Running,
+                TaskEventKind::Created,
+            ));
+            let before = app.notifier().latest().unwrap().at;
+            app.on_stream(resolved("f", 4));
+            assert_eq!(
+                app.notifier().latest().unwrap().at,
+                before,
+                "a settled command does not notify again"
+            );
+        }
+
+        #[test]
+        fn a_verdict_on_a_command_the_row_does_not_know_asks_for_a_read() {
+            let mut app = loaded(running("a", 1));
+            app.on_stream(event(
+                "d",
+                "a",
+                2,
+                TaskLifecycle::Running,
+                TaskEventKind::OperatorCommandResolved {
+                    command_id: "command-9".to_string(),
+                    status: OperatorCommandStatus::Applied,
+                    detail: None,
+                },
+            ));
+            assert!(app.refresh_wanted());
+            assert!(note(&app).contains("polecenie operatora wykonane"), "{}", note(&app));
+        }
+
+        #[test]
+        fn an_applied_transition_says_the_runner_goes_on() {
+            let mut app = loaded(running("a", 1));
+            app.list_mut().note_operator_command(
+                "a",
+                queued_command(
+                    "command-1",
+                    OperatorCommand::Transition {
+                        target: "ship".to_string(),
+                        forced: true,
+                        reason: Some("bo".to_string()),
+                    },
+                ),
+            );
+            app.on_stream(event(
+                "d",
+                "a",
+                2,
+                TaskLifecycle::Running,
+                TaskEventKind::OperatorCommandResolved {
+                    command_id: "command-1".to_string(),
+                    status: OperatorCommandStatus::Applied,
+                    detail: None,
+                },
+            ));
+            let text = note(&app);
+            assert!(text.contains("override do „ship” wykonane"), "{text}");
+            assert!(text.contains("runner kontynuuje"), "{text}");
+        }
+    }
+
+    // -- the reasons of early refusals ------------------------------------------
+
+    mod refusals {
+        use super::*;
+
+        #[test]
+        fn every_early_refusal_of_the_control_plane_has_words() {
+            for (code, expected) in [
+                ("override_reason_required", "override wymaga powodu"),
+                ("override_not_allowed", "nie dopuszcza override"),
+                ("illegal_transition", "nie jest dozwolone"),
+                ("missing_target", "brak stanu docelowego"),
+                ("stale_generation", "zmieniło się w międzyczasie"),
+                ("idempotency_key_reused", "klucz został już użyty"),
+            ] {
+                let text = refusal_reason(&ClientError::Request {
+                    code: code.to_string(),
+                    message: "detail from the server".to_string(),
+                });
+                assert!(text.contains(expected), "{code}: {text}");
+                assert!(text.contains("detail from the server"), "{code}: {text}");
+                let refused = refusal_reason(&ClientError::Refused {
+                    code: code.to_string(),
+                    message: String::new(),
+                });
+                assert!(!refused.contains("()"), "{code}: {refused}");
+            }
+            assert_eq!(
+                refusal_reason(&ClientError::Refused {
+                    code: "operator_command_refused".to_string(),
+                    message: "the task is paused; resume it first".to_string(),
+                }),
+                "the task is paused; resume it first"
+            );
+        }
+    }
+
+    // -- against a served control plane ------------------------------------------
+
+    mod served {
+        use super::*;
+
+        async fn next_event(app: &mut TaskApp, feed: &mut EventFeed) {
+            let item = tokio::time::timeout(Duration::from_secs(5), feed.next())
+                .await
+                .expect("an event arrives");
+            app.on_stream(item);
+        }
+
+        /// The runner of `task` takes the commands it has been sent and
+        /// settles each as `applied` (with `detail` when it refuses).
+        async fn settle_all(runner: &RunnerClient, applied: bool, detail: Option<&str>) -> usize {
+            let polled = runner.poll(None, 0).await.expect("poll");
+            for command in &polled.commands {
+                runner
+                    .ack_command(&command.command_id, applied, detail.map(str::to_string))
+                    .await
+                    .expect("ack");
+            }
+            polled.commands.len()
+        }
+
+        #[tokio::test]
+        async fn x_then_y_ends_with_the_runner_applying_it_and_the_row_updated() {
+            let harness = RemoteHarness::start().await;
+            let running = harness.running("NAR-12", "local", snapshot(1, None)).await;
+            let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+            app.refresh().await;
+            let mut feed = EventFeed::new(harness.owner.clone());
+            feed.ensure_open(&app);
+
+            assert_eq!(ch(&mut app, 'x'), Request::None);
+            let request = ch(&mut app, 'y');
+            assert!(matches!(request, Request::Act(_)), "{request:?}");
+            app.perform(request).await;
+            assert_eq!(
+                note(&app),
+                "NAR-12: przerwanie kroku wysłane do runnera",
+                "the answer says: queued"
+            );
+            assert_eq!(
+                app.list().tasks()[0].operator_commands[0].status,
+                OperatorCommandStatus::Queued
+            );
+
+            assert_eq!(settle_all(&running.runner, true, None).await, 1);
+            for _ in 0..8 {
+                if app.list().tasks()[0].operator_commands[0].status
+                    == OperatorCommandStatus::Applied
+                {
+                    break;
+                }
+                next_event(&mut app, &mut feed).await;
+            }
+            let command = &app.list().tasks()[0].operator_commands[0];
+            assert_eq!(command.status, OperatorCommandStatus::Applied);
+            assert_eq!(command.command, OperatorCommand::Interrupt);
+            assert_eq!(note(&app), "NAR-12: przerwanie kroku wykonane");
+            assert_eq!(app.list().tasks()[0].operator_commands.len(), 1, "no duplicate");
+        }
+
+        #[tokio::test]
+        async fn a_command_the_runner_rejects_ends_on_the_bar_with_its_reason() {
+            let harness = RemoteHarness::start().await;
+            let running = harness.running("NAR-12", "local", snapshot(1, None)).await;
+            let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+            app.refresh().await;
+            let mut feed = EventFeed::new(harness.owner.clone());
+            feed.ensure_open(&app);
+
+            ch(&mut app, 'x');
+            let request = ch(&mut app, 'y');
+            app.perform(request).await;
+            assert_eq!(
+                settle_all(&running.runner, false, Some("no step is in flight")).await,
+                1
+            );
+            for _ in 0..8 {
+                if app.list().tasks()[0].operator_commands[0].status
+                    == OperatorCommandStatus::Rejected
+                {
+                    break;
+                }
+                next_event(&mut app, &mut feed).await;
+            }
+            let text = note(&app);
+            assert!(text.contains("przerwanie kroku odrzucone przez runnera"), "{text}");
+            assert!(text.contains("no step is in flight"), "{text}");
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Error);
+        }
+
+        #[tokio::test]
+        async fn an_override_without_a_reason_is_refused_early_and_the_bar_says_why() {
+            let harness = RemoteHarness::start().await;
+            let _running = harness.running("NAR-12", "local", snapshot(1, None)).await;
+            let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+            app.refresh().await;
+            let task = app.list().tasks()[0].clone();
+            let request = ActionRequest {
+                task_id: "NAR-12".to_string(),
+                title: "NAR-12".to_string(),
+                generation: task.generation,
+                key: "override-1".to_string(),
+                verb: "override".to_string(),
+                summary: "override wysłany".to_string(),
+                send: ActionSend::Operator(OperatorCommand::Transition {
+                    target: "plan".to_string(),
+                    forced: true,
+                    reason: None,
+                }),
+            };
+            app.perform(Request::Act(Box::new(request))).await;
+            let text = note(&app);
+            assert!(text.contains("override odrzucone"), "{text}");
+            assert!(text.contains("override wymaga powodu"), "{text}");
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Error);
+        }
+
+        #[tokio::test]
+        async fn a_command_to_a_task_that_moved_on_is_refused_with_the_generation() {
+            let harness = RemoteHarness::start().await;
+            let _running = harness.running("NAR-12", "local", snapshot(1, None)).await;
+            let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+            app.refresh().await;
+            ch(&mut app, 'x');
+            let mut request = act(ch(&mut app, 'y'));
+            request.generation += 7;
+            app.perform(Request::Act(Box::new(request))).await;
+            let text = note(&app);
+            assert!(text.contains("przerwanie odrzucone"), "{text}");
+            assert!(text.contains("zmieniło się w międzyczasie"), "{text}");
+        }
+
+        #[tokio::test]
+        async fn archiving_a_finished_task_removes_its_row_and_selects_the_one_below() {
+            let harness = RemoteHarness::start().await;
+            let mut done = snapshot(1, None);
+            done.execution_status = ExecutionStatus::Completed;
+            let _running = harness.running("t1", "k8s", done).await;
+            harness.create("t2", Some("k8s")).await;
+            harness.create("t3", Some("k8s")).await;
+            let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+            app.refresh().await;
+            let mut feed = EventFeed::new(harness.owner.clone());
+            feed.ensure_open(&app);
+            let ids = |app: &TaskApp| -> Vec<String> {
+                app.list().tasks().iter().map(|t| t.task_id.to_string()).collect()
+            };
+            assert_eq!(ids(&app), ["t1", "t2", "t3"]);
+            assert_eq!(app.list().selected_id(), Some("t1"));
+
+            assert_eq!(ch(&mut app, 'a'), Request::None);
+            assert!(confirmation(&app).heading().contains("Archiwizuj"));
+            assert_eq!(ids(&app).len(), 3, "nothing was sent yet");
+            let request = ch(&mut app, 'y');
+            app.perform(request).await;
+            for _ in 0..8 {
+                if ids(&app).len() == 2 {
+                    break;
+                }
+                next_event(&mut app, &mut feed).await;
+            }
+            assert_eq!(ids(&app), ["t2", "t3"], "the row left the list");
+            assert_eq!(app.list().selected_id(), Some("t2"), "the selection went below");
+            assert!(note(&app).contains("zniknęło z listy"), "{}", note(&app));
+        }
+
+        #[tokio::test]
+        async fn pause_goes_through_the_owner_command_and_the_stream_shows_it() {
+            let harness = RemoteHarness::start().await;
+            let _running = harness.running("NAR-12", "local", snapshot(1, None)).await;
+            let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+            app.refresh().await;
+            let mut feed = EventFeed::new(harness.owner.clone());
+            feed.ensure_open(&app);
+            let request = ch(&mut app, 'p');
+            app.perform(request).await;
+            assert_eq!(note(&app), "NAR-12: wstrzymanie zlecone");
+            for _ in 0..8 {
+                if app.list().tasks()[0].lifecycle != TaskLifecycle::Running {
+                    break;
+                }
+                next_event(&mut app, &mut feed).await;
+            }
+            assert_eq!(app.list().tasks()[0].lifecycle, TaskLifecycle::PauseRequested);
+        }
+
+        #[tokio::test]
+        async fn the_exits_of_a_running_task_come_from_its_workflow() {
+            let harness = RemoteHarness::start().await;
+            let mut first = snapshot(1, None);
+            first.execution_cursor.current_state = Some("work".to_string());
+            let _running = harness.running("NAR-12", "local", first).await;
+            let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+            app.refresh().await;
+            let offer = app.list().tasks()[0]
+                .manual_transitions
+                .clone()
+                .expect("the sealed workflow names the exits of `work`");
+            assert_eq!(offer.from_state, "work");
+            assert_eq!(offer.exits.len(), 1);
+            assert_eq!(offer.exits[0].label, "success");
+            assert_eq!(offer.exits[0].target, "done");
+            assert!(!offer.override_allowed);
+            assert!(offer.override_targets.is_empty());
+
+            // `t` offers it, and the choice goes through the control plane
+            // that checks it against the same workflow.
+            ch(&mut app, 't');
+            let request = press(&mut app, KeyCode::Enter);
+            let request = act(request);
+            assert_eq!(
+                request.send,
+                ActionSend::Operator(OperatorCommand::Transition {
+                    target: "done".to_string(),
+                    forced: false,
+                    reason: None,
+                })
+            );
+            app.perform(Request::Act(Box::new(request))).await;
+            assert_eq!(note(&app), "NAR-12: przejście do „done” wysłane do runnera");
+
+            // The state the runner reported earlier was not one of the
+            // workflow's: the server offers nothing it cannot back.
+            let mut other = TaskApp::new(harness.owner.clone(), "local", None);
+            harness.running("NAR-13", "backend-a", snapshot(1, None)).await;
+            other.refresh().await;
+            let task = other
+                .list()
+                .tasks()
+                .iter()
+                .find(|task| task.task_id.as_str() == "NAR-13")
+                .unwrap();
+            assert!(task.manual_transitions.is_none());
+            assert_eq!(
+                unavailable(task, TaskAction::Transition),
+                "serwer nie podał wyjść bieżącego stanu"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_illegal_transition_is_refused_early_with_the_reason() {
+            let harness = RemoteHarness::start().await;
+            let mut first = snapshot(1, None);
+            first.execution_cursor.current_state = Some("work".to_string());
+            let _running = harness.running("NAR-12", "local", first).await;
+            let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+            app.refresh().await;
+            let request = ActionRequest {
+                task_id: "NAR-12".to_string(),
+                title: "NAR-12".to_string(),
+                generation: app.list().tasks()[0].generation,
+                key: "t-1".to_string(),
+                verb: "przejście".to_string(),
+                summary: "x".to_string(),
+                send: ActionSend::Operator(OperatorCommand::Transition {
+                    target: "work".to_string(),
+                    forced: false,
+                    reason: None,
+                }),
+            };
+            app.perform(Request::Act(Box::new(request))).await;
+            let text = note(&app);
+            assert!(text.contains("przejście odrzucone"), "{text}");
+            assert!(text.contains("nie jest dozwolone"), "{text}");
+        }
     }
 }

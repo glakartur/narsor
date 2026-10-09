@@ -1664,6 +1664,7 @@ impl ProtocolService {
             attention: task_attention(record),
             queue: record.queue.as_ref().map(QueueView::from),
             display: task_display(record),
+            manual_transitions: manual_transitions(record),
             as_of: now,
         })
     }
@@ -1934,6 +1935,58 @@ fn current_position(timeline: &Timeline) -> Option<String> {
 /// What a task shows as its title and links: the runner's latest rendering,
 /// else the workflow's `display` rendered from the sealed inputs alone —
 /// which is all there is to go on while the task still waits in the queue.
+/// The transitions an owner can ask for out of the state the runner last
+/// reported: read from the sealed workflow snapshot, only while the task is
+/// running (nothing else can carry one out).
+fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
+    if record.lifecycle != TaskLifecycle::Running {
+        return None;
+    }
+    let current = record
+        .runner
+        .as_ref()?
+        .snapshot
+        .execution_cursor
+        .current_state
+        .as_deref()?;
+    let definition = record.launch_spec.definition().ok()?;
+    let state = definition.states.get(current)?;
+    let mut exits: Vec<TransitionExit> = Vec::new();
+    let mut labels: Vec<(&String, &String)> = state.transitions.iter().collect();
+    labels.sort();
+    for (label, target) in labels {
+        if exits.iter().any(|exit| exit.target == *target) {
+            continue;
+        }
+        exits.push(TransitionExit {
+            label: label.clone(),
+            target: target.clone(),
+            description: state
+                .outputs
+                .iter()
+                .find(|output| output.label == *label)
+                .and_then(|output| output.description.clone()),
+        });
+    }
+    let mut override_targets: Vec<String> = if state.allow_manual_override {
+        definition
+            .states
+            .keys()
+            .filter(|id| id.as_str() != current)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    override_targets.sort();
+    Some(TransitionOffer {
+        from_state: current.to_string(),
+        exits,
+        override_allowed: state.allow_manual_override,
+        override_targets,
+    })
+}
+
 fn task_display(record: &TaskRecord) -> TaskDisplay {
     if let Some(reported) = record
         .runner

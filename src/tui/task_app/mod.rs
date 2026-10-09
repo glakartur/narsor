@@ -1,5 +1,5 @@
 //! The new task-based application (U8): the list, the header, the event
-//! stream, refreshing and moving tasks.
+//! stream, refreshing and moving tasks; the action menu (U11).
 //!
 //! It is built next to the old [`super::app`] and [`super::remote`] and takes
 //! the module name over in U14, when `tui::run` switches to it. The state it
@@ -59,13 +59,19 @@
 //!   height from [`detail::render`] and the tab content gives up the rows; the
 //!   keys of [`keymap::Context::Panel`] apply while it has the focus (`Tab` is
 //!   [`Action::SwitchFocus`], ignored until then).
-//! * **The action menu (U11)** is an overlay like the help: a new field next
-//!   to `help_open`, a new arm in [`TaskApp::key_context`]. A mutation must
-//!   first pass [`TaskApp::mutation_allowed`], and send its own
-//!   [`idempotency_key`].
+//! * **The action menu (U11)** is in: [`actions`]. `.` opens it, every action
+//!   has a shortcut, and [`actions::availability`] decides — for the menu, the
+//!   shortcuts and the bar — whether an action can be done and why not. What
+//!   sits over the screen is an [`Overlay`] in the field next to `help_open`;
+//!   it takes the keys first ([`TaskApp::key_context`], [`TaskApp::on_key`]).
+//!   An action `!` waits in the `y` / `n` [`actions::Confirmation`]. A new
+//!   mutation must first pass [`TaskApp::mutation_allowed`], and send its own
+//!   [`idempotency_key`]; the verdict of an operator command comes back as an
+//!   event and ends on the bar ([`list::CommandResolved`]).
 //! * **The new-task form (U13)** takes [`layout::Areas::detail`]; a task it
 //!   sent shows as an [`list::StateIcon::Sending`] row.
 
+pub mod actions;
 pub mod detail;
 pub mod layout;
 pub mod list;
@@ -83,12 +89,13 @@ use crate::api::{ApiClient, ClientError};
 use crate::controller_protocol::{
     CapabilitiesView, ControlEventEnvelope, MoveTaskRequest, TaskListResponse,
 };
-use crate::orchestration::{MoveTarget, TaskLifecycle};
+use crate::orchestration::MoveTarget;
 
 use super::connection::Connection;
 use super::keymap::{self, Action, Context};
 use super::refresh::RefreshSchedule;
 use super::scroll::sanitize;
+use actions::{availability, ActionRequest, Availability, LinkRequest, Overlay, TaskAction};
 use detail::TaskDetail;
 use list::{title_of, MoveRequest, Removal, TaskList};
 use notify::{Notifier, Severity};
@@ -255,6 +262,10 @@ pub enum Request {
     Move(MoveRequest),
     /// Send what the answer panel's operator chose.
     Answer(Box<AnswerRequest>),
+    /// Send an action of the menu, confirmed where it asks to be.
+    Act(Box<ActionRequest>),
+    /// Point the browser at a link of the task.
+    OpenLink(LinkRequest),
 }
 
 /// A fresh key for a command that must not run twice (an owner command, an
@@ -275,6 +286,12 @@ pub struct TaskApp {
     focus: Focus,
     detail: DetailState,
     help_open: bool,
+    /// What sits over the screen and takes the keys: the action menu, a list
+    /// of exits or links, the `y` / `n` window.
+    overlay: Option<Overlay>,
+    /// The keys of actions that got no answer, by decision: a retry of the
+    /// same decision reuses its key.
+    action_keys: BTreeMap<String, String>,
     /// The keyboard is on the answer panel at the bottom of the details.
     panel_focus: bool,
     quit: bool,
@@ -305,6 +322,8 @@ impl TaskApp {
             focus: Focus::List,
             detail: DetailState::new(),
             help_open: false,
+            overlay: None,
+            action_keys: BTreeMap::new(),
             panel_focus: false,
             quit: false,
             quit_confirm: false,
@@ -392,6 +411,9 @@ impl TaskApp {
 
     /// The context whose keys apply now.
     pub fn key_context(&self) -> Context {
+        if let Some(overlay) = &self.overlay {
+            return overlay.context();
+        }
         if self.panel_focused() {
             // Typing into a field: `q` and `?` are text, not commands.
             return if self.panel_typing() {
@@ -430,6 +452,9 @@ impl TaskApp {
             return Request::None;
         }
         let confirming_quit = std::mem::take(&mut self.quit_confirm);
+        if self.overlay.is_some() {
+            return self.on_overlay_key(key, confirming_quit);
+        }
         if self.panel_focused() {
             return self.on_panel_key(key, confirming_quit);
         }
@@ -472,8 +497,12 @@ impl TaskApp {
             Action::MoveMode => self.start_move_mode(),
             Action::Confirm if context == Context::Move => return self.finish_move_mode(),
             Action::Cancel if context == Context::Move => self.list.cancel_move(),
-            // Keys of the units to come: the menu, the panel, the forms.
-            _ => {}
+            Action::ActionMenu => self.open_menu(),
+            other => {
+                if let Some(action) = TaskAction::of_key(other) {
+                    return self.invoke(action);
+                }
+            }
         }
         Request::None
     }
@@ -539,8 +568,9 @@ impl TaskApp {
         let Some(task) = self.list.selected() else {
             return false;
         };
-        if task.lifecycle != TaskLifecycle::Queued {
-            self.notify(Severity::Warning, "przesuń: zadanie nie jest w kolejce");
+        if let Availability::Unavailable(reason) = availability(task, TaskAction::Move) {
+            let word = actions::verb(task, TaskAction::Move);
+            self.notify(Severity::Warning, format!("{word}: {reason}"));
             return false;
         }
         self.mutation_allowed()
@@ -577,7 +607,14 @@ impl TaskApp {
 
     /// `m`: previews a place with `j`/`k`.
     fn start_move_mode(&mut self) {
-        if self.movable_selection() && !self.list.start_move() {
+        if self.movable_selection() {
+            self.begin_move();
+        }
+    }
+
+    /// Enters the move mode on the selected task, which must be movable.
+    fn begin_move(&mut self) {
+        if !self.list.start_move() {
             self.notify(Severity::Warning, "przesuń: zadanie nie jest na liście");
         }
     }
@@ -604,6 +641,8 @@ impl TaskApp {
             Request::None => {}
             Request::Move(request) => self.move_task(request).await,
             Request::Answer(request) => self.answer(*request).await,
+            Request::Act(request) => self.act(*request).await,
+            Request::OpenLink(link) => self.open_link(link),
         }
     }
 
@@ -700,6 +739,7 @@ impl TaskApp {
         self.detail.retain(self.list.tasks());
         self.detail.invalidate();
         self.sync_waiting();
+        self.sync_overlay();
         self.announce(removal);
     }
 
@@ -773,6 +813,10 @@ impl TaskApp {
                     self.schedule.request(now);
                 }
                 self.sync_waiting();
+                self.sync_overlay();
+                if let Some(resolved) = &effect.resolved {
+                    self.notify_resolved(resolved);
+                }
                 self.announce(effect.removal);
             }
             Some(Err(error)) if is_transport(&error) => {

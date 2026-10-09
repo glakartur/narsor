@@ -33,7 +33,7 @@ use ratatui::Frame;
 
 use super::super::keymap::{self, Context};
 use super::super::style::{Role, Styles};
-use super::detail;
+use super::{actions, detail};
 use super::list::{Counters, Slots, TaskList};
 use super::{Focus, TaskApp};
 
@@ -163,13 +163,14 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
         detail::render(frame, detail_area, app, styles, stale);
     }
     render_bar(frame, areas.bar, app, styles, now);
+    let body = Rect::new(
+        areas.outer.x + 2,
+        areas.outer.y + 1,
+        areas.outer.width.saturating_sub(4),
+        areas.outer.height.saturating_sub(3),
+    );
+    actions::render(frame, body, app, styles);
     if app.is_help_open() {
-        let body = Rect::new(
-            areas.outer.x + 2,
-            areas.outer.y + 1,
-            areas.outer.width.saturating_sub(4),
-            areas.outer.height.saturating_sub(3),
-        );
         keymap::render_help(frame, body, app.key_context(), styles);
     }
 }

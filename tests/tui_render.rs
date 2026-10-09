@@ -338,6 +338,7 @@ mod colour_discipline {
         "failure_form.rs",
         "input_form.rs",
         "keymap.rs",
+        "task_app/actions.rs",
         "task_app/detail.rs",
         "task_app/layout.rs",
         "task_app/list.rs",
@@ -1192,5 +1193,258 @@ mod task_app_waiting_render {
         let mut app = opened(with_pending(running(), hostile));
         let screen = draw_app(&mut app, 120, 40, false);
         assert!(!screen.contains('\u{1b}') && !screen.contains('\u{202e}') && !screen.contains('\u{7}'), "{screen}");
+    }
+}
+
+/// U11: the action menu, the lists of exits and links and the confirmation
+/// window, drawn.
+mod task_app_actions_render {
+    use super::*;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use narsor::api::ApiClient;
+    use narsor::controller_protocol::TaskSummary;
+    use narsor::domain::ExecutionStatus;
+    use narsor::tui::task_app::{layout, TaskApp};
+
+    use crate::task_app_support::{
+        displayed, listing, queued, task, titled, with_controller, with_runner, with_transitions,
+    };
+
+    fn press(app: &mut TaskApp, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn running() -> TaskSummary {
+        with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        )
+    }
+
+    fn opened(task: TaskSummary, keys: &str) -> TaskApp {
+        let mut app = TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        );
+        app.load(listing(vec![titled(task, "NAR-12")], "c"));
+        for key in keys.chars() {
+            press(&mut app, KeyCode::Char(key));
+        }
+        app
+    }
+
+    fn draw_app(app: &mut TaskApp, width: u16, height: u16, no_color: bool) -> String {
+        screen(&draw(width, height, |frame| {
+            layout::render(frame, app, &Styles::new(no_color), Instant::now())
+        }))
+    }
+
+    #[test]
+    fn the_menu_shows_the_actions_their_keys_and_why_the_move_is_grey() {
+        let mut app = opened(running(), ".");
+        let screen = draw_app(&mut app, 120, 40, false);
+        for expected in [
+            "Akcje · NAR-12",
+            "p  wstrzymaj",
+            "x  przerwij krok !",
+            "t  przejście ręczne",
+            "a  archiwizuj !",
+            "o  otwórz link",
+            "m  przesuń w kolejce",
+            "Opis",
+        ] {
+            assert!(
+                screen.contains(expected),
+                "{expected:?} is missing:\n{screen}"
+            );
+        }
+        // The highlighted entry is the move, which cannot be done: its
+        // description starts with the reason.
+        assert!(
+            screen.contains("niedostępne: zadanie nie jest w kolejce"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_menu_fits_a_narrow_terminal_with_the_description_under_it() {
+        let mut app = opened(running(), ".");
+        let screen = draw_app(&mut app, 64, 40, false);
+        let rows: Vec<&str> = screen.lines().collect();
+        let list = rows
+            .iter()
+            .position(|row| row.contains("o  otwórz link"))
+            .expect("the list");
+        let description = rows
+            .iter()
+            .position(|row| row.contains("Opis"))
+            .expect("the description");
+        assert!(description > list, "{screen}");
+    }
+
+    #[test]
+    fn the_bar_shows_the_keys_of_the_menu_and_of_the_confirmation() {
+        let mut app = opened(running(), ".");
+        let menu = draw_app(&mut app, 120, 40, false);
+        assert!(menu.contains("wykonaj") && menu.contains("zamknij"), "{menu}");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('x'));
+        let asking = draw_app(&mut app, 120, 40, false);
+        assert!(
+            asking.contains("potwierdź") && asking.contains("anuluj"),
+            "{asking}"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_window_says_what_will_happen_and_what_y_and_n_do() {
+        let mut app = opened(running(), "x");
+        let screen = draw_app(&mut app, 120, 40, false);
+        for expected in [
+            "Przerwij bieżący krok !",
+            "Przerywa trwający krok „review” zadania NAR-12.",
+            "odzyskania",
+            "y potwierdź",
+            "n/Esc anuluj",
+        ] {
+            assert!(
+                screen.contains(expected),
+                "{expected:?} is missing:\n{screen}"
+            );
+        }
+
+        let finished = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Completed,
+            "done",
+        );
+        let mut app = opened(finished, "a");
+        let screen = draw_app(&mut app, 100, 30, false);
+        assert!(
+            screen.contains("Archiwizuj zadanie !")
+                && screen.contains("Usuwa workload i storage zadania NAR-12.")
+                && screen.contains("! Tego nie da się cofnąć."),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_window_fits_a_narrow_terminal() {
+        let mut app = opened(running(), "x");
+        let screen = draw_app(&mut app, 64, 24, false);
+        assert!(
+            screen.contains("Przerywa trwający krok") && screen.contains("y potwierdź"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn without_colour_the_bangs_and_the_reasons_survive() {
+        let mut app = opened(running(), ".");
+        let menu = draw_app(&mut app, 120, 40, true);
+        assert!(
+            menu.contains("przerwij krok !") && menu.contains("archiwizuj !"),
+            "{menu}"
+        );
+        assert!(menu.contains("niedostępne: zadanie nie jest w kolejce"), "{menu}");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('x'));
+        let confirm = draw_app(&mut app, 120, 40, true);
+        assert!(confirm.contains("!") && confirm.contains("y potwierdź"), "{confirm}");
+    }
+
+    #[test]
+    fn a_queued_task_has_its_move_available_and_everything_else_greyed() {
+        let mut app = TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        );
+        app.load(listing(vec![queued("a", 1)], "c"));
+        press(&mut app, KeyCode::Char('.'));
+        press(&mut app, KeyCode::Char('2'));
+        let screen = draw_app(&mut app, 120, 40, false);
+        assert!(
+            screen.contains("niedostępne: zadanie jest w kolejce"),
+            "the pause says why:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_transition_list_shows_the_exits_with_their_descriptions_and_the_override() {
+        let task = with_transitions(
+            running(),
+            "review",
+            &[
+                ("approved", "ship", Some("Zatwierdza i wypuszcza zmianę.")),
+                ("revise", "implement", None),
+            ],
+            Some(&["plan", "ship"]),
+        );
+        let mut app = opened(task, "t");
+        let screen = draw_app(&mut app, 120, 40, false);
+        for expected in [
+            "Przejście ręczne · NAR-12 · z „review”",
+            "approved → ship",
+            "revise → implement",
+            "! override — dowolny stan",
+            "Zatwierdza i wypuszcza zmianę.",
+        ] {
+            assert!(
+                screen.contains(expected),
+                "{expected:?} is missing:\n{screen}"
+            );
+        }
+        // The override asks for a target and a reason.
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Enter);
+        let fields = draw_app(&mut app, 120, 40, false);
+        assert!(
+            fields.contains("stan docelowy (wymagane)") && fields.contains("powód (wymagane)"),
+            "{fields}"
+        );
+        assert!(fields.contains("trafia do audytu"), "{fields}");
+    }
+
+    #[test]
+    fn the_link_list_shows_the_addresses_it_would_open() {
+        let task = displayed(
+            running(),
+            "NAR-12",
+            &[
+                ("Jira", "NAR-12", Some("https://jira.example/browse/NAR-12")),
+                ("PR", "—", None),
+            ],
+        );
+        let mut app = opened(task, "o");
+        let screen = draw_app(&mut app, 120, 40, false);
+        assert!(
+            screen.contains("Linki · NAR-12")
+                && screen.contains("Jira: NAR-12")
+                && screen.contains("https://jira.example/browse/NAR-12"),
+            "{screen}"
+        );
+        assert!(
+            screen.matches("PR: —").count() == 1,
+            "an empty link is in the header only, not in the list:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_hostile_label_in_a_link_cannot_reach_the_terminal() {
+        let task = displayed(
+            running(),
+            "NAR-12",
+            &[("Ji\u{1b}[31mra\u{202e}", "NAR", Some("https://jira.example/x"))],
+        );
+        let mut app = opened(task, "o");
+        let screen = draw_app(&mut app, 120, 40, false);
+        assert!(
+            !screen.contains('\u{1b}') && !screen.contains('\u{202e}'),
+            "{screen}"
+        );
     }
 }

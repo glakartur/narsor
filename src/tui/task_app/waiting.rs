@@ -241,8 +241,6 @@ struct Entry {
     context_scroll: ScrollState,
     /// What the last send found wrong, or the server refused with.
     error: Option<String>,
-    /// The action that needs its second `Enter`: irreversible.
-    armed: Option<usize>,
     /// The key of a send that did not get an answer; a retry of the same
     /// decision reuses it.
     key: Option<String>,
@@ -267,7 +265,6 @@ impl Entry {
             chooser,
             context_scroll: ScrollState::new(),
             error: None,
-            armed: None,
             key: None,
             sent: false,
         }
@@ -407,19 +404,9 @@ impl Entry {
         }
     }
 
-    /// The lines under the context: what is armed, what went wrong.
+    /// The lines under the context: what went wrong.
     fn notices(&self) -> Vec<(Role, String)> {
         let mut notices = Vec::new();
-        if let Some(label) = self
-            .armed
-            .and_then(|index| self.chooser.items().get(index))
-            .map(|item| one_line(&item.label))
-        {
-            notices.push((
-                Role::Problem,
-                format!("! {label} jest nieodwracalne — Enter potwierdza, Esc anuluje"),
-            ));
-        }
         if let Some(error) = &self.error {
             notices.push((Role::Problem, format!("✗ {}", one_line(error))));
         }
@@ -447,6 +434,8 @@ pub enum PanelEffect {
     Notice(String),
     /// Send the chosen action.
     Submit(Submission),
+    /// The chosen action cannot be undone: ask in the `y` / `n` window first.
+    Confirm(Submission),
 }
 
 /// What a read of the panel's entries changed.
@@ -664,7 +653,6 @@ impl WaitingPanel {
             }
         }
         let entry = &mut self.entries[self.current];
-        let was_armed = entry.armed.take();
         let action = entry.chooser.on_key(key);
         match action {
             ChooserAction::None => {
@@ -673,7 +661,6 @@ impl WaitingPanel {
                 entry.error = None;
                 PanelEffect::None
             }
-            ChooserAction::Cancel if was_armed.is_some() => PanelEffect::None,
             ChooserAction::Cancel => PanelEffect::Collapse,
             ChooserAction::Blocked(reason) => PanelEffect::Notice(reason),
             ChooserAction::Submit(submission) => {
@@ -682,11 +669,11 @@ impl WaitingPanel {
                     .items()
                     .get(submission.index)
                     .is_some_and(|item| item.irreversible);
-                if irreversible && was_armed != Some(submission.index) {
-                    entry.armed = Some(submission.index);
-                    return PanelEffect::None;
+                if irreversible {
+                    PanelEffect::Confirm(submission)
+                } else {
+                    PanelEffect::Submit(submission)
                 }
-                PanelEffect::Submit(submission)
             }
         }
     }
@@ -911,6 +898,11 @@ impl WaitingPanel {
 
 /// The context wrapped to `width` columns, one row per line, each in its
 /// tone. Everything in it is somebody else's text, so it is made safe here.
+/// A description as lines, each safe for a terminal.
+fn one_line_per_row(text: &str) -> Vec<String> {
+    text.lines().map(one_line).collect()
+}
+
 fn context_rows(lines: &[ContextLine], width: usize) -> Vec<(Tone, String)> {
     let width = width.max(1);
     let mut rows = Vec::new();
@@ -1091,12 +1083,37 @@ impl TaskApp {
                 Request::None
             }
             PanelEffect::Submit(submission) => self.submit_answer(&id, &submission),
+            PanelEffect::Confirm(submission) => self.ask_to_confirm(&id, &submission),
         };
         if let Some(view) = self.detail.views.get(&id) {
             let text = view.waiting.draft_text();
             self.detail.set_draft(&id, text);
         }
         request
+    }
+
+    /// An action that cannot be undone: the request is prepared as for any
+    /// other, but waits in the confirmation window for `y`.
+    fn ask_to_confirm(&mut self, id: &str, submission: &Submission) -> Request {
+        let Request::Answer(request) = self.submit_answer(id, submission) else {
+            return Request::None;
+        };
+        let (label, mut lines) = self
+            .selected_panel()
+            .and_then(WaitingPanel::chooser)
+            .and_then(|chooser| chooser.items().get(submission.index))
+            .map_or_else(
+                || (submission.label.clone(), Vec::new()),
+                |item| {
+                    (
+                        item.label.clone(),
+                        one_line_per_row(&item.description),
+                    )
+                },
+            );
+        lines.push("! Tego nie da się cofnąć.".to_string());
+        self.confirm_answer(request, format!("{} !", one_line(&label)), lines);
+        Request::None
     }
 
     /// Turns a chosen action into a request, unless the connection or the

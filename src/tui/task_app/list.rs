@@ -39,10 +39,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use ratatui::Frame;
 
-use crate::controller_protocol::{Freshness, InputView, QueueView, TaskSummary};
+use crate::controller_protocol::{
+    Freshness, InputView, OperatorCommandView, QueueView, TaskSummary,
+};
 use crate::domain::{BackendId, ExecutionStatus};
 use crate::orchestration::{
-    AttentionItem, AttentionKind, MoveTarget, QueueReason, TaskEvent, TaskEventKind, TaskLifecycle,
+    AttentionItem, AttentionKind, MoveTarget, OperatorCommand, OperatorCommandStatus, QueueReason,
+    TaskEvent, TaskEventKind, TaskLifecycle,
 };
 
 use super::super::scroll::sanitize;
@@ -309,6 +312,24 @@ pub struct EventEffect {
     pub applied: bool,
     /// The selected task left the list.
     pub removal: Option<Removal>,
+    /// The runner settled a command of the operator.
+    pub resolved: Option<CommandResolved>,
+}
+
+/// An operator command the runner settled (or the control plane made
+/// obsolete), as the event said it, with what the row knew of the command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandResolved {
+    /// The task.
+    pub task_id: String,
+    /// What its row shows.
+    pub title: String,
+    /// What was asked, when the row knew the command.
+    pub command: Option<OperatorCommand>,
+    /// How it ended.
+    pub status: OperatorCommandStatus,
+    /// Why it was rejected.
+    pub detail: Option<String>,
 }
 
 /// A move the operator asked for, ready to send.
@@ -718,9 +739,35 @@ impl TaskList {
 
         match &event.kind {
             TaskEventKind::Moved { order, .. } => self.apply_order(index, order),
+            kind @ (TaskEventKind::OperatorCommandQueued { .. }
+            | TaskEventKind::OperatorCommandResolved { .. }) => {
+                let (refresh, resolved) = patch_operator_command(&mut self.tasks[index], kind, event);
+                effect.refresh = refresh;
+                effect.resolved = resolved;
+            }
             kind => effect.refresh = patch_row(&mut self.tasks[index], kind, event),
         }
         effect
+    }
+
+    /// Records a command the server accepted in the row it belongs to, unless
+    /// the row already has it (the stream's `OperatorCommandQueued` may have
+    /// come first), so that its verdict can be told by what it was.
+    pub fn note_operator_command(&mut self, task_id: &str, command: OperatorCommandView) {
+        let Some(task) = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.task_id.as_str() == task_id)
+        else {
+            return;
+        };
+        if task
+            .operator_commands
+            .iter()
+            .all(|known| known.command_id != command.command_id)
+        {
+            task.operator_commands.push(command);
+        }
     }
 
     /// Reorders the rows of the backend of `tasks[index]` to `order` and
@@ -914,6 +961,70 @@ impl TaskList {
         );
         frame.render_widget(block, area);
         frame.render_stateful_widget(List::new(items), inner, &mut self.view);
+    }
+}
+
+/// Patches the commands of a row with what an operator-command event says.
+/// Returns whether a read is wanted — an applied command may have moved the
+/// execution, which the event does not say where — and the verdict, when this
+/// event is the one that settled the command.
+fn patch_operator_command(
+    task: &mut TaskSummary,
+    kind: &TaskEventKind,
+    event: &TaskEvent,
+) -> (bool, Option<CommandResolved>) {
+    match kind {
+        TaskEventKind::OperatorCommandQueued {
+            command_id,
+            command,
+            ..
+        } => {
+            if task
+                .operator_commands
+                .iter()
+                .all(|known| known.command_id != *command_id)
+            {
+                task.operator_commands.push(OperatorCommandView {
+                    command_id: command_id.clone(),
+                    command: command.clone(),
+                    status: OperatorCommandStatus::Queued,
+                    submitted_at: event.at,
+                    updated_at: event.at,
+                    detail: None,
+                });
+            }
+            (false, None)
+        }
+        TaskEventKind::OperatorCommandResolved {
+            command_id,
+            status,
+            detail,
+        } => {
+            let known = task
+                .operator_commands
+                .iter_mut()
+                .find(|known| known.command_id == *command_id);
+            let (command, was_settled) = match known {
+                Some(known) => {
+                    let was_settled = known.status.is_settled();
+                    known.status = *status;
+                    known.detail = detail.clone();
+                    known.updated_at = event.at;
+                    (Some(known.command.clone()), was_settled)
+                }
+                None => (None, false),
+            };
+            let resolved = (!was_settled).then(|| CommandResolved {
+                task_id: task.task_id.to_string(),
+                title: title_of(task),
+                command: command.clone(),
+                status: *status,
+                detail: detail.clone(),
+            });
+            let refresh = command.is_none() || *status == OperatorCommandStatus::Applied;
+            (refresh, resolved)
+        }
+        _ => (true, None),
     }
 }
 
