@@ -1,20 +1,15 @@
-//! The full-screen terminal interface (U10).
+//! The full-screen terminal interface.
 //!
 //! A windowed, `lazygit`-shaped console: the alternate screen is taken over
 //! entirely, bordered panels fill it, one of them holds focus, and a bar of
 //! context-sensitive shortcuts sits at the bottom. Navigation is vim-flavoured
 //! (`j`/`k`, `g`/`G`, `q`) and nothing depends on a mouse.
 //!
-//! # The three layers
-//!
-//! * [`app`] — everything the interface *knows*: which executions exist, which
-//!   one is selected, what its event stream holds, which modal is open and what
-//!   the operator has typed into it. It never touches a terminal, which is why
-//!   it is the layer `tests/tui_state.rs` drives.
-//! * [`views`] — everything the interface *looks like*: the panel geometry and
-//!   the widgets. Pure rendering, derived from [`app::App`].
-//! * this module — the terminal lifecycle and the event loop that joins the
-//!   two: keys in, engine events in, a redraw out.
+//! There is one mode and one application, [`task_app::TaskApp`]: the tasks of
+//! the control plane (`/control/v1`) of whichever backend the configuration
+//! names — the local daemon, launched when none runs, or a remote server. This
+//! module is the terminal lifecycle and the event loop that joins the
+//! application to the terminal: keys in, control-plane events in, a redraw out.
 //!
 //! # Why the terminal is restored twice over
 //!
@@ -27,50 +22,13 @@
 //! go through [`restore_terminal`], which is idempotent and counts its calls so
 //! that a test can prove the path actually ran.
 //!
-//! # Events come from the daemon, not from an in-process engine (U7)
+//! # An unreachable server does not keep the interface closed
 //!
-//! The live stream used to be [`crate::engine::Engine::subscribe`] — an
-//! in-process broadcast channel shared with an `Arc<Engine>` this module
-//! constructed itself. U7 removes that construction entirely (R4): the only
-//! engine this process ever touches now is the daemon's, reached over
-//! [`crate::api::ApiClient`], discovered or transparently launched by
-//! [`crate::api::ensure_daemon_running`] (AE2) exactly as every CLI command
-//! already does (U6). The live stream is [`ApiClient::stream_all`] — a global
-//! SSE connection — mixed into the same `tokio::select!` a broadcast receiver
-//! used to occupy; the loop's shape does not change, only where its events
-//! come from.
-//!
-//! # The SSE replay gap, and why this loop does not try to close it
-//!
-//! `stream_all()`'s underlying connection is lazy — building the stream value
-//! does nothing over the wire; only the first `.next().await` actually opens
-//! it — so there is no way to *guarantee* the connection is live before
-//! [`App::refresh`] runs its own first `GET /executions` a few lines below.
-//! This mirrors the exact gap `src/cli/commands.rs`'s `wait_until_stopped`
-//! documents for `stream_execution`: a broadcast/SSE subscription has no
-//! replay, so a subscriber that connects a moment too late silently misses
-//! whatever already happened.
-//!
-//! This loop does not attempt to close that gap by synchronizing the SSE
-//! handshake (there is no explicit "subscribed" acknowledgement to wait on,
-//! short of racily waiting for the first keep-alive comment frame). Instead
-//! it leans on the same fallback the CLI settled on: every mutating call this
-//! interface makes ([`App::start_new_task`], [`App::run_selected`],
-//! [`App::submit_input`], [`App::apply_transition`]) already re-reads the
-//! authoritative state itself (`App::refresh`) right after the call returns,
-//! rather than waiting on the stream to tell it what happened. So the one
-//! window this gap can actually bite is the sliver between process startup
-//! and the very first `refresh()` a few lines down — before the operator has
-//! had a chance to select or act on anything — which is why the stream is
-//! still built *before* that first `refresh()` call: whatever ordering
-//! guarantee is available is taken, even though it is not a complete one.
-//! Losing the connection later (the daemon restarting, the connection
-//! dropping) is treated exactly as a closed broadcast channel used to be: a
-//! permanent, visible "disconnected" indicator ([`app::StreamStatus`]) for
-//! the rest of this process's life, not a silent reconnect-and-hope. Adding
-//! an actual reconnect loop is a reasonable follow-up, but nothing in this
-//! unit's test scenarios (AE5: two TUIs already up, watching the same
-//! already-running execution) requires it.
+//! The first read happens after the first draw, so the screen opens with
+//! "łączę z …" and the application retries on its own schedule
+//! ([`task_app::TaskApp::refresh_if_due`]). The event stream is opened by
+//! [`task_app::EventFeed::ensure_open`] only once a read gave the application
+//! a cursor, and resumes from it after every drop.
 
 pub mod app;
 pub mod chat;
@@ -89,29 +47,25 @@ pub mod task_app;
 pub mod transcript;
 pub mod views;
 
-use std::future::Future;
 use std::io::{self, Stdout};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
-use crate::persistence::{CatalogPaths, StatePaths, WorkPaths};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event as TerminalEvent, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use futures::StreamExt as _;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use crate::api::ensure_daemon_running;
-use crate::config::Flags;
+use crate::api::ApiClient;
 
-use app::{App, Request, StreamStatus};
+use style::Styles;
+use task_app::{detail, layout, EventFeed, TaskApp};
 
 /// The terminal this interface draws on.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -194,123 +148,68 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Runs the interface until the operator quits.
+/// Runs the interface over `client` until the operator quits.
 ///
 /// Keys are read on a dedicated thread because `crossterm` reads block, and
-/// are forwarded over a channel so the loop can wait on keys and daemon
-/// events at once. `state`/`flags` are exactly what
-/// [`ensure_daemon_running`] needs to discover — or transparently launch
-/// (AE2) — a daemon over the same state root this process was invoked
-/// against; `App` then holds nothing but the [`crate::api::ApiClient`] that
-/// call hands back (R4): no `Engine`, no `ExecutionStore`, constructed here
-/// or anywhere else in this module.
+/// are forwarded over a channel so the loop can wait on keys, control-plane
+/// events and the next due read at once. `connection_name` is what the header
+/// calls the server until the server says its own name.
 pub async fn run(
-    state: StatePaths,
-    flags: Flags,
-    catalog: CatalogPaths,
-    work: WorkPaths,
+    client: ApiClient,
+    connection_name: String,
     refresh_interval: Option<Duration>,
 ) -> io::Result<()> {
     install_panic_hook();
 
-    // D23 startup reconciliation ran here before U2, then moved to
-    // `crate::cli::daemon::run_daemon` in U2 (R8): the daemon is the one
-    // process that opens the store for write, so it is the one responsible
-    // for reconciling whatever a previous, differently-killed holder left
-    // behind. Until U7 this TUI still constructed its own
-    // `Engine`/`ExecutionStore` regardless (dual ownership U2 deliberately
-    // left in place, narrow in scope to what it asked for) — that
-    // construction is what this unit removes for good.
-    let client = connect_local_daemon(&state, &flags, |state, flags| {
-        Box::pin(ensure_daemon_running(state, flags))
-    })
-    .await?;
-
-    // Built before `app.refresh()`'s first read, not after — see the module
-    // doc's "SSE replay gap" section for what this ordering does and does
-    // not guarantee.
-    let mut events = Box::pin(client.stream_all());
-
-    let mut app = App::new(state, catalog, work, client).with_refresh_interval(refresh_interval);
-    app.refresh().await;
+    let styles = Styles::from_env();
+    let mut app = TaskApp::new(client.clone(), connection_name, refresh_interval);
+    app.detail_mut()
+        .set_hyperlinks(detail::hyperlinks_supported(|name| std::env::var(name).ok()));
+    let mut feed = EventFeed::new(client);
 
     let mut guard = TerminalGuard::enter()?;
-
     let stop = Arc::new(AtomicBool::new(false));
     let (keys_tx, mut keys_rx) = mpsc::unbounded_channel();
     let reader_stop = Arc::clone(&stop);
     let reader = std::thread::spawn(move || read_terminal_events(&keys_tx, &reader_stop));
 
+    // The first read comes after the first draw: an unreachable server shows
+    // "łączę z …" instead of a blank terminal.
+    let mut first_read_pending = true;
+
     while !app.should_quit() {
         guard
             .terminal()
-            .draw(|frame| views::render(frame, &mut app))?;
+            .draw(|frame| layout::render(frame, &mut app, &styles, Instant::now()))?;
 
+        if first_read_pending {
+            first_read_pending = false;
+            app.refresh().await;
+            feed.ensure_open(&app);
+            continue;
+        }
+
+        let wait = wait_until_next_due(&app, Instant::now());
         tokio::select! {
             incoming = keys_rx.recv() => match incoming {
                 Some(TerminalEvent::Key(key)) if key.kind == KeyEventKind::Press => {
-                    match app.on_key(key) {
-                        Request::None => {}
-                        Request::Refresh => app.refresh().await,
-                        Request::SelectExecution => app.reload_selection().await,
-                        Request::SubmitInput => app.submit_input().await,
-                        Request::ApplyTransition => app.apply_transition().await,
-                        Request::RunSelected => app.run_selected().await,
-                        Request::RecoverSelected { comment } => app.recover_selected(comment).await,
-                        Request::SaveOperatorNote { note } => app.save_operator_note(note).await,
-                        Request::InterruptSelected => app.interrupt_selected().await,
-                        Request::StartNewTask => app.start_new_task().await,
-                        Request::OpenConversation { sequence } => {
-                            app.open_conversation_for_event(sequence).await
-                        }
-                        Request::OpenTaskView => app.open_task_for_execution().await,
-                        Request::TaskRefresh => app.refresh_task().await,
-                        Request::TaskLoadSelected => app.load_task_position().await,
-                        Request::LoadHarnessSelection => app.load_harness_selection().await,
-                        Request::SetHarnessSelection { harness } => {
-                            app.set_harness_selection(harness).await
-                        }
-                        Request::ResetHarnessSelection => app.reset_harness_selection().await,
-                        Request::OpenFailureForm => app.open_failure_form().await,
-                        Request::LoadChat => app.load_chat().await,
-                        Request::SendChat => app.send_chat().await,
-                        Request::ConfirmProposal {
-                            execution_id,
-                            proposal_id,
-                        } => app.confirm_proposal(&execution_id, &proposal_id).await,
-                        Request::RejectProposal {
-                            execution_id,
-                            proposal_id,
-                        } => app.reject_proposal(&execution_id, &proposal_id).await,
-                        Request::UndoDecision {
-                            execution_id,
-                            decision_id,
-                        } => app.undo_decision(&execution_id, &decision_id).await,
-                        Request::RecoverFailure {
-                            execution_id,
-                            episode,
-                            comment,
-                        } => app.recover_failure(&execution_id, &episode, comment).await,
-                    }
+                    let request = app.on_key(key);
+                    app.perform(request).await;
                 }
                 // A resize needs no state change: the next draw re-derives the
                 // whole layout from the new area.
                 Some(_) => {}
-                None => app.quit(),
+                None => break,
             },
-            // A closed stream stays closed: polling it again would only
-            // spin, and the periodic refresh below keeps the view current.
-            received = events.next(), if app.stream_status() != &StreamStatus::Disconnected => {
-                app.on_stream(received)
-            }
-            _ = tokio::time::sleep(TICK) => {}
+            received = feed.next() => app.on_stream(received),
+            _ = tokio::time::sleep(wait) => {}
         }
 
-        // KTD16: the periodic read and the refresh a relevant live event
-        // asked for, neither of which disturbs what the operator is doing.
-        if app.refresh_due(Instant::now()) {
-            app.auto_refresh().await;
-        }
+        feed.ensure_open(&app);
+        app.refresh_if_due(Instant::now()).await;
+        app.retry_outgoing_if_due(Instant::now()).await;
+        app.sync_detail().await;
+        feed.ensure_open(&app);
     }
 
     stop.store(true, Ordering::SeqCst);
@@ -319,24 +218,14 @@ pub async fn run(
     Ok(())
 }
 
-/// Enters the local daemon discovery-or-launch phase before the TUI touches
-/// terminal state. Keeping this boundary separate lets its routing be tested
-/// without spawning a detached process or claiming a terminal.
-type DaemonConnectionFuture<'a> = Pin<
-    Box<dyn Future<Output = Result<crate::api::ApiClient, crate::api::DiscoveryError>> + Send + 'a>,
->;
-
-async fn connect_local_daemon<F>(
-    state: &StatePaths,
-    flags: &Flags,
-    connect: F,
-) -> io::Result<crate::api::ApiClient>
-where
-    F: for<'a> FnOnce(&'a StatePaths, &'a Flags) -> DaemonConnectionFuture<'a>,
-{
-    connect(state, flags)
-        .await
-        .map_err(|error| io::Error::other(error.to_string()))
+/// How long the loop may sleep: until the next due read or resend, but no
+/// longer than [`TICK`], so relative ages and the notification stay honest.
+fn wait_until_next_due(app: &TaskApp, now: Instant) -> Duration {
+    [app.next_refresh_due(), app.next_outgoing_due()]
+        .into_iter()
+        .flatten()
+        .map(|due| due.saturating_duration_since(now))
+        .fold(TICK, Duration::min)
 }
 
 /// Forwards terminal events until the loop asks it to stop.
@@ -354,111 +243,5 @@ fn read_terminal_events(sender: &mpsc::UnboundedSender<TerminalEvent>, stop: &At
             Ok(false) => {}
             Err(_) => return,
         }
-    }
-}
-
-/// Runs the remote tasks mode ([`remote`]) over `client` until the operator
-/// quits.
-///
-/// The same loop shape as [`run`]: keys from a reader thread, the
-/// control-plane event stream and a redraw tick in one `select!`. Unlike the
-/// local stream, this one is opened from the cursor of the first listing and
-/// reconnects on its own ([`crate::api::ApiClient::follow_control_events`]),
-/// so an expired network-mode token or a recycled proxy connection costs a
-/// "reconnecting" marker, not missed events. Events that the list cannot
-/// apply directly ask for a re-read, debounced by [`refresh::RefreshSchedule`],
-/// which also runs the periodic read.
-pub async fn run_remote(
-    client: crate::api::ApiClient,
-    refresh_interval: Option<Duration>,
-) -> io::Result<()> {
-    install_panic_hook();
-
-    let mut app = remote::RemoteApp::new(client);
-    app.refresh().await;
-    let mut events = Box::pin(
-        app.client()
-            .follow_control_events(app.cursor().map(str::to_string), None),
-    );
-    let mut schedule = refresh::RefreshSchedule::new(refresh_interval, Instant::now());
-
-    let mut guard = TerminalGuard::enter()?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let (keys_tx, mut keys_rx) = mpsc::unbounded_channel();
-    let reader_stop = Arc::clone(&stop);
-    let reader = std::thread::spawn(move || read_terminal_events(&keys_tx, &reader_stop));
-
-    while !app.should_quit() {
-        guard
-            .terminal()
-            .draw(|frame| remote_views::render(frame, &mut app))?;
-
-        tokio::select! {
-            incoming = keys_rx.recv() => match incoming {
-                Some(TerminalEvent::Key(key)) if key.kind == KeyEventKind::Press => {
-                    let request = app.on_key(key);
-                    let manual = request == remote::RemoteRequest::Refresh;
-                    app.perform(request).await;
-                    if manual {
-                        schedule.done(Instant::now());
-                    }
-                }
-                Some(_) => {}
-                None => break,
-            },
-            received = events.next(), if !matches!(app.stream(), remote::RemoteStream::Ended(_)) => {
-                app.on_stream(received);
-                if app.refresh_wanted() {
-                    schedule.request(Instant::now());
-                }
-            }
-            _ = tokio::time::sleep(TICK) => {}
-        }
-
-        if schedule.is_due(Instant::now()) {
-            app.refresh().await;
-            schedule.done(Instant::now());
-        }
-    }
-
-    stop.store(true, Ordering::SeqCst);
-    drop(guard);
-    let _ = reader.join();
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
-
-    #[tokio::test]
-    async fn local_startup_enters_daemon_connection_phase_without_starting_a_process() {
-        let state = StatePaths::new("/tmp/narsor-tui-startup-state");
-        let flags = Flags {
-            root: Some(PathBuf::from("/tmp/narsor-tui-startup-root")),
-            config: None,
-        };
-        let called = AtomicBool::new(false);
-
-        let result = connect_local_daemon(&state, &flags, |received_state, received_flags| {
-            assert_eq!(received_state, &state);
-            assert_eq!(received_flags.root, flags.root);
-            assert_eq!(received_flags.config, flags.config);
-            called.store(true, Ordering::SeqCst);
-            Box::pin(async {
-                Err::<crate::api::ApiClient, _>(crate::api::DiscoveryError::NetworkMode)
-            })
-        })
-        .await;
-
-        assert!(called.load(Ordering::SeqCst));
-        assert_eq!(
-            result
-                .expect_err("the fake connector must stop startup")
-                .kind(),
-            io::ErrorKind::Other
-        );
     }
 }

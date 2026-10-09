@@ -2560,3 +2560,56 @@ mod remote_cli {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// `narsor tui`: one interface, `--remote` an ignored alias (U14)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tui_remote_alias_is_warned_about_and_plain_tui_is_not() {
+    let warning = narsor::cli::tui_remote_warning(true).expect("the alias warns");
+    assert!(warning.contains("--remote"), "{warning}");
+    assert!(warning.contains("ignored"), "{warning}");
+    assert_eq!(narsor::cli::tui_remote_warning(false), None);
+}
+
+/// Without a terminal the interface cannot take the screen, so both spellings
+/// stop at the same place — after connecting — which is how to see, without a
+/// terminal, that they run the same thing: the alias differs by its warning
+/// and nothing else, and the local daemon was launched and answers on
+/// `/control/v1`.
+#[test]
+fn tui_without_a_server_launches_the_local_daemon_and_remote_runs_the_same_interface() {
+    let root = TempRoot::new();
+    let _processes = LocalProcesses {
+        root: root.path().to_path_buf(),
+    };
+
+    let plain = cli(&root, &["tui"]);
+    assert_eq!(plain.code, EXIT_FAILURE, "{}", plain.output());
+    assert!(
+        plain.stderr.contains("The terminal interface stopped with an error"),
+        "it got as far as the terminal; stderr: {}",
+        plain.stderr
+    );
+    assert!(!plain.stderr.contains("--remote"), "{}", plain.stderr);
+
+    let info = narsor::persistence::DaemonInfo::read(
+        &narsor::persistence::StatePaths::new(root.path()).daemon_file(),
+    )
+    .expect("`narsor tui` launched the local daemon");
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let capabilities = runtime
+        .block_on(narsor::api::ApiClient::new(info.addr, info.token).control_capabilities())
+        .expect("the daemon answers on /control/v1");
+    assert!(!capabilities.connection_name.is_empty());
+
+    let alias = cli(&root, &["tui", "--remote"]);
+    assert_eq!(alias.code, plain.code, "{}", alias.output());
+    assert!(alias.stderr.contains("`narsor tui --remote` is ignored"), "{}", alias.stderr);
+    assert!(
+        alias.stderr.contains("The terminal interface stopped with an error"),
+        "{}",
+        alias.stderr
+    );
+}

@@ -1355,70 +1355,34 @@ fn truncate(text: &str, limit: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// tui (U10)
+// tui
 // ---------------------------------------------------------------------------
 
-/// `narsor tui` — the full-screen interface, added in U10.
+/// `narsor tui` — the full-screen interface over the control plane `target`
+/// names: a remote server, or the local daemon of the state directory
+/// (launched when none runs, as for every other command).
 ///
 /// The loop is async but this entry point is not, because the subcommand
 /// dispatch calls it from inside the runtime `main` already started. So the
 /// current worker thread is handed over with `block_in_place` and the loop is
 /// driven on it: spawning a second runtime inside the first would panic, and
 /// the interface has to own a thread anyway — it blocks on keys.
-///
-/// No longer constructs `Engine`/`ExecutionStore` itself (R4/U7): like every
-/// other command in this module, it discovers or transparently launches a
-/// daemon (`crate::tui::run`'s own `ensure_daemon_running` call, AE2) and
-/// drives the whole interface as that daemon's REST(+SSE) client. The three
-/// roots are still opened and handed to the interface separately — the state
-/// root (now just `StatePaths`, path arithmetic only — no store is opened
-/// here) decides which daemon this discovers/launches, the catalogue is
-/// where workflows and the registry are read from, and the work tree is
-/// where the interface's own reads (`resolve_definition`) look for a pinned
-/// definition copy.
-pub fn tui(config: &Resolved, flags: &Flags) -> Result<()> {
-    let state = StatePaths::new(config.state_dir());
-    let handle = tokio::runtime::Handle::current();
-    let catalog = config.catalog_paths();
-    let work = config.work_paths();
-    let refresh_interval = config
-        .tui_refresh_interval()
-        .map(std::time::Duration::from_secs);
-    tokio::task::block_in_place(move || {
-        handle.block_on(crate::tui::run(
-            state,
-            flags.clone(),
-            catalog,
-            work,
-            refresh_interval,
-        ))
-    })
-    .map_err(|error| {
-        CliError::failure(format!(
-            "The terminal interface stopped with an error: {error}"
-        ))
-    })
-}
-
-/// `narsor tui --remote` (or `narsor --server <url> tui`) — the remote
-/// tasks mode ([`crate::tui::remote`]) over the control plane `target`
-/// names, or over the local daemon's control plane without one.
-pub fn tui_remote(
-    config: &Resolved,
-    flags: &Flags,
-    target: &crate::api::ServerTarget,
-) -> Result<()> {
+pub fn tui(config: &Resolved, flags: &Flags, target: &crate::api::ServerTarget) -> Result<()> {
     let state = StatePaths::new(config.state_dir());
     let handle = tokio::runtime::Handle::current();
     let refresh_interval = config
         .tui_refresh_interval()
         .map(std::time::Duration::from_secs);
+    let connection_name = target
+        .server
+        .clone()
+        .unwrap_or_else(|| "local".to_string());
     tokio::task::block_in_place(move || {
         handle.block_on(async {
             let client = crate::api::connect(target, &state, flags)
                 .await
                 .map_err(CliError::failure)?;
-            crate::tui::run_remote(client, refresh_interval)
+            crate::tui::run(client, connection_name, refresh_interval)
                 .await
                 .map_err(|error| {
                     CliError::failure(format!(

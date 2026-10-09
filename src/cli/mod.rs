@@ -263,8 +263,8 @@ pub enum Command {
 
     /// Opens the full-screen terminal interface.
     Tui {
-        /// Shows the control plane's remote tasks instead of the local
-        /// executions; implied by `--server`.
+        /// Ignored: there is one interface, over the control plane of the
+        /// configured backend. Kept so existing invocations keep working.
         #[arg(long)]
         remote: bool,
     },
@@ -570,6 +570,15 @@ pub enum ConfigFormat {
     Json,
 }
 
+/// The warning `narsor tui --remote` prints: the flag no longer selects a
+/// mode, the one interface runs either way.
+pub fn tui_remote_warning(remote: bool) -> Option<&'static str> {
+    remote.then_some(
+        "warning: `narsor tui --remote` is ignored; there is one interface, over the control \
+         plane of the configured backend (use --server for a remote one)",
+    )
+}
+
 /// Runs the parsed command line and returns the process exit code.
 ///
 /// Nothing here panics on an operator mistake: every failure becomes a message
@@ -701,11 +710,10 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             ConfigCommand::Show { format } => commands::config_show(&config, format),
         },
         Command::Tui { remote } => {
-            if remote || target.is_remote() {
-                commands::tui_remote(&config, &flags, &target)
-            } else {
-                commands::tui(&config, &flags)
+            if let Some(warning) = tui_remote_warning(remote) {
+                eprintln!("{warning}");
             }
+            commands::tui(&config, &flags, &target)
         }
         Command::Task { command } => remote::task(command, &target, &state, &catalog, &flags).await,
         Command::Backend { command } => remote::backend(command, &target, &state, &flags).await,
