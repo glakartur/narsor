@@ -33,6 +33,11 @@ pub enum ExecutionStatus {
 }
 
 impl ExecutionStatus {
+    /// Whether the execution ended: completed, failed or cancelled.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+
     /// The schema spelling of the status — the same words the CLI prints.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -256,10 +261,7 @@ impl WorkflowExecution {
 
     /// Checks if the execution is in a terminal state
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.status,
-            ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
-        )
+        self.status.is_terminal()
     }
 }
 

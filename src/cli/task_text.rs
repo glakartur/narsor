@@ -105,12 +105,18 @@ pub fn queue_badge(queue: &QueueView) -> ToneLine {
 
 /// `at` as an age relative to `now`: `12s`, `3m`, `2h`, `4d`.
 pub fn age(now: DateTime<Utc>, at: DateTime<Utc>) -> String {
-    let secs = (now - at).num_seconds().max(0);
-    match secs {
-        0..=59 => format!("{secs}s"),
-        60..=3599 => format!("{}m", secs / 60),
-        3600..=86_399 => format!("{}h", secs / 3600),
-        _ => format!("{}d", secs / 86_400),
+    short_age((now - at).num_seconds())
+}
+
+/// `45s`, `4m`, `3h`, `2d`: `seconds` in the largest whole unit (a negative
+/// span reads as zero).
+pub fn short_age(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m", seconds / 60),
+        3600..=86_399 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86_400),
     }
 }
 

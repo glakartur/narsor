@@ -227,13 +227,7 @@ impl ControlPlane {
                 return Ok(Mutation::Unchanged((receipt.clone(), true)));
             }
             if let Some(expected) = request.expected_generation {
-                if expected != record.generation {
-                    return Err(OrchestrationError::StaleGeneration {
-                        task_id: record.task_id.clone(),
-                        current: record.generation,
-                        presented: expected,
-                    });
-                }
+                record.check_generation(expected)?;
             }
 
             match command_effect(record.lifecycle, request.command) {
@@ -411,13 +405,7 @@ impl ControlPlane {
                     });
                 }
             }
-            if report.desired_generation != record.generation {
-                return Err(OrchestrationError::StaleGeneration {
-                    task_id: record.task_id.clone(),
-                    current: record.generation,
-                    presented: report.desired_generation,
-                });
-            }
+            record.check_generation(report.desired_generation)?;
             check_resource_order(record, &report)?;
 
             let effect = observation_effect(record.lifecycle, report.observation);

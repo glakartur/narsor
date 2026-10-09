@@ -54,13 +54,7 @@ impl ControlPlane {
                 }));
             }
             if let Some(expected) = request.expected_generation {
-                if expected != record.generation {
-                    return Err(OrchestrationError::StaleGeneration {
-                        task_id: record.task_id.clone(),
-                        current: record.generation,
-                        presented: expected,
-                    });
-                }
+                record.check_generation(expected)?;
             }
             if let Some(reason) = record.operator_command_refusal() {
                 return Err(OrchestrationError::OperatorCommandRefused {

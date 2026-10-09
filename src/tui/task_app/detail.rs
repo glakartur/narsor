@@ -48,6 +48,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::api::ClientError;
+use crate::cli::task_text::lifecycle_name;
+pub use crate::cli::task_text::short_age;
 use crate::controller_protocol::{
     ConductorReadResponse, ExecutionEventsQuery, ExecutionEventsResponse, TaskSummary,
     TimelineResponse,
@@ -60,7 +62,7 @@ use crate::orchestration::{QueueReason, TaskLifecycle};
 use super::super::scroll::one_line;
 use super::super::keymap::Action;
 use super::super::style::{Role, Styles};
-use super::list::{fit, lifecycle_word, state_icon, title_of};
+use super::list::{fit, state_icon, title_of};
 use super::tabs::conductor::{self, Conductor};
 use super::tabs::conversation::{self, transcript_action, AttemptRead, Attempts, Conversation};
 use super::tabs::events::{self, Events};
@@ -262,21 +264,10 @@ pub fn unstarted_message(task: &TaskSummary, queue_place: Option<usize>) -> Opti
             let place = match (task.lifecycle, queue_place) {
                 (TaskLifecycle::Queued, Some(place)) => format!("#{place} w kolejce"),
                 (TaskLifecycle::Queued, None) => "w kolejce".to_string(),
-                (other, _) => lifecycle_word(other).to_string(),
+                (other, _) => lifecycle_name(other).to_string(),
             };
             Some(format!("jeszcze nie wystartowało, {place}"))
         }
-    }
-}
-
-/// `45s`, `4m`, `3h`, `2d`: the largest whole unit.
-pub fn short_age(seconds: i64) -> String {
-    let seconds = seconds.max(0);
-    match seconds {
-        0..=59 => format!("{seconds}s"),
-        60..=3599 => format!("{}m", seconds / 60),
-        3600..=86399 => format!("{}h", seconds / 3600),
-        _ => format!("{}d", seconds / 86400),
     }
 }
 
@@ -733,7 +724,7 @@ fn status_word(task: &TaskSummary) -> &'static str {
         Some(ExecutionStatus::Completed) => "completed",
         Some(ExecutionStatus::Failed) => "failed",
         Some(ExecutionStatus::Cancelled) => "cancelled",
-        _ => lifecycle_word(task.lifecycle),
+        _ => lifecycle_name(task.lifecycle),
     }
 }
 
@@ -774,10 +765,10 @@ fn status_parts(
 /// The whole life of a task so far, or what it took: it runs until the
 /// runner's last word when the runner finished.
 fn elapsed(task: &TaskSummary) -> Option<i64> {
-    let finished = matches!(
-        task.runner.as_ref().map(|runner| &runner.execution_status),
-        Some(ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled)
-    );
+    let finished = task
+        .runner
+        .as_ref()
+        .is_some_and(|runner| runner.execution_status.is_terminal());
     let until = match (&task.runner, finished) {
         (Some(runner), true) => runner.observed_at,
         _ => task.as_of,

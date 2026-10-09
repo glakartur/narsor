@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::text::Span;
 
+use crate::cli::task_text::short_age;
 use super::style::{Role, Styles};
 
 /// Where the connection stands.
@@ -137,7 +138,7 @@ impl Connection {
             return None;
         }
         self.data_age(now)
-            .map(|age| format!("stan sprzed {}", format_age(age)))
+            .map(|age| format!("stan sprzed {}", short_age(i64::try_from(age.as_secs()).unwrap_or(i64::MAX))))
     }
 
     /// Whether the data on screen should be drawn grey: it is not live and
@@ -196,14 +197,4 @@ impl Connection {
 fn seconds_left(at: Instant, now: Instant) -> u64 {
     let left = at.saturating_duration_since(now);
     left.as_secs() + u64::from(left.subsec_nanos() > 0)
-}
-
-/// An age in the largest unit that keeps it short: `40s`, `3m`, `2h`.
-fn format_age(age: Duration) -> String {
-    let seconds = age.as_secs();
-    match seconds {
-        0..=59 => format!("{seconds}s"),
-        60..=3599 => format!("{}m", seconds / 60),
-        _ => format!("{}h", seconds / 3600),
-    }
 }

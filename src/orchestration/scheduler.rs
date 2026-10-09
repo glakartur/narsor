@@ -358,13 +358,7 @@ impl ControlPlane {
 /// Whether `record` may be moved now.
 fn check_movable(record: &TaskRecord, expected_generation: Option<u64>) -> Result<()> {
     if let Some(expected) = expected_generation {
-        if expected != record.generation {
-            return Err(OrchestrationError::StaleGeneration {
-                task_id: record.task_id.clone(),
-                current: record.generation,
-                presented: expected,
-            });
-        }
+        record.check_generation(expected)?;
     }
     if record.lifecycle != TaskLifecycle::Queued {
         return Err(OrchestrationError::TaskNotQueued {

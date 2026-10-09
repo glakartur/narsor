@@ -87,7 +87,7 @@ pub mod token;
 
 pub use active::ActiveTasks;
 pub(crate) use client::handle_json_response;
-pub use client::{ApiClient, ClientError};
+pub use client::{reconnect_delay, ApiClient, ClientError};
 pub use connect::{connect, ServerTarget};
 pub use discovery::{ensure_daemon_running, DiscoveryError};
 pub use dto::{

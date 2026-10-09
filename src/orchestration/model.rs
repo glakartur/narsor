@@ -501,6 +501,19 @@ pub struct TaskRecord {
 }
 
 impl TaskRecord {
+    /// Refuses a request made against another generation than the task's
+    /// current one.
+    pub fn check_generation(&self, presented: u64) -> super::error::Result<()> {
+        if presented == self.generation {
+            return Ok(());
+        }
+        Err(super::error::OrchestrationError::StaleGeneration {
+            task_id: self.task_id.clone(),
+            current: self.generation,
+            presented,
+        })
+    }
+
     /// Whether the task occupies one of its backend's capacity slots.
     ///
     /// Conservative on purpose (R6, R11, R13): a slot is free only once the

@@ -59,7 +59,6 @@ use crate::controller_protocol::{
     OwnerCommandRequest, SubmitOperatorCommandRequest, TaskSummary, TransitionExit,
 };
 use crate::domain::display::safe_link_url;
-use crate::domain::ExecutionStatus;
 use crate::orchestration::{
     AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskLifecycle,
 };
@@ -192,12 +191,7 @@ fn state_phrase(task: &TaskSummary) -> &'static str {
 /// Whether the execution ended: completed, failed or cancelled.
 fn is_finished(task: &TaskSummary) -> bool {
     matches!(task.lifecycle, TaskLifecycle::Running | TaskLifecycle::Provisioning)
-        && task.runner.as_ref().is_some_and(|runner| {
-            matches!(
-                runner.execution_status,
-                ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
-            )
-        })
+        && task.runner.as_ref().is_some_and(|runner| runner.execution_status.is_terminal())
 }
 
 /// Whether the control plane could not prepare the workspace.

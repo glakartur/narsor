@@ -109,6 +109,27 @@ pub fn without_unsafe_chars_multiline(text: &str) -> String {
         .collect()
 }
 
+/// Cleans every string of `value` (and every object key) in place, keeping
+/// line breaks in the strings: [`without_unsafe_chars_multiline`] for text,
+/// [`without_unsafe_chars`] for names.
+pub fn without_unsafe_chars_json(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => *text = without_unsafe_chars_multiline(text),
+        Value::Array(items) => items.iter_mut().for_each(without_unsafe_chars_json),
+        Value::Object(map) => {
+            *map = std::mem::take(map)
+                .into_iter()
+                .map(|(key, mut value)| {
+                    without_unsafe_chars_json(&mut value);
+                    (without_unsafe_chars(&key), value)
+                })
+                .collect();
+        }
+        _ => {}
+    }
+}
+
 /// Whether `ch` could spoof or disturb what a terminal shows: a control
 /// character, or an invisible Unicode format character (zero-width and
 /// directional marks, bidi overrides and isolates, line and paragraph

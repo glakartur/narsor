@@ -102,7 +102,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::KeyEvent;
 use futures::stream::{BoxStream, StreamExt as _};
 
-use crate::api::{ApiClient, ClientError};
+use crate::api::{reconnect_delay, ApiClient, ClientError};
 use crate::controller_protocol::{
     CapabilitiesView, ControlEventEnvelope, CreateRepositoryRequest, MoveTaskRequest,
     TaskListResponse,
@@ -993,7 +993,7 @@ impl TaskApp {
             }
             Some(Err(error)) if is_transport(&error) => {
                 self.stream_failures = self.stream_failures.saturating_add(1);
-                let delay = reconnect_estimate(self.stream_failures);
+                let delay = reconnect_delay(self.stream_failures);
                 self.mark_failure(&error, now, delay);
             }
             Some(Err(error)) => {
@@ -1007,16 +1007,6 @@ impl TaskApp {
             }
         }
     }
-}
-
-/// The delay the client's own reconnect backoff has after `failures` failed
-/// attempts, for the header's countdown. Mirrors the client's schedule
-/// (250ms doubling to 15s); the stream does not report its own.
-fn reconnect_estimate(failures: u32) -> Duration {
-    let factor = 2u32.saturating_pow(failures.saturating_sub(1).min(16));
-    Duration::from_millis(250)
-        .saturating_mul(factor)
-        .min(Duration::from_secs(15))
 }
 
 /// Whether `error` is the server being unreachable or unwell, which a retry

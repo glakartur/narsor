@@ -41,6 +41,7 @@ use ratatui::Frame;
 use crate::controller_protocol::{
     Freshness, InputView, OperatorCommandView, QueueView, TaskSummary,
 };
+use crate::cli::task_text::lifecycle_name;
 use crate::domain::{BackendId, ExecutionStatus};
 use crate::orchestration::{
     AttentionItem, AttentionKind, MoveTarget, OperatorCommand, OperatorCommandStatus, QueueReason,
@@ -124,21 +125,6 @@ impl StateIcon {
     }
 }
 
-/// A lifecycle in words, for labels and the details placeholder.
-pub fn lifecycle_word(lifecycle: TaskLifecycle) -> &'static str {
-    match lifecycle {
-        TaskLifecycle::Queued => "queued",
-        TaskLifecycle::Provisioning => "provisioning",
-        TaskLifecycle::Running => "running",
-        TaskLifecycle::PauseRequested => "pausing",
-        TaskLifecycle::Paused => "paused",
-        TaskLifecycle::Interrupted => "interrupted",
-        TaskLifecycle::Unknown => "unknown",
-        TaskLifecycle::Archiving => "archiving",
-        TaskLifecycle::Archived => "archived",
-    }
-}
-
 /// What the first column shows for `task`. A problem has precedence over a
 /// question (origin §5).
 pub fn attention_of(task: &TaskSummary) -> Attention {
@@ -211,10 +197,10 @@ pub fn label_of(task: &TaskSummary, queue_position: Option<usize>) -> String {
             Some(ExecutionStatus::Failed) => "failed".to_string(),
             Some(ExecutionStatus::Cancelled) => "cancelled".to_string(),
             _ if controller_offline(task) => "offline".to_string(),
-            _ => current_step(task).unwrap_or_else(|| lifecycle_word(task.lifecycle).to_string()),
+            _ => current_step(task).unwrap_or_else(|| lifecycle_name(task.lifecycle).to_string()),
         },
         TaskLifecycle::Archiving | TaskLifecycle::Archived => "done".to_string(),
-        other => lifecycle_word(other).to_string(),
+        other => lifecycle_name(other).to_string(),
     }
 }
 

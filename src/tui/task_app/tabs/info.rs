@@ -19,7 +19,7 @@ use crate::tui::style::{Role, Styles};
 
 use super::super::super::scroll::one_line;
 use super::super::detail::short_age;
-use super::super::list::lifecycle_word;
+use crate::cli::task_text::lifecycle_name;
 
 /// What the tab remembers per task: how far it is scrolled.
 #[derive(Debug, Clone)]
@@ -145,7 +145,7 @@ pub fn lines(task: &TaskSummary, styles: &Styles, stale: bool) -> Vec<Line<'stat
         format!("{} v{}", task.workflow_id, task.workflow_version),
         Role::Calm,
     );
-    sheet.row("stan", lifecycle_word(task.lifecycle), Role::Calm);
+    sheet.row("stan", lifecycle_name(task.lifecycle), Role::Calm);
     sheet.row("pozycja", format!("#{} · generacja {} · rewizja {}", task.rank, task.generation, task.revision), Role::Calm);
     if let Some(queue) = &task.queue {
         let text = match &queue.reason {

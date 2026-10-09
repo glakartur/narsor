@@ -35,7 +35,9 @@ use crate::controller_protocol::{
     ValidateWorkflowResponse, WorkflowInputView, WorkflowListResponse, WorkflowSource,
     WorkflowView,
 };
-use crate::domain::display::{without_unsafe_chars, without_unsafe_chars_multiline};
+use crate::domain::display::{
+    without_unsafe_chars, without_unsafe_chars_json, without_unsafe_chars_multiline,
+};
 use crate::domain::{Event, ExecutionStatus, WorkflowDefinition};
 use crate::engine::Timeline;
 use crate::persistence::ExecutionStore;
@@ -186,24 +188,12 @@ fn inputs_of(definition: &WorkflowDefinition) -> Vec<WorkflowInputView> {
                 .description
                 .as_deref()
                 .map(without_unsafe_chars_multiline),
-            default: input.default.clone().map(clean_value),
+            default: input.default.clone().map(|mut default| {
+                without_unsafe_chars_json(&mut default);
+                default
+            }),
         })
         .collect()
-}
-
-/// A JSON value with every string made terminal-safe.
-fn clean_value(value: serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    match value {
-        Value::String(text) => Value::String(without_unsafe_chars_multiline(&text)),
-        Value::Array(items) => Value::Array(items.into_iter().map(clean_value).collect()),
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(key, value)| (without_unsafe_chars(&key), clean_value(value)))
-                .collect(),
-        ),
-        other => other,
-    }
 }
 
 /// The violations a failed load stands for, cleaned for display.

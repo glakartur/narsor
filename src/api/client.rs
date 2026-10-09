@@ -1293,7 +1293,7 @@ struct FollowState {
 }
 
 /// The delay before reconnect attempt number `failures` (0: at once).
-fn reconnect_delay(failures: u32) -> Duration {
+pub fn reconnect_delay(failures: u32) -> Duration {
     if failures == 0 {
         return Duration::ZERO;
     }

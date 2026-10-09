@@ -13,7 +13,6 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::conductor::chat::{ProposalContext, ProposalRecord};
 use crate::conductor::proposal::{EXECUTED, REJECTED};
@@ -22,7 +21,7 @@ use crate::conductor::store::{
 };
 use crate::conductor::undo::{undoable_in, UNDONE};
 use crate::domain::{
-    without_unsafe_chars_multiline, ConductorPurpose, ConductorTrigger, Confidence,
+    without_unsafe_chars_json, ConductorPurpose, ConductorTrigger, Confidence,
 };
 use crate::persistence::{ExecutionStore, Result};
 
@@ -239,7 +238,7 @@ impl ConductorView {
         let Ok(mut value) = serde_json::to_value(&self) else {
             return self;
         };
-        clean_strings(&mut value);
+        without_unsafe_chars_json(&mut value);
         serde_json::from_value(value).unwrap_or(self)
     }
 }
@@ -259,16 +258,6 @@ pub fn pending_chat_proposals(
         .filter(|proposal| proposal.state == ProposalState::Pending)
         .filter(|proposal| proposal.in_reply_to.is_some())
         .collect())
-}
-
-/// Strips every string in `value`, keeping line breaks.
-fn clean_strings(value: &mut Value) {
-    match value {
-        Value::String(text) => *text = without_unsafe_chars_multiline(text),
-        Value::Array(items) => items.iter_mut().for_each(clean_strings),
-        Value::Object(map) => map.values_mut().for_each(clean_strings),
-        _ => {}
-    }
 }
 
 fn work_of(state: &ConductorState) -> Vec<ConductorWork> {

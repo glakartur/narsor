@@ -410,7 +410,7 @@ pub async fn events(state: &Path, flags: &Flags, execution_id: &str, follow: boo
             after = last.sequence;
         }
 
-        if !follow || is_final(&summary.status) {
+        if !follow || summary.status.is_terminal() {
             break;
         }
         tokio::time::sleep(FOLLOW_INTERVAL).await;
@@ -1755,14 +1755,6 @@ fn print_pending_input(pending: &PendingHumanInput) {
             }
         }
     }
-}
-
-/// Whether an execution can still move.
-fn is_final(status: &ExecutionStatus) -> bool {
-    matches!(
-        status,
-        ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
-    )
 }
 
 // ---------------------------------------------------------------------------
