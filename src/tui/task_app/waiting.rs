@@ -1248,7 +1248,11 @@ impl TaskApp {
                 after: view.conductor.last_sequence(),
                 limit: None,
             };
-            let result = client.control_conductor(id, &query).await;
+            let result = super::detail::bounded_read(
+                super::detail::RELAYED_READ_LIMIT,
+                client.control_conductor(id, &query),
+            )
+            .await;
             let failed = result.is_err();
             self.on_detail_read(id, revision, super::detail::DetailRead::Conductor(result));
             if failed || !shown {

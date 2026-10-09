@@ -879,6 +879,9 @@ impl TaskApp {
         self.connection.on_data(now);
         self.schedule.done(now);
         self.stream_failures = 0;
+        // A read that worked is a reason to follow the stream again, if it
+        // ended: the feed reopens from the cursor just taken.
+        self.stream_ended = false;
         let revisions: HashMap<String, u64> = self
             .list
             .tasks()
@@ -1060,7 +1063,12 @@ impl EventFeed {
     /// Opens the stream from the application's cursor when it is closed, the
     /// application has a cursor and the stream did not end for good.
     pub fn ensure_open(&mut self, app: &TaskApp) {
-        if self.stream.is_some() || app.stream_ended() {
+        if app.stream_ended() {
+            // Whatever is left of an ended stream yields nothing more.
+            self.stream = None;
+            return;
+        }
+        if self.stream.is_some() {
             return;
         }
         if let Some(cursor) = app.cursor() {

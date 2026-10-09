@@ -336,6 +336,32 @@ pub fn areas(area: Rect, panel_height: u16) -> Areas {
 // Reading
 // ---------------------------------------------------------------------
 
+/// How long the loop waits for a read the runner has to answer (the
+/// conversation, the events, the conductor) before it gives the tab a note
+/// instead: the runner answers on its next poll, and a silent one would
+/// otherwise freeze keys and redraw for as long as the server's relay waits.
+pub const RELAYED_READ_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The failure a read gets when the runner did not answer in time: a note
+/// in the tab, like the relay's own `503`, and no mark against the
+/// connection.
+pub fn runner_not_answering() -> ClientError {
+    ClientError::Degraded {
+        code: "runner_timeout".to_string(),
+        message: "runner nie odpowiada — spróbuję ponownie przy następnej zmianie".to_string(),
+    }
+}
+
+/// `read`, but no longer than `limit`: past it, [`runner_not_answering`].
+pub async fn bounded_read<T>(
+    limit: std::time::Duration,
+    read: impl std::future::Future<Output = Result<T, ClientError>>,
+) -> Result<T, ClientError> {
+    tokio::time::timeout(limit, read)
+        .await
+        .unwrap_or_else(|_| Err(runner_not_answering()))
+}
+
 impl TaskApp {
     /// Takes an answer of a read of `task_id`'s details in. `revision` is the
     /// revision of the row the read was made for. A failure stays in its tab;
@@ -476,7 +502,8 @@ impl TaskApp {
                 after,
                 limit: Some(events::PAGE_LIMIT),
             };
-            let result = client.control_execution_events(id, &query).await;
+            let result =
+                bounded_read(RELAYED_READ_LIMIT, client.control_execution_events(id, &query)).await;
             let more = matches!(
                 &result,
                 Ok(ExecutionEventsResponse::Available { events, has_more: true, .. })

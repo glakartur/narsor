@@ -67,9 +67,13 @@ pub async fn read_attempt(
             from: cursor,
             byte_budget: Some(PAGE_BYTE_BUDGET),
         };
-        client
-            .control_conversation_page(task_id, attempt_id, &query)
-            .await
+        // Through the relay, so the runner has to answer: not for longer
+        // than the loop can wait.
+        super::super::detail::bounded_read(
+            super::super::detail::RELAYED_READ_LIMIT,
+            client.control_conversation_page(task_id, attempt_id, &query),
+        )
+        .await
     })
     .await
 }

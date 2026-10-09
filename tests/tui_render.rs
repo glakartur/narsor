@@ -945,6 +945,48 @@ mod task_app_detail_render {
     }
 
     #[test]
+    fn a_silent_runner_leaves_a_note_in_the_tab_and_the_connection_alone() {
+        let mut app = running_app();
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        let before = app.connection().status(std::time::Instant::now()).text;
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Events {
+                after: 0,
+                result: Err(narsor::tui::task_app::detail::runner_not_answering()),
+            },
+        );
+        let screen = screen(&render(&mut app, &Styles::new(false)));
+        assert!(screen.contains("runner nie odpowiada"), "{screen}");
+        assert_eq!(app.connection().status(std::time::Instant::now()).text, before);
+        // The rest of the screen is intact.
+        assert!(screen.contains("NAR-12 Zmiana API zamówień"));
+    }
+
+    #[tokio::test]
+    async fn a_read_that_the_runner_never_answers_is_cut_off_by_the_limit() {
+        use narsor::tui::task_app::detail::{bounded_read, runner_not_answering};
+        let started = std::time::Instant::now();
+        let result: Result<(), _> = bounded_read(
+            std::time::Duration::from_millis(30),
+            std::future::pending(),
+        )
+        .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        match (result, runner_not_answering()) {
+            (
+                Err(narsor::api::ClientError::Degraded { code, .. }),
+                narsor::api::ClientError::Degraded { code: expected, .. },
+            ) => assert_eq!(code, expected),
+            (other, _) => panic!("expected the runner-silent failure, got {other:?}"),
+        }
+        let answered = bounded_read(std::time::Duration::from_secs(5), async { Ok(7) }).await;
+        assert_eq!(answered.unwrap(), 7);
+    }
+
+    #[test]
     fn events_are_listed_with_the_detail_of_the_selected_one() {
         let mut app = running_app();
         press(&mut app, KeyCode::Right);

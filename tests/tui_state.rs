@@ -1864,6 +1864,26 @@ mod task_app_list {
             assert!(!feed.is_open());
         }
 
+        #[test]
+        fn a_read_that_worked_follows_an_ended_stream_again() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1)], "c"));
+            app.on_stream(Some(Err(ClientError::Unauthorized)));
+            let mut feed = EventFeed::new(offline_client());
+            feed.ensure_open(&app);
+            assert!(!feed.is_open());
+
+            app.load(listing(vec![queued("a", 1)], "c2"));
+            assert!(!app.stream_ended());
+            feed.ensure_open(&app);
+            assert!(feed.is_open(), "the feed resumes from the new cursor");
+
+            // And ending again closes what is left of it.
+            app.on_stream(None);
+            feed.ensure_open(&app);
+            assert!(!feed.is_open());
+        }
+
         #[tokio::test]
         async fn an_unreachable_server_opens_as_connecting_and_goes_live_without_a_restart() {
             // Reserve a port, and let nothing listen on it yet.
