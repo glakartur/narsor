@@ -14,6 +14,7 @@ use std::time::Duration;
 use chrono::Utc;
 use narsor::api;
 use narsor::api::{ClientError, ExecutionSummary, StartTaskResponse};
+use narsor::conductor::assembly::assemble;
 use narsor::conductor::{
     ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, PendingInvocation,
     QueuedRequest,
@@ -2860,13 +2861,13 @@ mod conductor_chat {
         for (purpose, answer) in answers {
             by_purpose.entry(purpose).or_default().push_back(answer);
         }
-        let registry = Arc::new(ConductorRegistry::new(
-            Arc::clone(&engine),
+        let registry = assemble(
+            &engine,
             Arc::new(ScriptedConductor {
                 answers: Mutex::new(by_purpose),
             }),
-        ));
-        engine.attach_conductor(&registry);
+            None,
+        );
 
         let definition = load_from_file(&definition_path).expect("load the fixture");
         let workspace_path = root.join("workspace");

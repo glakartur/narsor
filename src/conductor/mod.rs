@@ -12,6 +12,8 @@
 //!
 //! # Layout
 //!
+//! * [`assembly`] — putting a registry together and restoring it at
+//!   startup, shared by the daemon and the task runner.
 //! * [`store`] — the conductor's own files of one execution: state, chat,
 //!   annotations (KTD2).
 //! * [`actor`] — one actor per execution, the only writer of those files,
@@ -48,6 +50,7 @@
 //! own record rather than from anything parked here.
 
 pub mod actor;
+pub mod assembly;
 pub mod chat;
 pub mod failure;
 pub mod invoke;

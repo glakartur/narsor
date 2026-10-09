@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use engine_support::{workflow, Harness};
+use narsor::conductor::assembly::assemble;
 use narsor::conductor::{
     ChatEntryKind, ConductorAnswer, ConductorInvoker, ConductorRegistry, ConductorStore,
     Invocation, InvocationOutcome, SavedDecision,
@@ -230,11 +231,7 @@ impl Fixture {
                 .engine()
                 .with_executor(ActionKind::Agent, agent.clone()),
         );
-        let registry = Arc::new(ConductorRegistry::new(
-            Arc::clone(&engine),
-            conductor.clone(),
-        ));
-        engine.attach_conductor(&registry);
+        let registry = assemble(&engine, conductor.clone(), None);
         Self {
             harness,
             engine,

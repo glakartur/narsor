@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use engine_support::{workflow, Harness};
+use narsor::conductor::assembly::assemble;
 use narsor::conductor::{
     active_failure_problem, ChatEntry, ChatEntryKind, ConductorAnswer, ConductorInvoker,
     ConductorRegistry, ConductorState, ConductorStore, FailureOutcome, Invocation,
@@ -225,11 +226,7 @@ impl Fixture {
             definition: definition.clone(),
             launched: Mutex::new(0),
         });
-        let registry = Arc::new(
-            ConductorRegistry::new(Arc::clone(&engine), conductor.clone())
-                .with_pass_launcher(passes.clone()),
-        );
-        engine.attach_conductor(&registry);
+        let registry = assemble(&engine, conductor.clone(), Some(passes.clone()));
         Self {
             harness,
             fake,

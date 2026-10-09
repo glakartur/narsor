@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use engine_support::{workflow, Harness};
+use narsor::conductor::assembly::{assemble, restore_at_startup};
 use narsor::conductor::{
     Annotation, ChatAuthor, ChatEntry, ChatEntryKind, ConductorActor, ConductorAnswer,
     ConductorInvoker, ConductorRegistry, ConductorState, ConductorStore, Invocation,
@@ -754,6 +755,40 @@ async fn an_unanswered_chat_message_is_served_again_after_a_restart() {
         store.load_state().expect("load").pending.is_none()
     })
     .await;
+}
+
+#[tokio::test]
+async fn the_shared_assembly_attaches_the_conductor_and_restores_its_queue() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let message = store
+        .append_chat(operator_message("still there?"))
+        .expect("append");
+    store
+        .save_state(&ConductorState {
+            pending: Some(PendingInvocation {
+                invocation_id: "cut-short".to_string(),
+                request: QueuedRequest::for_chat(&message),
+                started_at: Utc::now(),
+            }),
+            ..ConductorState::default()
+        })
+        .expect("save the state");
+
+    let stub = Arc::new(StubInvoker::default());
+    let registry = assemble(&fixture.engine, stub.clone(), None);
+    let restoration = restore_at_startup(&registry);
+    assert_eq!(
+        restoration.restore.requeued,
+        vec![(fixture.execution_id.clone(), 1)]
+    );
+    assert!(restoration.diagnosed.is_empty(), "nothing failed");
+
+    wait_until("the message was answered", || {
+        store.unanswered_chat().expect("read").is_empty()
+    })
+    .await;
+    assert_eq!(stub.calls().len(), 1);
 }
 
 /// Marks the fixture's execution as rescuing the output of state `first`

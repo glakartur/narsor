@@ -11,6 +11,7 @@ mod engine_support;
 use std::sync::Arc;
 
 use engine_support::{workflow, Harness};
+use narsor::conductor::assembly::assemble;
 use narsor::conductor::{
     ConductorInvoker, ConductorRegistry, ConductorState, ConductorStore, Invocation,
     InvocationOutcome, PendingInvocation, QueuedRequest, SavedDecision,
@@ -749,8 +750,7 @@ fn rescuing_engine(
             .engine()
             .with_executor(ActionKind::Agent, agent.clone()),
     );
-    let registry = Arc::new(ConductorRegistry::new(Arc::clone(&engine), conductor));
-    engine.attach_conductor(&registry);
+    let registry = assemble(&engine, conductor, None);
     (engine, registry, agent)
 }
 

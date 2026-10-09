@@ -66,6 +66,7 @@ use crate::auth::{
 use crate::backends::{
     supervise, Controller, ControllerConfig, LocalBackend, LocalBackendConfig, Supervision,
 };
+use crate::conductor::assembly::{assemble, restore_at_startup};
 use crate::conductor::{ConductorRegistry, HarnessInvoker, PassLauncher};
 use crate::config::Resolved;
 use crate::controller_protocol::{CreateEnrollmentRequest, ProtocolService};
@@ -194,16 +195,15 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     // weakly, and hands a step without a usable output label to it (F1).
     // A pass the conductor starts — its one retry of a failed step (F3) —
     // is driven like one the API starts, and interrupted the same way.
-    let conductor = Arc::new(
-        ConductorRegistry::new(Arc::clone(&engine), Arc::new(invoker)).with_pass_launcher(
-            Arc::new(DaemonPasses {
-                store: store.clone(),
-                catalog_dir: config.catalog_dir().to_path_buf(),
-                active_tasks: active_tasks.clone(),
-            }),
-        ),
+    let conductor = assemble(
+        &engine,
+        Arc::new(invoker),
+        Some(Arc::new(DaemonPasses {
+            store: store.clone(),
+            catalog_dir: config.catalog_dir().to_path_buf(),
+            active_tasks: active_tasks.clone(),
+        })),
     );
-    engine.attach_conductor(&conductor);
     if let Some(recovery) = &recovery {
         continue_at_startup(
             &engine,
@@ -532,10 +532,10 @@ pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
 /// * The conductor's own rows: unanswered chat messages and interrupted
 ///   advisory invocations are served again, and what a rescue left for an
 ///   execution that no longer owes one is discarded
-///   ([`ConductorRegistry::restore_at_startup`]).
+///   ([`restore_at_startup`]).
 /// * `Failed` with a step failure (F3) the conductor had not concluded
 ///   about: it is diagnosed again — R24's one repeat when the restart cut
-///   the invocation short ([`ConductorRegistry::restore_failures_at_startup`]).
+///   the invocation short (also [`restore_at_startup`]).
 pub fn continue_at_startup(
     engine: &Arc<Engine>,
     conductor: &Arc<ConductorRegistry>,
@@ -574,51 +574,7 @@ pub fn continue_at_startup(
         }
     }
 
-    match conductor.restore_at_startup() {
-        Ok(restore) => {
-            for (execution_id, requests) in &restore.requeued {
-                tracing::info!(
-                    execution_id = %execution_id,
-                    requests,
-                    "daemon: the conductor resumes its queue after the restart"
-                );
-            }
-            for execution_id in &restore.discarded {
-                tracing::info!(
-                    execution_id = %execution_id,
-                    "daemon: discarded a label rescue for an execution that moved on"
-                );
-            }
-            for (execution_id, requests, pending) in &restore.parked {
-                tracing::warn!(
-                    execution_id = %execution_id,
-                    queued = requests.len(),
-                    interrupted = pending.is_some(),
-                    "daemon: automatic conductor requests were left from before the restart"
-                );
-            }
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, "daemon: the conductor could not be restored");
-        }
-    }
-
-    match conductor.restore_failures_at_startup() {
-        Ok(diagnosed) => {
-            for execution_id in &diagnosed {
-                tracing::info!(
-                    execution_id = %execution_id,
-                    "daemon: the conductor diagnoses again a failed step it had not concluded about"
-                );
-            }
-        }
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "daemon: the conductor's failed-step diagnoses could not be restored"
-            );
-        }
-    }
+    restore_at_startup(conductor);
 }
 
 /// The daemon's [`PassLauncher`]: a pass the conductor starts resolves its
