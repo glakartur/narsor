@@ -39,7 +39,7 @@ use crate::orchestration::{
 };
 use crate::workflow::TemplateScope;
 use events::LocalTaskStorage;
-use relay::Relay;
+use relay::{Relay, RelayGuard};
 
 /// A launch that did not resolve, as the owner sees it: a `400` naming the
 /// reason, or a bare `500` when the catalogue could not even be read.
@@ -781,9 +781,10 @@ impl ProtocolService {
                 }
             });
         // Wakes the runner's long-poll, which then sees the request.
+        let guard = RelayGuard::new(&self.pages, request_id);
         self.notify(&task_id);
         let page = tokio::time::timeout(self.config.conversation_page_timeout, answer).await;
-        self.lock_pages().close(&request_id);
+        drop(guard);
         match page {
             Ok(Ok(page)) => Ok(page),
             _ => Err(ProtocolError::conflict(

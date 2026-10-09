@@ -109,6 +109,19 @@ pub fn without_unsafe_chars_multiline(text: &str) -> String {
         .collect()
 }
 
+/// The longest `detail` a runner's acknowledgement may carry, in characters.
+pub const MAX_DETAIL_CHARS: usize = 2_000;
+
+/// A runner-supplied `detail` made safe to store and print: unsafe
+/// characters removed (see [`without_unsafe_chars_multiline`]) and cut to
+/// [`MAX_DETAIL_CHARS`] characters, on a character boundary.
+pub fn bounded_detail(text: &str) -> String {
+    without_unsafe_chars_multiline(text)
+        .chars()
+        .take(MAX_DETAIL_CHARS)
+        .collect()
+}
+
 /// Cleans every string of `value` (and every object key) in place, keeping
 /// line breaks in the strings: [`without_unsafe_chars_multiline`] for text,
 /// [`without_unsafe_chars`] for names.

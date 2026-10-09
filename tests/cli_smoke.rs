@@ -58,6 +58,7 @@ impl TempRoot {
 
 impl Drop for TempRoot {
     fn drop(&mut self) {
+        engine_support::kill_processes_under(&self.path);
         let _ = fs::remove_dir_all(&self.path);
     }
 }

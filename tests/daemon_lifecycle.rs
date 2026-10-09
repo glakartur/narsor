@@ -71,10 +71,53 @@ fn daemon_file(root: &Path) -> PathBuf {
     root.join("daemon.json")
 }
 
+/// A spawned daemon that never outlives its test: when the guard is dropped
+/// — also while an assertion unwinds — the daemon is killed and reaped, and
+/// the runners under its root (which outlive a daemon by design) are
+/// stopped. It derefs to the [`Child`].
+struct DaemonGuard {
+    child: Child,
+    _processes: ProcessesUnder,
+}
+
+impl DaemonGuard {
+    fn new(root: &Path, child: Child) -> Self {
+        Self {
+            child,
+            _processes: ProcessesUnder {
+                root: root.to_path_buf(),
+            },
+        }
+    }
+}
+
+impl std::ops::Deref for DaemonGuard {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for DaemonGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Spawns `narsor --root <root> daemon` as a plain (non-detached) child, so
 /// the test itself can `wait()` on it directly.
-fn spawn_daemon(root: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_narsor"))
+fn spawn_daemon(root: &Path) -> DaemonGuard {
+    DaemonGuard::new(
+        root,
+        Command::new(env!("CARGO_BIN_EXE_narsor"))
         .arg("--root")
         .arg(root)
         .arg("daemon")
@@ -82,7 +125,8 @@ fn spawn_daemon(root: &Path) -> Child {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn the daemon")
+        .expect("spawn the daemon"),
+    )
 }
 
 /// Runs `narsor --root <root> daemon stop` to completion; returns its exit
@@ -1188,21 +1232,24 @@ fn seed_rescue(root: &Path) -> (ExecutionStore, narsor::domain::WorkflowExecutio
 }
 
 /// Spawns a daemon over `root` whose `PATH` starts with `bin`.
-fn spawn_daemon_with_path(root: &Path, bin: &Path) -> Child {
+fn spawn_daemon_with_path(root: &Path, bin: &Path) -> DaemonGuard {
     let path = format!(
         "{}:{}",
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    Command::new(env!("CARGO_BIN_EXE_narsor"))
-        .arg("--root")
-        .arg(root)
-        .arg("daemon")
-        .env("PATH", path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the daemon")
+    DaemonGuard::new(
+        root,
+        Command::new(env!("CARGO_BIN_EXE_narsor"))
+            .arg("--root")
+            .arg(root)
+            .arg("daemon")
+            .env("PATH", path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the daemon"),
+    )
 }
 
 /// Leaves the conductor's marker of the rescue invocation a restart cut

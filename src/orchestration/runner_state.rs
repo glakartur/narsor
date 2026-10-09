@@ -18,6 +18,7 @@ use super::model::{
     InputOutcome, InputRequest, InputStatus, InputUpdate, QueuedInput, RunnerObservation,
     RunnerReportOutcome, RunnerSnapshot, TaskEventKind, TaskLifecycle, TaskRecord,
 };
+use crate::domain::display::bounded_detail;
 use crate::domain::{without_unsafe_chars, TaskId};
 use crate::engine::{ConversationState, EventLink, Timeline};
 use chrono::{DateTime, Utc};
@@ -257,6 +258,7 @@ impl ControlPlane {
         accepted: bool,
         detail: Option<String>,
     ) -> Result<(QueuedInput, bool)> {
+        let detail = detail.map(|detail| bounded_detail(&detail));
         let (_, settled) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
             let target = if accepted {

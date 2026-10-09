@@ -6,6 +6,7 @@
 //! the payload differs.
 
 use super::events::{is_safe_component, not_running};
+use super::relay::RelayGuard;
 use super::ProtocolService;
 use crate::conductor::{ConductorView, DEFAULT_CHAT_PAGE, MAX_CHAT_PAGE};
 use crate::controller_protocol::credentials::RunnerIdentity;
@@ -78,9 +79,10 @@ impl ProtocolService {
                     }
                 });
         // Wakes the runner's long-poll, which then sees the request.
+        let guard = RelayGuard::new(&self.conductor_reads, request_id);
         self.notify(task_id);
         let view = tokio::time::timeout(self.config.conversation_page_timeout, answer).await;
-        self.lock_conductor_reads().close(&request_id);
+        drop(guard);
         match view {
             Ok(Ok(view)) => Ok(ConductorReadResponse::Available {
                 conductor: Box::new(view),

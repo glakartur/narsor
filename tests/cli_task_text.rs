@@ -75,3 +75,41 @@ fn a_full_backend_on_resume_is_backend_full_not_a_task_failure() {
     );
     assert_eq!(other.tone, Tone::Error);
 }
+
+#[test]
+fn runner_text_never_reaches_a_terminal_as_control_sequences() {
+    use narsor::cli::task_text::conversation_lines;
+    use narsor::controller_protocol::ConversationResponse;
+    use narsor::orchestration::ConversationAttemptSummary;
+
+    let hostile = "x\u{1b}]0;pwned\u{7}y\u{202e}z";
+    let clean = |text: &str| !text.contains('\u{1b}') && !text.contains('\u{202e}');
+
+    let refused = command_outcome(
+        OwnerCommand::Pause,
+        &Err(ClientError::Refused {
+            code: "no".into(),
+            message: hostile.into(),
+        }),
+    );
+    assert!(clean(&refused.text), "{:?}", refused.text);
+
+    let unknown = queue_badge(&queue(QueueReason::BackendUnknown {
+        detail: hostile.into(),
+    }));
+    assert!(clean(&unknown.text), "{:?}", unknown.text);
+
+    let conversation = ConversationResponse::Available {
+        attempts: vec![ConversationAttemptSummary {
+            attempt_id: hostile.into(),
+            state_id: Some(hostile.into()),
+            entries: 1,
+            closed: false,
+            last_entry_at: None,
+        }],
+        observed_at: Utc::now(),
+    };
+    for line in conversation_lines(Utc::now(), &conversation) {
+        assert!(clean(&line.text), "{:?}", line.text);
+    }
+}

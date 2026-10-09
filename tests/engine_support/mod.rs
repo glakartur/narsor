@@ -565,3 +565,32 @@ pub fn fake_claude_first_on_path() -> String {
     })
     .clone()
 }
+
+/// Kills every `narsor` process whose command line names `root` — the daemon
+/// a test started and the runners that outlive it by design — so a test that
+/// panics before its own cleanup leaves nothing behind. A runner leads its
+/// process group, which takes its harness with it.
+pub fn kill_processes_under(root: &Path) {
+    let root = root.display().to_string();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let command = fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let command = String::from_utf8_lossy(&command).replace('\0', " ");
+        if pid != std::process::id() && command.contains("narsor") && command.contains(&root) {
+            // SAFETY: a process of a test's own, unique temporary root.
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}

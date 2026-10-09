@@ -21,6 +21,7 @@ use super::model::{
     TaskEventKind, TaskLifecycle, TaskRecord,
 };
 use super::runner_state::fence_runner;
+use crate::domain::display::bounded_detail;
 use crate::domain::TaskId;
 
 impl ControlPlane {
@@ -149,6 +150,7 @@ impl ControlPlane {
         applied: bool,
         detail: Option<String>,
     ) -> Result<(QueuedOperatorCommand, bool)> {
+        let detail = detail.map(|detail| bounded_detail(&detail));
         let (_, settled) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
             let target = if applied {

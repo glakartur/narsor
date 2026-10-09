@@ -11,6 +11,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::api::ClientError;
+use crate::domain::without_unsafe_chars;
 use crate::controller_protocol::{
     ConversationResponse, ConversationUnavailableReason, DefaultBackendView, Freshness,
     OwnerCommandResponse, QueueView, TaskSummary, TimelineResponse,
@@ -48,9 +49,12 @@ pub struct ToneLine {
 }
 
 impl ToneLine {
+    /// Everything a line shows may come from a runner or an agent, so the
+    /// characters a terminal would act on (escape sequences, bidi
+    /// overrides, line breaks) never get into it.
     fn new(text: impl Into<String>, tone: Tone) -> Self {
         Self {
-            text: text.into(),
+            text: without_unsafe_chars(&text.into()),
             tone,
         }
     }

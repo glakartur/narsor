@@ -736,6 +736,7 @@ pub async fn task(
                         } else {
                             classified.summary
                         };
+                        let body = crate::tui::scroll::sanitize(&body);
                         println!(
                             "{:>5}  {}  {:<10} {}",
                             classified.entry_number,
@@ -1176,7 +1177,7 @@ async fn operator_command(
             OperatorCommandStatus::Rejected => {
                 return Err(CliError::failure(format!(
                     "The runner rejected the {name} ({command_id}): {}",
-                    status.detail.as_deref().unwrap_or("no reason given")
+                    without_unsafe_chars(status.detail.as_deref().unwrap_or("no reason given"))
                 )));
             }
             OperatorCommandStatus::Queued => {}

@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use super::relay::RelayGuard;
 use super::{ProtocolService, DEFAULT_EVENTS_LIMIT, MAX_EVENTS_LIMIT};
 use crate::controller_protocol::credentials::RunnerIdentity;
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
@@ -89,9 +90,10 @@ impl ProtocolService {
                     }
                 });
         // Wakes the runner's long-poll, which then sees the request.
+        let guard = RelayGuard::new(&self.event_reads, request_id);
         self.notify(task_id);
         let page = tokio::time::timeout(self.config.conversation_page_timeout, answer).await;
-        self.lock_event_reads().close(&request_id);
+        drop(guard);
         match page {
             Ok(Ok(page)) => Ok(ExecutionEventsResponse::Available {
                 events: page.events,

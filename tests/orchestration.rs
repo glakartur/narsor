@@ -2004,3 +2004,39 @@ fn a_task_record_written_before_operator_commands_still_reads() {
 
     assert!(record.operator_commands.is_empty());
 }
+
+#[test]
+fn a_runner_detail_is_cleaned_and_bounded_when_a_command_is_settled() {
+    use narsor::orchestration::OperatorCommand;
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    running_with_runner(&fx, "task-1", &lease);
+    let queued = fx
+        .control
+        .queue_operator_command(
+            &task("task-1"),
+            operator_request(OperatorCommand::Interrupt, "i-1"),
+        )
+        .expect("queued");
+    fx.control
+        .deliver_operator_commands(&task("task-1"), "pod-1", 1)
+        .expect("delivered");
+    let hostile = format!("bad\u{1b}[31m\u{202e}news{}", "é".repeat(5_000));
+
+    let (settled, _) = fx
+        .control
+        .settle_operator_command(
+            &task("task-1"),
+            "pod-1",
+            1,
+            &queued.command.command_id,
+            false,
+            Some(hostile),
+        )
+        .expect("settled");
+
+    let detail = settled.detail.expect("the detail is kept");
+    assert!(detail.starts_with("bad[31mnews"), "{detail}");
+    assert!(!detail.contains('\u{1b}') && !detail.contains('\u{202e}'));
+    assert_eq!(detail.chars().count(), 2_000);
+}
