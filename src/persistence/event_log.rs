@@ -95,9 +95,16 @@ impl EventLog {
     /// numbering is corruption (`DOMAIN_MODEL.md` §5: monotonic, no gaps) and
     /// is reported as [`PersistenceError::SequenceGap`].
     pub fn read_all(&self) -> Result<Vec<Event>> {
-        let sequences = self.sequence_numbers()?;
-        let mut events = Vec::with_capacity(sequences.len());
+        Ok(self.read_after(0, usize::MAX)?.0)
+    }
 
+    /// Reads the events with a sequence greater than `after`, at most
+    /// `limit` of them, ordered by sequence number, and whether more follow.
+    ///
+    /// The numbering is checked for holes over the whole log (listing the
+    /// directory is cheap), but only the files that are returned are read.
+    pub fn read_after(&self, after: u64, limit: usize) -> Result<(Vec<Event>, bool)> {
+        let sequences = self.sequence_numbers()?;
         for (index, sequence) in sequences.iter().copied().enumerate() {
             let expected = FIRST_SEQUENCE + index as u64;
             if sequence != expected {
@@ -107,7 +114,11 @@ impl EventLog {
                     found: sequence,
                 });
             }
+        }
 
+        let wanted = &sequences[sequences.partition_point(|&sequence| sequence <= after)..];
+        let mut events = Vec::with_capacity(wanted.len().min(limit));
+        for &sequence in wanted.iter().take(limit) {
             let path = self.event_path(sequence);
             let event: Event = read_json(&path)?;
             if event.sequence != sequence {
@@ -119,8 +130,7 @@ impl EventLog {
             }
             events.push(event);
         }
-
-        Ok(events)
+        Ok((events, wanted.len() > limit))
     }
 
     /// Returns the sequence numbers present on disk, ascending.

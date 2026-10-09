@@ -636,11 +636,7 @@ fn read_events(
     execution_id: &str,
     after: u64,
 ) -> Result<Vec<Event>, ApiError> {
-    let events = store.event_log(execution_id).read_all()?;
-    Ok(events
-        .into_iter()
-        .filter(|event| event.sequence > after)
-        .collect())
+    Ok(store.event_log(execution_id).read_after(after, usize::MAX)?.0)
 }
 
 /// `GET /executions/:execution_id/conductor`

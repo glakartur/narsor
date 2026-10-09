@@ -767,9 +767,19 @@ impl ApiClient {
             "{}/control/v1/tasks/{task_id}/attempts/{attempt_id}/conversation",
             self.base_url
         );
+        self.get_relayed(&url, query).await
+    }
+
+    /// A `GET` that the control plane answers through a runner's next poll,
+    /// so it may take as long as [`CONVERSATION_PAGE_TIMEOUT`].
+    async fn get_relayed<Q, R>(&self, url: &str, query: &Q) -> Result<R, ClientError>
+    where
+        Q: serde::Serialize + ?Sized,
+        R: serde::de::DeserializeOwned,
+    {
         let response = self
             .send(&self.stream_http, |http, token| {
-                http.get(&url)
+                http.get(url)
                     .bearer_auth(token)
                     .query(query)
                     .timeout(CONVERSATION_PAGE_TIMEOUT)
@@ -790,15 +800,7 @@ impl ApiClient {
             "{}/control/v1/tasks/{task_id}/execution-events",
             self.base_url
         );
-        let response = self
-            .send(&self.stream_http, |http, token| {
-                http.get(&url)
-                    .bearer_auth(token)
-                    .query(query)
-                    .timeout(CONVERSATION_PAGE_TIMEOUT)
-            })
-            .await?;
-        handle_json_response(response).await
+        self.get_relayed(&url, query).await
     }
 
     /// The state of a task's conductor — chat after `query.after`,
@@ -811,15 +813,7 @@ impl ApiClient {
         query: &ConductorReadQuery,
     ) -> Result<ConductorReadResponse, ClientError> {
         let url = format!("{}/control/v1/tasks/{task_id}/conductor", self.base_url);
-        let response = self
-            .send(&self.stream_http, |http, token| {
-                http.get(&url)
-                    .bearer_auth(token)
-                    .query(query)
-                    .timeout(CONVERSATION_PAGE_TIMEOUT)
-            })
-            .await?;
-        handle_json_response(response).await
+        self.get_relayed(&url, query).await
     }
 
     /// Submits an answer to the remote runner's pending input request.

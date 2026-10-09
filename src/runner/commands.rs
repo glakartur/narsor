@@ -123,23 +123,15 @@ impl Session {
         if let Some(pass) = &conductor {
             pass.abort();
         }
-        let mut finished = false;
         // The claim goes with the dropped pass; settling takes it.
-        if let Some(pass) = own {
-            if let Ok(result) = pass.await {
-                tracing::info!(
-                    ok = result.is_ok(),
-                    "the pass finished before the interrupt reached it"
-                );
-                finished = true;
-            }
-        }
-        if let Some(pass) = conductor {
-            if pass.await.is_ok() {
-                tracing::info!("the conductor's pass finished before the interrupt reached it");
-                finished = true;
-            }
-        }
+        let own_finished =
+            joined(own, "the pass finished before the interrupt reached it").await;
+        let conductor_finished = joined(
+            conductor,
+            "the conductor's pass finished before the interrupt reached it",
+        )
+        .await;
+        let finished = own_finished || conductor_finished;
         if finished {
             return Err("the step finished before it could be interrupted".to_string());
         }
@@ -217,4 +209,17 @@ fn refusal(error: &EngineError) -> String {
         EngineError::AlreadyRunning { .. } => "a step is running; interrupt it first".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Waits for an aborted pass to let go. Whether it ran to its end instead of
+/// being cancelled: the interrupt came too late for it.
+async fn joined<T>(pass: Option<tokio::task::JoinHandle<T>>, finished_message: &str) -> bool {
+    let Some(pass) = pass else {
+        return false;
+    };
+    let finished = pass.await.is_ok();
+    if finished {
+        tracing::info!("{finished_message}");
+    }
+    finished
 }

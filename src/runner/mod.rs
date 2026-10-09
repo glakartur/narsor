@@ -1105,21 +1105,18 @@ impl Session {
         else {
             return;
         };
-        let events = match self.engine.store().event_log(&execution_id).read_all() {
-            Ok(events) => events,
+        let (events, has_more) = match self
+            .engine
+            .store()
+            .event_log(&execution_id)
+            .read_after(request.after, request.limit as usize)
+        {
+            Ok(page) => page,
             Err(error) => {
                 tracing::warn!(%error, "cannot read the execution events");
                 return;
             }
         };
-        let limit = request.limit as usize;
-        let mut events: Vec<_> = events
-            .into_iter()
-            .filter(|event| event.sequence > request.after)
-            .take(limit.saturating_add(1))
-            .collect();
-        let has_more = events.len() > limit;
-        events.truncate(limit);
         let page = ExecutionEventsPage { events, has_more };
         if let Err(error) = client
             .upload_execution_events(&request.request_id, &page)

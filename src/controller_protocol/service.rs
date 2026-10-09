@@ -442,10 +442,21 @@ impl ProtocolService {
                     .then_with(|| b.task_id.as_str().cmp(a.task_id.as_str()))
             });
         }
-        let tasks = kept
-            .iter()
-            .map(|record| self.summarize(record))
-            .collect::<ProtocolResult<Vec<_>>>()?;
+        let now = self.control.now();
+        let mut presences: HashMap<&BackendId, Option<ControllerPresence>> = HashMap::new();
+        let mut tasks = Vec::with_capacity(kept.len());
+        for record in &kept {
+            let backend_id = &record.assignment.backend_id;
+            let controller = match presences.get(backend_id) {
+                Some(controller) => controller.clone(),
+                None => {
+                    let controller = self.controller_presence(backend_id, now)?;
+                    presences.insert(backend_id, controller.clone());
+                    controller
+                }
+            };
+            tasks.push(self.summarize_with(record, now, controller)?);
+        }
         Ok(TaskListResponse {
             tasks,
             cursor: cursor.to_string(),
@@ -1600,6 +1611,17 @@ impl ProtocolService {
     pub fn summarize(&self, record: &TaskRecord) -> ProtocolResult<TaskSummary> {
         let now = self.control.now();
         let controller = self.controller_presence(&record.assignment.backend_id, now)?;
+        self.summarize_with(record, now, controller)
+    }
+
+    /// [`Self::summarize`] with the controller of the record's backend
+    /// already looked up, as of `now`.
+    fn summarize_with(
+        &self,
+        record: &TaskRecord,
+        now: DateTime<Utc>,
+        controller: Option<ControllerPresence>,
+    ) -> ProtocolResult<TaskSummary> {
         let controller_freshness = controller
             .as_ref()
             .map_or(Freshness::Stale, |presence| presence.freshness);

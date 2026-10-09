@@ -134,24 +134,20 @@ impl ProtocolService {
             if !store.exists(&execution_id) {
                 return Ok(None);
             }
-            store.event_log(&execution_id).read_all().map(Some)
+            store
+                .event_log(&execution_id)
+                .read_after(after, limit as usize)
+                .map(Some)
         })
         .await
         .map_err(|error| ProtocolError::Internal(error.to_string()))?
         .map_err(|error| ProtocolError::Internal(error.to_string()))?;
-        let Some(events) = read else {
+        let Some((events, has_more)) = read else {
             return Ok(unavailable(
                 reason,
                 "the task's storage holds no such execution",
             ));
         };
-        let mut events: Vec<_> = events
-            .into_iter()
-            .filter(|event| event.sequence > after)
-            .take(limit as usize + 1)
-            .collect();
-        let has_more = events.len() > limit as usize;
-        events.truncate(limit as usize);
         Ok(ExecutionEventsResponse::Available {
             events,
             has_more,

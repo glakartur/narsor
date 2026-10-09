@@ -54,9 +54,11 @@ use crate::persistence::atomic::{
 };
 use crate::persistence::paths::{parse_event_file_name, StatePaths};
 use crate::persistence::PersistenceError;
+use std::collections::HashSet;
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// The control plane's file store. Holds no state of its own beyond paths, so
 /// any number of handles — in any number of threads — are safe: every
@@ -64,12 +66,20 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct OrchestrationStore {
     paths: StatePaths,
+    /// Backends this process has seen with every record at the current
+    /// version, so that [`Self::lock_schedule`] does not scan them again. Only
+    /// a build that predates version 2 writes version 1 records, so a backend
+    /// does not become legacy again while handles to it are alive.
+    migrated: Arc<Mutex<HashSet<BackendId>>>,
 }
 
 impl OrchestrationStore {
     /// A store below the state root of `paths`.
     pub fn new(paths: StatePaths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            migrated: Arc::default(),
+        }
     }
 
     /// The path layout.
@@ -190,17 +200,15 @@ impl OrchestrationStore {
         // Backends in the order their oldest task was created — stable, so
         // a new task never reorders another backend's rows — and each
         // backend's tasks in queue order.
-        let mut first_seen: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        let mut group: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         for task in &tasks {
-            let seen = first_seen
-                .entry(task.assignment.backend_id.as_str())
-                .or_insert(task.queue_sequence);
-            *seen = (*seen).min(task.queue_sequence);
+            match group.get_mut(task.assignment.backend_id.as_str()) {
+                Some(seen) => *seen = (*seen).min(task.queue_sequence),
+                None => {
+                    group.insert(task.assignment.backend_id.to_string(), task.queue_sequence);
+                }
+            }
         }
-        let group: std::collections::HashMap<String, u64> = first_seen
-            .into_iter()
-            .map(|(backend, seen)| (backend.to_string(), seen))
-            .collect();
         tasks.sort_by(|left, right| {
             group[left.assignment.backend_id.as_str()]
                 .cmp(&group[right.assignment.backend_id.as_str()])
@@ -252,16 +260,34 @@ impl OrchestrationStore {
     }
 
     /// Migrates `backend_id` if any of its records is still at version 1.
+    ///
+    /// Scans the records once per backend and process; the backend is then
+    /// remembered as migrated.
     fn migrate_backend_if_legacy(&self, backend_id: &BackendId) -> Result<()> {
+        if self.migrated_backends().contains(backend_id) {
+            return Ok(());
+        }
+        let mut legacy = false;
         for task_id in self.list_task_ids()? {
             let record = self.load_task_unmigrated(&task_id)?;
             if record.assignment.backend_id == *backend_id
                 && record.record_version < TASK_RECORD_VERSION
             {
-                return self.migrate_backend(backend_id);
+                legacy = true;
+                break;
             }
         }
+        if legacy {
+            self.migrate_backend(backend_id)?;
+        }
+        self.migrated_backends().insert(backend_id.clone());
         Ok(())
+    }
+
+    fn migrated_backends(&self) -> std::sync::MutexGuard<'_, HashSet<BackendId>> {
+        self.migrated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The events of a task with a sequence greater than `after`, in order.

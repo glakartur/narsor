@@ -492,23 +492,28 @@ fn legacy_store(state: &AppState, execution_id: &str) -> Result<ExecutionStore, 
 async fn get_history(
     State(state): State<AppState>,
 ) -> Result<Json<LegacyExecutionListResponse>, ApiError> {
-    let mut executions = Vec::new();
-    if state.local {
-        for id in state.store.list_execution_ids()? {
-            // One corrupt execution must not take the whole Historia away.
-            match history_view(&state, &id) {
-                Ok(view) => executions.push(view),
-                Err(_) => {
-                    tracing::warn!(execution_id = %id, "control: skipping an unreadable execution")
+    let executions = blocking(move || -> Result<_, ApiError> {
+        let mut executions = Vec::new();
+        if state.local {
+            for id in state.store.list_execution_ids()? {
+                // One corrupt execution must not take the whole Historia away.
+                match history_view(&state, &id) {
+                    Ok(view) => executions.push(view),
+                    Err(_) => {
+                        tracing::warn!(execution_id = %id, "control: skipping an unreadable execution")
+                    }
                 }
             }
         }
-    }
-    executions.sort_by(|a, b| {
-        b.started_at
-            .cmp(&a.started_at)
-            .then_with(|| b.id.cmp(&a.id))
-    });
+        executions.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(executions)
+    })
+    .await
+    .map_err(|error| ApiError::Internal(error.to_string()))??;
     Ok(Json(LegacyExecutionListResponse { executions }))
 }
 
