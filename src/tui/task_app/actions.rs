@@ -451,6 +451,14 @@ pub struct LinkList {
     chooser: Chooser,
 }
 
+/// The harnesses the conductor of a task can run on (the *Dyrygent* tab).
+#[derive(Debug, Clone)]
+pub struct HarnessList {
+    pub(super) task_id: String,
+    pub(super) harnesses: Vec<String>,
+    pub(super) chooser: Chooser,
+}
+
 /// What sits over the screen, taking the keys.
 #[derive(Debug, Clone)]
 pub enum Overlay {
@@ -460,6 +468,8 @@ pub enum Overlay {
     Transitions(TransitionList),
     /// The links of the task (`o`).
     Links(LinkList),
+    /// The harnesses of the task's conductor (`h` on its tab).
+    Harness(HarnessList),
     /// The `y` / `n` window.
     Confirm(Confirmation),
 }
@@ -471,6 +481,7 @@ impl Overlay {
             Self::Menu(menu) => &menu.task_id,
             Self::Transitions(list) => &list.task_id,
             Self::Links(list) => &list.task_id,
+            Self::Harness(list) => &list.task_id,
             Self::Confirm(confirmation) => &confirmation.task_id,
         }
     }
@@ -481,6 +492,7 @@ impl Overlay {
             Self::Menu(menu) => Some(&menu.chooser),
             Self::Transitions(list) => Some(&list.chooser),
             Self::Links(list) => Some(&list.chooser),
+            Self::Harness(list) => Some(&list.chooser),
             Self::Confirm(_) => None,
         }
     }
@@ -500,6 +512,7 @@ impl Overlay {
             Self::Confirm(_) => Context::Confirm,
             Self::Transitions(list) => chooser_context(&list.chooser),
             Self::Links(list) => chooser_context(&list.chooser),
+            Self::Harness(list) => chooser_context(&list.chooser),
         }
     }
 }
@@ -762,7 +775,9 @@ impl TaskApp {
         match overlay {
             Overlay::Menu(_) => self.on_menu_key(&key),
             Overlay::Confirm(_) => self.on_confirm_key(&key),
-            Overlay::Transitions(_) | Overlay::Links(_) => self.on_list_key(key),
+            Overlay::Transitions(_) | Overlay::Links(_) | Overlay::Harness(_) => {
+                self.on_list_key(key)
+            }
         }
     }
 
@@ -836,6 +851,7 @@ impl TaskApp {
         let chooser = match &mut self.overlay {
             Some(Overlay::Transitions(list)) => &mut list.chooser,
             Some(Overlay::Links(list)) => &mut list.chooser,
+            Some(Overlay::Harness(list)) => &mut list.chooser,
             _ => return Request::None,
         };
         match chooser.on_key(key) {
@@ -854,6 +870,7 @@ impl TaskApp {
                     Some(link) => Request::OpenLink(link.clone()),
                     None => Request::None,
                 },
+                Some(Overlay::Harness(list)) => self.chosen_harness(&list, &submission),
                 _ => Request::None,
             },
         }
@@ -1023,7 +1040,7 @@ impl TaskApp {
     /// The request for `send` to `task`. A retry of the same decision — the
     /// same command to the same task, after one that got no answer — reuses
     /// its key; an answer, or a refusal, forgets it.
-    fn action_request(
+    pub(super) fn action_request(
         &mut self,
         task: &TaskSummary,
         verb: &str,
@@ -1065,6 +1082,7 @@ impl TaskApp {
             send,
         } = request;
         let signature = key_signature(&task_id, &send);
+        let conductor = conductor_command(&send);
         let result = match send {
             ActionSend::Owner(command) => self
                 .client
@@ -1098,6 +1116,9 @@ impl TaskApp {
             }
             Ok(Some(command)) => {
                 self.action_keys.remove(&signature);
+                if let Some(sent) = conductor {
+                    self.conductor_command_sent(&task_id, sent, command.status);
+                }
                 let (severity, text) = match command.status {
                     OperatorCommandStatus::Queued => (Severity::Success, summary),
                     OperatorCommandStatus::Applied => {
@@ -1147,8 +1168,40 @@ impl TaskApp {
 
     /// Tells the verdict of an operator command on the bar.
     pub(super) fn notify_resolved(&mut self, resolved: &CommandResolved) {
+        if resolved.command.as_ref().and_then(conductor_kind).is_some() {
+            self.conductor_command_settled(&resolved.task_id);
+        }
         let (severity, text) = resolved_notice(resolved);
         self.notify(severity, text);
+    }
+}
+
+/// What the *Dyrygent* tab sent through the shared path of operator commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConductorSent {
+    /// A message to the conductor.
+    Chat,
+    /// An undone decision.
+    Undo,
+    /// Another harness.
+    Harness,
+}
+
+/// Which command of the conductor's `command` is, if it is one of the three
+/// the tab sends.
+fn conductor_kind(command: &OperatorCommand) -> Option<ConductorSent> {
+    match command {
+        OperatorCommand::ConductorChat { .. } => Some(ConductorSent::Chat),
+        OperatorCommand::UndoDecision { .. } => Some(ConductorSent::Undo),
+        OperatorCommand::SetConductorHarness { .. } => Some(ConductorSent::Harness),
+        _ => None,
+    }
+}
+
+fn conductor_command(send: &ActionSend) -> Option<ConductorSent> {
+    match send {
+        ActionSend::Operator(command) => conductor_kind(command),
+        ActionSend::Owner(_) => None,
     }
 }
 
@@ -1325,6 +1378,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles)
         Overlay::Links(list) => {
             render_list(frame, area, &format!("Linki · {title}"), &mut list.chooser, styles);
         }
+        Overlay::Harness(list) => render_list(
+            frame,
+            area,
+            &format!("Harness dyrygenta · {title}"),
+            &mut list.chooser,
+            styles,
+        ),
     }
 }
 

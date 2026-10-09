@@ -295,3 +295,60 @@ pub fn with_transitions(
     });
     task
 }
+
+/// The runner of `task` reports a conductor that works.
+pub fn with_conductor(mut task: TaskSummary) -> TaskSummary {
+    if let Some(runner) = task.runner.as_mut() {
+        runner.conductor_available = true;
+        runner.conductor_unavailable_reason = None;
+    }
+    task
+}
+
+/// The runner of `task` reports that it has no conductor, and why.
+pub fn without_conductor(mut task: TaskSummary, reason: &str) -> TaskSummary {
+    if let Some(runner) = task.runner.as_mut() {
+        runner.conductor_available = false;
+        runner.conductor_unavailable_reason = Some(reason.to_string());
+    }
+    task
+}
+
+/// One chat entry of a conductor, as the runner would serve it.
+pub fn chat_entry(
+    id: &str,
+    sequence: u64,
+    author: &str,
+    kind: &str,
+    text: &str,
+    payload: Option<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "sequence": sequence,
+        "at": at(),
+        "author": author,
+        "kind": kind,
+        "text": text,
+        "payload": payload,
+    })
+}
+
+/// The view of a conductor that runs on `claude-code` and has said `chat`;
+/// `extra` adds or replaces fields (`decisions`, `proposals`, …).
+pub fn conductor_view(
+    chat: Vec<serde_json::Value>,
+    extra: serde_json::Value,
+) -> narsor::conductor::ConductorView {
+    let mut view = serde_json::json!({
+        "available": true,
+        "harness": "claude-code",
+        "chat": chat,
+    });
+    if let (Some(view), Some(extra)) = (view.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            view.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::from_value(view).expect("a conductor view")
+}

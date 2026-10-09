@@ -11,8 +11,10 @@
 //! * [`conversation`] — the whole conversation, and the per-attempt cache the
 //!   progress tab shares;
 //! * [`events`] — the raw event log with the detail of one event;
+//! * [`conductor`] — the chat with the conductor, its decisions and harness;
 //! * [`info`] — what the control plane knows about the task.
 
+pub mod conductor;
 pub mod conversation;
 pub mod events;
 pub mod info;

@@ -68,6 +68,7 @@ use super::super::style::{Role, Styles};
 use super::detail::short_age;
 use super::list::{one_line, title_of};
 use super::notify::Severity;
+use super::tabs::conductor;
 use super::{idempotency_key, move_failure_reason, Request, TaskApp};
 
 /// The most rows of the context the panel gives itself before it scrolls.
@@ -1030,7 +1031,7 @@ impl TaskApp {
                 lost = effect.lost_current;
                 released = effect.released;
             }
-            drafts.push((id.to_string(), view.waiting.draft_text()));
+            drafts.push((id.to_string(), view.draft_text()));
         }
         for (id, text) in drafts {
             self.detail.set_draft(&id, text);
@@ -1086,7 +1087,7 @@ impl TaskApp {
             PanelEffect::Confirm(submission) => self.ask_to_confirm(&id, &submission),
         };
         if let Some(view) = self.detail.views.get(&id) {
-            let text = view.waiting.draft_text();
+            let text = view.draft_text();
             self.detail.set_draft(&id, text);
         }
         request
@@ -1220,30 +1221,46 @@ impl TaskApp {
     fn settle_answer(&mut self, task_id: &str, waiting_id: &str, outcome: Result<(), (String, bool)>) {
         if let Some(view) = self.detail.views.get_mut(task_id) {
             view.waiting.settle(waiting_id, outcome);
-            let text = view.waiting.draft_text();
+            let text = view.draft_text();
             self.detail.set_draft(task_id, text);
         }
     }
 
-    /// Reads the conductor's state when the selected task's panel is made of
-    /// it and has not got it for this revision of the row.
+    /// Reads the conductor's state when the answer panel is made of it, or
+    /// the *Dyrygent* tab is shown, and the task has not got it for this
+    /// revision. One read serves both. The tab's chat is read from the last
+    /// entry held, a page at a time, up to [`conductor::MAX_PAGES`] pages.
     pub(super) async fn sync_conductor(&mut self, id: &str, revision: u64) {
-        let wanted = self
-            .detail
-            .views
-            .get(id)
-            .is_some_and(|view| view.waiting.needs_conductor(revision));
-        if !wanted {
-            return;
-        }
+        let shown = self.detail.tab() == super::DetailTab::Conductor;
         let client = self.client.clone();
-        let result = client
-            .control_conductor(id, &crate::controller_protocol::ConductorReadQuery::default())
-            .await;
-        self.on_detail_read(id, revision, super::detail::DetailRead::Conductor(result));
+        for page in 0..conductor::MAX_PAGES {
+            let Some(view) = self.detail.views.get(id) else {
+                return;
+            };
+            let panel = page == 0 && view.waiting.needs_conductor(revision);
+            let tab = shown
+                && if page == 0 {
+                    view.conductor.needs_read(revision, std::time::Instant::now())
+                } else {
+                    view.conductor.has_more()
+                };
+            if !panel && !tab {
+                return;
+            }
+            let query = crate::controller_protocol::ConductorReadQuery {
+                after: view.conductor.last_sequence(),
+                limit: None,
+            };
+            let result = client.control_conductor(id, &query).await;
+            let failed = result.is_err();
+            self.on_detail_read(id, revision, super::detail::DetailRead::Conductor(result));
+            if failed || !shown {
+                return;
+            }
+        }
     }
 
-    /// Takes a read of the conductor's state in.
+    /// Takes a read of the conductor's state in: the panel and the tab both.
     pub(super) fn apply_conductor_read(
         &mut self,
         task_id: &str,
@@ -1255,6 +1272,8 @@ impl TaskApp {
             return;
         };
         let view = self.detail.view_mut(task_id);
+        view.conductor
+            .apply(revision, std::time::Instant::now(), result.clone());
         let positions = view.progress().positions().to_vec();
         view.waiting.apply_conductor(task, &positions, revision, result);
     }

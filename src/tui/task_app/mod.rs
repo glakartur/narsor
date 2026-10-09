@@ -47,11 +47,7 @@
 //!   [`TaskApp::list`]`.selected()`, and the tab and what each task's tabs
 //!   remember (cursors, the followed step, scroll, what was read) are in
 //!   [`DetailState`] ([`DetailState::view`]). Keys reach the tabs by the
-//!   `Context::Details` arm of [`TaskApp::on_key`]. *Dyrygent* (U12) is a tab
-//!   that says it is coming: give it a state in [`detail::TaskDetail`], a
-//!   module in [`tabs`], and replace its arm in [`detail::render`], its arm in
-//!   [`detail::TaskDetail::on_action`] and its read in
-//!   [`TaskApp::sync_detail`].
+//!   `Context::Details` arm of [`TaskApp::on_key`].
 //! * **The answer panel (U10)** is a part of the details; the list already
 //!   leads to it (`Space` → [`list::TaskList::select_next_waiting`], `Enter`
 //!   → [`Focus::Details`]). A draft belongs in [`DetailState::set_draft`]. The
@@ -68,6 +64,13 @@
 //!   mutation must first pass [`TaskApp::mutation_allowed`], and send its own
 //!   [`idempotency_key`]; the verdict of an operator command comes back as an
 //!   event and ends on the bar ([`list::CommandResolved`]).
+//! * **The *Dyrygent* tab (U12)** is in: [`tabs::conductor`]. Its chat, its
+//!   decisions and its harness go through [`Request::Act`] like any operator
+//!   command (a message is [`actions::ActionSend::Operator`] with
+//!   `ConductorChat`), so they pass [`TaskApp::mutation_allowed`] and carry an
+//!   [`idempotency_key`]. What is typed in its text box is a draft
+//!   ([`detail::TaskDetail::draft_text`]), and while typing
+//!   [`TaskApp::key_context`] is [`Context::Form`].
 //! * **The new-task form (U13)** takes [`layout::Areas::detail`]; a task it
 //!   sent shows as an [`list::StateIcon::Sending`] row.
 
@@ -422,6 +425,9 @@ impl TaskApp {
                 Context::Panel
             };
         }
+        if self.conductor_typing() {
+            return Context::Form;
+        }
         layout::context_of(self.focus, &self.list)
     }
 
@@ -458,6 +464,9 @@ impl TaskApp {
         if self.panel_focused() {
             return self.on_panel_key(key, confirming_quit);
         }
+        if self.conductor_typing() {
+            return self.on_conductor_typing_key(key);
+        }
         let context = self.key_context();
         let Some(action) = keymap::lookup(context, &key) else {
             return Request::None;
@@ -477,6 +486,11 @@ impl TaskApp {
                 if context == Context::Details =>
             {
                 self.on_detail_action(action)
+            }
+            Action::Compose | Action::UndoDecision | Action::ChooseHarness | Action::LoadMore
+                if context == Context::Details =>
+            {
+                return self.on_conductor_action(action);
             }
             Action::NextWaiting => {
                 if !self.list.select_next_waiting() {

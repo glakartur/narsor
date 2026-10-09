@@ -517,8 +517,19 @@ impl Chooser {
         top + self.field_rows()
     }
 
+    /// Puts the keys in the fields of the highlighted entry, as `Tab` does
+    /// (for an owner whose only entry is a text box).
+    pub fn enter_fields(&mut self) {
+        self.focus_fields();
+    }
+
+    /// Takes the keys out of the fields; what was typed stays.
+    pub fn leave_fields(&mut self) {
+        self.focus = ChooserFocus::Actions;
+    }
+
     /// The rows the fields of the highlighted entry take.
-    fn field_rows(&self) -> u16 {
+    pub fn field_rows(&self) -> u16 {
         let Some(item) = self.selected_item() else {
             return 0;
         };
@@ -878,6 +889,15 @@ pub fn render(frame: &mut Frame, area: Rect, chooser: &mut Chooser, styles: &Sty
         let offset = (focus_line + 1).saturating_sub(fields_height as usize) as u16;
         frame.render_widget(Paragraph::new(fields).scroll((offset, 0)), bottom);
     }
+}
+
+/// Draws only the fields of the highlighted entry into `area`, scrolled so
+/// that the focused one is in view: a text box without the list around it.
+pub fn render_fields(frame: &mut Frame, area: Rect, chooser: &Chooser, styles: &Styles) {
+    let (fields, focus_line) = field_lines(chooser, styles);
+    let height = usize::from(area.height);
+    let offset = (focus_line + 1).saturating_sub(height) as u16;
+    frame.render_widget(Paragraph::new(fields).scroll((offset, 0)), area);
 }
 
 fn pane(title: &str, active: bool, styles: &Styles) -> Block<'static> {

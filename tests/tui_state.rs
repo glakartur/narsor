@@ -10571,3 +10571,994 @@ mod task_app_actions {
         }
     }
 }
+
+/// U12: the *Dyrygent* tab — the chat, the decisions with their undo, the
+/// harness, and what it says when there is no conductor.
+mod task_app_conductor {
+    use std::time::{Duration, Instant};
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::{json, Value};
+
+    use narsor::api::{ApiClient, ClientError};
+    use narsor::conductor::ConductorView;
+    use narsor::controller_protocol::{
+        ConductorReadResponse, ConversationUnavailableReason, ExecutionEventsSource, RunnerClient,
+        TaskSummary,
+    };
+    use narsor::domain::ExecutionStatus;
+    use narsor::orchestration::{
+        AttentionKind, OperatorCommand, OwnerRef, TaskEventKind, TaskLifecycle,
+    };
+    use narsor::tui::chat::UndoState;
+    use narsor::tui::keymap::{self, Action, Context};
+    use narsor::tui::task_app::actions::{ActionRequest, ActionSend, Overlay};
+    use narsor::tui::task_app::detail::DetailRead;
+    use narsor::tui::task_app::notify::Severity;
+    use narsor::tui::task_app::waiting::Submit;
+    use narsor::tui::task_app::{DetailTab, Focus, Request, TaskApp};
+    use narsor::tui::transcript::TranscriptPresentation;
+
+    use super::remote_support::{snapshot, RemoteHarness};
+    use super::task_app_support::{
+        chat_entry, conductor_view, event, listing, task, titled, waiting_on, with_conductor,
+        with_controller, with_runner, without_conductor,
+    };
+
+    fn app() -> TaskApp {
+        TaskApp::new(ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"), "local", None)
+    }
+
+    fn press(app: &mut TaskApp, code: KeyCode) -> Request {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn ch(app: &mut TaskApp, character: char) -> Request {
+        press(app, KeyCode::Char(character))
+    }
+
+    fn typed(app: &mut TaskApp, text: &str) {
+        for character in text.chars() {
+            ch(app, character);
+        }
+    }
+
+    fn note(app: &TaskApp) -> String {
+        app.notifier()
+            .latest()
+            .map(|note| note.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn act(request: Request) -> ActionRequest {
+        match request {
+            Request::Act(request) => *request,
+            other => panic!("an action was expected, got {other:?}"),
+        }
+    }
+
+    fn sent_command(request: Request) -> OperatorCommand {
+        match act(request).send {
+            ActionSend::Operator(command) => command,
+            other => panic!("an operator command was expected, got {other:?}"),
+        }
+    }
+
+    fn running(id: &str, rank: u32) -> TaskSummary {
+        with_conductor(with_runner(
+            with_controller(task(id, "local", "running", rank)),
+            ExecutionStatus::Running,
+            "review",
+        ))
+    }
+
+    /// An app over the running task `a`, on the details of the *Dyrygent* tab.
+    fn tab_app() -> TaskApp {
+        let mut app = app();
+        app.load(listing(vec![titled(running("a", 1), "NAR-12")], "c"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Details);
+        app.detail_mut().set_tab(DetailTab::Conductor);
+        app
+    }
+
+    fn revision(app: &TaskApp) -> u64 {
+        app.list().selected().expect("a selection").revision
+    }
+
+    fn read(app: &mut TaskApp, view: ConductorView) {
+        read_response(
+            app,
+            Ok(ConductorReadResponse::Available {
+                conductor: Box::new(view),
+                source: ExecutionEventsSource::Runner,
+            }),
+        );
+    }
+
+    fn read_response(app: &mut TaskApp, result: Result<ConductorReadResponse, ClientError>) {
+        let revision = revision(app);
+        app.on_detail_read("a", revision, DetailRead::Conductor(result));
+    }
+
+    fn conductor(app: &TaskApp) -> &narsor::tui::task_app::tabs::conductor::Conductor {
+        app.detail().view("a").expect("details").conductor()
+    }
+
+    fn screen(app: &mut TaskApp, width: u16, height: u16) -> String {
+        use narsor::tui::style::Styles;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                narsor::tui::task_app::layout::render(frame, app, &Styles::new(false), Instant::now())
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        buffer
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn decision_entry(id: &str, sequence: u64, decision_id: &str) -> Value {
+        chat_entry(
+            id,
+            sequence,
+            "conductor",
+            "decision",
+            "Wybrano wyjście approved",
+            Some(json!({
+                "kind": "choose_output",
+                "decision_id": decision_id,
+                "output_label": "approved",
+                "confidence": "high",
+                "rationale": "Testy przeszły."
+            })),
+        )
+    }
+
+    fn decision_view(decision_id: &str, undone: bool, undoable: bool) -> Value {
+        json!({
+            "decision_id": decision_id,
+            "kind": "choose_output",
+            "text": "Wybrano wyjście approved",
+            "at": "2026-10-09T12:00:00Z",
+            "confidence": "high",
+            "rationale": "Testy przeszły.",
+            "undone": undone,
+            "undoable": undoable
+        })
+    }
+
+    // -- the chat ----------------------------------------------------------
+
+    mod chat {
+        use super::*;
+
+        #[test]
+        fn a_message_goes_out_as_a_conductor_chat_exactly_as_typed() {
+            let mut app = tab_app();
+            read(&mut app, conductor_view(vec![], json!({})));
+            ch(&mut app, 'c');
+            assert!(conductor(&app).is_typing());
+            assert_eq!(app.key_context(), Context::Form, "typing inherits no global key");
+
+            typed(&mut app, "  Czy revise? q");
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+            typed(&mut app, "Dziękuję  ");
+            let request = act(press(&mut app, KeyCode::Enter));
+            assert_eq!(
+                request.send,
+                ActionSend::Operator(OperatorCommand::ConductorChat {
+                    text: "  Czy revise? q\nDziękuję  ".to_string()
+                }),
+                "what the operator typed is sent without a change"
+            );
+            assert_eq!(request.verb, "wiadomość do dyrygenta");
+            assert!(app.detail().has_drafts(), "the text stays until the control plane took it");
+
+            let again = act(press(&mut app, KeyCode::Enter));
+            assert_eq!(again.key, request.key, "a retry of the same message reuses its key");
+        }
+
+        #[test]
+        fn the_operators_entry_and_then_the_conductors_answer_have_their_roles() {
+            let mut app = tab_app();
+            read(
+                &mut app,
+                conductor_view(
+                    vec![chat_entry("m1", 1, "operator", "message", "Czy revise?", None)],
+                    json!({ "unanswered_chat": ["m1"] }),
+                ),
+            );
+            assert!(conductor(&app).awaits_answer());
+            read(
+                &mut app,
+                conductor_view(
+                    vec![chat_entry("m2", 2, "conductor", "message", "Raczej revise — brak planu.", None)],
+                    json!({}),
+                ),
+            );
+            let presentations: Vec<_> = conductor(&app)
+                .transcript()
+                .entries()
+                .iter()
+                .map(|entry| entry.presentation)
+                .collect();
+            assert_eq!(
+                presentations,
+                [TranscriptPresentation::Operator, TranscriptPresentation::Conductor]
+            );
+            assert!(!conductor(&app).awaits_answer());
+            let text = screen(&mut app, 120, 30);
+            assert!(text.contains("USER") && text.contains("Czy revise?"), "{text}");
+            assert!(text.contains("KONDUKTOR") && text.contains("Raczej revise"), "{text}");
+        }
+
+        #[test]
+        fn what_was_typed_survives_a_refresh_and_a_visit_to_another_task() {
+            let mut app = tab_app();
+            read(&mut app, conductor_view(vec![], json!({})));
+            ch(&mut app, 'c');
+            typed(&mut app, "pół zdania");
+            press(&mut app, KeyCode::Esc);
+            assert!(!conductor(&app).is_typing(), "Esc leaves the box");
+            assert_eq!(conductor(&app).draft(), "pół zdania");
+            assert_eq!(app.detail().draft("a"), Some("pół zdania"));
+
+            app.load(listing(vec![titled(running("a", 1), "NAR-12")], "d"));
+            assert_eq!(conductor(&app).draft(), "pół zdania", "a refresh keeps the draft");
+            assert!(app.detail().has_drafts());
+            assert!(screen(&mut app, 120, 30).contains("szkic: pół zdania"));
+
+            ch(&mut app, 'c');
+            typed(&mut app, " i reszta");
+            assert_eq!(conductor(&app).draft(), "pół zdania i reszta");
+        }
+
+        #[test]
+        fn q_and_the_question_mark_are_text_while_typing_and_quitting_asks_about_the_draft() {
+            let mut app = tab_app();
+            read(&mut app, conductor_view(vec![], json!({})));
+            ch(&mut app, 'c');
+            typed(&mut app, "q?");
+            assert!(!app.should_quit());
+            assert!(!app.is_help_open());
+            assert_eq!(conductor(&app).draft(), "q?");
+
+            press(&mut app, KeyCode::Esc);
+            ch(&mut app, 'q');
+            assert!(!app.should_quit(), "an unsent message is asked about first");
+            assert!(note(&app).contains("niewysłany szkic"), "{}", note(&app));
+        }
+
+        #[test]
+        fn a_blank_message_is_not_sent() {
+            let mut app = tab_app();
+            read(&mut app, conductor_view(vec![], json!({})));
+            ch(&mut app, 'c');
+            typed(&mut app, "   ");
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert!(conductor(&app).is_typing());
+        }
+
+        #[test]
+        fn nothing_from_the_conductor_reaches_the_screen_with_a_terminal_control() {
+            let mut app = tab_app();
+            read(
+                &mut app,
+                conductor_view(
+                    vec![chat_entry(
+                        "m1",
+                        1,
+                        "conductor",
+                        "message",
+                        "ok\u{1b}[31m czerwony\u{202e}tekst\u{200b}",
+                        None,
+                    )],
+                    json!({ "harness": "cla\u{1b}]8;;x\u{7}ude" }),
+                ),
+            );
+            let text = screen(&mut app, 120, 30);
+            assert!(text.contains("czerwony"), "{text}");
+            assert!(
+                !text.chars().any(|c| c.is_control() && c != '\n' || "\u{202e}\u{200b}".contains(c)),
+                "{text:?}"
+            );
+        }
+    }
+
+    // -- decisions and their undo ----------------------------------------------
+
+    mod decisions {
+        use super::*;
+
+        fn with_decision() -> TaskApp {
+            let mut app = tab_app();
+            read(
+                &mut app,
+                conductor_view(
+                    vec![decision_entry("e1", 1, "d1")],
+                    json!({ "decisions": [decision_view("d1", false, true)] }),
+                ),
+            );
+            app
+        }
+
+        #[test]
+        fn undoing_a_decision_asks_with_its_confidence_and_sends_after_y() {
+            let mut app = with_decision();
+            assert_eq!(ch(&mut app, 'u'), Request::None);
+            let window = app.overlay().and_then(Overlay::confirmation).expect("the window");
+            assert!(window.heading().contains("Cofnij decyzję"), "{}", window.heading());
+            let text = screen(&mut app, 120, 30);
+            assert!(text.contains("Pewność dyrygenta: high"), "{text}");
+            assert!(text.contains("Uzasadnienie: Testy przeszły."), "{text}");
+            assert!(text.contains("skutki uboczne"), "{text}");
+
+            ch(&mut app, 'n');
+            assert!(app.overlay().is_none(), "n takes it back");
+            ch(&mut app, 'u');
+            let command = sent_command(ch(&mut app, 'y'));
+            assert_eq!(
+                command,
+                OperatorCommand::UndoDecision {
+                    decision_id: "d1".to_string()
+                }
+            );
+        }
+
+        #[test]
+        fn the_undo_comes_back_as_an_entry_and_the_decision_is_marked_undone() {
+            let mut app = with_decision();
+            assert!(matches!(
+                conductor(&app).items()[0].undo,
+                Some(UndoState::Undoable { .. })
+            ));
+            read(
+                &mut app,
+                conductor_view(
+                    vec![chat_entry(
+                        "e2",
+                        2,
+                        "conductor",
+                        "decision",
+                        "Cofnięto decyzję d1",
+                        Some(json!({ "kind": "decision_undone", "decision_id": "d1" })),
+                    )],
+                    json!({ "decisions": [decision_view("d1", true, false)] }),
+                ),
+            );
+            let items = conductor(&app).items();
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].undo, Some(UndoState::Undone));
+            let entries = conductor(&app).transcript().entries();
+            assert!(entries[0].rendered_lines.iter().any(|line| line.contains("decyzja cofnięta")));
+            assert!(entries[1].rendered_lines[0].contains("Cofnięto decyzję"));
+
+            // The selection is on the entry of the undo now: nothing to undo there.
+            assert_eq!(ch(&mut app, 'u'), Request::None);
+            assert!(app.overlay().is_none());
+            assert!(note(&app).contains("zaznacz"), "{}", note(&app));
+        }
+
+        #[test]
+        fn a_message_is_not_a_decision_and_says_so() {
+            let mut app = tab_app();
+            read(
+                &mut app,
+                conductor_view(vec![chat_entry("m1", 1, "conductor", "message", "Cześć", None)], json!({})),
+            );
+            ch(&mut app, 'u');
+            assert!(app.overlay().is_none());
+            assert!(note(&app).contains("którą można cofnąć"), "{}", note(&app));
+        }
+
+        #[test]
+        fn a_decision_the_server_says_cannot_be_undone_is_not_offered() {
+            let mut app = tab_app();
+            read(
+                &mut app,
+                conductor_view(
+                    vec![decision_entry("e1", 1, "d1")],
+                    json!({ "decisions": [decision_view("d1", false, false)] }),
+                ),
+            );
+            assert_eq!(conductor(&app).items()[0].undo, None);
+            ch(&mut app, 'u');
+            assert!(app.overlay().is_none());
+        }
+
+        #[test]
+        fn a_refused_undo_says_why_on_the_bar() {
+            let mut app = with_decision();
+            for (cursor, kind) in [
+                (
+                    "d",
+                    TaskEventKind::OperatorCommandQueued {
+                        command_id: "command-1".to_string(),
+                        command: OperatorCommand::UndoDecision {
+                            decision_id: "d1".to_string(),
+                        },
+                        requested_by: OwnerRef::new("local"),
+                    },
+                ),
+                (
+                    "e",
+                    TaskEventKind::OperatorCommandResolved {
+                        command_id: "command-1".to_string(),
+                        status: narsor::orchestration::OperatorCommandStatus::Rejected,
+                        detail: Some("a later step already ran".to_string()),
+                    },
+                ),
+            ] {
+                let sequence = if cursor == "d" { 2 } else { 3 };
+                app.on_stream(event(cursor, "a", sequence, TaskLifecycle::Running, kind));
+            }
+            let text = note(&app);
+            assert!(text.contains("cofnięcie decyzji dyrygenta odrzucone przez runnera"), "{text}");
+            assert!(text.contains("a later step already ran"), "{text}");
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Error);
+            let revision = revision(&app);
+            assert!(conductor(&app).needs_read(revision, Instant::now()), "the tab is due for a read");
+        }
+    }
+
+    // -- proposals live in the panel --------------------------------------------
+
+    mod proposals {
+        use super::*;
+
+        fn proposal_view() -> ConductorView {
+            conductor_view(
+                vec![chat_entry("p1", 2, "conductor", "proposal", "Uruchom krok od nowa", None)],
+                json!({
+                    "proposals": [{
+                        "proposal_id": "p1",
+                        "text": "Uruchom krok od nowa",
+                        "at": "2026-10-09T12:00:00Z",
+                        "record": {
+                            "episode": "ep-x",
+                            "state_id": "test",
+                            "proposal": { "kind": "retry", "summary": "Uruchom krok od nowa", "text": "z nowszym toolchainem" },
+                            "confidence": "high",
+                            "rationale": "Błąd wygląda na przejściowy."
+                        },
+                        "in_reply_to": "m1",
+                        "state": "pending"
+                    }]
+                }),
+            )
+        }
+
+        fn waiting_app() -> TaskApp {
+            let mut app = app();
+            app.load(listing(
+                vec![titled(
+                    waiting_on(running("a", 1), AttentionKind::ConductorProposal, "p1", Some("test")),
+                    "NAR-12",
+                )],
+                "c",
+            ));
+            ch(&mut app, ' ');
+            press(&mut app, KeyCode::Enter);
+            assert!(app.panel_focused());
+            app.detail_mut().set_tab(DetailTab::Conductor);
+            app
+        }
+
+        #[test]
+        fn a_proposal_from_the_chat_is_answered_in_the_panel_not_in_the_tab() {
+            let mut app = waiting_app();
+            read(&mut app, proposal_view());
+            let text = screen(&mut app, 120, 40);
+            assert!(text.contains("Propozycja dyrygenta"), "the panel: {text}");
+            assert!(text.contains("dyrygent proponuje: Uruchom krok od nowa"), "{text}");
+            assert!(
+                text.contains("(propozycja: czeka na Ciebie w panelu na dole)"),
+                "the tab says where it is answered: {text}"
+            );
+            let answer = match press(&mut app, KeyCode::Enter) {
+                Request::Answer(answer) => *answer,
+                other => panic!("an answer was expected, got {other:?}"),
+            };
+            assert_eq!(
+                answer.submit,
+                Submit::Operator(OperatorCommand::ConfirmProposal {
+                    proposal_id: "p1".to_string()
+                })
+            );
+            ch(&mut app, '2');
+            let reject = match press(&mut app, KeyCode::Enter) {
+                Request::Answer(answer) => *answer,
+                other => panic!("an answer was expected, got {other:?}"),
+            };
+            assert_eq!(
+                reject.submit,
+                Submit::Operator(OperatorCommand::RejectProposal {
+                    proposal_id: "p1".to_string()
+                })
+            );
+        }
+
+        #[test]
+        fn one_read_serves_the_tab_and_the_panel() {
+            let mut app = waiting_app();
+            let revision = revision(&app);
+            assert!(conductor(&app).needs_read(revision, Instant::now()));
+            read(&mut app, proposal_view());
+            assert!(!conductor(&app).needs_read(revision, Instant::now()));
+            let panel = app.detail().view("a").unwrap().waiting();
+            assert!(!panel.needs_conductor(revision), "the panel did not need a second read");
+        }
+
+        #[test]
+        fn a_settled_proposal_says_so_in_the_tab() {
+            let mut app = tab_app();
+            let mut view = proposal_view();
+            view.proposals[0].state = narsor::conductor::ProposalState::Executed;
+            read(&mut app, view);
+            assert!(screen(&mut app, 120, 30).contains("(propozycja: wykonana)"));
+        }
+    }
+
+    // -- no conductor, nothing to read -------------------------------------------
+
+    mod unavailable {
+        use super::*;
+
+        fn app_of(task: TaskSummary) -> TaskApp {
+            let mut app = app();
+            app.load(listing(vec![titled(task, "NAR-12")], "c"));
+            press(&mut app, KeyCode::Enter);
+            app.detail_mut().set_tab(DetailTab::Conductor);
+            app
+        }
+
+        #[test]
+        fn a_task_whose_runner_has_no_conductor_shows_why_and_has_no_box() {
+            let mut app = app_of(without_conductor(running("a", 1), "brak harnessu dyrygenta"));
+            let text = screen(&mut app, 120, 30);
+            assert!(text.contains("dyrygent niedostępny: brak harnessu dyrygenta"), "{text}");
+            assert!(!text.contains("c napisz"), "no box, no hint for it: {text}");
+            ch(&mut app, 'c');
+            assert!(!conductor(&app).is_typing());
+            assert!(note(&app).contains("brak harnessu dyrygenta"), "{}", note(&app));
+            ch(&mut app, 'h');
+            assert!(app.overlay().is_none());
+            assert!(note(&app).contains("brak harnessu dyrygenta"), "{}", note(&app));
+        }
+
+        #[test]
+        fn a_view_that_says_there_is_none_wins_and_its_history_stays_readable() {
+            let mut app = tab_app();
+            let mut view = conductor_view(
+                vec![chat_entry("m1", 1, "conductor", "message", "Stara odpowiedź", None)],
+                json!({}),
+            );
+            view.available = false;
+            view.unavailable_reason = Some("the runner is not running".to_string());
+            read(&mut app, view);
+            let text = screen(&mut app, 120, 30);
+            assert!(text.contains("dyrygent niedostępny: the runner is not running"), "{text}");
+            assert!(text.contains("Stara odpowiedź"), "{text}");
+            ch(&mut app, 'c');
+            assert!(!conductor(&app).is_typing());
+        }
+
+        #[test]
+        fn a_remote_task_without_a_runner_says_so_with_the_servers_words() {
+            let mut app = tab_app();
+            read_response(
+                &mut app,
+                Ok(ConductorReadResponse::Unavailable {
+                    reason: ConversationUnavailableReason::NotStarted,
+                    message: "zadanie nie ma żywego runnera".to_string(),
+                }),
+            );
+            let text = screen(&mut app, 120, 30);
+            assert!(text.contains("zadanie nie ma żywego runnera"), "{text}");
+            ch(&mut app, 'c');
+            assert!(!conductor(&app).is_typing());
+        }
+
+        #[test]
+        fn a_503_with_a_reason_is_a_message_in_the_tab_and_not_a_lost_connection() {
+            let mut app = tab_app();
+            read_response(
+                &mut app,
+                Err(ClientError::Degraded {
+                    code: "runner_timeout".to_string(),
+                    message: "runner nie odpowiedział na czas".to_string(),
+                }),
+            );
+            let text = screen(&mut app, 120, 30);
+            assert!(
+                text.contains("nie udało się wczytać dyrygenta (runner nie odpowiedział na czas)"),
+                "{text}"
+            );
+            assert!(app.connection().is_live(), "the relay missing a deadline says nothing against the connection");
+            assert_eq!(conductor(&app).failure(), Some("runner nie odpowiedział na czas"));
+        }
+
+        #[test]
+        fn a_failed_refresh_keeps_what_was_read() {
+            let mut app = tab_app();
+            read(
+                &mut app,
+                conductor_view(vec![chat_entry("m1", 1, "conductor", "message", "Zostaje", None)], json!({})),
+            );
+            read_response(
+                &mut app,
+                Err(ClientError::Degraded {
+                    code: "runner_timeout".to_string(),
+                    message: "runner nie odpowiedział".to_string(),
+                }),
+            );
+            let text = screen(&mut app, 120, 30);
+            assert!(text.contains("Zostaje"), "{text}");
+            assert!(text.contains("nie udało się odświeżyć (runner nie odpowiedział)"), "{text}");
+            ch(&mut app, 'c');
+            assert!(conductor(&app).is_typing(), "the conductor is still there to write to");
+        }
+
+        #[test]
+        fn an_archived_task_says_its_storage_went_with_the_archiving() {
+            let mut app = app();
+            app.load(listing(vec![titled(task("a", "local", "archived", 1), "NAR-12")], "c"));
+            press(&mut app, KeyCode::Enter);
+            app.detail_mut().set_tab(DetailTab::Conductor);
+            let text = screen(&mut app, 120, 30);
+            assert!(text.contains("storage usunięty przy archiwizacji"), "{text}");
+        }
+
+        #[test]
+        fn before_the_first_read_the_tab_says_it_is_reading() {
+            let mut app = tab_app();
+            assert!(screen(&mut app, 120, 30).contains("wczytuję dyrygenta"));
+        }
+
+        #[test]
+        fn the_tab_keys_say_they_belong_to_the_tab_elsewhere() {
+            let mut app = tab_app();
+            app.detail_mut().set_tab(DetailTab::Progress);
+            for key in ['c', 'u', 'h', 'M'] {
+                ch(&mut app, key);
+                assert!(note(&app).contains("zakładce Dyrygent"), "{key}: {}", note(&app));
+                assert!(app.overlay().is_none());
+                assert!(app
+                    .detail()
+                    .view("a")
+                    .is_none_or(|view| !view.conductor().is_typing()));
+            }
+        }
+    }
+
+    // -- the harness ----------------------------------------------------------
+
+    mod harness {
+        use super::*;
+
+        fn labels(app: &TaskApp) -> Vec<String> {
+            app.overlay()
+                .and_then(Overlay::chooser)
+                .expect("the list of harnesses")
+                .items()
+                .iter()
+                .map(|item| item.label.clone())
+                .collect()
+        }
+
+        #[test]
+        fn h_lists_the_harnesses_the_current_one_greyed_and_the_choice_is_sent() {
+            let mut app = tab_app();
+            read(&mut app, conductor_view(vec![], json!({})));
+            ch(&mut app, 'h');
+            assert_eq!(labels(&app), ["claude-code", "codex", "opencode"]);
+            let text = screen(&mut app, 120, 30);
+            assert!(text.contains("Harness dyrygenta"), "{text}");
+            let chooser = app.overlay().and_then(Overlay::chooser).unwrap();
+            assert!(chooser.items()[0].unavailable.is_some(), "claude-code is the current one");
+            assert_eq!(chooser.selected(), 1, "the list opens on another harness");
+
+            let request = act(press(&mut app, KeyCode::Enter));
+            assert_eq!(
+                request.send,
+                ActionSend::Operator(OperatorCommand::SetConductorHarness {
+                    harness: "codex".to_string()
+                })
+            );
+            assert!(request.summary.contains("codex"));
+            assert!(app.overlay().is_none());
+        }
+
+        #[test]
+        fn the_current_harness_cannot_be_chosen_again() {
+            let mut app = tab_app();
+            read(&mut app, conductor_view(vec![], json!({})));
+            ch(&mut app, 'h');
+            ch(&mut app, 'k');
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert!(note(&app).contains("już działa na tym harnessie"), "{}", note(&app));
+            assert!(app.overlay().is_some(), "the list stays to choose again");
+            press(&mut app, KeyCode::Esc);
+            assert!(app.overlay().is_none());
+        }
+
+        #[test]
+        fn a_runner_that_has_no_conductor_refuses_and_the_bar_gives_its_reason() {
+            let mut app = tab_app();
+            for (cursor, sequence, kind) in [
+                (
+                    "d",
+                    2,
+                    TaskEventKind::OperatorCommandQueued {
+                        command_id: "command-1".to_string(),
+                        command: OperatorCommand::SetConductorHarness {
+                            harness: "codex".to_string(),
+                        },
+                        requested_by: OwnerRef::new("local"),
+                    },
+                ),
+                (
+                    "e",
+                    3,
+                    TaskEventKind::OperatorCommandResolved {
+                        command_id: "command-1".to_string(),
+                        status: narsor::orchestration::OperatorCommandStatus::Rejected,
+                        detail: Some("no conductor runs for this task".to_string()),
+                    },
+                ),
+            ] {
+                app.on_stream(event(cursor, "a", sequence, TaskLifecycle::Running, kind));
+            }
+            let text = note(&app);
+            assert!(text.contains("zmiana harnessu dyrygenta odrzucone przez runnera"), "{text}");
+            assert!(text.contains("no conductor runs for this task"), "{text}");
+        }
+    }
+
+    // -- paging ----------------------------------------------------------------
+
+    mod paging {
+        use super::*;
+
+        fn page(from: u64, to: u64, more: bool) -> ConductorView {
+            conductor_view(
+                (from..=to)
+                    .map(|sequence| {
+                        chat_entry(&format!("m{sequence}"), sequence, "conductor", "message", &format!("wpis {sequence}"), None)
+                    })
+                    .collect(),
+                json!({ "chat_has_more": more }),
+            )
+        }
+
+        #[test]
+        fn a_history_that_goes_on_is_continued_after_the_last_entry_with_m() {
+            let mut app = tab_app();
+            read(&mut app, page(1, 2, true));
+            assert!(conductor(&app).has_more());
+            assert_eq!(conductor(&app).last_sequence(), 2);
+            let revision = revision(&app);
+            assert!(!conductor(&app).needs_read(revision, Instant::now()));
+            assert!(screen(&mut app, 120, 30).contains("M dalsze wpisy"));
+
+            ch(&mut app, 'M');
+            assert!(conductor(&app).wants_more());
+            assert!(conductor(&app).needs_read(revision, Instant::now()), "the same revision is read on");
+
+            // The next page overlaps the last entry: it is not shown twice.
+            read(&mut app, page(2, 3, false));
+            assert_eq!(conductor(&app).items().len(), 3);
+            assert_eq!(conductor(&app).last_sequence(), 3);
+            assert!(!conductor(&app).has_more());
+            assert!(!conductor(&app).wants_more());
+            assert!(!screen(&mut app, 120, 30).contains("M dalsze wpisy"));
+
+            ch(&mut app, 'M');
+            assert!(note(&app).contains("to cały czat"), "{}", note(&app));
+        }
+
+        #[test]
+        fn while_the_conductor_owes_an_answer_the_tab_is_read_again_after_a_moment() {
+            let mut app = tab_app();
+            read(
+                &mut app,
+                conductor_view(
+                    vec![chat_entry("m1", 1, "operator", "message", "Hej", None)],
+                    json!({ "unanswered_chat": ["m1"] }),
+                ),
+            );
+            let revision = revision(&app);
+            let now = Instant::now();
+            assert!(!conductor(&app).needs_read(revision, now));
+            assert!(conductor(&app).needs_read(revision, now + Duration::from_secs(3)));
+        }
+
+        #[test]
+        fn a_refresh_makes_the_tab_due_without_forgetting_the_history() {
+            let mut app = tab_app();
+            read(&mut app, page(1, 2, false));
+            let revision = revision(&app);
+            assert!(!conductor(&app).needs_read(revision, Instant::now()));
+            app.load(listing(vec![titled(running("a", 1), "NAR-12")], "d"));
+            assert!(conductor(&app).needs_read(revision, Instant::now()));
+            assert_eq!(conductor(&app).items().len(), 2);
+        }
+    }
+
+    // -- keys --------------------------------------------------------------------
+
+    #[test]
+    fn the_keys_of_the_tab_are_in_the_key_map_and_in_help() {
+        assert_eq!(keymap::check_consistency(keymap::BINDINGS), Ok(()));
+        for (action, key) in [
+            (Action::Compose, "c"),
+            (Action::UndoDecision, "u"),
+            (Action::ChooseHarness, "h"),
+            (Action::LoadMore, "M"),
+        ] {
+            assert_eq!(keymap::key_of(Context::Details, action).as_deref(), Some(key));
+            assert!(
+                keymap::help_entries(Context::Details)
+                    .iter()
+                    .any(|entry| entry.keys == key && entry.description.contains("Dyrygent")),
+                "{action:?} is in the help of the details"
+            );
+        }
+    }
+
+    // -- against a served control plane -------------------------------------------
+
+    mod served {
+        use super::*;
+
+        fn conducting() -> narsor::orchestration::RunnerSnapshot {
+            let mut first = snapshot(1, None);
+            first.conductor_available = true;
+            first
+        }
+
+        /// The tab of task `NAR-12`, nothing read yet.
+        async fn open_unread(harness: &RemoteHarness) -> TaskApp {
+            let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+            app.refresh().await;
+            press(&mut app, KeyCode::Enter);
+            app.detail_mut().set_tab(DetailTab::Conductor);
+            app
+        }
+
+        /// The tab of task `NAR-12`, with the conductor read already.
+        async fn open(harness: &RemoteHarness) -> TaskApp {
+            let mut app = open_unread(harness).await;
+            let revision = app.list().selected().expect("a selection").revision;
+            app.on_detail_read(
+                "NAR-12",
+                revision,
+                DetailRead::Conductor(Ok(ConductorReadResponse::Available {
+                    conductor: Box::new(conductor_view(vec![], json!({}))),
+                    source: ExecutionEventsSource::Runner,
+                })),
+            );
+            app
+        }
+
+        /// The runner's side of one relayed conductor read: the `after` it
+        /// was asked for, and `view` as the answer.
+        async fn answer(runner: &RunnerClient, view: ConductorView) -> u64 {
+            loop {
+                let poll = runner.poll(None, 5).await.expect("poll");
+                if let Some(request) = poll.conductor_reads.first() {
+                    runner
+                        .upload_conductor_read(&request.request_id, &view)
+                        .await
+                        .expect("upload");
+                    return request.after;
+                }
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_message_is_taken_by_the_control_plane_and_leaves_the_box() {
+            let harness = RemoteHarness::start().await;
+            let _running = harness.running("NAR-12", "local", conducting()).await;
+            let mut app = open(&harness).await;
+            ch(&mut app, 'c');
+            assert!(conductor_typing(&app));
+            typed(&mut app, "Dlaczego revise?");
+            let request = press(&mut app, KeyCode::Enter);
+            app.perform(request).await;
+
+            assert_eq!(note(&app), "NAR-12: wiadomość wysłana do dyrygenta");
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Success);
+            assert_eq!(app.detail().view("NAR-12").unwrap().conductor().draft(), "");
+            assert!(!app.detail().has_drafts(), "the text left with the message");
+            let summary = harness.owner.control_task("NAR-12").await.unwrap();
+            assert_eq!(
+                summary.operator_commands[0].command,
+                OperatorCommand::ConductorChat {
+                    text: "Dlaczego revise?".to_string()
+                }
+            );
+        }
+
+        fn conductor_typing(app: &TaskApp) -> bool {
+            app.detail().view("NAR-12").unwrap().conductor().is_typing()
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_message_that_is_too_long_is_refused_and_stays_in_the_box() {
+            let harness = RemoteHarness::start().await;
+            let _running = harness.running("NAR-12", "local", conducting()).await;
+            let mut app = open(&harness).await;
+            ch(&mut app, 'c');
+            typed(&mut app, &"a".repeat(4001));
+            let request = press(&mut app, KeyCode::Enter);
+            app.perform(request).await;
+
+            let text = note(&app);
+            assert!(text.contains("wiadomość do dyrygenta odrzucone"), "{text}");
+            assert!(text.contains("4000"), "{text}");
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Error);
+            let draft = app.detail().view("NAR-12").unwrap().conductor().draft().to_string();
+            assert_eq!(draft.chars().count(), 4001, "nothing the operator typed was lost");
+            assert!(app.detail().has_drafts());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_unknown_harness_is_refused_early_with_the_supported_ones() {
+            let harness = RemoteHarness::start().await;
+            let _running = harness.running("NAR-12", "local", conducting()).await;
+            let mut app = open(&harness).await;
+            let generation = app.list().tasks()[0].generation;
+            let request = ActionRequest {
+                task_id: "NAR-12".to_string(),
+                title: "NAR-12".to_string(),
+                generation,
+                key: "h-1".to_string(),
+                verb: "zmiana harnessu dyrygenta".to_string(),
+                summary: "x".to_string(),
+                send: ActionSend::Operator(OperatorCommand::SetConductorHarness {
+                    harness: "nope".to_string(),
+                }),
+            };
+            app.perform(Request::Act(Box::new(request))).await;
+            let text = note(&app);
+            assert!(text.contains("zmiana harnessu dyrygenta odrzucone"), "{text}");
+            assert!(text.contains("unknown agent harness 'nope'"), "{text}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_chat_is_read_through_the_relay_a_page_at_a_time_after_the_last_entry() {
+            let harness = RemoteHarness::start().await;
+            let running = harness.running("NAR-12", "local", conducting()).await;
+            let mut app = open_unread(&harness).await;
+
+            let first = conductor_view(
+                vec![
+                    chat_entry("m1", 1, "operator", "message", "Hej", None),
+                    chat_entry("m2", 2, "conductor", "message", "Cześć", None),
+                ],
+                json!({ "chat_has_more": true }),
+            );
+            let second = conductor_view(
+                vec![chat_entry("m3", 3, "conductor", "message", "Jeszcze coś", None)],
+                json!({}),
+            );
+            let (_, afters) = tokio::join!(app.sync_detail(), async {
+                let one = answer(&running.runner, first).await;
+                let two = answer(&running.runner, second).await;
+                (one, two)
+            });
+            assert_eq!(afters, (0, 2), "the second page continued after the last entry");
+            let tab = app.detail().view("NAR-12").unwrap().conductor();
+            assert_eq!(tab.items().len(), 3);
+            assert!(!tab.has_more());
+            assert!(app.connection().is_live());
+        }
+    }
+}

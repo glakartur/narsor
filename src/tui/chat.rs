@@ -16,8 +16,13 @@
 
 use serde_json::Value;
 
-use crate::conductor::{ChatAuthor, ChatEntry, ChatEntryKind};
+use crate::conductor::{
+    ChatAuthor, ChatEntry, ChatEntryKind, DecisionView, ProposalState as ViewProposalState,
+    ProposalView,
+};
 use crate::domain::{ConductorDecisionKind, Confidence};
+use crate::tui::keymap::{key_of, Action, Context};
+use crate::tui::scroll::sanitize;
 use crate::tui::transcript::{
     utterance_header, TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptPresentation,
     TranscriptState,
@@ -523,4 +528,154 @@ fn chat_transcript_entry(item: &ChatItem) -> TranscriptEntry {
     ))
     .with_technical_lines(technical_lines)
     .with_presentation(presentation)
+}
+
+// ---------------------------------------------------------------------
+// The history as the *Dyrygent* tab of the task application shows it
+// ---------------------------------------------------------------------
+//
+// Nothing below knows of the old task view: the tab keeps the entries it has
+// read, asks for them as items ([`tab_items`]) and draws each as a transcript
+// entry ([`tab_entry`]). What the history cannot say alone — whether a
+// decision can still be undone, what became of a proposal when the entry that
+// settled it is on a page not read yet — the conductor's own view says
+// (`decisions`, `proposals`), and it has the last word.
+
+/// The history `entries` with each entry's state, settled by what the
+/// conductor's view says of its decisions.
+pub fn tab_items(entries: &[ChatEntry], decisions: &[DecisionView]) -> Vec<ChatItem> {
+    let mut items = chat_items(entries);
+    for item in &mut items {
+        if item.entry.kind != ChatEntryKind::Decision || item.entry.author != ChatAuthor::Conductor
+        {
+            continue;
+        }
+        let Some(decision_id) = payload_str(&item.entry, "decision_id") else {
+            continue;
+        };
+        if let Some(decision) = decisions
+            .iter()
+            .find(|decision| decision.decision_id == decision_id)
+        {
+            item.undo = if decision.undone {
+                Some(UndoState::Undone)
+            } else if decision.undoable {
+                Some(UndoState::Undoable {
+                    decision_id: decision.decision_id.clone(),
+                })
+            } else {
+                None
+            };
+        }
+    }
+    items
+}
+
+/// What became of a proposal, in words: from the conductor's view when it
+/// knows the proposal, from the history otherwise.
+fn proposal_word(item: &ChatItem, proposal: Option<&ProposalView>) -> &'static str {
+    match proposal.map(|proposal| proposal.state) {
+        Some(ViewProposalState::Pending) => "czeka na Ciebie w panelu na dole",
+        Some(ViewProposalState::Executed) => "wykonana",
+        Some(ViewProposalState::Rejected) => "odrzucona",
+        Some(ViewProposalState::Stale) => "nieaktualna: wykonanie poszło dalej",
+        None => match item.proposal.unwrap_or(ProposalState::Open) {
+            ProposalState::Open => "czeka na Ciebie w panelu na dole",
+            ProposalState::Executed => "wykonana",
+            ProposalState::Rejected => "odrzucona",
+        },
+    }
+}
+
+/// One item as a transcript entry of the tab. Every text of it comes from a
+/// model or a remote runner and goes through [`sanitize`]; a proposal says
+/// where it is answered (the panel, not the tab), a decision that can be
+/// undone says which key does it.
+pub fn tab_entry(item: &ChatItem, proposal: Option<&ProposalView>) -> TranscriptEntry {
+    let raw = serde_json::to_vec(&item.entry).unwrap_or_default();
+    let mut lines: Vec<String> = sanitize(&item.entry.text)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    let conductor = item.entry.author == ChatAuthor::Conductor;
+    match item.entry.kind {
+        ChatEntryKind::Proposal => {
+            lines.push(format!("(propozycja: {})", proposal_word(item, proposal)));
+        }
+        ChatEntryKind::Decision => match &item.undo {
+            Some(UndoState::Undone) => lines.push("(decyzja cofnięta)".to_string()),
+            Some(UndoState::Undoable { .. }) => {
+                lines.push(match key_of(Context::Details, Action::UndoDecision) {
+                    Some(key) => format!("(decyzja; {key} — cofnij)"),
+                    None => "(decyzja)".to_string(),
+                });
+            }
+            None => lines.push("(decyzja)".to_string()),
+        },
+        ChatEntryKind::Message | ChatEntryKind::Error => {}
+    }
+    if conductor
+        && matches!(
+            item.entry.kind,
+            ChatEntryKind::Decision | ChatEntryKind::Proposal
+        )
+    {
+        let mut why = Vec::new();
+        if let Some(confidence) = item.confidence {
+            why.push(format!("pewność: {}", confidence.name()));
+        }
+        if let Some(rationale) = &item.rationale {
+            why.push(format!(
+                "dlaczego: {}",
+                sanitize(rationale).replace('\n', " ")
+            ));
+        }
+        if !why.is_empty() {
+            lines.push(why.join(" · "));
+        }
+    }
+    let presentation = if item.entry.kind == ChatEntryKind::Error {
+        TranscriptPresentation::Error
+    } else if conductor {
+        TranscriptPresentation::Conductor
+    } else {
+        TranscriptPresentation::Operator
+    };
+    TranscriptEntry::new(TranscriptEntryId::from(item.entry.id.clone()), lines, raw)
+        .with_header(utterance_header(
+            presentation,
+            if conductor { "Dyrygent" } else { "Operator" },
+            item.entry.at,
+        ))
+        .with_technical_lines(vec![format!("wpis #{}", item.entry.sequence)])
+        .with_presentation(presentation)
+}
+
+/// What undoing `item` costs, for the window that asks: the decision, how sure
+/// the conductor was, why, and what an undo leaves alone (R31).
+pub fn undo_lines(item: &ChatItem) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Cofa decyzję dyrygenta: {}",
+        sanitize(&item.entry.text).replace('\n', " ")
+    )];
+    if let Some(label) = &item.label {
+        lines.push(format!(
+            "Wybrane wyjście: {}",
+            sanitize(label).replace('\n', " ")
+        ));
+    }
+    if let Some(confidence) = item.confidence {
+        lines.push(format!("Pewność dyrygenta: {}", confidence.name()));
+    }
+    if let Some(rationale) = &item.rationale {
+        lines.push(format!(
+            "Uzasadnienie: {}",
+            sanitize(rationale).replace('\n', " ")
+        ));
+    }
+    lines.push("! Krok, który ruszył po tej decyzji, zachowuje swoje skutki uboczne.".to_string());
+    lines
 }

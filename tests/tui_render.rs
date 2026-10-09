@@ -345,6 +345,7 @@ mod colour_discipline {
         "task_app/mod.rs",
         "task_app/notify.rs",
         "task_app/tabs.rs",
+        "task_app/tabs/conductor.rs",
         "task_app/tabs/conversation.rs",
         "task_app/tabs/events.rs",
         "task_app/tabs/info.rs",
@@ -1446,5 +1447,185 @@ mod task_app_actions_render {
             !screen.contains('\u{1b}') && !screen.contains('\u{202e}'),
             "{screen}"
         );
+    }
+}
+
+mod task_app_conductor_render {
+    use super::*;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use narsor::api::ApiClient;
+    use narsor::controller_protocol::{ConductorReadResponse, ExecutionEventsSource};
+    use narsor::domain::ExecutionStatus;
+    use narsor::tui::task_app::detail::DetailRead;
+    use narsor::tui::task_app::{layout, DetailTab, TaskApp};
+    use serde_json::json;
+
+    use crate::task_app_support::{
+        chat_entry, conductor_view, listing, task, titled, with_conductor, with_controller,
+        with_runner, without_conductor,
+    };
+
+    fn press(app: &mut TaskApp, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn running() -> narsor::controller_protocol::TaskSummary {
+        with_conductor(with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        ))
+    }
+
+    /// The tab of task `a`, with a short conversation read.
+    fn opened(task: narsor::controller_protocol::TaskSummary, read: bool) -> TaskApp {
+        let mut app = TaskApp::new(ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"), "local", None);
+        app.load(listing(vec![titled(task, "NAR-12")], "c"));
+        press(&mut app, KeyCode::Enter);
+        app.detail_mut().set_tab(DetailTab::Conductor);
+        if read {
+            let view = conductor_view(
+                vec![
+                    chat_entry("m1", 1, "operator", "message", "Czy revise?", None),
+                    chat_entry("m2", 2, "conductor", "message", "Raczej revise — brak planu migracji.", None),
+                    chat_entry(
+                        "d1",
+                        3,
+                        "conductor",
+                        "decision",
+                        "Wybrano revise",
+                        Some(json!({ "kind": "choose_output", "decision_id": "d1", "confidence": "low", "rationale": "Brak planu." })),
+                    ),
+                ],
+                json!({
+                    "chat_has_more": true,
+                    "decisions": [{
+                        "decision_id": "d1", "kind": "choose_output", "text": "Wybrano revise",
+                        "at": "2026-10-09T12:00:00Z", "undone": false, "undoable": true
+                    }]
+                }),
+            );
+            app.on_detail_read(
+                "a",
+                1,
+                DetailRead::Conductor(Ok(ConductorReadResponse::Available {
+                    conductor: Box::new(view),
+                    source: ExecutionEventsSource::Runner,
+                })),
+            );
+        }
+        app
+    }
+
+    fn draw_app(app: &mut TaskApp, width: u16, height: u16, no_color: bool) -> Buffer {
+        draw(width, height, |frame| {
+            layout::render(frame, app, &Styles::new(no_color), Instant::now())
+        })
+    }
+
+    #[test]
+    fn wide_the_tab_has_the_conductor_the_roles_the_decision_and_the_keys() {
+        let mut app = opened(running(), true);
+        let text = screen(&draw_app(&mut app, 120, 30, false));
+        for expected in [
+            "Dyrygent",
+            "◆ dyrygent · harness claude-code",
+            "USER · Operator",
+            "KONDUKTOR · Dyrygent",
+            "Raczej revise — brak planu migracji.",
+            "(decyzja; u — cofnij)",
+            "pewność: low",
+            "c napisz",
+            "u cofnij decyzję",
+            "h harness",
+            "M dalsze wpisy",
+        ] {
+            assert!(text.contains(expected), "{expected:?} is missing:\n{text}");
+        }
+    }
+
+    #[test]
+    fn narrow_the_tab_still_shows_the_conversation_and_the_keys() {
+        let mut app = opened(running(), true);
+        let text = screen(&draw_app(&mut app, 60, 20, false));
+        assert!(text.contains("◆ dyrygent"), "{text}");
+        assert!(text.contains("Raczej revise"), "{text}");
+        assert!(text.contains("c napisz"), "{text}");
+    }
+
+    #[test]
+    fn the_conductors_entries_are_magenta_and_the_operators_cyan() {
+        let mut app = opened(running(), true);
+        let buffer = draw_app(&mut app, 120, 30, false);
+        let width = usize::from(buffer.area.width);
+        let fg_of = |needle: &str| {
+            let row = row_of(&buffer, needle);
+            let column = rows(&buffer)[row].find(needle).map(|byte| rows(&buffer)[row][..byte].chars().count()).unwrap();
+            buffer.content()[row * width + column].fg
+        };
+        assert_eq!(fg_of("KONDUKTOR"), Color::Magenta, "the role colour of the conductor");
+        assert_eq!(fg_of("USER"), Color::Cyan);
+        assert_eq!(fg_of("◆ dyrygent"), Color::Magenta);
+    }
+
+    #[test]
+    fn without_colour_the_roles_are_told_apart_by_their_words() {
+        let mut app = opened(running(), true);
+        let buffer = draw_app(&mut app, 120, 30, true);
+        let text = screen(&buffer);
+        assert!(text.contains("USER") && text.contains("KONDUKTOR") && text.contains("◆ dyrygent"), "{text}");
+        assert!(
+            buffer.content().iter().all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset),
+            "NO_COLOR draws no colour at all"
+        );
+    }
+
+    #[test]
+    fn writing_shows_the_box_with_the_text_and_the_keys_of_the_box() {
+        let mut app = opened(running(), true);
+        press(&mut app, KeyCode::Char('c'));
+        for character in "Dlaczego?".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        let text = screen(&draw_app(&mut app, 120, 30, false));
+        assert!(text.contains("wiadomość (wymagane)"), "{text}");
+        assert!(text.contains("> Dlaczego?▏"), "{text}");
+        assert!(text.contains("Enter wyślij") && text.contains("Alt+Enter nowa linia"), "{text}");
+        assert!(text.contains("Esc koniec pisania"), "{text}");
+
+        press(&mut app, KeyCode::Esc);
+        let text = screen(&draw_app(&mut app, 120, 30, false));
+        assert!(text.contains("✎ szkic: Dlaczego?"), "the draft stays in view:\n{text}");
+    }
+
+    #[test]
+    fn a_task_without_a_conductor_shows_the_reason_and_not_the_box() {
+        let mut app = opened(without_conductor(running(), "brak harnessu dyrygenta"), false);
+        let text = screen(&draw_app(&mut app, 120, 30, false));
+        assert!(text.contains("◆ dyrygent niedostępny: brak harnessu dyrygenta"), "{text}");
+        assert!(!text.contains("c napisz"), "{text}");
+        let buffer = draw_app(&mut app, 100, 30, true);
+        assert!(screen(&buffer).contains("dyrygent niedostępny"), "no colour, still said in words");
+    }
+
+    #[test]
+    fn the_harness_list_fits_a_narrow_terminal() {
+        let mut app = opened(running(), true);
+        press(&mut app, KeyCode::Char('h'));
+        let text = screen(&draw_app(&mut app, 64, 24, false));
+        for expected in ["Harness dyrygenta", "claude-code", "codex", "opencode"] {
+            assert!(text.contains(expected), "{expected:?} is missing:\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_tiny_area_does_not_panic() {
+        let mut app = opened(running(), true);
+        for (width, height) in [(20, 6), (30, 8), (80, 5)] {
+            draw_app(&mut app, width, height, false);
+        }
+        press(&mut app, KeyCode::Char('c'));
+        draw_app(&mut app, 24, 7, false);
     }
 }

@@ -177,6 +177,14 @@ pub enum Action {
     Confirm,
     /// Say yes to what the confirmation window shows.
     Accept,
+    /// Write to the conductor (the *Dyrygent* tab).
+    Compose,
+    /// Undo the selected decision of the conductor.
+    UndoDecision,
+    /// Choose the harness the conductor runs on.
+    ChooseHarness,
+    /// Read the next page of the conductor's chat.
+    LoadMore,
 }
 
 /// A key a binding listens to.
@@ -670,6 +678,35 @@ pub static BINDINGS: &[Binding] = &[
         "",
         "otwórz link zadania w przeglądarce",
     ),
+    // The *Dyrygent* tab. Help only: the tab draws its own line of them.
+    bind(
+        Context::Details,
+        Key::char('c'),
+        Action::Compose,
+        "",
+        "zakładka Dyrygent: napisz do dyrygenta (Enter wysyła, Alt+Enter nowa linia, Esc kończy)",
+    ),
+    bind(
+        Context::Details,
+        Key::char('u'),
+        Action::UndoDecision,
+        "",
+        "zakładka Dyrygent: cofnij zaznaczoną decyzję dyrygenta (wymaga potwierdzenia)",
+    ),
+    bind(
+        Context::Details,
+        Key::char('h'),
+        Action::ChooseHarness,
+        "",
+        "zakładka Dyrygent: wybierz harness dyrygenta",
+    ),
+    bind(
+        Context::Details,
+        Key::char('M'),
+        Action::LoadMore,
+        "",
+        "zakładka Dyrygent: wczytaj dalsze wpisy czatu",
+    ),
     // The "waiting for you" panel, focus on its actions. Focus in a field
     // types text; the chooser handles those keys.
     bind(
@@ -1043,6 +1080,15 @@ pub fn lookup_in(bindings: &[Binding], context: Context, event: &KeyEvent) -> Op
             .flatten()
     };
     own.or_else(inherited).map(|binding| binding.action)
+}
+
+/// The first key that does `action` in `context`, as it is written in the
+/// bar and in help; for text that names a key.
+pub fn key_of(context: Context, action: Action) -> Option<String> {
+    BINDINGS
+        .iter()
+        .find(|binding| binding.context == context && binding.action == action)
+        .map(|binding| binding.key.display())
 }
 
 /// Why a table is not consistent: one message per problem.

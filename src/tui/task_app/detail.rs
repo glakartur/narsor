@@ -28,6 +28,9 @@
 //! error included — without a server. A failed read stays in its tab; only an
 //! unreachable server counts against the connection.
 //!
+//! The conductor's tab is read with the same answer as the answer panel's
+//! ([`DetailRead::Conductor`]); see [`super::tabs::conductor`].
+//!
 //! # The answer panel (U10)
 //!
 //! [`areas`] takes the height of the panel and returns where it goes; the tab
@@ -58,6 +61,7 @@ use crate::orchestration::{QueueReason, TaskLifecycle};
 use super::super::keymap::Action;
 use super::super::style::{Role, Styles};
 use super::list::{fit, lifecycle_word, one_line, state_icon, title_of};
+use super::tabs::conductor::{self, Conductor};
 use super::tabs::conversation::{self, transcript_action, AttemptRead, Attempts, Conversation};
 use super::tabs::events::{self, Events};
 use super::tabs::info::{self, Info};
@@ -74,6 +78,7 @@ pub struct TaskDetail {
     conversation: Conversation,
     events: Events,
     info: Info,
+    pub(super) conductor: Conductor,
     /// The answer panel at the bottom (U10).
     pub(super) waiting: WaitingPanel,
 }
@@ -87,6 +92,7 @@ impl TaskDetail {
             conversation: Conversation::new(task_id),
             events: Events::default(),
             info: Info::default(),
+            conductor: Conductor::new(task_id),
             waiting: WaitingPanel::default(),
         }
     }
@@ -121,11 +127,29 @@ impl TaskDetail {
         &self.info
     }
 
+    /// *Dyrygent*.
+    pub fn conductor(&self) -> &Conductor {
+        &self.conductor
+    }
+
+    /// What the operator wrote and has not sent: in the answer panel and in
+    /// the text box of *Dyrygent*.
+    pub fn draft_text(&self) -> String {
+        let chat = self.conductor.draft();
+        let panel = self.waiting.draft_text();
+        match (panel.is_empty(), chat.is_empty()) {
+            (_, true) => panel,
+            (true, false) => chat.to_string(),
+            (false, false) => format!("{panel}\n{chat}"),
+        }
+    }
+
     /// Makes everything due for a new read, keeping what is shown.
     pub fn invalidate(&mut self) {
         self.progress.invalidate();
         self.attempts.invalidate();
         self.events.invalidate();
+        self.conductor.invalidate();
         self.waiting.invalidate();
     }
 
@@ -139,7 +163,7 @@ impl TaskDetail {
             }
             DetailTab::Events => self.events.on_action(action),
             DetailTab::Info => self.info.on_action(action),
-            DetailTab::Conductor => {}
+            DetailTab::Conductor => self.conductor.on_action(action),
         }
     }
 
@@ -509,7 +533,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
     let content = parts.content;
     let unstarted = unstarted_message(view.task, view.queue_place);
     match (view.tab, unstarted) {
-        (DetailTab::Progress | DetailTab::Conversation | DetailTab::Events, Some(message)) => {
+        (
+            DetailTab::Progress | DetailTab::Conversation | DetailTab::Events | DetailTab::Conductor,
+            Some(message),
+        ) => {
             frame.render_widget(
                 Paragraph::new(Line::styled(message, styles.of(Role::Done))),
                 content,
@@ -530,13 +557,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         (DetailTab::Events, None) => {
             events::render(frame, content, styles, &mut view.detail.events, stale);
         }
-        (DetailTab::Conductor, _) => frame.render_widget(
-            Paragraph::new(Line::styled(
-                "Dyrygent: czat i decyzje pojawią się w kolejnym kroku",
-                styles.of(Role::Done),
-            )),
-            content,
-        ),
+        (DetailTab::Conductor, None) => {
+            conductor::render(frame, content, styles, &mut view.detail.conductor, view.task, stale);
+        }
         (DetailTab::Info, _) => {
             info::render(frame, content, styles, &mut view.detail.info, view.task, stale);
         }
