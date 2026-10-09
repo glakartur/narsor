@@ -335,6 +335,8 @@ mod colour_discipline {
     const NEW_VIEW_SOURCES: &[&str] = &[
         "chooser.rs",
         "connection.rs",
+        "failure_form.rs",
+        "input_form.rs",
         "keymap.rs",
         "task_app/detail.rs",
         "task_app/layout.rs",
@@ -346,6 +348,7 @@ mod colour_discipline {
         "task_app/tabs/events.rs",
         "task_app/tabs/info.rs",
         "task_app/tabs/progress.rs",
+        "task_app/waiting.rs",
     ];
 
     /// The one module that may name a colour.
@@ -1021,5 +1024,173 @@ mod task_app_detail_render {
         assert!(screen.contains("✓ plan #1") && screen.contains("▸● review #1"), "{screen}");
         assert!(screen.contains("brak rozmowy: script") || screen.contains("review #1 · w toku"), "{screen}");
         assert!(screen.contains("● live"));
+    }
+}
+
+/// U10: the panel "Czeka na Ciebie" drawn at the bottom of the details.
+mod task_app_waiting_render {
+    use super::*;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use narsor::api::ApiClient;
+    use narsor::domain::ExecutionStatus;
+    use narsor::orchestration::AttentionKind;
+    use narsor::tui::task_app::detail::DetailRead;
+    use narsor::tui::task_app::{layout, TaskApp};
+    use serde_json::json;
+
+    use crate::task_app_support::{
+        listing, position, task, timeline, titled, waiting_on, with_controller, with_pending,
+        with_runner,
+    };
+
+    fn press(app: &mut TaskApp, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn running() -> narsor::controller_protocol::TaskSummary {
+        with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::InputNeeded,
+            "review_scope",
+        )
+    }
+
+    fn gate() -> serde_json::Value {
+        json!({
+            "execution_id": "exec-1",
+            "state_id": "review_scope",
+            "action_execution_id": "act-7",
+            "instruction": "Czy zakres zmian obejmuje też migrację danych?",
+            "fields": [{ "name": "comment", "type": "text", "required": true }],
+            "outputs": [
+                { "label": "approved" },
+                { "label": "revise", "description": "Zakres wymaga poprawy. Agent planu wznowi swoją sesję.", "resume_comment_field": "comment" },
+                { "label": "reject" }
+            ],
+            "resume_targets": { "revise": { "action_execution_id": "act-plan", "harness": "claude", "session_id": "s1" } },
+            "episode": "ep-1",
+            "requested_at": "2026-10-09T11:54:00Z"
+        })
+    }
+
+    fn problem() -> serde_json::Value {
+        json!({
+            "execution_id": "exec-1",
+            "state_id": "implement",
+            "action_execution_id": "act-9",
+            "instruction": "Krok nie dał etykiety",
+            "outputs": [{ "label": "implemented", "description": "Funkcja gotowa." }],
+            "continuation": "resolve_output",
+            "problem": {
+                "reason": "Odpowiedź agenta nie zawiera etykiety.",
+                "answers": [],
+                "requirements": [{ "label": "implemented", "data": [], "variables": ["summary"] }],
+                "analysis": { "label": "implemented", "data": {}, "variables": { "summary": "all units done" }, "rationale": "Testy przechodzą." }
+            },
+            "episode": "ep-p",
+            "requested_at": "2026-10-09T11:54:00Z"
+        })
+    }
+
+    fn opened(task: narsor::controller_protocol::TaskSummary) -> TaskApp {
+        let mut app = TaskApp::new(ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"), "local", None);
+        app.load(listing(vec![titled(task, "NAR-12")], "c"));
+        // The step the output `revise` returns to is known from the timeline.
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline(
+                "a",
+                vec![position("plan", narsor::engine::PositionStatus::Succeeded)],
+                None,
+            ))),
+        );
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+        app
+    }
+
+    fn draw_app(app: &mut TaskApp, width: u16, height: u16, no_color: bool) -> String {
+        screen(&draw(width, height, |frame| {
+            layout::render(frame, app, &Styles::new(no_color), Instant::now())
+        }))
+    }
+
+    #[test]
+    fn wide_the_panel_shows_context_actions_description_and_fields() {
+        let mut app = opened(with_pending(running(), gate()));
+        let screen = draw_app(&mut app, 120, 40, false);
+        for expected in [
+            "? Pytanie · review_scope",
+            "Czy zakres zmian obejmuje też migrację danych?",
+            "Akcje",
+            "Opis",
+            "▸ 2 revise",
+            "↩ wraca do agenta: plan",
+            "Zakres wymaga poprawy.",
+            "comment (wymagane)",
+        ] {
+            assert!(screen.contains(expected), "{expected:?} is missing:\n{screen}");
+        }
+        let list_row = screen.lines().position(|row| row.contains("▸ 2 revise")).unwrap();
+        let description_row = screen.lines().position(|row| row.contains("↩ wraca do agenta: plan")).unwrap();
+        assert!(description_row <= list_row + 1, "the description sits beside the list:\n{screen}");
+    }
+
+    #[test]
+    fn narrow_the_description_goes_under_the_actions() {
+        let mut app = opened(with_pending(running(), gate()));
+        let screen = draw_app(&mut app, 64, 40, false);
+        let rows: Vec<&str> = screen.lines().collect();
+        let last_action = rows.iter().position(|row| row.contains("reject")).expect("the list");
+        let description = rows.iter().position(|row| row.contains("Opis")).expect("the description");
+        assert!(description > last_action, "{screen}");
+        assert!(screen.contains("↩ wraca do agenta: plan"), "{screen}");
+    }
+
+    #[test]
+    fn without_colour_the_markers_survive() {
+        let mut app = opened(with_pending(running(), gate()));
+        let question = draw_app(&mut app, 120, 40, true);
+        assert!(question.contains('?') && question.contains('↩'), "{question}");
+
+        let mut app = opened(with_pending(running(), problem()));
+        let problem = draw_app(&mut app, 120, 40, true);
+        for marker in ["! Problem", "◆", "◆ dyrygent: Testy przechodzą."] {
+            assert!(problem.contains(marker), "{marker:?} is missing:\n{problem}");
+        }
+        assert!(problem.contains("variables.summary ◆"), "the proposed value is marked:\n{problem}");
+    }
+
+    #[test]
+    fn the_panel_gives_its_rows_back_to_the_tab_when_folded() {
+        let mut app = opened(with_pending(running(), gate()));
+        let open = draw_app(&mut app, 120, 40, false);
+        press(&mut app, KeyCode::Esc);
+        let folded = draw_app(&mut app, 120, 40, false);
+        assert!(open.contains("Akcje") && !folded.contains("Akcje"), "{folded}");
+        assert!(folded.contains("? Pytanie · review_scope") && folded.contains("Tab rozwiń"), "{folded}");
+    }
+
+    #[test]
+    fn a_failed_provisioning_and_a_hostile_diagnosis_are_drawn_safely() {
+        let failed = waiting_on(
+            task("a", "local", "interrupted", 1),
+            AttentionKind::ProvisioningFailed,
+            "provisioning-1",
+            None,
+        );
+        let mut app = opened(failed);
+        let screen = draw_app(&mut app, 120, 40, false);
+        assert!(screen.contains("! Nieudany provisioning"), "{screen}");
+        assert!(screen.contains("Uruchom od nowa") && screen.contains("Archiwizuj"), "{screen}");
+        assert!(screen.contains('!'), "the irreversible action is marked");
+
+        let mut hostile = gate();
+        hostile["instruction"] = json!("pytanie\u{1b}[31m\u{202e}ewil\u{7}");
+        let mut app = opened(with_pending(running(), hostile));
+        let screen = draw_app(&mut app, 120, 40, false);
+        assert!(!screen.contains('\u{1b}') && !screen.contains('\u{202e}') && !screen.contains('\u{7}'), "{screen}");
     }
 }

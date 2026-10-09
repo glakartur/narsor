@@ -8257,3 +8257,837 @@ mod task_app_detail {
         }
     }
 }
+
+/// U10: the panel "Czeka na Ciebie". The first group characterises the form
+/// semantics of the old `InputForm`, `ProblemForm` and `FailureForm`
+/// (`3f3dab2`, `4ca1e73`, `2a9c6f2`, `9c6af7f`, `c7f3f0d`) on the new panel;
+/// the rest is what the panel adds. Nothing here starts a daemon.
+mod task_app_waiting {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::{json, Value};
+
+    use narsor::api::{ApiClient, ClientError};
+    use narsor::conductor::ConductorView;
+    use narsor::controller_protocol::{ConductorReadResponse, ExecutionEventsSource};
+    use narsor::engine::actions::human::HumanInputAction;
+    use narsor::engine::PositionStatus;
+    use narsor::orchestration::{AttentionKind, OperatorCommand, OwnerCommand, TaskEventKind, TaskLifecycle};
+    use narsor::tui::chooser::ChooserFocus;
+    use narsor::tui::task_app::detail::DetailRead;
+    use narsor::tui::task_app::notify::Severity;
+    use narsor::tui::task_app::waiting::{AnswerRequest, Submit};
+    use narsor::tui::task_app::{Focus, Request, TaskApp};
+
+    use super::remote_support::{snapshot, RemoteHarness};
+    use super::task_app_support::{
+        event, listing, position, task, timeline, titled, waiting_on, with_controller, with_pending,
+        with_runner,
+    };
+    use narsor::domain::ExecutionStatus;
+
+    fn app() -> TaskApp {
+        TaskApp::new(ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"), "local", None)
+    }
+
+    fn press(app: &mut TaskApp, code: KeyCode) -> Request {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn ch(app: &mut TaskApp, character: char) -> Request {
+        press(app, KeyCode::Char(character))
+    }
+
+    fn typed(app: &mut TaskApp, text: &str) {
+        for character in text.chars() {
+            ch(app, character);
+        }
+    }
+
+    fn sent(request: Request) -> AnswerRequest {
+        match request {
+            Request::Answer(answer) => *answer,
+            other => panic!("an answer was expected, got {other:?}"),
+        }
+    }
+
+    fn delivery(request: Request) -> narsor::engine::HumanInputDelivery {
+        match sent(request).submit {
+            Submit::Input { delivery, .. } => delivery,
+            other => panic!("an input was expected, got {other:?}"),
+        }
+    }
+
+    fn running(id: &str, rank: u32) -> narsor::controller_protocol::TaskSummary {
+        with_runner(
+            with_controller(task(id, "local", "running", rank)),
+            ExecutionStatus::InputNeeded,
+            "review_scope",
+        )
+    }
+
+    /// An app whose only task `a` waits; the panel is open on its actions.
+    fn opened(task: narsor::controller_protocol::TaskSummary) -> TaskApp {
+        let mut app = app();
+        app.load(listing(vec![titled(task, "NAR-12")], "c"));
+        ch(&mut app, ' ');
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Details);
+        assert!(app.panel_focused(), "Enter on a waiting task opens its panel");
+        app
+    }
+
+    fn chooser_of(app: &TaskApp) -> &narsor::tui::chooser::Chooser {
+        app.detail().view("a").expect("details").waiting().chooser().expect("a panel")
+    }
+
+    fn selected_label(app: &TaskApp) -> String {
+        chooser_of(app).selected_item().expect("an entry").label.clone()
+    }
+
+    fn screen(app: &mut TaskApp, width: u16, height: u16) -> String {
+        use narsor::tui::style::Styles;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                narsor::tui::task_app::layout::render(frame, app, &Styles::new(false), std::time::Instant::now())
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        buffer
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // -- forms -------------------------------------------------------------
+
+    /// A gate with a resume comment: only `revise` resumes the agent.
+    fn gate(episode: &str) -> Value {
+        json!({
+            "execution_id": "exec-1",
+            "state_id": "review_scope",
+            "action_execution_id": "act-7",
+            "instruction": "Czy zakres zmian obejmuje też migrację danych?",
+            "question": "Czy migracja wchodzi w zakres?",
+            "fields": [{ "name": "comment", "type": "text", "required": true }],
+            "outputs": [
+                { "label": "approved" },
+                { "label": "revise", "description": "Zakres wymaga poprawy.", "resume_comment_field": "comment" },
+                { "label": "reject" }
+            ],
+            "resume_targets": { "revise": { "action_execution_id": "act-plan", "harness": "claude", "session_id": "s1" } },
+            "episode": episode,
+            "requested_at": "2026-10-09T11:54:00Z"
+        })
+    }
+
+    fn question(prefilled: Option<&str>) -> Value {
+        json!({
+            "execution_id": "exec-1",
+            "state_id": "review_scope",
+            "action_execution_id": "act-7",
+            "instruction": "Która wersja API?",
+            "fields": [{ "name": "answer", "type": "text", "required": true }],
+            "continuation": "resume_agent",
+            "prefilled_answer": prefilled,
+            "episode": "ep-q",
+            "requested_at": "2026-10-09T11:54:00Z"
+        })
+    }
+
+    fn approval(resumable: bool) -> Value {
+        json!({
+            "execution_id": "exec-1",
+            "state_id": "review_scope",
+            "action_execution_id": "act-7",
+            "instruction": "Zatwierdź wynik",
+            "outputs": [{ "label": "reviewed", "description": "Wynik przeglądu." }],
+            "continuation": "approve_output",
+            "approval": {
+                "action_execution_id": "act-7",
+                "result": { "output_label": "reviewed", "data": { "files": 3 }, "variables": {}, "exit_code": null, "stdout": "", "stderr": "" },
+                "agent_session_id": if resumable { json!("sess-1") } else { Value::Null }
+            },
+            "episode": "ep-a",
+            "requested_at": "2026-10-09T11:54:00Z"
+        })
+    }
+
+    fn problem(proposed: bool) -> Value {
+        json!({
+            "execution_id": "exec-1",
+            "state_id": "implement",
+            "action_execution_id": "act-9",
+            "instruction": "Krok nie dał etykiety",
+            "outputs": [
+                { "label": "implemented", "description": "Funkcja gotowa." },
+                { "label": "needs_human_decision", "description": "Najpierw decyzja człowieka." }
+            ],
+            "continuation": "resolve_output",
+            "problem": {
+                "reason": "Odpowiedź agenta nie zawiera etykiety.",
+                "answers": [{ "action_execution_id": "act-9", "reason": "brak etykiety", "answer_tail": "Done, all tests pass." }],
+                "requirements": [
+                    { "label": "implemented", "data": [], "variables": ["summary"] },
+                    { "label": "needs_human_decision", "data": ["question"], "variables": [] }
+                ],
+                "analysis": if proposed { json!({
+                    "label": "implemented",
+                    "data": {},
+                    "variables": { "summary": "all units done", "files": 3 },
+                    "rationale": "Odpowiedź mówi, że testy przechodzą."
+                }) } else { Value::Null }
+            },
+            "episode": "ep-p",
+            "requested_at": "2026-10-09T11:54:00Z"
+        })
+    }
+
+    fn gate_app() -> TaskApp {
+        opened(with_pending(running("a", 1), gate("ep-1")))
+    }
+
+    // -- characterisation of the form semantics --------------------------------
+
+    #[test]
+    fn a_resume_comment_is_required_only_for_the_output_that_resumes_the_agent() {
+        // 3f3dab2: `approved` has no need of the comment, `revise ↩` does.
+        let mut app = gate_app();
+        // The state the agent returns to is known from the steps read.
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline("a", vec![position("plan", PositionStatus::Succeeded)], None))),
+        );
+        let items = chooser_of(&app).items();
+        assert!(!items[0].fields[0].required, "approved: the comment is optional");
+        assert!(items[1].fields[0].required, "revise: the comment is required");
+        assert!(!items[2].fields[0].required);
+        assert_eq!(items[1].resumes_agent.as_deref(), Some("plan"), "↩ wraca do agenta: plan");
+        assert!(items[0].resumes_agent.is_none());
+
+        // The panel opens on the output that returns the work to the agent.
+        assert_eq!(selected_label(&app), "revise");
+        // Enter without the comment takes the operator to the field, sends nothing.
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "still refused: the comment is empty");
+        assert!(chooser_of(&app).fields_of(1)[0].error().is_some());
+
+        typed(&mut app, "Uwzględnij migrację");
+        let delivery = delivery(press(&mut app, KeyCode::Enter));
+        assert_eq!(delivery.chosen_label.as_deref(), Some("revise"));
+        assert_eq!(delivery.values["comment"], "Uwzględnij migrację");
+        assert_eq!(delivery.episode.as_deref(), Some("ep-1"), "the answer names its request");
+    }
+
+    #[test]
+    fn an_output_without_a_need_for_the_comment_is_sent_at_once() {
+        let mut app = gate_app();
+        ch(&mut app, '1');
+        assert_eq!(selected_label(&app), "approved");
+        let request = sent(press(&mut app, KeyCode::Enter));
+        assert_eq!(request.summary, "odpowiedziano approved");
+        let Submit::Input { pending_input_id, delivery } = request.submit else {
+            panic!("an input");
+        };
+        assert_eq!(pending_input_id, "ep-1");
+        assert_eq!(delivery.chosen_label.as_deref(), Some("approved"));
+        assert!(delivery.values.is_empty(), "a blank optional field is left out");
+    }
+
+    #[test]
+    fn a_select_that_offers_exactly_the_outputs_is_the_label_and_not_a_field() {
+        // KTD17: the picked value is both the field and the chosen label.
+        let form = json!({
+            "execution_id": "exec-1",
+            "state_id": "resolve_ambiguity",
+            "action_execution_id": "act-1",
+            "instruction": "Agent zatrzymał się na niejednoznaczności.",
+            "fields": [
+                { "name": "ambiguity_decision", "type": "select", "required": true, "options": ["answered", "replan"] },
+                { "name": "ambiguity_answer", "type": "text" }
+            ],
+            "outputs": [{ "label": "answered" }, { "label": "replan" }],
+            "episode": "ep-g",
+            "requested_at": "2026-10-09T11:54:00Z"
+        });
+        let mut app = opened(with_pending(running("a", 1), form));
+        let items = chooser_of(&app).items();
+        assert_eq!(items.len(), 2, "one entry per output, no label row");
+        assert!(items.iter().all(|item| item.fields.len() == 1 && item.fields[0].name == "ambiguity_answer"));
+        ch(&mut app, '2');
+        let delivery = delivery(press(&mut app, KeyCode::Enter));
+        assert_eq!(delivery.chosen_label.as_deref(), Some("replan"));
+        assert_eq!(delivery.values["ambiguity_decision"], "replan");
+    }
+
+    #[test]
+    fn a_rejected_resume_gives_the_reply_back_in_the_field() {
+        // 2a9c6f2: the text of an answer that could not be delivered returns.
+        let mut app = opened(with_pending(running("a", 1), question(Some("wersja 2"))));
+        assert_eq!(chooser_of(&app).items()[0].fields[0].value(), "wersja 2");
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "a required field: Enter goes to it");
+        let delivery = delivery(press(&mut app, KeyCode::Enter));
+        assert_eq!(delivery.values["answer"], "wersja 2");
+        assert!(delivery.chosen_label.is_none(), "a question has no label");
+    }
+
+    #[test]
+    fn a_question_is_answered_with_the_text_alone() {
+        let mut app = opened(with_pending(running("a", 1), question(None)));
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "the answer is required");
+        assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
+        typed(&mut app, "ab");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        typed(&mut app, "cd");
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        typed(&mut app, "X");
+        assert_eq!(chooser_of(&app).fields_of(0)[0].value(), "ab\nXcd", "an editor, not an append-only line");
+        let delivery = delivery(press(&mut app, KeyCode::Enter));
+        assert_eq!(delivery.values["answer"], "ab\nXcd", "typed text goes out unchanged");
+    }
+
+    #[test]
+    fn an_approval_returns_to_the_agent_by_default_and_accepts_on_request() {
+        // 9c6af7f / 4ca1e73: accepting is explicit, returning needs a comment.
+        let mut app = opened(with_pending(running("a", 1), approval(true)));
+        let labels: Vec<_> = chooser_of(&app).items().iter().map(|item| item.label.clone()).collect();
+        assert_eq!(labels, ["Akceptuj", "Zwróć agentowi"]);
+        assert_eq!(selected_label(&app), "Zwróć agentowi", "nothing moves on by a stray Enter");
+
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "the comment comes first");
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "and is required");
+        typed(&mut app, "popraw testy");
+        let delivery = delivery(press(&mut app, KeyCode::Enter));
+        assert_eq!(delivery.action, Some(HumanInputAction::Resume));
+        assert_eq!(delivery.comment.as_deref(), Some("popraw testy"));
+
+        let mut app = opened(with_pending(running("a", 1), approval(true)));
+        ch(&mut app, '1');
+        let request = sent(press(&mut app, KeyCode::Enter));
+        assert_eq!(request.summary, "zaakceptowano reviewed");
+        let Submit::Input { delivery, .. } = request.submit else { panic!("an input") };
+        assert_eq!(delivery.action, Some(HumanInputAction::Approve));
+        assert_eq!(delivery.episode.as_deref(), Some("ep-a"));
+    }
+
+    #[test]
+    fn an_approval_whose_session_cannot_be_resumed_offers_a_new_one() {
+        let app = opened(with_pending(running("a", 1), approval(false)));
+        let item = &chooser_of(&app).items()[1];
+        assert_eq!(item.label, "Nowa sesja");
+        assert!(item.description.contains("nie da się wznowić"));
+    }
+
+    #[test]
+    fn a_problem_opens_on_a_message_to_the_agent_and_has_no_data_to_fill() {
+        // c7f3f0d: problems start in conversation mode.
+        let mut app = opened(with_pending(running("a", 1), problem(false)));
+        assert_eq!(selected_label(&app), "Napisz do agenta");
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        typed(&mut app, "spróbuj jeszcze raz");
+        let delivery = delivery(press(&mut app, KeyCode::Enter));
+        assert_eq!(delivery.agent_message.as_deref(), Some("spróbuj jeszcze raz"));
+        assert!(delivery.chosen_label.is_none());
+    }
+
+    #[test]
+    fn a_problem_offers_the_conductors_label_and_values_marked_until_edited() {
+        let mut app = opened(with_pending(running("a", 1), problem(true)));
+        assert_eq!(selected_label(&app), "implemented", "the recommendation is selected");
+        let item = chooser_of(&app).selected_item().unwrap();
+        assert!(item.recommended);
+        let summary = &item.fields[0];
+        assert_eq!(summary.name, "variables.summary");
+        assert!(summary.is_proposed(), "◆ until the operator changes it");
+        assert_eq!(summary.value(), "all units done");
+
+        // Untouched, a proposal goes out as it was: the number stays a number.
+        let delivery = delivery(press(&mut app, KeyCode::Enter));
+        assert_eq!(delivery.chosen_label.as_deref(), Some("implemented"));
+        assert_eq!(delivery.variables["summary"], "all units done");
+        assert_eq!(delivery.variables["files"], json!(3));
+
+        // Edited, the value is the operator's and the mark is gone.
+        let mut app = opened(with_pending(running("a", 1), problem(true)));
+        press(&mut app, KeyCode::Tab);
+        typed(&mut app, "!");
+        let field = &chooser_of(&app).selected_item().unwrap().fields[0];
+        assert!(!field.is_proposed());
+        assert_eq!(field.value(), "all units done!");
+    }
+
+    #[test]
+    fn a_problem_label_needing_a_key_is_refused_until_it_is_given() {
+        let mut app = opened(with_pending(running("a", 1), problem(false)));
+        ch(&mut app, '2');
+        assert_eq!(selected_label(&app), "needs_human_decision");
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "data.question is required");
+        assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        let field = &chooser_of(&app).fields_of(1)[0];
+        assert_eq!(field.name, "data.question");
+        assert!(field.error().is_some_and(|error| error.contains("data.question")));
+
+        typed(&mut app, "Konto czy użytkownik?");
+        // A key of the operator's own, beside the ones the label needs.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        typed(&mut app, "scope=account");
+        let delivery = delivery(press(&mut app, KeyCode::Enter));
+        assert_eq!(delivery.chosen_label.as_deref(), Some("needs_human_decision"));
+        assert_eq!(delivery.data["question"], "Konto czy użytkownik?");
+        assert_eq!(delivery.variables["scope"], "account");
+    }
+
+    #[test]
+    fn a_key_given_twice_or_without_a_value_is_refused_at_the_panel() {
+        let mut app = opened(with_pending(running("a", 1), problem(false)));
+        ch(&mut app, '1');
+        press(&mut app, KeyCode::Tab);
+        typed(&mut app, "x");
+        press(&mut app, KeyCode::Down);
+        typed(&mut app, "x=1");
+        press(&mut app, KeyCode::Down);
+        typed(&mut app, "summary=again");
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        let error = app.detail().view("a").unwrap().waiting().error().expect("refused").to_string();
+        assert!(error.contains("variables.summary"), "{error}");
+
+        // A line without `=` is refused too.
+        let mut app = opened(with_pending(running("a", 1), problem(false)));
+        ch(&mut app, '1');
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down);
+        typed(&mut app, "bez znaku");
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        assert!(app.detail().view("a").unwrap().waiting().error().is_some());
+    }
+
+    #[test]
+    fn the_conductors_summary_of_a_gate_recommends_an_output_with_the_diamond() {
+        let pending: narsor::engine::PendingHumanInput = serde_json::from_value(gate("ep-1")).unwrap();
+        let mut panel = narsor::tui::input_form::InputPanel::new(&pending, &|_| None);
+        let annotation: narsor::conductor::Annotation = serde_json::from_value(json!({
+            "key": "ep-1", "summary": "brak planu migracji", "recommendation": "reject",
+            "created_at": "2026-10-09T12:00:00Z"
+        }))
+        .unwrap();
+        panel.annotate(&annotation);
+        assert_eq!(panel.items()[panel.selected()].label, "reject");
+        assert!(panel.items()[2].recommended);
+        assert!(panel.context().iter().any(|line| line.text.contains("◆ dyrygent: brak planu migracji")));
+
+        // A summary of another request changes nothing.
+        let mut other = narsor::tui::input_form::InputPanel::new(&pending, &|_| None);
+        let mut stranger = annotation.clone();
+        stranger.key = "ep-2".to_string();
+        other.annotate(&stranger);
+        assert!(other.items().iter().all(|item| !item.recommended));
+    }
+
+    // -- the panel ------------------------------------------------------------
+
+    #[test]
+    fn a_failed_step_confirms_the_conductors_proposal() {
+        let failed = waiting_on(running("a", 1), AttentionKind::FailedStep, "fk1", Some("test"));
+        let mut app = opened(failed);
+        read_conductor(&mut app, conductor(true));
+        let labels: Vec<String> = chooser_of(&app).items().iter().map(|item| item.label.clone()).collect();
+        assert!(labels[0].starts_with("Potwierdź: Uruchom krok"), "{labels:?}");
+        assert!(labels[1].starts_with("Odrzuć: Uruchom krok"));
+        assert_eq!(labels[2], "Restart kroku z notatką");
+        assert!(chooser_of(&app).items()[0].recommended, "◆ the conductor's");
+        assert_eq!(chooser_of(&app).selected(), 0, "the recommendation is selected");
+
+        let request = sent(press(&mut app, KeyCode::Enter));
+        assert_eq!(
+            request.submit,
+            Submit::Operator(OperatorCommand::ConfirmProposal { proposal_id: "p1".to_string() })
+        );
+        assert_eq!(request.generation, 1);
+        assert!(!request.key.is_empty());
+    }
+
+    #[test]
+    fn a_failed_step_rejects_or_restarts_with_a_note_naming_its_failure() {
+        let failed = waiting_on(running("a", 1), AttentionKind::FailedStep, "fk1", Some("test"));
+        let mut app = opened(failed);
+        read_conductor(&mut app, conductor(true));
+        ch(&mut app, '2');
+        assert_eq!(
+            sent(press(&mut app, KeyCode::Enter)).submit,
+            Submit::Operator(OperatorCommand::RejectProposal { proposal_id: "p1".to_string() })
+        );
+
+        ch(&mut app, '3');
+        press(&mut app, KeyCode::Tab);
+        typed(&mut app, "użyj nowszego toolchaina");
+        assert_eq!(
+            sent(press(&mut app, KeyCode::Enter)).submit,
+            Submit::Operator(OperatorCommand::RestartStep {
+                note: Some("użyj nowszego toolchaina".to_string()),
+                failure_key: Some("fk1".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_failed_step_without_a_conductor_shows_the_raw_error_and_restarts() {
+        let failed = waiting_on(running("a", 1), AttentionKind::FailedStep, "fk1", Some("test"));
+        let mut app = opened(failed);
+        let mut failing = position("test", PositionStatus::Failed);
+        failing.error = Some("cargo test: exit 101".to_string());
+        app.on_detail_read("a", 1, DetailRead::Timeline(Ok(timeline("a", vec![failing], None))));
+        read_conductor_response(
+            &mut app,
+            Ok(ConductorReadResponse::Unavailable {
+                reason: narsor::controller_protocol::ConversationUnavailableReason::RunnerUnreachable,
+                message: "brak harnessu".to_string(),
+            }),
+        );
+        let text = screen(&mut app, 120, 40);
+        assert!(text.contains("dyrygent niedostępny: brak harnessu"), "{text}");
+        // The raw error comes from the timeline once the entry is built again.
+        assert_eq!(chooser_of(&app).items().len(), 1, "only the restart");
+        let request = sent(press(&mut app, KeyCode::Enter));
+        assert_eq!(
+            request.submit,
+            Submit::Operator(OperatorCommand::RestartStep { note: None, failure_key: Some("fk1".to_string()) })
+        );
+    }
+
+    #[test]
+    fn a_proposal_from_the_chat_is_confirmed_or_rejected() {
+        let waiting = waiting_on(running("a", 1), AttentionKind::ConductorProposal, "p1", Some("test"));
+        let mut app = opened(waiting);
+        read_conductor(&mut app, conductor(false));
+        let text = screen(&mut app, 120, 40);
+        assert!(text.contains("dyrygent proponuje: Uruchom krok od nowa"), "{text}");
+        assert_eq!(
+            sent(press(&mut app, KeyCode::Enter)).submit,
+            Submit::Operator(OperatorCommand::ConfirmProposal { proposal_id: "p1".to_string() })
+        );
+        ch(&mut app, '2');
+        assert_eq!(
+            sent(press(&mut app, KeyCode::Enter)).submit,
+            Submit::Operator(OperatorCommand::RejectProposal { proposal_id: "p1".to_string() })
+        );
+    }
+
+    #[test]
+    fn a_failed_provisioning_starts_again_or_archives_after_a_second_enter() {
+        let failed = waiting_on(task("a", "local", "interrupted", 1), AttentionKind::ProvisioningFailed, "provisioning-1", None);
+        let mut app = opened(failed);
+        assert_eq!(selected_label(&app), "Uruchom od nowa");
+        assert_eq!(sent(press(&mut app, KeyCode::Enter)).submit, Submit::Owner(OwnerCommand::Start));
+
+        ch(&mut app, '2');
+        assert!(chooser_of(&app).items()[1].irreversible);
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "archiving asks first");
+        let text = screen(&mut app, 120, 40);
+        assert!(text.contains("nieodwracalne — Enter potwierdza, Esc anuluje"), "{text}");
+        assert_eq!(press(&mut app, KeyCode::Esc), Request::None);
+        assert!(app.panel_focused(), "Esc took the question back, it did not fold the panel");
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "asks again");
+        assert_eq!(sent(press(&mut app, KeyCode::Enter)).submit, Submit::Owner(OwnerCommand::Archive));
+    }
+
+    #[test]
+    fn two_waitings_are_counted_and_the_bracket_keys_move_between_them() {
+        let both = with_pending(with_pending(running("a", 1), gate("ep-1")), question(None));
+        let mut app = opened(both);
+        assert_eq!(app.detail().view("a").unwrap().waiting().len(), 2);
+        assert_eq!(app.detail().view("a").unwrap().waiting().current_index(), 0);
+        let text = screen(&mut app, 120, 40);
+        assert!(text.contains("1/2"), "{text}");
+        ch(&mut app, ']');
+        assert_eq!(app.detail().view("a").unwrap().waiting().current_index(), 1);
+        assert!(screen(&mut app, 120, 40).contains("2/2"));
+        ch(&mut app, '[');
+        assert_eq!(app.detail().view("a").unwrap().waiting().current_index(), 0);
+    }
+
+    #[test]
+    fn a_refresh_while_typing_keeps_the_draft_and_the_place() {
+        let mut app = gate_app();
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "Uwzględnij");
+        assert!(app.detail().has_drafts());
+        let waiting = with_pending(running("a", 1), gate("ep-1"));
+        app.load(listing(vec![titled(waiting.clone(), "NAR-12")], "d"));
+        app.on_stream(event("e", "a", 2, TaskLifecycle::Running, TaskEventKind::Created));
+        app.load(listing(vec![titled(waiting, "NAR-12")], "e"));
+        assert!(app.panel_focused());
+        assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
+        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "Uwzględnij");
+        assert!(app.detail().draft("a").is_some_and(|draft| draft.contains("Uwzględnij")));
+        typed(&mut app, " migrację");
+        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "Uwzględnij migrację");
+    }
+
+    #[test]
+    fn esc_folds_the_panel_and_opening_it_again_brings_the_draft_back() {
+        let mut app = gate_app();
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "szkic");
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.panel_focused());
+        assert!(app.detail().view("a").unwrap().waiting().is_collapsed());
+        assert!(screen(&mut app, 120, 40).contains("Tab rozwiń"));
+        assert!(app.detail().has_drafts(), "the draft stays");
+
+        press(&mut app, KeyCode::Tab);
+        assert!(app.panel_focused() && !app.detail().view("a").unwrap().waiting().is_collapsed());
+        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "szkic");
+        // From the list, Enter does the same.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus(), Focus::List);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.panel_focused());
+        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "szkic");
+    }
+
+    #[test]
+    fn a_waiting_that_goes_away_while_typing_folds_the_panel_and_keeps_the_draft() {
+        let mut app = gate_app();
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "moja odpowiedź");
+        // Answered from the CLI: the row no longer waits.
+        app.load(listing(vec![titled(running("a", 1), "NAR-12")], "d"));
+        assert!(!app.panel_focused(), "the focus left the panel");
+        let panel = app.detail().view("a").unwrap().waiting();
+        assert!(panel.is_empty());
+        assert_eq!(panel.released().len(), 1);
+        assert!(panel.released()[0].text.contains("moja odpowiedź"));
+        assert!(app.detail().has_drafts());
+        let text = screen(&mut app, 120, 40);
+        assert!(text.contains("moja odpowiedź") && text.contains("skopiuj"), "{text}");
+        assert!(app.notifier().latest().unwrap().text.contains("oczekiwanie zniknęło"));
+
+        // The box is dismissed on purpose.
+        press(&mut app, KeyCode::Tab);
+        assert!(app.panel_focused());
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.detail().has_drafts());
+        assert!(!app.detail().view("a").unwrap().waiting().is_present());
+    }
+
+    #[test]
+    fn sending_without_a_connection_is_blocked_with_a_reason_and_keeps_the_draft() {
+        let mut app = gate_app();
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "tekst");
+        app.on_stream(Some(Err(ClientError::Unavailable("down".to_string()))));
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        let note = app.notifier().latest().expect("a reason").clone();
+        assert!(note.text.contains("zablokowana"), "{}", note.text);
+        assert_eq!(note.severity, Severity::Warning);
+        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "tekst");
+    }
+
+    #[test]
+    fn quitting_with_an_unsent_draft_asks_first() {
+        let mut app = gate_app();
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "q?");
+        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "q?", "q and ? are text while typing");
+        assert!(!app.should_quit());
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        ch(&mut app, 'q');
+        assert!(!app.should_quit(), "the draft makes q ask");
+        assert!(app.notifier().latest().unwrap().text.contains("niewysłany szkic"));
+        ch(&mut app, 'q');
+        assert!(app.should_quit());
+
+        let mut app = gate_app();
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        ch(&mut app, 'q');
+        assert!(app.should_quit(), "no draft, no question");
+    }
+
+    #[test]
+    fn tab_in_the_details_goes_to_the_panel_and_a_task_that_waits_on_nothing_says_so() {
+        let mut app = app();
+        app.load(listing(vec![titled(running("a", 1), "NAR-12")], "c"));
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.panel_focused());
+        press(&mut app, KeyCode::Tab);
+        assert!(!app.panel_focused());
+        assert!(app.notifier().latest().unwrap().text.contains("na nic nie czeka"));
+
+        let mut app = gate_app();
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.panel_focused() && app.focus() == Focus::Details);
+        press(&mut app, KeyCode::Tab);
+        assert!(app.panel_focused());
+    }
+
+    #[test]
+    fn untyped_keys_of_the_panel_are_the_keymaps() {
+        let mut app = gate_app();
+        assert_eq!(app.key_context(), narsor::tui::keymap::Context::Panel);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.key_context(), narsor::tui::keymap::Context::Form, "typing inherits no global key");
+        ch(&mut app, '?');
+        assert!(!app.is_help_open());
+        press(&mut app, KeyCode::Tab);
+        ch(&mut app, '?');
+        assert!(app.is_help_open());
+    }
+
+    fn conductor(with_failure: bool) -> ConductorView {
+        let proposal = json!({
+            "proposal_id": "p1",
+            "text": "Uruchom krok od nowa",
+            "at": "2026-10-09T12:00:00Z",
+            "record": {
+                "episode": if with_failure { "fk1" } else { "ep-x" },
+                "state_id": "test",
+                "proposal": { "kind": "retry", "summary": "Uruchom krok od nowa", "text": "z nowszym toolchainem" },
+                "confidence": "high",
+                "rationale": "Błąd wygląda na przejściowy."
+            },
+            "state": "pending"
+        });
+        let mut view = json!({ "available": true, "harness": "claude", "proposals": [proposal] });
+        if with_failure {
+            view["failure"] = json!({
+                "key": "fk1",
+                "episode": "fk1",
+                "state_id": "test",
+                "reason": "cargo test nie przeszło",
+                "outcome": { "kind": "diagnosed", "diagnosis": "Testy padają przez toolchain.", "proposals": [] },
+                "concluded_at": "2026-10-09T12:00:00Z"
+            });
+        }
+        serde_json::from_value(view).expect("a conductor view")
+    }
+
+    fn read_conductor(app: &mut TaskApp, view: ConductorView) {
+        read_conductor_response(
+            app,
+            Ok(ConductorReadResponse::Available {
+                conductor: Box::new(view),
+                source: ExecutionEventsSource::Runner,
+            }),
+        );
+    }
+
+    fn read_conductor_response(app: &mut TaskApp, result: Result<ConductorReadResponse, ClientError>) {
+        app.on_detail_read("a", 1, DetailRead::Conductor(result));
+    }
+
+    // -- against a served control plane -----------------------------------------
+
+    fn approval_snapshot(sequence: u64) -> narsor::orchestration::RunnerSnapshot {
+        let mut snapshot = snapshot(sequence, None);
+        let form: narsor::engine::PendingHumanInput = serde_json::from_value(approval(true)).unwrap();
+        snapshot.pending_input = Some(narsor::orchestration::PendingInputRef {
+            id: "ep-a".to_string(),
+            attempt_id: None,
+            form,
+        });
+        snapshot.attention = vec![narsor::orchestration::AttentionItem {
+            kind: AttentionKind::Approval,
+            state_id: Some("review_scope".to_string()),
+            since: chrono::Utc::now(),
+            waiting_id: "ep-a".to_string(),
+        }];
+        snapshot
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn space_enter_accept_enter_sends_returns_to_the_list_and_says_so() {
+        let harness = RemoteHarness::start().await;
+        let _running = harness.running("NAR-12", "local", approval_snapshot(1)).await;
+        let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+        app.refresh().await;
+
+        ch(&mut app, ' ');
+        let request = press(&mut app, KeyCode::Enter);
+        assert_eq!(request, Request::None);
+        assert!(app.panel_focused());
+        ch(&mut app, '1');
+        let chooser = app.detail().view("NAR-12").unwrap().waiting().chooser().unwrap();
+        assert_eq!(chooser.selected_item().unwrap().label, "Akceptuj");
+        let request = press(&mut app, KeyCode::Enter);
+        app.perform(request).await;
+
+        assert_eq!(app.focus(), Focus::List, "after sending, the focus is on the list");
+        let note = app.notifier().latest().expect("a notification");
+        assert_eq!(note.text, "NAR-12: zaakceptowano reviewed");
+        assert_eq!(note.severity, Severity::Success);
+        let summary = harness.owner.control_task("NAR-12").await.unwrap();
+        assert_eq!(summary.inputs.len(), 1, "the answer was queued for the runner");
+        assert_eq!(summary.inputs[0].pending_input_id, "ep-a");
+        assert!(!app.detail().has_drafts());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_keeps_the_panel_and_the_text_and_reads_the_task_again() {
+        let harness = RemoteHarness::start().await;
+        let running = harness.running("NAR-12", "local", approval_snapshot(1)).await;
+        let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+        app.refresh().await;
+        ch(&mut app, ' ');
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "popraw testy");
+
+        // The runner moved on: the request the panel shows is gone.
+        running.runner.snapshot(&snapshot(2, None)).await.expect("the runner moved on");
+        let request = press(&mut app, KeyCode::Enter);
+        app.perform(request).await;
+
+        let note = app.notifier().latest().unwrap();
+        assert_eq!(note.severity, Severity::Error);
+        assert!(note.text.starts_with("NAR-12: nie wysłano"), "{}", note.text);
+        // The task was read again: nothing waits any more, and the text is kept.
+        let panel = app.detail().view("NAR-12").unwrap().waiting();
+        assert!(panel.is_empty());
+        assert!(panel.released()[0].text.contains("popraw testy"), "{:?}", panel.released());
+        assert!(app.detail().has_drafts());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_label_from_the_workflow_cannot_put_control_characters_on_the_bar() {
+        let harness = RemoteHarness::start().await;
+        let mut form = gate("ep-1");
+        form["outputs"][0]["label"] = json!("ap\u{1b}[31mpr\u{202e}oved\u{7}");
+        let mut snapshot = snapshot(1, None);
+        let pending: narsor::engine::PendingHumanInput = serde_json::from_value(form).unwrap();
+        snapshot.pending_input = Some(narsor::orchestration::PendingInputRef {
+            id: "ep-1".to_string(),
+            attempt_id: None,
+            form: pending,
+        });
+        snapshot.attention = vec![narsor::orchestration::AttentionItem {
+            kind: AttentionKind::Question,
+            state_id: Some("review_scope".to_string()),
+            since: chrono::Utc::now(),
+            waiting_id: "ep-1".to_string(),
+        }];
+        let _running = harness.running("NAR-12", "local", snapshot).await;
+        let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+        app.refresh().await;
+        ch(&mut app, ' ');
+        press(&mut app, KeyCode::Enter);
+        ch(&mut app, '1');
+        let request = press(&mut app, KeyCode::Enter);
+        app.perform(request).await;
+        let text = app.notifier().latest().expect("sent").text.clone();
+        assert!(text.contains("approved") || text.contains("oved"), "{text}");
+        assert!(
+            !text.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "no control or bidi characters reach the bar: {text:?}"
+        );
+    }
+}

@@ -227,3 +227,40 @@ pub fn execution_events(n: u64) -> Vec<Event> {
         })
         .collect()
 }
+
+/// The form a runner reports as the pending input of a task, from the JSON of
+/// an engine `PendingHumanInput`: the task's runner holds it and the row says
+/// it waits (the kind follows the form's `continuation`).
+pub fn with_pending(mut task: TaskSummary, form: serde_json::Value) -> TaskSummary {
+    let form: narsor::engine::PendingHumanInput = serde_json::from_value(form).expect("a pending input");
+    let kind = match form.continuation {
+        narsor::engine::InputContinuation::ResolveOutput => AttentionKind::Problem,
+        narsor::engine::InputContinuation::ApproveOutput => AttentionKind::Approval,
+        _ => AttentionKind::Question,
+    };
+    let id = form.episode_key().to_string();
+    let runner = task.runner.get_or_insert_with(|| runner(ExecutionStatus::InputNeeded, &form.state_id));
+    runner.pending_input = Some(narsor::orchestration::PendingInputRef {
+        id: id.clone(),
+        attempt_id: None,
+        form: form.clone(),
+    });
+    task.attention.push(AttentionItem {
+        kind,
+        state_id: Some(form.state_id.to_string()),
+        since: at(),
+        waiting_id: id,
+    });
+    task
+}
+
+/// The task waits on `kind` with the identity `waiting_id`.
+pub fn waiting_on(mut task: TaskSummary, kind: AttentionKind, waiting_id: &str, state: Option<&str>) -> TaskSummary {
+    task.attention.push(AttentionItem {
+        kind,
+        state_id: state.map(str::to_string),
+        since: at(),
+        waiting_id: waiting_id.to_string(),
+    });
+    task
+}
