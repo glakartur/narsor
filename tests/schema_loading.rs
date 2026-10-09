@@ -109,6 +109,38 @@ fn inputs_keep_their_declared_types() {
 }
 
 #[test]
+fn a_text_input_keeps_its_type_default_and_required_flag() {
+    let yaml = r#"
+name: prompts
+version: 1
+inputs:
+  - { name: prompt, type: text, required: true }
+  - { name: notes, type: text, default: "none" }
+  - { name: ticket_id, type: string }
+states:
+  start:
+    action: { type: agent, prompt: do it }
+    outputs: [done]
+    transitions: { done: end }
+terminal_states:
+  end: completed
+"#;
+    let definition = load_from_str(yaml).expect("a text input is valid");
+    assert_eq!(definition.inputs[0].param_type, ParamType::Text);
+    assert!(definition.inputs[0].required);
+    assert_eq!(definition.inputs[1].param_type, ParamType::Text);
+    assert_eq!(
+        definition.inputs[1].default,
+        Some(serde_json::json!("none"))
+    );
+    assert_eq!(definition.inputs[2].param_type, ParamType::String);
+
+    let error = load_from_str(&yaml.replace("type: text, required", "type: textarea, required"))
+        .expect_err("an unknown input type must be rejected");
+    assert!(error.to_string().contains("textarea"), "{error}");
+}
+
+#[test]
 fn global_workspace_becomes_a_definition_level_spec() {
     let definition = load_reference();
 

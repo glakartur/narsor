@@ -13,11 +13,11 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::api::ClientError;
-use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
 use crate::controller_protocol::{
     ConversationResponse, ConversationUnavailableReason, DefaultBackendView, Freshness,
     OwnerCommandResponse, QueueView, TaskSummary, TimelineResponse,
 };
+use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
 use crate::orchestration::{
     AttentionItem, AttentionKind, ConversationAttemptSummary, InputStatus, OwnerCommand,
     PendingInputRef, QueueReason, TaskLifecycle,
@@ -262,9 +262,9 @@ pub fn attention_lines(task: &TaskSummary) -> Vec<ToneLine> {
 fn attention_glyph(kind: AttentionKind) -> char {
     match kind {
         AttentionKind::Question | AttentionKind::Approval | AttentionKind::ConductorProposal => '?',
-        AttentionKind::Problem
-        | AttentionKind::FailedStep
-        | AttentionKind::ProvisioningFailed => '!',
+        AttentionKind::Problem | AttentionKind::FailedStep | AttentionKind::ProvisioningFailed => {
+            '!'
+        }
     }
 }
 

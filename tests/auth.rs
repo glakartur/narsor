@@ -1837,16 +1837,34 @@ async fn the_cli_gets_a_readable_refusal_from_a_network_server() {
     assert!(out.contains("Workflow paths:         no ("), "{out}");
     assert!(out.contains("Local repository paths: no"), "{out}");
 
-    let (code, _, err) = run(vec!["task", "repo", "add", "disk", "--remote", "/srv/git/repo.git"]).await;
+    let (code, _, err) = run(vec![
+        "task",
+        "repo",
+        "add",
+        "disk",
+        "--remote",
+        "/srv/git/repo.git",
+    ])
+    .await;
     assert_eq!(code, 1);
     assert!(err.contains("invalid_repository"), "{err}");
-    let (code, out, err) =
-        run(vec!["task", "repo", "add", "api", "--remote", "git@example.com:team/api.git"]).await;
+    let (code, out, err) = run(vec![
+        "task",
+        "repo",
+        "add",
+        "api",
+        "--remote",
+        "git@example.com:team/api.git",
+    ])
+    .await;
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("Registered repository 'api'"), "{out}");
     let (code, out, _) = run(vec!["task", "repo", "list"]).await;
     assert_eq!(code, 0);
-    assert!(out.contains("git@example.com:team/api.git") && !out.contains("disk"), "{out}");
+    assert!(
+        out.contains("git@example.com:team/api.git") && !out.contains("disk"),
+        "{out}"
+    );
     let (code, _, err) = run(vec!["task", "repo", "remove", "api"]).await;
     assert_eq!(code, 0, "{err}");
 

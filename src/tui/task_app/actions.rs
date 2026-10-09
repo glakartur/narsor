@@ -63,14 +63,14 @@ use crate::orchestration::{
     AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskLifecycle,
 };
 
-use super::super::scroll::one_line;
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
 use super::super::keymap::{self, Action, Context};
+use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 use super::list::{title_of, CommandResolved};
 use super::notify::Severity;
 use super::waiting::AnswerRequest;
-use super::{idempotency_key, is_transport, failure_reason, Request, TaskApp};
+use super::{failure_reason, idempotency_key, is_transport, Request, TaskApp};
 
 // ---------------------------------------------------------------------
 // What can be done, and when
@@ -190,8 +190,13 @@ fn state_phrase(task: &TaskSummary) -> &'static str {
 
 /// Whether the execution ended: completed, failed or cancelled.
 fn is_finished(task: &TaskSummary) -> bool {
-    matches!(task.lifecycle, TaskLifecycle::Running | TaskLifecycle::Provisioning)
-        && task.runner.as_ref().is_some_and(|runner| runner.execution_status.is_terminal())
+    matches!(
+        task.lifecycle,
+        TaskLifecycle::Running | TaskLifecycle::Provisioning
+    ) && task
+        .runner
+        .as_ref()
+        .is_some_and(|runner| runner.execution_status.is_terminal())
 }
 
 /// Whether the control plane could not prepare the workspace.
@@ -243,10 +248,12 @@ pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
             TaskLifecycle::PauseRequested => Availability::because("zadanie jest już wstrzymywane"),
             _ => not_running(task).map_or(Availability::Available, Availability::because),
         },
-        TaskAction::Interrupt => match not_running(task).or(runner_unreachable(task).map(str::to_string)) {
-            Some(reason) => Availability::because(reason),
-            None => Availability::Available,
-        },
+        TaskAction::Interrupt => {
+            match not_running(task).or(runner_unreachable(task).map(str::to_string)) {
+                Some(reason) => Availability::because(reason),
+                None => Availability::Available,
+            }
+        }
         TaskAction::Transition => {
             if let Some(reason) = not_running(task).or(runner_unreachable(task).map(str::to_string))
             {
@@ -266,12 +273,12 @@ pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
         TaskAction::Restart => match task.lifecycle {
             TaskLifecycle::Interrupted | TaskLifecycle::Unknown => Availability::Available,
             _ if provisioning_failed(task) => Availability::Available,
-            TaskLifecycle::Running if !is_finished(task) => {
-                Availability::because("zadanie działa — jest co przerwać (x), nie ma co uruchamiać od nowa")
-            }
-            TaskLifecycle::Paused | TaskLifecycle::PauseRequested => Availability::because(
-                format!("{} — wznów je (p)", state_phrase(task)),
+            TaskLifecycle::Running if !is_finished(task) => Availability::because(
+                "zadanie działa — jest co przerwać (x), nie ma co uruchamiać od nowa",
             ),
+            TaskLifecycle::Paused | TaskLifecycle::PauseRequested => {
+                Availability::because(format!("{} — wznów je (p)", state_phrase(task)))
+            }
             _ => Availability::because(state_phrase(task)),
         },
         TaskAction::Archive => match task.lifecycle {
@@ -801,7 +808,9 @@ impl TaskApp {
         match action {
             Action::Cancel => self.overlay = None,
             Action::Down => menu.chooser.select(menu.chooser.selected() + 1),
-            Action::Up => menu.chooser.select(menu.chooser.selected().saturating_sub(1)),
+            Action::Up => menu
+                .chooser
+                .select(menu.chooser.selected().saturating_sub(1)),
             Action::Pick => {
                 if let Some(digit) = keymap::digit_of(key) {
                     menu.chooser.select(usize::from(digit) - 1);
@@ -892,7 +901,11 @@ impl TaskApp {
         if !self.mutation_allowed() {
             return Request::None;
         }
-        let Some(task) = self.list.tasks().iter().find(|task| task.task_id.as_str() == list.task_id)
+        let Some(task) = self
+            .list
+            .tasks()
+            .iter()
+            .find(|task| task.task_id.as_str() == list.task_id)
         else {
             return Request::None;
         };
@@ -907,7 +920,12 @@ impl TaskApp {
                 "przejście do „{}” wysłane do runnera",
                 one_line(&exit.target)
             );
-            return Request::Act(Box::new(self.action_request(&task, "przejście", summary, send)));
+            return Request::Act(Box::new(self.action_request(
+                &task,
+                "przejście",
+                summary,
+                send,
+            )));
         }
         // The override: a target and a reason, then the window.
         let value = |name: &str| {
@@ -977,9 +995,12 @@ impl TaskApp {
                 };
                 self.owner_request(&task, verb(&task, action), summary, command)
             }
-            TaskAction::Restart => {
-                self.owner_request(&task, "uruchomienie od nowa", "uruchomienie od nowa zlecone", OwnerCommand::Start)
-            }
+            TaskAction::Restart => self.owner_request(
+                &task,
+                "uruchomienie od nowa",
+                "uruchomienie od nowa zlecone",
+                OwnerCommand::Start,
+            ),
             TaskAction::Interrupt => {
                 let send = ActionSend::Operator(OperatorCommand::Interrupt);
                 let request = self.action_request(
@@ -988,7 +1009,12 @@ impl TaskApp {
                     "przerwanie kroku wysłane do runnera".to_string(),
                     send,
                 );
-                self.ask(&task, "Przerwij bieżący krok !", action, Confirmed::Act(Box::new(request)));
+                self.ask(
+                    &task,
+                    "Przerwij bieżący krok !",
+                    action,
+                    Confirmed::Act(Box::new(request)),
+                );
                 Request::None
             }
             TaskAction::Archive => {
@@ -998,7 +1024,12 @@ impl TaskApp {
                     "archiwizacja rozpoczęta".to_string(),
                     ActionSend::Owner(OwnerCommand::Archive),
                 );
-                self.ask(&task, "Archiwizuj zadanie !", action, Confirmed::Act(Box::new(request)));
+                self.ask(
+                    &task,
+                    "Archiwizuj zadanie !",
+                    action,
+                    Confirmed::Act(Box::new(request)),
+                );
                 Request::None
             }
             TaskAction::Transition => {
@@ -1039,7 +1070,12 @@ impl TaskApp {
 
     /// Opens the window for a chosen action of the answer panel that cannot
     /// be undone, saying what it does.
-    pub(super) fn confirm_answer(&mut self, request: Box<AnswerRequest>, heading: String, lines: Vec<String>) {
+    pub(super) fn confirm_answer(
+        &mut self,
+        request: Box<AnswerRequest>,
+        heading: String,
+        lines: Vec<String>,
+    ) {
         self.overlay = Some(Overlay::Confirm(Confirmation::new(
             request.task_id.clone(),
             heading,
@@ -1165,14 +1201,20 @@ impl TaskApp {
     /// Points the browser at a link.
     pub(super) fn open_link(&mut self, link: LinkRequest) {
         let Some(url) = safe_link_url(&link.url) else {
-            self.notify(Severity::Error, format!("{}: adres linku jest niebezpieczny", link.label));
+            self.notify(
+                Severity::Error,
+                format!("{}: adres linku jest niebezpieczny", link.label),
+            );
             return;
         };
         match launch_browser(&url) {
             Ok(()) => self.notify(Severity::Success, format!("otwarto link {}", link.label)),
             Err(error) => self.notify(
                 Severity::Error,
-                format!("link {}: nie udało się uruchomić przeglądarki ({error})", link.label),
+                format!(
+                    "link {}: nie udało się uruchomić przeglądarki ({error})",
+                    link.label
+                ),
             ),
         }
     }
@@ -1232,9 +1274,9 @@ fn command_name(command: Option<&OperatorCommand>) -> String {
         }) => format!("override do „{}”", one_line(target)),
         Some(OperatorCommand::RestartStep { .. }) => "restart kroku".to_string(),
         Some(OperatorCommand::ConductorChat { .. }) => "wiadomość do dyrygenta".to_string(),
-        Some(
-            OperatorCommand::ConfirmProposal { .. } | OperatorCommand::RejectProposal { .. },
-        ) => "decyzja o propozycji dyrygenta".to_string(),
+        Some(OperatorCommand::ConfirmProposal { .. } | OperatorCommand::RejectProposal { .. }) => {
+            "decyzja o propozycji dyrygenta".to_string()
+        }
         Some(OperatorCommand::UndoDecision { .. }) => "cofnięcie decyzji dyrygenta".to_string(),
         Some(OperatorCommand::SetConductorHarness { .. }) => {
             "zmiana harnessu dyrygenta".to_string()
@@ -1378,16 +1420,31 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles)
     };
     match overlay {
         Overlay::Confirm(confirmation) => render_confirmation(frame, area, confirmation, styles),
-        Overlay::Menu(menu) => render_list(frame, area, &format!("Akcje · {title}"), &mut menu.chooser, styles),
+        Overlay::Menu(menu) => render_list(
+            frame,
+            area,
+            &format!("Akcje · {title}"),
+            &mut menu.chooser,
+            styles,
+        ),
         Overlay::Transitions(list) => render_list(
             frame,
             area,
-            &format!("Przejście ręczne · {title} · z „{}”", one_line(&list.from_state)),
+            &format!(
+                "Przejście ręczne · {title} · z „{}”",
+                one_line(&list.from_state)
+            ),
             &mut list.chooser,
             styles,
         ),
         Overlay::Links(list) => {
-            render_list(frame, area, &format!("Linki · {title}"), &mut list.chooser, styles);
+            render_list(
+                frame,
+                area,
+                &format!("Linki · {title}"),
+                &mut list.chooser,
+                styles,
+            );
         }
         Overlay::Harness(list) => render_list(
             frame,
@@ -1431,7 +1488,12 @@ fn render_list(frame: &mut Frame, area: Rect, title: &str, chooser: &mut Chooser
     chooser::render(frame, inner, chooser, styles);
 }
 
-fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmation, styles: &Styles) {
+fn render_confirmation(
+    frame: &mut Frame,
+    area: Rect,
+    confirmation: &Confirmation,
+    styles: &Styles,
+) {
     let width = area.width.saturating_sub(4).min(72);
     let text_width = usize::from(width.saturating_sub(4)).max(1);
     let rows: usize = confirmation
@@ -1446,7 +1508,11 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
         .lines
         .iter()
         .map(|line| {
-            let role = if line.starts_with('!') { Role::Problem } else { Role::Calm };
+            let role = if line.starts_with('!') {
+                Role::Problem
+            } else {
+                Role::Calm
+            };
             Line::styled(one_line(line), styles.of(role))
         })
         .collect();

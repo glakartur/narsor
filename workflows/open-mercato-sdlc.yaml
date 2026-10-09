@@ -15,7 +15,7 @@ inputs:
     required: true
     description: The tracker id of the ticket, or the brief this run files one for.
   - name: task_brief
-    type: string
+    type: text
     required: true
     description: What the work is, in one or two sentences.
   - name: target_repo

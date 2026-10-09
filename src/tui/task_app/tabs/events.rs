@@ -209,7 +209,12 @@ impl Events {
         }
         if matches!(
             action,
-            Action::Down | Action::Up | Action::PageDown | Action::PageUp | Action::Top | Action::Bottom
+            Action::Down
+                | Action::Up
+                | Action::PageDown
+                | Action::PageUp
+                | Action::Top
+                | Action::Bottom
         ) {
             self.detail_scroll = 0;
         }
@@ -269,7 +274,10 @@ pub fn render(frame: &mut Frame, area: Rect, styles: &Styles, events: &mut Event
             (Availability::Available(_), _) => "brak zdarzeń",
             _ => "",
         };
-        frame.render_widget(Paragraph::new(Line::styled(text, styles.of(Role::Done))), body);
+        frame.render_widget(
+            Paragraph::new(Line::styled(text, styles.of(Role::Done))),
+            body,
+        );
         return;
     }
 
@@ -295,9 +303,15 @@ pub fn render(frame: &mut Frame, area: Rect, styles: &Styles, events: &mut Event
         .take(height)
         .map(|(index, event)| {
             let selected = index == events.cursor;
-            let marker = Span::styled(if selected { "▸ " } else { "  " }, styles.of(grey(Role::Focus)));
+            let marker = Span::styled(
+                if selected { "▸ " } else { "  " },
+                styles.of(grey(Role::Focus)),
+            );
             let text = fit(&row_text(event, events.raw), width);
-            let line = Line::from(vec![marker, Span::styled(text, styles.of(grey(Role::Calm)))]);
+            let line = Line::from(vec![
+                marker,
+                Span::styled(text, styles.of(grey(Role::Calm))),
+            ]);
             if selected {
                 line.style(styles.of(Role::Selected))
             } else {
@@ -309,24 +323,28 @@ pub fn render(frame: &mut Frame, area: Rect, styles: &Styles, events: &mut Event
 
     if detail_rows > 0 {
         let detail = Rect::new(body.x, list.y + list.height, body.width, detail_rows);
-        let lines = events.selected().map(event_detail_lines).unwrap_or_default();
+        let lines = events
+            .selected()
+            .map(event_detail_lines)
+            .unwrap_or_default();
         let visible = usize::from(detail.height).saturating_sub(1).max(1);
-        let scroll = events.detail_scroll.min(lines.len().saturating_sub(visible));
+        let scroll = events
+            .detail_scroll
+            .min(lines.len().saturating_sub(visible));
         events.detail_scroll = scroll;
         let mut shown = vec![Line::styled(
-            format!("─ szczegóły zdarzenia {} ─", events.selected().map_or(0, |e| e.sequence)),
+            format!(
+                "─ szczegóły zdarzenia {} ─",
+                events.selected().map_or(0, |e| e.sequence)
+            ),
             styles.of(Role::Focus),
         )];
-        shown.extend(
-            lines
-                .into_iter()
-                .skip(scroll)
-                .take(visible)
-                .map(|text| Line::styled(
-                    crate::domain::display::without_unsafe_chars_multiline(&sanitize(&text)),
-                    styles.of(grey(Role::Calm)),
-                )),
-        );
+        shown.extend(lines.into_iter().skip(scroll).take(visible).map(|text| {
+            Line::styled(
+                crate::domain::display::without_unsafe_chars_multiline(&sanitize(&text)),
+                styles.of(grey(Role::Calm)),
+            )
+        }));
         frame.render_widget(Paragraph::new(shown), detail);
     }
 }

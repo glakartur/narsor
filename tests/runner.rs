@@ -724,7 +724,10 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
         )
         .await
         .expect_err("the runner cannot read its log");
-    assert!(refused.to_string().contains("runner_read_failed"), "{refused}");
+    assert!(
+        refused.to_string().contains("runner_read_failed"),
+        "{refused}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "answered at once, not at the relay's timeout: {:?}",

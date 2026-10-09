@@ -20,9 +20,7 @@ use crate::conductor::store::{
     ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, FailureReport,
 };
 use crate::conductor::undo::{undoable_in, UNDONE};
-use crate::domain::{
-    without_unsafe_chars_json, ConductorPurpose, ConductorTrigger, Confidence,
-};
+use crate::domain::{without_unsafe_chars_json, ConductorPurpose, ConductorTrigger, Confidence};
 use crate::persistence::{ExecutionStore, Result};
 
 /// The most chat entries one read returns.

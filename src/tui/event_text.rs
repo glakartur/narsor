@@ -248,4 +248,3 @@ pub fn event_detail_lines(event: &Event) -> Vec<String> {
 
     lines
 }
-

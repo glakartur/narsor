@@ -150,9 +150,15 @@ fn a_list_row_shows_the_attention_mark_the_status_and_the_title() {
 
 #[test]
 fn a_list_row_never_carries_what_a_terminal_would_act_on() {
-    let hostile = titled(task("t-1", "local", "paused", 1), "x\u{1b}]0;pwned\u{7}y\u{202e}z");
+    let hostile = titled(
+        task("t-1", "local", "paused", 1),
+        "x\u{1b}]0;pwned\u{7}y\u{202e}z",
+    );
     let line = list_line(&hostile);
-    assert!(!line.contains('\u{1b}') && !line.contains('\u{202e}'), "{line:?}");
+    assert!(
+        !line.contains('\u{1b}') && !line.contains('\u{202e}'),
+        "{line:?}"
+    );
 }
 
 #[test]
@@ -184,7 +190,10 @@ fn the_details_name_the_title_the_links_and_what_the_task_waits_on() {
         .collect();
     let has = |needle: &str| text.iter().any(|line| line.contains(needle));
     assert!(has("Title      NAR-1 login"), "{text:#?}");
-    assert!(has("Link       Jira: NAR-1 <https://jira.example/NAR-1>"), "{text:#?}");
+    assert!(
+        has("Link       Jira: NAR-1 <https://jira.example/NAR-1>"),
+        "{text:#?}"
+    );
     assert!(has("Link       PR: —"), "{text:#?}");
     assert!(
         has("Waiting    ? approval in 'review' for 0s (id pending-7)"),
@@ -217,7 +226,12 @@ fn the_next_waiting_task_follows_the_list_and_wraps_round() {
     assert_eq!(next_waiting(&tasks, "a").unwrap().task_id.as_str(), "c");
     assert_eq!(next_waiting(&tasks, "b").unwrap().task_id.as_str(), "c");
     assert_eq!(next_waiting(&tasks, "c").unwrap().task_id.as_str(), "a");
-    let alone = vec![waiting_on(queued("a", 1), AttentionKind::Question, "q", None)];
+    let alone = vec![waiting_on(
+        queued("a", 1),
+        AttentionKind::Question,
+        "q",
+        None,
+    )];
     assert!(next_waiting(&alone, "a").is_none());
 }
 

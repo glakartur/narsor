@@ -76,13 +76,18 @@ impl Sheet<'_> {
         if !self.lines.is_empty() {
             self.lines.push(Line::raw(""));
         }
-        self.lines
-            .push(Line::styled(text.to_string(), self.styles.of(self.grey(Role::Focus))));
+        self.lines.push(Line::styled(
+            text.to_string(),
+            self.styles.of(self.grey(Role::Focus)),
+        ));
     }
 
     fn row(&mut self, label: &str, value: impl Into<String>, role: Role) {
         self.lines.push(Line::from(vec![
-            Span::styled(format!("  {:<14}", one_line(label)), self.styles.of(Role::Done)),
+            Span::styled(
+                format!("  {:<14}", one_line(label)),
+                self.styles.of(Role::Done),
+            ),
             Span::styled(one_line(&value.into()), self.styles.of(self.grey(role))),
         ]));
     }
@@ -118,7 +123,11 @@ pub fn lines(task: &TaskSummary, styles: &Styles, stale: bool) -> Vec<Line<'stat
     sheet.heading("Zapieczętowane wejścia");
     sheet.row("zadanie", task.task_id.to_string(), Role::Calm);
     sheet.row("backend", task.backend_id.to_string(), Role::Calm);
-    sheet.row("utworzone", task.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(), Role::Calm);
+    sheet.row(
+        "utworzone",
+        task.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        Role::Calm,
+    );
     sheet.row("launch digest", task.launch_digest.clone(), Role::Calm);
     sheet.row("środowisko", task.environment_identity.clone(), Role::Calm);
     if !task.display.title.trim().is_empty() {
@@ -132,7 +141,10 @@ pub fn lines(task: &TaskSummary, styles: &Styles, stale: bool) -> Vec<Line<'stat
         sheet.row("odpowiedzi", "brak", Role::Done);
     }
     for input in &task.inputs {
-        let mut text = format!("{} dla {}: {:?}", input.input_id, input.pending_input_id, input.status);
+        let mut text = format!(
+            "{} dla {}: {:?}",
+            input.input_id, input.pending_input_id, input.status
+        );
         if let Some(detail) = &input.detail {
             text.push_str(&format!(" ({detail})"));
         }
@@ -146,17 +158,32 @@ pub fn lines(task: &TaskSummary, styles: &Styles, stale: bool) -> Vec<Line<'stat
         Role::Calm,
     );
     sheet.row("stan", lifecycle_name(task.lifecycle), Role::Calm);
-    sheet.row("pozycja", format!("#{} · generacja {} · rewizja {}", task.rank, task.generation, task.revision), Role::Calm);
+    sheet.row(
+        "pozycja",
+        format!(
+            "#{} · generacja {} · rewizja {}",
+            task.rank, task.generation, task.revision
+        ),
+        Role::Calm,
+    );
     if let Some(queue) = &task.queue {
         let text = match &queue.reason {
-            QueueReason::WaitingForCapacity { position, running, limit } => {
+            QueueReason::WaitingForCapacity {
+                position,
+                running,
+                limit,
+            } => {
                 format!("czeka na slot: miejsce {position}, zajęte {running} z {limit}")
             }
             QueueReason::ControllerOffline => "kontroler offline — nic nie startuje".to_string(),
             QueueReason::Admitted => "przyjęte, czeka na start przez kontroler".to_string(),
             QueueReason::BackendUnknown { detail } => format!("backend nieznany: {detail}"),
         };
-        sheet.row("kolejka", format!("{text} · od {}", ago(task, queue.since)), Role::Calm);
+        sheet.row(
+            "kolejka",
+            format!("{text} · od {}", ago(task, queue.since)),
+            Role::Calm,
+        );
     }
     if let Some(archive) = &task.archive {
         let text = match archive.completed_at {
@@ -186,7 +213,11 @@ pub fn lines(task: &TaskSummary, styles: &Styles, stale: bool) -> Vec<Line<'stat
                     ago(task, observation.observed_at),
                     freshness_word(observation.freshness)
                 ),
-                if observation.freshness == Freshness::Stale { Role::Attention } else { Role::Calm },
+                if observation.freshness == Freshness::Stale {
+                    Role::Attention
+                } else {
+                    Role::Calm
+                },
             );
             if let Some(detail) = &observation.summary.detail {
                 sheet.row("szczegół", detail.clone(), Role::Done);
@@ -210,10 +241,18 @@ pub fn lines(task: &TaskSummary, styles: &Styles, stale: bool) -> Vec<Line<'stat
                     ago(task, runner.observed_at),
                     freshness_word(runner.freshness)
                 ),
-                if runner.freshness == Freshness::Stale { Role::Attention } else { Role::Calm },
+                if runner.freshness == Freshness::Stale {
+                    Role::Attention
+                } else {
+                    Role::Calm
+                },
             );
             if let Some(problem) = &runner.problem {
-                sheet.row("problem", format!("{}: {}", problem.code, problem.message), Role::Problem);
+                sheet.row(
+                    "problem",
+                    format!("{}: {}", problem.code, problem.message),
+                    Role::Problem,
+                );
             }
             if runner.conductor_available {
                 sheet.row("dyrygent", "dostępny", Role::Conductor);
@@ -238,15 +277,30 @@ pub fn lines(task: &TaskSummary, styles: &Styles, stale: bool) -> Vec<Line<'stat
                 .last_heartbeat_at
                 .map_or_else(|| "nigdy".to_string(), |at| ago(task, at));
             sheet.row("heartbeat", heartbeat, Role::Done);
-            sheet.row("epoka dzierżawy", controller.lease_epoch.to_string(), Role::Done);
+            sheet.row(
+                "epoka dzierżawy",
+                controller.lease_epoch.to_string(),
+                Role::Done,
+            );
         }
-        None => sheet.row("kontroler", "żaden nie trzyma dzierżawy backendu", Role::Attention),
+        None => sheet.row(
+            "kontroler",
+            "żaden nie trzyma dzierżawy backendu",
+            Role::Attention,
+        ),
     }
     sheet.lines
 }
 
 /// Draws the tab.
-pub fn render(frame: &mut Frame, area: Rect, styles: &Styles, info: &mut Info, task: &TaskSummary, stale: bool) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    styles: &Styles,
+    info: &mut Info,
+    task: &TaskSummary,
+    stale: bool,
+) {
     let lines = lines(task, styles, stale);
     info.height = usize::from(area.height).max(1);
     info.top = info.top.min(lines.len().saturating_sub(info.height));

@@ -39,8 +39,19 @@ fn inputs_are_typed_by_what_the_definition_declares() {
     .unwrap();
     assert_eq!(values["greeting"], json!("42"), "a string stays text");
     assert_eq!(values["count"], json!(7));
-    assert_eq!(values["flag"], json!(false), "the default fills what is left out");
+    assert_eq!(
+        values["flag"],
+        json!(false),
+        "the default fills what is left out"
+    );
     assert_eq!(values["repo"], json!("api"));
+}
+
+#[test]
+fn a_text_input_passes_a_multi_line_value_unchanged() {
+    let declared = vec![input("prompt", ParamType::Text, true)];
+    let values = typed_inputs(&declared, &["prompt=first\nsecond".into()]).unwrap();
+    assert_eq!(values["prompt"], json!("first\nsecond"));
 }
 
 #[test]
@@ -55,7 +66,10 @@ fn a_wrongly_typed_unknown_or_missing_input_is_a_usage_error() {
     let flag = typed_inputs(&declared, &["flag=maybe".into()]).unwrap_err();
     assert!(flag.message.contains("boolean"), "{flag:?}");
     let unknown = typed_inputs(&declared, &["nope=1".into()]).unwrap_err();
-    assert!(unknown.message.contains("greeting, count, flag"), "{unknown:?}");
+    assert!(
+        unknown.message.contains("greeting, count, flag"),
+        "{unknown:?}"
+    );
     let missing = typed_inputs(&declared, &[]).unwrap_err();
     assert!(
         missing.message.contains("greeting, count"),
@@ -117,7 +131,10 @@ fn a_verdict_lists_every_violation_or_the_definition() {
 
 #[test]
 fn capabilities_say_what_is_refused_and_why() {
-    let text = texts(capabilities_lines(&capabilities(false, Some("not a local daemon"))));
+    let text = texts(capabilities_lines(&capabilities(
+        false,
+        Some("not a local daemon"),
+    )));
     assert_eq!(text[0], "Connection:             staging");
     assert_eq!(text[1], "Workflow paths:         no (not a local daemon)");
     assert_eq!(text[2], "Old executions:         no");
@@ -130,8 +147,13 @@ fn capabilities_say_what_is_refused_and_why() {
 fn an_old_execution_says_whether_it_can_be_recovered() {
     let failed = legacy("exec-1", "implement-feature", "failed", 0, true, None);
     let text = texts(history_detail_lines(&failed));
-    assert!(text.iter().any(|line| line == "Execution  exec-1"), "{text:?}");
-    assert!(text.iter().any(|line| line.contains("possible (narsor task history recover")));
+    assert!(
+        text.iter().any(|line| line == "Execution  exec-1"),
+        "{text:?}"
+    );
+    assert!(text
+        .iter()
+        .any(|line| line.contains("possible (narsor task history recover")));
     let done = legacy(
         "exec-2",
         "implement-feature",
@@ -142,11 +164,16 @@ fn an_old_execution_says_whether_it_can_be_recovered() {
     );
     let text = texts(history_detail_lines(&done));
     assert!(
-        text.iter().any(|line| line.contains("not possible: a completed execution")),
+        text.iter()
+            .any(|line| line.contains("not possible: a completed execution")),
         "{text:?}"
     );
     let row = history_row(&done);
-    assert!(row.starts_with("exec-2") && row.contains("completed") && row.ends_with("implement-feature v1"));
+    assert!(
+        row.starts_with("exec-2")
+            && row.contains("completed")
+            && row.ends_with("implement-feature v1")
+    );
 }
 
 #[test]
@@ -161,13 +188,19 @@ fn a_repository_row_matches_the_local_listing() {
 fn what_a_server_sends_never_reaches_a_terminal_as_control_sequences() {
     let hostile = "x\u{1b}]0;pwned\u{7}y\u{202e}z";
     let clean = |text: &str| !text.contains('\u{1b}') && !text.contains('\u{202e}');
-    let mut workflow = catalogue_workflow(hostile, hostile, vec![input(hostile, ParamType::String, true)]);
+    let mut workflow = catalogue_workflow(
+        hostile,
+        hostile,
+        vec![input(hostile, ParamType::String, true)],
+    );
     workflow.violations = vec![hostile.into()];
     for line in workflow_lines(&workflow) {
         assert!(clean(&line.text), "{:?}", line.text);
     }
     assert!(clean(&repository_row(&repository(hostile, hostile))));
-    assert!(clean(&history_row(&legacy(hostile, hostile, "failed", 0, false, None))));
+    assert!(clean(&history_row(&legacy(
+        hostile, hostile, "failed", 0, false, None
+    ))));
     for line in history_detail_lines(&legacy(hostile, hostile, "failed", 0, false, Some(hostile))) {
         assert!(clean(&line.text), "{:?}", line.text);
     }

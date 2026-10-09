@@ -46,8 +46,8 @@ use crate::controller_protocol::{
 use crate::domain::{Event, ExecutionStatus, TaskId};
 use crate::engine::Timeline;
 
-use super::super::scroll::one_line;
 use super::super::keymap::{self, Action, Context};
+use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 use super::detail::TaskDetail;
 use super::detail::{recorded_attempt, render_view, ViewOptions};

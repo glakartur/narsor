@@ -17,8 +17,8 @@
 use super::control_plane::{ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
-    OperatorCommand, OperatorCommandOutcome, OperatorCommandRequest, OperatorCommandStatus, QueuedOperatorCommand,
-    TaskEventKind, TaskLifecycle, TaskRecord,
+    OperatorCommand, OperatorCommandOutcome, OperatorCommandRequest, OperatorCommandStatus,
+    QueuedOperatorCommand, TaskEventKind, TaskLifecycle, TaskRecord,
 };
 use super::runner_state::fence_runner;
 use crate::domain::display::bounded_detail;
@@ -74,7 +74,10 @@ impl ControlPlane {
                     replayed: true,
                 }));
             }
-            if record.retired_command_keys.contains(&request.idempotency_key) {
+            if record
+                .retired_command_keys
+                .contains(&request.idempotency_key)
+            {
                 return Err(OrchestrationError::OperatorCommandKeyReused {
                     task_id: record.task_id.clone(),
                     key: request.idempotency_key.clone(),

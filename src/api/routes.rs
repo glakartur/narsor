@@ -636,7 +636,10 @@ fn read_events(
     execution_id: &str,
     after: u64,
 ) -> Result<Vec<Event>, ApiError> {
-    Ok(store.event_log(execution_id).read_after(after, usize::MAX)?.0)
+    Ok(store
+        .event_log(execution_id)
+        .read_after(after, usize::MAX)?
+        .0)
 }
 
 /// `GET /executions/:execution_id/conductor`

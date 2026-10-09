@@ -24,6 +24,8 @@ use crate::api::{ApiClient, ClientError, ConversationResponse as Page};
 use crate::controller_protocol::ConversationPageQuery;
 use crate::engine::{ConversationState, Position};
 
+use super::super::super::scroll::one_line;
+use super::super::layout::first_row;
 use crate::tui::conversation::{agent_transcript_entry, classify};
 use crate::tui::keymap::Action;
 use crate::tui::style::{Role, Styles};
@@ -31,8 +33,6 @@ use crate::tui::transcript::{
     wrap_visible_lines, DisplayMode, TranscriptEntry, TranscriptEntryId, TranscriptId,
     TranscriptLine, TranscriptPresentation, TranscriptState,
 };
-use super::super::layout::first_row;
-use super::super::super::scroll::one_line;
 
 /// Soft cap on the raw bytes of one relayed conversation page.
 pub const PAGE_BYTE_BUDGET: u64 = 64 * 1024;
@@ -233,7 +233,9 @@ impl Attempts {
 
     /// The entry a read of the attempt continues from.
     pub fn from(&self, attempt_id: &str) -> u64 {
-        self.map.get(attempt_id).map_or(0, |attempt| attempt.next_entry)
+        self.map
+            .get(attempt_id)
+            .map_or(0, |attempt| attempt.next_entry)
     }
 
     /// Makes every attempt due again, keeping what is shown.
@@ -350,9 +352,10 @@ impl Conversation {
         self.loading = false;
         self.failure = None;
         for position in positions {
-            let (ConversationState::Recorded, Some(attempt_id)) =
-                (&position.conversation, position.action_execution_id.as_deref())
-            else {
+            let (ConversationState::Recorded, Some(attempt_id)) = (
+                &position.conversation,
+                position.action_execution_id.as_deref(),
+            ) else {
                 continue;
             };
             let Some(attempt) = attempts.get(attempt_id) else {
@@ -400,7 +403,10 @@ fn transcript_row(line: TranscriptLine, styles: &Styles, stale: bool) -> Line<'s
     };
     Line::from(vec![
         Span::styled(marker, styles.of(Role::Focus)),
-        Span::styled(crate::domain::display::without_unsafe_chars(&line.text), style),
+        Span::styled(
+            crate::domain::display::without_unsafe_chars(&line.text),
+            style,
+        ),
     ])
 }
 
@@ -441,7 +447,12 @@ pub fn render(
             )),
             first_row(area),
         );
-        body = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
+        body = Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(1),
+        );
     }
     if conversation.transcript().entries().is_empty() {
         let text = if conversation.is_loading() {
@@ -449,17 +460,28 @@ pub fn render(
         } else {
             "brak rozmowy — żaden krok nie zapisał jej jeszcze"
         };
-        frame.render_widget(Paragraph::new(Line::styled(text, styles.of(Role::Done))), body);
+        frame.render_widget(
+            Paragraph::new(Line::styled(text, styles.of(Role::Done))),
+            body,
+        );
         return;
     }
     let raw = conversation.transcript().mode() == DisplayMode::Raw;
     let (title, rest) = (
         first_row(body),
-        Rect::new(body.x, body.y + 1, body.width, body.height.saturating_sub(1)),
+        Rect::new(
+            body.x,
+            body.y + 1,
+            body.width,
+            body.height.saturating_sub(1),
+        ),
     );
     if raw {
         frame.render_widget(
-            Paragraph::new(Line::styled("widok surowy (Ctrl+v wraca)", styles.of(Role::Attention))),
+            Paragraph::new(Line::styled(
+                "widok surowy (Ctrl+v wraca)",
+                styles.of(Role::Attention),
+            )),
             title,
         );
         render_transcript(frame, rest, styles, conversation.transcript_mut(), stale);

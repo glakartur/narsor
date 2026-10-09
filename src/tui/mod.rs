@@ -161,7 +161,9 @@ pub async fn run(
     let styles = Styles::from_env();
     let mut app = TaskApp::new(client.clone(), connection_name, refresh_interval);
     app.detail_mut()
-        .set_hyperlinks(detail::hyperlinks_supported(|name| std::env::var(name).ok()));
+        .set_hyperlinks(detail::hyperlinks_supported(|name| {
+            std::env::var(name).ok()
+        }));
     let mut feed = EventFeed::new(client);
 
     let mut guard = TerminalGuard::enter()?;

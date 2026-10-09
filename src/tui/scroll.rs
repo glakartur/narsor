@@ -333,5 +333,4 @@ mod tests {
         scroll.page_down(12);
         assert_eq!(scroll.offset(), 5);
     }
-
 }

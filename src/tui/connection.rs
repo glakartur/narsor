@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::text::Span;
 
-use crate::cli::task_text::short_age;
 use super::style::{Role, Styles};
+use crate::cli::task_text::short_age;
 
 /// Where the connection stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,8 +137,12 @@ impl Connection {
         if self.is_live() {
             return None;
         }
-        self.data_age(now)
-            .map(|age| format!("stan sprzed {}", short_age(i64::try_from(age.as_secs()).unwrap_or(i64::MAX))))
+        self.data_age(now).map(|age| {
+            format!(
+                "stan sprzed {}",
+                short_age(i64::try_from(age.as_secs()).unwrap_or(i64::MAX))
+            )
+        })
     }
 
     /// Whether the data on screen should be drawn grey: it is not live and

@@ -99,12 +99,7 @@ pub fn areas(area: Rect, focus: Focus) -> Areas {
             bar: Rect::default(),
         };
     }
-    let inner = Rect::new(
-        area.x + 1,
-        area.y + 1,
-        area.width - 2,
-        area.height - 2,
-    );
+    let inner = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
     let bar = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
     let body = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
     let (list, detail) = match (screen, focus) {
@@ -203,7 +198,10 @@ fn render_view(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles
 
 fn render_too_small(frame: &mut Frame, area: Rect, styles: &Styles) {
     let lines = vec![
-        Line::styled("Terminal za mały — powiększ okno", styles.of(Role::Attention)),
+        Line::styled(
+            "Terminal za mały — powiększ okno",
+            styles.of(Role::Attention),
+        ),
         Line::styled(
             format!(
                 "min. {MIN_WIDTH}×{MIN_HEIGHT}, jest {}×{}",
@@ -213,7 +211,12 @@ fn render_too_small(frame: &mut Frame, area: Rect, styles: &Styles) {
         ),
     ];
     let top = area.y + area.height.saturating_sub(2) / 2;
-    let centred = Rect::new(area.x, top, area.width, area.height.saturating_sub(top - area.y).min(2));
+    let centred = Rect::new(
+        area.x,
+        top,
+        area.width,
+        area.height.saturating_sub(top - area.y).min(2),
+    );
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), centred);
 }
 
@@ -234,7 +237,10 @@ fn header_left(app: &TaskApp, styles: &Styles, now: Instant) -> Line<'static> {
 
 /// `sloty 2/3 · ? 1 · ! 1`, shortened from the left when it does not fit.
 fn header_right(app: &TaskApp, styles: &Styles, width: usize) -> Line<'static> {
-    let Counters { questions, problems } = app.list().counters();
+    let Counters {
+        questions,
+        problems,
+    } = app.list().counters();
     let mut parts: Vec<Span<'static>> = Vec::new();
     if let Some(Slots { used, limit }) = app.list().slots() {
         let text = match limit {
@@ -254,7 +260,11 @@ fn header_right(app: &TaskApp, styles: &Styles, width: usize) -> Line<'static> {
     ));
     // Leave room for the left title: drop `sloty` before the counters.
     let length = |parts: &[Span]| -> usize {
-        parts.iter().map(|part| part.content.chars().count() + 3).sum::<usize>() + 1
+        parts
+            .iter()
+            .map(|part| part.content.chars().count() + 3)
+            .sum::<usize>()
+            + 1
     };
     while parts.len() > 2 && length(&parts) > width / 2 {
         parts.remove(0);

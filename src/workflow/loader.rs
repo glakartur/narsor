@@ -181,6 +181,7 @@ fn compile_input(input: InputSchema) -> InputParameter {
         name: input.name,
         param_type: match input.param_type {
             ParamTypeSchema::String => ParamType::String,
+            ParamTypeSchema::Text => ParamType::Text,
             ParamTypeSchema::Integer => ParamType::Integer,
             ParamTypeSchema::Boolean => ParamType::Boolean,
             ParamTypeSchema::Repository => ParamType::Repository,

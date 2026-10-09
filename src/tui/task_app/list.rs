@@ -38,10 +38,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use ratatui::Frame;
 
+use crate::cli::task_text::lifecycle_name;
 use crate::controller_protocol::{
     Freshness, InputView, OperatorCommandView, QueueView, TaskSummary,
 };
-use crate::cli::task_text::lifecycle_name;
 use crate::domain::{BackendId, ExecutionStatus};
 use crate::orchestration::{
     AttentionItem, AttentionKind, MoveTarget, OperatorCommand, OperatorCommandStatus, QueueReason,
@@ -129,7 +129,10 @@ impl StateIcon {
 /// question (origin §5).
 pub fn attention_of(task: &TaskSummary) -> Attention {
     let is = |kinds: &[AttentionKind]| task.attention.iter().any(|item| kinds.contains(&item.kind));
-    let runner_problem = task.runner.as_ref().is_some_and(|runner| runner.problem.is_some());
+    let runner_problem = task
+        .runner
+        .as_ref()
+        .is_some_and(|runner| runner.problem.is_some());
     if runner_problem
         || is(&[
             AttentionKind::Problem,
@@ -154,7 +157,11 @@ pub fn state_icon(task: &TaskSummary) -> StateIcon {
     match task.lifecycle {
         TaskLifecycle::Queued => StateIcon::Queued,
         TaskLifecycle::Provisioning => StateIcon::Provisioning,
-        TaskLifecycle::Running => match task.runner.as_ref().map(|runner| runner.execution_status.clone()) {
+        TaskLifecycle::Running => match task
+            .runner
+            .as_ref()
+            .map(|runner| runner.execution_status.clone())
+        {
             Some(ExecutionStatus::Completed) => StateIcon::Done,
             Some(ExecutionStatus::Failed | ExecutionStatus::Cancelled) => StateIcon::Failed,
             _ => StateIcon::Running,
@@ -186,7 +193,10 @@ fn controller_offline(task: &TaskSummary) -> bool {
 /// The label of a row (column 4). `queue_position` is the 1-based place among
 /// the queued tasks of the backend, in list order.
 pub fn label_of(task: &TaskSummary, queue_position: Option<usize>) -> String {
-    let runner_status = task.runner.as_ref().map(|runner| runner.execution_status.clone());
+    let runner_status = task
+        .runner
+        .as_ref()
+        .map(|runner| runner.execution_status.clone());
     match task.lifecycle {
         TaskLifecycle::Queued => match task.queue.as_ref().map(|queue| &queue.reason) {
             Some(QueueReason::ControllerOffline) => "offline".to_string(),
@@ -206,7 +216,12 @@ pub fn label_of(task: &TaskSummary, queue_position: Option<usize>) -> String {
 
 /// The workflow state the runner reports being in.
 fn current_step(task: &TaskSummary) -> Option<String> {
-    let step = task.runner.as_ref()?.execution_cursor.current_state.as_deref()?;
+    let step = task
+        .runner
+        .as_ref()?
+        .execution_cursor
+        .current_state
+        .as_deref()?;
     let step = one_line(step);
     (!step.trim().is_empty()).then_some(step)
 }
@@ -589,7 +604,11 @@ impl TaskList {
     pub fn append(&mut self, task: TaskSummary) {
         let id = task.task_id.to_string();
         self.pending.retain(|row| row.task_id != id);
-        match self.tasks.iter_mut().find(|known| known.task_id == task.task_id) {
+        match self
+            .tasks
+            .iter_mut()
+            .find(|known| known.task_id == task.task_id)
+        {
             Some(known) => *known = task,
             None => self.tasks.push(task),
         }
@@ -733,8 +752,11 @@ impl TaskList {
         let before = self.all_ids();
         let departed_title = self.selected().map(title_of);
         // What the server lists is no longer waiting to be confirmed.
-        self.pending
-            .retain(|row| tasks.iter().all(|task| task.task_id.as_str() != row.task_id));
+        self.pending.retain(|row| {
+            tasks
+                .iter()
+                .all(|task| task.task_id.as_str() != row.task_id)
+        });
         self.tasks = tasks;
         self.cancel_move_if_gone();
         self.settle_selection_with(&before, departed_title)
@@ -854,7 +876,8 @@ impl TaskList {
             TaskEventKind::Moved { order, .. } => self.apply_order(index, order),
             kind @ (TaskEventKind::OperatorCommandQueued { .. }
             | TaskEventKind::OperatorCommandResolved { .. }) => {
-                let (refresh, resolved) = patch_operator_command(&mut self.tasks[index], kind, event);
+                let (refresh, resolved) =
+                    patch_operator_command(&mut self.tasks[index], kind, event);
                 effect.refresh = refresh;
                 effect.resolved = resolved;
             }
@@ -930,7 +953,9 @@ impl TaskList {
         let origin = group
             .iter()
             .position(|&index| self.tasks[index].task_id.as_str() == id)?;
-        let rest = group.into_iter().filter(|&index| self.tasks[index].task_id.as_str() != id);
+        let rest = group
+            .into_iter()
+            .filter(|&index| self.tasks[index].task_id.as_str() != id);
         Some((origin, rest.collect()))
     }
 
@@ -1022,7 +1047,14 @@ impl TaskList {
     /// Draws the list into `area`: a column titled `Zadania`, one row per
     /// task. `focused` lights the frame; `stale` greys every row (no
     /// connection: the rows are a memory, not news).
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, styles: &Styles, focused: bool, stale: bool) {
+    pub fn render(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        styles: &Styles,
+        focused: bool,
+        stale: bool,
+    ) {
         let frame_role = if focused { Role::Focus } else { Role::Done };
         let title = match self.hidden_count() {
             0 => " Zadania ".to_string(),
@@ -1063,7 +1095,11 @@ impl TaskList {
             .collect();
         let rows: Vec<(String, RowText)> = rows
             .into_iter()
-            .chain(self.pending.iter().map(|row| (row.task_id.clone(), row.text())))
+            .chain(
+                self.pending
+                    .iter()
+                    .map(|row| (row.task_id.clone(), row.text())),
+            )
             .collect();
         let label_width = rows
             .iter()
@@ -1078,7 +1114,14 @@ impl TaskList {
             .iter()
             .map(|(id, row)| {
                 let is_selected = selected.as_deref() == Some(id.as_str());
-                ListItem::new(row_line(row, usize::from(inner.width), label_width, styles, stale, is_selected))
+                ListItem::new(row_line(
+                    row,
+                    usize::from(inner.width),
+                    label_width,
+                    styles,
+                    stale,
+                    is_selected,
+                ))
             })
             .collect();
         self.view.select(
@@ -1238,7 +1281,12 @@ fn replace_reported_attention(
         .filter(|item| item.kind == AttentionKind::ProvisioningFailed)
         .cloned()
         .collect();
-    items.extend(reported.iter().filter(|item| !answered(&item.waiting_id)).cloned());
+    items.extend(
+        reported
+            .iter()
+            .filter(|item| !answered(&item.waiting_id))
+            .cloned(),
+    );
     items.sort_by_key(|item| item.since);
     *current = items;
 }
@@ -1252,7 +1300,11 @@ pub fn fit(text: &str, width: usize) -> String {
     match width {
         0 => String::new(),
         1 => "…".to_string(),
-        _ => text.chars().take(width - 1).chain(std::iter::once('…')).collect(),
+        _ => text
+            .chars()
+            .take(width - 1)
+            .chain(std::iter::once('…'))
+            .collect(),
     }
 }
 
@@ -1277,8 +1329,14 @@ pub(super) fn row_line(
     };
 
     let mut spans = vec![
-        Span::styled(row.attention.glyph().to_string(), styles.of(grey(row.attention.role()))),
-        Span::styled(row.icon.glyph().to_string(), styles.of(grey(row.icon.role()))),
+        Span::styled(
+            row.attention.glyph().to_string(),
+            styles.of(grey(row.attention.role())),
+        ),
+        Span::styled(
+            row.icon.glyph().to_string(),
+            styles.of(grey(row.icon.role())),
+        ),
         Span::raw(" "),
         Span::styled(
             format!("{:<title_width$}", fit(&row.title, title_width)),

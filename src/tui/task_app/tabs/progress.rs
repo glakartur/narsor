@@ -16,8 +16,8 @@ use crate::controller_protocol::TimelineResponse;
 use crate::engine::{ConversationState, Position, PositionStatus};
 use crate::tui::style::{Role, Styles};
 
-use super::super::layout::first_row;
 use super::super::super::scroll::one_line;
+use super::super::layout::first_row;
 use super::super::list::fit;
 use super::conversation::{self, Attempt, Attempts};
 
@@ -80,7 +80,9 @@ impl Progress {
     /// The selected step.
     pub fn selected_position(&self) -> Option<&Position> {
         let label = self.selected.as_deref()?;
-        self.positions().iter().find(|position| position.label == label)
+        self.positions()
+            .iter()
+            .find(|position| position.label == label)
     }
 
     /// `(n, m)`: the running step is the `n`th of the `m` steps so far.
@@ -92,7 +94,11 @@ impl Progress {
         }
         let current = self.current_label();
         let at = current
-            .and_then(|label| positions.iter().position(|position| position.label == label))
+            .and_then(|label| {
+                positions
+                    .iter()
+                    .position(|position| position.label == label)
+            })
             .unwrap_or(positions.len() - 1);
         Some((at + 1, positions.len()))
     }
@@ -175,7 +181,9 @@ impl Progress {
 
     fn selected_index(&self) -> Option<usize> {
         let label = self.selected.as_deref()?;
-        self.positions().iter().position(|position| position.label == label)
+        self.positions()
+            .iter()
+            .position(|position| position.label == label)
     }
 
     fn select_index(&mut self, index: usize) {
@@ -210,7 +218,10 @@ fn axis_line(
 ) -> Line<'static> {
     let (glyph, role, word) = status_look(position.status);
     let grey = |role: Role| if stale { Role::Done } else { role };
-    let label = fit(&one_line(&position.label), width.saturating_sub(4 + word.chars().count()));
+    let label = fit(
+        &one_line(&position.label),
+        width.saturating_sub(4 + word.chars().count()),
+    );
     let mut line = Line::from(vec![
         Span::styled(
             if selected { "▸" } else { " " },
@@ -231,11 +242,17 @@ fn axis_line(
 fn duration_of(position: &Position, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
     let started = position.started_at?;
     let ended = position.ended_at.unwrap_or(now);
-    Some(super::super::detail::short_age((ended - started).num_seconds()))
+    Some(super::super::detail::short_age(
+        (ended - started).num_seconds(),
+    ))
 }
 
 /// The facts of a step above its content.
-fn step_lines(position: &Position, now: chrono::DateTime<chrono::Utc>, styles: &Styles) -> Vec<Line<'static>> {
+fn step_lines(
+    position: &Position,
+    now: chrono::DateTime<chrono::Utc>,
+    styles: &Styles,
+) -> Vec<Line<'static>> {
     let (glyph, role, word) = status_look(position.status);
     let mut head = vec![
         Span::styled(format!("{glyph} "), styles.of(role)),
@@ -243,10 +260,16 @@ fn step_lines(position: &Position, now: chrono::DateTime<chrono::Utc>, styles: &
         Span::styled(format!(" · {word}"), styles.of(role)),
     ];
     if let Some(action) = &position.action_type {
-        head.push(Span::styled(format!(" · {}", one_line(action)), styles.of(Role::Done)));
+        head.push(Span::styled(
+            format!(" · {}", one_line(action)),
+            styles.of(Role::Done),
+        ));
     }
     if let Some(duration) = duration_of(position, now) {
-        head.push(Span::styled(format!(" · {duration}"), styles.of(Role::Done)));
+        head.push(Span::styled(
+            format!(" · {duration}"),
+            styles.of(Role::Done),
+        ));
     }
     let mut lines = vec![Line::from(head)];
     if let Some(error) = &position.error {
@@ -372,7 +395,9 @@ fn render_step(
         .unwrap_or_else(chrono::Utc::now);
     let mut lines = step_lines(position, now, styles);
     lines.push(Line::raw(""));
-    let facts = u16::try_from(lines.len()).unwrap_or(u16::MAX).min(area.height);
+    let facts = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .min(area.height);
     frame.render_widget(
         Paragraph::new(lines),
         Rect::new(area.x, area.y, area.width, facts),
@@ -389,7 +414,10 @@ fn render_step(
             body,
         );
     };
-    match (&position.conversation, position.action_execution_id.as_deref()) {
+    match (
+        &position.conversation,
+        position.action_execution_id.as_deref(),
+    ) {
         (ConversationState::Recorded, Some(attempt_id)) => match attempts.get_mut(attempt_id) {
             Some(attempt) => render_attempt(frame, body, styles, attempt, stale),
             None => message(frame, "wczytuję rozmowę kroku…".to_string()),
@@ -403,7 +431,13 @@ fn render_step(
     }
 }
 
-fn render_attempt(frame: &mut Frame, area: Rect, styles: &Styles, attempt: &mut Attempt, stale: bool) {
+fn render_attempt(
+    frame: &mut Frame,
+    area: Rect,
+    styles: &Styles,
+    attempt: &mut Attempt,
+    stale: bool,
+) {
     if let Some(failure) = attempt.failure() {
         frame.render_widget(
             Paragraph::new(Line::styled(

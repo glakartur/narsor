@@ -118,8 +118,8 @@ use detail::TaskDetail;
 use history::History;
 use list::{title_of, MoveRequest, Removal, TaskList};
 use new_task::{NewTaskForm, Outgoing};
-use repositories::Repositories;
 use notify::{Notifier, Severity};
+use repositories::Repositories;
 use waiting::AnswerRequest;
 
 /// Where the keyboard is.
@@ -467,7 +467,8 @@ impl TaskApp {
     /// Takes what the server offers in, as the first read does: the name of
     /// the connection and what the new-task form may offer.
     pub fn set_capabilities(&mut self, capabilities: CapabilitiesView) {
-        self.connection.rename(one_line(&capabilities.connection_name));
+        self.connection
+            .rename(one_line(&capabilities.connection_name));
         self.capabilities = Some(capabilities);
     }
 
@@ -728,7 +729,10 @@ impl TaskApp {
         };
         let anchor = neighbour.task_id.clone();
         let anchor_title = title_of(neighbour);
-        let task = self.list.selected().expect("a neighbour implies a selection");
+        let task = self
+            .list
+            .selected()
+            .expect("a neighbour implies a selection");
         Request::Move(MoveRequest {
             task_id: task.task_id.to_string(),
             title: title_of(task),
@@ -827,7 +831,11 @@ impl TaskApp {
                     // bar, not the notice of a row that left the list.
                     self.refresh().await;
                 }
-                let tail = if reloaded { "; lista wczytana na nowo" } else { "" };
+                let tail = if reloaded {
+                    "; lista wczytana na nowo"
+                } else {
+                    ""
+                };
                 self.notify(
                     Severity::Error,
                     format!(
@@ -890,7 +898,8 @@ impl TaskApp {
             .collect();
         let removal = self.list.replace(listing.tasks);
         self.detail.retain(self.list.tasks());
-        self.detail.invalidate_changed(self.list.tasks(), &revisions);
+        self.detail
+            .invalidate_changed(self.list.tasks(), &revisions);
         self.sync_waiting();
         self.sync_overlay();
         self.settle_outbox();
@@ -1002,7 +1011,10 @@ impl TaskApp {
             Some(Err(error)) => {
                 self.stream_ended = true;
                 self.connection.on_failure(now, None);
-                self.notify(Severity::Error, format!("strumień zdarzeń zakończony: {error}"));
+                self.notify(
+                    Severity::Error,
+                    format!("strumień zdarzeń zakończony: {error}"),
+                );
             }
             None => {
                 self.stream_ended = true;

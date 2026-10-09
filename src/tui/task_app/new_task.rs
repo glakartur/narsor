@@ -72,16 +72,16 @@ use crate::controller_protocol::{
 };
 use crate::domain::ParamType;
 
-use super::super::scroll::one_line;
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem};
 use super::super::input_form::{workflow_input_fields, workflow_input_values};
 use super::super::keymap::{self, Action, Context};
+use super::super::scroll::one_line;
 use super::super::scroll::sanitize;
 use super::super::style::{Role, Styles};
 use super::actions::chooser_context;
 use super::list::{fit, PendingRow, PendingState};
 use super::notify::Severity;
-use super::{is_transport, failure_reason, Focus, Request, TaskApp, View};
+use super::{failure_reason, is_transport, Focus, Request, TaskApp, View};
 
 /// The key the unsent data of the form is kept under in
 /// [`DetailState::set_draft`](super::DetailState::set_draft); not a task id.
@@ -450,12 +450,17 @@ impl Outgoing {
 /// The title a task being sent has until the server gives it one: its first
 /// text input as declared — the ticket, usually — else the workflow's name.
 fn title_for(workflow: &str, inputs: &[WorkflowInputView], values: &Map<String, Value>) -> String {
-    inputs
-        .iter()
-        .filter(|input| matches!(input.input_type, ParamType::String | ParamType::Repository))
-        .find_map(|input| values.get(&input.name).and_then(Value::as_str))
-        .filter(|text| !text.trim().is_empty())
-        .map_or_else(|| workflow.to_string(), |text| text.trim().to_string())
+    let first_given = |kinds: &[ParamType]| {
+        inputs
+            .iter()
+            .filter(|input| kinds.contains(&input.input_type))
+            .find_map(|input| values.get(&input.name).and_then(Value::as_str))
+            .filter(|text| !text.trim().is_empty())
+    };
+    first_given(&[ParamType::String, ParamType::Repository])
+        .or_else(|| first_given(&[ParamType::Text]))
+        .and_then(|text| text.trim().lines().next())
+        .map_or_else(|| workflow.to_string(), |line| line.trim().to_string())
 }
 
 fn new_task_id() -> String {

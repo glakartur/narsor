@@ -458,7 +458,12 @@ impl Chooser {
     /// Puts a complaint next to the field `name` of entry `index` — the
     /// server's verdict on what was typed there — and the keys on that field.
     /// Returns whether there is such a field.
-    pub fn set_field_error(&mut self, index: usize, name: &str, message: impl Into<String>) -> bool {
+    pub fn set_field_error(
+        &mut self,
+        index: usize,
+        name: &str,
+        message: impl Into<String>,
+    ) -> bool {
         let Some(position) = self
             .items
             .get(index)
@@ -485,7 +490,8 @@ impl Chooser {
                 continue;
             };
             for field in &mut item.fields {
-                if let Some(earlier) = old.fields.iter().find(|earlier| earlier.name == field.name) {
+                if let Some(earlier) = old.fields.iter().find(|earlier| earlier.name == field.name)
+                {
                     field.carry_over(earlier);
                 }
             }
@@ -500,8 +506,16 @@ impl Chooser {
         self.selected = selected;
         self.description_scroll = scroll;
         let kept = self.field.min(self.field_count().saturating_sub(1));
-        self.focus = if self.field_count() == 0 { ChooserFocus::Actions } else { focus };
-        self.field = if self.focus == ChooserFocus::Fields { field.min(kept) } else { 0 };
+        self.focus = if self.field_count() == 0 {
+            ChooserFocus::Actions
+        } else {
+            focus
+        };
+        self.field = if self.focus == ChooserFocus::Fields {
+            field.min(kept)
+        } else {
+            0
+        };
         self
     }
 

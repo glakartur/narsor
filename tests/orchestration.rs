@@ -2291,7 +2291,11 @@ fn settled_commands_are_pruned_ids_stay_unique_and_chat_text_is_dropped() {
     assert_eq!(ids[29], "command-30");
 
     let record = fx.control.task(&task("task-1")).unwrap();
-    assert_eq!(record.operator_commands.len(), 20, "the last 20 settled ones");
+    assert_eq!(
+        record.operator_commands.len(),
+        20,
+        "the last 20 settled ones"
+    );
     assert_eq!(record.operator_commands[0].command_id, "command-11");
     assert!(record.operator_commands.iter().all(|command| matches!(
         &command.command,
@@ -2307,7 +2311,10 @@ fn settled_commands_are_pruned_ids_stay_unique_and_chat_text_is_dropped() {
     }
     let record = fx.control.task(&task("task-1")).unwrap();
     assert!(record.operator_command("command-31").is_some());
-    assert_eq!(record.operator_command("command-31").unwrap().command_id, open);
+    assert_eq!(
+        record.operator_command("command-31").unwrap().command_id,
+        open
+    );
 }
 
 #[test]
@@ -2339,7 +2346,11 @@ fn retrying_a_command_key_is_safe_whether_the_command_was_kept_or_forgotten() {
         "{error:?}"
     );
     assert_eq!(
-        fx.control.task(&task("task-1")).unwrap().operator_commands.len(),
+        fx.control
+            .task(&task("task-1"))
+            .unwrap()
+            .operator_commands
+            .len(),
         20
     );
 }
@@ -2396,5 +2407,4 @@ fn a_runner_poll_with_nothing_to_reject_reads_and_never_writes() {
         assert_eq!(commands[0].command_id, id);
     }
     assert_eq!(fx.control.task(&task("task-1")).unwrap().revision, revision);
-
 }

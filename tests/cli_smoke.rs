@@ -2121,9 +2121,15 @@ fn a_task_from_a_file_is_listed_shown_answered_and_archived_from_the_cli() {
     );
     let valid = cli(&root, &["task", "validate", &greet]);
     assert_eq!(valid.code, EXIT_SUCCESS, "{}", valid.output());
-    assert!(valid.stdout.contains("Valid: cli-greet v1"), "{}", valid.stdout);
     assert!(
-        valid.stdout.contains("input is_experimental: Boolean optional, default false"),
+        valid.stdout.contains("Valid: cli-greet v1"),
+        "{}",
+        valid.stdout
+    );
+    assert!(
+        valid
+            .stdout
+            .contains("input is_experimental: Boolean optional, default false"),
         "{}",
         valid.stdout
     );
@@ -2137,8 +2143,16 @@ fn a_task_from_a_file_is_listed_shown_answered_and_archived_from_the_cli() {
     let mistyped = cli(
         &root,
         &[
-            "task", "create", "--file", &greet, "--input", "greeting=Hi", "--input", &script,
-            "--input", "is_experimental=maybe",
+            "task",
+            "create",
+            "--file",
+            &greet,
+            "--input",
+            "greeting=Hi",
+            "--input",
+            &script,
+            "--input",
+            "is_experimental=maybe",
         ],
     );
     assert_eq!(mistyped.code, EXIT_USAGE, "{}", mistyped.output());
@@ -2151,12 +2165,24 @@ fn a_task_from_a_file_is_listed_shown_answered_and_archived_from_the_cli() {
     let created = cli(
         &root,
         &[
-            "task", "create", "--file", &greet, "--input", "greeting=Hi", "--input", &script,
-            "--task-id", "t-greet",
+            "task",
+            "create",
+            "--file",
+            &greet,
+            "--input",
+            "greeting=Hi",
+            "--input",
+            &script,
+            "--task-id",
+            "t-greet",
         ],
     );
     assert_eq!(created.code, EXIT_SUCCESS, "{}", created.output());
-    assert!(created.stdout.contains("Created task: t-greet"), "{}", created.stdout);
+    assert!(
+        created.stdout.contains("Created task: t-greet"),
+        "{}",
+        created.stdout
+    );
 
     // It runs until the human step asks: the list marks it, the details say
     // what it waits on and by which id it is answered.
@@ -2180,7 +2206,10 @@ fn a_task_from_a_file_is_listed_shown_answered_and_archived_from_the_cli() {
     assert_eq!(json.code, EXIT_SUCCESS, "{}", json.output());
     let summary: serde_json::Value = serde_json::from_str(&json.stdout).expect("JSON");
     assert_eq!(summary["task_id"], "t-greet");
-    let waiting_id = summary["attention"][0]["waiting_id"].as_str().unwrap().to_string();
+    let waiting_id = summary["attention"][0]["waiting_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(waiting.contains(&waiting_id), "{waiting}");
     let listing = cli(&root, &["task", "list", "--json"]);
     let listed: serde_json::Value = serde_json::from_str(&listing.stdout).expect("JSON");
@@ -2189,14 +2218,27 @@ fn a_task_from_a_file_is_listed_shown_answered_and_archived_from_the_cli() {
     // An answer names the wait it is for; another one is refused.
     let wrong = cli(
         &root,
-        &["task", "input", "t-greet", "--field", "approval_status=approved", "--waiting-id", "other"],
+        &[
+            "task",
+            "input",
+            "t-greet",
+            "--field",
+            "approval_status=approved",
+            "--waiting-id",
+            "other",
+        ],
     );
     assert_eq!(wrong.code, EXIT_FAILURE, "{}", wrong.output());
     assert!(wrong.stderr.contains(&waiting_id), "{}", wrong.stderr);
     let answered = cli(
         &root,
         &[
-            "task", "input", "t-greet", "--field", "approval_status=approved", "--waiting-id",
+            "task",
+            "input",
+            "t-greet",
+            "--field",
+            "approval_status=approved",
+            "--waiting-id",
             &waiting_id,
         ],
     );
@@ -2208,7 +2250,9 @@ fn a_task_from_a_file_is_listed_shown_answered_and_archived_from_the_cli() {
     });
 
     // Archived, it leaves nothing to answer and shows in the history list only.
-    assert!(cli(&root, &["task", "list", "--archived"]).stdout.contains("No archived tasks."));
+    assert!(cli(&root, &["task", "list", "--archived"])
+        .stdout
+        .contains("No archived tasks."));
     let archived = cli(&root, &["task", "archive", "t-greet"]);
     assert_eq!(archived.code, EXIT_SUCCESS, "{}", archived.output());
     wait_for("the task to be archived", || {
@@ -2238,12 +2282,23 @@ fn history_reads_an_old_execution_and_refuses_to_recover_one_that_did_not_fail()
     );
     let shown = cli(&root, &["task", "history", "show", &id]);
     assert_eq!(shown.code, EXIT_SUCCESS, "{}", shown.output());
-    assert!(shown.stdout.contains(&format!("Execution  {id}")), "{}", shown.stdout);
-    assert!(shown.stdout.contains("Recovery   not possible"), "{}", shown.stdout);
+    assert!(
+        shown.stdout.contains(&format!("Execution  {id}")),
+        "{}",
+        shown.stdout
+    );
+    assert!(
+        shown.stdout.contains("Recovery   not possible"),
+        "{}",
+        shown.stdout
+    );
     let events = cli(&root, &["task", "history", "events", &id]);
     assert_eq!(events.code, EXIT_SUCCESS, "{}", events.output());
     assert!(events.stdout.lines().count() > 1, "{}", events.stdout);
-    let after = cli(&root, &["task", "history", "events", &id, "--after", "1000"]);
+    let after = cli(
+        &root,
+        &["task", "history", "events", &id, "--after", "1000"],
+    );
     assert_eq!(after.code, EXIT_SUCCESS, "{}", after.output());
     assert!(after.stdout.is_empty(), "{}", after.stdout);
     let steps = cli(&root, &["task", "history", "steps", &id]);
@@ -2251,13 +2306,27 @@ fn history_reads_an_old_execution_and_refuses_to_recover_one_that_did_not_fail()
     assert!(steps.stdout.contains("work"), "{}", steps.stdout);
     let conductor = cli(&root, &["task", "history", "conductor", &id]);
     assert_eq!(conductor.code, EXIT_SUCCESS, "{}", conductor.output());
-    assert!(conductor.stdout.contains("Working on:"), "{}", conductor.stdout);
-    let no_record = cli(&root, &["task", "history", "conversation", &id, "no-such-attempt"]);
+    assert!(
+        conductor.stdout.contains("Working on:"),
+        "{}",
+        conductor.stdout
+    );
+    let no_record = cli(
+        &root,
+        &["task", "history", "conversation", &id, "no-such-attempt"],
+    );
     assert_eq!(no_record.code, EXIT_FAILURE, "{}", no_record.output());
 
-    let recovered = cli(&root, &["task", "history", "recover", &id, "--comment", "try again"]);
+    let recovered = cli(
+        &root,
+        &["task", "history", "recover", &id, "--comment", "try again"],
+    );
     assert_eq!(recovered.code, EXIT_FAILURE, "{}", recovered.output());
-    assert!(recovered.stderr.contains("not_recoverable"), "{}", recovered.stderr);
+    assert!(
+        recovered.stderr.contains("not_recoverable"),
+        "{}",
+        recovered.stderr
+    );
 
     let unknown = cli(&root, &["task", "history", "show", "no-such-execution"]);
     assert_eq!(unknown.code, EXIT_FAILURE, "{}", unknown.output());
@@ -2272,22 +2341,42 @@ fn the_registry_and_the_catalogue_are_read_and_changed_from_the_cli() {
     };
     let empty = cli(&root, &["task", "repo", "list"]);
     assert_eq!(empty.code, EXIT_SUCCESS, "{}", empty.output());
-    assert!(empty.stdout.contains("No repositories registered."), "{}", empty.stdout);
+    assert!(
+        empty.stdout.contains("No repositories registered."),
+        "{}",
+        empty.stdout
+    );
 
     let added = cli(
         &root,
         &[
-            "task", "repo", "add", "api", "--remote", "https://example.com/api.git",
-            "--default-branch", "trunk",
+            "task",
+            "repo",
+            "add",
+            "api",
+            "--remote",
+            "https://example.com/api.git",
+            "--default-branch",
+            "trunk",
         ],
     );
     assert_eq!(added.code, EXIT_SUCCESS, "{}", added.output());
     // A local daemon takes a path of its own disk too.
-    let local = cli(&root, &["task", "repo", "add", "disk", "--remote", "/srv/disk"]);
+    let local = cli(
+        &root,
+        &["task", "repo", "add", "disk", "--remote", "/srv/disk"],
+    );
     assert_eq!(local.code, EXIT_SUCCESS, "{}", local.output());
     let duplicate = cli(
         &root,
-        &["task", "repo", "add", "api", "--remote", "https://example.com/other.git"],
+        &[
+            "task",
+            "repo",
+            "add",
+            "api",
+            "--remote",
+            "https://example.com/other.git",
+        ],
     );
     assert_eq!(duplicate.code, EXIT_FAILURE, "{}", duplicate.output());
     let listed = cli(&root, &["task", "repo", "list"]);
@@ -2308,8 +2397,18 @@ fn the_registry_and_the_catalogue_are_read_and_changed_from_the_cli() {
 
     let capabilities = cli(&root, &["task", "capabilities"]);
     assert_eq!(capabilities.code, EXIT_SUCCESS, "{}", capabilities.output());
-    assert!(capabilities.stdout.contains("Connection:             local"), "{}", capabilities.stdout);
-    assert!(capabilities.stdout.contains("Workflow paths:         yes"), "{}", capabilities.stdout);
+    assert!(
+        capabilities
+            .stdout
+            .contains("Connection:             local"),
+        "{}",
+        capabilities.stdout
+    );
+    assert!(
+        capabilities.stdout.contains("Workflow paths:         yes"),
+        "{}",
+        capabilities.stdout
+    );
     let workflows = cli(&root, &["task", "workflows"]);
     assert_eq!(workflows.code, EXIT_SUCCESS, "{}", workflows.output());
     assert!(
@@ -2703,11 +2802,23 @@ mod remote_cli {
         let refused = remote(
             &harness,
             token,
-            &["task", "input", "t-ask", "--field", "reason=x", "--waiting-id", "other"],
+            &[
+                "task",
+                "input",
+                "t-ask",
+                "--field",
+                "reason=x",
+                "--waiting-id",
+                "other",
+            ],
         )
         .await;
         assert_eq!(refused.code, EXIT_FAILURE, "{}", refused.output());
-        assert!(refused.stderr.contains("question ask-1"), "{}", refused.stderr);
+        assert!(
+            refused.stderr.contains("question ask-1"),
+            "{}",
+            refused.stderr
+        );
         let malformed = remote(&harness, token, &["task", "input", "t-ask", "--data", "n"]).await;
         assert_eq!(malformed.code, EXIT_USAGE, "{}", malformed.output());
 
@@ -2715,17 +2826,29 @@ mod remote_cli {
             &harness,
             token,
             &[
-                "task", "input", "t-ask",
-                "--field", "reason=because",
-                "--field", "numbers=3",
-                "--field", r#"extra={"a":[1,2]}"#,
-                "--data", "n=3",
-                "--data", "s=plain text",
-                "--data", r#"list=["a","b"]"#,
-                "--variable", "v=true",
-                "--label", "approved",
-                "--comment", "looks fine",
-                "--waiting-id", "ask-1",
+                "task",
+                "input",
+                "t-ask",
+                "--field",
+                "reason=because",
+                "--field",
+                "numbers=3",
+                "--field",
+                r#"extra={"a":[1,2]}"#,
+                "--data",
+                "n=3",
+                "--data",
+                "s=plain text",
+                "--data",
+                r#"list=["a","b"]"#,
+                "--variable",
+                "v=true",
+                "--label",
+                "approved",
+                "--comment",
+                "looks fine",
+                "--waiting-id",
+                "ask-1",
             ],
         )
         .await;
@@ -2769,16 +2892,26 @@ mod remote_cli {
             .lines()
             .filter_map(|line| line.split_whitespace().next())
             .collect();
-        assert_eq!(ids, ["t-old", "t-older"], "newest archive first: {}", history.stdout);
+        assert_eq!(
+            ids,
+            ["t-old", "t-older"],
+            "newest archive first: {}",
+            history.stdout
+        );
         assert!(history.stdout.contains("archived"), "{}", history.stdout);
 
         let all = remote(&harness, token, &["task", "list"]).await;
-        assert!(all.stdout.contains("t-keep") && all.stdout.contains("t-old"), "{}", all.stdout);
+        assert!(
+            all.stdout.contains("t-keep") && all.stdout.contains("t-old"),
+            "{}",
+            all.stdout
+        );
         let json = remote(&harness, token, &["task", "list", "--json"]).await;
         assert_eq!(json.code, EXIT_SUCCESS, "{}", json.output());
         let tasks: serde_json::Value = serde_json::from_str(&json.stdout).expect("JSON");
         assert_eq!(tasks.as_array().unwrap().len(), 3);
-        let archived_json = remote(&harness, token, &["task", "list", "--archived", "--json"]).await;
+        let archived_json =
+            remote(&harness, token, &["task", "list", "--archived", "--json"]).await;
         let tasks: serde_json::Value = serde_json::from_str(&archived_json.stdout).expect("JSON");
         assert_eq!(tasks.as_array().unwrap().len(), 2);
         assert_eq!(tasks[0]["lifecycle"], "archived");
@@ -2804,7 +2937,8 @@ mod remote_cli {
         let workflows = remote(&harness, token, &["task", "workflows"]).await;
         assert_eq!(workflows.code, EXIT_SUCCESS, "{}", workflows.output());
         assert!(
-            workflows.stdout.contains("implement-feature") && workflows.stdout.contains("[built-in]"),
+            workflows.stdout.contains("implement-feature")
+                && workflows.stdout.contains("[built-in]"),
             "{}",
             workflows.stdout
         );
@@ -2812,26 +2946,52 @@ mod remote_cli {
         let added = remote(
             &harness,
             token,
-            &["task", "repo", "add", "api", "--remote", "https://example.com/api.git"],
+            &[
+                "task",
+                "repo",
+                "add",
+                "api",
+                "--remote",
+                "https://example.com/api.git",
+            ],
         )
         .await;
         assert_eq!(added.code, EXIT_SUCCESS, "{}", added.output());
         let hostile = remote(
             &harness,
             token,
-            &["task", "repo", "add", "evil", "--remote", "ext::sh -c touch% /tmp/pwned"],
+            &[
+                "task",
+                "repo",
+                "add",
+                "evil",
+                "--remote",
+                "ext::sh -c touch% /tmp/pwned",
+            ],
         )
         .await;
         assert_eq!(hostile.code, EXIT_FAILURE, "{}", hostile.output());
-        assert!(hostile.stderr.contains("invalid_repository"), "{}", hostile.stderr);
+        assert!(
+            hostile.stderr.contains("invalid_repository"),
+            "{}",
+            hostile.stderr
+        );
         let listed = remote(&harness, token, &["task", "repo", "list"]).await;
-        assert!(listed.stdout.contains("api") && !listed.stdout.contains("evil"), "{}", listed.stdout);
+        assert!(
+            listed.stdout.contains("api") && !listed.stdout.contains("evil"),
+            "{}",
+            listed.stdout
+        );
         let removed = remote(&harness, token, &["task", "repo", "remove", "api"]).await;
         assert_eq!(removed.code, EXIT_SUCCESS, "{}", removed.output());
 
         let history = remote(&harness, token, &["task", "history", "list"]).await;
         assert_eq!(history.code, EXIT_SUCCESS, "{}", history.output());
-        assert!(history.stdout.contains("No executions from before"), "{}", history.stdout);
+        assert!(
+            history.stdout.contains("No executions from before"),
+            "{}",
+            history.stdout
+        );
         let unknown = remote(&harness, token, &["task", "history", "show", "exec-1"]).await;
         assert_eq!(unknown.code, EXIT_FAILURE, "{}", unknown.output());
     }
@@ -2989,7 +3149,9 @@ fn tui_without_a_server_launches_the_local_daemon_and_remote_runs_the_same_inter
     let plain = cli(&root, &["tui"]);
     assert_eq!(plain.code, EXIT_FAILURE, "{}", plain.output());
     assert!(
-        plain.stderr.contains("The terminal interface stopped with an error"),
+        plain
+            .stderr
+            .contains("The terminal interface stopped with an error"),
         "it got as far as the terminal; stderr: {}",
         plain.stderr
     );
@@ -3007,9 +3169,15 @@ fn tui_without_a_server_launches_the_local_daemon_and_remote_runs_the_same_inter
 
     let alias = cli(&root, &["tui", "--remote"]);
     assert_eq!(alias.code, plain.code, "{}", alias.output());
-    assert!(alias.stderr.contains("`narsor tui --remote` is ignored"), "{}", alias.stderr);
     assert!(
-        alias.stderr.contains("The terminal interface stopped with an error"),
+        alias.stderr.contains("`narsor tui --remote` is ignored"),
+        "{}",
+        alias.stderr
+    );
+    assert!(
+        alias
+            .stderr
+            .contains("The terminal interface stopped with an error"),
         "{}",
         alias.stderr
     );

@@ -100,6 +100,10 @@ clean stop, not a failure), `failed` and `cancelled`.
 * **Every agent prompt must name every label its state declares**, because the
   executor refuses to guess one. That is asserted too, so a prompt and its
   `outputs` cannot drift apart.
+* **Descriptive inputs are `type: text`, identifiers stay `type: string`.** The
+  TUI shows a `text` input as a large multi-line field and every other input in
+  a narrow bar; a workflow without a `text` input gets a bar and nothing else.
+  For the CLI and the API both are plain strings.
 * **Templates are substitution, not a language.** Only `{{ inputs.X }}` and
   `{{ context.X }}`; no filters, no defaults. A `{{ context.X }}` that is not
   set when the state is entered fails the action, so a variable is only quoted

@@ -456,12 +456,20 @@ mod task_app_render {
         app.load(listing(
             vec![
                 titled(
-                    with_runner(controlled("a", "running", 1), ExecutionStatus::Running, "edit"),
+                    with_runner(
+                        controlled("a", "running", 1),
+                        ExecutionStatus::Running,
+                        "edit",
+                    ),
                     "NAR-14",
                 ),
                 titled(
                     waiting(
-                        with_runner(controlled("b", "running", 2), ExecutionStatus::Running, "approval"),
+                        with_runner(
+                            controlled("b", "running", 2),
+                            ExecutionStatus::Running,
+                            "approval",
+                        ),
                         AttentionKind::Approval,
                     ),
                     "NAR-12",
@@ -473,7 +481,11 @@ mod task_app_render {
                 titled(waiting_for_capacity(queued("d", 4), 1, 2, 3), "NAR-16"),
                 titled(waiting_for_capacity(queued("e", 5), 2, 2, 3), "NAR-17"),
                 titled(
-                    with_runner(controlled("f", "running", 6), ExecutionStatus::Completed, "done"),
+                    with_runner(
+                        controlled("f", "running", 6),
+                        ExecutionStatus::Completed,
+                        "done",
+                    ),
                     "NAR-8",
                 ),
             ],
@@ -512,14 +524,26 @@ mod task_app_render {
             assert!(header.contains(expected), "{expected:?} in {header:?}");
         }
         assert!(rows(&buffer)[1].contains("Zadania"));
-        assert!(rows(&buffer)[1].contains("NAR-14"), "the details name the selected task");
+        assert!(
+            rows(&buffer)[1].contains("NAR-14"),
+            "the details name the selected task"
+        );
 
         let list_rows: Vec<String> = rows(&buffer)
             .iter()
             .map(|row| row.chars().skip(1).take(27).collect::<String>())
             .collect();
-        let find = |needle: &str| list_rows.iter().position(|row| row.contains(needle)).unwrap();
-        assert!(list_rows[find("NAR-14")].starts_with(" ●"), "{:?}", list_rows[find("NAR-14")]);
+        let find = |needle: &str| {
+            list_rows
+                .iter()
+                .position(|row| row.contains(needle))
+                .unwrap()
+        };
+        assert!(
+            list_rows[find("NAR-14")].starts_with(" ●"),
+            "{:?}",
+            list_rows[find("NAR-14")]
+        );
         assert!(list_rows[find("NAR-12")].starts_with("?●"));
         assert!(list_rows[find("NAR-9 ")].starts_with("!✗"));
         assert!(list_rows[find("NAR-16")].starts_with(" ◷"));
@@ -528,14 +552,22 @@ mod task_app_render {
         assert!(list_rows[find("NAR-8 ")].starts_with(" ✓"));
         assert!(list_rows[find("NAR-12")].contains("approval"));
         assert!(
-            find("NAR-14") < find("NAR-12") && find("NAR-12") < find("NAR-9 ") && find("NAR-17") < find("NAR-8 "),
+            find("NAR-14") < find("NAR-12")
+                && find("NAR-12") < find("NAR-9 ")
+                && find("NAR-17") < find("NAR-8 "),
             "the rows are in the server's order"
         );
 
         let bar = rows(&buffer).last().cloned().unwrap();
         let _ = bar;
-        assert!(screen.contains("następny czekający"), "the bar shows the list keys:\n{screen}");
-        assert!(screen.contains("Przebieg") && screen.contains("Zdarzenia"), "the details have their tabs:\n{screen}");
+        assert!(
+            screen.contains("następny czekający"),
+            "the bar shows the list keys:\n{screen}"
+        );
+        assert!(
+            screen.contains("Przebieg") && screen.contains("Zdarzenia"),
+            "the details have their tabs:\n{screen}"
+        );
     }
 
     #[test]
@@ -550,7 +582,11 @@ mod task_app_render {
             .map(|(index, _)| index)
             .collect();
         assert_eq!(divider.first(), Some(&0));
-        assert_eq!(divider.get(1), Some(&usize::from(layout::LIST_WIDTH)), "{header_row:?}");
+        assert_eq!(
+            divider.get(1),
+            Some(&usize::from(layout::LIST_WIDTH)),
+            "{header_row:?}"
+        );
     }
 
     #[test]
@@ -565,7 +601,10 @@ mod task_app_render {
         let details = render(90, 30, &mut app, &Styles::new(false));
         assert!(screen(&details).contains("Przebieg"));
         assert!(!screen(&details).contains("NAR-17"));
-        assert!(screen(&details).contains("lista"), "the bar offers the way back");
+        assert!(
+            screen(&details).contains("lista"),
+            "the bar offers the way back"
+        );
     }
 
     #[test]
@@ -600,7 +639,11 @@ mod task_app_render {
     fn a_connecting_screen_says_which_server_and_has_no_rows() {
         let mut app = app();
         let buffer = render(100, 24, &mut app, &Styles::new(false));
-        assert!(rows(&buffer)[0].contains("◌ łączę z local"), "{:?}", rows(&buffer)[0]);
+        assert!(
+            rows(&buffer)[0].contains("◌ łączę z local"),
+            "{:?}",
+            rows(&buffer)[0]
+        );
         assert!(screen(&buffer).contains("brak danych"));
     }
 
@@ -613,12 +656,18 @@ mod task_app_render {
         let row = list_row(&buffer, "NAR-12");
         let cells = &buffer.content()[row * width..(row + 1) * width];
         assert_eq!(cells[1].symbol(), "?");
-        assert_eq!(cells[1].fg, Color::Yellow, "the marker keeps its role colour");
+        assert_eq!(
+            cells[1].fg,
+            Color::Yellow,
+            "the marker keeps its role colour"
+        );
         assert_eq!(cells[2].symbol(), "●");
         assert_eq!(cells[2].fg, Color::Green);
         assert!(cells[1].modifier.contains(Modifier::REVERSED));
         let other = list_row(&buffer, "NAR-14");
-        assert!(!buffer.content()[other * width + 4].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer.content()[other * width + 4]
+            .modifier
+            .contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -639,7 +688,9 @@ mod task_app_render {
         );
         let width = usize::from(buffer.area.width);
         let row = list_row(&buffer, "NAR-12");
-        assert!(buffer.content()[row * width + 4].modifier.contains(Modifier::REVERSED));
+        assert!(buffer.content()[row * width + 4]
+            .modifier
+            .contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -654,8 +705,14 @@ mod task_app_render {
         let buffer = render(120, 30, &mut app, &Styles::new(true));
         let screen = screen(&buffer);
         assert!(screen.contains("↕"), "the moved row is marked:\n{screen}");
-        assert!(list_row(&buffer, "NAR-17") < list_row(&buffer, "NAR-16"), "the preview put NAR-16 after NAR-17");
-        assert!(screen.contains("zatwierdź") && screen.contains("anuluj"), "{screen}");
+        assert!(
+            list_row(&buffer, "NAR-17") < list_row(&buffer, "NAR-16"),
+            "the preview put NAR-16 after NAR-17"
+        );
+        assert!(
+            screen.contains("zatwierdź") && screen.contains("anuluj"),
+            "{screen}"
+        );
     }
 
     #[test]
@@ -681,7 +738,13 @@ mod task_app_render {
         press(&mut app, KeyCode::Char('K'));
         let buffer = render(120, 30, &mut app, &Styles::new(false));
         // NAR-8 is finished, so it cannot be moved.
-        assert!(rows(&buffer).iter().any(|row| row.contains("zadanie nie jest w kolejce")), "{}", screen(&buffer));
+        assert!(
+            rows(&buffer)
+                .iter()
+                .any(|row| row.contains("zadanie nie jest w kolejce")),
+            "{}",
+            screen(&buffer)
+        );
     }
 
     #[test]
@@ -786,10 +849,18 @@ mod task_app_detail_render {
         let buffer = render(&mut app, &Styles::new(false));
         let rows = rows(&buffer);
         // Row 0 is the frame; the details start on row 1.
-        assert!(rows[1].contains("NAR-12 Zmiana API zamówień"), "{}", rows[1]);
+        assert!(
+            rows[1].contains("NAR-12 Zmiana API zamówień"),
+            "{}",
+            rows[1]
+        );
         assert!(rows[1].contains("implement-feature v3"), "{}", rows[1]);
         assert!(rows[2].contains("Jira NAR-12 ↗"), "{}", rows[2]);
-        assert!(rows[2].contains("PR: —"), "a link without a value: {}", rows[2]);
+        assert!(
+            rows[2].contains("PR: —"),
+            "a link without a value: {}",
+            rows[2]
+        );
         assert!(!rows[2].contains("PR — ↗"));
         assert!(rows[2].contains("● running"), "{}", rows[2]);
         assert!(rows[2].contains("krok 3/5"), "{}", rows[2]);
@@ -804,17 +875,33 @@ mod task_app_detail_render {
         let mut app = running_app();
         let buffer = render(&mut app, &Styles::new(false));
         let screen = screen(&buffer);
-        for expected in ["✓ plan #1", "✓ edit #1", "● review #1", "▸● review #1", "w toku"] {
+        for expected in [
+            "✓ plan #1",
+            "✓ edit #1",
+            "● review #1",
+            "▸● review #1",
+            "w toku",
+        ] {
             assert!(screen.contains(expected), "{expected:?} in\n{screen}");
         }
         // The axis is the left part of the details: the selected step's own heading is on the right.
         let row = |needle: &str| {
             rows(&buffer)
                 .iter()
-                .position(|row| row.chars().skip(30).take(30).collect::<String>().contains(needle))
+                .position(|row| {
+                    row.chars()
+                        .skip(30)
+                        .take(30)
+                        .collect::<String>()
+                        .contains(needle)
+                })
                 .unwrap_or_else(|| panic!("{needle:?} is not on the axis"))
         };
-        assert!(row("plan #1") < row("edit #1") && row("edit #1") < row("review #1") && row("review #1") < row("test #1"));
+        assert!(
+            row("plan #1") < row("edit #1")
+                && row("edit #1") < row("review #1")
+                && row("review #1") < row("test #1")
+        );
         // Without colour the same is said in words and glyphs.
         let plain = render(&mut app, &Styles::new(true));
         assert!(super::screen(&plain).contains("▸● review #1"));
@@ -834,7 +921,11 @@ mod task_app_detail_render {
             "{:?}",
             rows(&buffer)[2]
         );
-        assert_eq!(screen.matches("\u{1b}]8;;https").count(), 1, "only the link with a target");
+        assert_eq!(
+            screen.matches("\u{1b}]8;;https").count(),
+            1,
+            "only the link with a target"
+        );
     }
 
     #[test]
@@ -852,10 +943,20 @@ mod task_app_detail_render {
                 ExecutionStatus::Running,
                 "review",
             );
-            app.load(listing(vec![displayed(running, "NAR-12", &[("Jira", "NAR-12", Some(url))])], "c"));
+            app.load(listing(
+                vec![displayed(
+                    running,
+                    "NAR-12",
+                    &[("Jira", "NAR-12", Some(url))],
+                )],
+                "c",
+            ));
             app.detail_mut().set_hyperlinks(true);
             let screen = screen(&render(&mut app, &Styles::new(false)));
-            assert!(!screen.contains("\u{1b}]8"), "{url:?} must not become a hyperlink");
+            assert!(
+                !screen.contains("\u{1b}]8"),
+                "{url:?} must not become a hyperlink"
+            );
         }
     }
 
@@ -863,7 +964,10 @@ mod task_app_detail_render {
     fn a_queued_task_says_it_has_not_started_and_where_it_waits() {
         let mut app = app();
         let waiting = narsor_waiting(queued("b", 2), 2, 2, 3);
-        app.load(listing(vec![queued("a", 1), displayed(waiting, "NAR-17", &[])], "c"));
+        app.load(listing(
+            vec![queued("a", 1), displayed(waiting, "NAR-17", &[])],
+            "c",
+        ));
         app.list_mut().select("b");
         press(&mut app, KeyCode::Enter);
 
@@ -871,17 +975,25 @@ mod task_app_detail_render {
         let rows = rows(&buffer);
         assert!(rows[2].contains("#2 · czeka na slot (2/3)"), "{}", rows[2]);
         let screen = screen(&buffer);
-        assert!(screen.contains("jeszcze nie wystartowało, #2 w kolejce"), "{screen}");
+        assert!(
+            screen.contains("jeszcze nie wystartowało, #2 w kolejce"),
+            "{screen}"
+        );
 
         // The other execution tabs say the same; Info shows what is there.
         press(&mut app, KeyCode::Right);
-        assert!(super::screen(&render(&mut app, &Styles::new(false))).contains("jeszcze nie wystartowało"));
+        assert!(super::screen(&render(&mut app, &Styles::new(false)))
+            .contains("jeszcze nie wystartowało"));
         press(&mut app, KeyCode::Right);
-        assert!(super::screen(&render(&mut app, &Styles::new(false))).contains("jeszcze nie wystartowało"));
+        assert!(super::screen(&render(&mut app, &Styles::new(false)))
+            .contains("jeszcze nie wystartowało"));
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Right);
         let info = super::screen(&render(&mut app, &Styles::new(false)));
-        assert!(info.contains("Zapieczętowane wejścia") && info.contains("launch digest"), "{info}");
+        assert!(
+            info.contains("Zapieczętowane wejścia") && info.contains("launch digest"),
+            "{info}"
+        );
     }
 
     fn narsor_waiting(
@@ -890,7 +1002,11 @@ mod task_app_detail_render {
         running: u32,
         limit: u32,
     ) -> narsor::controller_protocol::TaskSummary {
-        let reason = QueueReason::WaitingForCapacity { position, running, limit };
+        let reason = QueueReason::WaitingForCapacity {
+            position,
+            running,
+            limit,
+        };
         task.queue = Some(QueueView {
             message: reason.describe(),
             reason,
@@ -910,7 +1026,11 @@ mod task_app_detail_render {
         });
         app.load(listing(vec![waiting], "c"));
         let buffer = render(&mut app, &Styles::new(false));
-        assert!(rows(&buffer)[2].contains("kontroler offline 4m"), "{}", rows(&buffer)[2]);
+        assert!(
+            rows(&buffer)[2].contains("kontroler offline 4m"),
+            "{}",
+            rows(&buffer)[2]
+        );
     }
 
     #[test]
@@ -919,7 +1039,10 @@ mod task_app_detail_render {
         app.load(listing(vec![task("a", "local", "archived", 1)], "c"));
         press(&mut app, KeyCode::Enter);
         let screen = screen(&render(&mut app, &Styles::new(false)));
-        assert!(screen.contains("storage usunięty przy archiwizacji"), "{screen}");
+        assert!(
+            screen.contains("storage usunięty przy archiwizacji"),
+            "{screen}"
+        );
     }
 
     #[test]
@@ -939,7 +1062,10 @@ mod task_app_detail_render {
             },
         );
         let screen = screen(&render(&mut app, &Styles::new(false)));
-        assert!(screen.contains("zdarzenia niedostępne: the runner has not been heard from lately"), "{screen}");
+        assert!(
+            screen.contains("zdarzenia niedostępne: the runner has not been heard from lately"),
+            "{screen}"
+        );
         // The rest of the screen is intact.
         assert!(screen.contains("NAR-12 Zmiana API zamówień"));
     }
@@ -960,7 +1086,10 @@ mod task_app_detail_render {
         );
         let screen = screen(&render(&mut app, &Styles::new(false)));
         assert!(screen.contains("runner nie odpowiada"), "{screen}");
-        assert_eq!(app.connection().status(std::time::Instant::now()).text, before);
+        assert_eq!(
+            app.connection().status(std::time::Instant::now()).text,
+            before
+        );
         // The rest of the screen is intact.
         assert!(screen.contains("NAR-12 Zmiana API zamówień"));
     }
@@ -969,11 +1098,8 @@ mod task_app_detail_render {
     async fn a_read_that_the_runner_never_answers_is_cut_off_by_the_limit() {
         use narsor::tui::task_app::detail::{bounded_read, runner_not_answering};
         let started = std::time::Instant::now();
-        let result: Result<(), _> = bounded_read(
-            std::time::Duration::from_millis(30),
-            std::future::pending(),
-        )
-        .await;
+        let result: Result<(), _> =
+            bounded_read(std::time::Duration::from_millis(30), std::future::pending()).await;
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         match (result, runner_not_answering()) {
             (
@@ -1004,7 +1130,10 @@ mod task_app_detail_render {
             },
         );
         let list = screen(&render(&mut app, &Styles::new(false)));
-        assert!(list.contains("state_entered") && list.contains("state-4"), "{list}");
+        assert!(
+            list.contains("state_entered") && list.contains("state-4"),
+            "{list}"
+        );
         assert!(!list.contains("szczegóły zdarzenia"));
         press(&mut app, KeyCode::Char('v'));
         let detail = screen(&render(&mut app, &Styles::new(false)));
@@ -1033,18 +1162,29 @@ mod task_app_detail_render {
             vec![displayed(
                 running,
                 &hostile("T@itle"),
-                &[(&hostile("La@bel"), &hostile("Te@xt"), Some("https://x.example/"))],
+                &[(
+                    &hostile("La@bel"),
+                    &hostile("Te@xt"),
+                    Some("https://x.example/"),
+                )],
             )],
             "c",
         ));
         let mut step = position("st@ep", PositionStatus::Failed);
         step.label = hostile("st@ep #1");
         step.error = Some(hostile("bo@om"));
-        app.on_detail_read("a", 1, DetailRead::Timeline(Ok(timeline("a", vec![step], None))));
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline("a", vec![step], None))),
+        );
         press(&mut app, KeyCode::Enter);
         for _ in 0..5 {
             let screen = screen(&render(&mut app, &Styles::new(false)));
-            assert!(!screen.contains('\u{1b}') && !screen.contains('\u{202e}'), "{screen}");
+            assert!(
+                !screen.contains('\u{1b}') && !screen.contains('\u{202e}'),
+                "{screen}"
+            );
             press(&mut app, KeyCode::Right);
         }
     }
@@ -1053,7 +1193,9 @@ mod task_app_detail_render {
     async fn the_wide_screen_with_a_remote_task_shows_the_header_the_tabs_and_the_axis() {
         let harness = RemoteHarness::start().await;
         let mut recorded = position("plan", PositionStatus::Succeeded);
-        recorded.conversation = ConversationState::NotCreated { reason: "script".into() };
+        recorded.conversation = ConversationState::NotCreated {
+            reason: "script".into(),
+        };
         let current = position("review", PositionStatus::InProgress);
         let mut first = snapshot(1, None);
         first.timeline = Some(Timeline {
@@ -1071,11 +1213,29 @@ mod task_app_detail_render {
         let buffer = render(&mut app, &Styles::new(false));
         let screen = screen(&buffer);
         let rows = rows(&buffer);
-        assert!(rows[1].contains("task-1") && rows[1].contains("implement-feature v1"), "{}", rows[1]);
-        assert!(rows[2].contains("● running") && rows[2].contains("krok 2/2"), "{}", rows[2]);
-        assert!(rows[3].contains("Przebieg") && rows[3].contains("Info"), "{}", rows[3]);
-        assert!(screen.contains("✓ plan #1") && screen.contains("▸● review #1"), "{screen}");
-        assert!(screen.contains("brak rozmowy: script") || screen.contains("review #1 · w toku"), "{screen}");
+        assert!(
+            rows[1].contains("task-1") && rows[1].contains("implement-feature v1"),
+            "{}",
+            rows[1]
+        );
+        assert!(
+            rows[2].contains("● running") && rows[2].contains("krok 2/2"),
+            "{}",
+            rows[2]
+        );
+        assert!(
+            rows[3].contains("Przebieg") && rows[3].contains("Info"),
+            "{}",
+            rows[3]
+        );
+        assert!(
+            screen.contains("✓ plan #1") && screen.contains("▸● review #1"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("brak rozmowy: script") || screen.contains("review #1 · w toku"),
+            "{screen}"
+        );
         assert!(screen.contains("● live"));
     }
 }
@@ -1147,7 +1307,11 @@ mod task_app_waiting_render {
     }
 
     fn opened(task: narsor::controller_protocol::TaskSummary) -> TaskApp {
-        let mut app = TaskApp::new(ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"), "local", None);
+        let mut app = TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        );
         app.load(listing(vec![titled(task, "NAR-12")], "c"));
         // The step the output `revise` returns to is known from the timeline.
         app.on_detail_read(
@@ -1184,11 +1348,23 @@ mod task_app_waiting_render {
             "Zakres wymaga poprawy.",
             "comment (wymagane)",
         ] {
-            assert!(screen.contains(expected), "{expected:?} is missing:\n{screen}");
+            assert!(
+                screen.contains(expected),
+                "{expected:?} is missing:\n{screen}"
+            );
         }
-        let list_row = screen.lines().position(|row| row.contains("▸ 2 revise")).unwrap();
-        let description_row = screen.lines().position(|row| row.contains("↩ wraca do agenta: plan")).unwrap();
-        assert!(description_row <= list_row + 1, "the description sits beside the list:\n{screen}");
+        let list_row = screen
+            .lines()
+            .position(|row| row.contains("▸ 2 revise"))
+            .unwrap();
+        let description_row = screen
+            .lines()
+            .position(|row| row.contains("↩ wraca do agenta: plan"))
+            .unwrap();
+        assert!(
+            description_row <= list_row + 1,
+            "the description sits beside the list:\n{screen}"
+        );
     }
 
     #[test]
@@ -1196,8 +1372,14 @@ mod task_app_waiting_render {
         let mut app = opened(with_pending(running(), gate()));
         let screen = draw_app(&mut app, 64, 40, false);
         let rows: Vec<&str> = screen.lines().collect();
-        let last_action = rows.iter().position(|row| row.contains("reject")).expect("the list");
-        let description = rows.iter().position(|row| row.contains("Opis")).expect("the description");
+        let last_action = rows
+            .iter()
+            .position(|row| row.contains("reject"))
+            .expect("the list");
+        let description = rows
+            .iter()
+            .position(|row| row.contains("Opis"))
+            .expect("the description");
         assert!(description > last_action, "{screen}");
         assert!(screen.contains("↩ wraca do agenta: plan"), "{screen}");
     }
@@ -1206,14 +1388,23 @@ mod task_app_waiting_render {
     fn without_colour_the_markers_survive() {
         let mut app = opened(with_pending(running(), gate()));
         let question = draw_app(&mut app, 120, 40, true);
-        assert!(question.contains('?') && question.contains('↩'), "{question}");
+        assert!(
+            question.contains('?') && question.contains('↩'),
+            "{question}"
+        );
 
         let mut app = opened(with_pending(running(), problem()));
         let problem = draw_app(&mut app, 120, 40, true);
         for marker in ["! Problem", "◆", "◆ dyrygent: Testy przechodzą."] {
-            assert!(problem.contains(marker), "{marker:?} is missing:\n{problem}");
+            assert!(
+                problem.contains(marker),
+                "{marker:?} is missing:\n{problem}"
+            );
         }
-        assert!(problem.contains("variables.summary ◆"), "the proposed value is marked:\n{problem}");
+        assert!(
+            problem.contains("variables.summary ◆"),
+            "the proposed value is marked:\n{problem}"
+        );
     }
 
     #[test]
@@ -1222,8 +1413,14 @@ mod task_app_waiting_render {
         let open = draw_app(&mut app, 120, 40, false);
         press(&mut app, KeyCode::Esc);
         let folded = draw_app(&mut app, 120, 40, false);
-        assert!(open.contains("Akcje") && !folded.contains("Akcje"), "{folded}");
-        assert!(folded.contains("? Pytanie · review_scope") && folded.contains("Tab rozwiń"), "{folded}");
+        assert!(
+            open.contains("Akcje") && !folded.contains("Akcje"),
+            "{folded}"
+        );
+        assert!(
+            folded.contains("? Pytanie · review_scope") && folded.contains("Tab rozwiń"),
+            "{folded}"
+        );
     }
 
     #[test]
@@ -1237,14 +1434,20 @@ mod task_app_waiting_render {
         let mut app = opened(failed);
         let screen = draw_app(&mut app, 120, 40, false);
         assert!(screen.contains("! Nieudany provisioning"), "{screen}");
-        assert!(screen.contains("Uruchom od nowa") && screen.contains("Archiwizuj"), "{screen}");
+        assert!(
+            screen.contains("Uruchom od nowa") && screen.contains("Archiwizuj"),
+            "{screen}"
+        );
         assert!(screen.contains('!'), "the irreversible action is marked");
 
         let mut hostile = gate();
         hostile["instruction"] = json!("pytanie\u{1b}[31m\u{202e}ewil\u{7}");
         let mut app = opened(with_pending(running(), hostile));
         let screen = draw_app(&mut app, 120, 40, false);
-        assert!(!screen.contains('\u{1b}') && !screen.contains('\u{202e}') && !screen.contains('\u{7}'), "{screen}");
+        assert!(
+            !screen.contains('\u{1b}') && !screen.contains('\u{202e}') && !screen.contains('\u{7}'),
+            "{screen}"
+        );
     }
 }
 
@@ -1341,7 +1544,10 @@ mod task_app_actions_render {
     fn the_bar_shows_the_keys_of_the_menu_and_of_the_confirmation() {
         let mut app = opened(running(), ".");
         let menu = draw_app(&mut app, 120, 40, false);
-        assert!(menu.contains("wykonaj") && menu.contains("zamknij"), "{menu}");
+        assert!(
+            menu.contains("wykonaj") && menu.contains("zamknij"),
+            "{menu}"
+        );
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Char('x'));
         let asking = draw_app(&mut app, 120, 40, false);
@@ -1401,11 +1607,17 @@ mod task_app_actions_render {
             menu.contains("przerwij krok !") && menu.contains("archiwizuj !"),
             "{menu}"
         );
-        assert!(menu.contains("niedostępne: zadanie nie jest w kolejce"), "{menu}");
+        assert!(
+            menu.contains("niedostępne: zadanie nie jest w kolejce"),
+            "{menu}"
+        );
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Char('x'));
         let confirm = draw_app(&mut app, 120, 40, true);
-        assert!(confirm.contains("!") && confirm.contains("y potwierdź"), "{confirm}");
+        assert!(
+            confirm.contains("!") && confirm.contains("y potwierdź"),
+            "{confirm}"
+        );
     }
 
     #[test]
@@ -1490,7 +1702,11 @@ mod task_app_actions_render {
         let task = displayed(
             running(),
             "NAR-12",
-            &[("Ji\u{1b}[31mra\u{202e}", "NAR", Some("https://jira.example/x"))],
+            &[(
+                "Ji\u{1b}[31mra\u{202e}",
+                "NAR",
+                Some("https://jira.example/x"),
+            )],
         );
         let mut app = opened(task, "o");
         let screen = draw_app(&mut app, 120, 40, false);
@@ -1531,7 +1747,11 @@ mod task_app_conductor_render {
 
     /// The tab of task `a`, with a short conversation read.
     fn opened(task: narsor::controller_protocol::TaskSummary, read: bool) -> TaskApp {
-        let mut app = TaskApp::new(ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"), "local", None);
+        let mut app = TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        );
         app.load(listing(vec![titled(task, "NAR-12")], "c"));
         press(&mut app, KeyCode::Enter);
         app.detail_mut().set_tab(DetailTab::Conductor);
@@ -1539,14 +1759,23 @@ mod task_app_conductor_render {
             let view = conductor_view(
                 vec![
                     chat_entry("m1", 1, "operator", "message", "Czy revise?", None),
-                    chat_entry("m2", 2, "conductor", "message", "Raczej revise — brak planu migracji.", None),
+                    chat_entry(
+                        "m2",
+                        2,
+                        "conductor",
+                        "message",
+                        "Raczej revise — brak planu migracji.",
+                        None,
+                    ),
                     chat_entry(
                         "d1",
                         3,
                         "conductor",
                         "decision",
                         "Wybrano revise",
-                        Some(json!({ "kind": "choose_output", "decision_id": "d1", "confidence": "low", "rationale": "Brak planu." })),
+                        Some(
+                            json!({ "kind": "choose_output", "decision_id": "d1", "confidence": "low", "rationale": "Brak planu." }),
+                        ),
                     ),
                 ],
                 json!({
@@ -1612,10 +1841,17 @@ mod task_app_conductor_render {
         let width = usize::from(buffer.area.width);
         let fg_of = |needle: &str| {
             let row = row_of(&buffer, needle);
-            let column = rows(&buffer)[row].find(needle).map(|byte| rows(&buffer)[row][..byte].chars().count()).unwrap();
+            let column = rows(&buffer)[row]
+                .find(needle)
+                .map(|byte| rows(&buffer)[row][..byte].chars().count())
+                .unwrap();
             buffer.content()[row * width + column].fg
         };
-        assert_eq!(fg_of("KONDUKTOR"), Color::Magenta, "the role colour of the conductor");
+        assert_eq!(
+            fg_of("KONDUKTOR"),
+            Color::Magenta,
+            "the role colour of the conductor"
+        );
         assert_eq!(fg_of("USER"), Color::Cyan);
         assert_eq!(fg_of("◆ dyrygent"), Color::Magenta);
     }
@@ -1625,9 +1861,15 @@ mod task_app_conductor_render {
         let mut app = opened(running(), true);
         let buffer = draw_app(&mut app, 120, 30, true);
         let text = screen(&buffer);
-        assert!(text.contains("USER") && text.contains("KONDUKTOR") && text.contains("◆ dyrygent"), "{text}");
         assert!(
-            buffer.content().iter().all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset),
+            text.contains("USER") && text.contains("KONDUKTOR") && text.contains("◆ dyrygent"),
+            "{text}"
+        );
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset),
             "NO_COLOR draws no colour at all"
         );
     }
@@ -1642,22 +1884,37 @@ mod task_app_conductor_render {
         let text = screen(&draw_app(&mut app, 120, 30, false));
         assert!(text.contains("wiadomość (wymagane)"), "{text}");
         assert!(text.contains("> Dlaczego?▏"), "{text}");
-        assert!(text.contains("Enter wyślij") && text.contains("Alt+Enter nowa linia"), "{text}");
+        assert!(
+            text.contains("Enter wyślij") && text.contains("Alt+Enter nowa linia"),
+            "{text}"
+        );
         assert!(text.contains("Esc koniec pisania"), "{text}");
 
         press(&mut app, KeyCode::Esc);
         let text = screen(&draw_app(&mut app, 120, 30, false));
-        assert!(text.contains("✎ szkic: Dlaczego?"), "the draft stays in view:\n{text}");
+        assert!(
+            text.contains("✎ szkic: Dlaczego?"),
+            "the draft stays in view:\n{text}"
+        );
     }
 
     #[test]
     fn a_task_without_a_conductor_shows_the_reason_and_not_the_box() {
-        let mut app = opened(without_conductor(running(), "brak harnessu dyrygenta"), false);
+        let mut app = opened(
+            without_conductor(running(), "brak harnessu dyrygenta"),
+            false,
+        );
         let text = screen(&draw_app(&mut app, 120, 30, false));
-        assert!(text.contains("◆ dyrygent niedostępny: brak harnessu dyrygenta"), "{text}");
+        assert!(
+            text.contains("◆ dyrygent niedostępny: brak harnessu dyrygenta"),
+            "{text}"
+        );
         assert!(!text.contains("c napisz"), "{text}");
         let buffer = draw_app(&mut app, 100, 30, true);
-        assert!(screen(&buffer).contains("dyrygent niedostępny"), "no colour, still said in words");
+        assert!(
+            screen(&buffer).contains("dyrygent niedostępny"),
+            "no colour, still said in words"
+        );
     }
 
     #[test]
@@ -1714,7 +1971,10 @@ mod task_app_create_render {
         );
         app.set_capabilities(capabilities(true, None));
         app.load(listing(
-            vec![titled(queued("a", 1), "NAR-14"), titled(queued("b", 2), "NAR-12")],
+            vec![
+                titled(queued("a", 1), "NAR-14"),
+                titled(queued("b", 2), "NAR-12"),
+            ],
             "c",
         ));
         app
@@ -1728,8 +1988,18 @@ mod task_app_create_render {
                     "implement-feature",
                     "Pełny cykl: plan, implementacja, review, testy i PR.",
                     vec![
-                        workflow_input("ticket_id", ParamType::String, true, Some("numer zgłoszenia")),
-                        workflow_input("attempts", ParamType::Integer, false, Some("ile razy ponawiać")),
+                        workflow_input(
+                            "ticket_id",
+                            ParamType::String,
+                            true,
+                            Some("numer zgłoszenia"),
+                        ),
+                        workflow_input(
+                            "attempts",
+                            ParamType::Integer,
+                            false,
+                            Some("ile razy ponawiać"),
+                        ),
                         workflow_input("dry_run", ParamType::Boolean, false, None),
                         workflow_input("target_repo", ParamType::Repository, false, None),
                     ],
@@ -1828,7 +2098,10 @@ mod task_app_create_render {
     #[test]
     fn a_path_that_cannot_be_used_is_grey_and_says_why() {
         let mut app = app();
-        app.set_capabilities(capabilities(false, Some("serwer zdalny nie czyta plików z dysku")));
+        app.set_capabilities(capabilities(
+            false,
+            Some("serwer zdalny nie czyta plików z dysku"),
+        ));
         open_form(&mut app);
         keys(&mut app, "jj");
         let screen = draw_app(&mut app, 130, 34, false);
@@ -1880,15 +2153,26 @@ mod task_app_create_render {
             panic!("a send was expected");
         };
         let sending = draw_app(&mut app, 130, 30, false);
-        for expected in ["↻ NAR-18", "wysyłanie…", "Serwer jeszcze nie potwierdził zadania"] {
+        for expected in [
+            "↻ NAR-18",
+            "wysyłanie…",
+            "Serwer jeszcze nie potwierdził zadania",
+        ] {
             assert!(sending.contains(expected), "{expected}:\n{sending}");
         }
-        assert!(sending.contains("NAR-14"), "the rows above stay:\n{sending}");
+        assert!(
+            sending.contains("NAR-14"),
+            "the rows above stay:\n{sending}"
+        );
 
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             app.perform(Request::SendTask(id.clone())).await;
-            app.retry_outgoing_if_due(Instant::now() + std::time::Duration::from_secs(5)).await;
+            app.retry_outgoing_if_due(Instant::now() + std::time::Duration::from_secs(5))
+                .await;
         });
         let unsent = draw_app(&mut app, 130, 30, false);
         for expected in ["✗ NAR-18", "nie wysłano", "Dane zostały zachowane", &id] {
@@ -1919,7 +2203,10 @@ mod task_app_create_render {
         ] {
             assert!(screen.contains(expected), "{expected}:\n{screen}");
         }
-        assert!(!screen.contains("NAR-14"), "the task list gives way:\n{screen}");
+        assert!(
+            !screen.contains("NAR-14"),
+            "the task list gives way:\n{screen}"
+        );
     }
 
     #[test]
@@ -1931,12 +2218,18 @@ mod task_app_create_render {
             Ok(LegacyExecutionListResponse { executions: vec![] }),
         );
         let list = draw_app(&mut app, 80, 24, false);
-        assert!(list.contains("Historia") && list.contains("NAR-9"), "{list}");
+        assert!(
+            list.contains("Historia") && list.contains("NAR-9"),
+            "{list}"
+        );
         assert!(!list.contains("Przebieg"), "{list}");
         press(&mut app, KeyCode::Enter);
         let details = draw_app(&mut app, 80, 24, false);
         assert!(details.contains("Przebieg"), "{details}");
-        assert!(details.contains("lista"), "the way back is on the bar:\n{details}");
+        assert!(
+            details.contains("lista"),
+            "the way back is on the bar:\n{details}"
+        );
     }
 
     #[test]
@@ -1966,7 +2259,13 @@ mod task_app_create_render {
         press(&mut app, KeyCode::Enter);
         keys(&mut app, "evil");
         let form = draw_app(&mut app, 130, 30, false);
-        for expected in ["nowe repozytorium", "dodaj repozytorium", "id", "remote", "(wymagane)"] {
+        for expected in [
+            "nowe repozytorium",
+            "dodaj repozytorium",
+            "id",
+            "remote",
+            "(wymagane)",
+        ] {
             assert!(form.contains(expected), "{expected}:\n{form}");
         }
     }
@@ -1975,10 +2274,18 @@ mod task_app_create_render {
     fn removing_a_repository_asks_in_the_window_of_every_action_with_a_bang() {
         let mut app = app();
         keys(&mut app, "R");
-        app.open_repositories(registry(vec![repository("docs", "git@github.com:acme/docs.git")]));
+        app.open_repositories(registry(vec![repository(
+            "docs",
+            "git@github.com:acme/docs.git",
+        )]));
         keys(&mut app, "d");
         let screen = draw_app(&mut app, 130, 30, false);
-        for expected in ["Usuń repozytorium !", "Usuwa repozytorium docs", "potwierdź", "anuluj"] {
+        for expected in [
+            "Usuń repozytorium !",
+            "Usuwa repozytorium docs",
+            "potwierdź",
+            "anuluj",
+        ] {
             assert!(screen.contains(expected), "{expected}:\n{screen}");
         }
     }
@@ -2005,7 +2312,9 @@ mod task_app_main_screen {
     #[tokio::test]
     async fn the_main_screen_of_the_origin_is_drawn_from_a_real_control_plane() {
         let harness = RemoteHarness::start().await;
-        harness.running("NAR-14", "backend-b", snapshot(1, None)).await;
+        harness
+            .running("NAR-14", "backend-b", snapshot(1, None))
+            .await;
         let mut waiting = snapshot(1, Some("in-1"));
         waiting.attention = vec![AttentionItem {
             kind: AttentionKind::Approval,
@@ -2027,7 +2336,11 @@ mod task_app_main_screen {
 
         // The frame: the connection by name and state, the counters.
         assert!(rows[0].contains("narsor · local ● live"), "{}", rows[0]);
-        assert!(rows[0].contains("? 1") && rows[0].contains("! 0"), "{}", rows[0]);
+        assert!(
+            rows[0].contains("? 1") && rows[0].contains("! 0"),
+            "{}",
+            rows[0]
+        );
         assert!(rows[0].contains("sloty"), "{}", rows[0]);
 
         // The list, in the order of the queue, one row per task: attention,
@@ -2041,8 +2354,16 @@ mod task_app_main_screen {
                 .find(|row| row.contains(title))
                 .unwrap_or_else(|| panic!("no row for {title}:\n{screen}"))
         };
-        assert!(row_of("NAR-14").starts_with("│ ● NAR-14"), "{}", row_of("NAR-14"));
-        assert!(row_of("NAR-12").starts_with("│?● NAR-12"), "{}", row_of("NAR-12"));
+        assert!(
+            row_of("NAR-14").starts_with("│ ● NAR-14"),
+            "{}",
+            row_of("NAR-14")
+        );
+        assert!(
+            row_of("NAR-12").starts_with("│?● NAR-12"),
+            "{}",
+            row_of("NAR-12")
+        );
         assert!(row_of("NAR-16").starts_with("│ ◷ NAR-16") && row_of("NAR-16").contains("#1"));
         assert!(row_of("NAR-17").starts_with("│ ◷ NAR-17") && row_of("NAR-17").contains("#2"));
         let order: Vec<usize> = ["NAR-14", "NAR-12", "NAR-16", "NAR-17"]
@@ -2057,12 +2378,23 @@ mod task_app_main_screen {
 
         // The details of the selected task: header, tabs, and the panel of
         // what waits for the operator, with its own keys on the bar.
-        assert!(rows[1].contains("NAR-12") && rows[1].contains("implement-feature v1"), "{}", rows[1]);
+        assert!(
+            rows[1].contains("NAR-12") && rows[1].contains("implement-feature v1"),
+            "{}",
+            rows[1]
+        );
         assert!(rows[2].contains("● running"), "{}", rows[2]);
-        assert!(rows[3].contains("Przebieg") && rows[3].contains("Dyrygent") && rows[3].contains("Info"));
+        assert!(
+            rows[3].contains("Przebieg")
+                && rows[3].contains("Dyrygent")
+                && rows[3].contains("Info")
+        );
         assert!(screen.contains("? Approval · review"), "{screen}");
         assert!(screen.contains("Approve the plan?"), "{screen}");
         let bar = &rows[rows.len() - 2];
-        assert!(bar.contains("Enter wyślij") && bar.contains("Esc zwiń"), "{bar}");
+        assert!(
+            bar.contains("Enter wyślij") && bar.contains("Esc zwiń"),
+            "{bar}"
+        );
     }
 }

@@ -232,6 +232,7 @@ pub struct InputSchema {
 pub enum ParamTypeSchema {
     #[default]
     String,
+    Text,
     Integer,
     Boolean,
     Repository,

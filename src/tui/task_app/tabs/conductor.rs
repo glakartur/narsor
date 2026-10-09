@@ -61,12 +61,12 @@ use crate::tui::keymap::{key_of, Action, Context};
 use crate::tui::style::{Role, Styles};
 use crate::tui::transcript::{DisplayMode, TranscriptId, TranscriptState};
 
-use super::super::layout::first_row;
 use super::super::super::scroll::one_line;
 use super::super::actions::{
     ActionSend, ConductorSent, Confirmation, Confirmed, HarnessList, Overlay,
 };
 use super::super::detail::short_age;
+use super::super::layout::first_row;
 use super::super::list::fit;
 use super::super::notify::Severity;
 use super::super::{DetailTab, Focus, Request, TaskApp};

@@ -67,13 +67,15 @@ impl OperatorPanel {
                 view.proposals
                     .iter()
                     .filter(|proposal| proposal.state == ProposalState::Pending)
-                    .filter(|proposal| match (report, proposal.record.episode.as_deref()) {
-                        (Some(report), Some(episode)) => {
-                            episode == report.key || episode == report.episode
-                        }
-                        (None, Some(episode)) => episode == failure_key,
-                        (_, None) => false,
-                    })
+                    .filter(
+                        |proposal| match (report, proposal.record.episode.as_deref()) {
+                            (Some(report), Some(episode)) => {
+                                episode == report.key || episode == report.episode
+                            }
+                            (None, Some(episode)) => episode == failure_key,
+                            (_, None) => false,
+                        },
+                    )
                     .collect()
             })
             .unwrap_or_default();
@@ -202,7 +204,10 @@ impl OperatorPanel {
                 self.context
                     .push(ContextLine::conductor(format!("◆ diagnoza: {diagnosis}")));
                 if let Some(proposal) = reasoned {
-                    self.push_reasoning(proposal.record.confidence, proposal.record.rationale.as_deref());
+                    self.push_reasoning(
+                        proposal.record.confidence,
+                        proposal.record.rationale.as_deref(),
+                    );
                 }
                 return;
             }
@@ -243,8 +248,9 @@ impl OperatorPanel {
             )));
         }
         if let Some(rationale) = rationale {
-            self.context
-                .push(ContextLine::conductor(format!("◆ uzasadnienie: {rationale}")));
+            self.context.push(ContextLine::conductor(format!(
+                "◆ uzasadnienie: {rationale}"
+            )));
         }
     }
 
@@ -253,7 +259,10 @@ impl OperatorPanel {
             "◆ dyrygent proponuje: {}",
             proposal_text(proposal)
         )));
-        self.push_reasoning(proposal.record.confidence, proposal.record.rationale.as_deref());
+        self.push_reasoning(
+            proposal.record.confidence,
+            proposal.record.rationale.as_deref(),
+        );
     }
 
     /// Two entries for `proposal`: confirm (the conductor's recommendation)
@@ -268,7 +277,8 @@ impl OperatorPanel {
             description.push_str(&format!("\nPewność: {}", confidence_word(confidence)));
         }
         let short: String = text.chars().take(LIST_SUMMARY_WIDTH).collect();
-        let mut confirm = ChooserItem::new(format!("Potwierdź: {short}"), description).recommended();
+        let mut confirm =
+            ChooserItem::new(format!("Potwierdź: {short}"), description).recommended();
         match proposal.record.proposal.kind {
             ProposalKind::Retry | ProposalKind::MessageAgent => {
                 confirm = confirm.resuming(self.state_id.clone().unwrap_or_default());

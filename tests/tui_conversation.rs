@@ -605,8 +605,12 @@ mod conductor_chat {
         assert_eq!(items[0].label.as_deref(), Some("approved"));
         assert_eq!(items[0].confidence, Some(Confidence::High));
         let lines = tab_entry(&items[0], None).rendered_lines;
-        assert!(lines.iter().any(|line| line.contains("(propozycja: czeka na Ciebie")));
-        assert!(lines.iter().any(|line| line.contains("dlaczego: It is ready.")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("(propozycja: czeka na Ciebie")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("dlaczego: It is ready.")));
 
         let rejected = entry(
             2,

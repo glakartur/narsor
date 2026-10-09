@@ -278,7 +278,7 @@ fn declared_input_names(definition: &WorkflowDefinition) -> String {
 /// from guessing at the text.
 fn parse_input_value(parameter: &InputParameter, raw: &str) -> Result<Value> {
     match parameter.param_type {
-        ParamType::String | ParamType::Repository => Ok(Value::String(raw.to_string())),
+        ParamType::String | ParamType::Text | ParamType::Repository => Ok(Value::String(raw.to_string())),
         ParamType::Integer => raw.parse::<i64>().map(Value::from).map_err(|_| {
             CliError::usage(format!(
                 "Input '{}' is of type integer, and '{raw}' is not a whole number.",
@@ -1373,10 +1373,7 @@ pub fn tui(config: &Resolved, flags: &Flags, target: &crate::api::ServerTarget) 
     let refresh_interval = config
         .tui_refresh_interval()
         .map(std::time::Duration::from_secs);
-    let connection_name = target
-        .server
-        .clone()
-        .unwrap_or_else(|| "local".to_string());
+    let connection_name = target.server.clone().unwrap_or_else(|| "local".to_string());
     tokio::task::block_in_place(move || {
         handle.block_on(async {
             let client = crate::api::connect(target, &state, flags)

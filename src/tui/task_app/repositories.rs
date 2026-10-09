@@ -28,9 +28,9 @@ use ratatui::Frame;
 use crate::api::ClientError;
 use crate::controller_protocol::{CreateRepositoryRequest, RepositoryListResponse, RepositoryView};
 
-use super::super::scroll::one_line;
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
 use super::super::keymap::{self, Action, Context};
+use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 use super::actions::{chooser_context, Confirmation, Confirmed, Overlay};
 use super::notify::Severity;

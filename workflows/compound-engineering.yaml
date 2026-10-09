@@ -12,7 +12,7 @@ description: >
 
 inputs:
   - name: feature_description
-    type: string
+    type: text
     required: true
     description: The idea, problem or feature to explore, plan and ship.
   - name: target_repo

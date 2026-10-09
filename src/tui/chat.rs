@@ -265,10 +265,7 @@ pub fn tab_entry(item: &ChatItem, proposal: Option<&ProposalView>) -> Transcript
             why.push(format!("pewność: {}", confidence.name()));
         }
         if let Some(rationale) = &item.rationale {
-            why.push(format!(
-                "dlaczego: {}",
-                one_line(rationale)
-            ));
+            why.push(format!("dlaczego: {}", one_line(rationale)));
         }
         if !why.is_empty() {
             lines.push(why.join(" · "));
@@ -299,19 +296,13 @@ pub fn undo_lines(item: &ChatItem) -> Vec<String> {
         one_line(&item.entry.text)
     )];
     if let Some(label) = &item.label {
-        lines.push(format!(
-            "Wybrane wyjście: {}",
-            one_line(label)
-        ));
+        lines.push(format!("Wybrane wyjście: {}", one_line(label)));
     }
     if let Some(confidence) = item.confidence {
         lines.push(format!("Pewność dyrygenta: {}", confidence.name()));
     }
     if let Some(rationale) = &item.rationale {
-        lines.push(format!(
-            "Uzasadnienie: {}",
-            one_line(rationale)
-        ));
+        lines.push(format!("Uzasadnienie: {}", one_line(rationale)));
     }
     lines.push("! Krok, który ruszył po tej decyzji, zachowuje swoje skutki uboczne.".to_string());
     lines

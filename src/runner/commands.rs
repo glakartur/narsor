@@ -124,8 +124,7 @@ impl Session {
             pass.abort();
         }
         // The claim goes with the dropped pass; settling takes it.
-        let own_finished =
-            joined(own, "the pass finished before the interrupt reached it").await;
+        let own_finished = joined(own, "the pass finished before the interrupt reached it").await;
         let conductor_finished = joined(
             conductor,
             "the conductor's pass finished before the interrupt reached it",

@@ -118,14 +118,14 @@ fn spawn_daemon(root: &Path) -> DaemonGuard {
     DaemonGuard::new(
         root,
         Command::new(env!("CARGO_BIN_EXE_narsor"))
-        .arg("--root")
-        .arg(root)
-        .arg("daemon")
-        .env("PATH", engine_support::fake_claude_first_on_path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the daemon"),
+            .arg("--root")
+            .arg(root)
+            .arg("daemon")
+            .env("PATH", engine_support::fake_claude_first_on_path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the daemon"),
     )
 }
 

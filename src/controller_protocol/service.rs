@@ -1552,7 +1552,10 @@ impl ProtocolService {
         let task_id = &identity.task_id;
         let failed = self.lock_pages().take(request_id, task_id).is_some()
             || self.lock_event_reads().take(request_id, task_id).is_some()
-            || self.lock_conductor_reads().take(request_id, task_id).is_some();
+            || self
+                .lock_conductor_reads()
+                .take(request_id, task_id)
+                .is_some();
         Ok(ConversationPageAccepted { delivered: failed })
     }
 

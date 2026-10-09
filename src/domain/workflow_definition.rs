@@ -115,6 +115,8 @@ pub enum WorkspaceSpec {
 pub enum ParamType {
     #[default]
     String,
+    /// Multi-line text: a string whose value is prose, shown as a large field in the TUI.
+    Text,
     Integer,
     Boolean,
     Repository,

@@ -288,7 +288,7 @@ fn declared_names(declared: &[WorkflowInputView]) -> String {
 
 fn typed_value(input: &WorkflowInputView, raw: &str) -> Result<Value> {
     match input.input_type {
-        ParamType::String | ParamType::Repository => Ok(Value::String(raw.to_string())),
+        ParamType::String | ParamType::Text | ParamType::Repository => Ok(Value::String(raw.to_string())),
         ParamType::Integer => raw.parse::<i64>().map(Value::from).map_err(|_| {
             CliError::usage(format!(
                 "Input '{}' is of type integer, and '{raw}' is not a whole number.",

@@ -20,6 +20,11 @@ use clap::Subcommand;
 use futures::StreamExt as _;
 use serde_json::{Map, Value};
 
+use super::task_text::{
+    age, awaiting_input, command_outcome, conversation_lines, default_backend_line, detail_lines,
+    lifecycle_name, list_line, next_waiting, safe_json, status_badge, waiting_summary,
+    PAGE_BYTE_BUDGET,
+};
 use crate::api::{
     ApiClient, ClientError, ConversationResponse as PageResponse, ServerTarget, TokenSource,
 };
@@ -39,11 +44,6 @@ use crate::orchestration::{
 };
 use crate::persistence::StatePaths;
 use crate::tui::conversation::classify;
-use super::task_text::{
-    age, awaiting_input, command_outcome, conversation_lines, default_backend_line, detail_lines,
-    lifecycle_name, list_line, next_waiting, safe_json, status_badge, waiting_summary,
-    PAGE_BYTE_BUDGET,
-};
 use crate::workflows::WorkflowResolver;
 
 use super::commands::{CliError, Result};

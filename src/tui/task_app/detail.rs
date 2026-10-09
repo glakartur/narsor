@@ -59,8 +59,8 @@ use crate::domain::ExecutionStatus;
 use crate::engine::ConversationState;
 use crate::orchestration::{QueueReason, TaskLifecycle};
 
-use super::super::scroll::one_line;
 use super::super::keymap::Action;
+use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 use super::list::{fit, state_icon, title_of};
 use super::tabs::conductor::{self, Conductor};
@@ -283,7 +283,10 @@ pub fn hyperlinks_supported(var: impl Fn(&str) -> Option<String>) -> bool {
         return true;
     }
     if var("TERM_PROGRAM").is_some_and(|program| {
-        matches!(program.as_str(), "iTerm.app" | "WezTerm" | "vscode" | "ghostty" | "Hyper")
+        matches!(
+            program.as_str(),
+            "iTerm.app" | "WezTerm" | "vscode" | "ghostty" | "Hyper"
+        )
     }) {
         return true;
     }
@@ -316,14 +319,18 @@ pub struct Areas {
 /// below one row.
 pub fn areas(area: Rect, panel_height: u16) -> Areas {
     let header = Rect::new(area.x, area.y, area.width, 2.min(area.height));
-    let tabs = Rect::new(area.x, area.y + header.height, area.width, 1.min(area.height - header.height));
+    let tabs = Rect::new(
+        area.x,
+        area.y + header.height,
+        area.width,
+        1.min(area.height - header.height),
+    );
     let used = header.height + tabs.height;
     let remaining = area.height - used;
     let panel_height = panel_height.min(remaining.saturating_sub(1));
     let content = Rect::new(area.x, area.y + used, area.width, remaining - panel_height);
-    let panel = (panel_height > 0).then(|| {
-        Rect::new(area.x, content.y + content.height, area.width, panel_height)
-    });
+    let panel = (panel_height > 0)
+        .then(|| Rect::new(area.x, content.y + content.height, area.width, panel_height));
     Areas {
         header,
         tabs,
@@ -372,12 +379,18 @@ impl TaskApp {
         match read {
             DetailRead::Timeline(result) => {
                 let result = self.settle(result);
-                self.detail.view_mut(task_id).progress.apply(revision, result);
+                self.detail
+                    .view_mut(task_id)
+                    .progress
+                    .apply(revision, result);
                 self.reread_waiting(task_id);
             }
             DetailRead::Events { after, result } => {
                 let result = self.settle(result);
-                self.detail.view_mut(task_id).events.apply(revision, after, result);
+                self.detail
+                    .view_mut(task_id)
+                    .events
+                    .apply(revision, after, result);
             }
             DetailRead::Attempt {
                 attempt_id,
@@ -502,8 +515,11 @@ impl TaskApp {
                 after,
                 limit: Some(events::PAGE_LIMIT),
             };
-            let result =
-                bounded_read(RELAYED_READ_LIMIT, client.control_execution_events(id, &query)).await;
+            let result = bounded_read(
+                RELAYED_READ_LIMIT,
+                client.control_execution_events(id, &query),
+            )
+            .await;
             let more = matches!(
                 &result,
                 Ok(ExecutionEventsResponse::Available { events, has_more: true, .. })
@@ -546,12 +562,21 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
     // A task created here that the server has not confirmed has no summary
     // yet: its row says where it stands (the new-task form).
     if let Some(pending) = app.list().selected_pending().cloned() {
-        super::new_task::render_pending(frame, area, &pending, app.send_data(&pending.task_id), styles);
+        super::new_task::render_pending(
+            frame,
+            area,
+            &pending,
+            app.send_data(&pending.task_id),
+            styles,
+        );
         return;
     }
     let Some(view) = app.detail_view() else {
         frame.render_widget(
-            Paragraph::new(Line::styled("brak zaznaczonego zadania", styles.of(Role::Done))),
+            Paragraph::new(Line::styled(
+                "brak zaznaczonego zadania",
+                styles.of(Role::Done),
+            )),
             area,
         );
         return;
@@ -593,10 +618,20 @@ pub(super) fn render_view(
         panel_focused,
         hyperlinks,
     } = options;
-    let panel_height = view.detail.waiting.preferred_height(area.width, area.height);
+    let panel_height = view
+        .detail
+        .waiting
+        .preferred_height(area.width, area.height);
     let parts = areas(area, panel_height);
 
-    let (lines, spots) = header(view.task, view.queue_place, &view.detail.progress, styles, stale, area.width);
+    let (lines, spots) = header(
+        view.task,
+        view.queue_place,
+        &view.detail.progress,
+        styles,
+        stale,
+        area.width,
+    );
     frame.render_widget(Paragraph::new(lines), parts.header);
     if hyperlinks {
         link_spots(frame.buffer_mut(), parts.header, &spots);
@@ -610,7 +645,10 @@ pub(super) fn render_view(
     let unstarted = unstarted_message(view.task, view.queue_place);
     match (view.tab, unstarted) {
         (
-            DetailTab::Progress | DetailTab::Conversation | DetailTab::Events | DetailTab::Conductor,
+            DetailTab::Progress
+            | DetailTab::Conversation
+            | DetailTab::Events
+            | DetailTab::Conductor,
             Some(message),
         ) => {
             frame.render_widget(
@@ -634,10 +672,24 @@ pub(super) fn render_view(
             events::render(frame, content, styles, &mut view.detail.events, stale);
         }
         (DetailTab::Conductor, None) => {
-            conductor::render(frame, content, styles, &mut view.detail.conductor, view.task, stale);
+            conductor::render(
+                frame,
+                content,
+                styles,
+                &mut view.detail.conductor,
+                view.task,
+                stale,
+            );
         }
         (DetailTab::Info, _) => {
-            info::render(frame, content, styles, &mut view.detail.info, view.task, stale);
+            info::render(
+                frame,
+                content,
+                styles,
+                &mut view.detail.info,
+                view.task,
+                stale,
+            );
         }
     }
     if let Some(panel) = parts.panel {
@@ -649,7 +701,12 @@ pub(super) fn render_view(
 
 /// The tab titles, the active one in the focus role while the details have
 /// the keyboard.
-fn tab_bar(active: DetailTab, progress: &Progress, focused: bool, styles: &Styles) -> Line<'static> {
+fn tab_bar(
+    active: DetailTab,
+    progress: &Progress,
+    focused: bool,
+    styles: &Styles,
+) -> Line<'static> {
     let mut spans = Vec::new();
     for tab in DetailTab::ALL {
         let style = if tab == active {
@@ -708,7 +765,11 @@ fn header(
     let mut column = 0usize;
     for link in &task.display.links {
         let (text, url) = link_text(link);
-        let role = if url.is_some() { Role::Link } else { Role::Done };
+        let role = if url.is_some() {
+            Role::Link
+        } else {
+            Role::Done
+        };
         let span = Span::styled(text, styles.of(if stale { Role::Done } else { role }));
         if let Some(url) = url {
             if let (Ok(column), Ok(width)) = (u16::try_from(column), u16::try_from(span.width())) {
@@ -781,7 +842,10 @@ fn status_parts(
     if let Some(seconds) = elapsed(task) {
         parts.push((short_age(seconds), Role::Done));
     }
-    if matches!(task.lifecycle, TaskLifecycle::Provisioning | TaskLifecycle::Running) {
+    if matches!(
+        task.lifecycle,
+        TaskLifecycle::Provisioning | TaskLifecycle::Running
+    ) {
         if let Some(offline) = controller_offline(task) {
             parts.push((offline, Role::Attention));
         }
@@ -809,7 +873,10 @@ fn controller_offline(task: &TaskSummary) -> Option<String> {
     match &task.controller {
         Some(controller) if controller.freshness == Freshness::Live => None,
         Some(controller) => Some(match controller.last_heartbeat_at {
-            Some(at) => format!("kontroler offline {}", short_age((task.as_of - at).num_seconds())),
+            Some(at) => format!(
+                "kontroler offline {}",
+                short_age((task.as_of - at).num_seconds())
+            ),
             None => "kontroler offline".to_string(),
         }),
         None => Some("brak kontrolera".to_string()),
@@ -852,7 +919,8 @@ pub fn queue_text(task: &TaskSummary, queue_place: Option<usize>) -> String {
 /// but printable ASCII, which rules out ESC, BEL, C1 controls, spaces and
 /// bidirectional overrides that could end the sequence or disguise the target.
 fn is_safe_link_target(url: &str) -> bool {
-    (url.starts_with("http://") || url.starts_with("https://")) && url.chars().all(|c| c.is_ascii_graphic())
+    (url.starts_with("http://") || url.starts_with("https://"))
+        && url.chars().all(|c| c.is_ascii_graphic())
 }
 
 /// Makes the links at `spots` clickable by writing OSC 8 into the buffer.
@@ -869,7 +937,8 @@ fn link_spots(buffer: &mut Buffer, header: Rect, spots: &[LinkSpot]) {
     let y = header.y + 1;
     for spot in spots {
         let end = u32::from(spot.column) + u32::from(spot.width);
-        let (Some(width), true) = (NonZeroU16::new(spot.width), end <= u32::from(header.width)) else {
+        let (Some(width), true) = (NonZeroU16::new(spot.width), end <= u32::from(header.width))
+        else {
             continue;
         };
         if !is_safe_link_target(&spot.url) {

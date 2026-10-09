@@ -140,9 +140,7 @@ impl From<OrchestrationError> for ProtocolError {
             E::Persistence(_)
             | E::UnsupportedRecordVersion { .. }
             | E::LegacyRecordAppeared { .. }
-            | E::Lock { .. } => {
-                Self::Internal(message)
-            }
+            | E::Lock { .. } => Self::Internal(message),
         }
     }
 }

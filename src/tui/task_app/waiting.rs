@@ -59,18 +59,18 @@ use crate::controller_protocol::{
 use crate::engine::{HumanInputDelivery, Position, PositionStatus};
 use crate::orchestration::{AttentionItem, AttentionKind, OperatorCommand, OwnerCommand};
 
-use super::super::scroll::one_line;
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserFocus, ChooserItem, Submission};
 use super::super::failure_form::OperatorPanel;
 use super::super::input_form::{ContextLine, InputPanel, Tone};
 use super::super::keymap::{self, Action, Context};
+use super::super::scroll::one_line;
 use super::super::scroll::{wrap_line, ScrollState};
 use super::super::style::{Role, Styles};
 use super::detail::short_age;
 use super::list::title_of;
 use super::notify::Severity;
 use super::tabs::conductor;
-use super::{idempotency_key, failure_reason, Request, TaskApp};
+use super::{failure_reason, idempotency_key, Request, TaskApp};
 
 /// The most rows of the context the panel gives itself before it scrolls.
 const MAX_CONTEXT_ROWS: usize = 4;
@@ -288,7 +288,9 @@ impl Entry {
                     let state_of = |attempt: &str| {
                         positions
                             .iter()
-                            .find(|position| position.action_execution_id.as_deref() == Some(attempt))
+                            .find(|position| {
+                                position.action_execution_id.as_deref() == Some(attempt)
+                            })
                             .map(|position| position.state_id.clone())
                     };
                     Model::Input(InputPanel::new(&pending.form, &state_of))
@@ -355,7 +357,11 @@ impl Entry {
         let chooser = std::mem::replace(&mut self.chooser, Chooser::new(Vec::new()));
         // An operator who has not moved from the opening entry follows the
         // recommendation to wherever the new build puts it.
-        let opening = self.model.items().get(self.model.selected()).map(|item| item.label.clone());
+        let opening = self
+            .model
+            .items()
+            .get(self.model.selected())
+            .map(|item| item.label.clone());
         let untouched = chooser.focus() == ChooserFocus::Actions
             && chooser.selected_item().map(|item| &item.label) == opening.as_ref();
         let rebuilt = chooser.rebuilt(model.items());
@@ -393,8 +399,12 @@ impl Entry {
     /// `?` for what asks, `!` for what is wrong.
     fn glyph(&self) -> char {
         match self.item.kind {
-            AttentionKind::Question | AttentionKind::Approval | AttentionKind::ConductorProposal => '?',
-            AttentionKind::Problem | AttentionKind::FailedStep | AttentionKind::ProvisioningFailed => '!',
+            AttentionKind::Question
+            | AttentionKind::Approval
+            | AttentionKind::ConductorProposal => '?',
+            AttentionKind::Problem
+            | AttentionKind::FailedStep
+            | AttentionKind::ProvisioningFailed => '!',
         }
     }
 
@@ -566,7 +576,11 @@ impl WaitingPanel {
             Err(_) => return,
         }
         let conductor = self.conductor.as_ref();
-        for entry in self.entries.iter_mut().filter(|entry| entry.wants_conductor()) {
+        for entry in self
+            .entries
+            .iter_mut()
+            .filter(|entry| entry.wants_conductor())
+        {
             entry.rebuild(task, positions, conductor);
         }
     }
@@ -589,7 +603,10 @@ impl WaitingPanel {
         let mut old = std::mem::take(&mut self.entries);
         let mut entries = Vec::with_capacity(task.attention.len());
         for item in &task.attention {
-            match old.iter().position(|entry| entry.item.waiting_id == item.waiting_id) {
+            match old
+                .iter()
+                .position(|entry| entry.item.waiting_id == item.waiting_id)
+            {
                 Some(index) => {
                     let mut entry = old.remove(index);
                     if matches!(entry.model, Model::Missing) {
@@ -603,7 +620,14 @@ impl WaitingPanel {
         for gone in old {
             if gone.is_drafted() {
                 self.released.push(Released {
-                    title: format!("{} · {}", gone.kind_word(), gone.item.state_id.as_deref().map_or_else(String::new, one_line)),
+                    title: format!(
+                        "{} · {}",
+                        gone.kind_word(),
+                        gone.item
+                            .state_id
+                            .as_deref()
+                            .map_or_else(String::new, one_line)
+                    ),
                     text: gone.chooser.draft_text(),
                 });
                 effect.released = true;
@@ -614,7 +638,11 @@ impl WaitingPanel {
         }
         self.entries = entries;
         self.current = shown
-            .and_then(|id| self.entries.iter().position(|entry| entry.item.waiting_id == id))
+            .and_then(|id| {
+                self.entries
+                    .iter()
+                    .position(|entry| entry.item.waiting_id == id)
+            })
             .unwrap_or(0);
         effect
     }
@@ -643,7 +671,9 @@ impl WaitingPanel {
                 }
                 Some(Action::Bottom) => {
                     // The row count is only known to the drawing, which clamps.
-                    self.entries[self.current].context_scroll.set_offset(usize::MAX, usize::MAX);
+                    self.entries[self.current]
+                        .context_scroll
+                        .set_offset(usize::MAX, usize::MAX);
                     return PanelEffect::None;
                 }
                 _ => {}
@@ -863,7 +893,14 @@ impl WaitingPanel {
         ])
         .areas(inner);
 
-        render_context(frame, context_area, &rows, &mut entry.context_scroll, styles, stale);
+        render_context(
+            frame,
+            context_area,
+            &rows,
+            &mut entry.context_scroll,
+            styles,
+            stale,
+        );
         let lines: Vec<Line> = notices
             .iter()
             .map(|(role, text)| Line::styled(text.clone(), styles.of(*role)))
@@ -875,7 +912,11 @@ impl WaitingPanel {
     fn render_released(&self, frame: &mut Frame, area: Rect, styles: &Styles, focused: bool) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(styles.of(if focused { Role::Focus } else { Role::Attention }))
+            .border_style(styles.of(if focused {
+                Role::Focus
+            } else {
+                Role::Attention
+            }))
             .title(Line::styled(
                 " Szkic bez oczekiwania — skopiuj; Esc go usuwa ",
                 styles.of(Role::Attention),
@@ -884,7 +925,10 @@ impl WaitingPanel {
         frame.render_widget(block, area);
         let mut lines = Vec::new();
         for released in &self.released {
-            lines.push(Line::styled(one_line(&released.title), styles.of(Role::Done)));
+            lines.push(Line::styled(
+                one_line(&released.title),
+                styles.of(Role::Done),
+            ));
             for line in released.text.lines() {
                 lines.push(Line::raw(one_line(line)));
             }
@@ -1017,7 +1061,11 @@ impl TaskApp {
         let mut drafts = Vec::new();
         for task in self.list.tasks() {
             let id = task.task_id.as_str();
-            let present = self.detail.views.get(id).is_some_and(|view| view.waiting.is_present());
+            let present = self
+                .detail
+                .views
+                .get(id)
+                .is_some_and(|view| view.waiting.is_present());
             if task.attention.is_empty() && !present {
                 continue;
             }
@@ -1102,12 +1150,7 @@ impl TaskApp {
             .and_then(|chooser| chooser.items().get(submission.index))
             .map_or_else(
                 || (submission.label.clone(), Vec::new()),
-                |item| {
-                    (
-                        item.label.clone(),
-                        one_line_per_row(&item.description),
-                    )
-                },
+                |item| (item.label.clone(), one_line_per_row(&item.description)),
             );
         lines.push("! Tego nie da się cofnąć.".to_string());
         self.confirm_answer(request, format!("{} !", one_line(&label)), lines);
@@ -1120,7 +1163,12 @@ impl TaskApp {
         if !self.mutation_allowed() {
             return Request::None;
         }
-        let Some(task) = self.list.tasks().iter().find(|task| task.task_id.as_str() == id) else {
+        let Some(task) = self
+            .list
+            .tasks()
+            .iter()
+            .find(|task| task.task_id.as_str() == id)
+        else {
             return Request::None;
         };
         let Some(view) = self.detail.views.get_mut(id) else {
@@ -1207,15 +1255,17 @@ impl TaskApp {
                     // First the read, so the reason is the last word on the bar.
                     self.refresh().await;
                 }
-                self.notify(
-                    Severity::Error,
-                    format!("{title}: nie wysłano — {reason}"),
-                );
+                self.notify(Severity::Error, format!("{title}: nie wysłano — {reason}"));
             }
         }
     }
 
-    fn settle_answer(&mut self, task_id: &str, waiting_id: &str, outcome: Result<(), (String, bool)>) {
+    fn settle_answer(
+        &mut self,
+        task_id: &str,
+        waiting_id: &str,
+        outcome: Result<(), (String, bool)>,
+    ) {
         if let Some(view) = self.detail.views.get_mut(task_id) {
             view.waiting.settle(waiting_id, outcome);
             let text = view.draft_text();
@@ -1237,7 +1287,8 @@ impl TaskApp {
             let panel = page == 0 && view.waiting.needs_conductor(revision);
             let tab = shown
                 && if page == 0 {
-                    view.conductor.needs_read(revision, std::time::Instant::now())
+                    view.conductor
+                        .needs_read(revision, std::time::Instant::now())
                 } else {
                     view.conductor.has_more()
                 };
@@ -1269,19 +1320,30 @@ impl TaskApp {
         result: Result<ConductorReadResponse, ClientError>,
     ) {
         let result = self.settle(result);
-        let Some(task) = self.list.tasks().iter().find(|task| task.task_id.as_str() == task_id) else {
+        let Some(task) = self
+            .list
+            .tasks()
+            .iter()
+            .find(|task| task.task_id.as_str() == task_id)
+        else {
             return;
         };
         let view = self.detail.view_mut(task_id);
         view.conductor
             .apply(revision, std::time::Instant::now(), result.clone());
         let positions = view.progress().positions().to_vec();
-        view.waiting.apply_conductor(task, &positions, revision, result);
+        view.waiting
+            .apply_conductor(task, &positions, revision, result);
     }
 
     /// The steps were read: what a waiting says about them is built again.
     pub(super) fn reread_waiting(&mut self, task_id: &str) {
-        let Some(task) = self.list.tasks().iter().find(|task| task.task_id.as_str() == task_id) else {
+        let Some(task) = self
+            .list
+            .tasks()
+            .iter()
+            .find(|task| task.task_id.as_str() == task_id)
+        else {
             return;
         };
         let view = self.detail.view_mut(task_id);

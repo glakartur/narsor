@@ -25,7 +25,7 @@ description: <string>       # Opis celu workflow (opcjonalne)
 
 inputs:                     # Definica wejść wymaganych do uruchomienia (opcjonalne)
   - name: <string>
-    type: <string>          # string, integer, boolean, repository
+    type: <string>          # string, text, integer, boolean, repository
     required: <boolean>
     default: <any>          # Wartość domyślna (opcjonalne)
 
@@ -99,6 +99,8 @@ inputs:
     required: false
     default: false
 ```
+
+Typy wejść: `string` (krótki tekst jednoliniowy), `text` (tekst wieloliniowy — dla CLI/API to zwykły string, w TUI duże pole z fokusem; używaj go dla promptów i opisów), `integer`, `boolean`, `repository`. Formularz nowego zadania w TUI pokazuje wejścia `string`/`integer`/`boolean`/`repository` w wąskim pasku, a wejścia `text` w polach wieloliniowych; workflow bez wejścia `text` ma tylko pasek.
 
 ### 3.2. Globals (Ustawienia Globalne)
 

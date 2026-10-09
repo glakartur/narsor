@@ -1088,7 +1088,8 @@ impl Session {
             Ok(None) => ConversationResponse::NoRecord,
             Err(error) => {
                 tracing::warn!(%error, attempt = %request.attempt_id, "cannot read a conversation page");
-                self.fail_read(&request.request_id, &error.to_string()).await;
+                self.fail_read(&request.request_id, &error.to_string())
+                    .await;
                 return;
             }
         };
@@ -1131,7 +1132,8 @@ impl Session {
             Ok(page) => page,
             Err(error) => {
                 tracing::warn!(%error, "cannot read the execution events");
-                self.fail_read(&request.request_id, &error.to_string()).await;
+                self.fail_read(&request.request_id, &error.to_string())
+                    .await;
                 return;
             }
         };

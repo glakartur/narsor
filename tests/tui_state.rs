@@ -33,7 +33,6 @@ mod environment_support;
 mod remote_support;
 mod task_app_support;
 
-
 /// A key press, as the event loop would deliver it.
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent {
@@ -241,7 +240,6 @@ fn event_line_has_no_debug_style_dump_for_any_variant() {
         );
     }
 }
-
 
 /// Edge case: content with ANSI escapes and control characters reaches the
 /// detail window with no raw control bytes left in it.
@@ -464,7 +462,6 @@ fn transcript_separates_adjacent_entries() {
         .collect();
     assert_eq!(lines, vec!["first", "", "second"]);
 }
-
 
 /// U7: the building blocks of the redesigned interface — key map, colour
 /// roles, the chooser and the connection state. None of it needs a daemon.
@@ -1122,7 +1119,12 @@ mod task_app_list {
             .unwrap_or_default()
     }
 
-    fn controlled(id: &str, backend: &str, lifecycle: &str, rank: u32) -> narsor::controller_protocol::TaskSummary {
+    fn controlled(
+        id: &str,
+        backend: &str,
+        lifecycle: &str,
+        rank: u32,
+    ) -> narsor::controller_protocol::TaskSummary {
         with_controller(task(id, backend, lifecycle, rank))
     }
 
@@ -1187,7 +1189,8 @@ mod task_app_list {
 
                 // The debounced read brings the runner's step.
                 let mut tasks = app.list().tasks().to_vec();
-                tasks[index] = with_runner(tasks[index].clone(), ExecutionStatus::Running, "implement");
+                tasks[index] =
+                    with_runner(tasks[index].clone(), ExecutionStatus::Running, "implement");
                 tasks[index].revision = sequence;
                 app.load(listing(tasks, "read"));
                 assert_eq!(row(&app, id).2, "implement");
@@ -1207,7 +1210,10 @@ mod task_app_list {
                     },
                 ));
                 assert_eq!(titles(&app), order, "{id} done");
-                assert_eq!(row(&app, id), (Attention::None, StateIcon::Done, "done".into()));
+                assert_eq!(
+                    row(&app, id),
+                    (Attention::None, StateIcon::Done, "done".into())
+                );
             }
         }
 
@@ -1225,7 +1231,11 @@ mod task_app_list {
                 TaskEventKind::Created,
             ));
             assert_eq!(row(&app, "a").1, StateIcon::Running);
-            assert_eq!(app.cursor(), Some("c7"), "a dropped event does not move the cursor");
+            assert_eq!(
+                app.cursor(),
+                Some("c7"),
+                "a dropped event does not move the cursor"
+            );
             assert!(!app.refresh_wanted());
         }
 
@@ -1248,7 +1258,13 @@ mod task_app_list {
         fn an_event_for_an_unknown_task_asks_for_a_debounced_read() {
             let mut app = app();
             app.load(listing(vec![queued("a", 1)], "c"));
-            app.on_stream(event("n", "new", 1, TaskLifecycle::Queued, TaskEventKind::Created));
+            app.on_stream(event(
+                "n",
+                "new",
+                1,
+                TaskLifecycle::Queued,
+                TaskEventKind::Created,
+            ));
             assert!(app.refresh_wanted());
             let due = app.next_refresh_due().expect("a refresh is due");
             assert!(due > Instant::now(), "debounced, not immediate");
@@ -1257,7 +1273,10 @@ mod task_app_list {
         #[test]
         fn queue_changes_and_answers_patch_the_row_without_a_read() {
             let mut app = app();
-            let mut waiting_task = waiting(controlled("a", "local", "running", 1), AttentionKind::Question);
+            let mut waiting_task = waiting(
+                controlled("a", "local", "running", 1),
+                AttentionKind::Question,
+            );
             waiting_task.runner = Some(narsor_runner());
             app.load(listing(vec![waiting_task, queued("b", 2)], "c"));
             assert_eq!(row(&app, "a").0, Attention::Question);
@@ -1297,7 +1316,10 @@ mod task_app_list {
         fn a_problem_wins_over_a_question_in_the_attention_column() {
             let mut app = app();
             let both = waiting(
-                waiting(controlled("a", "local", "running", 1), AttentionKind::Question),
+                waiting(
+                    controlled("a", "local", "running", 1),
+                    AttentionKind::Question,
+                ),
                 AttentionKind::FailedStep,
             );
             app.load(listing(vec![both], "c"));
@@ -1316,9 +1338,15 @@ mod task_app_list {
             app.load(listing(
                 vec![
                     controlled("a", "local", "running", 1),
-                    waiting(controlled("b", "local", "running", 2), AttentionKind::Question),
+                    waiting(
+                        controlled("b", "local", "running", 2),
+                        AttentionKind::Question,
+                    ),
                     controlled("c", "local", "running", 3),
-                    waiting(controlled("d", "local", "running", 4), AttentionKind::Problem),
+                    waiting(
+                        controlled("d", "local", "running", 4),
+                        AttentionKind::Problem,
+                    ),
                 ],
                 "c",
             ));
@@ -1346,8 +1374,14 @@ mod task_app_list {
             let mut app = app();
             app.load(listing(
                 vec![
-                    waiting(controlled("a", "local", "running", 1), AttentionKind::Approval),
-                    waiting(controlled("b", "local", "running", 2), AttentionKind::ProvisioningFailed),
+                    waiting(
+                        controlled("a", "local", "running", 1),
+                        AttentionKind::Approval,
+                    ),
+                    waiting(
+                        controlled("b", "local", "running", 2),
+                        AttentionKind::ProvisioningFailed,
+                    ),
                     controlled("c", "local", "running", 3),
                     waiting_for_capacity(queued("d", 4), 1, 2, 3),
                 ],
@@ -1427,7 +1461,13 @@ mod task_app_list {
         #[test]
         fn z_hides_finished_tasks_keeps_the_order_and_a_second_z_brings_them_back() {
             let mut app = app();
-            let done = |id: &str, rank| with_runner(controlled(id, "local", "running", rank), ExecutionStatus::Completed, "done");
+            let done = |id: &str, rank| {
+                with_runner(
+                    controlled(id, "local", "running", rank),
+                    ExecutionStatus::Completed,
+                    "done",
+                )
+            };
             app.load(listing(
                 vec![
                     queued("a", 1),
@@ -1450,7 +1490,11 @@ mod task_app_list {
         #[test]
         fn hiding_the_selected_finished_task_moves_the_selection_to_the_row_below() {
             let mut app = app();
-            let done = with_runner(controlled("x", "local", "running", 2), ExecutionStatus::Completed, "done");
+            let done = with_runner(
+                controlled("x", "local", "running", 2),
+                ExecutionStatus::Completed,
+                "done",
+            );
             app.load(listing(vec![queued("a", 1), done, queued("b", 3)], "c"));
             ch(&mut app, 'j');
             assert_eq!(app.list().selected_id(), Some("x"));
@@ -1461,7 +1505,10 @@ mod task_app_list {
         #[test]
         fn a_selected_task_archived_from_the_cli_hands_the_selection_to_the_row_below() {
             let mut app = app();
-            app.load(listing(vec![queued("a", 1), queued("b", 2), queued("c", 3)], "c0"));
+            app.load(listing(
+                vec![queued("a", 1), queued("b", 2), queued("c", 3)],
+                "c0",
+            ));
             ch(&mut app, 'j');
             assert_eq!(app.list().selected_id(), Some("b"));
 
@@ -1475,7 +1522,10 @@ mod task_app_list {
             assert_eq!(titles(&app), ["a", "c"]);
             assert_eq!(app.list().selected_id(), Some("c"));
             let text = note(&app);
-            assert!(text.contains("b") && text.contains("zarchiwizowane") && text.contains("c"), "{text}");
+            assert!(
+                text.contains("b") && text.contains("zarchiwizowane") && text.contains("c"),
+                "{text}"
+            );
         }
 
         #[test]
@@ -1540,8 +1590,14 @@ mod task_app_list {
             assert!(on_list.list.is_some() && on_list.detail.is_none());
             let on_details = layout::areas(Rect::new(0, 0, 90, 30), Focus::Details);
             assert!(on_details.list.is_none() && on_details.detail.is_some());
-            assert_eq!(layout::areas(Rect::new(0, 0, 100, 30), Focus::List).screen, Screen::Split);
-            assert_eq!(layout::areas(Rect::new(0, 0, 99, 30), Focus::List).screen, Screen::Full);
+            assert_eq!(
+                layout::areas(Rect::new(0, 0, 100, 30), Focus::List).screen,
+                Screen::Split
+            );
+            assert_eq!(
+                layout::areas(Rect::new(0, 0, 99, 30), Focus::List).screen,
+                Screen::Full
+            );
         }
 
         #[test]
@@ -1553,7 +1609,10 @@ mod task_app_list {
                     "{width}x{height}"
                 );
             }
-            assert_eq!(layout::areas(Rect::new(0, 0, 60, 20), Focus::List).screen, Screen::Full);
+            assert_eq!(
+                layout::areas(Rect::new(0, 0, 60, 20), Focus::List).screen,
+                Screen::Full
+            );
         }
 
         #[test]
@@ -1582,7 +1641,10 @@ mod task_app_list {
         #[test]
         fn k_and_j_ask_to_go_before_the_row_above_and_after_the_row_below() {
             let mut app = app();
-            app.load(listing(vec![queued("a", 1), queued("b", 2), queued("c", 3)], "c"));
+            app.load(listing(
+                vec![queued("a", 1), queued("b", 2), queued("c", 3)],
+                "c",
+            ));
             ch(&mut app, 'j');
             let up = expect_move(ch(&mut app, 'K'));
             assert_eq!(up.target, MoveTarget::Before(ids(&["a"]).remove(0)));
@@ -1614,27 +1676,47 @@ mod task_app_list {
             assert_eq!(note(&app), "przesuń: zadanie nie jest w kolejce");
             assert_eq!(app.notifier().latest().unwrap().severity, Severity::Warning);
             assert_eq!(ch(&mut app, 'm'), Request::None);
-            assert!(app.list().moving().is_none(), "no move mode for a running task");
+            assert!(
+                app.list().moving().is_none(),
+                "no move mode for a running task"
+            );
         }
 
         #[test]
         fn m_previews_the_place_and_enter_sends_after_for_a_task_moved_down() {
             let mut app = app();
             app.load(listing(
-                vec![queued("a", 1), queued("b", 2), queued("c", 3), queued("d", 4)],
+                vec![
+                    queued("a", 1),
+                    queued("b", 2),
+                    queued("c", 3),
+                    queued("d", 4),
+                ],
                 "c",
             ));
             ch(&mut app, 'm');
             ch(&mut app, 'j');
             ch(&mut app, 'j');
-            assert_eq!(titles(&app), ["b", "c", "a", "d"], "the preview moves the row");
-            assert_eq!(app.list().tasks()[0].task_id.as_str(), "a", "the data does not");
+            assert_eq!(
+                titles(&app),
+                ["b", "c", "a", "d"],
+                "the preview moves the row"
+            );
+            assert_eq!(
+                app.list().tasks()[0].task_id.as_str(),
+                "a",
+                "the data does not"
+            );
             assert_eq!(app.list().selected_id(), Some("a"));
             let request = expect_move(press(&mut app, KeyCode::Enter));
             assert_eq!(request.task_id, "a");
             assert_eq!(request.target, MoveTarget::After(ids(&["c"]).remove(0)));
             assert!(app.list().moving().is_none());
-            assert_eq!(titles(&app), ["a", "b", "c", "d"], "nothing moves before the server says so");
+            assert_eq!(
+                titles(&app),
+                ["a", "b", "c", "d"],
+                "nothing moves before the server says so"
+            );
         }
 
         #[test]
@@ -1788,7 +1870,11 @@ mod task_app_list {
                 expected_generation: None,
             };
             // A first move, seen live.
-            harness.owner.control_move_task("t3", &top).await.expect("move");
+            harness
+                .owner
+                .control_move_task("t3", &top)
+                .await
+                .expect("move");
             for _ in 0..5 {
                 if titles(&app) == ["t3", "t1", "t2"] {
                     break;
@@ -1803,8 +1889,16 @@ mod task_app_list {
             // The connection breaks; a second move happens while it is down.
             feed.close();
             assert!(!feed.is_open());
-            harness.owner.control_move_task("t2", &top).await.expect("move");
-            assert_eq!(titles(&app), ["t3", "t1", "t2"], "the app has not heard of it");
+            harness
+                .owner
+                .control_move_task("t2", &top)
+                .await
+                .expect("move");
+            assert_eq!(
+                titles(&app),
+                ["t3", "t1", "t2"],
+                "the app has not heard of it"
+            );
 
             feed.ensure_open(&app);
             for _ in 0..5 {
@@ -1907,7 +2001,9 @@ mod task_app_list {
             assert!(!app.mutation_allowed());
 
             // The server comes up on that address.
-            let listener = TcpListener::bind(address).await.expect("bind the reserved port");
+            let listener = TcpListener::bind(address)
+                .await
+                .expect("bind the reserved port");
             let target = harness.handle.addr();
             tokio::spawn(async move {
                 loop {
@@ -1916,7 +2012,8 @@ mod task_app_list {
                     };
                     tokio::spawn(async move {
                         if let Ok(mut outbound) = TcpStream::connect(target).await {
-                            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                            let _ =
+                                tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
                         }
                         let _ = inbound.shutdown().await;
                     });
@@ -1925,10 +2022,17 @@ mod task_app_list {
 
             // Not due yet; due once the retry delay has passed.
             assert!(!app.refresh_if_due(Instant::now()).await);
-            assert!(app.refresh_if_due(Instant::now() + Duration::from_secs(2)).await);
+            assert!(
+                app.refresh_if_due(Instant::now() + Duration::from_secs(2))
+                    .await
+            );
             assert_eq!(status(&app), "● live");
             assert_eq!(titles(&app), ["t1"]);
-            assert_eq!(app.connection().name(), "local", "the server's own name replaces the configured one");
+            assert_eq!(
+                app.connection().name(),
+                "local",
+                "the server's own name replaces the configured one"
+            );
             feed.ensure_open(&app);
             assert!(feed.is_open());
             assert!(app.mutation_allowed());
@@ -1960,8 +2064,8 @@ mod task_app_detail {
 
     use super::remote_support::{report, snapshot, RemoteHarness};
     use super::task_app_support::{
-        event, execution_events, listing, position, queued, task, timeline, titled, with_controller,
-        with_runner,
+        event, execution_events, listing, position, queued, task, timeline, titled,
+        with_controller, with_runner,
     };
 
     fn offline_client() -> ApiClient {
@@ -1992,7 +2096,10 @@ mod task_app_detail {
     fn details_app() -> TaskApp {
         let mut app = app();
         app.load(listing(
-            vec![titled(running("a", 1), "NAR-1"), titled(running("b", 2), "NAR-2")],
+            vec![
+                titled(running("a", 1), "NAR-1"),
+                titled(running("b", 2), "NAR-2"),
+            ],
             "c",
         ));
         press(&mut app, KeyCode::Enter);
@@ -2033,15 +2140,33 @@ mod task_app_detail {
             let mut app = details_app();
             read_timeline(&mut app, "a", 1, &["plan", "edit", "review"], "review #1");
             assert_eq!(selected_step(&app, "a").as_deref(), Some("review #1"));
-            assert_eq!(app.detail().view("a").unwrap().progress().step_count(), Some((3, 3)));
+            assert_eq!(
+                app.detail().view("a").unwrap().progress().step_count(),
+                Some((3, 3))
+            );
 
             // The runner moves on: the event bumps the row's revision, which makes the
             // details due, and the new timeline takes the selection with it.
-            app.on_stream(event("e", "a", 2, TaskLifecycle::Running, TaskEventKind::Created));
+            app.on_stream(event(
+                "e",
+                "a",
+                2,
+                TaskLifecycle::Running,
+                TaskEventKind::Created,
+            ));
             assert!(app.detail().view("a").unwrap().progress().needs_read(2));
-            read_timeline(&mut app, "a", 2, &["plan", "edit", "review", "test"], "test #1");
+            read_timeline(
+                &mut app,
+                "a",
+                2,
+                &["plan", "edit", "review", "test"],
+                "test #1",
+            );
             assert_eq!(selected_step(&app, "a").as_deref(), Some("test #1"));
-            assert_eq!(app.detail().view("a").unwrap().progress().step_count(), Some((4, 4)));
+            assert_eq!(
+                app.detail().view("a").unwrap().progress().step_count(),
+                Some((4, 4))
+            );
         }
 
         #[test]
@@ -2052,7 +2177,13 @@ mod task_app_detail {
 
             ch(&mut app, 'f');
             assert!(!app.detail().view("a").unwrap().progress().follows());
-            read_timeline(&mut app, "a", 2, &["plan", "edit", "review", "test"], "test #1");
+            read_timeline(
+                &mut app,
+                "a",
+                2,
+                &["plan", "edit", "review", "test"],
+                "test #1",
+            );
             assert_eq!(
                 selected_step(&app, "a").as_deref(),
                 Some("review #1"),
@@ -2060,7 +2191,11 @@ mod task_app_detail {
             );
 
             ch(&mut app, 'f');
-            assert_eq!(selected_step(&app, "a").as_deref(), Some("test #1"), "following again picks the running step up");
+            assert_eq!(
+                selected_step(&app, "a").as_deref(),
+                Some("test #1"),
+                "following again picks the running step up"
+            );
         }
 
         #[test]
@@ -2071,7 +2206,10 @@ mod task_app_detail {
             assert_eq!(selected_step(&app, "a").as_deref(), Some("edit #1"));
             assert!(!app.detail().view("a").unwrap().progress().follows());
 
-            let tasks = vec![titled(running("a", 1), "NAR-1"), titled(running("b", 2), "NAR-2")];
+            let tasks = vec![
+                titled(running("a", 1), "NAR-1"),
+                titled(running("b", 2), "NAR-2"),
+            ];
             app.load(listing(tasks, "d"));
             read_timeline(&mut app, "a", 1, &["plan", "edit", "review"], "review #1");
             assert_eq!(selected_step(&app, "a").as_deref(), Some("edit #1"));
@@ -2116,8 +2254,15 @@ mod task_app_detail {
             ch(&mut app, 'j');
             assert_eq!(app.list().selected_id(), Some("b"));
             press(&mut app, KeyCode::Enter);
-            assert_eq!(app.detail().tab(), DetailTab::Events, "the tab is the operator's, not the task's");
-            assert!(app.detail().view("b").is_none_or(|view| view.events().events().is_empty()));
+            assert_eq!(
+                app.detail().tab(),
+                DetailTab::Events,
+                "the tab is the operator's, not the task's"
+            );
+            assert!(app
+                .detail()
+                .view("b")
+                .is_none_or(|view| view.events().events().is_empty()));
             press(&mut app, KeyCode::Esc);
             ch(&mut app, 'k');
             press(&mut app, KeyCode::Enter);
@@ -2141,7 +2286,10 @@ mod task_app_detail {
             );
             let view = app.detail().view("a").unwrap();
             assert_eq!(view.progress().failure(), Some("the runner did not answer"));
-            assert!(app.connection().is_live(), "a 503 with a reason is not a lost connection");
+            assert!(
+                app.connection().is_live(),
+                "a 503 with a reason is not a lost connection"
+            );
 
             // The other tabs still work.
             press(&mut app, KeyCode::Right);
@@ -2164,7 +2312,12 @@ mod task_app_detail {
         fn flatten(lines: &[ratatui::text::Line<'_>]) -> String {
             lines
                 .iter()
-                .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         }
@@ -2184,7 +2337,13 @@ mod task_app_detail {
             );
 
             let text = flatten(&info::lines(&task, &Styles::new(false), false));
-            for expected in ["Zapieczętowane wejścia", "launch digest", "digest", "środowisko", "implement-feature v3"] {
+            for expected in [
+                "Zapieczętowane wejścia",
+                "launch digest",
+                "digest",
+                "środowisko",
+                "implement-feature v3",
+            ] {
                 assert!(text.contains(expected), "{expected:?} in\n{text}");
             }
         }
@@ -2194,8 +2353,14 @@ mod task_app_detail {
             let mut app = app();
             app.load(listing(vec![queued("a", 1)], "c"));
             app.sync_detail().await;
-            assert!(app.connection().is_live(), "no request was made, so none failed");
-            assert!(app.detail().view("a").is_none_or(|view| view.progress().timeline().is_none()));
+            assert!(
+                app.connection().is_live(),
+                "no request was made, so none failed"
+            );
+            assert!(app
+                .detail()
+                .view("a")
+                .is_none_or(|view| view.progress().timeline().is_none()));
         }
 
         #[test]
@@ -2216,7 +2381,8 @@ mod task_app_detail {
 
         #[test]
         fn the_queue_line_says_why_a_task_waits() {
-            let waiting = super::super::task_app_support::waiting_for_capacity(queued("a", 1), 2, 2, 3);
+            let waiting =
+                super::super::task_app_support::waiting_for_capacity(queued("a", 1), 2, 2, 3);
             assert_eq!(queue_text(&waiting, Some(2)), "#2 · czeka na slot (2/3)");
             let mut offline = queued("b", 2);
             offline.queue = Some(narsor::controller_protocol::QueueView {
@@ -2280,7 +2446,14 @@ mod task_app_detail {
                     source: ExecutionEventsSource::Runner,
                 })
             };
-            app.on_detail_read("a", 1, DetailRead::Events { after: 0, result: available(execution_events(3)) });
+            app.on_detail_read(
+                "a",
+                1,
+                DetailRead::Events {
+                    after: 0,
+                    result: available(execution_events(3)),
+                },
+            );
             app.on_detail_read(
                 "a",
                 2,
@@ -2296,7 +2469,10 @@ mod task_app_detail {
             assert_eq!(events.events().len(), 3);
             assert!(matches!(
                 events.availability(),
-                Availability::Unavailable { reason: ConversationUnavailableReason::RunnerUnreachable, .. }
+                Availability::Unavailable {
+                    reason: ConversationUnavailableReason::RunnerUnreachable,
+                    ..
+                }
             ));
         }
 
@@ -2310,15 +2486,33 @@ mod task_app_detail {
                     source: ExecutionEventsSource::Storage,
                 })
             };
-            app.on_detail_read("a", 1, DetailRead::Events { after: 0, result: page(execution_events(3), true) });
+            app.on_detail_read(
+                "a",
+                1,
+                DetailRead::Events {
+                    after: 0,
+                    result: page(execution_events(3), true),
+                },
+            );
             let events = app.detail().view("a").unwrap().events();
             assert!(events.has_more());
             assert_eq!(events.after(), 3);
             assert_eq!(events.cursor(), 2);
-            app.on_detail_read("a", 1, DetailRead::Events { after: 3, result: page(execution_events(6)[3..].to_vec(), false) });
+            app.on_detail_read(
+                "a",
+                1,
+                DetailRead::Events {
+                    after: 3,
+                    result: page(execution_events(6)[3..].to_vec(), false),
+                },
+            );
             let events = app.detail().view("a").unwrap().events();
             assert_eq!(events.events().len(), 6);
-            assert_eq!(events.cursor(), 5, "a cursor on the last event stays on the last");
+            assert_eq!(
+                events.cursor(),
+                5,
+                "a cursor on the last event stays on the last"
+            );
         }
 
         #[test]
@@ -2348,8 +2542,12 @@ mod task_app_detail {
         }
 
         fn entry(id: &str, text: &str) -> TranscriptEntry {
-            TranscriptEntry::new(TranscriptEntryId::from(id), vec![text.to_string()], text.as_bytes().to_vec())
-                .with_header(format!("AGENT · {id}"))
+            TranscriptEntry::new(
+                TranscriptEntryId::from(id),
+                vec![text.to_string()],
+                text.as_bytes().to_vec(),
+            )
+            .with_header(format!("AGENT · {id}"))
         }
 
         fn read(entries: Vec<TranscriptEntry>) -> AttemptRead {
@@ -2370,13 +2568,26 @@ mod task_app_detail {
                 step.conversation = ConversationState::Recorded;
                 step
             };
-            let positions = vec![recorded("plan"), position("script", PositionStatus::Succeeded), recorded("edit")];
+            let positions = vec![
+                recorded("plan"),
+                position("script", PositionStatus::Succeeded),
+                recorded("edit"),
+            ];
             let mut attempts = Attempts::default();
-            attempts.apply("act-plan", 1, 0, Ok(read(vec![entry("1", "plan one"), entry("2", "plan two")])));
+            attempts.apply(
+                "act-plan",
+                1,
+                0,
+                Ok(read(vec![entry("1", "plan one"), entry("2", "plan two")])),
+            );
             let mut conversation = Conversation::new("a");
             conversation.rebuild(&positions, &attempts);
             assert!(conversation.is_loading(), "act-edit was not read yet");
-            assert_eq!(conversation.transcript().entries().len(), 3, "a heading and two entries");
+            assert_eq!(
+                conversation.transcript().entries().len(),
+                3,
+                "a heading and two entries"
+            );
 
             attempts.apply("act-edit", 1, 0, Ok(read(vec![entry("1", "edit one")])));
             conversation.rebuild(&positions, &attempts);
@@ -2388,12 +2599,24 @@ mod task_app_detail {
                 .map(|line| line.text)
                 .collect();
             let at = |needle: &str| lines.iter().position(|line| line.contains(needle)).unwrap();
-            assert!(at("plan #1") < at("plan one") && at("plan two") < at("edit #1") && at("edit #1") < at("edit one"), "{lines:?}");
+            assert!(
+                at("plan #1") < at("plan one")
+                    && at("plan two") < at("edit #1")
+                    && at("edit #1") < at("edit one"),
+                "{lines:?}"
+            );
 
             attempts.apply("act-plan", 2, 3, Err("the runner did not answer".into()));
             conversation.rebuild(&positions, &attempts);
-            assert_eq!(conversation.failure(), Some("plan #1: the runner did not answer"));
-            assert_eq!(conversation.transcript().entries().len(), 5, "what was read stays");
+            assert_eq!(
+                conversation.failure(),
+                Some("plan #1: the runner did not answer")
+            );
+            assert_eq!(
+                conversation.transcript().entries().len(),
+                5,
+                "what was read stays"
+            );
         }
 
         #[test]
@@ -2417,7 +2640,8 @@ mod task_app_detail {
             loop {
                 let poll = runner.poll(None, 5).await.expect("poll");
                 if let Some(request) = poll.execution_events.first() {
-                    let page = narsor::controller_protocol::ExecutionEventsPage { events, has_more };
+                    let page =
+                        narsor::controller_protocol::ExecutionEventsPage { events, has_more };
                     runner
                         .upload_execution_events(&request.request_id, &page)
                         .await
@@ -2496,14 +2720,20 @@ mod task_app_detail {
             };
             let live = sheet(&app);
             assert!(live.iter().any(|line| line.contains("online")), "{live:#?}");
-            assert!(!live.iter().any(|line| line.contains("nieaktualne")), "{live:#?}");
+            assert!(
+                !live.iter().any(|line| line.contains("nieaktualne")),
+                "{live:#?}"
+            );
 
             harness.clock.advance(chrono::Duration::minutes(10));
             app.refresh().await;
             let task = app.list().selected().expect("a selected task");
             assert_eq!(task.lifecycle, TaskLifecycle::Running, "never invented");
             let stale = sheet(&app);
-            assert!(stale.iter().any(|line| line.contains("offline")), "{stale:#?}");
+            assert!(
+                stale.iter().any(|line| line.contains("offline")),
+                "{stale:#?}"
+            );
             assert!(
                 stale
                     .iter()
@@ -2511,9 +2741,9 @@ mod task_app_detail {
                 "{stale:#?}"
             );
             assert!(
-                stale
-                    .iter()
-                    .any(|line| line.contains("zgłoszenie") && line.contains("temu") && line.contains("nieaktualne")),
+                stale.iter().any(|line| line.contains("zgłoszenie")
+                    && line.contains("temu")
+                    && line.contains("nieaktualne")),
                 "{stale:#?}"
             );
         }
@@ -2533,7 +2763,10 @@ mod task_app_detail {
             );
             let events = app.detail().view("task-1").unwrap().events();
             assert_eq!(events.events().len(), 4);
-            assert_eq!(*events.availability(), Availability::Available(ExecutionEventsSource::Runner));
+            assert_eq!(
+                *events.availability(),
+                Availability::Available(ExecutionEventsSource::Runner)
+            );
         }
 
         #[tokio::test]
@@ -2552,7 +2785,10 @@ mod task_app_detail {
                 .await
                 .expect("lost");
             let mut app = app_over(&harness).await;
-            assert_eq!(app.list().selected().unwrap().lifecycle, TaskLifecycle::Interrupted);
+            assert_eq!(
+                app.list().selected().unwrap().lifecycle,
+                TaskLifecycle::Interrupted
+            );
             press(&mut app, KeyCode::Right);
             press(&mut app, KeyCode::Right);
 
@@ -2599,8 +2835,14 @@ mod task_app_detail {
                 .into_iter()
                 .map(|line| line.text)
                 .collect();
-            assert!(lines.iter().any(|line| line.contains("plan #1")), "{lines:?}");
-            assert!(lines.iter().any(|line| line.contains("Fix it")), "{lines:?}");
+            assert!(
+                lines.iter().any(|line| line.contains("plan #1")),
+                "{lines:?}"
+            );
+            assert!(
+                lines.iter().any(|line| line.contains("Fix it")),
+                "{lines:?}"
+            );
             assert!(view.attempts().get("act-plan").is_some());
         }
     }
@@ -2633,7 +2875,10 @@ mod task_app_detail {
             assert!(hyperlinks_supported(env(&[("TERM", "xterm-kitty")])));
             assert!(!hyperlinks_supported(env(&[("VTE_VERSION", "4000")])));
             assert!(!hyperlinks_supported(env(&[("TERM", "xterm-256color")])));
-            assert!(!hyperlinks_supported(env(&[("TERM", "dumb"), ("WT_SESSION", "x")])));
+            assert!(!hyperlinks_supported(env(&[
+                ("TERM", "dumb"),
+                ("WT_SESSION", "x")
+            ])));
         }
 
         #[test]
@@ -2650,7 +2895,11 @@ mod task_app_detail {
             assert_eq!(with_panel.content.height, 11);
             let panel = with_panel.panel.expect("a panel");
             assert_eq!((panel.y, panel.height), (area.y + 14, 6));
-            assert_eq!(detail::areas(area, 40).content.height, 1, "the content keeps a row");
+            assert_eq!(
+                detail::areas(area, 40).content.height,
+                1,
+                "the content keeps a row"
+            );
         }
 
         #[test]
@@ -2666,7 +2915,11 @@ mod task_app_detail {
             app.on_detail_read(
                 id,
                 1,
-                DetailRead::Timeline(Ok(timeline(id, vec![position("plan", PositionStatus::Succeeded)], None))),
+                DetailRead::Timeline(Ok(timeline(
+                    id,
+                    vec![position("plan", PositionStatus::Succeeded)],
+                    None,
+                ))),
             );
         }
     }
@@ -2685,7 +2938,9 @@ mod task_app_waiting {
     use narsor::controller_protocol::{ConductorReadResponse, ExecutionEventsSource};
     use narsor::engine::actions::human::HumanInputAction;
     use narsor::engine::PositionStatus;
-    use narsor::orchestration::{AttentionKind, OperatorCommand, OwnerCommand, TaskEventKind, TaskLifecycle};
+    use narsor::orchestration::{
+        AttentionKind, OperatorCommand, OwnerCommand, TaskEventKind, TaskLifecycle,
+    };
     use narsor::tui::chooser::ChooserFocus;
     use narsor::tui::task_app::detail::DetailRead;
     use narsor::tui::task_app::notify::Severity;
@@ -2694,13 +2949,17 @@ mod task_app_waiting {
 
     use super::remote_support::{snapshot, RemoteHarness};
     use super::task_app_support::{
-        event, listing, position, task, timeline, titled, waiting_on, with_controller, with_pending,
-        with_runner,
+        event, listing, position, task, timeline, titled, waiting_on, with_controller,
+        with_pending, with_runner,
     };
     use narsor::domain::ExecutionStatus;
 
     fn app() -> TaskApp {
-        TaskApp::new(ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"), "local", None)
+        TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        )
     }
 
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
@@ -2746,24 +3005,42 @@ mod task_app_waiting {
         ch(&mut app, ' ');
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.focus(), Focus::Details);
-        assert!(app.panel_focused(), "Enter on a waiting task opens its panel");
+        assert!(
+            app.panel_focused(),
+            "Enter on a waiting task opens its panel"
+        );
         app
     }
 
     fn chooser_of(app: &TaskApp) -> &narsor::tui::chooser::Chooser {
-        app.detail().view("a").expect("details").waiting().chooser().expect("a panel")
+        app.detail()
+            .view("a")
+            .expect("details")
+            .waiting()
+            .chooser()
+            .expect("a panel")
     }
 
     fn selected_label(app: &TaskApp) -> String {
-        chooser_of(app).selected_item().expect("an entry").label.clone()
+        chooser_of(app)
+            .selected_item()
+            .expect("an entry")
+            .label
+            .clone()
     }
 
     fn screen(app: &mut TaskApp, width: u16, height: u16) -> String {
         use narsor::tui::style::Styles;
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
-                narsor::tui::task_app::layout::render(frame, app, &Styles::new(false), std::time::Instant::now())
+                narsor::tui::task_app::layout::render(
+                    frame,
+                    app,
+                    &Styles::new(false),
+                    std::time::Instant::now(),
+                )
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -2873,13 +3150,27 @@ mod task_app_waiting {
         app.on_detail_read(
             "a",
             1,
-            DetailRead::Timeline(Ok(timeline("a", vec![position("plan", PositionStatus::Succeeded)], None))),
+            DetailRead::Timeline(Ok(timeline(
+                "a",
+                vec![position("plan", PositionStatus::Succeeded)],
+                None,
+            ))),
         );
         let items = chooser_of(&app).items();
-        assert!(!items[0].fields[0].required, "approved: the comment is optional");
-        assert!(items[1].fields[0].required, "revise: the comment is required");
+        assert!(
+            !items[0].fields[0].required,
+            "approved: the comment is optional"
+        );
+        assert!(
+            items[1].fields[0].required,
+            "revise: the comment is required"
+        );
         assert!(!items[2].fields[0].required);
-        assert_eq!(items[1].resumes_agent.as_deref(), Some("plan"), "↩ wraca do agenta: plan");
+        assert_eq!(
+            items[1].resumes_agent.as_deref(),
+            Some("plan"),
+            "↩ wraca do agenta: plan"
+        );
         assert!(items[0].resumes_agent.is_none());
 
         // The panel opens on the output that returns the work to the agent.
@@ -2887,14 +3178,22 @@ mod task_app_waiting {
         // Enter without the comment takes the operator to the field, sends nothing.
         assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
         assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
-        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "still refused: the comment is empty");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Request::None,
+            "still refused: the comment is empty"
+        );
         assert!(chooser_of(&app).fields_of(1)[0].error().is_some());
 
         typed(&mut app, "Uwzględnij migrację");
         let delivery = delivery(press(&mut app, KeyCode::Enter));
         assert_eq!(delivery.chosen_label.as_deref(), Some("revise"));
         assert_eq!(delivery.values["comment"], "Uwzględnij migrację");
-        assert_eq!(delivery.episode.as_deref(), Some("ep-1"), "the answer names its request");
+        assert_eq!(
+            delivery.episode.as_deref(),
+            Some("ep-1"),
+            "the answer names its request"
+        );
     }
 
     #[test]
@@ -2904,12 +3203,19 @@ mod task_app_waiting {
         assert_eq!(selected_label(&app), "approved");
         let request = sent(press(&mut app, KeyCode::Enter));
         assert_eq!(request.summary, "odpowiedziano approved");
-        let Submit::Input { pending_input_id, delivery } = request.submit else {
+        let Submit::Input {
+            pending_input_id,
+            delivery,
+        } = request.submit
+        else {
             panic!("an input");
         };
         assert_eq!(pending_input_id, "ep-1");
         assert_eq!(delivery.chosen_label.as_deref(), Some("approved"));
-        assert!(delivery.values.is_empty(), "a blank optional field is left out");
+        assert!(
+            delivery.values.is_empty(),
+            "a blank optional field is left out"
+        );
     }
 
     #[test]
@@ -2931,7 +3237,9 @@ mod task_app_waiting {
         let mut app = opened(with_pending(running("a", 1), form));
         let items = chooser_of(&app).items();
         assert_eq!(items.len(), 2, "one entry per output, no label row");
-        assert!(items.iter().all(|item| item.fields.len() == 1 && item.fields[0].name == "ambiguity_answer"));
+        assert!(items
+            .iter()
+            .all(|item| item.fields.len() == 1 && item.fields[0].name == "ambiguity_answer"));
         ch(&mut app, '2');
         let delivery = delivery(press(&mut app, KeyCode::Enter));
         assert_eq!(delivery.chosen_label.as_deref(), Some("replan"));
@@ -2943,7 +3251,11 @@ mod task_app_waiting {
         // 2a9c6f2: the text of an answer that could not be delivered returns.
         let mut app = opened(with_pending(running("a", 1), question(Some("wersja 2"))));
         assert_eq!(chooser_of(&app).items()[0].fields[0].value(), "wersja 2");
-        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "a required field: Enter goes to it");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Request::None,
+            "a required field: Enter goes to it"
+        );
         let delivery = delivery(press(&mut app, KeyCode::Enter));
         assert_eq!(delivery.values["answer"], "wersja 2");
         assert!(delivery.chosen_label.is_none(), "a question has no label");
@@ -2952,7 +3264,11 @@ mod task_app_waiting {
     #[test]
     fn a_question_is_answered_with_the_text_alone() {
         let mut app = opened(with_pending(running("a", 1), question(None)));
-        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "the answer is required");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Request::None,
+            "the answer is required"
+        );
         assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
         typed(&mut app, "ab");
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
@@ -2960,21 +3276,44 @@ mod task_app_waiting {
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Left);
         typed(&mut app, "X");
-        assert_eq!(chooser_of(&app).fields_of(0)[0].value(), "ab\nXcd", "an editor, not an append-only line");
+        assert_eq!(
+            chooser_of(&app).fields_of(0)[0].value(),
+            "ab\nXcd",
+            "an editor, not an append-only line"
+        );
         let delivery = delivery(press(&mut app, KeyCode::Enter));
-        assert_eq!(delivery.values["answer"], "ab\nXcd", "typed text goes out unchanged");
+        assert_eq!(
+            delivery.values["answer"], "ab\nXcd",
+            "typed text goes out unchanged"
+        );
     }
 
     #[test]
     fn an_approval_returns_to_the_agent_by_default_and_accepts_on_request() {
         // 9c6af7f / 4ca1e73: accepting is explicit, returning needs a comment.
         let mut app = opened(with_pending(running("a", 1), approval(true)));
-        let labels: Vec<_> = chooser_of(&app).items().iter().map(|item| item.label.clone()).collect();
+        let labels: Vec<_> = chooser_of(&app)
+            .items()
+            .iter()
+            .map(|item| item.label.clone())
+            .collect();
         assert_eq!(labels, ["Akceptuj", "Zwróć agentowi"]);
-        assert_eq!(selected_label(&app), "Zwróć agentowi", "nothing moves on by a stray Enter");
+        assert_eq!(
+            selected_label(&app),
+            "Zwróć agentowi",
+            "nothing moves on by a stray Enter"
+        );
 
-        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "the comment comes first");
-        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "and is required");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Request::None,
+            "the comment comes first"
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Request::None,
+            "and is required"
+        );
         typed(&mut app, "popraw testy");
         let delivery = delivery(press(&mut app, KeyCode::Enter));
         assert_eq!(delivery.action, Some(HumanInputAction::Resume));
@@ -2984,7 +3323,9 @@ mod task_app_waiting {
         ch(&mut app, '1');
         let request = sent(press(&mut app, KeyCode::Enter));
         assert_eq!(request.summary, "zaakceptowano reviewed");
-        let Submit::Input { delivery, .. } = request.submit else { panic!("an input") };
+        let Submit::Input { delivery, .. } = request.submit else {
+            panic!("an input")
+        };
         assert_eq!(delivery.action, Some(HumanInputAction::Approve));
         assert_eq!(delivery.episode.as_deref(), Some("ep-a"));
     }
@@ -3005,14 +3346,21 @@ mod task_app_waiting {
         assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
         typed(&mut app, "spróbuj jeszcze raz");
         let delivery = delivery(press(&mut app, KeyCode::Enter));
-        assert_eq!(delivery.agent_message.as_deref(), Some("spróbuj jeszcze raz"));
+        assert_eq!(
+            delivery.agent_message.as_deref(),
+            Some("spróbuj jeszcze raz")
+        );
         assert!(delivery.chosen_label.is_none());
     }
 
     #[test]
     fn a_problem_offers_the_conductors_label_and_values_marked_until_edited() {
         let mut app = opened(with_pending(running("a", 1), problem(true)));
-        assert_eq!(selected_label(&app), "implemented", "the recommendation is selected");
+        assert_eq!(
+            selected_label(&app),
+            "implemented",
+            "the recommendation is selected"
+        );
         let item = chooser_of(&app).selected_item().unwrap();
         assert!(item.recommended);
         let summary = &item.fields[0];
@@ -3040,12 +3388,18 @@ mod task_app_waiting {
         let mut app = opened(with_pending(running("a", 1), problem(false)));
         ch(&mut app, '2');
         assert_eq!(selected_label(&app), "needs_human_decision");
-        assert_eq!(press(&mut app, KeyCode::Enter), Request::None, "data.question is required");
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Request::None,
+            "data.question is required"
+        );
         assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
         assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
         let field = &chooser_of(&app).fields_of(1)[0];
         assert_eq!(field.name, "data.question");
-        assert!(field.error().is_some_and(|error| error.contains("data.question")));
+        assert!(field
+            .error()
+            .is_some_and(|error| error.contains("data.question")));
 
         typed(&mut app, "Konto czy użytkownik?");
         // A key of the operator's own, beside the ones the label needs.
@@ -3053,7 +3407,10 @@ mod task_app_waiting {
         press(&mut app, KeyCode::Down);
         typed(&mut app, "scope=account");
         let delivery = delivery(press(&mut app, KeyCode::Enter));
-        assert_eq!(delivery.chosen_label.as_deref(), Some("needs_human_decision"));
+        assert_eq!(
+            delivery.chosen_label.as_deref(),
+            Some("needs_human_decision")
+        );
         assert_eq!(delivery.data["question"], "Konto czy użytkownik?");
         assert_eq!(delivery.variables["scope"], "account");
     }
@@ -3069,7 +3426,14 @@ mod task_app_waiting {
         press(&mut app, KeyCode::Down);
         typed(&mut app, "summary=again");
         assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
-        let error = app.detail().view("a").unwrap().waiting().error().expect("refused").to_string();
+        let error = app
+            .detail()
+            .view("a")
+            .unwrap()
+            .waiting()
+            .error()
+            .expect("refused")
+            .to_string();
         assert!(error.contains("variables.summary"), "{error}");
 
         // A line without `=` is refused too.
@@ -3084,7 +3448,8 @@ mod task_app_waiting {
 
     #[test]
     fn the_conductors_summary_of_a_gate_recommends_an_output_with_the_diamond() {
-        let pending: narsor::engine::PendingHumanInput = serde_json::from_value(gate("ep-1")).unwrap();
+        let pending: narsor::engine::PendingHumanInput =
+            serde_json::from_value(gate("ep-1")).unwrap();
         let mut panel = narsor::tui::input_form::InputPanel::new(&pending, &|_| None);
         let annotation: narsor::conductor::Annotation = serde_json::from_value(json!({
             "key": "ep-1", "summary": "brak planu migracji", "recommendation": "reject",
@@ -3094,7 +3459,10 @@ mod task_app_waiting {
         panel.annotate(&annotation);
         assert_eq!(panel.items()[panel.selected()].label, "reject");
         assert!(panel.items()[2].recommended);
-        assert!(panel.context().iter().any(|line| line.text.contains("◆ dyrygent: brak planu migracji")));
+        assert!(panel
+            .context()
+            .iter()
+            .any(|line| line.text.contains("◆ dyrygent: brak planu migracji")));
 
         // A summary of another request changes nothing.
         let mut other = narsor::tui::input_form::InputPanel::new(&pending, &|_| None);
@@ -3108,20 +3476,38 @@ mod task_app_waiting {
 
     #[test]
     fn a_failed_step_confirms_the_conductors_proposal() {
-        let failed = waiting_on(running("a", 1), AttentionKind::FailedStep, "fk1", Some("test"));
+        let failed = waiting_on(
+            running("a", 1),
+            AttentionKind::FailedStep,
+            "fk1",
+            Some("test"),
+        );
         let mut app = opened(failed);
         read_conductor(&mut app, conductor(true));
-        let labels: Vec<String> = chooser_of(&app).items().iter().map(|item| item.label.clone()).collect();
-        assert!(labels[0].starts_with("Potwierdź: Uruchom krok"), "{labels:?}");
+        let labels: Vec<String> = chooser_of(&app)
+            .items()
+            .iter()
+            .map(|item| item.label.clone())
+            .collect();
+        assert!(
+            labels[0].starts_with("Potwierdź: Uruchom krok"),
+            "{labels:?}"
+        );
         assert!(labels[1].starts_with("Odrzuć: Uruchom krok"));
         assert_eq!(labels[2], "Restart kroku z notatką");
         assert!(chooser_of(&app).items()[0].recommended, "◆ the conductor's");
-        assert_eq!(chooser_of(&app).selected(), 0, "the recommendation is selected");
+        assert_eq!(
+            chooser_of(&app).selected(),
+            0,
+            "the recommendation is selected"
+        );
 
         let request = sent(press(&mut app, KeyCode::Enter));
         assert_eq!(
             request.submit,
-            Submit::Operator(OperatorCommand::ConfirmProposal { proposal_id: "p1".to_string() })
+            Submit::Operator(OperatorCommand::ConfirmProposal {
+                proposal_id: "p1".to_string()
+            })
         );
         assert_eq!(request.generation, 1);
         assert!(!request.key.is_empty());
@@ -3129,13 +3515,20 @@ mod task_app_waiting {
 
     #[test]
     fn a_failed_step_rejects_or_restarts_with_a_note_naming_its_failure() {
-        let failed = waiting_on(running("a", 1), AttentionKind::FailedStep, "fk1", Some("test"));
+        let failed = waiting_on(
+            running("a", 1),
+            AttentionKind::FailedStep,
+            "fk1",
+            Some("test"),
+        );
         let mut app = opened(failed);
         read_conductor(&mut app, conductor(true));
         ch(&mut app, '2');
         assert_eq!(
             sent(press(&mut app, KeyCode::Enter)).submit,
-            Submit::Operator(OperatorCommand::RejectProposal { proposal_id: "p1".to_string() })
+            Submit::Operator(OperatorCommand::RejectProposal {
+                proposal_id: "p1".to_string()
+            })
         );
 
         ch(&mut app, '3');
@@ -3152,44 +3545,72 @@ mod task_app_waiting {
 
     #[test]
     fn a_failed_step_without_a_conductor_shows_the_raw_error_and_restarts() {
-        let failed = waiting_on(running("a", 1), AttentionKind::FailedStep, "fk1", Some("test"));
+        let failed = waiting_on(
+            running("a", 1),
+            AttentionKind::FailedStep,
+            "fk1",
+            Some("test"),
+        );
         let mut app = opened(failed);
         let mut failing = position("test", PositionStatus::Failed);
         failing.error = Some("cargo test: exit 101".to_string());
-        app.on_detail_read("a", 1, DetailRead::Timeline(Ok(timeline("a", vec![failing], None))));
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline("a", vec![failing], None))),
+        );
         read_conductor_response(
             &mut app,
             Ok(ConductorReadResponse::Unavailable {
-                reason: narsor::controller_protocol::ConversationUnavailableReason::RunnerUnreachable,
+                reason:
+                    narsor::controller_protocol::ConversationUnavailableReason::RunnerUnreachable,
                 message: "brak harnessu".to_string(),
             }),
         );
         let text = screen(&mut app, 120, 40);
-        assert!(text.contains("dyrygent niedostępny: brak harnessu"), "{text}");
+        assert!(
+            text.contains("dyrygent niedostępny: brak harnessu"),
+            "{text}"
+        );
         // The raw error comes from the timeline once the entry is built again.
         assert_eq!(chooser_of(&app).items().len(), 1, "only the restart");
         let request = sent(press(&mut app, KeyCode::Enter));
         assert_eq!(
             request.submit,
-            Submit::Operator(OperatorCommand::RestartStep { note: None, failure_key: Some("fk1".to_string()) })
+            Submit::Operator(OperatorCommand::RestartStep {
+                note: None,
+                failure_key: Some("fk1".to_string())
+            })
         );
     }
 
     #[test]
     fn a_proposal_from_the_chat_is_confirmed_or_rejected() {
-        let waiting = waiting_on(running("a", 1), AttentionKind::ConductorProposal, "p1", Some("test"));
+        let waiting = waiting_on(
+            running("a", 1),
+            AttentionKind::ConductorProposal,
+            "p1",
+            Some("test"),
+        );
         let mut app = opened(waiting);
         read_conductor(&mut app, conductor(false));
         let text = screen(&mut app, 120, 40);
-        assert!(text.contains("dyrygent proponuje: Uruchom krok od nowa"), "{text}");
+        assert!(
+            text.contains("dyrygent proponuje: Uruchom krok od nowa"),
+            "{text}"
+        );
         assert_eq!(
             sent(press(&mut app, KeyCode::Enter)).submit,
-            Submit::Operator(OperatorCommand::ConfirmProposal { proposal_id: "p1".to_string() })
+            Submit::Operator(OperatorCommand::ConfirmProposal {
+                proposal_id: "p1".to_string()
+            })
         );
         ch(&mut app, '2');
         assert_eq!(
             sent(press(&mut app, KeyCode::Enter)).submit,
-            Submit::Operator(OperatorCommand::RejectProposal { proposal_id: "p1".to_string() })
+            Submit::Operator(OperatorCommand::RejectProposal {
+                proposal_id: "p1".to_string()
+            })
         );
     }
 
@@ -3203,7 +3624,10 @@ mod task_app_waiting {
         );
         let mut app = opened(failed);
         assert_eq!(selected_label(&app), "Uruchom od nowa");
-        assert_eq!(sent(press(&mut app, KeyCode::Enter)).submit, Submit::Owner(OwnerCommand::Start));
+        assert_eq!(
+            sent(press(&mut app, KeyCode::Enter)).submit,
+            Submit::Owner(OwnerCommand::Start)
+        );
 
         ch(&mut app, '2');
         assert!(chooser_of(&app).items()[1].irreversible);
@@ -3264,14 +3688,26 @@ mod task_app_waiting {
         assert!(app.detail().has_drafts());
         let waiting = with_pending(running("a", 1), gate("ep-1"));
         app.load(listing(vec![titled(waiting.clone(), "NAR-12")], "d"));
-        app.on_stream(event("e", "a", 2, TaskLifecycle::Running, TaskEventKind::Created));
+        app.on_stream(event(
+            "e",
+            "a",
+            2,
+            TaskLifecycle::Running,
+            TaskEventKind::Created,
+        ));
         app.load(listing(vec![titled(waiting, "NAR-12")], "e"));
         assert!(app.panel_focused());
         assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
         assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "Uwzględnij");
-        assert!(app.detail().draft("a").is_some_and(|draft| draft.contains("Uwzględnij")));
+        assert!(app
+            .detail()
+            .draft("a")
+            .is_some_and(|draft| draft.contains("Uwzględnij")));
         typed(&mut app, " migrację");
-        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "Uwzględnij migrację");
+        assert_eq!(
+            chooser_of(&app).fields_of(1)[0].value(),
+            "Uwzględnij migrację"
+        );
     }
 
     #[test]
@@ -3311,8 +3747,16 @@ mod task_app_waiting {
         assert!(panel.released()[0].text.contains("moja odpowiedź"));
         assert!(app.detail().has_drafts());
         let text = screen(&mut app, 120, 40);
-        assert!(text.contains("moja odpowiedź") && text.contains("skopiuj"), "{text}");
-        assert!(app.notifier().latest().unwrap().text.contains("oczekiwanie zniknęło"));
+        assert!(
+            text.contains("moja odpowiedź") && text.contains("skopiuj"),
+            "{text}"
+        );
+        assert!(app
+            .notifier()
+            .latest()
+            .unwrap()
+            .text
+            .contains("oczekiwanie zniknęło"));
 
         // The box is dismissed on purpose.
         press(&mut app, KeyCode::Tab);
@@ -3340,13 +3784,22 @@ mod task_app_waiting {
         let mut app = gate_app();
         press(&mut app, KeyCode::Enter);
         typed(&mut app, "q?");
-        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "q?", "q and ? are text while typing");
+        assert_eq!(
+            chooser_of(&app).fields_of(1)[0].value(),
+            "q?",
+            "q and ? are text while typing"
+        );
         assert!(!app.should_quit());
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
         ch(&mut app, 'q');
         assert!(!app.should_quit(), "the draft makes q ask");
-        assert!(app.notifier().latest().unwrap().text.contains("niewysłany szkic"));
+        assert!(app
+            .notifier()
+            .latest()
+            .unwrap()
+            .text
+            .contains("niewysłany szkic"));
         ch(&mut app, 'q');
         assert!(app.should_quit());
 
@@ -3365,7 +3818,12 @@ mod task_app_waiting {
         assert!(!app.panel_focused());
         press(&mut app, KeyCode::Tab);
         assert!(!app.panel_focused());
-        assert!(app.notifier().latest().unwrap().text.contains("na nic nie czeka"));
+        assert!(app
+            .notifier()
+            .latest()
+            .unwrap()
+            .text
+            .contains("na nic nie czeka"));
 
         let mut app = gate_app();
         press(&mut app, KeyCode::Esc);
@@ -3379,7 +3837,11 @@ mod task_app_waiting {
         let mut app = gate_app();
         assert_eq!(app.key_context(), narsor::tui::keymap::Context::Panel);
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.key_context(), narsor::tui::keymap::Context::Form, "typing inherits no global key");
+        assert_eq!(
+            app.key_context(),
+            narsor::tui::keymap::Context::Form,
+            "typing inherits no global key"
+        );
         ch(&mut app, '?');
         assert!(!app.is_help_open());
         press(&mut app, KeyCode::Tab);
@@ -3425,7 +3887,10 @@ mod task_app_waiting {
         );
     }
 
-    fn read_conductor_response(app: &mut TaskApp, result: Result<ConductorReadResponse, ClientError>) {
+    fn read_conductor_response(
+        app: &mut TaskApp,
+        result: Result<ConductorReadResponse, ClientError>,
+    ) {
         app.on_detail_read("a", 1, DetailRead::Conductor(result));
     }
 
@@ -3433,7 +3898,8 @@ mod task_app_waiting {
 
     fn approval_snapshot(sequence: u64) -> narsor::orchestration::RunnerSnapshot {
         let mut snapshot = snapshot(sequence, None);
-        let form: narsor::engine::PendingHumanInput = serde_json::from_value(approval(true)).unwrap();
+        let form: narsor::engine::PendingHumanInput =
+            serde_json::from_value(approval(true)).unwrap();
         snapshot.pending_input = Some(narsor::orchestration::PendingInputRef {
             id: "ep-a".to_string(),
             attempt_id: None,
@@ -3451,7 +3917,9 @@ mod task_app_waiting {
     #[tokio::test(flavor = "multi_thread")]
     async fn space_enter_accept_enter_sends_returns_to_the_list_and_says_so() {
         let harness = RemoteHarness::start().await;
-        let _running = harness.running("NAR-12", "local", approval_snapshot(1)).await;
+        let _running = harness
+            .running("NAR-12", "local", approval_snapshot(1))
+            .await;
         let mut app = TaskApp::new(harness.owner.clone(), "local", None);
         app.refresh().await;
 
@@ -3460,17 +3928,31 @@ mod task_app_waiting {
         assert_eq!(request, Request::None);
         assert!(app.panel_focused());
         ch(&mut app, '1');
-        let chooser = app.detail().view("NAR-12").unwrap().waiting().chooser().unwrap();
+        let chooser = app
+            .detail()
+            .view("NAR-12")
+            .unwrap()
+            .waiting()
+            .chooser()
+            .unwrap();
         assert_eq!(chooser.selected_item().unwrap().label, "Akceptuj");
         let request = press(&mut app, KeyCode::Enter);
         app.perform(request).await;
 
-        assert_eq!(app.focus(), Focus::List, "after sending, the focus is on the list");
+        assert_eq!(
+            app.focus(),
+            Focus::List,
+            "after sending, the focus is on the list"
+        );
         let note = app.notifier().latest().expect("a notification");
         assert_eq!(note.text, "NAR-12: zaakceptowano reviewed");
         assert_eq!(note.severity, Severity::Success);
         let summary = harness.owner.control_task("NAR-12").await.unwrap();
-        assert_eq!(summary.inputs.len(), 1, "the answer was queued for the runner");
+        assert_eq!(
+            summary.inputs.len(),
+            1,
+            "the answer was queued for the runner"
+        );
         assert_eq!(summary.inputs[0].pending_input_id, "ep-a");
         assert!(!app.detail().has_drafts());
     }
@@ -3478,7 +3960,9 @@ mod task_app_waiting {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_refusal_keeps_the_panel_and_the_text_and_reads_the_task_again() {
         let harness = RemoteHarness::start().await;
-        let running = harness.running("NAR-12", "local", approval_snapshot(1)).await;
+        let running = harness
+            .running("NAR-12", "local", approval_snapshot(1))
+            .await;
         let mut app = TaskApp::new(harness.owner.clone(), "local", None);
         app.refresh().await;
         ch(&mut app, ' ');
@@ -3487,17 +3971,29 @@ mod task_app_waiting {
         typed(&mut app, "popraw testy");
 
         // The runner moved on: the request the panel shows is gone.
-        running.runner.snapshot(&snapshot(2, None)).await.expect("the runner moved on");
+        running
+            .runner
+            .snapshot(&snapshot(2, None))
+            .await
+            .expect("the runner moved on");
         let request = press(&mut app, KeyCode::Enter);
         app.perform(request).await;
 
         let note = app.notifier().latest().unwrap();
         assert_eq!(note.severity, Severity::Error);
-        assert!(note.text.starts_with("NAR-12: nie wysłano"), "{}", note.text);
+        assert!(
+            note.text.starts_with("NAR-12: nie wysłano"),
+            "{}",
+            note.text
+        );
         // The task was read again: nothing waits any more, and the text is kept.
         let panel = app.detail().view("NAR-12").unwrap().waiting();
         assert!(panel.is_empty());
-        assert!(panel.released()[0].text.contains("popraw testy"), "{:?}", panel.released());
+        assert!(
+            panel.released()[0].text.contains("popraw testy"),
+            "{:?}",
+            panel.released()
+        );
         assert!(app.detail().has_drafts());
     }
 
@@ -3559,8 +4055,8 @@ mod task_app_actions {
 
     use super::remote_support::{snapshot, RemoteHarness};
     use super::task_app_support::{
-        displayed, event, listing, queued, task, titled, waiting_on, with_controller,
-        with_runner, with_transitions,
+        displayed, event, listing, queued, task, titled, waiting_on, with_controller, with_runner,
+        with_transitions,
     };
 
     fn offline_client() -> ApiClient {
@@ -3697,11 +4193,15 @@ mod task_app_actions {
                 unavailable(&lifecycle("provisioning"), TaskAction::PauseResume),
                 "zadanie jest przygotowywane"
             );
-            assert!(unavailable(&lifecycle("interrupted"), TaskAction::PauseResume)
-                .contains("uruchom je od nowa"));
+            assert!(
+                unavailable(&lifecycle("interrupted"), TaskAction::PauseResume)
+                    .contains("uruchom je od nowa")
+            );
             assert!(unavailable(&finished("a", 1), TaskAction::PauseResume).contains("zakończone"));
-            assert!(unavailable(&lifecycle("pause_requested"), TaskAction::PauseResume)
-                .contains("wstrzymywane"));
+            assert!(
+                unavailable(&lifecycle("pause_requested"), TaskAction::PauseResume)
+                    .contains("wstrzymywane")
+            );
         }
 
         #[test]
@@ -3718,7 +4218,8 @@ mod task_app_actions {
                 "runner jeszcze się nie zgłosił"
             );
             let mut silent = running("a", 1);
-            silent.runner.as_mut().unwrap().freshness = narsor::controller_protocol::Freshness::Stale;
+            silent.runner.as_mut().unwrap().freshness =
+                narsor::controller_protocol::Freshness::Stale;
             assert!(unavailable(&silent, TaskAction::Interrupt).contains("nie odpowiada"));
         }
 
@@ -3870,7 +4371,12 @@ mod task_app_actions {
 
         #[test]
         fn the_transition_entry_is_there_when_the_state_has_exits() {
-            let task = with_transitions(running("a", 1), "review", &[("approved", "ship", None)], None);
+            let task = with_transitions(
+                running("a", 1),
+                "review",
+                &[("approved", "ship", None)],
+                None,
+            );
             let mut app = loaded(task);
             ch(&mut app, '.');
             let chooser = app.overlay().unwrap().chooser().unwrap();
@@ -3932,7 +4438,11 @@ mod task_app_actions {
             let mut app = loaded(running("a", 1));
             ch(&mut app, '.');
             assert_eq!(ch(&mut app, 'a'), Request::None);
-            assert!(note(&app).starts_with("archiwizacja: zadanie działa"), "{}", note(&app));
+            assert!(
+                note(&app).starts_with("archiwizacja: zadanie działa"),
+                "{}",
+                note(&app)
+            );
             assert!(app.overlay().is_some());
         }
 
@@ -3964,7 +4474,10 @@ mod task_app_actions {
             ));
             let chooser = app.overlay().unwrap().chooser().unwrap();
             assert!(
-                chooser.items().iter().any(|item| item.label.contains("wznów")),
+                chooser
+                    .items()
+                    .iter()
+                    .any(|item| item.label.contains("wznów")),
                 "the pause became a resume"
             );
             app.on_stream(event(
@@ -4030,7 +4543,11 @@ mod task_app_actions {
 
             let mut app = loaded(running("a", 1));
             assert_eq!(ch(&mut app, 's'), Request::None);
-            assert!(note(&app).starts_with("uruchomienie od nowa:"), "{}", note(&app));
+            assert!(
+                note(&app).starts_with("uruchomienie od nowa:"),
+                "{}",
+                note(&app)
+            );
         }
 
         #[test]
@@ -4076,14 +4593,21 @@ mod task_app_actions {
             let mut app = loaded(running("a", 1));
             assert_eq!(ch(&mut app, 'x'), Request::None);
             let window = confirmation(&app);
-            assert!(window.heading().contains("Przerwij"), "{}", window.heading());
+            assert!(
+                window.heading().contains("Przerwij"),
+                "{}",
+                window.heading()
+            );
             let text = window.lines().join(" ");
             assert!(text.contains("„review”"), "the step it cuts short: {text}");
             assert!(text.contains("NAR-12"), "{text}");
             assert_eq!(app.key_context(), Context::Confirm);
 
             let request = act(ch(&mut app, 'y'));
-            assert_eq!(request.send, ActionSend::Operator(OperatorCommand::Interrupt));
+            assert_eq!(
+                request.send,
+                ActionSend::Operator(OperatorCommand::Interrupt)
+            );
             assert_eq!(request.task_id, "a");
             assert_eq!(request.generation, 1);
             assert!(!request.key.is_empty());
@@ -4171,11 +4695,18 @@ mod task_app_actions {
                 keymap::lookup(Context::Confirm, &press(KeyCode::Esc)),
                 Some(Action::Cancel)
             );
-            assert!(Context::ALL.contains(&Context::Confirm), "the confirmation is a context of the map");
+            assert!(
+                Context::ALL.contains(&Context::Confirm),
+                "the confirmation is a context of the map"
+            );
             keymap::check_consistency(keymap::BINDINGS).expect("the key map stays consistent");
             let hints = keymap::hints(Context::Confirm);
-            assert!(hints.iter().any(|(keys, label)| keys == "y" && *label == "potwierdź"));
-            assert!(hints.iter().any(|(keys, label)| keys.starts_with('n') && *label == "anuluj"));
+            assert!(hints
+                .iter()
+                .any(|(keys, label)| keys == "y" && *label == "potwierdź"));
+            assert!(hints
+                .iter()
+                .any(|(keys, label)| keys.starts_with('n') && *label == "anuluj"));
         }
     }
 
@@ -4207,7 +4738,9 @@ mod task_app_actions {
             assert_eq!(chooser.items().len(), 2, "no override: only the exits");
             assert!(chooser.items()[0].label.contains("approved"));
             assert!(chooser.items()[0].label.contains("ship"));
-            assert!(chooser.items()[0].description.contains("Zatwierdza i wypuszcza"));
+            assert!(chooser.items()[0]
+                .description
+                .contains("Zatwierdza i wypuszcza"));
             assert!(
                 chooser.items()[1].description.contains("nie opisuje"),
                 "an exit without a description says so"
@@ -4281,7 +4814,10 @@ mod task_app_actions {
             let window = confirmation(&app);
             assert!(window.heading().contains("Override"));
             let text = window.lines().join(" ");
-            assert!(text.contains("„review”") && text.contains("„plan”"), "{text}");
+            assert!(
+                text.contains("„review”") && text.contains("„plan”"),
+                "{text}"
+            );
             assert!(text.contains("CI nie ruszy bez tego"), "{text}");
             assert!(text.contains("audytu"), "{text}");
 
@@ -4367,7 +4903,11 @@ mod task_app_actions {
             let mut app = loaded(task);
             ch(&mut app, 'o');
             let chooser = app.overlay().unwrap().chooser().unwrap();
-            assert_eq!(chooser.items().len(), 2, "the unresolved one is not offered");
+            assert_eq!(
+                chooser.items().len(),
+                2,
+                "the unresolved one is not offered"
+            );
             assert!(chooser.items()[0].label.contains("Jira"));
             ch(&mut app, '2');
             let request = press(&mut app, KeyCode::Enter);
@@ -4441,7 +4981,10 @@ mod task_app_actions {
                 .find(|item| item.label.contains("wstrzymaj"))
                 .unwrap();
             assert!(
-                pause.unavailable.as_deref().is_some_and(|reason| reason.contains("zablokowana")),
+                pause
+                    .unavailable
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("zablokowana")),
                 "{:?}",
                 pause.unavailable
             );
@@ -4562,7 +5105,10 @@ mod task_app_actions {
                 },
             ));
             let text = note(&app);
-            assert!(text.contains("przejście do „ship” odrzucone przez runnera"), "{text}");
+            assert!(
+                text.contains("przejście do „ship” odrzucone przez runnera"),
+                "{text}"
+            );
             assert!(text.contains("the execution moved on"), "{text}");
             assert!(!text.contains('\u{1b}'), "{text:?}");
             assert_eq!(app.notifier().latest().unwrap().severity, Severity::Error);
@@ -4588,7 +5134,11 @@ mod task_app_actions {
                     detail: None,
                 },
             ));
-            assert!(note(&app).contains("bez podania przyczyny"), "{}", note(&app));
+            assert!(
+                note(&app).contains("bez podania przyczyny"),
+                "{}",
+                note(&app)
+            );
         }
 
         #[test]
@@ -4643,7 +5193,11 @@ mod task_app_actions {
                 },
             ));
             assert!(app.refresh_wanted());
-            assert!(note(&app).contains("polecenie operatora wykonane"), "{}", note(&app));
+            assert!(
+                note(&app).contains("polecenie operatora wykonane"),
+                "{}",
+                note(&app)
+            );
         }
 
         #[test]
@@ -4775,7 +5329,11 @@ mod task_app_actions {
             assert_eq!(command.status, OperatorCommandStatus::Applied);
             assert_eq!(command.command, OperatorCommand::Interrupt);
             assert_eq!(note(&app), "NAR-12: przerwanie kroku wykonane");
-            assert_eq!(app.list().tasks()[0].operator_commands.len(), 1, "no duplicate");
+            assert_eq!(
+                app.list().tasks()[0].operator_commands.len(),
+                1,
+                "no duplicate"
+            );
         }
 
         #[tokio::test]
@@ -4803,7 +5361,10 @@ mod task_app_actions {
                 next_event(&mut app, &mut feed).await;
             }
             let text = note(&app);
-            assert!(text.contains("przerwanie kroku odrzucone przez runnera"), "{text}");
+            assert!(
+                text.contains("przerwanie kroku odrzucone przez runnera"),
+                "{text}"
+            );
             assert!(text.contains("no step is in flight"), "{text}");
             assert_eq!(app.notifier().latest().unwrap().severity, Severity::Error);
         }
@@ -4863,7 +5424,11 @@ mod task_app_actions {
             let mut feed = EventFeed::new(harness.owner.clone());
             feed.ensure_open(&app);
             let ids = |app: &TaskApp| -> Vec<String> {
-                app.list().tasks().iter().map(|t| t.task_id.to_string()).collect()
+                app.list()
+                    .tasks()
+                    .iter()
+                    .map(|t| t.task_id.to_string())
+                    .collect()
             };
             assert_eq!(ids(&app), ["t1", "t2", "t3"]);
             assert_eq!(app.list().selected_id(), Some("t1"));
@@ -4880,7 +5445,11 @@ mod task_app_actions {
                 next_event(&mut app, &mut feed).await;
             }
             assert_eq!(ids(&app), ["t2", "t3"], "the row left the list");
-            assert_eq!(app.list().selected_id(), Some("t2"), "the selection went below");
+            assert_eq!(
+                app.list().selected_id(),
+                Some("t2"),
+                "the selection went below"
+            );
             assert!(note(&app).contains("zniknęło z listy"), "{}", note(&app));
         }
 
@@ -4901,7 +5470,10 @@ mod task_app_actions {
                 }
                 next_event(&mut app, &mut feed).await;
             }
-            assert_eq!(app.list().tasks()[0].lifecycle, TaskLifecycle::PauseRequested);
+            assert_eq!(
+                app.list().tasks()[0].lifecycle,
+                TaskLifecycle::PauseRequested
+            );
         }
 
         #[tokio::test]
@@ -4942,7 +5514,9 @@ mod task_app_actions {
             // The state the runner reported earlier was not one of the
             // workflow's: the server offers nothing it cannot back.
             let mut other = TaskApp::new(harness.owner.clone(), "local", None);
-            harness.running("NAR-13", "backend-a", snapshot(1, None)).await;
+            harness
+                .running("NAR-13", "backend-a", snapshot(1, None))
+                .await;
             other.refresh().await;
             let task = other
                 .list()
@@ -5020,7 +5594,11 @@ mod task_app_conductor {
     };
 
     fn app() -> TaskApp {
-        TaskApp::new(ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"), "local", None)
+        TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        )
     }
 
     fn press(app: &mut TaskApp, code: KeyCode) -> Request {
@@ -5105,7 +5683,12 @@ mod task_app_conductor {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
-                narsor::tui::task_app::layout::render(frame, app, &Styles::new(false), Instant::now())
+                narsor::tui::task_app::layout::render(
+                    frame,
+                    app,
+                    &Styles::new(false),
+                    Instant::now(),
+                )
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -5158,7 +5741,11 @@ mod task_app_conductor {
             read(&mut app, conductor_view(vec![], json!({})));
             ch(&mut app, 'c');
             assert!(conductor(&app).is_typing());
-            assert_eq!(app.key_context(), Context::Form, "typing inherits no global key");
+            assert_eq!(
+                app.key_context(),
+                Context::Form,
+                "typing inherits no global key"
+            );
 
             typed(&mut app, "  Czy revise? q");
             app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
@@ -5172,10 +5759,16 @@ mod task_app_conductor {
                 "what the operator typed is sent without a change"
             );
             assert_eq!(request.verb, "wiadomość do dyrygenta");
-            assert!(app.detail().has_drafts(), "the text stays until the control plane took it");
+            assert!(
+                app.detail().has_drafts(),
+                "the text stays until the control plane took it"
+            );
 
             let again = act(press(&mut app, KeyCode::Enter));
-            assert_eq!(again.key, request.key, "a retry of the same message reuses its key");
+            assert_eq!(
+                again.key, request.key,
+                "a retry of the same message reuses its key"
+            );
         }
 
         #[test]
@@ -5184,7 +5777,14 @@ mod task_app_conductor {
             read(
                 &mut app,
                 conductor_view(
-                    vec![chat_entry("m1", 1, "operator", "message", "Czy revise?", None)],
+                    vec![chat_entry(
+                        "m1",
+                        1,
+                        "operator",
+                        "message",
+                        "Czy revise?",
+                        None,
+                    )],
                     json!({ "unanswered_chat": ["m1"] }),
                 ),
             );
@@ -5192,7 +5792,14 @@ mod task_app_conductor {
             read(
                 &mut app,
                 conductor_view(
-                    vec![chat_entry("m2", 2, "conductor", "message", "Raczej revise — brak planu.", None)],
+                    vec![chat_entry(
+                        "m2",
+                        2,
+                        "conductor",
+                        "message",
+                        "Raczej revise — brak planu.",
+                        None,
+                    )],
                     json!({}),
                 ),
             );
@@ -5204,12 +5811,21 @@ mod task_app_conductor {
                 .collect();
             assert_eq!(
                 presentations,
-                [TranscriptPresentation::Operator, TranscriptPresentation::Conductor]
+                [
+                    TranscriptPresentation::Operator,
+                    TranscriptPresentation::Conductor
+                ]
             );
             assert!(!conductor(&app).awaits_answer());
             let text = screen(&mut app, 120, 30);
-            assert!(text.contains("USER") && text.contains("Czy revise?"), "{text}");
-            assert!(text.contains("KONDUKTOR") && text.contains("Raczej revise"), "{text}");
+            assert!(
+                text.contains("USER") && text.contains("Czy revise?"),
+                "{text}"
+            );
+            assert!(
+                text.contains("KONDUKTOR") && text.contains("Raczej revise"),
+                "{text}"
+            );
         }
 
         #[test]
@@ -5224,7 +5840,11 @@ mod task_app_conductor {
             assert_eq!(app.detail().draft("a"), Some("pół zdania"));
 
             app.load(listing(vec![titled(running("a", 1), "NAR-12")], "d"));
-            assert_eq!(conductor(&app).draft(), "pół zdania", "a refresh keeps the draft");
+            assert_eq!(
+                conductor(&app).draft(),
+                "pół zdania",
+                "a refresh keeps the draft"
+            );
             assert!(app.detail().has_drafts());
             assert!(screen(&mut app, 120, 30).contains("szkic: pół zdania"));
 
@@ -5279,7 +5899,9 @@ mod task_app_conductor {
             let text = screen(&mut app, 120, 30);
             assert!(text.contains("czerwony"), "{text}");
             assert!(
-                !text.chars().any(|c| c.is_control() && c != '\n' || "\u{202e}\u{200b}".contains(c)),
+                !text
+                    .chars()
+                    .any(|c| c.is_control() && c != '\n' || "\u{202e}\u{200b}".contains(c)),
                 "{text:?}"
             );
         }
@@ -5306,8 +5928,15 @@ mod task_app_conductor {
         fn undoing_a_decision_asks_with_its_confidence_and_sends_after_y() {
             let mut app = with_decision();
             assert_eq!(ch(&mut app, 'u'), Request::None);
-            let window = app.overlay().and_then(Overlay::confirmation).expect("the window");
-            assert!(window.heading().contains("Cofnij decyzję"), "{}", window.heading());
+            let window = app
+                .overlay()
+                .and_then(Overlay::confirmation)
+                .expect("the window");
+            assert!(
+                window.heading().contains("Cofnij decyzję"),
+                "{}",
+                window.heading()
+            );
             let text = screen(&mut app, 120, 30);
             assert!(text.contains("Pewność dyrygenta: high"), "{text}");
             assert!(text.contains("Uzasadnienie: Testy przeszły."), "{text}");
@@ -5350,7 +5979,10 @@ mod task_app_conductor {
             assert_eq!(items.len(), 2);
             assert_eq!(items[0].undo, Some(UndoState::Undone));
             let entries = conductor(&app).transcript().entries();
-            assert!(entries[0].rendered_lines.iter().any(|line| line.contains("decyzja cofnięta")));
+            assert!(entries[0]
+                .rendered_lines
+                .iter()
+                .any(|line| line.contains("decyzja cofnięta")));
             assert!(entries[1].rendered_lines[0].contains("Cofnięto decyzję"));
 
             // The selection is on the entry of the undo now: nothing to undo there.
@@ -5364,7 +5996,10 @@ mod task_app_conductor {
             let mut app = tab_app();
             read(
                 &mut app,
-                conductor_view(vec![chat_entry("m1", 1, "conductor", "message", "Cześć", None)], json!({})),
+                conductor_view(
+                    vec![chat_entry("m1", 1, "conductor", "message", "Cześć", None)],
+                    json!({}),
+                ),
             );
             ch(&mut app, 'u');
             assert!(app.overlay().is_none());
@@ -5413,11 +6048,17 @@ mod task_app_conductor {
                 app.on_stream(event(cursor, "a", sequence, TaskLifecycle::Running, kind));
             }
             let text = note(&app);
-            assert!(text.contains("cofnięcie decyzji dyrygenta odrzucone przez runnera"), "{text}");
+            assert!(
+                text.contains("cofnięcie decyzji dyrygenta odrzucone przez runnera"),
+                "{text}"
+            );
             assert!(text.contains("a later step already ran"), "{text}");
             assert_eq!(app.notifier().latest().unwrap().severity, Severity::Error);
             let revision = revision(&app);
-            assert!(conductor(&app).needs_read(revision, Instant::now()), "the tab is due for a read");
+            assert!(
+                conductor(&app).needs_read(revision, Instant::now()),
+                "the tab is due for a read"
+            );
         }
     }
 
@@ -5428,7 +6069,14 @@ mod task_app_conductor {
 
         fn proposal_view() -> ConductorView {
             conductor_view(
-                vec![chat_entry("p1", 2, "conductor", "proposal", "Uruchom krok od nowa", None)],
+                vec![chat_entry(
+                    "p1",
+                    2,
+                    "conductor",
+                    "proposal",
+                    "Uruchom krok od nowa",
+                    None,
+                )],
                 json!({
                     "proposals": [{
                         "proposal_id": "p1",
@@ -5452,7 +6100,12 @@ mod task_app_conductor {
             let mut app = app();
             app.load(listing(
                 vec![titled(
-                    waiting_on(running("a", 1), AttentionKind::ConductorProposal, "p1", Some("test")),
+                    waiting_on(
+                        running("a", 1),
+                        AttentionKind::ConductorProposal,
+                        "p1",
+                        Some("test"),
+                    ),
                     "NAR-12",
                 )],
                 "c",
@@ -5470,7 +6123,10 @@ mod task_app_conductor {
             read(&mut app, proposal_view());
             let text = screen(&mut app, 120, 40);
             assert!(text.contains("Propozycja dyrygenta"), "the panel: {text}");
-            assert!(text.contains("dyrygent proponuje: Uruchom krok od nowa"), "{text}");
+            assert!(
+                text.contains("dyrygent proponuje: Uruchom krok od nowa"),
+                "{text}"
+            );
             assert!(
                 text.contains("(propozycja: czeka na Ciebie w panelu na dole)"),
                 "the tab says where it is answered: {text}"
@@ -5506,7 +6162,10 @@ mod task_app_conductor {
             read(&mut app, proposal_view());
             assert!(!conductor(&app).needs_read(revision, Instant::now()));
             let panel = app.detail().view("a").unwrap().waiting();
-            assert!(!panel.needs_conductor(revision), "the panel did not need a second read");
+            assert!(
+                !panel.needs_conductor(revision),
+                "the panel did not need a second read"
+            );
         }
 
         #[test]
@@ -5534,30 +6193,54 @@ mod task_app_conductor {
 
         #[test]
         fn a_task_whose_runner_has_no_conductor_shows_why_and_has_no_box() {
-            let mut app = app_of(without_conductor(running("a", 1), "brak harnessu dyrygenta"));
+            let mut app = app_of(without_conductor(
+                running("a", 1),
+                "brak harnessu dyrygenta",
+            ));
             let text = screen(&mut app, 120, 30);
-            assert!(text.contains("dyrygent niedostępny: brak harnessu dyrygenta"), "{text}");
+            assert!(
+                text.contains("dyrygent niedostępny: brak harnessu dyrygenta"),
+                "{text}"
+            );
             assert!(!text.contains("c napisz"), "no box, no hint for it: {text}");
             ch(&mut app, 'c');
             assert!(!conductor(&app).is_typing());
-            assert!(note(&app).contains("brak harnessu dyrygenta"), "{}", note(&app));
+            assert!(
+                note(&app).contains("brak harnessu dyrygenta"),
+                "{}",
+                note(&app)
+            );
             ch(&mut app, 'h');
             assert!(app.overlay().is_none());
-            assert!(note(&app).contains("brak harnessu dyrygenta"), "{}", note(&app));
+            assert!(
+                note(&app).contains("brak harnessu dyrygenta"),
+                "{}",
+                note(&app)
+            );
         }
 
         #[test]
         fn a_view_that_says_there_is_none_wins_and_its_history_stays_readable() {
             let mut app = tab_app();
             let mut view = conductor_view(
-                vec![chat_entry("m1", 1, "conductor", "message", "Stara odpowiedź", None)],
+                vec![chat_entry(
+                    "m1",
+                    1,
+                    "conductor",
+                    "message",
+                    "Stara odpowiedź",
+                    None,
+                )],
                 json!({}),
             );
             view.available = false;
             view.unavailable_reason = Some("the runner is not running".to_string());
             read(&mut app, view);
             let text = screen(&mut app, 120, 30);
-            assert!(text.contains("dyrygent niedostępny: the runner is not running"), "{text}");
+            assert!(
+                text.contains("dyrygent niedostępny: the runner is not running"),
+                "{text}"
+            );
             assert!(text.contains("Stara odpowiedź"), "{text}");
             ch(&mut app, 'c');
             assert!(!conductor(&app).is_typing());
@@ -5594,8 +6277,14 @@ mod task_app_conductor {
                 text.contains("nie udało się wczytać dyrygenta (runner nie odpowiedział na czas)"),
                 "{text}"
             );
-            assert!(app.connection().is_live(), "the relay missing a deadline says nothing against the connection");
-            assert_eq!(conductor(&app).failure(), Some("runner nie odpowiedział na czas"));
+            assert!(
+                app.connection().is_live(),
+                "the relay missing a deadline says nothing against the connection"
+            );
+            assert_eq!(
+                conductor(&app).failure(),
+                Some("runner nie odpowiedział na czas")
+            );
         }
 
         #[test]
@@ -5603,7 +6292,10 @@ mod task_app_conductor {
             let mut app = tab_app();
             read(
                 &mut app,
-                conductor_view(vec![chat_entry("m1", 1, "conductor", "message", "Zostaje", None)], json!({})),
+                conductor_view(
+                    vec![chat_entry("m1", 1, "conductor", "message", "Zostaje", None)],
+                    json!({}),
+                ),
             );
             read_response(
                 &mut app,
@@ -5614,19 +6306,31 @@ mod task_app_conductor {
             );
             let text = screen(&mut app, 120, 30);
             assert!(text.contains("Zostaje"), "{text}");
-            assert!(text.contains("nie udało się odświeżyć (runner nie odpowiedział)"), "{text}");
+            assert!(
+                text.contains("nie udało się odświeżyć (runner nie odpowiedział)"),
+                "{text}"
+            );
             ch(&mut app, 'c');
-            assert!(conductor(&app).is_typing(), "the conductor is still there to write to");
+            assert!(
+                conductor(&app).is_typing(),
+                "the conductor is still there to write to"
+            );
         }
 
         #[test]
         fn an_archived_task_says_its_storage_went_with_the_archiving() {
             let mut app = app();
-            app.load(listing(vec![titled(task("a", "local", "archived", 1), "NAR-12")], "c"));
+            app.load(listing(
+                vec![titled(task("a", "local", "archived", 1), "NAR-12")],
+                "c",
+            ));
             press(&mut app, KeyCode::Enter);
             app.detail_mut().set_tab(DetailTab::Conductor);
             let text = screen(&mut app, 120, 30);
-            assert!(text.contains("storage usunięty przy archiwizacji"), "{text}");
+            assert!(
+                text.contains("storage usunięty przy archiwizacji"),
+                "{text}"
+            );
         }
 
         #[test]
@@ -5641,7 +6345,11 @@ mod task_app_conductor {
             app.detail_mut().set_tab(DetailTab::Progress);
             for key in ['c', 'u', 'h', 'M'] {
                 ch(&mut app, key);
-                assert!(note(&app).contains("zakładce Dyrygent"), "{key}: {}", note(&app));
+                assert!(
+                    note(&app).contains("zakładce Dyrygent"),
+                    "{key}: {}",
+                    note(&app)
+                );
                 assert!(app.overlay().is_none());
                 assert!(app
                     .detail()
@@ -5675,7 +6383,10 @@ mod task_app_conductor {
             let text = screen(&mut app, 120, 30);
             assert!(text.contains("Harness dyrygenta"), "{text}");
             let chooser = app.overlay().and_then(Overlay::chooser).unwrap();
-            assert!(chooser.items()[0].unavailable.is_some(), "claude-code is the current one");
+            assert!(
+                chooser.items()[0].unavailable.is_some(),
+                "claude-code is the current one"
+            );
             assert_eq!(chooser.selected(), 1, "the list opens on another harness");
 
             let request = act(press(&mut app, KeyCode::Enter));
@@ -5696,7 +6407,11 @@ mod task_app_conductor {
             ch(&mut app, 'h');
             ch(&mut app, 'k');
             assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
-            assert!(note(&app).contains("już działa na tym harnessie"), "{}", note(&app));
+            assert!(
+                note(&app).contains("już działa na tym harnessie"),
+                "{}",
+                note(&app)
+            );
             assert!(app.overlay().is_some(), "the list stays to choose again");
             press(&mut app, KeyCode::Esc);
             assert!(app.overlay().is_none());
@@ -5730,7 +6445,10 @@ mod task_app_conductor {
                 app.on_stream(event(cursor, "a", sequence, TaskLifecycle::Running, kind));
             }
             let text = note(&app);
-            assert!(text.contains("zmiana harnessu dyrygenta odrzucone przez runnera"), "{text}");
+            assert!(
+                text.contains("zmiana harnessu dyrygenta odrzucone przez runnera"),
+                "{text}"
+            );
             assert!(text.contains("no conductor runs for this task"), "{text}");
         }
     }
@@ -5744,7 +6462,14 @@ mod task_app_conductor {
             conductor_view(
                 (from..=to)
                     .map(|sequence| {
-                        chat_entry(&format!("m{sequence}"), sequence, "conductor", "message", &format!("wpis {sequence}"), None)
+                        chat_entry(
+                            &format!("m{sequence}"),
+                            sequence,
+                            "conductor",
+                            "message",
+                            &format!("wpis {sequence}"),
+                            None,
+                        )
                     })
                     .collect(),
                 json!({ "chat_has_more": more }),
@@ -5763,7 +6488,10 @@ mod task_app_conductor {
 
             ch(&mut app, 'M');
             assert!(conductor(&app).wants_more());
-            assert!(conductor(&app).needs_read(revision, Instant::now()), "the same revision is read on");
+            assert!(
+                conductor(&app).needs_read(revision, Instant::now()),
+                "the same revision is read on"
+            );
 
             // The next page overlaps the last entry: it is not shown twice.
             read(&mut app, page(2, 3, false));
@@ -5816,7 +6544,10 @@ mod task_app_conductor {
             (Action::ChooseHarness, "h"),
             (Action::LoadMore, "M"),
         ] {
-            assert_eq!(keymap::key_of(Context::Details, action).as_deref(), Some(key));
+            assert_eq!(
+                keymap::key_of(Context::Details, action).as_deref(),
+                Some(key)
+            );
             assert!(
                 keymap::help_entries(Context::Details)
                     .iter()
@@ -5918,8 +6649,18 @@ mod task_app_conductor {
             assert!(text.contains("wiadomość do dyrygenta odrzucone"), "{text}");
             assert!(text.contains("4000"), "{text}");
             assert_eq!(app.notifier().latest().unwrap().severity, Severity::Error);
-            let draft = app.detail().view("NAR-12").unwrap().conductor().draft().to_string();
-            assert_eq!(draft.chars().count(), 4001, "nothing the operator typed was lost");
+            let draft = app
+                .detail()
+                .view("NAR-12")
+                .unwrap()
+                .conductor()
+                .draft()
+                .to_string();
+            assert_eq!(
+                draft.chars().count(),
+                4001,
+                "nothing the operator typed was lost"
+            );
             assert!(app.detail().has_drafts());
         }
 
@@ -5942,7 +6683,10 @@ mod task_app_conductor {
             };
             app.perform(Request::Act(Box::new(request))).await;
             let text = note(&app);
-            assert!(text.contains("zmiana harnessu dyrygenta odrzucone"), "{text}");
+            assert!(
+                text.contains("zmiana harnessu dyrygenta odrzucone"),
+                "{text}"
+            );
             assert!(text.contains("unknown agent harness 'nope'"), "{text}");
         }
 
@@ -5960,7 +6704,14 @@ mod task_app_conductor {
                 json!({ "chat_has_more": true }),
             );
             let second = conductor_view(
-                vec![chat_entry("m3", 3, "conductor", "message", "Jeszcze coś", None)],
+                vec![chat_entry(
+                    "m3",
+                    3,
+                    "conductor",
+                    "message",
+                    "Jeszcze coś",
+                    None,
+                )],
                 json!({}),
             );
             let (_, afters) = tokio::join!(app.sync_detail(), async {
@@ -5968,7 +6719,11 @@ mod task_app_conductor {
                 let two = answer(&running.runner, second).await;
                 (one, two)
             });
-            assert_eq!(afters, (0, 2), "the second page continued after the last entry");
+            assert_eq!(
+                afters,
+                (0, 2),
+                "the second page continued after the last entry"
+            );
             let tab = app.detail().view("NAR-12").unwrap().conductor();
             assert_eq!(tab.items().len(), 3);
             assert!(!tab.has_more());
@@ -5992,6 +6747,7 @@ mod task_app_create {
     };
     use narsor::domain::ParamType;
     use narsor::orchestration::TaskLifecycle;
+    use narsor::persistence::ExecutionStore;
     use narsor::tui::keymap::{self, Action, Context};
     use narsor::tui::task_app::history::HistoryEntry;
     use narsor::tui::task_app::list::PendingState;
@@ -5999,7 +6755,6 @@ mod task_app_create {
         absolute_path, CreateHow, PathVerdict, DRAFT_KEY, PATH_FIELD, PATH_LABEL, RETRY_AFTER,
     };
     use narsor::tui::task_app::notify::Severity;
-    use narsor::persistence::ExecutionStore;
     use narsor::tui::task_app::{DetailTab, Request, TaskApp, ViewKind};
 
     use super::remote_support::RemoteHarness;
@@ -6048,8 +6803,18 @@ mod task_app_create {
                 "implement-feature",
                 "Pełny cykl: plan, implementacja, review, testy i PR.",
                 vec![
-                    workflow_input("ticket_id", ParamType::String, true, Some("numer zgłoszenia")),
-                    workflow_input("attempts", ParamType::Integer, false, Some("ile razy ponawiać")),
+                    workflow_input(
+                        "ticket_id",
+                        ParamType::String,
+                        true,
+                        Some("numer zgłoszenia"),
+                    ),
+                    workflow_input(
+                        "attempts",
+                        ParamType::Integer,
+                        false,
+                        Some("ile razy ponawiać"),
+                    ),
                     workflow_input("dry_run", ParamType::Boolean, false, None),
                     workflow_input("target_repo", ParamType::Repository, false, None),
                 ],
@@ -6105,7 +6870,11 @@ mod task_app_create {
 
     fn field_value(app: &TaskApp, label: &str, field: &str) -> String {
         let chooser = app.new_task_form().unwrap().chooser();
-        let index = chooser.items().iter().position(|item| item.label == label).unwrap();
+        let index = chooser
+            .items()
+            .iter()
+            .position(|item| item.label == label)
+            .unwrap();
         chooser
             .fields_of(index)
             .iter()
@@ -6152,7 +6921,10 @@ mod task_app_create {
 
         #[test]
         fn n_opens_the_catalogue_with_the_path_last_and_leaves_the_list_alone() {
-            let mut app = app_with(vec![titled(queued("a", 1), "NAR-1"), titled(queued("b", 2), "NAR-2")]);
+            let mut app = app_with(vec![
+                titled(queued("a", 1), "NAR-1"),
+                titled(queued("b", 2), "NAR-2"),
+            ]);
             let before = rows(&app);
             open_form(&mut app);
             let labels: Vec<&str> = app
@@ -6176,10 +6948,17 @@ mod task_app_create {
             let mut app = app_with(vec![]);
             open_form(&mut app);
             let item = chooser_item(&app, "implement-feature");
-            let names: Vec<&str> = item.fields.iter().map(|field| field.name.as_str()).collect();
+            let names: Vec<&str> = item
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect();
             assert_eq!(names, ["ticket_id", "attempts", "dry_run", "target_repo"]);
             assert!(item.fields[0].required);
-            assert_eq!(item.fields[0].description.as_deref(), Some("numer zgłoszenia"));
+            assert_eq!(
+                item.fields[0].description.as_deref(),
+                Some("numer zgłoszenia")
+            );
             assert!(!item.fields[1].required);
             assert_eq!(
                 item.fields[1].description.as_deref(),
@@ -6188,7 +6967,8 @@ mod task_app_create {
         }
 
         #[test]
-        fn a_boolean_is_a_choice_that_starts_on_false_and_a_repository_offers_the_registered_ones() {
+        fn a_boolean_is_a_choice_that_starts_on_false_and_a_repository_offers_the_registered_ones()
+        {
             let mut app = app_with(vec![]);
             open_form(&mut app);
             let item = chooser_item(&app, "implement-feature");
@@ -6201,7 +6981,10 @@ mod task_app_create {
                 item.fields[3].kind,
                 narsor::tui::chooser::FieldKind::Select(vec!["docs".into(), "narsor".into()])
             );
-            assert_eq!(app.new_task_form().unwrap().repositories(), ["docs", "narsor"]);
+            assert_eq!(
+                app.new_task_form().unwrap().repositories(),
+                ["docs", "narsor"]
+            );
         }
 
         #[test]
@@ -6224,7 +7007,9 @@ mod task_app_create {
             assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
             let item = chooser_item(&app, "implement-feature");
             assert!(
-                item.fields[0].error().is_some_and(|error| error.contains("ticket_id")),
+                item.fields[0]
+                    .error()
+                    .is_some_and(|error| error.contains("ticket_id")),
                 "{:?}",
                 item.fields[0].error()
             );
@@ -6256,16 +7041,26 @@ mod task_app_create {
 
         #[test]
         fn esc_gives_the_selected_task_back_and_the_next_n_brings_the_data_back() {
-            let mut app = app_with(vec![titled(queued("a", 1), "NAR-1"), titled(queued("b", 2), "NAR-2")]);
+            let mut app = app_with(vec![
+                titled(queued("a", 1), "NAR-1"),
+                titled(queued("b", 2), "NAR-2"),
+            ]);
             ch(&mut app, 'g');
             open_form(&mut app);
             fill_ticket(&mut app, "NAR-18");
             assert!(app.detail().has_drafts(), "typed data is an unsent draft");
-            assert!(app.detail().draft(DRAFT_KEY).is_some_and(|text| text.contains("NAR-18")));
+            assert!(app
+                .detail()
+                .draft(DRAFT_KEY)
+                .is_some_and(|text| text.contains("NAR-18")));
 
             assert_eq!(press(&mut app, KeyCode::Esc), Request::None);
             assert_eq!(app.view_kind(), ViewKind::Tasks);
-            assert_eq!(app.list().selected_id(), Some("a"), "the task selected before is back");
+            assert_eq!(
+                app.list().selected_id(),
+                Some("a"),
+                "the task selected before is back"
+            );
             assert!(app.remembered_new_task().is_some());
 
             // `q` asks before throwing the data away.
@@ -6275,8 +7070,14 @@ mod task_app_create {
 
             ch(&mut app, 'n');
             app.open_new_task(workflows(), narsor_registry());
-            assert_eq!(field_value(&app, "implement-feature", "ticket_id"), "NAR-18");
-            assert!(app.remembered_new_task().is_none(), "it is the open form now");
+            assert_eq!(
+                field_value(&app, "implement-feature", "ticket_id"),
+                "NAR-18"
+            );
+            assert!(
+                app.remembered_new_task().is_none(),
+                "it is the open form now"
+            );
         }
 
         #[test]
@@ -6312,7 +7113,11 @@ mod task_app_create {
                 .unwrap();
             runtime.block_on(app.perform(request));
             assert_eq!(app.view_kind(), ViewKind::Tasks);
-            assert!(note(&app).contains("nie udało się wczytać katalogu"), "{}", note(&app));
+            assert!(
+                note(&app).contains("nie udało się wczytać katalogu"),
+                "{}",
+                note(&app)
+            );
         }
     }
 
@@ -6324,7 +7129,10 @@ mod task_app_create {
         #[test]
         fn a_server_that_does_not_read_files_greys_the_path_out_with_its_reason() {
             let mut app = app_with(vec![]);
-            app.set_capabilities(capabilities(false, Some("serwer zdalny nie czyta plików z dysku")));
+            app.set_capabilities(capabilities(
+                false,
+                Some("serwer zdalny nie czyta plików z dysku"),
+            ));
             open_form(&mut app);
             let item = chooser_item(&app, PATH_LABEL);
             assert_eq!(
@@ -6382,7 +7190,10 @@ mod task_app_create {
                 press(&mut app, KeyCode::Enter),
                 Request::ValidatePath("/srv/workflows/wf.yaml".to_string())
             );
-            assert!(app.outgoing().is_empty(), "nothing is created before the check");
+            assert!(
+                app.outgoing().is_empty(),
+                "nothing is created before the check"
+            );
         }
 
         #[test]
@@ -6415,11 +7226,7 @@ mod task_app_create {
                 assert!(description.contains(violation), "{description}");
             }
             assert!(description.contains("naruszeń: 3"), "{description}");
-            let error = app
-                .new_task_form()
-                .unwrap()
-                .chooser()
-                .fields_of(2)[0]
+            let error = app.new_task_form().unwrap().chooser().fields_of(2)[0]
                 .error()
                 .map(str::to_string);
             assert!(error.is_some_and(|error| error.contains('3')));
@@ -6448,10 +7255,18 @@ mod task_app_create {
                 }),
             );
             let item = chooser_item(&app, PATH_LABEL);
-            let names: Vec<&str> = item.fields.iter().map(|field| field.name.as_str()).collect();
+            let names: Vec<&str> = item
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect();
             assert_eq!(names, [PATH_FIELD, "ticket"]);
             assert!(item.description.contains("my-flow v4"));
-            assert_eq!(field_value(&app, PATH_LABEL, PATH_FIELD), "/srv/ok.yaml", "what was typed stays");
+            assert_eq!(
+                field_value(&app, PATH_LABEL, PATH_FIELD),
+                "/srv/ok.yaml",
+                "what was typed stays"
+            );
 
             press(&mut app, KeyCode::Down);
             typed(&mut app, "NAR-3");
@@ -6496,7 +7311,10 @@ mod task_app_create {
         use super::*;
 
         fn filled() -> TaskApp {
-            let mut app = app_with(vec![titled(queued("a", 1), "NAR-1"), titled(queued("b", 2), "NAR-2")]);
+            let mut app = app_with(vec![
+                titled(queued("a", 1), "NAR-1"),
+                titled(queued("b", 2), "NAR-2"),
+            ]);
             ch(&mut app, 'g');
             open_form(&mut app);
             fill_ticket(&mut app, "NAR-18");
@@ -6518,8 +7336,14 @@ mod task_app_create {
             let now = rows(&app);
             assert_eq!(now[..2], before[..], "the rows above are where they were");
             assert_eq!(now.len(), 3);
-            assert_eq!(now[2], ('↻', "NAR-18".to_string(), "wysyłanie…".to_string()));
-            assert!(app.detail().has_drafts(), "until the server has it, it is unsent");
+            assert_eq!(
+                now[2],
+                ('↻', "NAR-18".to_string(), "wysyłanie…".to_string())
+            );
+            assert!(
+                app.detail().has_drafts(),
+                "until the server has it, it is unsent"
+            );
         }
 
         #[test]
@@ -6572,7 +7396,10 @@ mod task_app_create {
             fill_ticket(&mut app, "NAR-18");
             assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
             assert_eq!(app.view_kind(), ViewKind::NewTask, "the form stays");
-            assert_eq!(field_value(&app, "implement-feature", "ticket_id"), "NAR-18");
+            assert_eq!(
+                field_value(&app, "implement-feature", "ticket_id"),
+                "NAR-18"
+            );
             assert_eq!(app.notifier().latest().unwrap().severity, Severity::Warning);
             assert!(app.outgoing().is_empty());
             assert!(app.list().pending().is_empty());
@@ -6590,7 +7417,11 @@ mod task_app_create {
             assert_eq!(rows(&app)[2].0, '↻');
             assert_eq!(app.list().pending()[0].state, PendingState::Sending);
             assert!(app.next_outgoing_due().is_some());
-            assert!(note(&app).contains("ponawiam z tym samym id"), "{}", note(&app));
+            assert!(
+                note(&app).contains("ponawiam z tym samym id"),
+                "{}",
+                note(&app)
+            );
             let first = app.outgoing()[0].clone();
 
             // Not yet due.
@@ -6598,10 +7429,16 @@ mod task_app_create {
             assert_eq!(app.outgoing()[0].attempts(), 1);
 
             // Due: the same request goes out and gets nothing again.
-            assert!(app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2).await);
+            assert!(
+                app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2)
+                    .await
+            );
             assert_eq!(app.outgoing()[0].send, first.send, "the same request");
             assert_eq!(app.outgoing()[0].task_id, id, "under the same id");
-            assert_eq!(rows(&app)[2], ('✗', "NAR-18".to_string(), "nie wysłano".to_string()));
+            assert_eq!(
+                rows(&app)[2],
+                ('✗', "NAR-18".to_string(), "nie wysłano".to_string())
+            );
             assert_eq!(app.list().pending()[0].state, PendingState::NotSent);
             assert!(app.next_outgoing_due().is_none(), "no more by itself");
             assert!(app.detail().has_drafts(), "the data is kept");
@@ -6609,7 +7446,8 @@ mod task_app_create {
         }
 
         #[test]
-        fn r_on_an_unsent_row_sends_it_again_when_the_connection_allows_and_says_why_not_otherwise() {
+        fn r_on_an_unsent_row_sends_it_again_when_the_connection_allows_and_says_why_not_otherwise()
+        {
             let mut app = filled();
             let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
                 panic!("a send was expected");
@@ -6620,7 +7458,8 @@ mod task_app_create {
                 .unwrap();
             runtime.block_on(async {
                 app.perform(Request::SendTask(id.clone())).await;
-                app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2).await;
+                app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2)
+                    .await;
             });
             assert_eq!(app.list().pending()[0].state, PendingState::NotSent);
 
@@ -6631,7 +7470,11 @@ mod task_app_create {
 
             // It came back.
             app.load(listing(vec![titled(queued("a", 1), "NAR-1")], "d"));
-            assert_eq!(app.list().selected_id(), Some(id.as_str()), "the row keeps the selection");
+            assert_eq!(
+                app.list().selected_id(),
+                Some(id.as_str()),
+                "the row keeps the selection"
+            );
             assert_eq!(ch(&mut app, 'r'), Request::SendTask(id.clone()));
             assert_eq!(app.list().pending()[0].state, PendingState::Sending);
             assert_eq!(app.outgoing()[0].task_id, id);
@@ -6641,7 +7484,11 @@ mod task_app_create {
         fn r_on_a_task_the_server_has_has_nothing_to_send() {
             let mut app = app_with(vec![titled(queued("a", 1), "NAR-1")]);
             assert_eq!(ch(&mut app, 'r'), Request::None);
-            assert!(note(&app).contains("nie ma czego ponawiać"), "{}", note(&app));
+            assert!(
+                note(&app).contains("nie ma czego ponawiać"),
+                "{}",
+                note(&app)
+            );
         }
 
         #[test]
@@ -6656,7 +7503,8 @@ mod task_app_create {
                 .unwrap();
             runtime.block_on(async {
                 app.perform(Request::SendTask(id.clone())).await;
-                app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2).await;
+                app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2)
+                    .await;
             });
             let screen = screen(&mut app, 120, 30);
             for expected in [
@@ -6725,7 +7573,14 @@ mod task_app_create {
                 Ok(LegacyExecutionListResponse {
                     executions: vec![
                         legacy("exec-failed", "fix-bug", "failed", 3, true, None),
-                        legacy("exec-done", "fix-bug", "completed", 2, false, Some("zakończone — nie ma czego wznawiać")),
+                        legacy(
+                            "exec-done",
+                            "fix-bug",
+                            "completed",
+                            2,
+                            false,
+                            Some("zakończone — nie ma czego wznawiać"),
+                        ),
                     ],
                 }),
             );
@@ -6734,7 +7589,12 @@ mod task_app_create {
         }
 
         fn titles(app: &TaskApp) -> Vec<String> {
-            app.history().unwrap().rows().into_iter().map(|row| row.title).collect()
+            app.history()
+                .unwrap()
+                .rows()
+                .into_iter()
+                .map(|row| row.title)
+                .collect()
         }
 
         #[test]
@@ -6754,7 +7614,10 @@ mod task_app_create {
             assert_eq!(app.key_context(), Context::HistoryDetails);
             for (tab, expected) in [
                 (DetailTab::Progress, "storage usunięty przy archiwizacji"),
-                (DetailTab::Conversation, "storage usunięty przy archiwizacji"),
+                (
+                    DetailTab::Conversation,
+                    "storage usunięty przy archiwizacji",
+                ),
                 (DetailTab::Events, "storage usunięty przy archiwizacji"),
                 (DetailTab::Conductor, "storage usunięty przy archiwizacji"),
             ] {
@@ -6789,16 +7652,27 @@ mod task_app_create {
             let mut app = opened();
             // The archived task: nothing to recover, and why.
             assert_eq!(ch(&mut app, 'w'), Request::None);
-            assert!(note(&app).contains("storage usunięty przy archiwizacji"), "{}", note(&app));
+            assert!(
+                note(&app).contains("storage usunięty przy archiwizacji"),
+                "{}",
+                note(&app)
+            );
 
             // The failed execution can be.
             ch(&mut app, 'j');
-            assert_eq!(ch(&mut app, 'w'), Request::Recover("exec-failed".to_string()));
+            assert_eq!(
+                ch(&mut app, 'w'),
+                Request::Recover("exec-failed".to_string())
+            );
 
             // The completed one cannot; the server's reason is on the bar.
             ch(&mut app, 'j');
             assert_eq!(ch(&mut app, 'w'), Request::None);
-            assert!(note(&app).contains("zakończone — nie ma czego wznawiać"), "{}", note(&app));
+            assert!(
+                note(&app).contains("zakończone — nie ma czego wznawiać"),
+                "{}",
+                note(&app)
+            );
         }
 
         #[test]
@@ -6842,14 +7716,21 @@ mod task_app_create {
             );
             assert_eq!(titles(&app), ["NAR-9"]);
             assert!(app.history().unwrap().note().is_some());
-            assert!(note(&app).contains("dawne executions niedostępne"), "{}", note(&app));
+            assert!(
+                note(&app).contains("dawne executions niedostępne"),
+                "{}",
+                note(&app)
+            );
         }
 
         #[test]
         fn an_empty_history_is_an_empty_list_not_an_error() {
             let mut app = app_with(vec![]);
             ch(&mut app, 'H');
-            app.open_history(listing(vec![], "c"), Ok(LegacyExecutionListResponse { executions: vec![] }));
+            app.open_history(
+                listing(vec![], "c"),
+                Ok(LegacyExecutionListResponse { executions: vec![] }),
+            );
             assert!(titles(&app).is_empty());
             let screen = screen(&mut app, 120, 30);
             assert!(screen.contains("historia jest pusta"), "{screen}");
@@ -6862,7 +7743,10 @@ mod task_app_create {
             let keys = keymap::hints(Context::History);
             assert!(keys.iter().any(|(_, label)| *label == "wznów"));
             assert_eq!(
-                keymap::lookup(Context::History, &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+                keymap::lookup(
+                    Context::History,
+                    &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)
+                ),
                 Some(Action::Recover)
             );
             let entry = app.history().unwrap().selected_entry().unwrap();
@@ -6911,7 +7795,9 @@ mod task_app_create {
                     workflow_version: 1,
                     inputs: json!({}),
                 },
-                EventData::StateEntered { state_id: "plan".to_string() },
+                EventData::StateEntered {
+                    state_id: "plan".to_string(),
+                },
                 EventData::ActionStarted {
                     action_execution_id: "attempt-1".to_string(),
                     state_id: "plan".to_string(),
@@ -6926,7 +7812,9 @@ mod task_app_create {
             }
             let conversations = store.conversation_store(id);
             let mut writer = conversations.writer("attempt-1").expect("writer");
-            writer.append_narsor("prompt: zaplanuj zmianę").expect("prompt");
+            writer
+                .append_narsor("prompt: zaplanuj zmianę")
+                .expect("prompt");
             writer
                 .append(ConversationSource::Stdout, br#"{"type":"assistant"}"#)
                 .expect("stdout");
@@ -6935,7 +7823,8 @@ mod task_app_create {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn an_old_execution_is_read_through_the_history_routes_in_every_tab_and_recover_is_refused_with_the_reason() {
+        async fn an_old_execution_is_read_through_the_history_routes_in_every_tab_and_recover_is_refused_with_the_reason(
+        ) {
             let harness = RemoteHarness::start().await;
             seed_old_execution(harness.root.path(), "exec-old");
             let mut app = TaskApp::new(harness.owner.clone(), "test", None);
@@ -6948,25 +7837,37 @@ mod task_app_create {
 
             app.sync_detail().await;
             let progress = screen(&mut app, 130, 30);
-            assert!(progress.contains("plan #1"), "the timeline of the old execution:\n{progress}");
+            assert!(
+                progress.contains("plan #1"),
+                "the timeline of the old execution:\n{progress}"
+            );
             assert!(progress.contains("completed"), "{progress}");
 
             press(&mut app, KeyCode::Right);
             app.sync_detail().await;
             let conversation = screen(&mut app, 130, 30);
-            assert!(conversation.contains("Workflow sends input to agent"), "{conversation}");
+            assert!(
+                conversation.contains("Workflow sends input to agent"),
+                "{conversation}"
+            );
             assert!(conversation.contains("assistant message"), "{conversation}");
 
             press(&mut app, KeyCode::Right);
             app.sync_detail().await;
             let events = screen(&mut app, 130, 30);
-            assert!(events.contains("WorkflowStarted") || events.contains("workflow"), "{events}");
+            assert!(
+                events.contains("WorkflowStarted") || events.contains("workflow"),
+                "{events}"
+            );
             assert!(events.contains("plan"), "{events}");
 
             press(&mut app, KeyCode::Right);
             app.sync_detail().await;
             let conductor = screen(&mut app, 130, 30);
-            assert!(conductor.contains("tylko do odczytu"), "no chat box, only history:\n{conductor}");
+            assert!(
+                conductor.contains("tylko do odczytu"),
+                "no chat box, only history:\n{conductor}"
+            );
 
             // Nothing of the old execution is a key of the task list: `w` is
             // refused up front, and the server's refusal is shown if it is asked.
@@ -6999,7 +7900,11 @@ mod task_app_create {
 
             let mut app = TaskApp::new(harness.owner.clone(), "test", None);
             app.refresh().await;
-            assert_eq!(app.list().tasks().len(), 1, "the archived task left the list");
+            assert_eq!(
+                app.list().tasks().len(),
+                1,
+                "the archived task left the list"
+            );
 
             let request = ch(&mut app, 'H');
             app.perform(request).await;
@@ -7012,7 +7917,10 @@ mod task_app_create {
             press(&mut app, KeyCode::Enter);
             app.sync_detail().await;
             let screen = screen(&mut app, 130, 30);
-            assert!(screen.contains("storage usunięty przy archiwizacji"), "{screen}");
+            assert!(
+                screen.contains("storage usunięty przy archiwizacji"),
+                "{screen}"
+            );
 
             // `Esc` twice: the task list is where it was.
             press(&mut app, KeyCode::Esc);
@@ -7059,7 +7967,11 @@ mod task_app_create {
             app.perform(request).await;
             let said = note(&app);
             assert!(said.contains("exec-failed wznawia się w tle"), "{said}");
-            assert_eq!(app.view_kind(), ViewKind::History, "the history is still open");
+            assert_eq!(
+                app.view_kind(),
+                ViewKind::History,
+                "the history is still open"
+            );
         }
     }
 
@@ -7098,7 +8010,10 @@ mod task_app_create {
         /// The served control plane, with a live controller on its backend: a
         /// queued task shows its place (`#n`), not `offline`. Keep the second
         /// part alive for as long as the test runs.
-        async fn harness() -> (RemoteHarness, (narsor::controller_protocol::ControllerClient, u64)) {
+        async fn harness() -> (
+            RemoteHarness,
+            (narsor::controller_protocol::ControllerClient, u64),
+        ) {
             let harness = RemoteHarness::start_with(write_workflow).await;
             let controller = harness.controller("k8s").await;
             (harness, controller)
@@ -7108,7 +8023,11 @@ mod task_app_create {
         async fn existing(harness: &RemoteHarness, id: &str) {
             let mut request = super::super::remote_support::create_request(id, Some("k8s"));
             request.launch.inputs = json!({ "ticket_id": id });
-            harness.owner.create_control_task(&request).await.expect("create");
+            harness
+                .owner
+                .create_control_task(&request)
+                .await
+                .expect("create");
         }
 
         async fn open(harness: &RemoteHarness) -> TaskApp {
@@ -7220,7 +8139,10 @@ mod task_app_create {
             assert_eq!(app.list().selected_id(), Some(id.as_str()));
             assert!(app.list().pending().is_empty());
             assert!(app.outgoing().is_empty());
-            assert!(app.remembered_new_task().is_none(), "what was sent is forgotten");
+            assert!(
+                app.remembered_new_task().is_none(),
+                "what was sent is forgotten"
+            );
             assert!(!app.detail().has_drafts());
             assert!(note(&app).contains("zadanie utworzone"), "{}", note(&app));
             assert_eq!(tasks_on_the_server(&harness).await.len(), 3);
@@ -7237,10 +8159,19 @@ mod task_app_create {
             app.perform(Request::SendTask(id.clone())).await;
 
             // The server has the task, the client does not know.
-            assert_eq!(tasks_on_the_server(&harness).await, std::slice::from_ref(&id));
-            assert_eq!(rows(&app), [('↻', "NAR-18".to_string(), "wysyłanie…".to_string())]);
+            assert_eq!(
+                tasks_on_the_server(&harness).await,
+                std::slice::from_ref(&id)
+            );
+            assert_eq!(
+                rows(&app),
+                [('↻', "NAR-18".to_string(), "wysyłanie…".to_string())]
+            );
 
-            assert!(app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2).await);
+            assert!(
+                app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2)
+                    .await
+            );
             assert_eq!(rows(&app), [('◷', "NAR-18".to_string(), "#1".to_string())]);
             assert_eq!(app.list().selected_id(), Some(id.as_str()));
             assert_eq!(
@@ -7253,7 +8184,8 @@ mod task_app_create {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn when_the_retry_is_lost_too_the_row_is_unsent_and_a_read_that_lists_the_task_settles_it() {
+        async fn when_the_retry_is_lost_too_the_row_is_unsent_and_a_read_that_lists_the_task_settles_it(
+        ) {
             let (harness, _controller) = harness().await;
             let mut app = app_behind_a_lossy_proxy(&harness, 2).await;
             open_the_form(&mut app, &harness).await;
@@ -7261,9 +8193,18 @@ mod task_app_create {
                 panic!("a send was expected");
             };
             app.perform(Request::SendTask(id.clone())).await;
-            assert!(app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2).await);
-            assert_eq!(rows(&app), [('✗', "NAR-18".to_string(), "nie wysłano".to_string())]);
-            assert_eq!(tasks_on_the_server(&harness).await, std::slice::from_ref(&id));
+            assert!(
+                app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2)
+                    .await
+            );
+            assert_eq!(
+                rows(&app),
+                [('✗', "NAR-18".to_string(), "nie wysłano".to_string())]
+            );
+            assert_eq!(
+                tasks_on_the_server(&harness).await,
+                std::slice::from_ref(&id)
+            );
 
             // The connection is back (a read succeeded), the operator sends again.
             app.load(harness.owner.control_tasks().await.unwrap());
@@ -7283,7 +8224,8 @@ mod task_app_create {
                 panic!("a send was expected");
             };
             app.perform(Request::SendTask(id.clone())).await;
-            app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2).await;
+            app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2)
+                .await;
             assert_eq!(app.list().pending()[0].state, PendingState::NotSent);
 
             // A read that does not list it (an older listing) brings the
@@ -7294,7 +8236,11 @@ mod task_app_create {
             assert_eq!(request, Request::SendTask(id.clone()));
             app.perform(request).await;
             assert_eq!(rows(&app), [('◷', "NAR-18".to_string(), "#1".to_string())]);
-            assert_eq!(tasks_on_the_server(&harness).await, [id], "one task, one id");
+            assert_eq!(
+                tasks_on_the_server(&harness).await,
+                [id],
+                "one task, one id"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -7312,7 +8258,10 @@ mod task_app_create {
             app.perform(request).await;
 
             assert_eq!(app.view_kind(), ViewKind::NewTask, "the form is back");
-            assert_eq!(field_value(&app, "implement-feature", "ticket_id"), "NAR-18");
+            assert_eq!(
+                field_value(&app, "implement-feature", "ticket_id"),
+                "NAR-18"
+            );
             assert!(app.list().pending().is_empty());
             assert!(app.outgoing().is_empty());
             assert!(note(&app).contains("serwer odrzucił"), "{}", note(&app));
@@ -7344,18 +8293,31 @@ mod task_app_create {
             let mut app = open(&harness).await;
             let request = ch(&mut app, 'n');
             app.perform(request).await;
-            assert_eq!(chooser_item(&app, PATH_LABEL).unavailable, None, "a local daemon reads files");
+            assert_eq!(
+                chooser_item(&app, PATH_LABEL).unavailable,
+                None,
+                "a local daemon reads files"
+            );
             choose(&mut app, PATH_LABEL);
             press(&mut app, KeyCode::Tab);
             typed(&mut app, bad_path.to_str().unwrap());
             let request = press(&mut app, KeyCode::Enter);
-            assert_eq!(request, Request::ValidatePath(bad_path.to_str().unwrap().to_string()));
+            assert_eq!(
+                request,
+                Request::ValidatePath(bad_path.to_str().unwrap().to_string())
+            );
             app.perform(request).await;
             let description = &chooser_item(&app, PATH_LABEL).description;
             for violation in &expected {
-                assert!(description.contains(violation.as_str()), "{violation}\n{description}");
+                assert!(
+                    description.contains(violation.as_str()),
+                    "{violation}\n{description}"
+                );
             }
-            assert!(tasks_on_the_server(&harness).await.is_empty(), "nothing was created");
+            assert!(
+                tasks_on_the_server(&harness).await.is_empty(),
+                "nothing was created"
+            );
 
             // A good file: first checked, then created from.
             for _ in 0..bad_path.to_str().unwrap().len() {
@@ -7412,7 +8374,8 @@ mod task_app_create {
         }
 
         #[test]
-        fn the_list_shows_what_is_registered_with_a_description_and_a_remote_only_form_for_a_remote_server() {
+        fn the_list_shows_what_is_registered_with_a_description_and_a_remote_only_form_for_a_remote_server(
+        ) {
             let mut app = app_with(vec![]);
             app.set_capabilities(capabilities(false, Some("remote")));
             assert_eq!(ch(&mut app, 'R'), Request::OpenRepositories);
@@ -7421,7 +8384,14 @@ mod task_app_create {
             assert_eq!(names(&app), ["docs", "narsor"]);
             assert_eq!(app.key_context(), Context::Repositories);
             let screen = screen(&mut app, 130, 30);
-            for expected in ["Repozytoria (2)", "docs", "narsor", "git@github.com:acme/docs.git", "a dodaj", "d usuń"] {
+            for expected in [
+                "Repozytoria (2)",
+                "docs",
+                "narsor",
+                "git@github.com:acme/docs.git",
+                "a dodaj",
+                "d usuń",
+            ] {
                 assert!(screen.contains(expected), "{expected}:\n{screen}");
             }
 
@@ -7430,7 +8400,10 @@ mod task_app_create {
             let remote = &form.items()[0].fields[1];
             assert_eq!(remote.name, "remote");
             assert!(
-                remote.description.as_deref().is_some_and(|text| text.contains("tylko zdalny URL")),
+                remote
+                    .description
+                    .as_deref()
+                    .is_some_and(|text| text.contains("tylko zdalny URL")),
                 "{:?}",
                 remote.description
             );
@@ -7443,7 +8416,10 @@ mod task_app_create {
             app.open_repositories(narsor_registry());
             ch(&mut app, 'j');
             ch(&mut app, 'd');
-            let window = app.overlay().and_then(|overlay| overlay.confirmation()).expect("the window");
+            let window = app
+                .overlay()
+                .and_then(|overlay| overlay.confirmation())
+                .expect("the window");
             assert!(window.heading().contains("Usuń repozytorium"));
             assert!(window.lines().iter().any(|line| line.contains("narsor")));
             assert_eq!(app.key_context(), Context::Confirm);
@@ -7452,8 +8428,14 @@ mod task_app_create {
             // The window survives a re-read of the task list.
             ch(&mut app, 'd');
             app.load(listing(vec![], "d"));
-            assert!(app.overlay().is_some(), "it is not about a task of the list");
-            assert_eq!(ch(&mut app, 'y'), Request::RemoveRepository("narsor".to_string()));
+            assert!(
+                app.overlay().is_some(),
+                "it is not about a task of the list"
+            );
+            assert_eq!(
+                ch(&mut app, 'y'),
+                Request::RemoveRepository("narsor".to_string())
+            );
         }
 
         #[test]
@@ -7507,9 +8489,16 @@ mod task_app_create {
 
             assert_eq!(names(&app), ["narsor"]);
             assert!(app.repositories().unwrap().form().is_none());
-            assert!(note(&app).contains("dodano repozytorium narsor"), "{}", note(&app));
+            assert!(
+                note(&app).contains("dodano repozytorium narsor"),
+                "{}",
+                note(&app)
+            );
             let screen = screen(&mut app, 130, 30);
-            assert!(screen.contains("git@github.com:acme/narsor.git"), "{screen}");
+            assert!(
+                screen.contains("git@github.com:acme/narsor.git"),
+                "{screen}"
+            );
 
             // It is in the form of a new task, too.
             press(&mut app, KeyCode::Esc);
@@ -7541,7 +8530,10 @@ mod task_app_create {
 
             let form = app.repositories().unwrap().form().expect("the form stays");
             let remote = &form.items()[0].fields[1];
-            assert!(remote.error().is_some(), "the refusal is at the remote field");
+            assert!(
+                remote.error().is_some(),
+                "the refusal is at the remote field"
+            );
             assert!(form.items()[0].fields[0].error().is_none());
             assert_eq!(remote.value(), "ext::sh -c evil", "what was typed stays");
             assert!(names(&app).is_empty());
@@ -7552,7 +8544,10 @@ mod task_app_create {
         #[tokio::test(flavor = "multi_thread")]
         async fn d_y_removes_the_repository_and_a_removed_one_is_gone_from_the_list() {
             let harness = RemoteHarness::start().await;
-            for (id, remote) in [("docs", "git@github.com:acme/docs.git"), ("narsor", "git@github.com:acme/narsor.git")] {
+            for (id, remote) in [
+                ("docs", "git@github.com:acme/docs.git"),
+                ("narsor", "git@github.com:acme/narsor.git"),
+            ] {
                 harness
                     .owner
                     .control_add_repository(&narsor::controller_protocol::CreateRepositoryRequest {
@@ -7577,11 +8572,28 @@ mod task_app_create {
             assert_eq!(request, Request::RemoveRepository("docs".to_string()));
             app.perform(request).await;
             assert_eq!(names(&app), ["narsor"]);
-            assert!(note(&app).contains("usunięto repozytorium docs"), "{}", note(&app));
-            assert_eq!(harness.owner.control_repositories().await.unwrap().repositories.len(), 1);
+            assert!(
+                note(&app).contains("usunięto repozytorium docs"),
+                "{}",
+                note(&app)
+            );
+            assert_eq!(
+                harness
+                    .owner
+                    .control_repositories()
+                    .await
+                    .unwrap()
+                    .repositories
+                    .len(),
+                1
+            );
 
             // Gone behind our back: said, and the list is read again.
-            harness.owner.control_remove_repository("narsor").await.unwrap();
+            harness
+                .owner
+                .control_remove_repository("narsor")
+                .await
+                .unwrap();
             ch(&mut app, 'd');
             let request = ch(&mut app, 'y');
             app.perform(request).await;

@@ -35,14 +35,12 @@ use serde_json::{Map, Value};
 
 use crate::conductor::Annotation;
 use crate::controller_protocol::WorkflowInputView;
-use crate::tui::chooser::{ChooserField, ChooserItem, Submission};
 use crate::domain::{
     AnsweredBy, EventData, HumanInputField, HumanInputType, InputCloseReason, OutputDefinition,
     ParamType,
 };
-use crate::engine::{
-    HumanInputDelivery, InputContinuation, PendingHumanInput,
-};
+use crate::engine::{HumanInputDelivery, InputContinuation, PendingHumanInput};
+use crate::tui::chooser::{ChooserField, ChooserItem, Submission};
 
 /// What kind of wait the form answers, as the operator reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,7 +269,6 @@ fn step_index(current: usize, delta: isize, length: usize) -> usize {
     ((current as isize + delta).rem_euclid(length as isize)) as usize
 }
 
-
 // ---------------------------------------------------------------------------
 // The answer panel
 // ---------------------------------------------------------------------------
@@ -389,7 +386,10 @@ impl InputPanel {
     /// The panel for `pending`. `resumed_state` says which workflow state an
     /// agent attempt belongs to, for the `↩ wraca do agenta <stan>` of an
     /// output that resumes one.
-    pub fn new(pending: &PendingHumanInput, resumed_state: &dyn Fn(&str) -> Option<String>) -> Self {
+    pub fn new(
+        pending: &PendingHumanInput,
+        resumed_state: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
         let kind = InputKind::of(pending.continuation);
         let mut panel = Self {
             kind,
@@ -402,12 +402,18 @@ impl InputPanel {
             originals: Vec::new(),
             approval_label: None,
         };
-        panel.context.push(ContextLine::plain(pending.instruction()));
+        panel
+            .context
+            .push(ContextLine::plain(pending.instruction()));
         if let Some(question) = &pending.request.question {
-            panel.context.push(ContextLine::plain(format!("„{question}”")));
+            panel
+                .context
+                .push(ContextLine::plain(format!("„{question}”")));
         }
         if let Some(tail) = &pending.request.answer_tail {
-            panel.context.push(ContextLine::dim(format!("agent: …{tail}")));
+            panel
+                .context
+                .push(ContextLine::dim(format!("agent: …{tail}")));
         }
         match kind {
             InputKind::Gate => panel.build_gate(pending, resumed_state),
@@ -451,9 +457,10 @@ impl InputPanel {
         if annotation.key != self.episode {
             return;
         }
-        let recommended = annotation.recommendation.as_deref().and_then(|answer| {
-            self.items.iter().position(|item| item.label == answer)
-        });
+        let recommended = annotation
+            .recommendation
+            .as_deref()
+            .and_then(|answer| self.items.iter().position(|item| item.label == answer));
         let mut line = format!("◆ dyrygent: {}", annotation.summary);
         if let Some(answer) = annotation.recommendation.as_deref() {
             line.push_str(&format!(" — raczej {answer}"));
@@ -615,7 +622,11 @@ impl InputPanel {
         );
         if let Some(answer) = pending.request.prefilled_answer.as_deref() {
             // The text of an answer a refused resume gave back (2a9c6f2).
-            for field in item.fields.iter_mut().filter(|field| field.name == "answer") {
+            for field in item
+                .fields
+                .iter_mut()
+                .filter(|field| field.name == "answer")
+            {
                 *field = field.clone().with_value(answer);
             }
         }
@@ -641,7 +652,8 @@ impl InputPanel {
         let Some(problem) = &pending.problem else {
             return;
         };
-        self.context.push(ContextLine::problem(problem.reason.clone()));
+        self.context
+            .push(ContextLine::problem(problem.reason.clone()));
         for answer in &problem.answers {
             let mut text = format!("odrzucona odpowiedź agenta: {}", answer.reason);
             if let Some(tail) = &answer.answer_tail {
@@ -722,16 +734,24 @@ impl InputPanel {
                 }
             }
         }
-        for (slot, (field, map)) in [(EXTRA_DATA_FIELD, "data"), (EXTRA_VARIABLES_FIELD, "variables")]
-            .into_iter()
-            .enumerate()
+        for (slot, (field, map)) in [
+            (EXTRA_DATA_FIELD, "data"),
+            (EXTRA_VARIABLES_FIELD, "variables"),
+        ]
+        .into_iter()
+        .enumerate()
         {
-            for line in Self::value_of(submission, field).unwrap_or_default().lines() {
+            for line in Self::value_of(submission, field)
+                .unwrap_or_default()
+                .lines()
+            {
                 if line.trim().is_empty() {
                     continue;
                 }
                 let Some((key, value)) = line.split_once('=') else {
-                    return Err(format!("Linia '{line}' w {map} nie ma postaci klucz=wartość."));
+                    return Err(format!(
+                        "Linia '{line}' w {map} nie ma postaci klucz=wartość."
+                    ));
                 };
                 if key.trim().is_empty() {
                     return Err(format!("Linia '{line}' w {map} nie ma klucza."));
@@ -786,7 +806,8 @@ impl InputPanel {
             }
             if !approval.result.data.is_null() {
                 let data = serde_json::to_string_pretty(&approval.result.data).unwrap_or_default();
-                self.context.push(ContextLine::plain(format!("data: {data}")));
+                self.context
+                    .push(ContextLine::plain(format!("data: {data}")));
             }
             resumable = approval.agent_session_id.is_some();
             self.approval_label = Some(label);
@@ -824,7 +845,12 @@ pub const MESSAGE_FIELD: &str = "Wiadomość dla agenta";
 pub const COMMENT_TO_AGENT: &str = "Komentarz dla agenta";
 
 /// Puts `value` under `key` in `map`, refusing a second one.
-fn insert_once(map: &mut Map<String, Value>, name: &str, key: &str, value: Value) -> Result<(), String> {
+fn insert_once(
+    map: &mut Map<String, Value>,
+    name: &str,
+    key: &str,
+    value: Value,
+) -> Result<(), String> {
     if map.insert(key.to_string(), value).is_some() {
         return Err(format!("Klucz '{name}.{key}' jest podany dwa razy."));
     }
@@ -906,16 +932,18 @@ pub fn workflow_input_fields(
             let mut field = match input.input_type {
                 ParamType::Boolean => ChooserField::select(
                     input.name.clone(),
-                    BOOLEAN_OPTIONS.iter().map(|option| option.to_string()).collect(),
+                    BOOLEAN_OPTIONS
+                        .iter()
+                        .map(|option| option.to_string())
+                        .collect(),
                 )
                 .with_value(BOOLEAN_OPTIONS[1]),
                 ParamType::Repository if !repositories.is_empty() => {
                     ChooserField::select(input.name.clone(), repositories.to_vec())
                 }
                 ParamType::Integer => ChooserField::integer(input.name.clone()),
-                ParamType::String | ParamType::Repository => {
-                    ChooserField::text(input.name.clone())
-                }
+                ParamType::Text => ChooserField::multiline(input.name.clone()),
+                ParamType::String | ParamType::Repository => ChooserField::text(input.name.clone()),
             };
             if let Some(default) = &input.default {
                 field = field.with_value(value_as_text(default));
@@ -935,7 +963,7 @@ pub fn workflow_input_fields(
 /// what the workflow says of it.
 fn input_description(input: &WorkflowInputView) -> Option<String> {
     let kind = match input.input_type {
-        ParamType::String => None,
+        ParamType::String | ParamType::Text => None,
         ParamType::Integer => Some("liczba całkowita"),
         ParamType::Boolean => Some("true / false"),
         ParamType::Repository => Some("repozytorium"),
@@ -982,18 +1010,27 @@ pub fn workflow_input_values(
             continue;
         };
         let value = match input.input_type {
-            ParamType::String | ParamType::Repository => Value::String(raw.to_string()),
-            ParamType::Integer => raw.parse::<i64>().map(Value::from).map_err(|_| InputProblem {
-                field: input.name.clone(),
-                message: format!("Pole '{}' wymaga liczby całkowitej.", input.name),
-            })?,
+            ParamType::String | ParamType::Text | ParamType::Repository => {
+                Value::String(raw.to_string())
+            }
+            ParamType::Integer => {
+                raw.parse::<i64>()
+                    .map(Value::from)
+                    .map_err(|_| InputProblem {
+                        field: input.name.clone(),
+                        message: format!("Pole '{}' wymaga liczby całkowitej.", input.name),
+                    })?
+            }
             ParamType::Boolean => match raw.to_ascii_lowercase().as_str() {
                 "true" => Value::Bool(true),
                 "false" => Value::Bool(false),
                 other => {
                     return Err(InputProblem {
                         field: input.name.clone(),
-                        message: format!("Pole '{}' wymaga true albo false, nie '{other}'.", input.name),
+                        message: format!(
+                            "Pole '{}' wymaga true albo false, nie '{other}'.",
+                            input.name
+                        ),
                     })
                 }
             },
