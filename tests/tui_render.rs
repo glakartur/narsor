@@ -21,6 +21,8 @@ use narsor::tui::connection::Connection;
 use narsor::tui::keymap::{self, Context};
 use narsor::tui::style::Styles;
 
+mod task_app_support;
+
 fn draw(width: u16, height: u16, paint: impl FnOnce(&mut ratatui::Frame)) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test terminal");
     terminal.draw(paint).expect("draw");
@@ -328,7 +330,15 @@ mod colour_discipline {
 
     /// The new views' sources, relative to `src/tui`. Everything that draws
     /// belongs here; `style.rs` is the one file allowed to name a colour.
-    const NEW_VIEW_SOURCES: &[&str] = &["chooser.rs", "connection.rs", "keymap.rs"];
+    const NEW_VIEW_SOURCES: &[&str] = &[
+        "chooser.rs",
+        "connection.rs",
+        "keymap.rs",
+        "task_app/layout.rs",
+        "task_app/list.rs",
+        "task_app/mod.rs",
+        "task_app/notify.rs",
+    ];
 
     /// The one module that may name a colour.
     const ROLE_MODULE: &str = "style.rs";
@@ -387,5 +397,289 @@ mod colour_discipline {
         assert!(style.contains("Color::Cyan"));
         assert!(!style.contains("Color::Rgb"), "only the 16 ANSI colours");
         assert!(!style.contains("Color::Indexed"));
+    }
+}
+
+/// U8: the task application's screens — the wide and the narrow layout, the
+/// request for room, the connection states and the move preview.
+mod task_app_render {
+    use super::*;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use narsor::api::{ApiClient, ClientError};
+    use narsor::domain::ExecutionStatus;
+    use narsor::orchestration::AttentionKind;
+    use narsor::tui::task_app::{layout, TaskApp};
+
+    use crate::task_app_support::{
+        listing, queued, titled, waiting, waiting_for_capacity, with_controller, with_runner,
+    };
+
+    fn app() -> TaskApp {
+        let client = ApiClient::new("127.0.0.1:9".parse().unwrap(), "token");
+        TaskApp::new(client, "local", None)
+    }
+
+    fn press(app: &mut TaskApp, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// The screen of the origin's mock-up: a running task, one that waits for
+    /// an approval, a failed one, two queued, a finished one.
+    fn busy_app() -> TaskApp {
+        let mut app = app();
+        let controlled = |id: &str, lifecycle: &str, rank| {
+            with_controller(crate::task_app_support::task(id, "local", lifecycle, rank))
+        };
+        app.load(listing(
+            vec![
+                titled(
+                    with_runner(controlled("a", "running", 1), ExecutionStatus::Running, "edit"),
+                    "NAR-14",
+                ),
+                titled(
+                    waiting(
+                        with_runner(controlled("b", "running", 2), ExecutionStatus::Running, "approval"),
+                        AttentionKind::Approval,
+                    ),
+                    "NAR-12",
+                ),
+                titled(
+                    waiting(controlled("c", "interrupted", 3), AttentionKind::Problem),
+                    "NAR-9",
+                ),
+                titled(waiting_for_capacity(queued("d", 4), 1, 2, 3), "NAR-16"),
+                titled(waiting_for_capacity(queued("e", 5), 2, 2, 3), "NAR-17"),
+                titled(
+                    with_runner(controlled("f", "running", 6), ExecutionStatus::Completed, "done"),
+                    "NAR-8",
+                ),
+            ],
+            "c",
+        ));
+        app
+    }
+
+    /// The screen row whose list column (the first 28) holds `needle`.
+    fn list_row(buffer: &Buffer, needle: &str) -> usize {
+        rows(buffer)
+            .iter()
+            .position(|row| {
+                row.chars()
+                    .take(usize::from(layout::LIST_WIDTH))
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("{needle:?} is not in the list:\n{}", screen(buffer)))
+    }
+
+    fn render(width: u16, height: u16, app: &mut TaskApp, styles: &Styles) -> Buffer {
+        draw(width, height, |frame| {
+            layout::render(frame, app, styles, Instant::now())
+        })
+    }
+
+    #[test]
+    fn the_wide_screen_has_the_header_the_list_and_the_details() {
+        let mut app = busy_app();
+        let buffer = render(120, 30, &mut app, &Styles::new(false));
+        let screen = screen(&buffer);
+
+        let header = &rows(&buffer)[0];
+        for expected in ["narsor · local", "● live", "sloty 2/3", "? 1", "! 1"] {
+            assert!(header.contains(expected), "{expected:?} in {header:?}");
+        }
+        assert!(rows(&buffer)[1].contains("Zadania"));
+        assert!(rows(&buffer)[1].contains("NAR-14"), "the details name the selected task");
+
+        let list_rows: Vec<String> = rows(&buffer)
+            .iter()
+            .map(|row| row.chars().skip(1).take(27).collect::<String>())
+            .collect();
+        let find = |needle: &str| list_rows.iter().position(|row| row.contains(needle)).unwrap();
+        assert!(list_rows[find("NAR-14")].starts_with(" ●"), "{:?}", list_rows[find("NAR-14")]);
+        assert!(list_rows[find("NAR-12")].starts_with("?●"));
+        assert!(list_rows[find("NAR-9 ")].starts_with("!✗"));
+        assert!(list_rows[find("NAR-16")].starts_with(" ◷"));
+        assert!(list_rows[find("NAR-16")].contains("#1"));
+        assert!(list_rows[find("NAR-17")].contains("#2"));
+        assert!(list_rows[find("NAR-8 ")].starts_with(" ✓"));
+        assert!(list_rows[find("NAR-12")].contains("approval"));
+        assert!(
+            find("NAR-14") < find("NAR-12") && find("NAR-12") < find("NAR-9 ") && find("NAR-17") < find("NAR-8 "),
+            "the rows are in the server's order"
+        );
+
+        let bar = rows(&buffer).last().cloned().unwrap();
+        let _ = bar;
+        assert!(screen.contains("następny czekający"), "the bar shows the list keys:\n{screen}");
+        assert!(screen.contains("szczegóły zadania"));
+    }
+
+    #[test]
+    fn the_list_column_is_28_wide_and_the_details_begin_right_after() {
+        let mut app = busy_app();
+        let buffer = render(120, 30, &mut app, &Styles::new(true));
+        let header_row = &rows(&buffer)[1];
+        let divider: Vec<usize> = header_row
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| *c == '│')
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(divider.first(), Some(&0));
+        assert_eq!(divider.get(1), Some(&usize::from(layout::LIST_WIDTH)), "{header_row:?}");
+    }
+
+    #[test]
+    fn at_90_columns_the_list_is_full_screen_and_enter_swaps_it_for_the_details() {
+        let mut app = busy_app();
+        let list = render(90, 30, &mut app, &Styles::new(false));
+        assert!(screen(&list).contains("NAR-17"));
+        assert!(!screen(&list).contains("szczegóły zadania"));
+        assert!(screen(&list).contains("Zadania"));
+
+        press(&mut app, KeyCode::Enter);
+        let details = render(90, 30, &mut app, &Styles::new(false));
+        assert!(screen(&details).contains("szczegóły zadania"));
+        assert!(!screen(&details).contains("NAR-17"));
+        assert!(screen(&details).contains("lista"), "the bar offers the way back");
+    }
+
+    #[test]
+    fn a_small_terminal_only_asks_for_more_room() {
+        let mut app = busy_app();
+        let buffer = render(50, 15, &mut app, &Styles::new(false));
+        let screen = screen(&buffer);
+        assert!(screen.contains("powiększ okno"), "{screen}");
+        assert!(screen.contains("50×15"));
+        assert!(!screen.contains("NAR-14"));
+    }
+
+    #[test]
+    fn without_a_connection_the_rows_are_grey_with_their_age_and_the_header_says_so() {
+        let mut app = busy_app();
+        app.on_stream(Some(Err(ClientError::Unavailable("reset".into()))));
+        let buffer = render(120, 30, &mut app, &Styles::new(false));
+        let header = &rows(&buffer)[0];
+        assert!(header.contains("◌ ponawiam ("), "{header:?}");
+        assert!(header.contains("stan sprzed"), "{header:?}");
+
+        let row = list_row(&buffer, "NAR-14");
+        let width = usize::from(buffer.area.width);
+        let cells = &buffer.content()[row * width..(row + 1) * width];
+        let title_cell = cells.iter().find(|cell| cell.symbol() == "N").unwrap();
+        assert_eq!(title_cell.fg, Color::DarkGray, "stale data is grey");
+        let marker = cells.iter().find(|cell| cell.symbol() == "●").unwrap();
+        assert_eq!(marker.fg, Color::DarkGray);
+    }
+
+    #[test]
+    fn a_connecting_screen_says_which_server_and_has_no_rows() {
+        let mut app = app();
+        let buffer = render(100, 24, &mut app, &Styles::new(false));
+        assert!(rows(&buffer)[0].contains("◌ łączę z local"), "{:?}", rows(&buffer)[0]);
+        assert!(screen(&buffer).contains("brak danych"));
+    }
+
+    #[test]
+    fn live_markers_keep_their_colours_and_the_selection_is_reversed() {
+        let mut app = busy_app();
+        press(&mut app, KeyCode::Char('j'));
+        let buffer = render(120, 30, &mut app, &Styles::new(false));
+        let width = usize::from(buffer.area.width);
+        let row = list_row(&buffer, "NAR-12");
+        let cells = &buffer.content()[row * width..(row + 1) * width];
+        assert_eq!(cells[1].symbol(), "?");
+        assert_eq!(cells[1].fg, Color::Yellow, "the marker keeps its role colour");
+        assert_eq!(cells[2].symbol(), "●");
+        assert_eq!(cells[2].fg, Color::Green);
+        assert!(cells[1].modifier.contains(Modifier::REVERSED));
+        let other = list_row(&buffer, "NAR-14");
+        assert!(!buffer.content()[other * width + 4].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn without_colour_every_marker_and_the_selection_survive() {
+        let mut app = busy_app();
+        press(&mut app, KeyCode::Char('j'));
+        let buffer = render(120, 30, &mut app, &Styles::new(true));
+        let screen = screen(&buffer);
+        for marker in ["?●", "!✗", "◷", "✓", "● live", "? 1", "! 1"] {
+            assert!(screen.contains(marker), "{marker:?} lost:\n{screen}");
+        }
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset),
+            "NO_COLOR draws no colour at all"
+        );
+        let width = usize::from(buffer.area.width);
+        let row = list_row(&buffer, "NAR-12");
+        assert!(buffer.content()[row * width + 4].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn the_move_mode_shows_the_preview_and_its_own_keys() {
+        let mut app = busy_app();
+        // The first queued row.
+        press(&mut app, KeyCode::Char('G'));
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('j'));
+        let buffer = render(120, 30, &mut app, &Styles::new(true));
+        let screen = screen(&buffer);
+        assert!(screen.contains("↕"), "the moved row is marked:\n{screen}");
+        assert!(list_row(&buffer, "NAR-17") < list_row(&buffer, "NAR-16"), "the preview put NAR-16 after NAR-17");
+        assert!(screen.contains("zatwierdź") && screen.contains("anuluj"), "{screen}");
+    }
+
+    #[test]
+    fn the_help_overlay_comes_from_the_key_map() {
+        let mut app = busy_app();
+        press(&mut app, KeyCode::Char('?'));
+        let buffer = render(120, 40, &mut app, &Styles::new(false));
+        let screen = screen(&buffer);
+        assert!(screen.contains("Pomoc"));
+        assert!(screen.contains("następne zadanie, które czeka"));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.is_help_open(), "any key closes it");
+    }
+
+    #[test]
+    fn the_notification_sits_on_the_bar() {
+        let mut app = busy_app();
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('K'));
+        press(&mut app, KeyCode::Char('K'));
+        press(&mut app, KeyCode::Char('K'));
+        press(&mut app, KeyCode::Char('G'));
+        press(&mut app, KeyCode::Char('K'));
+        let buffer = render(120, 30, &mut app, &Styles::new(false));
+        // NAR-8 is finished, so it cannot be moved.
+        assert!(rows(&buffer).iter().any(|row| row.contains("zadanie nie jest w kolejce")), "{}", screen(&buffer));
+    }
+
+    #[test]
+    fn a_long_title_is_cut_with_an_ellipsis_and_the_label_stays() {
+        let mut app = app();
+        let long = titled(
+            with_runner(
+                with_controller(crate::task_app_support::task("a", "local", "running", 1)),
+                ExecutionStatus::Running,
+                "implement",
+            ),
+            "Bardzo długi tytuł zadania który nie mieści się w kolumnie",
+        );
+        app.load(listing(vec![long], "c"));
+        let buffer = render(120, 30, &mut app, &Styles::new(true));
+        let row: String = rows(&buffer)[list_row(&buffer, "Bardzo")]
+            .chars()
+            .take(usize::from(layout::LIST_WIDTH))
+            .collect();
+        assert!(row.contains('…'), "{row:?}");
+        assert!(row.contains("implement"), "{row:?}");
     }
 }

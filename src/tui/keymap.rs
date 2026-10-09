@@ -472,6 +472,15 @@ pub static BINDINGS: &[Binding] = &[
         "otwórz link zadania w przeglądarce",
     ),
     // The task details.
+    // `Esc` first: on a narrow screen the details are full screen and the way
+    // back must survive a shortened bar, which drops hints from the end.
+    bind(
+        Context::Details,
+        Key::code(KeyCode::Esc),
+        Action::Back,
+        "lista",
+        "wróć na listę z zachowanym zaznaczeniem",
+    ),
     bind(
         Context::Details,
         Key::code(KeyCode::Left),
@@ -583,13 +592,6 @@ pub static BINDINGS: &[Binding] = &[
         Action::Follow,
         "podążaj",
         "włącz albo wyłącz podążanie za bieżącym krokiem",
-    ),
-    bind(
-        Context::Details,
-        Key::code(KeyCode::Esc),
-        Action::Back,
-        "lista",
-        "wróć na listę z zachowanym zaznaczeniem",
     ),
     bind(
         Context::Details,

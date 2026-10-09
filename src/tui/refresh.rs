@@ -10,6 +10,11 @@
 //!   a burst of events (an answer, then the next state, then the next
 //!   question) costs one read, not one per event.
 //!
+//! A third, private to failures: when a read fails the schedule backs off
+//! ([`RefreshSchedule::fail`]) — 1s, 2s, 4s … up to [`MAX_RETRY`] — so an
+//! unreachable server is probed soon after it returns without being hammered,
+//! and the delay is what the header counts down.
+//!
 //! The schedule is plain data over [`Instant`]s handed in by the caller, so a
 //! test can step time without sleeping.
 
@@ -17,6 +22,12 @@ use std::time::{Duration, Instant};
 
 /// How long after the first relevant event the refresh it asked for runs.
 pub const DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// The first delay before a failed read is tried again.
+pub const FIRST_RETRY: Duration = Duration::from_secs(1);
+
+/// The longest delay between two attempts after failures.
+pub const MAX_RETRY: Duration = Duration::from_secs(10);
 
 /// When the next automatic refresh is due.
 #[derive(Debug, Clone)]
@@ -27,6 +38,10 @@ pub struct RefreshSchedule {
     last: Instant,
     /// When the first event still waiting for its refresh arrived.
     requested: Option<Instant>,
+    /// Consecutive failed reads; sets the retry delay.
+    failures: u32,
+    /// When the retry after the last failure runs.
+    retry_at: Option<Instant>,
 }
 
 impl RefreshSchedule {
@@ -36,6 +51,8 @@ impl RefreshSchedule {
             interval,
             last: now,
             requested: None,
+            failures: 0,
+            retry_at: None,
         }
     }
 
@@ -64,16 +81,31 @@ impl RefreshSchedule {
     pub fn next_due(&self) -> Option<Instant> {
         let requested = self.requested.map(|at| at + DEBOUNCE);
         let periodic = self.interval.map(|interval| self.last + interval);
-        match (requested, periodic) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (left, right) => left.or(right),
-        }
+        [requested, periodic, self.retry_at]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
-    /// A refresh finished at `now`: both triggers start over.
+    /// A refresh finished at `now`: all triggers start over.
     pub fn done(&mut self, now: Instant) {
         self.last = now;
         self.requested = None;
+        self.failures = 0;
+        self.retry_at = None;
+    }
+
+    /// A refresh failed at `now`: the period starts over, the events waiting
+    /// are dropped (the retry reads everything anyway) and the next attempt is
+    /// scheduled after a growing delay, which is returned.
+    pub fn fail(&mut self, now: Instant) -> Duration {
+        let factor = 2u32.saturating_pow(self.failures.min(16));
+        let delay = FIRST_RETRY.saturating_mul(factor).min(MAX_RETRY);
+        self.failures = self.failures.saturating_add(1);
+        self.last = now;
+        self.requested = None;
+        self.retry_at = Some(now + delay);
+        delay
     }
 }
 
@@ -111,6 +143,35 @@ mod tests {
         assert!(!schedule.is_due(start + Duration::from_secs(3600)));
         schedule.request(start);
         assert!(schedule.is_due(start + DEBOUNCE));
+    }
+
+    #[test]
+    fn a_failed_read_backs_off_and_a_success_resets_the_delay() {
+        let start = Instant::now();
+        let mut schedule = RefreshSchedule::new(Some(Duration::from_secs(30)), start);
+        assert_eq!(schedule.fail(start), Duration::from_secs(1));
+        assert!(!schedule.is_due(start));
+        assert!(schedule.is_due(start + Duration::from_secs(1)));
+        assert_eq!(schedule.fail(start), Duration::from_secs(2));
+        assert_eq!(schedule.fail(start), Duration::from_secs(4));
+        assert_eq!(schedule.fail(start), Duration::from_secs(8));
+        assert_eq!(schedule.fail(start), MAX_RETRY);
+        assert_eq!(schedule.fail(start), MAX_RETRY);
+
+        schedule.done(start);
+        assert_eq!(schedule.fail(start), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_failure_swallows_the_waiting_events_and_restarts_the_period() {
+        let start = Instant::now();
+        let mut schedule = RefreshSchedule::new(Some(Duration::from_secs(5)), start);
+        schedule.request(start);
+        let later = start + Duration::from_secs(20);
+        schedule.fail(later);
+        assert!(!schedule.is_requested());
+        assert!(!schedule.is_due(later));
+        assert!(schedule.is_due(later + FIRST_RETRY));
     }
 
     #[test]

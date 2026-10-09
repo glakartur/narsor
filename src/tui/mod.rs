@@ -85,6 +85,7 @@ pub mod remote;
 pub mod remote_views;
 pub mod scroll;
 pub mod style;
+pub mod task_app;
 pub mod transcript;
 pub mod views;
 

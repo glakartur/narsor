@@ -88,6 +88,7 @@ use narsor::workflows::{builtin, WorkflowResolver};
 mod engine_support;
 mod environment_support;
 mod remote_support;
+mod task_app_support;
 
 // ---------------------------------------------------------------------------
 // harness
@@ -6699,6 +6700,866 @@ mod foundations {
                     .iter()
                     .all(|other| other.fg != header.fg));
             }
+        }
+    }
+}
+
+/// U8: the task application's list — stable order, stream patching, header
+/// counters, the finished-tasks filter, moving queued tasks and the
+/// connection. Most of it needs no server (a listing and events are handed
+/// in); what talks to the API uses the served control plane of `RemoteHarness`.
+mod task_app_list {
+    use std::time::{Duration, Instant};
+
+    use crossterm::event::KeyCode;
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::net::{TcpListener, TcpStream};
+
+    use narsor::api::{ApiClient, ClientError};
+    use narsor::controller_protocol::MoveTaskRequest;
+    use narsor::domain::ExecutionStatus;
+    use narsor::orchestration::{
+        AttentionKind, MoveTarget, Observation, QueueReason, TaskEventKind, TaskLifecycle,
+    };
+    use narsor::tui::connection::LinkState;
+    use narsor::tui::task_app::list::{Attention, StateIcon};
+    use narsor::tui::task_app::notify::Severity;
+    use narsor::tui::task_app::{layout, DetailTab, EventFeed, Focus, Request, TaskApp};
+
+    use super::key;
+    use super::remote_support::RemoteHarness;
+    use super::task_app_support::{
+        event, ids, listing, queued, task, titled, waiting, waiting_for_capacity, with_controller,
+        with_runner,
+    };
+
+    fn offline_client() -> ApiClient {
+        ApiClient::new("127.0.0.1:9".parse().unwrap(), "token")
+    }
+
+    fn app() -> TaskApp {
+        TaskApp::new(offline_client(), "local", None)
+    }
+
+    fn press(app: &mut TaskApp, code: KeyCode) -> Request {
+        app.on_key(key(code))
+    }
+
+    fn ch(app: &mut TaskApp, character: char) -> Request {
+        press(app, KeyCode::Char(character))
+    }
+
+    fn titles(app: &TaskApp) -> Vec<String> {
+        app.list().rows().into_iter().map(|row| row.title).collect()
+    }
+
+    fn row(app: &TaskApp, title: &str) -> (Attention, StateIcon, String) {
+        let row = app
+            .list()
+            .rows()
+            .into_iter()
+            .find(|row| row.title == title)
+            .unwrap_or_else(|| panic!("no row {title}"));
+        (row.attention, row.icon, row.label)
+    }
+
+    fn note(app: &TaskApp) -> String {
+        app.notifier()
+            .latest()
+            .map(|note| note.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn controlled(id: &str, backend: &str, lifecycle: &str, rank: u32) -> narsor::controller_protocol::TaskSummary {
+        with_controller(task(id, backend, lifecycle, rank))
+    }
+
+    mod order {
+        use super::*;
+
+        /// Three tasks go queued → provisioning → running → done one after
+        /// the other; the rows never move, icons and labels do.
+        #[test]
+        fn a_state_stream_never_reorders_the_rows() {
+            let mut app = app();
+            let queued_all = || {
+                listing(
+                    vec![
+                        controlled("a", "local", "queued", 1),
+                        controlled("b", "local", "queued", 2),
+                        controlled("c", "local", "queued", 3),
+                    ],
+                    "c0",
+                )
+            };
+            app.load(queued_all());
+            let order = vec!["a", "b", "c"];
+            assert_eq!(titles(&app), order);
+            assert_eq!(row(&app, "b").2, "#2");
+
+            let mut sequence = 1;
+            for (index, id) in ["a", "b", "c"].into_iter().enumerate() {
+                sequence += 1;
+                app.on_stream(event(
+                    &format!("p{id}"),
+                    id,
+                    sequence,
+                    TaskLifecycle::Provisioning,
+                    TaskEventKind::ControllerReported {
+                        observation: Observation::StartAccepted,
+                        lease_epoch: 1,
+                    },
+                ));
+                assert_eq!(titles(&app), order, "{id} provisioning");
+                assert_eq!(row(&app, id).1, StateIcon::Provisioning);
+                // Whoever waits behind moves up in the queue, not on screen.
+                let waiting_behind = ["a", "b", "c"].iter().skip(index + 1).count();
+                if waiting_behind > 0 {
+                    let next = ["a", "b", "c"][index + 1];
+                    assert_eq!(row(&app, next).2, "#1");
+                }
+
+                sequence += 1;
+                app.on_stream(event(
+                    &format!("r{id}"),
+                    id,
+                    sequence,
+                    TaskLifecycle::Running,
+                    TaskEventKind::ControllerReported {
+                        observation: Observation::RunnerReady,
+                        lease_epoch: 1,
+                    },
+                ));
+                assert_eq!(titles(&app), order, "{id} running");
+                assert_eq!(row(&app, id).1, StateIcon::Running);
+
+                // The debounced read brings the runner's step.
+                let mut tasks = app.list().tasks().to_vec();
+                tasks[index] = with_runner(tasks[index].clone(), ExecutionStatus::Running, "implement");
+                tasks[index].revision = sequence;
+                app.load(listing(tasks, "read"));
+                assert_eq!(row(&app, id).2, "implement");
+
+                sequence += 1;
+                app.on_stream(event(
+                    &format!("d{id}"),
+                    id,
+                    sequence,
+                    TaskLifecycle::Running,
+                    TaskEventKind::RunnerReported {
+                        incarnation: "pod-1".into(),
+                        event_cursor: 9,
+                        execution_status: ExecutionStatus::Completed,
+                        pending_input_id: None,
+                        attention: Vec::new(),
+                    },
+                ));
+                assert_eq!(titles(&app), order, "{id} done");
+                assert_eq!(row(&app, id), (Attention::None, StateIcon::Done, "done".into()));
+            }
+        }
+
+        #[test]
+        fn a_stale_event_does_not_undo_a_newer_read() {
+            let mut app = app();
+            let mut running = controlled("a", "local", "running", 1);
+            running.revision = 7;
+            app.load(listing(vec![running], "c7"));
+            app.on_stream(event(
+                "old",
+                "a",
+                5,
+                TaskLifecycle::Queued,
+                TaskEventKind::Created,
+            ));
+            assert_eq!(row(&app, "a").1, StateIcon::Running);
+            assert_eq!(app.cursor(), Some("c7"), "a dropped event does not move the cursor");
+            assert!(!app.refresh_wanted());
+        }
+
+        #[test]
+        fn the_list_is_never_sorted_by_state() {
+            let mut app = app();
+            app.load(listing(
+                vec![
+                    controlled("done", "local", "running", 1),
+                    controlled("queue", "local", "queued", 2),
+                    controlled("fail", "local", "interrupted", 3),
+                    controlled("run", "local", "running", 4),
+                ],
+                "c",
+            ));
+            assert_eq!(titles(&app), ["done", "queue", "fail", "run"]);
+        }
+
+        #[test]
+        fn an_event_for_an_unknown_task_asks_for_a_debounced_read() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1)], "c"));
+            app.on_stream(event("n", "new", 1, TaskLifecycle::Queued, TaskEventKind::Created));
+            assert!(app.refresh_wanted());
+            let due = app.next_refresh_due().expect("a refresh is due");
+            assert!(due > Instant::now(), "debounced, not immediate");
+        }
+
+        #[test]
+        fn queue_changes_and_answers_patch_the_row_without_a_read() {
+            let mut app = app();
+            let mut waiting_task = waiting(controlled("a", "local", "running", 1), AttentionKind::Question);
+            waiting_task.runner = Some(narsor_runner());
+            app.load(listing(vec![waiting_task, queued("b", 2)], "c"));
+            assert_eq!(row(&app, "a").0, Attention::Question);
+
+            let waiting_id = app.list().tasks()[0].attention[0].waiting_id.clone();
+            app.on_stream(event(
+                "i",
+                "a",
+                2,
+                TaskLifecycle::Running,
+                TaskEventKind::InputQueued {
+                    input_id: "in-1".into(),
+                    pending_input_id: waiting_id,
+                },
+            ));
+            assert_eq!(row(&app, "a").0, Attention::None);
+            assert!(!app.refresh_wanted(), "an answer shows without a read");
+
+            app.on_stream(event(
+                "q",
+                "b",
+                2,
+                TaskLifecycle::Queued,
+                TaskEventKind::QueueChanged {
+                    reason: QueueReason::ControllerOffline,
+                },
+            ));
+            assert_eq!(row(&app, "b").2, "offline");
+            assert!(!app.refresh_wanted());
+        }
+
+        fn narsor_runner() -> narsor::controller_protocol::RunnerView {
+            super::super::task_app_support::runner(ExecutionStatus::Running, "review")
+        }
+
+        #[test]
+        fn a_problem_wins_over_a_question_in_the_attention_column() {
+            let mut app = app();
+            let both = waiting(
+                waiting(controlled("a", "local", "running", 1), AttentionKind::Question),
+                AttentionKind::FailedStep,
+            );
+            app.load(listing(vec![both], "c"));
+            assert_eq!(row(&app, "a").0, Attention::Problem);
+            let counters = app.list().counters();
+            assert_eq!((counters.questions, counters.problems), (0, 1));
+        }
+    }
+
+    mod waiting_and_header {
+        use super::*;
+
+        #[test]
+        fn space_walks_the_waiting_tasks_in_a_circle_and_the_rows_stand_still() {
+            let mut app = app();
+            app.load(listing(
+                vec![
+                    controlled("a", "local", "running", 1),
+                    waiting(controlled("b", "local", "running", 2), AttentionKind::Question),
+                    controlled("c", "local", "running", 3),
+                    waiting(controlled("d", "local", "running", 4), AttentionKind::Problem),
+                ],
+                "c",
+            ));
+            let order = titles(&app);
+            let mut visited = Vec::new();
+            for _ in 0..5 {
+                ch(&mut app, ' ');
+                visited.push(app.list().selected_id().unwrap().to_string());
+                assert_eq!(titles(&app), order, "the rows do not move");
+            }
+            assert_eq!(visited, ["b", "d", "b", "d", "b"]);
+        }
+
+        #[test]
+        fn space_with_nobody_waiting_says_so() {
+            let mut app = app();
+            app.load(listing(vec![controlled("a", "local", "running", 1)], "c"));
+            ch(&mut app, ' ');
+            assert_eq!(app.list().selected_id(), Some("a"));
+            assert!(note(&app).contains("nie czeka"));
+        }
+
+        #[test]
+        fn the_header_counts_questions_and_problems_and_slots() {
+            let mut app = app();
+            app.load(listing(
+                vec![
+                    waiting(controlled("a", "local", "running", 1), AttentionKind::Approval),
+                    waiting(controlled("b", "local", "running", 2), AttentionKind::ProvisioningFailed),
+                    controlled("c", "local", "running", 3),
+                    waiting_for_capacity(queued("d", 4), 1, 2, 3),
+                ],
+                "c",
+            ));
+            let counters = app.list().counters();
+            assert_eq!((counters.questions, counters.problems), (1, 1));
+            let slots = app.list().slots().expect("slots");
+            assert_eq!((slots.used, slots.limit), (2, Some(3)));
+        }
+
+        #[test]
+        fn slots_without_a_waiting_task_count_what_holds_compute() {
+            let mut app = app();
+            app.load(listing(
+                vec![
+                    controlled("a", "local", "running", 1),
+                    controlled("b", "local", "paused", 2),
+                    controlled("c", "local", "provisioning", 3),
+                ],
+                "c",
+            ));
+            let slots = app.list().slots().expect("slots");
+            assert_eq!((slots.used, slots.limit), (2, None));
+        }
+
+        #[test]
+        fn a_title_comes_from_display_and_falls_back_to_the_id() {
+            let mut app = app();
+            app.load(listing(
+                vec![
+                    titled(queued("a", 1), "Zmiana API\u{1b}[31m"),
+                    queued("plain", 2),
+                ],
+                "c",
+            ));
+            let shown = titles(&app);
+            assert_eq!(shown[1], "plain");
+            assert!(!shown[0].contains('\u{1b}'), "{:?}", shown[0]);
+            assert!(shown[0].starts_with("Zmiana API"));
+        }
+    }
+
+    mod refresh_and_filter {
+        use super::*;
+
+        #[test]
+        fn a_read_changes_neither_the_selection_nor_the_focus_nor_the_tab_nor_the_draft() {
+            let mut app = app();
+            app.load(listing(
+                vec![queued("a", 1), queued("b", 2), queued("c", 3)],
+                "c1",
+            ));
+            ch(&mut app, 'j');
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Right);
+            app.detail_mut().set_draft("b", "Uwzględnij migrację");
+            assert_eq!(app.list().selected_id(), Some("b"));
+            assert_eq!(app.focus(), Focus::Details);
+            assert_eq!(app.detail().tab(), DetailTab::Conversation);
+
+            let mut moved = vec![
+                controlled("a", "local", "running", 1),
+                controlled("b", "local", "queued", 2),
+                controlled("c", "local", "queued", 3),
+            ];
+            moved[1].revision = 4;
+            app.load(listing(moved, "c2"));
+
+            assert_eq!(app.list().selected_id(), Some("b"));
+            assert_eq!(app.focus(), Focus::Details);
+            assert_eq!(app.detail().tab(), DetailTab::Conversation);
+            assert_eq!(app.detail().draft("b"), Some("Uwzględnij migrację"));
+            assert_eq!(app.cursor(), Some("c2"));
+        }
+
+        #[test]
+        fn z_hides_finished_tasks_keeps_the_order_and_a_second_z_brings_them_back() {
+            let mut app = app();
+            let done = |id: &str, rank| with_runner(controlled(id, "local", "running", rank), ExecutionStatus::Completed, "done");
+            app.load(listing(
+                vec![
+                    queued("a", 1),
+                    done("x", 2),
+                    queued("b", 3),
+                    done("y", 4),
+                    queued("c", 5),
+                ],
+                "c",
+            ));
+            assert_eq!(titles(&app), ["a", "x", "b", "y", "c"]);
+            ch(&mut app, 'z');
+            assert_eq!(titles(&app), ["a", "b", "c"]);
+            assert_eq!(app.list().hidden_count(), 2);
+            assert_eq!(app.list().tasks().len(), 5, "hidden, not removed");
+            ch(&mut app, 'z');
+            assert_eq!(titles(&app), ["a", "x", "b", "y", "c"]);
+        }
+
+        #[test]
+        fn hiding_the_selected_finished_task_moves_the_selection_to_the_row_below() {
+            let mut app = app();
+            let done = with_runner(controlled("x", "local", "running", 2), ExecutionStatus::Completed, "done");
+            app.load(listing(vec![queued("a", 1), done, queued("b", 3)], "c"));
+            ch(&mut app, 'j');
+            assert_eq!(app.list().selected_id(), Some("x"));
+            ch(&mut app, 'z');
+            assert_eq!(app.list().selected_id(), Some("b"));
+        }
+
+        #[test]
+        fn a_selected_task_archived_from_the_cli_hands_the_selection_to_the_row_below() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1), queued("b", 2), queued("c", 3)], "c0"));
+            ch(&mut app, 'j');
+            assert_eq!(app.list().selected_id(), Some("b"));
+
+            app.on_stream(event(
+                "arch",
+                "b",
+                2,
+                TaskLifecycle::Archived,
+                TaskEventKind::Created,
+            ));
+            assert_eq!(titles(&app), ["a", "c"]);
+            assert_eq!(app.list().selected_id(), Some("c"));
+            let text = note(&app);
+            assert!(text.contains("b") && text.contains("zarchiwizowane") && text.contains("c"), "{text}");
+        }
+
+        #[test]
+        fn archiving_the_last_row_selects_the_one_above() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1), queued("b", 2)], "c0"));
+            ch(&mut app, 'G');
+            app.load(listing(vec![queued("a", 1)], "c1"));
+            assert_eq!(app.list().selected_id(), Some("a"));
+            assert!(note(&app).contains("zaznaczono a"), "{}", note(&app));
+        }
+
+        #[tokio::test]
+        async fn archived_through_the_api_the_selected_task_hands_over_on_the_next_read() {
+            let harness = RemoteHarness::start().await;
+            for id in ["t1", "t2", "t3"] {
+                harness.create(id, None).await;
+            }
+            let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+            app.refresh().await;
+            assert_eq!(titles(&app), ["t1", "t2", "t3"]);
+            ch(&mut app, 'j');
+            assert_eq!(app.list().selected_id(), Some("t2"));
+
+            harness
+                .owner
+                .control_command(
+                    "t2",
+                    &narsor::controller_protocol::OwnerCommandRequest {
+                        command: narsor::orchestration::OwnerCommand::Archive,
+                        idempotency_key: "archive-t2".into(),
+                        expected_generation: None,
+                    },
+                )
+                .await
+                .expect("archive");
+            app.refresh().await;
+            assert_eq!(titles(&app), ["t1", "t3"]);
+            assert_eq!(app.list().selected_id(), Some("t3"));
+            assert!(note(&app).contains("t2"), "{}", note(&app));
+        }
+    }
+
+    mod layouts {
+        use ratatui::layout::Rect;
+
+        use super::*;
+        use layout::Screen;
+
+        #[test]
+        fn a_wide_terminal_splits_into_a_narrow_list_and_the_details() {
+            let areas = layout::areas(Rect::new(0, 0, 120, 30), Focus::List);
+            assert_eq!(areas.screen, Screen::Split);
+            assert_eq!(areas.list.unwrap().width, layout::LIST_WIDTH);
+            assert_eq!(areas.detail.unwrap().width, 120 - 2 - layout::LIST_WIDTH);
+        }
+
+        #[test]
+        fn under_100_columns_the_list_and_the_details_take_turns_full_screen() {
+            let on_list = layout::areas(Rect::new(0, 0, 90, 30), Focus::List);
+            assert_eq!(on_list.screen, Screen::Full);
+            assert!(on_list.list.is_some() && on_list.detail.is_none());
+            let on_details = layout::areas(Rect::new(0, 0, 90, 30), Focus::Details);
+            assert!(on_details.list.is_none() && on_details.detail.is_some());
+            assert_eq!(layout::areas(Rect::new(0, 0, 100, 30), Focus::List).screen, Screen::Split);
+            assert_eq!(layout::areas(Rect::new(0, 0, 99, 30), Focus::List).screen, Screen::Full);
+        }
+
+        #[test]
+        fn under_60_by_20_there_is_only_a_request_for_room() {
+            for (width, height) in [(50, 15), (59, 30), (100, 19)] {
+                assert_eq!(
+                    layout::areas(Rect::new(0, 0, width, height), Focus::List).screen,
+                    Screen::TooSmall,
+                    "{width}x{height}"
+                );
+            }
+            assert_eq!(layout::areas(Rect::new(0, 0, 60, 20), Focus::List).screen, Screen::Full);
+        }
+
+        #[test]
+        fn enter_goes_to_the_details_and_esc_comes_back_with_the_selection() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1), queued("b", 2)], "c"));
+            ch(&mut app, 'j');
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.focus(), Focus::Details);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.focus(), Focus::List);
+            assert_eq!(app.list().selected_id(), Some("b"));
+        }
+    }
+
+    mod moving {
+        use super::*;
+
+        fn expect_move(request: Request) -> narsor::tui::task_app::list::MoveRequest {
+            match request {
+                Request::Move(request) => request,
+                other => panic!("a move was expected, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn k_and_j_ask_to_go_before_the_row_above_and_after_the_row_below() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1), queued("b", 2), queued("c", 3)], "c"));
+            ch(&mut app, 'j');
+            let up = expect_move(ch(&mut app, 'K'));
+            assert_eq!(up.target, MoveTarget::Before(ids(&["a"]).remove(0)));
+            let down = expect_move(ch(&mut app, 'J'));
+            assert_eq!(down.target, MoveTarget::After(ids(&["c"]).remove(0)));
+            assert_eq!(down.generation, 1);
+        }
+
+        #[test]
+        fn k_on_the_first_row_and_j_on_the_last_say_there_is_nowhere_to_go() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1), queued("b", 2)], "c"));
+            assert_eq!(ch(&mut app, 'K'), Request::None);
+            assert!(note(&app).contains("pierwsze"), "{}", note(&app));
+            ch(&mut app, 'G');
+            assert_eq!(ch(&mut app, 'J'), Request::None);
+            assert!(note(&app).contains("ostatnie"), "{}", note(&app));
+        }
+
+        #[test]
+        fn k_on_a_running_task_says_so_and_sends_nothing() {
+            let mut app = app();
+            app.load(listing(
+                vec![queued("a", 1), controlled("b", "local", "running", 2)],
+                "c",
+            ));
+            ch(&mut app, 'j');
+            assert_eq!(ch(&mut app, 'K'), Request::None);
+            assert_eq!(note(&app), "przesuń: zadanie nie jest w kolejce");
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Warning);
+            assert_eq!(ch(&mut app, 'm'), Request::None);
+            assert!(app.list().moving().is_none(), "no move mode for a running task");
+        }
+
+        #[test]
+        fn m_previews_the_place_and_enter_sends_after_for_a_task_moved_down() {
+            let mut app = app();
+            app.load(listing(
+                vec![queued("a", 1), queued("b", 2), queued("c", 3), queued("d", 4)],
+                "c",
+            ));
+            ch(&mut app, 'm');
+            ch(&mut app, 'j');
+            ch(&mut app, 'j');
+            assert_eq!(titles(&app), ["b", "c", "a", "d"], "the preview moves the row");
+            assert_eq!(app.list().tasks()[0].task_id.as_str(), "a", "the data does not");
+            assert_eq!(app.list().selected_id(), Some("a"));
+            let request = expect_move(press(&mut app, KeyCode::Enter));
+            assert_eq!(request.task_id, "a");
+            assert_eq!(request.target, MoveTarget::After(ids(&["c"]).remove(0)));
+            assert!(app.list().moving().is_none());
+            assert_eq!(titles(&app), ["a", "b", "c", "d"], "nothing moves before the server says so");
+        }
+
+        #[test]
+        fn moving_up_goes_before_the_row_it_takes_the_place_of() {
+            let mut app = app();
+            app.load(listing(
+                vec![queued("a", 1), queued("b", 2), queued("c", 3)],
+                "c",
+            ));
+            ch(&mut app, 'G');
+            ch(&mut app, 'm');
+            ch(&mut app, 'k');
+            ch(&mut app, 'k');
+            assert_eq!(titles(&app), ["c", "a", "b"]);
+            let request = expect_move(press(&mut app, KeyCode::Enter));
+            assert_eq!(request.target, MoveTarget::Before(ids(&["a"]).remove(0)));
+        }
+
+        #[test]
+        fn esc_and_an_unchanged_place_send_nothing() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1), queued("b", 2)], "c"));
+            ch(&mut app, 'm');
+            ch(&mut app, 'j');
+            press(&mut app, KeyCode::Esc);
+            assert!(app.list().moving().is_none());
+            assert_eq!(titles(&app), ["a", "b"]);
+
+            ch(&mut app, 'm');
+            ch(&mut app, 'j');
+            ch(&mut app, 'k');
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        }
+
+        #[test]
+        fn the_preview_stops_at_the_ends_of_the_queue() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1), queued("b", 2)], "c"));
+            ch(&mut app, 'm');
+            for _ in 0..5 {
+                ch(&mut app, 'j');
+            }
+            assert_eq!(titles(&app), ["b", "a"]);
+            for _ in 0..5 {
+                ch(&mut app, 'k');
+            }
+            assert_eq!(titles(&app), ["a", "b"]);
+        }
+
+        #[test]
+        fn a_move_is_refused_with_a_reason_while_the_connection_is_down() {
+            let mut app = app();
+            // Never heard from the server: connecting.
+            app.on_stream(Some(Err(ClientError::Unavailable("refused".into()))));
+            assert_eq!(app.connection().state(), LinkState::Connecting);
+            assert!(!app.mutation_allowed());
+            assert!(note(&app).contains("łączę"), "{}", note(&app));
+        }
+
+        #[tokio::test]
+        async fn a_move_the_server_refuses_reloads_the_list_and_says_why() {
+            let harness = RemoteHarness::start().await;
+            for id in ["t1", "t2", "t3"] {
+                harness.create(id, None).await;
+            }
+            let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+            app.refresh().await;
+            assert_eq!(titles(&app), ["t1", "t2", "t3"]);
+
+            // Another client archives t1 behind the list's back.
+            harness
+                .owner
+                .control_command(
+                    "t1",
+                    &narsor::controller_protocol::OwnerCommandRequest {
+                        command: narsor::orchestration::OwnerCommand::Archive,
+                        idempotency_key: "archive-t1".into(),
+                        expected_generation: None,
+                    },
+                )
+                .await
+                .expect("archive");
+
+            let request = ch(&mut app, 'J');
+            app.perform(request).await;
+            let text = note(&app);
+            assert!(text.contains("odrzucone") && text.contains("t1"), "{text}");
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Error);
+            assert_eq!(titles(&app), ["t2", "t3"], "the list was read again");
+            assert_eq!(app.list().selected_id(), Some("t2"));
+        }
+
+        /// `m` `j` `j` `Enter` over the real API: a `move --after` goes out
+        /// and the `Moved` event patches the list without a read.
+        #[tokio::test]
+        async fn a_moved_event_patches_the_list_without_reading_it_again() {
+            let harness = RemoteHarness::start().await;
+            for id in ["t1", "t2", "t3"] {
+                harness.create(id, None).await;
+            }
+            let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+            app.refresh().await;
+            let mut feed = EventFeed::new(harness.owner.clone());
+            feed.ensure_open(&app);
+
+            ch(&mut app, 'm');
+            ch(&mut app, 'j');
+            ch(&mut app, 'j');
+            let request = press(&mut app, KeyCode::Enter);
+            let Request::Move(move_request) = &request else {
+                panic!("a move was expected");
+            };
+            assert!(matches!(move_request.target, MoveTarget::After(_)));
+            app.perform(request).await;
+            assert_eq!(titles(&app), ["t1", "t2", "t3"], "no read, no event yet");
+            assert!(note(&app).contains("przesunięto za t3"), "{}", note(&app));
+
+            let before_cursor = app.cursor().map(str::to_string);
+            for _ in 0..5 {
+                if titles(&app) == ["t2", "t3", "t1"] {
+                    break;
+                }
+                let item = tokio::time::timeout(Duration::from_secs(5), feed.next())
+                    .await
+                    .expect("the Moved event arrives");
+                app.on_stream(item);
+            }
+            assert_eq!(titles(&app), ["t2", "t3", "t1"]);
+            assert_ne!(app.cursor().map(str::to_string), before_cursor);
+            assert_eq!(app.list().selected_id(), Some("t1"));
+            let ranks: Vec<u32> = app.list().tasks().iter().map(|task| task.rank).collect();
+            assert_eq!(ranks, [1, 2, 3]);
+            assert!(!app.refresh_wanted(), "a move is patched, not re-read");
+        }
+
+        /// The stream drops; whatever happens meanwhile is delivered when it
+        /// resumes from the cursor of the last event applied.
+        #[tokio::test]
+        async fn a_dropped_stream_resumes_from_its_cursor_and_loses_no_move() {
+            let harness = RemoteHarness::start().await;
+            for id in ["t1", "t2", "t3"] {
+                harness.create(id, None).await;
+            }
+            let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+            app.refresh().await;
+            let mut feed = EventFeed::new(harness.owner.clone());
+            feed.ensure_open(&app);
+
+            let top = MoveTaskRequest {
+                target: MoveTarget::Top,
+                expected_generation: None,
+            };
+            // A first move, seen live.
+            harness.owner.control_move_task("t3", &top).await.expect("move");
+            for _ in 0..5 {
+                if titles(&app) == ["t3", "t1", "t2"] {
+                    break;
+                }
+                let item = tokio::time::timeout(Duration::from_secs(5), feed.next())
+                    .await
+                    .expect("the first Moved arrives");
+                app.on_stream(item);
+            }
+            assert_eq!(titles(&app), ["t3", "t1", "t2"]);
+
+            // The connection breaks; a second move happens while it is down.
+            feed.close();
+            assert!(!feed.is_open());
+            harness.owner.control_move_task("t2", &top).await.expect("move");
+            assert_eq!(titles(&app), ["t3", "t1", "t2"], "the app has not heard of it");
+
+            feed.ensure_open(&app);
+            for _ in 0..5 {
+                if titles(&app) == ["t2", "t3", "t1"] {
+                    break;
+                }
+                let item = tokio::time::timeout(Duration::from_secs(5), feed.next())
+                    .await
+                    .expect("the second Moved arrives after the resume");
+                app.on_stream(item);
+            }
+            assert_eq!(titles(&app), ["t2", "t3", "t1"]);
+        }
+    }
+
+    mod connection {
+        use super::*;
+
+        fn status(app: &TaskApp) -> String {
+            let status = app.connection().status(Instant::now());
+            format!("{} {}", status.icon, status.text)
+        }
+
+        #[test]
+        fn the_stream_dropping_and_coming_back_changes_the_header_not_the_rows() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1), queued("b", 2)], "c"));
+            assert_eq!(status(&app), "● live");
+
+            app.on_stream(Some(Err(ClientError::Unavailable("reset".into()))));
+            assert!(status(&app).starts_with("◌ ponawiam ("), "{}", status(&app));
+            assert!(app.connection().is_stale());
+            assert_eq!(titles(&app), ["a", "b"], "the data stays, grey");
+            assert!(!app.mutation_allowed());
+            assert!(note(&app).contains("ponawiam"), "{}", note(&app));
+
+            app.on_stream(event(
+                "e",
+                "a",
+                2,
+                TaskLifecycle::Provisioning,
+                TaskEventKind::Created,
+            ));
+            assert_eq!(status(&app), "● live");
+            assert!(app.mutation_allowed());
+        }
+
+        #[test]
+        fn a_stream_that_ends_for_good_is_no_connection_and_is_not_reopened() {
+            let mut app = app();
+            app.load(listing(vec![queued("a", 1)], "c"));
+            app.on_stream(Some(Err(ClientError::Unauthorized)));
+            assert_eq!(status(&app), "✖ brak połączenia");
+            assert!(app.stream_ended());
+            let mut feed = EventFeed::new(offline_client());
+            feed.ensure_open(&app);
+            assert!(!feed.is_open());
+        }
+
+        #[tokio::test]
+        async fn an_unreachable_server_opens_as_connecting_and_goes_live_without_a_restart() {
+            // Reserve a port, and let nothing listen on it yet.
+            let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = reserved.local_addr().unwrap();
+            drop(reserved);
+
+            let harness = RemoteHarness::start().await;
+            harness.create("t1", None).await;
+            let client = ApiClient::new(address, harness.handle.token());
+            let mut app = TaskApp::new(client.clone(), "moj-serwer", None);
+
+            app.refresh().await;
+            assert_eq!(app.connection().state(), LinkState::Connecting);
+            assert_eq!(status(&app), "◌ łączę z moj-serwer");
+            assert!(app.list().tasks().is_empty());
+            assert!(app.cursor().is_none());
+            let mut feed = EventFeed::new(client);
+            feed.ensure_open(&app);
+            assert!(!feed.is_open(), "no cursor yet, so no stream");
+            assert!(!app.mutation_allowed());
+
+            // The server comes up on that address.
+            let listener = TcpListener::bind(address).await.expect("bind the reserved port");
+            let target = harness.handle.addr();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut inbound, _)) = listener.accept().await else {
+                        return;
+                    };
+                    tokio::spawn(async move {
+                        if let Ok(mut outbound) = TcpStream::connect(target).await {
+                            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                        }
+                        let _ = inbound.shutdown().await;
+                    });
+                }
+            });
+
+            // Not due yet; due once the retry delay has passed.
+            assert!(!app.refresh_if_due(Instant::now()).await);
+            assert!(app.refresh_if_due(Instant::now() + Duration::from_secs(2)).await);
+            assert_eq!(status(&app), "● live");
+            assert_eq!(titles(&app), ["t1"]);
+            assert_eq!(app.connection().name(), "local", "the server's own name replaces the configured one");
+            feed.ensure_open(&app);
+            assert!(feed.is_open());
+            assert!(app.mutation_allowed());
         }
     }
 }

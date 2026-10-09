@@ -91,6 +91,12 @@ impl Connection {
         &self.name
     }
 
+    /// Replaces the name once the server has told its own (`capabilities`);
+    /// the state and the age of the data are kept.
+    pub fn rename(&mut self, name: impl Into<String>) {
+        self.name = name.into();
+    }
+
     /// Where the connection stands.
     pub fn state(&self) -> LinkState {
         self.state
