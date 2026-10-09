@@ -10,16 +10,19 @@
 
 use chrono::{DateTime, Utc};
 
+use serde::Serialize;
+
 use crate::api::ClientError;
-use crate::domain::without_unsafe_chars;
+use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
 use crate::controller_protocol::{
     ConversationResponse, ConversationUnavailableReason, DefaultBackendView, Freshness,
     OwnerCommandResponse, QueueView, TaskSummary, TimelineResponse,
 };
 use crate::orchestration::{
-    ConversationAttemptSummary, InputStatus, OwnerCommand, PendingInputRef, QueueReason,
-    TaskLifecycle,
+    AttentionItem, AttentionKind, ConversationAttemptSummary, InputStatus, OwnerCommand,
+    PendingInputRef, QueueReason, TaskLifecycle,
 };
+use crate::tui::task_app::list::{attention_of, Attention};
 
 /// Soft cap on the raw bytes of one relayed conversation page.
 pub const PAGE_BYTE_BUDGET: u64 = 64 * 1024;
@@ -52,7 +55,7 @@ impl ToneLine {
     /// Everything a line shows may come from a runner or an agent, so the
     /// characters a terminal would act on (escape sequences, bidi
     /// overrides, line breaks) never get into it.
-    fn new(text: impl Into<String>, tone: Tone) -> Self {
+    pub(super) fn new(text: impl Into<String>, tone: Tone) -> Self {
         Self {
             text: without_unsafe_chars(&text.into()),
             tone,
@@ -158,6 +161,146 @@ pub fn status_badge(task: &TaskSummary) -> ToneLine {
     ToneLine::new(lifecycle, lifecycle_tone(task.lifecycle))
 }
 
+/// One row of `narsor task list`: id, backend, queue place, the attention
+/// mark (`?` asks, `!` is wrong), the status and — when the workflow declares
+/// one — the title.
+pub fn list_line(task: &TaskSummary) -> String {
+    let title = display_title(task);
+    let title = if title.is_empty() {
+        String::new()
+    } else {
+        format!(" — {title}")
+    };
+    without_unsafe_chars(&format!(
+        "{:<28} {:<14} {:<10} {} {}{title}",
+        task.task_id,
+        task.backend_id,
+        format!("#{}", task.rank),
+        attention_of(task).glyph(),
+        status_badge(task).text
+    ))
+}
+
+/// The task's title from its `display`, made safe to print.
+fn display_title(task: &TaskSummary) -> String {
+    without_unsafe_chars(task.display.title.trim())
+}
+
+/// What a kind of waiting is called.
+pub fn attention_kind_name(kind: AttentionKind) -> &'static str {
+    match kind {
+        AttentionKind::Question => "question",
+        AttentionKind::Approval => "approval",
+        AttentionKind::Problem => "problem",
+        AttentionKind::FailedStep => "failed step",
+        AttentionKind::ConductorProposal => "conductor proposal",
+        AttentionKind::ProvisioningFailed => "provisioning failed",
+    }
+}
+
+/// The title and the links of the task's `display`; nothing when the
+/// workflow declares none. A link without a value reads `—`.
+pub fn display_lines(task: &TaskSummary) -> Vec<ToneLine> {
+    // A runner reports its own display: it is cleaned (and a URL that is not
+    // `http(s)` dropped) before anything is printed.
+    let display = task.display.clone().sanitized();
+    let mut lines = Vec::new();
+    if !display.title.trim().is_empty() {
+        lines.push(ToneLine::new(
+            format!("Title      {}", display.title.trim()),
+            Tone::Normal,
+        ));
+    }
+    for link in &display.links {
+        let text = if link.text.trim().is_empty() {
+            crate::domain::EMPTY_LINK_TEXT
+        } else {
+            link.text.trim()
+        };
+        let url = link
+            .url
+            .as_deref()
+            .map(|url| format!(" <{url}>"))
+            .unwrap_or_default();
+        lines.push(ToneLine::new(
+            format!("Link       {}: {text}{url}", link.label),
+            Tone::Normal,
+        ));
+    }
+    lines
+}
+
+/// What the task waits on its owner for, oldest first: the kind, the state
+/// it concerns, since when, and the id an answer names (`--waiting-id`).
+pub fn attention_lines(task: &TaskSummary) -> Vec<ToneLine> {
+    task.attention
+        .iter()
+        .map(|item| {
+            let tone = match attention_glyph(item.kind) {
+                '?' => Tone::Warning,
+                _ => Tone::Error,
+            };
+            let state = item
+                .state_id
+                .as_deref()
+                .map(|state| format!(" in '{state}'"))
+                .unwrap_or_default();
+            ToneLine::new(
+                format!(
+                    "Waiting    {} {}{state} for {} (id {})",
+                    attention_glyph(item.kind),
+                    attention_kind_name(item.kind),
+                    age(task.as_of, item.since),
+                    item.waiting_id
+                ),
+                tone,
+            )
+        })
+        .collect()
+}
+
+fn attention_glyph(kind: AttentionKind) -> char {
+    match kind {
+        AttentionKind::Question | AttentionKind::Approval | AttentionKind::ConductorProposal => '?',
+        AttentionKind::Problem
+        | AttentionKind::FailedStep
+        | AttentionKind::ProvisioningFailed => '!',
+    }
+}
+
+/// The next task after `current` that waits on its owner, wrapping round
+/// the list (the TUI's `Space`); `None` when no other task waits.
+pub fn next_waiting<'a>(tasks: &'a [TaskSummary], current: &str) -> Option<&'a TaskSummary> {
+    let start = tasks
+        .iter()
+        .position(|task| task.task_id.as_str() == current)
+        .map_or(0, |index| index + 1);
+    (0..tasks.len())
+        .map(|offset| &tasks[(start + offset) % tasks.len()])
+        .find(|task| task.task_id.as_str() != current && attention_of(task) != Attention::None)
+}
+
+/// The ids an owner answer can name: what the task waits on, as `kind id`.
+pub fn waiting_summary(attention: &[AttentionItem]) -> String {
+    if attention.is_empty() {
+        return "nothing".to_string();
+    }
+    attention
+        .iter()
+        .map(|item| format!("{} {}", attention_kind_name(item.kind), item.waiting_id))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `value` as pretty JSON for a machine to read. Strings the runner or an
+/// agent wrote are cleaned of what a terminal would act on (bidi marks,
+/// zero-width characters); serde escapes the control characters.
+pub fn safe_json<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(value)?;
+    without_unsafe_chars_json(&mut value);
+    serde_json::to_string_pretty(&value)
+}
+
 /// Lifecycles in which a runner is expected to report.
 fn is_live(lifecycle: TaskLifecycle) -> bool {
     matches!(
@@ -248,9 +391,11 @@ pub fn detail_lines(
             Tone::Normal,
         ),
     ];
+    lines.splice(1..1, display_lines(task));
     if let Some(hint) = lifecycle_hint(task) {
         lines.push(hint);
     }
+    lines.extend(attention_lines(task));
 
     match &task.controller {
         Some(controller) if controller.freshness == Freshness::Live => lines.push(ToneLine::new(

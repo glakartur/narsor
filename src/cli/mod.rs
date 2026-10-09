@@ -31,9 +31,12 @@
 //! which is also the code clap itself returns for a malformed command line.
 
 pub mod commands;
+pub mod control_text;
 pub mod controller;
 pub mod daemon;
 pub mod remote;
+pub mod task_history;
+pub mod task_registry;
 pub mod task_text;
 
 use std::path::PathBuf;

@@ -41,11 +41,16 @@ use crate::persistence::StatePaths;
 use crate::tui::conversation::classify;
 use super::task_text::{
     age, awaiting_input, command_outcome, conversation_lines, default_backend_line, detail_lines,
-    lifecycle_name, status_badge, PAGE_BYTE_BUDGET,
+    lifecycle_name, list_line, next_waiting, safe_json, status_badge, waiting_summary,
+    PAGE_BYTE_BUDGET,
 };
 use crate::workflows::WorkflowResolver;
 
 use super::commands::{CliError, Result};
+use super::task_history::{history, HistoryCommand};
+use super::task_registry::{
+    capabilities, create_from_file, repo, validate, workflows, RepoCommand,
+};
 
 /// The environment variable holding a fixed token.
 pub const TOKEN_ENV: &str = "NARSOR_TOKEN";
@@ -53,16 +58,33 @@ pub const TOKEN_ENV: &str = "NARSOR_TOKEN";
 /// `narsor task …` — remote tasks on any backend.
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
-    /// Creates a task and queues it on a backend.
+    /// Creates a task and queues it on a backend: from a workflow of the
+    /// catalogue, or — on a local daemon — from a workflow file (`--file`).
     Create {
         /// Workflow to run (its id in the control plane's catalogue).
-        #[arg(value_name = "WORKFLOW")]
-        workflow: String,
+        #[arg(
+            value_name = "WORKFLOW",
+            required_unless_present = "file",
+            conflicts_with = "file"
+        )]
+        workflow: Option<String>,
+        /// A workflow definition on the local daemon's disk, instead of a
+        /// catalogue workflow: validated first (every violation is listed),
+        /// then queued on the local backend. Not accepted by any other
+        /// server (see `capabilities`).
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with_all = [
+                "workflow_version", "backend", "profile", "harness", "repository", "commit"
+            ]
+        )]
+        file: Option<PathBuf>,
         /// Workflow version; read from the local catalogue when omitted.
         #[arg(long = "workflow-version", value_name = "N")]
         workflow_version: Option<u32>,
         /// Workflow input, `name=value` (repeatable). A value that reads as
-        /// JSON is taken as that.
+        /// JSON is taken as that; with `--file` the declared type decides.
         #[arg(long = "input", value_name = "NAME=VALUE")]
         inputs: Vec<String>,
         /// Backend to pin the task to; the default backend when omitted.
@@ -85,14 +107,25 @@ pub enum TaskCommand {
         #[arg(long = "task-id", value_name = "ID")]
         task_id: Option<String>,
     },
-    /// Lists your tasks with backend, lifecycle and queue state.
-    List,
-    /// Shows one task: observations with their age, inputs, timeline and
-    /// conversation availability.
+    /// Lists your tasks with backend, lifecycle and queue state, the
+    /// attention mark (`?` asks, `!` is wrong) and the title.
+    List {
+        /// Only the archived tasks, newest archive first (the TUI's history).
+        #[arg(long)]
+        archived: bool,
+        /// Print the tasks as JSON (an array of task summaries).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Shows one task: title and links, what it waits on, observations with
+    /// their age, inputs, timeline and conversation availability.
     Show {
         /// The task id.
         #[arg(value_name = "TASK_ID")]
         task_id: String,
+        /// Print the task summary as JSON instead.
+        #[arg(long)]
+        json: bool,
     },
     /// Brings a running task to a safe point and releases its compute.
     Pause(CommandArgs),
@@ -160,15 +193,29 @@ pub enum TaskCommand {
         /// The task id.
         #[arg(value_name = "TASK_ID")]
         task_id: String,
-        /// Form field value, `name=value` (repeatable).
+        /// Form field value, `name=value` (repeatable). A value that reads
+        /// as a JSON object or array is taken as that; anything else is text.
         #[arg(long = "field", value_name = "NAME=VALUE")]
         fields: Vec<String>,
+        /// A key of the step's `data`, `name=value`, when resolving a
+        /// problem (repeatable). A value that reads as JSON (`3`, `true`,
+        /// `["a"]`) is taken as that; anything else is text.
+        #[arg(long = "data", value_name = "NAME=VALUE")]
+        data: Vec<String>,
+        /// A context variable of the step's result, `name=value`, when
+        /// resolving a problem (repeatable). Values read as for `--data`.
+        #[arg(long = "variable", value_name = "NAME=VALUE")]
+        variables: Vec<String>,
         /// Output label chosen explicitly.
         #[arg(long, value_name = "LABEL")]
         label: Option<String>,
         /// A remark kept with the answer.
         #[arg(long, value_name = "TEXT")]
         comment: Option<String>,
+        /// The wait to answer (its id as `show` lists it): refused when the
+        /// task waits on something else.
+        #[arg(long = "waiting-id", value_name = "ID")]
+        waiting_id: Option<String>,
     },
     /// Prints the conversation summary, or one attempt's entries read from
     /// the live runner through the control plane.
@@ -223,6 +270,32 @@ pub enum TaskCommand {
         #[command(subcommand)]
         action: MaterialsCommand,
     },
+    /// Executions from before the task scheduler (the TUI's history): list,
+    /// read and recover. A local daemon only.
+    History {
+        /// What to do.
+        #[command(subcommand)]
+        action: HistoryCommand,
+    },
+    /// The control plane's registry of repositories: list, add, remove.
+    Repo {
+        /// What to do.
+        #[command(subcommand)]
+        action: RepoCommand,
+    },
+    /// Lists the workflows a task can be created from, with their source,
+    /// description and inputs.
+    Workflows,
+    /// Checks a workflow file on the local daemon's disk and lists every
+    /// violation. Fails when there is one.
+    Validate {
+        /// The workflow definition.
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
+    /// Shows what the control plane offers: workflow paths, old executions,
+    /// local repository paths.
+    Capabilities,
 }
 
 /// `narsor task materials …` (U9).
@@ -475,7 +548,7 @@ async fn client(target: &ServerTarget, state: &Path, flags: &Flags) -> Result<Ap
 }
 
 /// A [`ClientError`] as the operator reads it.
-fn failure(what: &str, error: ClientError) -> CliError {
+pub(super) fn failure(what: &str, error: ClientError) -> CliError {
     let detail = match error {
         ClientError::NotFound => "not found".to_string(),
         ClientError::Unauthorized => {
@@ -487,6 +560,109 @@ fn failure(what: &str, error: ClientError) -> CliError {
         other => other.to_string(),
     };
     CliError::failure(format!("{what}: {detail}"))
+}
+
+/// What `task create` prints about the task it queued.
+pub(super) fn print_created(task: &TaskSummary) {
+    println!("Created task: {}", task.task_id);
+    println!("Backend: {}", task.backend_id);
+    print_status(task);
+}
+
+/// The capabilities of the control plane, once it is known to be a trusted
+/// local daemon: the only one that reads files and old executions of its own
+/// disk for its owner. Any other server is refused with the reason it gives.
+pub(super) async fn require_local_daemon(client: &ApiClient, what: &str) -> Result<()> {
+    let capabilities = client
+        .control_capabilities()
+        .await
+        .map_err(|error| failure("Could not read the server's capabilities", error))?;
+    if capabilities.workflow_paths {
+        return Ok(());
+    }
+    let reason = capabilities
+        .workflow_paths_reason
+        .as_deref()
+        .map(|reason| format!(": {reason}"))
+        .unwrap_or_default();
+    Err(CliError::failure(format!(
+        "{what} needs the local daemon; '{}' is not one{}",
+        without_unsafe_chars(&capabilities.connection_name),
+        without_unsafe_chars(&reason)
+    )))
+}
+
+/// The answer of `task input` from its command-line pieces: the form's
+/// fields, the step's `data` and `variables`, the chosen label and a remark.
+fn input_delivery(
+    fields: &[String],
+    data: &[String],
+    variables: &[String],
+    label: &Option<String>,
+    comment: &Option<String>,
+) -> Result<HumanInputDelivery> {
+    let mut delivery = HumanInputDelivery::with_values(field_values(fields)?)
+        .with_data(parse_pairs("data", data)?)
+        .with_variables(parse_pairs("variable", variables)?);
+    if let Some(label) = label {
+        delivery = delivery.choosing(label.clone());
+    }
+    if let Some(comment) = comment {
+        delivery = delivery.with_comment(comment.clone());
+    }
+    Ok(delivery)
+}
+
+/// The `--field name=value` pairs of a form. A form takes text (that is what
+/// the TUI sends too); a value that reads as a JSON object or array is the
+/// exception and goes in as that.
+fn field_values(fields: &[String]) -> Result<Map<String, Value>> {
+    let mut values = Map::new();
+    for pair in fields {
+        let (name, raw) = split_pair("field", pair)?;
+        let value = match serde_json::from_str::<Value>(raw) {
+            Ok(structured @ (Value::Object(_) | Value::Array(_))) => structured,
+            _ => Value::String(raw.to_string()),
+        };
+        values.insert(name.to_string(), value);
+    }
+    Ok(values)
+}
+
+/// `value` as pretty JSON, cleaned of what a terminal would act on.
+fn json_output<T: serde::Serialize>(value: &T) -> Result<String> {
+    safe_json(value).map_err(|error| CliError::failure(format!("Could not write JSON: {error}")))
+}
+
+/// Prints a page of a conversation record: number, time, kind and text, with
+/// a hint for how to continue when the record is still open.
+pub(super) fn print_conversation_entries(
+    entries: &[crate::api::ConversationEntryDto],
+    next_entry: u64,
+    closed: bool,
+) {
+    for entry in entries {
+        let classified = classify(entry);
+        let body = if matches!(
+            entry.source,
+            crate::persistence::conversation::ConversationSource::Narsor
+        ) {
+            String::from_utf8_lossy(&classified.raw).into_owned()
+        } else {
+            classified.summary
+        };
+        let body = crate::tui::scroll::sanitize(&body);
+        println!(
+            "{:>5}  {}  {:<10} {}",
+            classified.entry_number,
+            classified.timestamp.to_rfc3339(),
+            classified.kind.label(),
+            body
+        );
+    }
+    if !closed {
+        println!("(continue with --from {next_entry})");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -505,7 +681,7 @@ pub async fn task(
     // the control plane.
     let create = match &command {
         TaskCommand::Create {
-            workflow,
+            workflow: Some(workflow),
             workflow_version,
             inputs,
             backend,
@@ -514,6 +690,7 @@ pub async fn task(
             repository,
             commit,
             task_id,
+            ..
         } => Some(CreateTaskRequest {
             task_id: task_id.clone(),
             backend_id: backend.clone(),
@@ -535,48 +712,83 @@ pub async fn task(
         }),
         _ => None,
     };
+    let delivery = match &command {
+        TaskCommand::Input {
+            fields,
+            data,
+            variables,
+            label,
+            comment,
+            ..
+        } => Some(input_delivery(fields, data, variables, label, comment)?),
+        _ => None,
+    };
     let client = client(target, state, flags).await?;
 
     match command {
+        TaskCommand::Create {
+            file: Some(file),
+            inputs,
+            task_id,
+            ..
+        } => create_from_file(&client, &file, &inputs, task_id).await,
         TaskCommand::Create { .. } => {
             let request = create.expect("built above");
             let task = client
                 .create_control_task(&request)
                 .await
                 .map_err(|error| failure("Could not create the task", error))?;
-            println!("Created task: {}", task.task_id);
-            println!("Backend: {}", task.backend_id);
-            print_status(&task);
+            print_created(&task);
             Ok(())
         }
-        TaskCommand::List => {
-            let listing = client
-                .control_tasks()
-                .await
-                .map_err(|error| failure("Could not list the tasks", error))?;
-            if listing.tasks.is_empty() {
-                println!("No remote tasks.");
+        TaskCommand::List { archived, json } => {
+            let listing = if archived {
+                client.control_tasks_archived(true).await
+            } else {
+                client.control_tasks().await
             }
-            for task in &listing.tasks {
+            .map_err(|error| failure("Could not list the tasks", error))?;
+            if json {
+                println!("{}", json_output(&listing.tasks)?);
+                return Ok(());
+            }
+            if listing.tasks.is_empty() {
                 println!(
-                    "{:<28} {:<14} {:<10} {}",
-                    task.task_id,
-                    task.backend_id,
-                    format!("#{}", task.rank),
-                    status_badge(task).text
+                    "{}",
+                    if archived {
+                        "No archived tasks."
+                    } else {
+                        "No remote tasks."
+                    }
                 );
             }
+            for task in &listing.tasks {
+                println!("{}", list_line(task));
+            }
             Ok(())
         }
-        TaskCommand::Show { task_id } => {
+        TaskCommand::Show { task_id, json } => {
             let task = client
                 .control_task(&task_id)
                 .await
                 .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
+            if json {
+                println!("{}", json_output(&task)?);
+                return Ok(());
+            }
             let timeline = client.control_timeline(&task_id).await.ok();
             let conversation = client.control_conversation(&task_id).await.ok();
             for line in detail_lines(&task, timeline.as_ref(), conversation.as_ref()) {
                 println!("{}", line.text);
+            }
+            if !task.attention.is_empty() {
+                // The next task that waits on you, like the TUI's `Space`:
+                // best effort, the details above stand without it.
+                if let Ok(listing) = client.control_tasks().await {
+                    if let Some(next) = next_waiting(&listing.tasks, &task_id) {
+                        println!("Next       waiting: {}", next.task_id);
+                    }
+                }
             }
             Ok(())
         }
@@ -638,9 +850,8 @@ pub async fn task(
         }
         TaskCommand::Input {
             task_id,
-            fields,
-            label,
-            comment,
+            waiting_id,
+            ..
         } => {
             let task = client
                 .control_task(&task_id)
@@ -652,26 +863,16 @@ pub async fn task(
                     lifecycle_name(task.lifecycle)
                 )));
             };
-            let values = fields
-                .iter()
-                .map(|pair| {
-                    pair.split_once('=')
-                        .map(|(name, value)| (name.to_string(), Value::String(value.to_string())))
-                        .ok_or_else(|| {
-                            CliError::usage(format!(
-                                "Invalid field '{pair}' — expected the form name=value."
-                            ))
-                        })
-                })
-                .collect::<Result<Map<String, Value>>>()?;
-            let mut delivery =
-                HumanInputDelivery::with_values(values).for_episode(pending.id.clone());
-            if let Some(label) = label {
-                delivery = delivery.choosing(label);
+            if let Some(wanted) = waiting_id.filter(|wanted| *wanted != pending.id) {
+                return Err(CliError::failure(format!(
+                    "Task '{task_id}' is not waiting for input '{}'; it waits on: {}.",
+                    without_unsafe_chars(&wanted),
+                    without_unsafe_chars(&waiting_summary(&task.attention))
+                )));
             }
-            if let Some(comment) = comment {
-                delivery = delivery.with_comment(comment);
-            }
+            let delivery = delivery
+                .expect("built above")
+                .for_episode(pending.id.clone());
             let response = client
                 .control_input(
                     &task_id,
@@ -726,28 +927,7 @@ pub async fn task(
                     closed,
                     ..
                 } => {
-                    for entry in &entries {
-                        let classified = classify(entry);
-                        let body = if matches!(
-                            entry.source,
-                            crate::persistence::conversation::ConversationSource::Narsor
-                        ) {
-                            String::from_utf8_lossy(&classified.raw).into_owned()
-                        } else {
-                            classified.summary
-                        };
-                        let body = crate::tui::scroll::sanitize(&body);
-                        println!(
-                            "{:>5}  {}  {:<10} {}",
-                            classified.entry_number,
-                            classified.timestamp.to_rfc3339(),
-                            classified.kind.label(),
-                            body
-                        );
-                    }
-                    if !closed {
-                        println!("(continue with --from {next_entry})");
-                    }
+                    print_conversation_entries(&entries, next_entry, closed);
                     Ok(())
                 }
                 PageResponse::NoRecord => Err(CliError::failure(format!(
@@ -800,6 +980,11 @@ pub async fn task(
         }
         TaskCommand::Conductor { action } => conductor(&client, action).await,
         TaskCommand::Materials { action } => materials(&client, action).await,
+        TaskCommand::History { action } => history(&client, action).await,
+        TaskCommand::Repo { action } => repo(&client, action).await,
+        TaskCommand::Workflows => workflows(&client).await,
+        TaskCommand::Validate { path } => validate(&client, &path).await,
+        TaskCommand::Capabilities => capabilities(&client).await,
         TaskCommand::Watch { cursor } => {
             let cursor = match cursor {
                 Some(cursor) => cursor,
@@ -1343,18 +1528,23 @@ fn describe_operator_command(command: &OperatorCommand) -> String {
 fn parse_pairs(flag: &str, pairs: &[String]) -> Result<Map<String, Value>> {
     let mut values = Map::new();
     for pair in pairs {
-        let (name, raw) = pair
-            .split_once('=')
-            .filter(|(name, _)| !name.trim().is_empty())
-            .ok_or_else(|| {
-                CliError::usage(format!(
-                    "Invalid --{flag} '{pair}' — expected the form name=value."
-                ))
-            })?;
+        let (name, raw) = split_pair(flag, pair)?;
         let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
-        values.insert(name.trim().to_string(), value);
+        values.insert(name.to_string(), value);
     }
     Ok(values)
+}
+
+/// `name=value` of `--{flag}`, the name trimmed; a usage error otherwise.
+fn split_pair<'a>(flag: &str, pair: &'a str) -> Result<(&'a str, &'a str)> {
+    pair.split_once('=')
+        .map(|(name, raw)| (name.trim(), raw))
+        .filter(|(name, _)| !name.is_empty())
+        .ok_or_else(|| {
+            CliError::usage(format!(
+                "Invalid --{flag} '{pair}' — expected the form name=value."
+            ))
+        })
 }
 
 /// The version of `workflow` in the local catalogue, for a create without

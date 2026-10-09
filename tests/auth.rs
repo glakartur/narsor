@@ -1789,3 +1789,80 @@ async fn a_network_server_serves_no_disk_paths_but_still_manages_remote_reposito
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// The command line against a network server: only remote git URLs are
+/// registered, and the files and old executions of the server's disk are not
+/// offered — each refusal says so, instead of failing obscurely.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cli_gets_a_readable_refusal_from_a_network_server() {
+    let key = IssuerKey::es256("key-1");
+    let issuer = MockIssuer::start(&[&key]).await;
+    let server = NetworkServer::owned_by(&issuer, "alice").await;
+    let proxy = ForwardingProxy::start(server.handle.addr()).await;
+    let alice = issuer.token(&key, "alice");
+    let url = proxy.url();
+    let root = server.root.path().to_path_buf();
+
+    let run = move |args: Vec<&'static str>| {
+        let (url, alice, root) = (url.clone(), alice.clone(), root.clone());
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let output = std::process::Command::new(env!("CARGO_BIN_EXE_narsor"))
+                    .current_dir(&root)
+                    .env("HOME", &root)
+                    .env("XDG_CONFIG_HOME", root.join("config"))
+                    .env_remove("NARSOR_TOKEN_FILE")
+                    .env_remove("NARSOR_TOKEN_COMMAND")
+                    .env("NARSOR_SERVER", &url)
+                    .env("NARSOR_TOKEN", &alice)
+                    .arg("--root")
+                    .arg(&root)
+                    .args(&args)
+                    .output()
+                    .expect("run the narsor binary");
+                (
+                    output.status.code().expect("exited normally"),
+                    String::from_utf8_lossy(&output.stdout).into_owned(),
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                )
+            })
+            .await
+            .expect("the binary ran")
+        }
+    };
+
+    let (code, out, err) = run(vec!["task", "capabilities"]).await;
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("Connection:             remote"), "{out}");
+    assert!(out.contains("Workflow paths:         no ("), "{out}");
+    assert!(out.contains("Local repository paths: no"), "{out}");
+
+    let (code, _, err) = run(vec!["task", "repo", "add", "disk", "--remote", "/srv/git/repo.git"]).await;
+    assert_eq!(code, 1);
+    assert!(err.contains("invalid_repository"), "{err}");
+    let (code, out, err) =
+        run(vec!["task", "repo", "add", "api", "--remote", "git@example.com:team/api.git"]).await;
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("Registered repository 'api'"), "{out}");
+    let (code, out, _) = run(vec!["task", "repo", "list"]).await;
+    assert_eq!(code, 0);
+    assert!(out.contains("git@example.com:team/api.git") && !out.contains("disk"), "{out}");
+    let (code, _, err) = run(vec!["task", "repo", "remove", "api"]).await;
+    assert_eq!(code, 0, "{err}");
+
+    for args in [
+        vec!["task", "validate", "/srv/w.yaml"],
+        vec!["task", "create", "--file", "/srv/w.yaml"],
+        vec!["task", "history", "list"],
+        vec!["task", "history", "recover", "exec-1"],
+    ] {
+        let (code, _, err) = run(args.clone()).await;
+        assert_eq!(code, 1, "{args:?}: {err}");
+        assert!(err.contains("needs the local daemon"), "{args:?}: {err}");
+        assert!(err.contains("'remote' is not one"), "{args:?}: {err}");
+    }
+
+    let (code, out, err) = run(vec!["task", "workflows"]).await;
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("implement-feature"), "{out}");
+}
