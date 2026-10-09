@@ -439,6 +439,18 @@ impl RunnerClient {
             .await
     }
 
+    /// `POST /runner/v1/relay-failures/:request_id` — the read an owner
+    /// waits for cannot be answered.
+    pub async fn upload_relay_failure(
+        &self,
+        request_id: &str,
+        failure: &RelayFailure,
+    ) -> Result<ConversationPageAccepted, ClientError> {
+        self.transport
+            .post(&format!("/runner/v1/relay-failures/{request_id}"), failure)
+            .await
+    }
+
     /// `GET /runner/v1/materials/:material_id` — a material of this
     /// runner's task, with its manifest.
     pub async fn material(&self, material_id: &str) -> Result<MaterialView, ClientError> {

@@ -1085,6 +1085,16 @@ pub struct ExecutionEventsPage {
     pub has_more: bool,
 }
 
+/// `POST /runner/v1/relay-failures/:request_id` — the runner could not read
+/// what a waiting owner asked for. The owner is answered "unavailable" at
+/// once instead of after the relay's timeout, and the request leaves the
+/// poll, which would otherwise offer it again and again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayFailure {
+    /// Why, for the control plane's log; never shown to the owner.
+    pub reason: String,
+}
+
 /// `GET /control/v1/tasks/:task_id/execution-events` query.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionEventsQuery {

@@ -787,7 +787,11 @@ impl ProtocolService {
         drop(guard);
         match page {
             Ok(Ok(page)) => Ok(page),
-            _ => Err(ProtocolError::conflict(
+            Ok(Err(_)) => Err(ProtocolError::conflict(
+                "conversation_unavailable",
+                "the runner could not read the conversation page",
+            )),
+            Err(_) => Err(ProtocolError::conflict(
                 "conversation_unavailable",
                 "the runner did not upload the conversation page in time",
             )),
@@ -1527,6 +1531,29 @@ impl ProtocolService {
         let waiting = self.lock_pages().take(request_id, &identity.task_id);
         let delivered = waiting.is_some_and(|(_, reply)| reply.send(page).is_ok());
         Ok(ConversationPageAccepted { delivered })
+    }
+
+    /// The runner could not read what a waiting owner asked for: the
+    /// request is taken out of the relay — so no poll offers it again — and
+    /// its owner is answered "unavailable" now instead of at the timeout.
+    /// Only a request of the runner's own task can be failed.
+    pub fn runner_relay_failure(
+        &self,
+        identity: &RunnerIdentity,
+        request_id: &str,
+        reason: &str,
+    ) -> ProtocolResult<ConversationPageAccepted> {
+        self.credentials
+            .touch_runner(identity, None)?
+            .ok_or(ProtocolError::Unauthorized)?;
+        tracing::warn!(task_id = %identity.task_id, request_id, reason, "a runner could not answer a read");
+        // Dropping the owner's channel is the answer: the waiting side
+        // reports the runner as unable to read.
+        let task_id = &identity.task_id;
+        let failed = self.lock_pages().take(request_id, task_id).is_some()
+            || self.lock_event_reads().take(request_id, task_id).is_some()
+            || self.lock_conductor_reads().take(request_id, task_id).is_some();
+        Ok(ConversationPageAccepted { delivered: failed })
     }
 
     fn lock_pages(&self) -> std::sync::MutexGuard<'_, PageRelay> {

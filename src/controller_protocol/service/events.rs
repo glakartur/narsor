@@ -100,7 +100,11 @@ impl ProtocolService {
                 has_more: page.has_more,
                 source: ExecutionEventsSource::Runner,
             }),
-            _ => Err(ProtocolError::unavailable(
+            Ok(Err(_)) => Err(ProtocolError::unavailable(
+                "runner_read_failed",
+                "the runner could not read the events",
+            )),
+            Err(_) => Err(ProtocolError::unavailable(
                 "runner_timeout",
                 "the runner did not answer the events request in time",
             )),

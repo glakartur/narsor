@@ -320,6 +320,7 @@ impl Session {
             },
             Err(error) => {
                 tracing::warn!(%error, "cannot read the conductor's state");
+                self.fail_read(&request.request_id, &error.to_string()).await;
                 return;
             }
         };

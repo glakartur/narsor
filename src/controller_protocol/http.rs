@@ -177,6 +177,10 @@ where
             "/runner/v1/conductor-reads/:request_id",
             post(post_conductor_read),
         )
+        .route(
+            "/runner/v1/relay-failures/:request_id",
+            post(post_relay_failure),
+        )
         .route("/runner/v1/materials", post(post_runner_material))
         .route(
             "/runner/v1/materials/:material_id",
@@ -699,6 +703,19 @@ async fn post_conductor_read(
         &identity,
         &request_id,
         view,
+    )?))
+}
+
+async fn post_relay_failure(
+    State(service): State<Service>,
+    Extension(identity): Extension<RunnerIdentity>,
+    Path(request_id): Path<String>,
+    Json(failure): Json<RelayFailure>,
+) -> ProtocolResult<Json<ConversationPageAccepted>> {
+    Ok(Json(service.runner_relay_failure(
+        &identity,
+        &request_id,
+        &failure.reason,
     )?))
 }
 

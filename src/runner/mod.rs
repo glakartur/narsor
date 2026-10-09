@@ -88,7 +88,8 @@ use tokio::time::Instant;
 use crate::api::{ClientError, ConversationEntryDto, ConversationResponse};
 use crate::controller_protocol::{
     ConversationPageRequest, DeliveredInput, ExecutionEventsPage, ExecutionEventsRequest,
-    RunnerClient, RunnerDirective, RunnerLaunchView, RunnerPollQuery, RunnerPollResponse,
+    RelayFailure, RunnerClient, RunnerDirective, RunnerLaunchView, RunnerPollQuery,
+    RunnerPollResponse,
 };
 use crate::domain::{
     ExecutionStatus, LaunchDefinitionError, RepositoryInfo, TaskId, TaskLaunchSpec, TaskWorkspace,
@@ -1087,6 +1088,7 @@ impl Session {
             Ok(None) => ConversationResponse::NoRecord,
             Err(error) => {
                 tracing::warn!(%error, attempt = %request.attempt_id, "cannot read a conversation page");
+                self.fail_read(&request.request_id, &error.to_string()).await;
                 return;
             }
         };
@@ -1094,6 +1096,21 @@ impl Session {
             .upload_conversation_page(&request.request_id, &page)
             .await
         {
+            self.link.failed(&error, &self.timing);
+        }
+    }
+
+    /// Tells the control plane that the read `request_id` cannot be
+    /// answered, so its owner hears so now and the request stops being
+    /// offered to every poll.
+    pub(super) async fn fail_read(&mut self, request_id: &str, reason: &str) {
+        let Some(client) = self.link.client() else {
+            return;
+        };
+        let failure = RelayFailure {
+            reason: reason.to_string(),
+        };
+        if let Err(error) = client.upload_relay_failure(request_id, &failure).await {
             self.link.failed(&error, &self.timing);
         }
     }
@@ -1114,6 +1131,7 @@ impl Session {
             Ok(page) => page,
             Err(error) => {
                 tracing::warn!(%error, "cannot read the execution events");
+                self.fail_read(&request.request_id, &error.to_string()).await;
                 return;
             }
         };

@@ -709,6 +709,29 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
         other => panic!("expected events, got {other:?}"),
     }
 
+    // A runner that cannot read its own log answers "unavailable" at once;
+    // it does not leave the request pending until the relay gives up.
+    let log = launch.store().event_log(&execution_id);
+    let gap = log.event_path(cursor_at_gate + 2);
+    fs::copy(log.event_path(cursor_at_gate), &gap).unwrap();
+    let started = std::time::Instant::now();
+    let refused = fixture
+        .service
+        .execution_events(
+            &fixture.owner(),
+            "task-1",
+            narsor::controller_protocol::ExecutionEventsQuery::default(),
+        )
+        .await
+        .expect_err("the runner cannot read its log");
+    assert!(refused.to_string().contains("runner_read_failed"), "{refused}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "answered at once, not at the relay's timeout: {:?}",
+        started.elapsed()
+    );
+    fs::remove_file(&gap).unwrap();
+
     // Work in the workspace, and a remote that moves on: neither may be
     // touched by a resume.
     fs::write(launch.workspace().join("agent-work.txt"), "keep me").unwrap();

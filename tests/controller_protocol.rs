@@ -21,8 +21,8 @@ use narsor::controller_protocol::{
     CommandAck, ConductorReadQuery, ConductorReadResponse, ControllerClient, ConversationResponse,
     ConversationUnavailableReason, CreateEnrollmentRequest, CreateTaskRequest, DesiredAction,
     ExecutionEventsPage, ExecutionEventsQuery, ExecutionEventsResponse, ExecutionEventsSource,
-    Freshness, LaunchRequest, OwnerCommandRequest, ProtocolConfig, ProtocolService, ReportRequest,
-    RunnerClient, RunnerCredentialRequest, RunnerDirective, SubmitInputRequest,
+    Freshness, LaunchRequest, OwnerCommandRequest, ProtocolConfig, ProtocolService, RelayFailure,
+    ReportRequest, RunnerClient, RunnerCredentialRequest, RunnerDirective, SubmitInputRequest,
     SubmitOperatorCommandRequest, TaskSummary,
 };
 use narsor::domain::{
@@ -2406,6 +2406,55 @@ async fn a_runner_that_does_not_answer_in_time_is_a_503_with_the_reason() {
         }
         other => panic!("expected a 503, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_runner_that_cannot_read_fails_the_request_at_once_and_it_stops_being_offered() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    let started = std::time::Instant::now();
+    let read = {
+        let owner = harness.owner.clone();
+        tokio::spawn(async move {
+            owner
+                .control_execution_events("task-1", &ExecutionEventsQuery::default())
+                .await
+        })
+    };
+    let request_id = loop {
+        let poll = runner.poll(None, 5).await.expect("poll");
+        if let Some(request) = poll.execution_events.first() {
+            break request.request_id.clone();
+        }
+    };
+    let failure = RelayFailure {
+        reason: "the log is unreadable".into(),
+    };
+    assert!(
+        runner
+            .upload_relay_failure(&request_id, &failure)
+            .await
+            .expect("failure")
+            .delivered
+    );
+    match read.await.unwrap() {
+        Err(ClientError::Degraded { code, .. }) => assert_eq!(code, "runner_read_failed"),
+        other => panic!("expected a 503, got {other:?}"),
+    }
+    assert!(started.elapsed() < StdDuration::from_secs(10));
+    let poll = runner.poll(None, 0).await.expect("poll");
+    assert!(
+        poll.execution_events.is_empty(),
+        "a failed request is not offered again"
+    );
+    // Failing a request twice, or one that is not there, is harmless.
+    assert!(
+        !runner
+            .upload_relay_failure(&request_id, &failure)
+            .await
+            .expect("failure")
+            .delivered
+    );
 }
 
 #[tokio::test]
