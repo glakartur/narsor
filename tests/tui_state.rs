@@ -543,12 +543,12 @@ mod foundations {
         }
 
         #[test]
-        fn the_panel_bar_offers_tab_enter_alt_enter_and_esc() {
+        fn the_panel_bar_offers_tab_enter_ctrl_j_and_esc() {
             let bar: Vec<String> = hints(Context::Panel)
                 .into_iter()
                 .map(|(keys, _)| keys)
                 .collect();
-            for expected in ["Tab", "Enter", "Alt+Enter", "Esc"] {
+            for expected in ["Tab", "Enter", "Ctrl+J", "Esc"] {
                 assert!(
                     bar.iter().any(|keys| keys == expected),
                     "{expected}: {bar:?}"
@@ -656,6 +656,86 @@ mod foundations {
                     .recommended()
                     .with_field(ChooserField::multiline("comment").required()),
             ])
+        }
+
+        fn ctrl_j() -> KeyEvent {
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)
+        }
+
+        fn focused_comment(chooser: &mut Chooser) {
+            chooser.on_key(press(KeyCode::Enter));
+            assert_eq!(chooser.focus(), ChooserFocus::Fields);
+        }
+
+        #[test]
+        fn ctrl_j_is_a_new_line_in_every_terminal_and_does_not_send() {
+            keymap::override_modifiers_distinguished(Some(false));
+            let mut chooser = review_chooser().selecting(1);
+            focused_comment(&mut chooser);
+            type_text(&mut chooser, "a");
+            assert_eq!(chooser.on_key(ctrl_j()), ChooserAction::None);
+            type_text(&mut chooser, "b");
+            assert_eq!(chooser.fields_of(1)[0].value(), "a\nb");
+        }
+
+        #[test]
+        fn shift_enter_and_alt_enter_are_a_new_line_never_a_send() {
+            let mut chooser = review_chooser().selecting(1);
+            focused_comment(&mut chooser);
+            type_text(&mut chooser, "a");
+            let shift = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+            assert_eq!(chooser.on_key(shift), ChooserAction::None);
+            assert_eq!(chooser.on_key(alt_enter()), ChooserAction::None);
+            assert_eq!(chooser.fields_of(1)[0].value(), "a\n\n");
+            assert!(
+                matches!(
+                    chooser.on_key(press(KeyCode::Enter)),
+                    ChooserAction::Submit(_)
+                ),
+                "a plain Enter still sends"
+            );
+        }
+
+        #[test]
+        fn ctrl_j_in_a_one_line_or_choice_field_changes_nothing() {
+            let mut chooser = Chooser::new(vec![ChooserItem::new("go", "Start.")
+                .with_field(ChooserField::text("title").required())
+                .with_field(ChooserField::integer("count"))
+                .with_field(ChooserField::select("mode", vec!["a".into(), "b".into()]))]);
+            focused_comment(&mut chooser);
+            type_text(&mut chooser, "x");
+            for _ in 0..3 {
+                assert_eq!(chooser.on_key(ctrl_j()), ChooserAction::None);
+                chooser.on_key(press(KeyCode::Down));
+            }
+            let fields = chooser.fields_of(0);
+            assert_eq!(fields[0].value(), "x", "no `j`, no new line");
+            assert_eq!(fields[1].value(), "");
+            assert_eq!(fields[2].value(), fields[2].value().trim());
+        }
+
+        #[test]
+        fn the_bar_promises_only_the_new_line_keys_the_terminal_delivers() {
+            let bar = |distinguished| {
+                keymap::override_modifiers_distinguished(Some(distinguished));
+                hints(Context::Panel)
+                    .into_iter()
+                    .map(|(keys, _)| keys)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let plain = bar(false);
+            assert!(plain.contains("Ctrl+J"), "{plain}");
+            assert!(
+                !plain.contains("Shift+Enter") && !plain.contains("Alt+Enter"),
+                "{plain}"
+            );
+            let extended = bar(true);
+            assert!(
+                extended.contains("Ctrl+J/Shift+Enter/Alt+Enter"),
+                "{extended}"
+            );
+            keymap::override_modifiers_distinguished(None);
         }
 
         #[test]

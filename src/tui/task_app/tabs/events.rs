@@ -11,7 +11,7 @@
 //! * a failed read (`503` with a reason, a refusal) — shown as a note too.
 //!   Neither touches the state of the connection.
 //!
-//! `v` opens the detail of the selected event, `Ctrl+v` switches every row to
+//! `v` opens the detail of the selected event, `Ctrl+V` switches every row to
 //! its raw JSON.
 
 use ratatui::layout::Rect;

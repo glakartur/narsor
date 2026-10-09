@@ -231,7 +231,7 @@ mod shortcut_bar_and_help {
         let styles = Styles::new(false);
         let line = keymap::hint_line(Context::Panel, &styles, 120);
         let text = line_text(&line);
-        for expected in ["Tab", "Enter", "Alt+Enter", "Esc"] {
+        for expected in ["Tab", "Enter", "Ctrl+J", "Esc"] {
             assert!(text.contains(expected), "{expected}: {text}");
         }
         let caps = line
@@ -1885,7 +1885,7 @@ mod task_app_conductor_render {
         assert!(text.contains("wiadomość (wymagane)"), "{text}");
         assert!(text.contains("> Dlaczego?▏"), "{text}");
         assert!(
-            text.contains("Enter wyślij") && text.contains("Alt+Enter nowa linia"),
+            text.contains("Enter wyślij") && text.contains("Ctrl+J nowa linia"),
             "{text}"
         );
         assert!(text.contains("Esc koniec pisania"), "{text}");

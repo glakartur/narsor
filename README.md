@@ -556,7 +556,7 @@ the current step or a draft.
 |---|---|
 | Everywhere | `?` help, `q` quit (asks when a draft would be lost) |
 | List | `j` / `k` (`↓` / `↑`), `g` / `G`, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `r` |
-| Details | `Esc` list, `←` / `→` tabs, `Tab` content ↔ panel, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+v` raw all, `f` follow the current step |
+| Details | `Esc` list, `←` / `→` tabs, `Tab` content ↔ panel, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` follow the current step |
 | Panel | `Tab` actions ↔ fields, `Enter` send, `Alt+Enter` new line, `Esc` fold, `1`–`9` choose, `[` / `]` previous / next waiting |
 | Menu | `j` / `k`, `1`–`9`, `Enter`, `Esc` and the shortcuts above |
 | Confirmation | `y` confirm, `n` / `Esc` take it back |

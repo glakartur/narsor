@@ -50,7 +50,10 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event as TerminalEvent, KeyEventKind};
+use crossterm::event::{
+    self, Event as TerminalEvent, KeyEventKind, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -79,6 +82,10 @@ const TICK: Duration = Duration::from_millis(250);
 /// How many times [`restore_terminal`] has run in this process.
 static RESTORE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Whether the keyboard enhancement flags were pushed and still wait to be
+/// popped; the terminal keeps them after the process ends if nobody pops.
+static ENHANCEMENT_ARMED: AtomicBool = AtomicBool::new(false);
+
 /// Guards against chaining the panic hook onto itself.
 static PANIC_HOOK: Once = Once::new();
 
@@ -105,6 +112,10 @@ pub fn install_panic_hook() {
 /// call when no terminal was ever entered, which is what makes it usable from
 /// a test.
 pub fn restore_terminal() {
+    if ENHANCEMENT_ARMED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    keymap::set_modifiers_distinguished(false);
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
     RESTORE_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -129,6 +140,7 @@ impl TerminalGuard {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, Hide)?;
+        arm_modifier_reporting(&mut stdout);
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal })
     }
@@ -137,6 +149,27 @@ impl TerminalGuard {
     pub fn terminal(&mut self) -> &mut Tui {
         &mut self.terminal
     }
+}
+
+/// Asks the terminal whether it reports modifiers on keys that print as
+/// `Enter`, and when it does, switches that reporting on: then `Shift+Enter`
+/// and `Alt+Enter` arrive as themselves and can be a new line.
+///
+/// Asked once, at start. A terminal that does not answer, or answers with an
+/// error, is a terminal without it: only `Ctrl+J` is promised then, and
+/// nothing is left switched on that [`restore_terminal`] would have to undo.
+fn arm_modifier_reporting(stdout: &mut Stdout) {
+    let supported = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    let armed = supported
+        && execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok();
+    if armed {
+        ENHANCEMENT_ARMED.store(true, Ordering::SeqCst);
+    }
+    keymap::set_modifiers_distinguished(armed);
 }
 
 impl Drop for TerminalGuard {

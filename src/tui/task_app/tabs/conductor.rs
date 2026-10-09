@@ -26,7 +26,7 @@
 //! # What the operator can do
 //!
 //! * `c` writes to the conductor: a text box (the shared [`Chooser`] field, so
-//!   `Alt+Enter` is a new line and `Esc` leaves it with the text kept);
+//!   `Ctrl+J` is a new line and `Esc` leaves it with the text kept);
 //!   `Enter` sends `ConductorChat` through the operator commands. What is typed
 //!   survives a refresh and a move to another task, and counts as a draft when
 //!   the operator quits.
@@ -575,7 +575,7 @@ fn render_history(
     if raw {
         frame.render_widget(
             Paragraph::new(Line::styled(
-                "widok surowy (Ctrl+v wraca)",
+                "widok surowy (Ctrl+V wraca)",
                 styles.of(Role::Attention),
             )),
             first_row(area),

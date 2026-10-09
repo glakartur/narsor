@@ -24,6 +24,9 @@
 //! row without a description. A test runs it over [`BINDINGS`], and a second
 //! one proves it fails when a row is duplicated.
 
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -262,6 +265,9 @@ impl Key {
         }
         match code {
             KeyCode::Char(' ') => text.push_str("Space"),
+            KeyCode::Char(character) if modifiers.contains(KeyModifiers::CONTROL) => {
+                text.push(character.to_ascii_uppercase());
+            }
             KeyCode::Char(character) => text.push(character),
             KeyCode::Enter => text.push_str("Enter"),
             KeyCode::Esc => text.push_str("Esc"),
@@ -719,7 +725,7 @@ pub static BINDINGS: &[Binding] = &[
         Key::char('c'),
         Action::Compose,
         "",
-        "zakładka Dyrygent: napisz do dyrygenta (Enter wysyła, Alt+Enter nowa linia, Esc kończy)",
+        "zakładka Dyrygent: napisz do dyrygenta (Enter wysyła, Ctrl+J nowa linia, Esc kończy)",
     ),
     bind(
         Context::Details,
@@ -760,10 +766,10 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::Panel,
-        Key::alt(KeyCode::Enter),
+        Key::ctrl('j'),
         Action::Newline,
         "↵",
-        "nowa linia w polu tekstowym",
+        "nowa linia w polu tekstowym (także Shift+Enter i Alt+Enter, gdy terminal je rozróżnia)",
     ),
     bind(
         Context::Panel,
@@ -1036,10 +1042,10 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::Form,
-        Key::alt(KeyCode::Enter),
+        Key::ctrl('j'),
         Action::Newline,
         "↵",
-        "nowa linia w polu tekstowym",
+        "nowa linia w polu tekstowym (także Shift+Enter i Alt+Enter, gdy terminal je rozróżnia)",
     ),
     bind(
         Context::Form,
@@ -1355,6 +1361,62 @@ pub static BINDINGS: &[Binding] = &[
     ),
 ];
 
+/// Whether the terminal tells `Shift+Enter` and `Alt+Enter` from `Enter`
+/// (the keyboard enhancement protocol). Set once, when the terminal is taken
+/// over; it only decides which keys the bar and help promise.
+static MODIFIERS_DISTINGUISHED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// A thread's own answer to [`modifiers_distinguished`], so that tests
+    /// can run side by side without sharing the process flag.
+    static MODIFIERS_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Records whether the terminal reports modifiers on `Enter`.
+pub fn set_modifiers_distinguished(distinguished: bool) {
+    MODIFIERS_DISTINGUISHED.store(distinguished, Ordering::SeqCst);
+}
+
+/// Whether the terminal reports modifiers on `Enter`; what the bar and help
+/// may promise.
+pub fn modifiers_distinguished() -> bool {
+    MODIFIERS_OVERRIDE
+        .with(Cell::get)
+        .unwrap_or_else(|| MODIFIERS_DISTINGUISHED.load(Ordering::SeqCst))
+}
+
+/// Overrides [`modifiers_distinguished`] on the calling thread only (`None`
+/// takes the override away). For tests.
+pub fn override_modifiers_distinguished(distinguished: Option<bool>) {
+    MODIFIERS_OVERRIDE.with(|cell| cell.set(distinguished));
+}
+
+/// The one rule of the new line: `Ctrl+J` always; `Enter` carrying Shift or
+/// Alt, which only a terminal that reports modifiers delivers (any other
+/// sends a plain `Enter`, and that sends). Decided on the raw event, because
+/// [`Key::matches`] does not see Shift.
+pub fn is_newline(event: &KeyEvent) -> bool {
+    match event.code {
+        KeyCode::Char('j') => (event.modifiers - KeyModifiers::SHIFT) == KeyModifiers::CONTROL,
+        KeyCode::Enter => {
+            event
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                && !event.modifiers.contains(KeyModifiers::CONTROL)
+        }
+        _ => false,
+    }
+}
+
+/// The keys of the new line that work in this terminal, as written.
+pub fn newline_keys() -> Vec<&'static str> {
+    if modifiers_distinguished() {
+        vec!["Ctrl+J", "Shift+Enter", "Alt+Enter"]
+    } else {
+        vec!["Ctrl+J"]
+    }
+}
+
 /// What `event` does in `context`: the context's own keys first, then the
 /// global ones where the context inherits them.
 pub fn lookup(context: Context, event: &KeyEvent) -> Option<Action> {
@@ -1363,6 +1425,9 @@ pub fn lookup(context: Context, event: &KeyEvent) -> Option<Action> {
 
 /// [`lookup`] over an arbitrary table.
 pub fn lookup_in(bindings: &[Binding], context: Context, event: &KeyEvent) -> Option<Action> {
+    if matches!(context, Context::Panel | Context::Form) && is_newline(event) {
+        return Some(Action::Newline);
+    }
     let own = bindings
         .iter()
         .find(|binding| binding.context == context && binding.key.matches(event));
@@ -1382,10 +1447,14 @@ pub fn lookup_in(bindings: &[Binding], context: Context, event: &KeyEvent) -> Op
 /// The first key that does `action` in `context`, as it is written in the
 /// bar and in help; for text that names a key.
 pub fn key_of(context: Context, action: Action) -> Option<String> {
-    BINDINGS
+    let binding = BINDINGS
         .iter()
-        .find(|binding| binding.context == context && binding.action == action)
-        .map(|binding| binding.key.display())
+        .find(|binding| binding.context == context && binding.action == action)?;
+    Some(if action == Action::Newline {
+        newline_keys().join("/")
+    } else {
+        binding.key.display()
+    })
 }
 
 /// Why a table is not consistent: one message per problem.
@@ -1437,7 +1506,7 @@ pub fn check_consistency(bindings: &[Binding]) -> Result<(), Vec<String>> {
 pub struct HelpEntry {
     /// The context the keys belong to.
     pub context: Context,
-    /// The keys, as written (`j/k`, `Alt+Enter`).
+    /// The keys, as written (`j/k`, `Ctrl+J`).
     pub keys: String,
     /// The label for the bar; empty when the row is help-only.
     pub label: &'static str,
@@ -1471,9 +1540,13 @@ pub fn help_entries_in(bindings: &[Binding], context: Context) -> Vec<HelpEntry>
     }
     entries
         .into_iter()
-        .map(|(context, _, keys, binding)| HelpEntry {
+        .map(|(context, action, keys, binding)| HelpEntry {
             context,
-            keys: keys.join("/"),
+            keys: if action == Action::Newline {
+                newline_keys().join("/")
+            } else {
+                keys.join("/")
+            },
             label: binding.label,
             description: binding.description,
         })

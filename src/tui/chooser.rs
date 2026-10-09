@@ -32,7 +32,7 @@
 //! Each entry owns its fields, so moving to another action and back finds the
 //! text exactly where it was left. Editing goes through the primitives that
 //! [`super::input_form`] shares with its own fields ([`text_insert`],
-//! [`cycle_option`], …): one set of rules for the cursor, for `Alt+Enter` and
+//! [`cycle_option`], …): one set of rules for the cursor, for the new line and
 //! for stepping an option, whichever surface hosts the field.
 //!
 //! Text that comes from outside — workflow labels and descriptions, values
@@ -60,7 +60,7 @@ const CURSOR: char = '▏';
 /// What a field accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldKind {
-    /// Free text; `multiline` lets `Alt+Enter` start a new line.
+    /// Free text; `multiline` lets the new line key start a new line.
     Text {
         /// Whether a newline may be typed.
         multiline: bool,
@@ -200,10 +200,12 @@ impl ChooserField {
     /// Folds one key into the field. Returns whether it was used.
     fn edit(&mut self, event: &KeyEvent, newline: bool) -> bool {
         let used = match (&self.kind, event.code) {
+            // The new line key is never text: in a one-line field it is ignored.
             (FieldKind::Text { multiline: true }, _) if newline => {
                 text_insert(&mut self.value, &mut self.cursor, '\n');
                 true
             }
+            _ if newline => return false,
             (FieldKind::Text { .. }, KeyCode::Char(character)) => {
                 text_insert(&mut self.value, &mut self.cursor, character);
                 true

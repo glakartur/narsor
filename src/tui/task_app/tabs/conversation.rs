@@ -479,7 +479,7 @@ pub fn render(
     if raw {
         frame.render_widget(
             Paragraph::new(Line::styled(
-                "widok surowy (Ctrl+v wraca)",
+                "widok surowy (Ctrl+V wraca)",
                 styles.of(Role::Attention),
             )),
             title,
