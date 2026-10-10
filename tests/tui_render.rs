@@ -579,7 +579,7 @@ mod task_app_render {
 
         let list_rows: Vec<String> = rows(&buffer)
             .iter()
-            .map(|row| row.chars().skip(1).take(27).collect::<String>())
+            .map(|row| row.chars().skip(3).take(25).collect::<String>())
             .collect();
         let find = |needle: &str| {
             list_rows
@@ -785,38 +785,67 @@ mod task_app_render {
         assert!(screen(&buffer).contains("brak danych"));
     }
 
+    /// AE4: the selected task is bracketed — a thick cyan rule above and
+    /// below, a bar beside both of its lines — while the list has the focus,
+    /// and its markers keep their colours (R13).
     #[test]
-    fn live_markers_keep_their_colours_and_the_selection_is_reversed() {
+    fn live_markers_keep_their_colours_inside_the_bracket() {
         let mut app = busy_app();
         press(&mut app, KeyCode::Char('j'));
         let buffer = render(120, 30, &mut app, &Styles::new(false));
-        let width = usize::from(buffer.area.width);
         let row = list_row(&buffer, "NAR-12");
-        let cells = &buffer.content()[row * width..(row + 1) * width];
-        assert_eq!(cells[1].symbol(), "?");
+        let y = row as u16;
         assert_eq!(
-            cells[1].fg,
-            Color::Yellow,
+            cell_at(&buffer, 3, y),
+            ("?".to_string(), Color::Yellow),
             "the marker keeps its role colour"
         );
-        assert_eq!(cells[3].symbol(), "●");
-        assert_eq!(cells[3].fg, Color::Green);
-        let reversed = |row: usize, column: usize| {
-            buffer.content()[row * width + column]
-                .modifier
-                .contains(Modifier::REVERSED)
-        };
-        // AE2: both lines of the selected task are reversed, across the column.
-        for column in 1..usize::from(layout::LIST_WIDTH) - 1 {
-            assert!(reversed(row, column), "line 1, column {column}");
-            assert!(reversed(row + 1, column), "line 2, column {column}");
-        }
+        assert_eq!(cell_at(&buffer, 5, y), ("●".to_string(), Color::Green));
+        assert_bracket(&buffer, row, "┃", "━", Color::Cyan);
         let other = list_row(&buffer, "NAR-14");
-        assert!(!reversed(other, 4) && !reversed(other + 1, 4));
+        assert_eq!(bar(&buffer, other).0, " ");
+        assert_eq!(bar(&buffer, other + 1).0, " ");
+        assert!(no_reversed_in_list(&buffer), "{}", screen(&buffer));
     }
 
+    /// AE5: a selected task with a problem keeps its red markers, and no cell
+    /// of the list is reversed.
     #[test]
-    fn without_colour_every_marker_and_the_selection_survive() {
+    fn a_selected_problem_keeps_its_red_markers() {
+        let mut app = busy_app();
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        let buffer = render(120, 30, &mut app, &Styles::new(false));
+        let row = list_row(&buffer, "NAR-9 ");
+        let y = row as u16;
+        assert_eq!(cell_at(&buffer, 3, y), ("!".to_string(), Color::Red));
+        assert_eq!(cell_at(&buffer, 5, y), ("✗".to_string(), Color::Red));
+        assert_bracket(&buffer, row, "┃", "━", Color::Cyan);
+        assert!(no_reversed_in_list(&buffer), "{}", screen(&buffer));
+    }
+
+    /// AE4: with the focus gone to the details the bracket stays where it
+    /// was, thin and grey, and no task moves.
+    #[test]
+    fn enter_thins_the_bracket_and_moves_no_row() {
+        let mut app = busy_app();
+        press(&mut app, KeyCode::Char('j'));
+        let titles = ["NAR-14", "NAR-12", "NAR-9 ", "NAR-16", "NAR-17", "NAR-8 "];
+        let before = render(120, 30, &mut app, &Styles::new(false));
+        let rows_before: Vec<usize> = titles.iter().map(|t| list_row(&before, t)).collect();
+
+        press(&mut app, KeyCode::Enter);
+        let after = render(120, 30, &mut app, &Styles::new(false));
+        let rows_after: Vec<usize> = titles.iter().map(|t| list_row(&after, t)).collect();
+        assert_eq!(rows_before, rows_after, "{}", screen(&after));
+        let row = list_row(&after, "NAR-12");
+        assert_bracket(&after, row, "│", "─", Color::DarkGray);
+    }
+
+    /// AE6: without colour the shape and the weight of the bracket tell the
+    /// focus apart.
+    #[test]
+    fn without_colour_every_marker_and_the_bracket_survive() {
         let mut app = busy_app();
         press(&mut app, KeyCode::Char('j'));
         let buffer = render(120, 30, &mut app, &Styles::new(true));
@@ -831,13 +860,22 @@ mod task_app_render {
                 .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset),
             "NO_COLOR draws no colour at all"
         );
-        let width = usize::from(buffer.area.width);
         let row = list_row(&buffer, "NAR-12");
-        for line in [row, row + 1] {
-            assert!(buffer.content()[line * width + 4]
-                .modifier
-                .contains(Modifier::REVERSED));
-        }
+        assert_bracket(&buffer, row, "┃", "━", Color::Reset);
+        let y = row as u16;
+        assert!(bold_at(&buffer, 1, y) && bold_at(&buffer, 1, y + 1));
+        assert!(bold_at(&buffer, 3, y - 1) && bold_at(&buffer, 3, y + 2));
+        assert!(no_reversed_in_list(&buffer));
+
+        press(&mut app, KeyCode::Enter);
+        let buffer = render(120, 30, &mut app, &Styles::new(true));
+        let row = list_row(&buffer, "NAR-12");
+        assert_bracket(&buffer, row, "│", "─", Color::Reset);
+        let y = row as u16;
+        let dim = |x: u16, y: u16| buffer[(x, y)].modifier.contains(Modifier::DIM);
+        assert!(dim(1, y) && dim(1, y + 1) && dim(3, y - 1) && dim(3, y + 2));
+        assert!(!bold_at(&buffer, 1, y));
+        assert!(no_reversed_in_list(&buffer));
     }
 
     #[test]
@@ -897,27 +935,34 @@ mod task_app_render {
     #[test]
     fn a_long_title_is_cut_with_an_ellipsis_and_the_label_goes_under_it() {
         let mut app = app();
+        let title = "Bardzo długi tytuł zadania który nie mieści się w kolumnie";
         let long = titled(
             with_runner(
                 with_controller(crate::task_app_support::task("a", "local", "running", 1)),
                 ExecutionStatus::Running,
                 "implement",
             ),
-            "Bardzo długi tytuł zadania który nie mieści się w kolumnie",
+            title,
         );
         app.load(listing(vec![long], "c"));
         let buffer = render(120, 30, &mut app, &Styles::new(true));
-        let line = |at: usize| -> String {
-            rows(&buffer)[at]
-                .chars()
-                .take(usize::from(layout::LIST_WIDTH))
-                .collect()
-        };
         let row = list_row(&buffer, "Bardzo");
-        assert!(line(row).contains('…'), "{:?}", line(row));
-        assert!(line(row + 1).contains("implement"), "{:?}", line(row + 1));
+        // The list's inside is 26 columns: 2 for the bracket, 5 for the
+        // markers, so the title has 19, the ellipsis included.
+        let kept: String = title.chars().take(18).collect();
+        assert_eq!(
+            content_text(&buffer, row),
+            format!("  ●  {kept}…"),
+            "{}",
+            screen(&buffer)
+        );
         assert!(
-            !line(row + 2).contains("mieści"),
+            content_text(&buffer, row + 1).starts_with("     implement"),
+            "{:?}",
+            content_text(&buffer, row + 1)
+        );
+        assert!(
+            !list_text(&buffer, row + 2).contains("mieści"),
             "the title does not wrap to a third line:\n{}",
             screen(&buffer)
         );
@@ -936,22 +981,49 @@ mod task_app_render {
             .collect()
     }
 
-    fn all_reversed(buffer: &Buffer, row: usize) -> bool {
-        list_cells(buffer, row)
-            .iter()
-            .all(|cell| cell.modifier.contains(Modifier::REVERSED))
+    /// What a row of the list shows after the bracket's column.
+    fn content_text(buffer: &Buffer, row: usize) -> String {
+        list_text(buffer, row).chars().skip(2).collect()
     }
 
-    fn none_reversed(buffer: &Buffer, row: usize) -> bool {
-        list_cells(buffer, row)
-            .iter()
-            .all(|cell| !cell.modifier.contains(Modifier::REVERSED))
+    /// The bracket's column of screen row `row`: the cell right inside the
+    /// frame of the list.
+    fn bar(buffer: &Buffer, row: usize) -> (String, Color) {
+        cell_at(buffer, 1, row as u16)
     }
 
-    /// AE2: a task takes two lines, `j` takes the selection to the whole next
-    /// task.
-    #[test]
-    fn a_task_takes_two_lines_and_the_selection_covers_both() {
+    /// Whether screen row `row` is a rule of `symbol` in `colour`: blank in
+    /// the bracket's column and the gap after it, the rule up to the frame.
+    fn is_rule(buffer: &Buffer, row: usize, symbol: &str, colour: Color) -> bool {
+        let cells = list_cells(buffer, row);
+        cells[..2].iter().all(|cell| cell.symbol() == " ")
+            && cells[2..]
+                .iter()
+                .all(|cell| cell.symbol() == symbol && cell.fg == colour)
+    }
+
+    /// Asserts the task whose first line is screen row `row` is bracketed:
+    /// `rule` in the rows above and below it, `bar` beside both its lines.
+    fn assert_bracket(buffer: &Buffer, row: usize, bar_symbol: &str, rule: &str, colour: Color) {
+        let expected = (bar_symbol.to_string(), colour);
+        assert_eq!(bar(buffer, row), expected, "{}", screen(buffer));
+        assert_eq!(bar(buffer, row + 1), expected, "{}", screen(buffer));
+        assert!(is_rule(buffer, row - 1, rule, colour), "{}", screen(buffer));
+        assert!(is_rule(buffer, row + 2, rule, colour), "{}", screen(buffer));
+    }
+
+    /// Whether no cell inside the frame of the list is in reverse video (R7);
+    /// the key caps of the bar below may be.
+    fn no_reversed_in_list(buffer: &Buffer) -> bool {
+        (2..usize::from(buffer.area.height) - 2).all(|row| {
+            list_cells(buffer, row)
+                .iter()
+                .all(|cell| !cell.modifier.contains(Modifier::REVERSED))
+        })
+    }
+
+    /// Two running tasks with labels.
+    fn two_task_app() -> TaskApp {
         let mut app = app();
         let running = |id: &str, rank, step: &str, title: &str| {
             titled(
@@ -970,27 +1042,49 @@ mod task_app_render {
             ],
             "c",
         ));
+        app
+    }
+
+    /// R10: a task takes three rows — a gap, then its two lines — and the
+    /// first row inside the frame is a gap; `j` moves the bracket, not the
+    /// rows.
+    #[test]
+    fn a_task_takes_three_rows_and_the_bracket_covers_both_lines() {
+        let mut app = two_task_app();
         let buffer = render(120, 30, &mut app, &Styles::new(false));
         let first = list_row(&buffer, "Refactor parser");
-        assert!(
-            list_text(&buffer, first).starts_with("  ●  Refactor parser"),
-            "{:?}",
-            list_text(&buffer, first)
+        assert_eq!(
+            first,
+            3,
+            "the gap above the first task:\n{}",
+            screen(&buffer)
         );
         assert!(
-            list_text(&buffer, first + 1).starts_with("     implement"),
+            content_text(&buffer, first).starts_with("  ●  Refactor parser"),
             "{:?}",
-            list_text(&buffer, first + 1)
+            content_text(&buffer, first)
+        );
+        assert!(
+            content_text(&buffer, first + 1).starts_with("     implement"),
+            "{:?}",
+            content_text(&buffer, first + 1)
         );
         let second = list_row(&buffer, "Fix the lexer");
-        assert_eq!(second, first + 2, "the next task begins right below");
-        assert!(all_reversed(&buffer, first) && all_reversed(&buffer, first + 1));
-        assert!(none_reversed(&buffer, second) && none_reversed(&buffer, second + 1));
+        assert_eq!(second, first + 3, "a gap between the tasks");
+        assert_bracket(&buffer, first, "┃", "━", Color::Cyan);
+        assert_eq!(bar(&buffer, second).0, " ");
+        assert!(
+            list_text(&buffer, second + 2).trim().is_empty(),
+            "the gap under the last task"
+        );
 
         press(&mut app, KeyCode::Char('j'));
         let buffer = render(120, 30, &mut app, &Styles::new(false));
-        assert!(all_reversed(&buffer, second) && all_reversed(&buffer, second + 1));
-        assert!(none_reversed(&buffer, first) && none_reversed(&buffer, first + 1));
+        assert_eq!(list_row(&buffer, "Refactor parser"), first);
+        assert_eq!(list_row(&buffer, "Fix the lexer"), second);
+        assert_bracket(&buffer, second, "┃", "━", Color::Cyan);
+        assert_eq!(bar(&buffer, first).0, " ");
+        assert!(list_text(&buffer, first - 1).trim().is_empty());
     }
 
     /// R8: the label keeps its role on the second line.
@@ -1019,25 +1113,21 @@ mod task_app_render {
         let mut tasks = vec![offline, step];
         tasks.extend(queued_tasks);
         app.load(listing(tasks, "c"));
-        // The selection stays on the first row; look at the others unreversed.
         press(&mut app, KeyCode::Char('G'));
         let buffer = render(120, 30, &mut app, &Styles::new(false));
         let label = |title: &str, text: &str| {
             let row = list_row(&buffer, title) + 1;
-            let line = list_text(&buffer, row);
+            let line = content_text(&buffer, row);
             assert!(line.starts_with(&format!("     {text}")), "{line:?}");
-            list_cells(&buffer, row)[5].fg
+            list_cells(&buffer, row)[7].fg
         };
         assert_eq!(label("Offline task", "offline"), Color::Yellow);
         assert_eq!(label("Step task", "review"), Color::DarkGray);
         assert_eq!(label("Queued 4", "#2"), Color::Reset);
     }
 
-    /// R9: scrolling goes by whole tasks.
-    #[test]
-    fn a_long_list_scrolls_by_whole_tasks() {
-        let mut app = app();
-        let tasks = (1..=20)
+    fn long_list(count: u32) -> Vec<narsor::controller_protocol::TaskSummary> {
+        (1..=count)
             .map(|rank| {
                 titled(
                     with_runner(
@@ -1053,29 +1143,74 @@ mod task_app_render {
                     &format!("T-{rank:02}"),
                 )
             })
-            .collect();
-        app.load(listing(tasks, "c"));
+            .collect()
+    }
+
+    /// R11: scrolling goes by whole tasks, and the selected one is in view
+    /// with its whole bracket.
+    #[test]
+    fn a_long_list_scrolls_by_whole_tasks() {
+        let mut app = app();
+        app.load(listing(long_list(20), "c"));
         press(&mut app, KeyCode::Char('G'));
-        // An odd number of rows inside the frame: one is left over.
         let buffer = render(120, 31, &mut app, &Styles::new(true));
         let last = list_row(&buffer, "T-20");
         assert!(
-            list_text(&buffer, last + 1).starts_with("     implement"),
+            content_text(&buffer, last + 1).starts_with("     implement"),
             "the last task shows both lines:\n{}",
             screen(&buffer)
         );
-        assert!(all_reversed(&buffer, last) && all_reversed(&buffer, last + 1));
-        // The first row inside the frame begins a task, not half of one.
+        assert_bracket(&buffer, last, "┃", "━", Color::Reset);
         assert!(
-            list_text(&buffer, 2).starts_with("  ●  T-"),
-            "{:?}\n{}",
-            list_text(&buffer, 2),
+            last + 2 < usize::from(buffer.area.height) - 2,
+            "the rule below is inside the frame:\n{}",
             screen(&buffer)
         );
+        // The first row inside the frame is a gap and a whole task follows.
+        assert!(
+            list_text(&buffer, 2).trim().is_empty(),
+            "{}",
+            screen(&buffer)
+        );
+        assert!(
+            content_text(&buffer, 3).starts_with("  ●  T-"),
+            "{:?}\n{}",
+            content_text(&buffer, 3),
+            screen(&buffer)
+        );
+        assert!(content_text(&buffer, 4).starts_with("     implement"));
+
+        // Going up does not scroll while the bracket fits.
+        let top = content_text(&buffer, 3);
+        press(&mut app, KeyCode::Char('k'));
+        let buffer = render(120, 31, &mut app, &Styles::new(true));
+        assert_eq!(content_text(&buffer, 3), top, "{}", screen(&buffer));
+        assert_eq!(list_row(&buffer, "T-20"), last);
     }
 
-    /// R10: the rows of tasks being sent have the same two lines, and
-    /// `nie wysłano` is a problem.
+    /// A new read — a task added at the end — moves neither the view nor the
+    /// selected task.
+    #[test]
+    fn a_refresh_keeps_the_view_and_the_selected_row_in_place() {
+        let mut app = app();
+        app.load(listing(long_list(20), "c"));
+        press(&mut app, KeyCode::Char('G'));
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('k'));
+        }
+        let before = render(120, 31, &mut app, &Styles::new(false));
+        let selected = list_row(&before, "T-17");
+        let top = content_text(&before, 3);
+
+        app.load(listing(long_list(21), "d"));
+        let after = render(120, 31, &mut app, &Styles::new(false));
+        assert_eq!(content_text(&after, 3), top, "{}", screen(&after));
+        assert_eq!(list_row(&after, "T-17"), selected);
+        assert_bracket(&after, selected, "┃", "━", Color::Cyan);
+    }
+
+    /// R10: the rows of tasks being sent have the same two lines and the
+    /// bracket, and `nie wysłano` is a problem.
     #[test]
     fn pending_rows_take_two_lines_and_not_sent_is_a_problem() {
         use narsor::tui::task_app::list::{PendingRow, PendingState, TaskList};
@@ -1094,21 +1229,28 @@ mod task_app_render {
         });
         let width = usize::from(buffer.area.width);
         let line =
-            |row: usize| -> String { rows(&buffer)[row].chars().skip(1).take(width - 2).collect() };
-        assert!(line(1).starts_with("  ↻  Pending p1"), "{:?}", line(1));
-        assert!(line(2).starts_with("     wysyłanie…"), "{:?}", line(2));
-        assert!(line(3).starts_with("  ✗  Pending p2"), "{:?}", line(3));
-        assert!(line(4).starts_with("     nie wysłano"), "{:?}", line(4));
-        assert_eq!(buffer.content()[4 * width + 6].fg, Color::Red);
-        // The last pushed row is selected: both its lines are reversed.
-        for row in [3, 4] {
-            assert!(buffer.content()[row * width + 6]
-                .modifier
-                .contains(Modifier::REVERSED));
-        }
+            |row: usize| -> String { rows(&buffer)[row].chars().skip(3).take(width - 4).collect() };
+        assert!(line(1).trim().is_empty(), "{:?}", line(1));
+        assert!(line(2).starts_with("  ↻  Pending p1"), "{:?}", line(2));
+        assert!(line(3).starts_with("     wysyłanie…"), "{:?}", line(3));
+        assert!(line(5).starts_with("  ✗  Pending p2"), "{:?}", line(5));
+        assert!(line(6).starts_with("     nie wysłano"), "{:?}", line(6));
+        assert_eq!(buffer.content()[6 * width + 8].fg, Color::Red);
+        // The last pushed row is selected: it is bracketed.
+        let cell = |x: u16, y: u16| cell_at(&buffer, x, y);
+        assert_eq!(cell(1, 5), ("┃".to_string(), Color::Cyan));
+        assert_eq!(cell(1, 6), ("┃".to_string(), Color::Cyan));
+        assert_eq!(cell(3, 4), ("━".to_string(), Color::Cyan));
+        assert_eq!(cell(3, 7), ("━".to_string(), Color::Cyan));
+        assert_eq!(cell(1, 2).0, " ");
+        assert!(buffer
+            .content()
+            .iter()
+            .all(|cell| !cell.modifier.contains(Modifier::REVERSED)));
     }
 
-    /// R8: the move preview takes the place of the label.
+    /// R8: the move preview takes the place of the label, inside a thick
+    /// bracket.
     #[test]
     fn the_move_preview_is_on_the_second_line() {
         let mut app = app();
@@ -1118,14 +1260,15 @@ mod task_app_render {
         app.load(listing(tasks, "c"));
         press(&mut app, KeyCode::Char('m'));
         press(&mut app, KeyCode::Char('j'));
-        let buffer = render(120, 30, &mut app, &Styles::new(true));
+        let buffer = render(120, 30, &mut app, &Styles::new(false));
         let moved = list_row(&buffer, "Queued 1");
         assert!(
-            list_text(&buffer, moved + 1).starts_with("     ↕ 2/5"),
+            content_text(&buffer, moved + 1).starts_with("     ↕ 2/5"),
             "{}",
             screen(&buffer)
         );
         assert!(list_row(&buffer, "Queued 2") < moved);
+        assert_bracket(&buffer, moved, "┃", "━", Color::Cyan);
     }
 }
 
@@ -2785,10 +2928,50 @@ mod task_app_create_render {
         assert_two_lines(&screen, "✓  NAR-9", "     archiwum");
         assert_two_lines(&screen, "fix-bug exec-1", "     failed");
 
-        // The selection covers both lines of the entry, and only of it.
+        // The bracket covers both lines of the selected entry, and only of
+        // it: thick and cyan while the list has the focus.
         let buffer = draw_buffer(&mut app, 130, 30);
-        let width = usize::from(buffer.area.width);
-        let all = rows(&buffer);
+        let (selected, other) = history_rows(&buffer);
+        let cell = |buffer: &Buffer, x: u16, y: usize| cell_at(buffer, x, y as u16);
+        let thick = ("┃".to_string(), Color::Cyan);
+        assert_eq!(cell(&buffer, 1, selected + 1), thick);
+        assert_eq!(
+            cell(&buffer, 3, selected - 1),
+            ("━".to_string(), Color::Cyan)
+        );
+        assert_eq!(
+            cell(&buffer, 3, selected + 2),
+            ("━".to_string(), Color::Cyan)
+        );
+        assert_eq!(cell(&buffer, 1, other).0, " ");
+        assert_eq!(cell(&buffer, 1, other + 1).0, " ");
+        assert!(buffer
+            .content()
+            .iter()
+            .all(|cell| !cell.modifier.contains(Modifier::REVERSED)));
+
+        // With the focus in the details the same bracket is thin and grey,
+        // and no entry moves.
+        press(&mut app, KeyCode::Enter);
+        let details = draw_buffer(&mut app, 130, 30);
+        assert_eq!(history_rows(&details), (selected, other));
+        let thin = ("│".to_string(), Color::DarkGray);
+        assert_eq!(cell(&details, 1, selected), thin);
+        assert_eq!(cell(&details, 1, selected + 1), thin);
+        assert_eq!(
+            cell(&details, 3, selected - 1),
+            ("─".to_string(), Color::DarkGray)
+        );
+        assert_eq!(
+            cell(&details, 3, selected + 2),
+            ("─".to_string(), Color::DarkGray)
+        );
+    }
+
+    /// The first screen rows of the selected history entry and of the other
+    /// one, told apart by the bar beside the selected one.
+    fn history_rows(buffer: &Buffer) -> (usize, usize) {
+        let all = rows(buffer);
         let at = |needle: &str| {
             all.iter()
                 .position(|row| {
@@ -2799,18 +2982,14 @@ mod task_app_create_render {
                 })
                 .unwrap()
         };
-        let reversed = |row: usize| {
-            buffer.content()[row * width + 6]
-                .modifier
-                .contains(Modifier::REVERSED)
-        };
-        let (selected, other) = if reversed(at("NAR-9")) {
-            (at("NAR-9"), at("fix-bug"))
+        let barred = |row: usize| buffer[(1, row as u16)].symbol() != " ";
+        let (nine, fix) = (at("NAR-9"), at("fix-bug"));
+        assert_ne!(barred(nine), barred(fix), "{}", screen(buffer));
+        if barred(nine) {
+            (nine, fix)
         } else {
-            (at("fix-bug"), at("NAR-9"))
-        };
-        assert!(reversed(selected) && reversed(selected + 1));
-        assert!(!reversed(other) && !reversed(other + 1));
+            (fix, nine)
+        }
     }
 
     /// The list line holding `first` is followed by one that starts with
@@ -2820,8 +2999,8 @@ mod task_app_create_render {
             .lines()
             .map(|line| {
                 line.chars()
-                    .skip(1)
-                    .take(usize::from(layout::LIST_WIDTH) - 2)
+                    .skip(3)
+                    .take(usize::from(layout::LIST_WIDTH) - 4)
                     .collect()
             })
             .collect();
@@ -3036,21 +3215,25 @@ mod task_app_main_screen {
                 .unwrap_or_else(|| panic!("no row for {title}:\n{screen}"));
             list_part(&rows[at + 1])
         };
+        // The frame, the bracket's column, then the row; the selected task
+        // has the thin bar, the focus being in the details.
         assert!(
-            row_of("NAR-14").starts_with("│  ●  NAR-14"),
+            row_of("NAR-14").starts_with("│    ●  NAR-14"),
             "{}",
             row_of("NAR-14")
         );
         assert!(
-            row_of("NAR-12").starts_with("│? ●  NAR-12"),
+            row_of("NAR-12").starts_with("││ ? ●  NAR-12"),
             "{}",
             row_of("NAR-12")
         );
         assert!(
-            row_of("NAR-16").starts_with("│  ◷  NAR-16") && under("NAR-16").starts_with("│     #1")
+            row_of("NAR-16").starts_with("│    ◷  NAR-16")
+                && under("NAR-16").starts_with("│       #1")
         );
         assert!(
-            row_of("NAR-17").starts_with("│  ◷  NAR-17") && under("NAR-17").starts_with("│     #2")
+            row_of("NAR-17").starts_with("│    ◷  NAR-17")
+                && under("NAR-17").starts_with("│       #2")
         );
         let order: Vec<usize> = ["NAR-14", "NAR-12", "NAR-16", "NAR-17"]
             .iter()
