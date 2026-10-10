@@ -83,6 +83,17 @@ impl Role {
     ];
 }
 
+/// How a selection is drawn: see [`Styles::selection_marks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionMarks {
+    /// The horizontal rule above and below the selected item.
+    pub rule: &'static str,
+    /// The vertical bar beside each line of the selected item.
+    pub bar: &'static str,
+    /// The look of both.
+    pub style: Style,
+}
+
 /// Whether a value of `NO_COLOR` switches colour off: set and not empty, as
 /// no-color.org has it.
 pub fn no_color_requested(value: Option<OsString>) -> bool {
@@ -169,6 +180,30 @@ impl Styles {
             .border_type(border)
             .border_style(self.of(role))
             .title(Line::styled(title.into(), title_style))
+    }
+
+    /// The marks of a selection (R8, R12, R14): the rules above and below the
+    /// selected item and the bar on its left.
+    ///
+    /// The same rule as [`Styles::panel`]: where the keys are, thick `━`/`┃`
+    /// in the focus role; elsewhere thin `─`/`│` in the background role. The
+    /// characters are those of the thick and the plain panel frames, so a
+    /// selection reads like a piece of frame. Without colour the role leaves
+    /// bold or dim behind, and the shape of the line still tells them apart.
+    pub fn selection_marks(&self, focused: bool) -> SelectionMarks {
+        if focused {
+            SelectionMarks {
+                rule: "━",
+                bar: "┃",
+                style: self.of(Role::Focus),
+            }
+        } else {
+            SelectionMarks {
+                rule: "─",
+                bar: "│",
+                style: self.of(Role::Done),
+            }
+        }
     }
 
     /// Draws the frame of a panel titled `title` (see [`Styles::panel`]) over

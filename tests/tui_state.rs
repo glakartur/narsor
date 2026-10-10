@@ -1178,6 +1178,8 @@ mod foundations {
                 all.push(styles.chat_body(kind));
             }
             all.push(styles.key_cap());
+            all.push(styles.selection_marks(true).style);
+            all.push(styles.selection_marks(false).style);
             all
         }
 
@@ -1224,6 +1226,29 @@ mod foundations {
                     selected.add_modifier.contains(Modifier::BOLD),
                     "the base still speaks"
                 );
+            }
+        }
+
+        #[test]
+        fn selection_marks_are_thick_focus_or_thin_background() {
+            let colour = Styles::new(false);
+            let focused = colour.selection_marks(true);
+            assert_eq!((focused.rule, focused.bar), ("━", "┃"));
+            assert_eq!(focused.style, colour.of(Role::Focus));
+            assert_eq!(focused.style.fg, Some(Color::Cyan));
+            let unfocused = colour.selection_marks(false);
+            assert_eq!((unfocused.rule, unfocused.bar), ("─", "│"));
+            assert_eq!(unfocused.style, colour.of(Role::Done));
+
+            let plain = Styles::new(true);
+            let focused = plain.selection_marks(true);
+            assert_eq!((focused.rule, focused.bar), ("━", "┃"));
+            assert!(focused.style.add_modifier.contains(Modifier::BOLD));
+            let unfocused = plain.selection_marks(false);
+            assert_eq!((unfocused.rule, unfocused.bar), ("─", "│"));
+            assert!(unfocused.style.add_modifier.contains(Modifier::DIM));
+            for marks in [focused, unfocused] {
+                assert!(!marks.style.add_modifier.contains(Modifier::REVERSED));
             }
         }
 
