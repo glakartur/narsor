@@ -35,6 +35,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::watch;
 
 use crate::domain::{
     ActionConfig, BackendId, Context, DecisionConfig, GitIdentity, GitIdentityError, ImageError,
@@ -296,6 +297,12 @@ pub trait LaunchResolver: Send + Sync {
         let _ = backend;
         None
     }
+
+    /// A receiver woken whenever the live default harness changes, so a
+    /// waiting runner hears of it at once; `None` when there is none.
+    fn default_harness_changes(&self) -> Option<watch::Receiver<u64>> {
+        None
+    }
 }
 
 /// The installation's default harness as it applies to one task (U7),
@@ -326,6 +333,11 @@ pub trait HarnessDefaults: Send + Sync {
     /// The default running tasks follow (U7), when it can change while they
     /// run; `None` for a fixed default, which running tasks need not hear.
     fn live_default(&self) -> Option<String> {
+        None
+    }
+    /// A receiver woken by every change of [`Self::live_default`]; `None`
+    /// for a fixed default.
+    fn live_changes(&self) -> Option<watch::Receiver<u64>> {
         None
     }
 }
@@ -379,6 +391,10 @@ impl HarnessDefaults for DefaultHarnessSelector {
 
     fn live_default(&self) -> Option<String> {
         Some(self.current().effective)
+    }
+
+    fn live_changes(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.changes())
     }
 }
 
@@ -785,14 +801,8 @@ impl CatalogLaunchResolver {
                     harness,
                 });
             }
-            if !backend.allows_harness(&harness) {
-                return Err(LaunchError::UnsupportedHarness {
-                    reason: format!(
-                        "backend '{backend_id}' runs only {}",
-                        backend.harnesses.join(", ")
-                    ),
-                    harness,
-                });
+            if let Some(reason) = backend.harness_refusal(backend_id, &harness) {
+                return Err(LaunchError::UnsupportedHarness { reason, harness });
             }
         }
         Ok(selected)
@@ -992,17 +1002,14 @@ impl LaunchResolver for CatalogLaunchResolver {
                 return None;
             }
         };
-        Some(if record.allows_harness(&harness) {
-            TaskDefaultHarness::Available { harness }
-        } else {
-            TaskDefaultHarness::Unavailable {
-                reason: format!(
-                    "backend '{backend}' runs only {}",
-                    record.harnesses.join(", ")
-                ),
-                harness,
-            }
+        Some(match record.harness_refusal(backend, &harness) {
+            None => TaskDefaultHarness::Available { harness },
+            Some(reason) => TaskDefaultHarness::Unavailable { reason, harness },
         })
+    }
+
+    fn default_harness_changes(&self) -> Option<watch::Receiver<u64>> {
+        self.harness.live_changes()
     }
 
     fn resolve(&self, intent: &LaunchIntent) -> Result<ResolvedLaunch, LaunchError> {

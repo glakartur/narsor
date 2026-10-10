@@ -112,7 +112,7 @@ use crate::domain::{
     ExecutionStatus, LaunchDefinitionError, RepositoryInfo, TaskId, TaskLaunchSpec, TaskWorkspace,
     WorkflowDefinition, WorkflowExecution, Workspace,
 };
-use crate::engine::{AgentDefaults, DefaultHarnessSource, Engine, EngineError, Recovery};
+use crate::engine::{Engine, EngineError, Recovery};
 use crate::orchestration::{HarnessUnavailable, OwnerCommand, RunnerProblem, RunnerSnapshot};
 use crate::persistence::{reconcile, PersistenceError, ReconciliationOutcome};
 use crate::workspace::WorkspaceError;
@@ -372,13 +372,7 @@ pub async fn run(
     let harness = Arc::new(LiveHarness::new(
         starting.unwrap_or_else(|| spec.environment.harness.clone()),
     ));
-    let engine = Arc::new(Engine::new(store).with_agent_defaults_and_source(
-        AgentDefaults {
-            harness: spec.environment.harness.clone(),
-            timeout_secs: None,
-        },
-        Arc::clone(&harness) as Arc<dyn DefaultHarnessSource>,
-    ));
+    let engine = Arc::new(Engine::new(store).with_default_harness_source(harness.clone()));
 
     let conductor =
         conductor::ConductorHost::assemble(&engine, &storage, Arc::clone(&harness), &definition);
@@ -708,15 +702,29 @@ impl Session {
         // another (or none) turns the owner's queued answers to it obsolete.
         let pending = self.pending_input_id()?;
         match client.poll(pending.as_deref(), 0).await {
+            // What else the answer carries — answers, commands, reads — is
+            // offered again by the next poll until settled: drive picks it
+            // up there.
             Ok(response) => {
-                self.link.succeeded();
+                self.take_answer_header(response.default_harness, response.launch)?;
                 self.link.expires_at = Some(response.credential_expires_at);
-                self.learn_launch(response.launch)?;
-                self.follow_default_harness(response.default_harness);
             }
             Err(error) => self.link.failed(&error, &self.timing),
         }
         Ok(())
+    }
+
+    /// Applies what every answer of the control plane carries, in one
+    /// order: the link worked, then the default harness — an action the
+    /// rest of the answer resumes starts on it — then the launch.
+    fn take_answer_header(
+        &mut self,
+        default_harness: Option<TaskDefaultHarness>,
+        launch: RunnerLaunchView,
+    ) -> Result<(), RunnerError> {
+        self.link.succeeded();
+        self.follow_default_harness(default_harness);
+        self.learn_launch(launch)
     }
 
     /// Applies what the control plane says of the installation's default
@@ -733,29 +741,19 @@ impl Session {
             TaskDefaultHarness::Available { harness } => {
                 match conductor::harness_unavailable(&harness) {
                     None => {
-                        tracing::info!(from = %current, to = %harness, "following the default harness");
-                        // Work does not stop over it: only a later
-                        // incarnation would start on the older harness.
-                        if let Err(error) = self.storage.record_applied_harness(&harness) {
-                            tracing::warn!(%error, "the harness switched to cannot be recorded");
-                        }
-                        self.harness.set(harness);
-                        self.conductor.refresh();
+                        self.switch_harness(&current, harness);
                         None
                     }
-                    Some(reason) => Some(HarnessUnavailable {
-                        harness,
-                        kept: current,
-                        reason,
-                    }),
+                    Some(reason) => Some((harness, reason)),
                 }
             }
-            TaskDefaultHarness::Unavailable { harness, reason } => Some(HarnessUnavailable {
-                harness,
-                kept: current,
-                reason,
-            }),
-        };
+            TaskDefaultHarness::Unavailable { harness, reason } => Some((harness, reason)),
+        }
+        .map(|(harness, reason)| HarnessUnavailable {
+            harness,
+            kept: current,
+            reason,
+        });
         if unavailable != self.harness_unavailable {
             if let Some(unavailable) = &unavailable {
                 tracing::info!(
@@ -768,6 +766,18 @@ impl Session {
             self.harness_unavailable = unavailable;
             self.report_forced = true;
         }
+    }
+
+    /// Moves the agent actions to come and the conductor from `current`
+    /// to `harness`, which can run here. Work does not stop over it: only
+    /// a later incarnation would start on the older harness.
+    fn switch_harness(&mut self, current: &str, harness: String) {
+        tracing::info!(from = %current, to = %harness, "following the default harness");
+        if let Err(error) = self.storage.record_applied_harness(&harness) {
+            tracing::warn!(%error, "the harness switched to cannot be recorded");
+        }
+        self.harness.set(harness);
+        self.conductor.refresh(None);
     }
 
     /// Waits for the control plane to say which owner command launched
@@ -1005,7 +1015,6 @@ impl Session {
                     poll = None;
                     match answered {
                         Ok(Ok(response)) => {
-                            self.link.succeeded();
                             self.absorb(response).await?;
                             dirty = true;
                         }
@@ -1066,9 +1075,7 @@ impl Session {
         snapshot.snapshot_sequence = self.storage.next_snapshot_sequence()?;
         match client.snapshot(&snapshot).await {
             Ok(response) => {
-                self.link.succeeded();
-                self.follow_default_harness(response.default_harness);
-                self.learn_launch(response.launch)?;
+                self.take_answer_header(response.default_harness, response.launch)?;
                 self.directive = response.directive;
                 self.storage.record_reported_cursor(snapshot.event_cursor)?;
                 Ok(true)
@@ -1112,9 +1119,8 @@ impl Session {
     /// same answer's input resumes starts on it — then directive, input,
     /// operator commands, page requests.
     async fn absorb(&mut self, response: RunnerPollResponse) -> Result<(), RunnerError> {
-        self.follow_default_harness(response.default_harness);
+        self.take_answer_header(response.default_harness, response.launch)?;
         self.link.expires_at = Some(response.credential_expires_at);
-        self.learn_launch(response.launch)?;
         self.directive = response.directive;
         for input in response.inputs {
             self.deliver(input).await?;
@@ -1281,9 +1287,7 @@ impl Session {
                     snapshot.snapshot_sequence = self.storage.next_snapshot_sequence()?;
                     match client.snapshot(&snapshot).await {
                         Ok(response) => {
-                            self.link.succeeded();
-                            self.follow_default_harness(response.default_harness);
-                            self.learn_launch(response.launch)?;
+                            self.take_answer_header(response.default_harness, response.launch)?;
                             self.storage.record_reported_cursor(snapshot.event_cursor)?;
                             self.directive = response.directive;
                             match response.directive {

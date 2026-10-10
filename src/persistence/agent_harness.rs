@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 const ENVELOPE_VERSION: u32 = 1;
 
@@ -92,6 +92,10 @@ pub struct DefaultHarnessSelector {
     /// Written only after `state`'s snapshot, under `state`'s lock, so it
     /// never shows a value that did not reach disk.
     published: std::sync::RwLock<HarnessSelectionSnapshot>,
+    /// The revision of the last published snapshot, sent on every real
+    /// change (never on a no-op): whoever must hear of a change at once —
+    /// the control plane's waiting runner polls (U7) — watches it.
+    changes: watch::Sender<u64>,
 }
 
 impl DefaultHarnessSelector {
@@ -132,6 +136,7 @@ impl DefaultHarnessSelector {
             path,
             supported,
             configured,
+            changes: watch::Sender::new(revision),
             published: std::sync::RwLock::new(snapshot.clone()),
             state: Mutex::new(SelectionState { snapshot }),
         })
@@ -148,6 +153,12 @@ impl DefaultHarnessSelector {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Sees every change of the selection as it is published: the value is
+    /// its revision.
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 
     /// Durably changes the default. Repeating the active override is a no-op.
@@ -202,6 +213,7 @@ impl DefaultHarnessSelector {
             .published
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = next.clone();
+        self.changes.send_replace(revision);
         Ok(next)
     }
 }

@@ -78,7 +78,7 @@ impl ConductorHost {
             storage.root(),
             storage.conductor_work_dir(),
         )
-        .with_live_harness(Arc::clone(&harness))
+        .with_default_harness_source(harness.clone())
         .with_pinned_definition(Arc::clone(definition));
         let registry = build(
             engine,
@@ -94,14 +94,16 @@ impl ConductorHost {
             harness,
             passes,
         };
-        host.refresh();
+        let unavailable = harness_unavailable(&host.harness.get());
+        host.refresh(unavailable);
         host
     }
 
-    /// Looks again at whether the live harness can run here, after it
-    /// changed; attaches the conductor the first time it can.
-    pub(super) fn refresh(&mut self) {
-        self.unavailable = harness_unavailable(&self.harness.get());
+    /// Takes in whether the live harness can run here, after it changed —
+    /// `unavailable` is [`harness_unavailable`]'s answer for it; attaches
+    /// the conductor the first time it can.
+    pub(super) fn refresh(&mut self, unavailable: Option<String>) {
+        self.unavailable = unavailable;
         match &self.unavailable {
             Some(reason) => tracing::info!(%reason, "no conductor runs for this task"),
             None if !self.attached => {

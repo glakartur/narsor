@@ -317,6 +317,17 @@ impl BackendRecord {
     pub fn allows_harness(&self, harness: &str) -> bool {
         self.harnesses.is_empty() || self.harnesses.iter().any(|known| known == harness)
     }
+
+    /// Why this backend (`backend`) cannot run `harness`, or `None` when it
+    /// can.
+    pub fn harness_refusal(&self, backend: &BackendId, harness: &str) -> Option<String> {
+        (!self.allows_harness(harness)).then(|| {
+            format!(
+                "backend '{backend}' runs only {}",
+                self.harnesses.join(", ")
+            )
+        })
+    }
 }
 
 /// Whether `name` is usable as a secret, tool or skill reference: the same

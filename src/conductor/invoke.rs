@@ -3,9 +3,9 @@
 //!
 //! # Read-only, per harness (KTD5, R29)
 //!
-//! The conductor runs on the daemon's default harness, snapshotted from
-//! [`DefaultHarnessSelector`] at every invocation, the same way an agent
-//! step picks it. A task runner has no selector: its conductor runs on the
+//! The conductor runs on the daemon's default harness, read from
+//! [`DefaultHarnessSelector`](crate::persistence::DefaultHarnessSelector)
+//! at every invocation, the same way an agent step picks it. A task runner has no selector: its conductor runs on the
 //! default its control plane last handed it ([`LiveHarness`], U7) — the
 //! harness its task was created with until then — read at every invocation
 //! too. It never writes, and how that is enforced depends on the harness:
@@ -60,7 +60,7 @@ use crate::engine::actions::agent::{
     run_harness_process, DefaultHarnessSource, SpawnEnding, BUILT_IN_HARNESS,
 };
 use crate::engine::actions::harness::{HarnessRegistry, HarnessRequest, CLAUDE_CODE, CODEX};
-use crate::persistence::{DefaultHarnessSelector, ExecutionStore, WorkPaths};
+use crate::persistence::{ExecutionStore, WorkPaths};
 
 /// The time limit of an invocation when no `agent_timeout` is configured.
 pub const DEFAULT_CONDUCTOR_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -131,9 +131,7 @@ pub struct HarnessInvoker {
     catalog_dir: PathBuf,
     work: WorkPaths,
     harnesses: HarnessRegistry,
-    default_harness: String,
-    selector: Option<Arc<DefaultHarnessSelector>>,
-    live_harness: Option<Arc<LiveHarness>>,
+    default_harness: Arc<dyn DefaultHarnessSource>,
     pinned_definition: Option<Arc<WorkflowDefinition>>,
     timeout: Duration,
     budget: SnapshotBudget,
@@ -154,9 +152,7 @@ impl HarnessInvoker {
             catalog_dir: catalog_dir.into(),
             work: WorkPaths::new(work_dir.into()),
             harnesses: HarnessRegistry::defaults(),
-            default_harness: BUILT_IN_HARNESS.to_string(),
-            selector: None,
-            live_harness: None,
+            default_harness: Arc::new(BUILT_IN_HARNESS.to_string()),
             pinned_definition: None,
             timeout: DEFAULT_CONDUCTOR_TIMEOUT,
             budget: SnapshotBudget::default(),
@@ -169,24 +165,11 @@ impl HarnessInvoker {
         self
     }
 
-    /// Returns the invoker with a fixed default harness, used when there is
-    /// no selector.
-    pub fn with_default_harness(mut self, harness: impl Into<String>) -> Self {
-        self.default_harness = harness.into();
-        self
-    }
-
-    /// Returns the invoker with the daemon's live default-harness selector,
-    /// snapshotted at every invocation.
-    pub fn with_default_harness_selector(mut self, selector: Arc<DefaultHarnessSelector>) -> Self {
-        self.selector = Some(selector);
-        self
-    }
-
-    /// Returns the invoker with a harness its owner can change while it
-    /// runs, read at every invocation; used when there is no selector.
-    pub fn with_live_harness(mut self, harness: Arc<LiveHarness>) -> Self {
-        self.live_harness = Some(harness);
+    /// Returns the invoker with `source` answering which harness it runs
+    /// on, read at every invocation: a fixed name, the daemon's live
+    /// selector, or a runner's [`LiveHarness`].
+    pub fn with_default_harness_source(mut self, source: Arc<dyn DefaultHarnessSource>) -> Self {
+        self.default_harness = source;
         self
     }
 
@@ -234,11 +217,7 @@ impl HarnessInvoker {
     }
 
     async fn try_invoke(&self, invocation: &Invocation) -> Result<ConductorAnswer, String> {
-        let harness = match (&self.selector, &self.live_harness) {
-            (Some(selector), _) => selector.snapshot().await.effective,
-            (None, Some(live)) => live.get(),
-            (None, None) => self.default_harness.clone(),
-        };
+        let harness = self.default_harness.current_harness();
         let adapter = self
             .harnesses
             .get(&harness)

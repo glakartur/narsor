@@ -260,9 +260,7 @@ async fn put_harness_selection(
     Json(request): Json<SetHarnessSelectionRequest>,
 ) -> Result<Json<HarnessSelectionSnapshot>, ApiError> {
     let selector = require_harness_selector(&state)?;
-    let snapshot = selector.set(request.harness).await?;
-    announce_harness_change(&state);
-    Ok(Json(snapshot.into()))
+    Ok(Json(selector.set(request.harness).await?.into()))
 }
 
 /// Removes the durable override and returns the configured fallback view.
@@ -270,17 +268,7 @@ async fn delete_harness_selection(
     State(state): State<AppState>,
 ) -> Result<Json<HarnessSelectionSnapshot>, ApiError> {
     let selector = require_harness_selector(&state)?;
-    let snapshot = selector.reset().await?;
-    announce_harness_change(&state);
-    Ok(Json(snapshot.into()))
-}
-
-/// Running tasks follow the default (U7): their runners' long-polls answer
-/// now rather than when they run out.
-fn announce_harness_change(state: &AppState) {
-    if let Some(control) = &state.control {
-        control.default_harness_changed();
-    }
+    Ok(Json(selector.reset().await?.into()))
 }
 
 fn require_harness_selector(state: &AppState) -> Result<Arc<DefaultHarnessSelector>, ApiError> {

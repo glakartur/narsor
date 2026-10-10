@@ -104,13 +104,18 @@ struct Fixture {
 }
 
 /// A default harness a test changes by hand, the way the daemon's selector
-/// changes; `None` is a control plane with no default to hand out.
+/// changes — announcing each change to the waiting runner polls the same
+/// way; `None` is a control plane with no default to hand out.
 #[derive(Debug, Default)]
-struct LiveDefault(std::sync::Mutex<Option<String>>);
+struct LiveDefault {
+    harness: std::sync::Mutex<Option<String>>,
+    changes: tokio::sync::watch::Sender<u64>,
+}
 
 impl LiveDefault {
     fn set(&self, harness: Option<&str>) {
-        *self.0.lock().unwrap() = harness.map(str::to_string);
+        *self.harness.lock().unwrap() = harness.map(str::to_string);
+        self.changes.send_modify(|revision| *revision += 1);
     }
 }
 
@@ -125,7 +130,11 @@ impl HarnessDefaults for LiveDefault {
     }
 
     fn live_default(&self) -> Option<String> {
-        self.0.lock().unwrap().clone()
+        self.harness.lock().unwrap().clone()
+    }
+
+    fn live_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.changes.subscribe())
     }
 }
 
@@ -197,11 +206,10 @@ impl Fixture {
         }
     }
 
-    /// Changes the installation's default harness and tells the waiting
-    /// runners, as the settings API does.
+    /// Changes the installation's default harness, which tells the waiting
+    /// runners, as the daemon's selector does.
     fn set_default(&self, harness: Option<&str>) {
         self.default.set(harness);
-        self.service.default_harness_changed();
     }
 
     /// Lets the task backend run only `harnesses` (all of them when empty).

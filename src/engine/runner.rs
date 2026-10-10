@@ -103,7 +103,7 @@ use crate::engine::actions::{
 };
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
-use crate::persistence::{read_json, DefaultHarnessSelector, ExecutionStore, PersistenceError};
+use crate::persistence::{read_json, ExecutionStore, PersistenceError};
 use crate::workflow::{action_context_references, TemplateScope};
 
 mod failure;
@@ -170,21 +170,11 @@ pub fn terminal_status(state: &State) -> ExecutionStatus {
 }
 
 /// The agent executor this engine runs, wired to its own store and channel.
-///
-/// One constructor rather than two, so that anything added here — a second
-/// sink, a different registry — cannot be silently lost by whichever of
-/// [`Engine::new`] and [`Engine::with_agent_defaults`] ran last.
-fn agent_executor(
-    store: &ExecutionStore,
-    events: &broadcast::Sender<Event>,
-    default_harness: Arc<dyn DefaultHarnessSource>,
-) -> AgentExecutor {
-    AgentExecutor::new()
-        .with_default_harness_source(default_harness)
-        .with_event_sink(Arc::new(LoggingEventSink::new(
-            store.clone(),
-            Some(events.clone()),
-        )))
+fn agent_executor(store: &ExecutionStore, events: &broadcast::Sender<Event>) -> AgentExecutor {
+    AgentExecutor::new().with_event_sink(Arc::new(LoggingEventSink::new(
+        store.clone(),
+        Some(events.clone()),
+    )))
 }
 
 /// What the configuration contributes to an `agent` action.
@@ -770,6 +760,7 @@ pub struct Engine {
     store: ExecutionStore,
     executors: HashMap<ActionKind, Arc<dyn ActionExecutor>>,
     agent_timeout_secs: Option<u64>,
+    default_harness: Arc<dyn DefaultHarnessSource>,
     events: broadcast::Sender<Event>,
     pause_requests: Mutex<HashSet<ExecutionId>>,
     active_runs: Mutex<HashSet<ExecutionId>>,
@@ -905,7 +896,7 @@ impl Engine {
     pub fn new(store: ExecutionStore) -> Self {
         let events = broadcast::channel(EVENT_CHANNEL_CAPACITY).0;
 
-        let agent = agent_executor(&store, &events, Arc::new(BUILT_IN_HARNESS.to_string()));
+        let agent = agent_executor(&store, &events);
 
         let mut executors: HashMap<ActionKind, Arc<dyn ActionExecutor>> = HashMap::new();
         executors.insert(ActionKind::Script, Arc::new(ScriptExecutor::new()));
@@ -916,6 +907,7 @@ impl Engine {
             store,
             executors,
             agent_timeout_secs: None,
+            default_harness: Arc::new(BUILT_IN_HARNESS.to_string()),
             events,
             pause_requests: Mutex::new(HashSet::new()),
             active_runs: Mutex::new(HashSet::new()),
@@ -924,39 +916,26 @@ impl Engine {
         }
     }
 
-    /// Returns the engine with the configured defaults for `agent` actions.
-    ///
-    /// The default harness belongs to the agent executor, so this replaces it —
-    /// which means it must come **before** any
-    /// [`with_executor`](Engine::with_executor) registering an agent executor
-    /// of your own, or that one is overwritten.
+    /// Returns the engine with the configured defaults for `agent` actions:
+    /// a fixed default harness and the time limit.
     pub fn with_agent_defaults(self, defaults: AgentDefaults) -> Self {
-        let harness = Arc::new(defaults.harness.clone());
-        self.with_agent_defaults_and_source(defaults, harness)
+        self.with_agent_timeout(defaults.timeout_secs)
+            .with_default_harness_source(Arc::new(defaults.harness))
     }
 
-    /// Returns the engine with configured agent defaults and a shared live
-    /// selector for harnessless actions. Custom executors registered with
-    /// [`with_executor`](Engine::with_executor) remain untouched.
-    pub fn with_agent_defaults_and_selector(
-        self,
-        defaults: AgentDefaults,
-        selector: Arc<DefaultHarnessSelector>,
-    ) -> Self {
-        self.with_agent_defaults_and_source(defaults, selector)
+    /// Returns the engine with the time limit of an `agent` action that
+    /// declares none, `None` for no limit.
+    pub fn with_agent_timeout(mut self, timeout_secs: Option<u64>) -> Self {
+        self.agent_timeout_secs = timeout_secs;
+        self
     }
 
-    /// Returns the engine with configured agent defaults, except that the
-    /// harness of an action that names none comes from `source`, read once
-    /// per action (R16a) — `defaults.harness` is then unused.
-    pub fn with_agent_defaults_and_source(
-        mut self,
-        defaults: AgentDefaults,
-        source: Arc<dyn DefaultHarnessSource>,
-    ) -> Self {
-        self.agent_timeout_secs = defaults.timeout_secs;
-        let agent = agent_executor(&self.store, &self.events, source);
-        self.executors.insert(ActionKind::Agent, Arc::new(agent));
+    /// Returns the engine with `source` answering which harness an `agent`
+    /// action that names none runs on — read once per action, at its first
+    /// attempt (R16a). Whatever executor is registered for `agent` actions
+    /// is handed the answer.
+    pub fn with_default_harness_source(mut self, source: Arc<dyn DefaultHarnessSource>) -> Self {
+        self.default_harness = source;
         self
     }
 
@@ -2099,7 +2078,7 @@ impl Engine {
     /// Writes the action's default harness into a rendered agent `config`
     /// that names none (R16a, R16b).
     ///
-    /// The default is read from the agent executor once, at the action's
+    /// The default is read from the engine's source once, at the action's
     /// first attempt, and kept in `pinned` for the rest: a default changed
     /// while the action runs reaches the next action, never a retry of this
     /// one. A harness the workflow names — templated ones included, since
@@ -2115,13 +2094,8 @@ impl Engine {
         {
             return;
         }
-        if pinned.is_none() {
-            *pinned = self
-                .executors
-                .get(&ActionKind::Agent)
-                .and_then(|executor| executor.current_default_harness());
-        }
-        config.harness = pinned.clone();
+        let harness = pinned.get_or_insert_with(|| self.default_harness.current_harness());
+        config.harness = Some(harness.clone());
     }
 
     /// Hands an already rendered action to its executor and closes the

@@ -176,7 +176,8 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
     let agent_timeout_secs = defaults.timeout_secs;
     let engine = Arc::new(
         Engine::new(store.clone())
-            .with_agent_defaults_and_selector(defaults, Arc::clone(&selector)),
+            .with_agent_timeout(defaults.timeout_secs)
+            .with_default_harness_source(selector.clone()),
     );
 
     // One registry of background passes for the API and the startup hook,
@@ -189,7 +190,7 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         config.catalog_dir().to_path_buf(),
         config.work_dir().to_path_buf(),
     )
-    .with_default_harness_selector(Arc::clone(&selector))
+    .with_default_harness_source(selector.clone())
     .with_agent_timeout(agent_timeout_secs);
     // Held here for the daemon's whole life: the engine only holds it
     // weakly, and hands a step without a usable output label to it (F1).

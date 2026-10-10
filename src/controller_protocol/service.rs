@@ -33,7 +33,7 @@ use crate::orchestration::{
     AttentionItem, AttentionKind, BackendCapacity, BackendLease, CommandRequest, ControlPlane,
     ControllerReport, ConversationAvailability, InputRequest, InputStatus, LeaseToken, MoveTarget,
     NewTask, Observation, OperatorCommand, OperatorCommandRequest, OwnerRef, RunnerObservation,
-    TaskEvent, TaskLifecycle, TaskRecord,
+    TaskEvent, TaskLifecycle, TaskRecord, RETIRED_CONDUCTOR_HARNESS,
 };
 use crate::workflow::TemplateScope;
 use events::LocalTaskStorage;
@@ -139,8 +139,6 @@ pub struct ProtocolService {
     runner_auth: Arc<dyn RunnerAuthenticator>,
     config: ProtocolConfig,
     changes: broadcast::Sender<TaskId>,
-    /// Bumped when a setting every task sees changes (the default harness).
-    settings: watch::Sender<u64>,
     launch: Arc<dyn LaunchResolver>,
     pages: Mutex<PageRelay>,
     event_reads: Mutex<EventsRelay>,
@@ -185,7 +183,6 @@ impl ProtocolService {
             credentials,
             config,
             changes,
-            settings: watch::Sender::new(0),
             launch,
             pages: Mutex::new(PageRelay::default()),
             event_reads: Mutex::new(EventsRelay::default()),
@@ -244,14 +241,6 @@ impl ProtocolService {
     /// never make them skip or repeat one.
     pub fn subscribe(&self) -> broadcast::Receiver<TaskId> {
         self.changes.subscribe()
-    }
-
-    /// Announces that the installation's default harness changed (U7):
-    /// every waiting runner long-poll looks again, so a runner hears of the
-    /// change now rather than when its long-poll runs out.
-    pub fn default_harness_changed(&self) {
-        self.settings
-            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     /// The installation's default harness as it applies to the task of
@@ -1519,13 +1508,15 @@ impl ProtocolService {
             })
         };
         // A change of the default while the runner waits is an answer too:
-        // it should not wait out the long-poll to hear of it (U7).
-        let asked_with = self.default_harness_of(&self.control.task(&identity.task_id)?);
+        // it should not wait out the long-poll to hear of it (U7). The
+        // first look says which default the runner is waiting with.
+        let mut asked_with = None;
         let wait = self.long_poll(query.wait_secs);
         let found = self
             .wait_for(wait, Some(&identity.task_id), || {
                 let response = poll()?;
-                let actionable = response.default_harness != asked_with
+                let asked_with = asked_with.get_or_insert_with(|| response.default_harness.clone());
+                let actionable = response.default_harness != *asked_with
                     || !response.inputs.is_empty()
                     || !response.commands.is_empty()
                     || !response.conversation_pages.is_empty()
@@ -1897,7 +1888,10 @@ impl ProtocolService {
         mut check: impl FnMut() -> ProtocolResult<Option<T>>,
     ) -> ProtocolResult<Option<T>> {
         let mut changes = self.changes.subscribe();
-        let mut settings = self.settings.subscribe();
+        // The installation's default harness, which every task sees (U7):
+        // a runner hears of a change now rather than when its long-poll
+        // runs out.
+        let mut harness_changes = self.launch.default_harness_changes();
         let deadline = tokio::time::Instant::now() + wait;
         let mut relevant = true;
         loop {
@@ -1914,18 +1908,22 @@ impl ProtocolService {
                     Ok(Err(RecvError::Lagged(_))) => true,
                     Ok(Err(RecvError::Closed)) => return Ok(None),
                 },
-                // A setting every task sees changed (U7).
-                Ok(()) = settings.changed() => true,
+                Ok(()) = harness_changed(&mut harness_changes) => true,
             };
         }
     }
 }
 
-/// Why `SetConductorHarness` is refused: the harness is no longer chosen per
-/// task.
-const RETIRED_CONDUCTOR_HARNESS: &str =
-    "the conductor's harness is no longer chosen per task; the conductor follows the \
-     installation's default harness";
+/// Resolves when the default harness `changes` watches changes; never
+/// without one.
+async fn harness_changed(
+    changes: &mut Option<watch::Receiver<u64>>,
+) -> Result<(), watch::error::RecvError> {
+    match changes {
+        Some(changes) => changes.changed().await,
+        None => std::future::pending().await,
+    }
+}
 
 /// Most characters of one chat message to the conductor: the text is kept
 /// in the task's event stream, which is not the place for a document.

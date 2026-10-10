@@ -214,7 +214,7 @@ impl Fixture {
             self.work_dir(),
         )
         .with_harnesses(self.registry())
-        .with_default_harness(harness)
+        .with_default_harness_source(Arc::new(harness.to_string()))
     }
 
     fn invocation(&self, trigger: ConductorTrigger, purpose: ConductorPurpose) -> Invocation {
@@ -470,7 +470,7 @@ async fn the_harness_is_taken_from_the_selector_at_every_invocation() {
     );
     let invoker = fixture
         .invoker("codex")
-        .with_default_harness_selector(Arc::clone(&selector));
+        .with_default_harness_source(selector.clone());
 
     invoker.invoke_once(&fixture.rescue()).await;
     selector.set("opencode").await.expect("switch the default");
@@ -492,7 +492,7 @@ async fn a_runners_live_harness_is_read_at_every_invocation() {
     let live = Arc::new(LiveHarness::new("claude-code"));
     let invoker = fixture
         .invoker("codex")
-        .with_live_harness(Arc::clone(&live));
+        .with_default_harness_source(live.clone());
 
     invoker.invoke_once(&fixture.rescue()).await;
     live.set("opencode");

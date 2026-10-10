@@ -20,7 +20,7 @@ use super::{RunnerError, Session};
 use crate::controller_protocol::DeliveredOperatorCommand;
 use crate::domain::ExecutionStatus;
 use crate::engine::{EngineError, OperatorTransition, Recovery};
-use crate::orchestration::OperatorCommand;
+use crate::orchestration::{OperatorCommand, RETIRED_CONDUCTOR_HARNESS};
 
 impl Session {
     /// Carries out one delivered command, once, and acknowledges it.
@@ -99,11 +99,9 @@ impl Session {
             }
             // Historical: queued before the harness stopped being chosen
             // per task. Settled, never applied.
-            OperatorCommand::SetConductorHarness { .. } => Err(
-                "the conductor's harness is no longer chosen per task; the conductor follows \
-                 the installation's default harness"
-                    .to_string(),
-            ),
+            OperatorCommand::SetConductorHarness { .. } => {
+                Err(RETIRED_CONDUCTOR_HARNESS.to_string())
+            }
         };
         match outcome {
             Ok(()) => CommandVerdict::applied(),

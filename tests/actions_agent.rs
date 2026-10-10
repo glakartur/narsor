@@ -24,9 +24,9 @@ use narsor::domain::{
 use narsor::engine::actions::agent::{output_contract, AgentEventSink, SESSION_ID_VARIABLE};
 use narsor::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
-    CodexAdapter, Engine, HarnessRegistry, InputContinuation, LoggingEventSink, OpenCodeAdapter,
-    OutputProblem, OutputRejection, PendingHumanInput, METADATA_ENGINE_KEY,
-    METADATA_OUTPUT_REJECTION_KEY,
+    CodexAdapter, DefaultHarnessSource, Engine, HarnessAdapter, HarnessRegistry, InputContinuation,
+    LoggingEventSink, OpenCodeAdapter, OutputProblem, OutputRejection, PendingHumanInput,
+    METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY,
 };
 use narsor::persistence::{
     recover, ConversationEntry, ConversationSource, ConversationStore, DefaultHarnessSelector,
@@ -2117,9 +2117,10 @@ async fn the_reprompt_runs_on_the_harness_of_the_rejected_attempt() {
                 fixture.fake.program(),
             ))),
     )
-    .with_default_harness_selector(Arc::clone(&selector))
     .with_event_sink(Arc::new(LoggingEventSink::new(store.clone(), None)));
-    let engine = Engine::new(store).with_executor(ActionKind::Agent, Arc::new(executor));
+    let engine = Engine::new(store)
+        .with_default_harness_source(selector.clone())
+        .with_executor(ActionKind::Agent, Arc::new(executor));
 
     let definition =
         fixture.workflow(&REPROMPT_WORKFLOW.replace("      harness: claude-code\n", ""));
@@ -2220,9 +2221,10 @@ async fn engine_with_live_default(
             )))
             .with_adapter(Arc::new(CodexAdapter::with_program(fixture.fake.program()))),
     )
-    .with_default_harness_selector(Arc::clone(&selector))
     .with_event_sink(Arc::new(LoggingEventSink::new(store.clone(), None)));
-    let engine = Engine::new(store).with_executor(ActionKind::Agent, Arc::new(executor));
+    let engine = Engine::new(store)
+        .with_default_harness_source(selector.clone())
+        .with_executor(ActionKind::Agent, Arc::new(executor));
     (engine, selector)
 }
 
@@ -2964,30 +2966,68 @@ async fn a_model_that_would_be_read_as_a_flag_is_refused() {
 // The configured defaults (U7)
 // ---------------------------------------------------------------------------
 
+/// A one-state workflow whose agent action names `harness`, or none.
+fn single_agent_workflow(harness: Option<&str>) -> String {
+    let harness = harness.map_or(String::new(), |name| format!("      harness: {name}\n"));
+    format!(
+        r#"
+name: agent-default-harness
+version: 1
+states:
+  work:
+    action:
+      type: agent
+{harness}      prompt: "Do the thing."
+    outputs: [done]
+    transitions:
+      done: finished
+  finished:
+    description: Success.
+terminal_states:
+  finished: completed
+"#
+    )
+}
+
+/// Runs `workflow` on an engine whose default harness comes from `source`
+/// and whose only adapter wired to the fake is `adapter`.
+async fn run_with_default(
+    fixture: &EngineFixture,
+    adapter: Arc<dyn HarnessAdapter>,
+    source: Arc<dyn DefaultHarnessSource>,
+    workflow: &str,
+) -> narsor::domain::WorkflowExecution {
+    let store = fixture.store();
+    let executor = AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(adapter))
+        .with_event_sink(Arc::new(LoggingEventSink::new(store.clone(), None)));
+    Engine::new(store)
+        .with_default_harness_source(source)
+        .with_executor(ActionKind::Agent, Arc::new(executor))
+        .start_and_run(&fixture.workflow(workflow), json!({}), fixture.workspace())
+        .await
+        .expect("run the workflow")
+}
+
 /// An action that names no harness uses the configured default.
 #[tokio::test]
 async fn an_action_without_a_harness_uses_the_configured_default() {
-    let root = TempRoot::new();
-    let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope("{\"output\": \"done\"}"));
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers(&opencode_stream("oc-1", r#"{"output":"done"}"#));
 
     // The default points at `opencode`, and that adapter is the one wired to
     // the fake harness — so a run proves which name was chosen.
-    let executor = AgentExecutor::with_harnesses(
-        HarnessRegistry::defaults()
-            .with_adapter(Arc::new(OpenCodeAdapter::with_program(fake.program()))),
+    let execution = run_with_default(
+        &fixture,
+        Arc::new(OpenCodeAdapter::with_program(fixture.fake.program())),
+        Arc::new("opencode".to_string()),
+        &single_agent_workflow(None),
     )
-    .with_default_harness("opencode");
+    .await;
 
-    let mut config = agent_action("do the thing");
-    config.harness = None;
-
-    let outcome = execute(&executor, config, &root.workspace(), None)
-        .await
-        .expect("the action runs on the configured harness");
-
-    assert!(matches!(outcome, ActionOutcome::Completed(_)));
-    assert_eq!(fake.calls(), 1);
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(started_harnesses(&fixture, &execution.id), ["opencode"]);
 }
 
 /// With nothing configured, an action that names no harness gets the built-in.
@@ -2999,7 +3039,6 @@ async fn an_action_without_a_harness_falls_back_to_the_built_in_one() {
 
     // `claude-code` is the built-in default and the adapter wired to the fake.
     let executor = executor(&fake);
-    assert_eq!(executor.default_harness(), "claude-code");
 
     let mut config = agent_action("do the thing");
     config.harness = None;
@@ -3016,112 +3055,57 @@ async fn an_action_without_a_harness_falls_back_to_the_built_in_one() {
 async fn the_workflow_wins_over_the_configured_harness() {
     // AE4 / R13: a setting is a default, never an instruction the workflow
     // cannot override.
-    let root = TempRoot::new();
-    let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope("{\"output\": \"done\"}"));
-
-    let executor = executor(&fake).with_default_harness("opencode");
+    let fixture = EngineFixture::new();
+    fixture.fake.answers(&envelope("{\"output\": \"done\"}"));
 
     // The action says claude-code, which is the adapter pointed at the fake;
     // the configured opencode adapter is the stock one and would not answer.
-    let config = agent_action("do the thing");
+    let execution = run_with_default(
+        &fixture,
+        Arc::new(ClaudeCodeAdapter::with_program(fixture.fake.program())),
+        Arc::new("opencode".to_string()),
+        &single_agent_workflow(Some("claude-code")),
+    )
+    .await;
 
-    let outcome = execute(&executor, config, &root.workspace(), None)
-        .await
-        .expect("the harness the workflow named is the one that ran");
-
-    assert!(matches!(outcome, ActionOutcome::Completed(_)));
-    assert_eq!(fake.calls(), 1);
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(fixture.fake.calls(), 1);
 }
 
 /// An explicit action harness remains authoritative when the daemon default is
 /// changed live.
 #[tokio::test]
 async fn an_explicit_harness_wins_over_the_live_default_selector() {
-    let root = TempRoot::new();
-    let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope("{\"output\": \"done\"}"));
+    let fixture = EngineFixture::new();
+    fixture.fake.answers(&envelope("{\"output\": \"done\"}"));
     let selector = Arc::new(
         DefaultHarnessSelector::load(
-            StatePaths::new(root.path()),
+            StatePaths::new(fixture.root.path()),
             vec!["claude-code".into(), "opencode".into()],
             "opencode",
         )
         .await
         .expect("load selector"),
     );
-    let executor = AgentExecutor::with_harnesses(
-        HarnessRegistry::defaults()
-            .with_adapter(Arc::new(ClaudeCodeAdapter::with_program(fake.program()))),
-    )
-    .with_default_harness_selector(selector);
 
-    let outcome = execute(
-        &executor,
-        agent_action("do the thing"),
-        &root.workspace(),
-        None,
+    let execution = run_with_default(
+        &fixture,
+        Arc::new(ClaudeCodeAdapter::with_program(fixture.fake.program())),
+        selector,
+        &single_agent_workflow(Some("claude-code")),
     )
-    .await
-    .expect("the explicit Claude harness runs");
+    .await;
 
-    assert!(matches!(outcome, ActionOutcome::Completed(_)));
-    assert!(fake.args(1).iter().any(|argument| argument == "--print"));
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert!(fixture
+        .fake
+        .args(1)
+        .iter()
+        .any(|argument| argument == "--print"));
 }
 
-/// The executor reads the selector once as a harnessless action starts: a
-/// later mutation affects the next action, never one already launched. (The
-/// engine pins that reading for every retry of the action — see
-/// `covers_ae5_a_retry_stays_on_the_harness_its_action_started_with`.)
-#[tokio::test]
-async fn live_default_changes_apply_to_the_next_harnessless_action() {
-    let root = TempRoot::new();
-    let fake = FakeHarness::install(root.dir("bin"));
-    fake.answers(&envelope("{\"output\": \"done\"}")).sleeps(1);
-    let selector = Arc::new(
-        DefaultHarnessSelector::load(
-            StatePaths::new(root.path()),
-            vec!["claude-code".into(), "opencode".into()],
-            "claude-code",
-        )
-        .await
-        .expect("load selector"),
-    );
-    let executor = AgentExecutor::with_harnesses(
-        HarnessRegistry::defaults()
-            .with_adapter(Arc::new(ClaudeCodeAdapter::with_program(fake.program())))
-            .with_adapter(Arc::new(OpenCodeAdapter::with_program(fake.program()))),
-    )
-    .with_default_harness_selector(Arc::clone(&selector));
-    let mut config = agent_action("do the thing");
-    config.harness = None;
-
-    let first_executor = executor.clone();
-    let first_workspace = root.workspace();
-    let first_config = config.clone();
-    let first = tokio::spawn(async move {
-        execute(&first_executor, first_config, &first_workspace, None).await
-    });
-    for _ in 0..100 {
-        if fake.calls() == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(fake.calls(), 1, "the first harness process started");
-    selector.set("opencode").await.expect("change default");
-    first
-        .await
-        .expect("the first task joins")
-        .expect("the old default attempt completes");
-    execute(&executor, config, &root.workspace(), None)
-        .await
-        .expect("the new default runs");
-
-    assert!(fake.args(1).iter().any(|argument| argument == "--print"));
-    assert!(fake.args(2).iter().any(|argument| argument == "run"));
-}
-
+// A live default changed while an action runs reaching only the next
+// action is `covers_ae5_a_retry_stays_on_the_harness_its_action_started_with`.
 /// A bare resume id cannot be safely associated with a provider after the
 /// default has changed.
 #[tokio::test]

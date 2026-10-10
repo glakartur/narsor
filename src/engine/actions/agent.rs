@@ -363,7 +363,6 @@ impl ConversationSink {
 #[derive(Debug, Clone)]
 pub struct AgentExecutor {
     harnesses: HarnessRegistry,
-    default_harness: Arc<dyn DefaultHarnessSource>,
     events: Option<Arc<dyn AgentEventSink>>,
 }
 
@@ -398,7 +397,6 @@ impl AgentExecutor {
     pub fn new() -> Self {
         Self {
             harnesses: HarnessRegistry::defaults(),
-            default_harness: Arc::new(BUILT_IN_HARNESS.to_string()),
             events: None,
         }
     }
@@ -407,41 +405,8 @@ impl AgentExecutor {
     pub fn with_harnesses(harnesses: HarnessRegistry) -> Self {
         Self {
             harnesses,
-            default_harness: Arc::new(BUILT_IN_HARNESS.to_string()),
             events: None,
         }
-    }
-
-    /// Returns the executor with another default harness.
-    ///
-    /// The harness an action that names none falls back to. Applied here
-    /// rather than in the loader so that compiling a definition stays a pure
-    /// function of its source, and so that `AgentSessionStarted` records the
-    /// harness that actually ran rather than "unspecified" (D-F).
-    pub fn with_default_harness(self, harness: impl Into<String>) -> Self {
-        self.with_default_harness_source(Arc::new(harness.into()))
-    }
-
-    /// Returns the executor with the daemon's live, shared selector as the
-    /// source for harnessless actions.
-    pub fn with_default_harness_selector(self, selector: Arc<DefaultHarnessSelector>) -> Self {
-        self.with_default_harness_source(selector)
-    }
-
-    /// Returns the executor with `source` answering which harness an action
-    /// that names none runs on.
-    ///
-    /// The engine reads it once per action and writes the answer into every
-    /// attempt of that action (R16a); an attempt handed over without a
-    /// harness — by a caller other than the engine — reads it itself.
-    pub fn with_default_harness_source(mut self, source: Arc<dyn DefaultHarnessSource>) -> Self {
-        self.default_harness = source;
-        self
-    }
-
-    /// The harness an action that names none would run on right now.
-    pub fn default_harness(&self) -> String {
-        self.default_harness.current_harness()
     }
 
     /// Returns the executor with the session events routed to `sink`.
@@ -475,10 +440,6 @@ impl ActionExecutor for AgentExecutor {
         request: ActionRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
         Box::pin(async move { self.run(request).await })
-    }
-
-    fn current_default_harness(&self) -> Option<String> {
-        Some(self.default_harness())
     }
 }
 
@@ -523,18 +484,10 @@ impl AgentExecutor {
             });
         }
 
-        // An explicit action choice always wins — and the engine makes every
-        // attempt explicit, pinning the default once per action (R16a).
-        // Otherwise read the default exactly once, before the session,
-        // conversation, or process exists.
-        let selected_default;
-        let harness = match config.harness.as_deref() {
-            Some(harness) => harness,
-            None => {
-                selected_default = self.default_harness();
-                &selected_default
-            }
-        };
+        // The engine makes every attempt explicit, pinning its default
+        // harness once per action (R16a); only a caller other than the
+        // engine hands over one without, and gets the built-in.
+        let harness = config.harness.as_deref().unwrap_or(BUILT_IN_HARNESS);
         let adapter = self.harnesses.get(harness)?;
 
         let mut session = new_session(config, harness, request.execution_id);

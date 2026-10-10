@@ -1088,6 +1088,12 @@ pub enum OperatorCommand {
     },
 }
 
+/// Why a [`OperatorCommand::SetConductorHarness`] is refused or settled
+/// unapplied: the harness is no longer chosen per task.
+pub const RETIRED_CONDUCTOR_HARNESS: &str =
+    "the conductor's harness is no longer chosen per task; the conductor follows the \
+     installation's default harness";
+
 impl QueuedOperatorCommand {
     /// Drops what a settled command no longer needs: the text of a conductor
     /// message, which is up to thousands of characters the record, its
