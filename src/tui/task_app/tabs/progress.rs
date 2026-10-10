@@ -10,11 +10,11 @@
 //! step, the mode — is the state of [`Progress`]; what it replaces is the
 //! timeline.
 //!
-//! The axis is a spaced list ([`render_spaced_list`]): one row per step, a
-//! blank row between them, the selected step bracketed — thick while the keys
-//! are on the axis, thin while they read the step's conversation or are
-//! elsewhere. The conversation marks its selected entry with the same bar,
-//! thick only while the keys are in it.
+//! The axis is a bracketed list ([`render_bracketed_list`]): one row per step,
+//! stacked, the selected step bracketed — in the focus role while the keys
+//! are on the axis, in the background role while they read the step's
+//! conversation or are elsewhere. The conversation marks its selected entry
+//! with the same bar, in the focus role only while the keys are in it.
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -26,7 +26,7 @@ use crate::engine::{ConversationState, Position, PositionStatus};
 use crate::tui::style::{Role, Styles};
 
 use super::super::super::scroll::one_line;
-use super::super::super::selection::{render_spaced_list, PREFIX_WIDTH};
+use super::super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
 use super::super::layout::first_row;
 use super::super::list::fit;
 use super::super::StepFocus;
@@ -246,7 +246,7 @@ fn status_look(status: PositionStatus) -> (&'static str, Role, &'static str) {
 }
 
 /// One row of the axis, `width` columns wide. The selection is not drawn
-/// here: the spaced list brackets the row (R13).
+/// here: the bracketed list brackets the row (R13).
 fn axis_line(position: &Position, width: usize, styles: &Styles, stale: bool) -> Line<'static> {
     let (glyph, role, word) = status_look(position.status);
     let grey = |role: Role| if stale { Role::Done } else { role };
@@ -320,8 +320,8 @@ fn step_lines(
 
 /// Draws the tab: the axis on the left, the selected step on the right.
 /// `keys` is the level the keys are on, `None` while they are outside the
-/// tab's content: the axis's bracket and the step conversation's bar are
-/// thick only on that level (R12, R16).
+/// tab's content: the axis's bracket and the step conversation's bar are in
+/// the focus role only on that level (R12, R16).
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -381,7 +381,7 @@ pub fn render(
         .map(|position| vec![axis_line(position, line_width, styles, stale)])
         .collect();
     let selected = progress.selected_index();
-    render_spaced_list(
+    render_bracketed_list(
         frame,
         axis,
         styles,

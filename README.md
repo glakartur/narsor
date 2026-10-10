@@ -455,15 +455,15 @@ starts the same interface.
 ```text
 narsor · local ● live             harness claude-code (konfiguracja) · sloty 2/3 · ? 1 · ! 1
 ┏ Zadania ━━━━━━━━━━━━━━━━━┓┌ Zmiana API zamówień ─────────────────────────────────────────┐
-┃                          ┃│ Zmiana API zamówień · NAR-12                    implement v3 │
-┃    ●  NAR-14 Edycja pars…┃│ Jira NAR-12 ↗   PR !482 ↗   running · krok 3/5 · 14m         │
-┃       edit               ┃│ Przebieg  Rozmowa  Zdarzenia  Dyrygent  Info                 │
-┃  ━━━━━━━━━━━━━━━━━━━━━━━━┃│  ─────────────────│   Read src/api.rs                        │
-┃┃ ? ●  Zmiana API zamówień┃││ ● review_api     │   Edit src/api.rs  +12 −3                │
-┃┃      approval           ┃│  ─────────────────│ │ assistant: Zmieniam sygnaturę…         │
-┃  ━━━━━━━━━━━━━━━━━━━━━━━━┃│┌ ? Czeka na Ciebie: approval · 3m ──────────────────────────┐│
-┃  ! ✗  Migracja bazy dany…┃││ the answer panel                                           ││
-┃       failed             ┃│└────────────────────────────────────────────────────────────┘│
+┃    ●  NAR-14 Edycja pars…┃│ Zmiana API zamówień · NAR-12                    implement v3 │
+┃       edit               ┃│ Jira NAR-12 ↗   PR !482 ↗   running · krok 3/5 · 14m         │
+┃──────────────────────────┃│ Przebieg  Rozmowa  Zdarzenia  Dyrygent  Info                 │
+┃│ ? ●  Zmiana API zamówień┃│───────────────────│   Read src/api.rs                        │
+┃│      approval           ┃││ ● review_api     │   Edit src/api.rs  +12 −3                │
+┃──────────────────────────┃│───────────────────│ │ assistant: Zmieniam sygnaturę…         │
+┃  ! ✗  Migracja bazy dany…┃│┌ ? Czeka na Ciebie: approval · 3m ──────────────────────────┐│
+┃       failed             ┃││ the answer panel                                           ││
+┃                          ┃│└────────────────────────────────────────────────────────────┘│
 ┃                          ┃│                                                              │
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━┛└──────────────────────────────────────────────────────────────┘
 Enter szczegóły  Space następny czekający  . akcje  n nowe  h harness  ?           powiadom.
@@ -491,13 +491,14 @@ problem, a failed step or a failed provisioning), the state icon (`●` running,
 there is none) on the whole width of the list. The second, under the title,
 is the label: the current step, `#n` in the queue, `offline` when no
 controller holds the backend, `nie wysłano`, or the place preview `↕ n/m`
-while moving. Every row is two lines even with no label and rows are
-separated by an empty one, so the list scrolls by whole tasks and moving the
-selection moves no row. The selection is a bracket, never a fill: a rule in
-the empty row above the task, a rule in the empty row below it and a bar
-beside both its lines, so the row keeps its own colours. The bracket is thick
-and cyan where the keys are, thin and grey elsewhere — the rule of the panel
-frames. The history, the steps on *Przebieg* and every list of choices (the
+while moving. Every row is two lines even with no label and the rows stack
+directly, so the list scrolls by whole tasks. The selection is a bracket,
+never a fill: a thin rule across the whole width of the list in a row of its
+own directly above the task, another directly below it and a bar beside both
+its lines, so the row keeps its own colours. Only the selected task has the
+rules, so moving the selection shifts its neighbours by a row. The bracket is
+always thin: cyan where the keys are, grey elsewhere (bold and dim without
+colour). The history, the steps on *Przebieg* and every list of choices (the
 menu, the answer panel, the new task, the repositories) mark their selection
 the same way; a conversation and *Zdarzenia* keep only the bar. `z` hides finished tasks as
 a filter; `a` archives one. The selection follows the task, not the row,

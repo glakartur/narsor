@@ -5,7 +5,7 @@
 //! ```text
 //! │ Zadania            │ Repozytoria (2) · a dodaj · d usuń                  │
 //! │ ● NAR-14  edit     │┌ Akcje ───────────┐ ┌ Opis ───────────────────────┐│
-//! │                    ││ ┃ 1 narsor       │ │ narsor                      ││
+//! │                    ││ │ 1 narsor       │ │ narsor                      ││
 //! │                    ││   2 docs         │ │ github · gałąź main         ││
 //! │                    │└──────────────────┘ │ git@github.com:acme/narsor  ││
 //! ```

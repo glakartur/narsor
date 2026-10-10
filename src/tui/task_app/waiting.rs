@@ -7,7 +7,7 @@
 //! │ ◆ dyrygent: raczej revise — brak planu migracji                     │
 //! │ ┌ Akcje ─────────────────┐ ┌ Opis ─────────────────────────────────┐ │
 //! │ │   approved             │ │ ↩ wraca do agenta: plan               │ │
-//! │ │ ┃ revise  ↩          ◆ │ │ Zakres wymaga poprawy…                │ │
+//! │ │ │ revise  ↩          ◆ │ │ Zakres wymaga poprawy…                │ │
 //! │ └────────────────────────┘ └───────────────────────────────────────┘ │
 //! │ Komentarz dla agenta (wymagane):                                    │
 //! │ > Uwzględnij migrację tabeli orders▏                                │
@@ -822,8 +822,9 @@ impl WaitingPanel {
     ///
     /// The frame is always in the entry's role, focus or not (R4): whether
     /// the keys are here shows on the frame of the details around it, and on
-    /// the bracket of the actions — thick while `focused` says the panel has
-    /// the keys and they are on the actions, thin otherwise (R12). The actions
+    /// the bracket of the actions — in the focus role while `focused` says the
+    /// panel has the keys and they are on the actions, in the background role
+    /// otherwise (R12). The actions
     /// scroll inside what the context and the fields leave them (R17).
     pub fn render(
         &mut self,

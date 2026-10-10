@@ -8,9 +8,9 @@
 //!  Przebieg   Rozmowa   Zdarzenia   Dyrygent   Info          podąża
 //!                     ● review_api · w toku · agent · 2m
 //!   ✓ plan ok         …
-//!   ━━━━━━━━━━━━━━
-//! ┃ ● review_api w toku
-//!   ━━━━━━━━━━━━━━
+//! ────────────────
+//! │ ● review_api w toku
+//! ────────────────
 //! ```
 //!
 //! # What it remembers

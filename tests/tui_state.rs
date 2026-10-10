@@ -1229,10 +1229,10 @@ mod foundations {
         }
 
         #[test]
-        fn selection_marks_are_thick_focus_or_thin_background() {
+        fn selection_marks_are_thin_in_the_focus_or_the_background_role() {
             let colour = Styles::new(false);
             let focused = colour.selection_marks(true);
-            assert_eq!((focused.rule, focused.bar), ("━", "┃"));
+            assert_eq!((focused.rule, focused.bar), ("─", "│"));
             assert_eq!(focused.style, colour.of(Role::Focus));
             assert_eq!(focused.style.fg, Some(Color::Cyan));
             let unfocused = colour.selection_marks(false);
@@ -1241,7 +1241,7 @@ mod foundations {
 
             let plain = Styles::new(true);
             let focused = plain.selection_marks(true);
-            assert_eq!((focused.rule, focused.bar), ("━", "┃"));
+            assert_eq!((focused.rule, focused.bar), ("─", "│"));
             assert!(focused.style.add_modifier.contains(Modifier::BOLD));
             let unfocused = plain.selection_marks(false);
             assert_eq!((unfocused.rule, unfocused.bar), ("─", "│"));

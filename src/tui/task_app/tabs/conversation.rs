@@ -397,9 +397,9 @@ impl Conversation {
     }
 }
 
-/// One row of a transcript: the bar of the selected entry — thick while the
-/// keys are on the transcript, thin otherwise, the same rule as the lists'
-/// bracket (R16) — then the header or the body in the colour of the entry's
+/// One row of a transcript: the bar of the selected entry — in the focus role
+/// while the keys are on the transcript, in the background role otherwise,
+/// the same rule as the lists' bracket (R16) — then the header or the body in the colour of the entry's
 /// kind.
 fn transcript_row(
     line: TranscriptLine,

@@ -8,13 +8,11 @@
 //!
 //! ```text
 //! ┌ Akcje ─────────────────┐ ┌ Opis ─────────────────────────────────┐
-//! │                        │ │ ↩ wraca do agenta: plan               │
-//! │   1 approved           │ │ Zakres wymaga poprawy. Agent planu    │
-//! │     ━━━━━━━━━━━━━━━━━━ │ │ wznowi swoją sesję z Twoim komentarzem│
-//! │ ┃ 2 revise ↩ ◆         │ │                                       │
-//! │     ━━━━━━━━━━━━━━━━━━ │ │                                       │
+//! │   1 approved           │ │ ↩ wraca do agenta: plan               │
+//! │────────────────────────│ │ Zakres wymaga poprawy. Agent planu    │
+//! │ │ 2 revise ↩ ◆         │ │ wznowi swoją sesję z Twoim komentarzem│
+//! │────────────────────────│ │                                       │
 //! │   3 reject !           │ │                                       │
-//! │                        │ │                                       │
 //! └────────────────────────┘ └───────────────────────────────────────┘
 //! Komentarz dla agenta (wymagany):
 //! > Uwzględnij migrację tabeli orders▏
@@ -23,8 +21,9 @@
 //! Beside a wide area the description sits to the right of the list; below
 //! [`SIDE_BY_SIDE_MIN_WIDTH`] columns it moves under the list.
 //!
-//! The list is a spaced list with a bracket around the highlighted entry
-//! ([`super::selection`]): thick while the keys are on it, thin otherwise.
+//! The list stacks its entries and brackets the highlighted one
+//! ([`super::selection`]): in the focus role while the keys are on it, in
+//! the background role otherwise.
 //! When it does not fit its pane it scrolls inside it, by whole entries,
 //! and keeps where it was across a rebuild (R17).
 //!
@@ -59,7 +58,7 @@ mod inputs;
 use super::input_form::{cycle_option, text_backspace, text_insert, text_step};
 use super::keymap::{digit_of, lookup, Action, Context};
 use super::scroll::{one_line, sanitize, wrap_visible, ScrollState};
-use super::selection::{render_spaced_list, spaced_list_rows, PREFIX_WIDTH};
+use super::selection::{bracketed_list_rows, render_bracketed_list, PREFIX_WIDTH};
 use super::style::{Role, Styles};
 
 /// The narrowest area in which the description still sits beside the list.
@@ -865,15 +864,15 @@ fn focus_order_of(item: &ChooserItem, inputs_layout: bool) -> Vec<usize> {
 /// The rows of the list pane's frame.
 const LIST_FRAME_ROWS: u16 = 2;
 
-/// The rows the list pane needs for `entries` entries: the spaced list and
-/// the frame.
+/// The rows the list pane needs for `entries` entries: the entries, the
+/// bracket's two rules and the frame.
 fn list_rows(entries: usize) -> u16 {
-    spaced_list_rows(entries).saturating_add(LIST_FRAME_ROWS)
+    bracketed_list_rows(entries).saturating_add(LIST_FRAME_ROWS)
 }
 
 /// The rows of the smallest list pane: one entry with its bracket, and the
 /// frame.
-const LIST_MIN_ROWS: u16 = spaced_list_rows(1) + LIST_FRAME_ROWS;
+const LIST_MIN_ROWS: u16 = bracketed_list_rows(1) + LIST_FRAME_ROWS;
 
 /// How wide the list needs to be for its longest line.
 fn list_width(items: &[ChooserItem]) -> u16 {
@@ -999,8 +998,8 @@ fn field_value_rows(field: &ChooserField, value: &str, focused: bool) -> Vec<Str
 ///
 /// `focused` says whether the keys are on the chooser's owner — the answer
 /// panel, the form, the overlay. The bracket around the highlighted entry is
-/// thick while they are and the chooser has them on its list, thin
-/// otherwise (R12).
+/// in the focus role while they are and the chooser has them on its list, in
+/// the background role otherwise (R12).
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -1068,7 +1067,7 @@ fn pane(title: &str, active: bool, styles: &Styles) -> Block<'static> {
         .title(format!(" {title} "))
 }
 
-/// The list pane: the entries spaced out, the highlighted one bracketed and
+/// The list pane: the entries stacked, the highlighted one bracketed and
 /// scrolled into view inside the pane.
 fn render_list(
     frame: &mut Frame,
@@ -1086,7 +1085,7 @@ fn render_list(
         .enumerate()
         .map(|(index, item)| vec![list_line(item, index, styles)])
         .collect();
-    render_spaced_list(
+    render_bracketed_list(
         frame,
         inner,
         styles,

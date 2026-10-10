@@ -18,12 +18,12 @@
 //! # The selection is a mark beside the content, never a fill
 //!
 //! A list (tasks, history, the step timeline, every chooser) brackets its
-//! selected item: a rule in the gap row above it, a rule in the gap row below
-//! it and a bar beside each of its lines. A transcript and *Zdarzenia* keep
-//! the bar alone. Both come from [`Styles::selection_marks`] and follow the
-//! panel frames' rule: thick `━`/`┃` in [`Role::Focus`] where the keys are,
-//! thin `─`/`│` in [`Role::Done`] elsewhere. The content keeps its own roles,
-//! and without colour the shape and weight still tell the two apart.
+//! selected item: a full-width rule in a row directly above it, another
+//! directly below it and a bar beside each of its lines. A transcript and
+//! *Zdarzenia* keep the bar alone. Both come from [`Styles::selection_marks`]:
+//! always thin `─`/`│`, in [`Role::Focus`] where the keys are and in
+//! [`Role::Done`] elsewhere. The content keeps its own roles, and without
+//! colour bold and dim still tell the two apart.
 //!
 //! # `NO_COLOR` is read once
 //!
@@ -182,24 +182,16 @@ impl Styles {
     /// The marks of a selection (R8, R12, R14): the rules above and below the
     /// selected item and the bar on its left.
     ///
-    /// The same rule as [`Styles::panel`]: where the keys are, thick `━`/`┃`
-    /// in the focus role; elsewhere thin `─`/`│` in the background role. The
-    /// characters are those of the thick and the plain panel frames, so a
-    /// selection reads like a piece of frame. Without colour the role leaves
-    /// bold or dim behind, and the shape of the line still tells them apart.
+    /// The lines are always thin, `─`/`│`, so a selection stays lighter than
+    /// a panel frame; only the role tells where the keys are: the focus role
+    /// there, the background role elsewhere. Without colour the role leaves
+    /// bold or dim behind.
     pub fn selection_marks(&self, focused: bool) -> SelectionMarks {
-        if focused {
-            SelectionMarks {
-                rule: "━",
-                bar: "┃",
-                style: self.of(Role::Focus),
-            }
-        } else {
-            SelectionMarks {
-                rule: "─",
-                bar: "│",
-                style: self.of(Role::Done),
-            }
+        let role = if focused { Role::Focus } else { Role::Done };
+        SelectionMarks {
+            rule: "─",
+            bar: "│",
+            style: self.of(role),
         }
     }
 

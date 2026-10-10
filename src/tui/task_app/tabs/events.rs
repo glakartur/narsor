@@ -236,8 +236,9 @@ fn row_text(event: &Event, raw: bool) -> String {
     )
 }
 
-/// Draws the tab. The selected event has the transcripts' bar on its left,
-/// thick while `focused` — the keys are in the tab — and thin otherwise
+/// Draws the tab. The selected event has the transcripts' bar on its left, in
+/// the focus role while `focused` — the keys are in the tab — and in the
+/// background role otherwise
 /// (R15, R16).
 pub fn render(
     frame: &mut Frame,

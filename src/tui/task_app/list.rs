@@ -33,10 +33,11 @@
 //! the backend. Everything that comes from the server is passed through
 //! [`one_line`] before it is drawn.
 //!
-//! The rows are drawn as a spaced list ([`render_spaced_list`]): a blank row
-//! between tasks, and a bracket — rules above and below, a bar beside both
-//! lines — around the selected one instead of reverse video, so its markers
-//! keep their colours. A task thus takes three rows of the column.
+//! The rows are drawn as a bracketed list ([`render_bracketed_list`]): tasks
+//! stacked directly, and a bracket — full-width rules above and below, a bar
+//! beside both lines — around the selected one instead of reverse video, so
+//! its markers keep their colours. A task takes two rows of the column, the
+//! selected one four.
 
 use std::collections::HashMap;
 
@@ -55,7 +56,7 @@ use crate::orchestration::{
 };
 
 use super::super::scroll::one_line;
-use super::super::selection::{render_spaced_list, PREFIX_WIDTH};
+use super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
 
 /// What a row asks of the operator (column 1).
@@ -1054,9 +1055,9 @@ impl TaskList {
     // -----------------------------------------------------------------
 
     /// Draws the list into `area`: a column titled `Zadania`, one row per
-    /// task, with a blank row between rows and a bracket around the selected
-    /// one ([`render_spaced_list`]). `focused` lights the frame and thickens
-    /// the bracket; `stale` greys every row (no connection: the rows are a
+    /// task, stacked, with a bracket around the selected one
+    /// ([`render_bracketed_list`]). `focused` lights the frame and the
+    /// bracket; `stale` greys every row (no connection: the rows are a
     /// memory, not news).
     pub fn render(
         &mut self,
@@ -1115,7 +1116,7 @@ impl TaskList {
         let selected = rows
             .iter()
             .position(|(id, _)| self.selected.as_deref() == Some(id.as_str()));
-        render_spaced_list(
+        render_bracketed_list(
             frame,
             inner,
             styles,

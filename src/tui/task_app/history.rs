@@ -47,7 +47,7 @@ use crate::engine::Timeline;
 
 use super::super::keymap::{self, Action, Context, Stack};
 use super::super::scroll::one_line;
-use super::super::selection::{render_spaced_list, PREFIX_WIDTH};
+use super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
 use super::detail::{
     panel_title, recorded_attempt, render_view, KeysAt, StepLevel, TaskDetail, ViewOptions,
@@ -879,7 +879,8 @@ async fn read_conductor(
 // ---------------------------------------------------------------------
 
 /// Draws the list of the history into `area`, bracketing the selected entry
-/// ([`render_spaced_list`]); the bracket is thick while `focused`.
+/// ([`render_bracketed_list`]); the bracket is in the focus role while
+/// `focused`.
 pub fn render_list(
     frame: &mut Frame,
     area: Rect,
@@ -896,7 +897,7 @@ pub fn render_list(
         .map(|row| row_text(row, width, styles, stale))
         .collect();
     let selected = (!rows.is_empty()).then_some(history.selected);
-    render_spaced_list(
+    render_bracketed_list(
         frame,
         inner,
         styles,
