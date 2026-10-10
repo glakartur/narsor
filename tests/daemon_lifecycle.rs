@@ -1233,23 +1233,32 @@ fn seed_rescue(root: &Path) -> (ExecutionStore, narsor::domain::WorkflowExecutio
 
 /// Spawns a daemon over `root` whose `PATH` starts with `bin`.
 fn spawn_daemon_with_path(root: &Path, bin: &Path) -> DaemonGuard {
+    DaemonGuard::new(root, daemon_with_path(root, bin))
+}
+
+/// `narsor --root <root> daemon` with `bin` first on its `PATH`, spawned
+/// bare: the caller makes sure it does not outlive the test. Its output is
+/// appended to `<root>/daemon.log`, so a failing test can be read back.
+fn daemon_with_path(root: &Path, bin: &Path) -> Child {
     let path = format!(
         "{}:{}",
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    DaemonGuard::new(
-        root,
-        Command::new(env!("CARGO_BIN_EXE_narsor"))
-            .arg("--root")
-            .arg(root)
-            .arg("daemon")
-            .env("PATH", path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn the daemon"),
-    )
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("daemon.log"))
+        .expect("open the daemon's log");
+    Command::new(env!("CARGO_BIN_EXE_narsor"))
+        .arg("--root")
+        .arg(root)
+        .arg("daemon")
+        .env("PATH", path)
+        .stdout(log.try_clone().expect("share the daemon's log"))
+        .stderr(log)
+        .spawn()
+        .expect("spawn the daemon")
 }
 
 /// Leaves the conductor's marker of the rescue invocation a restart cut
@@ -1614,4 +1623,336 @@ async fn a_restarted_runner_answers_a_chat_message_left_unanswered() {
 
     send_sigterm(daemon.id());
     wait_for_exit(&mut daemon, Duration::from_secs(10));
+}
+
+// ---------------------------------------------------------------------------
+// Automatic resume across daemon restarts
+// ---------------------------------------------------------------------------
+
+/// The task every restart scenario below runs: the gate workflow, which
+/// waits on its owner's approval.
+const RESUMED_TASK: &str = "t-resumed";
+
+/// How long a task may take to come back after a restart: the scheduler's
+/// 5 s tick, the controller's idle long-poll and a fresh runner's recovery.
+const RESUME_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// A daemon over a root of its own whose task waits on an approval, which a
+/// test stops and starts again. Runners outlive a graceful stop by design,
+/// so whether the task's runner survives a restart is the test's choice.
+/// Dropping it kills the daemon and every process left under its root.
+struct RestartedDaemon {
+    daemon: Child,
+    bin: PathBuf,
+    _processes: ProcessesUnder,
+    root: TempRoot,
+}
+
+impl RestartedDaemon {
+    /// Starts the daemon and creates the task.
+    fn start() -> Self {
+        let root = TempRoot::new();
+        let bin = fake_claude(
+            &root.path().join("bin"),
+            r#"{"decision": "annotate", "summary": "Ship it?"}"#,
+        );
+        fs::create_dir_all(root.path().join("workflows")).unwrap();
+        fs::write(root.path().join("workflows/gate.yaml"), GATE_WORKFLOW).unwrap();
+        let daemon = daemon_with_path(root.path(), &bin);
+        let started = Self {
+            daemon,
+            bin,
+            _processes: ProcessesUnder {
+                root: root.path().to_path_buf(),
+            },
+            root,
+        };
+        wait_for_daemon_info(started.root(), Duration::from_secs(15));
+        let (code, text) = narsor(
+            started.root(),
+            &started.bin,
+            &["task", "create", "gate", "--task-id", RESUMED_TASK],
+        );
+        assert_eq!(code, 0, "{text}");
+        started
+    }
+
+    fn root(&self) -> &Path {
+        self.root.path()
+    }
+
+    /// Stops the daemon gracefully, as `daemon stop` does.
+    fn stop(&mut self) {
+        send_sigterm(self.daemon.id());
+        assert!(
+            wait_for_exit(&mut self.daemon, Duration::from_secs(30)).success(),
+            "the daemon stopped cleanly"
+        );
+        // A discovery file left behind would name the stopped daemon.
+        let _ = fs::remove_file(daemon_file(self.root()));
+    }
+
+    /// Starts the daemon again over the same root.
+    fn start_again(&mut self) {
+        self.daemon = daemon_with_path(self.root(), &self.bin);
+        wait_for_daemon_info(self.root(), Duration::from_secs(15));
+    }
+
+    fn client(&self) -> narsor::api::ApiClient {
+        let info = DaemonInfo::read(&daemon_file(self.root())).expect("read daemon.json");
+        narsor::api::ApiClient::new(info.addr, info.token)
+    }
+
+    async fn task(&self) -> narsor::controller_protocol::TaskSummary {
+        self.client()
+            .control_task(RESUMED_TASK)
+            .await
+            .expect("read the task")
+    }
+
+    async fn events(&self) -> Vec<narsor::orchestration::TaskEvent> {
+        self.client()
+            .control_events(RESUMED_TASK, 0)
+            .await
+            .expect("read the task's events")
+    }
+
+    /// The automatic resumes in the task's history: (attempt, limit) each.
+    async fn auto_resumes(&self) -> Vec<(u32, u32)> {
+        self.events()
+            .await
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                narsor::orchestration::TaskEventKind::AutoResumed { attempt, limit, .. } => {
+                    Some((attempt, limit))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Waits until a running task's runner — one other than `replaced`,
+    /// when given — reports the approval it waits on; returns that runner's
+    /// incarnation and the approval's waiting id.
+    async fn wait_at_approval(&self, replaced: Option<&str>) -> (String, String) {
+        let deadline = Instant::now() + RESUME_TIMEOUT;
+        loop {
+            let task = self.task().await;
+            let runner = task
+                .runner
+                .as_ref()
+                .filter(|runner| Some(runner.incarnation.as_str()) != replaced);
+            // The gate's human decision is the owner's answer to a question.
+            let approval = task.attention.iter().find(|item| {
+                item.kind == narsor::orchestration::AttentionKind::Question
+                    && item.state_id.as_deref() == Some("gate")
+            });
+            if let (narsor::orchestration::TaskLifecycle::Running, Some(runner), Some(approval)) =
+                (task.lifecycle, runner, approval)
+            {
+                return (runner.incarnation.clone(), approval.waiting_id.clone());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the task never waited at its approval again (replacing {replaced:?}): \
+                 {task:#?}\n{}",
+                fs::read_to_string(self.root().join("daemon.log")).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// The pid of the task's runner, read from the local controller's
+    /// workload record the way the controller finds it after a restart.
+    fn runner_pid(&self) -> u32 {
+        let workloads = self.root().join("local-controller/workloads");
+        let pids = fs::read_dir(&workloads)
+            .expect("the task's workloads")
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read(entry.path().join("workload.json")).ok())
+            .map(|bytes| {
+                let record: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("a workload record");
+                u32::try_from(record["pid"].as_u64().expect("a runner pid")).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 1, "one workload for the one task: {pids:?}");
+        pids[0]
+    }
+
+    /// Kills the task's runner — its process group, harness included — the
+    /// way a host loses it, and waits until it is gone.
+    fn kill_runner(&self) {
+        let pid = self.runner_pid();
+        assert!(pid_alive(pid), "the runner survived the daemon's stop");
+        // SAFETY: the runner of this test's task leads its process group.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pid_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the killed runner never went away"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// One restart that loses the runner: stop, kill it, start again.
+    fn restart_losing_the_runner(&mut self) {
+        self.stop();
+        self.kill_runner();
+        self.start_again();
+    }
+}
+
+impl Drop for RestartedDaemon {
+    fn drop(&mut self) {
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+    }
+}
+
+/// AE1: a task waiting on its owner's approval whose runner a daemon
+/// restart lost returns, without its owner, to the very same approval — and
+/// its history says it was resumed automatically.
+#[tokio::test]
+async fn a_task_waiting_on_an_approval_returns_to_it_after_a_restart_lost_its_runner() {
+    let mut daemon = RestartedDaemon::start();
+    let (runner, waiting_id) = daemon.wait_at_approval(None).await;
+
+    daemon.restart_losing_the_runner();
+
+    let (resumed, waiting_again) = daemon.wait_at_approval(Some(&runner)).await;
+    assert_ne!(resumed, runner, "a new runner took over");
+    assert_eq!(waiting_again, waiting_id, "it waits on the same approval");
+    let resumes = daemon.auto_resumes().await;
+    assert_eq!(resumes.len(), 1, "resumed automatically once: {resumes:?}");
+    let task = daemon.task().await;
+    assert!(task.resume.exhausted.is_none(), "{:?}", task.resume);
+}
+
+/// The restart rule: a loss a restarted daemon finds says nothing about
+/// whether the task can run, so six restarts in a row — each losing the
+/// runner well within the stability window — never use up the attempts.
+#[tokio::test]
+async fn six_restarts_that_each_lose_the_runner_do_not_exhaust_the_resume() {
+    let mut daemon = RestartedDaemon::start();
+    let (mut runner, waiting_id) = daemon.wait_at_approval(None).await;
+
+    for restart in 1..=6 {
+        daemon.restart_losing_the_runner();
+        let (resumed, waiting_again) = daemon.wait_at_approval(Some(&runner)).await;
+        assert_eq!(waiting_again, waiting_id, "restart {restart}");
+        runner = resumed;
+    }
+
+    let resumes = daemon.auto_resumes().await;
+    assert_eq!(resumes.len(), 6, "{resumes:?}");
+    assert!(
+        resumes.iter().all(|(attempt, _)| *attempt == 1),
+        "no restart counted as a failed attempt: {resumes:?}"
+    );
+    let task = daemon.task().await;
+    assert_eq!(task.resume.consecutive_losses, 0, "{:?}", task.resume);
+    assert!(task.resume.exhausted.is_none(), "{:?}", task.resume);
+}
+
+/// A runner that outlives the restart, as runners do by design, keeps its
+/// task: still running on the same process, and nothing resumed.
+#[tokio::test]
+async fn a_runner_that_survives_a_restart_keeps_its_task_without_a_resume() {
+    let mut daemon = RestartedDaemon::start();
+    daemon.wait_at_approval(None).await;
+    let pid = daemon.runner_pid();
+
+    daemon.stop();
+    let restarted_at = chrono::Utc::now();
+    daemon.start_again();
+
+    // The restarted controller has looked at the workload...
+    let deadline = Instant::now() + RESUME_TIMEOUT;
+    loop {
+        let task = daemon.task().await;
+        if task
+            .observation
+            .as_ref()
+            .is_some_and(|observation| observation.received_at > restarted_at)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the restarted controller never reported the task: {task:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // ...and the resume policy had more than one tick to act on it.
+    tokio::time::sleep(Duration::from_secs(12)).await;
+
+    let task = daemon.task().await;
+    assert_eq!(
+        task.lifecycle,
+        narsor::orchestration::TaskLifecycle::Running,
+        "{task:#?}"
+    );
+    assert_eq!(daemon.runner_pid(), pid, "the same runner");
+    assert!(pid_alive(pid), "the runner still runs");
+    assert!(daemon.auto_resumes().await.is_empty());
+    assert!(task.resume.is_empty(), "{:?}", task.resume);
+}
+
+/// A task a daemon before the resume policy left `Interrupted` — its record
+/// without any resume state — is resumed once a daemon with the policy
+/// starts, back to the approval it waited on.
+#[tokio::test]
+async fn a_task_interrupted_before_the_resume_policy_is_resumed_at_start() {
+    let mut daemon = RestartedDaemon::start();
+    let (runner, waiting_id) = daemon.wait_at_approval(None).await;
+
+    daemon.stop();
+    daemon.kill_runner();
+    interrupt_as_before_the_policy(daemon.root(), RESUMED_TASK);
+    daemon.start_again();
+
+    let (_, waiting_again) = daemon.wait_at_approval(Some(&runner)).await;
+    assert_eq!(waiting_again, waiting_id);
+    let resumes = daemon.auto_resumes().await;
+    assert_eq!(resumes.len(), 1, "{resumes:?}");
+    assert_eq!(resumes[0].0, 1, "the adopted loss is the first attempt");
+}
+
+/// Rewrites a stopped daemon's record of a running task the way a daemon
+/// that predates the resume policy left a lost one: `Interrupted` by the
+/// controller's report of the loss, committed as a new revision whose event
+/// is not published yet (startup recovery publishes it), and none of the
+/// fields the policy added.
+fn interrupt_as_before_the_policy(root: &Path, task_id: &str) {
+    use narsor::orchestration::{Observation, TaskEvent, TaskEventKind, TaskLifecycle, TaskRecord};
+
+    let path = narsor::persistence::StatePaths::new(root).orchestration_task_file(task_id);
+    let mut record: TaskRecord =
+        serde_json::from_slice(&fs::read(&path).expect("read the task record"))
+            .expect("parse the task record");
+    assert_eq!(record.lifecycle, TaskLifecycle::Running);
+    record.lifecycle = TaskLifecycle::Interrupted;
+    record.revision += 1;
+    record.last_event = TaskEvent {
+        sequence: record.revision,
+        task_id: record.task_id.clone(),
+        at: chrono::Utc::now(),
+        lifecycle: TaskLifecycle::Interrupted,
+        generation: record.generation,
+        kind: TaskEventKind::ControllerReported {
+            observation: Observation::WorkloadLost { state_known: true },
+            lease_epoch: record.last_report_epoch.expect("a controller reported"),
+        },
+    };
+    let mut stored = serde_json::to_value(&record).expect("serialize the task record");
+    let fields = stored.as_object_mut().expect("a record object");
+    for added in ["resume", "workload_epoch", "running_since"] {
+        assert!(fields.remove(added).is_some(), "the record has {added}");
+    }
+    fs::write(&path, serde_json::to_vec_pretty(&stored).unwrap()).expect("write the task record");
 }
