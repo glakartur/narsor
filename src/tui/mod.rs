@@ -40,6 +40,7 @@ pub mod input_form;
 pub mod keymap;
 pub mod refresh;
 pub mod scroll;
+pub mod selection;
 pub mod style;
 pub mod task_app;
 pub mod transcript;

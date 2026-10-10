@@ -3221,3 +3221,241 @@ mod task_app_harness_render {
         assert!(rows(&buffer).last().unwrap().contains("h harness"));
     }
 }
+
+/// U4: the spaced list with a selection bracket, drawn on its own.
+mod spaced_list_render {
+    use super::*;
+
+    use narsor::tui::selection::{bar_prefix, render_spaced_list};
+    use narsor::tui::style::Role;
+    use ratatui::text::{Line, Span};
+
+    /// `count` items of two lines each: a red `!` and a name, then a detail.
+    fn items(styles: &Styles, count: usize) -> Vec<Vec<Line<'static>>> {
+        (0..count)
+            .map(|index| {
+                vec![
+                    Line::from(vec![
+                        Span::styled("!", styles.of(Role::Problem)),
+                        Span::raw(format!(" item {index}")),
+                    ]),
+                    Line::raw(format!("detail {index}")),
+                ]
+            })
+            .collect()
+    }
+
+    fn draw_list(
+        width: u16,
+        height: u16,
+        styles: &Styles,
+        items: &[Vec<Line<'static>>],
+        selected: Option<usize>,
+        focused: bool,
+        top: &mut usize,
+    ) -> Buffer {
+        draw(width, height, |frame| {
+            render_spaced_list(
+                frame,
+                Rect::new(0, 0, width, height),
+                styles,
+                items,
+                selected,
+                focused,
+                top,
+            )
+        })
+    }
+
+    /// Whether row `y` is a rule of `symbol` from column 2 to the right edge,
+    /// with the first two columns blank.
+    fn is_rule(buffer: &Buffer, y: u16, symbol: &str) -> bool {
+        let blank_prefix = (0..2).all(|x| buffer[(x, y)].symbol() == " ");
+        let rule = (2..buffer.area.width).all(|x| buffer[(x, y)].symbol() == symbol);
+        blank_prefix && rule
+    }
+
+    fn no_marks(buffer: &Buffer) -> bool {
+        buffer
+            .content()
+            .iter()
+            .all(|cell| !["━", "─", "┃", "│"].contains(&cell.symbol()))
+    }
+
+    fn none_reversed(buffer: &Buffer) -> bool {
+        buffer
+            .content()
+            .iter()
+            .all(|cell| !cell.modifier.contains(Modifier::REVERSED))
+    }
+
+    #[test]
+    fn a_focused_selection_is_a_thick_cyan_bracket_that_does_not_touch_its_bar() {
+        let styles = Styles::new(false);
+        let mut top = 0;
+        let buffer = draw_list(20, 10, &styles, &items(&styles, 3), Some(1), true, &mut top);
+        let screen = screen(&buffer);
+        assert_eq!(row_of(&buffer, "item 0"), 1, "{screen}");
+        assert_eq!(row_of(&buffer, "item 1"), 4, "{screen}");
+        assert!(is_rule(&buffer, 3, "━"), "{screen}");
+        assert!(is_rule(&buffer, 6, "━"), "{screen}");
+        for y in [4, 5] {
+            assert_eq!(cell_at(&buffer, 0, y), ("┃".to_string(), Color::Cyan));
+            assert_eq!(cell_at(&buffer, 1, y).0, " ");
+        }
+        assert_eq!(cell_at(&buffer, 2, 3), ("━".to_string(), Color::Cyan));
+        for y in [0usize, 9] {
+            assert!(rows(&buffer)[y].trim().is_empty(), "{screen}");
+        }
+        assert_eq!(cell_at(&buffer, 0, 1).0, " ", "an item outside the bracket");
+    }
+
+    #[test]
+    fn without_focus_the_same_bracket_is_thin_and_grey() {
+        let styles = Styles::new(false);
+        let mut top = 0;
+        let buffer = draw_list(
+            20,
+            10,
+            &styles,
+            &items(&styles, 3),
+            Some(1),
+            false,
+            &mut top,
+        );
+        assert!(is_rule(&buffer, 3, "─"), "{}", screen(&buffer));
+        assert!(is_rule(&buffer, 6, "─"));
+        assert_eq!(cell_at(&buffer, 2, 6), ("─".to_string(), Color::DarkGray));
+        for y in [4, 5] {
+            assert_eq!(cell_at(&buffer, 0, y), ("│".to_string(), Color::DarkGray));
+        }
+    }
+
+    #[test]
+    fn without_colour_the_bracket_speaks_through_thickness_bold_and_dim() {
+        let styles = Styles::new(true);
+        let list = items(&styles, 3);
+        let mut top = 0;
+        let focused = draw_list(20, 10, &styles, &list, Some(1), true, &mut top);
+        assert!(is_rule(&focused, 3, "━") && is_rule(&focused, 6, "━"));
+        assert_eq!(focused[(0, 4)].symbol(), "┃");
+        assert!(bold_at(&focused, 0, 4) && bold_at(&focused, 5, 3));
+        let unfocused = draw_list(20, 10, &styles, &list, Some(1), false, &mut top);
+        assert!(is_rule(&unfocused, 3, "─") && is_rule(&unfocused, 6, "─"));
+        assert_eq!(unfocused[(0, 4)].symbol(), "│");
+        for (x, y) in [(0, 4), (5, 3)] {
+            assert!(unfocused[(x, y)].modifier.contains(Modifier::DIM));
+            assert!(!bold_at(&unfocused, x, y));
+        }
+        for buffer in [&focused, &unfocused] {
+            assert!(none_reversed(buffer), "{}", screen(buffer));
+            assert!(buffer
+                .content()
+                .iter()
+                .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset));
+        }
+    }
+
+    #[test]
+    fn the_selected_content_keeps_its_own_colours() {
+        let styles = Styles::new(false);
+        let mut top = 0;
+        let buffer = draw_list(20, 10, &styles, &items(&styles, 3), Some(1), true, &mut top);
+        assert_eq!(cell_at(&buffer, 2, 4), ("!".to_string(), Color::Red));
+        assert_eq!(cell_at(&buffer, 4, 4), ("i".to_string(), Color::Reset));
+        assert!(none_reversed(&buffer), "{}", screen(&buffer));
+    }
+
+    #[test]
+    fn moving_the_selection_moves_no_row() {
+        let styles = Styles::new(false);
+        let list = items(&styles, 3);
+        let mut top = 0;
+        let first = draw_list(20, 10, &styles, &list, Some(0), true, &mut top);
+        let second = draw_list(20, 10, &styles, &list, Some(1), true, &mut top);
+        for index in 0..3 {
+            let needle = format!("item {index}");
+            assert_eq!(row_of(&first, &needle), row_of(&second, &needle));
+        }
+        assert_eq!(row_of(&second, "item 2"), 7);
+    }
+
+    #[test]
+    fn the_first_item_has_its_rule_in_the_first_row_and_the_last_in_the_last() {
+        let styles = Styles::new(false);
+        let list = items(&styles, 3);
+        let mut top = 0;
+        let first = draw_list(20, 10, &styles, &list, Some(0), true, &mut top);
+        assert!(is_rule(&first, 0, "━") && is_rule(&first, 3, "━"));
+        let last = draw_list(20, 10, &styles, &list, Some(2), true, &mut top);
+        assert!(is_rule(&last, 6, "━") && is_rule(&last, 9, "━"));
+        assert_eq!(top, 0, "everything fits, nothing scrolls");
+    }
+
+    #[test]
+    fn a_long_list_scrolls_just_enough_for_the_whole_bracket() {
+        let styles = Styles::new(false);
+        let list = items(&styles, 10);
+        let mut top = 0;
+        let buffer = draw_list(20, 10, &styles, &list, Some(9), true, &mut top);
+        let screen = screen(&buffer);
+        assert_eq!(top, 7, "{screen}");
+        assert_eq!(row_of(&buffer, "item 9"), 7, "{screen}");
+        assert!(
+            is_rule(&buffer, 6, "━") && is_rule(&buffer, 9, "━"),
+            "{screen}"
+        );
+
+        for (selected, expected_row) in [(8, 4), (7, 1)] {
+            let buffer = draw_list(20, 10, &styles, &list, Some(selected), true, &mut top);
+            assert_eq!(top, 7, "the bracket still fits: the view stays");
+            assert_eq!(row_of(&buffer, &format!("item {selected}")), expected_row);
+        }
+        let buffer = draw_list(20, 10, &styles, &list, Some(6), true, &mut top);
+        assert_eq!(top, 6, "one item up, one step of the view");
+        assert!(is_rule(&buffer, 0, "━"), "{}", super::screen(&buffer));
+    }
+
+    #[test]
+    fn no_selection_and_no_items_draw_no_marks() {
+        let styles = Styles::new(false);
+        let mut top = 0;
+        let unselected = draw_list(20, 10, &styles, &items(&styles, 3), None, true, &mut top);
+        assert!(no_marks(&unselected), "{}", screen(&unselected));
+        assert_eq!(row_of(&unselected, "item 2"), 7);
+        let past_the_end = draw_list(20, 10, &styles, &items(&styles, 3), Some(5), true, &mut top);
+        assert!(no_marks(&past_the_end));
+        let empty = draw_list(20, 10, &styles, &[], Some(0), true, &mut top);
+        assert!(screen(&empty).trim().is_empty());
+        assert_eq!(top, 0);
+    }
+
+    #[test]
+    fn an_area_lower_than_the_bracket_keeps_the_bar_alone() {
+        let styles = Styles::new(false);
+        let list = items(&styles, 3);
+        let mut top = 0;
+        let buffer = draw_list(20, 3, &styles, &list, Some(2), true, &mut top);
+        let screen = screen(&buffer);
+        assert_eq!(row_of(&buffer, "item 2"), 0, "{screen}");
+        assert_eq!(cell_at(&buffer, 0, 0), ("┃".to_string(), Color::Cyan));
+        assert_eq!(cell_at(&buffer, 0, 1).0, "┃");
+        assert!(!screen.contains('━'), "{screen}");
+        for (width, height) in [(1, 1), (2, 2), (0, 0), (3, 1)] {
+            let mut top = 0;
+            draw_list(width, height, &styles, &list, Some(1), true, &mut top);
+        }
+    }
+
+    #[test]
+    fn the_bar_prefix_follows_the_focus_rule() {
+        let styles = Styles::new(false);
+        let focused = bar_prefix(&styles, true, true);
+        assert_eq!(focused.content, "┃ ");
+        assert_eq!(focused.style.fg, Some(Color::Cyan));
+        let unfocused = bar_prefix(&styles, true, false);
+        assert_eq!(unfocused.content, "│ ");
+        assert_eq!(unfocused.style.fg, Some(Color::DarkGray));
+        assert_eq!(bar_prefix(&styles, false, true).content, "  ");
+    }
+}
