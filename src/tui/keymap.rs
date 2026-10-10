@@ -17,12 +17,23 @@
 //! focus is in a field) must be able to type `q` and `?`, so it inherits
 //! nothing.
 //!
+//! # Layers
+//!
+//! The details (the task's and the history's) keep only what works on every
+//! tab. The keys of what a tab shows are in a layer over them: the timeline
+//! of *Przebieg* ([`Context::Axis`], [`Context::HistoryAxis`]), the
+//! conversation of a step ([`Context::StepConversation`]) or reading any
+//! other tab ([`Context::Reading`]). The keys in force are a [`Stack`] —
+//! layer, base, then [`Context::Global`] — and [`lookup`], the bar and help
+//! all read it in that order. A plain [`Context`] is a stack without a layer.
+//!
 //! # Consistency
 //!
-//! [`check_consistency`] is what keeps the table honest: no key twice in one
-//! context, no key that a context would shadow from [`Context::Global`], no
-//! row without a description. A test runs it over [`BINDINGS`], and a second
-//! one proves it fails when a row is duplicated.
+//! [`check_consistency`] is what keeps the table honest: over every stack the
+//! interface can be in ([`Stack::all`]), no key twice in one context, no key
+//! that a layer would shadow from its base or a context from
+//! [`Context::Global`], no row without a description. A test runs it over
+//! [`BINDINGS`], and a second one proves it fails when a row is duplicated.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,11 +71,21 @@ pub enum Context {
     HistoryDetails,
     /// The list of repositories has the focus.
     Repositories,
+    /// A layer over [`Context::Details`]: the step timeline of *Przebieg*.
+    Axis,
+    /// A layer over [`Context::HistoryDetails`]: the timeline of a closed
+    /// run, which has nothing to follow.
+    HistoryAxis,
+    /// A layer over either details: the conversation of the step picked on
+    /// the timeline.
+    StepConversation,
+    /// A layer over either details: reading any tab but *Przebieg*.
+    Reading,
 }
 
 impl Context {
     /// Every context, in the order help and tests walk them.
-    pub const ALL: [Context; 11] = [
+    pub const ALL: [Context; 15] = [
         Context::Global,
         Context::List,
         Context::Details,
@@ -76,6 +97,10 @@ impl Context {
         Context::History,
         Context::HistoryDetails,
         Context::Repositories,
+        Context::Axis,
+        Context::HistoryAxis,
+        Context::StepConversation,
+        Context::Reading,
     ];
 
     /// The name help uses.
@@ -92,13 +117,82 @@ impl Context {
             Self::History => "historia",
             Self::HistoryDetails => "historia: szczegóły",
             Self::Repositories => "repozytoria",
+            Self::Axis | Self::HistoryAxis => "oś",
+            Self::StepConversation => "rozmowa kroku",
+            Self::Reading => "czytanie",
         }
+    }
+
+    /// Whether the context is a layer, whose keys only ever apply over a
+    /// base ([`Stack`]).
+    pub fn is_layer(self) -> bool {
+        matches!(
+            self,
+            Self::Axis | Self::HistoryAxis | Self::StepConversation | Self::Reading
+        )
     }
 
     /// Whether the global keys also work here. False where typed text must
     /// not be intercepted.
     pub fn inherits_global(self) -> bool {
         !matches!(self, Self::Global | Self::Form)
+    }
+}
+
+/// The contexts whose keys apply at once: an optional layer, its base, then
+/// [`Context::Global`] where the base inherits it. A key is looked up in
+/// that order, and help and the bar list them in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Stack {
+    /// The keys of what the details show, over the base.
+    pub layer: Option<Context>,
+    /// Where the operator is.
+    pub base: Context,
+}
+
+impl Stack {
+    /// The stacks with a layer, each layer over the bases it goes with.
+    pub const LAYERED: [Stack; 6] = [
+        Stack::layered(Context::Axis, Context::Details),
+        Stack::layered(Context::StepConversation, Context::Details),
+        Stack::layered(Context::Reading, Context::Details),
+        Stack::layered(Context::HistoryAxis, Context::HistoryDetails),
+        Stack::layered(Context::StepConversation, Context::HistoryDetails),
+        Stack::layered(Context::Reading, Context::HistoryDetails),
+    ];
+
+    /// `layer` over `base`.
+    pub const fn layered(layer: Context, base: Context) -> Self {
+        Self {
+            layer: Some(layer),
+            base,
+        }
+    }
+
+    /// Every stack the interface can be in: each context that is not a
+    /// layer on its own, then [`Stack::LAYERED`].
+    pub fn all() -> impl Iterator<Item = Stack> {
+        Context::ALL
+            .into_iter()
+            .filter(|context| !context.is_layer())
+            .map(Stack::from)
+            .chain(Self::LAYERED)
+    }
+
+    /// The contexts to look in, first to last.
+    pub fn scopes(self) -> Vec<Context> {
+        let mut scopes: Vec<Context> = self.layer.into_iter().collect();
+        scopes.push(self.base);
+        if self.base.inherits_global() {
+            scopes.push(Context::Global);
+        }
+        scopes
+    }
+}
+
+impl From<Context> for Stack {
+    fn from(base: Context) -> Self {
+        Self { layer: None, base }
     }
 }
 
@@ -148,8 +242,13 @@ pub enum Action {
     RawEntry,
     /// The raw view of everything.
     RawAll,
-    /// Follow the step that is running.
+    /// Follow the step that is running; in a reader, to the end and after
+    /// what comes.
     Follow,
+    /// Enter the conversation of the step picked on the timeline.
+    EnterStep,
+    /// Leave the step's conversation for the timeline, on the same step.
+    LeaveStep,
     /// Back to the list.
     Back,
     /// Move a queued task one place up.
@@ -532,16 +631,8 @@ pub static BINDINGS: &[Binding] = &[
         "",
         "ponów wysłanie nowego zadania, które nie dotarło do serwera",
     ),
-    // The task details.
-    // `Esc` first: on a narrow screen the details are full screen and the way
-    // back must survive a shortened bar, which drops hints from the end.
-    bind(
-        Context::Details,
-        Key::code(KeyCode::Esc),
-        Action::Back,
-        "lista",
-        "wróć na listę z zachowanym zaznaczeniem",
-    ),
+    // The task details: what works on every tab. What reads the tab
+    // itself is in a layer over these (below the history's).
     bind(
         Context::Details,
         Key::char('['),
@@ -562,97 +653,6 @@ pub static BINDINGS: &[Binding] = &[
         Action::SwitchFocus,
         "treść ↔ panel",
         "przełącz fokus między treścią zakładki a panelem na dole",
-    ),
-    bind(
-        Context::Details,
-        Key::char('j'),
-        Action::Down,
-        "przewijanie",
-        "przewiń w dół",
-    ),
-    bind(
-        Context::Details,
-        Key::code(KeyCode::Down),
-        Action::Down,
-        "",
-        "przewiń w dół",
-    ),
-    bind(
-        Context::Details,
-        Key::char('k'),
-        Action::Up,
-        "",
-        "przewiń w górę",
-    ),
-    bind(
-        Context::Details,
-        Key::code(KeyCode::Up),
-        Action::Up,
-        "",
-        "przewiń w górę",
-    ),
-    bind(
-        Context::Details,
-        Key::code(KeyCode::PageDown),
-        Action::PageDown,
-        "",
-        "strona w dół",
-    ),
-    bind(
-        Context::Details,
-        Key::code(KeyCode::PageUp),
-        Action::PageUp,
-        "",
-        "strona w górę",
-    ),
-    bind(
-        Context::Details,
-        Key::char('g'),
-        Action::Top,
-        "",
-        "na początek",
-    ),
-    bind(
-        Context::Details,
-        Key::char('G'),
-        Action::Bottom,
-        "",
-        "na koniec",
-    ),
-    bind(
-        Context::Details,
-        Key::code(KeyCode::Enter),
-        Action::Expand,
-        "rozwiń",
-        "rozwiń albo zwiń wpis",
-    ),
-    bind(
-        Context::Details,
-        Key::char(' '),
-        Action::Expand,
-        "",
-        "rozwiń albo zwiń wpis",
-    ),
-    bind(
-        Context::Details,
-        Key::char('v'),
-        Action::RawEntry,
-        "",
-        "widok surowy wpisu",
-    ),
-    bind(
-        Context::Details,
-        Key::ctrl('v'),
-        Action::RawAll,
-        "",
-        "widok surowy całości",
-    ),
-    bind(
-        Context::Details,
-        Key::char('f'),
-        Action::Follow,
-        "podążaj",
-        "włącz albo wyłącz podążanie za bieżącym krokiem",
     ),
     bind(
         Context::Details,
@@ -1196,13 +1196,6 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::HistoryDetails,
-        Key::code(KeyCode::Esc),
-        Action::Back,
-        "lista",
-        "wróć na listę historii",
-    ),
-    bind(
-        Context::HistoryDetails,
         Key::char('['),
         Action::PrevTab,
         "zakładki",
@@ -1217,90 +1210,6 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind(
         Context::HistoryDetails,
-        Key::char('j'),
-        Action::Down,
-        "przewijanie",
-        "przewiń w dół",
-    ),
-    bind(
-        Context::HistoryDetails,
-        Key::code(KeyCode::Down),
-        Action::Down,
-        "",
-        "przewiń w dół",
-    ),
-    bind(
-        Context::HistoryDetails,
-        Key::char('k'),
-        Action::Up,
-        "",
-        "przewiń w górę",
-    ),
-    bind(
-        Context::HistoryDetails,
-        Key::code(KeyCode::Up),
-        Action::Up,
-        "",
-        "przewiń w górę",
-    ),
-    bind(
-        Context::HistoryDetails,
-        Key::code(KeyCode::PageDown),
-        Action::PageDown,
-        "",
-        "strona w dół",
-    ),
-    bind(
-        Context::HistoryDetails,
-        Key::code(KeyCode::PageUp),
-        Action::PageUp,
-        "",
-        "strona w górę",
-    ),
-    bind(
-        Context::HistoryDetails,
-        Key::char('g'),
-        Action::Top,
-        "",
-        "na początek",
-    ),
-    bind(
-        Context::HistoryDetails,
-        Key::char('G'),
-        Action::Bottom,
-        "",
-        "na koniec",
-    ),
-    bind(
-        Context::HistoryDetails,
-        Key::code(KeyCode::Enter),
-        Action::Expand,
-        "rozwiń",
-        "rozwiń albo zwiń wpis",
-    ),
-    bind(
-        Context::HistoryDetails,
-        Key::char(' '),
-        Action::Expand,
-        "",
-        "rozwiń albo zwiń wpis",
-    ),
-    bind(
-        Context::HistoryDetails,
-        Key::char('v'),
-        Action::RawEntry,
-        "",
-        "widok surowy wpisu",
-    ),
-    bind(
-        Context::HistoryDetails,
-        Key::ctrl('v'),
-        Action::RawAll,
-        "",
-        "widok surowy całości",
-    ),
-    bind(
-        Context::HistoryDetails,
         Key::char('w'),
         Action::Recover,
         "wznów",
@@ -1312,6 +1221,345 @@ pub static BINDINGS: &[Binding] = &[
         Action::ChooseHarness,
         "",
         CHOOSE_HARNESS,
+    ),
+    // The layers over the details, the task's and the history's: the keys of
+    // what the tab shows. They change nothing on the server, so nothing of
+    // the task's menu leaks into the read-only history. Each has its own
+    // `Esc`, first: on a narrow screen the details are full screen and the way
+    // back must survive a shortened bar, which drops hints from the end.
+    //
+    // The timeline of *Przebieg* in the task details.
+    bind(
+        Context::Axis,
+        Key::code(KeyCode::Esc),
+        Action::Back,
+        "lista",
+        "wróć na listę z zachowanym zaznaczeniem",
+    ),
+    bind(
+        Context::Axis,
+        Key::char('j'),
+        Action::Down,
+        "kroki",
+        "następny krok",
+    ),
+    bind(
+        Context::Axis,
+        Key::code(KeyCode::Down),
+        Action::Down,
+        "",
+        "następny krok",
+    ),
+    bind(
+        Context::Axis,
+        Key::char('k'),
+        Action::Up,
+        "",
+        "poprzedni krok",
+    ),
+    bind(
+        Context::Axis,
+        Key::code(KeyCode::Up),
+        Action::Up,
+        "",
+        "poprzedni krok",
+    ),
+    bind(
+        Context::Axis,
+        Key::char('g'),
+        Action::Top,
+        "",
+        "pierwszy krok",
+    ),
+    bind(
+        Context::Axis,
+        Key::char('G'),
+        Action::Bottom,
+        "",
+        "ostatni krok",
+    ),
+    bind(
+        Context::Axis,
+        Key::code(KeyCode::Enter),
+        Action::EnterStep,
+        "rozmowa kroku",
+        "wejdź do rozmowy wybranego kroku",
+    ),
+    bind(
+        Context::Axis,
+        Key::code(KeyCode::Right),
+        Action::EnterStep,
+        "",
+        "wejdź do rozmowy wybranego kroku",
+    ),
+    bind(
+        Context::Axis,
+        Key::char('f'),
+        Action::Follow,
+        "podążaj",
+        "włącz albo wyłącz podążanie za bieżącym krokiem",
+    ),
+    // The timeline of *Przebieg* in the history: a closed run, nothing to follow.
+    bind(
+        Context::HistoryAxis,
+        Key::code(KeyCode::Esc),
+        Action::Back,
+        "lista",
+        "wróć na listę historii",
+    ),
+    bind(
+        Context::HistoryAxis,
+        Key::char('j'),
+        Action::Down,
+        "kroki",
+        "następny krok",
+    ),
+    bind(
+        Context::HistoryAxis,
+        Key::code(KeyCode::Down),
+        Action::Down,
+        "",
+        "następny krok",
+    ),
+    bind(
+        Context::HistoryAxis,
+        Key::char('k'),
+        Action::Up,
+        "",
+        "poprzedni krok",
+    ),
+    bind(
+        Context::HistoryAxis,
+        Key::code(KeyCode::Up),
+        Action::Up,
+        "",
+        "poprzedni krok",
+    ),
+    bind(
+        Context::HistoryAxis,
+        Key::char('g'),
+        Action::Top,
+        "",
+        "pierwszy krok",
+    ),
+    bind(
+        Context::HistoryAxis,
+        Key::char('G'),
+        Action::Bottom,
+        "",
+        "ostatni krok",
+    ),
+    bind(
+        Context::HistoryAxis,
+        Key::code(KeyCode::Enter),
+        Action::EnterStep,
+        "rozmowa kroku",
+        "wejdź do rozmowy wybranego kroku",
+    ),
+    bind(
+        Context::HistoryAxis,
+        Key::code(KeyCode::Right),
+        Action::EnterStep,
+        "",
+        "wejdź do rozmowy wybranego kroku",
+    ),
+    // The conversation of the step picked on the timeline.
+    bind(
+        Context::StepConversation,
+        Key::code(KeyCode::Esc),
+        Action::LeaveStep,
+        "oś",
+        "wróć na oś, do tego samego kroku",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::code(KeyCode::Left),
+        Action::LeaveStep,
+        "",
+        "wróć na oś, do tego samego kroku",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::char('j'),
+        Action::Down,
+        "przewijanie",
+        "przewiń w dół",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::code(KeyCode::Down),
+        Action::Down,
+        "",
+        "przewiń w dół",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::char('k'),
+        Action::Up,
+        "",
+        "przewiń w górę",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::code(KeyCode::Up),
+        Action::Up,
+        "",
+        "przewiń w górę",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::code(KeyCode::PageDown),
+        Action::PageDown,
+        "",
+        "strona w dół",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::code(KeyCode::PageUp),
+        Action::PageUp,
+        "",
+        "strona w górę",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::char('g'),
+        Action::Top,
+        "",
+        "na początek",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::char('G'),
+        Action::Bottom,
+        "",
+        "na koniec",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::code(KeyCode::Enter),
+        Action::Expand,
+        "rozwiń",
+        "rozwiń albo zwiń wpis",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::char(' '),
+        Action::Expand,
+        "",
+        "rozwiń albo zwiń wpis",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::char('v'),
+        Action::RawEntry,
+        "",
+        "widok surowy wpisu",
+    ),
+    bind(
+        Context::StepConversation,
+        Key::ctrl('v'),
+        Action::RawAll,
+        "",
+        "widok surowy całości",
+    ),
+    // Every other tab: reading what it shows.
+    bind(
+        Context::Reading,
+        Key::code(KeyCode::Esc),
+        Action::Back,
+        "lista",
+        "wróć na listę",
+    ),
+    bind(
+        Context::Reading,
+        Key::char('j'),
+        Action::Down,
+        "przewijanie",
+        "przewiń w dół",
+    ),
+    bind(
+        Context::Reading,
+        Key::code(KeyCode::Down),
+        Action::Down,
+        "",
+        "przewiń w dół",
+    ),
+    bind(
+        Context::Reading,
+        Key::char('k'),
+        Action::Up,
+        "",
+        "przewiń w górę",
+    ),
+    bind(
+        Context::Reading,
+        Key::code(KeyCode::Up),
+        Action::Up,
+        "",
+        "przewiń w górę",
+    ),
+    bind(
+        Context::Reading,
+        Key::code(KeyCode::PageDown),
+        Action::PageDown,
+        "",
+        "strona w dół",
+    ),
+    bind(
+        Context::Reading,
+        Key::code(KeyCode::PageUp),
+        Action::PageUp,
+        "",
+        "strona w górę",
+    ),
+    bind(
+        Context::Reading,
+        Key::char('g'),
+        Action::Top,
+        "",
+        "na początek",
+    ),
+    bind(
+        Context::Reading,
+        Key::char('G'),
+        Action::Bottom,
+        "",
+        "na koniec",
+    ),
+    bind(
+        Context::Reading,
+        Key::code(KeyCode::Enter),
+        Action::Expand,
+        "rozwiń",
+        "rozwiń albo zwiń wpis",
+    ),
+    bind(
+        Context::Reading,
+        Key::char(' '),
+        Action::Expand,
+        "",
+        "rozwiń albo zwiń wpis",
+    ),
+    bind(
+        Context::Reading,
+        Key::char('v'),
+        Action::RawEntry,
+        "",
+        "widok surowy wpisu",
+    ),
+    bind(
+        Context::Reading,
+        Key::ctrl('v'),
+        Action::RawAll,
+        "",
+        "widok surowy całości",
+    ),
+    bind(
+        Context::Reading,
+        Key::char('f'),
+        Action::Follow,
+        "",
+        "na koniec i dalej za nowymi wpisami",
     ),
     // The repositories: a list and a description, `a` adds, `d` removes. The
     // list itself is the chooser, which reads the panel's keys for moving.
@@ -1450,39 +1698,41 @@ pub fn newline_keys() -> Vec<&'static str> {
     }
 }
 
-/// What `event` does in `context`: the context's own keys first, then the
-/// global ones where the context inherits them.
-pub fn lookup(context: Context, event: &KeyEvent) -> Option<Action> {
-    lookup_in(BINDINGS, context, event)
+/// What `event` does in `stack`: the layer's keys first, then the base's,
+/// then the global ones where the base inherits them.
+pub fn lookup(stack: impl Into<Stack>, event: &KeyEvent) -> Option<Action> {
+    lookup_in(BINDINGS, stack, event)
 }
 
 /// [`lookup`] over an arbitrary table.
-pub fn lookup_in(bindings: &[Binding], context: Context, event: &KeyEvent) -> Option<Action> {
-    if matches!(context, Context::Panel | Context::Form) && is_newline(event) {
+pub fn lookup_in(
+    bindings: &[Binding],
+    stack: impl Into<Stack>,
+    event: &KeyEvent,
+) -> Option<Action> {
+    let stack = stack.into();
+    if matches!(stack.base, Context::Panel | Context::Form) && is_newline(event) {
         return Some(Action::Newline);
     }
-    let own = bindings
-        .iter()
-        .find(|binding| binding.context == context && binding.key.matches(event));
-    let inherited = || {
-        context
-            .inherits_global()
-            .then(|| {
-                bindings.iter().find(|binding| {
-                    binding.context == Context::Global && binding.key.matches(event)
-                })
-            })
-            .flatten()
-    };
-    own.or_else(inherited).map(|binding| binding.action)
+    stack
+        .scopes()
+        .into_iter()
+        .find_map(|scope| {
+            bindings
+                .iter()
+                .find(|binding| binding.context == scope && binding.key.matches(event))
+        })
+        .map(|binding| binding.action)
 }
 
-/// The first key that does `action` in `context`, as it is written in the
-/// bar and in help; for text that names a key.
-pub fn key_of(context: Context, action: Action) -> Option<String> {
-    let binding = BINDINGS
-        .iter()
-        .find(|binding| binding.context == context && binding.action == action)?;
+/// The first key that does `action` in `stack`, as it is written in the bar
+/// and in help; for text that names a key.
+pub fn key_of(stack: impl Into<Stack>, action: Action) -> Option<String> {
+    let binding = stack.into().scopes().into_iter().find_map(|scope| {
+        BINDINGS
+            .iter()
+            .find(|binding| binding.context == scope && binding.action == action)
+    })?;
     Some(if action == Action::Newline {
         newline_keys().join("/")
     } else {
@@ -1490,39 +1740,50 @@ pub fn key_of(context: Context, action: Action) -> Option<String> {
     })
 }
 
-/// Why a table is not consistent: one message per problem.
+/// Why a table is not consistent: one message per problem. Every stack the
+/// interface can be in ([`Stack::all`]) is checked whole, so a key may not
+/// mean two things in one context, nor in a layer and its base, nor shadow a
+/// global key.
 pub fn check_consistency(bindings: &[Binding]) -> Result<(), Vec<String>> {
     let mut problems = Vec::new();
-    for (index, binding) in bindings.iter().enumerate() {
-        let label = binding.key.display();
+    for binding in bindings {
         if binding.description.trim().is_empty() {
             problems.push(format!(
-                "({}, {label}) has no description",
-                binding.context.name()
+                "({}, {}) has no description",
+                binding.context.name(),
+                binding.key.display()
             ));
         }
-        for other in &bindings[..index] {
-            if other.key != binding.key {
-                continue;
-            }
-            if other.context == binding.context {
-                problems.push(format!(
-                    "({}, {label}) is bound twice: {:?} and {:?}",
-                    binding.context.name(),
-                    other.action,
-                    binding.action
-                ));
-            } else if [other.context, binding.context].contains(&Context::Global) {
-                let shadowing = if other.context == Context::Global {
-                    binding.context
+    }
+    for stack in Stack::all() {
+        // In the order a key is looked up: an earlier row shadows a later one.
+        let rows: Vec<&Binding> = stack
+            .scopes()
+            .into_iter()
+            .flat_map(|scope| bindings.iter().filter(move |row| row.context == scope))
+            .collect();
+        for (index, binding) in rows.iter().enumerate() {
+            let label = binding.key.display();
+            for other in rows[..index]
+                .iter()
+                .filter(|other| other.key == binding.key)
+            {
+                let problem = if other.context == binding.context {
+                    format!(
+                        "({}, {label}) is bound twice: {:?} and {:?}",
+                        binding.context.name(),
+                        other.action,
+                        binding.action
+                    )
                 } else {
-                    other.context
+                    format!(
+                        "({}, {label}) shadows ({}, {label})",
+                        other.context.name(),
+                        binding.context.name()
+                    )
                 };
-                if shadowing.inherits_global() {
-                    problems.push(format!(
-                        "({}, {label}) shadows the global {label}",
-                        shadowing.name()
-                    ));
+                if !problems.contains(&problem) {
+                    problems.push(problem);
                 }
             }
         }
@@ -1547,20 +1808,16 @@ pub struct HelpEntry {
     pub description: &'static str,
 }
 
-/// The help for `context`: its own keys, then the global ones it inherits.
-/// Keys that do the same thing are written on one line.
-pub fn help_entries(context: Context) -> Vec<HelpEntry> {
-    help_entries_in(BINDINGS, context)
+/// The help for `stack`: the layer's keys, the base's, then the global ones
+/// the base inherits. Keys that do the same thing are written on one line.
+pub fn help_entries(stack: impl Into<Stack>) -> Vec<HelpEntry> {
+    help_entries_in(BINDINGS, stack)
 }
 
 /// [`help_entries`] over an arbitrary table.
-pub fn help_entries_in(bindings: &[Binding], context: Context) -> Vec<HelpEntry> {
-    let mut contexts = vec![context];
-    if context.inherits_global() {
-        contexts.push(Context::Global);
-    }
+pub fn help_entries_in(bindings: &[Binding], stack: impl Into<Stack>) -> Vec<HelpEntry> {
     let mut entries: Vec<(Context, Action, Vec<String>, &Binding)> = Vec::new();
-    for scope in contexts {
+    for scope in stack.into().scopes() {
         for binding in bindings.iter().filter(|binding| binding.context == scope) {
             let key = binding.key.display();
             match entries.iter_mut().find(|(entry_scope, action, ..)| {
@@ -1586,10 +1843,10 @@ pub fn help_entries_in(bindings: &[Binding], context: Context) -> Vec<HelpEntry>
         .collect()
 }
 
-/// The shortcut bar for `context`: `key label` pairs, in table order, only
-/// the rows that carry a label.
-pub fn hints(context: Context) -> Vec<(String, &'static str)> {
-    help_entries(context)
+/// The shortcut bar for `stack`: `key label` pairs, in the order of help,
+/// only the rows that carry a label.
+pub fn hints(stack: impl Into<Stack>) -> Vec<(String, &'static str)> {
+    help_entries(stack)
         .into_iter()
         .filter(|entry| !entry.label.is_empty())
         .map(|entry| (entry.keys, entry.label))
@@ -1599,10 +1856,10 @@ pub fn hints(context: Context) -> Vec<(String, &'static str)> {
 /// The shortcut bar as one line that fits `width` columns: the keys on the
 /// focus accent, the labels plain. Hints that do not fit are dropped from
 /// the end, so the first ones — the ones that matter — stay.
-pub fn hint_line(context: Context, styles: &Styles, width: usize) -> Line<'static> {
+pub fn hint_line(stack: impl Into<Stack>, styles: &Styles, width: usize) -> Line<'static> {
     let mut spans = Vec::new();
     let mut used = 0;
-    for (keys, label) in hints(context) {
+    for (keys, label) in hints(stack) {
         let needed = keys.chars().count() + label.chars().count() + 3;
         if used + needed > width {
             break;
@@ -1614,9 +1871,9 @@ pub fn hint_line(context: Context, styles: &Styles, width: usize) -> Line<'stati
     Line::from(spans)
 }
 
-/// Draws the `?` help for `context` as a bordered overlay over `area`.
-pub fn render_help(frame: &mut Frame, area: Rect, context: Context, styles: &Styles) {
-    let entries = help_entries(context);
+/// Draws the `?` help for `stack` as a bordered overlay over `area`.
+pub fn render_help(frame: &mut Frame, area: Rect, stack: impl Into<Stack>, styles: &Styles) {
+    let entries = help_entries(stack);
     let keys_width = entries
         .iter()
         .map(|entry| entry.keys.chars().count())

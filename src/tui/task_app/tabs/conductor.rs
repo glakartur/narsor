@@ -54,7 +54,7 @@ use crate::conductor::{ChatEntry, ConductorView, ConductorWork};
 use crate::controller_protocol::{ConductorReadResponse, TaskSummary};
 use crate::domain::ConductorPurpose;
 use crate::orchestration::{OperatorCommand, OperatorCommandStatus};
-use crate::tui::chat::{tab_entry, tab_items, undo_lines, ChatItem};
+use crate::tui::chat::{tab_entry, tab_items, undo_lines, ChatItem, TAB_KEYS};
 use crate::tui::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
 use crate::tui::keymap::{key_of, Action, Context};
 use crate::tui::style::{Role, Styles};
@@ -529,9 +529,8 @@ fn key_line(conductor: &Conductor, ready: bool, styles: &Styles) -> Line<'static
         parts.extend(named(Action::Newline, "nowa linia"));
         parts.extend(named(Action::Cancel, "koniec pisania"));
     } else {
-        let named = |action, what: &str| {
-            key_of(Context::Details, action).map(|key| format!("{key} {what}"))
-        };
+        let named =
+            |action, what: &str| key_of(TAB_KEYS, action).map(|key| format!("{key} {what}"));
         if ready {
             parts.extend(named(Action::Compose, "napisz"));
             parts.extend(named(Action::UndoDecision, "cofnij decyzję"));
@@ -689,7 +688,7 @@ impl TaskApp {
             return Request::None;
         };
         if self.detail.tab != DetailTab::Conductor {
-            let key = key_of(Context::Details, action).unwrap_or_default();
+            let key = key_of(TAB_KEYS, action).unwrap_or_default();
             self.notify(
                 Severity::Warning,
                 format!("{key}: to działa w zakładce Dyrygent"),

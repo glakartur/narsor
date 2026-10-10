@@ -15,11 +15,15 @@ use crate::conductor::{
     ProposalView,
 };
 use crate::domain::{ConductorDecisionKind, Confidence};
-use crate::tui::keymap::{key_of, Action, Context};
+use crate::tui::keymap::{key_of, Action, Context, Stack};
 use crate::tui::scroll::{one_line, sanitize};
 use crate::tui::transcript::{
     utterance_header, TranscriptEntry, TranscriptEntryId, TranscriptPresentation,
 };
+
+/// The keys in force on the *Dyrygent* tab, which its text names: the task
+/// details read through the reading layer.
+pub const TAB_KEYS: Stack = Stack::layered(Context::Reading, Context::Details);
 
 /// The `kind` a chat decision entry records for a carried-out proposal.
 const EXECUTED: &str = "execute_proposal";
@@ -245,7 +249,7 @@ pub fn tab_entry(item: &ChatItem, proposal: Option<&ProposalView>) -> Transcript
         ChatEntryKind::Decision => match &item.undo {
             Some(UndoState::Undone) => lines.push("(decyzja cofnięta)".to_string()),
             Some(UndoState::Undoable { .. }) => {
-                lines.push(match key_of(Context::Details, Action::UndoDecision) {
+                lines.push(match key_of(TAB_KEYS, Action::UndoDecision) {
                     Some(key) => format!("(decyzja; {key} — cofnij)"),
                     None => "(decyzja)".to_string(),
                 });

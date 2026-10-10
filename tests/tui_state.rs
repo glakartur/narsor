@@ -470,6 +470,7 @@ mod foundations {
 
     use narsor::tui::keymap::{
         self, bind, check_consistency, help_entries, hints, lookup, Action, Binding, Context, Key,
+        Stack,
     };
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -592,6 +593,141 @@ mod foundations {
                 );
                 assert_eq!(lookup(context, &press(KeyCode::Right)), None, "{context:?}");
             }
+        }
+
+        fn step_conversation() -> Stack {
+            Stack::layered(Context::StepConversation, Context::Details)
+        }
+
+        fn stack_keys(stack: Stack) -> Vec<String> {
+            help_entries(stack)
+                .iter()
+                .flat_map(|entry| entry.keys.split('/').map(str::to_string))
+                .collect()
+        }
+
+        #[test]
+        fn every_stack_has_its_layer_first_then_its_base_then_the_global_keys() {
+            for stack in Stack::LAYERED {
+                assert!(stack.layer.is_some_and(Context::is_layer), "{stack:?}");
+                assert_eq!(
+                    stack.scopes(),
+                    [stack.layer.unwrap(), stack.base, Context::Global]
+                );
+                assert_eq!(
+                    lookup(stack, &press(KeyCode::Char('?'))),
+                    Some(Action::Help)
+                );
+                assert_eq!(
+                    lookup(stack, &press(KeyCode::Char(']'))),
+                    Some(Action::NextTab),
+                    "{stack:?}: the base's keys work under every layer"
+                );
+            }
+            assert!(Stack::all().all(|stack| !stack.base.is_layer()));
+            assert_eq!(Stack::from(Context::Form).scopes(), [Context::Form]);
+        }
+
+        #[test]
+        fn the_axis_bar_enters_the_step_and_does_not_expand() {
+            let axis = Stack::layered(Context::Axis, Context::Details);
+            let bar = hints(axis);
+            assert_eq!(bar[0], ("Esc".to_string(), "lista"), "{bar:?}");
+            assert!(
+                bar.iter()
+                    .any(|(keys, label)| keys == "Enter/→" && *label == "rozmowa kroku"),
+                "{bar:?}"
+            );
+            assert!(bar.iter().all(|(_, label)| *label != "rozwiń"), "{bar:?}");
+            assert_eq!(
+                lookup(axis, &press(KeyCode::Right)),
+                Some(Action::EnterStep)
+            );
+            assert_eq!(
+                lookup(axis, &press(KeyCode::Char('f'))),
+                Some(Action::Follow)
+            );
+            for code in [
+                KeyCode::PageDown,
+                KeyCode::PageUp,
+                KeyCode::Char(' '),
+                KeyCode::Char('v'),
+            ] {
+                assert_eq!(lookup(axis, &press(code)), None, "{code:?} reads a step");
+            }
+        }
+
+        #[test]
+        fn the_step_conversation_reads_and_goes_back_to_the_axis() {
+            let bar = hints(step_conversation());
+            assert_eq!(bar[0], ("Esc/←".to_string(), "oś"), "{bar:?}");
+            let keys = stack_keys(step_conversation());
+            for expected in [
+                "PgUp", "PgDn", "v", "Ctrl+V", "Enter", "Space", "j", "g", "G",
+            ] {
+                assert!(
+                    keys.iter().any(|key| key == expected),
+                    "{expected}: {keys:?}"
+                );
+            }
+            assert!(!keys.iter().any(|key| key == "f"), "{keys:?}");
+            assert_eq!(
+                lookup(step_conversation(), &press(KeyCode::Left)),
+                Some(Action::LeaveStep)
+            );
+            assert_eq!(
+                lookup(step_conversation(), &press(KeyCode::Esc)),
+                Some(Action::LeaveStep),
+                "the layer's Esc is the only one in the stack"
+            );
+            assert_eq!(
+                lookup(step_conversation(), &press(KeyCode::Char('f'))),
+                None
+            );
+        }
+
+        #[test]
+        fn the_history_has_the_same_layers_without_the_tasks_actions_or_following() {
+            for layer in [
+                Context::HistoryAxis,
+                Context::StepConversation,
+                Context::Reading,
+            ] {
+                let stack = Stack::layered(layer, Context::HistoryDetails);
+                let keys = stack_keys(stack);
+                for task_only in ["p", "x", "t", "s", "a", ".", "m", "c"] {
+                    assert!(
+                        !keys.iter().any(|key| key == task_only),
+                        "{task_only} in {stack:?}: {keys:?}"
+                    );
+                }
+                assert!(keys.iter().any(|key| key == "w"), "{stack:?}");
+            }
+            let axis = Stack::layered(Context::HistoryAxis, Context::HistoryDetails);
+            assert!(!stack_keys(axis).iter().any(|key| key == "f"));
+            assert_eq!(
+                lookup(axis, &press(KeyCode::Enter)),
+                Some(Action::EnterStep)
+            );
+        }
+
+        #[test]
+        fn a_key_in_a_layer_and_in_its_base_breaks_the_consistency_check() {
+            let mut table: Vec<Binding> = keymap::BINDINGS.to_vec();
+            table.push(bind(
+                Context::Details,
+                Key::char('v'),
+                Action::PauseResume,
+                "",
+                "a second meaning",
+            ));
+            let problems = check_consistency(&table).expect_err("a shadowed key is refused");
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem == "(czytanie, v) shadows (szczegóły, v)"),
+                "{problems:?}"
+            );
         }
 
         #[test]
@@ -3049,6 +3185,30 @@ mod task_app_detail {
     mod tab_keys {
         use super::*;
 
+        use narsor::tui::keymap::{self, Action, Context, Stack};
+
+        fn screen(app: &mut TaskApp, width: u16, height: u16) -> String {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    narsor::tui::task_app::layout::render(
+                        frame,
+                        app,
+                        &Styles::new(false),
+                        std::time::Instant::now(),
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            buffer
+                .content()
+                .chunks(usize::from(width))
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
         #[test]
         fn brackets_switch_the_tabs_and_wrap_round() {
             let mut app = details_app();
@@ -3058,6 +3218,67 @@ mod task_app_detail {
             ch(&mut app, '[');
             ch(&mut app, '[');
             assert_eq!(app.detail().tab(), DetailTab::Info, "wraps round");
+        }
+
+        #[test]
+        fn przebieg_has_the_axis_layer_and_every_other_tab_the_reading_one() {
+            let mut app = details_app();
+            assert_eq!(
+                app.key_context(),
+                Stack::layered(Context::Axis, Context::Details)
+            );
+            for tab in [
+                DetailTab::Conversation,
+                DetailTab::Events,
+                DetailTab::Conductor,
+                DetailTab::Info,
+            ] {
+                app.detail_mut().set_tab(tab);
+                assert_eq!(
+                    app.key_context(),
+                    Stack::layered(Context::Reading, Context::Details),
+                    "{tab:?}"
+                );
+            }
+            // Reading the conversation: the keys of the tab, as before.
+            app.detail_mut().set_tab(DetailTab::Conversation);
+            for (key, action) in [
+                (KeyCode::Char('j'), Action::Down),
+                (KeyCode::Enter, Action::Expand),
+                (KeyCode::Char('v'), Action::RawEntry),
+                (KeyCode::Esc, Action::Back),
+            ] {
+                assert_eq!(
+                    keymap::lookup(app.key_context(), &KeyEvent::from(key)),
+                    Some(action)
+                );
+            }
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.focus(), Focus::List);
+        }
+
+        #[test]
+        fn on_the_axis_j_picks_the_step_and_enter_stays_on_it() {
+            let mut app = details_app();
+            read_timeline(&mut app, "a", 1, &["plan", "edit", "review"], "review #1");
+            ch(&mut app, 'k');
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("edit #1"));
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::PageDown);
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("edit #1"));
+            assert_eq!(app.detail().tab(), DetailTab::Progress);
+            assert_eq!(app.focus(), Focus::Details);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.focus(), Focus::List);
+        }
+
+        #[test]
+        fn the_bar_of_the_axis_offers_the_step_conversation() {
+            let mut app = details_app();
+            let screen = screen(&mut app, 120, 30);
+            assert!(screen.contains("Enter/→ rozmowa kroku"), "{screen}");
+            assert!(!screen.contains("rozwiń"), "{screen}");
         }
 
         #[test]
@@ -3982,10 +4203,10 @@ mod task_app_waiting {
     #[test]
     fn untyped_keys_of_the_panel_are_the_keymaps() {
         let mut app = gate_app();
-        assert_eq!(app.key_context(), narsor::tui::keymap::Context::Panel);
+        assert_eq!(app.key_context().base, narsor::tui::keymap::Context::Panel);
         press(&mut app, KeyCode::Enter);
         assert_eq!(
-            app.key_context(),
+            app.key_context().base,
             narsor::tui::keymap::Context::Form,
             "typing inherits no global key"
         );
@@ -4513,7 +4734,7 @@ mod task_app_actions {
             );
             assert!(by_label("archiwizuj").unavailable.is_some());
             assert!(by_label("otwórz link").unavailable.is_some());
-            assert_eq!(app.key_context(), Context::Menu);
+            assert_eq!(app.key_context().base, Context::Menu);
         }
 
         #[test]
@@ -4549,7 +4770,7 @@ mod task_app_actions {
             assert_eq!(app.overlay().unwrap().chooser().unwrap().selected(), 3);
             press(&mut app, KeyCode::Esc);
             assert!(app.overlay().is_none());
-            assert_eq!(app.key_context(), Context::List);
+            assert_eq!(app.key_context().base, Context::List);
         }
 
         #[test]
@@ -4748,7 +4969,7 @@ mod task_app_actions {
             let text = window.lines().join(" ");
             assert!(text.contains("„review”"), "the step it cuts short: {text}");
             assert!(text.contains("NAR-12"), "{text}");
-            assert_eq!(app.key_context(), Context::Confirm);
+            assert_eq!(app.key_context().base, Context::Confirm);
 
             let request = act(ch(&mut app, 'y'));
             assert_eq!(
@@ -4759,7 +4980,7 @@ mod task_app_actions {
             assert_eq!(request.generation, 1);
             assert!(!request.key.is_empty());
             assert!(app.overlay().is_none());
-            assert_eq!(app.key_context(), Context::List);
+            assert_eq!(app.key_context().base, Context::List);
         }
 
         #[test]
@@ -4795,7 +5016,7 @@ mod task_app_actions {
             for (key, task) in [('x', running("a", 1)), ('a', finished("a", 1))] {
                 let mut app = loaded(task);
                 ch(&mut app, key);
-                assert_eq!(app.key_context(), Context::Confirm, "{key}");
+                assert_eq!(app.key_context().base, Context::Confirm, "{key}");
                 assert!(matches!(
                     app.overlay().unwrap().confirmation().unwrap().confirmed(),
                     Confirmed::Act(_)
@@ -4956,7 +5177,11 @@ mod task_app_actions {
             // Down to the reason, type it, send.
             press(&mut app, KeyCode::Down);
             typed(&mut app, "CI nie ruszy bez tego");
-            assert_eq!(app.key_context(), Context::Form, "typing: q and ? are text");
+            assert_eq!(
+                app.key_context().base,
+                Context::Form,
+                "typing: q and ? are text"
+            );
             assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
             let window = confirmation(&app);
             assert!(window.heading().contains("Override"));
@@ -5889,7 +6114,7 @@ mod task_app_conductor {
             ch(&mut app, 'c');
             assert!(conductor(&app).is_typing());
             assert_eq!(
-                app.key_context(),
+                app.key_context().base,
                 Context::Form,
                 "typing inherits no global key"
             );
@@ -7231,9 +7456,9 @@ mod task_app_create {
         fn keys_in_the_form_are_the_choosers_and_q_is_text_in_a_field() {
             let mut app = app_with(vec![]);
             open_form(&mut app);
-            assert_eq!(app.key_context(), Context::Panel);
+            assert_eq!(app.key_context().base, Context::Panel);
             press(&mut app, KeyCode::Tab);
-            assert_eq!(app.key_context(), Context::Form);
+            assert_eq!(app.key_context().base, Context::Form);
             ch(&mut app, 'q');
             assert!(!app.should_quit());
             assert_eq!(field_value(&app, "implement-feature", "ticket_id"), "q");
@@ -7749,7 +7974,7 @@ mod task_app_create {
         fn an_archived_task_has_the_tabs_read_only_and_says_its_storage_is_gone() {
             let mut app = opened();
             press(&mut app, KeyCode::Enter);
-            assert_eq!(app.key_context(), Context::HistoryDetails);
+            assert_eq!(app.key_context().base, Context::HistoryDetails);
             for (tab, expected) in [
                 (DetailTab::Progress, "storage usunięty przy archiwizacji"),
                 (
@@ -7778,7 +8003,7 @@ mod task_app_create {
             assert_eq!(app.focus(), narsor::tui::task_app::Focus::Details);
             press(&mut app, KeyCode::Esc);
             assert_eq!(app.view_kind(), ViewKind::History);
-            assert_eq!(app.key_context(), Context::History);
+            assert_eq!(app.key_context().base, Context::History);
             press(&mut app, KeyCode::Esc);
             assert_eq!(app.view_kind(), ViewKind::Tasks);
             assert_eq!(app.list().selected_id(), Some("a"));
@@ -7874,6 +8099,8 @@ mod task_app_create {
             assert!(screen.contains("historia jest pusta"), "{screen}");
         }
 
+        use narsor::tui::keymap::Stack;
+
         #[test]
         fn brackets_switch_the_tabs_from_the_history_list_and_its_details() {
             let mut app = opened();
@@ -7882,17 +8109,28 @@ mod task_app_create {
             press(&mut app, KeyCode::Enter);
             ch(&mut app, ']');
             assert_eq!(app.history().unwrap().tab(), DetailTab::Events);
+            assert_eq!(
+                app.key_context(),
+                Stack::layered(Context::Reading, Context::HistoryDetails)
+            );
             ch(&mut app, '[');
             ch(&mut app, '[');
             assert_eq!(app.history().unwrap().tab(), DetailTab::Progress);
+            assert_eq!(
+                app.key_context(),
+                Stack::layered(Context::HistoryAxis, Context::HistoryDetails),
+                "the timeline of a closed run"
+            );
             press(&mut app, KeyCode::Right);
             assert_eq!(app.history().unwrap().tab(), DetailTab::Progress);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.key_context(), Stack::from(Context::History));
         }
 
         #[test]
         fn keys_and_help_of_the_history_come_from_the_map() {
             let app = opened();
-            assert_eq!(app.key_context(), Context::History);
+            assert_eq!(app.key_context().base, Context::History);
             let keys = keymap::hints(Context::History);
             assert!(keys.iter().any(|(_, label)| *label == "wznów"));
             assert_eq!(
@@ -8536,7 +8774,7 @@ mod task_app_create {
             app.open_repositories(narsor_registry());
             assert_eq!(app.view_kind(), ViewKind::Repositories);
             assert_eq!(names(&app), ["docs", "narsor"]);
-            assert_eq!(app.key_context(), Context::Repositories);
+            assert_eq!(app.key_context().base, Context::Repositories);
             let screen = screen(&mut app, 130, 30);
             for expected in [
                 "Repozytoria (2)",
@@ -8576,7 +8814,7 @@ mod task_app_create {
                 .expect("the window");
             assert!(window.heading().contains("Usuń repozytorium"));
             assert!(window.lines().iter().any(|line| line.contains("narsor")));
-            assert_eq!(app.key_context(), Context::Confirm);
+            assert_eq!(app.key_context().base, Context::Confirm);
             assert_eq!(ch(&mut app, 'n'), Request::None);
             assert!(app.overlay().is_none());
             // The window survives a re-read of the task list.
@@ -8611,7 +8849,7 @@ mod task_app_create {
             ch(&mut app, 'a');
             press(&mut app, KeyCode::Enter);
             typed(&mut app, "docs-2");
-            assert_eq!(app.key_context(), Context::Form);
+            assert_eq!(app.key_context().base, Context::Form);
             assert!(app.detail().has_drafts());
             press(&mut app, KeyCode::Esc);
             assert!(app.repositories().unwrap().form().is_none());
@@ -9056,7 +9294,7 @@ mod task_app_harness {
             )),
         );
         ch(&mut app, 'c');
-        assert_eq!(app.key_context(), Context::Form);
+        assert_eq!(app.key_context().base, Context::Form);
         assert_eq!(ch(&mut app, 'h'), Request::None);
         assert!(app.overlay().is_none());
         assert_eq!(app.detail().draft("a"), Some("h"));
@@ -9085,7 +9323,7 @@ mod task_app_harness {
         press(&mut app, KeyCode::Enter);
         assert!(app.panel_focused());
         press(&mut app, KeyCode::Tab);
-        assert_eq!(app.key_context(), Context::Form);
+        assert_eq!(app.key_context().base, Context::Form);
         assert_eq!(ch(&mut app, 'h'), Request::None);
         assert!(app.overlay().is_none());
         assert!(
@@ -9116,7 +9354,7 @@ mod task_app_harness {
             registry(vec![]),
         );
         press(&mut app, KeyCode::Tab);
-        assert_eq!(app.key_context(), Context::Form);
+        assert_eq!(app.key_context().base, Context::Form);
         assert_eq!(ch(&mut app, 'h'), Request::None);
         assert!(app.overlay().is_none());
         assert!(app.detail().has_drafts(), "the letter went into the field");

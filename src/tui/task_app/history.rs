@@ -46,7 +46,7 @@ use crate::controller_protocol::{
 use crate::domain::{Event, ExecutionStatus, TaskId};
 use crate::engine::Timeline;
 
-use super::super::keymap::{self, Action, Context};
+use super::super::keymap::{self, Action, Context, Stack};
 use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 use super::detail::TaskDetail;
@@ -55,7 +55,7 @@ use super::list::{fit, row_text, title_of, Attention, RowText, StateIcon};
 use super::notify::Severity;
 use super::tabs::conversation::{read_history_attempt, AttemptRead};
 use super::tabs::events;
-use super::{DetailTab, DetailView, Focus, Request, TaskApp, View};
+use super::{detail_keys, DetailTab, DetailView, Focus, Request, TaskApp, View};
 
 /// Pages of an old conductor's chat read in one go.
 const CHAT_PAGES: usize = 10;
@@ -395,11 +395,11 @@ impl TaskApp {
         );
     }
 
-    /// The context whose keys apply while the history is open.
-    pub(super) fn history_context(&self) -> Option<Context> {
+    /// The keys that apply while the history is open.
+    pub(super) fn history_context(&self) -> Option<Stack> {
         match &self.view {
-            View::History(_) if self.focus == Focus::List => Some(Context::History),
-            View::History(_) => Some(Context::HistoryDetails),
+            View::History(_) if self.focus == Focus::List => Some(Context::History.into()),
+            View::History(history) => Some(detail_keys(Context::HistoryDetails, history.tab)),
             _ => None,
         }
     }
@@ -410,12 +410,13 @@ impl TaskApp {
         key: crossterm::event::KeyEvent,
         confirming_quit: bool,
     ) -> Request {
-        let Some(context) = self.history_context() else {
+        let Some(keys) = self.history_context() else {
             return Request::None;
         };
-        let Some(action) = keymap::lookup(context, &key) else {
+        let Some(action) = keymap::lookup(keys, &key) else {
             return Request::None;
         };
+        let context = keys.base;
         match action {
             Action::Help => self.help_open = true,
             Action::Quit => self.on_quit(confirming_quit),

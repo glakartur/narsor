@@ -112,7 +112,7 @@ use crate::controller_protocol::{
 use crate::orchestration::MoveTarget;
 
 use super::connection::Connection;
-use super::keymap::{self, Action, Context};
+use super::keymap::{self, Action, Context, Stack};
 use super::refresh::RefreshSchedule;
 use super::scroll::one_line;
 use actions::{availability, ActionRequest, Availability, LinkRequest, Overlay, TaskAction};
@@ -175,6 +175,17 @@ impl DetailTab {
         let count = Self::ALL.len() as isize;
         Self::ALL[(at as isize + by).rem_euclid(count) as usize]
     }
+}
+
+/// The keys over the details `base` (the task's or the history's) while `tab`
+/// is shown: the timeline's on *Przebieg*, reading on every other tab.
+fn detail_keys(base: Context, tab: DetailTab) -> Stack {
+    let layer = match (tab, base) {
+        (DetailTab::Progress, Context::HistoryDetails) => Context::HistoryAxis,
+        (DetailTab::Progress, _) => Context::Axis,
+        _ => Context::Reading,
+    };
+    Stack::layered(layer, base)
 }
 
 /// What the details remember, which a refresh must not touch: the tab, and a
@@ -532,17 +543,20 @@ impl TaskApp {
         }
     }
 
-    /// The context whose keys apply now.
-    pub fn key_context(&self) -> Context {
+    /// The keys that apply now: the context, and over the details the layer
+    /// of the tab shown.
+    pub fn key_context(&self) -> Stack {
         if let Some(overlay) = &self.overlay {
-            return overlay.context();
+            return overlay.context().into();
         }
         if let Some(context) = self
             .new_task_context()
-            .or_else(|| self.history_context())
             .or_else(|| self.repositories_context())
         {
-            return context;
+            return context.into();
+        }
+        if let Some(stack) = self.history_context() {
+            return stack;
         }
         if self.panel_focused() {
             // Typing into a field: `q` and `?` are text, not commands.
@@ -550,12 +564,16 @@ impl TaskApp {
                 Context::Form
             } else {
                 Context::Panel
-            };
+            }
+            .into();
         }
         if self.conductor_typing() {
-            return Context::Form;
+            return Context::Form.into();
         }
-        layout::context_of(self.focus, &self.list)
+        match layout::context_of(self.focus, &self.list) {
+            Context::Details => detail_keys(Context::Details, self.detail.tab),
+            context => context.into(),
+        }
     }
 
     /// Whether an action that changes state may run now; otherwise the reason
@@ -600,10 +618,11 @@ impl TaskApp {
         if self.conductor_typing() {
             return self.on_conductor_typing_key(key);
         }
-        let context = self.key_context();
-        let Some(action) = keymap::lookup(context, &key) else {
+        let keys = self.key_context();
+        let Some(action) = keymap::lookup(keys, &key) else {
             return Request::None;
         };
+        let context = keys.base;
         match action {
             Action::Help => self.help_open = true,
             Action::Quit => self.on_quit(confirming_quit),
@@ -616,6 +635,8 @@ impl TaskApp {
             | Action::RawEntry
             | Action::RawAll
             | Action::Follow
+            | Action::EnterStep
+            | Action::LeaveStep
                 if context == Context::Details =>
             {
                 self.on_detail_action(action)

@@ -190,6 +190,9 @@ impl TaskDetail {
             Action::Top => self.progress.first(),
             Action::Bottom => self.progress.last(),
             Action::Follow => self.progress.toggle_follow(),
+            // The details do not know a level of focus yet: the timeline
+            // keeps it, and its keys are the axis layer's.
+            Action::EnterStep | Action::LeaveStep => {}
             other => {
                 let attempt = self
                     .progress
