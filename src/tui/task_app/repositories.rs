@@ -510,7 +510,7 @@ pub fn render(
     .areas(inner);
     frame.render_widget(Paragraph::new(failures), header);
     match repositories.adding.as_mut() {
-        Some(form) => chooser::render(frame, body, form, styles),
-        None => chooser::render(frame, body, &mut repositories.chooser, styles),
+        Some(form) => chooser::render(frame, body, form, styles, focused),
+        None => chooser::render(frame, body, &mut repositories.chooser, styles, focused),
     }
 }

@@ -877,6 +877,7 @@ pub fn render_details(
     let options = ViewOptions {
         stale,
         focused,
+        panel_focused: false,
         hyperlinks,
     };
     render_view(frame, inner, view, styles, options);

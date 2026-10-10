@@ -578,6 +578,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
     let panel_focused = app.panel_focused();
     let frame_focused = app.focus() == Focus::Details;
     let focused = frame_focused && !panel_focused;
+    let panel_has_keys = frame_focused && panel_focused;
     let hyperlinks = app.detail().hyperlinks();
     // A task created here that the server has not confirmed has no summary
     // yet: its row says where it stands (the new-task form).
@@ -617,6 +618,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
     let options = ViewOptions {
         stale,
         focused,
+        panel_focused: panel_has_keys,
         hyperlinks,
     };
     render_view(frame, inner, view, styles, options);
@@ -629,6 +631,8 @@ pub(super) struct ViewOptions {
     pub(super) stale: bool,
     /// The keys are in the tab's content.
     pub(super) focused: bool,
+    /// The keys are in the answer panel.
+    pub(super) panel_focused: bool,
     /// Links are written as OSC 8 hyperlinks.
     pub(super) hyperlinks: bool,
 }
@@ -645,6 +649,7 @@ pub(super) fn render_view(
     let ViewOptions {
         stale,
         focused,
+        panel_focused,
         hyperlinks,
     } = options;
     let panel_height = view
@@ -727,7 +732,7 @@ pub(super) fn render_view(
     if let Some(panel) = parts.panel {
         view.detail
             .waiting
-            .render(frame, panel, styles, stale, view.task.as_of);
+            .render(frame, panel, styles, stale, panel_focused, view.task.as_of);
     }
 }
 

@@ -8,9 +8,13 @@
 //!
 //! ```text
 //! ┌ Akcje ─────────────────┐ ┌ Opis ─────────────────────────────────┐
-//! │   approved             │ │ ↩ wraca do agenta: plan               │
-//! │ ▸ revise  ↩          ◆ │ │ Zakres wymaga poprawy. Agent planu    │
-//! │   reject               │ │ wznowi swoją sesję z Twoim komentarzem│
+//! │                        │ │ ↩ wraca do agenta: plan               │
+//! │   1 approved           │ │ Zakres wymaga poprawy. Agent planu    │
+//! │     ━━━━━━━━━━━━━━━━━━ │ │ wznowi swoją sesję z Twoim komentarzem│
+//! │ ┃ 2 revise ↩ ◆         │ │                                       │
+//! │     ━━━━━━━━━━━━━━━━━━ │ │                                       │
+//! │   3 reject !           │ │                                       │
+//! │                        │ │                                       │
 //! └────────────────────────┘ └───────────────────────────────────────┘
 //! Komentarz dla agenta (wymagany):
 //! > Uwzględnij migrację tabeli orders▏
@@ -18,6 +22,11 @@
 //!
 //! Beside a wide area the description sits to the right of the list; below
 //! [`SIDE_BY_SIDE_MIN_WIDTH`] columns it moves under the list.
+//!
+//! The list is a spaced list with a bracket around the highlighted entry
+//! ([`super::selection`]): thick while the keys are on it, thin otherwise.
+//! When it does not fit its pane it scrolls inside it, by whole entries,
+//! and keeps where it was across a rebuild (R17).
 //!
 //! # State and drawing are apart
 //!
@@ -50,6 +59,7 @@ mod inputs;
 use super::input_form::{cycle_option, text_backspace, text_insert, text_step};
 use super::keymap::{digit_of, lookup, Action, Context};
 use super::scroll::{one_line, sanitize, wrap_visible, ScrollState};
+use super::selection::{render_spaced_list, PREFIX_WIDTH};
 use super::style::{Role, Styles};
 
 /// The narrowest area in which the description still sits beside the list.
@@ -403,6 +413,9 @@ pub struct Chooser {
     /// The layout of a form of inputs: with the focus in the fields, the list
     /// folds into a strip and the fields take the screen.
     inputs_layout: bool,
+    /// The first entry in view: the list scrolls inside its pane, and a
+    /// rebuild keeps it where it was.
+    top: usize,
 }
 
 impl Chooser {
@@ -415,6 +428,7 @@ impl Chooser {
             field: 0,
             description_scroll: ScrollState::new(),
             inputs_layout: false,
+            top: 0,
         }
     }
 
@@ -503,8 +517,8 @@ impl Chooser {
     /// The same chooser over new `items`, as when what an entry offers became
     /// known after it was first built. What the operator typed carries over to
     /// the fields that are still there (by entry label and field name), the
-    /// highlighted entry is the same one when it still exists, and the focus
-    /// stays where it was.
+    /// highlighted entry is the same one when it still exists, the focus
+    /// stays where it was and so does the scrolled list.
     pub fn rebuilt(mut self, mut items: Vec<ChooserItem>) -> Self {
         let label = self.selected_item().map(|item| item.label.clone());
         for item in &mut items {
@@ -557,9 +571,9 @@ impl Chooser {
     /// list and the description (beside each other when wide, stacked when
     /// narrow) and the fields of the highlighted entry under them.
     pub fn preferred_height(&self, width: u16) -> u16 {
-        let list = self.items.len() as u16 + 2;
+        let list = list_rows(self.items.len());
         let top = if width >= SIDE_BY_SIDE_MIN_WIDTH {
-            list.max(5)
+            list.max(LIST_MIN_ROWS)
         } else {
             list + 4
         };
@@ -848,6 +862,17 @@ fn focus_order_of(item: &ChooserItem, inputs_layout: bool) -> Vec<usize> {
     order
 }
 
+/// The rows the list pane needs for `entries` entries: an entry and a gap
+/// each, the gap above the first, and the frame.
+fn list_rows(entries: usize) -> u16 {
+    let entries = u16::try_from(entries).unwrap_or(u16::MAX / 2);
+    entries.saturating_mul(2).saturating_add(1 + 2)
+}
+
+/// The rows of the smallest list pane: one entry with its bracket, and the
+/// frame.
+const LIST_MIN_ROWS: u16 = 3 + 2;
+
 /// How wide the list needs to be for its longest line.
 fn list_width(items: &[ChooserItem]) -> u16 {
     let widest = items
@@ -855,36 +880,28 @@ fn list_width(items: &[ChooserItem]) -> u16 {
         .map(|item| one_line(&item.label).chars().count())
         .max()
         .unwrap_or(0);
-    // cursor, number, label, three marker slots, border.
-    (widest + 4 + 8) as u16
+    // bar, number, label, three marker slots, border.
+    (widest + usize::from(PREFIX_WIDTH) + 2 + 6 + 2) as u16
 }
 
-/// One line of the list: cursor, number, label and the markers.
-fn list_line(
-    item: &ChooserItem,
-    index: usize,
-    selected: bool,
-    width: usize,
-    styles: &Styles,
-) -> Line<'static> {
+/// One line of the list: number, label and the markers. The selection is
+/// the bracket around it, not a look of its own, so the markers keep their
+/// colours (R13).
+fn list_line(item: &ChooserItem, index: usize, styles: &Styles) -> Line<'static> {
     let base = if item.unavailable.is_some() {
         styles.of(Role::Done)
     } else {
         Style::default()
     };
-    let cursor = if selected { "▸ " } else { "  " };
     let number = if index < 9 {
         format!("{} ", index + 1)
     } else {
         "  ".to_string()
     };
-    let label = one_line(&item.label);
     let mut spans = vec![
-        Span::styled(cursor, styles.of(Role::Focus)),
         Span::styled(number, styles.of(Role::Done)),
-        Span::styled(label.clone(), base),
+        Span::styled(one_line(&item.label), base),
     ];
-    let mut used = 4 + label.chars().count();
     let markers: [(bool, &str, Role); 3] = [
         (item.resumes_agent.is_some(), "↩", Role::Calm),
         (item.recommended, "◆", Role::Conductor),
@@ -893,18 +910,9 @@ fn list_line(
     for (present, symbol, role) in markers {
         if present {
             spans.push(Span::styled(format!(" {symbol}"), styles.of(role)));
-            used += 2;
         }
     }
-    if selected {
-        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-    }
-    let line = Line::from(spans);
-    if selected {
-        line.style(styles.selected(Style::default()))
-    } else {
-        line
-    }
+    Line::from(spans)
 }
 
 /// The lines of the fields of the highlighted entry, and the line the focus
@@ -986,7 +994,18 @@ fn field_value_rows(field: &ChooserField, value: &str, focused: bool) -> Vec<Str
 
 /// Draws `chooser` into `area`: the list and the description (side by side,
 /// or stacked when the area is narrow) and the fields under them.
-pub fn render(frame: &mut Frame, area: Rect, chooser: &mut Chooser, styles: &Styles) {
+///
+/// `focused` says whether the keys are on the chooser's owner — the answer
+/// panel, the form, the overlay. The bracket around the highlighted entry is
+/// thick while they are and the chooser has them on its list, thin
+/// otherwise (R12).
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    chooser: &mut Chooser,
+    styles: &Styles,
+    focused: bool,
+) {
     if chooser.inputs_layout && chooser.focus == ChooserFocus::Fields {
         inputs::render(frame, area, chooser, styles);
         return;
@@ -997,20 +1016,29 @@ pub fn render(frame: &mut Frame, area: Rect, chooser: &mut Chooser, styles: &Sty
         Layout::vertical([Constraint::Min(3), Constraint::Length(fields_height)]).areas(area);
 
     let wide = area.width >= SIDE_BY_SIDE_MIN_WIDTH;
-    let list_rows = chooser.items.len() as u16 + 2;
     let (list_area, description_area) = if wide {
         let width = list_width(&chooser.items).clamp(20, area.width / 2);
         let [list, description] =
             Layout::horizontal([Constraint::Length(width), Constraint::Min(10)]).areas(top);
         (list, description)
     } else {
-        let height = list_rows.min(top.height.saturating_sub(3)).max(3);
-        let [list, description] =
-            Layout::vertical([Constraint::Length(height), Constraint::Min(3)]).areas(top);
+        // The description gives way first: down to three rows while the
+        // list scrolls, then to nothing, so that one entry with its bracket
+        // always fits.
+        let height = list_rows(chooser.items.len())
+            .min(top.height.saturating_sub(3).max(LIST_MIN_ROWS))
+            .min(top.height);
+        let list = Rect { height, ..top };
+        let description = Rect {
+            y: top.y + height,
+            height: top.height - height,
+            ..top
+        };
         (list, description)
     };
 
-    render_list(frame, list_area, chooser, styles);
+    let list_focused = focused && chooser.focus == ChooserFocus::Actions;
+    render_list(frame, list_area, chooser, styles, list_focused);
     render_description(frame, description_area, chooser, styles);
     if fields_height > 0 {
         let offset = (focus_line + 1).saturating_sub(fields_height as usize) as u16;
@@ -1034,22 +1062,33 @@ fn pane(title: &str, active: bool, styles: &Styles) -> Block<'static> {
         .title(format!(" {title} "))
 }
 
-fn render_list(frame: &mut Frame, area: Rect, chooser: &Chooser, styles: &Styles) {
+/// The list pane: the entries spaced out, the highlighted one bracketed and
+/// scrolled into view inside the pane.
+fn render_list(
+    frame: &mut Frame,
+    area: Rect,
+    chooser: &mut Chooser,
+    styles: &Styles,
+    focused: bool,
+) {
     let block = pane("Akcje", chooser.focus == ChooserFocus::Actions, styles);
     let inner = block.inner(area);
-    let width = usize::from(inner.width);
-    let height = usize::from(inner.height);
-    // Keep the highlighted line in view when the list is taller than its pane.
-    let first = (chooser.selected + 1).saturating_sub(height);
-    let lines: Vec<Line> = chooser
+    frame.render_widget(block, area);
+    let items: Vec<Vec<Line>> = chooser
         .items
         .iter()
         .enumerate()
-        .skip(first)
-        .take(height)
-        .map(|(index, item)| list_line(item, index, index == chooser.selected, width, styles))
+        .map(|(index, item)| vec![list_line(item, index, styles)])
         .collect();
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    render_spaced_list(
+        frame,
+        inner,
+        styles,
+        &items,
+        Some(chooser.selected),
+        focused,
+        &mut chooser.top,
+    );
 }
 
 fn render_description(frame: &mut Frame, area: Rect, chooser: &mut Chooser, styles: &Styles) {
