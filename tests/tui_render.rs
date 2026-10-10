@@ -1282,7 +1282,7 @@ mod task_app_detail_render {
         );
 
         for _ in 0..4 {
-            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Char(']'));
         }
         let info = screen(&draw(120, 50, |frame| {
             layout::render(frame, &mut app, &Styles::new(false), Instant::now())
@@ -1424,14 +1424,14 @@ mod task_app_detail_render {
         );
 
         // The other execution tabs say the same; Info shows what is there.
-        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Char(']'));
         assert!(super::screen(&render(&mut app, &Styles::new(false)))
             .contains("jeszcze nie wystartowało"));
-        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Char(']'));
         assert!(super::screen(&render(&mut app, &Styles::new(false)))
             .contains("jeszcze nie wystartowało"));
-        press(&mut app, KeyCode::Right);
-        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char(']'));
         let info = super::screen(&render(&mut app, &Styles::new(false)));
         assert!(
             info.contains("Zapieczętowane wejścia") && info.contains("launch digest"),
@@ -1491,8 +1491,8 @@ mod task_app_detail_render {
     #[test]
     fn events_that_cannot_be_read_say_why_in_their_tab() {
         let mut app = running_app();
-        press(&mut app, KeyCode::Right);
-        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char(']'));
         app.on_detail_read(
             "a",
             1,
@@ -1516,8 +1516,8 @@ mod task_app_detail_render {
     #[test]
     fn a_silent_runner_leaves_a_note_in_the_tab_and_the_connection_alone() {
         let mut app = running_app();
-        press(&mut app, KeyCode::Right);
-        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char(']'));
         let before = app.connection().status(std::time::Instant::now()).text;
         app.on_detail_read(
             "a",
@@ -1558,8 +1558,8 @@ mod task_app_detail_render {
     #[test]
     fn events_are_listed_with_the_detail_of_the_selected_one() {
         let mut app = running_app();
-        press(&mut app, KeyCode::Right);
-        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char(']'));
         app.on_detail_read(
             "a",
             1,
@@ -1587,7 +1587,7 @@ mod task_app_detail_render {
     #[test]
     fn the_conversation_tab_shows_a_message_for_a_task_without_one() {
         let mut app = running_app();
-        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Char(']'));
         let screen = screen(&render(&mut app, &Styles::new(false)));
         assert!(screen.contains("brak rozmowy"), "{screen}");
     }
@@ -1628,7 +1628,7 @@ mod task_app_detail_render {
                 !screen.contains('\u{1b}') && !screen.contains('\u{202e}'),
                 "{screen}"
             );
-            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Char(']'));
         }
     }
 

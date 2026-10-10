@@ -577,6 +577,24 @@ mod foundations {
         }
 
         #[test]
+        fn the_details_name_brackets_as_the_tabs() {
+            let entries = help_entries(Context::Details);
+            let tabs = entries
+                .iter()
+                .find(|entry| entry.keys == "[")
+                .expect("[ is in the help of the details");
+            assert_eq!(tabs.label, "zakładki");
+            assert!(entries.iter().any(|entry| entry.keys == "]"));
+            for context in [Context::Details, Context::HistoryDetails, Context::History] {
+                assert_eq!(
+                    lookup(context, &press(KeyCode::Char(']'))),
+                    Some(Action::NextTab)
+                );
+                assert_eq!(lookup(context, &press(KeyCode::Right)), None, "{context:?}");
+            }
+        }
+
+        #[test]
         fn global_keys_work_where_context_inherits_them_and_not_in_forms() {
             let help = press(KeyCode::Char('?'));
             assert_eq!(lookup(Context::List, &help), Some(Action::Help));
@@ -1536,7 +1554,7 @@ mod task_app_list {
             ));
             ch(&mut app, 'j');
             press(&mut app, KeyCode::Enter);
-            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Char(']'));
             app.detail_mut().set_draft("b", "Uwzględnij migrację");
             assert_eq!(app.list().selected_id(), Some("b"));
             assert_eq!(app.focus(), Focus::Details);
@@ -2334,8 +2352,8 @@ mod task_app_detail {
             ch(&mut app, 'k');
             ch(&mut app, 'k');
             assert_eq!(selected_step(&app, "a").as_deref(), Some("plan #1"));
-            press(&mut app, KeyCode::Right);
-            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Char(']'));
+            press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.detail().tab(), DetailTab::Events);
             app.on_detail_read(
                 "a",
@@ -2396,10 +2414,10 @@ mod task_app_detail {
             );
 
             // The other tabs still work.
-            press(&mut app, KeyCode::Right);
-            press(&mut app, KeyCode::Right);
-            press(&mut app, KeyCode::Right);
-            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Char(']'));
+            press(&mut app, KeyCode::Char(']'));
+            press(&mut app, KeyCode::Char(']'));
+            press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.detail().tab(), DetailTab::Info);
             let lines = info::lines(app.list().selected().unwrap(), &Styles::new(false), false);
             assert!(!lines.is_empty());
@@ -2504,7 +2522,7 @@ mod task_app_detail {
 
         fn open_tab(app: &mut TaskApp, tab: DetailTab) {
             while app.detail().tab() != tab {
-                press(app, KeyCode::Right);
+                press(app, KeyCode::Char(']'));
             }
         }
 
@@ -2857,8 +2875,8 @@ mod task_app_detail {
             let harness = RemoteHarness::start().await;
             let running = harness.running("task-1", "k8s", live_snapshot()).await;
             let mut app = app_over(&harness).await;
-            press(&mut app, KeyCode::Right);
-            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Char(']'));
+            press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.detail().tab(), DetailTab::Events);
 
             let (_, ()) = tokio::join!(
@@ -2893,8 +2911,8 @@ mod task_app_detail {
                 app.list().selected().unwrap().lifecycle,
                 TaskLifecycle::Interrupted
             );
-            press(&mut app, KeyCode::Right);
-            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Char(']'));
+            press(&mut app, KeyCode::Char(']'));
 
             app.sync_detail().await;
             match app.detail().view("task-1").unwrap().events().availability() {
@@ -2912,7 +2930,7 @@ mod task_app_detail {
             let harness = RemoteHarness::start().await;
             let running = harness.running("task-1", "k8s", live_snapshot()).await;
             let mut app = app_over(&harness).await;
-            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.detail().tab(), DetailTab::Conversation);
 
             let page = ConversationResponse::Recorded {
@@ -3025,6 +3043,31 @@ mod task_app_detail {
                     None,
                 ))),
             );
+        }
+    }
+
+    mod tab_keys {
+        use super::*;
+
+        #[test]
+        fn brackets_switch_the_tabs_and_wrap_round() {
+            let mut app = details_app();
+            assert_eq!(app.detail().tab(), DetailTab::Progress);
+            ch(&mut app, ']');
+            assert_eq!(app.detail().tab(), DetailTab::Conversation);
+            ch(&mut app, '[');
+            ch(&mut app, '[');
+            assert_eq!(app.detail().tab(), DetailTab::Info, "wraps round");
+        }
+
+        #[test]
+        fn the_arrows_do_not_switch_the_tabs() {
+            let mut app = details_app();
+            app.detail_mut().set_tab(DetailTab::Info);
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.detail().tab(), DetailTab::Info);
+            press(&mut app, KeyCode::Left);
+            assert_eq!(app.detail().tab(), DetailTab::Info);
         }
     }
 }
@@ -7717,7 +7760,7 @@ mod task_app_create {
                 (DetailTab::Conductor, "storage usunięty przy archiwizacji"),
             ] {
                 while app.history().unwrap().tab() != tab {
-                    press(&mut app, KeyCode::Right);
+                    press(&mut app, KeyCode::Char(']'));
                 }
                 let screen = screen(&mut app, 130, 30);
                 assert!(screen.contains(expected), "{tab:?}:\n{screen}");
@@ -7832,6 +7875,21 @@ mod task_app_create {
         }
 
         #[test]
+        fn brackets_switch_the_tabs_from_the_history_list_and_its_details() {
+            let mut app = opened();
+            ch(&mut app, ']');
+            assert_eq!(app.history().unwrap().tab(), DetailTab::Conversation);
+            press(&mut app, KeyCode::Enter);
+            ch(&mut app, ']');
+            assert_eq!(app.history().unwrap().tab(), DetailTab::Events);
+            ch(&mut app, '[');
+            ch(&mut app, '[');
+            assert_eq!(app.history().unwrap().tab(), DetailTab::Progress);
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.history().unwrap().tab(), DetailTab::Progress);
+        }
+
+        #[test]
         fn keys_and_help_of_the_history_come_from_the_map() {
             let app = opened();
             assert_eq!(app.key_context(), Context::History);
@@ -7938,7 +7996,7 @@ mod task_app_create {
             );
             assert!(progress.contains("completed"), "{progress}");
 
-            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Char(']'));
             app.sync_detail().await;
             let conversation = screen(&mut app, 130, 30);
             assert!(
@@ -7947,7 +8005,7 @@ mod task_app_create {
             );
             assert!(conversation.contains("assistant message"), "{conversation}");
 
-            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Char(']'));
             app.sync_detail().await;
             let events = screen(&mut app, 130, 30);
             assert!(
@@ -7956,7 +8014,7 @@ mod task_app_create {
             );
             assert!(events.contains("plan"), "{events}");
 
-            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Char(']'));
             app.sync_detail().await;
             let conductor = screen(&mut app, 130, 30);
             assert!(
