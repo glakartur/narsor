@@ -94,6 +94,9 @@ struct Harness {
     clock: Arc<ManualClock>,
     handle: api::ApiHandle,
     owner: ApiClient,
+    /// The served protocol service, for what the daemon drives in-process
+    /// (the resume policy's pass).
+    service: Arc<ProtocolService>,
 }
 
 /// A task brought to `Running` by a controller, with its runner.
@@ -153,8 +156,9 @@ impl Harness {
             service = service
                 .with_local_storage(BackendId::parse(backend).expect("backend id"), storage_root);
         }
+        let service = Arc::new(service);
         let services = ApiServices {
-            control: Some(Arc::new(service)),
+            control: Some(Arc::clone(&service)),
             harness_selector: selector,
             ..ApiServices::default()
         };
@@ -173,6 +177,7 @@ impl Harness {
             clock,
             handle,
             owner,
+            service,
         }
     }
 
@@ -3302,4 +3307,348 @@ fn the_protocol_config_sets_how_the_control_plane_counts_losses() {
     );
 
     assert_eq!(service.control_plane().resume_policy(), &policy);
+}
+
+// ---------------------------------------------------------------------------
+// The resume policy's pass (R1, R4, R7)
+// ---------------------------------------------------------------------------
+
+/// A report that the workload of `task` at `generation` was lost, saying why.
+fn lost(task: &str, epoch: u64, generation: u64, detail: &str) -> ReportRequest {
+    let mut request = report(
+        task,
+        epoch,
+        generation,
+        Observation::WorkloadLost { state_known: true },
+        None,
+    );
+    request.summary.detail = Some(detail.to_string());
+    request
+}
+
+/// The task's control-plane events, oldest first.
+fn task_events(harness: &Harness, task: &str) -> Vec<TaskEventKind> {
+    harness
+        .service
+        .control_plane()
+        .events_since(&TaskId::parse(task).unwrap(), 0)
+        .expect("events")
+        .into_iter()
+        .map(|event| event.kind)
+        .collect()
+}
+
+fn auto_resumed(events: &[TaskEventKind]) -> usize {
+    events
+        .iter()
+        .filter(|kind| matches!(kind, TaskEventKind::AutoResumed { .. }))
+        .count()
+}
+
+#[tokio::test]
+async fn the_resume_policy_resumes_a_lost_task_once_in_one_mutation() {
+    let harness = Harness::start().await;
+    let Running {
+        controller, epoch, ..
+    } = harness.running("task-1", "k8s").await;
+    controller
+        .report(&lost(
+            "task-1",
+            epoch,
+            1,
+            "the runner's workload disappeared",
+        ))
+        .await
+        .expect("loss");
+    let before = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(before.lifecycle, TaskLifecycle::Interrupted);
+
+    let pass = harness.service.auto_resume_pass();
+    assert_eq!(pass.resumed, vec![TaskId::parse("task-1").unwrap()]);
+    // A second tick before the controller acted: the task is no longer
+    // due, and repeating the policy's own command replays its receipt.
+    assert!(harness.service.auto_resume_pass().resumed.is_empty());
+    let replay = harness
+        .service
+        .control_plane()
+        .auto_resume(&TaskId::parse("task-1").unwrap(), 1)
+        .expect("a replay");
+    assert!(replay.replayed);
+
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(record.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(record.generation, 2);
+    assert_eq!(record.revision, before.revision + 1, "one mutation");
+    let resumes: Vec<_> = record
+        .commands
+        .iter()
+        .filter(|receipt| receipt.command == OwnerCommand::Resume)
+        .collect();
+    assert_eq!(resumes.len(), 1);
+    assert_eq!(
+        resumes[0].actor,
+        narsor::orchestration::CommandActor::Policy
+    );
+    assert_eq!(resumes[0].idempotency_key, "auto-resume:1");
+    assert_eq!(record.resume.consecutive_losses, 1, "the count stays");
+    assert_eq!(record.resume.next_attempt_at, None, "the attempt is used");
+    assert_eq!(
+        record.last_event.kind,
+        TaskEventKind::AutoResumed {
+            attempt: 1,
+            limit: 5,
+            loss_reason: Some("the runner's workload disappeared".to_string()),
+        }
+    );
+    assert_eq!(auto_resumed(&task_events(&harness, "task-1")), 1);
+
+    // The controller sees an ordinary resume, and the new runner learns
+    // that the policy decided.
+    let credential = controller
+        .issue_runner_credential(
+            "task-1",
+            &RunnerCredentialRequest {
+                lease_epoch: epoch,
+                generation: 2,
+                incarnation: "pod-2".to_string(),
+            },
+        )
+        .await
+        .expect("runner credential");
+    let runner = RunnerClient::new(harness.base_url(), credential.credential);
+    let answer = runner
+        .snapshot(&snapshot(1, ExecutionStatus::Running, 3, None))
+        .await
+        .expect("snapshot");
+    assert_eq!(answer.launch.authorized_by, Some(OwnerCommand::Resume));
+    assert_eq!(
+        answer.launch.authorized_by_actor,
+        Some(narsor::orchestration::CommandActor::Policy)
+    );
+}
+
+#[tokio::test]
+async fn the_resume_policy_waits_for_a_controller_to_launch_the_workload() {
+    let harness = Harness::start().await;
+    let Running {
+        controller, epoch, ..
+    } = harness.running("task-1", "k8s").await;
+    controller
+        .report(&lost("task-1", epoch, 1, "gone"))
+        .await
+        .expect("loss");
+    // The controller's lease runs out: nobody could launch anything.
+    harness.clock.advance(Duration::minutes(5));
+    let pass = harness.service.auto_resume_pass();
+    assert!(pass.resumed.is_empty());
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(record.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(record.resume.consecutive_losses, 1);
+    assert!(record.resume.next_attempt_at.is_some(), "still planned");
+    assert_eq!(auto_resumed(&task_events(&harness, "task-1")), 0);
+
+    controller.acquire_lease(None).await.expect("back online");
+    assert_eq!(harness.service.auto_resume_pass().resumed.len(), 1);
+}
+
+#[tokio::test]
+async fn an_owner_command_first_makes_the_policy_step_aside() {
+    let harness = Harness::start().await;
+    let Running {
+        controller, epoch, ..
+    } = harness.running("task-1", "k8s").await;
+    controller
+        .report(&lost("task-1", epoch, 1, "gone"))
+        .await
+        .expect("loss");
+    // The pass read the task at generation 1; the owner starts it first.
+    harness
+        .command("task-1", OwnerCommand::Start, "start-1")
+        .await;
+    let refused = harness
+        .service
+        .control_plane()
+        .auto_resume(&TaskId::parse("task-1").unwrap(), 1);
+    assert!(
+        matches!(
+            refused,
+            Err(narsor::orchestration::OrchestrationError::StaleGeneration { .. })
+        ),
+        "{refused:?}"
+    );
+    assert!(harness.service.auto_resume_pass().resumed.is_empty());
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(record.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(record.generation, 2, "one launch");
+    assert_eq!(auto_resumed(&task_events(&harness, "task-1")), 0);
+}
+
+#[tokio::test]
+async fn paused_tasks_and_losses_while_pausing_wait_for_the_owner() {
+    let harness = Harness::start().await;
+    // A paused task released its compute on purpose (R4).
+    let Running {
+        controller,
+        epoch,
+        runner,
+    } = harness.running("task-1", "k8s").await;
+    harness
+        .command("task-1", OwnerCommand::Pause, "pause-1")
+        .await;
+    let mut at_safe_point = snapshot(2, ExecutionStatus::Running, 5, None);
+    at_safe_point.safe_point = true;
+    runner.snapshot(&at_safe_point).await.expect("safe point");
+    controller
+        .report(&report(
+            "task-1",
+            epoch,
+            2,
+            Observation::PausedAtSafePoint,
+            Some(2),
+        ))
+        .await
+        .expect("paused");
+
+    // A workload lost before its safe point: the owner wanted a pause.
+    harness.create("task-2", "k8s").await;
+    controller
+        .report(&report(
+            "task-2",
+            epoch,
+            1,
+            Observation::StartAccepted,
+            None,
+        ))
+        .await
+        .expect("start accepted");
+    controller
+        .report(&report(
+            "task-2",
+            epoch,
+            1,
+            Observation::RunnerReady,
+            Some(1),
+        ))
+        .await
+        .expect("runner ready");
+    harness
+        .command("task-2", OwnerCommand::Pause, "pause-2")
+        .await;
+    controller
+        .report(&lost("task-2", epoch, 2, "gone while pausing"))
+        .await
+        .expect("loss");
+
+    for _ in 0..3 {
+        assert!(harness.service.auto_resume_pass().resumed.is_empty());
+        harness.clock.advance(Duration::seconds(30));
+        controller.renew_lease(epoch, None).await.expect("renew");
+    }
+    assert_eq!(
+        harness.task("task-1").await.lifecycle,
+        TaskLifecycle::Paused
+    );
+    assert_eq!(
+        harness.task("task-2").await.lifecycle,
+        TaskLifecycle::Interrupted
+    );
+    assert_eq!(auto_resumed(&task_events(&harness, "task-1")), 0);
+    assert_eq!(auto_resumed(&task_events(&harness, "task-2")), 0);
+}
+
+#[tokio::test]
+async fn an_exhausted_task_is_announced_exactly_once() {
+    let harness = Harness::start_with(
+        ProtocolConfig {
+            resume: ResumePolicy {
+                attempt_delays: vec![Duration::zero()],
+                stability_window: Duration::minutes(10),
+            },
+            ..ProtocolConfig::default()
+        },
+        None,
+    )
+    .await;
+    let Running {
+        controller, epoch, ..
+    } = harness.running("task-1", "k8s").await;
+    controller
+        .report(&lost("task-1", epoch, 1, "gone"))
+        .await
+        .expect("first loss");
+    assert_eq!(harness.service.auto_resume_pass().resumed.len(), 1);
+    controller
+        .report(&lost(
+            "task-1",
+            epoch,
+            2,
+            "the backend refused the workload",
+        ))
+        .await
+        .expect("second loss");
+
+    let pass = harness.service.auto_resume_pass();
+    assert!(pass.resumed.is_empty());
+    assert_eq!(pass.exhausted, vec![TaskId::parse("task-1").unwrap()]);
+    assert!(harness.service.auto_resume_pass().exhausted.is_empty());
+
+    let exhausted: Vec<_> = task_events(&harness, "task-1")
+        .into_iter()
+        .filter_map(|kind| match kind {
+            TaskEventKind::AutoResumeExhausted { attempts, reason } => Some((attempts, reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        exhausted,
+        vec![(
+            1,
+            "could not resume automatically: the backend refused the workload".to_string()
+        )]
+    );
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(record.lifecycle, TaskLifecycle::Interrupted);
+    assert!(record.resume.exhausted.unwrap().announced);
+}
+
+#[tokio::test]
+async fn an_owner_key_in_the_policys_namespace_is_refused() {
+    let harness = Harness::start().await;
+    harness.create("task-1", "k8s").await;
+    let refused = harness
+        .owner
+        .control_command(
+            "task-1",
+            &OwnerCommandRequest {
+                command: OwnerCommand::Archive,
+                idempotency_key: "auto-resume:1".to_string(),
+                expected_generation: None,
+            },
+        )
+        .await;
+    assert_eq!(bad_request_code(refused), "reserved_idempotency_key");
+    assert_eq!(
+        harness.task("task-1").await.lifecycle,
+        TaskLifecycle::Queued
+    );
 }

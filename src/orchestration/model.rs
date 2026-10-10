@@ -652,6 +652,24 @@ impl TaskRecord {
         })
     }
 
+    /// Whether the resume policy may resume the task now: it is
+    /// interrupted, its planned attempt is due and the policy has not given
+    /// up on it.
+    pub fn auto_resume_due(&self, now: DateTime<Utc>) -> bool {
+        self.lifecycle == TaskLifecycle::Interrupted
+            && self.resume.exhausted.is_none()
+            && self.resume.next_attempt_at.is_some_and(|at| at <= now)
+    }
+
+    /// The receipt of the start or resume that produced `launch_generation`
+    /// (see [`Self::launch_command`]).
+    pub fn launch_receipt(&self, launch_generation: u64) -> Option<&CommandReceipt> {
+        self.commands.iter().find(|receipt| {
+            matches!(receipt.command, OwnerCommand::Start | OwnerCommand::Resume)
+                && receipt.generation_after == launch_generation
+        })
+    }
+
     /// Whether the task occupies one of its backend's capacity slots.
     ///
     /// Conservative on purpose (R6, R11, R13): a slot is free only once the
@@ -714,12 +732,7 @@ impl TaskRecord {
     /// to resume or retry — the only thing that lets it run ordinary
     /// recovery on that storage.
     pub fn launch_command(&self, launch_generation: u64) -> Option<OwnerCommand> {
-        self.commands
-            .iter()
-            .find(|receipt| {
-                matches!(receipt.command, OwnerCommand::Start | OwnerCommand::Resume)
-                    && receipt.generation_after == launch_generation
-            })
+        self.launch_receipt(launch_generation)
             .map(|receipt| receipt.command)
     }
 

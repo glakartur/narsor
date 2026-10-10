@@ -27,6 +27,11 @@
 //! service. Runners are whatever the adapter starts: the fake's simulated
 //! runner, the local adapter's `narsor runner` processes, a mock cluster's
 //! Pods. Nothing here names a platform type.
+//!
+//! The resume policy runs as it does in the daemon, on a short tick and with
+//! short delays, so a lost workload comes back without the owner.
+//! [`Harness::without_auto_resume`] leaves it out, for scenarios where the
+//! owner must be the one who decides.
 
 #![allow(dead_code)]
 
@@ -44,13 +49,13 @@ use narsor::backends::{
 use narsor::controller_protocol::http::{controller_routes, runner_routes};
 use narsor::controller_protocol::{
     ControllerClient, CreateEnrollmentRequest, EnrollRequest, OwnerCommandRequest,
-    OwnerCommandResponse, ProtocolError, ProtocolService, SubmitOperatorCommandRequest,
-    LOCAL_OWNER,
+    OwnerCommandResponse, ProtocolConfig, ProtocolError, ProtocolService,
+    SubmitOperatorCommandRequest, LOCAL_OWNER,
 };
 use narsor::domain::{BackendId, TaskId, TaskLaunchSpec};
 use narsor::orchestration::{
-    NewTask, Observation, OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef,
-    TaskEventKind, TaskLifecycle, TaskRecord,
+    CommandActor, NewTask, Observation, OperatorCommand, OperatorCommandStatus, OwnerCommand,
+    OwnerRef, ResumePolicy, TaskEventKind, TaskLifecycle, TaskRecord,
 };
 use narsor::persistence::paths::StatePaths;
 use tokio::sync::oneshot;
@@ -86,6 +91,20 @@ pub trait ContractTarget: Send + Sync + Sized + 'static {
     /// How long one lifecycle transition may take on this target.
     fn patience(&self) -> Duration {
         Duration::from_secs(30)
+    }
+}
+
+/// How often the harness runs the resume policy (the daemon: every 5 s).
+const POLICY_TICK: Duration = Duration::from_millis(50);
+
+/// The resume policy of every scenario: the daemon's shape, in milliseconds.
+fn test_resume_policy() -> ResumePolicy {
+    ResumePolicy {
+        attempt_delays: [0, 100, 200, 300, 400]
+            .into_iter()
+            .map(chrono::Duration::milliseconds)
+            .collect(),
+        stability_window: chrono::Duration::minutes(10),
     }
 }
 
@@ -127,12 +146,24 @@ pub struct Harness<T: ContractTarget> {
     pub url: String,
     controllers: Vec<ControllerHandle>,
     server: tokio::task::JoinHandle<()>,
+    policy: Option<tokio::task::JoinHandle<()>>,
     root: TempRoot,
 }
 
 impl<T: ContractTarget> Harness<T> {
-    /// Serves a control plane and sets the target up; `None` skips.
+    /// Serves a control plane with its resume policy running and sets the
+    /// target up; `None` skips.
     pub async fn new() -> Option<Self> {
+        Self::serve(true).await
+    }
+
+    /// [`Self::new`] without the resume policy: a lost workload waits for
+    /// the owner.
+    pub async fn without_auto_resume() -> Option<Self> {
+        Self::serve(false).await
+    }
+
+    async fn serve(auto_resume: bool) -> Option<Self> {
         let root = TempRoot::new();
         let Some(target) = T::setup(&root.0.join("target")) else {
             eprintln!("skipped: the contract target cannot run here");
@@ -146,9 +177,13 @@ impl<T: ContractTarget> Harness<T> {
         narsor::environment::EnvironmentCatalog::new(&state)
             .save_backend(&crate::environment_support::backend(BACKEND))
             .expect("register the contract backend");
-        let service = Arc::new(ProtocolService::new(
+        let service = Arc::new(ProtocolService::with_config(
             narsor::orchestration::ControlPlane::new(StatePaths::new(&state)),
             launch,
+            ProtocolConfig {
+                resume: test_resume_policy(),
+                ..ProtocolConfig::default()
+            },
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -159,6 +194,7 @@ impl<T: ContractTarget> Harness<T> {
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.expect("serve");
         });
+        let policy = auto_resume.then(|| spawn_policy(Arc::clone(&service)));
         let probe = Probed::new(target.backend());
         Some(Self {
             target,
@@ -167,6 +203,7 @@ impl<T: ContractTarget> Harness<T> {
             url,
             controllers: Vec::new(),
             server,
+            policy,
             root,
         })
     }
@@ -439,10 +476,35 @@ impl<T: ContractTarget> Drop for Harness<T> {
                 let _ = shutdown.send(());
             }
         }
+        if let Some(policy) = self.policy.take() {
+            policy.abort();
+        }
         self.target.cleanup(self.probe.inner());
         self.server.abort();
         let _ = &self.root;
     }
+}
+
+/// Runs the resume policy on a tick, the way the daemon's scheduler does.
+fn spawn_policy(service: Arc<ProtocolService>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(POLICY_TICK).await;
+            let service = Arc::clone(&service);
+            let _ = tokio::task::spawn_blocking(move || service.auto_resume_pass()).await;
+        }
+    })
+}
+
+/// The automatic resumes in a task's log: `(attempt, limit)`.
+pub fn auto_resumes(events: &[TaskEventKind]) -> Vec<(u32, u32)> {
+    events
+        .iter()
+        .filter_map(|kind| match kind {
+            TaskEventKind::AutoResumed { attempt, limit, .. } => Some((*attempt, *limit)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn alive(observed: &TaskObservation) -> bool {
@@ -588,11 +650,56 @@ pub async fn a_lost_launch_answer_is_reconciled_not_duplicated<T: ContractTarget
     assert_eq!(counters.launches_over_existing, 0, "{counters:?}");
 }
 
-/// AE4: a workload that dies is reported Interrupted and never replaced
-/// until the owner resumes; the dead one is cleared — even when its
-/// deletion is slow — before the replacement is created (R7, R13).
-pub async fn workload_death_waits_for_the_owner<T: ContractTarget>() {
+/// AE4: a workload that dies is reported Interrupted and the resume policy
+/// launches it again on the same storage, without the owner; the dead one
+/// is cleared — even when its deletion is slow — before the replacement is
+/// created (R1, R7, R13).
+pub async fn a_dead_workload_is_resumed_automatically<T: ContractTarget>() {
     let Some(mut h) = Harness::<T>::new().await else {
+        return;
+    };
+    h.start_controller();
+    h.running("task-1").await;
+
+    h.probe.delay_deletions(8);
+    h.kill_workload("task-1");
+    h.wait_for("the replacement workload", |h| {
+        h.counters().workloads_created == 2 && h.lifecycle("task-1") == TaskLifecycle::Running
+    })
+    .await;
+    let counters = h.counters();
+    assert_eq!(
+        counters.workload_deletions, 1,
+        "the dead workload went first"
+    );
+    assert_eq!(counters.launches_over_existing, 0, "{counters:?}");
+    assert_eq!(counters.storages_created, 1, "the same storage");
+    assert!(
+        h.reported("task-1")
+            .contains(&Observation::WorkloadLost { state_known: true }),
+        "the loss itself is known"
+    );
+    let events = h.events("task-1");
+    assert_eq!(auto_resumes(&events), vec![(1, 5)], "{events:?}");
+    let record = h.record("task-1");
+    let resumes: Vec<_> = record
+        .commands
+        .iter()
+        .filter(|receipt| receipt.command == OwnerCommand::Resume)
+        .collect();
+    assert_eq!(resumes.len(), 1, "{:?}", record.commands);
+    assert_eq!(resumes[0].actor, CommandActor::Policy);
+    assert_eq!(
+        record.runner.map(|runner| runner.launch_generation),
+        Some(record.generation),
+        "the runner of the automatic resume reports"
+    );
+}
+
+/// Without the resume policy a dead workload waits for the owner, who
+/// resumes it on the same storage (R13).
+pub async fn workload_death_waits_for_the_owner_without_the_policy<T: ContractTarget>() {
+    let Some(mut h) = Harness::<T>::without_auto_resume().await else {
         return;
     };
     h.start_controller();
@@ -601,34 +708,20 @@ pub async fn workload_death_waits_for_the_owner<T: ContractTarget>() {
     h.kill_workload("task-1");
     h.wait_lifecycle("task-1", TaskLifecycle::Interrupted).await;
     h.settle().await;
-    h.settle().await;
     assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Interrupted);
-    assert_eq!(
-        h.counters().workloads_created,
-        1,
-        "no automatic replacement"
-    );
-    assert!(
-        h.reported("task-1")
-            .contains(&Observation::WorkloadLost { state_known: true }),
-        "the loss itself is known"
-    );
+    assert_eq!(h.counters().workloads_created, 1, "nothing replaces it");
 
-    h.probe.delay_deletions(8);
     h.must("task-1", OwnerCommand::Resume, "resume-1");
     h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
     let counters = h.counters();
     assert_eq!(counters.workloads_created, 2, "{counters:?}");
-    assert_eq!(
-        counters.workload_deletions, 1,
-        "the dead workload went first"
-    );
     assert_eq!(counters.launches_over_existing, 0, "{counters:?}");
     assert_eq!(counters.storages_created, 1, "the same storage");
 }
 
 /// A backend that cannot be observed makes the task Unknown, and nothing
-/// replaces its workload until the owner decides (R13).
+/// replaces its workload — not the resume policy either, which acts only on
+/// a confirmed loss — until the owner decides (R3, R13).
 pub async fn a_failed_observation_reports_unknown_and_waits<T: ContractTarget>() {
     let Some(mut h) = Harness::<T>::new().await else {
         return;
@@ -648,6 +741,7 @@ pub async fn a_failed_observation_reports_unknown_and_waits<T: ContractTarget>()
         "observing again changes nothing"
     );
     assert_eq!(h.counters().workloads_created, 1);
+    assert!(auto_resumes(&h.events("task-1")).is_empty());
 
     // The owner retries: the old launch goes, one new one comes.
     h.must("task-1", OwnerCommand::Start, "start-1");
@@ -658,9 +752,9 @@ pub async fn a_failed_observation_reports_unknown_and_waits<T: ContractTarget>()
     assert_eq!(counters.launches_over_existing, 0, "{counters:?}");
 }
 
-/// Transient launch failures are retried; a refusal interrupts the task
-/// until the owner starts it again (R13).
-pub async fn provisioning_failures_retry_or_wait_for_the_owner<T: ContractTarget>() {
+/// Transient launch failures are retried; a refusal interrupts the task,
+/// and the resume policy launches it again (R1, R13).
+pub async fn provisioning_failures_retry_or_resume_automatically<T: ContractTarget>() {
     let Some(mut h) = Harness::<T>::new().await else {
         return;
     };
@@ -676,14 +770,13 @@ pub async fn provisioning_failures_retry_or_wait_for_the_owner<T: ContractTarget
     );
 
     h.probe.fail_launches([BackendErrorKind::Rejected]);
-    h.create("task-2");
-    h.wait_lifecycle("task-2", TaskLifecycle::Interrupted).await;
-    h.settle().await;
-    assert_eq!(h.lifecycle("task-2"), TaskLifecycle::Interrupted);
-    assert!(h.observe("task-2").await.workload.is_none());
-
-    h.must("task-2", OwnerCommand::Start, "start-1");
-    h.wait_lifecycle("task-2", TaskLifecycle::Running).await;
+    h.running("task-2").await;
+    assert!(
+        h.reported("task-2")
+            .contains(&Observation::WorkloadLost { state_known: true }),
+        "the refusal interrupted it"
+    );
+    assert_eq!(auto_resumes(&h.events("task-2")), vec![(1, 5)]);
     let counters = h.counters();
     assert_eq!(counters.workloads_created, 2, "{counters:?}");
 }
@@ -1042,9 +1135,10 @@ macro_rules! contract_suite {
                 lifecycle_round_trip,
                 reconnect_reconciles_instead_of_duplicating,
                 a_lost_launch_answer_is_reconciled_not_duplicated,
-                workload_death_waits_for_the_owner,
+                a_dead_workload_is_resumed_automatically,
+                workload_death_waits_for_the_owner_without_the_policy,
                 a_failed_observation_reports_unknown_and_waits,
-                provisioning_failures_retry_or_wait_for_the_owner,
+                provisioning_failures_retry_or_resume_automatically,
                 archive_deletes_exactly_once,
                 a_finished_task_keeps_its_storage_until_archived,
                 delayed_deletion_and_resume_during_pause,

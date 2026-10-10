@@ -31,5 +31,5 @@ pub mod store;
 pub use control_plane::{Clock, ControlPlane, OrchestrationRecovery, SystemClock};
 pub use error::{OrchestrationError, Result};
 pub use model::*;
-pub use resume::ResumePolicy;
+pub use resume::{auto_resume_key, ResumePolicy, AUTO_RESUME_KEY_PREFIX};
 pub use store::OrchestrationStore;

@@ -2626,6 +2626,36 @@ fn a_receipt_records_the_actor_that_issued_the_command() {
 }
 
 #[test]
+fn the_policy_resumes_only_a_task_whose_attempt_is_due() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.running("task-1", &lease);
+    let refused = fx.control.auto_resume(&task("task-1"), 1);
+    assert!(
+        matches!(refused, Err(OrchestrationError::IllegalCommand { .. })),
+        "a running task: {refused:?}"
+    );
+
+    lose(&fx, "task-1", &lease, true, "gone");
+    policy_resume(&fx, "task-1");
+    lose(&fx, "task-1", &lease, true, "gone again");
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert!(record.resume.next_attempt_at.unwrap() > fx.control.now());
+    let early = fx.control.auto_resume(&task("task-1"), record.generation);
+    assert!(
+        matches!(early, Err(OrchestrationError::IllegalCommand { .. })),
+        "before its delay: {early:?}"
+    );
+    // The owner is never held back by the policy's schedule.
+    fx.control
+        .command(
+            &task("task-1"),
+            CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+        )
+        .expect("an owner resume");
+}
+
+#[test]
 fn a_task_record_written_before_automatic_resume_still_reads() {
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
@@ -2871,19 +2901,18 @@ fn lose(
     fx.control.report(loss).expect("loss report").task
 }
 
-/// Resumes the task the way the resume policy does.
+/// Resumes the task the way the resume policy does, once its attempt is
+/// due: the clock moves on to it first.
 fn policy_resume(fx: &Fixture, id: &str) -> TaskRecord {
     let record = fx.control.task(&task(id)).unwrap();
+    if let Some(due) = record.resume.next_attempt_at {
+        let wait = due - fx.control.now();
+        if wait > Duration::zero() {
+            fx.clock.advance(wait);
+        }
+    }
     fx.control
-        .command(
-            &task(id),
-            CommandRequest::new(
-                OwnerCommand::Resume,
-                format!("auto-resume:{}", record.generation),
-            )
-            .expecting_generation(record.generation)
-            .issued_by(CommandActor::Policy),
-        )
+        .auto_resume(&task(id), record.generation)
         .expect("policy resume")
         .task
 }

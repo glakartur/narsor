@@ -45,31 +45,35 @@
 //! action under way is never switched: the Engine reads the default once,
 //! when an action starts (R16a).
 //!
-//! # Unexpected loss needs an explicit owner decision (R13)
+//! # Unexpected loss needs an explicit decision (R13)
 //!
 //! Ordinary local recovery ([`crate::persistence::reconcile`]) turns an
 //! action that was in flight into `Unknown`, and an explicit recovery then
 //! starts that action again. Neither may happen just because a workload came
-//! back: the owner decides. The runner tells the two situations apart from
-//! its own storage and learns the decision from the control plane:
+//! back: the control plane decides. The runner tells the two situations
+//! apart from its own storage and learns the decision from the control
+//! plane:
 //!
 //! * every incarnation writes an open [`storage::SessionRecord`] when it
 //!   starts working and closes it only when it stops at a safe point. An
 //!   open record found at start-up is the storage's testimony that the
 //!   previous incarnation stopped unexpectedly;
 //! * the control plane tells a runner, with every poll and snapshot answer,
-//!   which owner command launched it
-//!   ([`crate::controller_protocol::RunnerLaunchView::authorized_by`]). A
-//!   controller never relaunches a lost workload on its own (KTD2), so a
-//!   new incarnation launched at a newer generation by an owner `start` or
-//!   `resume` *is* the owner's decision, recorded where only the owner can
-//!   write it.
+//!   which `start` or `resume` launched it
+//!   ([`crate::controller_protocol::RunnerLaunchView::authorized_by`]) and
+//!   who issued it (`authorized_by_actor`): the owner, or the control
+//!   plane's resume policy after it counted the loss. A controller never
+//!   relaunches a lost workload on its own (KTD2), so a new incarnation
+//!   launched at a newer generation by such a command *is* the decision,
+//!   recorded where only the control plane can write it.
 //!
 //! So after an unclean stop the runner touches nothing until it reaches the
 //! control plane. Authorized, it reconciles, and when an action was in
 //! flight it starts that action again through an ordinary explicit recovery
-//! (D24's idempotency key changes with the new attempt). Not authorized —
-//! the same incarnation restarted, or nothing says the owner decided — it
+//! (D24's idempotency key changes with the new attempt), noting in the
+//! history whether the owner or the resume policy decided. The actor words
+//! only that note: the authorization is the command alone. Not authorized —
+//! the same incarnation restarted, or nothing says anyone decided — it
 //! reports [`RunnerProblem`] `owner_decision_required` and exits without
 //! having changed a byte of work state. A clean stop (pause at a safe point)
 //! needs no decision: the resumed incarnation simply continues.
@@ -114,7 +118,9 @@ use crate::domain::{
     WorkflowDefinition, WorkflowExecution, Workspace,
 };
 use crate::engine::{Engine, EngineError, Recovery};
-use crate::orchestration::{HarnessUnavailable, OwnerCommand, RunnerProblem, RunnerSnapshot};
+use crate::orchestration::{
+    CommandActor, HarnessUnavailable, OwnerCommand, RunnerProblem, RunnerSnapshot,
+};
 use crate::persistence::{reconcile, PersistenceError, ReconciliationOutcome};
 use crate::workspace::WorkspaceError;
 
@@ -642,9 +648,33 @@ enum Continuation {
     Fresh,
     /// The last incarnation stopped cleanly (or none ever ran): go on.
     Clean,
-    /// The last incarnation stopped unexpectedly; the owner explicitly
-    /// decided, with this command, that it may be recovered.
-    Recover(OwnerCommand),
+    /// The last incarnation stopped unexpectedly; the owner or the resume
+    /// policy explicitly decided, with this command, that it may be
+    /// recovered.
+    Recover(Decision),
+}
+
+/// The command that authorized recovering a storage after an unclean stop,
+/// and who issued it.
+#[derive(Debug, Clone, Copy)]
+struct Decision {
+    command: OwnerCommand,
+    actor: CommandActor,
+}
+
+impl Decision {
+    /// What the recovered action's history says about who decided.
+    fn comment(self) -> String {
+        match (self.actor, self.command) {
+            (CommandActor::Policy, _) => "resumed automatically after workload loss".to_string(),
+            (CommandActor::Owner, OwnerCommand::Start) => {
+                "owner start after the task's workload stopped unexpectedly".to_string()
+            }
+            (CommandActor::Owner, _) => {
+                "owner resume after the task's workload stopped unexpectedly".to_string()
+            }
+        }
+    }
 }
 
 impl Session {
@@ -664,7 +694,7 @@ impl Session {
             (Some(_), None) => Continuation::Clean,
             (Some(_), Some(previous)) if previous.closed.is_some() => Continuation::Clean,
             (Some(_), Some(previous)) => match self.owner_decision(previous).await? {
-                Some(command) => Continuation::Recover(command),
+                Some(decision) => Continuation::Recover(decision),
                 None => return self.refuse_without_decision().await,
             },
         };
@@ -692,7 +722,7 @@ impl Session {
                 self.resume_pass()?;
             }
             Continuation::Clean => self.resume_pass()?,
-            Continuation::Recover(command) => self.recover(command)?,
+            Continuation::Recover(decision) => self.recover(decision)?,
         }
         // After the runner's own recovery, like the daemon's startup hook.
         self.conductor.restore_at_startup();
@@ -805,13 +835,13 @@ impl Session {
         self.conductor.refresh(None);
     }
 
-    /// Waits for the control plane to say which owner command launched
-    /// this incarnation, and returns it when it authorizes recovering the
+    /// Waits for the control plane to say which command launched this
+    /// incarnation, and returns it when it authorizes recovering the
     /// storage `previous` left behind.
     async fn owner_decision(
         &mut self,
         previous: &SessionRecord,
-    ) -> Result<Option<OwnerCommand>, RunnerError> {
+    ) -> Result<Option<Decision>, RunnerError> {
         tracing::warn!(
             previous = %previous.incarnation,
             "the previous runner stopped unexpectedly; waiting for the owner's decision"
@@ -850,7 +880,10 @@ impl Session {
         {
             return Ok(None);
         }
-        Ok(Some(command))
+        Ok(Some(Decision {
+            command,
+            actor: launch.authorized_by_actor.unwrap_or_default(),
+        }))
     }
 
     /// Reports that the storage waits for its owner and stops, having
@@ -868,23 +901,17 @@ impl Session {
         Ok(RunnerExit::Problem(problem))
     }
 
-    /// Runs reconciliation the owner authorized and, when it finds an
-    /// action that was in flight, starts that action again.
-    fn recover(&mut self, command: OwnerCommand) -> Result<(), RunnerError> {
+    /// Runs reconciliation the owner or the resume policy authorized and,
+    /// when it finds an action that was in flight, starts that action again.
+    fn recover(&mut self, decision: Decision) -> Result<(), RunnerError> {
         let execution_id = self.execution_id.clone().unwrap_or_default();
         let reconciliation = reconcile(self.engine.store(), &execution_id)?;
-        tracing::info!(?command, outcome = ?reconciliation.outcome, "recovering after an unexpected stop");
+        tracing::info!(?decision, outcome = ?reconciliation.outcome, "recovering after an unexpected stop");
         if let ReconciliationOutcome::InterruptedAction { .. } = reconciliation.outcome {
-            let comment = format!(
-                "owner {} after the task's workload stopped unexpectedly",
-                match command {
-                    OwnerCommand::Start => "start",
-                    _ => "resume",
-                }
-            );
-            let handle = self
-                .engine
-                .try_begin_recover_with(&execution_id, Recovery::with_comment(Some(comment)))?;
+            let handle = self.engine.try_begin_recover_with(
+                &execution_id,
+                Recovery::with_comment(Some(decision.comment())),
+            )?;
             self.spawn_pass(handle);
             return Ok(());
         }

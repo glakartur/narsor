@@ -30,11 +30,11 @@ use crate::domain::{
 use crate::engine::{HumanInputDelivery, Timeline};
 pub use crate::environment::TaskDefaultHarness;
 use crate::orchestration::{
-    ArchiveTombstone, AttentionItem, CommandReceipt, ConversationAttemptSummary, ExecutionCursor,
-    HarnessUnavailable, InputStatus, MoveTarget, Observation, ObservedSummary, OperatorCommand,
-    OperatorCommandStatus, OwnerCommand, PendingInputRef, QueueReason, QueueStatus, QueuedInput,
-    QueuedOperatorCommand, ResourceIdentity, ResumeState, RunnerProblem, RunnerSnapshot, TaskEvent,
-    TaskLifecycle,
+    ArchiveTombstone, AttentionItem, CommandActor, CommandReceipt, ConversationAttemptSummary,
+    ExecutionCursor, HarnessUnavailable, InputStatus, MoveTarget, Observation, ObservedSummary,
+    OperatorCommand, OperatorCommandStatus, OwnerCommand, PendingInputRef, QueueReason,
+    QueueStatus, QueuedInput, QueuedOperatorCommand, ResourceIdentity, ResumeState, RunnerProblem,
+    RunnerSnapshot, TaskEvent, TaskLifecycle,
 };
 
 /// Version of this protocol; part of every path (`…/v1/…`).
@@ -942,6 +942,11 @@ pub struct RunnerLaunchView {
     /// The owner command that produced that generation (`start` or
     /// `resume`); `None` for the first launch out of the queue.
     pub authorized_by: Option<OwnerCommand>,
+    /// Who issued [`Self::authorized_by`]: the owner, or the resume policy
+    /// after a workload loss. Only words the runner's history; absent from
+    /// an older control plane, and then read as the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_by_actor: Option<CommandActor>,
 }
 
 /// `POST /runner/v1/snapshots` response.

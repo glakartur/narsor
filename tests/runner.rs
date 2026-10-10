@@ -1044,6 +1044,142 @@ async fn an_unexpected_loss_is_recovered_only_after_the_owner_decides() {
     )));
 }
 
+/// The resume policy's resume authorizes the recovery like the owner's: the
+/// new incarnation reconciles, runs the interrupted action again once, and
+/// the history says the resume was automatic (R1, R2, AE2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_automatic_resume_recovers_the_interrupted_action_and_says_so() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let spec = spec(
+        SLOW_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-2", spec.clone());
+    fixture.report("task-2", Observation::StartAccepted);
+    let launch = Launch::new(&fixture, "task-2", &spec);
+    let credential = fixture.credential("task-2", "pod-1");
+    let first = fixture.spawn(&launch, "pod-1", &credential);
+    let attempts = launch.home().join("attempts");
+    wait_until_async(Duration::from_secs(30), "the first attempt", || {
+        attempts.is_file()
+    })
+    .await;
+
+    fixture.kill(first);
+    fixture.report("task-2", Observation::WorkloadLost { state_known: true });
+    let pass = fixture.service.auto_resume_pass();
+    assert_eq!(pass.resumed, vec![TaskId::parse("task-2").unwrap()]);
+    assert!(matches!(
+        fixture.record("task-2").last_event.kind,
+        TaskEventKind::AutoResumed { attempt: 1, .. }
+    ));
+
+    let credential = fixture.credential("task-2", "pod-2");
+    fixture.spawn(&launch, "pod-2", &credential);
+    wait_until_async(Duration::from_secs(60), "the recovered run", || {
+        runner_status(&fixture, "task-2") == Some(ExecutionStatus::Completed)
+    })
+    .await;
+    assert_eq!(fs::read_to_string(&attempts).unwrap().lines().count(), 2);
+    let record = fixture.record("task-2");
+    assert_eq!(
+        record
+            .runner
+            .unwrap()
+            .snapshot
+            .problem
+            .map(|problem| problem.code),
+        None,
+        "no owner decision was needed"
+    );
+    let events = launch.events();
+    let starts = events
+        .iter()
+        .filter(|event| matches!(event.data, EventData::ActionStarted { .. }))
+        .count();
+    assert_eq!(starts, 2, "the interrupted action ran exactly once more");
+    // A script step leaves the recovery's note unread, where the next
+    // agent attempt would find it.
+    let execution = launch
+        .store()
+        .load_execution(&launch.execution_id().unwrap())
+        .unwrap();
+    let note = execution.metadata.to_string();
+    assert!(
+        note.contains("resumed automatically after workload loss"),
+        "the automatic resume is noted: {note}"
+    );
+    assert!(!note.contains("owner resume"), "{note}");
+}
+
+/// A task waiting for an approval when its workload was lost waits for the
+/// same approval after the automatic resume: the owner's draft keeps its
+/// place (R8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_automatically_resumed_task_waits_for_the_same_approval() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let (bare, pinned) = origin(&fixture.root);
+    let bin = fake_claude(&fixture.root);
+    let spec = spec(
+        GATED_WORKFLOW,
+        TaskWorkspace::Git(GitIdentity {
+            repository: Some("demo".to_string()),
+            remote_url: bare.display().to_string(),
+            commit: pinned,
+            git_ref: None,
+            credential: None,
+        }),
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    fixture.report("task-1", Observation::StartAccepted);
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    let credential = fixture.credential("task-1", "pod-1");
+    let first = fixture.spawn(&launch, "pod-1", &credential);
+    let waiting = |fixture: &Fixture| -> Vec<String> {
+        fixture
+            .service
+            .task(&fixture.owner(), "task-1")
+            .expect("summary")
+            .attention
+            .into_iter()
+            .map(|item| item.waiting_id)
+            .collect()
+    };
+    wait_until_async(Duration::from_secs(30), "the gate", || {
+        !waiting(&fixture).is_empty()
+    })
+    .await;
+    let before = waiting(&fixture);
+
+    fixture.kill(first);
+    fixture.report("task-1", Observation::WorkloadLost { state_known: true });
+    assert_eq!(fixture.service.auto_resume_pass().resumed.len(), 1);
+    let generation = fixture.record("task-1").generation;
+    let credential = fixture.credential("task-1", "pod-2");
+    fixture.spawn(&launch, "pod-2", &credential);
+    wait_until_async(
+        Duration::from_secs(60),
+        "the new runner at the gate",
+        || {
+            fixture.record("task-1").runner.is_some_and(|runner| {
+                runner.incarnation == "pod-2"
+                    && runner.launch_generation == generation
+                    && runner.snapshot.pending_input.is_some()
+            })
+        },
+    )
+    .await;
+    assert_eq!(waiting(&fixture), before, "the same wait, by the same id");
+}
+
 // ---------------------------------------------------------------------------
 // Offline progress (R5, R14)
 // ---------------------------------------------------------------------------

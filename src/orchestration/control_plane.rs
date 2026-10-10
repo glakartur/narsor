@@ -24,7 +24,7 @@ use super::model::{
     OwnerCommand, ReportOutcome, ResumeState, TaskAssignment, TaskEvent, TaskEventKind,
     TaskLifecycle, TaskRecord, WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
 };
-use super::resume::{count_loss, loss_from_history, ResumePolicy};
+use super::resume::{auto_resume_key, count_loss, loss_from_history, ResumePolicy};
 use super::store::OrchestrationStore;
 use crate::domain::{BackendId, TaskId};
 use crate::persistence::{ExecutionStore, StatePaths};
@@ -238,7 +238,11 @@ impl ControlPlane {
     /// An owner command that takes the task out of `Interrupted`/`Unknown`
     /// is the owner's decision and resets its resume state (R6); one the
     /// resume policy issued ([`super::model::CommandActor::Policy`]) only
-    /// consumes the planned attempt and keeps the count.
+    /// consumes the planned attempt and keeps the count. A policy command is
+    /// a `Resume` of a task whose attempt is due
+    /// ([`TaskRecord::auto_resume_due`]) and nothing else; its receipt is
+    /// announced as [`TaskEventKind::AutoResumed`] instead of
+    /// `OwnerCommandAccepted`, in the same mutation.
     pub fn command(&self, task_id: &TaskId, request: CommandRequest) -> Result<CommandOutcome> {
         let (task, (receipt, replayed)) = self.mutate(task_id, |record, now| {
             if let Some(receipt) = record.receipt(&request.idempotency_key) {
@@ -257,6 +261,30 @@ impl ControlPlane {
             if let Some(expected) = request.expected_generation {
                 record.check_generation(expected)?;
             }
+            let policy_may_act =
+                request.command == OwnerCommand::Resume && record.auto_resume_due(now);
+            if request.actor == CommandActor::Policy && !policy_may_act {
+                return Err(OrchestrationError::IllegalCommand {
+                    task_id: record.task_id.clone(),
+                    command: request.command,
+                    lifecycle: record.lifecycle,
+                });
+            }
+            let event = match request.actor {
+                CommandActor::Owner => TaskEventKind::OwnerCommandAccepted {
+                    command: request.command,
+                    idempotency_key: request.idempotency_key.clone(),
+                },
+                CommandActor::Policy => TaskEventKind::AutoResumed {
+                    attempt: record.resume.consecutive_losses.max(1),
+                    limit: self.resume_policy.limit(),
+                    loss_reason: record
+                        .resume
+                        .last_loss
+                        .as_ref()
+                        .and_then(|loss| loss.reason.clone()),
+                },
+            };
 
             match command_effect(record.lifecycle, request.command) {
                 CommandEffect::Illegal => {
@@ -298,19 +326,57 @@ impl ControlPlane {
                 actor: request.actor,
             };
             record.commands.push(receipt.clone());
-            Ok(Mutation::Changed(
-                TaskEventKind::OwnerCommandAccepted {
-                    command: request.command,
-                    idempotency_key: request.idempotency_key.clone(),
-                },
-                (receipt, false),
-            ))
+            Ok(Mutation::Changed(event, (receipt, false)))
         })?;
         Ok(CommandOutcome {
             receipt,
             task,
             replayed,
         })
+    }
+
+    /// The resume policy resumes a task interrupted at `generation` whose
+    /// attempt is due: a `Resume` with [`CommandActor::Policy`], keyed
+    /// [`auto_resume_key`]`(generation)` and expecting that generation.
+    ///
+    /// Idempotent like any command: a second pass before the controller
+    /// acted replays the receipt. An owner command that came first moved
+    /// the generation, so the policy's is refused with `StaleGeneration`.
+    /// No capacity check: an interrupted task still holds its slot, and the
+    /// resume keeps it.
+    pub fn auto_resume(&self, task_id: &TaskId, generation: u64) -> Result<CommandOutcome> {
+        self.command(
+            task_id,
+            CommandRequest::new(OwnerCommand::Resume, auto_resume_key(generation))
+                .expecting_generation(generation)
+                .issued_by(CommandActor::Policy),
+        )
+    }
+
+    /// Publishes [`TaskEventKind::AutoResumeExhausted`] for the task's
+    /// exhaustion once: `None` when there is none, or it was announced.
+    pub fn announce_exhaustion(&self, task_id: &TaskId) -> Result<Option<TaskRecord>> {
+        let (record, announced) = self.mutate(task_id, |record, _| {
+            // The loss past the last attempt exhausted the limit.
+            let attempts = record.resume.consecutive_losses.saturating_sub(1);
+            let Some(exhaustion) = record
+                .resume
+                .exhausted
+                .as_mut()
+                .filter(|exhaustion| !exhaustion.announced)
+            else {
+                return Ok(Mutation::Unchanged(false));
+            };
+            exhaustion.announced = true;
+            Ok(Mutation::Changed(
+                TaskEventKind::AutoResumeExhausted {
+                    attempts,
+                    reason: exhaustion.reason.clone(),
+                },
+                true,
+            ))
+        })?;
+        Ok(announced.then_some(record))
     }
 
     /// Acquires the backend's lease with a new, higher fencing epoch.

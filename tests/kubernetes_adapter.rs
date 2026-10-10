@@ -36,7 +36,7 @@ use narsor::domain::{
     BackendId, GitIdentity, ImageDigest, ImageSource, ResolvedEnvironment, ResolvedImage,
     ResourceProfile, SecretDelivery, SecretReference, TaskId, TaskLaunchSpec, TaskWorkspace,
 };
-use narsor::orchestration::{OwnerCommand, TaskLifecycle};
+use narsor::orchestration::{Observation, OwnerCommand, TaskLifecycle};
 use narsor::runner::{HarnessHome, HomeMode};
 use serde_json::Value;
 
@@ -1268,11 +1268,36 @@ async fn two_tasks_share_pinned_images_but_nothing_writable() {
 }
 
 /// AE4: a Pod deleted behind the controller's back (an eviction) makes the
-/// task Interrupted; nothing replaces it until the owner resumes, and the
-/// resumed runner continues on the same storage.
+/// task Interrupted; the resume policy replaces it without the owner, and
+/// the resumed runner continues on the same storage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_evicted_pod_waits_for_the_owner() {
+async fn an_evicted_pod_is_replaced_automatically() {
     let Some(mut h) = Harness::<KubernetesTarget>::new().await else {
+        return;
+    };
+    h.start_controller();
+    h.running("task-1").await;
+    let cluster = Arc::clone(&h.target.cluster);
+    let task = h.resources("task-1");
+    assert!(cluster.evict(&task.workload));
+    h.wait_for("the replacement Pod", |h| {
+        cluster.created_of("Pod").len() == 2 && h.lifecycle("task-1") == TaskLifecycle::Running
+    })
+    .await;
+    assert_eq!(cluster.created_of("PersistentVolumeClaim").len(), 1);
+    assert!(h
+        .reported("task-1")
+        .contains(&Observation::WorkloadLost { state_known: true }));
+    assert_eq!(
+        backend_contract_support::auto_resumes(&h.events("task-1")),
+        vec![(1, 5)]
+    );
+}
+
+/// Without the resume policy an evicted Pod waits for the owner (R13).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_evicted_pod_waits_for_the_owner_without_the_policy() {
+    let Some(mut h) = Harness::<KubernetesTarget>::without_auto_resume().await else {
         return;
     };
     h.start_controller();
@@ -1282,11 +1307,10 @@ async fn an_evicted_pod_waits_for_the_owner() {
     assert!(cluster.evict(&task.workload));
     h.wait_lifecycle("task-1", TaskLifecycle::Interrupted).await;
     h.settle().await;
-    h.settle().await;
     assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Interrupted);
     assert!(
         cluster.pod(&task.workload).is_none(),
-        "no automatic replacement"
+        "no replacement without the policy"
     );
     assert_eq!(cluster.created_of("Pod").len(), 1);
 

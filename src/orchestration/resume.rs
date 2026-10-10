@@ -12,13 +12,24 @@
 //! | ready at least the stability window               | 1         | now                   |
 //!
 //! The resume policy then only reads the outcome: an attempt that is due
-//! and not exhausted.
+//! and not exhausted ([`TaskRecord::auto_resume_due`]), resumed through
+//! `ControlPlane::auto_resume`.
 
 use super::model::{
     Observation, ResumeExhaustion, TaskEvent, TaskEventKind, TaskLifecycle, TaskRecord,
     WorkloadLoss,
 };
 use chrono::{DateTime, Duration, Utc};
+
+/// The prefix of the idempotency keys of the resume policy's commands
+/// (`auto-resume:<generation>`), reserved: an owner's key may not use it.
+pub const AUTO_RESUME_KEY_PREFIX: &str = "auto-resume:";
+
+/// The idempotency key of the policy's resume of a task interrupted at
+/// `generation`: one per interruption, however often the pass sees it.
+pub fn auto_resume_key(generation: u64) -> String {
+    format!("{AUTO_RESUME_KEY_PREFIX}{generation}")
+}
 
 /// How the control plane resumes a task after its workload was lost.
 ///

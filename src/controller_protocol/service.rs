@@ -14,6 +14,7 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, watch};
 
+mod auto_resume;
 mod conductor;
 mod events;
 mod materials;
@@ -39,6 +40,8 @@ use crate::orchestration::{
 use crate::workflow::TemplateScope;
 use events::LocalTaskStorage;
 use relay::{Relay, RelayGuard};
+
+pub use auto_resume::AutoResumePass;
 
 /// A launch that did not resolve, as the owner sees it: a `400` naming the
 /// reason, or a bare `500` when the catalogue could not even be read.
@@ -496,6 +499,18 @@ impl ProtocolService {
             return Err(ProtocolError::bad_request(
                 "missing_idempotency_key",
                 "an owner command needs an idempotency key",
+            ));
+        }
+        if request
+            .idempotency_key
+            .starts_with(crate::orchestration::AUTO_RESUME_KEY_PREFIX)
+        {
+            return Err(ProtocolError::bad_request(
+                "reserved_idempotency_key",
+                format!(
+                    "idempotency keys starting with `{}` are reserved for the resume policy",
+                    crate::orchestration::AUTO_RESUME_KEY_PREFIX
+                ),
             ));
         }
         let capacity = self.capacity(&record.assignment.backend_id);
@@ -2171,10 +2186,12 @@ fn is_attempt_id(value: &str) -> bool {
 
 /// The calling runner's launch, as the record knows it.
 fn launch_view(identity: &RunnerIdentity, record: &TaskRecord) -> RunnerLaunchView {
+    let receipt = record.launch_receipt(identity.launch_generation);
     RunnerLaunchView {
         incarnation: identity.incarnation.clone(),
         launch_generation: identity.launch_generation,
-        authorized_by: record.launch_command(identity.launch_generation),
+        authorized_by: receipt.map(|receipt| receipt.command),
+        authorized_by_actor: receipt.map(|receipt| receipt.actor),
     }
 }
 

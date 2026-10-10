@@ -184,14 +184,71 @@ contract_suite!(local, crate::LocalTarget);
 /// owner resume, and a finished step is never executed again (R13).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_engine_work_survives_loss_and_owner_resume() {
-    use narsor::domain::ExecutionStatus;
     use narsor::orchestration::{OwnerCommand, TaskLifecycle};
-    use narsor::persistence::ExecutionStore;
+
+    let Some(mut h) = backend_contract_support::Harness::<LocalTarget>::without_auto_resume().await
+    else {
+        return;
+    };
+    h.start_controller();
+    let before = finished_work(&h).await;
+
+    h.kill_workload("task-1");
+    h.wait_lifecycle("task-1", TaskLifecycle::Interrupted).await;
+    h.must("task-1", OwnerCommand::Resume, "resume-1");
+    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+
+    assert_work_continued(&h, &before);
+}
+
+/// The same, with nobody deciding: the resume policy launches a new runner
+/// on the storage, which continues the work without repeating it, and the
+/// task's history shows the loss and the automatic resume (R1, R2, AE2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_engine_work_survives_loss_and_automatic_resume() {
+    use narsor::orchestration::{Observation, TaskLifecycle};
 
     let Some(mut h) = backend_contract_support::Harness::<LocalTarget>::new().await else {
         return;
     };
     h.start_controller();
+    let before = finished_work(&h).await;
+    let first = h.record("task-1").runner.unwrap().incarnation;
+
+    h.kill_workload("task-1");
+    h.wait_for("a new runner", |h| {
+        let record = h.record("task-1");
+        record.lifecycle == TaskLifecycle::Running
+            && record
+                .runner
+                .is_some_and(|runner| runner.incarnation != first)
+    })
+    .await;
+
+    assert!(h
+        .reported("task-1")
+        .contains(&Observation::WorkloadLost { state_known: true }));
+    assert_eq!(
+        backend_contract_support::auto_resumes(&h.events("task-1")),
+        vec![(1, 5)]
+    );
+    assert_eq!(h.counters().workloads_created, 2);
+    assert_work_continued(&h, &before);
+}
+
+/// What the finished workflow left on the task's storage before a loss.
+struct FinishedWork {
+    storage: std::path::PathBuf,
+    execution_id: String,
+    events: Vec<narsor::domain::Event>,
+    cursor: u64,
+}
+
+/// Runs task-1 until its workflow finished and records what it left.
+async fn finished_work(h: &backend_contract_support::Harness<LocalTarget>) -> FinishedWork {
+    use narsor::domain::ExecutionStatus;
+    use narsor::persistence::ExecutionStore;
+
     h.running("task-1").await;
     h.wait_for("the workflow to finish", |h| {
         h.record("task-1")
@@ -202,42 +259,52 @@ async fn local_engine_work_survives_loss_and_owner_resume() {
     let storage = h.probe.inner().storage_dir(&h.resources("task-1"));
     let store = ExecutionStore::new(storage.join("state"));
     let execution_id = store.list_execution_ids().unwrap().remove(0);
-    let events_before = store.event_log(&execution_id).read_all().unwrap();
-    let cursor_before = h.record("task-1").runner.unwrap().snapshot.event_cursor;
+    FinishedWork {
+        events: store.event_log(&execution_id).read_all().unwrap(),
+        cursor: h.record("task-1").runner.unwrap().snapshot.event_cursor,
+        storage,
+        execution_id,
+    }
+}
 
-    h.kill_workload("task-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Interrupted).await;
-    h.must("task-1", OwnerCommand::Resume, "resume-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+/// The resumed runner continued `before` on the same storage: the same
+/// execution, its log only appended to, the finished step not run again.
+fn assert_work_continued(
+    h: &backend_contract_support::Harness<LocalTarget>,
+    before: &FinishedWork,
+) {
+    use narsor::domain::ExecutionStatus;
+    use narsor::persistence::ExecutionStore;
 
     let record = h.record("task-1");
     let runner = record.runner.unwrap();
     assert_eq!(runner.launch_generation, record.generation);
-    assert!(runner.snapshot.event_cursor >= cursor_before);
+    assert!(runner.snapshot.event_cursor >= before.cursor);
+    let store = ExecutionStore::new(before.storage.join("state"));
     assert_eq!(
         store.list_execution_ids().unwrap(),
-        std::slice::from_ref(&execution_id),
+        std::slice::from_ref(&before.execution_id),
         "the same execution, on the same storage"
     );
-    let events_after = store.event_log(&execution_id).read_all().unwrap();
+    let events_after = store.event_log(&before.execution_id).read_all().unwrap();
     let sequences = |events: &[narsor::domain::Event]| -> Vec<(u64, String)> {
         events
             .iter()
             .map(|event| (event.sequence, format!("{:?}", event.data)))
             .collect()
     };
-    assert!(events_after.len() >= events_before.len());
+    assert!(events_after.len() >= before.events.len());
     assert_eq!(
-        sequences(&events_after[..events_before.len()]),
-        sequences(&events_before),
+        sequences(&events_after[..before.events.len()]),
+        sequences(&before.events),
         "the event log is continued, never rewritten"
     );
     assert_eq!(
-        store.load_execution(&execution_id).unwrap().status,
+        store.load_execution(&before.execution_id).unwrap().status,
         ExecutionStatus::Completed
     );
     assert_eq!(
-        fs::read_to_string(storage.join("home/steps")).unwrap(),
+        fs::read_to_string(before.storage.join("home/steps")).unwrap(),
         "worked\n",
         "the finished step ran once"
     );
