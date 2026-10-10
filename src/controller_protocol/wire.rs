@@ -33,7 +33,7 @@ use crate::orchestration::{
     ArchiveTombstone, AttentionItem, CommandReceipt, ConversationAttemptSummary, ExecutionCursor,
     HarnessUnavailable, InputStatus, MoveTarget, Observation, ObservedSummary, OperatorCommand,
     OperatorCommandStatus, OwnerCommand, PendingInputRef, QueueReason, QueueStatus, QueuedInput,
-    QueuedOperatorCommand, ResourceIdentity, RunnerProblem, RunnerSnapshot, TaskEvent,
+    QueuedOperatorCommand, ResourceIdentity, ResumeState, RunnerProblem, RunnerSnapshot, TaskEvent,
     TaskLifecycle,
 };
 
@@ -319,6 +319,11 @@ pub struct TaskSummary {
     /// workflow snapshot cannot be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_transitions: Option<TransitionOffer>,
+    /// Automatic resume after a workload loss: the losses in a row, the
+    /// next planned attempt, or why the policy gave up. Empty when nothing
+    /// was lost and from a server that predates the policy.
+    #[serde(default)]
+    pub resume: ResumeState,
     /// The control plane's "now" this summary was computed at, so a client
     /// can show the age of every timestamp above.
     pub as_of: DateTime<Utc>,

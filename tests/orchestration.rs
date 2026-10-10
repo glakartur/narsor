@@ -7,9 +7,10 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
 use narsor::orchestration::{
-    BackendCapacity, BackendLease, Clock, CommandRequest, ControlPlane, ControllerReport,
-    MoveTarget, NewTask, Observation, ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef,
-    QueueReason, ResourceIdentity, RunnerSnapshot, TaskEventKind, TaskLifecycle, TaskRecord,
+    BackendCapacity, BackendLease, Clock, CommandActor, CommandRequest, ControlPlane,
+    ControllerReport, MoveTarget, NewTask, Observation, ObservedSummary, OrchestrationError,
+    OwnerCommand, OwnerRef, QueueReason, ResourceIdentity, ResumeExhaustion, ResumeState,
+    RunnerSnapshot, TaskEventKind, TaskLifecycle, TaskRecord, WorkloadLoss,
 };
 use narsor::persistence::paths::{temp_path_for, StatePaths};
 use narsor::persistence::ExecutionStore;
@@ -2437,6 +2438,400 @@ fn an_old_event_log_with_a_conductor_harness_command_still_decodes() {
                 harness: "codex".to_string(),
             },
             requested_by: OwnerRef::new("local"),
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Automatic resume: model and lifecycle
+// ---------------------------------------------------------------------------
+
+/// Drives a running task to `Unknown`: its controller lost track of the
+/// workload.
+fn unknown(fx: &Fixture, id: &str, lease: &BackendLease) -> TaskRecord {
+    fx.running(id, lease);
+    fx.observe(id, lease, Observation::WorkloadLost { state_known: false })
+        .expect("uncertain loss")
+}
+
+#[test]
+fn a_confirmed_loss_moves_an_unknown_task_to_interrupted() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    let before = unknown(&fx, "task-1", &lease);
+    assert_eq!(before.lifecycle, TaskLifecycle::Unknown);
+
+    let confirmed = fx
+        .observe("task-1", &lease, Observation::LossConfirmed)
+        .expect("a confirmation on Unknown is legal");
+
+    assert_eq!(confirmed.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(
+        confirmed.generation, before.generation,
+        "no new desired work"
+    );
+    assert!(
+        confirmed.commands.is_empty(),
+        "nothing resumes by itself yet"
+    );
+    assert_eq!(
+        confirmed.last_event.kind,
+        TaskEventKind::ControllerReported {
+            observation: Observation::LossConfirmed,
+            lease_epoch: lease.epoch,
+        }
+    );
+    assert_eq!(
+        confirmed
+            .observed
+            .as_ref()
+            .map(|observed| observed.observation),
+        Some(Observation::LossConfirmed)
+    );
+}
+
+#[test]
+fn a_confirmed_loss_changes_no_other_lifecycle() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+
+    fx.running("running", &lease);
+
+    fx.running("paused", &lease);
+    fx.command("paused", OwnerCommand::Pause, "pause-1");
+    fx.observe("paused", &lease, Observation::PausedAtSafePoint)
+        .expect("paused");
+
+    fx.running("interrupted", &lease);
+    fx.observe(
+        "interrupted",
+        &lease,
+        Observation::WorkloadLost { state_known: true },
+    )
+    .expect("interrupted");
+
+    fx.running("archiving", &lease);
+    fx.command("archiving", OwnerCommand::Archive, "archive-1");
+
+    for (id, lifecycle) in [
+        ("running", TaskLifecycle::Running),
+        ("paused", TaskLifecycle::Paused),
+        ("interrupted", TaskLifecycle::Interrupted),
+        ("archiving", TaskLifecycle::Archiving),
+    ] {
+        let before = fx.control.task(&task(id)).unwrap();
+        assert_eq!(before.lifecycle, lifecycle, "{id} set up");
+        let after = fx
+            .observe(id, &lease, Observation::LossConfirmed)
+            .unwrap_or_else(|error| panic!("{id}: a late confirmation is not an error: {error}"));
+        assert_eq!(after.lifecycle, lifecycle, "{id} stays where it was");
+        assert_eq!(after.generation, before.generation, "{id} gets no new work");
+        assert_eq!(after.commands, before.commands, "{id} is not resumed");
+    }
+}
+
+#[test]
+fn a_repeated_loss_confirmation_is_absorbed_as_a_redelivery() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    unknown(&fx, "task-1", &lease);
+    let first = fx
+        .observe("task-1", &lease, Observation::LossConfirmed)
+        .unwrap();
+
+    let generation = first.generation;
+    let outcome = fx
+        .control
+        .report(report(
+            "task-1",
+            &lease,
+            generation,
+            Observation::LossConfirmed,
+            None,
+        ))
+        .expect("a redelivery is accepted");
+
+    assert!(!outcome.applied);
+    assert_eq!(outcome.task.revision, first.revision);
+    assert_eq!(outcome.task.lifecycle, TaskLifecycle::Interrupted);
+}
+
+#[test]
+fn an_observation_this_version_does_not_know_is_refused_in_a_report() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    let before = unknown(&fx, "task-1", &lease);
+
+    let error = fx
+        .observe("task-1", &lease, Observation::Unrecognized)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        OrchestrationError::IllegalObservation {
+            observation: Observation::Unrecognized,
+            lifecycle: TaskLifecycle::Unknown,
+            ..
+        }
+    ));
+    let after = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(after.revision, before.revision, "nothing was written");
+}
+
+#[test]
+fn a_new_task_has_an_empty_resume_state_and_owner_receipts() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    let running = fx.running("task-1", &lease);
+    assert!(running.resume.is_empty());
+    assert_eq!(running.resume, ResumeState::default());
+    assert_eq!(running.running_since, None, "kept from U2 on");
+
+    let paused = fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    assert_eq!(paused.commands[0].actor, CommandActor::Owner);
+}
+
+#[test]
+fn a_receipt_records_the_actor_that_issued_the_command() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.running("task-1", &lease);
+    fx.observe(
+        "task-1",
+        &lease,
+        Observation::WorkloadLost { state_known: true },
+    )
+    .unwrap();
+
+    let outcome = fx
+        .control
+        .command(
+            &task("task-1"),
+            CommandRequest::new(OwnerCommand::Resume, "auto-resume:1")
+                .expecting_generation(1)
+                .issued_by(CommandActor::Policy),
+        )
+        .expect("a policy resume");
+
+    assert_eq!(outcome.receipt.actor, CommandActor::Policy);
+    let stored = fx.reopen().task(&task("task-1")).unwrap();
+    assert_eq!(
+        stored.receipt("auto-resume:1").unwrap().actor,
+        CommandActor::Policy
+    );
+}
+
+#[test]
+fn a_task_record_written_before_automatic_resume_still_reads() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.running("task-1", &lease);
+    fx.observe(
+        "task-1",
+        &lease,
+        Observation::WorkloadLost { state_known: true },
+    )
+    .unwrap();
+    fx.command("task-1", OwnerCommand::Start, "retry-1");
+    let path = fx.root.paths().orchestration_task_file("task-1");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("resume").expect("the field is written");
+    object
+        .remove("running_since")
+        .expect("the field is written");
+    for receipt in object["commands"].as_array_mut().unwrap() {
+        receipt
+            .as_object_mut()
+            .unwrap()
+            .remove("actor")
+            .expect("the field is written");
+    }
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let record = fx
+        .reopen()
+        .task(&task("task-1"))
+        .expect("an older record reads");
+
+    assert_eq!(record.resume, ResumeState::default());
+    assert_eq!(record.running_since, None);
+    assert_eq!(record.commands.len(), 1);
+    assert_eq!(record.commands[0].actor, CommandActor::Owner);
+}
+
+#[test]
+fn a_partial_resume_state_fills_the_rest_with_defaults() {
+    let state: ResumeState = serde_json::from_value(serde_json::json!({
+        "consecutive_losses": 2,
+        "last_loss": {
+            "from": "running",
+            "at": "2026-10-10T12:00:00Z",
+            "lease_epoch": 4
+        }
+    }))
+    .expect("a partial resume state reads");
+
+    assert_eq!(state.consecutive_losses, 2);
+    assert_eq!(state.next_attempt_at, None);
+    assert_eq!(state.exhausted, None);
+    let loss = state.last_loss.expect("the loss");
+    assert_eq!(loss.from, TaskLifecycle::Running);
+    assert_eq!(loss.lease_epoch, 4);
+    assert_eq!(loss.reason, None);
+}
+
+#[test]
+fn a_full_resume_state_round_trips() {
+    let at = Utc.with_ymd_and_hms(2026, 10, 10, 12, 0, 0).unwrap();
+    let state = ResumeState {
+        consecutive_losses: 6,
+        next_attempt_at: Some(at + Duration::minutes(2)),
+        last_loss: Some(WorkloadLoss {
+            from: TaskLifecycle::PauseRequested,
+            at,
+            lease_epoch: 3,
+            reason: Some("pod deleted".to_string()),
+        }),
+        exhausted: Some(ResumeExhaustion {
+            reason: "could not resume automatically: pod deleted".to_string(),
+            at,
+            announced: true,
+        }),
+    };
+    assert!(!state.is_empty());
+
+    let json = serde_json::to_value(&state).unwrap();
+    assert_eq!(json["last_loss"]["from"], "pause_requested");
+    assert_eq!(json["exhausted"]["announced"], true);
+    let back: ResumeState = serde_json::from_value(json).unwrap();
+    assert_eq!(back, state);
+}
+
+#[test]
+fn the_automatic_resume_events_round_trip() {
+    for kind in [
+        TaskEventKind::AutoResumed {
+            attempt: 2,
+            limit: 5,
+            loss_reason: Some("runner process exited".to_string()),
+        },
+        TaskEventKind::AutoResumed {
+            attempt: 1,
+            limit: 5,
+            loss_reason: None,
+        },
+        TaskEventKind::AutoResumeExhausted {
+            attempts: 5,
+            reason: "could not resume automatically: runner process exited".to_string(),
+        },
+        TaskEventKind::ControllerReported {
+            observation: Observation::LossConfirmed,
+            lease_epoch: 7,
+        },
+    ] {
+        let json = serde_json::to_value(&kind).unwrap();
+        let back: TaskEventKind = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back, kind, "{json}");
+    }
+
+    let json = serde_json::to_value(TaskEventKind::AutoResumed {
+        attempt: 3,
+        limit: 5,
+        loss_reason: None,
+    })
+    .unwrap();
+    assert_eq!(json["type"], "auto_resumed");
+    let exhausted = serde_json::to_value(TaskEventKind::AutoResumeExhausted {
+        attempts: 5,
+        reason: "x".to_string(),
+    })
+    .unwrap();
+    assert_eq!(exhausted["type"], "auto_resume_exhausted");
+    let confirmed = serde_json::to_value(Observation::LossConfirmed).unwrap();
+    assert_eq!(confirmed, serde_json::json!({ "kind": "loss_confirmed" }));
+
+    // Written without its optional reason, the event still reads.
+    let bare: TaskEventKind = serde_json::from_value(serde_json::json!({
+        "type": "auto_resumed", "attempt": 1, "limit": 5
+    }))
+    .unwrap();
+    assert_eq!(
+        bare,
+        TaskEventKind::AutoResumed {
+            attempt: 1,
+            limit: 5,
+            loss_reason: None
+        }
+    );
+}
+
+#[test]
+fn a_malformed_automatic_resume_event_is_an_error_not_a_guess() {
+    // A known type with missing fields is corrupt, not newer: it must not
+    // be swallowed as an unrecognized event.
+    let result = serde_json::from_value::<TaskEventKind>(serde_json::json!({
+        "type": "auto_resume_exhausted", "attempts": 5
+    }));
+    assert!(result.is_err());
+}
+
+/// A stream frame as a newer server would send it, with `kind` spliced in.
+fn newer_frame(kind: serde_json::Value) -> String {
+    serde_json::json!({
+        "cursor": "task-1:9",
+        "event": {
+            "sequence": 9,
+            "task_id": "task-1",
+            "at": "2026-10-10T12:00:00Z",
+            "lifecycle": "interrupted",
+            "generation": 2,
+            "kind": kind
+        }
+    })
+    .to_string()
+}
+
+#[test]
+fn a_client_keeps_a_stream_frame_whose_event_or_observation_it_does_not_know() {
+    use narsor::controller_protocol::ControlEventEnvelope;
+
+    // An event type from a newer version.
+    let frame = newer_frame(serde_json::json!({ "type": "resumed_by_magic", "extra": [1, 2] }));
+    let envelope: ControlEventEnvelope =
+        serde_json::from_str(&frame).expect("a newer event type still decodes");
+    assert_eq!(envelope.event.kind, TaskEventKind::Unrecognized);
+    assert_eq!(envelope.cursor, "task-1:9", "the cursor still advances");
+    assert_eq!(envelope.event.lifecycle, TaskLifecycle::Interrupted);
+
+    // A controller report of an observation from a newer version.
+    let frame = newer_frame(serde_json::json!({
+        "type": "controller_reported",
+        "observation": { "kind": "workload_teleported" },
+        "lease_epoch": 3
+    }));
+    let envelope: ControlEventEnvelope =
+        serde_json::from_str(&frame).expect("a newer observation still decodes");
+    assert_eq!(
+        envelope.event.kind,
+        TaskEventKind::ControllerReported {
+            observation: Observation::Unrecognized,
+            lease_epoch: 3,
+        }
+    );
+
+    // The confirmation this version introduces decodes as itself.
+    let frame = newer_frame(serde_json::json!({
+        "type": "controller_reported",
+        "observation": { "kind": "loss_confirmed" },
+        "lease_epoch": 3
+    }));
+    let envelope: ControlEventEnvelope = serde_json::from_str(&frame).unwrap();
+    assert_eq!(
+        envelope.event.kind,
+        TaskEventKind::ControllerReported {
+            observation: Observation::LossConfirmed,
+            lease_epoch: 3,
         }
     );
 }

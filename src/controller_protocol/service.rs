@@ -30,10 +30,10 @@ use crate::engine::{plan_operator_transition, EngineError, PositionStatus, Timel
 use crate::environment::{LaunchError, LaunchIntent, LaunchResolver};
 use crate::materials::{MaterialLimits, MaterialStore};
 use crate::orchestration::{
-    AttentionItem, AttentionKind, BackendCapacity, BackendLease, CommandRequest, ControlPlane,
-    ControllerReport, ConversationAvailability, InputRequest, InputStatus, LeaseToken, MoveTarget,
-    NewTask, Observation, OperatorCommand, OperatorCommandRequest, OwnerRef, RunnerObservation,
-    TaskEvent, TaskLifecycle, TaskRecord, RETIRED_CONDUCTOR_HARNESS,
+    AttentionItem, AttentionKind, BackendCapacity, BackendLease, CommandActor, CommandRequest,
+    ControlPlane, ControllerReport, ConversationAvailability, InputRequest, InputStatus,
+    LeaseToken, MoveTarget, NewTask, Observation, OperatorCommand, OperatorCommandRequest,
+    OwnerRef, RunnerObservation, TaskEvent, TaskLifecycle, TaskRecord, RETIRED_CONDUCTOR_HARNESS,
 };
 use crate::workflow::TemplateScope;
 use events::LocalTaskStorage;
@@ -495,6 +495,7 @@ impl ProtocolService {
                 command,
                 idempotency_key: request.idempotency_key,
                 expected_generation: request.expected_generation,
+                actor: CommandActor::Owner,
             },
             &capacity,
         )?;
@@ -1750,6 +1751,7 @@ impl ProtocolService {
             queue: record.queue.as_ref().map(QueueView::from),
             display: task_display(record),
             manual_transitions: manual_transitions(record),
+            resume: record.resume.clone(),
             as_of: now,
         })
     }

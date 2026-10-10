@@ -21,8 +21,8 @@ use super::lifecycle::{command_effect, observation_effect, CommandEffect, Observ
 use super::model::{
     ArchiveTombstone, BackendLease, CommandOutcome, CommandReceipt, CommandRequest,
     ControllerReport, LeaseToken, MaterialChange, NewTask, Observation, ObservedState,
-    OwnerCommand, ReportOutcome, TaskAssignment, TaskEvent, TaskEventKind, TaskLifecycle,
-    TaskRecord, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
+    OwnerCommand, ReportOutcome, ResumeState, TaskAssignment, TaskEvent, TaskEventKind,
+    TaskLifecycle, TaskRecord, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
 };
 use super::store::OrchestrationStore;
 use crate::domain::{BackendId, TaskId};
@@ -170,6 +170,8 @@ impl ControlPlane {
             reservation: None,
             queue: None,
             request_digest: request.request_digest,
+            running_since: None,
+            resume: ResumeState::default(),
             last_event: TaskEvent {
                 sequence: 1,
                 task_id: request.task_id.clone(),
@@ -259,6 +261,7 @@ impl ControlPlane {
                 generation_after: record.generation,
                 lifecycle_after: record.lifecycle,
                 revision: record.revision + 1,
+                actor: request.actor,
             };
             record.commands.push(receipt.clone());
             Ok(Mutation::Changed(

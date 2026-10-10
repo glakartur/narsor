@@ -8,9 +8,18 @@
 //! Running ──owner pause──▶ PauseRequested ──safe point + compute removed──▶ Paused
 //! Paused ──owner resume──▶ Provisioning
 //! Provisioning | Running | PauseRequested ──workload lost──▶ Interrupted | Unknown
-//! Interrupted | Unknown ──owner start/resume──▶ Provisioning      (never automatic)
+//! Unknown ──loss confirmed (workload dead, storage present)──▶ Interrupted
+//! Interrupted ──resume policy──▶ Provisioning                     (automatic)
+//! Interrupted | Unknown ──owner start/resume──▶ Provisioning
 //! any non-archival ──owner archive──▶ Archiving ──deletion acknowledged──▶ Archived
 //! ```
+//!
+//! The automatic resume is an ordinary `Resume` the control plane's resume
+//! policy issues (with [`super::model::CommandActor::Policy`]); this module
+//! does not tell it from the owner's. *Whether* the policy resumes lives in
+//! the control plane: a task lost while pausing, `Paused` itself, and a task
+//! whose attempts are exhausted still wait for their owner, and `Unknown`
+//! is never resumed before its loss is confirmed.
 //!
 //! Archive wins: once a task is archival, no command or observation leads out
 //! of it again, and a repeated archive converges on the tombstone.
@@ -73,13 +82,19 @@ pub(crate) fn observation_effect(
         (Observation::PausedAtSafePoint, PauseRequested) => ObservationEffect::Transition(Paused),
         (Observation::PausedAtSafePoint, Paused) => ObservationEffect::Unchanged,
 
-        // Never a replacement: the task waits for an explicit owner command.
+        // Never a replacement on the controller's word alone: whether the
+        // task is resumed is the control plane's resume policy's decision.
         (Observation::WorkloadLost { state_known }, Provisioning | Running | PauseRequested) => {
             ObservationEffect::Transition(if state_known { Interrupted } else { Unknown })
         }
         (Observation::WorkloadLost { .. }, Interrupted | Unknown) => ObservationEffect::Unchanged,
         // Archive already won; losing the workload only helps it along.
         (Observation::WorkloadLost { .. }, Archiving) => ObservationEffect::Unchanged,
+
+        // Only an uncertain loss has anything to confirm; everywhere else
+        // the confirmation is late or moot and changes nothing.
+        (Observation::LossConfirmed, Unknown) => ObservationEffect::Transition(Interrupted),
+        (Observation::LossConfirmed, _) => ObservationEffect::Unchanged,
 
         (Observation::ResourcesDeleted, Archiving) => ObservationEffect::Transition(Archived),
         (Observation::ResourcesDeleted, Archived) => ObservationEffect::Unchanged,

@@ -1486,6 +1486,13 @@ fn print_event(event: &TaskEvent) {
             files,
             total_bytes,
         } => format!("material {material_id} {change:?} ({files} file(s), {total_bytes} bytes)"),
+        TaskEventKind::AutoResumed { attempt, limit, .. } => {
+            format!("resumed automatically after runner loss (attempt {attempt}/{limit})")
+        }
+        TaskEventKind::AutoResumeExhausted { attempts, reason } => {
+            format!("automatic resume gave up after {attempts} attempts: {reason}")
+        }
+        TaskEventKind::Unrecognized => "an event this version does not know".to_string(),
     };
     // Notes, reasons and details come from operators and runners: nothing a
     // terminal would act on gets through.

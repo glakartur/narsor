@@ -77,6 +77,22 @@ pub enum OwnerCommand {
     Archive,
 }
 
+/// Who issued a lifecycle command: the owner, or the control plane's own
+/// resume policy acting on the owner's behalf after a workload loss.
+///
+/// Only an owner command counts as the owner's decision: it resets the
+/// task's [`ResumeState`], a policy command never does.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandActor {
+    /// The task's owner, through a client. What every receipt written
+    /// before the resume policy existed was.
+    #[default]
+    Owner,
+    /// The automatic resume policy of the control plane.
+    Policy,
+}
+
 /// Opaque reference to the task's owner.
 ///
 /// Stored, but deliberately not part of the task identity (R32, R33): a later
@@ -134,11 +150,21 @@ pub enum Observation {
         /// Whether the loss itself is certain (Interrupted) or not (Unknown).
         state_known: bool,
     },
+    /// The workload of an `Unknown` task was checked again and found absent
+    /// or dead while its storage is still there (Unknown → Interrupted), so
+    /// a resume cannot end up with two runners on one storage.
+    LossConfirmed,
     /// Workload and storage deletion acknowledged, or both found absent
     /// (Archiving → Archived).
     ResourcesDeleted,
     /// A status refresh with no lifecycle meaning of its own.
     Status,
+    /// An observation of a newer version this one does not know. Never
+    /// written: it only lets a client decode a newer server's event or
+    /// summary instead of dropping it, and the control plane refuses it in
+    /// a report.
+    #[serde(other)]
+    Unrecognized,
 }
 
 /// Normalized summary of the last observation (KTD4): what clients may show,
@@ -242,6 +268,9 @@ pub struct CommandReceipt {
     pub lifecycle_after: TaskLifecycle,
     /// Record revision (= event sequence) it produced.
     pub revision: u64,
+    /// Who issued it; receipts from before the resume policy read `Owner`.
+    #[serde(default)]
+    pub actor: CommandActor,
 }
 
 /// Archive tombstone: archive won and the task never runs again.
@@ -366,6 +395,88 @@ pub enum TaskEventKind {
         /// Their total size in bytes.
         total_bytes: u64,
     },
+    /// The resume policy resumed the task after its workload was lost: a
+    /// `Resume` receipt with [`CommandActor::Policy`] was written in the
+    /// same mutation.
+    AutoResumed {
+        /// Which consecutive attempt this is, starting at 1.
+        attempt: u32,
+        /// How many consecutive attempts the policy makes at most.
+        limit: u32,
+        /// What the controller said about the loss, if anything.
+        #[serde(default)]
+        loss_reason: Option<String>,
+    },
+    /// The resume policy gave up: the task stays interrupted and waits for
+    /// its owner. Announced once per exhaustion.
+    AutoResumeExhausted {
+        /// How many consecutive attempts were made.
+        attempts: u32,
+        /// Why, for people (see [`ResumeExhaustion::reason`]).
+        reason: String,
+    },
+    /// An event of a newer version this one does not know. Never written:
+    /// it only lets a client keep reading a newer server's stream and log,
+    /// taking the lifecycle and generation from the envelope.
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// What the control plane remembers to resume a task after its workload was
+/// lost (see `ControlPlane::report` and the resume policy).
+///
+/// Empty on every task that never lost its workload and on every record
+/// written before the policy existed. Only an owner start or resume resets
+/// it; another controller report never touches the exhaustion it holds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ResumeState {
+    /// Losses in a row without a runner that stayed up long enough to count
+    /// as a successful start.
+    pub consecutive_losses: u32,
+    /// When the policy may resume the task next; `None` while no automatic
+    /// resume is planned (none needed, waiting for the owner, exhausted).
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    /// The last loss, recorded when the workload was lost — also when it
+    /// went to `Unknown` first, so a later confirmation counts the loss
+    /// from where it actually happened.
+    pub last_loss: Option<WorkloadLoss>,
+    /// Set once the policy gave up; the task waits for its owner.
+    pub exhausted: Option<ResumeExhaustion>,
+}
+
+impl ResumeState {
+    /// True when nothing about a lost workload is remembered.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Where and when a task lost its workload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadLoss {
+    /// The lifecycle the task was in when the workload was lost.
+    pub from: TaskLifecycle,
+    /// When the control plane accepted the loss report.
+    pub at: DateTime<Utc>,
+    /// Lease epoch of the controller that reported it.
+    pub lease_epoch: u64,
+    /// What the controller said about it, if anything.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// The resume policy gave up on a task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResumeExhaustion {
+    /// Why, for people: names the last loss.
+    pub reason: String,
+    /// When the limit was reached.
+    pub at: DateTime<Utc>,
+    /// Whether [`TaskEventKind::AutoResumeExhausted`] was published for it,
+    /// so the event appears exactly once.
+    #[serde(default)]
+    pub announced: bool,
 }
 
 /// What happened to a task material (U9).
@@ -504,6 +615,14 @@ pub struct TaskRecord {
     /// — which may have changed meanwhile (a new default backend).
     #[serde(default)]
     pub request_digest: Option<String>,
+    /// When the runner of the current launch last reported ready; `None`
+    /// before that and on records written before it was kept. Tells a loss
+    /// right after a start from one after a run long enough to count.
+    #[serde(default)]
+    pub running_since: Option<DateTime<Utc>>,
+    /// Automatic resume after a workload loss.
+    #[serde(default)]
+    pub resume: ResumeState,
     /// The event of revision [`Self::revision`]: an outbox of one, so a crash
     /// between writing the record and appending the event is repaired from
     /// the record itself (see `OrchestrationStore::publish_last_event`).
@@ -1249,16 +1368,25 @@ pub struct CommandRequest {
     /// Optimistic concurrency: when set, the command is refused unless the
     /// task is still at this desired generation.
     pub expected_generation: Option<u64>,
+    /// Who issues it; recorded on the receipt.
+    pub actor: CommandActor,
 }
 
 impl CommandRequest {
-    /// A command without an expected generation.
+    /// An owner command without an expected generation.
     pub fn new(command: OwnerCommand, idempotency_key: impl Into<String>) -> Self {
         Self {
             command,
             idempotency_key: idempotency_key.into(),
             expected_generation: None,
+            actor: CommandActor::Owner,
         }
+    }
+
+    /// Issued by `actor` instead of the owner.
+    pub fn issued_by(mut self, actor: CommandActor) -> Self {
+        self.actor = actor;
+        self
     }
 
     /// Requires the task to be at `generation`.
