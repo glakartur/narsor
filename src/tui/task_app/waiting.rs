@@ -821,13 +821,17 @@ impl WaitingPanel {
     /// the shown waiting is counted to.
     ///
     /// The frame is always in the entry's role, focus or not (R4): whether
-    /// the keys are here shows on the frame of the details around it.
+    /// the keys are here shows on the frame of the details around it, and on
+    /// the bracket of the actions — thick while `focused` says the panel has
+    /// the keys and they are on the actions, thin otherwise (R12). The actions
+    /// scroll inside what the context and the fields leave them (R17).
     pub fn render(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         styles: &Styles,
         stale: bool,
+        focused: bool,
         as_of: chrono::DateTime<chrono::Utc>,
     ) {
         if area.height == 0 || area.width < 4 {
@@ -907,7 +911,7 @@ impl WaitingPanel {
             .map(|(role, text)| Line::styled(text.clone(), styles.of(*role)))
             .collect();
         frame.render_widget(Paragraph::new(lines), notice_area);
-        chooser::render(frame, chooser_area, &mut entry.chooser, styles);
+        chooser::render(frame, chooser_area, &mut entry.chooser, styles, focused);
     }
 
     fn render_released(&self, frame: &mut Frame, area: Rect, styles: &Styles) {

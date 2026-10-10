@@ -1471,7 +1471,8 @@ fn render_list(frame: &mut Frame, area: Rect, title: &str, chooser: &mut Chooser
     let height = chooser.preferred_height(width.saturating_sub(2)) + 2;
     let place = popup(area, width, height.min(area.height.saturating_sub(2)));
     let inner = framed(frame, place, Role::Focus, title, styles);
-    chooser::render(frame, inner, chooser, styles);
+    // An overlay has the keys for as long as it is open.
+    chooser::render(frame, inner, chooser, styles, true);
 }
 
 fn render_confirmation(

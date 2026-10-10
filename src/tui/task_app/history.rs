@@ -969,6 +969,7 @@ pub fn render_details(
         stale,
         focused,
         step: history.step_focus,
+        panel_focused: false,
         hyperlinks,
     };
     render_view(frame, inner, view, styles, options);

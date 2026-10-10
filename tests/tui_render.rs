@@ -67,6 +67,81 @@ fn column_of(buffer: &Buffer, y: u16, from: u16, symbol: &str) -> Option<u16> {
     (from..buffer.area.width).find(|&x| buffer[(x, y)].symbol() == symbol)
 }
 
+/// The column at which `needle` starts in row `y`, counted in cells.
+fn column_in(buffer: &Buffer, y: usize, needle: &str) -> u16 {
+    let row = &rows(buffer)[y];
+    let byte = row
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle:?} is not in row {y}:\n{}", screen(buffer)));
+    u16::try_from(row[..byte].chars().count()).expect("a column")
+}
+
+/// Asserts that the list entry whose line starts with `needle` (its number
+/// and label, e.g. `"2 revise"`) is the bracketed one (R8, R12, R14): the bar
+/// two columns left of its content, a rule from the content column in the
+/// row above and in the row below, none of them touching. Thick and cyan —
+/// bold without colour — when `focused`, thin and grey — dim without colour —
+/// otherwise. Nothing on its line is reversed (R7).
+fn assert_bracketed(buffer: &Buffer, needle: &str, focused: bool, no_color: bool) {
+    let y = row_of(buffer, needle);
+    let x = column_in(buffer, y, needle);
+    let y = u16::try_from(y).expect("a row");
+    let (rule, bar, colour) = if focused {
+        ("━", "┃", Color::Cyan)
+    } else {
+        ("─", "│", Color::DarkGray)
+    };
+    let screen = screen(buffer);
+    assert_eq!(
+        buffer[(x - 2, y)].symbol(),
+        bar,
+        "{needle:?} bar:\n{screen}"
+    );
+    for row in [y - 1, y + 1] {
+        for column in x..x + 4 {
+            assert_eq!(
+                buffer[(column, row)].symbol(),
+                rule,
+                "{needle:?} rule in row {row}:\n{screen}"
+            );
+        }
+        assert_eq!(buffer[(x - 2, row)].symbol(), " ", "no corner:\n{screen}");
+    }
+    for (column, row) in [(x - 2, y), (x, y - 1), (x, y + 1)] {
+        let cell = &buffer[(column, row)];
+        if no_color {
+            assert_eq!(cell.fg, Color::Reset, "{needle:?}: no colour");
+            let modifier = if focused {
+                Modifier::BOLD
+            } else {
+                Modifier::DIM
+            };
+            assert!(cell.modifier.contains(modifier), "{needle:?}: {modifier:?}");
+        } else {
+            assert_eq!(cell.fg, colour, "{needle:?} mark colour:\n{screen}");
+        }
+    }
+    let width = buffer.area.width;
+    assert!(
+        (0..width).all(|column| !buffer[(column, y)].modifier.contains(Modifier::REVERSED)),
+        "{needle:?}: nothing on the selected line is reversed:\n{screen}"
+    );
+}
+
+/// Asserts that the list entry whose line starts with `needle` is drawn
+/// without the bar beside it.
+fn assert_not_bracketed(buffer: &Buffer, needle: &str) {
+    let y = row_of(buffer, needle);
+    let x = column_in(buffer, y, needle);
+    let y = u16::try_from(y).expect("a row");
+    assert_eq!(
+        buffer[(x - 2, y)].symbol(),
+        " ",
+        "{needle:?} has no bar:\n{}",
+        screen(buffer)
+    );
+}
+
 /// The corners of a thick frame (the panel with the focus) and of a thin one.
 const THICK: [&str; 4] = ["┏", "┓", "┗", "┛"];
 const THIN: [&str; 4] = ["┌", "┐", "└", "┘"];
@@ -119,9 +194,40 @@ fn review_chooser() -> Chooser {
 }
 
 fn draw_chooser(width: u16, height: u16, chooser: &mut Chooser, styles: &Styles) -> Buffer {
+    draw_chooser_focused(width, height, chooser, styles, true)
+}
+
+fn draw_chooser_focused(
+    width: u16,
+    height: u16,
+    chooser: &mut Chooser,
+    styles: &Styles,
+    focused: bool,
+) -> Buffer {
     draw(width, height, |frame| {
-        chooser::render(frame, Rect::new(0, 0, width, height), chooser, styles)
+        chooser::render(
+            frame,
+            Rect::new(0, 0, width, height),
+            chooser,
+            styles,
+            focused,
+        )
     })
+}
+
+/// Six plain entries, `out1` … `out6`, on the first.
+fn six_outputs() -> Chooser {
+    Chooser::new(
+        (1..=6)
+            .map(|index| ChooserItem::new(format!("out{index}"), format!("Wyjście {index}.")))
+            .collect(),
+    )
+}
+
+fn press_chooser(chooser: &mut Chooser, code: crossterm::event::KeyCode, times: usize) {
+    for _ in 0..times {
+        chooser.on_key(keymap::Key::code(code).to_event());
+    }
 }
 
 mod chooser_render {
@@ -133,17 +239,16 @@ mod chooser_render {
         let buffer = draw_chooser(100, 16, &mut chooser, &Styles::new(false));
         let screen = screen(&buffer);
         assert!(screen.contains("Akcje") && screen.contains("Opis"));
-        assert!(screen.contains("▸ 2 revise"), "{screen}");
+        assert!(screen.contains("2 revise ↩ ◆"), "{screen}");
         for marker in ["↩", "◆", "!"] {
             assert!(screen.contains(marker), "{marker} is missing:\n{screen}");
         }
         assert!(screen.contains("↩ wraca do agenta: plan"));
         assert!(screen.contains("◆ rekomendacja dyrygenta"));
 
-        let selected_row = &rows(&buffer)[row_of(&buffer, "approved")];
         assert!(
-            selected_row.contains("↩ wraca do agenta"),
-            "list and description share rows when wide: {selected_row}"
+            row_of(&buffer, "↩ wraca do agenta") < row_of(&buffer, "1 approved"),
+            "list and description share rows when wide:\n{screen}"
         );
         assert!(screen.contains("Komentarz dla agenta (wymagane)"));
         assert!(screen.contains("> Uwzględnij migrację"));
@@ -203,49 +308,136 @@ mod chooser_render {
     }
 
     #[test]
-    fn selection_is_reversed_in_colour_and_in_no_color_and_markers_survive() {
+    fn the_selection_is_a_bracket_in_colour_and_in_no_color_and_markers_survive() {
         for no_color in [false, true] {
-            let mut chooser = review_chooser();
-            let buffer = draw_chooser(100, 16, &mut chooser, &Styles::new(no_color));
-            let screen = screen(&buffer);
-            for marker in ["↩", "◆", "!", "▸"] {
-                assert!(
-                    screen.contains(marker),
-                    "NO_COLOR={no_color}: {marker} lost"
-                );
-            }
-
-            let selected = row_of(&buffer, "revise");
-            let other = row_of(&buffer, "approved");
-            let width = usize::from(buffer.area.width);
-            let reversed = |row: usize, column: usize| {
-                buffer.content()[row * width + column]
-                    .modifier
-                    .contains(Modifier::REVERSED)
-            };
-            let label_column = rows(&buffer)[selected]
-                .find("revise")
-                .map(|byte| rows(&buffer)[selected][..byte].chars().count());
-            let label_column = label_column.expect("the label is on its row");
-            assert!(
-                reversed(selected, label_column),
-                "NO_COLOR={no_color}: selected row"
-            );
-            assert!(
-                !reversed(other, label_column),
-                "NO_COLOR={no_color}: other row"
-            );
-
-            if no_color {
+            for focused in [true, false] {
+                let mut chooser = review_chooser();
+                let styles = Styles::new(no_color);
+                let buffer = draw_chooser_focused(100, 20, &mut chooser, &styles, focused);
+                let screen = screen(&buffer);
+                for marker in ["↩", "◆", "!"] {
+                    assert!(
+                        screen.contains(marker),
+                        "NO_COLOR={no_color}: {marker} lost"
+                    );
+                }
+                assert!(!screen.contains('▸'), "no cursor glyph:\n{screen}");
+                assert_bracketed(&buffer, "2 revise", focused, no_color);
+                assert_not_bracketed(&buffer, "1 approved");
+                assert_not_bracketed(&buffer, "3 reject");
                 assert!(
                     buffer
                         .content()
                         .iter()
-                        .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset),
-                    "NO_COLOR draws no colour at all"
+                        .all(|cell| !cell.modifier.contains(Modifier::REVERSED)),
+                    "NO_COLOR={no_color}: nothing is reversed"
                 );
+                if no_color {
+                    assert!(
+                        buffer
+                            .content()
+                            .iter()
+                            .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset),
+                        "NO_COLOR draws no colour at all"
+                    );
+                }
             }
         }
+    }
+
+    /// R10: one gap row above the first entry and between the entries.
+    #[test]
+    fn the_entries_are_spaced_by_a_row() {
+        let mut chooser = review_chooser();
+        let buffer = draw_chooser(100, 20, &mut chooser, &Styles::new(false));
+        let first = row_of(&buffer, "1 approved");
+        assert_eq!(first, 2, "frame, gap, entry:\n{}", screen(&buffer));
+        assert_eq!(row_of(&buffer, "2 revise"), first + 2);
+        assert_eq!(row_of(&buffer, "3 reject"), first + 4);
+    }
+
+    /// R12: with the keys in the fields the bracket on the list is thin.
+    #[test]
+    fn with_the_focus_in_the_fields_the_bracket_is_thin() {
+        let mut chooser = review_chooser();
+        press_chooser(&mut chooser, crossterm::event::KeyCode::Tab, 1);
+        let buffer = draw_chooser(100, 20, &mut chooser, &Styles::new(false));
+        assert_bracketed(&buffer, "2 revise", false, false);
+    }
+
+    /// R11, R17: a list longer than its pane scrolls inside it, and the
+    /// highlighted entry is there with both of its rules.
+    #[test]
+    fn a_long_list_scrolls_inside_its_pane() {
+        let mut chooser = six_outputs();
+        // Three entries with their gaps, and the frame.
+        let buffer = draw_chooser(100, 9, &mut chooser, &Styles::new(false));
+        assert_bracketed(&buffer, "1 out1", true, false);
+        assert!(!screen(&buffer).contains("out4"), "{}", screen(&buffer));
+        press_chooser(&mut chooser, crossterm::event::KeyCode::Down, 4);
+        let buffer = draw_chooser(100, 9, &mut chooser, &Styles::new(false));
+        assert_bracketed(&buffer, "5 out5", true, false);
+        assert!(!screen(&buffer).contains("1 out1"), "{}", screen(&buffer));
+    }
+
+    /// Stacked below 64 columns, the list keeps room for one entry with its
+    /// bracket, and the description gives way first.
+    #[test]
+    fn stacked_the_list_keeps_one_bracketed_entry_and_the_description_shrinks() {
+        let mut chooser = six_outputs();
+        press_chooser(&mut chooser, crossterm::event::KeyCode::Down, 3);
+        let roomy = draw_chooser(40, 24, &mut chooser, &Styles::new(false));
+        assert_bracketed(&roomy, "4 out4", true, false);
+        assert!(screen(&roomy).contains("Wyjście 4."), "{}", screen(&roomy));
+
+        for height in [8, 5] {
+            let buffer = draw_chooser(40, height, &mut chooser, &Styles::new(false));
+            assert_bracketed(&buffer, "4 out4", true, false);
+            let list_bottom = row_of(&buffer, "4 out4") + 2;
+            assert!(
+                rows(&buffer)[list_bottom].starts_with('└'),
+                "height {height}: the list pane ends under the bracket:\n{}",
+                screen(&buffer)
+            );
+        }
+    }
+
+    /// R13: an entry that cannot be chosen stays grey when highlighted, and
+    /// its bracket follows the focus like any other.
+    #[test]
+    fn a_highlighted_unavailable_entry_is_grey_inside_its_bracket() {
+        for focused in [true, false] {
+            let mut chooser = Chooser::new(vec![
+                ChooserItem::new("wznów", "Wznawia zadanie."),
+                ChooserItem::new("pauza", "Wstrzymuje zadanie.")
+                    .unavailable("zadanie jest w kolejce"),
+            ])
+            .selecting(1);
+            let styles = Styles::new(false);
+            let buffer = draw_chooser_focused(100, 10, &mut chooser, &styles, focused);
+            assert_bracketed(&buffer, "2 pauza", focused, false);
+            let y = row_of(&buffer, "2 pauza");
+            let x = column_in(&buffer, y, "pauza");
+            let y = u16::try_from(y).unwrap();
+            assert_eq!(cell_at(&buffer, x, y).1, Color::DarkGray, "grey label");
+        }
+    }
+
+    /// R17: rebuilding the chooser over the same entries keeps the highlighted
+    /// entry and where the list was scrolled.
+    #[test]
+    fn a_rebuild_keeps_the_selection_and_the_scroll() {
+        let mut chooser = six_outputs();
+        press_chooser(&mut chooser, crossterm::event::KeyCode::Down, 5);
+        draw_chooser(100, 9, &mut chooser, &Styles::new(false));
+        press_chooser(&mut chooser, crossterm::event::KeyCode::Up, 1);
+        let before = draw_chooser(100, 9, &mut chooser, &Styles::new(false));
+        let items = chooser.items().to_vec();
+        let mut chooser = chooser.rebuilt(items);
+        let after = draw_chooser(100, 9, &mut chooser, &Styles::new(false));
+        assert_eq!(screen(&before), screen(&after));
+        assert_bracketed(&after, "5 out5", true, false);
+        assert!(screen(&after).contains("6 out6"), "{}", screen(&after));
     }
 
     #[test]
@@ -261,6 +453,13 @@ mod chooser_render {
                 .map(|cell| cell.fg)
         };
         assert_eq!(colour_of("◆"), Some(Color::Magenta));
+        assert_eq!(colour_of("↩"), Some(Color::Reset));
+        let reject = row_of(&buffer, "3 reject");
+        let bang = column_in(&buffer, reject, "!");
+        assert_eq!(
+            cell_at(&buffer, bang, u16::try_from(reject).unwrap()).1,
+            Color::Red
+        );
     }
 }
 
@@ -2267,6 +2466,22 @@ mod task_app_waiting_render {
         })
     }
 
+    /// The gate with six outputs, `out1` … `out6`, and a required comment.
+    fn six_actions() -> serde_json::Value {
+        let mut form = gate();
+        form["outputs"] = (1..=6)
+            .map(|index| json!({ "label": format!("out{index}") }))
+            .collect();
+        form["resume_targets"] = json!({});
+        form
+    }
+
+    fn draw_buffer(app: &mut TaskApp, width: u16, height: u16, no_color: bool) -> Buffer {
+        draw(width, height, |frame| {
+            layout::render(frame, app, &Styles::new(no_color), Instant::now())
+        })
+    }
+
     fn opened(task: narsor::controller_protocol::TaskSummary) -> TaskApp {
         let mut app = TaskApp::new(
             ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
@@ -2323,7 +2538,7 @@ mod task_app_waiting_render {
             "Czy zakres zmian obejmuje też migrację danych?",
             "Akcje",
             "Opis",
-            "▸ 2 revise",
+            "2 revise ↩",
             "↩ wraca do agenta: plan",
             "Zakres wymaga poprawy.",
             "comment (wymagane)",
@@ -2335,7 +2550,7 @@ mod task_app_waiting_render {
         }
         let list_row = screen
             .lines()
-            .position(|row| row.contains("▸ 2 revise"))
+            .position(|row| row.contains("2 revise ↩"))
             .unwrap();
         let description_row = screen
             .lines()
@@ -2345,6 +2560,135 @@ mod task_app_waiting_render {
             description_row <= list_row + 1,
             "the description sits beside the list:\n{screen}"
         );
+    }
+
+    /// R12: with the keys on the actions the bracket is thick; in the
+    /// fields of the panel it is thin.
+    #[test]
+    fn the_bracket_on_the_actions_follows_the_focus_of_the_panel() {
+        let mut app = opened(with_pending(running(), gate()));
+        let buffer = draw_buffer(&mut app, 120, 40, false);
+        assert_bracketed(&buffer, "2 revise", true, false);
+        assert_not_bracketed(&buffer, "1 approved");
+
+        press(&mut app, KeyCode::Tab);
+        let buffer = draw_buffer(&mut app, 120, 40, false);
+        assert_bracketed(&buffer, "2 revise", false, false);
+    }
+
+    /// R12: a panel that appears while the keys are in the tab's content has
+    /// a thin bracket.
+    #[test]
+    fn with_the_keys_in_the_tab_the_bracket_on_the_actions_is_thin() {
+        let mut app = opened(running());
+        assert!(!app.panel_focused());
+        app.load(listing(
+            vec![titled(with_pending(running(), gate()), "NAR-12")],
+            "d",
+        ));
+        let buffer = draw_buffer(&mut app, 120, 40, false);
+        assert!(!app.panel_focused(), "{}", screen(&buffer));
+        assert_bracketed(&buffer, "2 revise", false, false);
+    }
+
+    /// R13, R14: without colour the bracket is bold and the markers stay
+    /// beside the label.
+    #[test]
+    fn without_colour_the_bracket_is_bold_and_keeps_the_markers() {
+        let mut app = opened(with_pending(running(), gate()));
+        let buffer = draw_buffer(&mut app, 120, 40, true);
+        assert_bracketed(&buffer, "2 revise ↩", true, true);
+
+        let mut app = opened(with_pending(running(), problem()));
+        let buffer = draw_buffer(&mut app, 120, 40, false);
+        let y = row_of(&buffer, "1 implemented ◆");
+        assert_bracketed(&buffer, "1 implemented ◆", true, false);
+        let x = column_in(&buffer, y, "◆");
+        let y = u16::try_from(y).unwrap();
+        assert_eq!(
+            cell_at(&buffer, x, y).1,
+            Color::Magenta,
+            "◆ keeps its colour"
+        );
+    }
+
+    /// AE7, R17: six actions in a panel that fits three scroll inside the
+    /// list; the question and the comment field stay where they were.
+    #[test]
+    fn ae7_the_actions_scroll_inside_the_panel_and_the_rest_stays() {
+        let mut app = opened(with_pending(running(), six_actions()));
+        press(&mut app, KeyCode::Char('1'));
+        let before = draw_buffer(&mut app, 120, 24, false);
+        let question = row_of(&before, "Czy zakres zmian");
+        let field = row_of(&before, "comment (wymagane)");
+        let shown = (1..=6)
+            .filter(|index| screen(&before).contains(&format!("{index} out{index}")))
+            .count();
+        assert_eq!(
+            shown,
+            3,
+            "the panel fits three:
+{}",
+            screen(&before)
+        );
+
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        let after = draw_buffer(&mut app, 120, 24, false);
+        assert_bracketed(&after, "5 out5", true, false);
+        assert!(!screen(&after).contains("1 out1"), "{}", screen(&after));
+        assert_eq!(row_of(&after, "Czy zakres zmian"), question);
+        assert_eq!(row_of(&after, "comment (wymagane)"), field);
+    }
+
+    /// At 60×20 the panel shows one action with its bracket, and `j` brings
+    /// the next one.
+    #[test]
+    fn at_the_smallest_terminal_one_action_shows_and_j_scrolls() {
+        let mut app = opened(with_pending(running(), gate()));
+        let labels = ["1 approved", "2 revise", "3 reject"];
+        let shown = |buffer: &Buffer| {
+            labels
+                .iter()
+                .filter(|label| screen(buffer).contains(*label))
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let buffer = draw_buffer(&mut app, 60, 20, false);
+        assert_eq!(shown(&buffer), ["2 revise"], "{}", screen(&buffer));
+        assert_bracketed(&buffer, "2 revise", true, false);
+        assert!(screen(&buffer).contains("comment"), "{}", screen(&buffer));
+
+        press(&mut app, KeyCode::Char('j'));
+        let buffer = draw_buffer(&mut app, 60, 20, false);
+        assert_eq!(shown(&buffer), ["3 reject"], "{}", screen(&buffer));
+        assert_bracketed(&buffer, "3 reject", true, false);
+    }
+
+    /// R17: a refresh that builds the actions again keeps the highlighted
+    /// one and where the list was scrolled.
+    #[test]
+    fn a_refresh_keeps_the_highlighted_action_and_the_scroll() {
+        let mut app = opened(with_pending(running(), six_actions()));
+        press(&mut app, KeyCode::Char('6'));
+        draw_buffer(&mut app, 120, 24, false);
+        press(&mut app, KeyCode::Char('k'));
+        let before = draw_buffer(&mut app, 120, 24, false);
+        assert!(screen(&before).contains("6 out6"), "{}", screen(&before));
+
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline(
+                "a",
+                vec![position("plan", narsor::engine::PositionStatus::Succeeded)],
+                None,
+            ))),
+        );
+        let after = draw_buffer(&mut app, 120, 24, false);
+        assert_eq!(screen(&before), screen(&after));
+        assert_bracketed(&after, "5 out5", true, false);
     }
 
     #[test]
@@ -2518,6 +2862,50 @@ mod task_app_actions_render {
             .position(|row| row.contains("Opis"))
             .expect("the description");
         assert!(description > list, "{screen}");
+    }
+
+    /// R9, R12, R13: an overlay has the keys, so its bracket is thick and
+    /// cyan; the highlighted entry that cannot be done stays grey inside it,
+    /// and one that can keeps its own look.
+    #[test]
+    fn the_menu_brackets_its_entry_thick_and_keeps_the_look_of_the_label() {
+        let mut app = opened(running(), ".");
+        let label_colour = |buffer: &Buffer, needle: &str, label: &str| {
+            let y = row_of(buffer, needle);
+            let x = column_in(buffer, y, label);
+            cell_at(buffer, x, u16::try_from(y).unwrap()).1
+        };
+        let buffer = draw(120, 40, |frame| {
+            layout::render(frame, &mut app, &Styles::new(false), Instant::now())
+        });
+        assert_bracketed(&buffer, "1 m  przesuń w kolejce", true, false);
+        assert_eq!(
+            label_colour(&buffer, "1 m  przesuń", "przesuń"),
+            Color::DarkGray
+        );
+
+        press(&mut app, KeyCode::Char('j'));
+        let buffer = draw(120, 40, |frame| {
+            layout::render(frame, &mut app, &Styles::new(false), Instant::now())
+        });
+        assert_bracketed(&buffer, "2 p  wstrzymaj", true, false);
+        assert_not_bracketed(&buffer, "1 m  przesuń w kolejce");
+        assert_eq!(
+            label_colour(&buffer, "2 p  wstrzymaj", "wstrzymaj"),
+            Color::Reset
+        );
+    }
+
+    /// R14: without colour the menu's bracket is bold, and nothing in the
+    /// menu is reversed.
+    #[test]
+    fn without_colour_the_menu_bracket_is_bold() {
+        let mut app = opened(running(), ".");
+        let buffer = draw(120, 40, |frame| {
+            layout::render(frame, &mut app, &Styles::new(true), Instant::now())
+        });
+        assert_bracketed(&buffer, "1 m  przesuń w kolejce", true, true);
+        assert!(screen(&buffer).contains("archiwizuj !"));
     }
 
     #[test]
@@ -3215,6 +3603,48 @@ mod task_app_create_render {
         );
     }
 
+    /// R12: the workflow list has a thick bracket while the keys are on it;
+    /// in the fields the list folds away and nothing breaks.
+    #[test]
+    fn the_workflow_list_is_bracketed_and_folds_away_in_the_fields() {
+        let mut app = app();
+        open_form(&mut app);
+        let buffer = draw_buffer(&mut app, 130, 34);
+        assert_bracketed(&buffer, "1 implement-feature", true, false);
+        assert_not_bracketed(&buffer, "2 fix-bug");
+
+        press(&mut app, KeyCode::Tab);
+        let buffer = draw_buffer(&mut app, 130, 34);
+        let screen = screen(&buffer);
+        assert!(screen.contains("ticket_id"), "{screen}");
+        assert!(
+            !screen.contains("┃ 1 implement-feature") && !screen.contains("│ 1 implement-feature"),
+            "{screen}"
+        );
+    }
+
+    /// R12: the repositories have a thick bracket on their list; with the
+    /// keys in the fields of the form the bracket on its entry is thin.
+    #[test]
+    fn the_repositories_are_bracketed_by_the_focus_of_their_chooser() {
+        let mut app = app();
+        keys(&mut app, "R");
+        app.open_repositories(registry(vec![
+            repository("docs", "git@github.com:acme/docs.git"),
+            repository("narsor", "git@github.com:acme/narsor.git"),
+        ]));
+        let buffer = draw_buffer(&mut app, 130, 30);
+        assert_bracketed(&buffer, "1 docs", true, false);
+        assert_not_bracketed(&buffer, "2 narsor");
+
+        keys(&mut app, "a");
+        let buffer = draw_buffer(&mut app, 130, 30);
+        assert_bracketed(&buffer, "1 dodaj repozytorium", true, false);
+        press(&mut app, KeyCode::Enter);
+        let buffer = draw_buffer(&mut app, 130, 30);
+        assert_bracketed(&buffer, "1 dodaj repozytorium", false, false);
+    }
+
     #[test]
     fn a_path_that_cannot_be_used_is_grey_and_says_why() {
         let mut app = app();
@@ -3797,6 +4227,7 @@ mod task_app_harness_render {
         let y = u16::try_from(row_of(&buffer, " Domyślny harness ")).unwrap();
         let x = column_of(&buffer, y, 0, "┌").expect("the list's frame");
         assert_eq!(cell_at(&buffer, x, y).1, Color::Cyan, "the focus frame");
+        assert_bracketed(&buffer, "1 ● domyślny z konfiguracji", true, false);
     }
 
     #[test]

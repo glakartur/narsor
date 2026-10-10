@@ -1040,7 +1040,7 @@ pub fn render(
         styles.of(Role::Done),
     );
     frame.render_widget(Paragraph::new(line), header);
-    chooser::render(frame, body, &mut form.chooser, styles);
+    chooser::render(frame, body, &mut form.chooser, styles, focused);
 }
 
 /// The details of a task that is being sent or was not: where it stands, what
