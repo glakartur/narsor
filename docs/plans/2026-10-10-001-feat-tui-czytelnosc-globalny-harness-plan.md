@@ -1,7 +1,7 @@
 ---
 title: "feat: TUI — ramki paneli, dwuliniowy wiersz zadania, globalny harness obejmujący zadania w toku"
 type: feat
-status: active
+status: completed
 date: 2026-10-10
 origin: docs/brainstorms/2026-10-10-tui-czytelnosc-requirements.md
 ---
