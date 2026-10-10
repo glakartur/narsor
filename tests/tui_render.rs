@@ -444,6 +444,28 @@ mod chooser_render {
         }
     }
 
+    /// Stacked, a description that would get less than three rows — a bare
+    /// frame with nothing inside — gives them all to the list.
+    #[test]
+    fn stacked_a_description_without_room_for_a_line_is_left_out() {
+        let mut chooser = six_outputs();
+        press_chooser(&mut chooser, crossterm::event::KeyCode::Down, 3);
+        for height in [6, 7] {
+            let buffer = draw_chooser(40, height, &mut chooser, &Styles::new(false));
+            let screen = screen(&buffer);
+            assert_bracketed(&buffer, "4 out4", true, false);
+            assert!(
+                !screen.contains("Opis"),
+                "height {height}: no description frame:\n{screen}"
+            );
+            let last = usize::from(height) - 1;
+            assert!(
+                rows(&buffer)[last].starts_with('└'),
+                "height {height}: the list fills the area:\n{screen}"
+            );
+        }
+    }
+
     /// R13: an entry that cannot be chosen stays grey when highlighted, and
     /// its bracket follows the focus like any other.
     #[test]
@@ -2215,6 +2237,69 @@ mod task_app_detail_render {
         assert_axis_bracket(&buffer, "● review #1 w toku", marks(false, false));
     }
 
+    /// `m` from the details moves the list's row: the keys are on the list,
+    /// so its bracket is thick and the axis's thin until the move ends.
+    #[test]
+    fn the_move_mode_from_the_details_thickens_the_list_and_thins_the_axis() {
+        let mut app = app();
+        // Queued again after it ran: its timeline stays readable.
+        let requeued = with_runner(queued("a", 1), ExecutionStatus::Running, "review");
+        app.load(listing(
+            vec![
+                displayed(requeued, "Requeued one", &[]),
+                displayed(queued("b", 2), "Queued two", &[]),
+            ],
+            "c",
+        ));
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline(
+                "a",
+                vec![position("review", PositionStatus::InProgress)],
+                Some("review #1"),
+            ))),
+        );
+        press(&mut app, KeyCode::Enter);
+        let list_row = |buffer: &Buffer| {
+            (0..buffer.area.height)
+                .find(|&y| {
+                    row_cells(buffer, y, 0..layout::LIST_WIDTH)
+                        .map(|cell| cell.symbol())
+                        .collect::<String>()
+                        .contains("Requeued one")
+                })
+                .expect("the row on the list")
+        };
+        let details = render(&mut app, &Styles::new(false));
+        assert_axis_bracket(&details, "● review #1 w toku", marks(true, false));
+        let y = list_row(&details);
+        assert_bracket(
+            &details,
+            (3, y),
+            2,
+            layout::LIST_WIDTH - 1,
+            marks(false, false),
+        );
+
+        press(&mut app, KeyCode::Char('m'));
+        assert!(app.list().moving().is_some(), "the move mode is on");
+        let moving = render(&mut app, &Styles::new(false));
+        let y = list_row(&moving);
+        assert_bracket(
+            &moving,
+            (3, y),
+            2,
+            layout::LIST_WIDTH - 1,
+            marks(true, false),
+        );
+        assert_axis_bracket(&moving, "● review #1 w toku", marks(false, false));
+
+        press(&mut app, KeyCode::Esc);
+        let back = render(&mut app, &Styles::new(false));
+        assert_axis_bracket(&back, "● review #1 w toku", marks(true, false));
+    }
+
     /// R11: at 60×20, with more steps than fit, the selected step is in
     /// view with both of its rules after `G` and after `g`.
     #[test]
@@ -3473,10 +3558,10 @@ mod task_app_create_render {
             let mut app = app();
             open_prompt_form(&mut app, &["prompt"]);
             let listed = draw_app(&mut app, width, height, false);
-            assert!(
-                listed.contains("Opis") && listed.contains("Akcje"),
-                "{listed}"
-            );
+            assert!(listed.contains("Akcje"), "{listed}");
+            // Stacked at 60×20 the description has no room for a line, so
+            // it gives way to the list.
+            assert_eq!(listed.contains("Opis"), width >= 64, "{listed}");
 
             press(&mut app, KeyCode::Enter);
             keys(&mut app, "pierwsza");

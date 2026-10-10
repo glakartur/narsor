@@ -150,7 +150,7 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
     let stale = app.connection().is_stale();
     render_header(frame, areas.header, app, styles, now);
 
-    let list_focused = app.focus() == Focus::List;
+    let list_focused = app.keys_on_list();
     if let Some(list_area) = areas.list {
         if let View::History(open) = &mut app.view {
             history::render_list(frame, list_area, open, styles, list_focused, stale);

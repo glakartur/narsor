@@ -77,7 +77,7 @@ use super::tabs::events::{self, Events};
 use super::tabs::info::{self, Info};
 use super::tabs::progress::{self, Progress};
 use super::waiting::WaitingPanel;
-use super::{failure_reason, DetailTab, DetailView, Focus, StepFocus, TaskApp};
+use super::{failure_reason, DetailTab, DetailView, StepFocus, TaskApp};
 
 /// Everything the details of one task remember.
 #[derive(Debug, Clone)]
@@ -732,9 +732,10 @@ pub(super) fn panel_title(title: &str, width: u16) -> String {
 
 /// Draws the details of the selected task into `area`: a frame named after
 /// the task, lit while the keys are in the details — in the answer panel too
-/// (R4) — and what it holds inside it.
+/// (R4), but not in the move mode, whose keys move the list's row — and what
+/// it holds inside it.
 pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles, stale: bool) {
-    let frame_focused = app.focus() == Focus::Details;
+    let frame_focused = !app.keys_on_list();
     let keys = match (frame_focused, app.panel_focused()) {
         (false, _) => KeysAt::Elsewhere,
         (true, true) => KeysAt::Panel,

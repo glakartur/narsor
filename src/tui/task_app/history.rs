@@ -280,7 +280,8 @@ impl History {
         let kept = self.selected_entry().map(HistoryEntry::key);
         self.entries = entries;
         self.selected = kept
-            .and_then(|key| self.entries.iter().position(|entry| entry.key() == key))
+            .as_ref()
+            .and_then(|key| self.entries.iter().position(|entry| entry.key() == *key))
             .unwrap_or(0)
             .min(self.entries.len().saturating_sub(1));
         self.revision += 1;
@@ -288,6 +289,10 @@ impl History {
             .retain(|key, _| self.entries.iter().any(|entry| entry.key() == *key));
         for detail in self.details.values_mut() {
             detail.invalidate();
+        }
+        // Another selected entry starts its details on the timeline.
+        if self.selected_entry().map(HistoryEntry::key) != kept {
+            self.back_to_axis();
         }
     }
 

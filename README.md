@@ -602,7 +602,7 @@ the current step or a draft.
 |---|---|
 | Everywhere | `?` help, `q` quit (asks when a draft would be lost) |
 | List | `j` / `k` (`↓` / `↑`), `g` / `G`, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `r`, `h` default harness |
-| Details (and the history's details) | `[` / `]` tabs, `Tab` content ↔ panel, `.` menu, `h` default harness; then by where the keys are: |
+| Details | `[` / `]` tabs, `Tab` content ↔ panel, `.` menu, `h` default harness (the history's details: `[` / `]`, `w` recover, `h`); then by where the keys are: |
 | — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step |
 | — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all |
 | — the other tabs | `Esc` list, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` to the end and follow |

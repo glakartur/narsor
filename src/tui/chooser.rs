@@ -1026,10 +1026,14 @@ pub fn render(
     } else {
         // The description gives way first: down to three rows while the
         // list scrolls, then to nothing, so that one entry with its bracket
-        // always fits.
-        let height = list_rows(chooser.items.len())
+        // always fits. Less than three rows would be a frame with no line in
+        // it: those go to the list.
+        let mut height = list_rows(chooser.items.len())
             .min(top.height.saturating_sub(3).max(LIST_MIN_ROWS))
             .min(top.height);
+        if top.height - height < 3 {
+            height = top.height;
+        }
         let list = Rect { height, ..top };
         let description = Rect {
             y: top.y + height,

@@ -521,6 +521,12 @@ impl TaskApp {
         self.focus
     }
 
+    /// Whether the keys work the task list: it has the focus, or the move
+    /// mode is on — that moves the list's row whichever side started it.
+    pub fn keys_on_list(&self) -> bool {
+        self.focus == Focus::List || self.list.moving().is_some()
+    }
+
     /// The level of the focus on *Przebieg* of the task details: the timeline
     /// or the selected step's conversation. What draws the timeline and the
     /// step's transcript asks it which of them has the keys.
@@ -674,7 +680,7 @@ impl TaskApp {
                 return self.on_conductor_action(action);
             }
             Action::NextWaiting => {
-                if !self.list.select_next_waiting() {
+                if !self.change_list(TaskList::select_next_waiting) {
                     self.notify(Severity::Warning, "żadne zadanie nie czeka na Ciebie");
                 }
             }
@@ -685,7 +691,7 @@ impl TaskApp {
                 self.panel_focus = false;
                 self.back_to_axis();
             }
-            Action::ToggleDone => self.list.toggle_hide_done(),
+            Action::ToggleDone => self.change_list(TaskList::toggle_hide_done),
             Action::PrevTab => self.shift_tab(-1),
             Action::NextTab => self.shift_tab(1),
             Action::MoveUp => return self.step_move(true),
@@ -726,10 +732,10 @@ impl TaskApp {
         match (context, action) {
             (Context::Move, Action::Down) => self.list.step_move(1),
             (Context::Move, Action::Up) => self.list.step_move(-1),
-            (Context::List, Action::Down) => self.list.step(1),
-            (Context::List, Action::Up) => self.list.step(-1),
-            (Context::List, Action::Top) => self.list.first(),
-            (Context::List, Action::Bottom) => self.list.last(),
+            (Context::List, Action::Down) => self.change_list(|list| list.step(1)),
+            (Context::List, Action::Up) => self.change_list(|list| list.step(-1)),
+            (Context::List, Action::Top) => self.change_list(TaskList::first),
+            (Context::List, Action::Bottom) => self.change_list(TaskList::last),
             (Context::Details, _) => self.on_detail_action(action),
             _ => {}
         }
@@ -769,12 +775,16 @@ impl TaskApp {
         self.step_focus.back_to_axis(&mut self.detail.views);
     }
 
-    /// Another selected task than `before` starts its details on the
-    /// timeline.
-    fn settle_step_focus(&mut self, before: Option<String>) {
+    /// Every change of the list that can move its selection goes through
+    /// here: another selected task than before starts its details on the
+    /// timeline, so the level of the focus never outlives the task it was on.
+    fn change_list<T>(&mut self, change: impl FnOnce(&mut TaskList) -> T) -> T {
+        let before = self.list.selected_id().map(str::to_string);
+        let answer = change(&mut self.list);
         if self.list.selected_id() != before.as_deref() {
             self.back_to_axis();
         }
+        answer
     }
 
     /// The selected task with the state its details remember, split so that
@@ -1002,9 +1012,7 @@ impl TaskApp {
             .iter()
             .map(|task| (task.task_id.to_string(), task.revision))
             .collect();
-        let selected = self.list.selected_id().map(str::to_string);
-        let removal = self.list.replace(listing.tasks);
-        self.settle_step_focus(selected);
+        let removal = self.change_list(|list| list.replace(listing.tasks));
         self.detail.retain(self.list.tasks());
         self.detail
             .invalidate_changed(self.list.tasks(), &revisions);
@@ -1097,9 +1105,7 @@ impl TaskApp {
             Some(Ok(envelope)) => {
                 self.connection.on_data(now);
                 self.stream_failures = 0;
-                let selected = self.list.selected_id().map(str::to_string);
-                let effect = self.list.apply_event(&envelope.event);
-                self.settle_step_focus(selected);
+                let effect = self.change_list(|list| list.apply_event(&envelope.event));
                 if effect.applied {
                     self.cursor = Some(envelope.cursor);
                 }

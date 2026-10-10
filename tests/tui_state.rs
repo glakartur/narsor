@@ -7719,6 +7719,66 @@ mod task_app_create {
             .collect()
     }
 
+    /// A running task `id` whose details are open on *Przebieg* with the
+    /// keys in its step's conversation.
+    fn running_task(id: &str, rank: u32) -> TaskSummary {
+        use narsor::domain::ExecutionStatus;
+        super::task_app_support::with_runner(
+            super::task_app_support::with_controller(super::task_app_support::task(
+                id, "local", "running", rank,
+            )),
+            ExecutionStatus::Running,
+            "review",
+        )
+    }
+
+    /// Selects `id` from the list and puts the keys in its step's
+    /// conversation.
+    fn into_step_conversation(app: &mut TaskApp, id: &str) {
+        use narsor::engine::{ConversationState, PositionStatus};
+        use narsor::tui::task_app::detail::DetailRead;
+        use narsor::tui::task_app::tabs::conversation::AttemptRead;
+        use narsor::tui::task_app::StepFocus;
+        use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
+
+        app.list_mut().select(id);
+        press(app, KeyCode::Enter);
+        let revision = app.list().selected().expect("a selected task").revision;
+        let mut step = super::task_app_support::position("plan", PositionStatus::InProgress);
+        step.conversation = ConversationState::Recorded;
+        app.on_detail_read(
+            id,
+            revision,
+            DetailRead::Timeline(Ok(super::task_app_support::timeline(
+                id,
+                vec![step],
+                Some("plan #1"),
+            ))),
+        );
+        app.on_detail_read(
+            id,
+            revision,
+            DetailRead::Attempt {
+                attempt_id: "act-plan".to_string(),
+                from: 0,
+                result: Ok(AttemptRead {
+                    entries: vec![TranscriptEntry::new(
+                        TranscriptEntryId::from("1"),
+                        vec!["line 1".to_string()],
+                        b"1".to_vec(),
+                    )],
+                    next_entry: 1,
+                    closed: false,
+                    truncated_tail: false,
+                    complete: true,
+                    no_record: false,
+                }),
+            },
+        );
+        press(app, KeyCode::Enter);
+        assert_eq!(app.step_focus(), StepFocus::Conversation);
+    }
+
     // -- the form -------------------------------------------------------------
 
     mod the_form {
@@ -8812,6 +8872,104 @@ mod task_app_create {
             assert_eq!(app.history().unwrap().step_focus(), StepFocus::Axis);
         }
 
+        /// The history of `harness` open, with the keys in the conversation
+        /// of the selected entry's `plan #1`.
+        async fn in_an_old_steps_conversation(harness: &RemoteHarness) -> TaskApp {
+            use narsor::tui::task_app::StepFocus;
+            let mut app = TaskApp::new(harness.owner.clone(), "test", None);
+            app.refresh().await;
+            let request = ch(&mut app, 'H');
+            app.perform(request).await;
+            press(&mut app, KeyCode::Enter);
+            app.sync_detail().await;
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.history().unwrap().step_focus(), StepFocus::Conversation);
+            app
+        }
+
+        /// Reads the history again, then the details of its selected entry.
+        async fn read_the_history_again(app: &mut TaskApp) {
+            app.perform(Request::OpenHistory).await;
+            app.sync_detail().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn another_selected_entry_after_a_read_of_the_history_starts_on_the_axis() {
+            use narsor::tui::task_app::StepFocus;
+            let harness = RemoteHarness::start().await;
+            seed_old_execution(harness.root.path(), "exec-a");
+            seed_old_execution(harness.root.path(), "exec-b");
+            let mut app = in_an_old_steps_conversation(&harness).await;
+            let held = app.history().unwrap().selected_entry().unwrap().key();
+
+            // The entry read went away: another one is selected.
+            let store = ExecutionStore::new(harness.root.path());
+            let execution = held.strip_prefix("execution:").expect("an old execution");
+            std::fs::remove_dir_all(store.execution_dir(execution)).expect("remove the execution");
+            app.perform(Request::OpenHistory).await;
+            let history = app.history().unwrap();
+            assert_eq!(history.entries().len(), 1, "{:?}", history.rows());
+            assert_ne!(history.selected_entry().unwrap().key(), held);
+            assert_eq!(history.step_focus(), StepFocus::Axis);
+            assert_eq!(app.key_context().layer, Some(Context::HistoryAxis));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_old_step_that_leaves_the_run_drops_the_focus_to_the_axis_and_says_so() {
+            use narsor::domain::EventData;
+            use narsor::tui::task_app::StepFocus;
+            let harness = RemoteHarness::start().await;
+            seed_old_execution(harness.root.path(), "exec-old");
+            let mut app = in_an_old_steps_conversation(&harness).await;
+
+            // The run now holds another step instead of `plan`.
+            let store = ExecutionStore::new(harness.root.path());
+            let log = store.event_log("exec-old");
+            std::fs::remove_dir_all(log.dir()).expect("clear the events");
+            let id = "exec-old".to_string();
+            for data in [
+                EventData::WorkflowStarted {
+                    workflow_id: "implement-feature".to_string(),
+                    workflow_version: 1,
+                    inputs: json!({}),
+                },
+                EventData::StateEntered {
+                    state_id: "implement".to_string(),
+                },
+            ] {
+                store
+                    .event_log("exec-old")
+                    .append_next(&id, data)
+                    .expect("append");
+            }
+            read_the_history_again(&mut app).await;
+            assert_eq!(app.history().unwrap().step_focus(), StepFocus::Axis);
+            assert_eq!(app.key_context().layer, Some(Context::HistoryAxis));
+            let said = note(&app);
+            assert!(
+                said.contains("plan #1") && said.contains("krok zniknął"),
+                "{said}"
+            );
+            assert_eq!(app.notifier().latest().unwrap().severity, Severity::Warning);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_old_conversation_that_stops_being_shown_drops_the_focus_quietly() {
+            use narsor::tui::task_app::StepFocus;
+            let harness = RemoteHarness::start().await;
+            seed_old_execution(harness.root.path(), "exec-old");
+            let mut app = in_an_old_steps_conversation(&harness).await;
+            let before = note(&app);
+
+            // The record of the attempt is gone.
+            let store = ExecutionStore::new(harness.root.path());
+            std::fs::remove_dir_all(store.execution_dir("exec-old").join("conversations"))
+                .expect("remove the conversations");
+            read_the_history_again(&mut app).await;
+            assert_eq!(app.history().unwrap().step_focus(), StepFocus::Axis);
+            assert_eq!(note(&app), before, "no notification");
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn the_archived_tasks_of_a_server_are_the_history() {
             let harness = RemoteHarness::start().await;
@@ -9114,6 +9272,30 @@ mod task_app_create {
             );
             assert!(app.list().pending().is_empty());
             assert!(app.outgoing().is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_confirmed_task_selected_away_from_a_step_conversation_starts_on_the_axis() {
+            use narsor::tui::task_app::StepFocus;
+            let (harness, _controller) = harness().await;
+            let mut app = app_behind_a_lossy_proxy(&harness, 1).await;
+            open_the_form(&mut app, &harness).await;
+            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+                panic!("a send was expected");
+            };
+            app.perform(Request::SendTask(id.clone())).await;
+            assert_eq!(app.list().pending().len(), 1, "the answer was lost");
+
+            // Meanwhile the operator reads another task's step.
+            app.load(listing(vec![running_task("a", 1)], "c"));
+            into_step_conversation(&mut app, "a");
+
+            assert!(
+                app.retry_outgoing_if_due(Instant::now() + RETRY_AFTER * 2)
+                    .await
+            );
+            assert_eq!(app.list().selected_id(), Some(id.as_str()));
+            assert_eq!(app.step_focus(), StepFocus::Axis);
         }
 
         #[tokio::test(flavor = "multi_thread")]

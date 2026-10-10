@@ -740,12 +740,13 @@ impl TaskApp {
             form.submitted = Some(id.clone());
             self.new_task_memory = Some(*form);
         }
-        self.list.push_pending(PendingRow {
+        let row = PendingRow {
             task_id: id.clone(),
             title: outgoing.title.clone(),
             state: PendingState::Sending,
             reason: None,
-        });
+        };
+        self.change_list(|list| list.push_pending(row));
         self.detail
             .set_draft(&id, format!("wysyłanie: {}", outgoing.title));
         self.outbox.push(outgoing);
@@ -785,7 +786,7 @@ impl TaskApp {
         self.outbox
             .retain(|known| known.task_id != outgoing.task_id);
         self.detail.set_draft(&outgoing.task_id, "");
-        self.list.append(task);
+        self.change_list(|list| list.append(task));
         if self
             .new_task_memory
             .as_ref()
@@ -873,7 +874,7 @@ impl TaskApp {
     fn task_refused(&mut self, outgoing: &Outgoing, error: &ClientError) {
         self.outbox
             .retain(|known| known.task_id != outgoing.task_id);
-        self.list.remove_pending(&outgoing.task_id);
+        self.change_list(|list| list.remove_pending(&outgoing.task_id));
         self.detail.set_draft(&outgoing.task_id, "");
         if let Some(form) = self.new_task_memory.take() {
             self.show_new_task(form);
