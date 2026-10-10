@@ -180,13 +180,9 @@ impl Stack {
     }
 
     /// The contexts to look in, first to last.
-    pub fn scopes(self) -> Vec<Context> {
-        let mut scopes: Vec<Context> = self.layer.into_iter().collect();
-        scopes.push(self.base);
-        if self.base.inherits_global() {
-            scopes.push(Context::Global);
-        }
-        scopes
+    pub fn scopes(self) -> impl Iterator<Item = Context> {
+        let global = self.base.inherits_global().then_some(Context::Global);
+        [self.layer, Some(self.base), global].into_iter().flatten()
     }
 }
 
@@ -1716,7 +1712,6 @@ pub fn lookup_in(
     }
     stack
         .scopes()
-        .into_iter()
         .find_map(|scope| {
             bindings
                 .iter()
@@ -1728,7 +1723,7 @@ pub fn lookup_in(
 /// The first key that does `action` in `stack`, as it is written in the bar
 /// and in help; for text that names a key.
 pub fn key_of(stack: impl Into<Stack>, action: Action) -> Option<String> {
-    let binding = stack.into().scopes().into_iter().find_map(|scope| {
+    let binding = stack.into().scopes().find_map(|scope| {
         BINDINGS
             .iter()
             .find(|binding| binding.context == scope && binding.action == action)
@@ -1759,7 +1754,6 @@ pub fn check_consistency(bindings: &[Binding]) -> Result<(), Vec<String>> {
         // In the order a key is looked up: an earlier row shadows a later one.
         let rows: Vec<&Binding> = stack
             .scopes()
-            .into_iter()
             .flat_map(|scope| bindings.iter().filter(move |row| row.context == scope))
             .collect();
         for (index, binding) in rows.iter().enumerate() {

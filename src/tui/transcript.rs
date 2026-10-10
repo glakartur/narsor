@@ -453,13 +453,7 @@ impl TranscriptState {
 
     fn restore_selection(&mut self, selected: Option<TranscriptEntryId>) {
         self.selected = selected
-            .and_then(|id| {
-                self.entries
-                    .iter()
-                    .position(|entry| entry.id == id)
-                    .or_else(|| self.entries.len().checked_sub(1))
-                    .map(|index| self.entries[index].id.clone())
-            })
+            .filter(|id| self.entries.iter().any(|entry| &entry.id == id))
             .or_else(|| self.entries.last().map(|entry| entry.id.clone()));
     }
 

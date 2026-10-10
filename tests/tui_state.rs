@@ -611,7 +611,7 @@ mod foundations {
             for stack in Stack::LAYERED {
                 assert!(stack.layer.is_some_and(Context::is_layer), "{stack:?}");
                 assert_eq!(
-                    stack.scopes(),
+                    stack.scopes().collect::<Vec<_>>(),
                     [stack.layer.unwrap(), stack.base, Context::Global]
                 );
                 assert_eq!(
@@ -625,7 +625,10 @@ mod foundations {
                 );
             }
             assert!(Stack::all().all(|stack| !stack.base.is_layer()));
-            assert_eq!(Stack::from(Context::Form).scopes(), [Context::Form]);
+            assert_eq!(
+                Stack::from(Context::Form).scopes().collect::<Vec<_>>(),
+                [Context::Form]
+            );
         }
 
         #[test]

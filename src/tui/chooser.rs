@@ -59,7 +59,7 @@ mod inputs;
 use super::input_form::{cycle_option, text_backspace, text_insert, text_step};
 use super::keymap::{digit_of, lookup, Action, Context};
 use super::scroll::{one_line, sanitize, wrap_visible, ScrollState};
-use super::selection::{render_spaced_list, PREFIX_WIDTH};
+use super::selection::{render_spaced_list, spaced_list_rows, PREFIX_WIDTH};
 use super::style::{Role, Styles};
 
 /// The narrowest area in which the description still sits beside the list.
@@ -862,16 +862,18 @@ fn focus_order_of(item: &ChooserItem, inputs_layout: bool) -> Vec<usize> {
     order
 }
 
-/// The rows the list pane needs for `entries` entries: an entry and a gap
-/// each, the gap above the first, and the frame.
+/// The rows of the list pane's frame.
+const LIST_FRAME_ROWS: u16 = 2;
+
+/// The rows the list pane needs for `entries` entries: the spaced list and
+/// the frame.
 fn list_rows(entries: usize) -> u16 {
-    let entries = u16::try_from(entries).unwrap_or(u16::MAX / 2);
-    entries.saturating_mul(2).saturating_add(1 + 2)
+    spaced_list_rows(entries).saturating_add(LIST_FRAME_ROWS)
 }
 
 /// The rows of the smallest list pane: one entry with its bracket, and the
 /// frame.
-const LIST_MIN_ROWS: u16 = 3 + 2;
+const LIST_MIN_ROWS: u16 = spaced_list_rows(1) + LIST_FRAME_ROWS;
 
 /// How wide the list needs to be for its longest line.
 fn list_width(items: &[ChooserItem]) -> u16 {

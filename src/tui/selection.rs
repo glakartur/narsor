@@ -39,6 +39,17 @@ use super::style::Styles;
 /// space. Callers lay their lines out in the area's width minus this.
 pub const PREFIX_WIDTH: u16 = 2;
 
+/// The rows a spaced list of `count` one-line items takes whole: each item
+/// with the gap above it, and the gap below the last. One item takes three,
+/// the least that shows a selection with its bracket.
+pub const fn spaced_list_rows(count: usize) -> u16 {
+    if count >= (u16::MAX / 2) as usize {
+        u16::MAX
+    } else {
+        count as u16 * 2 + 1
+    }
+}
+
 /// The two columns on the left of a line: `"┃ "` or `"│ "` when the line
 /// belongs to the selected element (thick when `focused`), two spaces when it
 /// does not. Shared by the bracketed lists and by the transcripts, which mark
