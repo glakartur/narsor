@@ -1,7 +1,7 @@
 //! The screen: geometry, the header line and the shortcut bar.
 //!
 //! ```text
-//! narsor · local ● live                            sloty 2/3 · ? 1 · ! 1
+//! narsor · local ● live      harness claude-code (konfiguracja) · sloty 2/3 · ? 1 · ! 1
 //! ┏ Zadania ━━━━━━━━━━━━━━━━┓┌ NAR-14 Edycja ───────────────────────────┐
 //! ┃ ● NAR-14  edit          ┃│ details                                  │
 //! ┃ …                       ┃│                                          │
@@ -39,8 +39,10 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use super::super::keymap::{self, Context};
+use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
-use super::list::{Counters, Slots, TaskList};
+use super::harness::HarnessHeader;
+use super::list::{fit as fit_text, Counters, Slots, TaskList};
 use super::{actions, detail, history, new_task, repositories};
 use super::{Focus, TaskApp, View};
 
@@ -223,16 +225,16 @@ fn render_too_small(frame: &mut Frame, area: Rect, styles: &Styles) {
 }
 
 /// The header row: [`header_left`] from the left edge, [`header_right`] at
-/// the right one. A new segment (the harness, U5) goes into one of the two.
-/// The right part wins the room it needs; the left one is cut at it.
+/// the right one, shortened by [`header_lines`] to fit. The right part wins
+/// the room it needs; the left one is cut at it.
 fn render_header(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles, now: Instant) {
-    let right = header_right(app, styles, usize::from(area.width));
+    let (left, right) = header_lines(app, styles, now, usize::from(area.width));
     let right_width = u16::try_from(right.width())
         .unwrap_or(u16::MAX)
         .min(area.width);
     let left_width = area.width - right_width;
     frame.render_widget(
-        Paragraph::new(header_left(app, styles, now)),
+        Paragraph::new(left),
         Rect::new(area.x, area.y, left_width, area.height),
     );
     frame.render_widget(
@@ -241,62 +243,136 @@ fn render_header(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles, 
     );
 }
 
-/// `narsor · name ● live`, and how old the data is when it is not live.
-fn header_left(app: &TaskApp, styles: &Styles, now: Instant) -> Line<'static> {
-    let connection = app.connection();
-    let mut spans = vec![
-        Span::styled(" narsor ", styles.of(Role::Focus)),
-        Span::styled(format!("· {} ", connection.name()), styles.of(Role::Calm)),
-        connection.status(now).span(styles),
+/// How far the header gave up detail to fit, step by step (R12): first the
+/// slots, then the age of the data, then `(konfiguracja)` becomes `(konf.)`,
+/// then the connection's name. What is still missing comes off the harness
+/// name. The counters `? n · ! n` always stay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Fit {
+    Full,
+    NoSlots,
+    NoAge,
+    ShortConfig,
+    NoName,
+}
+
+impl Fit {
+    const ALL: [Fit; 5] = [
+        Fit::Full,
+        Fit::NoSlots,
+        Fit::NoAge,
+        Fit::ShortConfig,
+        Fit::NoName,
     ];
-    if let Some(age) = connection.age_label(now) {
-        spans.push(Span::styled(format!(" · {age}"), styles.of(Role::Done)));
+}
+
+/// The two parts of the header for `width` columns, shortened in the order of
+/// [`Fit`] until they fit.
+fn header_lines(
+    app: &TaskApp,
+    styles: &Styles,
+    now: Instant,
+    width: usize,
+) -> (Line<'static>, Line<'static>) {
+    for fit in Fit::ALL {
+        let left = header_left(app, styles, now, fit);
+        let right = header_right(app, styles, fit, usize::MAX);
+        if left.width() + right.width() <= width {
+            return (left, right);
+        }
+    }
+    let left = header_left(app, styles, now, Fit::NoName);
+    let right = header_right(app, styles, Fit::NoName, usize::MAX);
+    let over = (left.width() + right.width()).saturating_sub(width);
+    let name = harness_name(app).chars().count();
+    let room = name.saturating_sub(over).max(1);
+    (left, header_right(app, styles, Fit::NoName, room))
+}
+
+/// `narsor · name ● live`, and how old the data is when it is not live.
+fn header_left(app: &TaskApp, styles: &Styles, now: Instant, fit: Fit) -> Line<'static> {
+    let connection = app.connection();
+    let mut spans = vec![Span::styled(" narsor ", styles.of(Role::Focus))];
+    if fit < Fit::NoName {
+        spans.push(Span::styled(
+            format!("· {} ", connection.name()),
+            styles.of(Role::Calm),
+        ));
+    }
+    spans.push(connection.status(now).span(styles));
+    if fit < Fit::NoAge {
+        if let Some(age) = connection.age_label(now) {
+            spans.push(Span::styled(format!(" · {age}"), styles.of(Role::Done)));
+        }
     }
     spans.push(Span::raw(" "));
     Line::from(spans)
 }
 
-/// `sloty 2/3 · ? 1 · ! 1`, shortened from the left when it does not fit.
-fn header_right(app: &TaskApp, styles: &Styles, width: usize) -> Line<'static> {
+/// The name of the harness the header shows, before any cut.
+fn harness_name(app: &TaskApp) -> String {
+    match app.harness_header() {
+        HarnessHeader::Unknown => "?".to_string(),
+        HarnessHeader::Pending(name) | HarnessHeader::Known { name, .. } => one_line(name),
+    }
+}
+
+/// `harness claude-code (konfiguracja)`, `harness opencode`, `harness ?`, or
+/// `harness opencode…` while a change waits for its answer. The name is cut
+/// to `room` columns.
+fn harness_spans(app: &TaskApp, styles: &Styles, fit: Fit, room: usize) -> Vec<Span<'static>> {
+    let name = fit_text(&harness_name(app), room);
+    let mut spans = vec![
+        Span::styled("harness ", styles.of(Role::Done)),
+        Span::styled(name, styles.of(Role::Calm)),
+    ];
+    match app.harness_header() {
+        HarnessHeader::Pending(_) => spans.push(Span::styled("…", styles.of(Role::Done))),
+        HarnessHeader::Known {
+            configured: true, ..
+        } => {
+            let note = if fit < Fit::ShortConfig {
+                " (konfiguracja)"
+            } else {
+                " (konf.)"
+            };
+            spans.push(Span::styled(note, styles.of(Role::Done)));
+        }
+        _ => {}
+    }
+    spans
+}
+
+/// `harness … · sloty 2/3 · ? 1 · ! 1`; the slots go once `fit` says so.
+fn header_right(app: &TaskApp, styles: &Styles, fit: Fit, room: usize) -> Line<'static> {
     let Counters {
         questions,
         problems,
     } = app.list().counters();
-    let mut parts: Vec<Span<'static>> = Vec::new();
-    if let Some(Slots { used, limit }) = app.list().slots() {
-        let text = match limit {
-            Some(limit) => format!("sloty {used}/{limit}"),
-            None => format!("sloty {used}"),
-        };
-        parts.push(Span::styled(text, styles.of(Role::Calm)));
+    let separator = || Span::styled(" · ", styles.of(Role::Done));
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(harness_spans(app, styles, fit, room));
+    if fit < Fit::NoSlots {
+        if let Some(Slots { used, limit }) = app.list().slots() {
+            let text = match limit {
+                Some(limit) => format!("sloty {used}/{limit}"),
+                None => format!("sloty {used}"),
+            };
+            spans.push(separator());
+            spans.push(Span::styled(text, styles.of(Role::Calm)));
+        }
     }
     let count_role = |count: usize, role: Role| if count == 0 { Role::Done } else { role };
-    parts.push(Span::styled(
+    spans.push(separator());
+    spans.push(Span::styled(
         format!("? {questions}"),
         styles.of(count_role(questions, Role::Attention)),
     ));
-    parts.push(Span::styled(
+    spans.push(separator());
+    spans.push(Span::styled(
         format!("! {problems}"),
         styles.of(count_role(problems, Role::Problem)),
     ));
-    // Leave room for the left title: drop `sloty` before the counters.
-    let length = |parts: &[Span]| -> usize {
-        parts
-            .iter()
-            .map(|part| part.content.chars().count() + 3)
-            .sum::<usize>()
-            + 1
-    };
-    while parts.len() > 2 && length(&parts) > width / 2 {
-        parts.remove(0);
-    }
-    let mut spans = vec![Span::raw(" ")];
-    for (index, part) in parts.into_iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(" · ", styles.of(Role::Done)));
-        }
-        spans.push(part);
-    }
     spans.push(Span::raw(" "));
     Line::from(spans)
 }

@@ -3002,3 +3002,140 @@ mod task_app_main_screen {
         );
     }
 }
+
+/// U5: the default harness in the header, shortened in its order, and the
+/// list `h` opens.
+mod task_app_harness_render {
+    use super::*;
+
+    use narsor::api::ApiClient;
+    use narsor::tui::task_app::{layout, TaskApp};
+
+    use crate::task_app_support::{
+        harness_selection, listing, queued, titled, waiting_for_capacity, HARNESSES,
+    };
+
+    /// A live application whose queue reports 2 of 3 slots taken, and whose
+    /// daemon runs on `claude-code` from the configuration, or on
+    /// `override_harness`.
+    fn app(override_harness: Option<&str>) -> TaskApp {
+        let mut app = TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        );
+        app.load(listing(
+            vec![titled(
+                waiting_for_capacity(queued("a", 1), 1, 2, 3),
+                "NAR-12",
+            )],
+            "c",
+        ));
+        app.set_harness_selection(harness_selection(
+            "claude-code",
+            override_harness,
+            &HARNESSES,
+        ));
+        app
+    }
+
+    fn header(app: &mut TaskApp, width: u16) -> String {
+        let buffer = draw(width, 24, |frame| {
+            layout::render(frame, app, &Styles::new(true), Instant::now())
+        });
+        rows(&buffer).remove(0)
+    }
+
+    #[test]
+    fn wide_the_header_has_everything() {
+        let top = header(&mut app(None), 120);
+        for expected in [
+            "narsor · local ● live",
+            "harness claude-code (konfiguracja)",
+            "sloty 2/3",
+            "? 0 · ! 0",
+        ] {
+            assert!(top.contains(expected), "{expected:?} is missing: {top:?}");
+        }
+    }
+
+    #[test]
+    fn at_80_columns_the_slots_go_first() {
+        let top = header(&mut app(None), 80);
+        assert!(!top.contains("sloty"), "{top:?}");
+        for expected in [
+            "narsor · local",
+            "harness claude-code (konfiguracja)",
+            "? 0 · ! 0",
+        ] {
+            assert!(top.contains(expected), "{expected:?} is missing: {top:?}");
+        }
+    }
+
+    #[test]
+    fn at_60_columns_the_note_shortens_and_the_name_goes_but_harness_and_counters_stay() {
+        let top = header(&mut app(None), 60);
+        assert!(!top.contains("sloty"), "{top:?}");
+        assert!(!top.contains("local"), "{top:?}");
+        for expected in ["narsor", "harness claude-code (konf.)", "? 0 · ! 0"] {
+            assert!(top.contains(expected), "{expected:?} is missing: {top:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_too_long_for_the_row_is_cut_and_the_counters_stay() {
+        let long = "a-very-long-harness-name-from-a-plugin";
+        let mut app = app(Some(long));
+        let mut snapshot = app.harness_selection().unwrap().clone();
+        snapshot.supported.push(long.to_string());
+        app.set_harness_selection(snapshot);
+        let top = header(&mut app, 60);
+        assert_eq!(top.chars().count(), 60);
+        assert!(top.contains("harness a-very-long"), "{top:?}");
+        assert!(top.contains('…'), "{top:?}");
+        assert!(top.contains("? 0 · ! 0"), "{top:?}");
+        assert!(!top.contains(long), "{top:?}");
+    }
+
+    #[test]
+    fn before_the_first_read_the_header_says_it_does_not_know() {
+        let mut app = TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        );
+        app.load(listing(vec![], "c"));
+        assert!(header(&mut app, 120).contains("harness ? "));
+    }
+
+    #[test]
+    fn the_harness_list_fits_a_narrow_terminal() {
+        let mut app = app(None);
+        assert!(app.open_harness());
+        let buffer = draw(64, 24, |frame| {
+            layout::render(frame, &mut app, &Styles::new(false), Instant::now())
+        });
+        let text = screen(&buffer);
+        for expected in [
+            " Domyślny harness ",
+            "● domyślny z konfiguracji (claude-code)",
+            "claude-code",
+            "codex",
+            "opencode",
+        ] {
+            assert!(text.contains(expected), "{expected:?} is missing:\n{text}");
+        }
+        let y = u16::try_from(row_of(&buffer, " Domyślny harness ")).unwrap();
+        let x = column_of(&buffer, y, 0, "┌").expect("the list's frame");
+        assert_eq!(cell_at(&buffer, x, y).1, Color::Cyan, "the focus frame");
+    }
+
+    #[test]
+    fn the_list_bar_offers_h() {
+        let mut app = app(None);
+        let buffer = draw(140, 24, |frame| {
+            layout::render(frame, &mut app, &Styles::new(true), Instant::now())
+        });
+        assert!(rows(&buffer).last().unwrap().contains("h harness"));
+    }
+}

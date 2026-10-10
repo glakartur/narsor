@@ -423,6 +423,7 @@ impl TaskApp {
             Action::Back => self.focus = Focus::List,
             Action::Open => self.focus = Focus::Details,
             Action::Recover => return self.recover_selected_entry(),
+            Action::ChooseHarness => return Request::OpenHarness,
             Action::PrevTab | Action::NextTab => {
                 if let View::History(history) = &mut self.view {
                     let by = if action == Action::PrevTab { -1 } else { 1 };

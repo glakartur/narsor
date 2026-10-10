@@ -6469,7 +6469,7 @@ mod task_app_conductor {
         use super::*;
 
         #[test]
-        fn the_tab_names_the_harness_and_offers_no_key_to_choose_it() {
+        fn the_tab_names_the_harness_and_h_is_the_global_choice_not_the_tabs() {
             let mut app = tab_app();
             read(&mut app, conductor_view(vec![], json!({})));
             let text = screen(&mut app, 120, 30);
@@ -6478,10 +6478,10 @@ mod task_app_conductor {
             assert!(!text.contains("h harness"), "{text}");
             assert_eq!(
                 keymap::lookup(Context::Details, &KeyEvent::from(KeyCode::Char('h'))),
-                None
+                Some(Action::ChooseHarness)
             );
-            ch(&mut app, 'h');
-            assert!(app.overlay().is_none());
+            // Not a command to the task's conductor: the installation's default.
+            assert_eq!(ch(&mut app, 'h'), Request::OpenHarness);
         }
 
         /// A command from before the per-task choice was retired still shows
@@ -8695,6 +8695,449 @@ mod task_app_create {
             app.perform(request).await;
             assert!(names(&app).is_empty());
             assert!(note(&app).contains("już nie istnieje"), "{}", note(&app));
+        }
+    }
+}
+
+/// U5: the installation's default harness — the header names it, `h` changes
+/// it from the list, the details, the history and the repositories, never
+/// from a field being typed into or over another window (R12–R15, AE3, AE4).
+mod task_app_harness {
+    use std::time::Instant;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::json;
+
+    use narsor::api::ApiClient;
+    use narsor::domain::ExecutionStatus;
+    use narsor::tui::keymap::{self, Action, Context, BINDINGS};
+    use narsor::tui::task_app::actions::Overlay;
+    use narsor::tui::task_app::harness::HarnessHeader;
+    use narsor::tui::task_app::notify::Severity;
+    use narsor::tui::task_app::{DetailTab, Focus, Request, TaskApp};
+
+    use super::remote_support::RemoteHarness;
+    use super::task_app_support::{
+        capabilities, catalogue, catalogue_workflow, harness_selection, listing, registry, task,
+        titled, with_controller, with_pending, with_runner, HARNESSES,
+    };
+
+    fn offline_client() -> ApiClient {
+        ApiClient::new("127.0.0.1:9".parse().unwrap(), "token")
+    }
+
+    /// A live application over one running task `a`, knowing that the
+    /// daemon's harness is `claude-code` from the configuration, or
+    /// `override_harness` over it.
+    fn app(override_harness: Option<&str>) -> TaskApp {
+        let mut app = TaskApp::new(offline_client(), "local", None);
+        app.load(listing(vec![titled(running("a"), "NAR-12")], "c"));
+        app.set_harness_selection(harness_selection(
+            "claude-code",
+            override_harness,
+            &HARNESSES,
+        ));
+        app
+    }
+
+    fn running(id: &str) -> narsor::controller_protocol::TaskSummary {
+        with_runner(
+            with_controller(task(id, "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        )
+    }
+
+    fn press(app: &mut TaskApp, code: KeyCode) -> Request {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn ch(app: &mut TaskApp, character: char) -> Request {
+        press(app, KeyCode::Char(character))
+    }
+
+    fn h() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)
+    }
+
+    fn note(app: &TaskApp) -> (String, Option<Severity>) {
+        let latest = app.notifier().latest();
+        (
+            latest.map(|note| note.text.clone()).unwrap_or_default(),
+            latest.map(|note| note.severity),
+        )
+    }
+
+    fn labels(app: &TaskApp) -> Vec<String> {
+        harness_chooser(app)
+            .items()
+            .iter()
+            .map(|item| item.label.clone())
+            .collect()
+    }
+
+    fn harness_chooser(app: &TaskApp) -> &narsor::tui::chooser::Chooser {
+        match app.overlay() {
+            Some(overlay @ Overlay::Harness(_)) => overlay.chooser().expect("a list"),
+            other => panic!("the harness list was expected, got {other:?}"),
+        }
+    }
+
+    fn header(app: &mut TaskApp, width: u16) -> String {
+        use narsor::tui::style::Styles;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                narsor::tui::task_app::layout::render(
+                    frame,
+                    app,
+                    &Styles::new(false),
+                    Instant::now(),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        buffer.content()[..usize::from(width)]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ae3_the_header_names_the_harness_h_changes_it_and_the_configuration_comes_back() {
+        let harness = RemoteHarness::start().await;
+        harness.create("t1", None).await;
+        let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+        app.refresh().await;
+        let top = header(&mut app, 120);
+        assert!(top.contains("harness claude-code (konfiguracja)"), "{top}");
+
+        let request = ch(&mut app, 'h');
+        assert_eq!(request, Request::OpenHarness);
+        app.perform(request).await;
+        assert_eq!(
+            labels(&app),
+            [
+                "● domyślny z konfiguracji (claude-code)",
+                "  claude-code",
+                "  codex",
+                "  opencode"
+            ]
+        );
+        assert_eq!(harness_chooser(&app).selected(), 0, "on the one in force");
+
+        for _ in 0..3 {
+            ch(&mut app, 'j');
+        }
+        let request = press(&mut app, KeyCode::Enter);
+        assert_eq!(request, Request::SetHarness(Some("opencode".to_string())));
+        assert!(app.overlay().is_none(), "the list closes at once");
+        assert_eq!(app.harness_header(), HarnessHeader::Pending("opencode"));
+        let top = header(&mut app, 120);
+        assert!(top.contains("harness opencode…"), "{top}");
+
+        app.perform(request).await;
+        let top = header(&mut app, 120);
+        assert!(top.contains("harness opencode "), "{top}");
+        assert!(!top.contains("konfiguracja"), "{top}");
+        let (text, severity) = note(&app);
+        assert!(text.contains("opencode"), "{text}");
+        assert_eq!(severity, Some(Severity::Success));
+        let served = harness.owner.harness_selection().await.unwrap();
+        assert_eq!(served.override_harness.as_deref(), Some("opencode"));
+
+        let request = ch(&mut app, 'h');
+        app.perform(request).await;
+        assert_eq!(harness_chooser(&app).selected(), 3);
+        assert_eq!(labels(&app)[3], "● opencode");
+        ch(&mut app, 'g');
+        for _ in 0..3 {
+            ch(&mut app, 'k');
+        }
+        let request = press(&mut app, KeyCode::Enter);
+        assert_eq!(request, Request::SetHarness(None));
+        assert_eq!(app.harness_header(), HarnessHeader::Pending("claude-code"));
+        app.perform(request).await;
+        let top = header(&mut app, 120);
+        assert!(top.contains("harness claude-code (konfiguracja)"), "{top}");
+        assert!(note(&app).0.contains("claude-code (konfiguracja)"));
+        let served = harness.owner.harness_selection().await.unwrap();
+        assert_eq!(served.override_harness, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unsupported_harness_is_a_problem_with_its_cause_and_the_header_keeps_the_old_one() {
+        let harness = RemoteHarness::start().await;
+        harness.create("t1", None).await;
+        let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+        app.refresh().await;
+        app.perform(Request::SetHarness(Some("nope".to_string())))
+            .await;
+        let (text, severity) = note(&app);
+        assert_eq!(severity, Some(Severity::Error));
+        assert!(text.contains("domyślny harness nie zmieniony"), "{text}");
+        assert!(text.contains("nope"), "the cause: {text}");
+        assert_eq!(
+            app.harness_header(),
+            HarnessHeader::Known {
+                name: "claude-code",
+                configured: true
+            }
+        );
+        assert!(app.connection().is_live());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_daemon_without_a_selector_shows_a_question_mark_and_keeps_what_was_known() {
+        let harness = RemoteHarness::start_without_harness_selector().await;
+        harness.create("t1", None).await;
+        let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+        assert_eq!(app.harness_header(), HarnessHeader::Unknown);
+        app.refresh().await;
+        assert_eq!(app.harness_header(), HarnessHeader::Unknown);
+        assert!(header(&mut app, 120).contains("harness ? "));
+        assert!(
+            app.connection().is_live(),
+            "no selector is not a broken connection"
+        );
+
+        // `h` with nothing known: says why, opens nothing.
+        let request = ch(&mut app, 'h');
+        app.perform(request).await;
+        assert!(app.overlay().is_none());
+        let (text, severity) = note(&app);
+        assert_eq!(severity, Some(Severity::Error));
+        assert!(text.contains("nie udało się odczytać"), "{text}");
+
+        // A value known before the read failed stays.
+        app.set_harness_selection(harness_selection("claude-code", Some("codex"), &HARNESSES));
+        app.refresh().await;
+        assert_eq!(
+            app.harness_header(),
+            HarnessHeader::Known {
+                name: "codex",
+                configured: false
+            }
+        );
+        assert!(app.connection().is_live());
+    }
+
+    #[test]
+    fn h_opens_the_choice_from_the_list_and_from_every_tab_of_the_details() {
+        let mut app = app(None);
+        assert_eq!(app.focus(), Focus::List);
+        assert_eq!(ch(&mut app, 'h'), Request::OpenHarness);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Details);
+        for tab in DetailTab::ALL {
+            app.detail_mut().set_tab(tab);
+            assert_eq!(ch(&mut app, 'h'), Request::OpenHarness, "{tab:?}");
+        }
+    }
+
+    #[test]
+    fn h_belongs_to_the_history_and_the_repositories_as_well() {
+        for context in [
+            Context::List,
+            Context::Details,
+            Context::History,
+            Context::HistoryDetails,
+            Context::Repositories,
+        ] {
+            assert_eq!(
+                keymap::lookup(context, &h()),
+                Some(Action::ChooseHarness),
+                "{context:?}"
+            );
+        }
+        let mut app = app(None);
+        app.open_repositories(registry(vec![]));
+        assert_eq!(ch(&mut app, 'h'), Request::OpenHarness);
+    }
+
+    #[test]
+    fn h_is_not_a_command_over_a_window_in_the_move_mode_or_in_a_field() {
+        for context in [
+            Context::Global,
+            Context::Menu,
+            Context::Confirm,
+            Context::Move,
+            Context::Panel,
+            Context::Form,
+        ] {
+            assert_eq!(keymap::lookup(context, &h()), None, "{context:?}");
+        }
+        // Over the action menu: nothing, and the menu stays.
+        let mut app = app(None);
+        ch(&mut app, '.');
+        assert!(matches!(app.overlay(), Some(Overlay::Menu(_))));
+        assert_eq!(ch(&mut app, 'h'), Request::None);
+        assert!(matches!(app.overlay(), Some(Overlay::Menu(_))));
+        // Over the harness list itself: nothing either.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.open_harness());
+        assert_eq!(ch(&mut app, 'h'), Request::None);
+        assert!(matches!(app.overlay(), Some(Overlay::Harness(_))));
+    }
+
+    #[test]
+    fn ae4_h_types_a_letter_in_the_conductors_chat() {
+        let mut app = app(None);
+        press(&mut app, KeyCode::Enter);
+        app.detail_mut().set_tab(DetailTab::Conductor);
+        let revision = app.list().selected().unwrap().revision;
+        app.on_detail_read(
+            "a",
+            revision,
+            narsor::tui::task_app::detail::DetailRead::Conductor(Ok(
+                narsor::controller_protocol::ConductorReadResponse::Available {
+                    conductor: Box::new(super::task_app_support::conductor_view(vec![], json!({}))),
+                    source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                },
+            )),
+        );
+        ch(&mut app, 'c');
+        assert_eq!(app.key_context(), Context::Form);
+        assert_eq!(ch(&mut app, 'h'), Request::None);
+        assert!(app.overlay().is_none());
+        assert_eq!(app.detail().draft("a"), Some("h"));
+    }
+
+    #[test]
+    fn ae4_h_types_a_letter_in_the_answer_panel() {
+        let mut app = TaskApp::new(offline_client(), "local", None);
+        let waiting = with_pending(
+            running("a"),
+            json!({
+                "execution_id": "exec-1",
+                "state_id": "review",
+                "action_execution_id": "act-7",
+                "instruction": "Która wersja API?",
+                "fields": [{ "name": "answer", "type": "text", "required": true }],
+                "continuation": "resume_agent",
+                "prefilled_answer": null,
+                "episode": "ep-q",
+                "requested_at": "2026-10-09T11:54:00Z"
+            }),
+        );
+        app.load(listing(vec![titled(waiting, "NAR-12")], "c"));
+        app.set_harness_selection(harness_selection("claude-code", None, &HARNESSES));
+        ch(&mut app, ' ');
+        press(&mut app, KeyCode::Enter);
+        assert!(app.panel_focused());
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.key_context(), Context::Form);
+        assert_eq!(ch(&mut app, 'h'), Request::None);
+        assert!(app.overlay().is_none());
+        assert!(
+            app.detail()
+                .draft("a")
+                .is_some_and(|draft| draft.contains('h')),
+            "{:?}",
+            app.detail().draft("a")
+        );
+    }
+
+    #[test]
+    fn ae4_h_types_a_letter_in_the_new_task_form() {
+        let mut app = app(None);
+        app.set_capabilities(capabilities(true, None));
+        assert_eq!(ch(&mut app, 'n'), Request::OpenNewTask);
+        app.open_new_task(
+            catalogue(vec![catalogue_workflow(
+                "fix-bug",
+                "Poprawka błędu.",
+                vec![super::task_app_support::workflow_input(
+                    "ticket_id",
+                    narsor::domain::ParamType::String,
+                    true,
+                    None,
+                )],
+            )]),
+            registry(vec![]),
+        );
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.key_context(), Context::Form);
+        assert_eq!(ch(&mut app, 'h'), Request::None);
+        assert!(app.overlay().is_none());
+        assert!(app.detail().has_drafts(), "the letter went into the field");
+    }
+
+    #[test]
+    fn the_list_starts_on_the_one_in_force_which_cannot_be_chosen_again() {
+        let mut app = app(Some("codex"));
+        assert!(app.open_harness());
+        assert_eq!(
+            labels(&app),
+            [
+                "  domyślny z konfiguracji (claude-code)",
+                "  claude-code",
+                "● codex",
+                "  opencode"
+            ]
+        );
+        let chooser = harness_chooser(&app);
+        assert_eq!(chooser.selected(), 2);
+        assert!(chooser.items()[2].unavailable.is_some(), "greyed out");
+        assert!(chooser.items()[0].unavailable.is_none());
+
+        // Choosing it changes nothing and sends nothing.
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        assert!(app.overlay().is_none());
+        assert_eq!(
+            app.harness_header(),
+            HarnessHeader::Known {
+                name: "codex",
+                configured: false
+            }
+        );
+
+        // `Esc` closes, the configuration entry sends a reset.
+        assert!(app.open_harness());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlay().is_none());
+        assert!(app.open_harness());
+        ch(&mut app, 'g');
+        ch(&mut app, 'k');
+        ch(&mut app, 'k');
+        assert_eq!(harness_chooser(&app).selected(), 0);
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::SetHarness(None));
+    }
+
+    #[test]
+    fn a_daemon_that_names_no_harness_leaves_only_the_configuration() {
+        let mut app = app(None);
+        app.set_harness_selection(harness_selection("claude-code", None, &[]));
+        assert!(app.open_harness());
+        assert_eq!(
+            labels(&app),
+            [
+                "● domyślny z konfiguracji (claude-code)",
+                "  demon nie zgłasza obsługiwanych harnessów"
+            ]
+        );
+        ch(&mut app, 'j');
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+    }
+
+    #[test]
+    fn the_key_map_stays_consistent_and_the_bar_and_help_name_h() {
+        assert_eq!(keymap::check_consistency(BINDINGS), Ok(()));
+        assert!(
+            keymap::hints(Context::List)
+                .iter()
+                .any(|(keys, label)| keys == "h" && *label == "harness"),
+            "{:?}",
+            keymap::hints(Context::List)
+        );
+        for context in [Context::List, Context::Details, Context::Repositories] {
+            assert!(
+                keymap::help_entries(context).iter().any(
+                    |entry| entry.keys == "h" && entry.description.contains("domyślny harness")
+                ),
+                "{context:?}"
+            );
         }
     }
 }

@@ -483,3 +483,26 @@ pub fn legacy(
     }))
     .expect("a legacy execution")
 }
+
+// ---------------------------------------------------------------------------
+// The installation's default harness (U5)
+// ---------------------------------------------------------------------------
+
+/// The daemon's default harness: `configured` from the configuration,
+/// `override_harness` chosen over it, `supported` in the daemon's order.
+pub fn harness_selection(
+    configured: &str,
+    override_harness: Option<&str>,
+    supported: &[&str],
+) -> narsor::api::HarnessSelectionSnapshot {
+    narsor::api::HarnessSelectionSnapshot {
+        supported: supported.iter().map(|name| (*name).to_string()).collect(),
+        configured: configured.to_string(),
+        override_harness: override_harness.map(str::to_string),
+        effective: override_harness.unwrap_or(configured).to_string(),
+        revision: 1,
+    }
+}
+
+/// The harnesses a daemon of the tests supports, in its order.
+pub const HARNESSES: [&str; 3] = ["claude-code", "codex", "opencode"];

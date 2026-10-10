@@ -92,6 +92,16 @@ impl RemoteHarness {
     /// workflows the owner API lists are those of the root and the built-in
     /// ones, never the developer's own directory.
     pub async fn start_with(prepare: impl FnOnce(&Path)) -> Self {
+        Self::start_inner(prepare, true).await
+    }
+
+    /// Like [`Self::start`], but the daemon has no default-harness selector:
+    /// `/settings/agent-harness` answers with an error.
+    pub async fn start_without_harness_selector() -> Self {
+        Self::start_inner(|_| {}, false).await
+    }
+
+    async fn start_inner(prepare: impl FnOnce(&Path), harness_selector: bool) -> Self {
         let root = TempRoot::new();
         let clock = Arc::new(ManualClock(Mutex::new(
             Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap(),
@@ -102,15 +112,20 @@ impl RemoteHarness {
         let resolver: Arc<dyn narsor::environment::LaunchResolver> = catalog.clone();
         // The daemon's default agent harness: configured `claude-code`,
         // no override until a test sets one.
-        let harness_selector = DefaultHarnessSelector::load(
-            StatePaths::new(root.path()),
-            vec!["claude-code".into(), "codex".into(), "opencode".into()],
-            "claude-code",
-        )
-        .await
-        .expect("load the harness selector");
+        let harness_selector = if harness_selector {
+            let selector = DefaultHarnessSelector::load(
+                StatePaths::new(root.path()),
+                vec!["claude-code".into(), "codex".into(), "opencode".into()],
+                "claude-code",
+            )
+            .await
+            .expect("load the harness selector");
+            Some(Arc::new(selector))
+        } else {
+            None
+        };
         let services = ApiServices {
-            harness_selector: Some(Arc::new(harness_selector)),
+            harness_selector,
             control: Some(Arc::new(ProtocolService::new(control, resolver))),
             local_launch: Some(catalog),
             workflows: Some(WorkflowResolver::with_user_dir(root.path(), None)),

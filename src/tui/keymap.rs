@@ -199,6 +199,9 @@ pub enum Action {
     UndoDecision,
     /// Read the next page of the conductor's chat.
     LoadMore,
+    /// Choose the installation's default agent harness (the header says
+    /// which one is in force).
+    ChooseHarness,
     /// Send a task again that did not get through (the new-task form).
     RetrySend,
     /// Recover an old execution of the history.
@@ -447,6 +450,13 @@ pub static BINDINGS: &[Binding] = &[
         Action::Repositories,
         "repozytoria",
         "repozytoria",
+    ),
+    bind(
+        Context::List,
+        Key::char('h'),
+        Action::ChooseHarness,
+        "harness",
+        "domyślny harness instalacji: wybór z listy obsługiwanych albo powrót do konfiguracji",
     ),
     bind(
         Context::List,
@@ -738,6 +748,13 @@ pub static BINDINGS: &[Binding] = &[
         Action::LoadMore,
         "",
         "zakładka Dyrygent: wczytaj dalsze wpisy czatu",
+    ),
+    bind(
+        Context::Details,
+        Key::char('h'),
+        Action::ChooseHarness,
+        "",
+        "domyślny harness instalacji: wybór z listy obsługiwanych albo powrót do konfiguracji",
     ),
     // The "waiting for you" panel, focus on its actions. Focus in a field
     // types text; the chooser handles those keys.
@@ -1167,6 +1184,13 @@ pub static BINDINGS: &[Binding] = &[
         "następna zakładka",
     ),
     bind(
+        Context::History,
+        Key::char('h'),
+        Action::ChooseHarness,
+        "",
+        "domyślny harness instalacji: wybór z listy obsługiwanych albo powrót do konfiguracji",
+    ),
+    bind(
         Context::HistoryDetails,
         Key::code(KeyCode::Esc),
         Action::Back,
@@ -1278,6 +1302,13 @@ pub static BINDINGS: &[Binding] = &[
         "wznów",
         "wznów stare execution, które na to pozwala (recover)",
     ),
+    bind(
+        Context::HistoryDetails,
+        Key::char('h'),
+        Action::ChooseHarness,
+        "",
+        "domyślny harness instalacji: wybór z listy obsługiwanych albo powrót do konfiguracji",
+    ),
     // The repositories: a list and a description, `a` adds, `d` removes. The
     // list itself is the chooser, which reads the panel's keys for moving.
     bind(
@@ -1349,6 +1380,13 @@ pub static BINDINGS: &[Binding] = &[
         Action::PageUp,
         "",
         "przewiń opis w górę",
+    ),
+    bind(
+        Context::Repositories,
+        Key::char('h'),
+        Action::ChooseHarness,
+        "",
+        "domyślny harness instalacji: wybór z listy obsługiwanych albo powrót do konfiguracji",
     ),
 ];
 

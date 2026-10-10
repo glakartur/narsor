@@ -87,6 +87,7 @@
 
 pub mod actions;
 pub mod detail;
+pub mod harness;
 pub mod history;
 pub mod layout;
 pub mod list;
@@ -102,7 +103,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::KeyEvent;
 use futures::stream::{BoxStream, StreamExt as _};
 
-use crate::api::{reconnect_delay, ApiClient, ClientError};
+use crate::api::{reconnect_delay, ApiClient, ClientError, HarnessSelectionSnapshot};
 use crate::controller_protocol::{
     CapabilitiesView, ControlEventEnvelope, CreateRepositoryRequest, MoveTaskRequest,
     TaskListResponse,
@@ -346,6 +347,11 @@ pub enum Request {
     Act(Box<ActionRequest>),
     /// Point the browser at a link of the task.
     OpenLink(LinkRequest),
+    /// `h`: read the default harness and open the list to change it.
+    OpenHarness,
+    /// Make this harness the installation's default; `None` goes back to
+    /// the configured one.
+    SetHarness(Option<String>),
 }
 
 /// A fresh key for a command that must not run twice (an owner command, an
@@ -363,6 +369,10 @@ pub struct TaskApp {
     schedule: RefreshSchedule,
     cursor: Option<String>,
     capabilities: Option<CapabilitiesView>,
+    /// The daemon's default harness, as last read (U5).
+    harness_selection: Option<HarnessSelectionSnapshot>,
+    /// The harness a change sent and the daemon has not answered yet.
+    harness_pending: Option<String>,
     focus: Focus,
     detail: DetailState,
     help_open: bool,
@@ -407,6 +417,8 @@ impl TaskApp {
             schedule: RefreshSchedule::new(refresh_interval, Instant::now()),
             cursor: None,
             capabilities: None,
+            harness_selection: None,
+            harness_pending: None,
             focus: Focus::List,
             detail: DetailState::new(),
             help_open: false,
@@ -635,6 +647,7 @@ impl TaskApp {
             Action::NewTask => return Request::OpenNewTask,
             Action::History => return Request::OpenHistory,
             Action::Repositories => return Request::OpenRepositories,
+            Action::ChooseHarness => return Request::OpenHarness,
             Action::RetrySend => return self.retry_selected(),
             other => {
                 if let Some(action) = TaskAction::of_key(other) {
@@ -792,6 +805,8 @@ impl TaskApp {
             Request::Answer(request) => self.answer(*request).await,
             Request::Act(request) => self.act(*request).await,
             Request::OpenLink(link) => self.open_link(link),
+            Request::OpenHarness => self.read_and_open_harness().await,
+            Request::SetHarness(harness) => self.change_harness(harness).await,
         }
     }
 
@@ -848,9 +863,9 @@ impl TaskApp {
         }
     }
 
-    /// Re-reads the task list (and the server's name, once). The selection,
-    /// the focus, the tab, the drafts and the move mode are not touched; the
-    /// selection stays on its `task_id`.
+    /// Re-reads the task list (and the server's name, once) and the default
+    /// harness. The selection, the focus, the tab, the drafts and the move
+    /// mode are not touched; the selection stays on its `task_id`.
     pub async fn refresh(&mut self) {
         let now = Instant::now();
         match self.client.control_tasks_archived(false).await {
@@ -859,6 +874,7 @@ impl TaskApp {
                 if self.capabilities.is_none() {
                     self.read_capabilities().await;
                 }
+                self.read_harness_selection().await;
             }
             Err(error) => self.on_read_failure(&error, now),
         }

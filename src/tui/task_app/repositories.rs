@@ -334,6 +334,7 @@ impl TaskApp {
             Action::Back => self.close_view(),
             Action::AddRepository => repositories.open_form(),
             Action::RemoveRepository => self.ask_remove_repository(),
+            Action::ChooseHarness => return Request::OpenHarness,
             Action::Down | Action::Up | Action::Pick | Action::PageDown | Action::PageUp => {
                 // The chooser reads the same keys of the panel's context.
                 repositories.chooser.on_key(key);
