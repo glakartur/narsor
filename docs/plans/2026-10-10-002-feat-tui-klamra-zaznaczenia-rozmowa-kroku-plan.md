@@ -1,7 +1,7 @@
 ---
 title: "feat: TUI — klamra zaznaczenia zamiast reverse video i wejście w rozmowę kroku na Przebiegu"
 type: feat
-status: active
+status: completed
 date: 2026-10-10
 origin: docs/brainstorms/2026-10-10-tui-zaznaczenie-i-rozmowa-kroku-requirements.md
 ---
