@@ -318,7 +318,25 @@ rather than claiming success.
 Other `backend.yaml` keys: `namespace`, `storage_mib` (PVC size, default
 10240), `run_as_user` / `run_as_group` / `fs_group` (default 1000),
 `start_timeout_secs` (default 900: how long a Pod may take to report ready
-before it counts as lost).
+before it counts as lost), `harness_home` (below).
+
+**`harness_home`** — which `HOME` and harness configuration the runner gives
+every action, passed as `narsor runner` flags on every Pod start:
+
+```yaml
+harness_home:
+  mode: private          # default: a private HOME on the task PVC; or: host
+  codex_home: /mnt/codex # optional, exported as CODEX_HOME
+  claude_config_dir: /mnt/claude  # optional, exported as CLAUDE_CONFIG_DIR
+```
+
+`host` is the image's own `HOME`, which is not on the task PVC: a new Pod
+starts without the harness sessions of the previous one. A harness directory
+must exist in the image or on a mount. Inherited `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY` and `CODEX_API_KEY` never reach a harness unless the task is
+given them as `env` secrets. For Claude Code on a subscription, a token from
+`claude setup-token` delivered as `!env CLAUDE_CODE_OAUTH_TOKEN` needs no
+writable login directory.
 
 Set in `controller.yaml`: the Narsor release image **by digest**,
 `NARSOR_CONTROL_PLANE` (the URL the controller uses) and, when task Pods
@@ -401,7 +419,8 @@ work and reports a readable `base_image_contract` problem otherwise:
 * `git` and a CA bundle (`/etc/ssl/certs/ca-certificates.crt` or equivalent);
 * runs as **non-root** — by default uid/gid 1000 (`run_as_user`,
   `run_as_group`, `fs_group`);
-* a writable mounted `$HOME` (the runner sets a private HOME on task storage);
+* a writable mounted `$HOME` (the runner sets a private HOME on task storage
+  unless `harness_home.mode` is `host`);
 * the start command can be overridden.
 
 Task start never installs packages and never logs in interactively.

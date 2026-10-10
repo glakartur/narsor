@@ -358,11 +358,14 @@ async fn start_local_controller(
     )
     .await
     .map_err(|error| CliError::failure(error.message))?;
-    let backend = LocalBackend::new(
-        LocalBackendConfig::new(config.work_dir().join("local-controller")).map_err(|error| {
+    let mut backend_config = LocalBackendConfig::new(config.work_dir().join("local-controller"))
+        .map_err(|error| {
             CliError::failure(format!("could not configure local backend: {error}"))
-        })?,
-    );
+        })?;
+    // Every runner this daemon starts reads it anew: a launch setting of the
+    // backend, not part of the task.
+    backend_config.runner_args = config.local_harness_home().runner_args();
+    let backend = LocalBackend::new(backend_config);
     let config = ControllerConfig::new(control_url);
     let (stop, shutdown) = tokio::sync::oneshot::channel();
     Ok((

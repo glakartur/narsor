@@ -16,7 +16,9 @@
 //! * **`file`** — a symbolic link at the requested path below the private
 //!   HOME points at the mounted file. The link lives on task storage; the
 //!   value does not. A link left by an earlier incarnation is replaced, so a
-//!   remounted secret is always the one used.
+//!   remounted secret is always the one used. A runner that keeps the host's
+//!   HOME ([`super::HomeMode::Host`]) refuses it rather than write a link
+//!   into a HOME that is not the task's.
 //!
 //! The Git clone credential (R39) is used the same way: by path, through a
 //! credential helper that reads the file itself
@@ -27,13 +29,15 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::{ResolvedEnvironment, SecretDelivery, SecretReference, SecretValue};
 
+use super::home::API_KEY_ENVS;
 use super::RunnerError;
 
 /// Environment a runner process must set before it starts any work.
 #[derive(Debug, Default)]
 pub struct ProcessEnvironment {
-    /// The private HOME on task storage (R17).
-    pub home: PathBuf,
+    /// The private HOME on task storage (R17), or `None` to keep the HOME
+    /// the runner was started with.
+    pub home: Option<PathBuf>,
     /// `env`-delivered secrets, by variable name.
     pub secrets: Vec<(String, SecretValue)>,
     /// Plain variables the runner adds itself (where the task finds its
@@ -44,7 +48,9 @@ pub struct ProcessEnvironment {
 impl ProcessEnvironment {
     /// Every variable to set, the secrets last.
     pub fn variables(&self) -> impl Iterator<Item = (&str, &str)> {
-        std::iter::once(("HOME", self.home.to_str().unwrap_or_default()))
+        self.home
+            .iter()
+            .map(|home| ("HOME", home.to_str().unwrap_or_default()))
             .chain(
                 self.task
                     .iter()
@@ -55,6 +61,15 @@ impl ProcessEnvironment {
                     .iter()
                     .map(|(name, value)| (name.as_str(), value.expose())),
             )
+    }
+
+    /// Every inherited variable to drop before any work: the API keys that
+    /// would turn a subscription login into API billing, unless the task was
+    /// given that key as a secret.
+    pub fn removed(&self) -> impl Iterator<Item = &'static str> + '_ {
+        API_KEY_ENVS
+            .into_iter()
+            .filter(|name| self.secrets.iter().all(|(secret, _)| secret != name))
     }
 }
 
@@ -94,7 +109,8 @@ impl MountedSecrets {
     }
 
     /// Makes every secret of `environment` reachable for its tool, below
-    /// `home`, and returns what the process environment must hold.
+    /// the private `home` (`None` keeps the host's HOME), and returns what
+    /// the process environment must hold.
     ///
     /// Fails before any work when a referenced secret is not mounted: a
     /// tool that finds no credential half-way through a task is a worse
@@ -102,10 +118,10 @@ impl MountedSecrets {
     pub fn materialize(
         &self,
         environment: &ResolvedEnvironment,
-        home: &Path,
+        home: Option<&Path>,
     ) -> Result<ProcessEnvironment, RunnerError> {
         let mut process = ProcessEnvironment {
-            home: home.to_path_buf(),
+            home: home.map(Path::to_path_buf),
             secrets: Vec::new(),
             task: Vec::new(),
         };
@@ -126,7 +142,16 @@ impl MountedSecrets {
                         .secrets
                         .push((name.clone(), SecretValue::new(value)));
                 }
-                SecretDelivery::File(relative) => link_into_home(home, relative, &file)?,
+                SecretDelivery::File(relative) => match home {
+                    Some(home) => link_into_home(home, relative, &file)?,
+                    None => {
+                        return Err(RunnerError::Secret {
+                            name: reference.name.clone(),
+                            detail: "file delivery needs the private HOME (--home private)"
+                                .to_string(),
+                        })
+                    }
+                },
             }
         }
         Ok(process)
@@ -161,4 +186,96 @@ fn is_plain_name(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\0')
         && name.len() <= 255
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::BackendId;
+
+    fn reference(name: &str, delivery: SecretDelivery) -> SecretReference {
+        SecretReference {
+            backend: BackendId::parse("k8s").unwrap(),
+            name: name.to_string(),
+            tool: "tool".to_string(),
+            key: format!("secret/{name}"),
+            delivery,
+        }
+    }
+
+    /// A secrets directory that deletes itself.
+    struct Mounted(PathBuf);
+
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn mounted(values: &[(&str, &str)]) -> (Mounted, MountedSecrets) {
+        let dir = std::env::temp_dir().join(format!("narsor-secrets-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        for (name, value) in values {
+            fs::write(dir.join(name), value).unwrap();
+        }
+        let secrets = MountedSecrets::new(Some(dir.clone()));
+        (Mounted(dir), secrets)
+    }
+
+    #[test]
+    fn a_host_home_leaves_home_alone() {
+        let process = ProcessEnvironment {
+            home: None,
+            ..Default::default()
+        };
+        assert!(process.variables().all(|(name, _)| name != "HOME"));
+
+        let private = ProcessEnvironment {
+            home: Some(PathBuf::from("/storage/home")),
+            ..Default::default()
+        };
+        assert!(private
+            .variables()
+            .any(|(name, value)| name == "HOME" && value == "/storage/home"));
+    }
+
+    #[test]
+    fn inherited_api_keys_are_removed_unless_the_task_was_given_one() {
+        let process = ProcessEnvironment {
+            secrets: vec![("OPENAI_API_KEY".into(), SecretValue::new("sk"))],
+            ..Default::default()
+        };
+        let removed: Vec<&str> = process.removed().collect();
+        assert_eq!(removed, vec!["ANTHROPIC_API_KEY", "CODEX_API_KEY"]);
+    }
+
+    #[test]
+    fn a_file_secret_is_refused_without_a_private_home() {
+        let (_dir, secrets) = mounted(&[("gh", "token")]);
+        let mut environment = ResolvedEnvironment::harness_only("codex");
+        environment.secrets = vec![reference(
+            "gh",
+            SecretDelivery::File(".config/gh/hosts.yml".into()),
+        )];
+        let error = secrets.materialize(&environment, None).unwrap_err();
+        assert!(
+            error.to_string().contains("private HOME"),
+            "the refusal says why: {error}"
+        );
+    }
+
+    #[test]
+    fn an_env_secret_is_delivered_with_a_host_home() {
+        let (_dir, secrets) = mounted(&[("key", "sk-1\n")]);
+        let mut environment = ResolvedEnvironment::harness_only("codex");
+        environment.secrets = vec![reference(
+            "key",
+            SecretDelivery::Env("CODEX_API_KEY".into()),
+        )];
+        let process = secrets.materialize(&environment, None).unwrap();
+        assert_eq!(process.home, None);
+        assert!(process
+            .variables()
+            .any(|(name, value)| name == "CODEX_API_KEY" && value == "sk-1"));
+    }
 }

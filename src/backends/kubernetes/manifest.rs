@@ -51,6 +51,7 @@ use crate::backends::{BackendError, BackendResult, TaskResources, WorkloadLaunch
 use crate::domain::{
     ImageReference, ResolvedImage, SecretReference, TaskLaunchSpec, TaskWorkspace,
 };
+use crate::runner::HarnessHome;
 
 /// Where the task storage is mounted in the main container.
 pub const TASK_MOUNT: &str = "/task";
@@ -152,6 +153,13 @@ pub struct KubernetesBackendConfig {
     /// launch Secret that never arrived) before it counts as dead.
     #[serde(default = "default_start_timeout")]
     pub start_timeout_secs: u64,
+    /// Which HOME and harness configuration the runner gives every action,
+    /// on every Pod start. The default keeps the private HOME on the task
+    /// storage. `host` is the image's HOME — not on the task volume, so a
+    /// new Pod starts without the harness sessions of the last one — and a
+    /// harness directory must be a path the image or a mount provides.
+    #[serde(default)]
+    pub harness_home: HarnessHome,
 }
 
 fn default_storage_mib() -> u64 {
@@ -184,6 +192,7 @@ impl KubernetesBackendConfig {
             allowed_registries,
             allowed_secrets: Vec::new(),
             start_timeout_secs: default_start_timeout(),
+            harness_home: HarnessHome::default(),
         }
     }
 
@@ -612,6 +621,13 @@ pub fn pod(
         args.push("--secrets-dir".into());
         args.push(SECRETS_MOUNT.into());
     }
+    args.extend(
+        config
+            .harness_home
+            .runner_args()
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned()),
+    );
 
     json!({
         "apiVersion": "v1",

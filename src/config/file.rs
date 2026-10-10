@@ -542,6 +542,19 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
             Ok(SettingValue::Text(items.join(",")))
         }
 
+        SettingKey::LocalHome => one_of(text, "local HOME mode", &settings::LOCAL_HOME_MODES),
+
+        SettingKey::LocalCodexHome | SettingKey::LocalClaudeConfigDir => {
+            let dir = text.trim();
+            if !dir.is_empty() && !std::path::Path::new(dir).is_absolute() {
+                return Err(format!(
+                    "'{dir}' is not an absolute path; name the directory absolutely, \
+                     or leave it empty for the harness's own"
+                ));
+            }
+            Ok(SettingValue::Text(dir.to_string()))
+        }
+
         SettingKey::LogLevel => {
             let level = text.trim().to_lowercase();
             if LOG_LEVELS.contains(&level.as_str()) {

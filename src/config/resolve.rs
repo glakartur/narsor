@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 
 use crate::engine::AgentDefaults;
 use crate::persistence::StatePaths;
+use crate::runner::{HarnessHome, HomeMode};
 
 use super::cascade::{CascadeError, ConfigCascade, Resolution};
 use super::file::{self, FileError, FileValues};
@@ -94,7 +95,10 @@ impl Flags {
             | SettingKey::TlsTermination
             | SettingKey::TrustedProxies
             | SettingKey::CorsAllowedOrigins
-            | SettingKey::LocalWorkspaceRoots => None,
+            | SettingKey::LocalWorkspaceRoots
+            | SettingKey::LocalHome
+            | SettingKey::LocalCodexHome
+            | SettingKey::LocalClaudeConfigDir => None,
         }
     }
 }
@@ -275,6 +279,21 @@ impl Resolved {
         self.value(SettingKey::DefaultProfile)
             .as_text()
             .expect("the default profile is text")
+    }
+
+    /// Which HOME and harness configuration a local task's runner gets.
+    pub fn local_harness_home(&self) -> HarnessHome {
+        let mode = match self.text(SettingKey::LocalHome) {
+            Some("private") => HomeMode::Private,
+            _ => HomeMode::Host,
+        };
+        HarnessHome {
+            mode,
+            codex_home: self.text(SettingKey::LocalCodexHome).map(PathBuf::from),
+            claude_config_dir: self
+                .text(SettingKey::LocalClaudeConfigDir)
+                .map(PathBuf::from),
+        }
     }
 
     /// One text setting as written, `None` when it is empty (not set).

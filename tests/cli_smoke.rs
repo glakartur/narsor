@@ -1888,9 +1888,9 @@ fn task_interrupt_restart_and_override_steer_the_runner_of_a_local_task() {
     fs::write(root.path().join("workflows/slow.yaml"), SLOW_STEP_WORKFLOW).unwrap();
     let created = cli(&root, &["task", "create", "slow", "--task-id", "t-slow"]);
     assert_eq!(created.code, EXIT_SUCCESS, "{}", created.output());
-    let started = root
-        .path()
-        .join("local-controller/storage/t-slow/home/started");
+    // A local task keeps the daemon's HOME (`local_home: host`), which
+    // `cli` points at the root.
+    let started = root.path().join("started");
     let started_runs = || {
         fs::read_to_string(&started)
             .map(|text| text.lines().count())

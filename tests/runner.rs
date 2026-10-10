@@ -359,6 +359,9 @@ impl Fixture {
         if let Some(secrets) = &launch.secrets {
             command.arg("--secrets-dir").arg(secrets);
         }
+        command
+            .args(&launch.args)
+            .envs(launch.env.iter().map(|(name, value)| (name, value)));
         self.runners
             .push(command.spawn().expect("start the runner process"));
         self.runners.len() - 1
@@ -404,6 +407,10 @@ struct Launch {
     storage: PathBuf,
     path: String,
     secrets: Option<PathBuf>,
+    /// Extra `narsor runner` arguments.
+    args: Vec<String>,
+    /// Extra variables of the runner process.
+    env: Vec<(String, String)>,
 }
 
 impl Launch {
@@ -416,6 +423,8 @@ impl Launch {
             storage: fixture.root.dir(&format!("storage-{task}")),
             path: std::env::var("PATH").unwrap_or_default(),
             secrets: None,
+            args: Vec::new(),
+            env: Vec::new(),
         }
     }
 
@@ -1234,6 +1243,113 @@ async fn a_base_image_without_git_fails_before_any_work() {
     assert_eq!(waiting[0].waiting_id, "base_image_contract");
     assert!(!launch.workspace().exists(), "nothing was cloned");
     assert!(launch.execution_id().is_none(), "no work started");
+}
+
+// ---------------------------------------------------------------------------
+// The HOME a task's tools see
+// ---------------------------------------------------------------------------
+
+const HOME_WORKFLOW: &str = r#"
+name: home-task
+version: 1
+states:
+  look:
+    action:
+      type: script
+      command: sh
+      args:
+        - -c
+        - |
+          {
+            printf 'home=%s\n' "$HOME"
+            printf 'codex=%s\n' "$CODEX_HOME"
+            printf 'claude=%s\n' "$CLAUDE_CONFIG_DIR"
+            printf 'anthropic=%s\n' "${ANTHROPIC_API_KEY-unset}"
+            printf 'openai=%s\n' "${OPENAI_API_KEY-unset}"
+          } > "$NARSOR_OUTBOX_DIR/../seen"
+          printf '{"output": "done"}'
+    outputs: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+terminal_states: [completed]
+"#;
+
+/// Runs [`HOME_WORKFLOW`] with the HOME `host_home`, the extra runner
+/// `args`, and API keys in the runner's environment; returns what the
+/// script saw and the private HOME of its storage.
+async fn seen_by_the_tools(task: &str, host_home: &Path, args: &[&str]) -> (String, PathBuf) {
+    let mut fixture = Fixture::served().await;
+    let spec = spec(
+        HOME_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("codex"),
+    );
+    fixture.create(task, spec.clone());
+    fixture.report(task, Observation::StartAccepted);
+    let mut launch = Launch::new(&fixture, task, &spec);
+    launch.args = args.iter().map(|arg| arg.to_string()).collect();
+    launch.env = vec![
+        ("HOME".into(), host_home.display().to_string()),
+        ("ANTHROPIC_API_KEY".into(), "sk-ant".into()),
+        ("OPENAI_API_KEY".into(), "sk-oai".into()),
+    ];
+    let credential = fixture.credential(task, "pod-1");
+    fixture.spawn(&launch, "pod-1", &credential);
+
+    wait_until_async(Duration::from_secs(30), "completion", || {
+        runner_status(&fixture, task) == Some(ExecutionStatus::Completed)
+    })
+    .await;
+    let seen = fs::read_to_string(launch.storage.join("seen")).expect("the script ran");
+    (seen, launch.home())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_home_runs_the_tools_with_the_hosts_logins_and_no_api_keys() {
+    if running_as_root() {
+        return;
+    }
+    let root = TempRoot::new();
+    let host_home = root.dir("host-home");
+    let (seen, _) = seen_by_the_tools(
+        "task-home-host",
+        &host_home,
+        &[
+            "--home",
+            "host",
+            "--codex-home",
+            "/srv/codex",
+            "--claude-config-dir",
+            "/srv/claude",
+        ],
+    )
+    .await;
+    assert_eq!(
+        seen,
+        format!(
+            "home={}\ncodex=/srv/codex\nclaude=/srv/claude\nanthropic=unset\nopenai=unset\n",
+            host_home.display()
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_private_home_is_the_default_and_drops_inherited_api_keys_too() {
+    if running_as_root() {
+        return;
+    }
+    let root = TempRoot::new();
+    let host_home = root.dir("host-home");
+    let (seen, private_home) = seen_by_the_tools("task-home-private", &host_home, &[]).await;
+    assert_eq!(
+        seen,
+        format!(
+            "home={}\ncodex=\nclaude=\nanthropic=unset\nopenai=unset\n",
+            private_home.display()
+        )
+    );
 }
 
 // ---------------------------------------------------------------------------

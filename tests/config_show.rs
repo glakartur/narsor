@@ -47,7 +47,7 @@ const EXIT_FAILURE: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 
 /// Every setting the command must account for (R7).
-const EVERY_SETTING: [&str; 18] = [
+const EVERY_SETTING: [&str; 21] = [
     "catalog_dir",
     "state_dir",
     "work_dir",
@@ -66,6 +66,9 @@ const EVERY_SETTING: [&str; 18] = [
     "trusted_proxies",
     "cors_allowed_origins",
     "local_workspace_roots",
+    "local_home",
+    "local_codex_home",
+    "local_claude_config_dir",
 ];
 
 /// A temporary directory that deletes itself when it goes out of scope.

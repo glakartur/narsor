@@ -67,6 +67,15 @@ pub const DEFAULT_TUI_REFRESH_SECS: u64 = 10;
 /// installation without any remote backend has always used.
 pub const DEFAULT_BACKEND: &str = "local";
 
+/// Where a local task's tools find HOME when nothing says otherwise: the
+/// daemon's own, so a harness runs with the subscription login it has on
+/// the console — the way local tasks ran before they went through the
+/// runner.
+pub const DEFAULT_LOCAL_HOME: &str = "host";
+
+/// The local HOME modes, as `narsor runner --home` spells them.
+pub const LOCAL_HOME_MODES: [&str; 2] = ["host", "private"];
+
 /// The server's security mode when nothing says otherwise (R36): the local
 /// daemon's loopback-only random-token mode, which is what every
 /// installation ran before network mode existed.
@@ -145,11 +154,21 @@ pub enum SettingKey {
     /// copied into its own storage, so which host directories it may read is
     /// the owner's decision.
     LocalWorkspaceRoots,
+    /// Where HOME points for a local task's tools: `host` (the daemon's own,
+    /// harness logins included) or `private` (on the task storage). Read on
+    /// every runner start.
+    LocalHome,
+    /// `codex`'s configuration directory for local tasks (`CODEX_HOME`);
+    /// empty leaves it to the harness.
+    LocalCodexHome,
+    /// Claude Code's configuration directory for local tasks
+    /// (`CLAUDE_CONFIG_DIR`); empty leaves it to the harness.
+    LocalClaudeConfigDir,
 }
 
 impl SettingKey {
     /// Every setting, in the order `config show` prints them.
-    pub const ALL: [SettingKey; 18] = [
+    pub const ALL: [SettingKey; 21] = [
         SettingKey::CatalogDir,
         SettingKey::StateDir,
         SettingKey::WorkDir,
@@ -168,6 +187,9 @@ impl SettingKey {
         SettingKey::TrustedProxies,
         SettingKey::CorsAllowedOrigins,
         SettingKey::LocalWorkspaceRoots,
+        SettingKey::LocalHome,
+        SettingKey::LocalCodexHome,
+        SettingKey::LocalClaudeConfigDir,
     ];
 
     /// The three roots, in the order `config show` prints them.
@@ -198,6 +220,9 @@ impl SettingKey {
             SettingKey::TrustedProxies => "trusted_proxies",
             SettingKey::CorsAllowedOrigins => "cors_allowed_origins",
             SettingKey::LocalWorkspaceRoots => "local_workspace_roots",
+            SettingKey::LocalHome => "local_home",
+            SettingKey::LocalCodexHome => "local_codex_home",
+            SettingKey::LocalClaudeConfigDir => "local_claude_config_dir",
         }
     }
 
@@ -238,7 +263,10 @@ impl SettingKey {
             | SettingKey::TlsTermination
             | SettingKey::TrustedProxies
             | SettingKey::CorsAllowedOrigins
-            | SettingKey::LocalWorkspaceRoots => false,
+            | SettingKey::LocalWorkspaceRoots
+            | SettingKey::LocalHome
+            | SettingKey::LocalCodexHome
+            | SettingKey::LocalClaudeConfigDir => false,
         }
     }
 
@@ -269,6 +297,7 @@ impl SettingKey {
             SettingKey::ServerMode => SettingValue::Text(SERVER_MODE_TRUSTED.to_string()),
             SettingKey::ServerBind => SettingValue::Text(DEFAULT_SERVER_BIND.to_string()),
             SettingKey::TlsTermination => SettingValue::Text(TLS_TERMINATION_NONE.to_string()),
+            SettingKey::LocalHome => SettingValue::Text(DEFAULT_LOCAL_HOME.to_string()),
             // Empty text is "not set": network mode refuses to start without
             // the ones it needs (`crate::auth::SecuritySettings::validate`).
             SettingKey::OidcIssuer
@@ -276,7 +305,9 @@ impl SettingKey {
             | SettingKey::OwnerSubject
             | SettingKey::TrustedProxies
             | SettingKey::CorsAllowedOrigins
-            | SettingKey::LocalWorkspaceRoots => SettingValue::Text(String::new()),
+            | SettingKey::LocalWorkspaceRoots
+            | SettingKey::LocalCodexHome
+            | SettingKey::LocalClaudeConfigDir => SettingValue::Text(String::new()),
         }
     }
 
@@ -526,7 +557,10 @@ mod tests {
                 "tls_termination",
                 "trusted_proxies",
                 "cors_allowed_origins",
-                "local_workspace_roots"
+                "local_workspace_roots",
+                "local_home",
+                "local_codex_home",
+                "local_claude_config_dir"
             ],
             "the registry is the one place the settings live, and the three \
              roots lead because that is the order `config show` prints"

@@ -84,6 +84,7 @@
 pub mod cli;
 mod commands;
 mod conductor;
+pub mod home;
 pub mod init;
 mod materials;
 pub mod preflight;
@@ -117,6 +118,7 @@ use crate::orchestration::{HarnessUnavailable, OwnerCommand, RunnerProblem, Runn
 use crate::persistence::{reconcile, PersistenceError, ReconciliationOutcome};
 use crate::workspace::WorkspaceError;
 
+pub use home::{HarnessHome, HomeMode};
 pub use init::{initialize, Initialization};
 pub use preflight::{BaseImageContract, ContractViolation};
 pub use secrets::{MountedSecrets, ProcessEnvironment};
@@ -258,6 +260,8 @@ pub struct RunnerConfig {
     pub credential_file: PathBuf,
     /// The read-only directory of mounted secrets, one file per reference.
     pub secrets_dir: Option<PathBuf>,
+    /// Which HOME and harness configuration every action sees.
+    pub harness_home: HarnessHome,
     /// This incarnation's identity, the one its credential is bound to.
     pub incarnation: String,
     /// Control-channel timing.
@@ -270,7 +274,8 @@ pub struct RunnerConfig {
 ///
 /// `apply_environment` is called once, after the secrets are materialized
 /// and before any work starts, with the variables every action's child
-/// process must inherit (the private HOME, `env`-delivered secrets). It is
+/// process must inherit (the private HOME, `env`-delivered secrets) and the
+/// ones it must not. It is
 /// a callback because only the process's entry point may change its
 /// environment; library code never does.
 pub async fn run(
@@ -331,7 +336,9 @@ pub async fn run(
     }
 
     let secrets = MountedSecrets::new(config.secrets_dir.clone());
-    let mut environment = match secrets.materialize(&spec.environment, &storage.home_dir()) {
+    let private_home = storage.home_dir();
+    let home = (config.harness_home.mode == HomeMode::Private).then_some(private_home.as_path());
+    let mut environment = match secrets.materialize(&spec.environment, home) {
         Ok(environment) => environment,
         Err(error) => {
             return Ok(
@@ -349,6 +356,7 @@ pub async fn run(
         OUTBOX_ENV.to_string(),
         storage.outbox_dir().display().to_string(),
     ));
+    environment.task.extend(config.harness_home.variables());
     apply_environment(&environment);
 
     if let Err(error) = initialize(&storage, &store, &config.task_id, &spec, &secrets) {

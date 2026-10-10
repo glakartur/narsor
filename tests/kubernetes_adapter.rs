@@ -37,6 +37,7 @@ use narsor::domain::{
     ResourceProfile, SecretDelivery, SecretReference, TaskId, TaskLaunchSpec, TaskWorkspace,
 };
 use narsor::orchestration::{OwnerCommand, TaskLifecycle};
+use narsor::runner::{HarnessHome, HomeMode};
 use serde_json::Value;
 
 /// Registry prefix every test image comes from.
@@ -248,7 +249,13 @@ contract_suite!(kubernetes, crate::KubernetesTarget);
 type Mutation = (&'static str, Box<dyn Fn(&mut Value)>);
 
 fn generated_pod(spec: TaskLaunchSpec) -> (Value, TaskResources, WorkloadLaunch) {
-    let config = config();
+    generated_pod_with(&config(), spec)
+}
+
+fn generated_pod_with(
+    config: &KubernetesBackendConfig,
+    spec: TaskLaunchSpec,
+) -> (Value, TaskResources, WorkloadLaunch) {
     let quiet_names = TaskResources {
         task_id: TaskId::parse("Task_1").unwrap(),
         resource_key: "Task_1".into(),
@@ -256,12 +263,42 @@ fn generated_pod(spec: TaskLaunchSpec) -> (Value, TaskResources, WorkloadLaunch)
         storage: names::storage("Task_1"),
     };
     let launch = launch_of("Task_1", 3, spec);
-    let plan = manifest::plan(&config, &launch).expect("a valid launch");
+    let plan = manifest::plan(config, &launch).expect("a valid launch");
     (
-        manifest::pod(&config, NAMESPACE, &quiet_names, &launch, &plan),
+        manifest::pod(config, NAMESPACE, &quiet_names, &launch, &plan),
         quiet_names,
         launch,
     )
+}
+
+fn runner_args(pod: &Value) -> Vec<String> {
+    pod["spec"]["containers"][0]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A Pod keeps the private HOME unless the backend says otherwise, and the
+/// runner is told so on every start.
+#[test]
+fn the_runner_is_told_the_backends_home_mode() {
+    let (pod, _, _) = generated_pod(spec());
+    let args = runner_args(&pod);
+    let at = args.iter().position(|a| a == "--home").expect("--home");
+    assert_eq!(args[at + 1], "private");
+    assert!(!args.iter().any(|a| a == "--codex-home"));
+
+    let mut config = config();
+    config.harness_home = HarnessHome {
+        mode: HomeMode::Host,
+        codex_home: Some("/mnt/codex".into()),
+        claude_config_dir: None,
+    };
+    let args = runner_args(&generated_pod_with(&config, spec()).0);
+    let tail: Vec<&str> = args[args.len() - 4..].iter().map(String::as_str).collect();
+    assert_eq!(tail, ["--home", "host", "--codex-home", "/mnt/codex"]);
 }
 
 /// One main runner container, one init container, separate task and PATH

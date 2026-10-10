@@ -793,6 +793,21 @@ codex exec [--model <model>] --sandbox <read-only|workspace-write> \
           --config approval_policy=never --json [resume <thread-id>] <prompt>
 ```
 
+**Which login a harness uses.** A harness keeps its subscription login next
+to its sessions — `codex` in `~/.codex/auth.json`, Claude Code in
+`~/.claude/.credentials.json` — so which `HOME` the runner gives a task decides
+whether the harness is logged in. A local task keeps the daemon's own `HOME` by
+default (`local_home: host`), with the same logins as the console. `local_home:
+private` gives every local task a fresh `HOME` on its own storage instead;
+`local_codex_home` and `local_claude_config_dir` (absolute paths, exported as
+`CODEX_HOME` and `CLAUDE_CONFIG_DIR`) then point the harnesses at a login
+directory of your choice. The runner reads these on every start — they are
+the backend's settings, not part of a task — so switching them leaves a
+running task's earlier sessions behind. Inherited `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY` and `CODEX_API_KEY` are always dropped, so a harness never
+switches to API billing behind the subscription's back; a task that should
+use a key gets it as an `env` secret.
+
 `--print` / `run` are what make the run a batch run; `json` output is what
 carries the session id as well as the text. The flag that takes exactly one
 value is always the last one before the prompt, so a prompt can never be read

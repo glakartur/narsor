@@ -424,3 +424,45 @@ fn a_default_backend_that_cannot_be_an_identifier_is_refused() {
         "a refused value never takes effect"
     );
 }
+
+#[test]
+fn local_tasks_keep_the_hosts_home_unless_configured_otherwise() {
+    use narsor::runner::{HarnessHome, HomeMode};
+    let root = TempRoot::new();
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    assert_eq!(
+        resolved.local_harness_home(),
+        HarnessHome {
+            mode: HomeMode::Host,
+            codex_home: None,
+            claude_config_dir: None,
+        }
+    );
+
+    root.user_config(
+        "local_home: private\nlocal_codex_home: /home/me/.codex\nlocal_claude_config_dir: /home/me/.claude\n",
+    );
+    let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
+    assert!(resolved.is_ok(), "{:?}", resolved.errors());
+    assert_eq!(
+        resolved.local_harness_home(),
+        HarnessHome {
+            mode: HomeMode::Private,
+            codex_home: Some(PathBuf::from("/home/me/.codex")),
+            claude_config_dir: Some(PathBuf::from("/home/me/.claude")),
+        }
+    );
+}
+
+#[test]
+fn a_relative_harness_directory_is_refused() {
+    let root = TempRoot::new();
+    let env = environment(&[("NARSOR_LOCAL_CODEX_HOME", ".codex")]);
+    let resolved = resolve_with(&Flags::default(), &env, &cascade(&root));
+    assert!(!resolved.is_ok());
+    assert!(
+        resolved.errors()[0].to_string().contains("absolute"),
+        "{}",
+        resolved.errors()[0]
+    );
+}
