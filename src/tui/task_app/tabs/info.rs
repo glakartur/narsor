@@ -259,6 +259,16 @@ pub fn lines(task: &TaskSummary, styles: &Styles, stale: bool) -> Vec<Line<'stat
             } else if let Some(reason) = &runner.conductor_unavailable_reason {
                 sheet.row("dyrygent", format!("niedostępny: {reason}"), Role::Done);
             }
+            if let Some(unavailable) = &runner.default_harness_unavailable {
+                sheet.row(
+                    "harness",
+                    format!(
+                        "{} niedostępny: {}",
+                        unavailable.harness, unavailable.reason
+                    ),
+                    Role::Attention,
+                );
+            }
         }
         None => sheet.row("status", "runner jeszcze się nie zgłosił", Role::Done),
     }

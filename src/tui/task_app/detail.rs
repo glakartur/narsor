@@ -1,5 +1,6 @@
 //! The details of the selected task (U9): a two-line header made of the
-//! workflow's `display`, the tabs, and what the active tab shows.
+//! workflow's `display` (three lines while the task cannot follow the
+//! installation's default harness), the tabs, and what the active tab shows.
 //!
 //! ```text
 //! NAR-12  Zmiana API zamówień                             implement v3
@@ -304,7 +305,8 @@ pub fn hyperlinks_supported(var: impl Fn(&str) -> Option<String>) -> bool {
 /// Where the parts of the details go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Areas {
-    /// The two header lines.
+    /// The header lines: two, and a third when the task has a notice
+    /// ([`notice`]).
     pub header: Rect,
     /// The tab titles.
     pub tabs: Rect,
@@ -318,7 +320,16 @@ pub struct Areas {
 /// `panel_height` is not zero — a panel at the bottom. The content never goes
 /// below one row.
 pub fn areas(area: Rect, panel_height: u16) -> Areas {
-    let header = Rect::new(area.x, area.y, area.width, 2.min(area.height));
+    areas_with_header(area, HEADER_LINES, panel_height)
+}
+
+/// The lines of the header of a task without a notice.
+const HEADER_LINES: u16 = 2;
+
+/// [`areas`] with a header `header_lines` high: one more than
+/// [`HEADER_LINES`] while the task has a notice, which moves the tabs down.
+pub fn areas_with_header(area: Rect, header_lines: u16, panel_height: u16) -> Areas {
+    let header = Rect::new(area.x, area.y, area.width, header_lines.min(area.height));
     let tabs = Rect::new(
         area.x,
         area.y + header.height,
@@ -638,9 +649,11 @@ pub(super) fn render_view(
         .detail
         .waiting
         .preferred_height(area.width, area.height);
-    let parts = areas(area, panel_height);
+    let notice = notice(view.task, styles, stale, area.width);
+    let header_lines = HEADER_LINES + u16::from(notice.is_some());
+    let parts = areas_with_header(area, header_lines, panel_height);
 
-    let (lines, spots) = header(
+    let (mut lines, spots) = header(
         view.task,
         view.queue_place,
         &view.detail.progress,
@@ -648,6 +661,7 @@ pub(super) fn render_view(
         stale,
         area.width,
     );
+    lines.extend(notice);
     frame.render_widget(Paragraph::new(lines), parts.header);
     if hyperlinks {
         link_spots(frame.buffer_mut(), parts.header, &spots);
@@ -806,6 +820,23 @@ fn header(
         second.push(Span::styled(text, styles.of(grey(role))));
     }
     (vec![Line::from(first), Line::from(second)], spots)
+}
+
+/// The one line under the header that says the installation's default
+/// harness cannot be used by this task, and which one it keeps (R16c), cut
+/// to `width`; `None` while the task can follow the default. The full reason
+/// is in *Info*.
+fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Option<Line<'static>> {
+    let unavailable = task.runner.as_ref()?.default_harness_unavailable.as_ref()?;
+    let text = format!(
+        "{} niedostępny tutaj — zostaje {}",
+        one_line(&unavailable.harness),
+        one_line(&unavailable.kept)
+    );
+    Some(Line::styled(
+        fit(&text, usize::from(width)),
+        styles.of(if stale { Role::Done } else { Role::Attention }),
+    ))
 }
 
 /// The visible text of a link and, when it can be followed, its target.

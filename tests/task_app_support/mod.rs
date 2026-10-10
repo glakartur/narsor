@@ -327,6 +327,24 @@ pub fn without_conductor(mut task: TaskSummary, reason: &str) -> TaskSummary {
     task
 }
 
+/// The runner of `task` reports that it cannot switch to the default
+/// `harness`, keeps `kept`, and says why (U7, R16c).
+pub fn with_harness_unavailable(
+    mut task: TaskSummary,
+    harness: &str,
+    kept: &str,
+    reason: &str,
+) -> TaskSummary {
+    if let Some(runner) = task.runner.as_mut() {
+        runner.default_harness_unavailable = Some(narsor::orchestration::HarnessUnavailable {
+            harness: harness.to_string(),
+            kept: kept.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+    task
+}
+
 /// One chat entry of a conductor, as the runner would serve it.
 pub fn chat_entry(
     id: &str,

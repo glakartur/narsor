@@ -1144,7 +1144,7 @@ mod task_app_detail_render {
     use crate::remote_support::{snapshot, RemoteHarness};
     use crate::task_app_support::{
         displayed, execution_events, listing, position, queued, task, timeline, with_controller,
-        with_runner,
+        with_harness_unavailable, with_runner,
     };
 
     fn app() -> TaskApp {
@@ -1229,6 +1229,88 @@ mod task_app_detail_render {
             assert!(rows[4].contains(tab), "{tab} in {}", rows[4]);
         }
         assert!(rows[4].contains("podąża"), "{}", rows[4]);
+    }
+
+    /// `running_app`, but its runner cannot switch to `harness` and keeps
+    /// `claude-code`.
+    fn app_without_the_default_harness(harness: &str) -> TaskApp {
+        let mut app = app();
+        let running = with_harness_unavailable(
+            with_runner(
+                with_controller(task("a", "k8s", "running", 1)),
+                ExecutionStatus::Running,
+                "review",
+            ),
+            harness,
+            "claude-code",
+            "backend 'k8s' runs only claude-code",
+        );
+        app.load(listing(
+            vec![displayed(running, "NAR-12 Zmiana API zamówień", &[])],
+            "c",
+        ));
+        press(&mut app, KeyCode::Enter);
+        app
+    }
+
+    // AE6: one line under the header says it; Info has the full reason; the
+    // list has no attention marker for it.
+    #[test]
+    fn a_default_harness_the_task_cannot_use_is_one_line_in_the_header_and_a_row_in_info() {
+        let mut app = app_without_the_default_harness("opencode");
+        let buffer = render(&mut app, &Styles::new(false));
+        let rows = rows(&buffer);
+        assert!(rows[3].contains("● running"), "{}", rows[3]);
+        assert!(
+            rows[4].contains("opencode niedostępny tutaj — zostaje claude-code"),
+            "{}",
+            rows[4]
+        );
+        for tab in ["Przebieg", "Info"] {
+            assert!(rows[5].contains(tab), "the tabs move down: {}", rows[5]);
+        }
+        let column = rows[4].find("opencode").unwrap();
+        let column = u16::try_from(rows[4][..column].chars().count()).unwrap();
+        assert_eq!(buffer[(column, 4)].fg, Color::Yellow, "the attention role");
+        // Not a problem: the counters and the list row carry no `!`.
+        assert!(rows[0].contains("! 0"), "{}", rows[0]);
+        let list_row = row_of(&buffer, "NAR-12");
+        assert!(
+            !rows[list_row].chars().take(28).any(|c| c == '!'),
+            "{}",
+            rows[list_row]
+        );
+
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Right);
+        }
+        let info = screen(&draw(120, 50, |frame| {
+            layout::render(frame, &mut app, &Styles::new(false), Instant::now())
+        }));
+        assert!(
+            info.contains("opencode niedostępny: backend 'k8s' runs only claude-code"),
+            "{info}"
+        );
+    }
+
+    #[test]
+    fn without_an_unavailable_harness_there_is_no_extra_line() {
+        let mut app = running_app();
+        let rows = rows(&render(&mut app, &Styles::new(false)));
+        assert!(rows[4].contains("Przebieg"), "{}", rows[4]);
+        assert!(!rows.join("\n").contains("niedostępny tutaj"));
+    }
+
+    #[test]
+    fn the_harness_line_is_cut_with_an_ellipsis_when_narrow() {
+        let mut app = app_without_the_default_harness("a-harness-from-a-plugin");
+        let buffer = draw(60, 20, |frame| {
+            layout::render(frame, &mut app, &Styles::new(true), Instant::now())
+        });
+        let row = row_of(&buffer, "a-harness-from-a-plugin niedostępny");
+        let line = &rows(&buffer)[row];
+        assert!(line.contains('…'), "{line}");
+        assert!(!line.contains("zostaje claude-code"), "{line}");
     }
 
     #[test]
