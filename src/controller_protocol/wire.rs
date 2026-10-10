@@ -974,6 +974,13 @@ pub struct RunnerPollQuery {
     /// delivered right now would turn the long-poll into a busy loop.
     #[serde(default)]
     pub defer_materials: bool,
+    /// The harness the runner settled on following the default (U7): the
+    /// one it runs on or, while it cannot switch, the default it cannot
+    /// run here. A default `Available` under another name answers the poll
+    /// at once — a change the runner has not applied yet does not wait out
+    /// the long-poll. Absent from older runners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
 }
 
 /// An owner answer handed to the runner.

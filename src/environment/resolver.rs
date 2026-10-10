@@ -783,8 +783,9 @@ impl CatalogLaunchResolver {
             .clone()
             .or_else(|| profile.harness.clone())
             .unwrap_or_else(|| self.harness.default_harness());
-        // Every harness the task may run: the pinned default plus each one a
-        // step names literally (a templated one is only known at run time).
+        // Every harness the task may run: the fallback harness (the live
+        // default is followed at run time, D56) plus each one a step names
+        // literally (a templated one is only known at run time).
         let mut needed = BTreeSet::from([selected.clone()]);
         for state in definition.states.values() {
             if let Some(ActionConfig::Agent(agent)) = &state.action {

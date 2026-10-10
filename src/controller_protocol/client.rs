@@ -385,7 +385,7 @@ impl RunnerClient {
         self.poll_with(&RunnerPollQuery {
             pending_input_id: pending_input_id.map(str::to_string),
             wait_secs: Some(wait_secs),
-            defer_materials: false,
+            ..RunnerPollQuery::default()
         })
         .await
     }

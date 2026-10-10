@@ -1,4 +1,6 @@
-//! The pinned environment a remote task runs in (R15-R22, R39, R42; KTD5).
+//! The pinned environment a remote task runs in (R15-R22, R39, R42; KTD5);
+//! its harness is only the fallback — a running task follows the live
+//! default (D56).
 //!
 //! Everything here is shared by both sides of KTD1's boundary: the control
 //! plane resolves these values once, when a task is created, and the runner

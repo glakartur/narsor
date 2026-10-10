@@ -3157,6 +3157,88 @@ async fn a_change_of_the_default_answers_an_open_long_poll_at_once() {
     assert!(started.elapsed() < StdDuration::from_secs(10));
 }
 
+/// A long-poll of a runner that says it runs on `on`.
+fn poll_on(on: &str, wait_secs: u64) -> narsor::controller_protocol::RunnerPollQuery {
+    narsor::controller_protocol::RunnerPollQuery {
+        wait_secs: Some(wait_secs),
+        harness: Some(on.to_string()),
+        ..Default::default()
+    }
+}
+
+/// A default that changed before the runner's poll began — between two
+/// polls, or hidden by a stale answer the runner applied — answers the
+/// poll at once when the runner says it is still on another harness.
+#[tokio::test]
+async fn a_runner_behind_the_default_is_answered_at_once() {
+    let harness = Harness::start_with_default_harness().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    harness
+        .owner
+        .set_harness_selection("opencode")
+        .await
+        .expect("change the default");
+
+    let answer = tokio::time::timeout(
+        StdDuration::from_secs(5),
+        runner.poll_with(&poll_on("claude-code", 20)),
+    )
+    .await
+    .expect("answered before the long-poll ran out")
+    .expect("poll");
+    assert_eq!(answer.default_harness, available("opencode"));
+}
+
+/// A runner already on the default waits out its long-poll as before.
+#[tokio::test]
+async fn a_runner_on_the_default_keeps_waiting() {
+    let harness = Harness::start_with_default_harness().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+
+    let waited = tokio::time::timeout(
+        StdDuration::from_secs(1),
+        runner.poll_with(&poll_on("claude-code", 20)),
+    )
+    .await;
+    assert!(waited.is_err(), "answered at once: {waited:?}");
+}
+
+/// A default the task's backend cannot run is not something the runner
+/// can switch to: it does not answer the poll at once, whichever harness
+/// the runner names.
+#[tokio::test]
+async fn an_unavailable_default_does_not_answer_the_poll_at_once() {
+    let harness = Harness::start_with_default_harness().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    environment_support::restrict_harnesses(harness.root.path(), "k8s", &["claude-code"]);
+    harness
+        .owner
+        .set_harness_selection("opencode")
+        .await
+        .expect("change the default");
+
+    for on in ["claude-code", "opencode"] {
+        let waited = tokio::time::timeout(
+            StdDuration::from_secs(1),
+            runner.poll_with(&poll_on(on, 20)),
+        )
+        .await;
+        assert!(waited.is_err(), "answered at once on {on}: {waited:?}");
+    }
+}
+
+/// A poll of an older runner, without the harness it runs on, still
+/// reads; one without it does not send the field.
+#[test]
+fn a_poll_without_the_runners_harness_still_reads() {
+    let query: narsor::controller_protocol::RunnerPollQuery =
+        serde_json::from_value(serde_json::json!({ "wait_secs": 5 })).expect("an old poll");
+    assert_eq!(query.harness, None);
+    assert_eq!(query.wait_secs, Some(5));
+    let encoded = serde_json::to_value(&query).unwrap();
+    assert!(encoded.get("harness").is_none(), "{encoded}");
+}
+
 /// Without a selector there is no default to follow: the answers carry
 /// nothing, and a runner keeps its harness.
 #[tokio::test]

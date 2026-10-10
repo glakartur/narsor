@@ -3030,6 +3030,43 @@ async fn an_action_without_a_harness_uses_the_configured_default() {
     assert_eq!(started_harnesses(&fixture, &execution.id), ["opencode"]);
 }
 
+/// An action that continues a session of its own (`resume_session`) and
+/// names no harness is not handed the live default: a default cannot say
+/// which harness that session belongs to, so the executor asks for an
+/// explicit one instead of resuming it on whatever the default is now.
+#[tokio::test]
+async fn a_resumed_session_without_a_harness_is_not_given_the_default() {
+    let fixture = EngineFixture::new();
+    fixture.fake.answers(&envelope(r#"{"output":"done"}"#));
+    let workflow = single_agent_workflow(None).replace(
+        "      prompt: \"Do the thing.\"\n",
+        "      prompt: \"Do the thing.\"\n      parameters:\n        resume_session: session-42\n",
+    );
+    assert!(workflow.contains("resume_session"), "{workflow}");
+
+    let execution = run_with_default(
+        &fixture,
+        Arc::new(ClaudeCodeAdapter::with_program(fixture.fake.program())),
+        Arc::new("claude-code".to_string()),
+        &workflow,
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Failed);
+    assert_eq!(fixture.fake.calls(), 0, "the session was not resumed");
+    let failure = events_of(&fixture, &execution.id)
+        .into_iter()
+        .find_map(|data| match data {
+            EventData::ActionFailed { error, .. } => Some(error),
+            _ => None,
+        })
+        .expect("the action failed");
+    assert!(
+        failure.contains("requires an explicit 'harness'"),
+        "{failure}"
+    );
+}
+
 /// With nothing configured, an action that names no harness gets the built-in.
 #[tokio::test]
 async fn an_action_without_a_harness_falls_back_to_the_built_in_one() {

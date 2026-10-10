@@ -88,7 +88,8 @@ pub struct DefaultHarnessSelector {
     configured: String,
     state: Mutex<SelectionState>,
     /// A copy of the last published snapshot for synchronous readers (the
-    /// control plane pins a task's harness inside a synchronous resolver).
+    /// control plane reads the default in a synchronous resolver and when
+    /// it builds the answers to runner polls).
     /// Written only after `state`'s snapshot, under `state`'s lock, so it
     /// never shows a value that did not reach disk.
     published: std::sync::RwLock<HarnessSelectionSnapshot>,

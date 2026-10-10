@@ -1509,7 +1509,16 @@ impl ProtocolService {
         };
         // A change of the default while the runner waits is an answer too:
         // it should not wait out the long-poll to hear of it (U7). The
+        // runner says which harness it settled on; one behind a default it
+        // can switch to is answered at once. Without it (older runners) the
         // first look says which default the runner is waiting with.
+        let runner_harness = query.harness;
+        let behind_default = |default: &Option<TaskDefaultHarness>| {
+            matches!(
+                (default, runner_harness.as_deref()),
+                (Some(TaskDefaultHarness::Available { harness }), Some(on)) if harness != on
+            )
+        };
         let mut asked_with = None;
         let wait = self.long_poll(query.wait_secs);
         let found = self
@@ -1517,6 +1526,7 @@ impl ProtocolService {
                 let response = poll()?;
                 let asked_with = asked_with.get_or_insert_with(|| response.default_harness.clone());
                 let actionable = response.default_harness != *asked_with
+                    || behind_default(&response.default_harness)
                     || !response.inputs.is_empty()
                     || !response.commands.is_empty()
                     || !response.conversation_pages.is_empty()

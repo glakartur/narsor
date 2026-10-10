@@ -701,7 +701,7 @@ impl Session {
         // Naming the request the execution waits on: a poll that names
         // another (or none) turns the owner's queued answers to it obsolete.
         let pending = self.pending_input_id()?;
-        match client.poll(pending.as_deref(), 0).await {
+        match client.poll_with(&self.poll_query(pending, 0)).await {
             // What else the answer carries — answers, commands, reads — is
             // offered again by the next poll until settled: drive picks it
             // up there.
@@ -712,6 +712,23 @@ impl Session {
             Err(error) => self.link.failed(&error, &self.timing),
         }
         Ok(())
+    }
+
+    /// A poll naming the request waited on and the harness settled on:
+    /// the one the runner runs on or, while it cannot switch, the default
+    /// it cannot run — so the control plane answers at once only a default
+    /// the runner has not applied yet, never one it already turned down.
+    fn poll_query(&self, pending_input_id: Option<String>, wait_secs: u64) -> RunnerPollQuery {
+        let harness = match &self.harness_unavailable {
+            Some(unavailable) => unavailable.harness.clone(),
+            None => self.harness.get(),
+        };
+        RunnerPollQuery {
+            pending_input_id,
+            wait_secs: Some(wait_secs),
+            defer_materials: false,
+            harness: Some(harness),
+        }
     }
 
     /// Applies what every answer of the control plane carries, in one
@@ -796,7 +813,7 @@ impl Session {
                 break launch.clone();
             }
             if let Some(client) = self.link.client() {
-                match client.poll(None, 0).await {
+                match client.poll_with(&self.poll_query(None, 0)).await {
                     Ok(response) => {
                         self.link.succeeded();
                         self.link.launch = Some(response.launch.clone());
@@ -983,9 +1000,8 @@ impl Session {
             if poll.is_none() && self.link.ready() {
                 if let Some(client) = self.link.client() {
                     let query = RunnerPollQuery {
-                        pending_input_id: pending.clone(),
-                        wait_secs: Some(self.timing.poll_wait.as_secs()),
                         defer_materials: self.materials_deferred(),
+                        ..self.poll_query(pending.clone(), self.timing.poll_wait.as_secs())
                     };
                     poll = Some(InFlightPoll {
                         asked: pending.clone(),
