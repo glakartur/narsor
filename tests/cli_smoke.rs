@@ -3061,6 +3061,31 @@ mod remote_cli {
             reset.stdout
         );
         assert!(reset.stdout.contains("Override: -"), "{}", reset.stdout);
+
+        // `--json` prints the selection itself, for get and for a change.
+        let set = remote(
+            &harness,
+            token,
+            &["harness", "default", "set", "codex", "--json"],
+        )
+        .await;
+        assert_eq!(set.code, EXIT_SUCCESS, "{}", set.output());
+        let selection: serde_json::Value =
+            serde_json::from_str(&set.stdout).expect("the selection as JSON");
+        assert_eq!(selection["effective"], "codex", "{}", set.stdout);
+        assert_eq!(selection["override"], "codex", "{}", set.stdout);
+        let get = remote(&harness, token, &["harness", "default", "--json"]).await;
+        assert_eq!(get.code, EXIT_SUCCESS, "{}", get.output());
+        let selection: serde_json::Value =
+            serde_json::from_str(&get.stdout).expect("the selection as JSON");
+        assert_eq!(selection["effective"], "codex", "{}", get.stdout);
+        assert_eq!(selection["configured"], "claude-code", "{}", get.stdout);
+        assert_eq!(
+            selection["supported"],
+            serde_json::json!(["claude-code", "codex", "opencode"]),
+            "{}",
+            get.stdout
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

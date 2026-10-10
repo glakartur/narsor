@@ -13,10 +13,11 @@ use narsor::cli::task_text::{
 };
 use narsor::controller_protocol::QueueView;
 use narsor::domain::display::DisplayLink;
-use narsor::orchestration::{AttentionKind, OwnerCommand, QueueReason};
+use narsor::domain::ExecutionStatus;
+use narsor::orchestration::{AttentionKind, HarnessUnavailable, OwnerCommand, QueueReason};
 
 mod task_app_support;
-use task_app_support::{queued, task, titled, waiting_on};
+use task_app_support::{queued, task, titled, waiting_on, with_runner};
 
 fn queue(reason: QueueReason) -> QueueView {
     QueueView {
@@ -274,4 +275,34 @@ fn the_default_harness_line_drops_invisible_characters() {
         !line.contains('\u{1b}') && !line.contains('\u{202e}'),
         "{line:?}"
     );
+}
+
+#[test]
+fn the_details_say_when_the_task_cannot_follow_the_default_harness() {
+    let mut subject = with_runner(
+        task("t-1", "k8s", "running", 1),
+        ExecutionStatus::Running,
+        "build",
+    );
+    let lines = |subject: &narsor::controller_protocol::TaskSummary| {
+        detail_lines(subject, None, None)
+            .into_iter()
+            .filter(|line| line.text.starts_with("Harness "))
+            .collect::<Vec<_>>()
+    };
+    assert!(lines(&subject).is_empty(), "nothing while it follows");
+
+    subject.runner.as_mut().unwrap().default_harness_unavailable = Some(HarnessUnavailable {
+        harness: "open\u{1b}[2Jcode".into(),
+        kept: "claude-code".into(),
+        reason: "backend 'k8s' runs only\u{202e} claude-code".into(),
+    });
+    let shown = lines(&subject);
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert_eq!(
+        shown[0].text,
+        "Harness    open[2Jcode unavailable here, keeping claude-code: \
+         backend 'k8s' runs only claude-code"
+    );
+    assert_eq!(shown[0].tone, Tone::Warning);
 }

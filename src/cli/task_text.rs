@@ -468,6 +468,17 @@ pub fn detail_lines(
                     Tone::Error,
                 ));
             }
+            if let Some(unavailable) = &runner.default_harness_unavailable {
+                lines.push(ToneLine::new(
+                    format!(
+                        "Harness    {} unavailable here, keeping {}: {}",
+                        without_unsafe_chars(&unavailable.harness),
+                        without_unsafe_chars(&unavailable.kept),
+                        without_unsafe_chars(&unavailable.reason)
+                    ),
+                    Tone::Warning,
+                ));
+            }
             if let Some(pending) = awaiting_input(task) {
                 lines.push(ToneLine::new(
                     format!(

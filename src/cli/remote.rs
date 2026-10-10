@@ -481,6 +481,10 @@ pub enum HarnessCommand {
         /// What to do; `get` when omitted.
         #[command(subcommand)]
         action: Option<DefaultHarnessAction>,
+        /// Print the selection as JSON instead (`effective`, `configured`,
+        /// `override`, `supported`, `revision`).
+        #[arg(long, global = true)]
+        json: bool,
     },
 }
 
@@ -1631,13 +1635,17 @@ pub async fn harness(
     flags: &Flags,
 ) -> Result<()> {
     let client = client(target, state, flags).await?;
-    let HarnessCommand::Default { action } = command;
+    let HarnessCommand::Default { action, json } = command;
     let selection = match action.unwrap_or(DefaultHarnessAction::Get) {
         DefaultHarnessAction::Get => client.harness_selection().await,
         DefaultHarnessAction::Set { harness } => client.set_harness_selection(&harness).await,
         DefaultHarnessAction::Reset => client.reset_harness_selection().await,
     }
     .map_err(|error| failure("Default harness", error))?;
+    if json {
+        println!("{}", json_output(&selection)?);
+        return Ok(());
+    }
     println!("{}", default_harness_line(&selection));
     println!("Effective: {}", without_unsafe_chars(&selection.effective));
     println!(

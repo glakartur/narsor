@@ -619,7 +619,7 @@ or a runner directly.
 
 ```bash
 narsor backend default                        # which backend new tasks get (set/reset to change)
-narsor harness default                        # the default agent harness, for new and running tasks (set/reset to change)
+narsor harness default [--json]               # the default agent harness, for new and running tasks (set/reset to change)
 narsor task create implement-feature --input ticket=NAR-1 [--backend k8s]
 narsor task create --file ./my-workflow.yaml --input name=value   # a workflow file of the local daemon, checked first
 narsor task list [--archived] [--json]        # queue position (#n), `?`/`!` attention mark, backend, lifecycle, title; --archived: the history
@@ -736,7 +736,7 @@ with `narsor harness default` (the configured one with `narsor config show`); a
 workflow meant to run reproducibly should declare `harness:` explicitly.
 
 ```bash
-narsor harness default               # get: effective, configured, override, supported
+narsor harness default               # get: effective, configured, override, supported (--json: as JSON)
 narsor harness default set codex     # the operator's choice, until changed or reset
 narsor harness default reset         # back to the configured agent_harness
 ```
