@@ -203,9 +203,12 @@ Uruchamia agenta AI (np. Claude Code, Codex, OpenCode).
 ```yaml
 action:
   type: agent
-  harness: <claude-code|codex|opencode> # Opcjonalne — domyślnie z konfiguracji
-                                      # (`agent_harness`, patrz README → Configuration),
-                                      # a w jej braku `claude-code`.
+  harness: <claude-code|codex|opencode> # Opcjonalne — bez niego harness instalacji:
+                                      # wybór operatora (`narsor harness default set`, `h` w TUI),
+                                      # inaczej konfiguracja (`agent_harness`, patrz README →
+                                      # Configuration), a w jej braku `claude-code`.
+                                      # Tylko jawne `harness:` przypina akcję; bez niego akcja
+                                      # bierze domyślny przy pierwszej próbie i trzyma go do końca.
   model: <string>                     # Model AI (opcjonalne, np. "sonnet-3.5")
   workspace_access: <read-write|read-only> # Opcjonalne; domyślnie read-write.
   prompt: |                           # Instrukcja dla agenta

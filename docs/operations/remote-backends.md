@@ -231,7 +231,9 @@ A workflow's `globals.image` overrides the repository image. Digests are
 recorded in the task's `ResolvedEnvironment`; a later change of any
 component affects only tasks created afterwards. Two tasks with the same
 images, bundle, tools, profile and harness have the same
-`environment_identity`.
+`environment_identity`. The harness recorded there is the task's fallback, not
+a pin: a running task follows the installation's default harness (see
+"Scheduling").
 
 ## 4. Secrets
 
@@ -425,7 +427,7 @@ any state ─▶ Archiving ─▶ Archived
 
 * **Pause** asks the runner for a safe point; only after it acknowledges does
   the controller delete the Pod. The PVC — workspace, engine state, private
-  `$HOME`, pinned harness — stays.
+  `$HOME`, the harness the runner last switched to — stays.
 * **Resume** creates a new Pod on the same PVC; nothing is cloned again.
 * **Interrupted / Unknown**: the workload disappeared (a Pod that failed or
   was deleted, or Pod phase `Unknown`). Narsor **never restarts it on its
@@ -465,13 +467,34 @@ any state ─▶ Archiving ─▶ Archived
   `--reason`, which is recorded with the owner in the task's events. The CLI
   waits for the verdict and, past `--wait-secs`, reports the command as
   queued.
+* The runner follows the installation's **default agent harness**
+  (`narsor harness default`, `h` in the TUI), not only the one the task was
+  created with: every poll and snapshot answer of the control plane carries
+  the default as it applies to the task (`default_harness`), and setting or
+  resetting it wakes open long-polls. The harness in the task's
+  `ResolvedEnvironment` (`--harness`, else the profile's) is only the
+  fallback until the runner has heard a default; the runner keeps the
+  harness it last switched to in `narsor/harness.json` on the task storage,
+  so a resumed task starts on it. A switch takes effect at a clean boundary:
+  an agent action in progress keeps its harness through its retries,
+  reprompts and a resumed session, and the next agent action and the next
+  conductor invocation take the new one. A `harness:` the workflow names
+  itself always wins. When the task's backend does not run the default
+  (the catalogue's `harnesses` allow list) or its binary is not on the
+  runner's `PATH`, the runner stays on its current harness and reports
+  `default_harness_unavailable` (harness, kept, reason) in its snapshot —
+  information for the owner, shown in the TUI's details, not a problem and
+  not a failure of a step.
 * The runner hosts the task's **conductor** when the task's harness can run
   in its environment: the harness binary (`claude`, `codex`, `opencode`) must
   be on the runner's `PATH`, which on Kubernetes means the base image or a
   tool package brings it — the adapter configures nothing for it. The
-  conductor runs on the harness the task pinned, or on the one the owner
-  chose with `narsor task conductor harness`, from its next invocation on;
-  it summarizes `human` gates, rescues a step's missing output label,
+  conductor runs on the runner's current harness — the installation's
+  default as above, from its next invocation on; there is no per-task
+  choice. A `SetConductorHarness` operator command is refused by the
+  control plane with `400 unsupported_command`, and one queued by an older
+  version is settled as rejected by the runner, changing nothing. It
+  summarizes `human` gates, rescues a step's missing output label,
   diagnoses a failed step and answers the chat, always read-only. Without a
   usable harness there is no conductor: the runner reports
   `conductor_available = false` with the reason (`narsor task conductor
@@ -500,6 +523,7 @@ plane and a token (section 2).
 
 ```bash
 narsor backend default                       # get; also: set <backend>, reset
+narsor harness default                       # get; also: set <harness>, reset — new and running tasks
 narsor task create implement-feature --input ticket=NAR-1 \
   [--backend k8s] [--profile default] [--harness codex] \
   [--repository api --commit <sha>] [--workflow-version 1] [--task-id my-id]
@@ -515,7 +539,6 @@ narsor task transition <task> <state> [--override --reason <why>] [--wait-secs N
 narsor task restart-step <task> [--note <text>] [--failure-key K] [--wait-secs N]
 narsor task conductor chat <task> <text> | history <task> [--after N]
 narsor task conductor confirm|reject <task> <proposal> | undo <task> <decision>
-narsor task conductor harness <task> <claude-code|codex|opencode>
 narsor task conversation <task> [<attempt>] [--from N]
 narsor task events <task> [--follow]
 narsor task watch [--cursor C]               # every task, reconnecting from the cursor
@@ -546,7 +569,8 @@ reasoned override), `start` (`s`), `archive` (`a`), `input` and
 `restart-step` (the answer panel), `conductor …` (the *Dyrygent* tab), `create`
 (`n`, also `create --file` for a path, with `workflows` and `validate` for the
 catalogue and the check), `list --archived` and `history …` (`H`), `repo …`
-(`R`) and `capabilities`. `?` shows the keys, README.md ("`tui`") describes the screens.
+(`R`) and `capabilities`; besides those, `h` is `narsor harness default set`
+/ `reset`, the installation's default harness the header names. `?` shows the keys, README.md ("`tui`") describes the screens.
 
 ### Task materials
 

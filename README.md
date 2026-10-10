@@ -453,38 +453,70 @@ for every other command), or a remote control plane with `--server` /
 starts the same interface.
 
 ```text
-┌ narsor · local ● live ──────────────────────────────── sloty 2/3 · ? 1 · ! 1 ┐
-│ Zadania            │ NAR-12  Zmiana API zamówień             implement v3    │
-│ ● NAR-14  edit     │ Jira NAR-12 ↗   PR !482 ↗   running · krok 3/5 · 14m    │
-│?● NAR-12  approval │ Przebieg  Rozmowa  Zdarzenia  Dyrygent  Info           │
-│!✗ NAR-9   failed   │ ✓ plan            │ ▸ Read src/api.rs                  │
-│ ◷ NAR-16  #1       │ ✓ implement (2)   │ ▸ Edit src/api.rs  +12 −3          │
-│ ✓ NAR-8   done     │ ● review_api      │ assistant: Zmieniam sygnaturę…     │
-│                    │┌ ? Czeka na Ciebie: approval · 3m ────────────────────┐│
-│                    ││ the answer panel                                     ││
-│                    │└──────────────────────────────────────────────────────┘│
-├────────────────────┴────────────────────────────────────────────────────────┤
-│ Enter szczegóły  Space następny czekający  . akcje  n nowe  ?  │ powiadom. │
-└─────────────────────────────────────────────────────────────────────────────┘
+narsor · local ● live             harness claude-code (konfiguracja) · sloty 2/3 · ? 1 · ! 1
+┏ Zadania ━━━━━━━━━━━━━━━━━┓┌ Zmiana API zamówień ─────────────────────────────────────────┐
+┃  ●  NAR-14 Edycja parsera┃│ Zmiana API zamówień · NAR-12                    implement v3 │
+┃     edit                 ┃│ Jira NAR-12 ↗   PR !482 ↗   running · krok 3/5 · 14m         │
+┃? ●  Zmiana API zamówień  ┃│ Przebieg  Rozmowa  Zdarzenia  Dyrygent  Info                 │
+┃     approval             ┃│ ✓ plan            │ ▸ Read src/api.rs                        │
+┃! ✗  Migracja bazy danyc… ┃│ ✓ implement (2)   │ ▸ Edit src/api.rs  +12 −3                │
+┃     failed               ┃│ ● review_api      │ assistant: Zmieniam sygnaturę…           │
+┃  ◷  Raport tygodniowy    ┃│┌ ? Czeka na Ciebie: approval · 3m ──────────────────────────┐│
+┃     #1                   ┃││ the answer panel                                           ││
+┃                          ┃│└────────────────────────────────────────────────────────────┘│
+┃                          ┃│                                                              │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━┛└──────────────────────────────────────────────────────────────┘
+Enter szczegóły  Space następny czekający  . akcje  n nowe  h harness  ?           powiadom.
 ```
+
+**The screen.** There is no frame around the screen: the first row is the
+header — the connection and its state on the left; on the right the
+installation's default agent harness (`harness claude-code (konfiguracja)`
+when it comes from the configuration, `harness opencode` when the operator
+chose it, `harness ?` before the first read), the slots and the counters of
+what waits. The last row is the shortcut bar. Every panel between them has a
+frame of its own: thick and in the focus colour (cyan, with a bold title) on
+the panel that has the keys, thin and grey on the others — so the active panel
+reads without colour too. The details frame is named after the task and stays
+thick while the keys are in the answer panel. New task, history and
+repositories use the same frames.
 
 **The list** is the queue: tasks stand in the order of the scheduler (`rank`),
 are never grouped or sorted by state, and change place only by an explicit
-action (`K` / `J` / `m`, the TUI's `narsor task move`). A row is the attention
-mark (`?` a question or an approval, `!` a problem, a failed step or a failed
-provisioning), the state icon (`●` running, `◷` queued, `⟳` provisioning, `‖`
-paused, `✗` failed or interrupted, `✓` done, `↻` being sent), the title from
-the workflow's `display` (the task id when there is none) and a label: the
-current step, `#n` in the queue, `offline` when no controller holds the
-backend. `z` hides finished tasks as a filter; `a` archives one. The selection
-follows the task, not the row, through every refresh.
+action (`K` / `J` / `m`, the TUI's `narsor task move`). A row takes two lines.
+The first holds the attention mark (`?` a question or an approval, `!` a
+problem, a failed step or a failed provisioning), the state icon (`●` running,
+`◷` queued, `⟳` provisioning, `‖` paused, `✗` failed or interrupted, `✓` done,
+`↻` being sent) and the title from the workflow's `display` (the task id when
+there is none) on the whole width of the list. The second, under the title,
+is the label: the current step, `#n` in the queue, `offline` when no
+controller holds the backend, `nie wysłano`, or the place preview `↕ n/m`
+while moving. Every row is two lines even with no label, so the list scrolls
+by whole tasks; the selection reverses both lines. `z` hides finished tasks as
+a filter; `a` archives one. The selection follows the task, not the row,
+through every refresh.
 
 **The details** show the header (title and links from `display`, lifecycle,
 step, duration) and five tabs: *Przebieg* (the steps and the selected one),
 *Rozmowa* (the agent's conversation), *Zdarzenia*, *Dyrygent* (the conductor's
-chat, decisions and harness) and *Info* (the sealed inputs, the observations
-with their age, the runner and the controller). A task that has not started
-says so and where it stands in the queue.
+chat and decisions; its status line names the harness the conductor runs on)
+and *Info* (the sealed inputs, the observations with their age, the runner and
+the controller). A task that has not started says so and where it stands in
+the queue. When a running task cannot follow the default harness — its
+backend does not run it, or the binary is not on the runner's `PATH` — one
+line under the header says so (`opencode niedostępny tutaj — zostaje
+claude-code`) and *Info* gives the full reason in the runner's section. It is
+information, not a problem: no list mark, no attention count.
+
+**The default harness** (`h` on the list, in the details, the history and the
+repositories — never in a text field, a menu or over another overlay) opens a
+list: first `domyślny z konfiguracji (<name>)`, which removes the operator's
+choice, then the harnesses the daemon supports; the one in force is marked
+`●`. `Enter` sends the choice and the header shows `harness <new>…` until the
+answer; a refusal comes back as a notification with its cause, the old value
+kept. The choice is the installation's, not the task's: new tasks take it, and
+tasks already running take it from their next agent action and the
+conductor's next invocation (see [`AgentAction`](#agentaction--running-an-ai-agent)).
 
 **What waits for you** is one panel at the bottom of the details, whatever the
 kind of waiting: a question or a `human` gate, an approval, a problem, a failed
@@ -510,13 +542,13 @@ reason. An action marked `!` asks `y` / `n` first.
 | `o` | open a link of the task (`display.links`) in the browser | — |
 | `c` (*Dyrygent*) | write to the conductor | `narsor task conductor chat` |
 | `u` (*Dyrygent*) | undo a decision of the conductor (`!`) | `narsor task conductor undo` |
-| `h` (*Dyrygent*) | choose the conductor's harness | `narsor task conductor harness` |
 | the panel | confirm / reject a proposal, restart a failed step with a note | `narsor task conductor confirm` / `reject`, `narsor task restart-step` |
 | `n` | new task (a catalogue workflow, or the path of a definition) | `narsor task create <workflow>`, `narsor task create --file <path>`; the catalogue is `narsor task workflows`, the check of a file `narsor task validate <path>` |
 | `i` / the panel | answer what waits: fields, `data`, `variables`, label, comment | `narsor task input <task> --field … --data … --variable … [--waiting-id ID]` |
 | `Space` | the next task that waits | `narsor task show` ends with `Next       waiting: <task>` |
 | `H` | history: archived tasks, and executions from before the scheduler (`w` recovers a failed one) | `narsor task list --archived`; `narsor task history list` / `show` / `events` / `steps` / `conversation` / `conductor` / `recover` |
 | `R` | repositories: `a` registers, `d` removes (`!`) | `narsor task repo list` / `add` / `remove` (the same registry on any server; `narsor repo …` is the local one) |
+| `h` | the installation's default agent harness: choose one, or go back to the configured one | `narsor harness default set <harness>` / `reset` (`narsor harness default` shows it) |
 | the header | what the connection offers | `narsor task capabilities` |
 
 The CLI of the remote-aware commands has a machine form too: `narsor task list
@@ -555,8 +587,8 @@ the current step or a draft.
 | Where | Keys |
 |---|---|
 | Everywhere | `?` help, `q` quit (asks when a draft would be lost) |
-| List | `j` / `k` (`↓` / `↑`), `g` / `G`, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `r` |
-| Details | `Esc` list, `←` / `→` tabs, `Tab` content ↔ panel, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` follow the current step |
+| List | `j` / `k` (`↓` / `↑`), `g` / `G`, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `r`, `h` default harness |
+| Details | `Esc` list, `←` / `→` tabs, `Tab` content ↔ panel, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` follow the current step, `h` default harness |
 | Panel | `Tab` actions ↔ fields, `Enter` send, `Ctrl+J` new line (also `Shift+Enter` / `Alt+Enter` where the terminal reports modifiers), `Esc` fold, `1`–`9` choose, `[` / `]` previous / next waiting |
 | Menu | `j` / `k`, `1`–`9`, `Enter`, `Esc` and the shortcuts above |
 | Confirmation | `y` confirm, `n` / `Esc` take it back |
@@ -587,6 +619,7 @@ or a runner directly.
 
 ```bash
 narsor backend default                        # which backend new tasks get (set/reset to change)
+narsor harness default                        # the default agent harness, for new and running tasks (set/reset to change)
 narsor task create implement-feature --input ticket=NAR-1 [--backend k8s]
 narsor task create --file ./my-workflow.yaml --input name=value   # a workflow file of the local daemon, checked first
 narsor task list [--archived] [--json]        # queue position (#n), `?`/`!` attention mark, backend, lifecycle, title; --archived: the history
@@ -619,8 +652,11 @@ credential rotation, lifecycle and scheduling semantics are described in
 ## The conductor
 
 The daemon runs a **conductor** beside every execution: an assistant on the
-default harness (the one `agent_harness` names, or the harness picked in the
-interface) that reads the task and never writes it. It has one history per
+installation's default harness (the operator's choice — `h` in the interface,
+`narsor harness default set` — or else the one `agent_harness` names) that
+reads the task and never writes it. There is no per-task choice: a changed
+default reaches the conductor of every task, running ones included, from its
+next invocation; the *Dyrygent* tab names the harness it runs on. It has one history per
 execution, with its chat, kept under the daemon's data directory, so it
 survives a restart of the daemon and of the interface.
 
@@ -689,13 +725,35 @@ analyze:
     ambiguous: human_clarification
 ```
 
-`harness` is **optional**. An action that names none uses the configured
+`harness` is **optional**. An action that names none uses the installation's
+default harness: the operator's choice (`narsor harness default set <harness>`,
+or `h` in the TUI) when there is one, otherwise the configured
 `agent_harness`, and failing that the built-in `claude-code` — so a workflow
 without it is portable and still passes `validate`. The other side of that
 bargain: its behaviour then depends on the environment, and the same file may
 run a different agent on a laptop than in a container. Read the effective value
-with `narsor config show`; a workflow meant to run reproducibly should declare
-`harness:` explicitly.
+with `narsor harness default` (the configured one with `narsor config show`); a
+workflow meant to run reproducibly should declare `harness:` explicitly.
+
+```bash
+narsor harness default               # get: effective, configured, override, supported
+narsor harness default set codex     # the operator's choice, until changed or reset
+narsor harness default reset         # back to the configured agent_harness
+```
+
+**A change of the default reaches work already under way**, not only new
+tasks — at a clean boundary. An agent action reads the default once, at its
+first attempt, and keeps that harness for its retries, reprompts and a
+resumed session; the next agent action takes the new default, and so does the
+conductor's next invocation. Only a `harness:` the workflow names itself pins
+an action. A harness given when a remote task is created (`--harness`, or the
+profile's) is the task's fallback, not a pin: the task follows the default
+like any other. A remote task's runner hears the default with every answer of
+the control plane; when the task's backend does not run that harness, or its
+binary is not on the runner's `PATH`, the task stays on the harness it has and
+reports it in its runner view (`default_harness_unavailable` in `narsor task
+show --json`; one line in the TUI's details) — information, not a failure of a
+step.
 
 `timeout` on an agent state works the same way: declared, it wins; absent, the
 configured `agent_timeout` applies. Script and human states are untouched by
@@ -933,7 +991,7 @@ sits right there is the failure this layer exists to prevent.
 ```yaml
 # ~/.config/narsor/config.yaml — every key is optional
 data_dir: /srv/narsor        # executions, workspaces, the registry
-agent_harness: claude-code   # for an agent action that names none itself
+agent_harness: claude-code   # for an agent action that names none itself (unless `narsor harness default set` overrides it)
 agent_timeout: 30m           # for an agent action that declares none; `none` for no limit
 log_level: info              # off, error, warn, info, debug, trace
 tui_refresh_interval: 10s    # how often the TUI re-reads the daemon; `none` turns it off
