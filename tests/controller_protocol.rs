@@ -34,7 +34,7 @@ use narsor::orchestration::{
     AttentionItem, AttentionKind, Clock, CommandRequest, ControlPlane, ConversationAttemptSummary,
     ConversationAvailability, ExecutionCursor, InputStatus, NewTask, Observation, ObservedSummary,
     OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, PendingInputRef,
-    ResourceIdentity, RunnerSnapshot, TaskEventKind, TaskLifecycle,
+    ResourceIdentity, ResumePolicy, RunnerSnapshot, TaskEventKind, TaskLifecycle,
 };
 use narsor::persistence::paths::{temp_path_for, StatePaths};
 use narsor::persistence::{DaemonInfo, DefaultHarnessSelector, ExecutionStore};
@@ -3281,4 +3281,25 @@ fn answers_and_views_without_the_default_harness_still_read() {
         encoded.get("default_harness_unavailable").is_none(),
         "an old reader is not shown the new field: {encoded}"
     );
+}
+
+#[test]
+fn the_protocol_config_sets_how_the_control_plane_counts_losses() {
+    let root = TempRoot::new();
+    let policy = ResumePolicy {
+        attempt_delays: vec![Duration::zero(), Duration::seconds(1)],
+        stability_window: Duration::seconds(5),
+    };
+    assert_eq!(ProtocolConfig::default().resume, ResumePolicy::default());
+
+    let service = ProtocolService::with_config(
+        ControlPlane::new(StatePaths::new(root.path())),
+        environment_support::seeded_resolver(root.path()),
+        ProtocolConfig {
+            resume: policy.clone(),
+            ..ProtocolConfig::default()
+        },
+    );
+
+    assert_eq!(service.control_plane().resume_policy(), &policy);
 }

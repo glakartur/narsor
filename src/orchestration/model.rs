@@ -620,6 +620,15 @@ pub struct TaskRecord {
     /// right after a start from one after a run long enough to count.
     #[serde(default)]
     pub running_since: Option<DateTime<Utc>>,
+    /// The newest controller lease epoch known to have the current workload
+    /// in hand: the backend's epoch when a command ordered the launch,
+    /// raised by every report about the live workload. A loss reported
+    /// under a newer epoch was found by a controller that took over (or
+    /// restarted) since, and does not count against the resume limit.
+    /// `None` before the first launch and on records written before it was
+    /// kept; such a loss counts.
+    #[serde(default)]
+    pub workload_epoch: Option<u64>,
     /// Automatic resume after a workload loss.
     #[serde(default)]
     pub resume: ResumeState,

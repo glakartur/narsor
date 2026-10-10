@@ -11,6 +11,7 @@
 //! * [`store`] — the file layout and its crash-safe commit protocol;
 //! * [`control_plane`] — the API owners and controllers mutate tasks through;
 //! * `runner_state` — runner snapshots and owner input on the same record;
+//! * [`resume`] — counting workload losses for the automatic resume;
 //! * [`scheduler`] — admission of queued tasks by backend capacity (U10).
 //!
 //! Records live under `{state}/orchestration/`, outside `executions/`, so
@@ -22,6 +23,7 @@ pub mod error;
 pub(crate) mod lifecycle;
 pub mod model;
 mod operator_commands;
+pub mod resume;
 mod runner_state;
 pub mod scheduler;
 pub mod store;
@@ -29,4 +31,5 @@ pub mod store;
 pub use control_plane::{Clock, ControlPlane, OrchestrationRecovery, SystemClock};
 pub use error::{OrchestrationError, Result};
 pub use model::*;
+pub use resume::ResumePolicy;
 pub use store::OrchestrationStore;

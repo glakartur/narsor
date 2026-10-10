@@ -513,6 +513,12 @@ pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
                     "daemon: republished a control-plane event a crash kept out of the log"
                 );
             }
+            for task_id in &recovery.adopted_losses {
+                tracing::info!(
+                    task_id = %task_id,
+                    "daemon: adopted a workload loss from before the resume policy"
+                );
+            }
         }
         Err(error) => {
             tracing::warn!(error = %error, "daemon: control-plane recovery failed");

@@ -19,11 +19,12 @@
 use super::error::{OrchestrationError, Result};
 use super::lifecycle::{command_effect, observation_effect, CommandEffect, ObservationEffect};
 use super::model::{
-    ArchiveTombstone, BackendLease, CommandOutcome, CommandReceipt, CommandRequest,
+    ArchiveTombstone, BackendLease, CommandActor, CommandOutcome, CommandReceipt, CommandRequest,
     ControllerReport, LeaseToken, MaterialChange, NewTask, Observation, ObservedState,
     OwnerCommand, ReportOutcome, ResumeState, TaskAssignment, TaskEvent, TaskEventKind,
-    TaskLifecycle, TaskRecord, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
+    TaskLifecycle, TaskRecord, WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
 };
+use super::resume::{count_loss, loss_from_history, ResumePolicy};
 use super::store::OrchestrationStore;
 use crate::domain::{BackendId, TaskId};
 use crate::persistence::{ExecutionStore, StatePaths};
@@ -59,6 +60,10 @@ pub struct OrchestrationRecovery {
     /// crash interrupted before they became materials, and materials of
     /// tasks archived before their purge completed.
     pub removed_material_leftovers: Vec<PathBuf>,
+    /// Tasks interrupted (or unknown) before losses were remembered, whose
+    /// loss was read from their event log so the resume policy can judge
+    /// it like any other.
+    pub adopted_losses: Vec<TaskId>,
 }
 
 /// Whether a mutation changed the record.
@@ -74,6 +79,7 @@ pub(crate) enum Mutation<T> {
 pub struct ControlPlane {
     store: OrchestrationStore,
     clock: Arc<dyn Clock>,
+    resume_policy: ResumePolicy,
 }
 
 impl ControlPlane {
@@ -87,7 +93,19 @@ impl ControlPlane {
         Self {
             store: OrchestrationStore::new(paths),
             clock,
+            resume_policy: ResumePolicy::default(),
         }
+    }
+
+    /// Replaces how workload losses are counted for the automatic resume.
+    pub fn with_resume_policy(mut self, policy: ResumePolicy) -> Self {
+        self.resume_policy = policy;
+        self
+    }
+
+    /// How workload losses are counted for the automatic resume.
+    pub fn resume_policy(&self) -> &ResumePolicy {
+        &self.resume_policy
     }
 
     /// The underlying file store.
@@ -171,6 +189,7 @@ impl ControlPlane {
             queue: None,
             request_digest: request.request_digest,
             running_since: None,
+            workload_epoch: None,
             resume: ResumeState::default(),
             last_event: TaskEvent {
                 sequence: 1,
@@ -215,6 +234,11 @@ impl ControlPlane {
     /// [`OrchestrationError::IdempotencyKeyReused`]. Archive wins over every
     /// state; on a task no controller ever accepted it completes at once,
     /// since resources that were never created count as already deleted.
+    ///
+    /// An owner command that takes the task out of `Interrupted`/`Unknown`
+    /// is the owner's decision and resets its resume state (R6); one the
+    /// resume policy issued ([`super::model::CommandActor::Policy`]) only
+    /// consumes the planned attempt and keeps the count.
     pub fn command(&self, task_id: &TaskId, request: CommandRequest) -> Result<CommandOutcome> {
         let (task, (receipt, replayed)) = self.mutate(task_id, |record, now| {
             if let Some(receipt) = record.receipt(&request.idempotency_key) {
@@ -245,8 +269,18 @@ impl ControlPlane {
                 // Recorded for the audit trail; the tombstone already holds.
                 CommandEffect::ArchiveConverged => {}
                 CommandEffect::Transition(next) => {
+                    let previous = record.lifecycle;
                     record.generation += 1;
                     record.lifecycle = next;
+                    if matches!(
+                        previous,
+                        TaskLifecycle::Interrupted | TaskLifecycle::Unknown
+                    ) {
+                        leave_loss(record, request.actor);
+                    }
+                    if next == TaskLifecycle::Provisioning {
+                        self.order_launch(record)?;
+                    }
                     if request.command == OwnerCommand::Archive {
                         archive(record, &request.idempotency_key, now);
                     }
@@ -388,8 +422,13 @@ impl ControlPlane {
     /// current lifecycle; `PausedAtSafePoint` additionally needs the runner's
     /// safe-point acknowledgement for the current generation
     /// ([`OrchestrationError::SafePointNotAcknowledged`]). A pure redelivery
-    /// is absorbed with `applied: false`. Workload loss never schedules a replacement — the
-    /// task waits in Interrupted/Unknown for an owner command (R13).
+    /// is absorbed with `applied: false`.
+    ///
+    /// A workload loss is remembered with where, when and under which lease
+    /// epoch it happened, and counted once the task enters `Interrupted`
+    /// (see [`super::resume`]): the report plans the resume policy's next
+    /// attempt or gives up, but never replaces the workload itself. `Unknown`
+    /// is counted only once a controller confirms the loss.
     pub fn report(&self, report: ControllerReport) -> Result<ReportOutcome> {
         let (task, applied) = self.mutate(&report.task_id, |record, now| {
             let lease = self.valid_lease(&report.lease)?;
@@ -456,9 +495,11 @@ impl ControlPlane {
                     {
                         return Err(OrchestrationError::NotAdmitted(record.task_id.clone()));
                     }
+                    let previous = record.lifecycle;
                     record.lifecycle = next;
                     match report.observation {
                         Observation::StartAccepted => record.resources_may_exist = true,
+                        Observation::RunnerReady => record.running_since = Some(now),
                         Observation::ResourcesDeleted => {
                             if let Some(tombstone) = &mut record.archive {
                                 tombstone.completed_at = Some(now);
@@ -466,7 +507,29 @@ impl ControlPlane {
                         }
                         _ => {}
                     }
+                    // A confirmation counts the loss remembered when the
+                    // task went `Unknown`; only one without such a memory
+                    // (from before losses were kept) is taken as new.
+                    let new_loss = match report.observation {
+                        Observation::WorkloadLost { .. } => true,
+                        Observation::LossConfirmed => record.resume.last_loss.is_none(),
+                        _ => false,
+                    };
+                    if new_loss {
+                        record.resume.last_loss = Some(WorkloadLoss {
+                            from: previous,
+                            at: now,
+                            lease_epoch: report.lease.epoch,
+                            reason: report.summary.detail.clone(),
+                        });
+                    }
+                    if next == TaskLifecycle::Interrupted {
+                        count_loss(record, &self.resume_policy, now);
+                    }
                 }
+            }
+            if holds_workload(record.lifecycle) && !reports_loss(report.observation) {
+                record.workload_epoch = record.workload_epoch.max(Some(report.lease.epoch));
             }
             record.observed = Some(observed);
             record.last_report_epoch = Some(report.lease.epoch);
@@ -543,11 +606,15 @@ impl ControlPlane {
     pub fn recover(&self) -> Result<OrchestrationRecovery> {
         let removed_temp_files = self.store.cleanup_orphaned_temp_files()?;
         let mut republished_events = Vec::new();
+        let mut adopted_losses = Vec::new();
         for task_id in self.store.list_task_ids()? {
             let _lock = self.store.lock_task(&task_id)?;
-            let record = self.store.load_task(&task_id)?;
+            let mut record = self.store.load_task(&task_id)?;
             if self.store.publish_last_event(&record)? {
-                republished_events.push((task_id, record.revision));
+                republished_events.push((task_id.clone(), record.revision));
+            }
+            if self.adopt_loss(&mut record)? {
+                adopted_losses.push(task_id);
             }
         }
         self.normalise_ranks()?;
@@ -571,7 +638,40 @@ impl ControlPlane {
             removed_temp_files,
             republished_events,
             removed_material_leftovers,
+            adopted_losses,
         })
+    }
+
+    /// Gives a task interrupted (or unknown) before losses were remembered
+    /// the loss its event log shows, counted as a fresh one, so the resume
+    /// policy resumes it — unless it was lost while pausing. Call under the
+    /// task's lock. Like rank repair, it announces nothing: the record's
+    /// lifecycle does not change, and clients' next read shows the state.
+    fn adopt_loss(&self, record: &mut TaskRecord) -> Result<bool> {
+        let lost = matches!(
+            record.lifecycle,
+            TaskLifecycle::Interrupted | TaskLifecycle::Unknown
+        );
+        if !lost || record.resume.last_loss.is_some() {
+            return Ok(false);
+        }
+        let events = self.store.events_since(&record.task_id, 0)?;
+        record.resume.last_loss = Some(loss_from_history(record, &events));
+        if record.lifecycle == TaskLifecycle::Interrupted {
+            count_loss(record, &self.resume_policy, self.clock.now());
+        }
+        self.store.save_task(record)?;
+        Ok(true)
+    }
+
+    /// A command ordered a new launch: no runner of it was ready yet, and
+    /// it is ordered under the backend's current lease epoch.
+    fn order_launch(&self, record: &mut TaskRecord) -> Result<()> {
+        record.running_since = None;
+        if let Some(lease) = self.store.load_lease(&record.assignment.backend_id)? {
+            record.workload_epoch = record.workload_epoch.max(Some(lease.epoch));
+        }
+        Ok(())
     }
 
     /// The serialized read-modify-write of one task.
@@ -654,6 +754,32 @@ impl ControlPlane {
         }
         Ok(lease)
     }
+}
+
+/// A command takes the task out of `Interrupted`/`Unknown`: the planned
+/// attempt is used up either way, and the owner's decision forgets the
+/// losses altogether (R6).
+fn leave_loss(record: &mut TaskRecord, actor: CommandActor) {
+    match actor {
+        CommandActor::Owner => record.resume = ResumeState::default(),
+        CommandActor::Policy => record.resume.next_attempt_at = None,
+    }
+}
+
+/// Whether a task in `lifecycle` has (or is getting) a workload.
+fn holds_workload(lifecycle: TaskLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        TaskLifecycle::Provisioning | TaskLifecycle::Running | TaskLifecycle::PauseRequested
+    )
+}
+
+/// Whether `observation` says the workload was lost.
+fn reports_loss(observation: Observation) -> bool {
+    matches!(
+        observation,
+        Observation::WorkloadLost { .. } | Observation::LossConfirmed
+    )
 }
 
 /// Sets the archive tombstone; completes at once when nothing was created.

@@ -33,7 +33,8 @@ use crate::orchestration::{
     AttentionItem, AttentionKind, BackendCapacity, BackendLease, CommandActor, CommandRequest,
     ControlPlane, ControllerReport, ConversationAvailability, InputRequest, InputStatus,
     LeaseToken, MoveTarget, NewTask, Observation, OperatorCommand, OperatorCommandRequest,
-    OwnerRef, RunnerObservation, TaskEvent, TaskLifecycle, TaskRecord, RETIRED_CONDUCTOR_HARNESS,
+    OwnerRef, ResumePolicy, RunnerObservation, TaskEvent, TaskLifecycle, TaskRecord,
+    RETIRED_CONDUCTOR_HARNESS,
 };
 use crate::workflow::TemplateScope;
 use events::LocalTaskStorage;
@@ -113,6 +114,10 @@ pub struct ProtocolConfig {
     /// How long an owner waits for the live runner to upload a requested
     /// conversation page or events page before the relay gives up.
     pub conversation_page_timeout: std::time::Duration,
+    /// How workload losses are counted for the automatic resume: the
+    /// attempts' delays (their number is the limit) and the stability
+    /// window. Installed on the service's control plane.
+    pub resume: ResumePolicy,
 }
 
 impl Default for ProtocolConfig {
@@ -127,6 +132,7 @@ impl Default for ProtocolConfig {
             controller_stale_after: Duration::seconds(90),
             max_long_poll: std::time::Duration::from_secs(30),
             conversation_page_timeout: std::time::Duration::from_secs(20),
+            resume: ResumePolicy::default(),
         }
     }
 }
@@ -167,11 +173,16 @@ impl ProtocolService {
     }
 
     /// A service with an explicit policy.
+    ///
+    /// The config's [`ProtocolConfig::resume`] replaces the control plane's
+    /// own resume policy, so the service and every report it accepts count
+    /// losses alike.
     pub fn with_config(
         control: ControlPlane,
         launch: Arc<dyn LaunchResolver>,
         config: ProtocolConfig,
     ) -> Self {
+        let control = control.with_resume_policy(config.resume.clone());
         let credentials = CredentialStore::new(control.clone());
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
         let materials = MaterialStore::new(control.store().paths(), MaterialLimits::default());

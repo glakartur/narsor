@@ -9,8 +9,8 @@ use narsor::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
 use narsor::orchestration::{
     BackendCapacity, BackendLease, Clock, CommandActor, CommandRequest, ControlPlane,
     ControllerReport, MoveTarget, NewTask, Observation, ObservedSummary, OrchestrationError,
-    OwnerCommand, OwnerRef, QueueReason, ResourceIdentity, ResumeExhaustion, ResumeState,
-    RunnerSnapshot, TaskEventKind, TaskLifecycle, TaskRecord, WorkloadLoss,
+    OwnerCommand, OwnerRef, QueueReason, ResourceIdentity, ResumeExhaustion, ResumePolicy,
+    ResumeState, RunnerSnapshot, TaskEventKind, TaskLifecycle, TaskRecord, WorkloadLoss,
 };
 use narsor::persistence::paths::{temp_path_for, StatePaths};
 use narsor::persistence::ExecutionStore;
@@ -2585,7 +2585,11 @@ fn a_new_task_has_an_empty_resume_state_and_owner_receipts() {
     let running = fx.running("task-1", &lease);
     assert!(running.resume.is_empty());
     assert_eq!(running.resume, ResumeState::default());
-    assert_eq!(running.running_since, None, "kept from U2 on");
+    assert_eq!(
+        running.running_since,
+        Some(fx.clock.now()),
+        "set when the runner reported ready"
+    );
 
     let paused = fx.command("task-1", OwnerCommand::Pause, "pause-1");
     assert_eq!(paused.commands[0].actor, CommandActor::Owner);
@@ -2834,4 +2838,567 @@ fn a_client_keeps_a_stream_frame_whose_event_or_observation_it_does_not_know() {
             lease_epoch: 3,
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// Automatic resume: counting losses and the owner's reset (U2)
+// ---------------------------------------------------------------------------
+
+/// A lease that outlives every clock advance of these tests.
+fn long_lease(fx: &Fixture, controller: &str) -> BackendLease {
+    fx.control
+        .acquire_lease(&backend_id("k8s"), controller, Duration::days(1))
+        .expect("acquire lease")
+}
+
+/// Reports a loss of the task's workload, with the controller's reason.
+fn lose(
+    fx: &Fixture,
+    id: &str,
+    lease: &BackendLease,
+    state_known: bool,
+    detail: &str,
+) -> TaskRecord {
+    let generation = fx.control.task(&task(id)).unwrap().generation;
+    let mut loss = report(
+        id,
+        lease,
+        generation,
+        Observation::WorkloadLost { state_known },
+        None,
+    );
+    loss.summary.detail = Some(detail.to_string());
+    fx.control.report(loss).expect("loss report").task
+}
+
+/// Resumes the task the way the resume policy does.
+fn policy_resume(fx: &Fixture, id: &str) -> TaskRecord {
+    let record = fx.control.task(&task(id)).unwrap();
+    fx.control
+        .command(
+            &task(id),
+            CommandRequest::new(
+                OwnerCommand::Resume,
+                format!("auto-resume:{}", record.generation),
+            )
+            .expecting_generation(record.generation)
+            .issued_by(CommandActor::Policy),
+        )
+        .expect("policy resume")
+        .task
+}
+
+/// Resumes the task by the policy and loses the new workload before its
+/// runner was ready: one more consecutive loss.
+fn lose_again_while_provisioning(
+    fx: &Fixture,
+    id: &str,
+    lease: &BackendLease,
+    detail: &str,
+) -> TaskRecord {
+    policy_resume(fx, id);
+    lose(fx, id, lease, true, detail)
+}
+
+#[test]
+fn a_loss_after_a_stable_run_starts_the_count_anew_and_is_due_now() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    lose(&fx, "task-1", &lease, true, "first");
+    lose_again_while_provisioning(&fx, "task-1", &lease, "second");
+    policy_resume(&fx, "task-1");
+    fx.observe("task-1", &lease, Observation::RunnerReady)
+        .expect("runner ready");
+    fx.clock.advance(Duration::minutes(11));
+
+    let lost = lose(&fx, "task-1", &lease, true, "the runner's workload exited");
+
+    assert_eq!(lost.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(lost.resume.consecutive_losses, 1);
+    assert_eq!(lost.resume.next_attempt_at, Some(fx.clock.now()));
+    assert_eq!(lost.resume.exhausted, None);
+    let loss = lost.resume.last_loss.expect("the loss is remembered");
+    assert_eq!(loss.from, TaskLifecycle::Running);
+    assert_eq!(loss.at, fx.clock.now());
+    assert_eq!(loss.lease_epoch, lease.epoch);
+    assert_eq!(loss.reason.as_deref(), Some("the runner's workload exited"));
+}
+
+#[test]
+fn a_loss_soon_after_the_runner_was_ready_counts_as_consecutive() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    let running = fx.running("task-1", &lease);
+    assert_eq!(running.running_since, Some(fx.clock.now()));
+    fx.clock.advance(Duration::minutes(9));
+
+    let lost = lose(&fx, "task-1", &lease, true, "exited");
+
+    assert_eq!(lost.resume.consecutive_losses, 1);
+    assert_eq!(lost.resume.next_attempt_at, Some(fx.clock.now()));
+
+    // The resumed runner is ready again, and lost again within the window.
+    policy_resume(&fx, "task-1");
+    let ready = fx
+        .observe("task-1", &lease, Observation::RunnerReady)
+        .unwrap();
+    assert_eq!(ready.running_since, Some(fx.clock.now()));
+    fx.clock.advance(Duration::minutes(9));
+    let lost = lose(&fx, "task-1", &lease, true, "exited");
+    assert_eq!(lost.resume.consecutive_losses, 2);
+    assert_eq!(
+        lost.resume.next_attempt_at,
+        Some(fx.clock.now() + Duration::seconds(30))
+    );
+}
+
+#[test]
+fn a_loss_while_provisioning_counts_and_follows_the_delay_table() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.create("task-1");
+    fx.observe("task-1", &lease, Observation::StartAccepted)
+        .unwrap();
+
+    let first = lose(
+        &fx,
+        "task-1",
+        &lease,
+        true,
+        "the backend refused the workload",
+    );
+    assert_eq!(first.resume.consecutive_losses, 1);
+    assert_eq!(first.resume.next_attempt_at, Some(fx.clock.now()));
+    assert_eq!(
+        first.resume.last_loss.as_ref().unwrap().from,
+        TaskLifecycle::Provisioning
+    );
+
+    let expected = [
+        (2, Duration::seconds(30)),
+        (3, Duration::minutes(2)),
+        (4, Duration::minutes(10)),
+        (5, Duration::minutes(30)),
+    ];
+    for (count, delay) in expected {
+        fx.clock.advance(Duration::seconds(1));
+        let lost = lose_again_while_provisioning(&fx, "task-1", &lease, "refused");
+        assert_eq!(lost.resume.consecutive_losses, count);
+        assert_eq!(lost.resume.next_attempt_at, Some(fx.clock.now() + delay));
+        assert_eq!(lost.resume.exhausted, None, "attempt {count} is planned");
+    }
+}
+
+#[test]
+fn the_sixth_consecutive_loss_exhausts_the_policy_with_the_last_reason() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    lose(&fx, "task-1", &lease, true, "exited");
+    for _ in 2..=5 {
+        lose_again_while_provisioning(&fx, "task-1", &lease, "exited");
+    }
+    let fifth = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(fifth.resume.consecutive_losses, 5);
+    assert_eq!(
+        fifth.resume.next_attempt_at,
+        Some(fx.clock.now() + Duration::minutes(30))
+    );
+
+    fx.clock.advance(Duration::minutes(30));
+    let sixth = lose_again_while_provisioning(
+        &fx,
+        "task-1",
+        &lease,
+        "the runner's workload failed before it was ready",
+    );
+
+    assert_eq!(sixth.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(sixth.resume.consecutive_losses, 6);
+    assert_eq!(sixth.resume.next_attempt_at, None, "no further attempt");
+    let exhausted = sixth.resume.exhausted.expect("the policy gave up");
+    assert_eq!(
+        exhausted.reason,
+        "could not resume automatically: the runner's workload failed before it was ready"
+    );
+    assert_eq!(exhausted.at, fx.clock.now());
+    assert!(!exhausted.announced, "the policy announces it later");
+}
+
+#[test]
+fn a_shorter_policy_exhausts_sooner() {
+    let root = TempRoot::new();
+    let clock = ManualClock::new();
+    let control =
+        ControlPlane::with_clock(root.paths(), clock.clone()).with_resume_policy(ResumePolicy {
+            attempt_delays: vec![Duration::zero(), Duration::seconds(1)],
+            stability_window: Duration::seconds(5),
+        });
+    assert_eq!(control.resume_policy().limit(), 2);
+    let fx = Fixture {
+        root,
+        clock,
+        control,
+    };
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    lose(&fx, "task-1", &lease, true, "exited");
+    let second = lose_again_while_provisioning(&fx, "task-1", &lease, "exited");
+    assert_eq!(
+        second.resume.next_attempt_at,
+        Some(fx.clock.now() + Duration::seconds(1))
+    );
+
+    let third = lose_again_while_provisioning(&fx, "task-1", &lease, "exited");
+    assert!(third.resume.exhausted.is_some());
+
+    // The window is the policy's too: five seconds of running start anew.
+    fx.command("task-1", OwnerCommand::Start, "owner-start");
+    fx.observe("task-1", &lease, Observation::RunnerReady)
+        .unwrap();
+    fx.clock.advance(Duration::seconds(5));
+    let stable = lose(&fx, "task-1", &lease, true, "exited");
+    assert_eq!(stable.resume.consecutive_losses, 1);
+}
+
+#[test]
+fn the_default_policy_is_five_attempts_with_a_ten_minute_window() {
+    let policy = ResumePolicy::default();
+    assert_eq!(policy.limit(), 5);
+    assert_eq!(
+        policy.attempt_delays,
+        vec![
+            Duration::zero(),
+            Duration::seconds(30),
+            Duration::minutes(2),
+            Duration::minutes(10),
+            Duration::minutes(30),
+        ]
+    );
+    assert_eq!(policy.stability_window, Duration::minutes(10));
+}
+
+#[test]
+fn a_loss_while_pausing_plans_no_resume() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+
+    let lost = lose(&fx, "task-1", &lease, true, "exited before a safe point");
+
+    assert_eq!(lost.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(lost.resume.next_attempt_at, None, "waits for the owner");
+    assert_eq!(lost.resume.consecutive_losses, 0);
+    assert_eq!(lost.resume.exhausted, None);
+    assert_eq!(
+        lost.resume.last_loss.unwrap().from,
+        TaskLifecycle::PauseRequested
+    );
+}
+
+#[test]
+fn a_loss_while_pausing_confirmed_through_unknown_plans_no_resume() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    let unknown = lose(&fx, "task-1", &lease, false, "cannot observe");
+    assert_eq!(unknown.lifecycle, TaskLifecycle::Unknown);
+    assert_eq!(unknown.resume.next_attempt_at, None);
+    assert_eq!(
+        unknown.resume.last_loss.as_ref().unwrap().from,
+        TaskLifecycle::PauseRequested,
+        "the origin is remembered before the confirmation"
+    );
+    fx.clock.advance(Duration::minutes(3));
+
+    let confirmed = fx
+        .observe("task-1", &lease, Observation::LossConfirmed)
+        .unwrap();
+
+    assert_eq!(confirmed.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(confirmed.resume.next_attempt_at, None);
+    assert_eq!(confirmed.resume.consecutive_losses, 0);
+    assert_eq!(
+        confirmed.resume.last_loss.unwrap().from,
+        TaskLifecycle::PauseRequested
+    );
+}
+
+#[test]
+fn a_confirmed_loss_is_counted_as_of_when_the_workload_was_lost() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    fx.clock.advance(Duration::minutes(9));
+    let unknown = lose(&fx, "task-1", &lease, false, "cannot observe");
+    let lost_at = fx.clock.now();
+    assert_eq!(unknown.resume.consecutive_losses, 0, "not counted yet");
+    fx.clock.advance(Duration::minutes(5));
+
+    let confirmed = fx
+        .observe("task-1", &lease, Observation::LossConfirmed)
+        .unwrap();
+
+    // Ready for nine minutes when lost: consecutive, though fourteen have
+    // passed by the confirmation.
+    assert_eq!(confirmed.resume.consecutive_losses, 1);
+    assert_eq!(confirmed.resume.next_attempt_at, Some(fx.clock.now()));
+    let loss = confirmed.resume.last_loss.unwrap();
+    assert_eq!(loss.from, TaskLifecycle::Running);
+    assert_eq!(loss.at, lost_at);
+    assert_eq!(loss.reason.as_deref(), Some("cannot observe"));
+}
+
+#[test]
+fn a_loss_found_under_a_newer_lease_epoch_than_the_launch_keeps_the_count() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    lose(&fx, "task-1", &lease, true, "exited");
+    let second = lose_again_while_provisioning(&fx, "task-1", &lease, "exited");
+    assert_eq!(second.resume.consecutive_losses, 2);
+    policy_resume(&fx, "task-1");
+    fx.observe("task-1", &lease, Observation::RunnerReady)
+        .unwrap();
+
+    // The controller restarts: same identity, next epoch, and the first
+    // thing it sees is the workload gone.
+    let restarted = long_lease(&fx, "controller-a");
+    assert!(restarted.epoch > lease.epoch);
+    let lost = lose(
+        &fx,
+        "task-1",
+        &restarted,
+        true,
+        "the runner's workload disappeared",
+    );
+
+    assert_eq!(
+        lost.resume.consecutive_losses, 2,
+        "a restart costs no attempt"
+    );
+    assert_eq!(lost.resume.next_attempt_at, Some(fx.clock.now()));
+    assert_eq!(lost.resume.exhausted, None);
+    assert_eq!(lost.resume.last_loss.unwrap().lease_epoch, restarted.epoch);
+
+    // The resume is ordered under the new epoch, so its loss counts again.
+    let again = lose_again_while_provisioning(&fx, "task-1", &restarted, "exited");
+    assert_eq!(again.resume.consecutive_losses, 3);
+}
+
+#[test]
+fn a_loss_after_the_new_controller_saw_the_workload_alive_counts() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    let restarted = long_lease(&fx, "controller-a");
+    let mut alive = report("task-1", &restarted, 1, Observation::Status, None);
+    alive.summary.detail = Some("running".to_string());
+    fx.control
+        .report(alive)
+        .expect("status from the new controller");
+
+    let lost = lose(&fx, "task-1", &restarted, true, "exited");
+
+    assert_eq!(lost.resume.consecutive_losses, 1, "counted like any loss");
+}
+
+#[test]
+fn an_owner_start_or_resume_resets_an_exhausted_resume_state() {
+    for command in [OwnerCommand::Start, OwnerCommand::Resume] {
+        let fx = Fixture::new();
+        let lease = long_lease(&fx, "controller-a");
+        fx.running("task-1", &lease);
+        lose(&fx, "task-1", &lease, true, "exited");
+        for _ in 2..=6 {
+            lose_again_while_provisioning(&fx, "task-1", &lease, "exited");
+        }
+        let exhausted = fx.control.task(&task("task-1")).unwrap();
+        assert!(exhausted.resume.exhausted.is_some());
+
+        let resumed = fx.command("task-1", command, "owner-retry");
+
+        assert_eq!(resumed.lifecycle, TaskLifecycle::Provisioning);
+        assert!(resumed.resume.is_empty(), "{command:?} resets the count");
+        assert_eq!(resumed.running_since, None);
+        let lost = lose(&fx, "task-1", &lease, true, "exited");
+        assert_eq!(lost.resume.consecutive_losses, 1, "counting starts over");
+    }
+}
+
+#[test]
+fn an_owner_resume_of_an_unknown_task_forgets_its_loss() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    lose(&fx, "task-1", &lease, false, "cannot observe");
+
+    let resumed = fx.command("task-1", OwnerCommand::Start, "owner-start");
+
+    assert!(resumed.resume.is_empty());
+}
+
+#[test]
+fn a_policy_resume_keeps_the_count_and_uses_up_the_planned_attempt() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    lose(&fx, "task-1", &lease, true, "exited");
+    let second = lose_again_while_provisioning(&fx, "task-1", &lease, "exited");
+    assert_eq!(second.resume.consecutive_losses, 2);
+
+    let resumed = policy_resume(&fx, "task-1");
+
+    assert_eq!(resumed.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(resumed.resume.consecutive_losses, 2);
+    assert_eq!(resumed.resume.next_attempt_at, None);
+    assert!(resumed.resume.last_loss.is_some());
+}
+
+#[test]
+fn later_controller_reports_keep_the_exhaustion() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    lose(&fx, "task-1", &lease, true, "exited");
+    for _ in 2..=6 {
+        lose_again_while_provisioning(&fx, "task-1", &lease, "exited");
+    }
+    let record = fx.control.task(&task("task-1")).unwrap();
+    let (exhausted, generation) = (record.resume, record.generation);
+    assert!(exhausted.exhausted.is_some());
+
+    let mut status = report("task-1", &lease, generation, Observation::Status, None);
+    status.summary.detail = Some("nothing to do".to_string());
+    let after_status = fx.control.report(status).unwrap().task;
+    let mut repeated = report(
+        "task-1",
+        &lease,
+        generation,
+        Observation::WorkloadLost { state_known: true },
+        None,
+    );
+    repeated.summary.detail = Some("still gone".to_string());
+    let after_loss = fx.control.report(repeated).unwrap().task;
+    let after_confirmation = fx
+        .observe("task-1", &lease, Observation::LossConfirmed)
+        .unwrap();
+
+    assert_eq!(after_status.resume, exhausted);
+    assert_eq!(
+        after_loss.resume, exhausted,
+        "a repeated loss is not recounted"
+    );
+    assert_eq!(after_confirmation.resume, exhausted);
+}
+
+/// Rewrites the stored record as a version before the resume policy wrote
+/// it: no resume state, no running mark, no workload epoch.
+fn strip_resume_fields(fx: &Fixture, id: &str) {
+    let path = fx.root.paths().orchestration_task_file(id);
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("resume");
+    object.remove("running_since");
+    object.remove("workload_epoch");
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+#[test]
+fn a_task_interrupted_before_the_policy_is_resumed_unless_lost_while_pausing() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("running-1", &lease);
+    lose(
+        &fx,
+        "running-1",
+        &lease,
+        true,
+        "the runner's workload exited",
+    );
+    let lost_at = fx.clock.now();
+    fx.running("pausing-1", &lease);
+    fx.command("pausing-1", OwnerCommand::Pause, "pause-1");
+    lose(&fx, "pausing-1", &lease, true, "exited before a safe point");
+    for id in ["running-1", "pausing-1"] {
+        strip_resume_fields(&fx, id);
+        assert!(fx.control.task(&task(id)).unwrap().resume.is_empty());
+    }
+    fx.clock.advance(Duration::hours(2));
+
+    let recovery = fx.reopen().recover().expect("recover");
+
+    assert_eq!(recovery.adopted_losses.len(), 2);
+    let running = fx.control.task(&task("running-1")).unwrap();
+    assert_eq!(running.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(running.resume.consecutive_losses, 1, "a fresh loss");
+    assert_eq!(running.resume.next_attempt_at, Some(fx.clock.now()));
+    let loss = running.resume.last_loss.unwrap();
+    assert_eq!(loss.from, TaskLifecycle::Running);
+    assert_eq!(loss.at, lost_at, "read from the event log");
+    assert_eq!(loss.lease_epoch, lease.epoch);
+    assert_eq!(loss.reason.as_deref(), Some("the runner's workload exited"));
+
+    let pausing = fx.control.task(&task("pausing-1")).unwrap();
+    assert_eq!(pausing.resume.next_attempt_at, None, "waits for the owner");
+    assert_eq!(
+        pausing.resume.last_loss.unwrap().from,
+        TaskLifecycle::PauseRequested
+    );
+
+    // Adopted once: a second recovery changes nothing.
+    let again = fx.reopen().recover().expect("recover again");
+    assert!(again.adopted_losses.is_empty());
+}
+
+#[test]
+fn a_task_unknown_before_the_policy_is_counted_once_confirmed() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    lose(&fx, "task-1", &lease, false, "cannot observe");
+    strip_resume_fields(&fx, "task-1");
+
+    let recovery = fx.reopen().recover().expect("recover");
+
+    assert_eq!(recovery.adopted_losses, vec![task("task-1")]);
+    let adopted = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(adopted.lifecycle, TaskLifecycle::Unknown);
+    assert_eq!(
+        adopted.resume.next_attempt_at, None,
+        "nothing confirmed yet"
+    );
+    assert_eq!(
+        adopted.resume.last_loss.as_ref().unwrap().from,
+        TaskLifecycle::Running
+    );
+
+    let confirmed = fx
+        .observe("task-1", &lease, Observation::LossConfirmed)
+        .unwrap();
+    assert_eq!(confirmed.resume.consecutive_losses, 1);
+    assert_eq!(confirmed.resume.next_attempt_at, Some(fx.clock.now()));
+}
+
+#[test]
+fn recovery_leaves_tasks_that_were_not_lost_and_current_losses_alone() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("running-1", &lease);
+    fx.running("lost-1", &lease);
+    let lost = lose(&fx, "lost-1", &lease, true, "exited");
+
+    let recovery = fx.reopen().recover().expect("recover");
+
+    assert!(recovery.adopted_losses.is_empty());
+    assert!(fx
+        .control
+        .task(&task("running-1"))
+        .unwrap()
+        .resume
+        .is_empty());
+    assert_eq!(fx.control.task(&task("lost-1")).unwrap(), lost);
 }
