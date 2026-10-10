@@ -9,6 +9,11 @@
 //! catches up on the way back. What a refresh must not touch — the selected
 //! step, the mode — is the state of [`Progress`]; what it replaces is the
 //! timeline.
+//!
+//! The axis is a spaced list ([`render_spaced_list`]): one row per step, a
+//! blank row between them, the selected step bracketed — thick while the keys
+//! are on the axis, thin while they read the step's conversation or are
+//! elsewhere.
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -20,8 +25,10 @@ use crate::engine::{ConversationState, Position, PositionStatus};
 use crate::tui::style::{Role, Styles};
 
 use super::super::super::scroll::one_line;
+use super::super::super::selection::{render_spaced_list, PREFIX_WIDTH};
 use super::super::layout::first_row;
 use super::super::list::fit;
+use super::super::StepFocus;
 use super::conversation::{self, Attempt, Attempts};
 
 /// Widest the axis grows, frame included.
@@ -38,6 +45,7 @@ pub struct Progress {
     /// The operator reads the selected step's conversation: a read does not
     /// move the selection, unless the step is gone.
     paused: bool,
+    /// The first step in view on the axis, kept between frames.
     top: usize,
 }
 
@@ -236,35 +244,21 @@ fn status_look(status: PositionStatus) -> (&'static str, Role, &'static str) {
     }
 }
 
-/// One row of the axis.
-fn axis_line(
-    position: &Position,
-    selected: bool,
-    focused: bool,
-    width: usize,
-    styles: &Styles,
-    stale: bool,
-) -> Line<'static> {
+/// One row of the axis, `width` columns wide. The selection is not drawn
+/// here: the spaced list brackets the row (R13).
+fn axis_line(position: &Position, width: usize, styles: &Styles, stale: bool) -> Line<'static> {
     let (glyph, role, word) = status_look(position.status);
     let grey = |role: Role| if stale { Role::Done } else { role };
     let label = fit(
         &one_line(&position.label),
-        width.saturating_sub(4 + word.chars().count()),
+        width.saturating_sub(3 + word.chars().count()),
     );
-    let mut line = Line::from(vec![
-        Span::styled(
-            if selected { "▸" } else { " " },
-            styles.of(grey(Role::Focus)),
-        ),
+    Line::from(vec![
         Span::styled(glyph, styles.of(grey(role))),
         Span::raw(" "),
         Span::styled(label, styles.of(grey(Role::Calm))),
         Span::styled(format!(" {word}"), styles.of(Role::Done)),
-    ]);
-    if selected && focused {
-        line = line.style(styles.of(Role::Selected));
-    }
-    line
+    ])
 }
 
 /// How long a step took, or has been taking.
@@ -324,6 +318,8 @@ fn step_lines(
 }
 
 /// Draws the tab: the axis on the left, the selected step on the right.
+/// `keys` is the level the keys are on, `None` while they are outside the
+/// tab's content: the axis's bracket is thick only on the axis (R12).
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -331,8 +327,9 @@ pub fn render(
     progress: &mut Progress,
     attempts: &mut Attempts,
     stale: bool,
-    focused: bool,
+    keys: Option<StepFocus>,
 ) {
+    let axis_focused = keys == Some(StepFocus::Axis);
     let mut top_rows = 0;
     if let Some(failure) = progress.failure() {
         frame.render_widget(
@@ -374,32 +371,22 @@ pub fn render(
         area.height,
     );
 
-    // The axis keeps its top while the cursor stays in view.
-    let height = usize::from(axis.height).max(1);
-    let cursor = progress.selected_index().unwrap_or(0);
-    if cursor < progress.top {
-        progress.top = cursor;
-    } else if cursor >= progress.top + height {
-        progress.top = cursor + 1 - height;
-    }
-    let lines: Vec<Line> = progress
+    let line_width = usize::from(axis.width.saturating_sub(PREFIX_WIDTH));
+    let items: Vec<Vec<Line>> = progress
         .positions()
         .iter()
-        .enumerate()
-        .skip(progress.top)
-        .take(height)
-        .map(|(index, position)| {
-            axis_line(
-                position,
-                index == cursor,
-                focused,
-                usize::from(axis.width),
-                styles,
-                stale,
-            )
-        })
+        .map(|position| vec![axis_line(position, line_width, styles, stale)])
         .collect();
-    frame.render_widget(Paragraph::new(lines), axis);
+    let selected = progress.selected_index();
+    render_spaced_list(
+        frame,
+        axis,
+        styles,
+        &items,
+        selected,
+        axis_focused,
+        &mut progress.top,
+    );
     if content.width < 8 {
         return;
     }

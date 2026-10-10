@@ -6,8 +6,11 @@
 //! NAR-12  Zmiana API zamówień                             implement v3
 //! Jira NAR-12 ↗   PR: —   ● running · krok 3/5 · 14m
 //!  Przebieg   Rozmowa   Zdarzenia   Dyrygent   Info          podąża
-//! ▸● review_api   │ ● review_api · w toku · agent · 2m
-//!  ✓ plan         │ …
+//!                     ● review_api · w toku · agent · 2m
+//!   ✓ plan ok         …
+//!   ━━━━━━━━━━━━━━
+//! ┃ ● review_api w toku
+//!   ━━━━━━━━━━━━━━
 //! ```
 //!
 //! # What it remembers
@@ -673,6 +676,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
     let frame_focused = app.focus() == Focus::Details;
     let focused = frame_focused && !panel_focused;
     let hyperlinks = app.detail().hyperlinks();
+    let step = app.step_focus();
     // A task created here that the server has not confirmed has no summary
     // yet: its row says where it stands (the new-task form).
     if let Some(pending) = app.list().selected_pending().cloned() {
@@ -711,6 +715,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
     let options = ViewOptions {
         stale,
         focused,
+        step,
         hyperlinks,
     };
     render_view(frame, inner, view, styles, options);
@@ -723,6 +728,8 @@ pub(super) struct ViewOptions {
     pub(super) stale: bool,
     /// The keys are in the tab's content.
     pub(super) focused: bool,
+    /// The level of *Przebieg* the keys are on.
+    pub(super) step: StepFocus,
     /// Links are written as OSC 8 hyperlinks.
     pub(super) hyperlinks: bool,
 }
@@ -739,6 +746,7 @@ pub(super) fn render_view(
     let ViewOptions {
         stale,
         focused,
+        step,
         hyperlinks,
     } = options;
     let panel_height = view
@@ -789,7 +797,7 @@ pub(super) fn render_view(
             &mut view.detail.progress,
             &mut view.detail.attempts,
             stale,
-            focused,
+            focused.then_some(step),
         ),
         (DetailTab::Conversation, None) => {
             conversation::render(frame, content, styles, &mut view.detail.conversation, stale);

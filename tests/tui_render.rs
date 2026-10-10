@@ -1457,19 +1457,14 @@ mod task_app_detail_render {
     }
 
     #[test]
-    fn the_axis_has_a_row_per_step_and_marks_the_selected_one() {
+    fn the_axis_has_a_row_per_step_and_brackets_the_selected_one() {
         let mut app = running_app();
         let buffer = render(&mut app, &Styles::new(false));
         let screen = screen(&buffer);
-        for expected in [
-            "✓ plan #1",
-            "✓ edit #1",
-            "● review #1",
-            "▸● review #1",
-            "w toku",
-        ] {
+        for expected in ["✓ plan #1", "✓ edit #1", "● review #1 w toku"] {
             assert!(screen.contains(expected), "{expected:?} in\n{screen}");
         }
+        assert!(!screen.contains('▸'), "{screen}");
         // The axis is the left part of the details: the selected step's own heading is on the right.
         let row = |needle: &str| {
             rows(&buffer)
@@ -1488,9 +1483,20 @@ mod task_app_detail_render {
                 && row("edit #1") < row("review #1")
                 && row("review #1") < row("test #1")
         );
-        // Without colour the same is said in words and glyphs.
+        assert_eq!(
+            row("edit #1") + 2,
+            row("review #1"),
+            "a blank row between steps"
+        );
+        // The keys are on the axis: a thick bracket in the focus role.
+        assert_axis_bracket(&buffer, "● review #1 w toku", "┃", "━", Color::Cyan);
+        assert!(no_reversed_on_the_axis(&buffer, "● review #1 w toku"));
+        // Without colour the same is said in words, glyphs and weight.
         let plain = render(&mut app, &Styles::new(true));
-        assert!(super::screen(&plain).contains("▸● review #1"));
+        assert_axis_bracket(&plain, "● review #1 w toku", "┃", "━", Color::Reset);
+        let (y, x) = spot(&plain, "● review #1 w toku");
+        assert!(bold_at(&plain, x - 2, y) && bold_at(&plain, x, y - 1));
+        assert!(no_reversed_on_the_axis(&plain, "● review #1 w toku"));
     }
 
     #[test]
@@ -1815,14 +1821,105 @@ mod task_app_detail_render {
             rows[4]
         );
         assert!(
-            screen.contains("✓ plan #1") && screen.contains("▸● review #1"),
+            screen.contains("✓ plan #1") && screen.contains("● review #1 w toku"),
             "{screen}"
         );
+        assert_axis_bracket(&buffer, "● review #1 w toku", "┃", "━", Color::Cyan);
         assert!(
             screen.contains("brak rozmowy: script") || screen.contains("review #1 · w toku"),
             "{screen}"
         );
         assert!(screen.contains("● live"));
+    }
+
+    // -----------------------------------------------------------------
+    // The bracket on the axis (U6)
+    // -----------------------------------------------------------------
+
+    /// The row and the column where `needle` first shows on the screen.
+    fn spot(buffer: &Buffer, needle: &str) -> (u16, u16) {
+        let row = row_of(buffer, needle);
+        let text = &rows(buffer)[row];
+        let column = text[..text.find(needle).unwrap()].chars().count();
+        (row as u16, u16::try_from(column).unwrap())
+    }
+
+    /// Asserts the axis row starting with `needle` is bracketed: `bar` two
+    /// columns to its left, `rule` from its first column in the rows above
+    /// and below, the bar's column and the gap blank there.
+    fn assert_axis_bracket(buffer: &Buffer, needle: &str, bar: &str, rule: &str, colour: Color) {
+        let (y, x) = spot(buffer, needle);
+        let screen = screen(buffer);
+        assert_eq!(
+            cell_at(buffer, x - 2, y),
+            (bar.to_string(), colour),
+            "{screen}"
+        );
+        assert_eq!(cell_at(buffer, x - 1, y).0, " ", "{screen}");
+        for rule_y in [y - 1, y + 1] {
+            assert_eq!(cell_at(buffer, x - 2, rule_y).0, " ", "{screen}");
+            assert_eq!(cell_at(buffer, x - 1, rule_y).0, " ", "{screen}");
+            assert_eq!(
+                cell_at(buffer, x, rule_y),
+                (rule.to_string(), colour),
+                "{screen}"
+            );
+        }
+    }
+
+    /// Whether no cell of the axis around the row of `needle` is in reverse
+    /// video (R7).
+    fn no_reversed_on_the_axis(buffer: &Buffer, needle: &str) -> bool {
+        let (y, x) = spot(buffer, needle);
+        (y - 1..=y + 1).all(|row| {
+            (x - 2..x + 16)
+                .all(|column| !buffer[(column, row)].modifier.contains(Modifier::REVERSED))
+        })
+    }
+
+    /// The keys on the list: the axis keeps its bracket, thin and grey.
+    #[test]
+    fn with_the_keys_on_the_list_the_axis_bracket_is_thin() {
+        let mut app = running_app();
+        press(&mut app, KeyCode::Esc);
+        let buffer = render(&mut app, &Styles::new(false));
+        assert_axis_bracket(&buffer, "● review #1 w toku", "│", "─", Color::DarkGray);
+    }
+
+    /// R11: at 60×20, with more steps than fit, the selected step is in
+    /// view with both of its rules after `G` and after `g`.
+    #[test]
+    fn the_selected_step_and_its_rules_stay_in_view_on_a_small_screen() {
+        let mut app = app();
+        let running = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "s5",
+        );
+        app.load(listing(vec![displayed(running, "NAR-12", &[])], "c"));
+        let steps: Vec<String> = (0..12).map(|index| format!("s{index}")).collect();
+        let positions = steps
+            .iter()
+            .map(|state| position(state, PositionStatus::Succeeded))
+            .collect();
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline("a", positions, Some("s5 #1")))),
+        );
+        press(&mut app, KeyCode::Enter);
+        let small = |app: &mut TaskApp| {
+            draw(60, 20, |frame| {
+                layout::render(frame, app, &Styles::new(false), Instant::now())
+            })
+        };
+        press(&mut app, KeyCode::Char('G'));
+        let bottom = small(&mut app);
+        assert_axis_bracket(&bottom, "✓ s11 #1 ok", "┃", "━", Color::Cyan);
+        press(&mut app, KeyCode::Char('g'));
+        let top = small(&mut app);
+        assert_axis_bracket(&top, "✓ s0 #1 ok", "┃", "━", Color::Cyan);
+        assert!(!screen(&top).contains("s11 #1"), "{}", screen(&top));
     }
 }
 

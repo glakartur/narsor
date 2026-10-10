@@ -968,6 +968,7 @@ pub fn render_details(
     let options = ViewOptions {
         stale,
         focused,
+        step: history.step_focus,
         hyperlinks,
     };
     render_view(frame, inner, view, styles, options);
