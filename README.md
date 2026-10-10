@@ -455,15 +455,15 @@ starts the same interface.
 ```text
 narsor · local ● live             harness claude-code (konfiguracja) · sloty 2/3 · ? 1 · ! 1
 ┏ Zadania ━━━━━━━━━━━━━━━━━┓┌ Zmiana API zamówień ─────────────────────────────────────────┐
-┃  ●  NAR-14 Edycja parsera┃│ Zmiana API zamówień · NAR-12                    implement v3 │
-┃     edit                 ┃│ Jira NAR-12 ↗   PR !482 ↗   running · krok 3/5 · 14m         │
-┃? ●  Zmiana API zamówień  ┃│ Przebieg  Rozmowa  Zdarzenia  Dyrygent  Info                 │
-┃     approval             ┃│ ✓ plan            │ ▸ Read src/api.rs                        │
-┃! ✗  Migracja bazy danyc… ┃│ ✓ implement (2)   │ ▸ Edit src/api.rs  +12 −3                │
-┃     failed               ┃│ ● review_api      │ assistant: Zmieniam sygnaturę…           │
-┃  ◷  Raport tygodniowy    ┃│┌ ? Czeka na Ciebie: approval · 3m ──────────────────────────┐│
-┃     #1                   ┃││ the answer panel                                           ││
-┃                          ┃│└────────────────────────────────────────────────────────────┘│
+┃                          ┃│ Zmiana API zamówień · NAR-12                    implement v3 │
+┃    ●  NAR-14 Edycja pars…┃│ Jira NAR-12 ↗   PR !482 ↗   running · krok 3/5 · 14m         │
+┃       edit               ┃│ Przebieg  Rozmowa  Zdarzenia  Dyrygent  Info                 │
+┃  ━━━━━━━━━━━━━━━━━━━━━━━━┃│  ─────────────────│   Read src/api.rs                        │
+┃┃ ? ●  Zmiana API zamówień┃││ ● review_api     │   Edit src/api.rs  +12 −3                │
+┃┃      approval           ┃│  ─────────────────│ │ assistant: Zmieniam sygnaturę…         │
+┃  ━━━━━━━━━━━━━━━━━━━━━━━━┃│┌ ? Czeka na Ciebie: approval · 3m ──────────────────────────┐│
+┃  ! ✗  Migracja bazy dany…┃││ the answer panel                                           ││
+┃       failed             ┃│└────────────────────────────────────────────────────────────┘│
 ┃                          ┃│                                                              │
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━┛└──────────────────────────────────────────────────────────────┘
 Enter szczegóły  Space następny czekający  . akcje  n nowe  h harness  ?           powiadom.
@@ -491,8 +491,15 @@ problem, a failed step or a failed provisioning), the state icon (`●` running,
 there is none) on the whole width of the list. The second, under the title,
 is the label: the current step, `#n` in the queue, `offline` when no
 controller holds the backend, `nie wysłano`, or the place preview `↕ n/m`
-while moving. Every row is two lines even with no label, so the list scrolls
-by whole tasks; the selection reverses both lines. `z` hides finished tasks as
+while moving. Every row is two lines even with no label and rows are
+separated by an empty one, so the list scrolls by whole tasks and moving the
+selection moves no row. The selection is a bracket, never a fill: a rule in
+the empty row above the task, a rule in the empty row below it and a bar
+beside both its lines, so the row keeps its own colours. The bracket is thick
+and cyan where the keys are, thin and grey elsewhere — the rule of the panel
+frames. The history, the steps on *Przebieg* and every list of choices (the
+menu, the answer panel, the new task, the repositories) mark their selection
+the same way; a conversation and *Zdarzenia* keep only the bar. `z` hides finished tasks as
 a filter; `a` archives one. The selection follows the task, not the row,
 through every refresh.
 
@@ -501,7 +508,14 @@ step, duration) and five tabs: *Przebieg* (the steps and the selected one),
 *Rozmowa* (the agent's conversation), *Zdarzenia*, *Dyrygent* (the conductor's
 chat and decisions; its status line names the harness the conductor runs on)
 and *Info* (the sealed inputs, the observations with their age, the runner and
-the controller). A task that has not started says so and where it stands in
+the controller). `[` / `]` switch the tabs. *Przebieg* has two levels of
+focus: the steps, where the details open, and the conversation of the selected
+step. `Enter` / `→` on a step that has a conversation to show go into it
+(a running step from its first entry on), and there `j` / `k` pick an entry
+and the keys of *Rozmowa* work; `Esc` / `←` go back to the same step. While
+the keys are in a step's conversation the timeline does not move by itself,
+even when following the current step; going back catches up. The history's
+details work the same way, without following. A task that has not started says so and where it stands in
 the queue. When a running task cannot follow the default harness — its
 backend does not run it, or the binary is not on the runner's `PATH` — one
 line under the header says so (`opencode niedostępny tutaj — zostaje
@@ -588,7 +602,10 @@ the current step or a draft.
 |---|---|
 | Everywhere | `?` help, `q` quit (asks when a draft would be lost) |
 | List | `j` / `k` (`↓` / `↑`), `g` / `G`, `Space` next waiting, `Enter` details, `.` menu, `n` `z` `H` `R`, `K` `J` `m`, `p` `x` `t` `s` `a` `o` `r`, `h` default harness |
-| Details | `Esc` list, `←` / `→` tabs, `Tab` content ↔ panel, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` follow the current step, `h` default harness |
+| Details (and the history's details) | `[` / `]` tabs, `Tab` content ↔ panel, `.` menu, `h` default harness; then by where the keys are: |
+| — *Przebieg*, the steps | `Esc` list, `j` / `k` (`↓` / `↑`) `g` / `G` pick a step, `Enter` / `→` the step's conversation, `f` follow the current step |
+| — *Przebieg*, a step's conversation | `Esc` / `←` back to the steps, `j` / `k` `PgUp` / `PgDn` `g` / `G` pick and scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all |
+| — the other tabs | `Esc` list, `j` / `k` `PgUp` / `PgDn` `g` / `G` scroll, `Enter` / `Space` expand an entry, `v` raw entry, `Ctrl+V` raw all, `f` to the end and follow |
 | Panel | `Tab` actions ↔ fields, `Enter` send, `Ctrl+J` new line (also `Shift+Enter` / `Alt+Enter` where the terminal reports modifiers), `Esc` fold, `1`–`9` choose, `[` / `]` previous / next waiting |
 | Menu | `j` / `k`, `1`–`9`, `Enter`, `Esc` and the shortcuts above |
 | Confirmation | `y` confirm, `n` / `Esc` take it back |
