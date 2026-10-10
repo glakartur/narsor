@@ -743,7 +743,9 @@ pub struct ResolvedProfile {
 /// Every pinned component a task's runner environment is made of (KTD5).
 ///
 /// Built once at task creation and never re-resolved for that task: a later
-/// configuration change affects only tasks created after it (R18, R42).
+/// configuration change affects only tasks created after it (R18). The
+/// harness is the exception: it is only the fallback, a running task follows
+/// the live default harness (D56).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedEnvironment {
     /// The base image the main container runs, `None` only on a backend that
@@ -759,7 +761,8 @@ pub struct ResolvedEnvironment {
     pub tools: BTreeMap<String, ResolvedImage>,
     /// The user profile.
     pub profile: ResolvedProfile,
-    /// Harness for agent steps that name none — pinned per task (R42).
+    /// Fallback harness for agent steps that name none, used until the control
+    /// plane sends the live default (D56).
     pub harness: String,
     /// Credentials the controller injects, as references only, by name.
     #[serde(default)]

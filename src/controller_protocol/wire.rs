@@ -70,8 +70,8 @@ pub struct LaunchRequest {
     /// Profile (R16); the owner default when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
-    /// Harness for agent steps that name none (R42); the profile's, else the
-    /// live default, when absent.
+    /// Fallback harness for agent steps that name none (D56); the profile's,
+    /// else the live default, when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
     /// CPU and memory; the backend's default when absent, never above its
