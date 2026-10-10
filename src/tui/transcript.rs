@@ -457,7 +457,7 @@ impl TranscriptState {
                 self.entries
                     .iter()
                     .position(|entry| entry.id == id)
-                    .or_else(|| (!self.entries.is_empty()).then_some(self.entries.len() - 1))
+                    .or_else(|| self.entries.len().checked_sub(1))
                     .map(|index| self.entries[index].id.clone())
             })
             .or_else(|| self.entries.last().map(|entry| entry.id.clone()));

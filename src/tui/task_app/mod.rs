@@ -133,6 +133,19 @@ pub enum Focus {
     Details,
 }
 
+/// Where the keys go on *Przebieg* (R1): the timeline, or the conversation of
+/// the step it picked. Every other tab has one level, so this is
+/// [`StepFocus::Axis`] there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StepFocus {
+    /// The timeline: the keys pick the step.
+    #[default]
+    Axis,
+    /// The selected step's conversation: the keys read it, and the timeline
+    /// holds its step ([`tabs::progress::Progress::is_paused`]).
+    Conversation,
+}
+
 /// The tabs of the details (origin §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailTab {
@@ -178,11 +191,13 @@ impl DetailTab {
 }
 
 /// The keys over the details `base` (the task's or the history's) while `tab`
-/// is shown: the timeline's on *Przebieg*, reading on every other tab.
-fn detail_keys(base: Context, tab: DetailTab) -> Stack {
-    let layer = match (tab, base) {
-        (DetailTab::Progress, Context::HistoryDetails) => Context::HistoryAxis,
-        (DetailTab::Progress, _) => Context::Axis,
+/// is shown: on *Przebieg* the timeline's or the step conversation's, as
+/// `step` says; reading on every other tab.
+fn detail_keys(base: Context, tab: DetailTab, step: StepFocus) -> Stack {
+    let layer = match (tab, step, base) {
+        (DetailTab::Progress, StepFocus::Conversation, _) => Context::StepConversation,
+        (DetailTab::Progress, StepFocus::Axis, Context::HistoryDetails) => Context::HistoryAxis,
+        (DetailTab::Progress, StepFocus::Axis, _) => Context::Axis,
         _ => Context::Reading,
     };
     Stack::layered(layer, base)
@@ -396,6 +411,10 @@ pub struct TaskApp {
     action_keys: BTreeMap<String, String>,
     /// The keyboard is on the answer panel at the bottom of the details.
     panel_focus: bool,
+    /// The level of the focus on *Przebieg*, kept while the panel, a menu or
+    /// the help take the keys and back to the timeline whenever the details
+    /// show something else ([`Self::back_to_axis`]).
+    step_focus: StepFocus,
     quit: bool,
     /// `q` found an unsent draft and asked; the next `q` leaves.
     quit_confirm: bool,
@@ -437,6 +456,7 @@ impl TaskApp {
             overlay: None,
             action_keys: BTreeMap::new(),
             panel_focus: false,
+            step_focus: StepFocus::Axis,
             quit: false,
             quit_confirm: false,
             view: View::Tasks,
@@ -499,6 +519,13 @@ impl TaskApp {
     /// Where the keyboard is.
     pub fn focus(&self) -> Focus {
         self.focus
+    }
+
+    /// The level of the focus on *Przebieg* of the task details: the timeline
+    /// or the selected step's conversation. What draws the timeline and the
+    /// step's transcript asks it which of them has the keys.
+    pub fn step_focus(&self) -> StepFocus {
+        self.step_focus
     }
 
     /// The stream cursor of the state shown: the last event applied, or the
@@ -571,7 +598,7 @@ impl TaskApp {
             return Context::Form.into();
         }
         match layout::context_of(self.focus, &self.list) {
-            Context::Details => detail_keys(Context::Details, self.detail.tab),
+            Context::Details => detail_keys(Context::Details, self.detail.tab, self.step_focus),
             context => context.into(),
         }
     }
@@ -635,12 +662,12 @@ impl TaskApp {
             | Action::RawEntry
             | Action::RawAll
             | Action::Follow
-            | Action::EnterStep
-            | Action::LeaveStep
                 if context == Context::Details =>
             {
                 self.on_detail_action(action)
             }
+            Action::EnterStep if context == Context::Details => self.enter_step(),
+            Action::LeaveStep if context == Context::Details => self.back_to_axis(),
             Action::Compose | Action::UndoDecision | Action::LoadMore
                 if context == Context::Details =>
             {
@@ -656,10 +683,14 @@ impl TaskApp {
             Action::Back => {
                 self.focus = Focus::List;
                 self.panel_focus = false;
+                self.back_to_axis();
             }
             Action::ToggleDone => self.list.toggle_hide_done(),
-            Action::PrevTab => self.detail.tab = self.detail.tab.shifted(-1),
-            Action::NextTab => self.detail.tab = self.detail.tab.shifted(1),
+            Action::PrevTab | Action::NextTab => {
+                let by = if action == Action::PrevTab { -1 } else { 1 };
+                self.detail.tab = self.detail.tab.shifted(by);
+                self.back_to_axis();
+            }
             Action::MoveUp => return self.step_move(true),
             Action::MoveDown => return self.step_move(false),
             Action::MoveMode => self.start_move_mode(),
@@ -714,7 +745,38 @@ impl TaskApp {
             return;
         };
         let tab = self.detail.tab;
-        self.detail.view_mut(&id).on_action(tab, action);
+        let step = self.step_focus;
+        self.detail.view_mut(&id).on_action(tab, step, action);
+    }
+
+    /// `Enter` / `→` on the timeline: into the selected step's conversation,
+    /// when it has one to show; otherwise nothing happens (AE2).
+    fn enter_step(&mut self) {
+        let Some(id) = self.list.selected_id().map(str::to_string) else {
+            return;
+        };
+        if self.detail.view_mut(&id).enter_step() {
+            self.step_focus = StepFocus::Conversation;
+        }
+    }
+
+    /// Back on the timeline: `Esc` / `←` in the step's conversation, and
+    /// whenever the details stop showing it (another tab, another task, the
+    /// list). Every timeline lets its step go, so none stays held by a task
+    /// the operator has left.
+    fn back_to_axis(&mut self) {
+        self.step_focus = StepFocus::Axis;
+        for view in self.detail.views.values_mut() {
+            view.leave_step();
+        }
+    }
+
+    /// Another selected task than `before` starts its details on the
+    /// timeline.
+    fn settle_step_focus(&mut self, before: Option<String>) {
+        if self.list.selected_id() != before.as_deref() {
+            self.back_to_axis();
+        }
     }
 
     /// The selected task with the state its details remember, split so that
@@ -942,7 +1004,9 @@ impl TaskApp {
             .iter()
             .map(|task| (task.task_id.to_string(), task.revision))
             .collect();
+        let selected = self.list.selected_id().map(str::to_string);
         let removal = self.list.replace(listing.tasks);
+        self.settle_step_focus(selected);
         self.detail.retain(self.list.tasks());
         self.detail
             .invalidate_changed(self.list.tasks(), &revisions);
@@ -1035,7 +1099,9 @@ impl TaskApp {
             Some(Ok(envelope)) => {
                 self.connection.on_data(now);
                 self.stream_failures = 0;
+                let selected = self.list.selected_id().map(str::to_string);
                 let effect = self.list.apply_event(&envelope.event);
+                self.settle_step_focus(selected);
                 if effect.applied {
                     self.cursor = Some(envelope.cursor);
                 }

@@ -4,8 +4,11 @@
 //! The selected step follows the one that is running ([`Progress::follows`]):
 //! a read that brings a new current step moves the selection there, until the
 //! operator moves it by hand or presses `f` — and `f` again picks the running
-//! step back up. What a refresh must not touch — the selected step, the mode —
-//! is the state of [`Progress`]; what it replaces is the timeline.
+//! step back up. While the operator reads the selected step's conversation
+//! the selection holds still ([`Progress::pause`]), following or not, and
+//! catches up on the way back. What a refresh must not touch — the selected
+//! step, the mode — is the state of [`Progress`]; what it replaces is the
+//! timeline.
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -32,6 +35,9 @@ pub struct Progress {
     revision: Option<u64>,
     selected: Option<String>,
     follow: bool,
+    /// The operator reads the selected step's conversation: a read does not
+    /// move the selection, unless the step is gone.
+    paused: bool,
     top: usize,
 }
 
@@ -43,6 +49,7 @@ impl Default for Progress {
             revision: None,
             selected: None,
             follow: true,
+            paused: false,
             top: 0,
         }
     }
@@ -70,6 +77,24 @@ impl Progress {
     /// Whether the selection follows the running step.
     pub fn follows(&self) -> bool {
         self.follow
+    }
+
+    /// Whether the selection holds still for the step's conversation.
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Holds the selection where it is while its conversation is read.
+    pub fn pause(&mut self) {
+        self.paused = true;
+    }
+
+    /// Lets the selection go again; with the follow on it jumps to the
+    /// running step it held off.
+    pub fn resume(&mut self) {
+        if std::mem::take(&mut self.paused) && self.follow {
+            self.selected = self.current_label().map(str::to_string);
+        }
     }
 
     /// The label of the selected step.
@@ -125,8 +150,9 @@ impl Progress {
     }
 
     /// Takes a read of the timeline in (`failure` is its reason in words).
-    /// The selection, the cursor and the mode stay; with the follow on, the
-    /// selection moves to the running step.
+    /// The selection, the cursor and the mode stay; with the follow on, and not
+    /// paused, the selection moves to the running step. A selected step that
+    /// is gone moves it anyway and ends the pause.
     pub fn apply(&mut self, revision: u64, result: Result<TimelineResponse, String>) {
         self.revision = Some(revision);
         match result {
@@ -137,7 +163,10 @@ impl Progress {
                     .selected
                     .as_deref()
                     .is_none_or(|label| !self.positions().iter().any(|step| step.label == label));
-                if self.follow || lost {
+                if lost {
+                    self.paused = false;
+                }
+                if (self.follow && !self.paused) || lost {
                     self.selected = self.current_label().map(str::to_string);
                 }
             }

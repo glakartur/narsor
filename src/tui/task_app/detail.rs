@@ -64,13 +64,16 @@ use super::super::keymap::Action;
 use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 use super::list::{fit, state_icon, title_of};
+use super::notify::Severity;
 use super::tabs::conductor::{self, Conductor};
-use super::tabs::conversation::{self, transcript_action, AttemptRead, Attempts, Conversation};
+use super::tabs::conversation::{
+    self, transcript_action, Attempt, AttemptRead, Attempts, Conversation,
+};
 use super::tabs::events::{self, Events};
 use super::tabs::info::{self, Info};
 use super::tabs::progress::{self, Progress};
 use super::waiting::WaitingPanel;
-use super::{failure_reason, DetailTab, DetailView, Focus, TaskApp};
+use super::{failure_reason, DetailTab, DetailView, Focus, StepFocus, TaskApp};
 
 /// Everything the details of one task remember.
 #[derive(Debug, Clone)]
@@ -167,11 +170,12 @@ impl TaskDetail {
         self.waiting.invalidate();
     }
 
-    /// What a key does in `tab`. Cursors, scroll positions and modes live
-    /// here and survive anything but the task being gone.
-    pub fn on_action(&mut self, tab: DetailTab, action: Action) {
+    /// What a key does in `tab`; on *Przebieg* `step` says whether the keys
+    /// pick the step or read its conversation. Cursors, scroll positions and
+    /// modes live here and survive anything but the task being gone.
+    pub fn on_action(&mut self, tab: DetailTab, step: StepFocus, action: Action) {
         match tab {
-            DetailTab::Progress => self.on_progress_action(action),
+            DetailTab::Progress => self.on_progress_action(step, action),
             DetailTab::Conversation => {
                 transcript_action(self.conversation.transcript_mut(), action);
             }
@@ -181,19 +185,20 @@ impl TaskDetail {
         }
     }
 
-    /// On the timeline `j` / `k` / `g` / `G` pick the step; the rest of the
-    /// keys read the step's own conversation.
-    fn on_progress_action(&mut self, action: Action) {
-        match action {
-            Action::Down => self.progress.step(1),
-            Action::Up => self.progress.step(-1),
-            Action::Top => self.progress.first(),
-            Action::Bottom => self.progress.last(),
-            Action::Follow => self.progress.toggle_follow(),
-            // The details do not know a level of focus yet: the timeline
-            // keeps it, and its keys are the axis layer's.
-            Action::EnterStep | Action::LeaveStep => {}
-            other => {
+    /// On the timeline `j` / `k` / `g` / `G` pick the step and `f` follows;
+    /// in the step's conversation the reading keys read it. Entering and
+    /// leaving are the application's: they move the focus.
+    fn on_progress_action(&mut self, step: StepFocus, action: Action) {
+        match (step, action) {
+            (StepFocus::Axis, Action::Down) => self.progress.step(1),
+            (StepFocus::Axis, Action::Up) => self.progress.step(-1),
+            (StepFocus::Axis, Action::Top) => self.progress.first(),
+            (StepFocus::Axis, Action::Bottom) => self.progress.last(),
+            (StepFocus::Axis, Action::Follow) => self.progress.toggle_follow(),
+            (StepFocus::Axis, _)
+            | (StepFocus::Conversation, Action::Follow | Action::EnterStep | Action::LeaveStep) => {
+            }
+            (StepFocus::Conversation, other) => {
                 let attempt = self
                     .progress
                     .selected_position()
@@ -204,6 +209,68 @@ impl TaskDetail {
             }
         }
     }
+
+    /// The selected step's attempt when it has a conversation to show (R2):
+    /// recorded under an attempt's id, read, with a record and at least one
+    /// entry. A banner of a failed read over entries read before does not
+    /// take it away.
+    pub fn step_conversation(&self) -> Option<&Attempt> {
+        let attempt = self
+            .progress
+            .selected_position()
+            .and_then(recorded_attempt)?;
+        self.attempts
+            .get(&attempt)
+            .filter(|attempt| attempt.has_conversation())
+    }
+
+    /// `Enter` / `→` on the timeline: whether the selected step's
+    /// conversation can take the focus. When it can, the timeline holds the
+    /// step until [`Self::leave_step`].
+    pub(super) fn enter_step(&mut self) -> bool {
+        if self.step_conversation().is_none() {
+            return false;
+        }
+        self.progress.pause();
+        true
+    }
+
+    /// Back on the timeline: it lets the step go, and with the follow on
+    /// picks the running one up.
+    pub(super) fn leave_step(&mut self) {
+        self.progress.resume();
+    }
+
+    /// After a read, while the operator is in the step's conversation:
+    /// `None` when it can stay; otherwise the timeline lets the step go and
+    /// the answer says why the focus has to fall back on it.
+    pub(super) fn recheck_step(&mut self) -> Option<StepDrop> {
+        if !self.progress.is_paused() {
+            return Some(StepDrop::Gone);
+        }
+        if self.step_conversation().is_some() {
+            return None;
+        }
+        self.leave_step();
+        Some(StepDrop::Unavailable)
+    }
+}
+
+/// Why the focus fell from a step's conversation back on the timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StepDrop {
+    /// The conversation has nothing to show any more (no record): quietly.
+    Unavailable,
+    /// The step is no longer in the run: the operator is told.
+    Gone,
+}
+
+/// What the bar says when the step whose conversation was read left the run.
+pub(super) fn step_gone_notice(label: &str) -> String {
+    format!(
+        "{}: krok zniknął z przebiegu — fokus wrócił na oś",
+        one_line(label)
+    )
 }
 
 /// An answer to one of the reads the details make.
@@ -385,6 +452,7 @@ impl TaskApp {
     /// connection, a `503` with a reason (the relay missing its deadline) does
     /// not.
     pub fn on_detail_read(&mut self, task_id: &str, revision: u64, read: DetailRead) {
+        let held = self.held_step(task_id);
         match read {
             DetailRead::Timeline(result) => {
                 let result = self.settle(result);
@@ -413,6 +481,32 @@ impl TaskApp {
                     .apply(&attempt_id, revision, from, result);
             }
             DetailRead::Conductor(result) => self.apply_conductor_read(task_id, revision, result),
+        }
+        if let Some(label) = held {
+            self.recheck_step(task_id, &label);
+        }
+    }
+
+    /// The step whose conversation has the focus, when it is `task_id`'s.
+    fn held_step(&self, task_id: &str) -> Option<String> {
+        if self.step_focus != StepFocus::Conversation || self.list.selected_id() != Some(task_id) {
+            return None;
+        }
+        let label = self.detail.view(task_id)?.progress.selected_label()?;
+        Some(label.to_string())
+    }
+
+    /// After a read of `task_id`, whose step `label` the operator reads: back
+    /// on the timeline when its conversation cannot stay, with a word on the
+    /// bar when the step left the run.
+    fn recheck_step(&mut self, task_id: &str, label: &str) {
+        match self.detail.view_mut(task_id).recheck_step() {
+            None => {}
+            Some(StepDrop::Unavailable) => self.back_to_axis(),
+            Some(StepDrop::Gone) => {
+                self.back_to_axis();
+                self.notify(Severity::Warning, step_gone_notice(label));
+            }
         }
     }
 

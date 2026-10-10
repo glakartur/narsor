@@ -2589,6 +2589,381 @@ mod task_app_detail {
         }
     }
 
+    /// *Przebieg* has two levels of focus: the timeline and the selected
+    /// step's conversation (R1–R5).
+    mod step_conversation {
+        use super::*;
+        use narsor::engine::Position;
+        use narsor::tui::keymap::Context;
+        use narsor::tui::task_app::StepFocus;
+
+        fn recorded(state: &str, status: PositionStatus) -> Position {
+            let mut step = position(state, status);
+            step.conversation = ConversationState::Recorded;
+            step
+        }
+
+        /// A timeline of `a` whose every step has a recorded conversation.
+        fn read_recorded(app: &mut TaskApp, revision: u64, steps: &[&str], current: &str) {
+            let positions = steps
+                .iter()
+                .map(|state| {
+                    let status = if format!("{state} #1") == current {
+                        PositionStatus::InProgress
+                    } else {
+                        PositionStatus::Succeeded
+                    };
+                    recorded(state, status)
+                })
+                .collect();
+            read_positions(app, revision, positions, current);
+        }
+
+        fn read_positions(
+            app: &mut TaskApp,
+            revision: u64,
+            positions: Vec<Position>,
+            current: &str,
+        ) {
+            app.on_detail_read(
+                "a",
+                revision,
+                DetailRead::Timeline(Ok(timeline("a", positions, Some(current)))),
+            );
+        }
+
+        fn entry(id: &str) -> TranscriptEntry {
+            TranscriptEntry::new(
+                TranscriptEntryId::from(id),
+                vec![format!("line {id}")],
+                id.as_bytes().to_vec(),
+            )
+            .with_header(format!("AGENT · {id}"))
+        }
+
+        fn attempt_read(entries: &[&str], next_entry: u64, no_record: bool) -> AttemptRead {
+            AttemptRead {
+                entries: entries.iter().map(|id| entry(id)).collect(),
+                next_entry,
+                closed: false,
+                truncated_tail: false,
+                complete: true,
+                no_record,
+            }
+        }
+
+        /// The conversation of `state`'s attempt, read `from` an entry.
+        fn read_step(app: &mut TaskApp, revision: u64, state: &str, from: u64, read: AttemptRead) {
+            app.on_detail_read(
+                "a",
+                revision,
+                DetailRead::Attempt {
+                    attempt_id: format!("act-{state}"),
+                    from,
+                    result: Ok(read),
+                },
+            );
+        }
+
+        /// The details of `a` on *Przebieg*: `plan` done, `implement` running,
+        /// both with three entries read.
+        fn on_the_axis() -> TaskApp {
+            let mut app = details_app();
+            read_recorded(&mut app, 1, &["plan", "implement"], "implement #1");
+            for state in ["plan", "implement"] {
+                read_step(
+                    &mut app,
+                    1,
+                    state,
+                    0,
+                    attempt_read(&["1", "2", "3"], 3, false),
+                );
+            }
+            assert_eq!(app.step_focus(), StepFocus::Axis);
+            app
+        }
+
+        fn layer(app: &TaskApp) -> Option<Context> {
+            app.key_context().layer
+        }
+
+        fn selected_entry(app: &TaskApp, state: &str) -> Option<String> {
+            app.detail()
+                .view("a")?
+                .attempts()
+                .get(&format!("act-{state}"))?
+                .transcript()
+                .selected_entry()
+                .map(|id| id.as_str().to_string())
+        }
+
+        fn note(app: &TaskApp) -> Option<String> {
+            app.notifier().latest().map(|note| note.text.clone())
+        }
+
+        #[test]
+        fn enter_reads_the_steps_conversation_and_esc_goes_back_to_the_same_step() {
+            let mut app = on_the_axis();
+            assert_eq!(layer(&app), Some(Context::Axis));
+
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.step_focus(), StepFocus::Conversation);
+            assert_eq!(layer(&app), Some(Context::StepConversation));
+            assert_eq!(
+                selected_entry(&app, "implement").as_deref(),
+                Some("3"),
+                "the conversation opens where it was: on the last entry"
+            );
+
+            ch(&mut app, 'g');
+            ch(&mut app, 'j');
+            assert_eq!(selected_entry(&app, "implement").as_deref(), Some("2"));
+            assert_eq!(
+                selected_step(&app, "a").as_deref(),
+                Some("implement #1"),
+                "j picks an entry, not a step"
+            );
+
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.step_focus(), StepFocus::Axis);
+            assert_eq!(app.focus(), Focus::Details);
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("implement #1"));
+            assert_eq!(
+                selected_entry(&app, "implement").as_deref(),
+                Some("2"),
+                "the place in the conversation is kept for the way back"
+            );
+
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.focus(), Focus::List);
+        }
+
+        #[test]
+        fn the_arrows_enter_and_leave_like_enter_and_esc() {
+            let mut app = on_the_axis();
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.step_focus(), StepFocus::Conversation);
+            press(&mut app, KeyCode::Up);
+            assert_eq!(selected_entry(&app, "implement").as_deref(), Some("2"));
+            press(&mut app, KeyCode::Left);
+            assert_eq!(app.step_focus(), StepFocus::Axis);
+            assert_eq!(app.focus(), Focus::Details);
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("implement #1"));
+        }
+
+        #[test]
+        fn a_step_without_a_record_keeps_the_focus_on_the_axis_and_says_nothing() {
+            let mut app = details_app();
+            read_timeline(&mut app, "a", 1, &["analyze"], "analyze #1");
+            let before = note(&app);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.step_focus(), StepFocus::Axis);
+            assert_eq!(layer(&app), Some(Context::Axis));
+            assert_eq!(app.focus(), Focus::Details);
+            assert_eq!(note(&app), before, "no notification");
+        }
+
+        #[test]
+        fn a_step_with_nothing_to_show_cannot_be_entered() {
+            // Not read yet.
+            let mut app = details_app();
+            read_recorded(&mut app, 1, &["plan"], "plan #1");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.step_focus(), StepFocus::Axis, "not read yet");
+
+            // Recorded, but without the attempt's id.
+            let mut app = details_app();
+            let mut step = recorded("plan", PositionStatus::Succeeded);
+            step.action_execution_id = None;
+            read_positions(&mut app, 1, vec![step], "plan #1");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.step_focus(), StepFocus::Axis, "no attempt");
+
+            // Never created.
+            let mut app = details_app();
+            let mut step = position("plan", PositionStatus::Failed);
+            step.conversation = ConversationState::NotCreated {
+                reason: "the harness did not start".into(),
+            };
+            read_positions(&mut app, 1, vec![step], "plan #1");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.step_focus(), StepFocus::Axis, "never created");
+
+            // The runner holds no record of it.
+            let mut app = details_app();
+            read_recorded(&mut app, 1, &["plan"], "plan #1");
+            read_step(&mut app, 1, "plan", 0, attempt_read(&[], 0, true));
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.step_focus(), StepFocus::Axis, "no record");
+
+            // Running, nothing said yet.
+            let mut app = details_app();
+            read_recorded(&mut app, 1, &["plan"], "plan #1");
+            read_step(&mut app, 1, "plan", 0, attempt_read(&[], 0, false));
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.step_focus(), StepFocus::Axis, "no entry yet");
+
+            // The first entry opens the way.
+            read_step(&mut app, 2, "plan", 0, attempt_read(&["1"], 1, false));
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.step_focus(), StepFocus::Conversation);
+        }
+
+        #[test]
+        fn a_new_step_does_not_move_the_axis_while_its_conversation_is_read() {
+            let mut app = details_app();
+            read_recorded(&mut app, 1, &["plan"], "plan #1");
+            read_step(&mut app, 1, "plan", 0, attempt_read(&["1"], 1, false));
+            assert!(app.detail().view("a").unwrap().progress().follows());
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.step_focus(), StepFocus::Conversation);
+
+            read_recorded(&mut app, 2, &["plan", "implement"], "implement #1");
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("plan #1"));
+            assert_eq!(app.step_focus(), StepFocus::Conversation);
+            assert!(app.detail().view("a").unwrap().progress().follows());
+
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(
+                selected_step(&app, "a").as_deref(),
+                Some("implement #1"),
+                "back on the axis, the following catches up"
+            );
+        }
+
+        #[test]
+        fn without_following_the_way_back_keeps_the_step() {
+            let mut app = on_the_axis();
+            ch(&mut app, 'k');
+            assert!(!app.detail().view("a").unwrap().progress().follows());
+            press(&mut app, KeyCode::Enter);
+            read_recorded(&mut app, 2, &["plan", "implement", "review"], "review #1");
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("plan #1"));
+        }
+
+        #[test]
+        fn f_does_nothing_in_the_conversation() {
+            let mut app = on_the_axis();
+            press(&mut app, KeyCode::Enter);
+            ch(&mut app, 'g');
+            ch(&mut app, 'f');
+            assert!(app.detail().view("a").unwrap().progress().follows());
+            assert_eq!(
+                selected_entry(&app, "implement").as_deref(),
+                Some("1"),
+                "f is not the end of the conversation either"
+            );
+            assert_eq!(app.step_focus(), StepFocus::Conversation);
+        }
+
+        #[test]
+        fn a_step_that_leaves_the_run_drops_the_focus_to_the_axis_and_says_so() {
+            let mut app = on_the_axis();
+            ch(&mut app, 'k');
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.step_focus(), StepFocus::Conversation);
+            read_recorded(&mut app, 2, &["implement"], "implement #1");
+            assert_eq!(app.step_focus(), StepFocus::Axis);
+            assert_eq!(layer(&app), Some(Context::Axis));
+            assert_eq!(selected_step(&app, "a").as_deref(), Some("implement #1"));
+            let said = note(&app).unwrap_or_default();
+            assert!(said.contains("plan #1"), "{said}");
+            assert_eq!(
+                app.notifier().latest().unwrap().severity,
+                narsor::tui::task_app::notify::Severity::Warning
+            );
+        }
+
+        #[test]
+        fn a_conversation_that_stops_being_shown_drops_the_focus_quietly() {
+            let mut app = on_the_axis();
+            press(&mut app, KeyCode::Enter);
+            let before = note(&app);
+            read_step(&mut app, 2, "implement", 0, attempt_read(&[], 0, true));
+            assert_eq!(app.step_focus(), StepFocus::Axis);
+            assert_eq!(note(&app), before, "no notification");
+        }
+
+        #[test]
+        fn a_failed_read_keeps_the_conversation_and_what_was_read() {
+            let mut app = on_the_axis();
+            press(&mut app, KeyCode::Enter);
+            app.on_detail_read(
+                "a",
+                2,
+                DetailRead::Attempt {
+                    attempt_id: "act-implement".to_string(),
+                    from: 3,
+                    result: Err(ClientError::Degraded {
+                        code: "runner_timeout".into(),
+                        message: "the runner did not answer".into(),
+                    }),
+                },
+            );
+            assert_eq!(app.step_focus(), StepFocus::Conversation);
+        }
+
+        #[test]
+        fn switching_the_tab_leaves_the_conversation_for_the_axis() {
+            let mut app = on_the_axis();
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char(']'));
+            assert_eq!(app.detail().tab(), DetailTab::Conversation);
+            assert_eq!(layer(&app), Some(Context::Reading));
+            press(&mut app, KeyCode::Char('['));
+            assert_eq!(app.detail().tab(), DetailTab::Progress);
+            assert_eq!(app.step_focus(), StepFocus::Axis);
+            assert_eq!(layer(&app), Some(Context::Axis));
+        }
+
+        #[test]
+        fn another_selected_task_starts_on_the_axis() {
+            let mut app = on_the_axis();
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.step_focus(), StepFocus::Conversation);
+            // `a` was archived elsewhere: the selection moves to `b`.
+            app.load(listing(vec![titled(running("b", 2), "NAR-2")], "d"));
+            assert_eq!(app.list().selected_id(), Some("b"));
+            assert_eq!(app.focus(), Focus::Details);
+            assert_eq!(app.step_focus(), StepFocus::Axis);
+            assert_eq!(layer(&app), Some(Context::Axis));
+        }
+
+        #[test]
+        fn opening_the_details_again_starts_on_the_axis() {
+            let mut app = on_the_axis();
+            press(&mut app, KeyCode::Enter);
+            // Help and back: the level stays.
+            ch(&mut app, '?');
+            assert!(app.is_help_open());
+            ch(&mut app, 'x');
+            assert_eq!(app.step_focus(), StepFocus::Conversation);
+            // Away to b and back to a.
+            press(&mut app, KeyCode::Esc);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.focus(), Focus::List);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.step_focus(), StepFocus::Axis);
+            assert_eq!(
+                selected_step(&app, "a").as_deref(),
+                Some("implement #1"),
+                "and the timeline follows again"
+            );
+        }
+
+        #[test]
+        fn new_entries_keep_the_picked_entry_and_the_conversation() {
+            let mut app = on_the_axis();
+            press(&mut app, KeyCode::Enter);
+            ch(&mut app, 'k');
+            assert_eq!(selected_entry(&app, "implement").as_deref(), Some("2"));
+            read_step(&mut app, 2, "implement", 3, attempt_read(&["4"], 4, false));
+            assert_eq!(selected_entry(&app, "implement").as_deref(), Some("2"));
+            assert_eq!(app.step_focus(), StepFocus::Conversation);
+        }
+    }
+
     mod not_started {
         use super::*;
 
@@ -4225,6 +4600,72 @@ mod task_app_waiting {
         assert!(app.panel_focused());
     }
 
+    /// The timeline of `id` at `revision` with one running step,
+    /// `review_scope`, whose conversation has two entries read.
+    fn read_step_conversation(app: &mut TaskApp, id: &str, revision: u64) {
+        use narsor::engine::ConversationState;
+        use narsor::tui::task_app::tabs::conversation::AttemptRead;
+        use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
+        let mut step = position("review_scope", PositionStatus::InProgress);
+        step.conversation = ConversationState::Recorded;
+        app.on_detail_read(
+            id,
+            revision,
+            DetailRead::Timeline(Ok(timeline(id, vec![step], Some("review_scope #1")))),
+        );
+        let entries = ["1", "2"]
+            .into_iter()
+            .map(|entry| {
+                TranscriptEntry::new(
+                    TranscriptEntryId::from(entry),
+                    vec![format!("line {entry}")],
+                    Vec::new(),
+                )
+            })
+            .collect();
+        app.on_detail_read(
+            id,
+            revision,
+            DetailRead::Attempt {
+                attempt_id: "act-review_scope".to_string(),
+                from: 0,
+                result: Ok(AttemptRead {
+                    entries,
+                    next_entry: 2,
+                    closed: false,
+                    truncated_tail: false,
+                    complete: true,
+                    no_record: false,
+                }),
+            },
+        );
+    }
+
+    #[test]
+    fn the_steps_conversation_keeps_its_focus_through_the_panel_and_the_menu() {
+        use narsor::tui::keymap::Context;
+        use narsor::tui::task_app::StepFocus;
+        let mut app = gate_app();
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.panel_focused() && app.focus() == Focus::Details);
+        read_step_conversation(&mut app, "a", 1);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.step_focus(), StepFocus::Conversation);
+
+        press(&mut app, KeyCode::Tab);
+        assert!(app.panel_focused());
+        assert_eq!(app.step_focus(), StepFocus::Conversation);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.panel_focused());
+        assert_eq!(app.key_context().layer, Some(Context::StepConversation));
+
+        ch(&mut app, '.');
+        assert_eq!(app.key_context().base, Context::Menu);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.key_context().layer, Some(Context::StepConversation));
+        assert_eq!(app.step_focus(), StepFocus::Conversation);
+    }
+
     #[test]
     fn untyped_keys_of_the_panel_are_the_keymaps() {
         let mut app = gate_app();
@@ -4348,6 +4789,36 @@ mod task_app_waiting {
         );
         assert_eq!(summary.inputs[0].pending_input_id, "ep-a");
         assert!(!app.detail().has_drafts());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_sent_from_the_steps_conversation_opens_the_details_again_on_the_axis() {
+        use narsor::tui::task_app::StepFocus;
+        let harness = RemoteHarness::start().await;
+        let _running = harness
+            .running("NAR-12", "local", approval_snapshot(1))
+            .await;
+        let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+        app.refresh().await;
+
+        ch(&mut app, ' ');
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        let revision = app.list().selected().unwrap().revision;
+        read_step_conversation(&mut app, "NAR-12", revision);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.step_focus(), StepFocus::Conversation);
+
+        press(&mut app, KeyCode::Tab);
+        assert!(app.panel_focused());
+        ch(&mut app, '1');
+        let request = press(&mut app, KeyCode::Enter);
+        app.perform(request).await;
+        assert_eq!(app.focus(), Focus::List, "{:?}", app.notifier().latest());
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Details);
+        assert_eq!(app.step_focus(), StepFocus::Axis);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -8293,6 +8764,53 @@ mod task_app_create {
             let said = note(&app);
             assert!(said.contains("wznowienie exec-old odrzucone"), "{said}");
             assert!(said.contains("completed"), "{said}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_conversation_of_an_old_step_is_entered_from_its_timeline() {
+            use narsor::tui::task_app::StepFocus;
+            let harness = RemoteHarness::start().await;
+            seed_old_execution(harness.root.path(), "exec-old");
+            let mut app = TaskApp::new(harness.owner.clone(), "test", None);
+            app.refresh().await;
+            let request = ch(&mut app, 'H');
+            app.perform(request).await;
+            press(&mut app, KeyCode::Enter);
+            app.sync_detail().await;
+            assert_eq!(app.key_context().layer, Some(Context::HistoryAxis));
+
+            press(&mut app, KeyCode::Enter);
+            let history = app.history().unwrap();
+            assert_eq!(history.step_focus(), StepFocus::Conversation);
+            assert_eq!(app.key_context().layer, Some(Context::StepConversation));
+            let picked = |app: &TaskApp| {
+                let detail = app.history().unwrap().selected_detail().unwrap();
+                let attempt = detail.attempts().get("attempt-1").unwrap();
+                attempt
+                    .transcript()
+                    .selected_entry()
+                    .map(|id| id.as_str().to_string())
+            };
+            ch(&mut app, 'g');
+            let first = picked(&app);
+            ch(&mut app, 'j');
+            assert_ne!(picked(&app), first, "j picks the next entry");
+
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.history().unwrap().step_focus(), StepFocus::Axis);
+            assert_eq!(app.key_context().layer, Some(Context::HistoryAxis));
+            assert_eq!(app.focus(), narsor::tui::task_app::Focus::Details);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.key_context().base, Context::History);
+            assert_eq!(app.view_kind(), ViewKind::History);
+
+            // Back into the details: on the timeline again.
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.history().unwrap().step_focus(), StepFocus::Conversation);
+            press(&mut app, KeyCode::Char(']'));
+            press(&mut app, KeyCode::Char('['));
+            assert_eq!(app.history().unwrap().step_focus(), StepFocus::Axis);
         }
 
         #[tokio::test(flavor = "multi_thread")]

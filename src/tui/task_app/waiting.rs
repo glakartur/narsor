@@ -1025,6 +1025,7 @@ impl TaskApp {
         };
         self.focus = super::Focus::Details;
         self.panel_focus = false;
+        self.back_to_axis();
         self.sync_waiting();
         if let Some(view) = self.detail.views.get_mut(&id) {
             if view.waiting.is_present() {
@@ -1241,6 +1242,7 @@ impl TaskApp {
                 self.settle_answer(&task_id, &waiting_id, Ok(()));
                 self.focus = super::Focus::List;
                 self.panel_focus = false;
+                self.back_to_axis();
                 self.notify(Severity::Success, format!("{title}: {summary}"));
             }
             Err(error) => {

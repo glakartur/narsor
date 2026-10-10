@@ -188,6 +188,12 @@ impl Attempt {
         self.entries.len()
     }
 
+    /// Whether there is a conversation to read: the runner holds a record
+    /// and at least one entry of it was read.
+    pub fn has_conversation(&self) -> bool {
+        !self.no_record && !self.entries.is_empty()
+    }
+
     /// Whether the attempt's conversation is closed.
     pub fn is_closed(&self) -> bool {
         self.closed
