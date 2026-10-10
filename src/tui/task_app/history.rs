@@ -32,7 +32,6 @@ use std::time::Instant;
 
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{List, ListItem, ListState};
 use ratatui::Frame;
 use serde_json::json;
 
@@ -48,6 +47,7 @@ use crate::engine::Timeline;
 
 use super::super::keymap::{self, Action, Context, Stack};
 use super::super::scroll::one_line;
+use super::super::selection::{render_spaced_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
 use super::detail::TaskDetail;
 use super::detail::{
@@ -240,7 +240,9 @@ pub struct History {
     details: BTreeMap<String, TaskDetail>,
     /// Why the old executions could not be listed, when they could not.
     note: Option<String>,
-    view: ListState,
+    /// The first row of the list in view, kept between frames so that a new
+    /// read does not scroll the list.
+    top: usize,
 }
 
 impl History {
@@ -258,7 +260,7 @@ impl History {
             revision: 1,
             details: BTreeMap::new(),
             note,
-            view: ListState::default(),
+            top: 0,
         };
         history.set_entries(archived, legacy);
         history
@@ -880,7 +882,8 @@ async fn read_conductor(
 // Drawing
 // ---------------------------------------------------------------------
 
-/// Draws the list of the history into `area`.
+/// Draws the list of the history into `area`, bracketing the selected entry
+/// ([`render_spaced_list`]); the bracket is thick while `focused`.
 pub fn render_list(
     frame: &mut Frame,
     area: Rect,
@@ -891,22 +894,21 @@ pub fn render_list(
 ) {
     let inner = styles.render_panel(frame, area, " Historia ", focused);
     let rows = history.rows();
-    let selected = history.selected;
-    let items: Vec<ListItem> = rows
+    let width = usize::from(inner.width.saturating_sub(PREFIX_WIDTH));
+    let items: Vec<Vec<Line>> = rows
         .iter()
-        .enumerate()
-        .map(|(index, row)| {
-            ListItem::new(row_text(
-                row,
-                usize::from(inner.width),
-                styles,
-                stale,
-                index == selected,
-            ))
-        })
+        .map(|row| row_text(row, width, styles, stale))
         .collect();
-    history.view.select((!rows.is_empty()).then_some(selected));
-    frame.render_stateful_widget(List::new(items), inner, &mut history.view);
+    let selected = (!rows.is_empty()).then_some(history.selected);
+    render_spaced_list(
+        frame,
+        inner,
+        styles,
+        &items,
+        selected,
+        focused,
+        &mut history.top,
+    );
     if rows.is_empty() {
         let text = history.note().unwrap_or("historia jest pusta").to_string();
         frame.render_widget(

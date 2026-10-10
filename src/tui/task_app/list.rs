@@ -32,12 +32,16 @@
 //! the current step, `#n` for a queued task, `offline` when no controller holds
 //! the backend. Everything that comes from the server is passed through
 //! [`one_line`] before it is drawn.
+//!
+//! The rows are drawn as a spaced list ([`render_spaced_list`]): a blank row
+//! between tasks, and a bracket — rules above and below, a bar beside both
+//! lines — around the selected one instead of reverse video, so its markers
+//! keep their colours. A task thus takes three rows of the column.
 
 use std::collections::HashMap;
 
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{List, ListItem, ListState};
+use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
 use crate::cli::task_text::lifecycle_name;
@@ -51,6 +55,7 @@ use crate::orchestration::{
 };
 
 use super::super::scroll::one_line;
+use super::super::selection::{render_spaced_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
 
 /// What a row asks of the operator (column 1).
@@ -394,7 +399,9 @@ pub struct TaskList {
     selected: Option<String>,
     hide_done: bool,
     moving: Option<MoveMode>,
-    view: ListState,
+    /// The first row in view, kept between frames so that a refresh does not
+    /// scroll the list.
+    top: usize,
 }
 
 impl Default for TaskList {
@@ -412,7 +419,7 @@ impl TaskList {
             selected: None,
             hide_done: false,
             moving: None,
-            view: ListState::default(),
+            top: 0,
         }
     }
 
@@ -1047,8 +1054,10 @@ impl TaskList {
     // -----------------------------------------------------------------
 
     /// Draws the list into `area`: a column titled `Zadania`, one row per
-    /// task. `focused` lights the frame; `stale` greys every row (no
-    /// connection: the rows are a memory, not news).
+    /// task, with a blank row between rows and a bracket around the selected
+    /// one ([`render_spaced_list`]). `focused` lights the frame and thickens
+    /// the bracket; `stale` greys every row (no connection: the rows are a
+    /// memory, not news).
     pub fn render(
         &mut self,
         frame: &mut Frame,
@@ -1098,25 +1107,23 @@ impl TaskList {
                     .map(|row| (row.task_id.clone(), row.text())),
             )
             .collect();
-        let selected = self.selected.clone();
-        let items: Vec<ListItem> = rows
+        let width = usize::from(inner.width.saturating_sub(PREFIX_WIDTH));
+        let items: Vec<Vec<Line>> = rows
             .iter()
-            .map(|(id, row)| {
-                let is_selected = selected.as_deref() == Some(id.as_str());
-                ListItem::new(row_text(
-                    row,
-                    usize::from(inner.width),
-                    styles,
-                    stale,
-                    is_selected,
-                ))
-            })
+            .map(|(_, row)| row_text(row, width, styles, stale))
             .collect();
-        self.view.select(
-            rows.iter()
-                .position(|(id, _)| selected.as_deref() == Some(id.as_str())),
+        let selected = rows
+            .iter()
+            .position(|(id, _)| self.selected.as_deref() == Some(id.as_str()));
+        render_spaced_list(
+            frame,
+            inner,
+            styles,
+            &items,
+            selected,
+            focused,
+            &mut self.top,
         );
-        frame.render_stateful_widget(List::new(items), inner, &mut self.view);
     }
 }
 
@@ -1299,16 +1306,17 @@ pub fn fit(text: &str, width: usize) -> String {
 /// a space, state, two spaces.
 const ROW_PREFIX: usize = 5;
 
-/// One row as two styled lines of exactly `width` columns: the markers and
-/// the title, then the label under the title. The second line is there even
-/// when the label is empty, so every row is as tall as the next.
+/// One row as two styled lines laid out in `width` columns — the content
+/// width, the bracket's column already taken off: the markers and the title,
+/// then the label under the title. The second line is there even when the
+/// label is empty, so every row is as tall as the next. The lines carry the
+/// roles of their content only; the selection is drawn around them.
 pub(super) fn row_text(
     row: &RowText,
     width: usize,
     styles: &Styles,
     stale: bool,
-    selected: bool,
-) -> Text<'static> {
+) -> Vec<Line<'static>> {
     let text_width = width.saturating_sub(ROW_PREFIX);
     let grey = |role: Role| if stale { Role::Done } else { role };
     let label_role = match row.label.as_str() {
@@ -1318,7 +1326,7 @@ pub(super) fn row_text(
         _ => Role::Done,
     };
 
-    let first = vec![
+    let first = Line::from(vec![
         Span::styled(
             row.attention.glyph().to_string(),
             styles.of(grey(row.attention.role())),
@@ -1330,20 +1338,10 @@ pub(super) fn row_text(
         ),
         Span::raw("  "),
         Span::styled(fit(&row.title, text_width), styles.of(grey(Role::Calm))),
-    ];
-    let second = vec![
+    ]);
+    let second = Line::from(vec![
         Span::raw(" ".repeat(ROW_PREFIX.min(width))),
         Span::styled(fit(&row.label, text_width), styles.of(grey(label_role))),
-    ];
-    let finish = |mut spans: Vec<Span<'static>>| {
-        let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
-        spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-        if selected {
-            for span in &mut spans {
-                span.style = styles.selected(span.style);
-            }
-        }
-        Line::from(spans)
-    };
-    Text::from(vec![finish(first), finish(second)])
+    ]);
+    vec![first, second]
 }
