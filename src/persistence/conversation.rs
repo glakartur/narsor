@@ -111,6 +111,11 @@ pub struct ConversationSnapshot {
     /// trace of a writer killed mid-`write_all`. That line is never included
     /// in `entries`; this is the only signal that it existed.
     pub truncated_tail: bool,
+    /// When the record was last written: the plain file's modification
+    /// time while the attempt is open, the timestamp of its last whole
+    /// entry once closed (compression gives the `.zst` a fresh mtime, so
+    /// it says nothing about the conversation). `None` for an empty record.
+    pub recorded_at: Option<DateTime<Utc>>,
 }
 
 /// Append-only writer for one attempt's conversation file.
@@ -312,6 +317,10 @@ impl ConversationStore {
         let source_path = if closed { &zst_path } else { &jsonl_path };
         let (lines, trailing) = split_lines(&bytes);
         let truncated_tail = trailing.is_some();
+        let last_entry_at = lines
+            .last()
+            .and_then(|line| serde_json::from_slice::<Envelope>(line).ok())
+            .map(|envelope| envelope.ts);
 
         let mut entries = Vec::new();
         let mut budget_used = 0usize;
@@ -352,11 +361,18 @@ impl ConversationStore {
             });
         }
 
+        let recorded_at = if closed {
+            last_entry_at
+        } else {
+            modified_at(&jsonl_path).or(last_entry_at)
+        };
+
         Ok(Some(ConversationSnapshot {
             entries,
             next_entry,
             closed,
             truncated_tail,
+            recorded_at,
         }))
     }
 
@@ -435,6 +451,15 @@ impl ConversationStore {
         }
         Ok(ids)
     }
+}
+
+/// The modification time of `path`, when it can be read: the file may have
+/// been compressed away since its bytes were read.
+fn modified_at(path: &Path) -> Option<DateTime<Utc>> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .map(DateTime::<Utc>::from)
 }
 
 /// Restricts `path` to owner-only read/write (`0600`).

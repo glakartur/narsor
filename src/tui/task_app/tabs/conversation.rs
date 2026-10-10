@@ -110,6 +110,7 @@ where
                 next_entry,
                 closed,
                 truncated_tail,
+                ..
             } => {
                 let empty = page.is_empty();
                 entries.extend(

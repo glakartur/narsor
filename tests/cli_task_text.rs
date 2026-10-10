@@ -116,6 +116,8 @@ fn runner_text_never_reaches_a_terminal_as_control_sequences() {
             last_entry_at: None,
         }],
         observed_at: Utc::now(),
+        source: Default::default(),
+        recorded_at: None,
     };
     for line in conversation_lines(Utc::now(), &conversation) {
         assert!(clean(&line.text), "{:?}", line.text);

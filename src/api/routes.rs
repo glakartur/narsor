@@ -77,7 +77,7 @@ use crate::conductor::{
     UndoError, UndoOutcome,
 };
 use crate::controller_protocol::http as protocol_http;
-use crate::controller_protocol::ProtocolError;
+use crate::controller_protocol::{ExecutionEventsSource, ProtocolError};
 use crate::domain::TaskId;
 use crate::domain::{Event, ExecutionStatus};
 use crate::engine::{
@@ -86,8 +86,9 @@ use crate::engine::{
 use crate::environment::{CatalogLaunchResolver, LaunchIntent};
 use crate::orchestration::OwnerRef;
 use crate::persistence::{
-    ConversationSource, DefaultHarnessSelector, ExecutionStore, HarnessSelectionError,
-    HarnessSelectionSnapshot as PersistenceHarnessSelectionSnapshot, PersistenceError,
+    ConversationSnapshot, ConversationSource, DefaultHarnessSelector, ExecutionStore,
+    HarnessSelectionError, HarnessSelectionSnapshot as PersistenceHarnessSelectionSnapshot,
+    PersistenceError,
 };
 use crate::tasks::{self, TaskError};
 use crate::workflows::WorkflowResolver;
@@ -944,6 +945,17 @@ pub enum ConversationResponse {
         closed: bool,
         /// Whether the on-disk file's last line was incomplete when read.
         truncated_tail: bool,
+        /// Where the control plane read the page from: the live runner, or
+        /// the task's own storage on the daemon that holds it. Absent from
+        /// a runner's upload, from the local execution API and from older
+        /// servers — read as the live runner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<ExecutionEventsSource>,
+        /// When the record was last written
+        /// ([`crate::persistence::ConversationSnapshot::recorded_at`]); set
+        /// only on a page read from the task's storage.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recorded_at: Option<DateTime<Utc>>,
     },
     /// No conversation record exists for this attempt: a non-agent step, an
     /// agent step whose conversation never started, or an old-format log.
@@ -981,25 +993,34 @@ fn read_conversation(
     }
     let store = execution_store.conversation_store(execution_id);
     let snapshot = store.read(attempt_id, from, byte_budget)?;
+    Ok(ConversationResponse::from_snapshot(snapshot))
+}
 
-    Ok(match snapshot {
-        Some(snapshot) => ConversationResponse::Recorded {
-            entries: snapshot
-                .entries
-                .into_iter()
-                .map(|entry| ConversationEntryDto {
-                    entry_number: entry.entry_number,
-                    timestamp: entry.timestamp,
-                    source: entry.source,
-                    raw_base64: base64_encode(&entry.raw),
-                })
-                .collect(),
-            next_entry: snapshot.next_entry,
-            closed: snapshot.closed,
-            truncated_tail: snapshot.truncated_tail,
-        },
-        None => ConversationResponse::NoRecord,
-    })
+impl ConversationResponse {
+    /// The wire page of what [`crate::persistence::ConversationStore::read`]
+    /// returned, without a source: the caller that knows one sets it.
+    pub fn from_snapshot(snapshot: Option<ConversationSnapshot>) -> Self {
+        match snapshot {
+            Some(snapshot) => Self::Recorded {
+                entries: snapshot
+                    .entries
+                    .into_iter()
+                    .map(|entry| ConversationEntryDto {
+                        entry_number: entry.entry_number,
+                        timestamp: entry.timestamp,
+                        source: entry.source,
+                        raw_base64: base64_encode(&entry.raw),
+                    })
+                    .collect(),
+                next_entry: snapshot.next_entry,
+                closed: snapshot.closed,
+                truncated_tail: snapshot.truncated_tail,
+                source: None,
+                recorded_at: None,
+            },
+            None => Self::NoRecord,
+        }
+    }
 }
 
 fn base64_encode(raw: &[u8]) -> String {

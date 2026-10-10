@@ -16,14 +16,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use narsor::api::{self, ApiClient, ApiServices, ClientError};
+use narsor::api::{
+    self, ApiClient, ApiServices, ClientError, ConversationResponse as PageResponse,
+};
 use narsor::controller_protocol::{
-    CommandAck, ConductorReadQuery, ConductorReadResponse, ControllerClient, ConversationResponse,
-    ConversationUnavailableReason, CreateEnrollmentRequest, CreateTaskRequest, DesiredAction,
-    ExecutionEventsPage, ExecutionEventsQuery, ExecutionEventsResponse, ExecutionEventsSource,
-    Freshness, LaunchRequest, OwnerCommandRequest, ProtocolConfig, ProtocolService, RelayFailure,
-    ReportRequest, RunnerClient, RunnerCredentialRequest, RunnerDirective, SubmitInputRequest,
-    SubmitOperatorCommandRequest, TaskDefaultHarness, TaskSummary,
+    CommandAck, ConductorReadQuery, ConductorReadResponse, ControllerClient, ConversationPageQuery,
+    ConversationResponse, ConversationUnavailableReason, CreateEnrollmentRequest,
+    CreateTaskRequest, DesiredAction, ExecutionEventsPage, ExecutionEventsQuery,
+    ExecutionEventsResponse, ExecutionEventsSource, Freshness, LaunchRequest, OwnerCommandRequest,
+    ProtocolConfig, ProtocolService, RelayFailure, ReportRequest, RunnerClient,
+    RunnerCredentialRequest, RunnerDirective, SubmitInputRequest, SubmitOperatorCommandRequest,
+    TaskDefaultHarness, TaskSummary, LOCAL_OWNER,
 };
 use narsor::domain::{
     BackendId, DisplayLink, Event, EventData, ExecutionStatus, TaskDisplay, TaskId,
@@ -934,8 +937,10 @@ async fn an_offline_runner_leaves_an_explicitly_stale_last_observation() {
             reason,
             last_attempts,
             observed_at,
+            message,
         } => {
             assert_eq!(reason, ConversationUnavailableReason::RunnerUnreachable);
+            assert_eq!(message, None);
             assert_eq!(last_attempts.len(), 1);
             assert!(observed_at.is_some());
         }
@@ -3651,4 +3656,552 @@ async fn an_owner_key_in_the_policys_namespace_is_refused() {
         harness.task("task-1").await.lifecycle,
         TaskLifecycle::Queued
     );
+}
+
+// ---------------------------------------------------------------------------
+// The conversation of a local task without a live runner (U6)
+// ---------------------------------------------------------------------------
+
+/// A harness whose `k8s` backend keeps its task storages on this host.
+async fn local_harness(storage: &TempRoot) -> Harness {
+    Harness::start_with(
+        ProtocolConfig::default(),
+        Some(("k8s", storage.path().to_path_buf())),
+    )
+    .await
+}
+
+/// The task's own storage, as the daemon holding it reads it.
+fn local_store(storage: &TempRoot, task: &str) -> ExecutionStore {
+    ExecutionStore::new(storage.path().join(task).join("state"))
+}
+
+/// `exec-1` — the execution the test runner names — with its attempt
+/// `act-1` of `review`, open, holding `entries` lines.
+fn record_attempt(store: &ExecutionStore, entries: usize) {
+    store
+        .save_execution(&WorkflowExecution {
+            id: "exec-1".to_string(),
+            workflow_id: "wf".to_string(),
+            workflow_version: 1,
+            status: ExecutionStatus::Running,
+            current_state: Some("review".to_string()),
+            started_at: Utc::now(),
+            completed_at: None,
+            inputs: serde_json::json!({}),
+            context: narsor::domain::Context::new(),
+            workspace: Workspace::local_folder("/tmp/none".to_string()),
+            current_action_execution: None,
+            metadata: serde_json::json!({}),
+        })
+        .expect("execution");
+    store
+        .event_log("exec-1")
+        .append_next(
+            &"exec-1".to_string(),
+            EventData::ActionStarted {
+                action_execution_id: "act-1".to_string(),
+                state_id: "review".to_string(),
+                action_type: "agent".to_string(),
+            },
+        )
+        .expect("event");
+    let mut writer = store
+        .conversation_store("exec-1")
+        .writer("act-1")
+        .expect("writer");
+    for entry in 1..=entries {
+        writer
+            .append_narsor(&format!("entry {entry}"))
+            .expect("line");
+    }
+    writer.finish().expect("finish");
+}
+
+/// Drives a running task to `Paused` at a safe point.
+async fn pause(harness: &Harness, running: &Running) {
+    harness
+        .command("task-1", OwnerCommand::Pause, "pause-1")
+        .await;
+    let mut at_safe_point = snapshot(2, ExecutionStatus::Running, 5, None);
+    at_safe_point.safe_point = true;
+    running
+        .runner
+        .snapshot(&at_safe_point)
+        .await
+        .expect("safe point");
+    running
+        .controller
+        .report(&report(
+            "task-1",
+            running.epoch,
+            2,
+            Observation::PausedAtSafePoint,
+            Some(2),
+        ))
+        .await
+        .expect("paused");
+}
+
+async fn lose(running: &Running) {
+    running
+        .controller
+        .report(&report(
+            "task-1",
+            running.epoch,
+            1,
+            Observation::WorkloadLost { state_known: true },
+            Some(1),
+        ))
+        .await
+        .expect("lost");
+}
+
+async fn page_from(
+    harness: &Harness,
+    attempt: &str,
+    from: u64,
+) -> Result<PageResponse, ClientError> {
+    harness
+        .owner
+        .control_conversation_page(
+            "task-1",
+            attempt,
+            &ConversationPageQuery {
+                from,
+                byte_budget: None,
+            },
+        )
+        .await
+}
+
+/// Entry numbers, the cursor, the source and the record's time of a page.
+fn page_of(
+    page: PageResponse,
+) -> (
+    Vec<u64>,
+    u64,
+    Option<ExecutionEventsSource>,
+    Option<DateTime<Utc>>,
+) {
+    match page {
+        PageResponse::Recorded {
+            entries,
+            next_entry,
+            source,
+            recorded_at,
+            ..
+        } => (
+            entries.iter().map(|entry| entry.entry_number).collect(),
+            next_entry,
+            source,
+            recorded_at,
+        ),
+        PageResponse::NoRecord => panic!("expected a record"),
+    }
+}
+
+/// The attempts and the record's time of a summary read from storage.
+fn stored_summary(response: ConversationResponse) -> (Vec<(String, u64)>, Option<DateTime<Utc>>) {
+    match response {
+        ConversationResponse::Available {
+            attempts,
+            source,
+            recorded_at,
+            ..
+        } => {
+            assert_eq!(source, ExecutionEventsSource::Storage);
+            (
+                attempts
+                    .into_iter()
+                    .map(|attempt| (attempt.attempt_id, attempt.entries))
+                    .collect(),
+                recorded_at,
+            )
+        }
+        other => panic!("expected a summary from storage, got {other:?}"),
+    }
+}
+
+/// The runner side of one relayed page, read from the storage exactly as
+/// the runner reads it.
+async fn answer_page_from(runner: &RunnerClient, store: &ExecutionStore) {
+    loop {
+        let poll = runner.poll(None, 5).await.expect("poll");
+        if let Some(request) = poll.conversation_pages.first() {
+            let read = store
+                .conversation_store("exec-1")
+                .read(
+                    &request.attempt_id,
+                    request.from_entry,
+                    request.byte_budget as usize,
+                )
+                .expect("read");
+            let accepted = runner
+                .upload_conversation_page(&request.request_id, &PageResponse::from_snapshot(read))
+                .await
+                .expect("upload");
+            assert!(accepted.delivered);
+            return;
+        }
+    }
+}
+
+/// AE5: a paused local task's conversation is read from its record, marked
+/// as such and dated.
+#[tokio::test]
+async fn ae5_a_paused_local_task_reads_its_conversation_from_its_record() {
+    let storage = TempRoot::new();
+    let harness = local_harness(&storage).await;
+    let running = harness.running("task-1", "k8s").await;
+    record_attempt(&local_store(&storage, "task-1"), 3);
+    pause(&harness, &running).await;
+    assert_eq!(
+        harness.task("task-1").await.lifecycle,
+        TaskLifecycle::Paused
+    );
+
+    let (attempts, summary_at) = stored_summary(
+        harness
+            .owner
+            .control_conversation("task-1")
+            .await
+            .expect("conversation"),
+    );
+    assert_eq!(
+        attempts,
+        vec![("act-1".to_string(), 3)],
+        "the record, not the last report"
+    );
+    assert!(summary_at.is_some());
+
+    let (entries, next, source, page_at) =
+        page_of(page_from(&harness, "act-1", 0).await.expect("a page"));
+    assert_eq!((entries, next), (vec![1, 2, 3], 4));
+    assert_eq!(source, Some(ExecutionEventsSource::Storage));
+    assert_eq!(page_at, summary_at);
+}
+
+#[tokio::test]
+async fn interrupted_and_provisioning_local_tasks_read_their_record() {
+    let storage = TempRoot::new();
+    let harness = local_harness(&storage).await;
+    let running = harness.running("task-1", "k8s").await;
+    record_attempt(&local_store(&storage, "task-1"), 2);
+    lose(&running).await;
+    assert_eq!(
+        harness.task("task-1").await.lifecycle,
+        TaskLifecycle::Interrupted
+    );
+    let read = |expected: TaskLifecycle| {
+        let harness = &harness;
+        async move {
+            assert_eq!(harness.task("task-1").await.lifecycle, expected);
+            let (attempts, _) = stored_summary(
+                harness
+                    .owner
+                    .control_conversation("task-1")
+                    .await
+                    .expect("conversation"),
+            );
+            assert_eq!(attempts, vec![("act-1".to_string(), 2)], "{expected:?}");
+            let (entries, _, source, _) =
+                page_of(page_from(harness, "act-1", 0).await.expect("a page"));
+            assert_eq!(entries, vec![1, 2], "{expected:?}");
+            assert_eq!(source, Some(ExecutionEventsSource::Storage));
+        }
+    };
+    read(TaskLifecycle::Interrupted).await;
+
+    // Restarted: the old runner's report no longer speaks for the task.
+    harness
+        .command("task-1", OwnerCommand::Start, "start-again")
+        .await;
+    read(TaskLifecycle::Provisioning).await;
+}
+
+#[tokio::test]
+async fn a_provisioning_local_task_without_a_report_has_an_empty_record() {
+    let storage = TempRoot::new();
+    let harness = local_harness(&storage).await;
+    harness.create("task-1", "k8s").await;
+    let (controller, epoch) = harness.controller("k8s").await;
+    controller
+        .report(&report(
+            "task-1",
+            epoch,
+            1,
+            Observation::StartAccepted,
+            None,
+        ))
+        .await
+        .expect("start accepted");
+    assert_eq!(
+        harness.task("task-1").await.lifecycle,
+        TaskLifecycle::Provisioning
+    );
+
+    let (attempts, recorded_at) = stored_summary(
+        harness
+            .owner
+            .control_conversation("task-1")
+            .await
+            .expect("conversation"),
+    );
+    assert!(attempts.is_empty());
+    assert_eq!(recorded_at, None);
+    assert!(matches!(
+        page_from(&harness, "act-1", 0).await.expect("an answer"),
+        PageResponse::NoRecord
+    ));
+}
+
+/// AE6: a remote task keeps today's answer.
+#[tokio::test]
+async fn ae6_a_remote_interrupted_task_cannot_be_read_right_now() {
+    let storage = TempRoot::new();
+    // The daemon holds the storages of another backend only.
+    let harness = Harness::start_with(
+        ProtocolConfig::default(),
+        Some(("local", storage.path().to_path_buf())),
+    )
+    .await;
+    let running = harness.running("task-1", "k8s").await;
+    record_attempt(&local_store(&storage, "task-1"), 2);
+    lose(&running).await;
+
+    match harness
+        .owner
+        .control_conversation("task-1")
+        .await
+        .expect("conversation")
+    {
+        ConversationResponse::Unavailable {
+            reason,
+            last_attempts,
+            message,
+            ..
+        } => {
+            assert_eq!(reason, ConversationUnavailableReason::Interrupted);
+            assert_eq!(last_attempts[0].attempt_id, "act-6", "the last report");
+            assert_eq!(message, None);
+        }
+        other => panic!("expected unavailable, got {other:?}"),
+    }
+    match page_from(&harness, "act-1", 0).await {
+        Err(ClientError::Refused { code, message }) => {
+            assert_eq!(code, "conversation_unavailable");
+            assert!(message.contains("cannot be read right now"), "{message}");
+        }
+        other => panic!("expected a 409, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_archived_local_task_cannot_be_read_right_now() {
+    let storage = TempRoot::new();
+    let harness = local_harness(&storage).await;
+    harness.create("task-1", "k8s").await;
+    record_attempt(&local_store(&storage, "task-1"), 2);
+    harness
+        .command("task-1", OwnerCommand::Archive, "archive-1")
+        .await;
+
+    match harness
+        .owner
+        .control_conversation("task-1")
+        .await
+        .expect("conversation")
+    {
+        ConversationResponse::Unavailable { reason, .. } => {
+            assert_eq!(reason, ConversationUnavailableReason::Archived)
+        }
+        other => panic!("expected unavailable, got {other:?}"),
+    }
+    match page_from(&harness, "act-1", 0).await {
+        Err(ClientError::Refused { code, message }) => {
+            assert_eq!(code, "conversation_unavailable");
+            assert!(message.contains("cannot be read right now"), "{message}");
+        }
+        other => panic!("expected a 409, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_record_says_why_instead_of_being_unavailable() {
+    let storage = TempRoot::new();
+    let harness = local_harness(&storage).await;
+    let running = harness.running("task-1", "k8s").await;
+    let store = local_store(&storage, "task-1");
+    record_attempt(&store, 1);
+    // A line in the middle that is not an entry: the record is damaged,
+    // not merely being written.
+    let file = store.conversation_store("exec-1").dir().join("act-1.jsonl");
+    let mut bytes = fs::read(&file).unwrap();
+    bytes.extend_from_slice(b"not an entry\n");
+    bytes.extend_from_slice(&fs::read(&file).unwrap());
+    fs::write(&file, bytes).unwrap();
+    lose(&running).await;
+
+    match harness
+        .owner
+        .control_conversation("task-1")
+        .await
+        .expect("conversation")
+    {
+        ConversationResponse::Unavailable {
+            reason, message, ..
+        } => {
+            assert_eq!(reason, ConversationUnavailableReason::StorageUnreadable);
+            let message = message.expect("why");
+            assert!(message.contains("could not be read"), "{message}");
+            assert!(message.contains("act-1.jsonl"), "{message}");
+        }
+        other => panic!("expected unreadable, got {other:?}"),
+    }
+    match page_from(&harness, "act-1", 0).await {
+        Err(ClientError::Refused { code, message }) => {
+            assert_eq!(code, "conversation_record_unreadable");
+            assert!(message.contains("could not be read"), "{message}");
+            assert!(!message.contains("right now"), "{message}");
+        }
+        other => panic!("expected the read error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_record_being_written_is_read_up_to_its_last_whole_line() {
+    let storage = TempRoot::new();
+    let harness = local_harness(&storage).await;
+    let running = harness.running("task-1", "k8s").await;
+    let store = local_store(&storage, "task-1");
+    record_attempt(&store, 2);
+    let file = store.conversation_store("exec-1").dir().join("act-1.jsonl");
+    let mut bytes = fs::read(&file).unwrap();
+    bytes.extend_from_slice(br#"{"n":3,"ts":"2026-10-03T12:00:00Z","source":"stdout","raw_"#);
+    fs::write(&file, bytes).unwrap();
+    lose(&running).await;
+
+    let (attempts, _) = stored_summary(
+        harness
+            .owner
+            .control_conversation("task-1")
+            .await
+            .expect("conversation"),
+    );
+    assert_eq!(attempts, vec![("act-1".to_string(), 2)]);
+    match page_from(&harness, "act-1", 0).await.expect("a page") {
+        PageResponse::Recorded {
+            entries,
+            next_entry,
+            truncated_tail,
+            ..
+        } => {
+            assert_eq!(entries.len(), 2);
+            assert_eq!(next_entry, 3);
+            assert!(truncated_tail);
+        }
+        other => panic!("expected a record, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_attempt_id_that_would_walk_the_path_is_refused() {
+    let storage = TempRoot::new();
+    let harness = local_harness(&storage).await;
+    let running = harness.running("task-1", "k8s").await;
+    record_attempt(&local_store(&storage, "task-1"), 1);
+    lose(&running).await;
+
+    let owner = OwnerRef::new(LOCAL_OWNER);
+    for attempt in ["..", "../act-1", "act/1", "a..b", ".hidden"] {
+        let refused = harness
+            .service
+            .conversation_page(&owner, "task-1", attempt, ConversationPageQuery::default())
+            .await
+            .expect_err(attempt);
+        assert!(
+            refused.to_string().starts_with("invalid_attempt"),
+            "{attempt}: {refused}"
+        );
+    }
+    // Over HTTP too, once the path is decoded.
+    assert_eq!(
+        bad_request_code(page_from(&harness, "..%2Fact-1", 0).await),
+        "invalid_attempt"
+    );
+}
+
+/// The record and the live runner number entries alike: a reader that
+/// continues from `next_entry` across the switch neither loses nor repeats
+/// an entry.
+#[tokio::test]
+async fn reading_the_record_then_the_runner_from_the_cursor_loses_and_repeats_nothing() {
+    let storage = TempRoot::new();
+    let harness = local_harness(&storage).await;
+    let running = harness.running("task-1", "k8s").await;
+    let store = local_store(&storage, "task-1");
+    record_attempt(&store, 5);
+
+    // The runner goes quiet: the record is read, a small page at a time.
+    harness.clock.advance(Duration::minutes(2));
+    let small = harness
+        .owner
+        .control_conversation_page(
+            "task-1",
+            "act-1",
+            &ConversationPageQuery {
+                from: 0,
+                byte_budget: Some(3 * "entry 1".len() as u64),
+            },
+        )
+        .await
+        .expect("a page");
+    let (first, next, source, _) = page_of(small);
+    assert_eq!((first.clone(), next), (vec![1, 2, 3], 4));
+    assert_eq!(source, Some(ExecutionEventsSource::Storage));
+    let (whole_record, record_next, _, _) =
+        page_of(page_from(&harness, "act-1", 0).await.expect("a page"));
+
+    // It speaks again: the reader continues live from the cursor.
+    running
+        .runner
+        .snapshot(&snapshot(2, ExecutionStatus::Running, 4, None))
+        .await
+        .expect("back");
+    let continued = {
+        let owner = harness.owner.clone();
+        tokio::spawn(async move {
+            owner
+                .control_conversation_page(
+                    "task-1",
+                    "act-1",
+                    &ConversationPageQuery {
+                        from: next,
+                        byte_budget: None,
+                    },
+                )
+                .await
+        })
+    };
+    answer_page_from(&running.runner, &store).await;
+    let (rest, _, source, recorded_at) = page_of(continued.await.unwrap().expect("live"));
+    assert_eq!(source, Some(ExecutionEventsSource::Runner));
+    assert_eq!(recorded_at, None);
+    let mut read: Vec<u64> = first;
+    read.extend(rest);
+    assert_eq!(read, vec![1, 2, 3, 4, 5]);
+
+    // The same attempt read whole from either side is the same.
+    let live = {
+        let owner = harness.owner.clone();
+        tokio::spawn(async move {
+            owner
+                .control_conversation_page("task-1", "act-1", &ConversationPageQuery::default())
+                .await
+        })
+    };
+    answer_page_from(&running.runner, &store).await;
+    let (live_entries, live_next, _, _) = page_of(live.await.unwrap().expect("live"));
+    assert_eq!((live_entries, live_next), (whole_record, record_next));
 }

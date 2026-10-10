@@ -100,13 +100,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine as _;
 use chrono::Utc;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::api::{ClientError, ConversationEntryDto, ConversationResponse};
+use crate::api::{ClientError, ConversationResponse};
 use crate::conductor::LiveHarness;
 use crate::controller_protocol::{
     ConversationPageRequest, DeliveredInput, ExecutionEventsPage, ExecutionEventsRequest,
@@ -1246,22 +1245,7 @@ impl Session {
             usize::try_from(request.byte_budget).unwrap_or(usize::MAX),
         );
         let page = match read {
-            Ok(Some(snapshot)) => ConversationResponse::Recorded {
-                entries: snapshot
-                    .entries
-                    .into_iter()
-                    .map(|entry| ConversationEntryDto {
-                        entry_number: entry.entry_number,
-                        timestamp: entry.timestamp,
-                        source: entry.source,
-                        raw_base64: base64::engine::general_purpose::STANDARD.encode(&entry.raw),
-                    })
-                    .collect(),
-                next_entry: snapshot.next_entry,
-                closed: snapshot.closed,
-                truncated_tail: snapshot.truncated_tail,
-            },
-            Ok(None) => ConversationResponse::NoRecord,
+            Ok(snapshot) => ConversationResponse::from_snapshot(snapshot),
             Err(error) => {
                 tracing::warn!(%error, attempt = %request.attempt_id, "cannot read a conversation page");
                 self.fail_read(&request.request_id, &error.to_string())

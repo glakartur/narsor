@@ -441,3 +441,111 @@ fn a_failed_attempt_that_will_retry_is_still_closed_for_compression() {
     assert!(conversations.dir().join("attempt-1.jsonl.zst").exists());
     assert!(!conversations.dir().join("attempt-1.jsonl").exists());
 }
+
+// --- When a record was last written, and its summaries (U6) ---------------
+
+#[test]
+fn an_open_record_is_dated_by_its_file_and_a_closed_one_by_its_last_entry() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let conversations = store.conversation_store("exec-11");
+    let mut writer = conversations.writer("attempt-1").expect("open writer");
+    writer.append_narsor("first").expect("append");
+    writer.append_narsor("second").expect("append");
+    writer.finish().expect("finish writer");
+
+    let open = conversations
+        .read("attempt-1", 0, usize::MAX)
+        .expect("read")
+        .expect("record must exist");
+    let modified = fs::metadata(conversations.dir().join("attempt-1.jsonl"))
+        .and_then(|metadata| metadata.modified())
+        .expect("mtime");
+    assert_eq!(open.recorded_at, Some(modified.into()));
+
+    conversations.close_attempt("attempt-1").expect("close");
+    // Even a read of the tail only dates the record by its very last entry.
+    let closed = conversations
+        .read("attempt-1", 2, usize::MAX)
+        .expect("read")
+        .expect("record must exist");
+    let all = conversations
+        .read("attempt-1", 0, usize::MAX)
+        .expect("read")
+        .expect("record must exist");
+    assert!(closed.closed);
+    assert_eq!(
+        closed.recorded_at,
+        Some(all.entries.last().unwrap().timestamp)
+    );
+}
+
+#[test]
+fn summaries_from_storage_follow_the_timeline_and_date_the_newest_record() {
+    use narsor::engine::conversation_summary::{read_summaries, ConversationCache};
+
+    let root = TempRoot::new();
+    let store = root.store();
+    let execution = sample_execution("exec-12", ExecutionStatus::Running);
+    store.save_execution(&execution).expect("save execution");
+    let log = store.event_log("exec-12");
+    for event in [
+        action_started("attempt-b"),
+        action_completed("attempt-b"),
+        action_started("attempt-a"),
+    ] {
+        log.append_next(&execution.id, event).expect("append");
+    }
+    let conversations = store.conversation_store("exec-12");
+    let mut closed = conversations.writer("attempt-b").expect("open writer");
+    closed.append_narsor("one").expect("append");
+    closed.append_narsor("two").expect("append");
+    closed.finish().expect("finish writer");
+    conversations.close_attempt("attempt-b").expect("close");
+    let mut open = conversations.writer("attempt-a").expect("open writer");
+    open.append_narsor("still going").expect("append");
+    open.finish().expect("finish writer");
+
+    let mut cache = ConversationCache::default();
+    let summaries = read_summaries(&store, "exec-12", &mut cache).expect("summaries");
+    let ids: Vec<_> = summaries
+        .attempts
+        .iter()
+        .map(|attempt| (attempt.attempt_id.as_str(), attempt.entries, attempt.closed))
+        .collect();
+    assert_eq!(
+        ids,
+        [("attempt-b", 2, true), ("attempt-a", 1, false)],
+        "in timeline order, not by name"
+    );
+    assert_eq!(summaries.attempts[0].state_id.as_deref(), Some("plan"));
+    let open_written = conversations
+        .read("attempt-a", 0, usize::MAX)
+        .expect("read")
+        .expect("record")
+        .recorded_at;
+    assert_eq!(
+        summaries.recorded_at,
+        summaries.attempts[0].last_entry_at.max(open_written),
+        "the newest of the records"
+    );
+    // A cached closed attempt is summarised the same the second time.
+    assert_eq!(
+        read_summaries(&store, "exec-12", &mut cache).expect("again"),
+        summaries
+    );
+}
+
+#[test]
+fn an_execution_without_records_has_no_summaries_and_no_age() {
+    use narsor::engine::conversation_summary::{read_summaries, ConversationCache};
+
+    let root = TempRoot::new();
+    let store = root.store();
+    let execution = sample_execution("exec-13", ExecutionStatus::Running);
+    store.save_execution(&execution).expect("save execution");
+    let summaries =
+        read_summaries(&store, "exec-13", &mut ConversationCache::default()).expect("summaries");
+    assert!(summaries.attempts.is_empty());
+    assert_eq!(summaries.recorded_at, None);
+}

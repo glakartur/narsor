@@ -361,7 +361,7 @@ async fn get_conversation(
     Extension(owner): Extension<OwnerRef>,
     Path(task_id): Path<String>,
 ) -> ProtocolResult<Json<ConversationResponse>> {
-    Ok(Json(service.conversation(&owner, &task_id)?))
+    Ok(Json(service.conversation(&owner, &task_id).await?))
 }
 
 async fn get_conversation_page(

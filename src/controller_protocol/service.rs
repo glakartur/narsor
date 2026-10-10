@@ -16,6 +16,7 @@ use tokio::sync::{broadcast, watch};
 
 mod auto_resume;
 mod conductor;
+mod conversation;
 mod events;
 mod materials;
 mod relay;
@@ -39,7 +40,7 @@ use crate::orchestration::{
 };
 use crate::workflow::TemplateScope;
 use events::LocalTaskStorage;
-use relay::{Relay, RelayGuard};
+use relay::Relay;
 
 pub use auto_resume::AutoResumePass;
 
@@ -153,6 +154,8 @@ pub struct ProtocolService {
     event_reads: Mutex<EventsRelay>,
     conductor_reads: Mutex<ConductorRelay>,
     local_storage: Option<LocalTaskStorage>,
+    /// Closed attempts' summaries of the local tasks read from storage.
+    stored_conversations: Mutex<conversation::StoredSummaries>,
     materials: MaterialStore,
 }
 
@@ -202,6 +205,7 @@ impl ProtocolService {
             event_reads: Mutex::new(EventsRelay::default()),
             conductor_reads: Mutex::new(ConductorRelay::default()),
             local_storage: None,
+            stored_conversations: Mutex::default(),
         }
     }
 
@@ -699,38 +703,6 @@ impl ProtocolService {
         })
     }
 
-    /// The task's conversation summary, or why it is unavailable.
-    ///
-    /// Available only while the runner should be and is live; a paused,
-    /// interrupted or archived task answers with its last safe summary and
-    /// an explicit reason — never by recreating compute (KTD4).
-    pub fn conversation(
-        &self,
-        owner: &OwnerRef,
-        task_id: &str,
-    ) -> ProtocolResult<ConversationResponse> {
-        let record = self.owned_task(owner, task_id)?;
-        let now = self.control.now();
-        let runner = record.runner.as_ref();
-        let last_attempts = match runner.map(|runner| &runner.snapshot.conversation) {
-            Some(ConversationAvailability::Live { attempts }) => attempts.clone(),
-            _ => Vec::new(),
-        };
-        let observed_at = runner.map(|runner| runner.snapshot.observed_at);
-        let reason = self.live_read_blocker(&record, now)?;
-        Ok(match (reason, observed_at) {
-            (None, Some(observed_at)) => ConversationResponse::Available {
-                attempts: last_attempts,
-                observed_at,
-            },
-            (reason, observed_at) => ConversationResponse::Unavailable {
-                reason: reason.unwrap_or(ConversationUnavailableReason::NotStarted),
-                last_attempts,
-                observed_at,
-            },
-        })
-    }
-
     /// Why the task's runner cannot be asked for content right now (a
     /// conversation page, execution events), or `None` when it is live.
     /// Archived, paused, interrupted, not yet started, unreachable, or
@@ -765,68 +737,6 @@ impl ProtocolService {
                 },
             },
         })
-    }
-
-    /// One bounded page of an attempt's raw conversation, fetched from the
-    /// live runner (KTD4).
-    ///
-    /// The request waits in memory until the runner's next poll picks it up
-    /// and uploads the page, which is handed to this caller and kept
-    /// nowhere. Refused at once when the conversation is not live (a paused,
-    /// interrupted or unreachable runner), and after
-    /// [`ProtocolConfig::conversation_page_timeout`] when the runner does
-    /// not answer.
-    pub async fn conversation_page(
-        &self,
-        owner: &OwnerRef,
-        task_id: &str,
-        attempt_id: &str,
-        query: ConversationPageQuery,
-    ) -> ProtocolResult<ConversationPage> {
-        if let ConversationResponse::Unavailable { reason, .. } =
-            self.conversation(owner, task_id)?
-        {
-            return Err(ProtocolError::conflict(
-                "conversation_unavailable",
-                format!("the task's conversation cannot be read right now ({reason:?})"),
-            ));
-        }
-        if !is_attempt_id(attempt_id) {
-            return Err(ProtocolError::bad_request(
-                "invalid_attempt",
-                "an attempt id is 1-128 characters of [A-Za-z0-9._-], not starting with '.'",
-            ));
-        }
-        let task_id = parse_identifier(TaskId::parse(task_id))?;
-        let (request_id, answer) = self
-            .lock_pages()
-            .open("page", task_id.clone(), |request_id| {
-                ConversationPageRequest {
-                    request_id,
-                    attempt_id: attempt_id.to_string(),
-                    from_entry: query.from,
-                    byte_budget: query
-                        .byte_budget
-                        .unwrap_or(DEFAULT_PAGE_BUDGET)
-                        .clamp(1, MAX_PAGE_BUDGET),
-                }
-            });
-        // Wakes the runner's long-poll, which then sees the request.
-        let guard = RelayGuard::new(&self.pages, request_id);
-        self.notify(&task_id);
-        let page = tokio::time::timeout(self.config.conversation_page_timeout, answer).await;
-        drop(guard);
-        match page {
-            Ok(Ok(page)) => Ok(page),
-            Ok(Err(_)) => Err(ProtocolError::conflict(
-                "conversation_unavailable",
-                "the runner could not read the conversation page",
-            )),
-            Err(_) => Err(ProtocolError::conflict(
-                "conversation_unavailable",
-                "the runner did not upload the conversation page in time",
-            )),
-        }
     }
 
     /// Queues an owner answer for the runner's pending input request.

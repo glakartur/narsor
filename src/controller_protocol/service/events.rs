@@ -208,6 +208,7 @@ pub(super) fn not_running(reason: ConversationUnavailableReason) -> &'static str
             "the runner is not running: it has not been heard from lately"
         }
         ConversationUnavailableReason::RunnerReported => "the runner cannot serve it right now",
+        ConversationUnavailableReason::StorageUnreadable => "the task's storage could not be read",
     }
 }
 

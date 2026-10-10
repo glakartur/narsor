@@ -3482,6 +3482,8 @@ mod task_app_detail {
                 next_entry: 2,
                 closed: true,
                 truncated_tail: false,
+                source: None,
+                recorded_at: None,
             };
             let (_, ()) = tokio::join!(app.sync_detail(), answer_page(&running.runner, page));
             let view = app.detail().view("task-1").unwrap();

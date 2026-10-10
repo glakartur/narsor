@@ -13,6 +13,7 @@
 //! hierarchy of retry policies and the backoff between attempts.
 
 pub mod actions;
+pub mod conversation_summary;
 pub mod decision;
 pub mod retry;
 pub mod runner;

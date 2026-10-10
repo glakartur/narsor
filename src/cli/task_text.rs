@@ -559,6 +559,7 @@ pub fn unavailable_reason(reason: ConversationUnavailableReason) -> &'static str
             "the runner has not been heard from lately"
         }
         ConversationUnavailableReason::RunnerReported => "the runner cannot serve it right now",
+        ConversationUnavailableReason::StorageUnreadable => "its record could not be read",
     }
 }
 
@@ -573,6 +574,7 @@ pub fn conversation_lines(
         ConversationResponse::Available {
             attempts,
             observed_at,
+            ..
         } => {
             lines.push(ToneLine::new(
                 format!(
@@ -588,6 +590,7 @@ pub fn conversation_lines(
             reason,
             last_attempts,
             observed_at,
+            ..
         } => {
             let since = observed_at
                 .map(|at| format!("; last safe summary from {} ago", age(now, at)))

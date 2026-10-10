@@ -12,30 +12,21 @@
 //! the event cursor in particular comes from the log, which outlives every
 //! incarnation and therefore never goes backwards.
 
-use std::collections::{HashMap, HashSet};
-
 use chrono::{DateTime, Utc};
 
 use crate::conductor::pending_chat_proposals;
 use crate::domain::{ExecutionStatus, TaskDisplay, WorkflowDefinition, WorkflowExecution};
-use crate::engine::{
-    build_timeline, step_failure, Engine, InputContinuation, PendingHumanInput, Timeline,
-};
+use crate::engine::conversation_summary::summaries;
+pub(crate) use crate::engine::conversation_summary::ConversationCache;
+use crate::engine::{build_timeline, step_failure, Engine, InputContinuation, PendingHumanInput};
 use crate::orchestration::{
-    AttentionItem, AttentionKind, ConversationAttemptSummary, ConversationAvailability,
-    ExecutionCursor, HarnessUnavailable, PendingInputRef, RunnerProblem, RunnerSnapshot,
+    AttentionItem, AttentionKind, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
+    PendingInputRef, RunnerProblem, RunnerSnapshot,
 };
-use crate::persistence::{ConversationStore, ExecutionStore};
+use crate::persistence::ExecutionStore;
 use crate::workflow::TemplateScope;
 
 use super::RunnerError;
-
-/// Summaries of attempts whose conversation is closed: they never change
-/// again, so each is counted once per process.
-#[derive(Debug, Default)]
-pub(crate) struct ConversationCache {
-    closed: HashMap<String, ConversationAttemptSummary>,
-}
 
 /// What the runner knows beyond the files.
 pub(crate) struct SnapshotContext<'a> {
@@ -117,7 +108,7 @@ pub(crate) fn build(
 
     let conversation = if !context.stopping {
         ConversationAvailability::Live {
-            attempts: summaries(&conversations, &recorded, &timeline, cache)?,
+            attempts: summaries(&conversations, &recorded, &timeline, cache)?.attempts,
         }
     } else {
         ConversationAvailability::Unavailable {
@@ -236,59 +227,115 @@ fn render_display(
     Some(scope.render_display(spec))
 }
 
-/// One summary per attempt with a conversation record, in timeline order.
-fn summaries(
-    conversations: &ConversationStore,
-    recorded: &HashSet<String>,
-    timeline: &Timeline,
-    cache: &mut ConversationCache,
-) -> Result<Vec<ConversationAttemptSummary>, RunnerError> {
-    let state_of: HashMap<&str, &str> = timeline
-        .positions
-        .iter()
-        .filter_map(|position| {
-            position
-                .action_execution_id
-                .as_deref()
-                .map(|attempt| (attempt, position.state_id.as_str()))
-        })
-        .collect();
-    let mut ordered: Vec<&String> = recorded.iter().collect();
-    let order: HashMap<&str, usize> = timeline
-        .positions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, position)| {
-            position
-                .action_execution_id
-                .as_deref()
-                .map(|attempt| (attempt, index))
-        })
-        .collect();
-    ordered.sort_by_key(|attempt| (order.get(attempt.as_str()).copied(), (*attempt).clone()));
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut attempts = Vec::with_capacity(ordered.len());
-    for attempt in ordered {
-        if let Some(summary) = cache.closed.get(attempt) {
-            attempts.push(summary.clone());
-            continue;
+    use crate::domain::{Context, EventData, Workspace};
+    use crate::engine::conversation_summary::read_summaries;
+
+    const WORKFLOW: &str = r#"
+name: summaries
+version: 1
+states:
+  plan:
+    action:
+      type: script
+      command: "true"
+    outputs: [done]
+    transitions:
+      done: completed
+"#;
+
+    struct TempRoot(std::path::PathBuf);
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
-        let Some(read) = conversations.read(attempt, 0, usize::MAX)? else {
-            continue;
-        };
-        let summary = ConversationAttemptSummary {
-            attempt_id: attempt.clone(),
-            state_id: state_of
-                .get(attempt.as_str())
-                .map(|state| state.to_string()),
-            entries: read.entries.len() as u64,
-            closed: read.closed,
-            last_entry_at: read.entries.last().map(|entry| entry.timestamp),
-        };
-        if summary.closed {
-            cache.closed.insert(attempt.clone(), summary.clone());
-        }
-        attempts.push(summary);
     }
-    Ok(attempts)
+
+    fn execution(id: &str) -> WorkflowExecution {
+        WorkflowExecution {
+            id: id.to_string(),
+            workflow_id: "summaries".to_string(),
+            workflow_version: 1,
+            status: ExecutionStatus::Running,
+            current_state: Some("plan".to_string()),
+            started_at: Utc::now(),
+            completed_at: None,
+            inputs: serde_json::json!({}),
+            context: Context::new(),
+            workspace: Workspace::local_folder("/tmp/none".to_string()),
+            current_action_execution: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn started(attempt: &str) -> EventData {
+        EventData::ActionStarted {
+            action_execution_id: attempt.to_string(),
+            state_id: "plan".to_string(),
+            action_type: "agent".to_string(),
+        }
+    }
+
+    /// The daemon reads a stopped local task's summaries with the very
+    /// function the runner's snapshot uses: both say the same of the same
+    /// storage.
+    #[test]
+    fn the_snapshot_summarises_attempts_like_a_read_of_the_storage() {
+        let root = TempRoot(
+            std::env::temp_dir().join(format!("narsor-snapshot-{}", uuid::Uuid::new_v4())),
+        );
+        let store = ExecutionStore::new(&root.0);
+        let execution = execution("exec-1");
+        store.save_execution(&execution).expect("execution");
+        let log = store.event_log("exec-1");
+        log.append_next(&execution.id, started("act-2"))
+            .expect("event");
+        log.append_next(
+            &execution.id,
+            EventData::ActionCompleted {
+                action_execution_id: "act-2".to_string(),
+                output_label: "done".to_string(),
+            },
+        )
+        .expect("event");
+        log.append_next(&execution.id, started("act-1"))
+            .expect("event");
+        let conversations = store.conversation_store("exec-1");
+        for (attempt, lines) in [("act-2", 2), ("act-1", 3)] {
+            let mut writer = conversations.writer(attempt).expect("writer");
+            for line in 0..lines {
+                writer.append_narsor(&format!("line {line}")).expect("line");
+            }
+            writer.finish().expect("finish");
+        }
+        conversations.close_attempt("act-2").expect("close");
+
+        let engine = Engine::new(store.clone());
+        let definition = crate::workflow::load_from_str(WORKFLOW).expect("workflow");
+        let snapshot = build(
+            &engine,
+            &mut ConversationCache::default(),
+            SnapshotContext {
+                definition: &definition,
+                execution_id: Some("exec-1"),
+                pass_active: false,
+                problem: None,
+                stopping: false,
+                conductor_unavailable: Some("no conductor in this test"),
+                default_harness_unavailable: None,
+            },
+        )
+        .expect("snapshot");
+        let ConversationAvailability::Live { attempts } = snapshot.conversation else {
+            panic!("a live conversation: {:?}", snapshot.conversation);
+        };
+        let stored =
+            read_summaries(&store, "exec-1", &mut ConversationCache::default()).expect("stored");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts, stored.attempts);
+    }
 }

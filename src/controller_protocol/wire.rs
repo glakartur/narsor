@@ -511,6 +511,9 @@ pub enum ConversationUnavailableReason {
     RunnerUnreachable,
     /// The runner itself said it cannot serve it.
     RunnerReported,
+    /// The task's own storage, read by the daemon that holds it, could not
+    /// be read; the answer's `message` says why.
+    StorageUnreadable,
 }
 
 /// `GET /control/v1/tasks/:task_id/conversation`.
@@ -519,12 +522,23 @@ pub enum ConversationUnavailableReason {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub enum ConversationResponse {
-    /// The runner is live; this is what it reported.
+    /// The attempts with a conversation record: what the live runner
+    /// reported, or — for the daemon's own local backend, while its runner
+    /// is not running — what the task's storage holds (possibly none).
     Available {
         /// Attempts with a conversation record.
         attempts: Vec<ConversationAttemptSummary>,
-        /// When the runner reported it.
+        /// When the runner reported it, or when the storage was read.
         observed_at: DateTime<Utc>,
+        /// Where it was read from; absent (an older server) means the
+        /// runner.
+        #[serde(default)]
+        source: ExecutionEventsSource,
+        /// When the newest record was last written — only from storage,
+        /// and only when a record holds an entry. A client shows the
+        /// conversation's age from it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recorded_at: Option<DateTime<Utc>>,
     },
     /// Explicitly unavailable, with the last safe summary if there is one.
     Unavailable {
@@ -534,6 +548,10 @@ pub enum ConversationResponse {
         last_attempts: Vec<ConversationAttemptSummary>,
         /// When that was.
         observed_at: Option<DateTime<Utc>>,
+        /// What went wrong, when a reason carries detail
+        /// ([`ConversationUnavailableReason::StorageUnreadable`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
 }
 
@@ -1147,11 +1165,12 @@ pub struct ExecutionEventsQuery {
     pub limit: Option<u32>,
 }
 
-/// Where an events answer was read from.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Where an answer (events, conductor, conversation) was read from.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionEventsSource {
     /// The live runner, through the relay.
+    #[default]
     Runner,
     /// The task's own storage, by the daemon that owns it (local backend
     /// without a live runner).
