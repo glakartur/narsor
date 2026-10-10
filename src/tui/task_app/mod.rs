@@ -52,7 +52,8 @@
 //! * **The answer panel (U10)** is a part of the details; the list already
 //!   leads to it (`Space` → [`list::TaskList::select_next_waiting`], `Enter`
 //!   → [`Focus::Details`]). A draft belongs in [`DetailState::set_draft`]. The
-//!   panel's place is [`detail::areas`]`(area, panel_height).panel`: pass its
+//!   panel's place is
+//!   [`detail::areas`]`(area, header_lines, panel_height).panel`: pass its
 //!   height from [`detail::render`] and the tab content gives up the rows; the
 //!   keys of [`keymap::Context::Panel`] apply while it has the focus (`Tab` is
 //!   [`Action::SwitchFocus`], ignored until then).
@@ -864,17 +865,25 @@ impl TaskApp {
     }
 
     /// Re-reads the task list (and the server's name, once) and the default
-    /// harness. The selection, the focus, the tab, the drafts and the move
-    /// mode are not touched; the selection stays on its `task_id`.
+    /// harness, both at once. The selection, the focus, the tab, the drafts
+    /// and the move mode are not touched; the selection stays on its
+    /// `task_id`. The harness is taken in only with the list, and a failed
+    /// read of it keeps the last value known.
     pub async fn refresh(&mut self) {
         let now = Instant::now();
-        match self.client.control_tasks_archived(false).await {
+        let (listing, harness) = tokio::join!(
+            self.client.control_tasks_archived(false),
+            self.client.harness_selection()
+        );
+        match listing {
             Ok(listing) => {
                 self.load(listing);
                 if self.capabilities.is_none() {
                     self.read_capabilities().await;
                 }
-                self.read_harness_selection().await;
+                if let Ok(snapshot) = harness {
+                    self.set_harness_selection(snapshot);
+                }
             }
             Err(error) => self.on_read_failure(&error, now),
         }

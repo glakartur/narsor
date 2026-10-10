@@ -316,19 +316,14 @@ pub struct Areas {
     pub panel: Option<Rect>,
 }
 
-/// Splits the details `area`: the header, the tabs, the content and — when
-/// `panel_height` is not zero — a panel at the bottom. The content never goes
-/// below one row.
-pub fn areas(area: Rect, panel_height: u16) -> Areas {
-    areas_with_header(area, HEADER_LINES, panel_height)
-}
-
 /// The lines of the header of a task without a notice.
 const HEADER_LINES: u16 = 2;
 
-/// [`areas`] with a header `header_lines` high: one more than
-/// [`HEADER_LINES`] while the task has a notice, which moves the tabs down.
-pub fn areas_with_header(area: Rect, header_lines: u16, panel_height: u16) -> Areas {
+/// Splits the details `area`: a header `header_lines` high — one more than
+/// [`HEADER_LINES`] while the task has a notice, which moves the tabs down —
+/// the tabs, the content and — when `panel_height` is not zero — a panel at
+/// the bottom. The content never goes below one row.
+pub fn areas(area: Rect, header_lines: u16, panel_height: u16) -> Areas {
     let header = Rect::new(area.x, area.y, area.width, header_lines.min(area.height));
     let tabs = Rect::new(
         area.x,
@@ -584,9 +579,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
     // A task created here that the server has not confirmed has no summary
     // yet: its row says where it stands (the new-task form).
     if let Some(pending) = app.list().selected_pending().cloned() {
-        let block = styles.panel(panel_title(&pending.title, area.width), frame_focused);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let inner = styles.render_panel(
+            frame,
+            area,
+            panel_title(&pending.title, area.width),
+            frame_focused,
+        );
         super::new_task::render_pending(
             frame,
             inner,
@@ -597,9 +595,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         return;
     }
     let Some(view) = app.detail_view() else {
-        let block = styles.panel(" Szczegóły ", frame_focused);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let inner = styles.render_panel(frame, area, " Szczegóły ", frame_focused);
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "brak zaznaczonego zadania",
@@ -609,9 +605,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
         );
         return;
     };
-    let block = styles.panel(panel_title(&title_of(view.task), area.width), frame_focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = styles.render_panel(
+        frame,
+        area,
+        panel_title(&title_of(view.task), area.width),
+        frame_focused,
+    );
     let options = ViewOptions {
         stale,
         focused,
@@ -651,7 +650,7 @@ pub(super) fn render_view(
         .preferred_height(area.width, area.height);
     let notice = notice(view.task, styles, stale, area.width);
     let header_lines = HEADER_LINES + u16::from(notice.is_some());
-    let parts = areas_with_header(area, header_lines, panel_height);
+    let parts = areas(area, header_lines, panel_height);
 
     let (mut lines, spots) = header(
         view.task,

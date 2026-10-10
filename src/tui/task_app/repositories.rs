@@ -489,9 +489,7 @@ pub fn render(
         title.push_str(" · brak zarejestrowanych — a dodaje");
     }
     title.push(' ');
-    let block = styles.panel(title, focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = styles.render_panel(frame, area, title, focused);
 
     let failures: Vec<Line> = repositories
         .unreadable

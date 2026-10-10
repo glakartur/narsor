@@ -484,14 +484,14 @@ impl Overlay {
         }
     }
 
-    /// The task it is about.
-    pub fn task_id(&self) -> &str {
+    /// The task it is about; the harness list is about none.
+    pub fn task_id(&self) -> Option<&str> {
         match self {
-            Self::Menu(menu) => &menu.task_id,
-            Self::Transitions(list) => &list.task_id,
-            Self::Links(list) => &list.task_id,
-            Self::Harness(_) => "",
-            Self::Confirm(confirmation) => &confirmation.task_id,
+            Self::Menu(menu) => Some(&menu.task_id),
+            Self::Transitions(list) => Some(&list.task_id),
+            Self::Links(list) => Some(&list.task_id),
+            Self::Harness(_) => None,
+            Self::Confirm(confirmation) => Some(&confirmation.task_id),
         }
     }
 
@@ -752,7 +752,7 @@ impl TaskApp {
             .list
             .tasks()
             .iter()
-            .find(|task| task.task_id.as_str() == overlay.task_id())
+            .find(|task| Some(task.task_id.as_str()) == overlay.task_id())
         else {
             self.overlay = None;
             return;
@@ -1401,7 +1401,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles)
             app.list
                 .tasks()
                 .iter()
-                .find(|task| task.task_id.as_str() == overlay.task_id())
+                .find(|task| Some(task.task_id.as_str()) == overlay.task_id())
         })
         .map(title_of)
         .unwrap_or_default();

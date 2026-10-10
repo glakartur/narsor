@@ -342,6 +342,10 @@ pub const fn bind(
     }
 }
 
+/// What `h` does, in every context that has it.
+const CHOOSE_HARNESS: &str =
+    "domyślny harness instalacji: wybór z listy obsługiwanych albo powrót do konfiguracji";
+
 /// The key map.
 pub static BINDINGS: &[Binding] = &[
     // Everywhere a context inherits them.
@@ -456,7 +460,7 @@ pub static BINDINGS: &[Binding] = &[
         Key::char('h'),
         Action::ChooseHarness,
         "harness",
-        "domyślny harness instalacji: wybór z listy obsługiwanych albo powrót do konfiguracji",
+        CHOOSE_HARNESS,
     ),
     bind(
         Context::List,
@@ -754,7 +758,7 @@ pub static BINDINGS: &[Binding] = &[
         Key::char('h'),
         Action::ChooseHarness,
         "",
-        "domyślny harness instalacji: wybór z listy obsługiwanych albo powrót do konfiguracji",
+        CHOOSE_HARNESS,
     ),
     // The "waiting for you" panel, focus on its actions. Focus in a field
     // types text; the chooser handles those keys.
@@ -1188,7 +1192,7 @@ pub static BINDINGS: &[Binding] = &[
         Key::char('h'),
         Action::ChooseHarness,
         "",
-        "domyślny harness instalacji: wybór z listy obsługiwanych albo powrót do konfiguracji",
+        CHOOSE_HARNESS,
     ),
     bind(
         Context::HistoryDetails,
@@ -1307,7 +1311,7 @@ pub static BINDINGS: &[Binding] = &[
         Key::char('h'),
         Action::ChooseHarness,
         "",
-        "domyślny harness instalacji: wybór z listy obsługiwanych albo powrót do konfiguracji",
+        CHOOSE_HARNESS,
     ),
     // The repositories: a list and a description, `a` adds, `d` removes. The
     // list itself is the chooser, which reads the panel's keys for moving.
@@ -1386,7 +1390,7 @@ pub static BINDINGS: &[Binding] = &[
         Key::char('h'),
         Action::ChooseHarness,
         "",
-        "domyślny harness instalacji: wybór z listy obsługiwanych albo powrót do konfiguracji",
+        CHOOSE_HARNESS,
     ),
 ];
 

@@ -1061,8 +1061,7 @@ impl TaskList {
             0 => " Zadania ".to_string(),
             hidden => format!(" Zadania · ✓ ukryte {hidden} "),
         };
-        let block = styles.panel(title, focused);
-        let inner = block.inner(area);
+        let inner = styles.render_panel(frame, area, title, focused);
 
         let shown = self.visible();
         let positions = self.queue_positions();
@@ -1117,7 +1116,6 @@ impl TaskList {
             rows.iter()
                 .position(|(id, _)| selected.as_deref() == Some(id.as_str())),
         );
-        frame.render_widget(block, area);
         frame.render_stateful_widget(List::new(items), inner, &mut self.view);
     }
 }

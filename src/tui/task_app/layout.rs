@@ -274,19 +274,23 @@ fn header_lines(
     now: Instant,
     width: usize,
 ) -> (Line<'static>, Line<'static>) {
-    for fit in Fit::ALL {
+    let [shorter @ .., tightest] = Fit::ALL;
+    for fit in shorter {
         let left = header_left(app, styles, now, fit);
         let right = header_right(app, styles, fit, usize::MAX);
         if left.width() + right.width() <= width {
             return (left, right);
         }
     }
-    let left = header_left(app, styles, now, Fit::NoName);
-    let right = header_right(app, styles, Fit::NoName, usize::MAX);
+    let left = header_left(app, styles, now, tightest);
+    let right = header_right(app, styles, tightest, usize::MAX);
     let over = (left.width() + right.width()).saturating_sub(width);
+    if over == 0 {
+        return (left, right);
+    }
     let name = harness_name(app).chars().count();
     let room = name.saturating_sub(over).max(1);
-    (left, header_right(app, styles, Fit::NoName, room))
+    (left, header_right(app, styles, tightest, room))
 }
 
 /// `narsor · name ● live`, and how old the data is when it is not live.

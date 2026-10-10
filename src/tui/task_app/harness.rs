@@ -9,7 +9,7 @@
 //!
 //! # What is read
 //!
-//! The snapshot ([`HarnessSelectionSnapshot`]) is read after every read of
+//! The snapshot ([`HarnessSelectionSnapshot`]) is read alongside every read of
 //! the task list, when the list opens and after a change. A read that fails
 //! keeps the last value known — a daemon without a selector, or one that is
 //! briefly away, does not make the header lie or the connection look broken;
@@ -25,7 +25,7 @@
 
 use crossterm::event::KeyEvent;
 
-use crate::api::HarnessSelectionSnapshot;
+use crate::api::{ClientError, HarnessSelectionSnapshot};
 
 use super::super::chooser::{Chooser, ChooserAction, ChooserItem};
 use super::super::scroll::one_line;
@@ -167,28 +167,21 @@ impl TaskApp {
         }
     }
 
-    /// Reads the snapshot. A failure keeps what was known and says nothing:
-    /// the header is the only place it shows, and the connection is judged
-    /// by the task list, not by this.
-    pub(super) async fn read_harness_selection(&mut self) {
-        if let Ok(snapshot) = self.client.harness_selection().await {
-            self.harness_selection = Some(snapshot);
-        }
+    /// Reads the snapshot. A failure keeps what was known and is only
+    /// returned: the header is the only place it shows, and the connection is
+    /// judged by the task list, not by this.
+    pub(super) async fn read_harness_selection(&mut self) -> Result<(), ClientError> {
+        self.harness_selection = Some(self.client.harness_selection().await?);
+        Ok(())
     }
 
     /// `h`: reads the snapshot and opens the list over what is known.
     pub(super) async fn read_and_open_harness(&mut self) {
-        let error = match self.client.harness_selection().await {
-            Ok(snapshot) => {
-                self.harness_selection = Some(snapshot);
-                None
-            }
-            Err(error) => Some(error),
-        };
+        let read = self.read_harness_selection().await;
         if self.open_harness() {
             return;
         }
-        if let Some(error) = error {
+        if let Err(error) = read {
             self.notify(
                 Severity::Error,
                 format!(

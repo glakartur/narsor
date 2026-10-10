@@ -32,9 +32,11 @@
 
 use std::ffi::OsString;
 
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType};
+use ratatui::Frame;
 
 use super::transcript::TranscriptPresentation;
 
@@ -167,6 +169,21 @@ impl Styles {
             .border_type(border)
             .border_style(self.of(role))
             .title(Line::styled(title.into(), title_style))
+    }
+
+    /// Draws the frame of a panel titled `title` (see [`Styles::panel`]) over
+    /// `area` and returns the area inside it.
+    pub fn render_panel(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        title: impl Into<String>,
+        focused: bool,
+    ) -> Rect {
+        let block = self.panel(title, focused);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        inner
     }
 
     /// A key on the shortcut bar: dark on the accent, or reversed.

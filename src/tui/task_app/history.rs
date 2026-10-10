@@ -799,8 +799,7 @@ pub fn render_list(
     focused: bool,
     stale: bool,
 ) {
-    let block = styles.panel(" Historia ", focused);
-    let inner = block.inner(area);
+    let inner = styles.render_panel(frame, area, " Historia ", focused);
     let rows = history.rows();
     let selected = history.selected;
     let items: Vec<ListItem> = rows
@@ -817,7 +816,6 @@ pub fn render_list(
         })
         .collect();
     history.view.select((!rows.is_empty()).then_some(selected));
-    frame.render_widget(block, area);
     frame.render_stateful_widget(List::new(items), inner, &mut history.view);
     if rows.is_empty() {
         let text = history.note().unwrap_or("historia jest pusta").to_string();
@@ -847,9 +845,7 @@ pub fn render_details(
 ) {
     let tab = history.tab;
     let Some(entry) = history.entries.get(history.selected) else {
-        let block = styles.panel(" Historia ", focused);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let inner = styles.render_panel(frame, area, " Historia ", focused);
         frame.render_widget(
             ratatui::widgets::Paragraph::new(Line::styled(
                 "brak zaznaczonego wpisu historii",
@@ -861,9 +857,12 @@ pub fn render_details(
     };
     let key = entry.key();
     let task = entry.summary();
-    let block = styles.panel(panel_title(&title_of(task), area.width), focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = styles.render_panel(
+        frame,
+        area,
+        panel_title(&title_of(task), area.width),
+        focused,
+    );
     let detail = history
         .details
         .entry(key.clone())

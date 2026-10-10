@@ -2988,19 +2988,19 @@ mod task_app_detail {
         #[test]
         fn the_areas_leave_room_for_a_panel_at_the_bottom() {
             let area = ratatui::layout::Rect::new(10, 2, 80, 20);
-            let plain = detail::areas(area, 0);
+            let plain = detail::areas(area, 2, 0);
             assert_eq!(plain.header.height, 2);
             assert_eq!(plain.tabs.y, area.y + 2);
             assert_eq!(plain.content.y, area.y + 3);
             assert_eq!(plain.content.height, 17);
             assert_eq!(plain.panel, None);
 
-            let with_panel = detail::areas(area, 6);
+            let with_panel = detail::areas(area, 2, 6);
             assert_eq!(with_panel.content.height, 11);
             let panel = with_panel.panel.expect("a panel");
             assert_eq!((panel.y, panel.height), (area.y + 14, 6));
             assert_eq!(
-                detail::areas(area, 40).content.height,
+                detail::areas(area, 2, 40).content.height,
                 1,
                 "the content keeps a row"
             );

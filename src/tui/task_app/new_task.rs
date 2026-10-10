@@ -1033,9 +1033,7 @@ pub fn render(
     styles: &Styles,
     focused: bool,
 ) {
-    let block = styles.panel(" Nowe zadanie ", focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = styles.render_panel(frame, area, " Nowe zadanie ", focused);
     let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(inner);
     let line = Line::styled(
         format!("→ trafi na koniec kolejki (#{place})"),
