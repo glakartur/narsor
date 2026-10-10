@@ -2149,6 +2149,256 @@ async fn the_reprompt_runs_on_the_harness_of_the_rejected_attempt() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The harness is pinned for the duration of one action (R16a, R16b)
+// ---------------------------------------------------------------------------
+
+/// A three-step workflow: `implement` and `review` name no harness,
+/// `analyze` names `claude-code`. `implement` may be attempted
+/// `implement_attempts` times.
+fn pinned_harness_workflow(implement_attempts: u32) -> String {
+    format!(
+        r#"
+name: agent-pinned-harness
+version: 1
+states:
+  implement:
+    action:
+      type: agent
+      prompt: "Implement the feature."
+    outputs: [implemented]
+    retry_policy:
+      max_attempts: {implement_attempts}
+      backoff: 0
+    transitions:
+      implemented: review
+  review:
+    action:
+      type: agent
+      prompt: "Review the change."
+    outputs: [reviewed]
+    transitions:
+      reviewed: analyze
+  analyze:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: "Analyse the result."
+    outputs: [analysed]
+    transitions:
+      analysed: done
+  done:
+    description: Success.
+terminal_states:
+  done: completed
+"#
+    )
+}
+
+/// A selector over claude-code, opencode and codex starting on claude-code,
+/// and an engine whose three adapters all run the fixture's fake harness.
+async fn engine_with_live_default(
+    fixture: &EngineFixture,
+) -> (Engine, Arc<DefaultHarnessSelector>) {
+    let selector = Arc::new(
+        DefaultHarnessSelector::load(
+            StatePaths::new(fixture.root.path()),
+            vec!["claude-code".into(), "opencode".into(), "codex".into()],
+            "claude-code",
+        )
+        .await
+        .expect("load selector"),
+    );
+    let store = fixture.store();
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(ClaudeCodeAdapter::with_program(
+                fixture.fake.program(),
+            )))
+            .with_adapter(Arc::new(OpenCodeAdapter::with_program(
+                fixture.fake.program(),
+            )))
+            .with_adapter(Arc::new(CodexAdapter::with_program(fixture.fake.program()))),
+    )
+    .with_default_harness_selector(Arc::clone(&selector))
+    .with_event_sink(Arc::new(LoggingEventSink::new(store.clone(), None)));
+    let engine = Engine::new(store).with_executor(ActionKind::Agent, Arc::new(executor));
+    (engine, selector)
+}
+
+/// Waits until the fake harness has been called `calls` times.
+async fn wait_for_calls(fixture: &EngineFixture, calls: usize) {
+    for _ in 0..200 {
+        if fixture.fake.calls() >= calls {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(fixture.fake.calls(), calls, "call {calls} started");
+}
+
+/// The harness of every `AgentSessionStarted` of an execution, in order.
+fn started_harnesses(fixture: &EngineFixture, execution_id: &str) -> Vec<String> {
+    events_of(fixture, execution_id)
+        .into_iter()
+        .filter_map(|data| match data {
+            EventData::AgentSessionStarted { harness, .. } => Some(harness),
+            _ => None,
+        })
+        .collect()
+}
+
+/// AE5: `implement` starts on claude-code, the default switches to opencode
+/// while it runs, the attempt fails and is retried — on claude-code. The
+/// next harnessless step, `review`, takes opencode; `analyze`, which names
+/// claude-code, stays on it.
+#[tokio::test]
+async fn covers_ae5_a_retry_stays_on_the_harness_its_action_started_with() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &failed_envelope("the model is overloaded"))
+        .sleeps_on_call(1, 1)
+        .answers_on_call(2, &envelope(r#"{"output":"implemented"}"#))
+        .answers_on_call(3, &opencode_stream("oc-1", r#"{"output":"reviewed"}"#))
+        .answers_on_call(4, &envelope(r#"{"output":"analysed"}"#));
+    let (engine, selector) = engine_with_live_default(&fixture).await;
+    let definition = fixture.workflow(&pinned_harness_workflow(2));
+    let workspace = fixture.workspace();
+    let run = tokio::spawn(async move {
+        engine
+            .start_and_run(&definition, json!({}), workspace)
+            .await
+    });
+
+    wait_for_calls(&fixture, 1).await;
+    selector.set("opencode").await.expect("change the default");
+    let execution = run.await.expect("the run joins").expect("run the workflow");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(
+        started_harnesses(&fixture, &execution.id),
+        ["claude-code", "claude-code", "opencode", "claude-code"]
+    );
+    let retry = fixture.fake.args(2);
+    assert!(retry.iter().any(|arg| arg == "--print"), "{retry:?}");
+    let review = fixture.fake.args(3);
+    assert!(review.iter().any(|arg| arg == "run"), "{review:?}");
+    let analyze = fixture.fake.args(4);
+    assert!(analyze.iter().any(|arg| arg == "--print"), "{analyze:?}");
+}
+
+/// R16a: however often the default changes during one action, the action
+/// and every one of its retries stay on the harness it started with.
+#[tokio::test]
+async fn a_default_changed_twice_during_an_action_leaves_its_retries_on_the_original() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &failed_envelope("the model is overloaded"))
+        .sleeps_on_call(1, 1)
+        .answers_on_call(2, &failed_envelope("the model is still overloaded"))
+        .sleeps_on_call(2, 1)
+        .answers_on_call(3, &envelope(r#"{"output":"implemented"}"#))
+        .answers_on_call(4, &codex_stream("thread-1", r#"{"output":"reviewed"}"#))
+        .answers_on_call(5, &envelope(r#"{"output":"analysed"}"#));
+    let (engine, selector) = engine_with_live_default(&fixture).await;
+    let definition = fixture.workflow(&pinned_harness_workflow(3));
+    let workspace = fixture.workspace();
+    let run = tokio::spawn(async move {
+        engine
+            .start_and_run(&definition, json!({}), workspace)
+            .await
+    });
+
+    wait_for_calls(&fixture, 1).await;
+    selector.set("opencode").await.expect("change the default");
+    wait_for_calls(&fixture, 2).await;
+    selector
+        .set("codex")
+        .await
+        .expect("change the default again");
+    let execution = run.await.expect("the run joins").expect("run the workflow");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(
+        started_harnesses(&fixture, &execution.id),
+        [
+            "claude-code",
+            "claude-code",
+            "claude-code",
+            "codex",
+            "claude-code"
+        ]
+    );
+}
+
+/// Restart matrix: the reprompt continued after a restart runs on the
+/// harness the rejected attempt recorded, not on the default current when
+/// the daemon came back.
+#[tokio::test]
+async fn a_reprompt_after_a_restart_runs_on_the_recorded_harness_not_the_new_default() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers(&envelope(r#"{"output":"implemented"}"#));
+    let (engine, selector) = engine_with_live_default(&fixture).await;
+    let definition =
+        fixture.workflow(&REPROMPT_WORKFLOW.replace("      harness: claude-code\n", ""));
+    let store = fixture.store();
+    let mut execution = engine
+        .start(&definition, json!({}), fixture.workspace())
+        .expect("start");
+
+    let log = store.event_log(&execution.id);
+    for data in [
+        EventData::StateEntered {
+            state_id: "work".to_string(),
+        },
+        EventData::ActionStarted {
+            action_execution_id: "attempt-1".to_string(),
+            state_id: "work".to_string(),
+            action_type: "agent".to_string(),
+        },
+        EventData::ActionOutputRejected {
+            action_execution_id: "attempt-1".to_string(),
+            state_id: "work".to_string(),
+            reason: "no output label".to_string(),
+            answer_tail: None,
+        },
+    ] {
+        log.append_next(&execution.id, data).expect("append");
+    }
+    let rejection = OutputRejection {
+        state_id: "work".to_string(),
+        action_execution_id: "attempt-1".to_string(),
+        reason: "no output label".to_string(),
+        answer_tail: None,
+        harness: Some("claude-code".to_string()),
+        harness_session_id: Some("session-7".to_string()),
+    };
+    execution.current_state = Some("work".to_string());
+    execution.metadata = json!({
+        METADATA_ENGINE_KEY: { METADATA_OUTPUT_REJECTION_KEY: rejection },
+    });
+    store
+        .save_execution(&execution)
+        .expect("save the execution");
+    recover(&store).expect("recover");
+
+    // The operator switched the default while the daemon was down.
+    selector.set("opencode").await.expect("change the default");
+    let execution = engine
+        .resume(&definition, &execution.id)
+        .await
+        .expect("resume");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let args = fixture.fake.args(1);
+    assert!(args.iter().any(|arg| arg == "--print"), "{args:?}");
+    assert!(has_flag(&args, "--resume", "session-7"), "{args:?}");
+}
+
 /// Restart matrix: a daemon that stopped after `ActionOutputRejected` and
 /// before the reprompt started leaves nothing in flight. Startup recovery
 /// keeps the execution `Running`, and the next pass continues with the
@@ -2819,10 +3069,12 @@ async fn an_explicit_harness_wins_over_the_live_default_selector() {
     assert!(fake.args(1).iter().any(|argument| argument == "--print"));
 }
 
-/// A selector is read once as an attempt starts: a later mutation affects the
-/// next action, never an action already launched with its previous snapshot.
+/// The executor reads the selector once as a harnessless action starts: a
+/// later mutation affects the next action, never one already launched. (The
+/// engine pins that reading for every retry of the action — see
+/// `covers_ae5_a_retry_stays_on_the_harness_its_action_started_with`.)
 #[tokio::test]
-async fn live_default_changes_apply_to_the_next_harnessless_attempt() {
+async fn live_default_changes_apply_to_the_next_harnessless_action() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&envelope("{\"output\": \"done\"}")).sleeps(1);

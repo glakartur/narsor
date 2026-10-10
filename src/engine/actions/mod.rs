@@ -45,7 +45,9 @@ use crate::domain::{
 };
 use crate::persistence::ConversationStore;
 
-pub use agent::{AgentEventSink, AgentExecutor, AgentOutput, LoggingEventSink};
+pub use agent::{
+    AgentEventSink, AgentExecutor, AgentOutput, DefaultHarnessSource, LoggingEventSink,
+};
 pub use harness::{
     ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, HarnessInvocation, HarnessRegistry,
     HarnessRequest, HarnessRun, OpenCodeAdapter,
@@ -283,4 +285,15 @@ pub trait ActionExecutor: Send + Sync {
         &'a self,
         request: ActionRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>>;
+
+    /// The harness an `agent` action that names none would run on right now.
+    ///
+    /// The engine reads it once, at the first attempt of such an action, and
+    /// writes it into that attempt and every later one — retries, reprompts,
+    /// continuations — so a default changed mid-action applies only from the
+    /// next action on (R16a). `None`, the default, leaves the action as the
+    /// workflow wrote it: the executor has no default to pin.
+    fn current_default_harness(&self) -> Option<String> {
+        None
+    }
 }
