@@ -1320,6 +1320,145 @@ async fn an_evicted_pod_waits_for_the_owner_without_the_policy() {
     assert_eq!(cluster.created_of("PersistentVolumeClaim").len(), 1);
 }
 
+/// A workflow whose one step waits for the owner's approval of its output:
+/// a runner of it stands at that waiting point until answered.
+const GATED_WORKFLOW: &str = r#"
+name: gated-task
+version: 1
+states:
+  work:
+    action:
+      type: script
+      command: sh
+      args: [-c, "echo worked >> \"$HOME/steps\"; printf '{\"output\": \"ok\"}'"]
+    outputs: [ok, rejected]
+    transitions:
+      ok: completed
+      rejected: failed
+    decision:
+      type: human
+      message: Ship it?
+  completed:
+    description: Done.
+  failed:
+    description: Rejected.
+terminal_states:
+  completed: completed
+  failed: failed
+"#;
+
+fn gated_spec() -> TaskLaunchSpec {
+    let definition = narsor::workflow::load_from_str(GATED_WORKFLOW).expect("a valid workflow");
+    TaskLaunchSpec::new(
+        definition.id.clone(),
+        definition.version,
+        serde_json::json!({}),
+        TaskWorkspace::None,
+        environment(),
+        ResourceProfile::new(1500, 3072),
+    )
+    .with_definition(&definition)
+    .expect("snapshot the definition")
+}
+
+/// The id of the input request the task's runner waits on, if it waits.
+fn waiting_on(h: &Harness<KubernetesTarget>, task: &str) -> Option<String> {
+    h.record(task)
+        .runner
+        .and_then(|runner| runner.snapshot.pending_input)
+        .map(|input| input.id)
+}
+
+/// A Pod whose node stops reporting (phase `Unknown`) makes the task
+/// Unknown and keeps it there — it may still run behind the partition.
+/// Once the node reports the runner failed, the loss is confirmed, the
+/// resume policy starts one new Pod on the same claim, and its runner
+/// returns to the very waiting point the lost one stood at without running
+/// the finished step again (R1, R3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partitioned_pod_waits_until_its_failure_is_reported() {
+    let Some(mut h) = Harness::<KubernetesTarget>::new().await else {
+        return;
+    };
+    h.start_controller();
+    h.create_with("task-1", gated_spec());
+    h.wait_for("the runner at its approval", |h| {
+        h.lifecycle("task-1") == TaskLifecycle::Running && waiting_on(h, "task-1").is_some()
+    })
+    .await;
+    let waiting = waiting_on(&h, "task-1").unwrap();
+    let first = h.record("task-1").runner.unwrap().incarnation;
+    let cluster = Arc::clone(&h.target.cluster);
+    let task = h.resources("task-1");
+
+    assert!(cluster.partition(&task.workload));
+    h.wait_lifecycle("task-1", TaskLifecycle::Unknown).await;
+    h.observed_again(3).await;
+    assert_eq!(
+        h.lifecycle("task-1"),
+        TaskLifecycle::Unknown,
+        "a Pod in phase Unknown is no confirmed loss"
+    );
+    assert_eq!(cluster.created_of("Pod").len(), 1);
+    assert!(!h.reported("task-1").contains(&Observation::LossConfirmed));
+
+    assert!(cluster.kill_runner(&task.workload));
+    h.wait_for("the resumed runner at the same approval", |h| {
+        let record = h.record("task-1");
+        record.lifecycle == TaskLifecycle::Running
+            && record
+                .runner
+                .as_ref()
+                .is_some_and(|runner| runner.incarnation != first)
+            && waiting_on(h, "task-1").is_some()
+    })
+    .await;
+    assert_eq!(
+        waiting_on(&h, "task-1"),
+        Some(waiting),
+        "the same waiting point"
+    );
+    assert!(h.reported("task-1").contains(&Observation::LossConfirmed));
+    assert_eq!(
+        backend_contract_support::auto_resumes(&h.events("task-1")),
+        vec![(1, 5)]
+    );
+    assert_eq!(cluster.created_of("Pod").len(), 2);
+    assert_eq!(cluster.created_of("PersistentVolumeClaim").len(), 1);
+    let steps = cluster
+        .volume_dir(&task.storage)
+        .unwrap()
+        .join("home/steps");
+    assert_eq!(
+        std::fs::read_to_string(steps).unwrap(),
+        "worked\n",
+        "the finished step ran once"
+    );
+}
+
+/// An Unknown task whose Pod is then deleted is a confirmed loss: without
+/// the resume policy it waits Interrupted for the owner (R3, R13).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deleted_pod_confirms_the_loss_of_an_unknown_task() {
+    let Some(mut h) = Harness::<KubernetesTarget>::without_auto_resume().await else {
+        return;
+    };
+    h.start_controller();
+    h.running("task-1").await;
+    let cluster = Arc::clone(&h.target.cluster);
+    let task = h.resources("task-1");
+
+    assert!(cluster.partition(&task.workload));
+    h.wait_lifecycle("task-1", TaskLifecycle::Unknown).await;
+    assert!(cluster.evict(&task.workload));
+    h.wait_lifecycle("task-1", TaskLifecycle::Interrupted).await;
+    assert!(h.reported("task-1").contains(&Observation::LossConfirmed));
+    h.settle().await;
+    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Interrupted);
+    assert_eq!(cluster.created_of("Pod").len(), 1, "nothing replaced it");
+    assert!(cluster.pvc(&task.storage).is_some());
+}
+
 /// AE8 + AE9 specifics on Kubernetes: a severed controller leaves the Pod
 /// running; a finished task keeps its PVC until archive, which then
 /// removes Pod, PVC and (by garbage collection) every launch Secret.

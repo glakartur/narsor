@@ -758,7 +758,16 @@ pub enum DesiredAction {
     PauseAtSafePoint,
     /// Paused: ensure no compute exists; keep storage.
     KeepPaused,
-    /// Interrupted/Unknown: do nothing until the owner decides (R13).
+    /// Interrupted/Unknown: create nothing, remove nothing (R13).
+    ///
+    /// Unknown: observe the workload again, as a running one is. Report
+    /// `LossConfirmed` (→ Interrupted) only when it is gone or terminated
+    /// while the task storage is present; a live workload, one still being
+    /// deleted, a failed observation or missing storage leave the task
+    /// Unknown for its owner.
+    ///
+    /// Interrupted: wait. The owner resumes it, or the control plane's
+    /// resume policy does, with a new desired generation.
     Hold,
     /// Archiving: delete workload and storage, then report
     /// `ResourcesDeleted` (absent resources count as deleted).

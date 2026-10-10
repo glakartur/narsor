@@ -296,6 +296,11 @@ impl<T: ContractTarget> Harness<T> {
     /// Creates and queues a task, announcing it the way every in-process
     /// writer must.
     pub fn create(&self, task: &str) {
+        self.create_with(task, self.target.launch_spec());
+    }
+
+    /// [`Self::create`] with a launch spec of the scenario's own.
+    pub fn create_with(&self, task: &str, spec: TaskLaunchSpec) {
         let task_id = TaskId::parse(task).unwrap();
         self.service
             .control_plane()
@@ -303,7 +308,7 @@ impl<T: ContractTarget> Harness<T> {
                 task_id.clone(),
                 OwnerRef::new(LOCAL_OWNER),
                 BackendId::parse(BACKEND).unwrap(),
-                self.target.launch_spec(),
+                spec,
             ))
             .expect("create the task");
         self.service.notify(&task_id);
@@ -454,6 +459,17 @@ impl<T: ContractTarget> Harness<T> {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    /// Waits until the platform was observed `count` more times: as many
+    /// controller passes over a task that observes on each, at the idle
+    /// pace.
+    pub async fn observed_again(&self, count: u64) {
+        let target = self.counters().observe_calls + count;
+        self.wait_for("more observations", |h| {
+            h.counters().observe_calls >= target
+        })
+        .await;
     }
 
     /// Lets controllers run a few rounds, for "nothing happens" checks.
@@ -719,9 +735,10 @@ pub async fn workload_death_waits_for_the_owner_without_the_policy<T: ContractTa
     assert_eq!(counters.storages_created, 1, "the same storage");
 }
 
-/// A backend that cannot be observed makes the task Unknown, and nothing
-/// replaces its workload — not the resume policy either, which acts only on
-/// a confirmed loss — until the owner decides (R3, R13).
+/// A backend that cannot be observed makes the task Unknown, and while its
+/// workload is seen alive again nothing replaces it — not the resume policy
+/// either, which acts only on a confirmed loss — until the owner decides
+/// (R3, R13, AE4).
 pub async fn a_failed_observation_reports_unknown_and_waits<T: ContractTarget>() {
     let Some(mut h) = Harness::<T>::new().await else {
         return;
@@ -734,13 +751,14 @@ pub async fn a_failed_observation_reports_unknown_and_waits<T: ContractTarget>()
     assert!(h
         .reported("task-1")
         .contains(&Observation::WorkloadLost { state_known: false }));
-    h.settle().await;
+    h.observed_again(3).await;
     assert_eq!(
         h.lifecycle("task-1"),
         TaskLifecycle::Unknown,
-        "observing again changes nothing"
+        "a live workload is no confirmed loss"
     );
     assert_eq!(h.counters().workloads_created, 1);
+    assert!(!h.reported("task-1").contains(&Observation::LossConfirmed));
     assert!(auto_resumes(&h.events("task-1")).is_empty());
 
     // The owner retries: the old launch goes, one new one comes.
@@ -750,6 +768,98 @@ pub async fn a_failed_observation_reports_unknown_and_waits<T: ContractTarget>()
     assert_eq!(counters.workloads_created, 2, "{counters:?}");
     assert_eq!(counters.workload_deletions, 1, "{counters:?}");
     assert_eq!(counters.launches_over_existing, 0, "{counters:?}");
+}
+
+/// An Unknown task whose workload is then seen dead, with its storage
+/// still there, is a confirmed loss: Interrupted, and the resume policy
+/// launches it again on the same storage. While the backend still cannot
+/// be observed nothing is concluded and nothing reported again (R1, R3).
+pub async fn a_confirmed_loss_of_an_unknown_task_is_resumed<T: ContractTarget>() {
+    let Some(mut h) = Harness::<T>::new().await else {
+        return;
+    };
+    h.start_controller();
+    h.running("task-1").await;
+
+    h.probe.fail_observes(2);
+    h.wait_lifecycle("task-1", TaskLifecycle::Unknown).await;
+    // The runner dies while the backend still cannot be observed.
+    h.probe.fail_observes(u32::MAX / 2);
+    h.kill_workload("task-1");
+    h.observed_again(2).await;
+    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Unknown);
+    let losses = |h: &Harness<T>| {
+        h.reported("task-1")
+            .into_iter()
+            .filter(|o| matches!(o, Observation::WorkloadLost { .. }))
+            .count()
+    };
+    assert_eq!(losses(&h), 1, "a failed observation reports nothing more");
+
+    h.probe.clear_faults();
+    h.wait_for("the replacement workload", |h| {
+        h.counters().workloads_created == 2 && h.lifecycle("task-1") == TaskLifecycle::Running
+    })
+    .await;
+    let reported = h.reported("task-1");
+    let confirmed = reported
+        .iter()
+        .position(|o| *o == Observation::LossConfirmed)
+        .expect("the loss was confirmed");
+    assert!(
+        reported[..confirmed].contains(&Observation::WorkloadLost { state_known: false }),
+        "{reported:?}"
+    );
+    assert_eq!(losses(&h), 1, "{reported:?}");
+    // Only an Interrupted task is resumed automatically.
+    assert_eq!(auto_resumes(&h.events("task-1")), vec![(1, 5)]);
+    let counters = h.counters();
+    assert_eq!(counters.launches_over_existing, 0, "{counters:?}");
+    assert_eq!(counters.storages_created, 1, "the same storage");
+}
+
+/// An Unknown task whose storage is gone stays Unknown even with its
+/// workload gone too: a resume could only fail on the missing storage
+/// again, so no loss is confirmed and nothing loops (R3, R13).
+pub async fn an_unknown_task_without_storage_stays_unknown<T: ContractTarget>() {
+    let Some(mut h) = Harness::<T>::new().await else {
+        return;
+    };
+    h.start_controller();
+    h.running("task-1").await;
+
+    h.probe.fail_observes(2);
+    h.wait_lifecycle("task-1", TaskLifecycle::Unknown).await;
+    // Workload and storage vanish behind the controller's back — unseen
+    // until both are gone, since a platform may remove them one by one.
+    h.probe.fail_observes(u32::MAX / 2);
+    let task = h.resources("task-1");
+    let deadline = Instant::now() + h.target.patience();
+    loop {
+        let gone = h
+            .probe
+            .inner()
+            .archive(&task)
+            .await
+            .is_ok_and(|progress| progress.is_complete());
+        if gone {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the platform kept the task");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    h.probe.clear_faults();
+
+    h.observed_again(3).await;
+    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Unknown);
+    assert!(!h.reported("task-1").contains(&Observation::LossConfirmed));
+    assert!(auto_resumes(&h.events("task-1")).is_empty());
+    let counters = h.counters();
+    assert_eq!(counters.workloads_created, 1, "{counters:?}");
+    assert_eq!(counters.storages_created, 1, "{counters:?}");
+
+    h.must("task-1", OwnerCommand::Archive, "archive-1");
+    h.wait_lifecycle("task-1", TaskLifecycle::Archived).await;
 }
 
 /// Transient launch failures are retried; a refusal interrupts the task,
@@ -1138,6 +1248,8 @@ macro_rules! contract_suite {
                 a_dead_workload_is_resumed_automatically,
                 workload_death_waits_for_the_owner_without_the_policy,
                 a_failed_observation_reports_unknown_and_waits,
+                a_confirmed_loss_of_an_unknown_task_is_resumed,
+                an_unknown_task_without_storage_stays_unknown,
                 provisioning_failures_retry_or_resume_automatically,
                 archive_deletes_exactly_once,
                 a_finished_task_keeps_its_storage_until_archived,

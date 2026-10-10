@@ -282,6 +282,18 @@ impl MockCluster {
         true
     }
 
+    /// The Pod's node stops reporting (a partition): the Pod's phase turns
+    /// `Unknown` while its runner keeps running. The runner's end, should
+    /// it come, is still reported.
+    pub fn partition(&self, name: &str) -> bool {
+        let mut state = self.lock();
+        let Some(pod) = state.pods.get_mut(name) else {
+            return false;
+        };
+        pod["status"]["phase"] = Value::String("Unknown".into());
+        true
+    }
+
     /// Kills the runner of a Pod (an OOM kill, a crash).
     pub fn kill_runner(&self, name: &str) -> bool {
         let state = self.lock();

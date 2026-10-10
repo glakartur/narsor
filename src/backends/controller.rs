@@ -17,8 +17,9 @@
 //!    identity, act, report. The rules are those of
 //!    [`DesiredAction`]; in short — report `StartAccepted` before creating
 //!    anything, never create a workload while one of the task's exists,
-//!    never recreate a lost one, remove a live runner's compute only after
-//!    its safe-point acknowledgement, and report archive complete only once
+//!    never recreate a lost one on its own (a replacement needs a new
+//!    desired generation), remove a live runner's compute only after its
+//!    safe-point acknowledgement, and report archive complete only once
 //!    workload and storage are gone.
 //!
 //! Between steps it sleeps briefly while something is in progress (a
@@ -39,10 +40,22 @@
 //! When the backend itself cannot be observed, a workload that should be
 //! running is reported `WorkloadLost { state_known: false }` (→ Unknown)
 //! after [`ControllerConfig::observe_failures_before_unknown`] consecutive
-//! failures, and then left alone until the owner decides (R13). A dead or
-//! vanished workload is reported `WorkloadLost { state_known: true }`
-//! (→ Interrupted) at once — whatever its exit code — and is never
-//! replaced without an owner `start`/`resume`.
+//! failures. A dead or vanished workload is reported
+//! `WorkloadLost { state_known: true }` (→ Interrupted) at once — whatever
+//! its exit code.
+//!
+//! An Unknown task's workload is observed again at the idle pace, as a
+//! running one is (R3). Only a workload seen gone or terminated while the
+//! task's storage is still there is reported `LossConfirmed`
+//! (→ Interrupted). A live workload, one still being deleted, another
+//! failed observation and missing storage all leave the task Unknown: a
+//! runner that may still be working, or a task whose work is gone, is not
+//! something to resume.
+//!
+//! The controller never replaces a lost workload by itself (R13). A
+//! replacement comes only with a new desired generation: an owner's
+//! `start`/`resume`, or the control plane's resume policy, which acts on
+//! Interrupted tasks alone.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -626,8 +639,13 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             DesiredAction::Run => self.keep_running(&context).await,
             DesiredAction::PauseAtSafePoint => self.pause_at_safe_point(&context).await,
             DesiredAction::KeepPaused => self.keep_paused(&context).await,
-            // Interrupted/Unknown: the owner decides (R13). Not even an
-            // observation: nothing here may lead to a replacement.
+            // Unknown: is the runner really gone? Nothing here creates or
+            // removes anything; a confirmed loss only makes the task
+            // Interrupted.
+            DesiredAction::Hold if command.lifecycle == TaskLifecycle::Unknown => {
+                self.confirm_loss(&context).await
+            }
+            // Interrupted: the owner or the resume policy decides (R13).
             DesiredAction::Hold => Ok(Progress::Settled),
             DesiredAction::Archive => self.archive(&context).await,
         }
@@ -793,8 +811,9 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         }
     }
 
-    /// Running: observe; a workload that is gone or dead is reported lost
-    /// and never replaced (R13).
+    /// Running: observe; a workload that is gone or dead is reported lost.
+    /// It is never replaced here (R13): a replacement needs a new desired
+    /// generation.
     async fn keep_running(&mut self, context: &TaskContext<'_>) -> Result<Progress, Interrupt> {
         let Some(observed) = self.observe(context, true).await? else {
             return Ok(Progress::Settling);
@@ -887,6 +906,41 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
                 self.lost(context, &observed, true, detail).await
             }
         }
+    }
+
+    /// Unknown: observe again, at the idle pace. Only a workload that is
+    /// gone or terminated, with the task's storage still present, is a
+    /// confirmed loss (→ Interrupted, which the resume policy may act on).
+    ///
+    /// Everything else leaves the task Unknown, with nothing reported: a
+    /// live workload (a runner that may still work must not get a second
+    /// one on its storage), one still being deleted (its node may not have
+    /// let go of it yet), a failed observation (no second `WorkloadLost`),
+    /// and storage that is gone or going (a resume could only end in
+    /// another storage loss).
+    async fn confirm_loss(&mut self, context: &TaskContext<'_>) -> Result<Progress, Interrupt> {
+        let Some(observed) = self.observe(context, false).await? else {
+            return Ok(Progress::Settled);
+        };
+        if observed.storage != super::StorageState::Present {
+            return Ok(Progress::Settled);
+        }
+        let detail = match &observed.workload {
+            None => "the runner's workload is gone".to_string(),
+            Some(workload) if matches!(workload.phase, WorkloadPhase::Exited { .. }) => {
+                format!("the runner's workload {}", workload.phase)
+            }
+            Some(_) => return Ok(Progress::Settled),
+        };
+        tracing::warn!(task = %context.command.task_id, %detail, "controller: loss confirmed");
+        self.report(
+            context,
+            Observation::LossConfirmed,
+            observed.workload.as_ref(),
+            summary(&observed, &detail),
+        )
+        .await?;
+        Ok(Progress::Settled)
     }
 
     /// Paused: no compute may exist; storage stays.

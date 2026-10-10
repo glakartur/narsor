@@ -29,6 +29,17 @@
 //! failure: the controller then reports the task Unknown rather than
 //! guessing it dead while a partitioned node may still run it.
 //!
+//! The same holds when the controller looks again to confirm an Unknown
+//! task's loss: only a Pod that is gone or `Succeeded`/`Failed` (its node
+//! reported the runner's end) confirms it. A Pod in phase `Unknown` stays
+//! an observation failure, a `Running` one on a `NotReady` node still
+//! counts as running, and an evicted one is `Deleting` until its node lets
+//! go of it — all of which keep the task Unknown. A Pod still `Pending`
+//! past the start timeout counts as terminated here too: a relaunch
+//! deletes it first and, the Pod's name being the task's, cannot create a
+//! second one while it exists. The ReadWriteOnce claim is the second guard
+//! against two runners on one storage.
+//!
 //! `resourceVersion` is opaque and must not be compared, so the monotonic
 //! `resource_generation` is derived deliberately: the phase only ever moves
 //! forward for one Pod (Starting 1 → Running 2 → Exited 3 → Deleting 4), and
