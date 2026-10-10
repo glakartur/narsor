@@ -8,13 +8,22 @@
 //!   or is happening now is loud, calm states keep the terminal's text colour;
 //! * only the 16 ANSI colours, so the interface inherits the terminal theme
 //!   and reads on a light background as well as a dark one — no RGB, and a
-//!   background only for the selected row (reverse video) and the key caps on
-//!   the shortcut bar;
+//!   background only for the key caps on the shortcut bar;
 //! * colour never carries information alone: every role is shown with an icon
 //!   and a word, which is why `NO_COLOR` can take all colour away
 //!   ([`Styles::new`]) and leave bold, dim and reverse video behind without
 //!   losing anything;
 //! * one accent, cyan, for focus and interaction.
+//!
+//! # The selection is a mark beside the content, never a fill
+//!
+//! A list (tasks, history, the step timeline, every chooser) brackets its
+//! selected item: a rule in the gap row above it, a rule in the gap row below
+//! it and a bar beside each of its lines. A transcript and *Zdarzenia* keep
+//! the bar alone. Both come from [`Styles::selection_marks`] and follow the
+//! panel frames' rule: thick `━`/`┃` in [`Role::Focus`] where the keys are,
+//! thin `─`/`│` in [`Role::Done`] elsewhere. The content keeps its own roles,
+//! and without colour the shape and weight still tell the two apart.
 //!
 //! # `NO_COLOR` is read once
 //!
@@ -56,21 +65,18 @@ pub enum Role {
     /// Finished or in the background: `✓`, inactive frames, secondary
     /// descriptions, ages, stale data, unavailable actions.
     Done,
-    /// Focus and interaction: the active frame, the active tab, the `▸`
-    /// cursor.
+    /// Focus and interaction: the active frame, the active tab, the
+    /// selection marks where the keys are.
     Focus,
     /// The conductor: `◆` recommendations, proposed values, its entries.
     Conductor,
     /// A link from `display.links`.
     Link,
-    /// The selected row. Reverse video, so a marker's own colour survives
-    /// inside it.
-    Selected,
 }
 
 impl Role {
     /// Every role, for tests that walk them.
-    pub const ALL: [Role; 9] = [
+    pub const ALL: [Role; 8] = [
         Role::Attention,
         Role::Problem,
         Role::Live,
@@ -79,7 +85,6 @@ impl Role {
         Role::Focus,
         Role::Conductor,
         Role::Link,
-        Role::Selected,
     ];
 }
 
@@ -127,7 +132,6 @@ impl Styles {
                 Role::Live | Role::Calm | Role::Conductor => Style::default(),
                 Role::Done => Style::default().add_modifier(Modifier::DIM),
                 Role::Link => Style::default().add_modifier(Modifier::UNDERLINED),
-                Role::Selected => Style::default().add_modifier(Modifier::REVERSED),
             };
         }
         match role {
@@ -141,14 +145,7 @@ impl Styles {
             Role::Link => Style::default()
                 .fg(Color::Blue)
                 .add_modifier(Modifier::UNDERLINED),
-            Role::Selected => Style::default().add_modifier(Modifier::REVERSED),
         }
-    }
-
-    /// `base` with the selection laid over it: reverse video, nothing else,
-    /// so what `base` says is still said.
-    pub fn selected(&self, base: Style) -> Style {
-        base.patch(self.of(Role::Selected))
     }
 
     /// The look of `role`, in bold: a title.

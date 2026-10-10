@@ -1213,19 +1213,15 @@ mod foundations {
         }
 
         #[test]
-        fn selection_is_reverse_video_in_both_modes_and_keeps_the_base() {
+        fn no_role_is_reverse_video_in_either_mode() {
             for no_color in [false, true] {
                 let styles = Styles::new(no_color);
-                assert!(styles
-                    .of(Role::Selected)
-                    .add_modifier
-                    .contains(Modifier::REVERSED));
-                let selected = styles.selected(styles.of(Role::Attention));
-                assert!(selected.add_modifier.contains(Modifier::REVERSED));
-                assert!(
-                    selected.add_modifier.contains(Modifier::BOLD),
-                    "the base still speaks"
-                );
+                for role in Role::ALL {
+                    assert!(
+                        !styles.of(role).add_modifier.contains(Modifier::REVERSED),
+                        "{role:?} with no_color={no_color}"
+                    );
+                }
             }
         }
 

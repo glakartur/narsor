@@ -7,7 +7,7 @@
 //! │ ◆ dyrygent: raczej revise — brak planu migracji                     │
 //! │ ┌ Akcje ─────────────────┐ ┌ Opis ─────────────────────────────────┐ │
 //! │ │   approved             │ │ ↩ wraca do agenta: plan               │ │
-//! │ │ ▸ revise  ↩          ◆ │ │ Zakres wymaga poprawy…                │ │
+//! │ │ ┃ revise  ↩          ◆ │ │ Zakres wymaga poprawy…                │ │
 //! │ └────────────────────────┘ └───────────────────────────────────────┘ │
 //! │ Komentarz dla agenta (wymagane):                                    │
 //! │ > Uwzględnij migrację tabeli orders▏                                │
