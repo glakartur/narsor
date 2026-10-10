@@ -15,8 +15,8 @@ use std::sync::Arc;
 use narsor::domain::{ImageSpec, ResourceProfile, SecretDelivery};
 use narsor::environment::{
     BackendKind, BackendLimits, BackendRecord, BackendSecret, CatalogLaunchResolver,
-    EnvironmentCatalog, LaunchResolver, OwnerDefaults, RuntimeCatalog, SecretDeliveryMode,
-    StaticHarnessDefaults, TrustScope,
+    EnvironmentCatalog, HarnessDefaults, LaunchResolver, OwnerDefaults, RuntimeCatalog,
+    SecretDeliveryMode, StaticHarnessDefaults, TrustScope,
 };
 use narsor::workflows::WorkflowResolver;
 
@@ -109,6 +109,20 @@ pub fn resolver_with_local_roots(
     root: &Path,
     local_workspace_roots: Vec<std::path::PathBuf>,
 ) -> CatalogLaunchResolver {
+    resolver_with(
+        root,
+        local_workspace_roots,
+        Arc::new(StaticHarnessDefaults::builtin("claude-code")),
+    )
+}
+
+/// Like [`resolver`], with the harness defaults of `harness` — a live
+/// selector makes the control plane hand running tasks its default (U7).
+pub fn resolver_with(
+    root: &Path,
+    local_workspace_roots: Vec<std::path::PathBuf>,
+    harness: Arc<dyn HarnessDefaults>,
+) -> CatalogLaunchResolver {
     CatalogLaunchResolver::new(
         root,
         WorkflowResolver::with_user_dir(root, None),
@@ -117,7 +131,7 @@ pub fn resolver_with_local_roots(
             default_profile: "default".to_string(),
             local_workspace_roots,
         },
-        Arc::new(StaticHarnessDefaults::builtin("claude-code")),
+        harness,
     )
 }
 
@@ -125,6 +139,25 @@ pub fn resolver_with_local_roots(
 pub fn seeded_catalog_resolver(root: &Path) -> Arc<CatalogLaunchResolver> {
     seed_catalog(root);
     Arc::new(resolver(root))
+}
+
+/// Seeds `root` and returns its resolver over the harness defaults of
+/// `harness`.
+pub fn seeded_catalog_resolver_with(
+    root: &Path,
+    harness: Arc<dyn HarnessDefaults>,
+) -> Arc<CatalogLaunchResolver> {
+    seed_catalog(root);
+    Arc::new(resolver_with(root, vec![root.to_path_buf()], harness))
+}
+
+/// Lets backend `id` run only `harnesses` from now on.
+pub fn restrict_harnesses(root: &Path, id: &str, harnesses: &[&str]) {
+    let mut record = backend(id);
+    record.harnesses = harnesses.iter().map(|name| name.to_string()).collect();
+    EnvironmentCatalog::new(root)
+        .save_backend(&record)
+        .expect("save backend");
 }
 
 pub fn seeded_resolver(root: &Path) -> Arc<dyn LaunchResolver> {

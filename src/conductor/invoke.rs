@@ -6,9 +6,9 @@
 //! The conductor runs on the daemon's default harness, snapshotted from
 //! [`DefaultHarnessSelector`] at every invocation, the same way an agent
 //! step picks it. A task runner has no selector: its conductor runs on the
-//! harness its task pinned, or on the one its owner chose since
-//! ([`LiveHarness`]), read at every invocation too. It never writes, and how that is enforced depends on the
-//! harness:
+//! default its control plane last handed it ([`LiveHarness`], U7) — the
+//! harness its task was created with until then — read at every invocation
+//! too. It never writes, and how that is enforced depends on the harness:
 //!
 //! * **claude-code, codex** enforce it themselves: the conductor runs in the
 //!   task's workspace with read-only access, which the adapters turn into
@@ -56,7 +56,9 @@ use crate::conductor::store::ConductorStore;
 use crate::domain::{
     AgentActionConfig, OutputDefinition, WorkflowDefinition, WorkflowExecution, WorkspaceAccess,
 };
-use crate::engine::actions::agent::{run_harness_process, SpawnEnding, BUILT_IN_HARNESS};
+use crate::engine::actions::agent::{
+    run_harness_process, DefaultHarnessSource, SpawnEnding, BUILT_IN_HARNESS,
+};
 use crate::engine::actions::harness::{HarnessRegistry, HarnessRequest, CLAUDE_CODE, CODEX};
 use crate::persistence::{DefaultHarnessSelector, ExecutionStore, WorkPaths};
 
@@ -111,6 +113,14 @@ impl LiveHarness {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = harness.into();
+    }
+}
+
+/// The runner's live default is also what its agent actions that name no
+/// harness start on (U7), read once per action like the daemon's selector.
+impl DefaultHarnessSource for LiveHarness {
+    fn current_harness(&self) -> String {
+        self.get()
     }
 }
 

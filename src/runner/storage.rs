@@ -22,6 +22,9 @@
 //!         report.json        the last snapshot sequence handed out
 //!         inputs.json        owner inputs this storage already consumed
 //!         commands.json      operator commands this storage already carried out
+//!         harness.json       the installation's default harness this storage
+//!                            last switched to (U7); its launch spec's harness
+//!                            is the fallback until there is one
 //!         conductor.json     a per-task conductor harness an older version
 //!                            kept; neither read nor removed any more
 //!         work/              scratch of the conductor's isolated invocations
@@ -156,6 +159,10 @@ impl TaskStorage {
 
     fn commands_file(&self) -> PathBuf {
         self.bookkeeping_dir().join("commands.json")
+    }
+
+    fn harness_file(&self) -> PathBuf {
+        self.bookkeeping_dir().join("harness.json")
     }
 
     /// `{root}/narsor/work`: where the conductor keeps its scratch.
@@ -298,6 +305,22 @@ impl TaskStorage {
         inputs.version = RECORD_VERSION;
         inputs.consumed.insert(input_id.to_string());
         write_json_atomic(&self.inputs_file(), &inputs).map_err(RunnerError::from)
+    }
+
+    /// The default harness this storage last switched to (U7), when it
+    /// ever switched: a resumed runner starts on it, not on its launch
+    /// spec's.
+    pub fn applied_harness(&self) -> Result<Option<String>, RunnerError> {
+        Ok(read_optional::<AppliedHarness>(&self.harness_file())?.map(|applied| applied.harness))
+    }
+
+    /// Records the default harness the runner switched to.
+    pub fn record_applied_harness(&self, harness: &str) -> Result<(), RunnerError> {
+        let applied = AppliedHarness {
+            version: RECORD_VERSION,
+            harness: harness.to_string(),
+        };
+        write_json_atomic(&self.harness_file(), &applied).map_err(RunnerError::from)
     }
 
     /// How far an operator command got here (U3).
@@ -465,6 +488,12 @@ struct ReportState {
     version: u32,
     last_sequence: u64,
     last_reported_event_cursor: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AppliedHarness {
+    version: u32,
+    harness: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

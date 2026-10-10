@@ -906,6 +906,12 @@ pub struct RunnerSnapshot {
     /// Why there is no conductor, when there is none.
     #[serde(default)]
     pub conductor_unavailable_reason: Option<String>,
+    /// The installation's default harness this task cannot switch to, while
+    /// it cannot (U7, R16c): its backend does not run it, or its binary is
+    /// not in the task's environment. The task keeps its harness meanwhile;
+    /// this is information for the owner, never a [`RunnerProblem`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_harness_unavailable: Option<HarnessUnavailable>,
     /// The workflow's `display` rendered against the execution's inputs and
     /// current variables. `None` when the runner could not render one (no
     /// execution yet), which leaves what the control plane rendered at
@@ -914,6 +920,17 @@ pub struct RunnerSnapshot {
     pub display: Option<TaskDisplay>,
     /// When the runner took this snapshot.
     pub observed_at: DateTime<Utc>,
+}
+
+/// A default harness a task cannot follow (U7, R16c).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HarnessUnavailable {
+    /// The installation's default the task cannot switch to.
+    pub harness: String,
+    /// The harness the task keeps running on meanwhile.
+    pub kept: String,
+    /// Why it cannot switch, for the owner.
+    pub reason: String,
 }
 
 /// A condition that keeps a runner from doing its work.

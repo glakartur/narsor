@@ -28,11 +28,13 @@ use crate::domain::{
     BackendId, Event, ExecutionStatus, ResourceProfile, TaskDisplay, TaskId, TaskLaunchSpec,
 };
 use crate::engine::{HumanInputDelivery, Timeline};
+pub use crate::environment::TaskDefaultHarness;
 use crate::orchestration::{
     ArchiveTombstone, AttentionItem, CommandReceipt, ConversationAttemptSummary, ExecutionCursor,
-    InputStatus, MoveTarget, Observation, ObservedSummary, OperatorCommand, OperatorCommandStatus,
-    OwnerCommand, PendingInputRef, QueueReason, QueueStatus, QueuedInput, QueuedOperatorCommand,
-    ResourceIdentity, RunnerProblem, RunnerSnapshot, TaskEvent, TaskLifecycle,
+    HarnessUnavailable, InputStatus, MoveTarget, Observation, ObservedSummary, OperatorCommand,
+    OperatorCommandStatus, OwnerCommand, PendingInputRef, QueueReason, QueueStatus, QueuedInput,
+    QueuedOperatorCommand, ResourceIdentity, RunnerProblem, RunnerSnapshot, TaskEvent,
+    TaskLifecycle,
 };
 
 /// Version of this protocol; part of every path (`…/v1/…`).
@@ -163,6 +165,10 @@ pub struct RunnerView {
     /// Why it hosts none, when it does not.
     #[serde(default)]
     pub conductor_unavailable_reason: Option<String>,
+    /// The installation's default harness the task cannot switch to, while
+    /// it cannot (U7, R16c): information for the owner, never a problem.
+    #[serde(default)]
+    pub default_harness_unavailable: Option<HarnessUnavailable>,
     /// When the runner took the snapshot.
     pub observed_at: DateTime<Utc>,
     /// When the control plane accepted it.
@@ -946,6 +952,10 @@ pub struct RunnerSnapshotResponse {
     pub lifecycle: TaskLifecycle,
     /// The calling runner's launch.
     pub launch: RunnerLaunchView,
+    /// The installation's default harness as it applies to this task (U7);
+    /// absent when there is none to follow. Applied before anything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_harness: Option<TaskDefaultHarness>,
 }
 
 /// `GET /runner/v1/poll` query.
@@ -1027,6 +1037,11 @@ pub struct RunnerPollResponse {
     /// acknowledged.
     #[serde(default)]
     pub materials: Vec<crate::materials::MaterialAnnouncement>,
+    /// The installation's default harness as it applies to this task (U7);
+    /// absent when there is none to follow. The runner applies it before
+    /// the inputs and commands of the same answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_harness: Option<TaskDefaultHarness>,
 }
 
 /// An owner's request for one bounded page of one attempt's raw

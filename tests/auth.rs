@@ -1168,6 +1168,7 @@ fn snapshot() -> RunnerSnapshot {
         attention: Vec::new(),
         conductor_available: false,
         conductor_unavailable_reason: None,
+        default_harness_unavailable: None,
         display: None,
         observed_at: Utc::now(),
     }

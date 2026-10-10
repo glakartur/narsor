@@ -26,13 +26,24 @@ pub fn assemble(
     invoker: Arc<dyn ConductorInvoker>,
     launcher: Option<Arc<dyn PassLauncher>>,
 ) -> Arc<ConductorRegistry> {
+    let registry = build(engine, invoker, launcher);
+    engine.attach_conductor(&registry);
+    registry
+}
+
+/// Like [`assemble`], but not yet attached to the engine: a task runner
+/// attaches its conductor only once its harness can run (U7), so the engine
+/// never hands a step to a conductor that cannot answer.
+pub fn build(
+    engine: &Arc<Engine>,
+    invoker: Arc<dyn ConductorInvoker>,
+    launcher: Option<Arc<dyn PassLauncher>>,
+) -> Arc<ConductorRegistry> {
     let mut registry = ConductorRegistry::new(Arc::clone(engine), invoker);
     if let Some(launcher) = launcher {
         registry = registry.with_pass_launcher(launcher);
     }
-    let registry = Arc::new(registry);
-    engine.attach_conductor(&registry);
-    registry
+    Arc::new(registry)
 }
 
 /// What [`restore_at_startup`] picked up again.

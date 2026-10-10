@@ -155,9 +155,9 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
                 CliError::failure(format!("could not load default harness selection: {error}"))
             })?,
     );
-    // Remote tasks resolve against the same catalogue and pin the same live
-    // default harness a local harnessless step would use (R42), read when
-    // each task is created — never re-read for an existing one (U6).
+    // Tasks resolve against the same catalogue and start on the same live
+    // default harness a local harnessless step would use; their runners
+    // follow it afterwards, through the control plane's answers (U7).
     let launch = Arc::new(CatalogLaunchResolver::new(
         config.catalog_dir(),
         WorkflowResolver::new(config.catalog_dir()),

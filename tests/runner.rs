@@ -35,6 +35,7 @@ use narsor::domain::{
     SecretDelivery, SecretReference, TaskId, TaskLaunchSpec, TaskWorkspace,
 };
 use narsor::engine::HumanInputDelivery;
+use narsor::environment::HarnessDefaults;
 use narsor::orchestration::{
     AttentionKind, ControlPlane, NewTask, Observation, ObservedSummary, OperatorCommand,
     OperatorCommandRequest, OperatorCommandStatus, OwnerCommand, OwnerRef, QueuedOperatorCommand,
@@ -98,6 +99,34 @@ struct Fixture {
     /// While set, the served routes refuse every operator command
     /// acknowledgement, as a network that drops the answers would.
     block_command_acks: Arc<AtomicBool>,
+    /// The installation's default harness running tasks follow (U7).
+    default: Arc<LiveDefault>,
+}
+
+/// A default harness a test changes by hand, the way the daemon's selector
+/// changes; `None` is a control plane with no default to hand out.
+#[derive(Debug, Default)]
+struct LiveDefault(std::sync::Mutex<Option<String>>);
+
+impl LiveDefault {
+    fn set(&self, harness: Option<&str>) {
+        *self.0.lock().unwrap() = harness.map(str::to_string);
+    }
+}
+
+impl HarnessDefaults for LiveDefault {
+    fn supported(&self) -> Vec<String> {
+        vec!["claude-code".into(), "codex".into(), "opencode".into()]
+    }
+
+    fn default_harness(&self) -> String {
+        self.live_default()
+            .unwrap_or_else(|| "claude-code".to_string())
+    }
+
+    fn live_default(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
 }
 
 impl Fixture {
@@ -120,9 +149,13 @@ impl Fixture {
         let root = TempRoot::new();
         let state = root.dir("control");
         let control = ControlPlane::new(StatePaths::new(&state));
+        let default = Arc::new(LiveDefault::default());
         let service = Arc::new(ProtocolService::new(
             control,
-            environment_support::seeded_resolver(&state),
+            environment_support::seeded_catalog_resolver_with(
+                &state,
+                Arc::clone(&default) as Arc<dyn HarnessDefaults>,
+            ),
         ));
         let code = service
             .create_enrollment(BACKEND, CreateEnrollmentRequest::default())
@@ -160,7 +193,24 @@ impl Fixture {
             server: None,
             runners: Vec::new(),
             block_command_acks: Arc::new(AtomicBool::new(false)),
+            default,
         }
+    }
+
+    /// Changes the installation's default harness and tells the waiting
+    /// runners, as the settings API does.
+    fn set_default(&self, harness: Option<&str>) {
+        self.default.set(harness);
+        self.service.default_harness_changed();
+    }
+
+    /// Lets the task backend run only `harnesses` (all of them when empty).
+    fn restrict_harnesses(&self, harnesses: &[&str]) {
+        environment_support::restrict_harnesses(
+            &self.root.path.join("control"),
+            BACKEND,
+            harnesses,
+        );
     }
 
     /// Starts serving the runner routes on the fixture's address.
@@ -2497,4 +2547,417 @@ async fn a_per_task_conductor_harness_from_before_is_ignored() {
         r#"{"version":1,"harness":"opencode"}"#,
         "the old file is neither read nor removed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The default harness running tasks follow (U7)
+// ---------------------------------------------------------------------------
+
+/// Fake harness binaries under one `bin`: each of `programs` (`claude`,
+/// `opencode`, `codex`) answers an agent step with the `done` label in its
+/// own stream format.
+fn fake_harnesses(root: &TempRoot, programs: &[&str]) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.dir("bin");
+    let answers = root.dir("harness-answers");
+    let text = "Done.\n{\"output\": \"done\"}";
+    for program in programs {
+        let lines: Vec<serde_json::Value> = match *program {
+            "claude" => vec![serde_json::json!({
+                "type": "result", "subtype": "success", "is_error": false,
+                "session_id": "fake-claude", "result": text,
+            })],
+            "opencode" => vec![
+                serde_json::json!({ "type": "step_start", "sessionID": "fake-opencode" }),
+                serde_json::json!({ "type": "text", "sessionID": "fake-opencode", "text": text }),
+                serde_json::json!({ "type": "step_finish", "sessionID": "fake-opencode" }),
+            ],
+            "codex" => vec![
+                serde_json::json!({ "type": "thread.started", "thread_id": "fake-codex" }),
+                serde_json::json!({
+                    "type": "item.completed",
+                    "item": { "type": "agent_message", "text": text },
+                }),
+                serde_json::json!({ "type": "turn.completed" }),
+            ],
+            other => panic!("no fake for {other}"),
+        };
+        let answer = answers.join(program);
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        fs::write(&answer, body).unwrap();
+        let temp = bin.join(format!(".{program}.tmp"));
+        fs::write(&temp, format!("#!/bin/sh\ncat '{}'\n", answer.display())).unwrap();
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&temp, bin.join(program)).unwrap();
+    }
+    bin
+}
+
+/// A PATH of `bin` alone, with the basic tools a task needs linked into it:
+/// no harness the test did not fake can be found (a developer's machine may
+/// have the real ones).
+fn only_on_path(bin: &Path) -> String {
+    for tool in [
+        "sh", "cat", "cp", "git", "sleep", "env", "grep", "ls", "mkdir", "mv", "rm", "sed",
+    ] {
+        let found = Command::new("sh")
+            .args(["-c", &format!("command -v {tool}")])
+            .output()
+            .unwrap();
+        let target = String::from_utf8_lossy(&found.stdout).trim().to_string();
+        let link = bin.join(tool);
+        if !link.exists() {
+            std::os::unix::fs::symlink(target, link).unwrap();
+        }
+    }
+    bin.display().to_string()
+}
+
+/// Three agent steps with an owner's gate between each two, so a test
+/// decides when the next one starts.
+const THREE_STEP_WORKFLOW: &str = r#"
+name: three-steps
+version: 1
+states:
+  a:
+    action:
+      type: agent
+      prompt: First.
+    outputs: [done]
+    transitions:
+      done: g1
+  g1:
+    action:
+      type: script
+      command: sh
+      args: [-c, "printf '{\"output\": \"ok\"}'"]
+    outputs: [ok, rejected]
+    transitions:
+      ok: b
+      rejected: failed
+    decision:
+      type: human
+      message: Go on?
+  b:
+    action:
+      type: agent
+      prompt: Second.
+    outputs: [done]
+    transitions:
+      done: g2
+  g2:
+    action:
+      type: script
+      command: sh
+      args: [-c, "printf '{\"output\": \"ok\"}'"]
+    outputs: [ok, rejected]
+    transitions:
+      ok: c
+      rejected: failed
+    decision:
+      type: human
+      message: Go on?
+  c:
+    action:
+      type: agent
+      prompt: Third.
+    outputs: [done]
+    transitions:
+      done: completed
+  completed:
+    description: Done.
+  failed:
+    description: Rejected.
+terminal_states:
+  completed: completed
+  failed: failed
+"#;
+
+/// The harness every agent session of the task started on, in order.
+fn agent_harnesses(launch: &Launch) -> Vec<String> {
+    launch
+        .events()
+        .into_iter()
+        .filter_map(|event| match event.data {
+            EventData::AgentSessionStarted { harness, .. } => Some(harness),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Waits for the task to stand at a gate other than `after`, and returns it.
+async fn gate_after(fixture: &Fixture, task: &str, after: Option<&str>) -> String {
+    wait_until_async(Duration::from_secs(30), "a gate", || {
+        fixture
+            .record(task)
+            .pending_input_id()
+            .is_some_and(|pending| Some(pending) != after)
+    })
+    .await;
+    fixture
+        .record(task)
+        .pending_input_id()
+        .expect("a gate")
+        .to_string()
+}
+
+fn answer_gate(fixture: &Fixture, task: &str, pending: &str, key: &str) {
+    fixture
+        .service
+        .submit_input(
+            &fixture.owner(),
+            task,
+            SubmitInputRequest {
+                pending_input_id: pending.to_string(),
+                idempotency_key: key.to_string(),
+                delivery: HumanInputDelivery::label("ok"),
+            },
+        )
+        .expect("queue the answer");
+}
+
+/// Why the runner says the task keeps its harness, as last reported.
+fn harness_unavailable(
+    fixture: &Fixture,
+    task: &str,
+) -> Option<narsor::orchestration::HarnessUnavailable> {
+    fixture
+        .record(task)
+        .runner
+        .and_then(|runner| runner.snapshot.default_harness_unavailable)
+}
+
+/// AE3, R16b: a task created on `codex` follows the installation's default
+/// from its first action; a change reaches the next action and the
+/// conductor — even when the answer that carries it also carries the input
+/// that starts that action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_task_follows_the_default_harness_from_its_next_action() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    fixture.set_default(Some("claude-code"));
+    let bin = fake_harnesses(&fixture.root, &["claude", "opencode", "codex"]);
+    let spec = spec(
+        GATED_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("codex"),
+    );
+    fixture.create("task-1", spec.clone());
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    running_runner(&mut fixture, "task-1", &launch).await;
+    let gate = gate_after(&fixture, "task-1", None).await;
+    assert_eq!(agent_harnesses(&launch), vec!["claude-code"]);
+
+    // Changed without telling the runner: the answer that wakes it for the
+    // owner's input is the one that brings the new default as well.
+    fixture.default.set(Some("opencode"));
+    answer_gate(&fixture, "task-1", &gate, "answer-1");
+    wait_until_async(Duration::from_secs(30), "completion", || {
+        runner_status(&fixture, "task-1") == Some(ExecutionStatus::Completed)
+    })
+    .await;
+    assert_eq!(agent_harnesses(&launch), vec!["claude-code", "opencode"]);
+
+    let view = wait_for_view(&fixture, "task-1", "the conductor on opencode", |view| {
+        view.harness.as_deref() == Some("opencode")
+    })
+    .await;
+    assert!(view.available, "{view:?}");
+    assert_eq!(harness_unavailable(&fixture, "task-1"), None);
+    let applied = fs::read_to_string(launch.storage.join("narsor/harness.json")).unwrap();
+    assert!(applied.contains("opencode"), "{applied}");
+}
+
+/// AE6, R16c: a default the backend does not run, or whose binary is not in
+/// the task's environment, leaves the next action on the task's harness;
+/// the owner sees why, as information — no problem, no failed step — and
+/// the reason goes once a default the task can run comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_default_the_task_cannot_run_keeps_its_harness_and_says_why() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    fixture.set_default(Some("claude-code"));
+    let bin = fake_harnesses(&fixture.root, &["claude"]);
+    let spec = spec(
+        THREE_STEP_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    // Only `claude` is on the runner's PATH.
+    let mut launch = Launch::new(&fixture, "task-1", &spec);
+    launch.path = only_on_path(&bin);
+    running_runner(&mut fixture, "task-1", &launch).await;
+    let first = gate_after(&fixture, "task-1", None).await;
+
+    // The backend runs only claude-code.
+    fixture.restrict_harnesses(&["claude-code"]);
+    fixture.set_default(Some("opencode"));
+    wait_until_async(Duration::from_secs(30), "the reason", || {
+        harness_unavailable(&fixture, "task-1").is_some()
+    })
+    .await;
+    let unavailable = harness_unavailable(&fixture, "task-1").unwrap();
+    assert_eq!(unavailable.harness, "opencode");
+    assert_eq!(unavailable.kept, "claude-code");
+    assert!(
+        unavailable.reason.contains("runs only claude-code"),
+        "{unavailable:?}"
+    );
+    let summary = fixture.service.task(&fixture.owner(), "task-1").unwrap();
+    let runner = summary.runner.expect("the runner reported");
+    assert_eq!(runner.default_harness_unavailable, Some(unavailable));
+    assert_eq!(runner.problem, None, "it is not a problem");
+    assert_eq!(
+        attention_kinds(&fixture, "task-1"),
+        vec![AttentionKind::Question]
+    );
+
+    answer_gate(&fixture, "task-1", &first, "answer-1");
+    let second = gate_after(&fixture, "task-1", Some(&first)).await;
+    assert_eq!(agent_harnesses(&launch), vec!["claude-code", "claude-code"]);
+
+    // The backend runs it now, but the binary is not here.
+    fixture.restrict_harnesses(&[]);
+    fixture.set_default(Some("opencode"));
+    wait_until_async(Duration::from_secs(30), "the missing binary", || {
+        harness_unavailable(&fixture, "task-1")
+            .is_some_and(|unavailable| unavailable.reason.contains("not on PATH"))
+    })
+    .await;
+    answer_gate(&fixture, "task-1", &second, "answer-2");
+    wait_until_async(Duration::from_secs(30), "completion", || {
+        runner_status(&fixture, "task-1") == Some(ExecutionStatus::Completed)
+    })
+    .await;
+    assert_eq!(
+        agent_harnesses(&launch),
+        vec!["claude-code", "claude-code", "claude-code"],
+        "no step failed or switched"
+    );
+
+    // Back to a default the task runs: the reason goes.
+    fixture.set_default(Some("claude-code"));
+    wait_until_async(Duration::from_secs(30), "the reason to go", || {
+        harness_unavailable(&fixture, "task-1").is_none()
+    })
+    .await;
+}
+
+/// A task that starts — or resumes after a pause — while the default is
+/// another than its own takes it from its first action; what it switched
+/// to survives the pause, even when the default meanwhile became one its
+/// backend does not run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_harness_switched_to_survives_a_pause_and_reaches_the_first_action() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    fixture.set_default(Some("opencode"));
+    let bin = fake_harnesses(&fixture.root, &["claude", "opencode", "codex"]);
+    let spec = spec(
+        THREE_STEP_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    let first_runner = running_runner(&mut fixture, "task-1", &launch).await;
+    let first = gate_after(&fixture, "task-1", None).await;
+    assert_eq!(
+        agent_harnesses(&launch),
+        vec!["opencode"],
+        "the first action did not start on the fallback"
+    );
+
+    fixture.restrict_harnesses(&["claude-code", "opencode"]);
+    fixture.set_default(Some("codex"));
+    wait_until_async(Duration::from_secs(30), "the reason", || {
+        harness_unavailable(&fixture, "task-1").is_some()
+    })
+    .await;
+
+    fixture.report("task-1", Observation::RunnerReady);
+    fixture.command("task-1", OwnerCommand::Pause, "pause-1");
+    let status = fixture.wait_exit(first_runner, Duration::from_secs(30));
+    assert!(status.success(), "{status:?}");
+    fixture.report("task-1", Observation::PausedAtSafePoint);
+    fixture.command("task-1", OwnerCommand::Resume, "resume-1");
+    let credential = fixture.credential("task-1", "pod-2");
+    fixture.spawn(&launch, "pod-2", &credential);
+    wait_until_async(Duration::from_secs(30), "the resumed runner", || {
+        fixture
+            .record("task-1")
+            .runner
+            .is_some_and(|runner| runner.incarnation == "pod-2")
+    })
+    .await;
+
+    answer_gate(&fixture, "task-1", &first, "answer-1");
+    gate_after(&fixture, "task-1", Some(&first)).await;
+    assert_eq!(agent_harnesses(&launch), vec!["opencode", "opencode"]);
+    let unavailable = harness_unavailable(&fixture, "task-1").expect("still says why");
+    assert_eq!(unavailable.harness, "codex");
+    assert_eq!(unavailable.kept, "opencode");
+}
+
+/// A runner that starts on a harness it cannot run has no conductor; once
+/// the control plane names one it can, the conductor works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_conductor_comes_up_once_the_default_is_a_harness_the_task_can_run() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let bin = conductor_claude(
+        &fixture.root,
+        &[(
+            "reply",
+            conductor_says(serde_json::json!({
+                "decision": "reply", "message": "From claude.",
+            })),
+        )],
+    );
+    let spec = spec(
+        LONG_STEP_WORKFLOW,
+        TaskWorkspace::None,
+        ResolvedEnvironment::harness_only("opencode"),
+    );
+    fixture.create("task-1", spec.clone());
+    let mut launch = Launch::new(&fixture, "task-1", &spec);
+    launch.path = only_on_path(&bin);
+    running_runner(&mut fixture, "task-1", &launch).await;
+
+    // No default to follow: the task stays on opencode, which is not here.
+    let summary = fixture.service.task(&fixture.owner(), "task-1").unwrap();
+    let runner = summary.runner.expect("the runner reported");
+    assert!(!runner.conductor_available, "{runner:?}");
+
+    fixture.set_default(Some("claude-code"));
+    wait_until_async(Duration::from_secs(30), "the conductor", || {
+        fixture
+            .record("task-1")
+            .runner
+            .is_some_and(|runner| runner.snapshot.conductor_available)
+    })
+    .await;
+    applied(
+        &fixture,
+        "task-1",
+        OperatorCommand::ConductorChat {
+            text: "hello".to_string(),
+        },
+        "chat-1",
+    )
+    .await;
+    let view = wait_for_view(&fixture, "task-1", "claude's answer", |view| {
+        view.chat.iter().any(|entry| entry.text == "From claude.")
+    })
+    .await;
+    assert_eq!(view.harness.as_deref(), Some("claude-code"));
 }

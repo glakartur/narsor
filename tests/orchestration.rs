@@ -259,6 +259,7 @@ fn safe_point_snapshot(sequence: u64) -> RunnerSnapshot {
         attention: Vec::new(),
         conductor_available: false,
         conductor_unavailable_reason: None,
+        default_harness_unavailable: None,
         display: None,
         observed_at: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap(),
     }

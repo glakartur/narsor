@@ -18,7 +18,11 @@
 //!   The step overrides are recorded separately, each with its
 //!   [`ImageSource`].
 //! * **Harness** — the request, else the profile, else the live default
-//!   harness selection; pinned per task (R42).
+//!   harness selection. Since U7 this is only the task's *fallback* (R42
+//!   reversed): a running task follows the installation's live default,
+//!   which the control plane hands its runner with every answer
+//!   ([`LaunchResolver::default_harness`]) as long as the task's backend
+//!   runs it. Only a workflow's own `harness:` pins an action.
 //! * **Profile** — the request, else `default_profile`.
 //! * **Resources** — the request, else the backend's default, never above
 //!   the backend's maximum.
@@ -28,6 +32,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -281,14 +286,48 @@ pub trait LaunchResolver: Send + Sync {
     /// The configured `default_backend` — the fallback when the owner has
     /// not chosen one through the control plane (R10).
     fn configured_default_backend(&self) -> String;
+
+    /// The installation's live default harness as it applies to a task on
+    /// `backend` (U7): the name when the backend runs it, why not when it
+    /// does not. `None` when there is no live default to follow (no
+    /// selector) or the backend's record cannot be read — never an error,
+    /// so a runner's poll is never refused for it.
+    fn default_harness(&self, backend: &BackendId) -> Option<TaskDefaultHarness> {
+        let _ = backend;
+        None
+    }
 }
 
-/// The harness registry and the live default harness (R42).
+/// The installation's default harness as it applies to one task (U7),
+/// handed to its runner with every control-plane answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TaskDefaultHarness {
+    /// The task's backend runs it: the runner switches to it.
+    Available {
+        /// The harness.
+        harness: String,
+    },
+    /// The task's backend cannot run it: the runner keeps its harness.
+    Unavailable {
+        /// The harness that was asked for.
+        harness: String,
+        /// Why the backend cannot run it.
+        reason: String,
+    },
+}
+
+/// The harness registry and the live default harness.
 pub trait HarnessDefaults: Send + Sync {
     /// Harnesses this build can run.
     fn supported(&self) -> Vec<String>;
     /// The default for agent steps that name none, right now.
     fn default_harness(&self) -> String;
+    /// The default running tasks follow (U7), when it can change while they
+    /// run; `None` for a fixed default, which running tasks need not hear.
+    fn live_default(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Fixed harness defaults.
@@ -336,6 +375,10 @@ impl HarnessDefaults for DefaultHarnessSelector {
     fn default_harness(&self) -> String {
         let HarnessSelectionSnapshot { effective, .. } = self.current();
         effective
+    }
+
+    fn live_default(&self) -> Option<String> {
+        Some(self.current().effective)
     }
 }
 
@@ -937,6 +980,29 @@ impl LaunchResolver for CatalogLaunchResolver {
 
     fn configured_default_backend(&self) -> String {
         self.owner.default_backend.clone()
+    }
+
+    fn default_harness(&self, backend: &BackendId) -> Option<TaskDefaultHarness> {
+        let harness = self.harness.live_default()?;
+        let record = match self.catalog.backend(backend.as_str()) {
+            Ok(Some(record)) => record,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(%backend, %error, "cannot read the backend to check the default harness");
+                return None;
+            }
+        };
+        Some(if record.allows_harness(&harness) {
+            TaskDefaultHarness::Available { harness }
+        } else {
+            TaskDefaultHarness::Unavailable {
+                reason: format!(
+                    "backend '{backend}' runs only {}",
+                    record.harnesses.join(", ")
+                ),
+                harness,
+            }
+        })
     }
 
     fn resolve(&self, intent: &LaunchIntent) -> Result<ResolvedLaunch, LaunchError> {

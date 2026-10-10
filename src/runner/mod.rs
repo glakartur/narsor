@@ -21,13 +21,29 @@
 //! 4. **Initialize** the storage once ([`init`], R39): copy the spec, clone
 //!    the pinned commit into empty storage, write the marker. A resumed
 //!    storage is never cloned again.
-//! 5. **Assemble the conductor** when the task's harness is usable in this
-//!    environment ([`conductor`]); without one, a failed step goes to the
-//!    owner as it is.
-//! 6. **Decide how to continue** (below), then run the Engine with the
-//!    harness pinned in the launch spec (R42) while a control loop reports
-//!    snapshots, long-polls for directives, input, page requests and
-//!    materials (U9), and renews the credential.
+//! 5. **Assemble the conductor** ([`conductor`]); it is attached to the
+//!    Engine once its harness is usable in this environment, and until then
+//!    a failed step goes to the owner as it is.
+//! 6. **Decide how to continue** (below), ask the control plane once,
+//!    without waiting, which default harness to follow, then run the
+//!    Engine while a control loop reports snapshots, long-polls for
+//!    directives, input, page requests and materials (U9), and renews the
+//!    credential.
+//!
+//! # The default harness follows the installation's (U7)
+//!
+//! The harness the task was created with is only its fallback. Every
+//! control-plane answer may carry the installation's default as it applies
+//! to the task ([`TaskDefaultHarness`]), and the runner applies it before
+//! anything else in that answer: a harness its backend runs and whose
+//! binary is on this environment's `PATH` becomes the runner's live harness
+//! — what the next agent action without a `harness:` of its own and the
+//! next conductor invocation run on — and is kept on storage, so a resumed
+//! runner starts on it. One it cannot switch to leaves the live harness as
+//! it is, and the snapshot says why ([`HarnessUnavailable`]) until an answer
+//! names one it can run. An answer without the field changes nothing. An
+//! action under way is never switched: the Engine reads the default once,
+//! when an action starts (R16a).
 //!
 //! # Unexpected loss needs an explicit owner decision (R13)
 //!
@@ -86,17 +102,18 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::api::{ClientError, ConversationEntryDto, ConversationResponse};
+use crate::conductor::LiveHarness;
 use crate::controller_protocol::{
     ConversationPageRequest, DeliveredInput, ExecutionEventsPage, ExecutionEventsRequest,
     RelayFailure, RunnerClient, RunnerDirective, RunnerLaunchView, RunnerPollQuery,
-    RunnerPollResponse,
+    RunnerPollResponse, TaskDefaultHarness,
 };
 use crate::domain::{
     ExecutionStatus, LaunchDefinitionError, RepositoryInfo, TaskId, TaskLaunchSpec, TaskWorkspace,
     WorkflowDefinition, WorkflowExecution, Workspace,
 };
-use crate::engine::{AgentDefaults, Engine, EngineError, Recovery};
-use crate::orchestration::{OwnerCommand, RunnerProblem, RunnerSnapshot};
+use crate::engine::{AgentDefaults, DefaultHarnessSource, Engine, EngineError, Recovery};
+use crate::orchestration::{HarnessUnavailable, OwnerCommand, RunnerProblem, RunnerSnapshot};
 use crate::persistence::{reconcile, PersistenceError, ReconciliationOutcome};
 use crate::workspace::WorkspaceError;
 
@@ -345,23 +362,33 @@ pub async fn run(
         .await);
     }
 
-    // The harness is the one pinned at task creation, never a live default
-    // (R42): a later change of the global default reaches new tasks only.
-    let engine = Arc::new(Engine::new(store).with_agent_defaults(AgentDefaults {
-        harness: spec.environment.harness.clone(),
-        timeout_secs: None,
-    }));
+    // One live harness for the Engine and the conductor (U7): the default
+    // this storage last switched to, else the one the task was created with,
+    // until the control plane names another.
+    let starting = storage.applied_harness().unwrap_or_else(|error| {
+        tracing::warn!(%error, "the harness last switched to cannot be read; using the task's");
+        None
+    });
+    let harness = Arc::new(LiveHarness::new(
+        starting.unwrap_or_else(|| spec.environment.harness.clone()),
+    ));
+    let engine = Arc::new(Engine::new(store).with_agent_defaults_and_source(
+        AgentDefaults {
+            harness: spec.environment.harness.clone(),
+            timeout_secs: None,
+        },
+        Arc::clone(&harness) as Arc<dyn DefaultHarnessSource>,
+    ));
 
-    let conductor = conductor::ConductorHost::assemble(
-        &engine,
-        &storage,
-        &spec.environment.harness,
-        &definition,
-    );
+    let conductor =
+        conductor::ConductorHost::assemble(&engine, &storage, Arc::clone(&harness), &definition);
     let mut session = Session {
         storage,
         engine,
         conductor,
+        harness,
+        harness_unavailable: None,
+        report_forced: false,
         definition,
         incarnation: config.incarnation.clone(),
         timing: config.timing.clone(),
@@ -464,6 +491,7 @@ async fn report_problem(
         problem: Some(problem.clone()),
         conductor_available: false,
         conductor_unavailable_reason: Some("the runner cannot work".to_string()),
+        default_harness_unavailable: None,
         display: None,
         observed_at,
     };
@@ -581,6 +609,14 @@ struct Session {
     storage: TaskStorage,
     engine: Arc<Engine>,
     conductor: conductor::ConductorHost,
+    /// The harness agent actions without their own and the conductor run
+    /// on, shared with both (U7).
+    harness: Arc<LiveHarness>,
+    /// The default harness the task cannot switch to, while it cannot.
+    harness_unavailable: Option<HarnessUnavailable>,
+    /// A snapshot must go out even if nothing else changed: what it says
+    /// about the default harness did.
+    report_forced: bool,
     definition: Arc<WorkflowDefinition>,
     incarnation: String,
     timing: RunnerTiming,
@@ -638,6 +674,9 @@ impl Session {
                 .as_ref()
                 .map(|launch| launch.launch_generation),
         ))?;
+        // A queued or paused task may have missed a change of the default:
+        // its first action starts on the current one, not on the fallback.
+        self.ask_default_harness().await?;
 
         match continuation {
             Continuation::Fresh => {
@@ -656,6 +695,79 @@ impl Session {
         // After the runner's own recovery, like the daemon's startup hook.
         self.conductor.restore_at_startup();
         self.drive().await
+    }
+
+    /// Asks the control plane once, without waiting, which default harness
+    /// to follow, and applies it. Unreachable, the runner starts on the one
+    /// it has.
+    async fn ask_default_harness(&mut self) -> Result<(), RunnerError> {
+        let Some(client) = self.link.client() else {
+            return Ok(());
+        };
+        // Naming the request the execution waits on: a poll that names
+        // another (or none) turns the owner's queued answers to it obsolete.
+        let pending = self.pending_input_id()?;
+        match client.poll(pending.as_deref(), 0).await {
+            Ok(response) => {
+                self.link.succeeded();
+                self.link.expires_at = Some(response.credential_expires_at);
+                self.learn_launch(response.launch)?;
+                self.follow_default_harness(response.default_harness);
+            }
+            Err(error) => self.link.failed(&error, &self.timing),
+        }
+        Ok(())
+    }
+
+    /// Applies what the control plane says of the installation's default
+    /// harness (see the module documentation): switches to it when this
+    /// environment can run it, otherwise keeps the live harness and says
+    /// why. `None` changes nothing.
+    fn follow_default_harness(&mut self, default: Option<TaskDefaultHarness>) {
+        let Some(default) = default else {
+            return;
+        };
+        let current = self.harness.get();
+        let unavailable = match default {
+            TaskDefaultHarness::Available { harness } if harness == current => None,
+            TaskDefaultHarness::Available { harness } => {
+                match conductor::harness_unavailable(&harness) {
+                    None => {
+                        tracing::info!(from = %current, to = %harness, "following the default harness");
+                        // Work does not stop over it: only a later
+                        // incarnation would start on the older harness.
+                        if let Err(error) = self.storage.record_applied_harness(&harness) {
+                            tracing::warn!(%error, "the harness switched to cannot be recorded");
+                        }
+                        self.harness.set(harness);
+                        self.conductor.refresh();
+                        None
+                    }
+                    Some(reason) => Some(HarnessUnavailable {
+                        harness,
+                        kept: current,
+                        reason,
+                    }),
+                }
+            }
+            TaskDefaultHarness::Unavailable { harness, reason } => Some(HarnessUnavailable {
+                harness,
+                kept: current,
+                reason,
+            }),
+        };
+        if unavailable != self.harness_unavailable {
+            if let Some(unavailable) = &unavailable {
+                tracing::info!(
+                    harness = %unavailable.harness,
+                    kept = %unavailable.kept,
+                    reason = %unavailable.reason,
+                    "the default harness cannot run for this task; keeping the current one"
+                );
+            }
+            self.harness_unavailable = unavailable;
+            self.report_forced = true;
+        }
     }
 
     /// Waits for the control plane to say which owner command launched
@@ -788,6 +900,7 @@ impl Session {
                 problem,
                 stopping,
                 conductor_unavailable: self.conductor.unavailable_reason(),
+                default_harness_unavailable: self.harness_unavailable.as_ref(),
             },
         )
     }
@@ -842,6 +955,9 @@ impl Session {
                     dirty = false;
                 }
                 last_report = Some(Instant::now());
+            }
+            if std::mem::take(&mut self.report_forced) {
+                dirty = true;
             }
 
             if self.link.renew_due(self.timing.renew_margin) && self.link.ready() {
@@ -951,6 +1067,7 @@ impl Session {
         match client.snapshot(&snapshot).await {
             Ok(response) => {
                 self.link.succeeded();
+                self.follow_default_harness(response.default_harness);
                 self.learn_launch(response.launch)?;
                 self.directive = response.directive;
                 self.storage.record_reported_cursor(snapshot.event_cursor)?;
@@ -991,9 +1108,11 @@ impl Session {
         }
     }
 
-    /// Acts on a poll answer: directive, input, operator commands, page
-    /// requests.
+    /// Acts on a poll answer: the default harness first — an action the
+    /// same answer's input resumes starts on it — then directive, input,
+    /// operator commands, page requests.
     async fn absorb(&mut self, response: RunnerPollResponse) -> Result<(), RunnerError> {
+        self.follow_default_harness(response.default_harness);
         self.link.expires_at = Some(response.credential_expires_at);
         self.learn_launch(response.launch)?;
         self.directive = response.directive;
@@ -1163,6 +1282,7 @@ impl Session {
                     match client.snapshot(&snapshot).await {
                         Ok(response) => {
                             self.link.succeeded();
+                            self.follow_default_harness(response.default_harness);
                             self.learn_launch(response.launch)?;
                             self.storage.record_reported_cursor(snapshot.event_cursor)?;
                             self.directive = response.directive;

@@ -23,7 +23,7 @@ use narsor::controller_protocol::{
     ExecutionEventsPage, ExecutionEventsQuery, ExecutionEventsResponse, ExecutionEventsSource,
     Freshness, LaunchRequest, OwnerCommandRequest, ProtocolConfig, ProtocolService, RelayFailure,
     ReportRequest, RunnerClient, RunnerCredentialRequest, RunnerDirective, SubmitInputRequest,
-    SubmitOperatorCommandRequest, TaskSummary,
+    SubmitOperatorCommandRequest, TaskDefaultHarness, TaskSummary,
 };
 use narsor::domain::{
     BackendId, DisplayLink, Event, EventData, ExecutionStatus, TaskDisplay, TaskId,
@@ -37,7 +37,7 @@ use narsor::orchestration::{
     ResourceIdentity, RunnerSnapshot, TaskEventKind, TaskLifecycle,
 };
 use narsor::persistence::paths::{temp_path_for, StatePaths};
-use narsor::persistence::{DaemonInfo, ExecutionStore};
+use narsor::persistence::{DaemonInfo, DefaultHarnessSelector, ExecutionStore};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -111,20 +111,51 @@ impl Harness {
     /// A harness with its own timing policy, and optionally a backend whose
     /// task storages this host holds under the given root.
     async fn start_with(config: ProtocolConfig, local: Option<(&str, PathBuf)>) -> Self {
+        Self::start_inner(config, local, false).await
+    }
+
+    /// A harness whose daemon has a default-harness selector (configured
+    /// `claude-code`) that running tasks follow (U7).
+    async fn start_with_default_harness() -> Self {
+        Self::start_inner(ProtocolConfig::default(), None, true).await
+    }
+
+    async fn start_inner(
+        config: ProtocolConfig,
+        local: Option<(&str, PathBuf)>,
+        with_selector: bool,
+    ) -> Self {
         let root = TempRoot::new();
         let clock = ManualClock::new();
         let control = ControlPlane::with_clock(StatePaths::new(root.path()), clock.clone());
-        let mut service = ProtocolService::with_config(
-            control,
-            environment_support::seeded_resolver(root.path()),
-            config,
-        );
+        let selector = if with_selector {
+            Some(Arc::new(
+                DefaultHarnessSelector::load(
+                    StatePaths::new(root.path()),
+                    vec!["claude-code".into(), "codex".into(), "opencode".into()],
+                    "claude-code",
+                )
+                .await
+                .expect("load the harness selector"),
+            ))
+        } else {
+            None
+        };
+        let resolver: Arc<dyn narsor::environment::LaunchResolver> = match &selector {
+            Some(selector) => environment_support::seeded_catalog_resolver_with(
+                root.path(),
+                Arc::clone(selector) as Arc<dyn narsor::environment::HarnessDefaults>,
+            ),
+            None => environment_support::seeded_resolver(root.path()),
+        };
+        let mut service = ProtocolService::with_config(control, resolver, config);
         if let Some((backend, storage_root)) = local {
             service = service
                 .with_local_storage(BackendId::parse(backend).expect("backend id"), storage_root);
         }
         let services = ApiServices {
             control: Some(Arc::new(service)),
+            harness_selector: selector,
             ..ApiServices::default()
         };
         let engine = Arc::new(Engine::new(ExecutionStore::new(root.path())));
@@ -336,6 +367,7 @@ fn snapshot(
         attention: Vec::new(),
         conductor_available: false,
         conductor_unavailable_reason: None,
+        default_harness_unavailable: None,
         display: None,
         observed_at: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 5).unwrap(),
     }
@@ -3007,5 +3039,164 @@ async fn what_a_runner_says_of_its_problem_and_its_conductor_is_cleaned() {
     assert_eq!(
         runner.conductor_unavailable_reason.as_deref(),
         Some("harness missing")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The default harness running tasks follow (U7)
+// ---------------------------------------------------------------------------
+
+fn available(harness: &str) -> Option<TaskDefaultHarness> {
+    Some(TaskDefaultHarness::Available {
+        harness: harness.to_string(),
+    })
+}
+
+/// AE3: every answer to a runner carries the installation's default as it
+/// applies to its task, and a change reaches the next answer.
+#[tokio::test]
+async fn every_runner_answer_carries_the_current_default_harness() {
+    let harness = Harness::start_with_default_harness().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+
+    let poll = runner.poll(None, 0).await.expect("poll");
+    assert_eq!(poll.default_harness, available("claude-code"));
+
+    harness
+        .owner
+        .set_harness_selection("opencode")
+        .await
+        .expect("change the default");
+    let poll = runner.poll(None, 0).await.expect("poll");
+    assert_eq!(poll.default_harness, available("opencode"));
+    let answer = runner
+        .snapshot(&snapshot(2, ExecutionStatus::Running, 4, None))
+        .await
+        .expect("snapshot");
+    assert_eq!(answer.default_harness, available("opencode"));
+
+    harness
+        .owner
+        .reset_harness_selection()
+        .await
+        .expect("reset the default");
+    let poll = runner.poll(None, 0).await.expect("poll");
+    assert_eq!(poll.default_harness, available("claude-code"));
+}
+
+/// AE6: a backend that does not run the default gets the reason instead of
+/// the name; what its runner then reports reaches the owner as information,
+/// not as a problem or something waiting on them.
+#[tokio::test]
+async fn a_backend_that_does_not_run_the_default_hears_why_and_the_owner_sees_it() {
+    let harness = Harness::start_with_default_harness().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    environment_support::restrict_harnesses(harness.root.path(), "k8s", &["claude-code"]);
+    harness
+        .owner
+        .set_harness_selection("opencode")
+        .await
+        .expect("change the default");
+
+    let poll = runner.poll(None, 0).await.expect("poll");
+    match poll.default_harness {
+        Some(TaskDefaultHarness::Unavailable { harness, reason }) => {
+            assert_eq!(harness, "opencode");
+            assert!(reason.contains("runs only claude-code"), "{reason}");
+        }
+        other => panic!("expected the reason, got {other:?}"),
+    }
+
+    let mut report = snapshot(2, ExecutionStatus::Running, 4, None);
+    report.default_harness_unavailable = Some(narsor::orchestration::HarnessUnavailable {
+        harness: "opencode".to_string(),
+        kept: "claude-code".to_string(),
+        reason: "backend 'k8s' runs only\u{1b}[2J claude-code".to_string(),
+    });
+    runner.snapshot(&report).await.expect("snapshot");
+    let view = harness.task("task-1").await.runner.expect("a runner view");
+    let unavailable = view
+        .default_harness_unavailable
+        .expect("the owner sees why the task keeps its harness");
+    assert_eq!(unavailable.harness, "opencode");
+    assert_eq!(unavailable.kept, "claude-code");
+    assert_eq!(unavailable.reason, "backend 'k8s' runs only[2J claude-code");
+    assert_eq!(view.problem, None, "it is not a problem");
+    assert!(harness.task("task-1").await.attention.is_empty());
+
+    // Back to a harness the backend runs: the name again.
+    harness
+        .owner
+        .set_harness_selection("claude-code")
+        .await
+        .expect("change the default");
+    let poll = runner.poll(None, 0).await.expect("poll");
+    assert_eq!(poll.default_harness, available("claude-code"));
+}
+
+/// A change of the default answers a runner's open long-poll at once.
+#[tokio::test]
+async fn a_change_of_the_default_answers_an_open_long_poll_at_once() {
+    let harness = Harness::start_with_default_harness().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+
+    let started = Instant::now();
+    let waiting = tokio::spawn(async move { runner.poll(None, 20).await });
+    tokio::time::sleep(StdDuration::from_millis(300)).await;
+    harness
+        .owner
+        .set_harness_selection("codex")
+        .await
+        .expect("change the default");
+    let answer = tokio::time::timeout(StdDuration::from_secs(5), waiting)
+        .await
+        .expect("answered before the long-poll ran out")
+        .expect("the poll task")
+        .expect("poll");
+    assert_eq!(answer.default_harness, available("codex"));
+    assert!(started.elapsed() < StdDuration::from_secs(10));
+}
+
+/// Without a selector there is no default to follow: the answers carry
+/// nothing, and a runner keeps its harness.
+#[tokio::test]
+async fn without_a_selector_the_answers_carry_no_default_harness() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    let poll = runner.poll(None, 0).await.expect("poll");
+    assert_eq!(poll.default_harness, None);
+    let answer = runner
+        .snapshot(&snapshot(2, ExecutionStatus::Running, 4, None))
+        .await
+        .expect("snapshot");
+    assert_eq!(answer.default_harness, None);
+}
+
+/// Answers and views from before U7 still read.
+#[test]
+fn answers_and_views_without_the_default_harness_still_read() {
+    let poll: narsor::controller_protocol::RunnerPollResponse =
+        serde_json::from_value(serde_json::json!({
+            "directive": "continue",
+            "generation": 1,
+            "lifecycle": "running",
+            "inputs": [],
+            "credential_expires_at": "2026-10-03T12:15:00Z",
+            "launch": { "incarnation": "pod-1", "launch_generation": 1, "authorized_by": null },
+        }))
+        .expect("an old poll answer");
+    assert_eq!(poll.default_harness, None);
+    let snapshot: RunnerSnapshot = serde_json::from_value(serde_json::json!({
+        "snapshot_sequence": 1,
+        "execution_status": "running",
+        "event_cursor": 0,
+        "observed_at": "2026-10-03T12:00:00Z",
+    }))
+    .expect("an old snapshot");
+    assert_eq!(snapshot.default_harness_unavailable, None);
+    let encoded = serde_json::to_value(&snapshot).unwrap();
+    assert!(
+        encoded.get("default_harness_unavailable").is_none(),
+        "an old reader is not shown the new field: {encoded}"
     );
 }

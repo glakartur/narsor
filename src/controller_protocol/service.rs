@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
-use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, watch};
 
 mod conductor;
 mod events;
@@ -139,6 +139,8 @@ pub struct ProtocolService {
     runner_auth: Arc<dyn RunnerAuthenticator>,
     config: ProtocolConfig,
     changes: broadcast::Sender<TaskId>,
+    /// Bumped when a setting every task sees changes (the default harness).
+    settings: watch::Sender<u64>,
     launch: Arc<dyn LaunchResolver>,
     pages: Mutex<PageRelay>,
     event_reads: Mutex<EventsRelay>,
@@ -183,6 +185,7 @@ impl ProtocolService {
             credentials,
             config,
             changes,
+            settings: watch::Sender::new(0),
             launch,
             pages: Mutex::new(PageRelay::default()),
             event_reads: Mutex::new(EventsRelay::default()),
@@ -241,6 +244,20 @@ impl ProtocolService {
     /// never make them skip or repeat one.
     pub fn subscribe(&self) -> broadcast::Receiver<TaskId> {
         self.changes.subscribe()
+    }
+
+    /// Announces that the installation's default harness changed (U7):
+    /// every waiting runner long-poll looks again, so a runner hears of the
+    /// change now rather than when its long-poll runs out.
+    pub fn default_harness_changed(&self) {
+        self.settings
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    /// The installation's default harness as it applies to the task of
+    /// `record`, for its runner; `None` when there is none to follow.
+    fn default_harness_of(&self, record: &TaskRecord) -> Option<TaskDefaultHarness> {
+        self.launch.default_harness(&record.assignment.backend_id)
     }
 
     /// Announces that `task_id`'s record changed. Public so an in-process
@@ -1437,6 +1454,7 @@ impl ProtocolService {
             generation: outcome.task.generation,
             lifecycle: outcome.task.lifecycle,
             launch: launch_view(identity, &outcome.task),
+            default_harness: self.default_harness_of(&outcome.task),
         })
     }
 
@@ -1497,13 +1515,18 @@ impl ProtocolService {
                 execution_events: self.lock_event_reads().requests_of(&identity.task_id),
                 conductor_reads: self.lock_conductor_reads().requests_of(&identity.task_id),
                 materials: self.material_announcements(&identity.task_id),
+                default_harness: self.default_harness_of(&record),
             })
         };
+        // A change of the default while the runner waits is an answer too:
+        // it should not wait out the long-poll to hear of it (U7).
+        let asked_with = self.default_harness_of(&self.control.task(&identity.task_id)?);
         let wait = self.long_poll(query.wait_secs);
         let found = self
             .wait_for(wait, Some(&identity.task_id), || {
                 let response = poll()?;
-                let actionable = !response.inputs.is_empty()
+                let actionable = response.default_harness != asked_with
+                    || !response.inputs.is_empty()
                     || !response.commands.is_empty()
                     || !response.conversation_pages.is_empty()
                     || !response.execution_events.is_empty()
@@ -1679,6 +1702,10 @@ impl ProtocolService {
                     conductor_unavailable_reason: runner
                         .snapshot
                         .conductor_unavailable_reason
+                        .clone(),
+                    default_harness_unavailable: runner
+                        .snapshot
+                        .default_harness_unavailable
                         .clone(),
                     observed_at: runner.snapshot.observed_at,
                     received_at: runner.received_at,
@@ -1870,6 +1897,7 @@ impl ProtocolService {
         mut check: impl FnMut() -> ProtocolResult<Option<T>>,
     ) -> ProtocolResult<Option<T>> {
         let mut changes = self.changes.subscribe();
+        let mut settings = self.settings.subscribe();
         let deadline = tokio::time::Instant::now() + wait;
         let mut relevant = true;
         loop {
@@ -1878,12 +1906,16 @@ impl ProtocolService {
                     return Ok(Some(found));
                 }
             }
-            relevant = match tokio::time::timeout_at(deadline, changes.recv()).await {
-                Err(_elapsed) => return Ok(None),
-                Ok(Ok(changed)) => only.is_none_or(|task_id| *task_id == changed),
-                // Some notifications were missed: any of them may matter.
-                Ok(Err(RecvError::Lagged(_))) => true,
-                Ok(Err(RecvError::Closed)) => return Ok(None),
+            relevant = tokio::select! {
+                received = tokio::time::timeout_at(deadline, changes.recv()) => match received {
+                    Err(_elapsed) => return Ok(None),
+                    Ok(Ok(changed)) => only.is_none_or(|task_id| *task_id == changed),
+                    // Some notifications were missed: any of them may matter.
+                    Ok(Err(RecvError::Lagged(_))) => true,
+                    Ok(Err(RecvError::Closed)) => return Ok(None),
+                },
+                // A setting every task sees changed (U7).
+                Ok(()) = settings.changed() => true,
             };
         }
     }

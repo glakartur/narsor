@@ -44,5 +44,5 @@ pub use image::{ImageResolver, NoTagResolution, StaticImageResolver};
 pub use profile::{ProfileRecord, RuntimeCatalog, DEFAULT_PROFILE};
 pub use resolver::{
     CatalogLaunchResolver, HarnessDefaults, LaunchError, LaunchIntent, LaunchResolver,
-    OwnerDefaults, ResolvedLaunch, StaticHarnessDefaults,
+    OwnerDefaults, ResolvedLaunch, StaticHarnessDefaults, TaskDefaultHarness,
 };

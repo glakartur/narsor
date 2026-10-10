@@ -20,7 +20,7 @@ use narsor::conductor::snapshot::{render, ConversationTail, SnapshotBudget, Snap
 use narsor::conductor::{
     prompt::conductor_prompt, ChatAuthor, ChatEntry, ChatEntryKind, ConductorAccess,
     ConductorRegistry, ConductorResponse, ConductorStore, Decision, DecisionKind, HarnessInvoker,
-    Invocation, InvocationOutcome, QueuedRequest, ResponseError,
+    Invocation, InvocationOutcome, LiveHarness, QueuedRequest, ResponseError,
 };
 use narsor::domain::{
     ArtifactReference, ConductorOutcome, ConductorPurpose, ConductorTrigger, Confidence, Event,
@@ -29,7 +29,7 @@ use narsor::domain::{
 use narsor::engine::actions::harness::{
     ClaudeCodeAdapter, CodexAdapter, HarnessRegistry, OpenCodeAdapter,
 };
-use narsor::engine::Engine;
+use narsor::engine::{DefaultHarnessSource, Engine};
 use narsor::persistence::DefaultHarnessSelector;
 use serde_json::{json, Value};
 
@@ -474,6 +474,29 @@ async fn the_harness_is_taken_from_the_selector_at_every_invocation() {
 
     invoker.invoke_once(&fixture.rescue()).await;
     selector.set("opencode").await.expect("switch the default");
+    invoker.invoke_once(&fixture.rescue()).await;
+
+    assert_eq!(fixture.claude.calls(), 1);
+    assert_eq!(fixture.opencode.calls(), 1);
+    assert_eq!(fixture.codex.calls(), 0);
+}
+
+/// A task runner has no selector: its conductor runs on the live harness
+/// the control plane last handed it (U7), read at every invocation, and the
+/// same handle answers the Engine's default for harnessless actions.
+#[tokio::test]
+async fn a_runners_live_harness_is_read_at_every_invocation() {
+    let fixture = Fixture::new();
+    fixture.claude.answers(&claude_answer(CHOOSE_DONE));
+    fixture.opencode.answers(&opencode_answer(CHOOSE_DONE));
+    let live = Arc::new(LiveHarness::new("claude-code"));
+    let invoker = fixture
+        .invoker("codex")
+        .with_live_harness(Arc::clone(&live));
+
+    invoker.invoke_once(&fixture.rescue()).await;
+    live.set("opencode");
+    assert_eq!(live.current_harness(), "opencode");
     invoker.invoke_once(&fixture.rescue()).await;
 
     assert_eq!(fixture.claude.calls(), 1);

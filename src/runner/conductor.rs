@@ -2,20 +2,23 @@
 //!
 //! The conductor is the same module the daemon hosts for its own
 //! executions ([`crate::conductor`]); what differs is what it runs on. The
-//! runner has no catalogue and no live default harness: its conductor reads
-//! the workflow snapshot of the launch spec and runs on the harness the
-//! task pinned (R42) — or on the one its owner chose since, which is kept on
-//! the storage so a new incarnation honours it.
+//! runner has no catalogue and no selector: its conductor reads the workflow
+//! snapshot of the launch spec and runs on the runner's [`LiveHarness`] —
+//! the installation's default its control plane last handed it (U7), or the
+//! harness the task was created with until then. The same handle is what
+//! the runner's agent actions without a harness of their own start on.
 //!
-//! # Available or not, decided once
+//! # Available or not, looked at again on every switch
 //!
 //! A conductor needs its harness in the task's own environment: the base
 //! image brings the binary, not Narsor. So the runner looks for it when it
-//! starts. Found, the conductor is assembled and attached to the Engine;
-//! not found, there is none, the snapshot says why
-//! (`conductor_available = false`), and a step that fails goes to the owner
-//! as it is, with no diagnosis and no proposals. The Engine is never
-//! attached to a conductor that cannot run, so it never waits for one.
+//! starts, and again whenever its live harness changes. Found, the
+//! conductor is attached to the Engine; not found, it is not, the snapshot
+//! says why (`conductor_available = false`), and a step that fails goes to
+//! the owner as it is, with no diagnosis and no proposals. The Engine is
+//! never attached to a conductor that cannot run, so it never waits for
+//! one. The runner only ever switches to a harness it found, so a conductor
+//! that became available stays so.
 //!
 //! # Passes the conductor starts
 //!
@@ -34,7 +37,7 @@ use tokio::task::JoinHandle;
 use super::preflight::{find_on_path, is_executable};
 use super::storage::TaskStorage;
 use super::Session;
-use crate::conductor::assembly::{assemble, restore_at_startup};
+use crate::conductor::assembly::{build, restore_at_startup};
 use crate::conductor::{
     ConductorRegistry, ConductorView, HarnessInvoker, LiveHarness, PassLauncher,
 };
@@ -42,38 +45,34 @@ use crate::controller_protocol::ConductorReadRequest;
 use crate::domain::{WorkflowDefinition, WorkflowExecution};
 use crate::engine::{Engine, HarnessRegistry};
 
-/// The conductor of one runner, or the reason there is none.
+/// The conductor of one runner, and whether it can run right now.
 pub(super) struct ConductorHost {
-    registry: Option<Arc<ConductorRegistry>>,
+    engine: Arc<Engine>,
+    registry: Arc<ConductorRegistry>,
+    /// Whether the registry is attached to the Engine: once, the first time
+    /// its harness can run.
+    attached: bool,
+    /// The startup restoration asked for while the conductor could not run,
+    /// carried out when it can.
+    restore_due: bool,
     unavailable: Option<String>,
     harness: Arc<LiveHarness>,
     passes: Arc<RunnerPasses>,
 }
 
 impl ConductorHost {
-    /// Assembles the conductor of the task on `storage` over `engine`, when
-    /// its harness can run here.
+    /// Assembles the conductor of the task on `storage` over `engine`,
+    /// running on `harness`; attached to the Engine when that harness can
+    /// run here.
     ///
-    /// The harness is `pinned_harness`, the one the task was created with. A
-    /// per-task choice an older version kept on the storage is not read.
+    /// A per-task choice an older version kept on the storage is not read.
     pub(super) fn assemble(
         engine: &Arc<Engine>,
         storage: &TaskStorage,
-        pinned_harness: &str,
+        harness: Arc<LiveHarness>,
         definition: &Arc<WorkflowDefinition>,
     ) -> Self {
-        let harness = Arc::new(LiveHarness::new(pinned_harness));
         let passes = Arc::new(RunnerPasses::new(Arc::clone(definition)));
-
-        if let Some(reason) = harness_unavailable(pinned_harness) {
-            tracing::info!(%reason, "no conductor runs for this task");
-            return Self {
-                registry: None,
-                unavailable: Some(reason),
-                harness,
-                passes,
-            };
-        }
         let invoker = HarnessInvoker::new(
             engine.store().clone(),
             storage.root(),
@@ -81,32 +80,57 @@ impl ConductorHost {
         )
         .with_live_harness(Arc::clone(&harness))
         .with_pinned_definition(Arc::clone(definition));
-        let registry = assemble(
+        let registry = build(
             engine,
             Arc::new(invoker),
             Some(Arc::clone(&passes) as Arc<dyn PassLauncher>),
         );
-        Self {
-            registry: Some(registry),
+        let mut host = Self {
+            engine: Arc::clone(engine),
+            registry,
+            attached: false,
+            restore_due: false,
             unavailable: None,
             harness,
             passes,
+        };
+        host.refresh();
+        host
+    }
+
+    /// Looks again at whether the live harness can run here, after it
+    /// changed; attaches the conductor the first time it can.
+    pub(super) fn refresh(&mut self) {
+        self.unavailable = harness_unavailable(&self.harness.get());
+        match &self.unavailable {
+            Some(reason) => tracing::info!(%reason, "no conductor runs for this task"),
+            None if !self.attached => {
+                self.engine.attach_conductor(&self.registry);
+                self.attached = true;
+                if std::mem::take(&mut self.restore_due) {
+                    restore_at_startup(&self.registry);
+                }
+            }
+            None => {}
         }
     }
 
     /// The conductor, or why there is none, worded for the owner.
     pub(super) fn registry(&self) -> Result<&Arc<ConductorRegistry>, String> {
-        self.registry.as_ref().ok_or_else(|| {
-            format!(
-                "this task has no conductor: {}",
-                self.unavailable.as_deref().unwrap_or("it was not started")
-            )
-        })
+        match &self.unavailable {
+            None => Ok(&self.registry),
+            Some(reason) => Err(format!("this task has no conductor: {reason}")),
+        }
     }
 
     /// Why there is no conductor; `None` while there is one.
     pub(super) fn unavailable_reason(&self) -> Option<&str> {
         self.unavailable.as_deref()
+    }
+
+    /// The harness the conductor runs on.
+    pub(super) fn harness(&self) -> String {
+        self.harness.get()
     }
 
     /// The passes the conductor started.
@@ -115,10 +139,13 @@ impl ConductorHost {
     }
 
     /// Serves again what the conductor left unfinished (run after the
-    /// runner's own recovery, like the daemon's startup hook).
-    pub(super) fn restore_at_startup(&self) {
-        if let Some(registry) = &self.registry {
-            restore_at_startup(registry);
+    /// runner's own recovery, like the daemon's startup hook) — now, or once
+    /// the conductor can run.
+    pub(super) fn restore_at_startup(&mut self) {
+        if self.attached {
+            restore_at_startup(&self.registry);
+        } else {
+            self.restore_due = true;
         }
     }
 }
@@ -294,7 +321,7 @@ impl Session {
         );
         let view = match read {
             Ok(view) => match self.conductor.unavailable_reason() {
-                None => view.available_on(self.conductor.harness.get()),
+                None => view.available_on(self.conductor.harness()),
                 Some(reason) => view.without_conductor(reason),
             },
             Err(error) => {

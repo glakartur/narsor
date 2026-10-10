@@ -107,9 +107,6 @@ impl RemoteHarness {
             Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap(),
         )));
         let control = ControlPlane::with_clock(StatePaths::new(root.path()), clock.clone());
-        let catalog = environment_support::seeded_catalog_resolver(root.path());
-        prepare(root.path());
-        let resolver: Arc<dyn narsor::environment::LaunchResolver> = catalog.clone();
         // The daemon's default agent harness: configured `claude-code`,
         // no override until a test sets one.
         let harness_selector = if harness_selector {
@@ -124,6 +121,17 @@ impl RemoteHarness {
         } else {
             None
         };
+        // Tasks start on the selector's default and their runners follow it
+        // (U7), as in the daemon.
+        let catalog = match &harness_selector {
+            Some(selector) => environment_support::seeded_catalog_resolver_with(
+                root.path(),
+                Arc::clone(selector) as Arc<dyn narsor::environment::HarnessDefaults>,
+            ),
+            None => environment_support::seeded_catalog_resolver(root.path()),
+        };
+        prepare(root.path());
+        let resolver: Arc<dyn narsor::environment::LaunchResolver> = catalog.clone();
         let services = ApiServices {
             harness_selector,
             control: Some(Arc::new(ProtocolService::new(control, resolver))),
@@ -303,6 +311,7 @@ pub fn snapshot(sequence: u64, pending_input: Option<&str>) -> RunnerSnapshot {
         attention: Vec::new(),
         conductor_available: false,
         conductor_unavailable_reason: None,
+        default_harness_unavailable: None,
         display: None,
         observed_at: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 5).unwrap(),
     }

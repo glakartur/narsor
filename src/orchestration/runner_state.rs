@@ -58,6 +58,11 @@ impl ControlPlane {
         if let Some(reason) = &mut snapshot.conductor_unavailable_reason {
             *reason = without_unsafe_chars(reason);
         }
+        if let Some(unavailable) = &mut snapshot.default_harness_unavailable {
+            unavailable.harness = without_unsafe_chars(&unavailable.harness);
+            unavailable.kept = without_unsafe_chars(&unavailable.kept);
+            unavailable.reason = without_unsafe_chars(&unavailable.reason);
+        }
         let (task, applied) = self.mutate(task_id, |record, now| {
             fence_runner(record, incarnation, launch_generation)?;
             if let Some(previous) = &record.runner {

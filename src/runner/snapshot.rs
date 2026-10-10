@@ -23,7 +23,7 @@ use crate::engine::{
 };
 use crate::orchestration::{
     AttentionItem, AttentionKind, ConversationAttemptSummary, ConversationAvailability,
-    ExecutionCursor, PendingInputRef, RunnerProblem, RunnerSnapshot,
+    ExecutionCursor, HarnessUnavailable, PendingInputRef, RunnerProblem, RunnerSnapshot,
 };
 use crate::persistence::{ConversationStore, ExecutionStore};
 use crate::workflow::TemplateScope;
@@ -55,6 +55,8 @@ pub(crate) struct SnapshotContext<'a> {
     pub stopping: bool,
     /// Why the runner hosts no conductor; `None` while it hosts one.
     pub conductor_unavailable: Option<&'a str>,
+    /// The default harness the task cannot switch to, while it cannot.
+    pub default_harness_unavailable: Option<&'a HarnessUnavailable>,
 }
 
 /// Builds the snapshot of the storage's execution, without a sequence (the
@@ -81,6 +83,7 @@ pub(crate) fn build(
             problem: context.problem,
             conductor_available: context.conductor_unavailable.is_none(),
             conductor_unavailable_reason: context.conductor_unavailable.map(str::to_string),
+            default_harness_unavailable: context.default_harness_unavailable.cloned(),
             // Nothing to render against yet; the control plane's own
             // rendering from the sealed inputs stays in force.
             display: None,
@@ -143,6 +146,7 @@ pub(crate) fn build(
         problem: context.problem,
         conductor_available: context.conductor_unavailable.is_none(),
         conductor_unavailable_reason: context.conductor_unavailable.map(str::to_string),
+        default_harness_unavailable: context.default_harness_unavailable.cloned(),
         display: render_display(context.definition, &execution),
         observed_at,
     })
