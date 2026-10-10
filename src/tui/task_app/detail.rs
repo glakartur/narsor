@@ -43,6 +43,7 @@
 //! panel there; the conductor's state, which a failed step and a proposal are
 //! made of, is read with the other tabs' data ([`DetailRead::Conductor`]).
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU16;
 
 use ratatui::buffer::{Buffer, CellDiffOption};
@@ -192,24 +193,40 @@ impl TaskDetail {
     /// in the step's conversation the reading keys read it. Entering and
     /// leaving are the application's: they move the focus.
     fn on_progress_action(&mut self, step: StepFocus, action: Action) {
-        match (step, action) {
-            (StepFocus::Axis, Action::Down) => self.progress.step(1),
-            (StepFocus::Axis, Action::Up) => self.progress.step(-1),
-            (StepFocus::Axis, Action::Top) => self.progress.first(),
-            (StepFocus::Axis, Action::Bottom) => self.progress.last(),
-            (StepFocus::Axis, Action::Follow) => self.progress.toggle_follow(),
-            (StepFocus::Axis, _)
-            | (StepFocus::Conversation, Action::Follow | Action::EnterStep | Action::LeaveStep) => {
-            }
-            (StepFocus::Conversation, other) => {
-                let attempt = self
-                    .progress
-                    .selected_position()
-                    .and_then(|position| position.action_execution_id.clone());
-                if let Some(attempt) = attempt.and_then(|id| self.attempts.get_mut(&id)) {
-                    transcript_action(attempt.transcript_mut(), other);
-                }
-            }
+        match step {
+            StepFocus::Axis => self.on_axis_action(action),
+            StepFocus::Conversation => self.on_step_conversation_action(action),
+        }
+    }
+
+    /// A key on the timeline: it picks the step, or switches the following.
+    fn on_axis_action(&mut self, action: Action) {
+        match action {
+            Action::Down => self.progress.step(1),
+            Action::Up => self.progress.step(-1),
+            Action::Top => self.progress.first(),
+            Action::Bottom => self.progress.last(),
+            Action::Follow => self.progress.toggle_follow(),
+            _ => {}
+        }
+    }
+
+    /// A key in the selected step's conversation: it reads the transcript.
+    /// `f` is the timeline's, and entering and leaving the application's, so
+    /// they do not reach it.
+    fn on_step_conversation_action(&mut self, action: Action) {
+        if matches!(
+            action,
+            Action::Follow | Action::EnterStep | Action::LeaveStep
+        ) {
+            return;
+        }
+        let attempt = self
+            .progress
+            .selected_position()
+            .and_then(|position| position.action_execution_id.clone());
+        if let Some(attempt) = attempt.and_then(|id| self.attempts.get_mut(&id)) {
+            transcript_action(attempt.transcript_mut(), action);
         }
     }
 
@@ -247,7 +264,7 @@ impl TaskDetail {
     /// After a read, while the operator is in the step's conversation:
     /// `None` when it can stay; otherwise the timeline lets the step go and
     /// the answer says why the focus has to fall back on it.
-    pub(super) fn recheck_step(&mut self) -> Option<StepDrop> {
+    fn recheck_step(&mut self) -> Option<StepDrop> {
         if !self.progress.is_paused() {
             return Some(StepDrop::Gone);
         }
@@ -259,9 +276,70 @@ impl TaskDetail {
     }
 }
 
+/// The level of the focus on *Przebieg* of a set of details — the tasks' or
+/// the history's — and the moves between the levels, which keep every
+/// timeline's hold on its step in line with it.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct StepLevel {
+    level: StepFocus,
+}
+
+impl StepLevel {
+    /// The level the keys are on.
+    pub(super) fn get(self) -> StepFocus {
+        self.level
+    }
+
+    /// `Enter` / `→` on the timeline of `selected`: into its step's
+    /// conversation when it has one to show; otherwise nothing happens (AE2).
+    pub(super) fn enter(&mut self, selected: &mut TaskDetail) {
+        if selected.enter_step() {
+            self.level = StepFocus::Conversation;
+        }
+    }
+
+    /// Back on the timeline. Every timeline of `details` lets its step go, so
+    /// none stays held by details the operator has left.
+    pub(super) fn back_to_axis(&mut self, details: &mut BTreeMap<String, TaskDetail>) {
+        self.level = StepFocus::Axis;
+        for detail in details.values_mut() {
+            detail.leave_step();
+        }
+    }
+
+    /// The step whose conversation has the focus, when it is the details
+    /// `key`'s and those are the `selected` ones.
+    pub(super) fn held(
+        self,
+        details: &BTreeMap<String, TaskDetail>,
+        selected: Option<&str>,
+        key: &str,
+    ) -> Option<String> {
+        if self.level != StepFocus::Conversation || selected != Some(key) {
+            return None;
+        }
+        let label = details.get(key)?.progress.selected_label()?;
+        Some(label.to_string())
+    }
+
+    /// After a read of the details `key`, whose step `label` the operator
+    /// reads: back on the timeline when its conversation cannot stay. The
+    /// answer is the word for the bar when the step left the run.
+    pub(super) fn recheck(
+        &mut self,
+        details: &mut BTreeMap<String, TaskDetail>,
+        key: &str,
+        label: &str,
+    ) -> Option<String> {
+        let drop = details.get_mut(key)?.recheck_step()?;
+        self.back_to_axis(details);
+        (drop == StepDrop::Gone).then(|| step_gone_notice(label))
+    }
+}
+
 /// Why the focus fell from a step's conversation back on the timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StepDrop {
+enum StepDrop {
     /// The conversation has nothing to show any more (no record): quietly.
     Unavailable,
     /// The step is no longer in the run: the operator is told.
@@ -269,7 +347,7 @@ pub(super) enum StepDrop {
 }
 
 /// What the bar says when the step whose conversation was read left the run.
-pub(super) fn step_gone_notice(label: &str) -> String {
+fn step_gone_notice(label: &str) -> String {
     format!(
         "{}: krok zniknął z przebiegu — fokus wrócił na oś",
         one_line(label)
@@ -455,7 +533,9 @@ impl TaskApp {
     /// connection, a `503` with a reason (the relay missing its deadline) does
     /// not.
     pub fn on_detail_read(&mut self, task_id: &str, revision: u64, read: DetailRead) {
-        let held = self.held_step(task_id);
+        let held = self
+            .step_focus
+            .held(&self.detail.views, self.list.selected_id(), task_id);
         match read {
             DetailRead::Timeline(result) => {
                 let result = self.settle(result);
@@ -486,29 +566,11 @@ impl TaskApp {
             DetailRead::Conductor(result) => self.apply_conductor_read(task_id, revision, result),
         }
         if let Some(label) = held {
-            self.recheck_step(task_id, &label);
-        }
-    }
-
-    /// The step whose conversation has the focus, when it is `task_id`'s.
-    fn held_step(&self, task_id: &str) -> Option<String> {
-        if self.step_focus != StepFocus::Conversation || self.list.selected_id() != Some(task_id) {
-            return None;
-        }
-        let label = self.detail.view(task_id)?.progress.selected_label()?;
-        Some(label.to_string())
-    }
-
-    /// After a read of `task_id`, whose step `label` the operator reads: back
-    /// on the timeline when its conversation cannot stay, with a word on the
-    /// bar when the step left the run.
-    fn recheck_step(&mut self, task_id: &str, label: &str) {
-        match self.detail.view_mut(task_id).recheck_step() {
-            None => {}
-            Some(StepDrop::Unavailable) => self.back_to_axis(),
-            Some(StepDrop::Gone) => {
-                self.back_to_axis();
-                self.notify(Severity::Warning, step_gone_notice(label));
+            let notice = self
+                .step_focus
+                .recheck(&mut self.detail.views, task_id, &label);
+            if let Some(notice) = notice {
+                self.notify(Severity::Warning, notice);
             }
         }
     }
@@ -672,12 +734,13 @@ pub(super) fn panel_title(title: &str, width: u16) -> String {
 /// the task, lit while the keys are in the details — in the answer panel too
 /// (R4) — and what it holds inside it.
 pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles, stale: bool) {
-    let panel_focused = app.panel_focused();
     let frame_focused = app.focus() == Focus::Details;
-    let focused = frame_focused && !panel_focused;
-    let panel_has_keys = frame_focused && panel_focused;
+    let keys = match (frame_focused, app.panel_focused()) {
+        (false, _) => KeysAt::Elsewhere,
+        (true, true) => KeysAt::Panel,
+        (true, false) => KeysAt::Content(app.step_focus()),
+    };
     let hyperlinks = app.detail().hyperlinks();
-    let step = app.step_focus();
     // A task created here that the server has not confirmed has no summary
     // yet: its row says where it stands (the new-task form).
     if let Some(pending) = app.list().selected_pending().cloned() {
@@ -715,12 +778,21 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
     );
     let options = ViewOptions {
         stale,
-        focused,
-        step,
-        panel_focused: panel_has_keys,
+        keys,
         hyperlinks,
     };
     render_view(frame, inner, view, styles, options);
+}
+
+/// Where the keys are, as the details draw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KeysAt {
+    /// In the tab's content; on *Przebieg* at this level.
+    Content(StepFocus),
+    /// In the answer panel.
+    Panel,
+    /// Outside the details: on the list.
+    Elsewhere,
 }
 
 /// How the details are drawn, apart from what they show.
@@ -728,12 +800,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles,
 pub(super) struct ViewOptions {
     /// No connection: everything is grey.
     pub(super) stale: bool,
-    /// The keys are in the tab's content.
-    pub(super) focused: bool,
-    /// The level of *Przebieg* the keys are on.
-    pub(super) step: StepFocus,
-    /// The keys are in the answer panel.
-    pub(super) panel_focused: bool,
+    /// Where the keys are.
+    pub(super) keys: KeysAt,
     /// Links are written as OSC 8 hyperlinks.
     pub(super) hyperlinks: bool,
 }
@@ -749,11 +817,14 @@ pub(super) fn render_view(
 ) {
     let ViewOptions {
         stale,
-        focused,
-        step,
-        panel_focused,
+        keys,
         hyperlinks,
     } = options;
+    let content_keys = match keys {
+        KeysAt::Content(step) => Some(step),
+        KeysAt::Panel | KeysAt::Elsewhere => None,
+    };
+    let focused = content_keys.is_some();
     let panel_height = view
         .detail
         .waiting
@@ -802,7 +873,7 @@ pub(super) fn render_view(
             &mut view.detail.progress,
             &mut view.detail.attempts,
             stale,
-            focused.then_some(step),
+            content_keys,
         ),
         (DetailTab::Conversation, None) => {
             conversation::render(
@@ -847,9 +918,14 @@ pub(super) fn render_view(
         }
     }
     if let Some(panel) = parts.panel {
-        view.detail
-            .waiting
-            .render(frame, panel, styles, stale, panel_focused, view.task.as_of);
+        view.detail.waiting.render(
+            frame,
+            panel,
+            styles,
+            stale,
+            keys == KeysAt::Panel,
+            view.task.as_of,
+        );
     }
 }
 

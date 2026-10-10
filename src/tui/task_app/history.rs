@@ -49,9 +49,8 @@ use super::super::keymap::{self, Action, Context, Stack};
 use super::super::scroll::one_line;
 use super::super::selection::{render_spaced_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
-use super::detail::TaskDetail;
 use super::detail::{
-    panel_title, recorded_attempt, render_view, step_gone_notice, StepDrop, ViewOptions,
+    panel_title, recorded_attempt, render_view, KeysAt, StepLevel, TaskDetail, ViewOptions,
 };
 use super::list::{fit, row_text, title_of, Attention, RowText, StateIcon};
 use super::notify::Severity;
@@ -233,7 +232,7 @@ pub struct History {
     tab: DetailTab,
     /// The level of the focus on *Przebieg* of the details, as in the task
     /// details but without following: the run is over.
-    step_focus: StepFocus,
+    step_focus: StepLevel,
     /// Counted up when the history is read again, so what the tabs hold is
     /// due for a new read.
     revision: u64,
@@ -256,7 +255,7 @@ impl History {
             entries: Vec::new(),
             selected: 0,
             tab: DetailTab::Progress,
-            step_focus: StepFocus::Axis,
+            step_focus: StepLevel::default(),
             revision: 1,
             details: BTreeMap::new(),
             note,
@@ -319,7 +318,7 @@ impl History {
 
     /// The level of the focus on *Przebieg* of the details.
     pub fn step_focus(&self) -> StepFocus {
-        self.step_focus
+        self.step_focus.get()
     }
 
     /// What the details of the selected entry remember, once shown or read.
@@ -339,7 +338,7 @@ impl History {
     }
 
     fn on_detail_action(&mut self, action: Action) {
-        let (tab, step) = (self.tab, self.step_focus);
+        let (tab, step) = (self.tab, self.step_focus());
         if let Some(detail) = self.selected_detail_mut() {
             detail.on_action(tab, step, action);
         }
@@ -359,31 +358,32 @@ impl History {
     /// `Enter` / `→` on the timeline: into the selected step's conversation,
     /// when it has one to show.
     fn enter_step(&mut self) {
-        if self
-            .selected_detail_mut()
-            .is_some_and(TaskDetail::enter_step)
-        {
-            self.step_focus = StepFocus::Conversation;
-        }
+        let Some(key) = self.selected_entry().map(HistoryEntry::key) else {
+            return;
+        };
+        let detail = self
+            .details
+            .entry(key.clone())
+            .or_insert_with(|| TaskDetail::new(&key));
+        self.step_focus.enter(detail);
     }
 
     /// Back on the timeline, every entry's timeline letting its step go.
     fn back_to_axis(&mut self) {
-        self.step_focus = StepFocus::Axis;
-        for detail in self.details.values_mut() {
-            detail.leave_step();
-        }
+        self.step_focus.back_to_axis(&mut self.details);
+    }
+
+    /// `[` / `]`: the tab `by` places along, on its timeline.
+    fn shift_tab(&mut self, by: isize) {
+        self.tab = self.tab.shifted(by);
+        self.back_to_axis();
     }
 
     /// The step whose conversation has the focus, when it is the entry `key`'s.
     fn held_step(&self, key: &str) -> Option<String> {
-        if self.step_focus != StepFocus::Conversation
-            || self.selected_entry().map(HistoryEntry::key).as_deref() != Some(key)
-        {
-            return None;
-        }
-        let label = self.details.get(key)?.progress.selected_label()?;
-        Some(label.to_string())
+        let selected = self.selected_entry().map(HistoryEntry::key);
+        self.step_focus
+            .held(&self.details, selected.as_deref(), key)
     }
 }
 
@@ -458,7 +458,7 @@ impl TaskApp {
             View::History(history) => Some(detail_keys(
                 Context::HistoryDetails,
                 history.tab,
-                history.step_focus,
+                history.step_focus(),
             )),
             _ => None,
         }
@@ -481,34 +481,14 @@ impl TaskApp {
             Action::Help => self.help_open = true,
             Action::Quit => self.on_quit(confirming_quit),
             Action::Back if context == Context::History => self.close_view(),
-            Action::Back | Action::Open => {
-                self.focus = if action == Action::Back {
-                    Focus::List
-                } else {
-                    Focus::Details
-                };
-                if let View::History(history) = &mut self.view {
-                    history.back_to_axis();
-                }
-            }
-            Action::EnterStep | Action::LeaveStep => {
-                if let View::History(history) = &mut self.view {
-                    if action == Action::EnterStep {
-                        history.enter_step();
-                    } else {
-                        history.back_to_axis();
-                    }
-                }
-            }
+            Action::Back => self.focus_history(Focus::List),
+            Action::Open => self.focus_history(Focus::Details),
+            Action::EnterStep => self.with_history(History::enter_step),
+            Action::LeaveStep => self.with_history(History::back_to_axis),
             Action::Recover => return self.recover_selected_entry(),
             Action::ChooseHarness => return Request::OpenHarness,
-            Action::PrevTab | Action::NextTab => {
-                if let View::History(history) = &mut self.view {
-                    let by = if action == Action::PrevTab { -1 } else { 1 };
-                    history.tab = history.tab.shifted(by);
-                    history.back_to_axis();
-                }
-            }
+            Action::PrevTab => self.with_history(|history| history.shift_tab(-1)),
+            Action::NextTab => self.with_history(|history| history.shift_tab(1)),
             Action::Down | Action::Up | Action::Top | Action::Bottom
                 if context == Context::History =>
             {
@@ -528,6 +508,20 @@ impl TaskApp {
             }
         }
         Request::None
+    }
+
+    /// Does `change` to the history, while it is open.
+    fn with_history(&mut self, change: impl FnOnce(&mut History)) {
+        if let View::History(history) = &mut self.view {
+            change(history);
+        }
+    }
+
+    /// Puts the keys on the history's list or on its details, which start on
+    /// the timeline.
+    fn focus_history(&mut self, focus: Focus) {
+        self.focus = focus;
+        self.with_history(History::back_to_axis);
     }
 
     /// `Esc` from a view that has its own screen: back to the list of tasks.
@@ -764,14 +758,11 @@ impl TaskApp {
         let Some(label) = held else {
             return;
         };
-        match detail.recheck_step() {
-            None => {}
-            Some(drop) => {
-                history.back_to_axis();
-                if drop == StepDrop::Gone {
-                    self.notify(Severity::Warning, step_gone_notice(&label));
-                }
-            }
+        let notice = history
+            .step_focus
+            .recheck(&mut history.details, &plan.key, &label);
+        if let Some(notice) = notice {
+            self.notify(Severity::Warning, notice);
         }
     }
 }
@@ -936,6 +927,11 @@ pub fn render_details(
     hyperlinks: bool,
 ) {
     let tab = history.tab;
+    let keys = if focused {
+        KeysAt::Content(history.step_focus())
+    } else {
+        KeysAt::Elsewhere
+    };
     let Some(entry) = history.entries.get(history.selected) else {
         let inner = styles.render_panel(frame, area, " Historia ", focused);
         frame.render_widget(
@@ -967,9 +963,7 @@ pub fn render_details(
     };
     let options = ViewOptions {
         stale,
-        focused,
-        step: history.step_focus,
-        panel_focused: false,
+        keys,
         hyperlinks,
     };
     render_view(frame, inner, view, styles, options);
