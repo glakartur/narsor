@@ -800,10 +800,24 @@ pub(super) fn render_view(
             focused.then_some(step),
         ),
         (DetailTab::Conversation, None) => {
-            conversation::render(frame, content, styles, &mut view.detail.conversation, stale);
+            conversation::render(
+                frame,
+                content,
+                styles,
+                &mut view.detail.conversation,
+                stale,
+                focused,
+            );
         }
         (DetailTab::Events, None) => {
-            events::render(frame, content, styles, &mut view.detail.events, stale);
+            events::render(
+                frame,
+                content,
+                styles,
+                &mut view.detail.events,
+                stale,
+                focused,
+            );
         }
         (DetailTab::Conductor, None) => {
             conductor::render(
@@ -813,6 +827,7 @@ pub(super) fn render_view(
                 &mut view.detail.conductor,
                 view.task,
                 stale,
+                focused,
             );
         }
         (DetailTab::Info, _) => {

@@ -382,7 +382,9 @@ fn purpose_word(purpose: ConductorPurpose) -> &'static str {
 // ---------------------------------------------------------------------
 
 /// Draws the tab into `area`: what the conductor is, the history, the text
-/// box (while it is written in or holds a draft) and the keys.
+/// box (while it is written in or holds a draft) and the keys. `focused` says
+/// the keys are in the tab; while the operator writes they are in the text
+/// box, not on the history.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -390,6 +392,7 @@ pub fn render(
     conductor: &mut Conductor,
     task: &TaskSummary,
     stale: bool,
+    focused: bool,
 ) {
     let grey = |role: Role| if stale { Role::Done } else { role };
     let standing = conductor.standing(task);
@@ -428,7 +431,16 @@ pub fn render(
 
     let [header, body, text_box, footer] = split(area, top_rows, box_rows, bottom_rows);
     frame.render_widget(Paragraph::new(top), header);
-    render_history(frame, body, styles, conductor, ready, stale);
+    let history_focused = focused && !conductor.is_typing();
+    render_history(
+        frame,
+        body,
+        styles,
+        conductor,
+        ready,
+        stale,
+        history_focused,
+    );
     if box_rows > 0 {
         chooser::render_fields(frame, text_box, &conductor.composer, styles);
     }
@@ -549,6 +561,7 @@ fn render_history(
     conductor: &mut Conductor,
     ready: bool,
     stale: bool,
+    focused: bool,
 ) {
     if area.height == 0 {
         return;
@@ -582,7 +595,14 @@ fn render_history(
             area.height.saturating_sub(1),
         );
     }
-    render_transcript(frame, body, styles, &mut conductor.transcript, stale);
+    render_transcript(
+        frame,
+        body,
+        styles,
+        &mut conductor.transcript,
+        stale,
+        focused,
+    );
 }
 
 // ---------------------------------------------------------------------

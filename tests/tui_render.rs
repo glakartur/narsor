@@ -1282,7 +1282,9 @@ mod task_app_detail_render {
     use narsor::engine::{ConversationState, PositionStatus, Timeline};
     use narsor::orchestration::QueueReason;
     use narsor::tui::task_app::detail::DetailRead;
-    use narsor::tui::task_app::{layout, TaskApp};
+    use narsor::tui::task_app::tabs::conversation::{self, AttemptRead, Attempts, Conversation};
+    use narsor::tui::task_app::{layout, StepFocus, TaskApp};
+    use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
 
     use crate::remote_support::{snapshot, RemoteHarness};
     use crate::task_app_support::{
@@ -1833,7 +1835,8 @@ mod task_app_detail_render {
     }
 
     // -----------------------------------------------------------------
-    // The bracket on the axis (U6)
+    // The bracket on the axis (U6) and the bar of the transcripts and
+    // *Zdarzenia* (U8)
     // -----------------------------------------------------------------
 
     /// The row and the column where `needle` first shows on the screen.
@@ -1875,6 +1878,127 @@ mod task_app_detail_render {
             (x - 2..x + 16)
                 .all(|column| !buffer[(column, row)].modifier.contains(Modifier::REVERSED))
         })
+    }
+
+    /// The bar beside the transcript row holding `needle`: the cell two
+    /// columns to the left of its text.
+    fn bar_of(buffer: &Buffer, needle: &str) -> (String, Color) {
+        let (y, x) = spot(buffer, needle);
+        cell_at(buffer, x - 2, y)
+    }
+
+    fn entry(id: &str, lines: &[&str]) -> TranscriptEntry {
+        TranscriptEntry::new(
+            TranscriptEntryId::from(id),
+            lines.iter().map(|line| line.to_string()).collect(),
+            id.as_bytes().to_vec(),
+        )
+        .with_header(format!("AGENT · {id}"))
+    }
+
+    /// The details of `NAR-12` on *Przebieg*: `review` running, with a
+    /// recorded conversation of `entries`, the keys on the axis.
+    fn recorded_app(entries: Vec<TranscriptEntry>) -> TaskApp {
+        let mut app = app();
+        let running = with_runner(
+            with_controller(task("a", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        );
+        app.load(listing(vec![displayed(running, "NAR-12", &[])], "c"));
+        let mut done = position("plan", PositionStatus::Succeeded);
+        done.conversation = ConversationState::Recorded;
+        let mut review = position("review", PositionStatus::InProgress);
+        review.conversation = ConversationState::Recorded;
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline("a", vec![done, review], Some("review #1")))),
+        );
+        let next_entry = entries.len() as u64;
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Attempt {
+                attempt_id: "act-review".into(),
+                from: 0,
+                result: Ok(AttemptRead {
+                    entries,
+                    next_entry,
+                    closed: false,
+                    truncated_tail: false,
+                    complete: true,
+                    no_record: false,
+                }),
+            },
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.step_focus(), StepFocus::Axis);
+        app
+    }
+
+    fn three_entries() -> Vec<TranscriptEntry> {
+        ["1", "2", "3"]
+            .iter()
+            .map(|id| entry(id, &[&format!("line {id}")]))
+            .collect()
+    }
+
+    /// AE1: in the step's conversation the selected entry's bar is thick and
+    /// the axis's bracket thin; after `Esc` the same cells hold a thin grey
+    /// bar and the axis's bracket is thick again.
+    #[test]
+    fn the_bar_and_the_bracket_follow_the_level_of_the_focus() {
+        let mut app = recorded_app(three_entries());
+        let on_the_axis = render(&mut app, &Styles::new(false));
+        assert_axis_bracket(&on_the_axis, "● review #1 w toku", "┃", "━", Color::Cyan);
+        assert_eq!(
+            bar_of(&on_the_axis, "line 3"),
+            ("│".to_string(), Color::DarkGray),
+            "the keys are on the axis: the entry's bar is thin"
+        );
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.step_focus(), StepFocus::Conversation);
+        press(&mut app, KeyCode::Char('k'));
+        let reading = render(&mut app, &Styles::new(false));
+        let cell = spot(&reading, "line 2");
+        assert_eq!(bar_of(&reading, "line 2"), ("┃".to_string(), Color::Cyan));
+        assert_eq!(bar_of(&reading, "line 3").0, " ");
+        assert_axis_bracket(&reading, "● review #1 w toku", "│", "─", Color::DarkGray);
+        assert!(no_reversed_on_the_axis(&reading, "● review #1 w toku"));
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.step_focus(), StepFocus::Axis);
+        let back = render(&mut app, &Styles::new(false));
+        assert_eq!(spot(&back, "line 2"), cell, "the entry stays where it was");
+        assert_eq!(bar_of(&back, "line 2"), ("│".to_string(), Color::DarkGray));
+        assert_axis_bracket(&back, "● review #1 w toku", "┃", "━", Color::Cyan);
+    }
+
+    /// AE6: without colour the weight tells the two levels apart.
+    #[test]
+    fn without_colour_the_weight_tells_the_levels_apart() {
+        let mut app = recorded_app(three_entries());
+        let on_the_axis = render(&mut app, &Styles::new(true));
+        let (y, x) = spot(&on_the_axis, "● review #1 w toku");
+        assert_eq!(cell_at(&on_the_axis, x - 2, y).0, "┃");
+        assert!(bold_at(&on_the_axis, x - 2, y));
+        let (entry_y, entry_x) = spot(&on_the_axis, "line 3");
+        assert_eq!(cell_at(&on_the_axis, entry_x - 2, entry_y).0, "│");
+        assert!(on_the_axis[(entry_x - 2, entry_y)]
+            .modifier
+            .contains(Modifier::DIM));
+
+        press(&mut app, KeyCode::Enter);
+        let reading = render(&mut app, &Styles::new(true));
+        assert_eq!(cell_at(&reading, x - 2, y).0, "│");
+        assert!(reading[(x - 2, y)].modifier.contains(Modifier::DIM));
+        assert_eq!(cell_at(&reading, entry_x - 2, entry_y).0, "┃");
+        assert!(bold_at(&reading, entry_x - 2, entry_y));
+        assert!(no_reversed_on_the_axis(&reading, "● review #1 w toku"));
+        assert!((entry_x - 2..entry_x + 6)
+            .all(|x| !reading[(x, entry_y)].modifier.contains(Modifier::REVERSED)));
     }
 
     /// The keys on the list: the axis keeps its bracket, thin and grey.
@@ -1920,6 +2044,160 @@ mod task_app_detail_render {
         let top = small(&mut app);
         assert_axis_bracket(&top, "✓ s0 #1 ok", "┃", "━", Color::Cyan);
         assert!(!screen(&top).contains("s11 #1"), "{}", screen(&top));
+    }
+
+    /// *Rozmowa* of `review`'s `entries`, drawn 60×12 straight by the tab.
+    fn conversation_tab(entries: Vec<TranscriptEntry>) -> Conversation {
+        let mut review = position("review", PositionStatus::InProgress);
+        review.conversation = ConversationState::Recorded;
+        let next_entry = entries.len() as u64;
+        let mut attempts = Attempts::default();
+        attempts.apply(
+            "act-review",
+            1,
+            0,
+            Ok(AttemptRead {
+                entries,
+                next_entry,
+                closed: false,
+                truncated_tail: false,
+                complete: true,
+                no_record: false,
+            }),
+        );
+        let mut conversation = Conversation::new("a");
+        conversation.rebuild(&[review], &attempts);
+        conversation
+    }
+
+    fn draw_conversation(
+        conversation: &mut Conversation,
+        styles: &Styles,
+        stale: bool,
+        focused: bool,
+    ) -> Buffer {
+        draw(60, 12, |frame| {
+            conversation::render(frame, frame.area(), styles, conversation, stale, focused);
+        })
+    }
+
+    /// *Rozmowa*: the bar is thick with the keys in the tab, thin and grey
+    /// without them, in the same cells.
+    #[test]
+    fn the_conversation_tab_bar_follows_the_focus() {
+        let mut tab = conversation_tab(three_entries());
+        let focused = draw_conversation(&mut tab, &Styles::new(false), false, true);
+        assert_eq!(bar_of(&focused, "line 3"), ("┃".to_string(), Color::Cyan));
+        assert_eq!(bar_of(&focused, "line 2").0, " ");
+
+        let unfocused = draw_conversation(&mut tab, &Styles::new(false), false, false);
+        assert_eq!(spot(&unfocused, "line 3"), spot(&focused, "line 3"));
+        assert_eq!(
+            bar_of(&unfocused, "line 3"),
+            ("│".to_string(), Color::DarkGray)
+        );
+    }
+
+    /// A wrapped entry has the bar beside every row of its text, and a
+    /// stale tab greys the text but not the bar.
+    #[test]
+    fn a_wrapped_entry_has_the_bar_on_every_row_and_stale_keeps_its_colour() {
+        let long = "word ".repeat(30);
+        let mut tab = conversation_tab(vec![entry("1", &["short"]), entry("2", &[long.trim()])]);
+        let buffer = draw_conversation(&mut tab, &Styles::new(false), false, true);
+        let (first, x) = spot(&buffer, "word word");
+        let wrapped: Vec<u16> = (first..buffer.area.height)
+            .take_while(|&y| cell_at(&buffer, x, y).0 != " ")
+            .collect();
+        assert_eq!(wrapped.len(), 3, "{}", screen(&buffer));
+        for &y in &wrapped {
+            assert_eq!(
+                cell_at(&buffer, x - 2, y),
+                ("┃".to_string(), Color::Cyan),
+                "{}",
+                screen(&buffer)
+            );
+        }
+        assert_eq!(bar_of(&buffer, "short").0, " ");
+
+        let stale = draw_conversation(&mut tab, &Styles::new(false), true, true);
+        assert_eq!(
+            cell_at(&stale, x - 2, first),
+            ("┃".to_string(), Color::Cyan)
+        );
+        assert_eq!(
+            cell_at(&stale, x, first).1,
+            Color::DarkGray,
+            "the text is grey"
+        );
+    }
+
+    /// *Zdarzenia*: the selected event has the bar in the first column of
+    /// the tab, no `▸` and no reverse video anywhere.
+    #[test]
+    fn the_selected_event_has_the_bar_and_no_reverse_video() {
+        let mut app = running_app();
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char(']'));
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Events {
+                after: 0,
+                result: Ok(ExecutionEventsResponse::Available {
+                    events: execution_events(4),
+                    has_more: false,
+                    source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                }),
+            },
+        );
+        for (no_color, colour) in [(false, Color::Cyan), (true, Color::Reset)] {
+            let buffer = render(&mut app, &Styles::new(no_color));
+            let screen = screen(&buffer);
+            assert!(!screen.contains('▸'), "{screen}");
+            let x = content_column(&buffer);
+            let rows = event_rows(&buffer);
+            assert_eq!(rows.len(), 4, "{screen}");
+            for &y in &rows {
+                assert!(
+                    (x..x + 40)
+                        .all(|column| !buffer[(column, y)].modifier.contains(Modifier::REVERSED)),
+                    "{screen}"
+                );
+            }
+            let bars: Vec<u16> = rows
+                .iter()
+                .copied()
+                .filter(|&y| cell_at(&buffer, x, y).0 != " ")
+                .collect();
+            assert_eq!(bars.len(), 1, "one selected event:\n{screen}");
+            assert_eq!(cell_at(&buffer, x, bars[0]), ("┃".to_string(), colour));
+            assert_eq!(cell_at(&buffer, x + 1, bars[0]).0, " ");
+            if no_color {
+                assert!(bold_at(&buffer, x, bars[0]));
+            }
+        }
+        press(&mut app, KeyCode::Esc);
+        let unfocused = render(&mut app, &Styles::new(false));
+        let x = content_column(&unfocused);
+        let bars: Vec<(String, Color)> = event_rows(&unfocused)
+            .into_iter()
+            .map(|y| cell_at(&unfocused, x, y))
+            .filter(|(symbol, _)| symbol != " ")
+            .collect();
+        assert_eq!(bars, vec![("│".to_string(), Color::DarkGray)]);
+    }
+
+    /// The rows of the screen that list an event.
+    fn event_rows(buffer: &Buffer) -> Vec<u16> {
+        (0..buffer.area.height)
+            .filter(|&y| rows(buffer)[usize::from(y)].contains("state_entered"))
+            .collect()
+    }
+
+    /// The first column of the details' content: where the tab bar starts.
+    fn content_column(buffer: &Buffer) -> u16 {
+        spot(buffer, " Przebieg ").1
     }
 }
 
@@ -2616,6 +2894,35 @@ mod task_app_conductor_render {
         assert!(
             screen(&buffer).contains("dyrygent niedostępny"),
             "no colour, still said in words"
+        );
+    }
+
+    /// R16: the selected entry's bar is thick while the keys are on the
+    /// history, thin and grey while the operator writes a message.
+    #[test]
+    fn the_bar_of_the_history_thins_while_the_operator_writes() {
+        let mut app = opened(running(), true);
+        let bar = |buffer: &Buffer| {
+            let row = row_of(buffer, "Wybrano revise");
+            let text = &rows(buffer)[row];
+            let column = text[..text.find("Wybrano revise").unwrap()].chars().count();
+            cell_at(buffer, u16::try_from(column).unwrap() - 2, row as u16)
+        };
+        let reading = draw_app(&mut app, 120, 30, false);
+        assert_eq!(
+            bar(&reading),
+            ("┃".to_string(), Color::Cyan),
+            "{}",
+            screen(&reading)
+        );
+
+        press(&mut app, KeyCode::Char('c'));
+        let writing = draw_app(&mut app, 120, 30, false);
+        assert_eq!(
+            bar(&writing),
+            ("│".to_string(), Color::DarkGray),
+            "{}",
+            screen(&writing)
         );
     }
 

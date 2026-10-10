@@ -25,6 +25,7 @@ use crate::controller_protocol::ConversationPageQuery;
 use crate::engine::{ConversationState, Position};
 
 use super::super::super::scroll::one_line;
+use super::super::super::selection::{bar_prefix, PREFIX_WIDTH};
 use super::super::layout::first_row;
 use crate::tui::conversation::{agent_transcript_entry, classify};
 use crate::tui::keymap::Action;
@@ -396,10 +397,16 @@ impl Conversation {
     }
 }
 
-/// One row of a transcript: the entry's marker, then the header or the body in
-/// the colour of the entry's kind.
-fn transcript_row(line: TranscriptLine, styles: &Styles, stale: bool) -> Line<'static> {
-    let marker = if line.selected { "┃ " } else { "  " };
+/// One row of a transcript: the bar of the selected entry — thick while the
+/// keys are on the transcript, thin otherwise, the same rule as the lists'
+/// bracket (R16) — then the header or the body in the colour of the entry's
+/// kind.
+fn transcript_row(
+    line: TranscriptLine,
+    styles: &Styles,
+    stale: bool,
+    focused: bool,
+) -> Line<'static> {
     let style = if stale {
         styles.of(Role::Done)
     } else if line.header {
@@ -408,7 +415,7 @@ fn transcript_row(line: TranscriptLine, styles: &Styles, stale: bool) -> Line<'s
         styles.chat_body(line.presentation)
     };
     Line::from(vec![
-        Span::styled(marker, styles.of(Role::Focus)),
+        bar_prefix(styles, line.selected, focused),
         Span::styled(
             crate::domain::display::without_unsafe_chars(&line.text),
             style,
@@ -416,33 +423,38 @@ fn transcript_row(line: TranscriptLine, styles: &Styles, stale: bool) -> Line<'s
     ])
 }
 
-/// Draws `transcript` into `area`, wrapped to it.
+/// Draws `transcript` into `area`, wrapped to it. `focused` says the keys
+/// are on it.
 pub fn render_transcript(
     frame: &mut Frame,
     area: Rect,
     styles: &Styles,
     transcript: &mut TranscriptState,
     stale: bool,
+    focused: bool,
 ) {
-    let width = usize::from(area.width).saturating_sub(2).max(1);
+    let width = usize::from(area.width)
+        .saturating_sub(usize::from(PREFIX_WIDTH))
+        .max(1);
     let height = usize::from(area.height);
     transcript.set_width(width);
     transcript.set_viewport(height);
     let lines = transcript.logical_lines();
     let rows: Vec<Line> = wrap_visible_lines(&lines, width, transcript.scroll_offset(), height)
         .into_iter()
-        .map(|line| transcript_row(line, styles, stale))
+        .map(|line| transcript_row(line, styles, stale, focused))
         .collect();
     frame.render_widget(Paragraph::new(rows), area);
 }
 
-/// Draws the tab. `empty` says what an empty conversation means.
+/// Draws the tab. `focused` says the keys are in it.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     styles: &Styles,
     conversation: &mut Conversation,
     stale: bool,
+    focused: bool,
 ) {
     let mut body = area;
     if let Some(failure) = conversation.failure() {
@@ -490,8 +502,22 @@ pub fn render(
             )),
             title,
         );
-        render_transcript(frame, rest, styles, conversation.transcript_mut(), stale);
+        render_transcript(
+            frame,
+            rest,
+            styles,
+            conversation.transcript_mut(),
+            stale,
+            focused,
+        );
     } else {
-        render_transcript(frame, body, styles, conversation.transcript_mut(), stale);
+        render_transcript(
+            frame,
+            body,
+            styles,
+            conversation.transcript_mut(),
+            stale,
+            focused,
+        );
     }
 }

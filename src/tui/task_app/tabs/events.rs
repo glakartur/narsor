@@ -26,6 +26,7 @@ use crate::domain::Event;
 use crate::tui::event_text::{event_detail_lines, event_line};
 use crate::tui::keymap::Action;
 use crate::tui::scroll::sanitize;
+use crate::tui::selection::{bar_prefix, PREFIX_WIDTH};
 use crate::tui::style::{Role, Styles};
 
 use super::super::super::scroll::one_line;
@@ -235,8 +236,17 @@ fn row_text(event: &Event, raw: bool) -> String {
     )
 }
 
-/// Draws the tab.
-pub fn render(frame: &mut Frame, area: Rect, styles: &Styles, events: &mut Events, stale: bool) {
+/// Draws the tab. The selected event has the transcripts' bar on its left,
+/// thick while `focused` — the keys are in the tab — and thin otherwise
+/// (R15, R16).
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    styles: &Styles,
+    events: &mut Events,
+    stale: bool,
+    focused: bool,
+) {
     let grey = |role: Role| if stale { Role::Done } else { role };
     let mut notes: Vec<Line<'static>> = Vec::new();
     if let Availability::Unavailable { message, .. } = &events.availability {
@@ -294,7 +304,7 @@ pub fn render(frame: &mut Frame, area: Rect, styles: &Styles, events: &mut Event
     } else if events.cursor >= events.top + height {
         events.top = events.cursor + 1 - height;
     }
-    let width = usize::from(list.width).saturating_sub(2);
+    let width = usize::from(list.width).saturating_sub(usize::from(PREFIX_WIDTH));
     let rows: Vec<Line> = events
         .events
         .iter()
@@ -302,21 +312,11 @@ pub fn render(frame: &mut Frame, area: Rect, styles: &Styles, events: &mut Event
         .skip(events.top)
         .take(height)
         .map(|(index, event)| {
-            let selected = index == events.cursor;
-            let marker = Span::styled(
-                if selected { "▸ " } else { "  " },
-                styles.of(grey(Role::Focus)),
-            );
             let text = fit(&row_text(event, events.raw), width);
-            let line = Line::from(vec![
-                marker,
+            Line::from(vec![
+                bar_prefix(styles, index == events.cursor, focused),
                 Span::styled(text, styles.of(grey(Role::Calm))),
-            ]);
-            if selected {
-                line.style(styles.of(Role::Selected))
-            } else {
-                line
-            }
+            ])
         })
         .collect();
     frame.render_widget(Paragraph::new(rows), list);

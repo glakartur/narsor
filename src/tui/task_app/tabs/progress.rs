@@ -13,7 +13,8 @@
 //! The axis is a spaced list ([`render_spaced_list`]): one row per step, a
 //! blank row between them, the selected step bracketed — thick while the keys
 //! are on the axis, thin while they read the step's conversation or are
-//! elsewhere.
+//! elsewhere. The conversation marks its selected entry with the same bar,
+//! thick only while the keys are in it.
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -319,7 +320,8 @@ fn step_lines(
 
 /// Draws the tab: the axis on the left, the selected step on the right.
 /// `keys` is the level the keys are on, `None` while they are outside the
-/// tab's content: the axis's bracket is thick only on the axis (R12).
+/// tab's content: the axis's bracket and the step conversation's bar are
+/// thick only on that level (R12, R16).
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -330,6 +332,7 @@ pub fn render(
     keys: Option<StepFocus>,
 ) {
     let axis_focused = keys == Some(StepFocus::Axis);
+    let conversation_focused = keys == Some(StepFocus::Conversation);
     let mut top_rows = 0;
     if let Some(failure) = progress.failure() {
         frame.render_widget(
@@ -390,7 +393,15 @@ pub fn render(
     if content.width < 8 {
         return;
     }
-    render_step(frame, content, styles, progress, attempts, stale);
+    render_step(
+        frame,
+        content,
+        styles,
+        progress,
+        attempts,
+        stale,
+        conversation_focused,
+    );
 }
 
 /// The right-hand side: the facts of the selected step, then its content.
@@ -401,6 +412,7 @@ fn render_step(
     progress: &Progress,
     attempts: &mut Attempts,
     stale: bool,
+    focused: bool,
 ) {
     let Some(position) = progress.selected_position() else {
         return;
@@ -435,7 +447,7 @@ fn render_step(
         position.action_execution_id.as_deref(),
     ) {
         (ConversationState::Recorded, Some(attempt_id)) => match attempts.get_mut(attempt_id) {
-            Some(attempt) => render_attempt(frame, body, styles, attempt, stale),
+            Some(attempt) => render_attempt(frame, body, styles, attempt, stale, focused),
             None => message(frame, "wczytuję rozmowę kroku…".to_string()),
         },
         (ConversationState::Recorded, None) | (ConversationState::NoRecord, _) => {
@@ -453,6 +465,7 @@ fn render_attempt(
     styles: &Styles,
     attempt: &mut Attempt,
     stale: bool,
+    focused: bool,
 ) {
     if let Some(failure) = attempt.failure() {
         frame.render_widget(
@@ -476,5 +489,12 @@ fn render_attempt(
         );
         return;
     }
-    conversation::render_transcript(frame, area, styles, attempt.transcript_mut(), stale);
+    conversation::render_transcript(
+        frame,
+        area,
+        styles,
+        attempt.transcript_mut(),
+        stale,
+        focused,
+    );
 }
