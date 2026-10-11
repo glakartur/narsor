@@ -127,6 +127,39 @@ pub fn short_age(seconds: i64) -> String {
     }
 }
 
+/// How old a record is, in the coarse steps people read its age in: under
+/// a minute it is "just now", then whole minutes, hours and days. The TUI
+/// and the CLI word the same bucket in their own language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordAge {
+    /// Less than a minute.
+    JustNow,
+    /// Whole minutes, under an hour.
+    Minutes(i64),
+    /// Whole hours, under a day.
+    Hours(i64),
+    /// Whole days.
+    Days(i64),
+}
+
+impl RecordAge {
+    /// The bucket of a record written `seconds` ago (a negative span — a
+    /// clock behind the writer's — reads as just now).
+    pub fn of_seconds(seconds: i64) -> Self {
+        match seconds.max(0) {
+            0..=59 => Self::JustNow,
+            seconds @ 60..=3599 => Self::Minutes(seconds / 60),
+            seconds @ 3600..=86_399 => Self::Hours(seconds / 3600),
+            seconds => Self::Days(seconds / 86_400),
+        }
+    }
+
+    /// The bucket of a record written `at`, seen `now`.
+    pub fn between(now: DateTime<Utc>, at: DateTime<Utc>) -> Self {
+        Self::of_seconds((now - at).num_seconds())
+    }
+}
+
 /// The one-line status of a task in the list: its lifecycle, then the most
 /// useful detail — the queue verdict, a pending question, a runner problem,
 /// or the runner's status — with staleness marked.

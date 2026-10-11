@@ -427,12 +427,19 @@ impl Entry {
 }
 
 /// What a waiting left behind when it went away with a draft.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The entry itself is kept: should the same waiting come back — a task
+/// resumed after its runner was lost asks the same question again, under
+/// the same id — the draft goes back to it ([`WaitingPanel::sync`]).
+#[derive(Debug, Clone)]
 pub struct Released {
     /// What it was.
     pub title: String,
     /// What the operator had typed.
     pub text: String,
+    /// The waiting it was typed for.
+    pub waiting_id: String,
+    entry: Box<Entry>,
 }
 
 /// What a key in the panel asks of the application.
@@ -596,7 +603,9 @@ impl WaitingPanel {
 
     /// Brings the entries in line with what `task` waits on: new waitings get
     /// an entry, the typed text of the others stays, and a waiting that went
-    /// away takes its draft to [`Self::released`].
+    /// away takes its draft to [`Self::released`] — from where it comes back
+    /// to its entry, in the entry's place, when the same waiting returns
+    /// (R8). Neither moves the entry shown.
     pub fn sync(&mut self, task: &TaskSummary, positions: &[Position]) -> SyncEffect {
         let mut effect = SyncEffect::default();
         let shown = self.current_waiting_id().map(str::to_string);
@@ -614,10 +623,36 @@ impl WaitingPanel {
                     }
                     entries.push(entry);
                 }
-                None => entries.push(Entry::build(item, task, positions, self.conductor.as_ref())),
+                None => {
+                    let parked = self
+                        .released
+                        .iter()
+                        .position(|released| released.waiting_id == item.waiting_id)
+                        .map(|index| self.released.remove(index));
+                    let entry = match parked {
+                        Some(released) => {
+                            let mut entry = *released.entry;
+                            entry.item = item.clone();
+                            entry.error = None;
+                            // Until the waiting's content arrives again, the
+                            // entry keeps what it was typed into.
+                            let conductor = self.conductor.as_ref();
+                            let model = Entry::model(item, task, positions, conductor);
+                            if !matches!(model, Model::Missing) {
+                                entry.rebuild(task, positions, conductor);
+                            }
+                            entry
+                        }
+                        None => Entry::build(item, task, positions, self.conductor.as_ref()),
+                    };
+                    entries.push(entry);
+                }
             }
         }
         for gone in old {
+            if shown.as_deref() == Some(gone.item.waiting_id.as_str()) {
+                effect.lost_current = true;
+            }
             if gone.is_drafted() {
                 self.released.push(Released {
                     title: format!(
@@ -629,11 +664,10 @@ impl WaitingPanel {
                             .map_or_else(String::new, one_line)
                     ),
                     text: gone.chooser.draft_text(),
+                    waiting_id: gone.item.waiting_id.clone(),
+                    entry: Box::new(gone),
                 });
                 effect.released = true;
-            }
-            if shown.as_deref() == Some(gone.item.waiting_id.as_str()) {
-                effect.lost_current = true;
             }
         }
         self.entries = entries;

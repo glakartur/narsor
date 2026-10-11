@@ -14,8 +14,8 @@ use narsor::domain::display::DisplayLink;
 use narsor::domain::{Event, EventData, ExecutionStatus, TaskId};
 use narsor::engine::{ConversationState, Position, PositionStatus, Timeline};
 use narsor::orchestration::{
-    AttentionItem, AttentionKind, ExecutionCursor, QueueReason, TaskEvent, TaskEventKind,
-    TaskLifecycle,
+    AttentionItem, AttentionKind, ExecutionCursor, QueueReason, ResumeExhaustion, ResumeState,
+    TaskEvent, TaskEventKind, TaskLifecycle, WorkloadLoss,
 };
 
 pub fn at() -> DateTime<Utc> {
@@ -524,3 +524,53 @@ pub fn harness_selection(
 
 /// The harnesses a daemon of the tests supports, in its order.
 pub const HARNESSES: [&str; 3] = ["claude-code", "codex", "opencode"];
+
+/// An `Interrupted` task whose loss the control plane counted as `losses`
+/// in a row, lost from `from`; `planned` says an automatic resume is due.
+pub fn interrupted(id: &str, from: TaskLifecycle, losses: u32, planned: bool) -> TaskSummary {
+    let mut task = task(id, "local", "interrupted", 1);
+    task.resume = ResumeState {
+        consecutive_losses: losses,
+        next_attempt_at: planned.then(at),
+        last_loss: Some(WorkloadLoss {
+            from,
+            at: at(),
+            lease_epoch: 1,
+            reason: None,
+        }),
+        exhausted: None,
+    };
+    task
+}
+
+/// The resume policy gave up on `task` with `reason` (the server's words).
+pub fn exhausted(mut task: TaskSummary, reason: &str) -> TaskSummary {
+    task.resume.next_attempt_at = None;
+    task.resume.exhausted = Some(ResumeExhaustion {
+        reason: reason.to_string(),
+        at: at(),
+        announced: true,
+    });
+    task
+}
+
+/// The stream's `AutoResumed` of `task` at `sequence`: attempt `attempt` of
+/// five, the task back to provisioning.
+pub fn auto_resumed(
+    cursor: &str,
+    task: &str,
+    sequence: u64,
+    attempt: u32,
+) -> Option<Result<ControlEventEnvelope, narsor::api::ClientError>> {
+    event(
+        cursor,
+        task,
+        sequence,
+        TaskLifecycle::Provisioning,
+        TaskEventKind::AutoResumed {
+            attempt,
+            limit: 5,
+            loss_reason: None,
+        },
+    )
+}

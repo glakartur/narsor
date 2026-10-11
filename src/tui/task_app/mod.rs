@@ -118,7 +118,7 @@ use super::scroll::one_line;
 use actions::{availability, ActionRequest, Availability, LinkRequest, Overlay, TaskAction};
 use detail::{StepLevel, TaskDetail};
 use history::History;
-use list::{title_of, MoveRequest, Removal, TaskList};
+use list::{title_of, MoveRequest, Removal, ResumeNotice, ResumeNoticeKind, TaskList};
 use new_task::{NewTaskForm, Outgoing};
 use notify::{Notifier, Severity};
 use repositories::Repositories;
@@ -1043,6 +1043,32 @@ impl TaskApp {
         left
     }
 
+    /// Tells what the resume policy did on the bar (R7): a resume as a
+    /// warning — several in a row counted in one — and giving up as an
+    /// error.
+    fn notify_resume(&mut self, resume: &ResumeNotice, now: Instant) {
+        match &resume.kind {
+            ResumeNoticeKind::Resumed { attempt, limit } => self.notifier.push_counted(
+                Severity::Warning,
+                "auto-resume",
+                format!(
+                    "{}: wznowiono automatycznie po utracie runnera (próba {attempt}/{limit})",
+                    resume.title
+                ),
+                |count| format!("wznowiono automatycznie {count} {}", tasks_word(count)),
+                now,
+            ),
+            ResumeNoticeKind::Exhausted(detail) => self.notifier.push(
+                Severity::Error,
+                format!(
+                    "{}: nie udało się wznowić automatycznie: {detail}",
+                    resume.title
+                ),
+                now,
+            ),
+        }
+    }
+
     fn announce(&mut self, removal: Option<Removal>) {
         let Some(removal) = removal else {
             return;
@@ -1117,6 +1143,9 @@ impl TaskApp {
                 if let Some(resolved) = &effect.resolved {
                     self.notify_resolved(resolved);
                 }
+                if let Some(resume) = &effect.resume {
+                    self.notify_resume(resume, now);
+                }
                 self.announce(effect.removal);
             }
             Some(Err(error)) if is_transport(&error) => {
@@ -1137,6 +1166,15 @@ impl TaskApp {
                 self.connection.on_failure(now, None);
             }
         }
+    }
+}
+
+/// "zadanie" in the form that follows the number `count`.
+fn tasks_word(count: usize) -> &'static str {
+    match (count % 10, count % 100) {
+        _ if count == 1 => "zadanie",
+        (2..=4, tens) if !(12..=14).contains(&tens) => "zadania",
+        _ => "zadań",
     }
 }
 

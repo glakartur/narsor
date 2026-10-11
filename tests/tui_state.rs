@@ -2338,7 +2338,9 @@ mod task_app_detail {
         self, hyperlinks_supported, queue_text, readiness, short_age, unstarted_message,
         DetailRead, Readiness,
     };
-    use narsor::tui::task_app::tabs::conversation::{AttemptRead, Attempts, Conversation};
+    use narsor::tui::task_app::tabs::conversation::{
+        AttemptRead, Attempts, Conversation, ReadFailure,
+    };
     use narsor::tui::task_app::tabs::events::Availability;
     use narsor::tui::task_app::tabs::info;
     use narsor::tui::task_app::{DetailTab, Focus, TaskApp};
@@ -2648,6 +2650,8 @@ mod task_app_detail {
                 truncated_tail: false,
                 complete: true,
                 no_record,
+                source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                recorded_at: None,
             }
         }
 
@@ -3215,6 +3219,8 @@ mod task_app_detail {
                 truncated_tail: false,
                 complete: true,
                 no_record: false,
+                source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                recorded_at: None,
             }
         }
 
@@ -3263,11 +3269,18 @@ mod task_app_detail {
                 "{lines:?}"
             );
 
-            attempts.apply("act-plan", 2, 3, Err("the runner did not answer".into()));
+            attempts.apply(
+                "act-plan",
+                2,
+                3,
+                Err(ReadFailure::Failed("the runner did not answer".into())),
+            );
             conversation.rebuild(&positions, &attempts);
+            let failure = conversation.failure().expect("the failure");
+            assert_eq!(failure.detail(), "the runner did not answer");
             assert_eq!(
-                conversation.failure(),
-                Some("plan #1: the runner did not answer")
+                failure.note(Some("plan #1")).0,
+                "✗ nie udało się wczytać rozmowy (plan #1: the runner did not answer)"
             );
             assert_eq!(
                 conversation.transcript().entries().len(),
@@ -3503,6 +3516,45 @@ mod task_app_detail {
                 "{lines:?}"
             );
             assert!(view.attempts().get("act-plan").is_some());
+        }
+
+        /// AE6: a remote task without its runner keeps today's answer — the
+        /// conversation is unavailable, with the server's reason, and is not
+        /// read from any record.
+        #[tokio::test]
+        async fn a_remote_task_without_a_live_runner_says_its_conversation_is_unavailable() {
+            let harness = RemoteHarness::start().await;
+            let running = harness.running("task-1", "k8s", live_snapshot()).await;
+            running
+                .controller
+                .report(&report(
+                    "task-1",
+                    running.epoch,
+                    1,
+                    Observation::WorkloadLost { state_known: true },
+                    Some(1),
+                ))
+                .await
+                .expect("lost");
+            let mut app = app_over(&harness).await;
+            press(&mut app, KeyCode::Char(']'));
+            assert_eq!(app.detail().tab(), DetailTab::Conversation);
+
+            app.sync_detail().await;
+            let conversation = app.detail().view("task-1").unwrap().conversation();
+            let failure = conversation.failure().expect("a reason");
+            assert!(
+                matches!(failure, ReadFailure::Unavailable(_)),
+                "{failure:?}"
+            );
+            let (text, _) = failure.note(None);
+            assert!(
+                text.starts_with("◌ rozmowa niedostępna: ")
+                    && text.contains("cannot be read right now"),
+                "{text}"
+            );
+            assert_eq!(conversation.record(), None);
+            assert!(app.connection().is_live());
         }
     }
 
@@ -4535,6 +4587,88 @@ mod task_app_waiting {
         assert!(!app.detail().view("a").unwrap().waiting().is_present());
     }
 
+    /// R8: the waiting comes back under the same id — a task resumed after
+    /// its runner was lost asks again — and the draft goes back to it: no
+    /// copy is left behind and the focus is not taken.
+    #[test]
+    fn a_draft_goes_back_to_its_waiting_when_the_same_one_returns() {
+        let mut app = gate_app();
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "moja odpowiedź");
+        app.load(listing(vec![titled(running("a", 1), "NAR-12")], "d"));
+        assert_eq!(
+            app.detail().view("a").unwrap().waiting().released().len(),
+            1
+        );
+        assert!(!app.panel_focused());
+
+        let back = with_pending(running("a", 1), gate("ep-1"));
+        app.load(listing(vec![titled(back, "NAR-12")], "e"));
+        let panel = app.detail().view("a").unwrap().waiting();
+        assert!(panel.released().is_empty(), "{:?}", panel.released());
+        assert_eq!(panel.len(), 1);
+        assert_eq!(panel.current_waiting_id(), Some("ep-1"));
+        assert_eq!(chooser_of(&app).fields_of(1)[0].value(), "moja odpowiedź");
+        let draft = app.detail().draft("a").expect("the draft");
+        assert_eq!(draft.matches("moja odpowiedź").count(), 1, "{draft}");
+        assert!(!app.panel_focused(), "the focus stays where it was");
+        assert_eq!(app.focus(), Focus::Details);
+    }
+
+    /// The draft of a waiting that returns among others goes back to its
+    /// own entry, in the panel's order, and the entry shown stays shown.
+    #[test]
+    fn a_returning_waiting_takes_its_place_and_leaves_the_shown_one_alone() {
+        let mut app = gate_app();
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "pierwsza");
+        app.load(listing(vec![titled(running("a", 1), "NAR-12")], "d"));
+        let other = waiting_on(running("a", 1), AttentionKind::Problem, "other", None);
+        app.load(listing(vec![titled(other, "NAR-12")], "e"));
+        assert_eq!(
+            app.detail()
+                .view("a")
+                .unwrap()
+                .waiting()
+                .current_waiting_id(),
+            Some("other")
+        );
+
+        let both = waiting_on(
+            with_pending(running("a", 1), gate("ep-1")),
+            AttentionKind::Problem,
+            "other",
+            None,
+        );
+        app.load(listing(vec![titled(both, "NAR-12")], "f"));
+        let panel = app.detail().view("a").unwrap().waiting();
+        assert!(panel.released().is_empty());
+        assert_eq!(panel.len(), 2);
+        assert_eq!(panel.current_index(), 1, "the shown entry stays shown");
+        assert_eq!(panel.current_waiting_id(), Some("other"));
+        assert!(app
+            .detail()
+            .draft("a")
+            .is_some_and(|draft| draft.matches("pierwsza").count() == 1));
+    }
+
+    /// Another waiting in its place does not take the draft: it stays to be
+    /// copied.
+    #[test]
+    fn a_different_waiting_leaves_the_draft_where_it_was() {
+        let mut app = gate_app();
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "moja odpowiedź");
+        app.load(listing(vec![titled(running("a", 1), "NAR-12")], "d"));
+        let other = with_pending(running("a", 1), gate("ep-2"));
+        app.load(listing(vec![titled(other, "NAR-12")], "e"));
+        let panel = app.detail().view("a").unwrap().waiting();
+        assert_eq!(panel.released().len(), 1);
+        assert!(panel.released()[0].text.contains("moja odpowiedź"));
+        assert_eq!(panel.current_waiting_id(), Some("ep-2"));
+        assert_eq!(chooser_of(&app).draft_text(), "");
+    }
+
     #[test]
     fn sending_without_a_connection_is_blocked_with_a_reason_and_keeps_the_draft() {
         let mut app = gate_app();
@@ -4637,6 +4771,8 @@ mod task_app_waiting {
                     truncated_tail: false,
                     complete: true,
                     no_record: false,
+                    source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                    recorded_at: None,
                 }),
             },
         );
@@ -4732,11 +4868,16 @@ mod task_app_waiting {
     // -- against a served control plane -----------------------------------------
 
     fn approval_snapshot(sequence: u64) -> narsor::orchestration::RunnerSnapshot {
+        approval_snapshot_in(sequence, "ep-a")
+    }
+
+    /// An approval of the waiting `episode`.
+    fn approval_snapshot_in(sequence: u64, episode: &str) -> narsor::orchestration::RunnerSnapshot {
         let mut snapshot = snapshot(sequence, None);
         let form: narsor::engine::PendingHumanInput =
             serde_json::from_value(approval(true)).unwrap();
         snapshot.pending_input = Some(narsor::orchestration::PendingInputRef {
-            id: "ep-a".to_string(),
+            id: episode.to_string(),
             attempt_id: None,
             form,
         });
@@ -4744,7 +4885,7 @@ mod task_app_waiting {
             kind: AttentionKind::Approval,
             state_id: Some("review_scope".to_string()),
             since: chrono::Utc::now(),
-            waiting_id: "ep-a".to_string(),
+            waiting_id: episode.to_string(),
         }];
         snapshot
     }
@@ -4860,6 +5001,112 @@ mod task_app_waiting {
             panel.released()
         );
         assert!(app.detail().has_drafts());
+    }
+
+    /// An answer to the waiting from before the runner was lost, sent once
+    /// the resumed task asks in a new episode, is refused like any answer to
+    /// a waiting the runner moved on from (D55): the text stays to be copied
+    /// and the bar says why.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_to_a_waiting_from_before_the_loss_is_refused_and_kept() {
+        use narsor::controller_protocol::{
+            OwnerCommandRequest, RunnerClient, RunnerCredentialRequest,
+        };
+        use narsor::orchestration::Observation;
+
+        use super::remote_support::report;
+
+        let harness = RemoteHarness::start().await;
+        let running = harness
+            .running("NAR-12", "local", approval_snapshot(1))
+            .await;
+        let mut app = TaskApp::new(harness.owner.clone(), "local", None);
+        app.refresh().await;
+        ch(&mut app, ' ');
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "popraw testy");
+
+        // The runner is lost, the task resumed, and the new runner's action
+        // asks again in a new episode — while the screen still shows the old.
+        let (controller, epoch) = (&running.controller, running.epoch);
+        controller
+            .report(&report(
+                "NAR-12",
+                epoch,
+                1,
+                Observation::WorkloadLost { state_known: true },
+                Some(1),
+            ))
+            .await
+            .expect("lost");
+        harness
+            .owner
+            .control_command(
+                "NAR-12",
+                &OwnerCommandRequest {
+                    command: OwnerCommand::Resume,
+                    idempotency_key: "resume-1".to_string(),
+                    expected_generation: None,
+                },
+            )
+            .await
+            .expect("resumed");
+        controller
+            .report(&report(
+                "NAR-12",
+                epoch,
+                2,
+                Observation::StartAccepted,
+                None,
+            ))
+            .await
+            .expect("start accepted");
+        let credential = controller
+            .issue_runner_credential(
+                "NAR-12",
+                &RunnerCredentialRequest {
+                    lease_epoch: epoch,
+                    generation: 2,
+                    incarnation: "pod-2".to_string(),
+                },
+            )
+            .await
+            .expect("runner credential");
+        let runner = RunnerClient::new(harness.base_url(), credential.credential);
+        runner
+            .snapshot(&approval_snapshot_in(1, "ep-b"))
+            .await
+            .expect("the new episode");
+        controller
+            .report(&report(
+                "NAR-12",
+                epoch,
+                2,
+                Observation::RunnerReady,
+                Some(2),
+            ))
+            .await
+            .expect("runner ready");
+
+        let request = press(&mut app, KeyCode::Enter);
+        app.perform(request).await;
+        let note = app.notifier().latest().unwrap();
+        assert_eq!(note.severity, Severity::Error);
+        assert!(
+            note.text.starts_with("NAR-12: nie wysłano"),
+            "{}",
+            note.text
+        );
+        let summary = harness.owner.control_task("NAR-12").await.unwrap();
+        assert!(summary.inputs.is_empty(), "nothing was queued");
+        let panel = app.detail().view("NAR-12").unwrap().waiting();
+        assert_eq!(panel.current_waiting_id(), Some("ep-b"));
+        assert!(
+            panel.released()[0].text.contains("popraw testy"),
+            "{:?}",
+            panel.released()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7774,6 +8021,8 @@ mod task_app_create {
                     truncated_tail: false,
                     complete: true,
                     no_record: false,
+                    source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                    recorded_at: None,
                 }),
             },
         );
@@ -10161,5 +10410,322 @@ mod task_app_harness {
                 "{context:?}"
             );
         }
+    }
+}
+
+/// Automatic resume (R7, R8, R10): what the stream's resume events say on
+/// the bar, what an interrupted task is said to wait for, and the
+/// conversation read from the task's record going back to live.
+mod task_app_auto_resume {
+    use chrono::Utc;
+
+    use narsor::api::ApiClient;
+    use narsor::cli::task_text::RecordAge;
+    use narsor::controller_protocol::{ExecutionEventsSource, TaskSummary};
+    use narsor::engine::{ConversationState, PositionStatus};
+    use narsor::orchestration::{TaskEventKind, TaskLifecycle};
+    use narsor::tui::task_app::actions::{availability, TaskAction};
+    use narsor::tui::task_app::detail::DetailRead;
+    use narsor::tui::task_app::list::{attention_of, Attention};
+    use narsor::tui::task_app::notify::Severity;
+    use narsor::tui::task_app::tabs::conversation::{record_badge, AttemptRead, Attempts};
+    use narsor::tui::task_app::TaskApp;
+    use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
+
+    use super::task_app_support::{
+        auto_resumed, event, exhausted, interrupted, listing, position, timeline, titled,
+    };
+
+    fn app() -> TaskApp {
+        TaskApp::new(
+            ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
+            "local",
+            None,
+        )
+    }
+
+    /// `count` interrupted tasks `t1`…, `NAR-1`…, each resumed automatically
+    /// soon.
+    fn lost_tasks(count: u32) -> Vec<TaskSummary> {
+        (1..=count)
+            .map(|n| {
+                let mut task = titled(
+                    interrupted(&format!("t{n}"), TaskLifecycle::Running, 1, true),
+                    &format!("NAR-{n}"),
+                );
+                task.rank = n;
+                task
+            })
+            .collect()
+    }
+
+    fn order(app: &TaskApp) -> Vec<String> {
+        app.list()
+            .tasks()
+            .iter()
+            .map(|task| task.task_id.to_string())
+            .collect()
+    }
+
+    fn note(app: &TaskApp) -> (Severity, String) {
+        let note = app.notifier().latest().expect("a notification");
+        (note.severity, note.text.clone())
+    }
+
+    /// AE1: a resume says so with the task's name; the row keeps its place
+    /// and the selection stays.
+    #[test]
+    fn an_automatic_resume_is_a_notification_and_the_row_stays_put() {
+        let mut app = app();
+        app.load(listing(lost_tasks(3), "c"));
+        let selected = app.list().selected_id().map(str::to_string);
+        app.on_stream(auto_resumed("e1", "t2", 2, 1));
+        assert_eq!(
+            note(&app),
+            (
+                Severity::Warning,
+                "NAR-2: wznowiono automatycznie po utracie runnera (próba 1/5)".to_string()
+            )
+        );
+        assert_eq!(order(&app), ["t1", "t2", "t3"]);
+        assert_eq!(app.list().selected_id().map(str::to_string), selected);
+        let row = &app.list().tasks()[1];
+        assert_eq!(row.lifecycle, TaskLifecycle::Provisioning);
+        assert_eq!(attention_of(row), Attention::None);
+    }
+
+    /// Resumes in a row — a restart — are counted in one notification.
+    #[test]
+    fn resumes_in_a_row_are_counted_in_one_notification() {
+        let mut app = app();
+        app.load(listing(lost_tasks(5), "c"));
+        for (n, task) in ["t1", "t2", "t3"].iter().enumerate() {
+            app.on_stream(auto_resumed(&format!("e{n}"), task, 2, 1));
+        }
+        assert_eq!(
+            note(&app),
+            (
+                Severity::Warning,
+                "wznowiono automatycznie 3 zadania".to_string()
+            )
+        );
+        app.on_stream(auto_resumed("e4", "t4", 2, 1));
+        app.on_stream(auto_resumed("e5", "t5", 2, 1));
+        assert_eq!(note(&app).1, "wznowiono automatycznie 5 zadań");
+        assert_eq!(order(&app), ["t1", "t2", "t3", "t4", "t5"]);
+    }
+
+    /// Events the list already shows — replayed when the stream connects
+    /// again — say nothing.
+    #[test]
+    fn replayed_resume_events_raise_no_notification() {
+        let mut app = app();
+        let mut tasks = lost_tasks(1);
+        tasks[0].revision = 5;
+        app.load(listing(tasks, "c"));
+        app.on_stream(auto_resumed("e1", "t1", 4, 1));
+        app.on_stream(auto_resumed("e2", "t1", 5, 1));
+        app.on_stream(event(
+            "e3",
+            "t1",
+            5,
+            TaskLifecycle::Interrupted,
+            TaskEventKind::AutoResumeExhausted {
+                attempts: 5,
+                reason: "could not resume automatically: pod evicted".to_string(),
+            },
+        ));
+        assert!(app.notifier().latest().is_none());
+    }
+
+    /// AE3: giving up is an error with the reason, and the row is marked
+    /// for its owner in its place.
+    #[test]
+    fn giving_up_is_an_error_and_marks_the_row() {
+        let mut app = app();
+        app.load(listing(lost_tasks(3), "c"));
+        app.on_stream(event(
+            "e1",
+            "t2",
+            2,
+            TaskLifecycle::Interrupted,
+            TaskEventKind::AutoResumeExhausted {
+                attempts: 5,
+                reason: "could not resume automatically: pod evicted".to_string(),
+            },
+        ));
+        assert_eq!(
+            note(&app),
+            (
+                Severity::Error,
+                "NAR-2: nie udało się wznowić automatycznie: pod evicted".to_string()
+            )
+        );
+        assert_eq!(attention_of(&app.list().tasks()[1]), Attention::Problem);
+        assert_eq!(order(&app), ["t1", "t2", "t3"]);
+
+        app.on_stream(event(
+            "e2",
+            "t3",
+            2,
+            TaskLifecycle::Interrupted,
+            TaskEventKind::AutoResumeExhausted {
+                attempts: 5,
+                reason: "could not resume automatically: the workload was lost".to_string(),
+            },
+        ));
+        assert_eq!(
+            note(&app).1,
+            "NAR-3: nie udało się wznowić automatycznie: runner utracony"
+        );
+    }
+
+    /// Only the two cases that wait for the owner mark the row.
+    #[test]
+    fn the_row_is_marked_only_when_the_owner_has_to_act() {
+        let planned = interrupted("a", TaskLifecycle::Running, 2, true);
+        assert_eq!(attention_of(&planned), Attention::None);
+        let pausing = interrupted("a", TaskLifecycle::PauseRequested, 0, false);
+        assert_eq!(attention_of(&pausing), Attention::Problem);
+        let given_up = exhausted(
+            interrupted("a", TaskLifecycle::Running, 6, false),
+            "could not resume automatically: pod evicted",
+        );
+        assert_eq!(attention_of(&given_up), Attention::Problem);
+    }
+
+    /// The menu's reason for an interrupted task mentions a planned resume.
+    #[test]
+    fn an_action_of_a_task_resuming_on_its_own_says_so() {
+        let planned = interrupted("a", TaskLifecycle::Running, 2, true);
+        let reason = availability(&planned, TaskAction::Interrupt);
+        assert_eq!(
+            reason.reason(),
+            Some(
+                "zadanie jest przerwane — wznowi się samo (próba 2/5) albo uruchom je od nowa (s)"
+            )
+        );
+        let pausing = interrupted("a", TaskLifecycle::PauseRequested, 0, false);
+        assert_eq!(
+            availability(&pausing, TaskAction::Interrupt).reason(),
+            Some("zadanie jest przerwane — uruchom je od nowa (s)")
+        );
+        assert!(availability(&planned, TaskAction::Restart).is_available());
+    }
+
+    #[test]
+    fn a_record_is_as_old_as_its_largest_whole_unit() {
+        assert_eq!(RecordAge::of_seconds(-3), RecordAge::JustNow);
+        assert_eq!(RecordAge::of_seconds(59), RecordAge::JustNow);
+        assert_eq!(RecordAge::of_seconds(60), RecordAge::Minutes(1));
+        assert_eq!(RecordAge::of_seconds(3599), RecordAge::Minutes(59));
+        assert_eq!(RecordAge::of_seconds(3600), RecordAge::Hours(1));
+        assert_eq!(RecordAge::of_seconds(2 * 86_400 + 5), RecordAge::Days(2));
+
+        let now = Utc::now();
+        let ago = |seconds| Some(now - chrono::Duration::seconds(seconds));
+        assert_eq!(record_badge(ago(20), now, 80), "zapis sprzed chwili");
+        assert_eq!(record_badge(ago(20), now, 12), "zapis · przed chwilą");
+        assert_eq!(record_badge(ago(185), now, 80), "zapis sprzed 3 min");
+        assert_eq!(record_badge(ago(185), now, 12), "zapis · 3 min");
+        assert_eq!(record_badge(ago(7300), now, 80), "zapis sprzed 2 h");
+        assert_eq!(record_badge(ago(90_000), now, 80), "zapis sprzed 1 d");
+        assert_eq!(record_badge(None, now, 80), "rozmowa z zapisu");
+    }
+
+    fn entry(id: &str) -> TranscriptEntry {
+        TranscriptEntry::new(
+            TranscriptEntryId::from(id),
+            vec![format!("line {id}")],
+            id.as_bytes().to_vec(),
+        )
+    }
+
+    fn read(ids: &[&str], next_entry: u64, source: ExecutionEventsSource) -> AttemptRead {
+        AttemptRead {
+            entries: ids.iter().map(|id| entry(id)).collect(),
+            next_entry,
+            closed: false,
+            truncated_tail: false,
+            complete: true,
+            no_record: false,
+            source,
+            recorded_at: (source == ExecutionEventsSource::Storage).then(Utc::now),
+        }
+    }
+
+    /// R10: an interrupted task's conversation is read from the record; once
+    /// the task runs again it is due for a read from where the record
+    /// stopped, which comes from the runner and takes the badge away.
+    #[test]
+    fn back_to_running_the_conversation_is_read_live_from_where_it_stopped() {
+        let mut app = app();
+        app.load(listing(
+            vec![titled(
+                interrupted("a", TaskLifecycle::Running, 1, true),
+                "NAR-1",
+            )],
+            "c",
+        ));
+        let mut plan = position("plan", PositionStatus::InProgress);
+        plan.conversation = ConversationState::Recorded;
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Timeline(Ok(timeline("a", vec![plan], Some("plan #1")))),
+        );
+        app.on_detail_read(
+            "a",
+            1,
+            DetailRead::Attempt {
+                attempt_id: "act-plan".into(),
+                from: 0,
+                result: Ok(read(&["1", "2", "3"], 3, ExecutionEventsSource::Storage)),
+            },
+        );
+        let attempts = app.detail().view("a").unwrap().attempts();
+        assert!(attempts.get("act-plan").unwrap().from_record());
+        assert!(!attempts.needs_read("act-plan", 1));
+
+        app.on_stream(event(
+            "e1",
+            "a",
+            2,
+            TaskLifecycle::Running,
+            TaskEventKind::Created,
+        ));
+        let revision = app.list().selected().unwrap().revision;
+        assert_eq!(revision, 2);
+        let attempts = app.detail().view("a").unwrap().attempts();
+        assert!(attempts.needs_read("act-plan", revision));
+        assert_eq!(attempts.from("act-plan"), 3);
+    }
+
+    /// The same, as the cache sees it: the read from the runner continues the
+    /// record and the reader keeps its entry — even a closed attempt is read
+    /// again once, since only the runner's word ends the badge.
+    #[test]
+    fn a_live_read_after_the_record_keeps_the_place_and_ends_the_badge() {
+        let mut attempts = Attempts::default();
+        let mut stored = read(&["1", "2", "3"], 3, ExecutionEventsSource::Storage);
+        stored.closed = true;
+        attempts.apply("act-plan", 1, 0, Ok(stored));
+        assert!(attempts.needs_read("act-plan", 2), "a record is read again");
+        let transcript = attempts.get_mut("act-plan").unwrap().transcript_mut();
+        transcript.set_viewport(10);
+        transcript.to_bottom();
+        transcript.line_up();
+        assert_eq!(transcript.selected_entry().unwrap().as_str(), "2");
+
+        attempts.apply(
+            "act-plan",
+            2,
+            3,
+            Ok(read(&["4"], 4, ExecutionEventsSource::Runner)),
+        );
+        let attempt = attempts.get("act-plan").unwrap();
+        assert!(!attempt.from_record());
+        assert_eq!(attempt.len(), 4);
+        assert_eq!(attempt.transcript().selected_entry().unwrap().as_str(), "2");
     }
 }

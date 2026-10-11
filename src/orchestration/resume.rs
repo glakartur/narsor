@@ -115,11 +115,19 @@ pub(crate) fn count_loss(record: &mut TaskRecord, policy: &ResumePolicy, now: Da
     }
 }
 
+/// What every [`ResumeExhaustion::reason`] begins with; a client that words
+/// it in another language strips it and keeps the loss after it.
+pub const EXHAUSTION_REASON_PREFIX: &str = "could not resume automatically: ";
+
+/// The loss in [`ResumeExhaustion::reason`] when the controller said nothing
+/// about it.
+pub const UNSPECIFIED_LOSS: &str = "the workload was lost";
+
 /// Why the policy gave up, for people.
 fn exhaustion_reason(loss_reason: Option<&str>) -> String {
     format!(
-        "could not resume automatically: {}",
-        loss_reason.unwrap_or("the workload was lost")
+        "{EXHAUSTION_REASON_PREFIX}{}",
+        loss_reason.unwrap_or(UNSPECIFIED_LOSS)
     )
 }
 

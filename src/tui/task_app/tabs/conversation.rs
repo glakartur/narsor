@@ -7,6 +7,14 @@
 //! in the tab, not in the connection. An attempt is read once and then only
 //! from the entry it stopped at ([`Attempts::from`]).
 //!
+//! Without a live runner, the daemon's own local backend serves the pages
+//! from the task's storage: such a page says so ([`ExecutionEventsSource`])
+//! and when the record was last written, and the tab and the step's
+//! conversation carry a badge with that age ([`record_badge`]) — counted
+//! from this terminal's clock at every draw. The entry numbers are the same
+//! from either source, so the next read after the runner is back continues
+//! from where the record stopped and the badge goes away by itself.
+//!
 //! Entries are the transcript model of [`crate::tui::transcript`]: an
 //! entry is projected by [`agent_transcript_entry`], with the same
 //! sanitisation and the same raw view as the conductor's chat. The colours come
@@ -15,13 +23,18 @@
 
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::api::{ApiClient, ClientError, ConversationResponse as Page};
-use crate::controller_protocol::ConversationPageQuery;
+use crate::cli::task_text::RecordAge;
+use crate::controller_protocol::{
+    ConversationPageQuery, ExecutionEventsSource, CONVERSATION_RECORD_UNREADABLE,
+    CONVERSATION_RECORD_UNREADABLE_PREFIX, CONVERSATION_UNAVAILABLE,
+};
 use crate::engine::{ConversationState, Position};
 
 use super::super::super::scroll::one_line;
@@ -53,6 +66,10 @@ pub struct AttemptRead {
     pub complete: bool,
     /// Whether the runner holds no record of the attempt at all.
     pub no_record: bool,
+    /// Where the last page was read from.
+    pub source: ExecutionEventsSource,
+    /// When the record was last written, for a page read from storage.
+    pub recorded_at: Option<DateTime<Utc>>,
 }
 
 /// Reads the conversation of `attempt_id` from entry `from`, page after page
@@ -110,7 +127,8 @@ where
                 next_entry,
                 closed,
                 truncated_tail,
-                ..
+                source,
+                recorded_at,
             } => {
                 let empty = page.is_empty();
                 entries.extend(
@@ -125,6 +143,8 @@ where
                         truncated_tail,
                         complete: !truncated_tail && (empty || closed),
                         no_record: false,
+                        source: source.unwrap_or_default(),
+                        recorded_at,
                     });
                 }
                 cursor = next_entry;
@@ -137,9 +157,102 @@ where
                     truncated_tail: false,
                     complete: true,
                     no_record: true,
+                    source: ExecutionEventsSource::default(),
+                    recorded_at: None,
                 });
             }
         }
+    }
+}
+
+/// Why a read of an attempt's conversation failed, as the tab tells it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadFailure {
+    /// No live runner can serve it and there is no record to read here (a
+    /// remote task without its runner): the server's reason.
+    Unavailable(String),
+    /// The task's own record could not be read: what went wrong.
+    RecordUnreadable(String),
+    /// Anything else: the reason in words.
+    Failed(String),
+}
+
+impl ReadFailure {
+    /// The failure of `error`, whose words are `reason`.
+    pub fn of(error: &ClientError, reason: String) -> Self {
+        match error {
+            ClientError::Refused { code, message } if code == CONVERSATION_RECORD_UNREADABLE => {
+                let detail = message
+                    .strip_prefix(CONVERSATION_RECORD_UNREADABLE_PREFIX)
+                    .unwrap_or(message);
+                Self::RecordUnreadable(one_line(detail))
+            }
+            ClientError::Refused { code, .. } if code == CONVERSATION_UNAVAILABLE => {
+                Self::Unavailable(reason)
+            }
+            _ => Self::Failed(reason),
+        }
+    }
+
+    /// The reason alone.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Unavailable(detail) | Self::RecordUnreadable(detail) | Self::Failed(detail) => {
+                detail
+            }
+        }
+    }
+
+    /// The note of the failure: its words and its role. `step` names the
+    /// step a failed read was of, when the note stands for several.
+    pub fn note(&self, step: Option<&str>) -> (String, Role) {
+        match self {
+            Self::Unavailable(detail) => (
+                format!("◌ rozmowa niedostępna: {}", one_line(detail)),
+                Role::Attention,
+            ),
+            Self::RecordUnreadable(detail) => (
+                format!("✗ nie udało się odczytać zapisu: {}", one_line(detail)),
+                Role::Problem,
+            ),
+            Self::Failed(detail) => (
+                match step {
+                    Some(step) => format!(
+                        "✗ nie udało się wczytać rozmowy ({}: {})",
+                        one_line(step),
+                        one_line(detail)
+                    ),
+                    None => format!("✗ nie udało się wczytać rozmowy: {}", one_line(detail)),
+                },
+                Role::Problem,
+            ),
+        }
+    }
+}
+
+/// The badge of a conversation read from the task's record written at
+/// `recorded_at`, seen `now`, fitted to `width` columns: "zapis sprzed 3 min",
+/// or "zapis · 3 min" where that does not fit. Words, not a colour, so it
+/// reads the same without colours.
+pub fn record_badge(recorded_at: Option<DateTime<Utc>>, now: DateTime<Utc>, width: u16) -> String {
+    let Some(at) = recorded_at else {
+        return if usize::from(width) >= "rozmowa z zapisu".chars().count() {
+            "rozmowa z zapisu".to_string()
+        } else {
+            "zapis".to_string()
+        };
+    };
+    let (since, age) = match RecordAge::between(now, at) {
+        RecordAge::JustNow => ("chwili".to_string(), "przed chwilą".to_string()),
+        RecordAge::Minutes(minutes) => (format!("{minutes} min"), format!("{minutes} min")),
+        RecordAge::Hours(hours) => (format!("{hours} h"), format!("{hours} h")),
+        RecordAge::Days(days) => (format!("{days} d"), format!("{days} d")),
+    };
+    let wide = format!("zapis sprzed {since}");
+    if wide.chars().count() <= usize::from(width) {
+        wide
+    } else {
+        format!("zapis · {age}")
     }
 }
 
@@ -151,7 +264,9 @@ pub struct Attempt {
     closed: bool,
     truncated_tail: bool,
     no_record: bool,
-    failure: Option<String>,
+    source: ExecutionEventsSource,
+    recorded_at: Option<DateTime<Utc>>,
+    failure: Option<ReadFailure>,
     revision: Option<u64>,
     transcript: TranscriptState,
 }
@@ -164,6 +279,8 @@ impl Attempt {
             closed: false,
             truncated_tail: false,
             no_record: false,
+            source: ExecutionEventsSource::default(),
+            recorded_at: None,
             failure: None,
             revision: None,
             transcript: TranscriptState::new(TranscriptId::from(attempt_id)),
@@ -171,8 +288,19 @@ impl Attempt {
     }
 
     /// Why the last read failed.
-    pub fn failure(&self) -> Option<&str> {
-        self.failure.as_deref()
+    pub fn failure(&self) -> Option<&ReadFailure> {
+        self.failure.as_ref()
+    }
+
+    /// Whether the last page read came from the task's record rather than
+    /// the live runner.
+    pub fn from_record(&self) -> bool {
+        self.source == ExecutionEventsSource::Storage
+    }
+
+    /// When the record the last page came from was last written.
+    pub fn recorded_at(&self) -> Option<DateTime<Utc>> {
+        self.recorded_at
     }
 
     /// Whether the runner holds no record of it.
@@ -232,8 +360,11 @@ impl Attempts {
     /// Whether the attempt must be read for a task at `revision`.
     pub fn needs_read(&self, attempt_id: &str, revision: u64) -> bool {
         self.map.get(attempt_id).is_none_or(|attempt| {
-            // A closed conversation that was read whole never changes.
+            // A closed conversation that was read whole never changes —
+            // but one read from the record is read again once the runner
+            // may be back, so that its badge goes.
             let settled = attempt.failure.is_none()
+                && !attempt.from_record()
                 && (attempt.no_record || (attempt.closed && !attempt.truncated_tail));
             !settled && attempt.revision != Some(revision)
         })
@@ -260,7 +391,7 @@ impl Attempts {
         attempt_id: &str,
         revision: u64,
         from: u64,
-        result: Result<AttemptRead, String>,
+        result: Result<AttemptRead, ReadFailure>,
     ) {
         let attempt = self
             .map
@@ -279,9 +410,11 @@ impl Attempts {
                 attempt.next_entry = attempt.next_entry.max(read.next_entry);
                 attempt.closed = read.closed;
                 attempt.truncated_tail = read.truncated_tail;
+                attempt.source = read.source;
+                attempt.recorded_at = read.recorded_at;
                 attempt.transcript.replace_entries(attempt.entries.clone());
             }
-            Err(message) => attempt.failure = Some(message),
+            Err(failure) => attempt.failure = Some(failure),
         }
     }
 }
@@ -313,7 +446,11 @@ pub struct Conversation {
     full: TranscriptState,
     built: bool,
     loading: bool,
-    failure: Option<String>,
+    /// The first failed read, and the step it was of.
+    failure: Option<(String, ReadFailure)>,
+    /// Some attempt was last read from the task's record: when the newest
+    /// such record was written.
+    record: Option<Option<DateTime<Utc>>>,
 }
 
 impl Conversation {
@@ -324,6 +461,7 @@ impl Conversation {
             built: false,
             loading: false,
             failure: None,
+            record: None,
         }
     }
 
@@ -348,8 +486,14 @@ impl Conversation {
     }
 
     /// Why an attempt could not be read, the first that failed.
-    pub fn failure(&self) -> Option<&str> {
-        self.failure.as_deref()
+    pub fn failure(&self) -> Option<&ReadFailure> {
+        self.failure.as_ref().map(|(_, failure)| failure)
+    }
+
+    /// Whether what is shown was read from the task's record, and when the
+    /// newest record was written: `Some(None)` when the record did not say.
+    pub fn record(&self) -> Option<Option<DateTime<Utc>>> {
+        self.record
     }
 
     /// Puts the whole conversation together from the attempts read, in the
@@ -359,6 +503,7 @@ impl Conversation {
         let mut entries = Vec::new();
         self.loading = false;
         self.failure = None;
+        self.record = None;
         for position in positions {
             let (ConversationState::Recorded, Some(attempt_id)) = (
                 &position.conversation,
@@ -373,7 +518,11 @@ impl Conversation {
             if self.failure.is_none() {
                 self.failure = attempt
                     .failure()
-                    .map(|reason| format!("{}: {reason}", position.label));
+                    .map(|failure| (position.label.clone(), failure.clone()));
+            }
+            if attempt.from_record() {
+                let newest = self.record.flatten().max(attempt.recorded_at());
+                self.record = Some(newest);
             }
             if attempt.entries.is_empty() {
                 continue;
@@ -448,6 +597,42 @@ pub fn render_transcript(
     frame.render_widget(Paragraph::new(rows), area);
 }
 
+/// The notes on the fixed lines above a conversation: the badge of a record
+/// (seen `now`) and a failed read, each one line fitted to `width`.
+pub fn notes(
+    record: Option<Option<DateTime<Utc>>>,
+    failure: Option<(String, Role)>,
+    now: DateTime<Utc>,
+    width: u16,
+    styles: &Styles,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(recorded_at) = record {
+        lines.push(Line::styled(
+            record_badge(recorded_at, now, width),
+            styles.of(Role::Attention),
+        ));
+    }
+    if let Some((text, role)) = failure {
+        lines.push(Line::styled(text, styles.of(role)));
+    }
+    lines
+}
+
+/// Draws `notes` at the top of `area` and returns what is left under them.
+pub fn render_notes(frame: &mut Frame, area: Rect, notes: Vec<Line<'static>>) -> Rect {
+    let rows = u16::try_from(notes.len())
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    if rows > 0 {
+        frame.render_widget(
+            Paragraph::new(notes),
+            Rect::new(area.x, area.y, area.width, rows),
+        );
+    }
+    Rect::new(area.x, area.y + rows, area.width, area.height - rows)
+}
+
 /// Draws the tab. `focused` says the keys are in it.
 pub fn render(
     frame: &mut Frame,
@@ -457,25 +642,23 @@ pub fn render(
     stale: bool,
     focused: bool,
 ) {
-    let mut body = area;
-    if let Some(failure) = conversation.failure() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                format!("✗ nie udało się wczytać rozmowy ({})", one_line(failure)),
-                styles.of(Role::Problem),
-            )),
-            first_row(area),
-        );
-        body = Rect::new(
-            area.x,
-            area.y + 1,
-            area.width,
-            area.height.saturating_sub(1),
-        );
-    }
+    let failure = conversation
+        .failure
+        .as_ref()
+        .map(|(step, failure)| failure.note(Some(step)));
+    let notes = notes(
+        conversation.record(),
+        failure,
+        Utc::now(),
+        area.width,
+        styles,
+    );
+    let body = render_notes(frame, area, notes);
     if conversation.transcript().entries().is_empty() {
         let text = if conversation.is_loading() {
             "wczytuję rozmowę…"
+        } else if conversation.record().is_some() {
+            "brak zapisanej rozmowy"
         } else {
             "brak rozmowy — żaden krok nie zapisał jej jeszcze"
         };

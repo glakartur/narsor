@@ -682,3 +682,58 @@ mod conductor_chat {
         );
     }
 }
+
+/// A failed read of a conversation page, as the tab tells it (U7 of the
+/// automatic resume): the record that could not be read, a conversation no
+/// one can serve, anything else.
+mod read_failures {
+    use narsor::api::ClientError;
+    use narsor::tui::task_app::tabs::conversation::ReadFailure;
+
+    fn refused(code: &str, message: &str) -> ClientError {
+        ClientError::Refused {
+            code: code.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_record_keeps_only_the_error() {
+        let error = refused(
+            "conversation_record_unreadable",
+            "the conversation record could not be read: permission denied",
+        );
+        let failure = ReadFailure::of(&error, "words".to_string());
+        assert_eq!(
+            failure,
+            ReadFailure::RecordUnreadable("permission denied".to_string())
+        );
+        assert_eq!(
+            failure.note(None).0,
+            "✗ nie udało się odczytać zapisu: permission denied"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_conversation_says_so_with_the_reason() {
+        let error = refused(
+            "conversation_unavailable",
+            "the task's conversation cannot be read right now (Interrupted)",
+        );
+        let failure = ReadFailure::of(&error, "the reason".to_string());
+        assert_eq!(failure.note(None).0, "◌ rozmowa niedostępna: the reason");
+    }
+
+    #[test]
+    fn any_other_failure_names_its_step_when_it_stands_for_several() {
+        let failure = ReadFailure::of(&ClientError::Conflict, "conflict".to_string());
+        assert_eq!(
+            failure.note(Some("plan #1")).0,
+            "✗ nie udało się wczytać rozmowy (plan #1: conflict)"
+        );
+        assert_eq!(
+            failure.note(None).0,
+            "✗ nie udało się wczytać rozmowy: conflict"
+        );
+    }
+}

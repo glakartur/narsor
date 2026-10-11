@@ -516,6 +516,20 @@ pub enum ConversationUnavailableReason {
     StorageUnreadable,
 }
 
+/// The code of a `409` refusing a conversation page because no live runner
+/// can serve it and no record of it can be read here (a remote task).
+pub const CONVERSATION_UNAVAILABLE: &str = "conversation_unavailable";
+
+/// The code of a `409` refusing a conversation page because the task's own
+/// storage could not be read; the message begins with
+/// [`CONVERSATION_RECORD_UNREADABLE_PREFIX`].
+pub const CONVERSATION_RECORD_UNREADABLE: &str = "conversation_record_unreadable";
+
+/// What the message of a [`CONVERSATION_RECORD_UNREADABLE`] refusal begins
+/// with, before the error itself.
+pub const CONVERSATION_RECORD_UNREADABLE_PREFIX: &str =
+    "the conversation record could not be read: ";
+
 /// `GET /control/v1/tasks/:task_id/conversation`.
 ///
 /// Summaries only: the raw transcript never leaves task storage (KTD4).

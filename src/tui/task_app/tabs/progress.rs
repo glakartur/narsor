@@ -459,6 +459,8 @@ fn render_step(
     }
 }
 
+/// The step's conversation: the badge of a record and a failed read on the
+/// fixed lines at the top, then the transcript.
 fn render_attempt(
     frame: &mut Frame,
     area: Rect,
@@ -467,31 +469,31 @@ fn render_attempt(
     stale: bool,
     focused: bool,
 ) {
-    if let Some(failure) = attempt.failure() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                format!("✗ nie udało się wczytać rozmowy: {}", one_line(failure)),
-                styles.of(Role::Problem),
-            )),
-            first_row(area),
-        );
-        if attempt.is_empty() {
-            return;
-        }
+    let record = attempt.from_record().then(|| attempt.recorded_at());
+    let failure = attempt.failure().map(|failure| failure.note(None));
+    let failed = failure.is_some();
+    let notes = conversation::notes(record, failure, chrono::Utc::now(), area.width, styles);
+    let body = conversation::render_notes(frame, area, notes);
+    if failed && attempt.is_empty() {
+        return;
     }
-    if attempt.no_record() {
+    let empty = if attempt.no_record() {
+        Some("brak zapisanej rozmowy tego kroku")
+    } else if attempt.is_empty() && attempt.from_record() {
+        Some("brak zapisanej rozmowy")
+    } else {
+        None
+    };
+    if let Some(text) = empty {
         frame.render_widget(
-            Paragraph::new(Line::styled(
-                "runner nie ma zapisu rozmowy tego kroku",
-                styles.of(Role::Done),
-            )),
-            area,
+            Paragraph::new(Line::styled(text, styles.of(Role::Done))),
+            body,
         );
         return;
     }
     conversation::render_transcript(
         frame,
-        area,
+        body,
         styles,
         attempt.transcript_mut(),
         stale,

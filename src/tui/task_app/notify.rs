@@ -4,6 +4,11 @@
 //! "przesuń: zadanie nie jest w kolejce" — coloured by what it means (green a
 //! success, yellow a warning, red an error) and gone a few seconds later. The
 //! time is handed in by the caller, so a test steps it without sleeping.
+//!
+//! There is one slot, so news of one kind arriving in a burst — several
+//! tasks resumed automatically after a restart — is counted in one
+//! notification ([`Notifier::push_counted`]) rather than each replacing the
+//! last.
 
 use std::time::{Duration, Instant};
 
@@ -53,6 +58,9 @@ pub struct Notification {
     pub severity: Severity,
     /// When it was raised.
     pub at: Instant,
+    /// The kind of news it counts, and how many so far
+    /// ([`Notifier::push_counted`]).
+    pub counted: Option<(&'static str, usize)>,
 }
 
 /// The latest notification.
@@ -69,6 +77,36 @@ impl Notifier {
             text: one_line(text.as_ref()),
             severity,
             at: now,
+            counted: None,
+        });
+    }
+
+    /// Raises a notification of the kind `kind`: `one` alone, or — while
+    /// one of the same kind is still on the bar — `many` of how many there
+    /// were in a row.
+    pub fn push_counted(
+        &mut self,
+        severity: Severity,
+        kind: &'static str,
+        one: impl AsRef<str>,
+        many: impl FnOnce(usize) -> String,
+        now: Instant,
+    ) {
+        let count = self
+            .current(now)
+            .and_then(|note| note.counted)
+            .filter(|(counted, _)| *counted == kind)
+            .map_or(1, |(_, count)| count + 1);
+        let text = if count == 1 {
+            one.as_ref().to_string()
+        } else {
+            many(count)
+        };
+        self.current = Some(Notification {
+            text: one_line(&text),
+            severity,
+            at: now,
+            counted: Some((kind, count)),
         });
     }
 

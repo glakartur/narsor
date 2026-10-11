@@ -27,9 +27,6 @@ use crate::orchestration::{
 /// storage — the daemon's own cache, apart from every runner's.
 pub(super) type StoredSummaries = HashMap<(TaskId, String), ConversationCache>;
 
-/// The code of a page the task's storage could not serve.
-const RECORD_UNREADABLE: &str = "conversation_record_unreadable";
-
 impl ProtocolService {
     /// The task's conversation summary, or why it is unavailable.
     ///
@@ -168,7 +165,7 @@ impl ProtocolService {
             },
         };
         Err(ProtocolError::conflict(
-            "conversation_unavailable",
+            CONVERSATION_UNAVAILABLE,
             format!("the task's conversation cannot be read right now ({blocker:?})"),
         ))
     }
@@ -198,11 +195,11 @@ impl ProtocolService {
         match page {
             Ok(Ok(page)) => Ok(with_source(page, ExecutionEventsSource::Runner, None)),
             Ok(Err(_)) => Err(ProtocolError::conflict(
-                "conversation_unavailable",
+                CONVERSATION_UNAVAILABLE,
                 "the runner could not read the conversation page",
             )),
             Err(_) => Err(ProtocolError::conflict(
-                "conversation_unavailable",
+                CONVERSATION_UNAVAILABLE,
                 "the runner did not upload the conversation page in time",
             )),
         }
@@ -225,7 +222,7 @@ impl ProtocolService {
         };
         if !is_safe_component(&execution_id) {
             return Err(ProtocolError::conflict(
-                RECORD_UNREADABLE,
+                CONVERSATION_RECORD_UNREADABLE,
                 "the execution id the runner reported is not valid",
             ));
         }
@@ -244,8 +241,8 @@ impl ProtocolService {
         .map_err(|error| ProtocolError::Internal(error.to_string()))?
         .map_err(|error| {
             ProtocolError::conflict(
-                RECORD_UNREADABLE,
-                format!("the conversation record could not be read: {error}"),
+                CONVERSATION_RECORD_UNREADABLE,
+                format!("{CONVERSATION_RECORD_UNREADABLE_PREFIX}{error}"),
             )
         })?;
         let recorded_at = read.as_ref().and_then(|snapshot| snapshot.recorded_at);

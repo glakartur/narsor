@@ -54,7 +54,7 @@ use super::detail::{
 };
 use super::list::{fit, row_text, title_of, Attention, RowText, StateIcon};
 use super::notify::Severity;
-use super::tabs::conversation::{read_history_attempt, AttemptRead};
+use super::tabs::conversation::{read_history_attempt, AttemptRead, ReadFailure};
 use super::tabs::events;
 use super::{detail_keys, DetailTab, DetailView, Focus, Request, StepFocus, TaskApp, View};
 
@@ -729,9 +729,11 @@ impl TaskApp {
                 )
             })
             .collect();
-        let attempts: Vec<(String, u64, Result<AttemptRead, String>)> = attempts
+        let attempts: Vec<(String, u64, Result<AttemptRead, ReadFailure>)> = attempts
             .into_iter()
-            .map(|(attempt, from, result)| (attempt, from, self.settle(result)))
+            .map(|(attempt, from, result)| {
+                (attempt, from, self.settle_with(result, ReadFailure::of))
+            })
             .collect();
 
         let View::History(history) = &mut self.view else {

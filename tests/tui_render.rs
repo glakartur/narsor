@@ -2168,6 +2168,8 @@ mod task_app_detail_render {
                     truncated_tail: false,
                     complete: true,
                     no_record: false,
+                    source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                    recorded_at: None,
                 }),
             },
         );
@@ -2369,6 +2371,8 @@ mod task_app_detail_render {
                 truncated_tail: false,
                 complete: true,
                 no_record: false,
+                source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                recorded_at: None,
             }),
         );
         let mut conversation = Conversation::new("a");
@@ -2500,6 +2504,191 @@ mod task_app_detail_render {
     /// The first column of the details' content: where the tab bar starts.
     fn content_column(buffer: &Buffer) -> u16 {
         spot(buffer, " Przebieg ").1
+    }
+
+    /// A read of `review`'s conversation from `source`, written three
+    /// minutes ago when it is the record.
+    fn read_from(
+        source: narsor::controller_protocol::ExecutionEventsSource,
+        entries: Vec<TranscriptEntry>,
+    ) -> AttemptRead {
+        let next_entry = entries.len() as u64;
+        let record = source == narsor::controller_protocol::ExecutionEventsSource::Storage;
+        AttemptRead {
+            entries,
+            next_entry,
+            closed: false,
+            truncated_tail: false,
+            complete: true,
+            no_record: false,
+            source,
+            recorded_at: record
+                .then(|| chrono::Utc::now() - chrono::Duration::seconds(3 * 60 + 10)),
+        }
+    }
+
+    /// *Rozmowa* of `review`, its one attempt read as `read`.
+    fn conversation_of(read: AttemptRead) -> Conversation {
+        let mut review = position("review", PositionStatus::InProgress);
+        review.conversation = ConversationState::Recorded;
+        let mut attempts = Attempts::default();
+        attempts.apply("act-review", 1, 0, Ok(read));
+        let mut conversation = Conversation::new("a");
+        conversation.rebuild(&[review], &attempts);
+        conversation
+    }
+
+    /// AE5: read from the record, *Rozmowa* and the step's conversation say
+    /// so with the record's age — in words, so without colour too — and a
+    /// page of the live runner has no badge.
+    #[test]
+    fn a_conversation_read_from_the_record_has_a_badge_with_its_age() {
+        use narsor::controller_protocol::ExecutionEventsSource::{Runner, Storage};
+        for no_color in [false, true] {
+            let styles = Styles::new(no_color);
+            let mut record = conversation_of(read_from(Storage, three_entries()));
+            let text = screen(&draw_conversation(&mut record, &styles, false, true));
+            assert!(text.contains("zapis sprzed 3 min"), "{text}");
+            assert!(text.contains("line 3"), "{text}");
+            let mut live = conversation_of(read_from(Runner, three_entries()));
+            let text = screen(&draw_conversation(&mut live, &styles, false, true));
+            assert!(!text.contains("zapis"), "{text}");
+
+            let mut app = recorded_app(three_entries());
+            app.on_detail_read(
+                "a",
+                1,
+                DetailRead::Attempt {
+                    attempt_id: "act-review".into(),
+                    from: 3,
+                    result: Ok(read_from(Storage, Vec::new())),
+                },
+            );
+            let text = screen(&render(&mut app, &styles));
+            assert!(text.contains("zapis sprzed 3 min"), "{text}");
+            assert!(text.contains("line 3"), "the entries stay: {text}");
+        }
+    }
+
+    /// The details of an interrupted task say what it waits for; the row
+    /// is marked only when its owner has to act, and stays where it was.
+    #[test]
+    fn an_interrupted_task_says_what_it_waits_for() {
+        use crate::task_app_support::{exhausted, interrupted};
+        use narsor::orchestration::TaskLifecycle;
+        let cases = [
+            (
+                interrupted("b", TaskLifecycle::Running, 2, true),
+                "wznowienie automatyczne, próba 2/5",
+                false,
+            ),
+            (
+                exhausted(
+                    interrupted("b", TaskLifecycle::Running, 6, false),
+                    "could not resume automatically: pod evicted",
+                ),
+                "nie udało się wznowić automatycznie: pod evicted, uruchom od nowa (s)",
+                true,
+            ),
+            (
+                interrupted("b", TaskLifecycle::PauseRequested, 0, false),
+                "utracone podczas wstrzymywania, czeka na Ciebie (s)",
+                true,
+            ),
+        ];
+        for (lost, words, marked) in cases {
+            for no_color in [false, true] {
+                let mut app = app();
+                let first = displayed(queued("a", 1), "NAR-1", &[]);
+                let third = displayed(queued("c", 3), "NAR-3", &[]);
+                let mut lost = displayed(lost.clone(), "NAR-2", &[]);
+                lost.rank = 2;
+                app.load(listing(vec![first, lost, third], "c"));
+                press(&mut app, KeyCode::Down);
+                assert_eq!(app.list().selected_id(), Some("b"));
+                let buffer = render(&mut app, &Styles::new(no_color));
+                let text = screen(&buffer);
+                assert!(text.contains(words), "{text}");
+                // The list is the first 28 columns.
+                let row = rows(&buffer)
+                    .into_iter()
+                    .map(|row| row.chars().take(28).collect::<String>())
+                    .find(|row| row.contains("NAR-2"))
+                    .expect("the row");
+                assert_eq!(row.contains("! ✗"), marked, "{row}");
+                let order: Vec<&str> = app
+                    .list()
+                    .tasks()
+                    .iter()
+                    .map(|task| task.task_id.as_str())
+                    .collect();
+                assert_eq!(order, ["a", "b", "c"]);
+            }
+        }
+    }
+
+    /// A narrow terminal shortens the badge to the age.
+    #[test]
+    fn a_narrow_conversation_shortens_the_badge() {
+        use narsor::controller_protocol::ExecutionEventsSource::Storage;
+        let mut record = conversation_of(read_from(Storage, three_entries()));
+        let buffer = draw(14, 6, |frame| {
+            conversation::render(
+                frame,
+                frame.area(),
+                &Styles::new(true),
+                &mut record,
+                false,
+                true,
+            );
+        });
+        assert!(
+            screen(&buffer).contains("zapis · 3 min"),
+            "{}",
+            screen(&buffer)
+        );
+    }
+
+    /// An empty record and an unreadable one say so in their own words.
+    #[test]
+    fn an_empty_or_unreadable_record_says_so() {
+        use narsor::api::ClientError;
+        use narsor::controller_protocol::ExecutionEventsSource::Storage;
+        use narsor::tui::task_app::tabs::conversation::ReadFailure;
+        let mut empty = conversation_of(read_from(Storage, Vec::new()));
+        let text = screen(&draw_conversation(
+            &mut empty,
+            &Styles::new(false),
+            false,
+            true,
+        ));
+        assert!(text.contains("brak zapisanej rozmowy"), "{text}");
+
+        let error = ClientError::Refused {
+            code: "conversation_record_unreadable".to_string(),
+            message: "the conversation record could not be read: permission denied".to_string(),
+        };
+        let mut review = position("review", PositionStatus::InProgress);
+        review.conversation = ConversationState::Recorded;
+        let mut attempts = Attempts::default();
+        attempts.apply(
+            "act-review",
+            1,
+            0,
+            Err(ReadFailure::of(&error, "ignored".to_string())),
+        );
+        let mut unreadable = Conversation::new("a");
+        unreadable.rebuild(&[review], &attempts);
+        let text = screen(&draw_conversation(
+            &mut unreadable,
+            &Styles::new(false),
+            false,
+            true,
+        ));
+        assert!(
+            text.contains("nie udało się odczytać zapisu: permission denied"),
+            "{text}"
+        );
     }
 }
 

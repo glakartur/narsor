@@ -1,6 +1,7 @@
 //! The details of the selected task (U9): a two-line header made of the
-//! workflow's `display` (three lines while the task cannot follow the
-//! installation's default harness), the tabs, and what the active tab shows.
+//! workflow's `display` (three lines while it has a notice: what an
+//! interrupted task waits for, or a default harness it cannot follow), the
+//! tabs, and what the active tab shows.
 //!
 //! ```text
 //! NAR-12  Zmiana API zamówień                             implement v3
@@ -67,11 +68,11 @@ use crate::orchestration::{QueueReason, TaskLifecycle};
 use super::super::keymap::Action;
 use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
-use super::list::{fit, state_icon, title_of};
+use super::list::{fit, loss_state, state_icon, title_of};
 use super::notify::Severity;
 use super::tabs::conductor::{self, Conductor};
 use super::tabs::conversation::{
-    self, transcript_action, Attempt, AttemptRead, Attempts, Conversation,
+    self, transcript_action, Attempt, AttemptRead, Attempts, Conversation, ReadFailure,
 };
 use super::tabs::events::{self, Events};
 use super::tabs::info::{self, Info};
@@ -557,7 +558,7 @@ impl TaskApp {
                 from,
                 result,
             } => {
-                let result = self.settle(result);
+                let result = self.settle_with(result, ReadFailure::of);
                 self.detail
                     .view_mut(task_id)
                     .attempts
@@ -580,11 +581,22 @@ impl TaskApp {
     /// relay missing its deadline (the connection is fine), and a refusal is
     /// an answer.
     pub(super) fn settle<T>(&mut self, result: Result<T, ClientError>) -> Result<T, String> {
+        self.settle_with(result, |_, reason| reason)
+    }
+
+    /// [`Self::settle`], with the failure made by `failure` from the error
+    /// and its words.
+    pub(super) fn settle_with<T, E>(
+        &mut self,
+        result: Result<T, ClientError>,
+        failure: impl FnOnce(&ClientError, String) -> E,
+    ) -> Result<T, E> {
         result.map_err(|error| {
             if matches!(error, ClientError::Unavailable(_) | ClientError::Server(_)) {
                 self.note_transport(&error);
             }
-            failure_reason(&error)
+            let reason = failure_reason(&error);
+            failure(&error, reason)
         })
     }
 
@@ -1023,11 +1035,24 @@ fn header(
     (vec![Line::from(first), Line::from(second)], spots)
 }
 
-/// The one line under the header that says the installation's default
-/// harness cannot be used by this task, and which one it keeps (R16c), cut
-/// to `width`; `None` while the task can follow the default. The full reason
-/// is in *Info*.
+/// The one line under the header: what an interrupted task waits for — the
+/// automatic resume, or its owner (R6, R7) — or else that the
+/// installation's default harness cannot be used by this task, and which one
+/// it keeps (R16c), cut to `width`; `None` when there is nothing to say. The
+/// harness's full reason is in *Info*.
 fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Option<Line<'static>> {
+    let grey = |role: Role| if stale { Role::Done } else { role };
+    if let Some(loss) = loss_state(task) {
+        let role = if loss.needs_owner() {
+            Role::Problem
+        } else {
+            Role::Attention
+        };
+        return Some(Line::styled(
+            fit(&loss.describe(), usize::from(width)),
+            styles.of(grey(role)),
+        ));
+    }
     let unavailable = task.runner.as_ref()?.default_harness_unavailable.as_ref()?;
     let text = format!(
         "{} niedostępny tutaj — zostaje {}",
@@ -1036,7 +1061,7 @@ fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Optio
     );
     Some(Line::styled(
         fit(&text, usize::from(width)),
-        styles.of(if stale { Role::Done } else { Role::Attention }),
+        styles.of(grey(Role::Attention)),
     ))
 }
 

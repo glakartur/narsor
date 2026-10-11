@@ -52,7 +52,8 @@ use crate::controller_protocol::{
 use crate::domain::{BackendId, ExecutionStatus};
 use crate::orchestration::{
     AttentionItem, AttentionKind, MoveTarget, OperatorCommand, OperatorCommandStatus, QueueReason,
-    TaskEvent, TaskEventKind, TaskLifecycle,
+    ResumeExhaustion, ResumePolicy, TaskEvent, TaskEventKind, TaskLifecycle,
+    EXHAUSTION_REASON_PREFIX, UNSPECIFIED_LOSS,
 };
 
 use super::super::scroll::one_line;
@@ -133,6 +134,84 @@ impl StateIcon {
     }
 }
 
+/// What an interrupted task waits for, from its resume state (R6, R7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LossState {
+    /// The control plane resumes it on its own: attempt `attempt` of
+    /// `limit`.
+    AutoResume {
+        /// The consecutive attempt, from 1.
+        attempt: u32,
+        /// How many the policy makes.
+        limit: u32,
+    },
+    /// The policy gave up: why, without the server's English prefix.
+    Exhausted(String),
+    /// The workload was lost while pausing: the owner decides.
+    LostWhilePausing,
+}
+
+impl LossState {
+    /// Whether the owner has to act: the row gets the attention marker.
+    pub fn needs_owner(&self) -> bool {
+        !matches!(self, Self::AutoResume { .. })
+    }
+
+    /// The state in words, for the details.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::AutoResume { attempt, limit } => {
+                format!("wznowienie automatyczne, próba {attempt}/{limit}")
+            }
+            Self::Exhausted(detail) => format!(
+                "nie udało się wznowić automatycznie: {}, uruchom od nowa (s)",
+                one_line(detail)
+            ),
+            Self::LostWhilePausing => {
+                "utracone podczas wstrzymywania, czeka na Ciebie (s)".to_string()
+            }
+        }
+    }
+}
+
+/// What an interrupted `task` waits for; `None` when it is not interrupted
+/// or nothing about its loss is known (a server that predates the policy).
+pub fn loss_state(task: &TaskSummary) -> Option<LossState> {
+    if task.lifecycle != TaskLifecycle::Interrupted {
+        return None;
+    }
+    let resume = &task.resume;
+    if let Some(exhausted) = &resume.exhausted {
+        return Some(LossState::Exhausted(exhaustion_detail(&exhausted.reason)));
+    }
+    if resume.next_attempt_at.is_some() {
+        return Some(LossState::AutoResume {
+            attempt: resume.consecutive_losses.max(1),
+            limit: ResumePolicy::default().limit(),
+        });
+    }
+    match &resume.last_loss {
+        Some(loss) if loss.from == TaskLifecycle::PauseRequested => {
+            Some(LossState::LostWhilePausing)
+        }
+        _ => None,
+    }
+}
+
+/// Why the resume policy gave up, from its reason for people: the loss
+/// after the server's English prefix, a loss the controller did not
+/// describe in words of its own.
+pub fn exhaustion_detail(reason: &str) -> String {
+    let loss = reason
+        .strip_prefix(EXHAUSTION_REASON_PREFIX)
+        .unwrap_or(reason);
+    if loss == UNSPECIFIED_LOSS {
+        "runner utracony".to_string()
+    } else {
+        one_line(loss)
+    }
+}
+
 /// What the first column shows for `task`. A problem has precedence over a
 /// question (origin §5).
 pub fn attention_of(task: &TaskSummary) -> Attention {
@@ -141,7 +220,9 @@ pub fn attention_of(task: &TaskSummary) -> Attention {
         .runner
         .as_ref()
         .is_some_and(|runner| runner.problem.is_some());
+    let owner_decides = loss_state(task).is_some_and(|loss| loss.needs_owner());
     if runner_problem
+        || owner_decides
         || is(&[
             AttentionKind::Problem,
             AttentionKind::FailedStep,
@@ -317,6 +398,33 @@ pub struct EventEffect {
     pub removal: Option<Removal>,
     /// The runner settled a command of the operator.
     pub resolved: Option<CommandResolved>,
+    /// The resume policy resumed the task or gave up on it.
+    pub resume: Option<ResumeNotice>,
+}
+
+/// What the resume policy did to a task, as an event said it (R7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeNotice {
+    /// The task.
+    pub task_id: String,
+    /// What its row shows.
+    pub title: String,
+    /// What happened.
+    pub kind: ResumeNoticeKind,
+}
+
+/// See [`ResumeNotice`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeNoticeKind {
+    /// Resumed: attempt `attempt` of `limit`.
+    Resumed {
+        /// The consecutive attempt, from 1.
+        attempt: u32,
+        /// How many the policy makes.
+        limit: u32,
+    },
+    /// Gave up: why, without the server's English prefix.
+    Exhausted(String),
 }
 
 /// An operator command the runner settled (or the control plane made
@@ -825,6 +933,10 @@ impl TaskList {
     /// * [`TaskEventKind::InputQueued`] and [`TaskEventKind::RunnerReported`]
     ///   patch the attention of the row (and the runner's status), so a
     ///   question or an answer shows without a read;
+    /// * [`TaskEventKind::AutoResumed`] and
+    ///   [`TaskEventKind::AutoResumeExhausted`] say so in
+    ///   [`EventEffect::resume`] for a notification — the row keeps its
+    ///   place, only its marker changes — and ask for a read;
     /// * everything else — and anything the event cannot say, such as the
     ///   runner's current step or a task this list does not know — asks for a
     ///   read, which the caller debounces.
@@ -890,6 +1002,35 @@ impl TaskList {
                     patch_operator_command(&mut self.tasks[index], kind, event);
                 effect.refresh = refresh;
                 effect.resolved = resolved;
+            }
+            TaskEventKind::AutoResumed { attempt, limit, .. } => {
+                let task = &mut self.tasks[index];
+                task.resume.next_attempt_at = None;
+                effect.refresh = true;
+                effect.resume = Some(ResumeNotice {
+                    task_id: task.task_id.to_string(),
+                    title: title_of(task),
+                    kind: ResumeNoticeKind::Resumed {
+                        attempt: *attempt,
+                        limit: *limit,
+                    },
+                });
+            }
+            TaskEventKind::AutoResumeExhausted { reason, .. } => {
+                // The marker shows at once; the read brings the rest.
+                let task = &mut self.tasks[index];
+                task.resume.next_attempt_at = None;
+                task.resume.exhausted = Some(ResumeExhaustion {
+                    reason: reason.clone(),
+                    at: event.at,
+                    announced: true,
+                });
+                effect.refresh = true;
+                effect.resume = Some(ResumeNotice {
+                    task_id: task.task_id.to_string(),
+                    title: title_of(task),
+                    kind: ResumeNoticeKind::Exhausted(exhaustion_detail(reason)),
+                });
             }
             kind => effect.refresh = patch_row(&mut self.tasks[index], kind, event),
         }
