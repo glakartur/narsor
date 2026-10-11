@@ -23,6 +23,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use narsor_protocol::controller::{
+    ConversationUnavailableReason, Freshness, CONVERSATION_RECORD_UNREADABLE,
+    CONVERSATION_RECORD_UNREADABLE_PREFIX, CONVERSATION_UNAVAILABLE,
+};
+
 use crate::conductor::ConductorView;
 use crate::domain::{
     BackendId, Event, ExecutionStatus, ResourceProfile, TaskDisplay, TaskId, TaskLaunchSpec,
@@ -108,20 +113,6 @@ pub struct CreateTaskRequest {
     pub backend_id: Option<String>,
     /// What to run.
     pub launch: LaunchRequest,
-}
-
-/// Freshness of something the control plane only *observed*.
-///
-/// A summary is never upgraded into a different state because it is old: it
-/// is shown as it was, with its time and this flag (R14).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Freshness {
-    /// Its source is reporting right now.
-    Live,
-    /// Its source has not been heard from within the staleness window, or is
-    /// not expected to report at all (paused, interrupted, archived).
-    Stale,
 }
 
 /// The last controller observation of a task, as clients see it.
@@ -494,45 +485,6 @@ pub struct TimelineResponse {
     #[serde(default)]
     pub current_position: Option<String>,
 }
-
-/// Why a task's conversation cannot be served right now.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ConversationUnavailableReason {
-    /// No runner has reported yet.
-    NotStarted,
-    /// The task is pausing or paused: its compute is (being) removed.
-    Paused,
-    /// The workload was lost (Interrupted or Unknown).
-    Interrupted,
-    /// The task is archived (or being archived).
-    Archived,
-    /// The runner should be live but has not been heard from lately.
-    RunnerUnreachable,
-    /// The runner itself said it cannot serve it.
-    RunnerReported,
-    /// The task's own storage, read by the daemon that holds it, could not
-    /// be read; the answer's `message` says why.
-    StorageUnreadable,
-    /// A reason of a newer version this one does not know. Never sent: it
-    /// only lets a client keep reading a newer server's answer.
-    #[serde(other)]
-    Unrecognized,
-}
-
-/// The code of a `409` refusing a conversation page because no live runner
-/// can serve it and no record of it can be read here (a remote task).
-pub const CONVERSATION_UNAVAILABLE: &str = "conversation_unavailable";
-
-/// The code of a `409` refusing a conversation page because the task's own
-/// storage could not be read; the message begins with
-/// [`CONVERSATION_RECORD_UNREADABLE_PREFIX`].
-pub const CONVERSATION_RECORD_UNREADABLE: &str = "conversation_record_unreadable";
-
-/// What the message of a [`CONVERSATION_RECORD_UNREADABLE`] refusal begins
-/// with, before the error itself.
-pub const CONVERSATION_RECORD_UNREADABLE_PREFIX: &str =
-    "the conversation record could not be read: ";
 
 /// `GET /control/v1/tasks/:task_id/conversation`.
 ///
