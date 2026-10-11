@@ -68,10 +68,11 @@ use super::super::keymap::{self, Action, Context};
 use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
 use super::harness::HarnessList;
-use super::list::{loss_state, title_of, CommandResolved, LossState};
+use super::list::{title_of, CommandResolved};
 use super::notify::Severity;
 use super::waiting::AnswerRequest;
 use super::{failure_reason, idempotency_key, is_transport, Request, TaskApp};
+use crate::orchestration::{loss_state, LossState};
 
 // ---------------------------------------------------------------------
 // What can be done, and when
@@ -215,12 +216,14 @@ fn not_running(task: &TaskSummary) -> Option<String> {
         TaskLifecycle::Running if is_finished(task) => Some(phrase.to_string()),
         TaskLifecycle::Running => None,
         TaskLifecycle::Paused => Some(format!("{phrase} — wznów je (p)")),
-        TaskLifecycle::Interrupted | TaskLifecycle::Unknown => Some(match loss_state(task) {
-            Some(LossState::AutoResume { attempt, limit }) => format!(
+        TaskLifecycle::Interrupted | TaskLifecycle::Unknown => {
+            Some(match loss_state(task.lifecycle, &task.resume) {
+                Some(LossState::AutoResume { attempt, limit }) => format!(
                 "{phrase} — wznowi się samo (próba {attempt}/{limit}) albo uruchom je od nowa (s)"
             ),
-            _ => format!("{phrase} — uruchom je od nowa (s)"),
-        }),
+                _ => format!("{phrase} — uruchom je od nowa (s)"),
+            })
+        }
         _ => Some(phrase.to_string()),
     }
 }

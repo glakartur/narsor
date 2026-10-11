@@ -68,7 +68,7 @@ use crate::orchestration::{QueueReason, TaskLifecycle};
 use super::super::keymap::Action;
 use super::super::scroll::one_line;
 use super::super::style::{Role, Styles};
-use super::list::{fit, loss_state, state_icon, title_of};
+use super::list::{describe_loss, fit, state_icon, title_of};
 use super::notify::Severity;
 use super::tabs::conductor::{self, Conductor};
 use super::tabs::conversation::{
@@ -1042,14 +1042,14 @@ fn header(
 /// harness's full reason is in *Info*.
 fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Option<Line<'static>> {
     let grey = |role: Role| if stale { Role::Done } else { role };
-    if let Some(loss) = loss_state(task) {
+    if let Some(loss) = crate::orchestration::loss_state(task.lifecycle, &task.resume) {
         let role = if loss.needs_owner() {
             Role::Problem
         } else {
             Role::Attention
         };
         return Some(Line::styled(
-            fit(&loss.describe(), usize::from(width)),
+            fit(&describe_loss(&loss), usize::from(width)),
             styles.of(grey(role)),
         ));
     }

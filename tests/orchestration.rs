@@ -7,10 +7,11 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
 use narsor::orchestration::{
-    BackendCapacity, BackendLease, Clock, CommandActor, CommandRequest, ControlPlane,
-    ControllerReport, MoveTarget, NewTask, Observation, ObservedSummary, OrchestrationError,
-    OwnerCommand, OwnerRef, QueueReason, ResourceIdentity, ResumeExhaustion, ResumePolicy,
-    ResumeState, RunnerSnapshot, TaskEventKind, TaskLifecycle, TaskRecord, WorkloadLoss,
+    exhaustion_loss, loss_state, BackendCapacity, BackendLease, Clock, CommandActor,
+    CommandRequest, ControlPlane, ControllerReport, LossState, MoveTarget, NewTask, Observation,
+    ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity,
+    ResumeExhaustion, ResumePolicy, ResumeState, RunnerSnapshot, TaskEventKind, TaskLifecycle,
+    TaskRecord, WorkloadLoss,
 };
 use narsor::persistence::paths::{temp_path_for, StatePaths};
 use narsor::persistence::ExecutionStore;
@@ -3600,4 +3601,39 @@ fn recovery_leaves_tasks_that_were_not_lost_and_current_losses_alone() {
         .resume
         .is_empty());
     assert_eq!(fx.control.task(&task("lost-1")).unwrap(), lost);
+}
+
+#[test]
+fn the_loss_state_tells_what_an_interrupted_task_waits_for() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    let running = fx.running("task-1", &lease);
+    assert_eq!(loss_state(running.lifecycle, &running.resume), None);
+
+    let lost = lose(&fx, "task-1", &lease, true, "exited");
+    let state = loss_state(lost.lifecycle, &lost.resume).expect("a loss state");
+    assert_eq!(
+        state,
+        LossState::AutoResume {
+            attempt: 1,
+            limit: 5
+        }
+    );
+    assert!(!state.needs_owner());
+
+    let exhausted = ResumeState {
+        exhausted: Some(ResumeExhaustion {
+            reason: "could not resume automatically: pod evicted".to_string(),
+            at: fx.clock.now(),
+            announced: true,
+        }),
+        ..ResumeState::default()
+    };
+    let state = loss_state(TaskLifecycle::Interrupted, &exhausted).unwrap();
+    assert!(state.needs_owner());
+    let LossState::Exhausted(reason) = state else {
+        panic!("exhausted: {state:?}");
+    };
+    assert_eq!(exhaustion_loss(&reason), "pod evicted");
+    assert_eq!(exhaustion_loss("in other words"), "in other words");
 }

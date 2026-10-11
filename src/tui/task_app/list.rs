@@ -51,9 +51,9 @@ use crate::controller_protocol::{
 };
 use crate::domain::{BackendId, ExecutionStatus};
 use crate::orchestration::{
-    AttentionItem, AttentionKind, MoveTarget, OperatorCommand, OperatorCommandStatus, QueueReason,
-    ResumeExhaustion, ResumePolicy, TaskEvent, TaskEventKind, TaskLifecycle,
-    EXHAUSTION_REASON_PREFIX, UNSPECIFIED_LOSS,
+    exhaustion_loss, loss_state, AttentionItem, AttentionKind, LossState, MoveTarget,
+    OperatorCommand, OperatorCommandStatus, QueueReason, ResumeExhaustion, TaskEvent,
+    TaskEventKind, TaskLifecycle, UNSPECIFIED_LOSS,
 };
 
 use super::super::scroll::one_line;
@@ -134,68 +134,19 @@ impl StateIcon {
     }
 }
 
-/// What an interrupted task waits for, from its resume state (R6, R7).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LossState {
-    /// The control plane resumes it on its own: attempt `attempt` of
-    /// `limit`.
-    AutoResume {
-        /// The consecutive attempt, from 1.
-        attempt: u32,
-        /// How many the policy makes.
-        limit: u32,
-    },
-    /// The policy gave up: why, as the server words it
-    /// ([`crate::orchestration::ResumeExhaustion::reason`]).
-    Exhausted(String),
-    /// The workload was lost while pausing: the owner decides.
-    LostWhilePausing,
-}
-
-impl LossState {
-    /// Whether the owner has to act: the row gets the attention marker.
-    pub fn needs_owner(&self) -> bool {
-        !matches!(self, Self::AutoResume { .. })
-    }
-
-    /// The state in words, for the details.
-    pub fn describe(&self) -> String {
-        match self {
-            Self::AutoResume { attempt, limit } => {
-                format!("wznowienie automatyczne, próba {attempt}/{limit}")
-            }
-            Self::Exhausted(reason) => format!(
-                "nie udało się wznowić automatycznie: {}, uruchom od nowa (s)",
-                exhaustion_detail(reason)
-            ),
-            Self::LostWhilePausing => {
-                "utracone podczas wstrzymywania, czeka na Ciebie (s)".to_string()
-            }
+/// A task's loss in words, for the details.
+pub fn describe_loss(loss: &LossState) -> String {
+    match loss {
+        LossState::AutoResume { attempt, limit } => {
+            format!("wznowienie automatyczne, próba {attempt}/{limit}")
         }
-    }
-}
-
-/// What an interrupted `task` waits for; `None` when it is not interrupted
-/// or nothing about its loss is known (a server that predates the policy).
-pub fn loss_state(task: &TaskSummary) -> Option<LossState> {
-    if task.lifecycle != TaskLifecycle::Interrupted {
-        return None;
-    }
-    let resume = &task.resume;
-    if let Some(exhausted) = &resume.exhausted {
-        return Some(LossState::Exhausted(exhausted.reason.clone()));
-    }
-    if resume.next_attempt_at.is_some() {
-        return Some(LossState::AutoResume {
-            attempt: resume.consecutive_losses.max(1),
-            limit: ResumePolicy::default().limit(),
-        });
-    }
-    match &resume.last_loss {
-        Some(loss) if loss.from == TaskLifecycle::PauseRequested => {
-            Some(LossState::LostWhilePausing)
+        LossState::Exhausted(reason) => format!(
+            "nie udało się wznowić automatycznie: {}, uruchom od nowa (s)",
+            exhaustion_detail(reason)
+        ),
+        LossState::LostWhilePausing => {
+            "utracone podczas wstrzymywania, czeka na Ciebie (s)".to_string()
         }
-        _ => None,
     }
 }
 
@@ -203,9 +154,7 @@ pub fn loss_state(task: &TaskSummary) -> Option<LossState> {
 /// after the server's English prefix, a loss the controller did not
 /// describe in words of its own.
 pub fn exhaustion_detail(reason: &str) -> String {
-    let loss = reason
-        .strip_prefix(EXHAUSTION_REASON_PREFIX)
-        .unwrap_or(reason);
+    let loss = exhaustion_loss(reason);
     if loss == UNSPECIFIED_LOSS {
         "runner utracony".to_string()
     } else {
@@ -221,7 +170,8 @@ pub fn attention_of(task: &TaskSummary) -> Attention {
         .runner
         .as_ref()
         .is_some_and(|runner| runner.problem.is_some());
-    let owner_decides = loss_state(task).is_some_and(|loss| loss.needs_owner());
+    let owner_decides =
+        loss_state(task.lifecycle, &task.resume).is_some_and(|loss| loss.needs_owner());
     if runner_problem
         || owner_decides
         || is(&[

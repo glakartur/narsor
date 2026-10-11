@@ -20,11 +20,11 @@ use crate::controller_protocol::{
 };
 use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
 use crate::orchestration::{
-    AttentionItem, AttentionKind, ConversationAttemptSummary, InputStatus, OperatorCommand,
-    OwnerCommand, PendingInputRef, QueueReason, TaskEvent, TaskEventKind, TaskLifecycle,
-    EXHAUSTION_REASON_PREFIX,
+    exhaustion_loss, loss_state, AttentionItem, AttentionKind, ConversationAttemptSummary,
+    InputStatus, LossState, OperatorCommand, OwnerCommand, PendingInputRef, QueueReason, TaskEvent,
+    TaskEventKind, TaskLifecycle,
 };
-use crate::tui::task_app::list::{attention_of, loss_state, Attention, LossState};
+use crate::tui::task_app::list::{attention_of, Attention};
 
 /// Soft cap on the raw bytes of one relayed conversation page.
 pub const PAGE_BYTE_BUDGET: u64 = 64 * 1024;
@@ -433,7 +433,7 @@ pub fn lifecycle_hint(task: &TaskSummary) -> Option<ToneLine> {
 fn interrupted_hint(task: &TaskSummary) -> ToneLine {
     const OWNER_CHOICES: &str =
         "it still holds its backend slot — resume (u), start afresh (s) or archive (a)";
-    match loss_state(task) {
+    match loss_state(task.lifecycle, &task.resume) {
         Some(LossState::AutoResume { attempt, limit }) => ToneLine::new(
             format!(
                 "the workload was lost; it is resumed automatically (attempt {attempt}/{limit}) \
@@ -881,14 +881,6 @@ fn describe_operator_command(command: &OperatorCommand) -> String {
             format!("conductor harness {harness}")
         }
     }
-}
-
-/// What the resume policy says it lost, without the "could not resume
-/// automatically" its reason begins with.
-fn exhaustion_loss(reason: &str) -> &str {
-    reason
-        .strip_prefix(EXHAUSTION_REASON_PREFIX)
-        .unwrap_or(reason)
 }
 
 /// The outcome of an owner command, as the notice shows it.

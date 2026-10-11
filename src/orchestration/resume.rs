@@ -20,8 +20,8 @@
 //! `ControlPlane::auto_resume`.
 
 use super::model::{
-    Observation, ResumeExhaustion, TaskEvent, TaskEventKind, TaskLifecycle, TaskRecord,
-    WorkloadLoss,
+    Observation, ResumeExhaustion, ResumeState, TaskEvent, TaskEventKind, TaskLifecycle,
+    TaskRecord, WorkloadLoss,
 };
 use chrono::{DateTime, Duration, Utc};
 
@@ -132,6 +132,64 @@ pub const EXHAUSTION_REASON_PREFIX: &str = "could not resume automatically: ";
 /// The loss in [`ResumeExhaustion::reason`] when the controller said nothing
 /// about it.
 pub const UNSPECIFIED_LOSS: &str = "the workload was lost";
+
+/// The loss a [`ResumeExhaustion::reason`] names, without the prefix every
+/// reason begins with.
+pub fn exhaustion_loss(reason: &str) -> &str {
+    reason
+        .strip_prefix(EXHAUSTION_REASON_PREFIX)
+        .unwrap_or(reason)
+}
+
+/// What an interrupted task waits for, from its resume state (R6, R7), as
+/// every client tells it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LossState {
+    /// The control plane resumes it on its own: attempt `attempt` of
+    /// `limit`.
+    AutoResume {
+        /// The consecutive attempt, from 1.
+        attempt: u32,
+        /// How many the policy makes.
+        limit: u32,
+    },
+    /// The policy gave up: why, as the server words it
+    /// ([`ResumeExhaustion::reason`]).
+    Exhausted(String),
+    /// The workload was lost while pausing: the owner decides.
+    LostWhilePausing,
+}
+
+impl LossState {
+    /// Whether the owner has to act.
+    pub fn needs_owner(&self) -> bool {
+        !matches!(self, Self::AutoResume { .. })
+    }
+}
+
+/// What a task in `lifecycle` with `resume` waits for; `None` when it is not
+/// interrupted or nothing about its loss is known (a server that predates
+/// the policy).
+pub fn loss_state(lifecycle: TaskLifecycle, resume: &ResumeState) -> Option<LossState> {
+    if lifecycle != TaskLifecycle::Interrupted {
+        return None;
+    }
+    if let Some(exhausted) = &resume.exhausted {
+        return Some(LossState::Exhausted(exhausted.reason.clone()));
+    }
+    if resume.next_attempt_at.is_some() {
+        return Some(LossState::AutoResume {
+            attempt: resume.consecutive_losses.max(1),
+            limit: ResumePolicy::default().limit(),
+        });
+    }
+    match &resume.last_loss {
+        Some(loss) if loss.from == TaskLifecycle::PauseRequested => {
+            Some(LossState::LostWhilePausing)
+        }
+        _ => None,
+    }
+}
 
 /// Why the policy gave up, for people.
 fn exhaustion_reason(loss_reason: Option<&str>) -> String {
