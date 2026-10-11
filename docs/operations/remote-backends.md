@@ -456,7 +456,8 @@ any state ─▶ Archiving ─▶ Archived
   0 s, 30 s, 2 min, 10 min and 30 min. A loss counts as consecutive when the
   runner was ready for less than 10 minutes (or never, e.g. a refused
   launch); a loss found after the controller restarted (a newer lease epoch)
-  uses up no attempt. Each resume leaves an `AutoResumed` event; when the
+  uses up no attempt — at most 5 of those in a row, after which a controller
+  that keeps restarting has its losses counted like any other. Each resume leaves an `AutoResumed` event; when the
   attempts run out the task stays `Interrupted` with "could not resume
   automatically: …" and an `AutoResumeExhausted` event. Still waiting for the
   owner (`resume`, `start` or `archive`): a task lost while pausing, a task
@@ -465,6 +466,16 @@ any state ─▶ Archiving ─▶ Archived
   confirms the Pod is gone or terminated while the PVC is present; a Pod in
   phase `Unknown`, one still being deleted or a missing PVC keep it
   `Unknown`. Resumes need the backend's controller online.
+* **Upgrading to automatic resume**: upgrade the control plane (the daemon)
+  first, then the controllers. An older control plane refuses a newer
+  controller's `LossConfirmed`; the controller says so once per task in its
+  log and the task stays `Unknown` until its owner acts. An older controller
+  never sends it, so its `Unknown` tasks wait for the owner as before.
+  Clients (CLI, TUI) built before this version cannot decode the new events
+  (`AutoResumed`, `AutoResumeExhausted`) and observations (`LossConfirmed`)
+  in the history and the event stream, so upgrade them together with the
+  server; clients of this version and later read anything newer as
+  "unrecognised" and keep going.
 * **Archive** stops everything and deletes the Pod **and the PVC**. It wins
   over every other state and cannot be undone; there is no automatic
   retention cleanup.
