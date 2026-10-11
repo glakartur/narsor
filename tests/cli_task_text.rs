@@ -8,16 +8,23 @@ use chrono::{Duration, TimeZone, Utc};
 
 use narsor::api::{ClientError, HarnessSelectionSnapshot};
 use narsor::cli::task_text::{
-    age, attention_lines, command_outcome, default_harness_line, detail_lines, display_lines,
-    list_line, next_waiting, queue_badge, safe_json, Tone,
+    age, attention_lines, command_outcome, conversation_lines, conversation_origin,
+    default_harness_line, detail_lines, display_lines, event_line, lifecycle_hint, list_line,
+    next_waiting, queue_badge, record_unreadable_detail, safe_json, Tone,
 };
-use narsor::controller_protocol::QueueView;
+use narsor::controller_protocol::{
+    ConversationResponse, ConversationUnavailableReason, ExecutionEventsSource, QueueView,
+    CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
+};
 use narsor::domain::display::DisplayLink;
-use narsor::domain::ExecutionStatus;
-use narsor::orchestration::{AttentionKind, HarnessUnavailable, OwnerCommand, QueueReason};
+use narsor::domain::{ExecutionStatus, TaskId};
+use narsor::orchestration::{
+    AttentionKind, ConversationAttemptSummary, HarnessUnavailable, OwnerCommand, QueueReason,
+    TaskEvent, TaskEventKind, TaskLifecycle, EXHAUSTION_REASON_PREFIX, UNSPECIFIED_LOSS,
+};
 
 mod task_app_support;
-use task_app_support::{queued, task, titled, waiting_on, with_runner};
+use task_app_support::{at, exhausted, interrupted, queued, task, titled, waiting_on, with_runner};
 
 fn queue(reason: QueueReason) -> QueueView {
     QueueView {
@@ -307,4 +314,254 @@ fn the_details_say_when_the_task_cannot_follow_the_default_harness() {
          backend 'k8s' runs only claude-code"
     );
     assert_eq!(shown[0].tone, Tone::Warning);
+}
+
+fn attempt(id: &str, entries: u64) -> ConversationAttemptSummary {
+    ConversationAttemptSummary {
+        attempt_id: id.to_string(),
+        state_id: Some("build".to_string()),
+        entries,
+        closed: true,
+        last_entry_at: None,
+    }
+}
+
+fn stored(
+    attempts: Vec<ConversationAttemptSummary>,
+    recorded_at: Option<chrono::DateTime<Utc>>,
+) -> ConversationResponse {
+    ConversationResponse::Available {
+        attempts,
+        observed_at: at(),
+        source: ExecutionEventsSource::Storage,
+        recorded_at,
+    }
+}
+
+#[test]
+fn a_conversation_from_storage_says_how_old_its_record_is() {
+    let lines = conversation_lines(
+        at(),
+        &stored(vec![attempt("a-1", 3)], Some(at() - Duration::minutes(5))),
+    );
+    assert_eq!(
+        lines[0].text,
+        "Conversation from record, 5 min old — 1 attempt(s) (c: read)"
+    );
+    assert_eq!(lines[0].tone, Tone::Normal);
+    assert_eq!(lines.len(), 2, "the attempt follows: {lines:?}");
+}
+
+#[test]
+fn a_record_age_reads_like_the_tui_buckets() {
+    let origin = |seconds: i64| {
+        conversation_origin(
+            at(),
+            ExecutionEventsSource::Storage,
+            Some(at() - Duration::seconds(seconds)),
+        )
+    };
+    assert_eq!(origin(10), "Conversation from record, written just now");
+    assert_eq!(origin(-30), "Conversation from record, written just now");
+    assert_eq!(origin(59 * 60), "Conversation from record, 59 min old");
+    assert_eq!(origin(3 * 3600 + 5), "Conversation from record, 3 h old");
+    assert_eq!(origin(2 * 86_400), "Conversation from record, 2 d old");
+    assert_eq!(
+        conversation_origin(at(), ExecutionEventsSource::Storage, None),
+        "Conversation from record"
+    );
+    assert_eq!(
+        conversation_origin(at(), ExecutionEventsSource::Runner, Some(at())),
+        "Conversation live"
+    );
+}
+
+#[test]
+fn a_conversation_from_the_runner_is_live() {
+    let live = ConversationResponse::Available {
+        attempts: vec![attempt("a-1", 3)],
+        observed_at: at() - Duration::seconds(4),
+        source: ExecutionEventsSource::Runner,
+        recorded_at: None,
+    };
+    let lines = conversation_lines(at(), &live);
+    assert_eq!(
+        lines[0].text,
+        "Conversation live — 1 attempt(s), reported 4s ago (c: read)"
+    );
+    assert_eq!(lines[0].tone, Tone::Good);
+}
+
+#[test]
+fn a_conversation_without_a_source_from_an_older_server_is_live() {
+    let older: ConversationResponse = serde_json::from_value(serde_json::json!({
+        "status": "available",
+        "attempts": [],
+        "observed_at": at(),
+    }))
+    .unwrap();
+    let lines = conversation_lines(at(), &older);
+    assert!(lines[0].text.starts_with("Conversation live"), "{lines:?}");
+}
+
+#[test]
+fn an_empty_record_says_nothing_was_recorded() {
+    let lines = conversation_lines(at(), &stored(Vec::new(), None));
+    assert_eq!(lines.len(), 1);
+    assert_eq!(
+        lines[0].text,
+        "Conversation from record — nothing was recorded"
+    );
+    assert_eq!(lines[0].tone, Tone::Muted);
+}
+
+#[test]
+fn an_unreadable_record_shows_what_went_wrong_once() {
+    let unreadable = ConversationResponse::Unavailable {
+        reason: ConversationUnavailableReason::StorageUnreadable,
+        last_attempts: Vec::new(),
+        observed_at: None,
+        message: Some(format!(
+            "{CONVERSATION_RECORD_UNREADABLE_PREFIX}permission denied\u{1b}[2J"
+        )),
+    };
+    let lines = conversation_lines(at(), &unreadable);
+    assert_eq!(
+        lines[0].text,
+        "Conversation unavailable: its record could not be read: permission denied[2J"
+    );
+    assert_eq!(lines[0].tone, Tone::Warning);
+
+    let plain = ConversationResponse::Unavailable {
+        reason: ConversationUnavailableReason::Paused,
+        last_attempts: Vec::new(),
+        observed_at: None,
+        message: None,
+    };
+    assert_eq!(
+        conversation_lines(at(), &plain)[0].text,
+        "Conversation unavailable: the task is paused; its compute is gone"
+    );
+}
+
+#[test]
+fn a_refused_page_of_an_unreadable_record_gives_its_detail() {
+    let refused = ClientError::Refused {
+        code: CONVERSATION_RECORD_UNREADABLE.to_string(),
+        message: format!("{CONVERSATION_RECORD_UNREADABLE_PREFIX}disk on fire"),
+    };
+    assert_eq!(
+        record_unreadable_detail(&refused).as_deref(),
+        Some("disk on fire")
+    );
+    let other = ClientError::Refused {
+        code: "conversation_unavailable".to_string(),
+        message: "no runner".to_string(),
+    };
+    assert_eq!(record_unreadable_detail(&other), None);
+}
+
+fn resume_event(kind: TaskEventKind) -> TaskEvent {
+    TaskEvent {
+        sequence: 7,
+        task_id: TaskId::parse("t-1").unwrap(),
+        at: at(),
+        lifecycle: TaskLifecycle::Interrupted,
+        generation: 2,
+        kind,
+    }
+}
+
+#[test]
+fn an_automatic_resume_event_names_the_attempt_and_the_limit() {
+    let line = event_line(&resume_event(TaskEventKind::AutoResumed {
+        attempt: 2,
+        limit: 5,
+        loss_reason: None,
+    }));
+    assert!(
+        line.ends_with("resumed automatically after runner loss (attempt 2/5)"),
+        "{line}"
+    );
+    assert!(line.contains("interrupted"), "{line}");
+}
+
+#[test]
+fn an_exhaustion_event_names_the_attempts_and_the_loss_once() {
+    let line = event_line(&resume_event(TaskEventKind::AutoResumeExhausted {
+        attempts: 5,
+        reason: format!("{EXHAUSTION_REASON_PREFIX}pod evicted\u{1b}[2J"),
+    }));
+    assert!(
+        line.ends_with("automatic resume gave up after 5 attempts: pod evicted[2J"),
+        "{line}"
+    );
+    assert!(!line.contains(EXHAUSTION_REASON_PREFIX), "{line}");
+
+    let single = event_line(&resume_event(TaskEventKind::AutoResumeExhausted {
+        attempts: 1,
+        reason: format!("{EXHAUSTION_REASON_PREFIX}{UNSPECIFIED_LOSS}"),
+    }));
+    assert!(
+        single.ends_with(&format!(
+            "automatic resume gave up after 1 attempt: {UNSPECIFIED_LOSS}"
+        )),
+        "{single}"
+    );
+}
+
+#[test]
+fn show_on_an_interrupted_task_tells_what_it_waits_for() {
+    let hint = |subject| lifecycle_hint(&subject).unwrap();
+
+    let planned = hint(interrupted("t-1", TaskLifecycle::Running, 2, true));
+    assert!(
+        planned.text.contains("resumed automatically (attempt 2/5)"),
+        "{planned:?}"
+    );
+    assert_eq!(planned.tone, Tone::Warning);
+
+    let gave_up = hint(exhausted(
+        interrupted("t-1", TaskLifecycle::Running, 5, false),
+        &format!("{EXHAUSTION_REASON_PREFIX}pod evicted"),
+    ));
+    assert!(
+        gave_up
+            .text
+            .starts_with("could not resume automatically: pod evicted; it still holds"),
+        "{gave_up:?}"
+    );
+    assert_eq!(gave_up.tone, Tone::Error);
+
+    let pausing = hint(interrupted("t-1", TaskLifecycle::PauseRequested, 1, false));
+    assert!(
+        pausing
+            .text
+            .starts_with("the workload was lost while pausing"),
+        "{pausing:?}"
+    );
+    assert_eq!(pausing.tone, Tone::Error);
+
+    let older = hint(task("t-1", "local", "interrupted", 1));
+    assert!(
+        older
+            .text
+            .starts_with("the workload was lost; it still holds"),
+        "{older:?}"
+    );
+    for line in [&planned, &gave_up, &pausing, &older] {
+        assert!(!line.text.contains("on its own"), "{line:?}");
+    }
+
+    let detail = detail_lines(
+        &interrupted("t-1", TaskLifecycle::Running, 3, true),
+        None,
+        None,
+    );
+    assert!(
+        detail
+            .iter()
+            .any(|line| line.text.contains("(attempt 3/5)")),
+        "{detail:?}"
+    );
 }

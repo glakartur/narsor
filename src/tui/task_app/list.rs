@@ -145,7 +145,8 @@ pub enum LossState {
         /// How many the policy makes.
         limit: u32,
     },
-    /// The policy gave up: why, without the server's English prefix.
+    /// The policy gave up: why, as the server words it
+    /// ([`crate::orchestration::ResumeExhaustion::reason`]).
     Exhausted(String),
     /// The workload was lost while pausing: the owner decides.
     LostWhilePausing,
@@ -163,9 +164,9 @@ impl LossState {
             Self::AutoResume { attempt, limit } => {
                 format!("wznowienie automatyczne, próba {attempt}/{limit}")
             }
-            Self::Exhausted(detail) => format!(
+            Self::Exhausted(reason) => format!(
                 "nie udało się wznowić automatycznie: {}, uruchom od nowa (s)",
-                one_line(detail)
+                exhaustion_detail(reason)
             ),
             Self::LostWhilePausing => {
                 "utracone podczas wstrzymywania, czeka na Ciebie (s)".to_string()
@@ -182,7 +183,7 @@ pub fn loss_state(task: &TaskSummary) -> Option<LossState> {
     }
     let resume = &task.resume;
     if let Some(exhausted) = &resume.exhausted {
-        return Some(LossState::Exhausted(exhaustion_detail(&exhausted.reason)));
+        return Some(LossState::Exhausted(exhausted.reason.clone()));
     }
     if resume.next_attempt_at.is_some() {
         return Some(LossState::AutoResume {

@@ -14,15 +14,17 @@ use serde::Serialize;
 
 use crate::api::{ClientError, HarnessSelectionSnapshot};
 use crate::controller_protocol::{
-    ConversationResponse, ConversationUnavailableReason, DefaultBackendView, Freshness,
-    OwnerCommandResponse, QueueView, TaskSummary, TimelineResponse,
+    ConversationResponse, ConversationUnavailableReason, DefaultBackendView, ExecutionEventsSource,
+    Freshness, OwnerCommandResponse, QueueView, TaskSummary, TimelineResponse,
+    CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
 };
 use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
 use crate::orchestration::{
-    AttentionItem, AttentionKind, ConversationAttemptSummary, InputStatus, OwnerCommand,
-    PendingInputRef, QueueReason, TaskLifecycle,
+    AttentionItem, AttentionKind, ConversationAttemptSummary, InputStatus, OperatorCommand,
+    OwnerCommand, PendingInputRef, QueueReason, TaskEvent, TaskEventKind, TaskLifecycle,
+    EXHAUSTION_REASON_PREFIX,
 };
-use crate::tui::task_app::list::{attention_of, Attention};
+use crate::tui::task_app::list::{attention_of, loss_state, Attention, LossState};
 
 /// Soft cap on the raw bytes of one relayed conversation page.
 pub const PAGE_BYTE_BUDGET: u64 = 64 * 1024;
@@ -157,6 +159,51 @@ impl RecordAge {
     /// The bucket of a record written `at`, seen `now`.
     pub fn between(now: DateTime<Utc>, at: DateTime<Utc>) -> Self {
         Self::of_seconds((now - at).num_seconds())
+    }
+
+    /// The age in English: `just now`, `5 min`, `3 h`, `2 d`.
+    pub fn words(self) -> String {
+        match self {
+            Self::JustNow => "just now".to_string(),
+            Self::Minutes(minutes) => format!("{minutes} min"),
+            Self::Hours(hours) => format!("{hours} h"),
+            Self::Days(days) => format!("{days} d"),
+        }
+    }
+}
+
+/// Where a conversation was read from, as the first words of its summary
+/// or page: `Conversation live` from the runner, `Conversation from record,
+/// 5 min old` from the task's storage (without the age when the record
+/// holds no entry yet).
+pub fn conversation_origin(
+    now: DateTime<Utc>,
+    source: ExecutionEventsSource,
+    recorded_at: Option<DateTime<Utc>>,
+) -> String {
+    match (source, recorded_at.map(|at| RecordAge::between(now, at))) {
+        (ExecutionEventsSource::Runner, _) => "Conversation live".to_string(),
+        (ExecutionEventsSource::Storage, None) => "Conversation from record".to_string(),
+        (ExecutionEventsSource::Storage, Some(RecordAge::JustNow)) => {
+            "Conversation from record, written just now".to_string()
+        }
+        (ExecutionEventsSource::Storage, Some(age)) => {
+            format!("Conversation from record, {} old", age.words())
+        }
+    }
+}
+
+/// What went wrong reading the task's own conversation record, when that is
+/// why the control plane refused a page; `None` for any other failure.
+pub fn record_unreadable_detail(error: &ClientError) -> Option<String> {
+    match error {
+        ClientError::Refused { code, message } if code == CONVERSATION_RECORD_UNREADABLE => {
+            let detail = message
+                .strip_prefix(CONVERSATION_RECORD_UNREADABLE_PREFIX)
+                .unwrap_or(message);
+            Some(without_unsafe_chars(detail))
+        }
+        _ => None,
     }
 }
 
@@ -363,9 +410,10 @@ pub fn lifecycle_hint(task: &TaskSummary) -> Option<ToneLine> {
             "paused at a safe point; storage is kept and no slot is held — resume (u) or archive (a)",
             Tone::Normal,
         ),
-        TaskLifecycle::Interrupted | TaskLifecycle::Unknown => ToneLine::new(
-            "the workload was lost and is not restarted on its own; it still holds its backend \
-             slot — resume (u), start afresh (s) or archive (a)",
+        TaskLifecycle::Interrupted => interrupted_hint(task),
+        TaskLifecycle::Unknown => ToneLine::new(
+            "the runner is not heard from and its workload may be lost; it still holds its \
+             backend slot — resume (u), start afresh (s) or archive (a)",
             Tone::Error,
         ),
         TaskLifecycle::Archiving => ToneLine::new(
@@ -378,6 +426,33 @@ pub fn lifecycle_hint(task: &TaskSummary) -> Option<ToneLine> {
         ),
     };
     Some(hint)
+}
+
+/// What an interrupted task waits for — the automatic resume or its owner —
+/// as the TUI tells it ([`loss_state`]).
+fn interrupted_hint(task: &TaskSummary) -> ToneLine {
+    const OWNER_CHOICES: &str =
+        "it still holds its backend slot — resume (u), start afresh (s) or archive (a)";
+    match loss_state(task) {
+        Some(LossState::AutoResume { attempt, limit }) => ToneLine::new(
+            format!(
+                "the workload was lost; it is resumed automatically (attempt {attempt}/{limit}) \
+                 — or start afresh (s) or archive (a)"
+            ),
+            Tone::Warning,
+        ),
+        Some(LossState::Exhausted(reason)) => {
+            ToneLine::new(format!("{reason}; {OWNER_CHOICES}"), Tone::Error)
+        }
+        Some(LossState::LostWhilePausing) => ToneLine::new(
+            format!("the workload was lost while pausing and waits for you; {OWNER_CHOICES}"),
+            Tone::Error,
+        ),
+        None => ToneLine::new(
+            format!("the workload was lost; {OWNER_CHOICES}"),
+            Tone::Error,
+        ),
+    }
 }
 
 /// The input request the runner waits on, unless the owner already
@@ -607,6 +682,7 @@ pub fn conversation_lines(
         ConversationResponse::Available {
             attempts,
             observed_at,
+            source: ExecutionEventsSource::Runner,
             ..
         } => {
             lines.push(ToneLine::new(
@@ -619,18 +695,44 @@ pub fn conversation_lines(
             ));
             lines.extend(attempts.iter().map(attempt_line));
         }
+        ConversationResponse::Available {
+            attempts,
+            source: source @ ExecutionEventsSource::Storage,
+            recorded_at,
+            ..
+        } => {
+            let origin = conversation_origin(now, *source, *recorded_at);
+            lines.push(if attempts.is_empty() {
+                ToneLine::new(format!("{origin} — nothing was recorded"), Tone::Muted)
+            } else {
+                ToneLine::new(
+                    format!("{origin} — {} attempt(s) (c: read)", attempts.len()),
+                    Tone::Normal,
+                )
+            });
+            lines.extend(attempts.iter().map(attempt_line));
+        }
         ConversationResponse::Unavailable {
             reason,
             last_attempts,
             observed_at,
-            ..
+            message,
         } => {
             let since = observed_at
                 .map(|at| format!("; last safe summary from {} ago", age(now, at)))
                 .unwrap_or_default();
+            let detail = message
+                .as_deref()
+                .map(|message| {
+                    let message = message
+                        .strip_prefix(CONVERSATION_RECORD_UNREADABLE_PREFIX)
+                        .unwrap_or(message);
+                    format!(": {message}")
+                })
+                .unwrap_or_default();
             lines.push(ToneLine::new(
                 format!(
-                    "Conversation unavailable: {}{since}",
+                    "Conversation unavailable: {}{detail}{since}",
                     unavailable_reason(*reason)
                 ),
                 Tone::Warning,
@@ -652,6 +754,135 @@ fn attempt_line(attempt: &ConversationAttemptSummary) -> ToneLine {
         ),
         Tone::Muted,
     )
+}
+
+/// One line of `narsor task events`: sequence, time, task, lifecycle and
+/// what happened.
+pub fn event_line(event: &TaskEvent) -> String {
+    let kind = match &event.kind {
+        TaskEventKind::Created => "created".to_string(),
+        TaskEventKind::OwnerCommandAccepted { command, .. } => {
+            format!("owner command {command:?}")
+        }
+        TaskEventKind::ControllerReported { observation, .. } => {
+            format!("controller reported {observation:?}")
+        }
+        TaskEventKind::RunnerReported {
+            execution_status,
+            pending_input_id,
+            ..
+        } => match pending_input_id {
+            Some(pending) => format!(
+                "runner reported {} (awaiting input {pending})",
+                execution_status.as_str()
+            ),
+            None => format!("runner reported {}", execution_status.as_str()),
+        },
+        TaskEventKind::InputQueued { input_id, .. } => format!("input {input_id} queued"),
+        TaskEventKind::OperatorCommandQueued {
+            command_id,
+            command,
+            requested_by,
+        } => format!(
+            "operator command {command_id} queued by {}: {}",
+            requested_by.0,
+            describe_operator_command(command)
+        ),
+        TaskEventKind::OperatorCommandResolved {
+            command_id,
+            status,
+            detail,
+        } => match detail {
+            Some(detail) => format!("operator command {command_id} {status:?}: {detail}"),
+            None => format!("operator command {command_id} {status:?}"),
+        },
+        TaskEventKind::PriorityChanged { priority } => format!("priority {priority} (obsolete)"),
+        TaskEventKind::Moved { rank, .. } => format!("moved to #{rank}"),
+        TaskEventKind::QueueChanged { reason } => format!("queue: {}", reason.describe()),
+        TaskEventKind::InputsUpdated { updates } => format!("{} input(s) updated", updates.len()),
+        TaskEventKind::MaterialChanged {
+            material_id,
+            change,
+            files,
+            total_bytes,
+        } => format!("material {material_id} {change:?} ({files} file(s), {total_bytes} bytes)"),
+        TaskEventKind::AutoResumed { attempt, limit, .. } => {
+            format!("resumed automatically after runner loss (attempt {attempt}/{limit})")
+        }
+        TaskEventKind::AutoResumeExhausted { attempts, reason } => format!(
+            "automatic resume gave up after {attempts} {}: {}",
+            if *attempts == 1 {
+                "attempt"
+            } else {
+                "attempts"
+            },
+            exhaustion_loss(reason)
+        ),
+        TaskEventKind::Unrecognized => "an event this version does not know".to_string(),
+    };
+    // Notes, reasons and details come from operators and runners: nothing a
+    // terminal would act on gets through.
+    let kind = without_unsafe_chars(&kind);
+    format!(
+        "{:>4}  {}  {:<24} {:<12} {kind}",
+        event.sequence,
+        event.at.to_rfc3339(),
+        event.task_id,
+        lifecycle_name(event.lifecycle)
+    )
+}
+
+/// An operator command with its parameters, for the event log — an
+/// override with the reason it was audited under.
+fn describe_operator_command(command: &OperatorCommand) -> String {
+    match command {
+        OperatorCommand::Interrupt => "interrupt".to_string(),
+        OperatorCommand::Transition {
+            target,
+            forced: false,
+            ..
+        } => format!("transition to '{target}'"),
+        OperatorCommand::Transition {
+            target,
+            forced: true,
+            reason,
+        } => format!(
+            "override transition to '{target}' (reason: {})",
+            reason.as_deref().unwrap_or("none")
+        ),
+        OperatorCommand::RestartStep { note, failure_key } => format!(
+            "restart step{}{}",
+            if note.is_some() { " with a note" } else { "" },
+            failure_key
+                .as_deref()
+                .map(|key| format!(" (failure {key})"))
+                .unwrap_or_default()
+        ),
+        // The chat text is the owner's own words and the event log is no
+        // place for them twice: only the length is told.
+        OperatorCommand::ConductorChat { text } => {
+            format!("conductor chat ({} characters)", text.chars().count())
+        }
+        OperatorCommand::ConfirmProposal { proposal_id } => {
+            format!("confirm proposal {proposal_id}")
+        }
+        OperatorCommand::RejectProposal { proposal_id } => {
+            format!("reject proposal {proposal_id}")
+        }
+        OperatorCommand::UndoDecision { decision_id } => format!("undo decision {decision_id}"),
+        // Historical: no longer accepted, but still in old event logs.
+        OperatorCommand::SetConductorHarness { harness } => {
+            format!("conductor harness {harness}")
+        }
+    }
+}
+
+/// What the resume policy says it lost, without the "could not resume
+/// automatically" its reason begins with.
+fn exhaustion_loss(reason: &str) -> &str {
+    reason
+        .strip_prefix(EXHAUSTION_REASON_PREFIX)
+        .unwrap_or(reason)
 }
 
 /// The outcome of an owner command, as the notice shows it.

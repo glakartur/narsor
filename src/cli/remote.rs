@@ -21,9 +21,10 @@ use futures::StreamExt as _;
 use serde_json::{Map, Value};
 
 use super::task_text::{
-    age, awaiting_input, command_outcome, conversation_lines, default_backend_line,
-    default_harness_line, detail_lines, lifecycle_name, list_line, next_waiting, safe_json,
-    status_badge, waiting_summary, PAGE_BYTE_BUDGET,
+    age, awaiting_input, command_outcome, conversation_lines, conversation_origin,
+    default_backend_line, default_harness_line, detail_lines, event_line, lifecycle_name,
+    list_line, next_waiting, record_unreadable_detail, safe_json, status_badge, waiting_summary,
+    PAGE_BYTE_BUDGET,
 };
 use crate::api::{
     ApiClient, ClientError, ConversationResponse as PageResponse, ServerTarget, TokenSource,
@@ -40,7 +41,7 @@ use crate::domain::{without_unsafe_chars, TaskId};
 use crate::engine::HumanInputDelivery;
 use crate::materials::{snapshot_paths, write_files, MaterialLimits, MaterialOrigin, WriteMode};
 use crate::orchestration::{
-    MoveTarget, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskEvent, TaskEventKind,
+    MoveTarget, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskEvent,
 };
 use crate::persistence::StatePaths;
 use crate::tui::conversation::classify;
@@ -942,14 +943,32 @@ pub async fn task(
                     },
                 )
                 .await
-                .map_err(|error| failure("The conversation cannot be read", error))?;
+                .map_err(|error| match record_unreadable_detail(&error) {
+                    Some(detail) => CliError::failure(format!(
+                        "The conversation record of task '{task_id}' could not be read: {detail}"
+                    )),
+                    None => failure("The conversation cannot be read", error),
+                })?;
             match page {
                 PageResponse::Recorded {
                     entries,
                     next_entry,
                     closed,
+                    source,
+                    recorded_at,
                     ..
                 } => {
+                    println!(
+                        "{}",
+                        conversation_origin(
+                            chrono::Utc::now(),
+                            source.unwrap_or_default(),
+                            recorded_at
+                        )
+                    );
+                    if entries.is_empty() {
+                        println!("(no entries from here)");
+                    }
                     print_conversation_entries(&entries, next_entry, closed);
                     Ok(())
                 }
@@ -1439,116 +1458,7 @@ fn print_status(task: &TaskSummary) {
 }
 
 fn print_event(event: &TaskEvent) {
-    let kind = match &event.kind {
-        TaskEventKind::Created => "created".to_string(),
-        TaskEventKind::OwnerCommandAccepted { command, .. } => {
-            format!("owner command {command:?}")
-        }
-        TaskEventKind::ControllerReported { observation, .. } => {
-            format!("controller reported {observation:?}")
-        }
-        TaskEventKind::RunnerReported {
-            execution_status,
-            pending_input_id,
-            ..
-        } => match pending_input_id {
-            Some(pending) => format!(
-                "runner reported {} (awaiting input {pending})",
-                execution_status.as_str()
-            ),
-            None => format!("runner reported {}", execution_status.as_str()),
-        },
-        TaskEventKind::InputQueued { input_id, .. } => format!("input {input_id} queued"),
-        TaskEventKind::OperatorCommandQueued {
-            command_id,
-            command,
-            requested_by,
-        } => format!(
-            "operator command {command_id} queued by {}: {}",
-            requested_by.0,
-            describe_operator_command(command)
-        ),
-        TaskEventKind::OperatorCommandResolved {
-            command_id,
-            status,
-            detail,
-        } => match detail {
-            Some(detail) => format!("operator command {command_id} {status:?}: {detail}"),
-            None => format!("operator command {command_id} {status:?}"),
-        },
-        TaskEventKind::PriorityChanged { priority } => format!("priority {priority} (obsolete)"),
-        TaskEventKind::Moved { rank, .. } => format!("moved to #{rank}"),
-        TaskEventKind::QueueChanged { reason } => format!("queue: {}", reason.describe()),
-        TaskEventKind::InputsUpdated { updates } => format!("{} input(s) updated", updates.len()),
-        TaskEventKind::MaterialChanged {
-            material_id,
-            change,
-            files,
-            total_bytes,
-        } => format!("material {material_id} {change:?} ({files} file(s), {total_bytes} bytes)"),
-        TaskEventKind::AutoResumed { attempt, limit, .. } => {
-            format!("resumed automatically after runner loss (attempt {attempt}/{limit})")
-        }
-        TaskEventKind::AutoResumeExhausted { attempts, reason } => {
-            format!("automatic resume gave up after {attempts} attempts: {reason}")
-        }
-        TaskEventKind::Unrecognized => "an event this version does not know".to_string(),
-    };
-    // Notes, reasons and details come from operators and runners: nothing a
-    // terminal would act on gets through.
-    let kind = without_unsafe_chars(&kind);
-    println!(
-        "{:>4}  {}  {:<24} {:<12} {kind}",
-        event.sequence,
-        event.at.to_rfc3339(),
-        event.task_id,
-        lifecycle_name(event.lifecycle)
-    );
-}
-
-/// An operator command with its parameters, for the event log — an
-/// override with the reason it was audited under.
-fn describe_operator_command(command: &OperatorCommand) -> String {
-    match command {
-        OperatorCommand::Interrupt => "interrupt".to_string(),
-        OperatorCommand::Transition {
-            target,
-            forced: false,
-            ..
-        } => format!("transition to '{target}'"),
-        OperatorCommand::Transition {
-            target,
-            forced: true,
-            reason,
-        } => format!(
-            "override transition to '{target}' (reason: {})",
-            reason.as_deref().unwrap_or("none")
-        ),
-        OperatorCommand::RestartStep { note, failure_key } => format!(
-            "restart step{}{}",
-            if note.is_some() { " with a note" } else { "" },
-            failure_key
-                .as_deref()
-                .map(|key| format!(" (failure {key})"))
-                .unwrap_or_default()
-        ),
-        // The chat text is the owner's own words and the event log is no
-        // place for them twice: only the length is told.
-        OperatorCommand::ConductorChat { text } => {
-            format!("conductor chat ({} characters)", text.chars().count())
-        }
-        OperatorCommand::ConfirmProposal { proposal_id } => {
-            format!("confirm proposal {proposal_id}")
-        }
-        OperatorCommand::RejectProposal { proposal_id } => {
-            format!("reject proposal {proposal_id}")
-        }
-        OperatorCommand::UndoDecision { decision_id } => format!("undo decision {decision_id}"),
-        // Historical: no longer accepted, but still in old event logs.
-        OperatorCommand::SetConductorHarness { harness } => {
-            format!("conductor harness {harness}")
-        }
-    }
+    println!("{}", event_line(event));
 }
 
 /// `name=value` pairs into a JSON object; a value that reads as JSON is
