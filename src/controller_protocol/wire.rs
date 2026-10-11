@@ -34,7 +34,6 @@ use crate::domain::{
     BackendId, Event, ExecutionStatus, ResourceProfile, TaskDisplay, TaskId, TaskLaunchSpec,
 };
 use crate::engine::{HumanInputDelivery, Timeline};
-pub use crate::environment::TaskDefaultHarness;
 use crate::orchestration::{
     ArchiveTombstone, AttentionItem, CommandActor, CommandReceipt, ConversationAttemptSummary,
     ExecutionCursor, HarnessUnavailable, InputStatus, MoveTarget, Observation, ObservedSummary,
@@ -42,6 +41,7 @@ use crate::orchestration::{
     QueueStatus, QueuedInput, QueuedOperatorCommand, ResourceIdentity, ResumeState, RunnerProblem,
     RunnerSnapshot, TaskEvent, TaskLifecycle,
 };
+pub use narsor_protocol::controller::TaskDefaultHarness;
 
 /// Version of this protocol; part of every path (`…/v1/…`).
 pub const PROTOCOL_VERSION: u32 = 1;

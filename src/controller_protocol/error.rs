@@ -12,8 +12,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use crate::api::RequestErrorResponse;
 use crate::orchestration::OrchestrationError;
+use narsor_protocol::api::RequestErrorResponse;
 
 /// Why a protocol request was refused.
 #[derive(Debug)]

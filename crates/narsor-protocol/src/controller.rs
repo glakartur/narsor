@@ -35,6 +35,14 @@ pub enum ExecutionEventsSource {
     Storage,
 }
 
+/// The installation default harness as it applies to a running task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TaskDefaultHarness {
+    Available { harness: String },
+    Unavailable { harness: String, reason: String },
+}
+
 /// Current lease holder of a task's backend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControllerPresence {
@@ -71,7 +79,7 @@ pub const CONVERSATION_RECORD_UNREADABLE_PREFIX: &str =
 
 #[cfg(test)]
 mod tests {
-    use super::{ConversationUnavailableReason, Freshness};
+    use super::{ConversationUnavailableReason, Freshness, TaskDefaultHarness};
 
     #[test]
     fn unknown_conversation_reasons_keep_the_forward_compatible_fallback() {
@@ -87,5 +95,18 @@ mod tests {
             serde_json::to_string(&Freshness::Stale).unwrap(),
             "\"stale\""
         );
+    }
+
+    #[test]
+    fn task_harness_keeps_its_tagged_wire_shape() {
+        let value = serde_json::to_value(TaskDefaultHarness::Unavailable {
+            harness: "codex".into(),
+            reason: "not installed".into(),
+        })
+        .unwrap();
+
+        assert_eq!(value["status"], "unavailable");
+        assert_eq!(value["harness"], "codex");
+        assert_eq!(value["reason"], "not installed");
     }
 }

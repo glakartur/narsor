@@ -32,10 +32,11 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::watch;
+
+pub use narsor_protocol::controller::TaskDefaultHarness;
 
 use crate::domain::{
     ActionConfig, BackendId, Context, DecisionConfig, GitIdentity, GitIdentityError, ImageError,
@@ -303,25 +304,6 @@ pub trait LaunchResolver: Send + Sync {
     fn default_harness_changes(&self) -> Option<watch::Receiver<u64>> {
         None
     }
-}
-
-/// The installation's default harness as it applies to one task (U7),
-/// handed to its runner with every control-plane answer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum TaskDefaultHarness {
-    /// The task's backend runs it: the runner switches to it.
-    Available {
-        /// The harness.
-        harness: String,
-    },
-    /// The task's backend cannot run it: the runner keeps its harness.
-    Unavailable {
-        /// The harness that was asked for.
-        harness: String,
-        /// Why the backend cannot run it.
-        reason: String,
-    },
 }
 
 /// The harness registry and the live default harness.
