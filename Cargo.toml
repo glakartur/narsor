@@ -3,6 +3,17 @@ name = "narsor"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = [
+    ".",
+    "crates/narsor-controller",
+    "crates/narsor-controller-runtime",
+    "crates/narsor-protocol",
+    "crates/narsor-runner",
+    "crates/narsor-server",
+]
+resolver = "2"
+
 [dependencies]
 # Web framework
 axum = { version = "0.7", features = ["macros"] }
