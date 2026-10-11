@@ -3543,6 +3543,29 @@ fn a_task_unknown_before_the_policy_is_counted_once_confirmed() {
 }
 
 #[test]
+fn an_unreadable_legacy_event_log_skips_only_its_task() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    for id in ["broken-1", "fine-1"] {
+        fx.running(id, &lease);
+        lose(&fx, id, &lease, true, "exited");
+        strip_resume_fields(&fx, id);
+    }
+    let first_event = fx.root.paths().orchestration_task_event_file("broken-1", 1);
+    fs::write(&first_event, b"not an event").unwrap();
+
+    let recovery = fx.reopen().recover().expect("recovery still succeeds");
+
+    assert_eq!(recovery.adopted_losses, vec![task("fine-1")]);
+    assert!(fx
+        .control
+        .task(&task("broken-1"))
+        .unwrap()
+        .resume
+        .is_empty());
+}
+
+#[test]
 fn recovery_leaves_tasks_that_were_not_lost_and_current_losses_alone() {
     let fx = Fixture::new();
     let lease = long_lease(&fx, "controller-a");

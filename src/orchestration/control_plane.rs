@@ -683,8 +683,17 @@ impl ControlPlane {
             if self.store.publish_last_event(&record)? {
                 republished_events.push((task_id.clone(), record.revision));
             }
-            if self.adopt_loss(&mut record)? {
-                adopted_losses.push(task_id);
+            // One task's unreadable history must not cost every other task
+            // its rank repair and material cleanup: it is skipped, and
+            // adopted at a later start once readable.
+            match self.adopt_loss(&mut record) {
+                Ok(true) => adopted_losses.push(task_id),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    task_id = %task_id,
+                    %error,
+                    "recovery: cannot adopt the task's workload loss; skipped"
+                ),
             }
         }
         self.normalise_ranks()?;
