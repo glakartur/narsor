@@ -392,6 +392,9 @@ pub struct Controller<B, L> {
     /// state did not yet show its safe point: judged again on a desired
     /// state read after that observation.
     exited_before_ack: HashSet<TaskId>,
+    /// Tasks whose loss confirmation the control plane refused (one that
+    /// predates `LossConfirmed`): said once at warn, then only at debug.
+    loss_confirmation_refused: OncePerTask,
 }
 
 impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
@@ -406,6 +409,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             observe_failures: HashMap::new(),
             last_status: HashMap::new(),
             exited_before_ack: HashSet::new(),
+            loss_confirmation_refused: OncePerTask::default(),
         }
     }
 
@@ -932,14 +936,29 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             }
             Some(_) => return Ok(Progress::Settled),
         };
-        tracing::warn!(task = %context.command.task_id, %detail, "controller: loss confirmed");
-        self.report(
-            context,
-            Observation::LossConfirmed,
-            observed.workload.as_ref(),
-            summary(&observed, &detail),
-        )
-        .await?;
+        let task_id = &context.command.task_id;
+        if self.loss_confirmation_refused.seen(task_id) {
+            tracing::debug!(task = %task_id, %detail, "controller: loss confirmed again");
+        } else {
+            tracing::warn!(task = %task_id, %detail, "controller: loss confirmed");
+        }
+        let accepted = self
+            .report(
+                context,
+                Observation::LossConfirmed,
+                observed.workload.as_ref(),
+                summary(&observed, &detail),
+            )
+            .await?;
+        if accepted.is_some() {
+            self.loss_confirmation_refused.forget(task_id);
+        } else if self.loss_confirmation_refused.first(task_id) {
+            tracing::warn!(
+                task = %task_id,
+                "controller: the control plane refused the loss confirmation (an older \
+                 control plane?); the task stays unknown until its owner acts"
+            );
+        }
         Ok(Progress::Settled)
     }
 
@@ -1136,6 +1155,33 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         self.acknowledged.clear();
         self.observe_failures.clear();
         self.last_status.clear();
+        self.loss_confirmation_refused.clear();
+    }
+}
+
+/// Tasks something was already said about, so a log line repeated every
+/// step is said loudly only once per task.
+#[derive(Debug, Default)]
+struct OncePerTask(HashSet<TaskId>);
+
+impl OncePerTask {
+    /// True the first time `task_id` is noted (until forgotten).
+    fn first(&mut self, task_id: &TaskId) -> bool {
+        self.0.insert(task_id.clone())
+    }
+
+    /// Whether `task_id` was noted.
+    fn seen(&self, task_id: &TaskId) -> bool {
+        self.0.contains(task_id)
+    }
+
+    /// Lets the next note of `task_id` be the first again.
+    fn forget(&mut self, task_id: &TaskId) {
+        self.0.remove(task_id);
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
     }
 }
 
@@ -1169,5 +1215,28 @@ fn summary(observed: &TaskObservation, detail: &str) -> ObservedSummary {
         storage_present: observed.storage.exists(),
         runner_status: None,
         detail: Some(detail.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_is_said_loudly_once_per_task_until_accepted() {
+        let mut said = OncePerTask::default();
+        let task = TaskId::parse("task-1").unwrap();
+        let other = TaskId::parse("task-2").unwrap();
+
+        assert!(!said.seen(&task));
+        assert!(said.first(&task), "the first refusal warns");
+        assert!(said.seen(&task));
+        assert!(!said.first(&task), "a repeated one does not");
+        assert!(said.first(&other), "another task warns on its own");
+
+        said.forget(&task);
+        assert!(said.first(&task), "after an accepted report it warns again");
+        said.clear();
+        assert!(!said.seen(&other));
     }
 }
