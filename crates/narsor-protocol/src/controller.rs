@@ -1,5 +1,6 @@
 //! Shared controller protocol values that do not depend on service internals.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Freshness of a value the control plane only observed.
@@ -23,6 +24,35 @@ pub enum ConversationUnavailableReason {
     StorageUnreadable,
     #[serde(other)]
     Unrecognized,
+}
+
+/// Current lease holder of a task's backend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControllerPresence {
+    pub controller_id: String,
+    pub lease_epoch: u64,
+    pub lease_expires_at: DateTime<Utc>,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    pub freshness: Freshness,
+}
+
+/// A manual transition a workflow declares from its current state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransitionOffer {
+    pub from_state: String,
+    pub exits: Vec<TransitionExit>,
+    pub override_allowed: bool,
+    #[serde(default)]
+    pub override_targets: Vec<String>,
+}
+
+/// One declared transition out of a workflow state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransitionExit {
+    pub label: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 pub const CONVERSATION_UNAVAILABLE: &str = "conversation_unavailable";

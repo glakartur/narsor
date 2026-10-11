@@ -24,8 +24,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use narsor_protocol::controller::{
-    ConversationUnavailableReason, Freshness, CONVERSATION_RECORD_UNREADABLE,
-    CONVERSATION_RECORD_UNREADABLE_PREFIX, CONVERSATION_UNAVAILABLE,
+    ControllerPresence, ConversationUnavailableReason, Freshness, TransitionExit, TransitionOffer,
+    CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
+    CONVERSATION_UNAVAILABLE,
 };
 
 use crate::conductor::ConductorView;
@@ -170,21 +171,6 @@ pub struct RunnerView {
     pub freshness: Freshness,
 }
 
-/// The controller currently responsible for a task's backend.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ControllerPresence {
-    /// The lease holder.
-    pub controller_id: String,
-    /// Its fencing epoch.
-    pub lease_epoch: u64,
-    /// When its lease runs out.
-    pub lease_expires_at: DateTime<Utc>,
-    /// Its last heartbeat.
-    pub last_heartbeat_at: Option<DateTime<Utc>>,
-    /// Stale when the lease expired or no heartbeat arrived lately.
-    pub freshness: Freshness,
-}
-
 /// An owner input, without its payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InputView {
@@ -318,34 +304,6 @@ pub struct TaskSummary {
     /// The control plane's "now" this summary was computed at, so a client
     /// can show the age of every timestamp above.
     pub as_of: DateTime<Utc>,
-}
-
-/// What a manual transition out of a task's current state can be (U11).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TransitionOffer {
-    /// The state the runner reports being in.
-    pub from_state: String,
-    /// The declared transitions, one per target (the lowest label wins when
-    /// several lead to the same state, as the runner picks it).
-    pub exits: Vec<TransitionExit>,
-    /// Whether the state declares `allow_manual_override` (D30).
-    pub override_allowed: bool,
-    /// Every other state of the workflow: what an override can go to. Empty
-    /// unless `override_allowed`.
-    #[serde(default)]
-    pub override_targets: Vec<String>,
-}
-
-/// One declared transition out of a state.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TransitionExit {
-    /// The output label that leads there.
-    pub label: String,
-    /// The state it leads to: what a `Transition` command names.
-    pub target: String,
-    /// What choosing the label means, when the workflow says.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
 }
 
 /// The scheduler's verdict on a queued task, as clients see it (U10).
