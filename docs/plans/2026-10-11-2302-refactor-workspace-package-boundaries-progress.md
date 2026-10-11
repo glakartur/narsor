@@ -15,6 +15,9 @@ plan. The plan remains the authority for scope and completion.
 - Split the root package's executable targets: `narsor` is the TUI and
   `narsor-cli` owns operator commands. The CLI no longer exposes a `tui` or
   `runner` subcommand.
+- Added the `narsor-controller` process entry point and changed the Kubernetes
+  Deployment to invoke it directly; controller identity administration stays
+  in `narsor-cli`.
 - Updated process and manifest tests to resolve workspace binaries explicitly.
 
 ## Verification evidence
@@ -32,6 +35,8 @@ plan. The plan remains the authority for scope and completion.
 - Materials: 10 passed.
 - Runner process suite: 26 passed on isolated rerun after one transient timeout
   in the first full run.
+- TUI without-terminal discovery and configured log-file tests pass; the
+  standalone controller help and Deployment command test pass.
 
 ## Remaining plan work
 
@@ -40,7 +45,8 @@ plan. The plan remains the authority for scope and completion.
 - Protocol extraction is partial: execution summaries, conductor payloads,
   controller protocol types, and several client-facing values still depend on
   internal root types.
-- Controller runtime and binary packages remain scaffolding.
+- The `narsor-controller-runtime` package is still scaffolding; controller
+  reconciliation and credential ownership have not moved into it.
 - Test ownership, deployment/build artifacts, and documentation still need a
   full audit against U2–U7 and the Verification Contract.
 - The pre-existing uncommitted daemon changes in `src/cli/daemon.rs`,

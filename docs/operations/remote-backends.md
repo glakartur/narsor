@@ -44,7 +44,7 @@ Contents:
 | Part | Holds | Never holds |
 | --- | --- | --- |
 | **Control plane** (`narsor-server`) | The authoritative orchestration state: task assignment, desired lifecycle and generation, owner commands, the scheduler's queue, controller leases, the *last observed* runner and backend summaries, a durable per-task event log | Workspace files, raw conversation transcripts, secret values |
-| **Controller** (`narsor controller`) | Its own identity (`nsk.` credential) and the backend's native credentials | Any user token; any task state of its own |
+| **Controller** (`narsor-controller`) | Its own identity (`nsk.` credential) and the backend's native credentials | Any user token; any task state of its own |
 | **Runner** (`narsor-runner`, inside the task Pod) | The task's real work state on **task storage** (the PVC): engine files, workspace, private `$HOME`, conversation records | Anything central — it reports cursors and summaries only |
 | **Task storage** | The authoritative work state of one task, surviving pause/resume | It is not a backup; archive deletes it |
 
@@ -351,7 +351,7 @@ Each controller has its own identity scoped to one backend.
 2. As the owner, create a one-time code (shown once, expires, default 15 min):
 
    ```bash
-   narsor controller enroll-code k8s --name prod-cluster
+   narsor-cli controller enroll-code k8s --name prod-cluster
    ```
 
 3. Hand it to the controller (first start only):
@@ -370,7 +370,7 @@ Each controller has its own identity scoped to one backend.
 
    ```bash
    kubectl -n narsor-user delete secret narsor-controller-enrollment
-   narsor controller list        # the identity holds the backend's lease
+   narsor-cli controller list        # the identity holds the backend's lease
    ```
 
 Every controller request is signed (method, path, query, body, timestamp,
@@ -383,13 +383,13 @@ nonce); the control plane and the controller clocks must agree within
   (`POST /controller/v1/key`, signed with the old key and proven by the new
   one); the old key stops working at once. Re-enrolling with a new code and
   revoking the old identity is equally valid.
-* **Revocation.** `narsor controller revoke <controller-id>` ends the
+* **Revocation.** `narsor-cli controller revoke <controller-id>` ends the
   identity and fences its lease immediately; queued tasks of that backend
   show `controller offline` until another controller holds the lease.
 
 **If a controller is compromised:**
 
-1. Revoke its identity: `narsor controller revoke <id>`.
+1. Revoke its identity: `narsor-cli controller revoke <id>`.
 2. Rotate every Secret the admission policy lets task Pods mount
    (`allowedSecrets`) — a controller can create Pods, and Pod creation is a
    secret-injection capability even without `get secret`.
@@ -602,7 +602,7 @@ narsor task materials list|show <task> [<material>]
 narsor task materials download <task> <material> <dest-dir> [--force]
 narsor task materials delete <task> <material>
 narsor auth whoami | claim <code>
-narsor controller enroll-code <backend> | list | revoke <id>
+narsor-cli controller enroll-code <backend> | list | revoke <id>
 narsor tui                                   # the interface; over --server when given
 ```
 

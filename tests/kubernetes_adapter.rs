@@ -1508,7 +1508,7 @@ async fn archive_leaves_nothing_of_the_task_behind() {
     assert_eq!(cluster.created_of("Pod").len(), 1, "exactly one Pod ever");
 }
 
-/// `narsor controller` enrolls once with a one-time code, persists the
+/// `narsor-controller` enrolls once with a one-time code, persists the
 /// credential `0600`, and loads it on every later start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_controller_command_enrolls_once_and_then_loads_its_credential() {
@@ -1889,7 +1889,8 @@ fn the_controller_deployment_is_locked_down() {
     assert_eq!(pod["serviceAccountName"], "narsor-controller");
     assert_eq!(pod["securityContext"]["runAsNonRoot"], true);
     let container = &pod["containers"][0];
-    assert_eq!(container["args"][0], "controller");
+    assert_eq!(container["command"][0], "/opt/narsor/bin/narsor-controller");
+    assert!(container.get("args").is_none());
     assert_eq!(
         container["securityContext"]["allowPrivilegeEscalation"],
         false

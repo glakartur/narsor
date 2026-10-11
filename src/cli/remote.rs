@@ -518,7 +518,7 @@ pub enum AuthCommand {
     Whoami,
 }
 
-/// `narsor controller …` for the installation operator.
+/// `narsor-cli controller …` for the installation operator.
 #[derive(Debug, Subcommand)]
 pub enum ControllerAdminCommand {
     /// Creates a one-time code that enrolls one controller for `BACKEND`.
@@ -1625,7 +1625,7 @@ pub async fn auth(
     }
 }
 
-/// Runs one operator `narsor controller` command.
+/// Runs one operator `narsor-cli controller` command.
 pub async fn controller_admin(
     command: ControllerAdminCommand,
     target: &ServerTarget,

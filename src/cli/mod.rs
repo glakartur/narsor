@@ -307,25 +307,17 @@ pub enum Command {
         command: Option<DaemonCommand>,
     },
 
-    /// Runs the environment controller of one backend (U5).
-    ///
-    /// Started next to the backend (for Kubernetes, as the Deployment in
-    /// `deploy/kubernetes/`): it enrolls once with a one-time code, then
-    /// reconciles the backend with the control plane.
+    /// Manages controller identities through the control plane.
     Controller(ControllerCli),
 }
 
-/// `narsor controller`: run a controller (flags only), or — with a
-/// subcommand — manage controller identities as the installation operator.
+/// Controller identity management in `narsor-cli`.
 #[derive(Debug, clap::Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct ControllerCli {
-    /// Operator commands; without one, the controller runs.
+    /// Controller identity management commands.
     #[command(subcommand)]
     pub admin: Option<remote::ControllerAdminCommand>,
-    /// The controller's own flags.
-    #[command(flatten)]
-    pub run: Option<controller::ControllerArgs>,
 }
 
 /// The daemon half of the command line.
@@ -595,10 +587,6 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
     let catalog = config.catalog_dir().to_path_buf();
     let state = config.state_dir().to_path_buf();
     let command = match cli.command {
-        Command::Controller(ControllerCli {
-            admin: None,
-            run: Some(args),
-        }) => return controller::run_command(args).await,
         command => command,
     };
     let outcome = match command {
@@ -705,8 +693,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Controller(ControllerCli { admin, .. }) => match admin {
             Some(command) => remote::controller_admin(command, &target, &state, &flags).await,
             None => Err(commands::CliError::usage(
-                "narsor controller needs its flags (--control-plane, --credential-file, \
-                 --kubernetes-config) or an operator subcommand (enroll-code, list, revoke)",
+                "narsor-cli controller needs an operator subcommand (enroll-code, list, revoke)",
             )),
         },
         Command::Daemon { command } => match command {

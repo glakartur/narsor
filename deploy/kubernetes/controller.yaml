@@ -1,4 +1,4 @@
-# The environment controller of one Kubernetes backend (`narsor controller`).
+# The environment controller of one Kubernetes backend (`narsor-controller`).
 #
 # Before applying:
 #   * set the image digest of the Narsor release below;
@@ -81,7 +81,7 @@ spec:
       containers:
         - name: controller
           image: ghcr.io/narsor/narsor@sha256:0000000000000000000000000000000000000000000000000000000000000000
-          args: ["controller"]
+          command: ["/opt/narsor/bin/narsor-controller"]
           env:
             - name: NARSOR_CONTROL_PLANE
               value: https://narsor.example

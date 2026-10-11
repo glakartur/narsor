@@ -1,8 +1,8 @@
-//! `narsor controller`: the environment controller of one backend, run next
+//! `narsor-controller`: the environment controller of one backend, run next
 //! to it (R3-R5, R37; KTD1, KTD6).
 //!
 //! ```text
-//! narsor controller --control-plane <url> --credential-file <file> \
+//! narsor-controller --control-plane <url> --credential-file <file> \
 //!                   [--enrollment-code <code>] --kubernetes-config <file> \
 //!                   [--namespace <ns>] [--api-server <url> --token-file <file> --ca-file <file>]
 //! ```
@@ -40,14 +40,14 @@ use crate::controller_protocol::ControllerClient;
 
 use super::{EXIT_FAILURE, EXIT_SUCCESS, EXIT_USAGE};
 
-/// Platforms `narsor controller` can drive.
+/// Platforms `narsor-controller` can drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ControllerBackend {
     /// One Pod and one PVC per task.
     Kubernetes,
 }
 
-/// Arguments of `narsor controller`.
+/// Arguments of `narsor-controller`.
 #[derive(Debug, Clone, Args)]
 pub struct ControllerArgs {
     /// The control plane's base URL, as the controller reaches it.
