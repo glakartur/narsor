@@ -69,7 +69,7 @@ use crate::backends::{
 use crate::conductor::assembly::{assemble, restore_at_startup};
 use crate::conductor::{ConductorRegistry, HarnessInvoker, PassLauncher};
 use crate::config::Resolved;
-use crate::controller_protocol::{CreateEnrollmentRequest, ProtocolService};
+use crate::controller_protocol::{AutoResumePass, CreateEnrollmentRequest, ProtocolService};
 use crate::domain::{BackendId, ExecutionStatus, WorkflowDefinition, WorkflowExecution};
 use crate::engine::{owed_output_rescue, owed_reprompt, Engine, HarnessRegistry};
 use crate::environment::{
@@ -406,17 +406,24 @@ fn spawn_periodic_admission(control: Arc<ProtocolService>) -> tokio::task::JoinH
             interval.tick().await;
             let control = Arc::clone(&control);
             // File I/O under advisory locks: keep it off the async workers.
-            // The same tick expires task materials whose time ran out (U9).
             let pass = move || {
-                control.reschedule_all();
-                control.auto_resume_pass();
-                control.sweep_materials();
+                run_periodic_pass(&control);
             };
             if let Err(error) = tokio::task::spawn_blocking(pass).await {
                 tracing::warn!(%error, "scheduler: periodic admission pass panicked");
             }
         }
     })
+}
+
+/// One tick of the daemon's periodic pass: admission, then the resume
+/// policy, then task materials whose time to live ran out (U9). Returns
+/// what the resume policy did.
+pub fn run_periodic_pass(control: &ProtocolService) -> AutoResumePass {
+    control.reschedule_all();
+    let resumed = control.auto_resume_pass();
+    control.sweep_materials();
+    resumed
 }
 
 /// The server's security mode from the configuration (U7), or a failure

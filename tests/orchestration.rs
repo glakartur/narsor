@@ -3565,6 +3565,23 @@ fn an_unreadable_legacy_event_log_skips_only_its_task() {
         .is_empty());
 }
 
+/// The daemon's startup goes through the same function this test calls: a
+/// task lost before the resume policy is adopted without a daemon process.
+#[test]
+fn the_daemons_startup_recovery_adopts_a_loss_from_before_the_policy() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    lose(&fx, "task-1", &lease, true, "exited");
+    strip_resume_fields(&fx, "task-1");
+
+    narsor::cli::daemon::recover_orchestration_at_startup(fx.reopen());
+
+    let adopted = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(adopted.resume.consecutive_losses, 1);
+    assert!(adopted.auto_resume_due(fx.clock.now()));
+}
+
 #[test]
 fn recovery_leaves_tasks_that_were_not_lost_and_current_losses_alone() {
     let fx = Fixture::new();

@@ -3351,6 +3351,31 @@ fn auto_resumed(events: &[TaskEventKind]) -> usize {
         .count()
 }
 
+/// The daemon's tick goes through the same function this test calls, so a
+/// due task is resumed without a daemon process.
+#[tokio::test]
+async fn the_daemons_periodic_pass_resumes_a_due_interrupted_task() {
+    let harness = Harness::start().await;
+    let Running {
+        controller, epoch, ..
+    } = harness.running("task-1", "k8s").await;
+    controller
+        .report(&lost("task-1", epoch, 1, "exited"))
+        .await
+        .expect("loss");
+
+    let pass = narsor::cli::daemon::run_periodic_pass(&harness.service);
+
+    assert_eq!(pass.resumed, vec![TaskId::parse("task-1").unwrap()]);
+    let record = harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse("task-1").unwrap())
+        .unwrap();
+    assert_eq!(record.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(auto_resumed(&task_events(&harness, "task-1")), 1);
+}
+
 #[tokio::test]
 async fn the_resume_policy_resumes_a_lost_task_once_in_one_mutation() {
     let harness = Harness::start().await;
