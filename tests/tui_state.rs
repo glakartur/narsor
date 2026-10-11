@@ -448,6 +448,30 @@ fn transcript_keeps_entry_raw_separate_from_global_raw() {
 }
 
 #[test]
+fn transcript_cycles_agent_views_without_losing_the_selected_source() {
+    let mut transcript = TranscriptState::new(TranscriptId::from("attempt-a"));
+    transcript.load(vec![
+        transcript_entry("one", &["first"]),
+        transcript_entry("two", &["second"]),
+    ]);
+    transcript.to_top();
+    transcript.next_conversation_view();
+    assert_eq!(transcript.mode(), DisplayMode::Chronology);
+    assert_eq!(
+        transcript.selected_entry(),
+        Some(&TranscriptEntryId::from("one"))
+    );
+    transcript.next_conversation_view();
+    assert_eq!(transcript.mode(), DisplayMode::Raw);
+    transcript.next_conversation_view();
+    assert_eq!(transcript.mode(), DisplayMode::Rendered);
+    assert_eq!(
+        transcript.selected_entry(),
+        Some(&TranscriptEntryId::from("one"))
+    );
+}
+
+#[test]
 fn transcript_separates_adjacent_entries() {
     let mut transcript = TranscriptState::new(TranscriptId::from("attempt-a"));
     transcript.load(vec![
@@ -610,10 +634,17 @@ mod foundations {
         fn every_stack_has_its_layer_first_then_its_base_then_the_global_keys() {
             for stack in Stack::LAYERED {
                 assert!(stack.layer.is_some_and(Context::is_layer), "{stack:?}");
-                assert_eq!(
-                    stack.scopes().collect::<Vec<_>>(),
-                    [stack.layer.unwrap(), stack.base, Context::Global]
-                );
+                let expected = if stack.layer == Some(Context::AgentConversation) {
+                    vec![
+                        Context::AgentConversation,
+                        Context::Reading,
+                        stack.base,
+                        Context::Global,
+                    ]
+                } else {
+                    vec![stack.layer.unwrap(), stack.base, Context::Global]
+                };
+                assert_eq!(stack.scopes().collect::<Vec<_>>(), expected);
                 assert_eq!(
                     lookup(stack, &press(KeyCode::Char('?'))),
                     Some(Action::Help)
@@ -665,9 +696,7 @@ mod foundations {
             let bar = hints(step_conversation());
             assert_eq!(bar[0], ("Esc/←".to_string(), "oś"), "{bar:?}");
             let keys = stack_keys(step_conversation());
-            for expected in [
-                "PgUp", "PgDn", "v", "Ctrl+V", "Enter", "Space", "j", "g", "G",
-            ] {
+            for expected in ["PgUp", "PgDn", "v", "r", "Enter", "Space", "j", "g", "G"] {
                 assert!(
                     keys.iter().any(|key| key == expected),
                     "{expected}: {keys:?}"
@@ -690,11 +719,44 @@ mod foundations {
         }
 
         #[test]
+        fn raw_conversation_shortcuts_keep_navigation_and_hide_unavailable_actions() {
+            for stack in [
+                step_conversation(),
+                Stack::layered(Context::AgentConversation, Context::Details),
+            ] {
+                let hints = keymap::raw_conversation_hints(stack);
+                assert!(
+                    hints.iter().any(|(_, label)| *label == "widok"),
+                    "{hints:?}"
+                );
+                assert!(
+                    hints.iter().all(|(_, label)| {
+                        !matches!(*label, "rozwiń" | "źródło" | "surowy całości")
+                    }),
+                    "{hints:?}"
+                );
+                let entries = keymap::raw_conversation_help_entries(stack);
+                assert!(
+                    entries.iter().all(|entry| {
+                        !matches!(
+                            entry.description,
+                            "rozwiń albo zwiń wpis"
+                                | "pokaż albo ukryj źródło wpisu"
+                                | "widok surowy całości"
+                        )
+                    }),
+                    "{entries:?}"
+                );
+            }
+        }
+
+        #[test]
         fn the_history_has_the_same_layers_without_the_tasks_actions_or_following() {
             for layer in [
                 Context::HistoryAxis,
                 Context::StepConversation,
                 Context::Reading,
+                Context::AgentConversation,
             ] {
                 let stack = Stack::layered(layer, Context::HistoryDetails);
                 let keys = stack_keys(stack);
@@ -2913,7 +2975,7 @@ mod task_app_detail {
             press(&mut app, KeyCode::Enter);
             press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.detail().tab(), DetailTab::Conversation);
-            assert_eq!(layer(&app), Some(Context::Reading));
+            assert_eq!(layer(&app), Some(Context::AgentConversation));
             press(&mut app, KeyCode::Char('['));
             assert_eq!(app.detail().tab(), DetailTab::Progress);
             assert_eq!(app.step_focus(), StepFocus::Axis);
@@ -3680,12 +3742,7 @@ mod task_app_detail {
                 app.key_context(),
                 Stack::layered(Context::Axis, Context::Details)
             );
-            for tab in [
-                DetailTab::Conversation,
-                DetailTab::Events,
-                DetailTab::Conductor,
-                DetailTab::Info,
-            ] {
+            for tab in [DetailTab::Events, DetailTab::Conductor, DetailTab::Info] {
                 app.detail_mut().set_tab(tab);
                 assert_eq!(
                     app.key_context(),
@@ -3693,12 +3750,18 @@ mod task_app_detail {
                     "{tab:?}"
                 );
             }
+            app.detail_mut().set_tab(DetailTab::Conversation);
+            assert_eq!(
+                app.key_context(),
+                Stack::layered(Context::AgentConversation, Context::Details)
+            );
             // Reading the conversation: the keys of the tab, as before.
             app.detail_mut().set_tab(DetailTab::Conversation);
             for (key, action) in [
                 (KeyCode::Char('j'), Action::Down),
                 (KeyCode::Enter, Action::Expand),
-                (KeyCode::Char('v'), Action::RawEntry),
+                (KeyCode::Char('v'), Action::NextConversationView),
+                (KeyCode::Char('r'), Action::RawEntry),
                 (KeyCode::Esc, Action::Back),
             ] {
                 assert_eq!(

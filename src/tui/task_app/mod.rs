@@ -198,6 +198,7 @@ fn detail_keys(base: Context, tab: DetailTab, step: StepFocus) -> Stack {
         (DetailTab::Progress, StepFocus::Conversation, _) => Context::StepConversation,
         (DetailTab::Progress, StepFocus::Axis, Context::HistoryDetails) => Context::HistoryAxis,
         (DetailTab::Progress, StepFocus::Axis, _) => Context::Axis,
+        (DetailTab::Conversation, _, _) => Context::AgentConversation,
         _ => Context::Reading,
     };
     Stack::layered(layer, base)
@@ -609,6 +610,33 @@ impl TaskApp {
         }
     }
 
+    /// The transcript projection whose shortcuts are active, when focus is
+    /// on an agent conversation reader.
+    pub fn active_agent_transcript_mode(&self) -> Option<crate::tui::transcript::DisplayMode> {
+        use crate::tui::keymap::Context;
+        use crate::tui::transcript::DisplayMode;
+
+        let context = self.key_context().layer?;
+        let transcript = match (&self.view, context) {
+            (View::Tasks, Context::AgentConversation) => {
+                let task_id = self.list.selected()?.task_id.as_str();
+                self.detail.view(task_id)?.conversation().transcript()
+            }
+            (View::Tasks, Context::StepConversation) => {
+                let task_id = self.list.selected()?.task_id.as_str();
+                self.detail.view(task_id)?.step_conversation()?.transcript()
+            }
+            (View::History(history), Context::AgentConversation) => {
+                history.selected_detail()?.conversation().transcript()
+            }
+            (View::History(history), Context::StepConversation) => {
+                history.selected_detail()?.step_conversation()?.transcript()
+            }
+            _ => return None,
+        };
+        (transcript.mode() == DisplayMode::Raw).then_some(DisplayMode::Raw)
+    }
+
     /// Whether an action that changes state may run now; otherwise the reason
     /// goes to the bar. Every mutation asks this first (R18).
     pub fn mutation_allowed(&mut self) -> bool {
@@ -655,6 +683,11 @@ impl TaskApp {
         let Some(action) = keymap::lookup(keys, &key) else {
             return Request::None;
         };
+        if self.active_agent_transcript_mode() == Some(crate::tui::transcript::DisplayMode::Raw)
+            && matches!(action, Action::Expand | Action::RawEntry | Action::RawAll)
+        {
+            return Request::None;
+        }
         let context = keys.base;
         match action {
             Action::Help => self.help_open = true,
@@ -667,6 +700,7 @@ impl TaskApp {
             | Action::Expand
             | Action::RawEntry
             | Action::RawAll
+            | Action::NextConversationView
             | Action::Follow
                 if context == Context::Details =>
             {

@@ -4,7 +4,7 @@
 //! reading position stable while a conversation grows or changes presentation.
 
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::scroll::{wrap_line, ScrollState};
 
@@ -50,7 +50,10 @@ impl From<String> for TranscriptEntryId {
 /// The reading representation selected by the operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
+    /// The semantic conversation projection.
     Rendered,
+    /// Every retained source event, with its observed time.
+    Chronology,
     Raw,
 }
 
@@ -112,10 +115,30 @@ pub struct TranscriptEntry {
     pub details: Option<Value>,
     /// Exact retained source bytes. This is never replaced by decoded text.
     pub raw: Vec<u8>,
+    /// Source-neutral lifecycle metadata used to recognize a safe, contiguous
+    /// summary card. Adapters decide which harness events qualify.
+    grouping: Option<TranscriptGrouping>,
+    /// Source identities represented by this item. A normal card has one;
+    /// a Conversation summary card has every source event it collapsed.
+    source_ids: Vec<TranscriptEntryId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptGrouping {
+    session_id: String,
+    family: String,
+    name: String,
+    phase: Option<String>,
+    correlation_id: Option<String>,
+    /// Unlike hook families, an operation is one start/result pair. Its
+    /// result may arrive after unrelated entries, so it is projected by its
+    /// correlation id rather than by contiguous source position.
+    operation: bool,
 }
 
 impl TranscriptEntry {
     pub fn new(id: TranscriptEntryId, rendered_lines: Vec<String>, raw: Vec<u8>) -> Self {
+        let source_ids = vec![id.clone()];
         Self {
             id,
             header: String::new(),
@@ -124,6 +147,8 @@ impl TranscriptEntry {
             technical_lines: Vec::new(),
             details: None,
             raw,
+            grouping: None,
+            source_ids,
         }
     }
 
@@ -140,6 +165,81 @@ impl TranscriptEntry {
     pub fn with_presentation(mut self, presentation: TranscriptPresentation) -> Self {
         self.presentation = presentation;
         self
+    }
+
+    /// Attaches the complete adapter-normalized operation tuple used by the
+    /// Conversation projection.  The tuple deliberately contains no source
+    /// JSON: presentation never reparses raw records to infer correlation.
+    pub fn with_operation_grouping(
+        mut self,
+        session_id: Option<&str>,
+        name: Option<&str>,
+        phase: Option<&str>,
+        correlation_id: Option<&str>,
+    ) -> Self {
+        let Some(session_id) = session_id else {
+            return self;
+        };
+        let Some(name) = name.filter(|name| !name.is_empty()) else {
+            return self;
+        };
+        self.grouping = Some(TranscriptGrouping {
+            session_id: session_id.to_owned(),
+            family: "Hooki".to_owned(),
+            name: name.to_owned(),
+            phase: phase.map(str::to_owned),
+            correlation_id: correlation_id.map(str::to_owned),
+            operation: false,
+        });
+        self
+    }
+
+    /// Names the technical family shown by a contiguous summary card.
+    pub fn with_group_family(mut self, family: impl Into<String>) -> Self {
+        if let Some(grouping) = &mut self.grouping {
+            grouping.family = family.into();
+        }
+        self
+    }
+
+    /// Attaches one correlated tool or skill operation.  This is deliberately
+    /// distinct from a hook family: multiple operations can interleave and
+    /// must still remain independently expandable and diagnosable.
+    pub fn with_correlated_operation(
+        mut self,
+        session_id: Option<&str>,
+        name: Option<&str>,
+        phase: Option<&str>,
+        correlation_id: Option<&str>,
+    ) -> Self {
+        let Some(session_id) = session_id else {
+            return self;
+        };
+        let Some(name) = name.filter(|name| !name.is_empty()) else {
+            return self;
+        };
+        let Some(correlation_id) = correlation_id.filter(|id| !id.is_empty()) else {
+            return self;
+        };
+        self.grouping = Some(TranscriptGrouping {
+            session_id: session_id.to_owned(),
+            family: "Narzędzie".to_owned(),
+            name: name.to_owned(),
+            phase: phase.map(str::to_owned),
+            correlation_id: Some(correlation_id.to_owned()),
+            operation: true,
+        });
+        self
+    }
+
+    /// Prefixes all stable source identities when composing several attempts.
+    pub fn prefix_source_ids(&mut self, prefix: &str) {
+        self.id = TranscriptEntryId::from(format!("{prefix}/{}", self.id.as_str()));
+        self.source_ids = self
+            .source_ids
+            .iter()
+            .map(|id| TranscriptEntryId::from(format!("{prefix}/{}", id.as_str())))
+            .collect();
     }
 }
 
@@ -219,7 +319,12 @@ pub struct TranscriptState {
     loaded: bool,
     expanded: HashSet<ExpansionIdentity>,
     raw_entries: HashSet<ExpansionIdentity>,
+    /// A group is a view over an append-only history. Once an operator opens
+    /// it (or asks for its source), retain that exact member set: later events
+    /// must not appear inside an already-open card.
+    revealed_members: HashMap<ExpansionIdentity, HashSet<TranscriptEntryId>>,
     selected: Option<TranscriptEntryId>,
+    selected_source: Option<TranscriptEntryId>,
 }
 
 impl TranscriptState {
@@ -234,7 +339,9 @@ impl TranscriptState {
             loaded: false,
             expanded: HashSet::new(),
             raw_entries: HashSet::new(),
+            revealed_members: HashMap::new(),
             selected: None,
+            selected_source: None,
         }
     }
 
@@ -272,7 +379,11 @@ impl TranscriptState {
     /// transcript which remains ready to follow its first appended entry.
     pub fn load(&mut self, entries: Vec<TranscriptEntry>) {
         self.entries = entries;
-        self.selected = self.entries.last().map(|entry| entry.id.clone());
+        self.selected = self
+            .projected_entries()
+            .last()
+            .map(|entry| entry.id.clone());
+        self.selected_source = self.entries.last().map(|entry| entry.id.clone());
         self.loaded = true;
         self.following_end = true;
         self.scroll.to_bottom(self.total_lines());
@@ -286,7 +397,10 @@ impl TranscriptState {
             return;
         }
         let anchor = self.anchor();
-        let selected = self.selected.clone();
+        let selected = self
+            .selected_source
+            .clone()
+            .or_else(|| self.selected.clone());
         let following = self.following_end;
         self.entries = entries;
         self.restore_selection(selected);
@@ -303,12 +417,22 @@ impl TranscriptState {
         let following = self.following_end;
         self.entries.extend(entries);
         if following {
-            self.selected = self.entries.last().map(|entry| entry.id.clone());
+            self.selected = self
+                .projected_entries()
+                .last()
+                .map(|entry| entry.id.clone());
+            self.selected_source = self
+                .projected_entries()
+                .last()
+                .and_then(|entry| entry.source_ids.last().cloned());
         }
         self.restore_after_change(anchor, following);
     }
 
     pub fn set_viewport(&mut self, height: usize) {
+        if self.scroll.viewport() == height {
+            return;
+        }
         let anchor = self.anchor();
         let following = self.following_end;
         self.scroll.set_viewport(height);
@@ -316,9 +440,13 @@ impl TranscriptState {
     }
 
     pub fn set_width(&mut self, width: usize) {
+        let width = width.max(1);
+        if self.width == width {
+            return;
+        }
         let anchor = self.anchor();
         let following = self.following_end;
-        self.width = width.max(1);
+        self.width = width;
         self.restore_after_change(anchor, following);
     }
 
@@ -328,7 +456,12 @@ impl TranscriptState {
         }
         let anchor = self.anchor();
         let following = self.following_end;
+        let source = self
+            .selected_source
+            .clone()
+            .or_else(|| self.selected.clone());
         self.mode = mode;
+        self.restore_selection(source);
         self.restore_after_change(anchor, following);
     }
 
@@ -336,6 +469,16 @@ impl TranscriptState {
     pub fn toggle_mode(&mut self) {
         self.set_mode(match self.mode {
             DisplayMode::Rendered => DisplayMode::Raw,
+            DisplayMode::Chronology | DisplayMode::Raw => DisplayMode::Rendered,
+        });
+    }
+
+    /// Advances the three agent-conversation projections without changing
+    /// generic readers, which still use [`Self::toggle_mode`].
+    pub fn next_conversation_view(&mut self) {
+        self.set_mode(match self.mode {
+            DisplayMode::Rendered => DisplayMode::Chronology,
+            DisplayMode::Chronology => DisplayMode::Raw,
             DisplayMode::Raw => DisplayMode::Rendered,
         });
     }
@@ -354,12 +497,54 @@ impl TranscriptState {
         let identity = self.expansion_identity(&entry);
         if !self.raw_entries.insert(identity.clone()) {
             self.raw_entries.remove(&identity);
+            self.forget_revealed_members_if_hidden(&identity);
+        } else {
+            self.remember_revealed_members(&entry, &identity);
         }
         self.restore_after_change(anchor, following);
     }
 
     pub fn is_raw(&self, entry: &TranscriptEntryId) -> bool {
-        self.raw_entries.contains(&self.expansion_identity(entry))
+        if self.raw_entries.contains(&self.expansion_identity(entry)) {
+            return true;
+        }
+        if let Some(group_identity) = self.group_identity_for(entry) {
+            if self
+                .revealed_members
+                .get(&group_identity)
+                .is_some_and(|snapshot| !snapshot.contains(entry))
+            {
+                return false;
+            }
+        }
+        let Some(index) = self.entries.iter().position(|source| source.id == *entry) else {
+            return false;
+        };
+        let Some(grouping) = self.entries[index].grouping.as_ref() else {
+            return false;
+        };
+        let same_group = |source: &TranscriptEntry| {
+            source.grouping.as_ref().is_some_and(|source_grouping| {
+                source_grouping.session_id == grouping.session_id
+                    && if grouping.operation {
+                        source_grouping.operation
+                            && source_grouping.correlation_id == grouping.correlation_id
+                    } else {
+                        !source_grouping.operation && source_grouping.name == grouping.name
+                    }
+            })
+        };
+        let start = (0..index)
+            .rev()
+            .take_while(|&candidate| same_group(&self.entries[candidate]))
+            .last()
+            .unwrap_or(index);
+        (start..self.entries.len())
+            .take_while(|&candidate| same_group(&self.entries[candidate]))
+            .any(|candidate| {
+                self.raw_entries
+                    .contains(&self.expansion_identity(&self.entries[candidate].id))
+            })
     }
 
     pub fn toggle_expanded(&mut self, entry: &TranscriptEntryId) {
@@ -368,6 +553,9 @@ impl TranscriptState {
         let identity = self.expansion_identity(entry);
         if !self.expanded.insert(identity.clone()) {
             self.expanded.remove(&identity);
+            self.forget_revealed_members_if_hidden(&identity);
+        } else {
+            self.remember_revealed_members(entry, &identity);
         }
         self.restore_after_change(anchor, following);
     }
@@ -393,13 +581,13 @@ impl TranscriptState {
     }
 
     pub fn to_top(&mut self) {
-        if let Some(entry) = self.entries.first() {
+        if let Some(entry) = self.projected_entries().first() {
             self.select(entry.id.clone());
         }
     }
 
     pub fn to_bottom(&mut self) {
-        if let Some(entry) = self.entries.last() {
+        if let Some(entry) = self.projected_entries().last() {
             self.select(entry.id.clone());
         }
         self.following_end = true;
@@ -407,11 +595,12 @@ impl TranscriptState {
 
     pub fn logical_lines(&self) -> Vec<TranscriptLine> {
         let mut lines = Vec::new();
-        for (index, entry) in self.entries.iter().enumerate() {
+        let entries = self.projected_entries();
+        for (index, entry) in entries.iter().enumerate() {
             let entry_lines = self.lines_for(entry);
             let next_logical_line = entry_lines.len();
             lines.extend(entry_lines);
-            if index + 1 < self.entries.len() {
+            if index + 1 < entries.len() {
                 lines.push(TranscriptLine {
                     entry_id: entry.id.clone(),
                     logical_line: next_logical_line,
@@ -427,10 +616,8 @@ impl TranscriptState {
 
     pub fn anchor(&self) -> Option<TranscriptAnchor> {
         let entry_id = self.selected.as_ref()?;
-        let entry_index = self
-            .entries
-            .iter()
-            .position(|entry| entry.id == *entry_id)?;
+        let entries = self.projected_entries();
+        let entry_index = entries.iter().position(|entry| entry.id == *entry_id)?;
         Some(TranscriptAnchor {
             entry_id: entry_id.clone(),
             logical_line: 0,
@@ -452,34 +639,51 @@ impl TranscriptState {
     }
 
     fn restore_selection(&mut self, selected: Option<TranscriptEntryId>) {
+        let entries = self.projected_entries();
         self.selected = selected
-            .filter(|id| self.entries.iter().any(|entry| &entry.id == id))
-            .or_else(|| self.entries.last().map(|entry| entry.id.clone()));
+            .clone()
+            .and_then(|id| Self::projected_id_for(&entries, &id))
+            .or_else(|| entries.last().map(|entry| entry.id.clone()));
+        self.selected_source = selected.or_else(|| self.selected.clone());
     }
 
     fn move_selected(&mut self, delta: isize) {
+        let entries = self.projected_entries();
         let Some(current) = self
             .selected
             .as_ref()
-            .and_then(|id| self.entries.iter().position(|entry| &entry.id == id))
+            .and_then(|id| entries.iter().position(|entry| &entry.id == id))
         else {
             return;
         };
-        let next = (current as isize + delta)
-            .clamp(0, self.entries.len().saturating_sub(1) as isize) as usize;
-        self.select(self.entries[next].id.clone());
+        let next =
+            (current as isize + delta).clamp(0, entries.len().saturating_sub(1) as isize) as usize;
+        self.select(entries[next].id.clone());
     }
 
     fn select(&mut self, entry: TranscriptEntryId) {
+        let entries = self.projected_entries();
+        let source = entries
+            .iter()
+            .find(|item| item.id == entry)
+            .and_then(|item| {
+                self.selected_source
+                    .as_ref()
+                    .filter(|source| item.source_ids.contains(source))
+                    .cloned()
+                    .or_else(|| item.source_ids.first().cloned())
+            })
+            .unwrap_or_else(|| entry.clone());
         self.selected = Some(entry.clone());
-        if let Some(index) = self.entries.iter().position(|item| item.id == entry) {
-            let preceding = self.entries[..index]
+        self.selected_source = Some(source);
+        if let Some(index) = entries.iter().position(|item| item.id == entry) {
+            let preceding = entries[..index]
                 .iter()
                 .map(|item| self.visual_line_count_for(item) + 1)
                 .sum();
             self.scroll.set_offset(preceding, self.total_lines());
         }
-        self.following_end = self.entries.last().is_some_and(|last| last.id == entry);
+        self.following_end = entries.last().is_some_and(|last| last.id == entry);
     }
 
     fn restore_anchor(&mut self, anchor: Option<TranscriptAnchor>) {
@@ -487,20 +691,20 @@ impl TranscriptState {
             self.scroll.clamp(self.total_lines());
             return;
         };
-        if self.entries.is_empty() {
+        let entries = self.projected_entries();
+        if entries.is_empty() {
             self.scroll.set_offset(0, 0);
             return;
         }
-        let index = self
-            .entries
+        let index = entries
             .iter()
             .position(|entry| entry.id == anchor.entry_id)
-            .unwrap_or_else(|| anchor.entry_index.min(self.entries.len() - 1));
-        let entry = &self.entries[index];
+            .unwrap_or_else(|| anchor.entry_index.min(entries.len() - 1));
+        let entry = &entries[index];
         let local_line = anchor
             .logical_line
             .min(self.lines_for(entry).len().saturating_sub(1));
-        let preceding = self.entries[..index]
+        let preceding = entries[..index]
             .iter()
             .map(|item| self.visual_line_count_for(item) + 1)
             .sum::<usize>();
@@ -509,13 +713,281 @@ impl TranscriptState {
     }
 
     fn total_lines(&self) -> usize {
-        self.entries
+        let entries = self.projected_entries();
+        entries
             .iter()
             .enumerate()
             .map(|(index, entry)| {
-                self.visual_line_count_for(entry) + usize::from(index + 1 < self.entries.len())
+                self.visual_line_count_for(entry) + usize::from(index + 1 < entries.len())
             })
             .sum()
+    }
+
+    fn projected_id_for(
+        entries: &[TranscriptEntry],
+        source_or_projected: &TranscriptEntryId,
+    ) -> Option<TranscriptEntryId> {
+        entries
+            .iter()
+            .find(|entry| {
+                entry.id == *source_or_projected
+                    || entry.source_ids.iter().any(|id| id == source_or_projected)
+            })
+            .map(|entry| entry.id.clone())
+    }
+
+    fn projected_entries(&self) -> Vec<TranscriptEntry> {
+        if self.mode != DisplayMode::Rendered {
+            return self.entries.clone();
+        }
+        let mut projected = Vec::new();
+        let mut cursor = 0;
+        while cursor < self.entries.len() {
+            let entry = &self.entries[cursor];
+            let Some(grouping) = entry.grouping.as_ref() else {
+                projected.push(entry.clone());
+                cursor += 1;
+                continue;
+            };
+            // A lifecycle card is only safe when the adapter supplied an
+            // operation identity. Similar-looking records without one stay
+            // individually reachable rather than being guessed into a group.
+            if grouping.correlation_id.is_none() {
+                projected.push(entry.clone());
+                cursor += 1;
+                continue;
+            }
+            if grouping.operation {
+                let correlation_id = grouping.correlation_id.as_deref().expect("checked above");
+                let same_operation = |candidate: &TranscriptEntry| {
+                    candidate
+                        .grouping
+                        .as_ref()
+                        .is_some_and(|candidate_grouping| {
+                            candidate_grouping.operation
+                                && candidate_grouping.session_id == grouping.session_id
+                                && candidate_grouping.correlation_id.as_deref()
+                                    == Some(correlation_id)
+                        })
+                };
+                if grouping.phase.as_deref() != Some("started") {
+                    let started_before = self.entries[..cursor].iter().any(|candidate| {
+                        same_operation(candidate)
+                            && candidate.grouping.as_ref().is_some_and(|metadata| {
+                                metadata.phase.as_deref() == Some("started")
+                            })
+                    });
+                    if started_before {
+                        let start = self.entries[..cursor]
+                            .iter()
+                            .rposition(|candidate| {
+                                same_operation(candidate)
+                                    && candidate.grouping.as_ref().is_some_and(|metadata| {
+                                        metadata.phase.as_deref() == Some("started")
+                                    })
+                            })
+                            .expect("started operation exists");
+                        let group_identity = self.expansion_identity(&self.entries[start].id);
+                        if self
+                            .revealed_members
+                            .get(&group_identity)
+                            .is_none_or(|snapshot| snapshot.contains(&entry.id))
+                        {
+                            cursor += 1;
+                            continue;
+                        }
+                    }
+                    projected.push(entry.clone());
+                    cursor += 1;
+                    continue;
+                }
+                let mut members = vec![entry];
+                if let Some(completed) = self.entries[cursor + 1..].iter().find(|candidate| {
+                    same_operation(candidate)
+                        && candidate
+                            .grouping
+                            .as_ref()
+                            .is_some_and(|metadata| metadata.phase.as_deref() == Some("completed"))
+                }) {
+                    members.push(completed);
+                }
+                let group_identity = self.expansion_identity(&entry.id);
+                let included: Vec<_> = self
+                    .revealed_members
+                    .get(&group_identity)
+                    .map(|snapshot| {
+                        members
+                            .iter()
+                            .copied()
+                            .filter(|member| snapshot.contains(&member.id))
+                            .collect()
+                    })
+                    .unwrap_or(members);
+                let mut operation = included[0].clone();
+                let completed = included.iter().any(|member| {
+                    member
+                        .grouping
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.phase.as_deref() == Some("completed"))
+                });
+                let failed = included.iter().any(|member| {
+                    member.presentation == TranscriptPresentation::Error
+                        || member.details.as_ref().is_some_and(|details| {
+                            details
+                                .get("error.message")
+                                .is_some_and(|error| !error.is_null() && error != "")
+                        })
+                });
+                let mut summary = format!(
+                    "Narzędzie · {} · {}",
+                    grouping.name,
+                    if completed { "zakończone" } else { "w toku" }
+                );
+                if failed {
+                    summary.push_str(" · błąd");
+                }
+                operation.rendered_lines = vec![summary];
+                operation.technical_lines = included
+                    .iter()
+                    .flat_map(|member| {
+                        let mut lines = vec![member.header.clone()];
+                        lines.extend(member.rendered_lines.clone());
+                        lines
+                    })
+                    .collect();
+                operation.raw = included
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, member)| {
+                        (index > 0)
+                            .then_some(b'\n')
+                            .into_iter()
+                            .chain(member.raw.iter().copied())
+                    })
+                    .collect();
+                operation.source_ids = included
+                    .iter()
+                    .flat_map(|member| member.source_ids.clone())
+                    .collect();
+                operation.grouping = None;
+                projected.push(operation);
+                cursor += 1;
+                continue;
+            }
+            let mut end = cursor;
+            while end < self.entries.len() {
+                let candidate = &self.entries[end];
+                let Some(candidate_grouping) = candidate.grouping.as_ref() else {
+                    break;
+                };
+                if candidate_grouping.session_id != grouping.session_id
+                    || candidate_grouping.name != grouping.name
+                {
+                    break;
+                }
+                end += 1;
+            }
+            if end - cursor < 2 {
+                projected.push(entry.clone());
+                cursor += 1;
+                continue;
+            }
+            let members = &self.entries[cursor..end];
+            let group_identity = self.expansion_identity(&entry.id);
+            let included: Vec<_> = self
+                .revealed_members
+                .get(&group_identity)
+                .map(|snapshot| {
+                    members
+                        .iter()
+                        .filter(|member| snapshot.contains(&member.id))
+                        .collect()
+                })
+                .unwrap_or_else(|| members.iter().collect());
+            if included.is_empty() {
+                cursor = end;
+                continue;
+            }
+            let mut group = (*included[0]).clone();
+            let has_error = included.iter().any(|member| {
+                member.presentation == TranscriptPresentation::Error
+                    || member
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("error.message"))
+                        .is_some_and(|error| !error.is_null() && error != "")
+            });
+            let mut operations: std::collections::BTreeMap<&str, bool> =
+                std::collections::BTreeMap::new();
+            for member in &included {
+                let Some(metadata) = member.grouping.as_ref() else {
+                    continue;
+                };
+                let Some(id) = metadata.correlation_id.as_deref() else {
+                    continue;
+                };
+                match metadata.phase.as_deref() {
+                    Some("started") => {
+                        operations.entry(id).or_insert(false);
+                    }
+                    Some("completed") => {
+                        if let Some(done) = operations.get_mut(id) {
+                            *done = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let completed = operations.values().filter(|done| **done).count();
+            let in_progress = operations.values().filter(|done| !**done).count();
+            let mut summary = format!("{} · {}", grouping.family, grouping.name);
+            if !operations.is_empty() {
+                summary.push_str(&format!(" · {completed} zakończone · {in_progress} w toku"));
+            } else {
+                summary.push_str(&format!(" · {} wpisy", included.len()));
+            }
+            if has_error {
+                summary.push_str(" · błąd");
+            }
+            group.rendered_lines = vec![summary];
+            group.technical_lines = included
+                .iter()
+                .flat_map(|member| {
+                    let mut lines = vec![member.header.clone()];
+                    lines.extend(member.rendered_lines.clone());
+                    lines
+                })
+                .collect();
+            group.raw = included
+                .iter()
+                .enumerate()
+                .flat_map(|(index, member)| {
+                    (index > 0)
+                        .then_some(b'\n')
+                        .into_iter()
+                        .chain(member.raw.iter().copied())
+                })
+                .collect();
+            group.source_ids = included
+                .iter()
+                .flat_map(|member| member.source_ids.clone())
+                .collect();
+            group.grouping = None;
+            projected.push(group);
+            // A frozen reveal must not absorb later records, but it must not
+            // make them disappear either. Keep newly appended members as
+            // independent cards until the original group is collapsed.
+            if let Some(snapshot) = self.revealed_members.get(&group_identity) {
+                projected.extend(
+                    members
+                        .iter()
+                        .filter(|member| !snapshot.contains(&member.id))
+                        .cloned(),
+                );
+            }
+            cursor = end;
+        }
+        projected
     }
 
     fn visual_line_count_for(&self, entry: &TranscriptEntry) -> usize {
@@ -534,7 +1006,7 @@ impl TranscriptState {
                     false,
                 )]
             }
-            DisplayMode::Rendered => {
+            DisplayMode::Rendered | DisplayMode::Chronology => {
                 if self.is_raw(&entry.id) {
                     vec![(
                         raw_display(&entry.raw),
@@ -559,7 +1031,11 @@ impl TranscriptState {
                     if lines.is_empty() {
                         lines.push((String::new(), TranscriptPresentation::Neutral, false));
                     }
-                    if self.is_expanded(&entry.id) {
+                    let expanded = self.is_expanded(&entry.id);
+                    if entry.source_ids.len() > 1 {
+                        lines[0].0 = format!("{} {}", if expanded { "v" } else { ">" }, lines[0].0);
+                    }
+                    if expanded {
                         lines.extend(
                             entry
                                 .technical_lines
@@ -568,6 +1044,10 @@ impl TranscriptState {
                                 .map(|text| (text, TranscriptPresentation::Technical, false)),
                         );
                     }
+                    // Conversation and Chronology intentionally share the
+                    // same card header. The source timestamp is already
+                    // shown as date, hour, minute and second; switching a
+                    // projection must not turn into a formatting change.
                     if !entry.header.is_empty() {
                         lines.insert(0, (entry.header.clone(), entry.presentation, true));
                     }
@@ -597,6 +1077,119 @@ impl TranscriptState {
             entry: entry.clone(),
         }
     }
+
+    fn remember_revealed_members(
+        &mut self,
+        entry: &TranscriptEntryId,
+        _identity: &ExpansionIdentity,
+    ) {
+        let Some(group_identity) = self.group_identity_for(entry) else {
+            return;
+        };
+        let members = self.group_members_for(&group_identity.entry);
+        if members.len() > 1
+            || self
+                .entries
+                .iter()
+                .find(|source| source.id == group_identity.entry)
+                .and_then(|source| source.grouping.as_ref())
+                .is_some_and(|grouping| grouping.operation)
+        {
+            self.revealed_members
+                .insert(group_identity, members.into_iter().collect());
+        }
+    }
+
+    fn forget_revealed_members_if_hidden(&mut self, identity: &ExpansionIdentity) {
+        let Some(group_identity) = self.group_identity_for(&identity.entry) else {
+            return;
+        };
+        let still_revealed = self
+            .group_members_for(&group_identity.entry)
+            .iter()
+            .any(|member| {
+                let member_identity = self.expansion_identity(member);
+                self.expanded.contains(&member_identity)
+                    || self.raw_entries.contains(&member_identity)
+            });
+        if !still_revealed {
+            self.revealed_members.remove(&group_identity);
+        }
+    }
+
+    /// The stable source which owns a rendered group.  A hook family owns a
+    /// contiguous run, while an operation owns the source that started its
+    /// correlation id even if its completion is later in the transcript.
+    fn group_identity_for(&self, entry: &TranscriptEntryId) -> Option<ExpansionIdentity> {
+        let index = self.entries.iter().position(|source| source.id == *entry)?;
+        let grouping = self.entries[index].grouping.as_ref()?;
+        if grouping.correlation_id.is_none() {
+            return None;
+        }
+        let primary = if grouping.operation {
+            self.entries
+                .iter()
+                .position(|candidate| {
+                    candidate.grouping.as_ref().is_some_and(|metadata| {
+                        metadata.operation
+                            && metadata.session_id == grouping.session_id
+                            && metadata.correlation_id == grouping.correlation_id
+                            && metadata.phase.as_deref() == Some("started")
+                    })
+                })
+                .unwrap_or(index)
+        } else {
+            (0..=index)
+                .rev()
+                .take_while(|&candidate| {
+                    self.entries[candidate]
+                        .grouping
+                        .as_ref()
+                        .is_some_and(|metadata| {
+                            !metadata.operation
+                                && metadata.session_id == grouping.session_id
+                                && metadata.name == grouping.name
+                        })
+                })
+                .last()
+                .unwrap_or(index)
+        };
+        Some(self.expansion_identity(&self.entries[primary].id))
+    }
+
+    fn group_members_for(&self, primary: &TranscriptEntryId) -> Vec<TranscriptEntryId> {
+        let Some(index) = self.entries.iter().position(|source| source.id == *primary) else {
+            return Vec::new();
+        };
+        let Some(grouping) = self.entries[index].grouping.as_ref() else {
+            return vec![primary.clone()];
+        };
+        if grouping.operation {
+            return self
+                .entries
+                .iter()
+                .filter(|candidate| {
+                    candidate.grouping.as_ref().is_some_and(|metadata| {
+                        metadata.operation
+                            && metadata.session_id == grouping.session_id
+                            && metadata.correlation_id == grouping.correlation_id
+                    })
+                })
+                .map(|candidate| candidate.id.clone())
+                .collect();
+        }
+        self.entries[index..]
+            .iter()
+            .take_while(|candidate| {
+                candidate.grouping.as_ref().is_some_and(|metadata| {
+                    !metadata.operation
+                        && metadata.session_id == grouping.session_id
+                        && metadata.name == grouping.name
+                })
+            })
+            .map(|candidate| candidate.id.clone())
+            .collect()
+    }
 }
 
 /// Shows retained bytes as readable, terminal-safe text.
@@ -621,4 +1214,281 @@ pub fn raw_display(raw: &[u8]) -> String {
         }
     }
     shown
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn hook_for_group(id: &str, event: &str, group_name: &str) -> TranscriptEntry {
+        let phase = match event {
+            "hook_started" => "started",
+            "hook_response" => "completed",
+            _ => event,
+        };
+        TranscriptEntry::new(
+            TranscriptEntryId::from(id),
+            vec![event.to_owned()],
+            format!("{{\"hook_id\":\"{id}\"}}").into_bytes(),
+        )
+        .with_header(format!("SYSTEM · Harness · 2026-10-11 12:00:00"))
+        .with_presentation(TranscriptPresentation::System)
+        .with_operation_grouping(Some("session"), Some(group_name), Some(phase), Some(id))
+    }
+
+    fn hook(id: &str, event: &str) -> TranscriptEntry {
+        hook_for_group(id, event, "SessionStart")
+    }
+
+    fn tool(id: &str, name: &str, phase: &str) -> TranscriptEntry {
+        TranscriptEntry::new(
+            TranscriptEntryId::from(format!("tool-{id}-{phase}")),
+            vec![format!("{phase}: {name}")],
+            format!("{{\"id\":\"{id}\",\"phase\":\"{phase}\"}}").into_bytes(),
+        )
+        .with_header("TECHNICZNE · Harness · 2026-10-11 12:00:00")
+        .with_presentation(TranscriptPresentation::Technical)
+        .with_correlated_operation(Some("session"), Some(name), Some(phase), Some(id))
+    }
+
+    #[test]
+    fn conversation_groups_all_contiguous_hook_events() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![
+            hook("one", "hook_started"),
+            hook("two", "hook_started"),
+            hook("two", "hook_response"),
+            hook("one", "hook_response"),
+        ]);
+
+        let rendered = transcript.logical_lines();
+        assert!(rendered
+            .iter()
+            .any(|line| line.text == "> Hooki · SessionStart · 2 zakończone · 0 w toku"));
+        assert_eq!(rendered.iter().filter(|line| line.header).count(), 1);
+
+        let group = transcript.selected_entry().cloned().unwrap();
+        transcript.toggle_expanded(&group);
+        assert!(transcript
+            .logical_lines()
+            .iter()
+            .any(|line| { line.text == "v Hooki · SessionStart · 2 zakończone · 0 w toku" }));
+
+        transcript.next_conversation_view();
+        let chronology = transcript.logical_lines();
+        assert_eq!(chronology.iter().filter(|line| line.header).count(), 4);
+        assert_eq!(
+            transcript.selected_entry(),
+            Some(&TranscriptEntryId::from("one"))
+        );
+    }
+
+    #[test]
+    fn conversation_pairs_interleaved_operations_by_id() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![
+            tool("one", "bash", "started"),
+            tool("two", "search", "started"),
+            tool("two", "search", "completed"),
+            tool("one", "bash", "completed"),
+        ]);
+
+        let rendered = transcript.logical_lines();
+        assert!(rendered
+            .iter()
+            .any(|line| line.text == "> Narzędzie · bash · zakończone"));
+        assert!(rendered
+            .iter()
+            .any(|line| line.text == "> Narzędzie · search · zakończone"));
+        assert_eq!(rendered.iter().filter(|line| line.header).count(), 2);
+    }
+
+    #[test]
+    fn operation_summary_exposes_a_result_error_without_expansion() {
+        let mut result = tool("one", "bash", "completed");
+        result.details = Some(serde_json::json!({"error.message": "permission denied"}));
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![tool("one", "bash", "started"), result]);
+
+        assert!(transcript
+            .logical_lines()
+            .iter()
+            .any(|line| line.text == "> Narzędzie · bash · zakończone · błąd"));
+    }
+
+    #[test]
+    fn local_raw_from_chronology_freezes_future_group_members() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![
+            hook("one", "hook_started"),
+            hook("two", "hook_started"),
+        ]);
+        transcript.next_conversation_view();
+        transcript.line_up();
+        transcript.toggle_selected_raw();
+        let mut response = hook("two", "hook_response");
+        response.id = TranscriptEntryId::from("two-response");
+        response.source_ids = vec![TranscriptEntryId::from("two-response")];
+        transcript.append(vec![response]);
+        transcript.set_mode(DisplayMode::Rendered);
+
+        let rendered = transcript.logical_lines();
+        assert_eq!(
+            rendered
+                .iter()
+                .map(|line| &line.entry_id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn chronology_keeps_the_same_second_precision_header_as_conversation() {
+        let at = Utc.with_ymd_and_hms(2026, 10, 11, 12, 34, 56).unwrap();
+        let entry = TranscriptEntry::new(
+            TranscriptEntryId::from("one"),
+            vec!["message".into()],
+            Vec::new(),
+        )
+        .with_header(utterance_header(TranscriptPresentation::Agent, "Agent", at))
+        .with_presentation(TranscriptPresentation::Agent);
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![entry]);
+        let conversation_header = transcript.logical_lines()[0].text.clone();
+        transcript.next_conversation_view();
+        assert_eq!(transcript.logical_lines()[0].text, conversation_header);
+    }
+
+    #[test]
+    fn conversation_keeps_different_hook_families_separate() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![
+            hook_for_group("one", "hook_started", "SessionStart"),
+            hook_for_group("two", "hook_response", "OtherLifecycle"),
+            hook_for_group("one", "hook_response", "SessionStart"),
+        ]);
+
+        let rendered = transcript.logical_lines();
+        assert_eq!(rendered.iter().filter(|line| line.header).count(), 3);
+        assert!(rendered.iter().any(|line| line.text == "hook_started"));
+    }
+
+    #[test]
+    fn conversation_groups_adjacent_hooks_even_when_one_is_unpaired() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![
+            hook("unpaired", "hook_started"),
+            hook("paired", "hook_started"),
+            hook("paired", "hook_response"),
+        ]);
+
+        let rendered = transcript.logical_lines();
+        assert_eq!(rendered.iter().filter(|line| line.header).count(), 1);
+        assert!(rendered
+            .iter()
+            .any(|line| line.text == "> Hooki · SessionStart · 1 zakończone · 1 w toku"));
+    }
+
+    #[test]
+    fn revealed_group_does_not_absorb_later_members() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![
+            hook("one", "hook_started"),
+            hook("two", "hook_started"),
+        ]);
+        let group = transcript.selected_entry().cloned().unwrap();
+        transcript.toggle_expanded(&group);
+        transcript.append(vec![hook("three", "hook_started")]);
+
+        let lines: Vec<_> = transcript
+            .logical_lines()
+            .into_iter()
+            .map(|line| line.text)
+            .collect();
+        assert!(lines.iter().any(|line| line == "hook_started"));
+        assert_eq!(
+            lines.iter().filter(|line| *line == "hook_started").count(),
+            3
+        );
+        assert!(lines
+            .iter()
+            .any(|line| line == "v Hooki · SessionStart · 0 zakończone · 2 w toku"));
+    }
+
+    #[test]
+    fn closing_local_raw_keeps_an_expanded_group_frozen() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![
+            hook("one", "hook_started"),
+            hook("two", "hook_started"),
+        ]);
+        let group = transcript.selected_entry().cloned().unwrap();
+        transcript.toggle_expanded(&group);
+        transcript.toggle_selected_raw();
+        transcript.toggle_selected_raw();
+        transcript.append(vec![hook("three", "hook_started")]);
+
+        assert_eq!(
+            transcript
+                .logical_lines()
+                .iter()
+                .filter(|line| line.text == "hook_started")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn hooks_without_correlation_remain_separate() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        let uncorrelated = |id: &str| {
+            TranscriptEntry::new(TranscriptEntryId::from(id), vec![id.into()], Vec::new())
+                .with_operation_grouping(
+                    Some("session"),
+                    Some("SessionStart"),
+                    Some("started"),
+                    None,
+                )
+        };
+        transcript.load(vec![uncorrelated("one"), uncorrelated("two")]);
+        assert_eq!(
+            transcript
+                .logical_lines()
+                .iter()
+                .filter(|line| line.header)
+                .count(),
+            0
+        );
+        assert_eq!(
+            transcript
+                .logical_lines()
+                .iter()
+                .filter(|line| line.text == "one" || line.text == "two")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_the_source_selected_inside_a_group() {
+        let entries = vec![hook("one", "hook_started"), hook("two", "hook_started")];
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(entries.clone());
+        transcript.set_mode(DisplayMode::Chronology);
+        transcript.line_down();
+        assert_eq!(
+            transcript.selected_entry(),
+            Some(&TranscriptEntryId::from("two"))
+        );
+
+        transcript.set_mode(DisplayMode::Rendered);
+        transcript.replace_entries(entries);
+        transcript.set_mode(DisplayMode::Chronology);
+        assert_eq!(
+            transcript.selected_entry(),
+            Some(&TranscriptEntryId::from("two"))
+        );
+    }
 }

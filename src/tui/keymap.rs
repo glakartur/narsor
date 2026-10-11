@@ -81,11 +81,13 @@ pub enum Context {
     StepConversation,
     /// A layer over either details: reading any tab but *Przebieg*.
     Reading,
+    /// A layer over either details: the task-wide agent conversation.
+    AgentConversation,
 }
 
 impl Context {
     /// Every context, in the order help and tests walk them.
-    pub const ALL: [Context; 15] = [
+    pub const ALL: [Context; 16] = [
         Context::Global,
         Context::List,
         Context::Details,
@@ -101,6 +103,7 @@ impl Context {
         Context::HistoryAxis,
         Context::StepConversation,
         Context::Reading,
+        Context::AgentConversation,
     ];
 
     /// The name help uses.
@@ -120,6 +123,7 @@ impl Context {
             Self::Axis | Self::HistoryAxis => "oś",
             Self::StepConversation => "rozmowa kroku",
             Self::Reading => "czytanie",
+            Self::AgentConversation => "rozmowa",
         }
     }
 
@@ -128,7 +132,11 @@ impl Context {
     pub fn is_layer(self) -> bool {
         matches!(
             self,
-            Self::Axis | Self::HistoryAxis | Self::StepConversation | Self::Reading
+            Self::Axis
+                | Self::HistoryAxis
+                | Self::StepConversation
+                | Self::Reading
+                | Self::AgentConversation
         )
     }
 
@@ -152,13 +160,15 @@ pub struct Stack {
 
 impl Stack {
     /// The stacks with a layer, each layer over the bases it goes with.
-    pub const LAYERED: [Stack; 6] = [
+    pub const LAYERED: [Stack; 8] = [
         Stack::layered(Context::Axis, Context::Details),
         Stack::layered(Context::StepConversation, Context::Details),
         Stack::layered(Context::Reading, Context::Details),
         Stack::layered(Context::HistoryAxis, Context::HistoryDetails),
         Stack::layered(Context::StepConversation, Context::HistoryDetails),
         Stack::layered(Context::Reading, Context::HistoryDetails),
+        Stack::layered(Context::AgentConversation, Context::Details),
+        Stack::layered(Context::AgentConversation, Context::HistoryDetails),
     ];
 
     /// `layer` over `base`.
@@ -182,7 +192,10 @@ impl Stack {
     /// The contexts to look in, first to last.
     pub fn scopes(self) -> impl Iterator<Item = Context> {
         let global = self.base.inherits_global().then_some(Context::Global);
-        [self.layer, Some(self.base), global].into_iter().flatten()
+        let reading = (self.layer == Some(Context::AgentConversation)).then_some(Context::Reading);
+        [self.layer, reading, Some(self.base), global]
+            .into_iter()
+            .flatten()
     }
 }
 
@@ -238,6 +251,8 @@ pub enum Action {
     RawEntry,
     /// The raw view of everything.
     RawAll,
+    /// Advance an agent conversation through Conversation, Chronology and RAW.
+    NextConversationView,
     /// Follow the step that is running; in a reader, to the end and after
     /// what comes.
     Follow,
@@ -1447,16 +1462,32 @@ pub static BINDINGS: &[Binding] = &[
     bind(
         Context::StepConversation,
         Key::char('v'),
-        Action::RawEntry,
-        "",
-        "widok surowy wpisu",
+        Action::NextConversationView,
+        "widok",
+        "następny widok rozmowy",
     ),
     bind(
         Context::StepConversation,
-        Key::ctrl('v'),
-        Action::RawAll,
-        "",
-        "widok surowy całości",
+        Key::char('r'),
+        Action::RawEntry,
+        "źródło",
+        "pokaż albo ukryj źródło wpisu",
+    ),
+    // The complete agent conversation reuses reading navigation through its
+    // stack, while its view-specific keys do not alter generic readers.
+    bind(
+        Context::AgentConversation,
+        Key::char('v'),
+        Action::NextConversationView,
+        "widok",
+        "następny widok rozmowy",
+    ),
+    bind(
+        Context::AgentConversation,
+        Key::char('r'),
+        Action::RawEntry,
+        "źródło",
+        "pokaż albo ukryj źródło wpisu",
     ),
     // Every other tab: reading what it shows.
     bind(
@@ -1697,7 +1728,9 @@ pub fn newline_keys() -> Vec<&'static str> {
 /// What `event` does in `stack`: the layer's keys first, then the base's,
 /// then the global ones where the base inherits them.
 pub fn lookup(stack: impl Into<Stack>, event: &KeyEvent) -> Option<Action> {
-    lookup_in(BINDINGS, stack, event)
+    let stack = stack.into();
+    let action = lookup_in(BINDINGS, stack, event)?;
+    (stack.layer != Some(Context::AgentConversation) || action != Action::RawAll).then_some(action)
 }
 
 /// [`lookup`] over an arbitrary table.
@@ -1762,6 +1795,18 @@ pub fn check_consistency(bindings: &[Binding]) -> Result<(), Vec<String>> {
                 .iter()
                 .filter(|other| other.key == binding.key)
             {
+                // Agent conversations deliberately refine the generic reader:
+                // `v` changes their projection while generic readers retain
+                // their local raw shortcut.
+                if (other.context == Context::AgentConversation
+                    && binding.context == Context::Reading)
+                    || (matches!(
+                        other.context,
+                        Context::AgentConversation | Context::StepConversation
+                    ) && binding.context == Context::Details)
+                {
+                    continue;
+                }
                 let problem = if other.context == binding.context {
                     format!(
                         "({}, {label}) is bound twice: {:?} and {:?}",
@@ -1805,14 +1850,46 @@ pub struct HelpEntry {
 /// The help for `stack`: the layer's keys, the base's, then the global ones
 /// the base inherits. Keys that do the same thing are written on one line.
 pub fn help_entries(stack: impl Into<Stack>) -> Vec<HelpEntry> {
-    help_entries_in(BINDINGS, stack)
+    help_entries_excluding(stack, &[])
+}
+
+/// The help for an agent conversation's RAW projection, where the payload is
+/// already visible and entry expansion is unavailable.
+pub fn raw_conversation_help_entries(stack: impl Into<Stack>) -> Vec<HelpEntry> {
+    help_entries_excluding(stack, &[Action::Expand, Action::RawEntry, Action::RawAll])
+}
+
+fn help_entries_excluding(stack: impl Into<Stack>, excluded: &[Action]) -> Vec<HelpEntry> {
+    let stack = stack.into();
+    let bindings: Vec<_> = BINDINGS
+        .iter()
+        .copied()
+        .filter(|binding| {
+            !excluded.contains(&binding.action)
+                && !(stack.layer == Some(Context::AgentConversation)
+                    && binding.action == Action::RawAll)
+        })
+        .collect();
+    help_entries_in(&bindings, stack)
 }
 
 /// [`help_entries`] over an arbitrary table.
 pub fn help_entries_in(bindings: &[Binding], stack: impl Into<Stack>) -> Vec<HelpEntry> {
+    help_entries_matching(bindings, stack, |_| true)
+}
+
+fn help_entries_matching(
+    bindings: &[Binding],
+    stack: impl Into<Stack>,
+    include: impl Fn(&Binding) -> bool,
+) -> Vec<HelpEntry> {
+    let stack = stack.into();
     let mut entries: Vec<(Context, Action, Vec<String>, &Binding)> = Vec::new();
-    for scope in stack.into().scopes() {
-        for binding in bindings.iter().filter(|binding| binding.context == scope) {
+    for scope in stack.scopes() {
+        for binding in bindings
+            .iter()
+            .filter(|binding| binding.context == scope && include(binding))
+        {
             let key = binding.key.display();
             match entries.iter_mut().find(|(entry_scope, action, ..)| {
                 *entry_scope == scope && *action == binding.action
@@ -1847,13 +1924,37 @@ pub fn hints(stack: impl Into<Stack>) -> Vec<(String, &'static str)> {
         .collect()
 }
 
+pub fn raw_conversation_hints(stack: impl Into<Stack>) -> Vec<(String, &'static str)> {
+    raw_conversation_help_entries(stack)
+        .into_iter()
+        .filter(|entry| !entry.label.is_empty())
+        .map(|entry| (entry.keys, entry.label))
+        .collect()
+}
+
 /// The shortcut bar as one line that fits `width` columns: the keys on the
 /// focus accent, the labels plain. Hints that do not fit are dropped from
 /// the end, so the first ones — the ones that matter — stay.
 pub fn hint_line(stack: impl Into<Stack>, styles: &Styles, width: usize) -> Line<'static> {
+    hint_line_from(hints(stack), styles, width)
+}
+
+pub fn raw_conversation_hint_line(
+    stack: impl Into<Stack>,
+    styles: &Styles,
+    width: usize,
+) -> Line<'static> {
+    hint_line_from(raw_conversation_hints(stack), styles, width)
+}
+
+fn hint_line_from(
+    hints: Vec<(String, &'static str)>,
+    styles: &Styles,
+    width: usize,
+) -> Line<'static> {
     let mut spans = Vec::new();
     let mut used = 0;
-    for (keys, label) in hints(stack) {
+    for (keys, label) in hints {
         let needed = keys.chars().count() + label.chars().count() + 3;
         if used + needed > width {
             break;
@@ -1868,6 +1969,19 @@ pub fn hint_line(stack: impl Into<Stack>, styles: &Styles, width: usize) -> Line
 /// Draws the `?` help for `stack` as a bordered overlay over `area`.
 pub fn render_help(frame: &mut Frame, area: Rect, stack: impl Into<Stack>, styles: &Styles) {
     let entries = help_entries(stack);
+    render_help_entries(frame, area, entries, styles);
+}
+
+pub fn render_raw_conversation_help(
+    frame: &mut Frame,
+    area: Rect,
+    stack: impl Into<Stack>,
+    styles: &Styles,
+) {
+    render_help_entries(frame, area, raw_conversation_help_entries(stack), styles);
+}
+
+fn render_help_entries(frame: &mut Frame, area: Rect, entries: Vec<HelpEntry>, styles: &Styles) {
     let keys_width = entries
         .iter()
         .map(|entry| entry.keys.chars().count())

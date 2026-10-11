@@ -429,13 +429,14 @@ pub fn transcript_action(transcript: &mut TranscriptState, action: Action) {
         Action::PageUp => transcript.page_up(),
         Action::Top => transcript.to_top(),
         Action::Bottom | Action::Follow => transcript.to_bottom(),
-        Action::Expand => {
+        Action::Expand if transcript.mode() != DisplayMode::Raw => {
             if let Some(entry) = transcript.selected_entry().cloned() {
                 transcript.toggle_expanded(&entry);
             }
         }
         Action::RawEntry => transcript.toggle_selected_raw(),
         Action::RawAll => transcript.toggle_mode(),
+        Action::NextConversationView => transcript.next_conversation_view(),
         _ => {}
     }
 }
@@ -538,7 +539,7 @@ impl Conversation {
             );
             entries.extend(attempt.entries.iter().map(|entry| {
                 let mut entry = entry.clone();
-                entry.id = TranscriptEntryId::from(format!("{attempt_id}/{}", entry.id.as_str()));
+                entry.prefix_source_ids(attempt_id);
                 entry
             }));
         }
@@ -668,7 +669,7 @@ pub fn render(
         );
         return;
     }
-    let raw = conversation.transcript().mode() == DisplayMode::Raw;
+    let mode = conversation.transcript().mode();
     let (title, rest) = (
         first_row(body),
         Rect::new(
@@ -678,30 +679,26 @@ pub fn render(
             body.height.saturating_sub(1),
         ),
     );
-    if raw {
+    let transcript_area = if mode != DisplayMode::Rendered {
+        let label = match mode {
+            DisplayMode::Chronology => "chronologia · v: RAW · r: źródło",
+            DisplayMode::Raw => "RAW · v: rozmowa",
+            DisplayMode::Rendered => unreachable!(),
+        };
         frame.render_widget(
-            Paragraph::new(Line::styled(
-                "widok surowy (Ctrl+V wraca)",
-                styles.of(Role::Attention),
-            )),
+            Paragraph::new(Line::styled(label, styles.of(Role::Attention))),
             title,
         );
-        render_transcript(
-            frame,
-            rest,
-            styles,
-            conversation.transcript_mut(),
-            stale,
-            focused,
-        );
+        rest
     } else {
-        render_transcript(
-            frame,
-            body,
-            styles,
-            conversation.transcript_mut(),
-            stale,
-            focused,
-        );
-    }
+        body
+    };
+    render_transcript(
+        frame,
+        transcript_area,
+        styles,
+        conversation.transcript_mut(),
+        stale,
+        focused,
+    );
 }

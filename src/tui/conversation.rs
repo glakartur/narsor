@@ -265,6 +265,39 @@ fn adapt_stdout(text: &str) -> (EntryKind, String, Value) {
 }
 
 fn adapt_claude(value: &Value) -> (EntryKind, String, Value) {
+    if value.get("type").and_then(Value::as_str) == Some("system") {
+        let subtype = value.get("subtype").and_then(Value::as_str);
+        let known = matches!(
+            subtype,
+            Some(
+                "init"
+                    | "hook_started"
+                    | "hook_progress"
+                    | "hook_response"
+                    | "thinking_tokens"
+                    | "rate_limit_event"
+            )
+        );
+        let hook_requires_identity = matches!(subtype, Some("hook_started" | "hook_response"));
+        let hook_is_valid = value.get("session_id").and_then(Value::as_str).is_some()
+            && value
+                .get("hook_id")
+                .or_else(|| value.get("hookId"))
+                .and_then(Value::as_str)
+                .is_some();
+        if !known || hook_requires_identity && !hook_is_valid {
+            let reason = if known {
+                "malformed Claude hook event"
+            } else {
+                "unsupported Claude system event"
+            };
+            return (
+                EntryKind::Raw,
+                reason.to_owned(),
+                serde_json::json!({"unsupported.reason": reason, "event.type": subtype}),
+            );
+        }
+    }
     let kind = classify_stdout_value(value);
     let block = value
         .pointer("/message/content")
@@ -348,6 +381,89 @@ fn adapt_claude(value: &Value) -> (EntryKind, String, Value) {
         detail_fields.insert("message.blocks".into(), Value::Array(normalized));
     }
     insert_detail(&mut details, "event.type", value.get("subtype"));
+    // Normalize the harness-specific hook envelope here.  The transcript
+    // projection consumes only these neutral fields and keeps `raw` solely
+    // for operator inspection.
+    insert_detail(&mut details, "group.session_id", value.get("session_id"));
+    insert_detail(
+        &mut details,
+        "group.correlation_id",
+        value.get("hook_id").or_else(|| value.get("hookId")),
+    );
+    let hook_name = value
+        .get("hook_name")
+        .or_else(|| value.get("hookName"))
+        .or_else(|| value.get("hook_event_name"))
+        .or_else(|| value.get("hookEventName"))
+        .or_else(|| value.get("hook"));
+    let group_name = value
+        .get("hook_event")
+        .or_else(|| value.get("hookEvent"))
+        .cloned()
+        .or_else(|| {
+            hook_name
+                .and_then(Value::as_str)
+                .and_then(|name| name.split(':').next())
+                .map(|name| Value::String(name.to_owned()))
+        });
+    insert_detail(&mut details, "group.name", group_name.as_ref());
+    let group_phase = match value.get("subtype").and_then(Value::as_str) {
+        Some("hook_started") => Some(Value::String("started".into())),
+        Some("hook_response") => Some(Value::String("completed".into())),
+        _ => None,
+    };
+    insert_detail(&mut details, "group.phase", group_phase.as_ref());
+    if value.get("subtype").and_then(Value::as_str) == Some("thinking_tokens") {
+        insert_detail(&mut details, "group.session_id", value.get("session_id"));
+        details["group.correlation_id"] = Value::String("thinking_tokens".into());
+        details["group.name"] = Value::String("tokeny myślenia".into());
+        details["group.family"] = Value::String("Techniczne".into());
+        details["group.phase"] = Value::String("progress".into());
+    }
+    // Claude tool calls keep their own opaque id. Normalize it separately
+    // from hooks so later projections can correlate a result without parsing
+    // the displayed summary.
+    if kind == EntryKind::ToolCall {
+        insert_detail(&mut details, "group.session_id", value.get("session_id"));
+        insert_detail(
+            &mut details,
+            "group.correlation_id",
+            block.and_then(|b| b.get("id")),
+        );
+        details["group.name"] = Value::String(
+            block
+                .and_then(|b| b.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool")
+                .to_owned(),
+        );
+        insert_detail(
+            &mut details,
+            "group.phase",
+            Some(&Value::String("started".into())),
+        );
+        details["group.operation"] = Value::Bool(true);
+    } else if kind == EntryKind::ToolResult {
+        insert_detail(&mut details, "group.session_id", value.get("session_id"));
+        insert_detail(
+            &mut details,
+            "group.correlation_id",
+            block.and_then(|b| b.get("tool_use_id")),
+        );
+        details["group.name"] = Value::String(
+            block
+                .and_then(|b| b.get("tool_name").or_else(|| b.get("name")))
+                .and_then(Value::as_str)
+                .unwrap_or("tool")
+                .to_owned(),
+        );
+        insert_detail(
+            &mut details,
+            "group.phase",
+            Some(&Value::String("completed".into())),
+        );
+        details["group.operation"] = Value::Bool(true);
+    }
     insert_detail(&mut details, "error.message", value.get("error"));
     (kind, summary, details)
 }
@@ -368,6 +484,34 @@ fn adapt_opencode(value: &Value) -> (EntryKind, String, Value) {
             .get("message")
             .or_else(|| value.pointer("/error/message")),
     );
+    if matches!(kind, EntryKind::ToolCall | EntryKind::ToolResult) {
+        let session = value
+            .get("sessionID")
+            .or_else(|| value.get("session_id"))
+            .or_else(|| value.get("sessionId"));
+        let correlation = value
+            .get("tool_call_id")
+            .or_else(|| value.get("toolCallId"))
+            .or_else(|| value.get("id"));
+        insert_detail(&mut details, "group.session_id", session);
+        insert_detail(&mut details, "group.correlation_id", correlation);
+        details["group.name"] = Value::String(
+            value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool")
+                .to_owned(),
+        );
+        details["group.phase"] = Value::String(
+            if kind == EntryKind::ToolResult {
+                "completed"
+            } else {
+                "started"
+            }
+            .to_owned(),
+        );
+        details["group.operation"] = Value::Bool(true);
+    }
     (kind, summary, details)
 }
 
@@ -423,6 +567,30 @@ fn adapt_codex(value: &Value) -> (EntryKind, String, Value) {
             .or_else(|| value.pointer("/error/message"))
             .or_else(|| value.get("error")),
     );
+    if matches!(kind, EntryKind::ToolCall | EntryKind::ToolResult) {
+        let session = value
+            .get("thread_id")
+            .or_else(|| item.and_then(|item| item.get("thread_id")));
+        let correlation = item.and_then(|item| item.get("id").or_else(|| item.get("call_id")));
+        insert_detail(&mut details, "group.session_id", session);
+        insert_detail(&mut details, "group.correlation_id", correlation);
+        details["group.name"] = Value::String(
+            item.and_then(|item| item.get("tool_name").or_else(|| item.get("name")))
+                .or_else(|| item.and_then(|item| item.get("command")))
+                .and_then(Value::as_str)
+                .unwrap_or("tool")
+                .to_owned(),
+        );
+        details["group.phase"] = Value::String(
+            if kind == EntryKind::ToolResult {
+                "completed"
+            } else {
+                "started"
+            }
+            .to_owned(),
+        );
+        details["group.operation"] = Value::Bool(true);
+    }
     (kind, summary, details)
 }
 
@@ -468,12 +636,46 @@ fn project_claude_summary(value: &Value, kind: EntryKind) -> String {
             .and_then(Value::as_str)
             .unwrap_or("completed")
             .to_owned(),
-        EntryKind::System => value
-            .get("message")
-            .and_then(Value::as_str)
-            .or_else(|| value.get("type").and_then(Value::as_str))
-            .unwrap_or("system event")
-            .to_owned(),
+        EntryKind::System => match value.get("subtype").and_then(Value::as_str) {
+            Some("hook_started") => value
+                .get("hook_name")
+                .or_else(|| value.get("hook_event"))
+                .and_then(Value::as_str)
+                .map(|name| format!("hook started: {name}"))
+                .unwrap_or_else(|| "hook started".to_owned()),
+            Some("hook_response") => value
+                .get("hook_name")
+                .or_else(|| value.get("hook_event"))
+                .and_then(Value::as_str)
+                .map(|name| format!("hook completed: {name}"))
+                .unwrap_or_else(|| "hook completed".to_owned()),
+            Some("hook_progress") => value
+                .get("hook_name")
+                .and_then(Value::as_str)
+                .map(|name| format!("hook progress: {name}"))
+                .unwrap_or_else(|| "hook progress".to_owned()),
+            Some("thinking_tokens") => value
+                .get("estimated_tokens_delta")
+                .and_then(Value::as_i64)
+                .map(|delta| format!("thinking tokens: +{delta}"))
+                .or_else(|| {
+                    value
+                        .get("estimated_tokens")
+                        .and_then(Value::as_i64)
+                        .map(|total| format!("thinking tokens: {total}"))
+                })
+                .unwrap_or_else(|| "thinking tokens updated".to_owned()),
+            Some(subtype) => value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("harness event: {subtype}")),
+            None => value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("harness event")
+                .to_owned(),
+        },
         EntryKind::ToolCall => value
             .pointer("/message/content")
             .and_then(Value::as_array)
@@ -774,14 +976,50 @@ pub(crate) fn agent_transcript_entry(entry: &TranscriptEvent) -> TranscriptEntry
     ) {
         body.truncate(1);
     }
-    TranscriptEntry::new(
+    let mut transcript = TranscriptEntry::new(
         TranscriptEntryId::from(entry.entry_number.to_string()),
         body,
         entry.raw.clone(),
     )
     .with_header(utterance_header(presentation, speaker, entry.timestamp))
     .with_technical_lines(semantic_detail_lines(&entry.details, &entry.summary))
-    .with_presentation(presentation)
+    .with_presentation(presentation);
+    // The adapter has already converted hook envelopes into this neutral
+    // correlation tuple; transcript rendering never reads harness fields.
+    let group_session = entry
+        .details
+        .get("group.session_id")
+        .and_then(Value::as_str);
+    let group_name = entry.details.get("group.name").and_then(Value::as_str);
+    let group_phase = entry.details.get("group.phase").and_then(Value::as_str);
+    let group_correlation = entry
+        .details
+        .get("group.correlation_id")
+        .and_then(Value::as_str);
+    transcript = if entry
+        .details
+        .get("group.operation")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        transcript.with_correlated_operation(
+            group_session,
+            group_name,
+            group_phase,
+            group_correlation,
+        )
+    } else {
+        transcript.with_operation_grouping(
+            group_session,
+            group_name,
+            group_phase,
+            group_correlation,
+        )
+    };
+    if let Some(family) = entry.details.get("group.family").and_then(Value::as_str) {
+        transcript = transcript.with_group_family(family);
+    }
+    transcript
 }
 
 /// What expanding an entry adds to its summary, as readable text: content
@@ -917,6 +1155,80 @@ mod tests {
     }
 
     #[test]
+    fn claude_technical_system_records_have_descriptive_summaries() {
+        let hook = classify(&entry(
+            ConversationSource::Stdout,
+            r#"{"type":"system","subtype":"hook_started","session_id":"s","hook_id":"hook-1","hook_name":"SessionStart:startup"}"#,
+        ));
+        assert_eq!(hook.summary, "hook started: SessionStart:startup");
+
+        let tokens = classify(&entry(
+            ConversationSource::Stdout,
+            r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens_delta":42}"#,
+        ));
+        assert_eq!(tokens.summary, "thinking tokens: +42");
+    }
+
+    #[test]
+    fn adjacent_claude_thinking_token_updates_form_a_technical_family() {
+        let mut first = entry(
+            ConversationSource::Stdout,
+            r#"{"type":"system","subtype":"thinking_tokens","session_id":"s","estimated_tokens_delta":42}"#,
+        );
+        first.entry_number = 1;
+        let mut second = entry(
+            ConversationSource::Stdout,
+            r#"{"type":"system","subtype":"thinking_tokens","session_id":"s","estimated_tokens_delta":7}"#,
+        );
+        second.entry_number = 2;
+        let mut transcript = crate::tui::transcript::TranscriptState::new(
+            crate::tui::transcript::TranscriptId::from("attempt"),
+        );
+        transcript.load(vec![
+            agent_transcript_entry(&classify(&first)),
+            agent_transcript_entry(&classify(&second)),
+        ]);
+
+        assert!(transcript
+            .logical_lines()
+            .iter()
+            .any(|line| line.text == "> Techniczne · tokeny myślenia · 2 wpisy"));
+    }
+
+    #[test]
+    fn malformed_or_unknown_claude_system_records_are_raw() {
+        for raw in [
+            r#"{"type":"system","subtype":"hook_started","session_id":"s"}"#,
+            r#"{"type":"system","subtype":"future_event"}"#,
+        ] {
+            assert_eq!(
+                classify(&entry(ConversationSource::Stdout, raw)).kind,
+                EntryKind::Raw,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_tool_lifecycle_exposes_a_normalized_correlation_tuple() {
+        let call = classify(&entry(
+            ConversationSource::Stdout,
+            r#"{"type":"assistant","session_id":"s","message":{"content":[{"type":"tool_use","id":"tool-1","name":"bash"}]}}"#,
+        ));
+        assert_eq!(call.details["group.correlation_id"], "tool-1");
+        assert_eq!(call.details["group.name"], "bash");
+        assert_eq!(call.details["group.phase"], "started");
+        assert_eq!(call.details["group.operation"], true);
+
+        let result = classify(&entry(
+            ConversationSource::Stdout,
+            r#"{"type":"user","session_id":"s","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"ok"}]}}"#,
+        ));
+        assert_eq!(result.details["group.correlation_id"], "tool-1");
+        assert_eq!(result.details["group.phase"], "completed");
+    }
+
+    #[test]
     fn opencode_text_line_is_the_assistant_kind() {
         let raw = r#"{"type":"text","sessionID":"s1","text":"hello"}"#;
         let classified = classify(&entry(ConversationSource::Stdout, raw));
@@ -1030,6 +1342,38 @@ mod utterance_tests {
             .into_iter()
             .map(|line| line.text)
             .collect()
+    }
+
+    #[test]
+    fn claude_hook_adapter_normalizes_session_start_for_grouping() {
+        let entries = [
+            r#"{"type":"system","subtype":"hook_started","session_id":"session","hook_id":"one","hook_name":"SessionStart:startup"}"#,
+            r#"{"type":"system","subtype":"hook_started","session_id":"session","hook_id":"two","hook_name":"SessionStart:startup"}"#,
+            r#"{"type":"system","subtype":"hook_response","session_id":"session","hook_id":"two","hook_name":"SessionStart:startup"}"#,
+            r#"{"type":"system","subtype":"hook_response","session_id":"session","hook_id":"one","hook_name":"SessionStart:startup"}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(entry_number, raw)| {
+            agent_transcript_entry(&classify(&ConversationEntryDto {
+                entry_number: entry_number as u64,
+                timestamp: chrono::Utc::now(),
+                source: ConversationSource::Stdout,
+                raw_base64: BASE64.encode(raw.as_bytes()),
+            }))
+        })
+        .collect();
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(entries);
+
+        assert_eq!(
+            transcript
+                .logical_lines()
+                .iter()
+                .filter(|line| line.header)
+                .count(),
+            1
+        );
     }
 
     /// AE1: each role gets its own header naming role, speaker and date.

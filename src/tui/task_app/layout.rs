@@ -169,7 +169,11 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
     let body = overlay_area(areas.outer);
     actions::render(frame, body, app, styles);
     if app.is_help_open() {
-        keymap::render_help(frame, body, app.key_context(), styles);
+        if app.active_agent_transcript_mode() == Some(crate::tui::transcript::DisplayMode::Raw) {
+            keymap::render_raw_conversation_help(frame, body, app.key_context(), styles);
+        } else {
+            keymap::render_help(frame, body, app.key_context(), styles);
+        }
     }
 }
 
@@ -407,7 +411,12 @@ fn render_bar(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles, now
         .map_or(0, |span| span.content.chars().count() + 1)
         .min(usize::from(area.width) / 2);
     let hints_width = usize::from(area.width).saturating_sub(note_width + 1);
-    let hints = keymap::hint_line(app.key_context(), styles, hints_width);
+    let hints =
+        if app.active_agent_transcript_mode() == Some(crate::tui::transcript::DisplayMode::Raw) {
+            keymap::raw_conversation_hint_line(app.key_context(), styles, hints_width)
+        } else {
+            keymap::hint_line(app.key_context(), styles, hints_width)
+        };
     frame.render_widget(Paragraph::new(hints), area);
     if let Some(span) = notification {
         frame.render_widget(
