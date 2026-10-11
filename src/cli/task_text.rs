@@ -668,6 +668,9 @@ pub fn unavailable_reason(reason: ConversationUnavailableReason) -> &'static str
         }
         ConversationUnavailableReason::RunnerReported => "the runner cannot serve it right now",
         ConversationUnavailableReason::StorageUnreadable => "its record could not be read",
+        ConversationUnavailableReason::Unrecognized => {
+            "the server gave a reason this version does not know"
+        }
     }
 }
 

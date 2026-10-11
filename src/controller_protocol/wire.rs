@@ -514,6 +514,10 @@ pub enum ConversationUnavailableReason {
     /// The task's own storage, read by the daemon that holds it, could not
     /// be read; the answer's `message` says why.
     StorageUnreadable,
+    /// A reason of a newer version this one does not know. Never sent: it
+    /// only lets a client keep reading a newer server's answer.
+    #[serde(other)]
+    Unrecognized,
 }
 
 /// The code of a `409` refusing a conversation page because no live runner

@@ -4231,3 +4231,113 @@ async fn reading_the_record_then_the_runner_from_the_cursor_loses_and_repeats_no
     let (live_entries, live_next, _, _) = page_of(live.await.unwrap().expect("live"));
     assert_eq!((live_entries, live_next), (whole_record, record_next));
 }
+
+// ---------------------------------------------------------------------------
+// Wire compatibility across versions (D58): an older server's answers decode
+// with defaults, a newer server's unknown kinds decode as `Unrecognized`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_task_summary_from_a_server_before_the_resume_policy_decodes_empty() {
+    let summary: TaskSummary = serde_json::from_value(serde_json::json!({
+        "task_id": "task-1",
+        "backend_id": "k8s",
+        "lifecycle": "interrupted",
+        "generation": 2,
+        "revision": 4,
+        "rank": 1,
+        "created_at": "2026-10-10T12:00:00Z",
+        "queue_sequence": 1,
+        "workflow_id": "implement-feature",
+        "workflow_version": 3,
+        "launch_digest": "digest",
+        "environment_identity": "env",
+        "archive": null,
+        "observation": null,
+        "runner": null,
+        "controller": null,
+        "inputs": [],
+        "as_of": "2026-10-10T12:00:00Z"
+    }))
+    .expect("an older summary decodes");
+
+    assert!(summary.resume.is_empty());
+}
+
+#[test]
+fn a_runner_launch_from_a_control_plane_before_the_policy_has_no_actor() {
+    let launch: narsor::controller_protocol::RunnerLaunchView =
+        serde_json::from_value(serde_json::json!({
+            "incarnation": "inc-1",
+            "launch_generation": 2,
+            "authorized_by": "resume"
+        }))
+        .expect("an older launch decodes");
+
+    assert_eq!(launch.authorized_by, Some(OwnerCommand::Resume));
+    assert_eq!(launch.authorized_by_actor, None, "read as the owner");
+}
+
+#[test]
+fn a_conversation_from_a_server_before_storage_reads_comes_from_the_runner() {
+    let conversation: ConversationResponse = serde_json::from_value(serde_json::json!({
+        "status": "available",
+        "attempts": [],
+        "observed_at": "2026-10-10T12:00:00Z"
+    }))
+    .expect("an older conversation decodes");
+
+    let ConversationResponse::Available {
+        source,
+        recorded_at,
+        ..
+    } = conversation
+    else {
+        panic!("available: {conversation:?}");
+    };
+    assert_eq!(source, ExecutionEventsSource::Runner);
+    assert_eq!(recorded_at, None);
+}
+
+#[test]
+fn an_unavailable_reason_of_a_newer_server_decodes_as_unrecognized() {
+    let conversation: ConversationResponse = serde_json::from_value(serde_json::json!({
+        "status": "unavailable",
+        "reason": "runner_on_vacation",
+        "last_attempts": [],
+        "observed_at": null
+    }))
+    .expect("a newer reason decodes");
+
+    let ConversationResponse::Unavailable { reason, .. } = conversation else {
+        panic!("unavailable: {conversation:?}");
+    };
+    assert_eq!(reason, ConversationUnavailableReason::Unrecognized);
+    assert_eq!(
+        narsor::cli::task_text::unavailable_reason(reason),
+        "the server gave a reason this version does not know"
+    );
+}
+
+#[test]
+fn a_newer_servers_event_and_observation_kinds_decode_as_unrecognized() {
+    let envelope: narsor::controller_protocol::ControlEventEnvelope =
+        serde_json::from_value(serde_json::json!({
+            "cursor": "task-1:9",
+            "event": {
+                "sequence": 9,
+                "task_id": "task-1",
+                "at": "2026-10-10T12:00:00Z",
+                "lifecycle": "interrupted",
+                "generation": 2,
+                "kind": { "type": "resumed_by_magic" }
+            }
+        }))
+        .expect("a newer event decodes");
+    assert_eq!(envelope.event.kind, TaskEventKind::Unrecognized);
+
+    let observation: Observation =
+        serde_json::from_value(serde_json::json!({ "kind": "workload_teleported" }))
+            .expect("a newer observation decodes");
+    assert_eq!(observation, Observation::Unrecognized);
+}
