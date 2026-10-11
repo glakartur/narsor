@@ -105,7 +105,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::api::{ClientError, ConversationResponse};
+use crate::api::ClientError;
 use crate::conductor::LiveHarness;
 use crate::controller_protocol::{
     ConversationPageRequest, DeliveredInput, ExecutionEventsPage, ExecutionEventsRequest,
@@ -1246,7 +1246,7 @@ impl Session {
             usize::try_from(request.byte_budget).unwrap_or(usize::MAX),
         );
         let page = match read {
-            Ok(snapshot) => ConversationResponse::from_snapshot(snapshot),
+            Ok(snapshot) => crate::api::conversation_response_from_snapshot(snapshot),
             Err(error) => {
                 tracing::warn!(%error, attempt = %request.attempt_id, "cannot read a conversation page");
                 self.fail_read(&request.request_id, &error.to_string())

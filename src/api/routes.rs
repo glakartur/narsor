@@ -55,8 +55,7 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
@@ -66,9 +65,10 @@ use tokio_stream::{Stream, StreamExt};
 use crate::api::active::ActiveTasks;
 use crate::api::dto::{
     AcceptedResponse, ActiveProblem, ChatMessageRequest, ConductorActivity, ConductorChatResponse,
-    ConductorStateResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
-    OperatorNoteRequest, RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest,
-    StartTaskRequest, StartTaskResponse, TransitionRequest,
+    ConductorStateResponse, ConversationEntryDto, ConversationEntrySource, ConversationResponse,
+    ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot, OperatorNoteRequest,
+    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
+    StartTaskResponse, TransitionRequest,
 };
 use crate::api::ApiServices;
 use crate::auth::gate::{self, OwnerAuth};
@@ -77,7 +77,7 @@ use crate::conductor::{
     UndoError, UndoOutcome,
 };
 use crate::controller_protocol::http as protocol_http;
-use crate::controller_protocol::{ExecutionEventsSource, ProtocolError};
+use crate::controller_protocol::ProtocolError;
 use crate::domain::TaskId;
 use crate::domain::{Event, ExecutionStatus};
 use crate::engine::{
@@ -908,60 +908,6 @@ fn default_byte_budget() -> usize {
     DEFAULT_BYTE_BUDGET
 }
 
-/// One decoded conversation entry, wire shape.
-///
-/// `raw` is base64 rather than a JSON string of the decoded bytes: the raw
-/// harness line is preserved byte for byte (R9) and is not guaranteed to be
-/// valid UTF-8, so it cannot be spliced into a JSON string unescaped — the
-/// same reasoning the on-disk envelope already follows
-/// (`src/persistence/conversation.rs`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ConversationEntryDto {
-    /// Sequential entry number, starting at 1.
-    pub entry_number: u64,
-    /// When narsor observed (or produced) this line.
-    pub timestamp: DateTime<Utc>,
-    /// Which stream this line came from.
-    pub source: ConversationSource,
-    /// Base64 of the raw bytes.
-    pub raw_base64: String,
-}
-
-/// The wire response of the conversation endpoint.
-///
-/// `NoRecord` is a normal, successful answer (see the module doc) rather
-/// than an error variant, precisely so a caller cannot mistake "this step
-/// has no conversation" for "something went wrong".
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum ConversationResponse {
-    /// A conversation record exists — possibly still being written.
-    Recorded {
-        /// Entries from the requested cursor onward, in order.
-        entries: Vec<ConversationEntryDto>,
-        /// The cursor to pass on the next read to continue exactly here.
-        next_entry: u64,
-        /// Whether the attempt is closed (compressed).
-        closed: bool,
-        /// Whether the on-disk file's last line was incomplete when read.
-        truncated_tail: bool,
-        /// Where the control plane read the page from: the live runner, or
-        /// the task's own storage on the daemon that holds it. Absent from
-        /// a runner's upload, from the local execution API and from older
-        /// servers — read as the live runner.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        source: Option<ExecutionEventsSource>,
-        /// When the record was last written
-        /// ([`crate::persistence::ConversationSnapshot::recorded_at`]); set
-        /// only on a page read from the task's storage.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        recorded_at: Option<DateTime<Utc>>,
-    },
-    /// No conversation record exists for this attempt: a non-agent step, an
-    /// agent step whose conversation never started, or an old-format log.
-    NoRecord,
-}
-
 /// `GET /executions/:execution_id/attempts/:attempt_id/conversation?from=<n>&byte_budget=<bytes>`
 async fn get_conversation(
     State(state): State<AppState>,
@@ -993,33 +939,37 @@ fn read_conversation(
     }
     let store = execution_store.conversation_store(execution_id);
     let snapshot = store.read(attempt_id, from, byte_budget)?;
-    Ok(ConversationResponse::from_snapshot(snapshot))
+    Ok(conversation_response_from_snapshot(snapshot))
 }
 
-impl ConversationResponse {
-    /// The wire page of what [`crate::persistence::ConversationStore::read`]
-    /// returned, without a source: the caller that knows one sets it.
-    pub fn from_snapshot(snapshot: Option<ConversationSnapshot>) -> Self {
-        match snapshot {
-            Some(snapshot) => Self::Recorded {
-                entries: snapshot
-                    .entries
-                    .into_iter()
-                    .map(|entry| ConversationEntryDto {
-                        entry_number: entry.entry_number,
-                        timestamp: entry.timestamp,
-                        source: entry.source,
-                        raw_base64: base64_encode(&entry.raw),
-                    })
-                    .collect(),
-                next_entry: snapshot.next_entry,
-                closed: snapshot.closed,
-                truncated_tail: snapshot.truncated_tail,
-                source: None,
-                recorded_at: None,
-            },
-            None => Self::NoRecord,
-        }
+/// Converts a persistence snapshot to the protocol DTO, leaving source
+/// metadata unset because the caller knows where the record was read.
+pub fn conversation_response_from_snapshot(
+    snapshot: Option<ConversationSnapshot>,
+) -> ConversationResponse {
+    match snapshot {
+        Some(snapshot) => ConversationResponse::Recorded {
+            entries: snapshot
+                .entries
+                .into_iter()
+                .map(|entry| ConversationEntryDto {
+                    entry_number: entry.entry_number,
+                    timestamp: entry.timestamp,
+                    source: match entry.source {
+                        ConversationSource::Narsor => ConversationEntrySource::Narsor,
+                        ConversationSource::Stdout => ConversationEntrySource::Stdout,
+                        ConversationSource::Stderr => ConversationEntrySource::Stderr,
+                    },
+                    raw_base64: base64_encode(&entry.raw),
+                })
+                .collect(),
+            next_entry: snapshot.next_entry,
+            closed: snapshot.closed,
+            truncated_tail: snapshot.truncated_tail,
+            source: None,
+            recorded_at: None,
+        },
+        None => ConversationResponse::NoRecord,
     }
 }
 
@@ -1597,6 +1547,7 @@ mod sse_stream_tests {
     //! exercises the same `Err(Lagged(_))` branch deterministically.
     use super::*;
     use crate::domain::EventData;
+    use chrono::Utc;
 
     #[tokio::test]
     async fn lagged_receiver_skips_missed_events_but_keeps_streaming() {

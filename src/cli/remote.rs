@@ -667,10 +667,7 @@ pub(super) fn print_conversation_entries(
 ) {
     for entry in entries {
         let classified = classify(entry);
-        let body = if matches!(
-            entry.source,
-            crate::persistence::conversation::ConversationSource::Narsor
-        ) {
+        let body = if matches!(entry.source, crate::api::ConversationEntrySource::Narsor) {
             String::from_utf8_lossy(&classified.raw).into_owned()
         } else {
             classified.summary

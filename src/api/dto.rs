@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use narsor_protocol::api::{
-    AcceptedResponse, ChatMessageRequest, HarnessSelectionSnapshot, OperatorNoteRequest,
-    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
-    TransitionRequest,
+    AcceptedResponse, ChatMessageRequest, ConversationEntryDto, ConversationEntrySource,
+    ConversationResponse, HarnessSelectionSnapshot, OperatorNoteRequest, RecoveryRequest,
+    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, TransitionRequest,
 };
 
 use crate::conductor::{

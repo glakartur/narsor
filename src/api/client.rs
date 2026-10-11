@@ -65,11 +65,10 @@ use crate::conductor::{ChatEntry, ProposalOutcome, UndoOutcome};
 
 use super::dto::{
     AcceptedResponse, ChatMessageRequest, ConductorChatResponse, ConductorStateResponse,
-    ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot, RecoveryRequest,
-    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
-    TransitionRequest,
+    ConversationResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
+    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
+    StartTaskResponse, TransitionRequest,
 };
-use super::routes::ConversationResponse;
 use crate::auth::{ClaimRequest, OwnerView, WhoAmIResponse};
 use crate::controller_protocol::{
     CapabilitiesView, ConductorReadQuery, ConductorReadResponse, ControlEventEnvelope,

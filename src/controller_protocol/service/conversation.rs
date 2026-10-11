@@ -247,7 +247,7 @@ impl ProtocolService {
         })?;
         let recorded_at = read.as_ref().and_then(|snapshot| snapshot.recorded_at);
         Ok(with_source(
-            ConversationPage::from_snapshot(read),
+            crate::api::conversation_response_from_snapshot(read),
             ExecutionEventsSource::Storage,
             recorded_at,
         ))

@@ -2394,7 +2394,6 @@ mod task_app_detail {
     use narsor::domain::{Event, ExecutionStatus};
     use narsor::engine::{ConversationState, PositionStatus, Timeline};
     use narsor::orchestration::{Observation, QueueReason, TaskEventKind, TaskLifecycle};
-    use narsor::persistence::conversation::ConversationSource;
     use narsor::tui::style::Styles;
     use narsor::tui::task_app::detail::{
         self, hyperlinks_supported, queue_text, readiness, short_age, unstarted_message,
@@ -3547,7 +3546,7 @@ mod task_app_detail {
                 entries: vec![ConversationEntryDto {
                     entry_number: 1,
                     timestamp: chrono::Utc::now(),
-                    source: ConversationSource::Narsor,
+                    source: narsor::api::ConversationEntrySource::Narsor,
                     raw_base64: {
                         use base64::Engine as _;
                         base64::engine::general_purpose::STANDARD

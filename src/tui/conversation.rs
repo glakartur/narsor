@@ -33,8 +33,7 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::api::ConversationEntryDto;
-use crate::persistence::conversation::ConversationSource;
+use crate::api::{ConversationEntryDto, ConversationEntrySource};
 
 use super::scroll::{one_line, sanitize};
 use super::transcript::{
@@ -96,7 +95,7 @@ pub struct TranscriptEvent {
     /// When narsor observed (or produced) this line.
     pub timestamp: DateTime<Utc>,
     /// Which stream this line came from.
-    pub source: ConversationSource,
+    pub source: ConversationEntrySource,
     /// This entry's kind.
     pub kind: EntryKind,
     /// Exact source bytes retained by the API.  Display code must use this
@@ -150,13 +149,13 @@ pub fn classify(entry: &ConversationEntryDto) -> TranscriptEvent {
     let text = String::from_utf8_lossy(&raw).into_owned();
 
     let (kind, summary, details) = match entry.source {
-        ConversationSource::Narsor => adapt_narsor(&text),
-        ConversationSource::Stderr => (
+        ConversationEntrySource::Narsor => adapt_narsor(&text),
+        ConversationEntrySource::Stderr => (
             EntryKind::Stderr,
             text.clone(),
             serde_json::json!({"error.message": text}),
         ),
-        ConversationSource::Stdout => adapt_stdout(&text),
+        ConversationEntrySource::Stdout => adapt_stdout(&text),
     };
 
     TranscriptEvent {
@@ -1087,7 +1086,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    fn entry(source: ConversationSource, raw: &str) -> ConversationEntryDto {
+    fn entry(source: ConversationEntrySource, raw: &str) -> ConversationEntryDto {
         ConversationEntryDto {
             entry_number: 1,
             timestamp: Utc::now(),
@@ -1098,7 +1097,10 @@ mod tests {
 
     #[test]
     fn narsor_lines_are_always_the_narsor_kind() {
-        let classified = classify(&entry(ConversationSource::Narsor, "prompt: do the thing"));
+        let classified = classify(&entry(
+            ConversationEntrySource::Narsor,
+            "prompt: do the thing",
+        ));
         assert_eq!(classified.kind, EntryKind::Narsor);
         assert_eq!(classified.summary, "Workflow sends input to agent");
         assert_eq!(classified.details["workflow.event"], "agent_input");
@@ -1106,7 +1108,10 @@ mod tests {
 
     #[test]
     fn stderr_lines_are_always_the_stderr_kind() {
-        let classified = classify(&entry(ConversationSource::Stderr, "warning: something"));
+        let classified = classify(&entry(
+            ConversationEntrySource::Stderr,
+            "warning: something",
+        ));
         assert_eq!(classified.kind, EntryKind::Stderr);
     }
 
@@ -1114,21 +1119,21 @@ mod tests {
     fn claude_assistant_text_block_is_the_assistant_kind() {
         let raw =
             r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}"#;
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        let classified = classify(&entry(ConversationEntrySource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::Assistant);
     }
 
     #[test]
     fn claude_assistant_thinking_block_is_the_thinking_kind() {
         let raw = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"thinking","thinking":""}]}}"#;
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        let classified = classify(&entry(ConversationEntrySource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::Thinking);
     }
 
     #[test]
     fn claude_assistant_tool_use_block_is_the_tool_call_kind() {
         let raw = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","name":"bash"}]}}"#;
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        let classified = classify(&entry(ConversationEntrySource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::ToolCall);
     }
 
@@ -1136,34 +1141,34 @@ mod tests {
     fn claude_user_tool_result_block_is_the_tool_result_kind() {
         let raw =
             r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#;
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        let classified = classify(&entry(ConversationEntrySource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::ToolResult);
     }
 
     #[test]
     fn claude_result_line_is_the_result_kind() {
         let raw = r#"{"type":"result","subtype":"success","result":"done"}"#;
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        let classified = classify(&entry(ConversationEntrySource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::Result);
     }
 
     #[test]
     fn claude_system_init_line_is_the_system_kind() {
         let raw = r#"{"type":"system","subtype":"init","session_id":"abc"}"#;
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        let classified = classify(&entry(ConversationEntrySource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::System);
     }
 
     #[test]
     fn claude_technical_system_records_have_descriptive_summaries() {
         let hook = classify(&entry(
-            ConversationSource::Stdout,
+            ConversationEntrySource::Stdout,
             r#"{"type":"system","subtype":"hook_started","session_id":"s","hook_id":"hook-1","hook_name":"SessionStart:startup"}"#,
         ));
         assert_eq!(hook.summary, "hook started: SessionStart:startup");
 
         let tokens = classify(&entry(
-            ConversationSource::Stdout,
+            ConversationEntrySource::Stdout,
             r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens_delta":42}"#,
         ));
         assert_eq!(tokens.summary, "thinking tokens: +42");
@@ -1172,12 +1177,12 @@ mod tests {
     #[test]
     fn adjacent_claude_thinking_token_updates_form_a_technical_family() {
         let mut first = entry(
-            ConversationSource::Stdout,
+            ConversationEntrySource::Stdout,
             r#"{"type":"system","subtype":"thinking_tokens","session_id":"s","estimated_tokens_delta":42}"#,
         );
         first.entry_number = 1;
         let mut second = entry(
-            ConversationSource::Stdout,
+            ConversationEntrySource::Stdout,
             r#"{"type":"system","subtype":"thinking_tokens","session_id":"s","estimated_tokens_delta":7}"#,
         );
         second.entry_number = 2;
@@ -1202,7 +1207,7 @@ mod tests {
             r#"{"type":"system","subtype":"future_event"}"#,
         ] {
             assert_eq!(
-                classify(&entry(ConversationSource::Stdout, raw)).kind,
+                classify(&entry(ConversationEntrySource::Stdout, raw)).kind,
                 EntryKind::Raw,
                 "{raw}"
             );
@@ -1212,7 +1217,7 @@ mod tests {
     #[test]
     fn claude_tool_lifecycle_exposes_a_normalized_correlation_tuple() {
         let call = classify(&entry(
-            ConversationSource::Stdout,
+            ConversationEntrySource::Stdout,
             r#"{"type":"assistant","session_id":"s","message":{"content":[{"type":"tool_use","id":"tool-1","name":"bash"}]}}"#,
         ));
         assert_eq!(call.details["group.correlation_id"], "tool-1");
@@ -1221,7 +1226,7 @@ mod tests {
         assert_eq!(call.details["group.operation"], true);
 
         let result = classify(&entry(
-            ConversationSource::Stdout,
+            ConversationEntrySource::Stdout,
             r#"{"type":"user","session_id":"s","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"ok"}]}}"#,
         ));
         assert_eq!(result.details["group.correlation_id"], "tool-1");
@@ -1231,42 +1236,42 @@ mod tests {
     #[test]
     fn opencode_text_line_is_the_assistant_kind() {
         let raw = r#"{"type":"text","sessionID":"s1","text":"hello"}"#;
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        let classified = classify(&entry(ConversationEntrySource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::Assistant);
     }
 
     #[test]
     fn opencode_reasoning_line_is_the_thinking_kind() {
         let raw = r#"{"type":"reasoning","sessionID":"s1","text":"because"}"#;
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        let classified = classify(&entry(ConversationEntrySource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::Thinking);
     }
 
     #[test]
     fn opencode_tool_use_line_is_the_tool_call_kind() {
         let raw = r#"{"type":"tool_use","sessionID":"s1","state":{"input":{}}}"#;
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        let classified = classify(&entry(ConversationEntrySource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::ToolCall);
     }
 
     #[test]
     fn opencode_step_finish_line_is_the_system_kind() {
         let raw = r#"{"type":"step_finish","sessionID":"s1"}"#;
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        let classified = classify(&entry(ConversationEntrySource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::System);
     }
 
     #[test]
     fn opencode_error_line_is_the_system_kind() {
         let raw = r#"{"type":"error","sessionID":"s1","message":"boom"}"#;
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        let classified = classify(&entry(ConversationEntrySource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::System);
     }
 
     #[test]
     fn unknown_type_is_raw_with_full_content() {
         let raw = r#"{"type":"api_retry","detail":"..."}"#;
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        let classified = classify(&entry(ConversationEntrySource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::Raw);
         assert_eq!(classified.summary, "event: api_retry");
         assert_eq!(classified.raw, raw.as_bytes());
@@ -1275,7 +1280,7 @@ mod tests {
     #[test]
     fn non_json_is_raw_with_full_content() {
         let raw = "not json at all";
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
+        let classified = classify(&entry(ConversationEntrySource::Stdout, raw));
         assert_eq!(classified.kind, EntryKind::Raw);
         assert_eq!(classified.summary, raw);
     }
@@ -1286,7 +1291,7 @@ mod tests {
         let entry = ConversationEntryDto {
             entry_number: 7,
             timestamp: Utc::now(),
-            source: ConversationSource::Stdout,
+            source: ConversationEntrySource::Stdout,
             raw_base64: BASE64.encode(raw),
         };
 
@@ -1303,7 +1308,7 @@ mod tests {
         let entry = ConversationEntryDto {
             entry_number: 8,
             timestamp: Utc::now(),
-            source: ConversationSource::Stdout,
+            source: ConversationEntrySource::Stdout,
             raw_base64: BASE64.encode(raw),
         };
 
@@ -1320,7 +1325,7 @@ mod utterance_tests {
     use crate::tui::transcript::{DisplayMode, TranscriptId, TranscriptState};
     use base64::engine::general_purpose::STANDARD as BASE64;
 
-    fn entry_from(source: ConversationSource, raw: &str) -> TranscriptEntry {
+    fn entry_from(source: ConversationEntrySource, raw: &str) -> TranscriptEntry {
         agent_transcript_entry(&classify(&ConversationEntryDto {
             entry_number: 1,
             timestamp: chrono::Utc::now(),
@@ -1358,7 +1363,7 @@ mod utterance_tests {
             agent_transcript_entry(&classify(&ConversationEntryDto {
                 entry_number: entry_number as u64,
                 timestamp: chrono::Utc::now(),
-                source: ConversationSource::Stdout,
+                source: ConversationEntrySource::Stdout,
                 raw_base64: BASE64.encode(raw.as_bytes()),
             }))
         })
@@ -1381,22 +1386,22 @@ mod utterance_tests {
     fn every_role_names_itself_the_speaker_and_the_full_date() {
         let cases = [
             (
-                ConversationSource::Narsor,
+                ConversationEntrySource::Narsor,
                 r#"{"event":"prompt","prompt":"Fix it"}"#,
                 "USER · Narsor · ",
             ),
             (
-                ConversationSource::Narsor,
+                ConversationEntrySource::Narsor,
                 "step started",
                 "SYSTEM · Narsor · ",
             ),
             (
-                ConversationSource::Stdout,
+                ConversationEntrySource::Stdout,
                 r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done"}]}}"#,
                 "AGENT · Agent · ",
             ),
             (
-                ConversationSource::Stdout,
+                ConversationEntrySource::Stdout,
                 r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hm"}]}}"#,
                 "TECHNICZNE · Harness · ",
             ),
@@ -1418,11 +1423,11 @@ mod utterance_tests {
     fn a_narsor_prompt_shows_its_start_and_expands_to_the_whole_text() {
         let raw = r#"{"event":"agent_input","prompt":"Implement the feature\nthen run the tests\nand report"}"#;
 
-        let collapsed = lines_of(entry_from(ConversationSource::Narsor, raw), false);
+        let collapsed = lines_of(entry_from(ConversationEntrySource::Narsor, raw), false);
         assert_eq!(collapsed.len(), 2, "{collapsed:?}");
         assert_eq!(collapsed[1], "Implement the feature");
 
-        let expanded = lines_of(entry_from(ConversationSource::Narsor, raw), true);
+        let expanded = lines_of(entry_from(ConversationEntrySource::Narsor, raw), true);
         assert_eq!(
             expanded[1..],
             ["Implement the feature", "then run the tests", "and report"]

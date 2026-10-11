@@ -92,11 +92,12 @@ pub use connect::{connect, ServerTarget};
 pub use discovery::{ensure_daemon_running, DiscoveryError};
 pub use dto::{
     AcceptedResponse, ActiveProblem, ChatMessageRequest, ConductorActivity, ConductorChatResponse,
-    ConductorStateResponse, ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot,
-    OperatorNoteRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
-    StartTaskResponse, TransitionRequest,
+    ConductorStateResponse, ConversationEntryDto, ConversationEntrySource, ConversationResponse,
+    ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot, OperatorNoteRequest,
+    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
+    TransitionRequest,
 };
-pub use routes::{local_task_storage_root, ConversationEntryDto, ConversationResponse};
+pub use routes::{conversation_response_from_snapshot, local_task_storage_root};
 pub use token::TokenSource;
 
 use crate::auth::gate::{self, NetworkAuth, OwnerAuth};

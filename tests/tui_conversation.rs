@@ -10,8 +10,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::Utc;
 
-use narsor::api::ConversationEntryDto;
-use narsor::persistence::conversation::ConversationSource;
+use narsor::api::{ConversationEntryDto, ConversationEntrySource as ConversationSource};
 use narsor::tui::conversation::{classify, EntryKind};
 
 fn entry(source: ConversationSource, raw: &str) -> ConversationEntryDto {

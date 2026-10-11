@@ -3864,7 +3864,10 @@ async fn answer_page_from(runner: &RunnerClient, store: &ExecutionStore) {
                 )
                 .expect("read");
             let accepted = runner
-                .upload_conversation_page(&request.request_id, &PageResponse::from_snapshot(read))
+                .upload_conversation_page(
+                    &request.request_id,
+                    &narsor::api::conversation_response_from_snapshot(read),
+                )
                 .await
                 .expect("upload");
             assert!(accepted.delivered);

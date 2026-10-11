@@ -26,6 +26,15 @@ pub enum ConversationUnavailableReason {
     Unrecognized,
 }
 
+/// Where task events or a conversation page was read from.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionEventsSource {
+    #[default]
+    Runner,
+    Storage,
+}
+
 /// Current lease holder of a task's backend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControllerPresence {

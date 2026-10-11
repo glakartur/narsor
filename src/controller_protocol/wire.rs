@@ -24,9 +24,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use narsor_protocol::controller::{
-    ControllerPresence, ConversationUnavailableReason, Freshness, TransitionExit, TransitionOffer,
-    CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
-    CONVERSATION_UNAVAILABLE,
+    ControllerPresence, ConversationUnavailableReason, ExecutionEventsSource, Freshness,
+    TransitionExit, TransitionOffer, CONVERSATION_RECORD_UNREADABLE,
+    CONVERSATION_RECORD_UNREADABLE_PREFIX, CONVERSATION_UNAVAILABLE,
 };
 
 use crate::conductor::ConductorView;
@@ -1038,7 +1038,7 @@ pub struct ConversationPageRequest {
 
 /// One page of an attempt's raw conversation — the shape the local API
 /// serves, so a client renders a remote page exactly like a local one.
-pub type ConversationPage = crate::api::ConversationResponse;
+pub type ConversationPage = narsor_protocol::api::ConversationResponse;
 
 /// `GET /control/v1/tasks/:task_id/attempts/:attempt_id/conversation` query.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1093,18 +1093,6 @@ pub struct ExecutionEventsQuery {
     /// Most events to return; bounded by the server.
     #[serde(default)]
     pub limit: Option<u32>,
-}
-
-/// Where an answer (events, conductor, conversation) was read from.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionEventsSource {
-    /// The live runner, through the relay.
-    #[default]
-    Runner,
-    /// The task's own storage, by the daemon that owns it (local backend
-    /// without a live runner).
-    Storage,
 }
 
 /// `GET /control/v1/tasks/:task_id/execution-events`.

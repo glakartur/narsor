@@ -586,10 +586,7 @@ pub async fn conversation(
 /// One conversation entry: number, timestamp, source/kind, decoded content.
 fn print_conversation_entry(entry: &crate::api::ConversationEntryDto) {
     let classified = classify(entry);
-    let body = if matches!(
-        entry.source,
-        crate::persistence::conversation::ConversationSource::Narsor
-    ) {
+    let body = if matches!(entry.source, crate::api::ConversationEntrySource::Narsor) {
         String::from_utf8_lossy(&classified.raw).into_owned()
     } else {
         classified.summary
