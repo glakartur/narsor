@@ -24,6 +24,21 @@
 //! process again through `workload.json` instead of starting a second one.
 //! Runners run in their own process group and survive the controller, like
 //! a Pod survives its controller (R14); removing compute kills the group.
+//!
+//! # Killing a group whose runner already died
+//!
+//! The group outlives its leader while anything the runner started (a
+//! harness, a tool) still runs, and such an orphan could keep writing the
+//! task storage under the next runner. Its id is the dead runner's pid,
+//! though, which the system may hand out again once the group is gone, and
+//! a stranger could lead a new group of that id. So the group is signalled
+//! only when one of its live members carries the workload's mark: the
+//! environment variable [`WORKLOAD_MARK_ENV`] set to the workload's uid,
+//! which every runner gets and its descendants inherit. A group is either
+//! all ours or all a stranger's, and a pid cannot be reused while a group
+//! of that id still has members, so a marked member proves the group ours.
+//! A runner started before the mark existed, or descendants that cleared
+//! their environment, are left alone once the runner is gone, as before.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -46,6 +61,10 @@ use crate::environment::{BackendCapabilities, BackendKind};
 /// How long removing compute waits for a killed runner to disappear before
 /// it answers "in progress" and lets the controller come back.
 const KILL_WAIT: Duration = Duration::from_secs(2);
+
+/// The environment variable every runner gets, set to its workload's uid:
+/// what proves a process group still ours after the runner is gone.
+const WORKLOAD_MARK_ENV: &str = "NARSOR_LOCAL_WORKLOAD_UID";
 
 /// Configuration of a [`LocalBackend`].
 #[derive(Debug, Clone)]
@@ -313,6 +332,7 @@ impl LocalBackend {
         let log_err = log
             .try_clone()
             .map_err(|error| io_error("create the runner log", error))?;
+        let uid = format!("local-{}", uuid::Uuid::new_v4().simple());
         let mut command = Command::new(&self.config.program);
         command
             .arg("runner")
@@ -327,6 +347,7 @@ impl LocalBackend {
             .args(["--incarnation", &launch.incarnation])
             .args(&self.config.runner_args)
             .envs(self.config.env.iter().map(|(k, v)| (k, v)))
+            .env(WORKLOAD_MARK_ENV, &uid)
             .stdin(Stdio::null())
             .stdout(log)
             .stderr(log_err)
@@ -345,7 +366,7 @@ impl LocalBackend {
             }
         };
         let record = WorkloadRecord {
-            uid: format!("local-{}", uuid::Uuid::new_v4().simple()),
+            uid,
             resource_generation: 1,
             incarnation: launch.incarnation.clone(),
             launch_generation: launch.generation,
@@ -386,6 +407,11 @@ impl LocalBackend {
             if !self.wait_gone(task, &record) {
                 return Ok(Removal::Initiated);
             }
+        }
+        // The runner is gone; what it started may not be (see the module
+        // docs on why the mark makes the group safe to signal).
+        if !kill_marked_group(record.pid, &record.uid) {
+            return Ok(Removal::Initiated);
         }
         self.children().remove(&task.workload);
         fs::remove_dir_all(&dir).map_err(|error| io_error("remove the workload", error))?;
@@ -499,6 +525,65 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
     fields.nth(18)?.parse().ok()
 }
 
+/// Kills what is left of the process group `pgid` when it is the
+/// workload's (a live member carries `uid` as [`WORKLOAD_MARK_ENV`]), and
+/// waits briefly for it to go; true when no marked member is left.
+fn kill_marked_group(pgid: u32, uid: &str) -> bool {
+    let deadline = Instant::now() + KILL_WAIT;
+    loop {
+        if !group_marked(pgid, uid) {
+            return true;
+        }
+        // SAFETY: a marked live member proves the group ours, and its id
+        // cannot be reused while that member lives.
+        unsafe {
+            libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+        }
+        if Instant::now() >= deadline {
+            return !group_marked(pgid, uid);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether a live (not zombie) member of process group `pgid` carries the
+/// workload's mark. A process whose environment cannot be read (another
+/// user's) does not.
+fn group_marked(pgid: u32, uid: &str) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    let mark = format!("{WORKLOAD_MARK_ENV}={uid}");
+    entries.flatten().any(|entry| {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        process_group(pid) == Some(pgid)
+            && fs::read(format!("/proc/{pid}/environ")).is_ok_and(|environ| {
+                environ
+                    .split(|byte| *byte == 0)
+                    .any(|entry| entry == mark.as_bytes())
+            })
+    })
+}
+
+/// Field 5 of `/proc/{pid}/stat`: its process group; `None` for a zombie or
+/// a process that is gone.
+fn process_group(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace();
+    if fields.next()? == "Z" {
+        return None;
+    }
+    // `rest` starts at field 3 (state); field 5 is two further on.
+    fields.nth(1)?.parse().ok()
+}
+
 /// Whether `pid` still names the process that started at `start_ticks`
 /// and has not terminated (a zombie counts as terminated).
 fn process_alive(pid: u32, start_ticks: Option<u64>) -> bool {
@@ -506,5 +591,47 @@ fn process_alive(pid: u32, start_ticks: Option<u64>) -> bool {
         (Some(now), Some(then)) => now == then,
         (Some(_), None) => true,
         (None, _) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+
+    /// A process in a group of its own, carrying `mark` (if any).
+    fn group_leader(mark: Option<&str>) -> Child {
+        let mut command = Command::new("sleep");
+        command.arg("600").process_group(0);
+        if let Some(uid) = mark {
+            command.env(WORKLOAD_MARK_ENV, uid);
+        }
+        command.spawn().expect("spawn sleep")
+    }
+
+    #[test]
+    fn a_group_without_the_workloads_mark_is_never_signalled() {
+        let mut stranger = group_leader(Some("local-someone-else"));
+        let mut unmarked = group_leader(None);
+
+        assert!(kill_marked_group(stranger.id(), "local-ours"));
+        assert!(kill_marked_group(unmarked.id(), "local-ours"));
+
+        assert!(stranger.try_wait().unwrap().is_none(), "still running");
+        assert!(unmarked.try_wait().unwrap().is_none(), "still running");
+        let _ = stranger.kill();
+        let _ = unmarked.kill();
+        let _ = stranger.wait();
+        let _ = unmarked.wait();
+    }
+
+    #[test]
+    fn a_group_with_the_workloads_mark_is_killed() {
+        let mut ours = group_leader(Some("local-ours"));
+
+        assert!(kill_marked_group(ours.id(), "local-ours"));
+
+        let status = ours.wait().expect("reaped");
+        assert!(!status.success(), "killed: {status:?}");
     }
 }

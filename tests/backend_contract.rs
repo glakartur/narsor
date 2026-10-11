@@ -309,3 +309,95 @@ fn assert_work_continued(
         "the finished step ran once"
     );
 }
+
+/// Whether `pid` names a live (not zombie) process.
+fn process_running(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rfind(')')
+            .and_then(|end| stat[end + 1..].split_whitespace().next())
+            .is_some_and(|state| state != "Z")
+    })
+}
+
+/// A runner that dies on its own leaves what it started in its process
+/// group; removing its workload — what comes before every relaunch —
+/// kills that orphan too, so it cannot write the storage under the next
+/// runner.
+#[tokio::test]
+async fn removing_a_dead_runners_workload_kills_what_it_left_running() {
+    use narsor::backends::{RunnerCredential, WorkloadLaunch};
+
+    let scratch = std::env::temp_dir().join(format!("narsor-orphan-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&scratch).unwrap();
+    let child_pid_file = scratch.join("child.pid");
+    let program = scratch.join("fake-runner");
+    // Starts a long-lived child in its group, then waits for it.
+    fs::write(
+        &program,
+        "#!/bin/sh\nsleep 600 &\necho $! > \"$CHILD_PID_FILE\"\nwait\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        &program,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let mut config = LocalBackendConfig::with_program(scratch.join("local"), &program);
+    config.env = vec![("CHILD_PID_FILE".into(), child_pid_file.clone().into())];
+    let backend = LocalBackend::new(config);
+    let task_id = TaskId::parse("task-1").unwrap();
+    let task = backend.resources(&task_id, "task-1").unwrap();
+    let launch = WorkloadLaunch {
+        task_id: task_id.clone(),
+        generation: 1,
+        incarnation: "task-1-g1".into(),
+        lease_epoch: 1,
+        launch_spec: FakeTarget {
+            platform: FakeBackend::new(),
+        }
+        .launch_spec(),
+        control_plane_url: "http://127.0.0.1:9".into(),
+        credential: RunnerCredential::new("nsr.test"),
+    };
+    backend.provision(&task, &launch).await.expect("provision");
+    let leader = backend.runner_pid(&task).expect("a running runner");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let child: u32 = loop {
+        if let Some(pid) = fs::read_to_string(&child_pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "no child started");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    // Only the runner dies; its child lives on in the group.
+    // SAFETY: signalling the fake runner this test started.
+    unsafe {
+        libc::kill(leader as libc::pid_t, libc::SIGKILL);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while backend.runner_pid(&task).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the runner never died"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(process_running(child), "the orphan still runs");
+
+    let removal = backend.release_compute(&task).await.expect("removal");
+
+    assert!(removal.is_complete(), "{removal:?}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while process_running(child) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the orphan {child} survived the removal"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = fs::remove_dir_all(&scratch);
+}
