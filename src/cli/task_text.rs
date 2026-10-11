@@ -806,6 +806,12 @@ pub fn event_line(event: &TaskEvent) -> String {
             files,
             total_bytes,
         } => format!("material {material_id} {change:?} ({files} file(s), {total_bytes} bytes)"),
+        TaskEventKind::AutoResumed {
+            attempt: 0, limit, ..
+        } => format!(
+            "resumed automatically after a controller restart lost the runner \
+             (not counted toward the {limit} attempts)"
+        ),
         TaskEventKind::AutoResumed { attempt, limit, .. } => {
             format!("resumed automatically after runner loss (attempt {attempt}/{limit})")
         }

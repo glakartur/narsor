@@ -400,7 +400,9 @@ pub enum TaskEventKind {
     /// `Resume` receipt with [`CommandActor::Policy`] was written in the
     /// same mutation.
     AutoResumed {
-        /// Which consecutive attempt this is, starting at 1.
+        /// Which consecutive attempt this is, starting at 1; 0 when the loss
+        /// was found by a controller that took over since the launch and the
+        /// policy did not count it (see `ResumeState::last_loss_uncounted`).
         attempt: u32,
         /// How many consecutive attempts the policy makes at most.
         limit: u32,
@@ -444,6 +446,14 @@ pub struct ResumeState {
     pub last_loss: Option<WorkloadLoss>,
     /// Set once the policy gave up; the task waits for its owner.
     pub exhausted: Option<ResumeExhaustion>,
+    /// Losses found by a controller that took over since the launch (a
+    /// restart) that the policy left uncounted since the count last started
+    /// anew. Capped at the policy's limit: a controller that keeps
+    /// restarting gets no endless free attempts.
+    pub uncounted_losses: u32,
+    /// Whether the last loss was one of those: the resume after it is no
+    /// counted attempt.
+    pub last_loss_uncounted: bool,
 }
 
 impl ResumeState {

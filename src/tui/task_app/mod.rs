@@ -1051,10 +1051,17 @@ impl TaskApp {
             ResumeNoticeKind::Resumed { attempt, limit } => self.notifier.push_counted(
                 Severity::Warning,
                 "auto-resume",
-                format!(
-                    "{}: wznowiono automatycznie po utracie runnera (próba {attempt}/{limit})",
-                    resume.title
-                ),
+                if *attempt == 0 {
+                    format!(
+                        "{}: wznowiono automatycznie po restarcie kontrolera (poza limitem {limit} prób)",
+                        resume.title
+                    )
+                } else {
+                    format!(
+                        "{}: wznowiono automatycznie po utracie runnera (próba {attempt}/{limit})",
+                        resume.title
+                    )
+                },
                 |count| format!("wznowiono automatycznie {count} {}", tasks_word(count)),
                 now,
             ),

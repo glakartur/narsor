@@ -419,7 +419,8 @@ pub struct ResumeNotice {
 pub enum ResumeNoticeKind {
     /// Resumed: attempt `attempt` of `limit`.
     Resumed {
-        /// The consecutive attempt, from 1.
+        /// The consecutive attempt, from 1; 0 after a controller restart
+        /// the policy did not count.
         attempt: u32,
         /// How many the policy makes.
         limit: u32,

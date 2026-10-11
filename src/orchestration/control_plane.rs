@@ -276,7 +276,11 @@ impl ControlPlane {
                     idempotency_key: request.idempotency_key.clone(),
                 },
                 CommandActor::Policy => TaskEventKind::AutoResumed {
-                    attempt: record.resume.consecutive_losses.max(1),
+                    attempt: if record.resume.last_loss_uncounted {
+                        0
+                    } else {
+                        record.resume.consecutive_losses.max(1)
+                    },
                     limit: self.resume_policy.limit(),
                     loss_reason: record
                         .resume

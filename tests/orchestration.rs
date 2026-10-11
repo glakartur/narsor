@@ -2709,6 +2709,8 @@ fn a_partial_resume_state_fills_the_rest_with_defaults() {
     assert_eq!(state.consecutive_losses, 2);
     assert_eq!(state.next_attempt_at, None);
     assert_eq!(state.exhausted, None);
+    assert_eq!(state.uncounted_losses, 0);
+    assert!(!state.last_loss_uncounted);
     let loss = state.last_loss.expect("the loss");
     assert_eq!(loss.from, TaskLifecycle::Running);
     assert_eq!(loss.lease_epoch, 4);
@@ -2732,12 +2734,16 @@ fn a_full_resume_state_round_trips() {
             at,
             announced: true,
         }),
+        uncounted_losses: 2,
+        last_loss_uncounted: true,
     };
     assert!(!state.is_empty());
 
     let json = serde_json::to_value(&state).unwrap();
     assert_eq!(json["last_loss"]["from"], "pause_requested");
     assert_eq!(json["exhausted"]["announced"], true);
+    assert_eq!(json["uncounted_losses"], 2);
+    assert_eq!(json["last_loss_uncounted"], true);
     let back: ResumeState = serde_json::from_value(json).unwrap();
     assert_eq!(back, state);
 }
@@ -3216,6 +3222,130 @@ fn a_loss_found_under_a_newer_lease_epoch_than_the_launch_keeps_the_count() {
     // The resume is ordered under the new epoch, so its loss counts again.
     let again = lose_again_while_provisioning(&fx, "task-1", &restarted, "exited");
     assert_eq!(again.resume.consecutive_losses, 3);
+}
+
+#[test]
+fn a_restart_loss_after_a_stable_run_starts_the_count_anew() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    lose(&fx, "task-1", &lease, true, "exited");
+    lose_again_while_provisioning(&fx, "task-1", &lease, "exited");
+    policy_resume(&fx, "task-1");
+    fx.observe("task-1", &lease, Observation::RunnerReady)
+        .unwrap();
+    fx.clock.advance(Duration::minutes(11));
+
+    let restarted = long_lease(&fx, "controller-a");
+    let lost = lose(&fx, "task-1", &restarted, true, "disappeared");
+    assert_eq!(lost.resume.consecutive_losses, 0, "the stable run reset it");
+    assert_eq!(lost.resume.next_attempt_at, Some(fx.clock.now()));
+
+    policy_resume(&fx, "task-1");
+    fx.observe("task-1", &restarted, Observation::RunnerReady)
+        .unwrap();
+    fx.clock.advance(Duration::minutes(1));
+    let quick = lose(&fx, "task-1", &restarted, true, "exited");
+
+    assert_eq!(quick.resume.consecutive_losses, 1, "attempt 1 again");
+    assert_eq!(quick.resume.next_attempt_at, Some(fx.clock.now()));
+}
+
+/// Resumes the task by the policy, restarts its controller (the next lease
+/// epoch) and loses the workload under it: a loss the policy may leave
+/// uncounted.
+fn lose_after_a_restart(fx: &Fixture, id: &str) -> (TaskRecord, BackendLease) {
+    policy_resume(fx, id);
+    let restarted = long_lease(fx, "controller-a");
+    let lost = lose(fx, id, &restarted, true, "the controller restarted");
+    (lost, restarted)
+}
+
+#[test]
+fn a_controller_that_keeps_restarting_gets_only_so_many_free_resumes() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    lose(&fx, "task-1", &lease, true, "exited");
+    let limit = ResumePolicy::default().limit();
+
+    for free in 1..=limit {
+        let (lost, _) = lose_after_a_restart(&fx, "task-1");
+        assert_eq!(lost.resume.consecutive_losses, 1, "free loss {free}");
+        assert_eq!(lost.resume.uncounted_losses, free);
+        assert!(lost.resume.last_loss_uncounted);
+        assert_eq!(lost.resume.next_attempt_at, Some(fx.clock.now()));
+    }
+
+    // Past the limit a restart loss counts like any other.
+    let (counted, _) = lose_after_a_restart(&fx, "task-1");
+    assert_eq!(counted.resume.consecutive_losses, 2);
+    assert!(!counted.resume.last_loss_uncounted);
+    assert_eq!(
+        counted.resume.next_attempt_at,
+        Some(fx.clock.now() + Duration::seconds(30))
+    );
+    let mut last = counted;
+    while last.resume.exhausted.is_none() {
+        let (lost, _) = lose_after_a_restart(&fx, "task-1");
+        last = lost;
+    }
+    assert_eq!(last.resume.consecutive_losses, limit + 1);
+    assert_eq!(last.resume.next_attempt_at, None, "the crash loop ends");
+}
+
+#[test]
+fn six_restart_losses_in_a_row_do_not_exhaust_the_policy() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    let restarted = long_lease(&fx, "controller-a");
+    let mut last = lose(&fx, "task-1", &restarted, true, "restarted");
+    for _ in 2..=6 {
+        last = lose_after_a_restart(&fx, "task-1").0;
+    }
+
+    assert_eq!(last.resume.exhausted, None);
+    assert_eq!(last.resume.consecutive_losses, 1, "the sixth is attempt 1");
+    assert_eq!(last.resume.next_attempt_at, Some(fx.clock.now()));
+}
+
+#[test]
+fn a_resume_after_an_uncounted_loss_says_attempt_zero() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    lose(&fx, "task-1", &lease, true, "exited");
+    lose_again_while_provisioning(&fx, "task-1", &lease, "exited");
+    lose_after_a_restart(&fx, "task-1");
+
+    let resumed = policy_resume(&fx, "task-1");
+
+    let attempts: Vec<u32> = fx
+        .control
+        .events_since(&task("task-1"), 0)
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            TaskEventKind::AutoResumed { attempt, .. } => Some(attempt),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attempts, vec![1, 2, 0], "no counted attempt is repeated");
+    assert_eq!(resumed.resume.consecutive_losses, 2);
+}
+
+#[test]
+fn an_owner_resume_forgets_the_uncounted_losses() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-1", &lease);
+    lose(&fx, "task-1", &lease, true, "exited");
+    lose_after_a_restart(&fx, "task-1");
+
+    let resumed = fx.command("task-1", OwnerCommand::Resume, "owner-resume");
+
+    assert!(resumed.resume.is_empty());
 }
 
 #[test]

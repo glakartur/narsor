@@ -538,7 +538,7 @@ pub fn interrupted(id: &str, from: TaskLifecycle, losses: u32, planned: bool) ->
             lease_epoch: 1,
             reason: None,
         }),
-        exhausted: None,
+        ..ResumeState::default()
     };
     task
 }

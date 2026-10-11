@@ -487,6 +487,23 @@ fn an_automatic_resume_event_names_the_attempt_and_the_limit() {
 }
 
 #[test]
+fn an_automatic_resume_after_an_uncounted_restart_names_no_attempt() {
+    let line = event_line(&resume_event(TaskEventKind::AutoResumed {
+        attempt: 0,
+        limit: 5,
+        loss_reason: None,
+    }));
+    assert!(
+        line.ends_with(
+            "resumed automatically after a controller restart lost the runner \
+             (not counted toward the 5 attempts)"
+        ),
+        "{line}"
+    );
+    assert!(!line.contains("attempt 0"), "{line}");
+}
+
+#[test]
 fn an_exhaustion_event_names_the_attempts_and_the_loss_once() {
     let line = event_line(&resume_event(TaskEventKind::AutoResumeExhausted {
         attempts: 5,

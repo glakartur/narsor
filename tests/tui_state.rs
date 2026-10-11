@@ -10494,6 +10494,23 @@ mod task_app_auto_resume {
         assert_eq!(attention_of(row), Attention::None);
     }
 
+    /// A resume after a controller restart the policy did not count names
+    /// no attempt.
+    #[test]
+    fn an_uncounted_automatic_resume_names_the_restart_not_an_attempt() {
+        let mut app = app();
+        app.load(listing(lost_tasks(3), "c"));
+        app.on_stream(auto_resumed("e1", "t2", 2, 0));
+        assert_eq!(
+            note(&app),
+            (
+                Severity::Warning,
+                "NAR-2: wznowiono automatycznie po restarcie kontrolera (poza limitem 5 prób)"
+                    .to_string()
+            )
+        );
+    }
+
     /// Resumes in a row — a restart — are counted in one notification.
     #[test]
     fn resumes_in_a_row_are_counted_in_one_notification() {

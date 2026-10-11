@@ -1851,6 +1851,9 @@ async fn a_task_waiting_on_an_approval_returns_to_it_after_a_restart_lost_its_ru
 /// The restart rule: a loss a restarted daemon finds says nothing about
 /// whether the task can run, so six restarts in a row — each losing the
 /// runner well within the stability window — never use up the attempts.
+/// Only the policy's limit of them (five) go uncounted, though: the sixth
+/// is counted as attempt 1, so a crash-looping daemon ends in an
+/// exhaustion rather than resuming forever.
 #[tokio::test]
 #[ignore = "starts a narsor daemon; run with --ignored"]
 async fn six_restarts_that_each_lose_the_runner_do_not_exhaust_the_resume() {
@@ -1866,12 +1869,14 @@ async fn six_restarts_that_each_lose_the_runner_do_not_exhaust_the_resume() {
 
     let resumes = daemon.auto_resumes().await;
     assert_eq!(resumes.len(), 6, "{resumes:?}");
-    assert!(
-        resumes.iter().all(|(attempt, _)| *attempt == 1),
-        "no restart counted as a failed attempt: {resumes:?}"
+    let attempts: Vec<u32> = resumes.iter().map(|(attempt, _)| *attempt).collect();
+    assert_eq!(
+        attempts,
+        [0, 0, 0, 0, 0, 1],
+        "five uncounted restarts, then the first counted attempt: {resumes:?}"
     );
     let task = daemon.task().await;
-    assert_eq!(task.resume.consecutive_losses, 0, "{:?}", task.resume);
+    assert_eq!(task.resume.consecutive_losses, 1, "{:?}", task.resume);
     assert!(task.resume.exhausted.is_none(), "{:?}", task.resume);
 }
 

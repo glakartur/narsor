@@ -7,9 +7,13 @@
 //! | loss                                              | count     | next attempt          |
 //! |---------------------------------------------------|-----------|-----------------------|
 //! | from `PauseRequested`                             | unchanged | none (owner decides)  |
-//! | reported under a newer lease epoch than the launch | unchanged | now                   |
+//! | reported under a newer lease epoch than the launch | unchanged | now (at most `limit` in a row, then counted) |
 //! | from `Provisioning`, or ready shorter than the window | +1     | delay of that attempt, or exhausted past the limit |
 //! | ready at least the stability window               | 1         | now                   |
+//!
+//! A loss after a run of at least the stability window starts both counts
+//! anew first, so a restart loss after it is free again and the next
+//! counted loss is attempt 1.
 //!
 //! The resume policy then only reads the outcome: an attempt that is due
 //! and not exhausted ([`TaskRecord::auto_resume_due`]), resumed through
@@ -79,30 +83,36 @@ pub(crate) fn count_loss(record: &mut TaskRecord, policy: &ResumePolicy, now: Da
     let Some(loss) = record.resume.last_loss.clone() else {
         return;
     };
-    let resume = &mut record.resume;
-    resume.next_attempt_at = None;
-    // Lost before a safe point: what the owner wanted was a pause.
-    if loss.from == TaskLifecycle::PauseRequested {
-        return;
-    }
-    // Found by a controller that took over since the launch (a restart):
-    // the loss says nothing about whether the task can run.
-    if record
-        .workload_epoch
-        .is_some_and(|epoch| loss.lease_epoch > epoch)
-    {
-        resume.next_attempt_at = Some(now);
-        return;
-    }
     let started_successfully = loss.from != TaskLifecycle::Provisioning
         && record
             .running_since
             .is_some_and(|since| loss.at - since >= policy.stability_window);
-    resume.consecutive_losses = if started_successfully {
-        1
-    } else {
-        resume.consecutive_losses.saturating_add(1)
-    };
+    let restarted = record
+        .workload_epoch
+        .is_some_and(|epoch| loss.lease_epoch > epoch);
+    let resume = &mut record.resume;
+    resume.next_attempt_at = None;
+    resume.last_loss_uncounted = false;
+    // Lost before a safe point: what the owner wanted was a pause.
+    if loss.from == TaskLifecycle::PauseRequested {
+        return;
+    }
+    // A runner that stayed up starts the count anew, whatever lost it.
+    if started_successfully {
+        resume.consecutive_losses = 0;
+        resume.uncounted_losses = 0;
+    }
+    // Found by a controller that took over since the launch (a restart):
+    // the loss says nothing about whether the task can run. Only so many in
+    // a row, though: past the limit a controller that keeps restarting
+    // counts like any other loss, so a crash loop ends in an exhaustion.
+    if restarted && resume.uncounted_losses < policy.limit() {
+        resume.uncounted_losses += 1;
+        resume.last_loss_uncounted = true;
+        resume.next_attempt_at = Some(now);
+        return;
+    }
+    resume.consecutive_losses = resume.consecutive_losses.saturating_add(1);
     match policy.delay(resume.consecutive_losses) {
         Some(delay) => resume.next_attempt_at = Some(now + delay),
         None => {
