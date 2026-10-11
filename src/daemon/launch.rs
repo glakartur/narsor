@@ -1,4 +1,4 @@
-//! Detach-spawn: turning a live client process into "narsor daemon, running
+//! Detach-spawn: turning a live client process into "narsor-server, running
 //! in a session of its own".
 //!
 //! # Why re-exec + `setsid()`, not a double fork
@@ -97,7 +97,7 @@ where
 }
 
 /// Environment variable [`set_exe_override_for_tests`] writes to, and
-/// [`resolve_exe`] checks before falling back to `current_exe()`.
+/// [`resolve_exe`] checks before falling back to the sibling `narsor-server`.
 ///
 /// Only ever read in a `debug_assertions` build (see [`resolve_exe`]): a
 /// release binary must never let *any* environment variable redirect which
@@ -111,26 +111,44 @@ const EXE_OVERRIDE_ENV: &str = "NARSOR_TEST_DAEMON_EXE";
 /// Resolves the executable [`spawn_detached`] re-execs: in a
 /// `debug_assertions` build, the override set by
 /// [`set_exe_override_for_tests`] if one was set, otherwise
-/// `current_exe()`. A release build only ever calls `current_exe()` — the
+/// the sibling `narsor-server`. A release build only ever resolves that sibling — the
 /// override does not exist in that build at all (see [`EXE_OVERRIDE_ENV`]).
 fn resolve_exe() -> io::Result<std::path::PathBuf> {
     #[cfg(debug_assertions)]
     if let Ok(path) = std::env::var(EXE_OVERRIDE_ENV) {
         return Ok(std::path::PathBuf::from(path));
     }
-    std::env::current_exe()
+    let client_exe = std::env::current_exe()?;
+    let server_name = if cfg!(windows) {
+        "narsor-server.exe"
+    } else {
+        "narsor-server"
+    };
+    let adjacent = client_exe.with_file_name(server_name);
+    if adjacent.is_file() {
+        return Ok(adjacent);
+    }
+    // Cargo integration tests run from `target/<profile>/deps`; workspace
+    // binaries under test are one directory above their test harnesses.
+    if let Some(profile_dir) = client_exe.parent().and_then(|deps| deps.parent()) {
+        let workspace_binary = profile_dir.join(server_name);
+        if workspace_binary.is_file() {
+            return Ok(workspace_binary);
+        }
+    }
+    Ok(adjacent)
 }
 
 /// Test-only seam: makes [`spawn_detached`] re-exec `path` instead of
 /// `current_exe()`.
 ///
-/// `cargo test`'s own harness binary is not the `narsor` binary — `current_exe()`
+/// `cargo test`'s own harness binary is not the `narsor-server` binary — `current_exe()`
 /// inside a test process resolves to the compiled test binary, not to
-/// `narsor` itself (see this module's doc comment on why a raw re-exec of
+/// `narsor-server` itself (see this module's doc comment on why a raw re-exec of
 /// `current_exe()` cannot be exercised directly from this crate's own unit
 /// tests). An integration test that wants `ensure_daemon_running`
 /// (`src/api/discovery.rs`, U5) to actually spawn the real daemon calls this
-/// once, with `env!("CARGO_BIN_EXE_narsor")`, before any test in the binary
+/// once, with the workspace path to `narsor-server`, before any test in the binary
 /// calls through to [`spawn_detached`].
 ///
 /// `#[cfg(debug_assertions)]`, not `#[cfg(test)]`: an integration test under

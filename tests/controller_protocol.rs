@@ -7,6 +7,8 @@
 //! clock, so lease expiry and staleness are deterministic; long-polls use
 //! real time but are only ever asked to wait briefly.
 
+#[path = "engine_support/mod.rs"]
+mod engine_support;
 mod environment_support;
 
 use std::fs;
@@ -1310,10 +1312,9 @@ async fn the_daemon_recovers_the_control_plane_at_startup_and_serves_it() {
 }
 
 fn spawn_daemon(root: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_narsor"))
+    Command::new(engine_support::workspace_binary("narsor-server"))
         .arg("--root")
         .arg(root)
-        .arg("daemon")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

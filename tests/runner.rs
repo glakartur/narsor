@@ -1,6 +1,6 @@
 //! Integration tests for the portable, resumable task runner (U3).
 //!
-//! Every runner here is the real `narsor runner` binary in a child process,
+//! Every runner here is the real `narsor-runner` binary in a child process,
 //! talking over real HTTP to the real [`ProtocolService`] served on
 //! loopback — so a lost workload is a killed process group, a lost control
 //! plane is a port nobody listens on, and a resumed workload is a second
@@ -10,6 +10,8 @@
 //! service. Workspaces are cloned from a local bare repository; agent steps
 //! run a fake `claude` put first on the runner's `PATH`.
 
+#[path = "engine_support/mod.rs"]
+mod engine_support;
 mod environment_support;
 
 use std::fs;
@@ -331,12 +333,12 @@ impl Fixture {
         path
     }
 
-    /// Starts `narsor runner` for `task` on `storage`.
+    /// Starts `narsor-runner` for `task` on `storage`.
     fn spawn(&mut self, launch: &Launch, incarnation: &str, credential: &Path) -> usize {
         use std::os::unix::process::CommandExt;
-        let mut command = Command::new(env!("CARGO_BIN_EXE_narsor"));
+        let mut command = Command::new(engine_support::workspace_binary("narsor-runner"));
         command
-            .args(["runner", "--task-id", &launch.task])
+            .args(["--task-id", &launch.task])
             .arg("--task-storage")
             .arg(&launch.storage)
             .arg("--launch-spec")
@@ -407,7 +409,7 @@ struct Launch {
     storage: PathBuf,
     path: String,
     secrets: Option<PathBuf>,
-    /// Extra `narsor runner` arguments.
+    /// Extra `narsor-runner` arguments.
     args: Vec<String>,
     /// Extra variables of the runner process.
     env: Vec<(String, String)>,

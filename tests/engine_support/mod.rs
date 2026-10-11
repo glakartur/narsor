@@ -25,6 +25,28 @@ use narsor::workflow::load_from_file;
 use narsor::workspace::WorkspaceProvisioner;
 use serde_json::{json, Map, Value};
 
+/// Locates a sibling workspace binary from a Cargo integration-test binary.
+/// Test executables live under `target/{profile}/deps` and workspace binaries
+/// live one directory above it.
+pub fn workspace_binary(name: &str) -> PathBuf {
+    let test_binary = std::env::current_exe().expect("test executable path");
+    let target_profile = test_binary
+        .parent()
+        .and_then(Path::parent)
+        .expect("Cargo test executable is under target/<profile>/deps");
+    #[cfg(windows)]
+    let name = format!("{name}.exe");
+    #[cfg(not(windows))]
+    let name = name.to_string();
+    let path = target_profile.join(name);
+    assert!(
+        path.is_file(),
+        "workspace binary was not built: {}",
+        path.display()
+    );
+    path
+}
+
 /// A temporary root with a store and a workspace, removed when it goes away.
 ///
 /// Stands in for the `tempfile` crate, which is not a dependency of this crate.

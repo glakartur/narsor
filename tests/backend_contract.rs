@@ -4,6 +4,8 @@
 //! The suite itself lives in `backend_contract_support` so other adapters'
 //! test crates (U5's Kubernetes adapter against a mock API) expand it too.
 
+#[path = "engine_support/mod.rs"]
+mod engine_support;
 mod environment_support;
 #[macro_use]
 mod backend_contract_support;
@@ -68,7 +70,7 @@ contract_suite!(fake, crate::FakeTarget);
 // The local adapter
 // ---------------------------------------------------------------------------
 
-/// `narsor runner` processes over local directories.
+/// `narsor-runner` processes over local directories.
 struct LocalTarget {
     config: LocalBackendConfig,
 }
@@ -101,8 +103,10 @@ impl ContractTarget for LocalTarget {
             eprintln!("skipped: the runner refuses to run as root");
             return None;
         }
-        let mut config =
-            LocalBackendConfig::with_program(scratch.join("local"), env!("CARGO_BIN_EXE_narsor"));
+        let mut config = LocalBackendConfig::with_program(
+            scratch.join("local"),
+            engine_support::workspace_binary("narsor-runner"),
+        );
         config.runner_args = [
             "--poll-wait-secs",
             "1",

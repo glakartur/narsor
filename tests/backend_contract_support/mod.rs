@@ -25,7 +25,7 @@
 //! puts the target's adapter behind a [`Probed`] that counts what it really
 //! did and injects faults. The owner acts in-process through the same
 //! service. Runners are whatever the adapter starts: the fake's simulated
-//! runner, the local adapter's `narsor runner` processes, a mock cluster's
+//! runner, the local adapter's `narsor-runner` processes, a mock cluster's
 //! Pods. Nothing here names a platform type.
 //!
 //! The resume policy runs as it does in the daemon, on a short tick and with

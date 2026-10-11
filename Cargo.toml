@@ -2,6 +2,16 @@
 name = "narsor"
 version = "0.1.0"
 edition = "2021"
+default-run = "narsor"
+autobins = false
+
+[[bin]]
+name = "narsor"
+path = "src/bin/narsor.rs"
+
+[[bin]]
+name = "narsor-cli"
+path = "src/main.rs"
 
 [workspace]
 members = [

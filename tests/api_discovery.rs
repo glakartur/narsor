@@ -62,7 +62,7 @@ impl Drop for TempRoot {
 fn init_exe_override() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        set_exe_override_for_tests(Path::new(env!("CARGO_BIN_EXE_narsor")));
+        set_exe_override_for_tests(&engine_support::workspace_binary("narsor-server"));
         // Every daemon spawned from here inherits it: its conductor runs on
         // the fake harness, never a real `claude`.
         engine_support::fake_claude_first_on_path();

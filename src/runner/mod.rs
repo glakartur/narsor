@@ -2,7 +2,7 @@
 //! storage, reporting to a control plane it does not depend on (U3, KTD5).
 //!
 //! A runner is what a backend starts inside a task's isolated workload
-//! (`narsor runner …`, see [`cli`]). It owns exactly one task storage
+//! (`narsor-runner …`, see [`cli`]). It owns exactly one task storage
 //! ([`storage`]) and exactly one execution on it, and it is the only thing
 //! that ever writes that execution. The control plane never sees the files;
 //! it sees [`RunnerSnapshot`]s — cursors and summaries — and relays owner

@@ -11,7 +11,7 @@
 //!   generation from the control plane, D58). An init container per bundle
 //!   copies the pinned runtime bundle (and each tool package) into an
 //!   `emptyDir`; the main container runs the repository's own pinned base
-//!   image with its command replaced by `narsor runner` (R20, R21);
+//!   image with its command replaced by `narsor-runner` (R20, R21);
 //! * a **Secret** `narsor-…-launch-…` per incarnation — the runner
 //!   credential and the launch spec, mounted read-only *outside* the task
 //!   storage and owned by the Pod, so the garbage collector removes it with
@@ -585,7 +585,6 @@ pub fn pod(
     }
 
     let mut args = vec![
-        "runner".to_string(),
         "--task-id".into(),
         launch.task_id.to_string(),
         "--task-storage".into(),
@@ -659,7 +658,7 @@ pub fn pod(
             "containers": [{
                 "name": RUNNER_CONTAINER,
                 "image": plan.base_image,
-                "command": [format!("{RUNTIME_MOUNT}/bin/narsor")],
+                "command": [format!("{RUNTIME_MOUNT}/bin/narsor-runner")],
                 "args": args,
                 // PATH only: HOME is the runner's to set (a private HOME on
                 // the task storage, R17), and tool secrets reach their

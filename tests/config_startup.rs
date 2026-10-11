@@ -99,7 +99,7 @@ struct Invocation {
 /// Runs the binary with `HOME` and `XDG_CONFIG_HOME` inside the temporary
 /// root, and without `--root` unless the caller passes one.
 fn cli(root: &TempRoot, environment: &[(&str, &str)], args: &[&str]) -> Invocation {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_narsor"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_narsor-cli"));
     command
         .current_dir(root.path())
         .env_clear()
@@ -172,7 +172,6 @@ fn a_broken_file_stops_every_subcommand_with_the_file_named() {
         vec!["list"],
         vec!["validate", "compound-engineering"],
         vec!["run", "compound-engineering"],
-        vec!["tui"],
     ] {
         let invocation = cli(&root, &[], &arguments);
 
@@ -436,7 +435,19 @@ fn the_tui_log_file_lands_in_the_resolved_state_directory() {
         store.display()
     ));
 
-    let invocation = cli(&root, &[], &["tui"]);
+    let output = Command::new(env!("CARGO_BIN_EXE_narsor"))
+        .current_dir(root.path())
+        .env_clear()
+        .env("PATH", engine_support::fake_claude_first_on_path())
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .output()
+        .expect("run the narsor TUI");
+    let invocation = Invocation {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
 
     assert_ne!(
         invocation.code, EXIT_USAGE,
@@ -682,7 +693,7 @@ fn the_root_flag_sets_all_three_and_every_row_names_it() {
 /// it forever: a daemon that wrongly starts is killed after `deadline`, and
 /// its exit code then reads as the signal's.
 fn daemon(root: &TempRoot, environment: &[(&str, &str)], deadline: Duration) -> Invocation {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_narsor"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_narsor-cli"));
     command
         .current_dir(root.path())
         .env_clear()

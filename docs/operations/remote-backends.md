@@ -37,15 +37,15 @@ Contents:
    └─ native API ─▶ Kubernetes: one Pod + one PVC per task
                       init container: copies the runtime bundle to /opt/narsor
                       main container: the repository's base image, runs
-                                      /opt/narsor/bin/narsor runner
+                                      /opt/narsor/bin/narsor-runner
                       runner ──outbound HTTPS──▶ control plane (/runner/v1)
 ```
 
 | Part | Holds | Never holds |
 | --- | --- | --- |
-| **Control plane** (`narsor daemon`) | The authoritative orchestration state: task assignment, desired lifecycle and generation, owner commands, the scheduler's queue, controller leases, the *last observed* runner and backend summaries, a durable per-task event log | Workspace files, raw conversation transcripts, secret values |
+| **Control plane** (`narsor-server`) | The authoritative orchestration state: task assignment, desired lifecycle and generation, owner commands, the scheduler's queue, controller leases, the *last observed* runner and backend summaries, a durable per-task event log | Workspace files, raw conversation transcripts, secret values |
 | **Controller** (`narsor controller`) | Its own identity (`nsk.` credential) and the backend's native credentials | Any user token; any task state of its own |
-| **Runner** (`narsor runner`, inside the task Pod) | The task's real work state on **task storage** (the PVC): engine files, workspace, private `$HOME`, conversation records | Anything central — it reports cursors and summaries only |
+| **Runner** (`narsor-runner`, inside the task Pod) | The task's real work state on **task storage** (the PVC): engine files, workspace, private `$HOME`, conversation records | Anything central — it reports cursors and summaries only |
 | **Task storage** | The authoritative work state of one task, surviving pause/resume | It is not a backup; archive deletes it |
 
 Rules that follow from this split:
@@ -321,7 +321,7 @@ Other `backend.yaml` keys: `namespace`, `storage_mib` (PVC size, default
 before it counts as lost), `harness_home` (below).
 
 **`harness_home`** — which `HOME` and harness configuration the runner gives
-every action, passed as `narsor runner` flags on every Pod start:
+every action, passed as `narsor-runner` flags on every Pod start:
 
 ```yaml
 harness_home:
@@ -403,7 +403,7 @@ nonce); the control plane and the controller clocks must agree within
 ### Runtime bundle image
 
 The bundle image (`runtime.yaml` → `bundle`) carries everything Narsor runs in
-a task under `/narsor`: at least `/narsor/bin/narsor`, plus the supported
+a task under `/narsor`: at least `/narsor/bin/narsor-runner`, plus the supported
 harnesses, their portable dependencies and skills. The init container runs
 `cp -a /narsor/. /opt/narsor/`, so the image needs `cp` and the payload must be
 self-contained (statically linked or carrying its own loader and libraries).
@@ -412,7 +412,7 @@ Tool images are copied the same way under `/opt/narsor-tools`.
 ### Repository base image
 
 The main container runs the repository's own image with its command replaced
-by `/opt/narsor/bin/narsor runner`. The runner checks the contract before any
+by `/opt/narsor/bin/narsor-runner`. The runner checks the contract before any
 work and reports a readable `base_image_contract` problem otherwise:
 
 * supported platform and architecture, `/bin/sh` and basic tools;

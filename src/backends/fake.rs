@@ -2,7 +2,7 @@
 //!
 //! A [`FakeBackend`] models a container platform in a map: task storage
 //! that outlives compute, workloads with platform UIDs, phases and resource
-//! versions, deterministic names. Instead of running a real `narsor runner`
+//! versions, deterministic names. Instead of running a real `narsor-runner`
 //! each workload runs a *simulated runner* — a task that speaks the real
 //! runner protocol over HTTP with the credential the controller issued:
 //! it reports a first snapshot (so the controller sees the runner up),

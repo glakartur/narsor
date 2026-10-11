@@ -1808,7 +1808,7 @@ async fn the_cli_gets_a_readable_refusal_from_a_network_server() {
         let (url, alice, root) = (url.clone(), alice.clone(), root.clone());
         async move {
             tokio::task::spawn_blocking(move || {
-                let output = std::process::Command::new(env!("CARGO_BIN_EXE_narsor"))
+                let output = std::process::Command::new(env!("CARGO_BIN_EXE_narsor-cli"))
                     .current_dir(&root)
                     .env("HOME", &root)
                     .env("XDG_CONFIG_HOME", root.join("config"))

@@ -112,7 +112,7 @@ struct Invocation {
 
 /// Runs the binary in the temporary root, with a controlled environment.
 fn show(root: &TempRoot, environment: &[(&str, &str)], args: &[&str]) -> Invocation {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_narsor"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_narsor-cli"));
     command
         .current_dir(root.path())
         .env_clear()
@@ -266,7 +266,7 @@ fn it_works_without_a_home_and_without_the_state_directory_existing() {
     let root = TempRoot::new();
     let absent = root.path().join("not-there");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_narsor"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_narsor-cli"));
     let output = command
         .current_dir(root.path())
         .env_clear()
@@ -360,7 +360,7 @@ fn an_unknown_key_is_reported_while_list_in_the_same_directory_refuses_outright(
         invocation.stdout
     );
 
-    let listing = Command::new(env!("CARGO_BIN_EXE_narsor"))
+    let listing = Command::new(env!("CARGO_BIN_EXE_narsor-cli"))
         .current_dir(root.path())
         .env_clear()
         .env("PATH", engine_support::fake_claude_first_on_path())

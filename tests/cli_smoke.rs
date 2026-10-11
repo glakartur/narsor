@@ -95,7 +95,7 @@ fn cli_at(root: &Path, args: &[&str]) -> Invocation {
 /// [`cli_at`] with `path` as the `PATH` of the process — and of the daemon
 /// it may spawn, whose conductor runs `claude` from it.
 fn cli_on_path(root: &Path, args: &[&str], path: &str) -> Invocation {
-    let output = Command::new(env!("CARGO_BIN_EXE_narsor"))
+    let output = Command::new(env!("CARGO_BIN_EXE_narsor-cli"))
         .current_dir(root)
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("HOME", root)
@@ -111,6 +111,24 @@ fn cli_on_path(root: &Path, args: &[&str], path: &str) -> Invocation {
         .output()
         .expect("run the narsor binary");
 
+    Invocation {
+        code: output.status.code().expect("the process exited normally"),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+fn tui(root: &TempRoot, args: &[&str]) -> Invocation {
+    let output = Command::new(env!("CARGO_BIN_EXE_narsor"))
+        .current_dir(root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("HOME", root.path())
+        .env("PATH", engine_support::fake_claude_first_on_path())
+        .arg("--root")
+        .arg(root.path())
+        .args(args)
+        .output()
+        .expect("run the narsor TUI");
     Invocation {
         code: output.status.code().expect("the process exited normally"),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -2468,7 +2486,7 @@ mod remote_cli {
         let token = token.map(str::to_string);
         let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
         tokio::task::spawn_blocking(move || {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_narsor"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_narsor-cli"));
             command
                 .current_dir(&root)
                 .env("XDG_CONFIG_HOME", root.join("config"))
@@ -3265,7 +3283,7 @@ mod remote_cli {
 }
 
 // ---------------------------------------------------------------------------
-// `narsor tui`: one interface, `--remote` an ignored alias (U14)
+// `narsor`: the TUI, `--remote` an ignored alias (U14)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3289,7 +3307,7 @@ fn tui_without_a_server_launches_the_local_daemon_and_remote_runs_the_same_inter
         root: root.path().to_path_buf(),
     };
 
-    let plain = cli(&root, &["tui"]);
+    let plain = tui(&root, &[]);
     assert_eq!(plain.code, EXIT_FAILURE, "{}", plain.output());
     assert!(
         plain
@@ -3310,10 +3328,10 @@ fn tui_without_a_server_launches_the_local_daemon_and_remote_runs_the_same_inter
         .expect("the daemon answers on /control/v1");
     assert!(!capabilities.connection_name.is_empty());
 
-    let alias = cli(&root, &["tui", "--remote"]);
+    let alias = tui(&root, &["--remote"]);
     assert_eq!(alias.code, plain.code, "{}", alias.output());
     assert!(
-        alias.stderr.contains("`narsor tui --remote` is ignored"),
+        alias.stderr.contains("`narsor --remote` is ignored"),
         "{}",
         alias.stderr
     );

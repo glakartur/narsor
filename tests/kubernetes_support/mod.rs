@@ -1,5 +1,5 @@
 //! An in-process mock of the Kubernetes API the adapter uses, with a
-//! "kubelet" that runs a real `narsor runner` for every Pod (U5, AE2).
+//! "kubelet" that runs a real `narsor-runner` for every Pod (U5, AE2).
 //!
 //! # The API
 //!
@@ -107,7 +107,7 @@ pub struct MockCluster {
 
 impl MockCluster {
     /// Serves a mock cluster on loopback. With `kubelet`, Pods run
-    /// `program runner …`; without, they stay Pending.
+    /// `program …`; without, they stay Pending.
     pub fn start(scratch: &Path, program: impl Into<PathBuf>, kubelet: bool) -> Arc<Self> {
         fs::create_dir_all(scratch).expect("scratch");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the mock API");
@@ -673,7 +673,7 @@ impl MockCluster {
             arg.to_string()
         };
         let command = container["command"][0].as_str().unwrap_or_default();
-        if command != "/opt/narsor/bin/narsor" {
+        if command != "/opt/narsor/bin/narsor-runner" {
             return Err(format!("unexpected command {command}"));
         }
         let args: Vec<String> = container["args"]

@@ -31,7 +31,7 @@
 //! * [`controller`] — the reconciliation loop over the controller protocol;
 //! * [`fake`] — the in-memory adapter with a simulated runner (contract
 //!   tests);
-//! * [`local`] — `narsor runner` as a local child process over a local
+//! * [`local`] — `narsor-runner` as a local child process over a local
 //!   directory, the supported local adapter;
 //! * [`kubernetes`] — one Pod and one PVC per task (KTD2), the first
 //!   production remote adapter;

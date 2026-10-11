@@ -1,9 +1,9 @@
-//! `narsor runner`: the entry point a backend starts in a task workload.
+//! `narsor-runner`: the entry point a backend starts in a task workload.
 //!
 //! # Invocation contract (for controllers)
 //!
 //! ```text
-//! narsor runner --task-id <id> --task-storage <dir> --incarnation <id> \
+//! narsor-runner --task-id <id> --task-storage <dir> --incarnation <id> \
 //!               --control-plane <url> --credential-file <file> \
 //!               [--launch-spec <file>] [--secrets-dir <dir>] \
 //!               [--home private|host] [--codex-home <dir>] \
@@ -62,7 +62,7 @@ pub const EXIT_PROBLEM: i32 = 3;
 /// The runner refused to touch storage left by an unexpected stop.
 pub const EXIT_OWNER_DECISION: i32 = 4;
 
-/// Arguments of `narsor runner`.
+/// Arguments of `narsor-runner`.
 #[derive(Debug, Clone, Args)]
 pub struct RunnerArgs {
     /// The task this runner works for.

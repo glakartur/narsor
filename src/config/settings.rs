@@ -73,7 +73,7 @@ pub const DEFAULT_BACKEND: &str = "local";
 /// runner.
 pub const DEFAULT_LOCAL_HOME: &str = "host";
 
-/// The local HOME modes, as `narsor runner --home` spells them.
+/// The local HOME modes, as `narsor-runner --home` spells them.
 pub const LOCAL_HOME_MODES: [&str; 2] = ["host", "private"];
 
 /// The server's security mode when nothing says otherwise (R36): the local

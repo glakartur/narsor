@@ -38,7 +38,7 @@ use std::process::{Command, Stdio};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use narsor::api::{ApiClient, ensure_daemon_running};
+use narsor::api::{ensure_daemon_running, ApiClient};
 use narsor::config::Flags;
 use narsor::daemon::launch::set_exe_override_for_tests;
 use narsor::domain::{Event, EventData};
@@ -85,7 +85,7 @@ impl Drop for TempRoot {
 fn init_exe_override() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        set_exe_override_for_tests(Path::new(env!("CARGO_BIN_EXE_narsor")));
+        set_exe_override_for_tests(&engine_support::workspace_binary("narsor-server"));
         // Every daemon spawned from here inherits it: its conductor runs on
         // the fake harness, never a real `claude`.
         engine_support::fake_claude_first_on_path();
@@ -283,7 +283,7 @@ async fn closing_the_client_that_started_an_action_does_not_kill_the_daemon_or_t
     // root, so it spawns one), `POST`s the task, then blocks polling for the
     // run to settle before printing anything — exactly the client this test
     // needs to kill mid-action.
-    let mut client_process = Command::new(env!("CARGO_BIN_EXE_narsor"))
+    let mut client_process = Command::new(env!("CARGO_BIN_EXE_narsor-cli"))
         .arg("--root")
         .arg(root.path())
         .arg("run")
@@ -389,7 +389,7 @@ async fn closing_the_client_that_started_an_action_does_not_kill_the_daemon_or_t
     // (6): clean up — `narsor daemon stop`, the same real CLI entry point an
     // operator would use, then confirm the process is actually gone before
     // this test's `TempRoot` removes the directory out from under it.
-    let stop = Command::new(env!("CARGO_BIN_EXE_narsor"))
+    let stop = Command::new(env!("CARGO_BIN_EXE_narsor-cli"))
         .arg("--root")
         .arg(root.path())
         .arg("daemon")

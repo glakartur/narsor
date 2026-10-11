@@ -1,4 +1,4 @@
-//! The local adapter: `narsor runner` as a child process of the host, task
+//! The local adapter: `narsor-runner` as a child process of the host, task
 //! storage as a local directory (U4).
 //!
 //! This is how the local machine becomes a backend like any other: the same
@@ -71,9 +71,9 @@ const WORKLOAD_MARK_ENV: &str = "NARSOR_LOCAL_WORKLOAD_UID";
 pub struct LocalBackendConfig {
     /// Directory holding task storages and workload records.
     pub root: PathBuf,
-    /// The `narsor` executable that provides `narsor runner`.
+    /// The standalone `narsor-runner` executable.
     pub program: PathBuf,
-    /// Extra arguments appended to every `narsor runner` invocation (timing
+    /// Extra arguments appended to every `narsor-runner` invocation (timing
     /// knobs, for instance).
     pub runner_args: Vec<OsString>,
     /// Environment variables set for every runner, on top of the
@@ -82,12 +82,22 @@ pub struct LocalBackendConfig {
 }
 
 impl LocalBackendConfig {
-    /// Runners started from the currently running executable.
+    /// Runners started from the `narsor-runner` sibling of the current
+    /// executable. The server and runner binaries are installed together.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
-        Ok(Self::with_program(root, std::env::current_exe()?))
+        let current_exe = std::env::current_exe()?;
+        let runner_name = if cfg!(windows) {
+            "narsor-runner.exe"
+        } else {
+            "narsor-runner"
+        };
+        let parent = current_exe.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "current executable has no parent")
+        })?;
+        Ok(Self::with_program(root, parent.join(runner_name)))
     }
 
-    /// Runners started from `program`.
+    /// Runners started from the explicit executable `program`.
     pub fn with_program(root: impl Into<PathBuf>, program: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -335,7 +345,6 @@ impl LocalBackend {
         let uid = format!("local-{}", uuid::Uuid::new_v4().simple());
         let mut command = Command::new(&self.config.program);
         command
-            .arg("runner")
             .args(["--task-id", launch.task_id.as_str()])
             .arg("--task-storage")
             .arg(storage)

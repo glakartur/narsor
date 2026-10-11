@@ -62,7 +62,7 @@ pub struct HarnessHome {
 }
 
 impl HarnessHome {
-    /// The `narsor runner` arguments that carry it.
+    /// The `narsor-runner` arguments that carry it.
     pub fn runner_args(&self) -> Vec<OsString> {
         let mut args = vec![OsString::from("--home"), OsString::from(self.mode.as_str())];
         if let Some(dir) = &self.codex_home {

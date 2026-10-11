@@ -157,7 +157,7 @@ fn cli(root: &TempRoot, args: &[&str]) -> Invocation {
 
 /// The same, with a directory prepended to `PATH` — for the fake `claude`.
 fn cli_with_path(root: &TempRoot, args: &[&str], bin: Option<&Path>) -> Invocation {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_narsor"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_narsor-cli"));
     command
         .current_dir(root.path())
         .env("XDG_CONFIG_HOME", root.config())

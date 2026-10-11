@@ -4,11 +4,13 @@
 //! on a loopback port it bound itself, serving the owner routes behind the
 //! trusted token and the runner routes behind runner credentials. The
 //! controller side (enrollment, lease, reports, runner credentials) is
-//! driven in-process. End-to-end scenarios run the real `narsor runner`
+//! driven in-process. End-to-end scenarios run the real `narsor-runner`
 //! binary on a task storage whose workspace is cloned from a local bare
 //! repository, so "no product-repository commit" is checked on a real Git
 //! clone, and "no live host mount" on a real copy.
 
+#[path = "engine_support/mod.rs"]
+mod engine_support;
 mod environment_support;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -264,7 +266,7 @@ impl Fixture {
             .expect("task events")
     }
 
-    /// Starts `narsor runner` for `task` on `storage`.
+    /// Starts `narsor-runner` for `task` on `storage`.
     fn spawn(&mut self, launch: &Launch, incarnation: &str) -> usize {
         use std::os::unix::process::CommandExt;
         let credential = self
@@ -272,9 +274,9 @@ impl Fixture {
             .dir("credentials")
             .join(format!("{}-{incarnation}", launch.task));
         fs::write(&credential, self.credential(&launch.task, incarnation)).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_narsor"));
+        let mut command = Command::new(engine_support::workspace_binary("narsor-runner"));
         command
-            .args(["runner", "--task-id", &launch.task])
+            .args(["--task-id", &launch.task])
             .arg("--task-storage")
             .arg(&launch.storage)
             .arg("--launch-spec")

@@ -10,10 +10,8 @@
 //! # Two streams
 //!
 //! Command output goes to stdout, diagnostics and `tracing` logs to stderr.
-//! That is what makes `narsor list | grep paused` work. The one
-//! exception is [`Command::Tui`], which owns the whole terminal: its logs are
-//! diverted to a file under `--root` (see `src/main.rs`) so that nothing is
-//! written over the alternate screen.
+//! That is what makes `narsor-cli list | grep paused` work. The TUI has its
+//! own `narsor` entry point and log setup.
 //!
 //! # Exit codes are a contract
 //!
@@ -57,7 +55,7 @@ pub const EXIT_USAGE: i32 = 2;
 /// The `narsor` command line.
 #[derive(Debug, Parser)]
 #[command(
-    name = "narsor",
+    name = "narsor-cli",
     version,
     about = "Narsor — an AI workflow orchestrator: validate definitions, run them, and inspect executions",
     disable_help_subcommand = true
@@ -265,14 +263,6 @@ pub enum Command {
         command: ConfigCommand,
     },
 
-    /// Opens the full-screen terminal interface.
-    Tui {
-        /// Ignored: there is one interface, over the control plane of the
-        /// configured backend. Kept so existing invocations keep working.
-        #[arg(long)]
-        remote: bool,
-    },
-
     /// Creates, inspects and steers remote tasks through the control plane.
     Task {
         /// What to do.
@@ -316,13 +306,6 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<DaemonCommand>,
     },
-
-    /// Runs one remote task inside its isolated workload (U3).
-    ///
-    /// Started by a backend controller, not by hand: it works on the
-    /// mounted task storage and reports to the control plane. See
-    /// [`crate::runner::cli`] for the invocation and exit-code contract.
-    Runner(crate::runner::cli::RunnerArgs),
 
     /// Runs the environment controller of one backend (U5).
     ///
@@ -541,16 +524,11 @@ impl Command {
             | Command::Conductor { .. }
             | Command::Workflow { .. }
             | Command::Repo { .. }
-            | Command::Tui { .. }
             | Command::Task { .. }
             | Command::Backend { .. }
             | Command::Harness { .. }
             | Command::Auth { .. }
             | Command::Daemon { .. } => false,
-            // The runner reads no configuration at all — everything it runs
-            // is in its launch spec — so whatever file a base image happens
-            // to carry must not keep a task from starting.
-            Command::Runner(_) => true,
             // Configured by its own flags and environment only, like the
             // runner: it reads no Narsor configuration file. Its operator
             // subcommands talk to a control plane and need none either.
@@ -583,11 +561,11 @@ pub enum ConfigFormat {
     Json,
 }
 
-/// The warning `narsor tui --remote` prints: the flag no longer selects a
+/// The warning `narsor --remote` prints: the flag no longer selects a
 /// mode, the one interface runs either way.
 pub fn tui_remote_warning(remote: bool) -> Option<&'static str> {
     remote.then_some(
-        "warning: `narsor tui --remote` is ignored; there is one interface, over the control \
+        "warning: `narsor --remote` is ignored; there is one interface, over the control \
          plane of the configured backend (use --server for a remote one)",
     )
 }
@@ -616,9 +594,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
     let target = remote::server_target(cli.server, cli.token_file, cli.token_command);
     let catalog = config.catalog_dir().to_path_buf();
     let state = config.state_dir().to_path_buf();
-    // The runner has its own exit-code contract (see `crate::runner::cli`).
     let command = match cli.command {
-        Command::Runner(args) => return crate::runner::cli::run_command(args).await,
         Command::Controller(ControllerCli {
             admin: None,
             run: Some(args),
@@ -722,12 +698,6 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         Command::Config { command } => match command {
             ConfigCommand::Show { format } => commands::config_show(&config, format),
         },
-        Command::Tui { remote } => {
-            if let Some(warning) = tui_remote_warning(remote) {
-                eprintln!("{warning}");
-            }
-            commands::tui(&config, &flags, &target)
-        }
         Command::Task { command } => remote::task(command, &target, &state, &catalog, &flags).await,
         Command::Backend { command } => remote::backend(command, &target, &state, &flags).await,
         Command::Harness { command } => remote::harness(command, &target, &state, &flags).await,
@@ -743,7 +713,6 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             None => daemon::run_daemon(&config).await,
             Some(DaemonCommand::Stop) => daemon::stop_daemon(&config),
         },
-        Command::Runner(_) => unreachable!("the runner returned above"),
     };
 
     match outcome {
@@ -772,7 +741,6 @@ mod tests {
 
         for command in [
             Command::List,
-            Command::Tui { remote: false },
             Command::Validate {
                 workflow: "any".to_string(),
             },

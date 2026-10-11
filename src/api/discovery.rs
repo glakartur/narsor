@@ -159,7 +159,7 @@ impl From<PersistenceError> for DiscoveryError {
 /// but relying on inherited environment alone here would be fragile, since
 /// the whole point of this call is that the spawned daemon must resolve
 /// exactly the same state root this caller did — not whatever a bare
-/// `narsor daemon` would default to.
+/// `narsor-server` would default to.
 pub async fn ensure_daemon_running(
     paths: &StatePaths,
     flags: &Flags,
@@ -275,12 +275,12 @@ async fn spawn_and_wait(
     poll_until_ready(daemon_file, DISCOVERY_TIMEOUT).await
 }
 
-/// Builds the argv a spawned `narsor daemon` needs to resolve the same
+/// Builds the argv a spawned `narsor-server` needs to resolve the same
 /// configuration as this process — see [`ensure_daemon_running`]'s doc on
 /// why this is spelled out explicitly rather than left to inherited
 /// environment.
 fn daemon_launch_args(flags: &Flags) -> Vec<String> {
-    let mut args = vec!["daemon".to_string()];
+    let mut args = Vec::new();
     if let Some(root) = &flags.root {
         args.push("--root".to_string());
         args.push(path_to_arg(root));
@@ -368,19 +368,13 @@ mod tests {
         };
         assert_eq!(
             daemon_launch_args(&flags),
-            vec![
-                "daemon",
-                "--root",
-                "/tmp/some-root",
-                "--config",
-                "/tmp/some.toml",
-            ]
+            vec!["--root", "/tmp/some-root", "--config", "/tmp/some.toml",]
         );
     }
 
     #[test]
     fn daemon_launch_args_omits_flags_that_were_not_given() {
         let flags = Flags::default();
-        assert_eq!(daemon_launch_args(&flags), vec!["daemon"]);
+        assert!(daemon_launch_args(&flags).is_empty());
     }
 }

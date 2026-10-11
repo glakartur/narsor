@@ -112,15 +112,14 @@ impl Drop for DaemonGuard {
     }
 }
 
-/// Spawns `narsor --root <root> daemon` as a plain (non-detached) child, so
+/// Spawns `narsor-server --root <root>` as a plain (non-detached) child, so
 /// the test itself can `wait()` on it directly.
 fn spawn_daemon(root: &Path) -> DaemonGuard {
     DaemonGuard::new(
         root,
-        Command::new(env!("CARGO_BIN_EXE_narsor"))
+        Command::new(engine_support::workspace_binary("narsor-server"))
             .arg("--root")
             .arg(root)
-            .arg("daemon")
             .env("PATH", engine_support::fake_claude_first_on_path())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -132,7 +131,7 @@ fn spawn_daemon(root: &Path) -> DaemonGuard {
 /// Runs `narsor --root <root> daemon stop` to completion; returns its exit
 /// code and combined stdout+stderr.
 fn stop_daemon_cli(root: &Path) -> (i32, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_narsor"))
+    let output = Command::new(env!("CARGO_BIN_EXE_narsor-cli"))
         .arg("--root")
         .arg(root)
         .arg("daemon")
@@ -857,10 +856,9 @@ async fn a_fresh_daemon_answers_a_chat_message_left_unanswered() {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_narsor"))
+    let mut child = Command::new(engine_support::workspace_binary("narsor-server"))
         .arg("--root")
         .arg(root.path())
-        .arg("daemon")
         .env("PATH", path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1130,10 +1128,9 @@ async fn a_fresh_daemon_continues_a_reprompt_the_restart_interrupted() {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_narsor"))
+    let mut child = Command::new(engine_support::workspace_binary("narsor-server"))
         .arg("--root")
         .arg(root.path())
-        .arg("daemon")
         .env("PATH", path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1260,10 +1257,9 @@ fn daemon_with_path(root: &Path, bin: &Path) -> Child {
         .append(true)
         .open(root.join("daemon.log"))
         .expect("open the daemon's log");
-    Command::new(env!("CARGO_BIN_EXE_narsor"))
+    Command::new(engine_support::workspace_binary("narsor-server"))
         .arg("--root")
         .arg(root)
-        .arg("daemon")
         .env("PATH", path)
         .stdout(log.try_clone().expect("share the daemon's log"))
         .stderr(log)
@@ -1474,7 +1470,7 @@ fn narsor(root: &Path, bin: &Path, args: &[&str]) -> (i32, String) {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_narsor"))
+    let output = Command::new(env!("CARGO_BIN_EXE_narsor-cli"))
         .current_dir(root)
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("HOME", root)
@@ -1516,7 +1512,7 @@ terminal_states:
 
 /// Restart matrix, for a task: a chat message its conductor had not
 /// answered when the runner stopped is answered after the runner is started
-/// again — by the real `narsor runner` the daemon's local backend starts on
+/// again — by the real `narsor-runner` the daemon's local backend starts on
 /// `task resume`, on the (fake) harness of its environment.
 #[tokio::test]
 #[ignore = "starts a narsor daemon; run with --ignored"]

@@ -12,23 +12,16 @@
 //! [`cli::run`] already reports a [`CliError`](narsor::cli::commands::CliError).
 //! Nothing in that path logs through `tracing`, so nothing is lost.
 //!
-//! # Where the logs go, and why it depends on the subcommand
+//! # Where CLI logs go
 //!
-//! For every subcommand but `tui` the logger writes to stderr, so that stdout
-//! carries nothing but the output of the command — `narsor list | grep paused`
-//! has to keep working with `RUST_LOG=debug` set.
-//!
-//! `tui` is the exception, because it owns the whole terminal: it switches to
-//! the alternate screen, and a log line written to stderr lands on top of the
-//! panels, corrupting a display that nothing redraws from scratch. So the
-//! interface's logs go to a file under the resolved data directory
-//! (`{state_dir}/narsor.log`, opened for appending).
+//! CLI logs go to stderr so stdout carries only command output. The separate
+//! `narsor` TUI process writes logs to the resolved state directory.
 //!
 //! When nothing turns logging on — no `RUST_LOG`, no configured level — no
 //! subscriber is installed at all and the records are dropped where they are
 //! made. That is today's behaviour and it is kept deliberately: the built-in
-//! level is `off`, so a `tui` run still creates neither a data directory nor a
-//! log file unless logging was actually asked for (D-N).
+//! level is `off`, so the CLI still creates no data directory unless logging
+//! was explicitly requested (D-N).
 //!
 //! # The one command that survives a broken configuration
 //!
@@ -42,13 +35,9 @@
 //! is exit code 2 for every command including this one, because the operator
 //! named a file that does not exist and there is nothing to diagnose.
 
-use std::fs::{File, OpenOptions};
-use std::sync::Mutex;
-
 use clap::Parser;
-use narsor::cli::{self, Cli, Command, EXIT_FAILURE, EXIT_USAGE};
+use narsor::cli::{self, Cli, EXIT_FAILURE, EXIT_USAGE};
 use narsor::config::{self, Flags, Resolved};
-use narsor::persistence::StatePaths;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[tokio::main]
@@ -68,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(code);
     }
 
-    init_tracing(&cli, &resolved)?;
+    init_tracing(&resolved)?;
 
     std::process::exit(cli::run(cli, resolved).await);
 }
@@ -103,31 +92,13 @@ fn report(resolved: &Resolved) {
     }
 }
 
-/// Installs the logger the chosen subcommand can live with.
-fn init_tracing(cli: &Cli, resolved: &Resolved) -> anyhow::Result<()> {
+/// Installs the CLI logger.
+fn init_tracing(resolved: &Resolved) -> anyhow::Result<()> {
     // Nothing configured: leave the process without a subscriber, which is
     // what makes every subcommand silent by default (D-N).
     let Some(directive) = resolved.log_directive() else {
         return Ok(());
     };
-
-    if matches!(cli.command, Command::Tui { .. }) {
-        let Some(file) = open_log_file(&resolved.state_paths()) else {
-            // The directory is not writable. The interface still runs; the
-            // logs are the thing given up, never the screen.
-            return Ok(());
-        };
-        let subscriber = FmtSubscriber::builder()
-            .with_env_filter(filter(&directive))
-            .with_writer(Mutex::new(file))
-            // A file is not a terminal: escape sequences would only make it
-            // harder to read.
-            .with_ansi(false)
-            .with_target(false)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)?;
-        return Ok(());
-    }
 
     let subscriber = FmtSubscriber::builder()
         .with_env_filter(filter(&directive))
@@ -151,22 +122,4 @@ fn init_tracing(cli: &Cli, resolved: &Resolved) -> anyhow::Result<()> {
 /// the run.
 fn filter(directive: &str) -> EnvFilter {
     EnvFilter::builder().parse_lossy(directive)
-}
-
-/// Opens `{state_dir}/narsor.log` for appending, creating the directory if
-/// needed.
-///
-/// The state root and not the catalogue: a log is something this process
-/// produced, not something a deployment declared, and the catalogue may be
-/// mounted read-only — which this function, which creates a directory, would
-/// not survive.
-///
-/// `None` when the file cannot be opened; the caller then runs without logs.
-fn open_log_file(paths: &StatePaths) -> Option<File> {
-    std::fs::create_dir_all(paths.root()).ok()?;
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.log_file())
-        .ok()
 }

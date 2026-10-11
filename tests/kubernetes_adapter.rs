@@ -1,7 +1,7 @@
 //! The Kubernetes adapter (U5) without a live cluster.
 //!
 //! * The backend contract suite of U4, **unchanged**, against an in-process
-//!   mock of the Kubernetes API whose kubelet runs the real `narsor runner`
+//!   mock of the Kubernetes API whose kubelet runs the real `narsor-runner`
 //!   from each generated Pod spec (AE2).
 //! * Manifest-shape tests: what the generated Pod, PVC and Secret look like
 //!   and what is refused before any API call.
@@ -14,6 +14,8 @@
 //! An optional smoke test against a real cluster is `#[ignore]`d and
 //! gated by environment variables.
 
+#[path = "engine_support/mod.rs"]
+mod engine_support;
 mod environment_support;
 #[macro_use]
 mod backend_contract_support;
@@ -170,7 +172,11 @@ impl Quiet {
 
     fn with(config: KubernetesBackendConfig) -> Self {
         let dir = scratch();
-        let cluster = MockCluster::start(&dir, env!("CARGO_BIN_EXE_narsor"), false);
+        let cluster = MockCluster::start(
+            &dir,
+            engine_support::workspace_binary("narsor-runner"),
+            false,
+        );
         let backend = KubernetesBackend::new(&cluster.access(), config).expect("adapter");
         Self {
             cluster,
@@ -217,7 +223,11 @@ impl ContractTarget for KubernetesTarget {
             return None;
         }
         Some(Self {
-            cluster: MockCluster::start(scratch, env!("CARGO_BIN_EXE_narsor"), true),
+            cluster: MockCluster::start(
+                scratch,
+                engine_support::workspace_binary("narsor-runner"),
+                true,
+            ),
         })
     }
 
@@ -320,7 +330,7 @@ fn the_pod_has_one_runner_one_init_container_and_separate_volumes() {
     );
     assert_eq!(
         runner["command"],
-        serde_json::json!(["/opt/narsor/bin/narsor"])
+        serde_json::json!(["/opt/narsor/bin/narsor-runner"])
     );
     let args: Vec<&str> = runner["args"]
         .as_array()
@@ -328,7 +338,7 @@ fn the_pod_has_one_runner_one_init_container_and_separate_volumes() {
         .iter()
         .map(|a| a.as_str().unwrap())
         .collect();
-    assert_eq!(args[0], "runner");
+    assert_eq!(args[0], "--task-id");
     for (flag, value) in [
         ("--task-id", "Task_1"),
         ("--task-storage", "/task"),
