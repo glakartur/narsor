@@ -15,8 +15,9 @@ use serde_json::Value;
 
 pub use narsor_protocol::api::{
     AcceptedResponse, ChatMessageRequest, ConversationEntryDto, ConversationEntrySource,
-    ConversationResponse, HarnessSelectionSnapshot, OperatorNoteRequest, RecoveryRequest,
-    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, TransitionRequest,
+    ConversationResponse, ExecutionStatusDto, HarnessSelectionSnapshot, OperatorNoteRequest,
+    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
+    TransitionRequest,
 };
 
 use crate::conductor::{
@@ -28,6 +29,36 @@ use crate::domain::{
     ConductorPurpose, ConductorTrigger, ExecutionStatus, ProblemKind, WorkflowExecution,
 };
 use crate::engine::{InputContinuation, PendingHumanInput, StepFailure};
+
+impl From<ExecutionStatus> for ExecutionStatusDto {
+    fn from(status: ExecutionStatus) -> Self {
+        match status {
+            ExecutionStatus::Running => Self::Running,
+            ExecutionStatus::Paused => Self::Paused,
+            ExecutionStatus::InputNeeded => Self::InputNeeded,
+            ExecutionStatus::WaitingForEvent => Self::WaitingForEvent,
+            ExecutionStatus::Completed => Self::Completed,
+            ExecutionStatus::Failed => Self::Failed,
+            ExecutionStatus::Cancelled => Self::Cancelled,
+            ExecutionStatus::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<ExecutionStatusDto> for ExecutionStatus {
+    fn from(status: ExecutionStatusDto) -> Self {
+        match status {
+            ExecutionStatusDto::Running => Self::Running,
+            ExecutionStatusDto::Paused => Self::Paused,
+            ExecutionStatusDto::InputNeeded => Self::InputNeeded,
+            ExecutionStatusDto::WaitingForEvent => Self::WaitingForEvent,
+            ExecutionStatusDto::Completed => Self::Completed,
+            ExecutionStatusDto::Failed => Self::Failed,
+            ExecutionStatusDto::Cancelled => Self::Cancelled,
+            ExecutionStatusDto::Unknown => Self::Unknown,
+        }
+    }
+}
 
 /// `POST /tasks` response body: `202 Accepted`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +97,7 @@ pub struct ExecutionSummary {
     #[serde(default)]
     pub workflow_version: u32,
     /// Its current status.
-    pub status: ExecutionStatus,
+    pub status: ExecutionStatusDto,
     /// The state it is currently at, if any.
     pub current_state: Option<String>,
     /// When it started.
@@ -215,7 +246,7 @@ impl From<&WorkflowExecution> for ExecutionSummary {
             id: execution.id.clone(),
             workflow_id: execution.workflow_id.clone(),
             workflow_version: execution.workflow_version,
-            status: execution.status.clone(),
+            status: execution.status.clone().into(),
             current_state: execution.current_state.clone(),
             started_at: execution.started_at,
             completed_at: execution.completed_at,

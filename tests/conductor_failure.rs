@@ -22,24 +22,24 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use engine_support::{workflow, Harness};
+use engine_support::{Harness, workflow};
 use narsor::conductor::assembly::assemble;
 use narsor::conductor::{
-    active_failure_problem, ChatEntry, ChatEntryKind, ConductorAnswer, ConductorInvoker,
-    ConductorRegistry, ConductorState, ConductorStore, FailureOutcome, Invocation,
-    InvocationOutcome, PassLauncher, PendingInvocation, ProposalKind, QueuedRequest,
+    ChatEntry, ChatEntryKind, ConductorAnswer, ConductorInvoker, ConductorRegistry, ConductorState,
+    ConductorStore, FailureOutcome, Invocation, InvocationOutcome, PassLauncher, PendingInvocation,
+    ProposalKind, QueuedRequest, active_failure_problem,
 };
 use narsor::domain::{
     ConductorDecisionKind, ConductorPurpose, ConductorTrigger, EventData, ExecutionStatus,
     ProblemKind, WorkflowDefinition, WorkflowExecution, Workspace,
 };
 use narsor::engine::{
-    step_failure, ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, EngineError,
-    HarnessRegistry, LoggingEventSink, Recovery, StepFailure,
+    ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, EngineError, HarnessRegistry,
+    LoggingEventSink, Recovery, StepFailure, step_failure,
 };
-use narsor::persistence::{sweep_orphaned_workspaces, DaemonInfo, ExecutionStore};
+use narsor::persistence::{DaemonInfo, ExecutionStore, sweep_orphaned_workspaces};
 use narsor::workspace::{CleanupPolicy, WorkspaceProvisioner};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Notify;
 
 // ---------------------------------------------------------------------------
@@ -840,11 +840,13 @@ async fn without_a_conductor_the_failure_is_recorded_and_keys_a_restart() {
         .expect("the failure is recorded");
     assert_eq!(failure.state_id, "build");
     assert!(!failure.conductor_retry);
-    assert!(!harness
-        .store()
-        .paths()
-        .conductor_dir(&execution.id)
-        .exists());
+    assert!(
+        !harness
+            .store()
+            .paths()
+            .conductor_dir(&execution.id)
+            .exists()
+    );
 
     // A restart naming another failure is refused, the one naming this is not.
     let stale = engine
@@ -1099,7 +1101,7 @@ async fn a_fresh_daemon_diagnoses_a_failed_step_again_and_the_sweep_keeps_its_wo
         .iter()
         .find(|summary| summary.id == execution.id)
         .expect("the execution is listed");
-    assert_eq!(summary.status, ExecutionStatus::Failed);
+    assert_eq!(summary.status, narsor::api::ExecutionStatusDto::Failed);
     let problem = summary.problem.clone().expect("a problem");
     assert_eq!(problem.kind, ProblemKind::Failure);
     assert_eq!(problem.episode.as_deref(), Some("attempt-1"));

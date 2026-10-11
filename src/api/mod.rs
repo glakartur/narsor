@@ -87,15 +87,15 @@ pub mod token;
 
 pub use active::ActiveTasks;
 pub(crate) use client::handle_json_response;
-pub use client::{reconnect_delay, ApiClient, ClientError};
-pub use connect::{connect, ServerTarget};
-pub use discovery::{ensure_daemon_running, DiscoveryError};
+pub use client::{ApiClient, ClientError, reconnect_delay};
+pub use connect::{ServerTarget, connect};
+pub use discovery::{DiscoveryError, ensure_daemon_running};
 pub use dto::{
     AcceptedResponse, ActiveProblem, ChatMessageRequest, ConductorActivity, ConductorChatResponse,
     ConductorStateResponse, ConversationEntryDto, ConversationEntrySource, ConversationResponse,
-    ExecutionListResponse, ExecutionSummary, HarnessSelectionSnapshot, OperatorNoteRequest,
-    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
-    TransitionRequest,
+    ExecutionListResponse, ExecutionStatusDto, ExecutionSummary, HarnessSelectionSnapshot,
+    OperatorNoteRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
+    StartTaskResponse, TransitionRequest,
 };
 pub use routes::{conversation_response_from_snapshot, local_task_storage_root};
 pub use token::TokenSource;

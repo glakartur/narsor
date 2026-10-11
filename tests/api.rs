@@ -1098,7 +1098,7 @@ async fn post_transition_happy_path_writes_the_expected_events_and_state() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let summary: ExecutionSummary = response.json().await.expect("parse summary");
     assert_eq!(summary.current_state.as_deref(), Some("done"));
-    assert_eq!(summary.status, ExecutionStatus::Completed);
+    assert_eq!(summary.status, narsor::api::ExecutionStatusDto::Completed);
 
     let events = store
         .event_log(&execution.id)
@@ -1703,7 +1703,7 @@ async fn client_transition_moves_a_waiting_execution_to_the_declared_target() {
         .await
         .expect("client transition");
     assert_eq!(summary.current_state.as_deref(), Some("done"));
-    assert_eq!(summary.status, ExecutionStatus::Completed);
+    assert_eq!(summary.status, narsor::api::ExecutionStatusDto::Completed);
 }
 
 #[tokio::test]
@@ -1917,9 +1917,11 @@ async fn client_stream_execution_ends_itself_after_the_terminal_event() {
         events.last().expect("at least one event").data,
         narsor::domain::EventData::WorkflowCompleted { .. }
     ));
-    assert!(events
-        .iter()
-        .all(|event| event.workflow_execution_id == execution.id));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.workflow_execution_id == execution.id)
+    );
 }
 
 /// A script-to-terminal fixture whose one action sleeps for a bit before
@@ -2445,9 +2447,11 @@ mod problems {
         assert_eq!(execution.status, ExecutionStatus::InputNeeded);
         assert!(problem.store.has_pending_input(&problem.execution_id));
         // Only the error note the engine records for any refused call.
-        assert!(events(&problem)[before..]
-            .iter()
-            .all(|event| matches!(event.data, EventData::Error { .. })));
+        assert!(
+            events(&problem)[before..]
+                .iter()
+                .all(|event| matches!(event.data, EventData::Error { .. }))
+        );
     }
 
     #[tokio::test]
@@ -2477,9 +2481,11 @@ mod problems {
             .expect("read")
             .expect("still pending");
         assert_eq!(still.episode_key(), problem.pending.episode_key());
-        assert!(!events(&problem)
-            .iter()
-            .any(|event| matches!(event.data, EventData::HumanInputReceived { .. })));
+        assert!(
+            !events(&problem)
+                .iter()
+                .any(|event| matches!(event.data, EventData::HumanInputReceived { .. }))
+        );
     }
 
     /// Two answers to the same request at once: exactly one is taken. The
@@ -2724,7 +2730,7 @@ mod failures {
             .iter()
             .find(|summary| summary.id == failed.execution_id)
             .expect("listed");
-        assert_eq!(summary.status, ExecutionStatus::Failed);
+        assert_eq!(summary.status, narsor::api::ExecutionStatusDto::Failed);
         let problem = summary.problem.clone().expect("a problem");
         assert_eq!(problem.kind, ProblemKind::Failure);
         assert_eq!(problem.reason, "A dependency is missing.");
@@ -3055,7 +3061,7 @@ mod conductor_chat {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        assert_eq!(listed.status, ExecutionStatus::InputNeeded);
+        assert_eq!(listed.status, narsor::api::ExecutionStatusDto::InputNeeded);
         let pending: PendingHumanInput = listed.pending_input.clone().expect("the gate");
         let annotation = listed.annotation.expect("the gate's summary");
         assert_eq!(annotation.key, pending.episode_key());
@@ -3064,7 +3070,7 @@ mod conductor_chat {
         let proposal = proposal_for(&served, "approve it for me").await;
         assert_eq!(
             summary(&served).await.status,
-            ExecutionStatus::InputNeeded,
+            narsor::api::ExecutionStatusDto::InputNeeded,
             "nothing happens before the confirmation"
         );
 
@@ -3191,7 +3197,10 @@ mod conductor_chat {
         )
         .await;
         let client = served.handle.client();
-        assert_eq!(summary(&served).await.status, ExecutionStatus::Completed);
+        assert_eq!(
+            summary(&served).await.status,
+            narsor::api::ExecutionStatusDto::Completed
+        );
         let decision = client
             .conductor_chat(&served.execution_id, 0)
             .await
@@ -3215,7 +3224,7 @@ mod conductor_chat {
         assert_eq!(undone.state_id, "work");
         assert!(undone.warning.is_some());
         let listed = summary(&served).await;
-        assert_eq!(listed.status, ExecutionStatus::InputNeeded);
+        assert_eq!(listed.status, narsor::api::ExecutionStatusDto::InputNeeded);
         assert_eq!(
             listed.problem.and_then(|problem| problem.episode),
             Some(undone.episode)
@@ -4063,10 +4072,12 @@ mod control_catalog {
         assert_eq!(workflow.source, WorkflowSource::BuiltIn);
         assert!(workflow.valid, "{:?}", workflow.violations);
         assert_eq!(workflow.version, Some(1));
-        assert!(workflow
-            .description
-            .as_deref()
-            .is_some_and(|text| text.starts_with("The compound engineering chain")));
+        assert!(
+            workflow
+                .description
+                .as_deref()
+                .is_some_and(|text| text.starts_with("The compound engineering chain"))
+        );
         let input = workflow
             .inputs
             .iter()
@@ -4076,9 +4087,11 @@ mod control_catalog {
         assert!(input.description.is_some());
         assert_eq!(workflow.inputs.len(), 2);
         // Never a path of the server.
-        assert!(!serde_json::to_string(&list)
-            .unwrap()
-            .contains(root.path().to_str().unwrap()));
+        assert!(
+            !serde_json::to_string(&list)
+                .unwrap()
+                .contains(root.path().to_str().unwrap())
+        );
     }
 
     #[tokio::test]
@@ -4174,12 +4187,14 @@ mod control_catalog {
         let root = TempRoot::new();
         let handle = start(&root).await;
         let client = handle.client();
-        assert!(client
-            .control_repositories()
-            .await
-            .unwrap()
-            .repositories
-            .is_empty());
+        assert!(
+            client
+                .control_repositories()
+                .await
+                .unwrap()
+                .repositories
+                .is_empty()
+        );
 
         let added = client
             .control_add_repository(&repository(
@@ -4274,12 +4289,14 @@ mod control_catalog {
         let root = TempRoot::new();
         let handle = start(&root).await;
         let client = handle.client();
-        assert!(client
-            .control_tasks_archived(true)
-            .await
-            .unwrap()
-            .tasks
-            .is_empty());
+        assert!(
+            client
+                .control_tasks_archived(true)
+                .await
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
 
         for id in ["task-a", "task-b", "task-live"] {
             client
@@ -4304,10 +4321,12 @@ mod control_catalog {
         let archived = client.control_tasks_archived(true).await.unwrap();
         let ids: Vec<_> = archived.tasks.iter().map(|t| t.task_id.as_str()).collect();
         assert_eq!(ids, ["task-b", "task-a"], "newest archive first");
-        assert!(archived
-            .tasks
-            .iter()
-            .all(|task| task.lifecycle == TaskLifecycle::Archived));
+        assert!(
+            archived
+                .tasks
+                .iter()
+                .all(|task| task.lifecycle == TaskLifecycle::Archived)
+        );
         let rest = client.control_tasks_archived(false).await.unwrap();
         assert_eq!(rest.tasks.len(), 1);
         assert_eq!(rest.tasks[0].task_id.as_str(), "task-live");
@@ -4361,12 +4380,14 @@ mod control_catalog {
                 .len(),
             2
         );
-        assert!(!client
-            .control_history_timeline("exec-old")
-            .await
-            .unwrap()
-            .positions
-            .is_empty());
+        assert!(
+            !client
+                .control_history_timeline("exec-old")
+                .await
+                .unwrap()
+                .positions
+                .is_empty()
+        );
         assert!(matches!(
             client
                 .control_history_conversation("exec-old", "attempt-1", 1)
@@ -4375,12 +4396,14 @@ mod control_catalog {
             narsor::api::ConversationResponse::Recorded { .. }
         ));
         assert!(client.control_history_conductor("exec-old").await.is_ok());
-        assert!(client
-            .control_history_conductor_chat("exec-old", 0)
-            .await
-            .unwrap()
-            .entries
-            .is_empty());
+        assert!(
+            client
+                .control_history_conductor_chat("exec-old", 0)
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
 
         match client.control_recover_execution("exec-old", None).await {
             Err(ClientError::Refused { code, message }) => {
@@ -4406,12 +4429,14 @@ mod control_catalog {
         let root = TempRoot::new();
         let handle = start(&root).await;
         let client = handle.client();
-        assert!(client
-            .control_history()
-            .await
-            .unwrap()
-            .executions
-            .is_empty());
+        assert!(
+            client
+                .control_history()
+                .await
+                .unwrap()
+                .executions
+                .is_empty()
+        );
         assert!(
             !client
                 .control_capabilities()

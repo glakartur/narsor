@@ -35,11 +35,13 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use serde_json::{Map, Value};
 
-use crate::api::{ApiClient, ClientError, ConversationResponse, ExecutionSummary};
+use crate::api::{
+    ApiClient, ClientError, ConversationResponse, ExecutionStatusDto, ExecutionSummary,
+};
 use crate::conductor::{ChatAuthor, ChatEntry, ChatEntryKind};
 use crate::domain::{
-    without_unsafe_chars, Event, ExecutionStatus, InputParameter, ParamType, ProblemKind,
-    WorkflowDefinition,
+    Event, ExecutionStatus, InputParameter, ParamType, ProblemKind, WorkflowDefinition,
+    without_unsafe_chars,
 };
 use crate::engine::{
     ConversationState, HumanInputDelivery, PendingHumanInput, Position, PositionStatus,
@@ -48,9 +50,9 @@ use crate::persistence::StatePaths;
 use crate::registry::{RepositoryEntry, RepositoryRegistry};
 use crate::tasks::{self, TaskError};
 use crate::tui::conversation::classify;
-use crate::workflows::{builtin, builtin_names, ResolvedWorkflow, WorkflowResolver};
+use crate::workflows::{ResolvedWorkflow, WorkflowResolver, builtin, builtin_names};
 
-use crate::config::{render_value, Flags, Resolved, SettingKey, Source};
+use crate::config::{Flags, Resolved, SettingKey, Source, render_value};
 
 use super::{ConfigFormat, EXIT_FAILURE, EXIT_USAGE};
 
@@ -278,7 +280,9 @@ fn declared_input_names(definition: &WorkflowDefinition) -> String {
 /// from guessing at the text.
 fn parse_input_value(parameter: &InputParameter, raw: &str) -> Result<Value> {
     match parameter.param_type {
-        ParamType::String | ParamType::Text | ParamType::Repository => Ok(Value::String(raw.to_string())),
+        ParamType::String | ParamType::Text | ParamType::Repository => {
+            Ok(Value::String(raw.to_string()))
+        }
         ParamType::Integer => raw.parse::<i64>().map(Value::from).map_err(|_| {
             CliError::usage(format!(
                 "Input '{}' is of type integer, and '{raw}' is not a whole number.",
@@ -707,7 +711,7 @@ pub async fn input(
     println!("Input delivered to execution {}.", summary.id);
     print_summary(&summary);
     print_open_matters(&summary);
-    if summary.status == ExecutionStatus::Failed {
+    if summary.status == ExecutionStatusDto::Failed {
         return Err(CliError::failure(format!(
             "Execution {} failed.",
             summary.id
@@ -774,12 +778,12 @@ pub async fn resume(
         .await
         .map_err(|error| client_error(execution_id, error))?;
 
-    let summary = wait_until_stopped(&client, execution_id, ExecutionStatus::Running).await?;
+    let summary = wait_until_stopped(&client, execution_id, ExecutionStatusDto::Running).await?;
 
     println!("Resumed execution {}.", summary.id);
     print_summary(&summary);
     print_open_matters(&summary);
-    if summary.status == ExecutionStatus::Failed {
+    if summary.status == ExecutionStatusDto::Failed {
         return Err(CliError::failure(format!(
             "Execution {} failed.",
             summary.id
@@ -809,7 +813,7 @@ pub async fn recover(
     let current = load_execution_summary(&client, execution_id).await?;
     if !matches!(
         current.status,
-        ExecutionStatus::Failed | ExecutionStatus::Unknown
+        ExecutionStatusDto::Failed | ExecutionStatusDto::Unknown
     ) {
         return Err(CliError::failure(format!(
             "Execution '{execution_id}' has no failed step to recover (status: {}).",
@@ -835,12 +839,12 @@ pub async fn recover(
         other => client_error(execution_id, other),
     })?;
 
-    let summary = wait_until_stopped(&client, execution_id, ExecutionStatus::Running).await?;
+    let summary = wait_until_stopped(&client, execution_id, ExecutionStatusDto::Running).await?;
 
     println!("Recovered execution {}.", summary.id);
     print_summary(&summary);
     print_open_matters(&summary);
-    if summary.status == ExecutionStatus::Failed {
+    if summary.status == ExecutionStatusDto::Failed {
         return Err(CliError::failure(format!(
             "Execution {} failed.",
             summary.id
@@ -1410,7 +1414,7 @@ fn print_summary(summary: &ExecutionSummary) {
 /// The two lines both of the above print, factored out so `run`/`resume`
 /// print byte-for-byte what they always did regardless of which of the two
 /// shapes above they are holding.
-fn print_status_line(status: &ExecutionStatus, current_state: Option<&str>) {
+fn print_status_line(status: &ExecutionStatusDto, current_state: Option<&str>) {
     println!("Status: {}", status.as_str());
     println!("Current state: {}", current_state.unwrap_or("-"));
 }
@@ -1535,12 +1539,12 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 async fn wait_until_stopped(
     client: &ApiClient,
     execution_id: &str,
-    before: ExecutionStatus,
+    before: ExecutionStatusDto,
 ) -> Result<ExecutionSummary> {
     let mut stream = Some(Box::pin(client.stream_execution(execution_id)));
     loop {
         if let Some(summary) = find_execution(client, execution_id).await? {
-            if summary.status != ExecutionStatus::Running && summary.status != before {
+            if summary.status != ExecutionStatusDto::Running && summary.status != before {
                 return Ok(summary);
             }
         }
@@ -1651,7 +1655,7 @@ async fn wait_until_task_terminal(
 /// `engine.pending_input()` returning `None` for that case before this
 /// unit.
 fn print_open_matters(summary: &ExecutionSummary) {
-    if summary.status == ExecutionStatus::InputNeeded {
+    if summary.status == ExecutionStatusDto::InputNeeded {
         if let Some(pending) = &summary.pending_input {
             print_pending_input(pending);
         }

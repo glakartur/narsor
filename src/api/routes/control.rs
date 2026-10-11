@@ -22,9 +22,8 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 
 use super::{
-    begin_recovery, build_summary, is_safe_id, read_conductor_chat, read_conductor_state,
-    read_conversation, read_events, read_timeline, ApiError, AppState, ConversationQuery,
-    EventsQuery,
+    ApiError, AppState, ConversationQuery, EventsQuery, begin_recovery, build_summary, is_safe_id,
+    read_conductor_chat, read_conductor_state, read_conversation, read_events, read_timeline,
 };
 use crate::api::dto::{
     AcceptedResponse, ActiveProblem, ConductorChatResponse, ConductorStateResponse, RecoveryRequest,
@@ -529,7 +528,8 @@ async fn get_history_one(
 fn history_view(state: &AppState, execution_id: &str) -> Result<LegacyExecutionView, ApiError> {
     let execution = state.store.load_execution(execution_id)?;
     let summary = build_summary(&state.store, &execution)?;
-    let not_recoverable_reason = match summary.status {
+    let status: ExecutionStatus = summary.status.into();
+    let not_recoverable_reason = match &status {
         _ if state.engine.is_active(execution_id) => {
             Some("it is being processed right now".to_string())
         }
@@ -543,7 +543,7 @@ fn history_view(state: &AppState, execution_id: &str) -> Result<LegacyExecutionV
         id: summary.id,
         workflow_id: without_unsafe_chars(&summary.workflow_id),
         workflow_version: summary.workflow_version,
-        status: summary.status,
+        status,
         current_state: summary.current_state.as_deref().map(without_unsafe_chars),
         started_at: summary.started_at,
         completed_at: summary.completed_at,

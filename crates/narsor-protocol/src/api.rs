@@ -5,6 +5,39 @@ use serde_json::{Map, Value};
 
 use crate::controller::ExecutionEventsSource;
 
+/// Execution state as it appears in API responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStatusDto {
+    Running,
+    Paused,
+    InputNeeded,
+    WaitingForEvent,
+    Completed,
+    Failed,
+    Cancelled,
+    Unknown,
+}
+
+impl ExecutionStatusDto {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::InputNeeded => "input_needed",
+            Self::WaitingForEvent => "waiting_for_event",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Authoritative default-harness selection returned by the settings API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessSelectionSnapshot {
@@ -115,7 +148,7 @@ pub struct ChatMessageRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationEntryDto, ConversationEntrySource, ConversationResponse,
+        ConversationEntryDto, ConversationEntrySource, ConversationResponse, ExecutionStatusDto,
         HarnessSelectionSnapshot, RecoveryRequest,
     };
 
@@ -168,5 +201,32 @@ mod tests {
         assert_eq!(value["entries"][0]["raw_base64"], "AP8=");
         assert!(value.get("source").is_none());
         assert!(value.get("recorded_at").is_none());
+    }
+
+    #[test]
+    fn execution_status_keeps_wire_names_and_terminal_classification() {
+        let statuses = [
+            (ExecutionStatusDto::Running, "running", false),
+            (ExecutionStatusDto::Paused, "paused", false),
+            (ExecutionStatusDto::InputNeeded, "input_needed", false),
+            (
+                ExecutionStatusDto::WaitingForEvent,
+                "waiting_for_event",
+                false,
+            ),
+            (ExecutionStatusDto::Completed, "completed", true),
+            (ExecutionStatusDto::Failed, "failed", true),
+            (ExecutionStatusDto::Cancelled, "cancelled", true),
+            (ExecutionStatusDto::Unknown, "unknown", false),
+        ];
+
+        for (status, wire, terminal) in statuses {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{wire}\"")
+            );
+            assert_eq!(status.as_str(), wire);
+            assert_eq!(status.is_terminal(), terminal);
+        }
     }
 }

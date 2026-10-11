@@ -38,10 +38,10 @@ use std::process::{Command, Stdio};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use narsor::api::{ensure_daemon_running, ApiClient};
+use narsor::api::{ApiClient, ensure_daemon_running};
 use narsor::config::Flags;
 use narsor::daemon::launch::set_exe_override_for_tests;
-use narsor::domain::{Event, EventData, ExecutionStatus};
+use narsor::domain::{Event, EventData};
 use narsor::persistence::{DaemonInfo, StatePaths};
 
 // ---------------------------------------------------------------------------
@@ -384,7 +384,7 @@ async fn closing_the_client_that_started_an_action_does_not_kill_the_daemon_or_t
         .iter()
         .find(|execution| execution.id == execution_id)
         .expect("the execution is still listed");
-    assert_eq!(summary.status, ExecutionStatus::Completed);
+    assert_eq!(summary.status, narsor::api::ExecutionStatusDto::Completed);
 
     // (6): clean up — `narsor daemon stop`, the same real CLI entry point an
     // operator would use, then confirm the process is actually gone before
