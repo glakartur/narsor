@@ -844,6 +844,7 @@ fn make_executable(path: &Path) {
 /// `narsor input` re-resolves from it. Both shipped workflows are full of
 /// human gates, so an execution that could not be answered would be useless.
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn an_execution_started_from_a_builtin_by_name_is_resumable_in_a_fresh_process() {
     let root = TempRoot::new();
     let bin = install_fake_claude(&root, "needs_direction");
@@ -924,6 +925,7 @@ fn an_execution_started_from_a_builtin_by_name_is_resumable_in_a_fresh_process()
 /// The same, for an execution started from a file path: the old behaviour is
 /// untouched.
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn an_execution_started_from_a_file_path_is_still_resumable_in_a_fresh_process() {
     let root = TempRoot::new();
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cli");

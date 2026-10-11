@@ -208,6 +208,7 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStat
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn daemon_starts_writes_discovery_file_and_serves_a_request() {
     let root = TempRoot::new();
     let mut child = spawn_daemon(root.path());
@@ -289,6 +290,7 @@ fn wait_for_lease(
 /// lease at once, and the next daemon reuses the same identity, taking the
 /// lease at a later epoch.
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn the_local_controller_holds_the_lease_and_a_restart_reuses_its_identity() {
     let root = TempRoot::new();
     let credential = root.path().join("local-controller/credential");
@@ -344,6 +346,7 @@ fn the_local_controller_holds_the_lease_and_a_restart_reuses_its_identity() {
 /// copy of anything: the same task ids, one storage each, and no task that
 /// the first daemon accepted is created again.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_restart_keeps_queued_and_admitted_tasks_without_duplicating_them() {
     let root = TempRoot::new();
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cli");
@@ -435,6 +438,7 @@ async fn a_restart_keeps_queued_and_admitted_tasks_without_duplicating_them() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn daemon_stop_signals_the_running_daemon_and_it_exits() {
     let root = TempRoot::new();
     let mut child = spawn_daemon(root.path());
@@ -495,6 +499,7 @@ fn daemon_stop_with_a_stale_pid_cleans_up_and_exits_nonzero() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn a_startup_error_leaves_no_half_written_discovery_file() {
     let root = TempRoot::new();
     // Occupy the discovery file's path with a directory, so `DaemonInfo::write`
@@ -529,6 +534,7 @@ fn a_startup_error_leaves_no_half_written_discovery_file() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_fresh_daemon_reconciles_an_execution_left_running_by_a_killed_predecessor() {
     let root = TempRoot::new();
     fs::create_dir_all(root.path().join("work")).expect("create a work dir");
@@ -710,6 +716,7 @@ terminal_states:
 /// finishes — asserts a second `POST /tasks` is refused at the connection
 /// level, not accepted.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn new_mutating_requests_are_refused_once_shutdown_begins_not_only_after_the_drain() {
     let root = TempRoot::new();
     let mut child = spawn_daemon(root.path());
@@ -828,6 +835,7 @@ fn fake_claude(dir: &Path, text: &str) -> PathBuf {
 /// daemon stopped is answered after the next start, by the conductor run on
 /// the (fake) default harness.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_fresh_daemon_answers_a_chat_message_left_unanswered() {
     let root = TempRoot::new();
     let bin = fake_claude(
@@ -925,6 +933,7 @@ async fn a_fresh_daemon_answers_a_chat_message_left_unanswered() {
 /// attempt stopped in the conductor, not in an action — a fresh daemon
 /// leaves it `Running`, not `Unknown`.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_fresh_daemon_does_not_mark_an_execution_stopped_in_the_conductor_unknown() {
     let root = TempRoot::new();
     let (store, execution) = seed_two_steps(root.path());
@@ -1038,6 +1047,7 @@ terminal_states:
 /// next start spawns a pass that asks the same session again, read-only,
 /// instead of replaying the attempt.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_fresh_daemon_continues_a_reprompt_the_restart_interrupted() {
     let root = TempRoot::new();
     let bin = root.path().join("bin");
@@ -1297,6 +1307,7 @@ fn wait_for_status(store: &ExecutionStore, execution_id: &str, status: Execution
 /// invocation invokes it once more at the next start — R24's one repeat,
 /// counted before it runs — and applies what it chose.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_fresh_daemon_repeats_a_rescue_invocation_the_restart_cut_short() {
     let root = TempRoot::new();
     let bin = fake_claude(
@@ -1336,6 +1347,7 @@ async fn a_fresh_daemon_repeats_a_rescue_invocation_the_restart_cut_short() {
 /// Restart matrix: when that one repeat fails too, the step is a problem
 /// with the agent's raw answer — never a third invocation.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_fresh_daemon_makes_a_problem_when_the_repeated_rescue_fails() {
     let root = TempRoot::new();
     let bin = fake_claude(&root.path().join("bin"), "no JSON at all");
@@ -1371,6 +1383,7 @@ async fn a_fresh_daemon_makes_a_problem_when_the_repeated_rescue_fails() {
 /// Restart matrix: a choice the conductor saved before the restart is
 /// applied at the next start without invoking it again.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_fresh_daemon_applies_a_saved_choice_without_invoking_the_conductor() {
     let root = TempRoot::new();
     // Never to be run; there only so a mistake cannot reach a real harness.
@@ -1506,6 +1519,7 @@ terminal_states:
 /// again — by the real `narsor runner` the daemon's local backend starts on
 /// `task resume`, on the (fake) harness of its environment.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_restarted_runner_answers_a_chat_message_left_unanswered() {
     let root = TempRoot::new();
     let _processes = ProcessesUnder {
@@ -1818,6 +1832,7 @@ impl Drop for RestartedDaemon {
 /// restart lost returns, without its owner, to the very same approval — and
 /// its history says it was resumed automatically.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_task_waiting_on_an_approval_returns_to_it_after_a_restart_lost_its_runner() {
     let mut daemon = RestartedDaemon::start();
     let (runner, waiting_id) = daemon.wait_at_approval(None).await;
@@ -1837,6 +1852,7 @@ async fn a_task_waiting_on_an_approval_returns_to_it_after_a_restart_lost_its_ru
 /// whether the task can run, so six restarts in a row — each losing the
 /// runner well within the stability window — never use up the attempts.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn six_restarts_that_each_lose_the_runner_do_not_exhaust_the_resume() {
     let mut daemon = RestartedDaemon::start();
     let (mut runner, waiting_id) = daemon.wait_at_approval(None).await;
@@ -1862,6 +1878,7 @@ async fn six_restarts_that_each_lose_the_runner_do_not_exhaust_the_resume() {
 /// A runner that outlives the restart, as runners do by design, keeps its
 /// task: still running on the same process, and nothing resumed.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_runner_that_survives_a_restart_keeps_its_task_without_a_resume() {
     let mut daemon = RestartedDaemon::start();
     daemon.wait_at_approval(None).await;
@@ -1907,6 +1924,7 @@ async fn a_runner_that_survives_a_restart_keeps_its_task_without_a_resume() {
 /// without any resume state — is resumed once a daemon with the policy
 /// starts, back to the approval it waited on.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_task_interrupted_before_the_resume_policy_is_resumed_at_start() {
     let mut daemon = RestartedDaemon::start();
     let (runner, waiting_id) = daemon.wait_at_approval(None).await;

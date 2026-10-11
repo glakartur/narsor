@@ -149,6 +149,7 @@ fn unused_loopback_addr() -> io::Result<std::net::SocketAddr> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn no_daemon_running_spawns_one_and_returns_a_working_client() {
     init_exe_override();
     let root = TempRoot::new();
@@ -180,6 +181,7 @@ async fn no_daemon_running_spawns_one_and_returns_a_working_client() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_stale_discovery_file_naming_a_dead_pid_is_cleaned_up_and_a_fresh_daemon_spawned() {
     init_exe_override();
     let root = TempRoot::new();
@@ -220,6 +222,7 @@ async fn a_stale_discovery_file_naming_a_dead_pid_is_cleaned_up_and_a_fresh_daem
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_live_responding_daemon_is_reused_without_spawning_a_duplicate() {
     init_exe_override();
     let root = TempRoot::new();
@@ -259,6 +262,7 @@ async fn a_live_responding_daemon_is_reused_without_spawning_a_duplicate() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn concurrent_calls_with_no_daemon_running_spawn_exactly_one_daemon() {
     init_exe_override();
     let root = TempRoot::new();
@@ -301,6 +305,7 @@ async fn concurrent_calls_with_no_daemon_running_spawn_exactly_one_daemon() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_pid_that_is_alive_but_not_a_daemon_is_treated_as_dead() {
     init_exe_override();
     let root = TempRoot::new();
@@ -364,6 +369,7 @@ async fn a_pid_that_is_alive_but_not_a_daemon_is_treated_as_dead() {
 /// is provably dead) and asserts `ensure_daemon_running` reaps it and spawns
 /// a fresh daemon instead of timing out.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_stale_lock_file_naming_a_dead_pid_is_reaped_instead_of_deadlocking() {
     init_exe_override();
     let root = TempRoot::new();

@@ -272,6 +272,7 @@ fn event_kind(data: &EventData) -> &'static str {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn closing_the_client_that_started_an_action_does_not_kill_the_daemon_or_the_action() {
     init_exe_override();
     let root = TempRoot::new();

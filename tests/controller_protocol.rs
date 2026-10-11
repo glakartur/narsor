@@ -1255,6 +1255,7 @@ async fn owner_scope_hides_other_owners_tasks() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn the_daemon_recovers_the_control_plane_at_startup_and_serves_it() {
     let root = TempRoot::new();
     let paths = StatePaths::new(root.path());

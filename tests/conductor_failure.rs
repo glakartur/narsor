@@ -1008,6 +1008,7 @@ async fn a_diagnosis_with_its_repeat_spent_raises_the_raw_error_at_startup() {
 /// harness, first on the daemon's `PATH` as `claude`), the problem shows in
 /// `GET /executions`, and the workspace sweep keeps the task's workspace.
 #[tokio::test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 async fn a_fresh_daemon_diagnoses_a_failed_step_again_and_the_sweep_keeps_its_workspace() {
     let harness = Harness::new();
     let root = harness.root().join("daemon");

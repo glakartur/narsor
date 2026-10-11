@@ -201,6 +201,7 @@ fn validate_confirms_a_correct_definition() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn run_creates_an_execution_and_prints_its_id() {
     let root = TempRoot::new();
 
@@ -225,6 +226,7 @@ fn run_creates_an_execution_and_prints_its_id() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn list_shows_the_created_execution_with_its_status() {
     let root = TempRoot::new();
     let (_, id) = start_greet(&root);
@@ -246,6 +248,7 @@ fn list_shows_the_created_execution_with_its_status() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn show_prints_state_status_and_context_variables() {
     let root = TempRoot::new();
     let (_, id) = start_greet(&root);
@@ -276,6 +279,7 @@ fn show_prints_state_status_and_context_variables() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn input_delivers_an_answer_and_resumes_the_execution() {
     let root = TempRoot::new();
     let (_, id) = start_greet(&root);
@@ -302,6 +306,7 @@ fn input_delivers_an_answer_and_resumes_the_execution() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn events_lists_the_log_in_sequence_order() {
     let root = TempRoot::new();
     let (_, id) = start_greet(&root);
@@ -327,6 +332,7 @@ fn events_lists_the_log_in_sequence_order() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn list_without_any_executions_prints_an_empty_list() {
     let root = TempRoot::new();
 
@@ -345,6 +351,7 @@ fn list_without_any_executions_prints_an_empty_list() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn a_boolean_input_reaches_the_context_as_a_boolean() {
     let root = TempRoot::new();
     let (_, id) = start_greet(&root);
@@ -454,6 +461,7 @@ fn a_missing_command_line_argument_is_a_usage_error() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn show_for_an_unknown_id_is_a_readable_failure() {
     let root = TempRoot::new();
 
@@ -468,6 +476,7 @@ fn show_for_an_unknown_id_is_a_readable_failure() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn input_for_an_execution_that_is_not_waiting_explains_the_status() {
     let root = TempRoot::new();
     let (_, id) = start_greet(&root);
@@ -496,6 +505,7 @@ fn input_for_an_execution_that_is_not_waiting_explains_the_status() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn validate_run_input_show_is_one_uninterrupted_path() {
     let root = TempRoot::new();
 
@@ -773,6 +783,7 @@ fn repo_add_refuses_a_remote_git_would_read_as_a_command() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn a_workflow_naming_a_registered_id_provisions_from_the_registered_remote() {
     let root = TempRoot::new();
     let registered = source_repo(&root, "registered", "from the registry");
@@ -822,6 +833,7 @@ fn a_workflow_naming_a_registered_id_provisions_from_the_registered_remote() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn a_workflow_naming_an_unregistered_raw_path_still_provisions_as_before() {
     let root = TempRoot::new();
     let raw = source_repo(&root, "raw-repo", "from the raw path");
@@ -858,6 +870,7 @@ fn a_workflow_naming_an_unregistered_raw_path_still_provisions_as_before() {
 /// no longer on the request path, so `run` acknowledges the queued task and
 /// finishes normally instead of reporting a lost daemon.
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn a_checkout_slower_than_the_request_timeout_is_not_a_lost_daemon() {
     let root = TempRoot::new();
     let raw = source_repo(&root, "slow-repo", "from the slow checkout");
@@ -916,6 +929,7 @@ fn a_checkout_slower_than_the_request_timeout_is_not_a_lost_daemon() {
 /// execution exists: `run` must end nonzero from the task-side failure
 /// instead of waiting for an execution projection that cannot arrive.
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn run_ends_nonzero_when_admitted_provisioning_fails_before_an_execution_exists() {
     let root = TempRoot::new();
     let missing = root.path().join("sources").join("does-not-exist");
@@ -982,6 +996,7 @@ fn validate_accepts_a_builtin_by_name() {
 /// A name in `{root}/workflows` is what `run` resolves, and the execution
 /// records that name beside the path.
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn run_resolves_a_name_from_the_root_workflow_directory() {
     let root = TempRoot::new();
     let directory = root.path().join("workflows");
@@ -1097,6 +1112,7 @@ fn start_flaky(root: &TempRoot) -> (Invocation, String) {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn steps_shows_one_line_per_attempt_with_its_status() {
     let root = TempRoot::new();
     let (invocation, id) = start_flaky(&root);
@@ -1129,6 +1145,7 @@ fn steps_shows_one_line_per_attempt_with_its_status() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn steps_for_an_unknown_execution_is_a_readable_failure() {
     let root = TempRoot::new();
 
@@ -1150,6 +1167,7 @@ fn steps_for_an_unknown_execution_is_a_readable_failure() {
 /// event; it is looked up purely by the id given on the command line), then
 /// checks every entry that was written comes back, in order, in full.
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn conversation_prints_every_entry_in_order() {
     let root = TempRoot::new();
     let (_, id) = start_greet(&root);
@@ -1194,6 +1212,7 @@ fn conversation_prints_every_entry_in_order() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn conversation_for_an_unknown_attempt_is_a_readable_failure() {
     let root = TempRoot::new();
     let (_, id) = start_greet(&root);
@@ -1295,6 +1314,7 @@ terminal_states:
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn resume_drives_a_paused_execution_to_a_terminal_state() {
     let root = TempRoot::new();
     let id = pause_a_fresh_execution(&root);
@@ -1326,6 +1346,7 @@ fn resume_drives_a_paused_execution_to_a_terminal_state() {
 /// `--file` on `resume` is refused, not silently ignored — the daemon has no
 /// way to honour a local override path (see `resume`'s own doc comment).
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn resume_with_file_override_is_a_usage_error() {
     let root = TempRoot::new();
     let id = pause_a_fresh_execution(&root);
@@ -1348,6 +1369,7 @@ fn resume_with_file_override_is_a_usage_error() {
 /// Exactly one must succeed; the other must fail readably — the daemon's
 /// `409` must not reach the operator as a raw HTTP/JSON dump.
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn two_concurrent_resumes_of_the_same_execution_exactly_one_succeeds() {
     let root = TempRoot::new();
     let id = pause_a_fresh_execution(&root);
@@ -1451,6 +1473,7 @@ fn stop_on_a_problem(root: &TempRoot) -> String {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn input_resolves_a_problem_with_a_label_data_and_variables() {
     let root = TempRoot::new();
     let id = stop_on_a_problem(&root);
@@ -1736,6 +1759,7 @@ fn recover_restarts_a_failed_step_shown_as_a_problem() {
 /// `recover` of an execution that has no failed step says why, without
 /// asking the daemon to recover anything.
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn recover_of_an_execution_that_did_not_fail_explains_the_status() {
     let root = TempRoot::new();
     let (started, id) = start_greet(&root);
@@ -1879,6 +1903,7 @@ fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn task_interrupt_restart_and_override_steer_the_runner_of_a_local_task() {
     let root = TempRoot::new();
     let _processes = LocalProcesses {
@@ -1992,6 +2017,7 @@ fn task_interrupt_restart_and_override_steer_the_runner_of_a_local_task() {
 /// The CLI half of the conductor of a local task (U5): chat, read what it
 /// said and proposed, reject a proposal, and what is refused and why.
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn task_conductor_commands_talk_to_the_conductor_in_the_tasks_runner() {
     let root = TempRoot::new();
     let _processes = LocalProcesses {
@@ -2100,6 +2126,7 @@ fn task_conductor_commands_talk_to_the_conductor_in_the_tasks_runner() {
 const BROKEN_WORKFLOW: &str = "name: broken\nversion: 1\nstates:\n  a:\n    description: x\n    transitions:\n      go: nowhere\nterminal_states: [missing]\n";
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn a_task_from_a_file_is_listed_shown_answered_and_archived_from_the_cli() {
     let root = TempRoot::new();
     let _processes = LocalProcesses {
@@ -2269,6 +2296,7 @@ fn a_task_from_a_file_is_listed_shown_answered_and_archived_from_the_cli() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn history_reads_an_old_execution_and_refuses_to_recover_one_that_did_not_fail() {
     let root = TempRoot::new();
     let _processes = LocalProcesses {
@@ -2337,6 +2365,7 @@ fn history_reads_an_old_execution_and_refuses_to_recover_one_that_did_not_fail()
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn the_registry_and_the_catalogue_are_read_and_changed_from_the_cli() {
     let root = TempRoot::new();
     let _processes = LocalProcesses {
@@ -3253,6 +3282,7 @@ fn tui_remote_alias_is_warned_about_and_plain_tui_is_not() {
 /// and nothing else, and the local daemon was launched and answers on
 /// `/control/v1`.
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn tui_without_a_server_launches_the_local_daemon_and_remote_runs_the_same_interface() {
     let root = TempRoot::new();
     let _processes = LocalProcesses {

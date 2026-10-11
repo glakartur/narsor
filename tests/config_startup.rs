@@ -239,6 +239,7 @@ fn a_config_path_that_is_not_there_is_a_usage_error() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn the_config_flag_works_after_the_subcommand_too() {
     needs_no_system_config!();
     let root = TempRoot::new();
@@ -255,6 +256,7 @@ fn the_config_flag_works_after_the_subcommand_too() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn a_good_file_does_not_disturb_anything() {
     needs_no_system_config!();
     let root = TempRoot::new();
@@ -267,6 +269,7 @@ fn a_good_file_does_not_disturb_anything() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn the_state_directory_from_the_file_is_the_one_the_command_works_in() {
     needs_no_system_config!();
     let root = TempRoot::new();
@@ -303,6 +306,7 @@ fn the_state_directory_from_the_file_is_the_one_the_command_works_in() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn the_flag_still_beats_the_file_for_the_state_directory() {
     needs_no_system_config!();
     // AE1, through the binary.
@@ -334,6 +338,7 @@ fn the_flag_still_beats_the_file_for_the_state_directory() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn nothing_configured_means_not_one_line_of_log() {
     needs_no_system_config!();
     // D-N: exactly today's behaviour, and the startup order did not change it.
@@ -361,6 +366,7 @@ fn nothing_configured_means_not_one_line_of_log() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn a_level_in_the_file_changes_what_reaches_stderr() {
     needs_no_system_config!();
     let root = TempRoot::new();
@@ -392,6 +398,7 @@ fn a_level_in_the_file_changes_what_reaches_stderr() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn rust_log_still_overrides_the_configured_level() {
     needs_no_system_config!();
     // D-K, through the binary: the file says be quiet, RUST_LOG says talk.
@@ -416,6 +423,7 @@ fn rust_log_still_overrides_the_configured_level() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn the_tui_log_file_lands_in_the_resolved_state_directory() {
     needs_no_system_config!();
     // The interface cannot be driven from a test, but the file it would write
@@ -442,6 +450,7 @@ fn the_tui_log_file_lands_in_the_resolved_state_directory() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn a_partly_invalid_rust_log_keeps_the_part_that_parsed() {
     needs_no_system_config!();
     // What EnvFilter::from_default_env did before the configuration layer
@@ -477,6 +486,7 @@ fn a_partly_invalid_rust_log_keeps_the_part_that_parsed() {
 /// expect" check and fail here. Listing each directory is the only way to see
 /// it.
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn three_roots_pointed_apart_each_hold_only_what_belongs_to_them() {
     needs_no_system_config!();
     let root = TempRoot::new();
@@ -714,6 +724,7 @@ const NETWORK_MODE: [(&str, &str); 6] = [
 ];
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn trusted_mode_refuses_to_listen_beyond_loopback() {
     needs_no_system_config!();
     for bind in ["0.0.0.0:7400", "[::]:7400", "[::ffff:127.0.0.1]:7400"] {
@@ -741,6 +752,7 @@ fn trusted_mode_refuses_to_listen_beyond_loopback() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn network_mode_without_issuer_audience_or_tls_policy_refuses_to_start() {
     needs_no_system_config!();
     let root = TempRoot::new();
@@ -765,6 +777,7 @@ fn network_mode_without_issuer_audience_or_tls_policy_refuses_to_start() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn an_insecure_security_value_stops_the_daemon_with_the_key_named() {
     needs_no_system_config!();
     let cases: [(&str, &str); 4] = [
@@ -795,6 +808,7 @@ fn an_insecure_security_value_stops_the_daemon_with_the_key_named() {
 }
 
 #[test]
+#[ignore = "starts a narsor daemon; run with --ignored"]
 fn an_unclaimed_network_daemon_prints_and_stores_a_one_time_claim_code() {
     use std::os::unix::fs::PermissionsExt;
 
