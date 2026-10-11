@@ -7,7 +7,8 @@
 //!   workspace and private HOME. No owner reference: it outlives every Pod
 //!   and is deleted only by archive (R34);
 //! * a **Pod** `narsor-…` — the compute of one launch, `restartPolicy:
-//!   Never` (no automatic restart, R13). An init container per bundle
+//!   Never` (Kubernetes never restarts it; a replacement is a new launch
+//!   generation from the control plane, D58). An init container per bundle
 //!   copies the pinned runtime bundle (and each tool package) into an
 //!   `emptyDir`; the main container runs the repository's own pinned base
 //!   image with its command replaced by `narsor runner` (R20, R21);

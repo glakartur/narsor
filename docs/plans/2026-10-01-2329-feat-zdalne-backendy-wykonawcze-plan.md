@@ -50,7 +50,7 @@ Nowy wariant rozszerza te granice, zamiast przyjmować Kubernetes jako źródło
 - **Pierwsza instalacja pozostaje mała i samowystarczalna.** (session-settled: user-directed — chosen over mandatory database, queue, and object storage dependencies: Narsor is an agent orchestrator with only a few concurrent tasks.) Governs R6, R29.
 - **Pierwszy produkcyjny adapter obsługuje Kubernetes.** (review-settled: user-approved — chosen over building Kubernetes and local Docker adapters in parallel: a backend-neutral contract and test adapter prove portability before another production implementation.) Governs R4, R8.
 - **Jeden aktywny task ma jeden izolowany workload.** (session-settled: user-directed — chosen over shared workers: isolation, resource control, and distinct environments are the primary reasons for the remote model.) Governs R7-R9.
-- **Działające taski nie są automatycznie wywłaszczane ani odtwarzane.** (session-settled: user-directed — chosen over automatic preemption and crash restart: the owner decides what happens to work already in progress.) Governs R11, R13.
+- **Działające taski nie są automatycznie wywłaszczane ani odtwarzane.** (session-settled: user-directed — chosen over automatic preemption and crash restart: the owner decides what happens to work already in progress.) Governs R11, R13. *(Częściowo zastąpione przez D58 w `ARCHITECTURE_DECISIONS.md`: wywłaszczania nadal nie ma, ale zadanie `Interrupted` po utracie workloadu control plane wznawia sam, z limitem prób.)*
 - **Repozytorium dostarcza obraz bazowy, a Narsor wstrzykuje własny runtime.** (review-settled: user-approved after independent Claude cross-check — chosen over building a derived image for every environment or requiring one Narsor-owned Ubuntu base: an init container materializes the pinned Narsor runtime bundle without a release-one builder or writable registry.) Governs R15-R22, R40.
 - **Pierwsza centrala ma jednego właściciela.** (review-settled: user-directed — chosen over implementing teams in the first release: deployment configuration or a one-time claim binds the instance to one OIDC identity.) Governs R31-R33, R38.
 - **Przyszła rewizja workspace'u służy lokalnej współpracy, nie odzyskiwaniu.** (session-settled: user-directed — chosen over recovery checkpoints and continuous central replication: task storage is assumed stable and remains authoritative, while workspace transfer will happen only on demand.) Governs R23-R30.
@@ -107,7 +107,7 @@ Stałe połączenie task runnera z centralą nie jest wymagane; centrala pokazuj
 - R10. Użytkownik ręcznie wybiera aktywny backend domyślny i może nadpisać go dla konkretnego taska; istniejący task nie migruje po zmianie tego ustawienia.
 - R11. Priorytet zmienia kolejność tasków oczekujących, ale nigdy automatycznie nie zatrzymuje taska w toku.
 - R12. Jawna pauza doprowadza task do bezpiecznej granicy i pozwala zwinąć jego compute do zera bez usuwania task storage'u.
-- R13. Nieoczekiwana śmierć workloadu ustawia task w stanie przerwanym lub nieznanym i wymaga decyzji właściciela przed odtworzeniem.
+- R13. Nieoczekiwana śmierć workloadu ustawia task w stanie przerwanym lub nieznanym i wymaga decyzji właściciela przed odtworzeniem. *(Superseded by D58: zadanie `Interrupted` control plane wznawia sam — 5 prób z odstępami do 30 min, bez liczenia utrat po restarcie controllera; decyzji właściciela wymagają już tylko utrata z `PauseRequested`, wyczerpany limit i `Unknown` bez potwierdzonej śmierci workloadu.)*
 - R14. Utrata łączności z centralą nie zatrzymuje automatycznie taska. Centrala pokazuje ostatni znany status lub stan nieznany, a po reconnect controller uzgadnia przypisanie z zasobem o deterministycznej tożsamości; nie rekonstruuje historii pracy przechowywanej na task storage'u.
 
 **Środowiska, konfiguracje i sekrety**
@@ -185,7 +185,7 @@ Stałe połączenie task runnera z centralą nie jest wymagane; centrala pokazuj
 - AE1. **Covers R7-R9, R12.** Dwa taski jednego użytkownika działają równolegle z osobnymi limitami i storage'ami; pauza jednego usuwa jego compute bez wpływu na drugi.
 - AE2. **Covers R3-R5, R8.** Produkcyjny controller Kubernetes i adapter testowy przechodzą ten sam zestaw testów kontraktowych bez ujawniania typów Kubernetes w zachowaniu TUI lub Web.
 - AE3. **Covers R10-R11.** Użytkownik zmienia domyślny backend i priorytet nowego taska; działający task pozostaje na swoim backendzie i nie zostaje automatycznie zatrzymany.
-- AE4. **Covers R13.** Workload ginie podczas akcji; Narsor pokazuje stan przerwany lub nieznany i nie uruchamia nowej instancji przed decyzją właściciela.
+- AE4. **Covers R13.** Workload ginie podczas akcji; Narsor pokazuje stan przerwany lub nieznany i nie uruchamia nowej instancji przed decyzją właściciela. *(Superseded by D58: po zgłoszonej utracie zadanie `Interrupted` jest wznawiane automatycznie; `Unknown` czeka, dopóki controller nie potwierdzi śmierci workloadu przy obecnym storage'u.)*
 - AE5. **Covers R15-R22, R40.** Dwa taski tego samego użytkownika dla jednego repo wykorzystują ten sam przypięty obraz bazowy i runtime bundle, startują bez budowania obrazu, instalacji pakietów i logowania, lecz otrzymują osobne zapisywalne katalogi domowe.
 - AE6. **Future compatibility for R24-R28.** Model nie wymaga centralnej kopii workspace'u i pozwala później dodać pobieranie rewizji z task storage'u po obowiązkowej pauzie bez zmiany kontraktu własności taska lub backendu.
 - AE7. **Covers R23, R30.** Użytkownik przesyła materiały wejściowe i pobiera tymczasową dokumentację bez tworzenia commitów w repozytorium produktu.
@@ -282,7 +282,7 @@ Product Contract changed: R41-R42 and AE12 record two user-directed clarificatio
 ### Key Technical Decisions
 
 - KTD1. **Separate orchestration from runner work state.** The control plane persistently owns task assignment, desired lifecycle, command generation, controller lease and the last observed runner/backend summary; the runner owns the existing execution store on task storage. Controllers and runners use authenticated protocol endpoints rather than mounting or writing the central state directory. This preserves the single-writer file-store boundary while allowing remote reconciliation. (R2-R5, R13-R14, R41)
-- KTD2. **Use a directly managed Kubernetes Pod plus one PVC per task.** The controller creates and observes a deterministically named Pod with `restartPolicy: Never` and an independently named PVC with no Pod owner reference; pause removes only the Pod after the runner acknowledges a safe point, resume waits for deletion observation then creates a replacement Pod against the same PVC, and archive deletes both. Archive wins over every nonterminal desired state. The backend admits only a storage class whose reclaim policy fulfils archive-as-destruction, otherwise archive remains cleanup-failed rather than claiming removal. (session-settled: user-approved — chosen over StatefulSet or Job: Narsor already owns lifecycle reconciliation, while a direct Pod avoids replica and retry semantics that would violate no automatic restart.) (R7-R9, R12-R14, R34, R39, R42)
+- KTD2. **Use a directly managed Kubernetes Pod plus one PVC per task.** The controller creates and observes a deterministically named Pod with `restartPolicy: Never` and an independently named PVC with no Pod owner reference; pause removes only the Pod after the runner acknowledges a safe point, resume waits for deletion observation then creates a replacement Pod against the same PVC, and archive deletes both. Archive wins over every nonterminal desired state. The backend admits only a storage class whose reclaim policy fulfils archive-as-destruction, otherwise archive remains cleanup-failed rather than claiming removal. (session-settled: user-approved — chosen over StatefulSet or Job: Narsor already owns lifecycle reconciliation, while a direct Pod avoids replica and retry semantics that would violate no automatic restart.) (R7-R9, R12-R14, R34, R39, R42) *(Reformulated by D58: neither Kubernetes nor the controller restarts a Pod; a replacement Pod is created only for a newer launch generation recorded by the control plane — the owner's start/resume or the resume policy's `Resume`.)*
 - KTD3. **Make commands and reports idempotent, ordered protocol messages.** Each task mutation carries a control-plane generation and idempotency key; a controller holds one fenced lease per backend and reports resource UID, generation and lease epoch. A runner initiates an outbound renewable long-poll to the control plane while it is active, using a short-lived read-only file credential bound to task, generation and Pod incarnation; it reports immutable progress cursors and receives queued input only for the matching pending-input/attempt identifier. At-least-once delivery is expected; stale commands, reports and incarnations are rejected or deduplicated. Controllers never use Pod exec or port-forward. (R4-R5, R10-R14, R41)
 - KTD4. **Proxy task interaction through the control plane.** The control plane exposes normalized task summaries, cursor-based SSE and paged conversations while the runner is connected, marking stale data with its observation time; once a Pod is paused or interrupted it returns the last safe summary and explicit conversation-unavailable state rather than recreating compute or replicating raw transcript storage. Raw workspace files, secret values and raw conversation storage never become central replicas. (R1-R2, R5, R19, R23-R30, R41)
 - KTD5. **Pin the complete runner environment at task creation.** `ResolvedEnvironment` includes base-image digest, runtime bundle digest, profile version and the effective harness selection. The task PVC persists workspace, Engine files and private HOME; controller-injected credentials are recreated on each Pod start and are not persisted in this descriptor or copied to the control plane. (R15-R22, R39-R42)
@@ -330,6 +330,8 @@ stateDiagram-v2
 ```
 
 `Running`, `Paused`, `Interrupted` and `Archived` are orchestration states; the runner's existing `ExecutionStatus` remains the work-state detail. Unknown or disconnected observations retain an explicit last-observed timestamp instead of silently changing work state.
+
+*(Superseded by D58: `Interrupted --> Provisioning` is also taken by the control plane's resume policy (a `Resume` with the `Policy` actor), and `Unknown --> Interrupted` by a controller's `LossConfirmed` once the workload is gone or exited while the storage is present.)*
 
 ### System-Wide Impact
 
@@ -422,7 +424,7 @@ stateDiagram-v2
 - The same lifecycle suite passes against the fake adapter without exposing backend-specific types.
 - The local adapter preserves current Engine events and recovery behavior while clients invoke it through the same control-plane lifecycle contract.
   - Reconciliation finds a resource with matching task identity instead of creating a duplicate.
-  - A failed observation reports interrupted/unknown and requires an explicit owner command before replacement.
+  - A failed observation reports interrupted/unknown and requires an explicit owner command before replacement. *(Superseded by D58: a confirmed loss in `Interrupted` is resumed by the control plane's resume policy.)*
   - Archive deletes compute and storage exactly once even when the command is delivered repeatedly.
 - **Verification:** Backend-contract tests define the required semantics independently of Kubernetes API objects.
 
@@ -440,7 +442,7 @@ stateDiagram-v2
 - The generated Pod uses `restartPolicy: Never`, disables automatic service-account token mounting and rejects privileged, host, foreign-volume or unapproved-secret shapes before Kubernetes creation.
 - Namespaced controller RBAC cannot operate outside its backend namespace or use exec, attach, port-forward or ephemeral containers; admission rejects a foreign image, service account, PVC or secret mapping.
   - Pause preserves the PVC while removing the Pod; resume recreates one Pod mounting the same PVC.
-- A failed or deleted Pod is observed as interrupted and does not cause automatic recreation.
+- A failed or deleted Pod is observed as interrupted and does not cause automatic recreation. *(Superseded by D58: the controller still never recreates it on its own, but the control plane's resume policy resumes the interrupted task, which creates a new Pod.)*
 - A delayed Pod deletion, lease handoff, resume during pause or archive racing start cannot produce a second current Pod or recreate a tombstoned task.
 - Archive removes the Pod and PVC, then reports success only after both deletions are observed.
 - A storage class that retains backing data after PVC deletion is rejected for archive-as-destruction semantics or leaves cleanup visibly failed.
@@ -549,7 +551,7 @@ Before a deployment smoke test, an operator supplies a disposable namespace, sto
 - U1-U8 meet their listed verification outcomes and the full Rust test suite and formatter pass.
 - The backend-neutral contract passes unchanged for the fake adapter and the Kubernetes adapter, including delayed deletion, lease handoff and archive/start races.
 - The control plane remains the only client-facing task endpoint; no client needs Kubernetes credentials or runner addresses.
-- A Kubernetes task has exactly one active Pod and one retained PVC, pauses only after runner acknowledgement, never restarts automatically after unexpected loss, and deletes PVC storage only on explicit archive.
+- A Kubernetes task has exactly one active Pod and one retained PVC, pauses only after runner acknowledgement, never restarts automatically after unexpected loss, and deletes PVC storage only on explicit archive. *(Superseded by D58: after an unexpected loss the control plane resumes the task automatically, up to the resume limit.)*
 - OIDC network mode enforces one immutable owner identity and revocable controller/runner identities; trusted mode cannot bind to a non-loopback interface.
 - Production network exposure follows successful TLS, OIDC, controller-revocation, RBAC/admission and disposable-namespace rollout checks.
 - Resolved environments, secret references and controller observations contain no secret values; workspace revision, multi-user transfer, local Docker and central workspace replication remain absent from the implementation.

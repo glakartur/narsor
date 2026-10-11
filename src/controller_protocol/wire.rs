@@ -796,7 +796,7 @@ pub enum DesiredAction {
     /// `LossConfirmed` (→ Interrupted) only when it is gone or terminated
     /// while the task storage is present; a live workload, one still being
     /// deleted, a failed observation or missing storage leave the task
-    /// Unknown for its owner.
+    /// Unknown for its owner (the resume policy never acts on Unknown).
     ///
     /// Interrupted: wait. The owner resumes it, or the control plane's
     /// resume policy does, with a new desired generation.
@@ -968,20 +968,22 @@ pub enum RunnerDirective {
 /// What the control plane knows about the launch of the calling runner.
 ///
 /// A runner learns its own launch generation here, and — through
-/// `authorized_by` — whether its owner explicitly started or resumed it.
-/// That is how a runner that finds its task storage left behind by an
-/// unexpected stop knows it may run ordinary recovery (R13): only an owner
-/// decision taken *after* the loss launches a new incarnation at a newer
-/// generation, so the decision is a fact on the control plane, never an
-/// inference of the runner's.
+/// `authorized_by` — whether a `start` or `resume` (its owner's, or the
+/// resume policy's, D58) launched it. That is how a runner that finds its
+/// task storage left behind by an unexpected stop knows it may run ordinary
+/// recovery (R13): only a command taken *after* the loss launches a new
+/// incarnation at a newer launch generation recorded by the control plane,
+/// so the decision is a fact on the control plane, never an inference of
+/// the runner's.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerLaunchView {
     /// The incarnation the credential is bound to.
     pub incarnation: String,
     /// The generation it was launched at.
     pub launch_generation: u64,
-    /// The owner command that produced that generation (`start` or
-    /// `resume`); `None` for the first launch out of the queue.
+    /// The command that produced that generation (`start` or `resume`, the
+    /// owner's or the resume policy's); `None` for the first launch out of
+    /// the queue.
     pub authorized_by: Option<OwnerCommand>,
     /// Who issued [`Self::authorized_by`]: the owner, or the resume policy
     /// after a workload loss. Only words the runner's history; absent from

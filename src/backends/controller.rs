@@ -1042,7 +1042,8 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         }
     }
 
-    /// Reports an unexpected loss; the task then waits for its owner.
+    /// Reports an unexpected loss; the task then waits for the control
+    /// plane's resume policy or its owner (D58).
     async fn lost(
         &mut self,
         context: &TaskContext<'_>,

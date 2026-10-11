@@ -441,6 +441,7 @@ Kubernetes backend in v1: one task runs in one container on one image.
 Queued ─▶ Provisioning ─▶ Running ─▶ PauseRequested ─▶ Paused ─▶ (resume) Provisioning
                              │
                              └─▶ Interrupted / Unknown ─▶ (resume or start) Provisioning
+                                   Unknown ─▶ (loss confirmed) Interrupted ─▶ (automatic resume) Provisioning
 any state ─▶ Archiving ─▶ Archived
 ```
 
@@ -449,13 +450,28 @@ any state ─▶ Archiving ─▶ Archived
   `$HOME`, the harness the runner last switched to — stays.
 * **Resume** creates a new Pod on the same PVC; nothing is cloned again.
 * **Interrupted / Unknown**: the workload disappeared (a Pod that failed or
-  was deleted, or Pod phase `Unknown`). Narsor **never restarts it on its
-  own**; the owner decides: `resume`, `start` (afresh) or `archive`.
+  was deleted, or Pod phase `Unknown`). Neither Kubernetes nor the controller
+  restarts the Pod; the control plane **resumes an `Interrupted` task on its
+  own** (D58): a new Pod on the same PVC, up to 5 consecutive attempts after
+  0 s, 30 s, 2 min, 10 min and 30 min. A loss counts as consecutive when the
+  runner was ready for less than 10 minutes (or never, e.g. a refused
+  launch); a loss found after the controller restarted (a newer lease epoch)
+  uses up no attempt. Each resume leaves an `AutoResumed` event; when the
+  attempts run out the task stays `Interrupted` with "could not resume
+  automatically: …" and an `AutoResumeExhausted` event. Still waiting for the
+  owner (`resume`, `start` or `archive`): a task lost while pausing, a task
+  whose attempts are exhausted (an owner `resume`/`start` resets the count),
+  and an `Unknown` task — it turns `Interrupted` only once the controller
+  confirms the Pod is gone or terminated while the PVC is present; a Pod in
+  phase `Unknown`, one still being deleted or a missing PVC keep it
+  `Unknown`. Resumes need the backend's controller online.
 * **Archive** stops everything and deletes the Pod **and the PVC**. It wins
   over every other state and cannot be undone; there is no automatic
   retention cleanup.
-* While a task is paused, interrupted or archived its conversation is
-  explicitly unavailable; clients show the last safe summary and its time.
+* While a remote task is paused, interrupted or archived its conversation is
+  explicitly unavailable; clients show the last safe summary and its time. A
+  task of the daemon's own `local` backend without a live runner is read
+  from its storage instead, marked with the age of the record (D59).
   Observations that are no longer current are shown as stale with their age,
   never turned into another state.
 
@@ -464,8 +480,8 @@ any state ─▶ Archiving ─▶ Archived
 * Each backend has `max_concurrent_tasks` slots. Slots are held by tasks in
   `Provisioning`, `Running`, `PauseRequested`, `Interrupted`, `Unknown`,
   `Archiving`, and by an admitted `Queued` task. `Paused` and `Archived` hold
-  none — so an interrupted task still blocks a slot until the owner resumes or
-  archives it.
+  none — so an interrupted task still blocks a slot until it is resumed
+  (automatically or by the owner) or archived.
 * Every task has a position (`rank`) in its backend's queue, shown as `#n` by
   `narsor task list`. A new task joins the end; waiting tasks are admitted in
   that order. A queued task is reordered with `narsor task move <task>
@@ -700,8 +716,9 @@ The ordinary test suite needs no cluster. Against a real cluster:
 * Task materials are one-off copies, bounded in size (section 11); there is
   no synchronization, and no removal of a copy already delivered to task
   storage short of archiving the task.
-* No automatic restart after workload loss and no automatic retention
-  cleanup — both are owner decisions by design.
+* No automatic retention cleanup — an owner decision by design. Automatic
+  resume after workload loss is bounded (section 9) and not configurable per
+  task, workflow or backend.
 * OIDC device-code login is not built in: use a token helper that writes a
   file or prints a token.
 * Old executions (from before the scheduler) are read, and a failed one

@@ -39,7 +39,7 @@
 //! | 1 | an error the runner could not report as a problem (storage, I/O) |
 //! | 2 | invalid invocation (clap) |
 //! | [`EXIT_PROBLEM`] | the runner could not work and reported why (base image, secret, initialization, launch spec) |
-//! | [`EXIT_OWNER_DECISION`] | the storage was left by an unexpected stop and no owner decision authorizes recovering it |
+//! | [`EXIT_OWNER_DECISION`] | the storage was left by an unexpected stop and no newer launch generation (the owner's or the resume policy's) authorizes recovering it |
 //!
 //! The runner reads no configuration file and no catalogue: everything it
 //! runs is in the launch spec.

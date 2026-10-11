@@ -38,7 +38,8 @@ Design documentation (written in Polish, and normative):
 
 ```bash
 cargo build              # builds target/debug/narsor
-cargo test               # the whole suite (unit + integration)
+cargo test               # the whole suite (unit + integration), without daemon tests
+cargo test -- --include-ignored   # also the tests that start a real `narsor daemon`
 cargo build --release    # release build
 ```
 

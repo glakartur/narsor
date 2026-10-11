@@ -15,8 +15,9 @@
 //! | archive | delete the Pod, then — once it is gone — the PVC |
 //!
 //! Why not a Job or a StatefulSet: both would restart or replace a Pod on
-//! their own, and Narsor never replaces a lost workload without its owner
-//! (R13, KTD2).
+//! their own, while Narsor replaces a lost workload only for a newer launch
+//! generation recorded by the control plane — the owner's start/resume or
+//! the resume policy's `Resume` (KTD2, D58).
 //!
 //! # Observation
 //!

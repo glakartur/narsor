@@ -142,8 +142,9 @@ pub const PROBLEM_LAUNCH_SPEC: &str = "launch_spec_invalid";
 pub const PROBLEM_SECRET: &str = "secret_unavailable";
 /// Problem code: the storage could not be initialized (clone, marker).
 pub const PROBLEM_INITIALIZATION: &str = "initialization_failed";
-/// Problem code: the storage was left by an unexpected stop and no owner
-/// decision authorizes this incarnation to recover it (R13).
+/// Problem code: the storage was left by an unexpected stop and no start or
+/// resume (the owner's or the resume policy's, D58) authorizes this
+/// incarnation to recover it (R13).
 pub const PROBLEM_OWNER_DECISION: &str = "owner_decision_required";
 
 /// Everything that can stop a runner.
@@ -885,8 +886,8 @@ impl Session {
         }))
     }
 
-    /// Reports that the storage waits for its owner and stops, having
-    /// changed nothing.
+    /// Reports that the storage waits for a start/resume (the owner's or the
+    /// resume policy's) and stops, having changed nothing.
     async fn refuse_without_decision(&mut self) -> Result<RunnerExit, RunnerError> {
         let problem = RunnerProblem {
             code: PROBLEM_OWNER_DECISION.to_string(),

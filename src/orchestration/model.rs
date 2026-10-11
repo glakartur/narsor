@@ -67,7 +67,8 @@ impl TaskLifecycle {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnerCommand {
-    /// Retry an interrupted or unknown task (explicit owner decision, R13).
+    /// Retry an interrupted or unknown task (an explicit owner decision;
+    /// the resume policy issues `Resume` instead, D58).
     Start,
     /// Bring a running task to a safe point and release its compute.
     Pause,
@@ -680,9 +681,10 @@ impl TaskRecord {
     /// * `Queued` with a reservation — admitted, the controller may create
     ///   compute any moment;
     /// * `Interrupted`, `Unknown` — the workload may still exist (a dead Pod
-    ///   object, a node that is merely unreachable), and only the owner's
-    ///   start/resume or archive resolves that; both keep or release the
-    ///   slot explicitly, so a retry never has to wait for capacity;
+    ///   object, a node that is merely unreachable), and only a start/resume
+    ///   (the owner's, or the resume policy's for a confirmed loss, D58) or
+    ///   an archive resolves that; both keep or release the slot
+    ///   explicitly, so a retry never has to wait for capacity;
     /// * `Archiving` — deletion is requested but not confirmed.
     ///
     /// `Paused` releases its slot: the safe point was acknowledged and the
@@ -723,13 +725,14 @@ impl TaskRecord {
         })
     }
 
-    /// The owner command that launched the runner of `launch_generation`,
-    /// when an owner command did (KTD3, R13).
+    /// The command that launched the runner of `launch_generation`, when a
+    /// command did (KTD3, D58).
     ///
-    /// `None` for the first launch out of `Queued`, which no owner command
+    /// `None` for the first launch out of `Queued`, which no command
     /// produces. A runner that finds its task storage left behind by an
-    /// unexpected stop reads this to learn that its owner explicitly chose
-    /// to resume or retry — the only thing that lets it run ordinary
+    /// unexpected stop reads this to learn that a newer launch generation
+    /// was recorded by the control plane — its owner's start/resume or the
+    /// resume policy's `Resume` — the only thing that lets it run ordinary
     /// recovery on that storage.
     pub fn launch_command(&self, launch_generation: u64) -> Option<OwnerCommand> {
         self.launch_receipt(launch_generation)
@@ -1029,7 +1032,8 @@ pub struct RunnerSnapshot {
     pub safe_point: bool,
     /// Why the runner cannot do its work, when it cannot — for instance a
     /// base image that breaks the runner contract (R22), or a storage it
-    /// will not touch before its owner decides (R13). Diagnosable text, never
+    /// will not touch before a newer launch generation authorizes it (the
+    /// owner's or the resume policy's command, D58). Diagnosable text, never
     /// a secret.
     #[serde(default)]
     pub problem: Option<RunnerProblem>,

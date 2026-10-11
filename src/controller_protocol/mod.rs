@@ -35,7 +35,8 @@
 //!    * name every resource after the task's `resource_key`, so a retried
 //!      create finds the existing resource instead of duplicating it (R7);
 //!    * never recreate a lost workload: report `WorkloadLost` and wait for
-//!      the owner (R13);
+//!      a new desired generation — the owner's or the resume policy's
+//!      (R13, D58);
 //!    * remove compute for a pause only after the runner acknowledged a
 //!      safe point for the current generation
 //!      (`runner.safe_point_acknowledged`); the control plane refuses
