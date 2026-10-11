@@ -141,6 +141,9 @@ reviewer should try to break.
   the task record. `StartAccepted` is refused without a reservation.
 - **Slot holding.** Interrupted, Unknown and Archiving tasks hold a slot. An
   ignored interrupted task blocks a slot indefinitely; this is deliberate.
+  Since D58 an interrupted task is resumed automatically, so only a task whose
+  automatic resume is exhausted, one lost while pausing, or an `Unknown` one
+  holds its slot until the owner acts.
 - **Periodic pass.** A pass runs every 5 s in the daemon
   (`spawn_periodic_admission`). Check its cost with many tasks.
 

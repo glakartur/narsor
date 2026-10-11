@@ -42,7 +42,7 @@ Tutaj są wyłącznie prace do wykonania: brakujące funkcje, weryfikacje i krok
 - [ ] **Unieważnienie long-polla controllera.** Long-poll już w toku kończy się dopiero po swoim limicie (30 s), nie natychmiast po unieważnieniu.
 - [ ] **Fencing zapisów do backendu.** Controller sprawdza lease na początku kroku. Warto dodać warunki wstępne na zapisach do Kubernetesa, np. etykietę z epoką leasa w warunkach wstępnych.
 - [ ] **`flock` na sieciowych systemach plików.** Blokady stanu centrali i task storage'u opierają się na `flock`. Trzeba udokumentować wymagania wobec wolumenu albo dodać alternatywę.
-- [ ] **Zablokowany slot przez porzucony task.** Task Interrupted/Unknown trzyma slot pojemności bez końca. Można rozważyć przypomnienie lub widoczny alert dla właściciela; automatyczne zwalnianie jest sprzeczne z R13.
+- [ ] **Zablokowany slot przez porzucony task.** Od D58 zadanie `Interrupted` jest wznawiane automatycznie, więc slot bez końca trzyma już tylko zadanie z wyczerpanymi próbami wznowienia, utracone podczas pauzy albo `Unknown` (dopóki controller nie potwierdzi utraty). Można rozważyć przypomnienie lub widoczny alert dla właściciela takiego zadania; automatyczne zwolnienie slotu (bez archiwizacji) nadal nie jest planowane.
 - [ ] **Blokujące oczekiwanie w `LocalBackend`.** `wait_gone` czeka do 2 s synchronicznie w kontekście async.
 - [ ] **Polityka retencji PV.** Adapter nie widzi `reclaimPolicy` pojedynczego PV. Admin, który ustawi `Retain` na PV, obchodzi gwarancję, że archiwizacja niszczy dane. Wymaga uprawnień do PV albo procedury operatora.
 

@@ -466,6 +466,9 @@ any state ─▶ Archiving ─▶ Archived
   confirms the Pod is gone or terminated while the PVC is present; a Pod in
   phase `Unknown`, one still being deleted or a missing PVC keep it
   `Unknown`. Resumes need the backend's controller online.
+  On the `local` backend a runner is marked with `NARSOR_LOCAL_WORKLOAD_UID`;
+  before a resume the backend kills what is left of a dead runner's process
+  group, but only while a live member of the group still carries that mark.
 * **Upgrading to automatic resume**: upgrade the control plane (the daemon)
   first, then the controllers. An older control plane refuses a newer
   controller's `LossConfirmed`; the controller says so once per task in its
