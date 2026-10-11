@@ -13,6 +13,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+pub use narsor_protocol::api::{
+    AcceptedResponse, ChatMessageRequest, HarnessSelectionSnapshot, OperatorNoteRequest,
+    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, TransitionRequest,
+};
+
 use crate::conductor::{
     Annotation, ChatEntry, ConductorState, FailureReport, PendingInvocation, QueuedRequest,
     SavedDecision,
@@ -22,39 +27,6 @@ use crate::domain::{
     ConductorPurpose, ConductorTrigger, ExecutionStatus, ProblemKind, WorkflowExecution,
 };
 use crate::engine::{InputContinuation, PendingHumanInput, StepFailure};
-
-/// Authoritative default-harness selection returned by `GET`, `PUT`, and
-/// `DELETE /settings/agent-harness`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HarnessSelectionSnapshot {
-    /// Harness adapters registered by this daemon, in registry order.
-    pub supported: Vec<String>,
-    /// The startup configuration value used when there is no override.
-    pub configured: String,
-    /// The durable operator override, if one is active.
-    #[serde(rename = "override")]
-    pub override_harness: Option<String>,
-    /// The harness new agent attempts will use by default.
-    pub effective: String,
-    /// Monotonically increasing durable mutation revision.
-    pub revision: u64,
-}
-
-/// `PUT /settings/agent-harness` request body.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SetHarnessSelectionRequest {
-    /// A name from [`HarnessSelectionSnapshot::supported`].
-    pub harness: String,
-}
-
-/// A safe, user-displayable invalid-request response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RequestErrorResponse {
-    /// Stable machine-readable reason, such as `unsupported_harness`.
-    pub code: String,
-    /// Human-readable explanation that contains no credentials.
-    pub message: String,
-}
 
 /// `POST /tasks` request body.
 ///
@@ -80,71 +52,6 @@ pub struct StartTaskResponse {
     /// The durable task acknowledgement. An execution relationship appears
     /// only after scheduler admission and runner initialization.
     pub task: TaskSummary,
-}
-
-/// `POST /executions/:id/resume`, `/input`, and `/recover` response
-/// body: `202 Accepted`.
-///
-/// Carries no execution state — by the time the response is sent, phase 2
-/// (`RunHandle::run_to_completion`) has only just been handed to
-/// `tokio::spawn` and has very likely not run at all yet. A caller that wants
-/// to know when the execution settles polls `GET /executions` or (from U4 on)
-/// subscribes to the SSE stream; inventing a body here would only invite a
-/// caller to read state that is already stale the instant it is written.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AcceptedResponse {
-    /// The execution the request was accepted for.
-    pub execution_id: String,
-}
-
-/// An explicit operator recovery of a failed or interrupted execution.
-///
-/// When present, `comment` is shown to the agent as an operator note in the
-/// newly started attempt; it is never used for an automatic retry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecoveryRequest {
-    #[serde(default)]
-    pub comment: Option<String>,
-    /// The key of the step failure the recovery answers (KTD9), as the
-    /// execution's [`ActiveProblem::episode`] names it: once the execution is
-    /// no longer failed on it, the recovery is refused with `409`. Without
-    /// it, whatever the execution is stopped on is recovered.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub episode: Option<String>,
-}
-
-/// A one-shot instruction appended to the next agent attempt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OperatorNoteRequest {
-    pub note: String,
-}
-
-/// `POST /executions/:id/transition` request body.
-///
-/// Mirrors the TUI's own split between an ordinary, declared transition and a
-/// forced one (`src/tui/app.rs`'s `manual_transition`/`force_transition`):
-///
-/// * `force: false` (the default) — `label` must name one of the current
-///   state's declared `transitions`; the target is looked up from it. This is
-///   the *only* shape the server allows unless the current state opts in to
-///   overrides.
-/// * `force: true` — `target` names the state to jump to directly, bypassing
-///   the declared transition graph; the current state must declare
-///   `allow_manual_override: true` (D30) or the request is rejected.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransitionRequest {
-    /// The declared output label to take. Required (and validated against
-    /// the current state's transitions) unless `force` is set.
-    #[serde(default)]
-    pub label: Option<String>,
-    /// The state to force a transition into. Required when `force` is set,
-    /// ignored otherwise.
-    #[serde(default)]
-    pub target: Option<String>,
-    /// Whether this is a forced override (D30) rather than an ordinary,
-    /// declared transition.
-    #[serde(default)]
-    pub force: bool,
 }
 
 /// `POST /executions/:id/transition` response body, and one row of
@@ -392,14 +299,6 @@ impl ConductorStateResponse {
             failure: state.failure,
         }
     }
-}
-
-/// `POST /executions/:id/conductor/chat` request body: the operator's
-/// message to the conductor (F4).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChatMessageRequest {
-    /// What the operator writes.
-    pub text: String,
 }
 
 /// `GET /executions/:id/conductor/chat?after=<sequence>` — the chat history
