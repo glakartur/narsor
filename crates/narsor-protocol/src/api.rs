@@ -1,6 +1,7 @@
 //! Stable request and response types for the local REST API.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 /// Authoritative default-harness selection returned by the settings API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +25,16 @@ pub struct SetHarnessSelectionRequest {
 pub struct RequestErrorResponse {
     pub code: String,
     pub message: String,
+}
+
+/// `POST /tasks` request body. The workflow field remains an unresolved
+/// reference so the client does not need server-side catalogue access.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartTaskRequest {
+    pub task_id: String,
+    pub workflow: String,
+    #[serde(default)]
+    pub inputs: Map<String, Value>,
 }
 
 /// `POST /executions/:id/resume`, `/input`, and `/recover` response body.

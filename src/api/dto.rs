@@ -11,11 +11,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 pub use narsor_protocol::api::{
     AcceptedResponse, ChatMessageRequest, HarnessSelectionSnapshot, OperatorNoteRequest,
-    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, TransitionRequest,
+    RecoveryRequest, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
+    TransitionRequest,
 };
 
 use crate::conductor::{
@@ -27,24 +28,6 @@ use crate::domain::{
     ConductorPurpose, ConductorTrigger, ExecutionStatus, ProblemKind, WorkflowExecution,
 };
 use crate::engine::{InputContinuation, PendingHumanInput, StepFailure};
-
-/// `POST /tasks` request body.
-///
-/// `workflow` is a reference exactly as `narsor run <reference>` accepts one
-/// — an existing file, `{catalog}/workflows/<name>.yaml`, the user directory,
-/// or a built-in name ([`crate::workflows::WorkflowResolver`]) — not a path
-/// the caller is expected to already have resolved.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StartTaskRequest {
-    /// Client-chosen submission id. Repeating the same id and body returns
-    /// the original queued task instead of creating another one.
-    pub task_id: String,
-    /// The workflow to start.
-    pub workflow: String,
-    /// Values for the workflow's declared inputs.
-    #[serde(default)]
-    pub inputs: Map<String, Value>,
-}
 
 /// `POST /tasks` response body: `202 Accepted`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
