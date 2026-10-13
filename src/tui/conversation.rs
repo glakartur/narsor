@@ -966,25 +966,22 @@ pub(crate) fn agent_transcript_entry(entry: &TranscriptEvent) -> TranscriptEntry
         }
         EntryKind::System => (TranscriptPresentation::System, "Harness"),
     };
+    let message_content = entry
+        .details
+        .get("message.content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty());
+    let workflow_input = entry.kind == EntryKind::Narsor && workflow_event == Some("agent_input");
     let speech = matches!(
         entry.kind,
         EntryKind::Narsor | EntryKind::User | EntryKind::Assistant | EntryKind::Result
-    ) && (entry.kind != EntryKind::Narsor || workflow_event == Some("agent_input"))
-        || entry.kind == EntryKind::System
-            && entry
-                .details
-                .get("message.content")
-                .and_then(Value::as_str)
-                .is_some_and(|text| !text.is_empty());
-    let consumed_content = if speech {
-        entry
-            .details
-            .get("message.content")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .map(|_| "message.content")
+    ) && (entry.kind != EntryKind::Narsor || workflow_input)
+        || entry.kind == EntryKind::System && message_content.is_some();
+    let speech_source = if speech {
+        message_content
+            .map(|text| ("message.content", text))
             .or_else(|| {
-                (entry.kind == EntryKind::Narsor && workflow_event == Some("agent_input"))
+                workflow_input
                     .then(|| {
                         entry
                             .details
@@ -992,36 +989,23 @@ pub(crate) fn agent_transcript_entry(entry: &TranscriptEvent) -> TranscriptEntry
                             .and_then(Value::as_str)
                     })
                     .flatten()
-                    .map(|_| "workflow.message")
+                    .map(|text| {
+                        (
+                            "workflow.message",
+                            text.strip_prefix("prompt:").unwrap_or(text).trim_start(),
+                        )
+                    })
             })
     } else {
         None
     };
-    let body_source = if speech {
-        entry
-            .details
-            .get("message.content")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .or_else(|| {
-                (entry.kind == EntryKind::Narsor && workflow_event == Some("agent_input"))
-                    .then(|| {
-                        entry
-                            .details
-                            .get("workflow.message")
-                            .and_then(Value::as_str)
-                            .map(|text| text.strip_prefix("prompt:").unwrap_or(text).trim_start())
-                    })
-                    .flatten()
-            })
-            .unwrap_or(&entry.summary)
-    } else {
-        &entry.summary
-    };
+    let consumed_content = speech_source.map(|(key, _)| key);
+    let body_source = speech_source.map_or(entry.summary.as_str(), |(_, text)| text);
     let mut body = sanitize(body_source)
         .lines()
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    let visible_body = body.clone();
     let extra_body = if speech && body.len() > 5 {
         body.split_off(5)
     } else {
@@ -1033,7 +1017,7 @@ pub(crate) fn agent_transcript_entry(entry: &TranscriptEvent) -> TranscriptEntry
         }
         Vec::new()
     };
-    let detail_lines = semantic_detail_lines(&entry.details, &body, consumed_content);
+    let detail_lines = semantic_detail_lines(&entry.details, &visible_body, consumed_content);
     let mut transcript = TranscriptEntry::new(
         TranscriptEntryId::from(entry.entry_number.to_string()),
         body,
@@ -1052,6 +1036,7 @@ pub(crate) fn agent_transcript_entry(entry: &TranscriptEvent) -> TranscriptEntry
             .collect(),
     )
     .with_presentation(presentation);
+    transcript.details = Some(entry.details.clone());
     // The adapter has already converted hook envelopes into this neutral
     // correlation tuple; transcript rendering never reads harness fields.
     let group_session = entry
@@ -1274,7 +1259,11 @@ mod tests {
         assert!(transcript
             .logical_lines()
             .iter()
-            .any(|line| line.text == "> Techniczne · tokeny myślenia · 2 wpisy"));
+            .any(|line| line.text.starts_with("› SYSTEM · Harness")));
+        assert!(transcript
+            .logical_lines()
+            .iter()
+            .any(|line| line.text == "Techniczne · tokeny myślenia · 2 wpisy"));
     }
 
     #[test]
@@ -1449,20 +1438,57 @@ mod utterance_tests {
         transcript.toggle_expanded(&id);
         let lines = transcript.logical_lines();
         for expected in ["one", "two", "three", "four", "five", "six", "seven"] {
-            assert_eq!(
-                lines
-                    .iter()
-                    .filter(|line| {
-                        line.text.trim_start_matches("> ").trim_start_matches("v ") == expected
-                    })
-                    .count(),
-                1
-            );
+            assert_eq!(lines.iter().filter(|line| line.text == expected).count(), 1);
         }
         assert!(lines
             .iter()
             .filter(|line| line.text.ends_with("six") || line.text == "seven")
             .all(|line| line.presentation == TranscriptPresentation::Operator));
+    }
+
+    #[test]
+    fn multi_block_assistant_expansion_shows_long_text_once() {
+        let raw = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"one\ntwo\nthree\nfour\nfive\nsix\nseven"},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let expanded = lines_of(entry_from(ConversationEntrySource::Stdout, raw), true);
+
+        for expected in ["one", "two", "three", "four", "five", "six", "seven"] {
+            assert_eq!(
+                expanded
+                    .iter()
+                    .filter(|line| line.as_str() == expected)
+                    .count(),
+                1,
+                "{expanded:?}"
+            );
+        }
+        assert!(expanded.iter().any(|line| line.contains("Bash")));
+    }
+
+    #[test]
+    fn grouped_hook_error_is_carried_from_adapter_to_expanded_member() {
+        let make = |entry_number, subtype, error: Option<&str>| {
+            let error = error.map_or(String::new(), |error| format!(",\"error\":{error:?}"));
+            let raw = format!(
+                "{{\"type\":\"system\",\"subtype\":\"{subtype}\",\"session_id\":\"session\",\"hook_id\":\"hook\",\"hook_name\":\"SessionStart:startup\"{error}}}"
+            );
+            agent_transcript_entry(&classify(&ConversationEntryDto {
+                entry_number,
+                timestamp: chrono::Utc::now(),
+                source: ConversationEntrySource::Stdout,
+                raw_base64: BASE64.encode(raw.as_bytes()),
+            }))
+        };
+        let mut transcript = TranscriptState::new(TranscriptId::from("t"));
+        transcript.load(vec![
+            make(1, "hook_started", None),
+            make(2, "hook_response", Some("permission denied")),
+        ]);
+        let id = transcript.selected_entry().cloned().unwrap();
+        transcript.toggle_expanded(&id);
+
+        let lines = transcript.logical_lines();
+        assert!(lines.iter().any(|line| line.text.contains("· błąd")));
+        assert!(lines.iter().any(|line| line.text.contains("BŁĄD · ")));
     }
 
     #[test]
@@ -1608,6 +1634,7 @@ mod utterance_tests {
         ];
         for (source, raw, prefix) in cases {
             let header = lines_of(entry_from(source, raw), false).remove(0);
+            let (_, header) = header.split_once(' ').expect("disclosure marker");
             assert!(header.starts_with(prefix), "{header}");
             // `YYYY-MM-DD HH:MM:SS`
             let date = &header[prefix.len()..];

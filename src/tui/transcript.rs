@@ -276,6 +276,7 @@ pub struct TranscriptLine {
     pub text: String,
     pub presentation: TranscriptPresentation,
     pub header: bool,
+    pub indented: bool,
     pub selected: bool,
 }
 
@@ -294,7 +295,8 @@ pub fn wrap_visible_lines(
     let mut window = Vec::with_capacity(height);
     let mut skipped = 0;
     'lines: for line in lines {
-        for (fragment, text) in wrap_line(&line.text, width.max(1)).into_iter().enumerate() {
+        let wrapped = wrap_line(&line.text, wrapped_width(line.indented, width));
+        for (fragment, text) in wrapped.into_iter().enumerate() {
             if skipped < offset {
                 skipped += 1;
                 continue;
@@ -308,6 +310,7 @@ pub fn wrap_visible_lines(
                 text,
                 presentation: line.presentation,
                 header: line.header && fragment == 0,
+                indented: line.indented,
                 // The cursor is a vertical rail for the whole entry. Headers
                 // only own their first wrapped fragment, but body fragments
                 // all remain visibly selected.
@@ -369,19 +372,19 @@ fn grouped_detail_lines<'a>(
                 let line = line.trim();
                 let keep = !line.is_empty() && omitted_line != Some(line);
                 keep.then(|| {
-                    let attribution = if member.presentation == TranscriptPresentation::Error {
+                    let attribution = if is_error_entry(member) {
                         "BŁĄD · "
                     } else {
                         ""
                     };
                     if time.is_empty() {
                         TranscriptDetailLine::new(
-                            format!("  {attribution}{line}"),
+                            format!("{attribution}{line}"),
                             TranscriptPresentation::Technical,
                         )
                     } else {
                         TranscriptDetailLine::new(
-                            format!("  {time} · {attribution}{line}"),
+                            format!("{time} · {attribution}{line}"),
                             TranscriptPresentation::Technical,
                         )
                     }
@@ -389,6 +392,23 @@ fn grouped_detail_lines<'a>(
             })
         })
         .collect()
+}
+
+fn is_error_entry(entry: &TranscriptEntry) -> bool {
+    entry.presentation == TranscriptPresentation::Error
+        || entry.details.as_ref().is_some_and(|details| {
+            details
+                .get("error.message")
+                .is_some_and(|error| !error.is_null() && error != "")
+        })
+}
+
+fn wrapped_width(indented: bool, width: usize) -> usize {
+    if indented {
+        width.saturating_sub(2).max(1)
+    } else {
+        width.max(1)
+    }
 }
 
 impl TranscriptState {
@@ -671,6 +691,7 @@ impl TranscriptState {
                     text: String::new(),
                     presentation: TranscriptPresentation::Neutral,
                     header: false,
+                    indented: false,
                     selected: false,
                 });
             }
@@ -894,14 +915,7 @@ impl TranscriptState {
                         .as_ref()
                         .is_some_and(|metadata| metadata.phase.as_deref() == Some("completed"))
                 });
-                let failed = included.iter().any(|member| {
-                    member.presentation == TranscriptPresentation::Error
-                        || member.details.as_ref().is_some_and(|details| {
-                            details
-                                .get("error.message")
-                                .is_some_and(|error| !error.is_null() && error != "")
-                        })
-                });
+                let failed = included.iter().any(|member| is_error_entry(member));
                 let mut summary = format!(
                     "Narzędzie · {} · {}",
                     grouping.name,
@@ -966,14 +980,7 @@ impl TranscriptState {
                 continue;
             }
             let mut group = (*included[0]).clone();
-            let has_error = included.iter().any(|member| {
-                member.presentation == TranscriptPresentation::Error
-                    || member
-                        .details
-                        .as_ref()
-                        .and_then(|details| details.get("error.message"))
-                        .is_some_and(|error| !error.is_null() && error != "")
-            });
+            let has_error = included.iter().any(|member| is_error_entry(member));
             let mut operations: std::collections::BTreeMap<&str, bool> =
                 std::collections::BTreeMap::new();
             for member in &included {
@@ -1048,7 +1055,7 @@ impl TranscriptState {
     fn visual_line_count_for(&self, entry: &TranscriptEntry) -> usize {
         self.lines_for(entry)
             .iter()
-            .map(|line| wrap_line(&line.text, self.width).len())
+            .map(|line| wrap_line(&line.text, wrapped_width(line.indented, self.width)).len())
             .sum()
     }
 
@@ -1059,6 +1066,7 @@ impl TranscriptState {
                     raw_display(&entry.raw),
                     TranscriptPresentation::Neutral,
                     false,
+                    false,
                 )]
             }
             DisplayMode::Rendered | DisplayMode::Chronology => {
@@ -1067,17 +1075,15 @@ impl TranscriptState {
                         raw_display(&entry.raw),
                         TranscriptPresentation::Neutral,
                         false,
+                        false,
                     )]
                 } else {
                     let mut lines = entry
                         .rendered_lines
                         .iter()
                         .cloned()
-                        .map(|text| (text, entry.presentation, false))
+                        .map(|text| (text, entry.presentation, false, true))
                         .collect::<Vec<_>>();
-                    if lines.is_empty() {
-                        lines.push((String::new(), TranscriptPresentation::Neutral, false));
-                    }
                     let expanded = self.is_expanded(&entry.id);
                     let has_details = !entry.detail_lines.is_empty()
                         && !entry
@@ -1085,26 +1091,35 @@ impl TranscriptState {
                             .iter()
                             .map(|detail| detail.text.as_str())
                             .eq(entry.rendered_lines.iter().map(String::as_str));
-                    if has_details {
-                        lines[0].0 = format!("{} {}", if expanded { "v" } else { ">" }, lines[0].0);
-                    }
                     if expanded {
-                        let has_additional_block = has_details;
-                        if has_additional_block {
-                            lines.extend(
-                                entry.detail_lines.iter().map(|detail| {
-                                    (detail.text.clone(), detail.presentation, false)
-                                }),
-                            );
+                        if has_details {
+                            lines.extend(entry.detail_lines.iter().map(|detail| {
+                                (detail.text.clone(), detail.presentation, false, true)
+                            }));
                         }
                     }
                     // Conversation and Chronology intentionally share the
                     // same card header. The source timestamp is already
                     // shown as date, hour, minute and second; switching a
                     // projection must not turn into a formatting change.
-                    if !entry.header.is_empty() {
-                        lines.insert(0, (entry.header.clone(), entry.presentation, true));
-                    }
+                    let marker = if has_details {
+                        if expanded {
+                            "⌄"
+                        } else {
+                            "›"
+                        }
+                    } else {
+                        "·"
+                    };
+                    lines.insert(
+                        0,
+                        (
+                            format!("{marker} {}", entry.header),
+                            entry.presentation,
+                            true,
+                            false,
+                        ),
+                    );
                     lines
                 }
             }
@@ -1113,12 +1128,13 @@ impl TranscriptState {
             .into_iter()
             .enumerate()
             .map(
-                |(logical_line, (text, presentation, header))| TranscriptLine {
+                |(logical_line, (text, presentation, header, indented))| TranscriptLine {
                     entry_id: entry.id.clone(),
                     logical_line,
                     text,
                     presentation,
                     header,
+                    indented,
                     selected: self.selected.as_ref() == Some(&entry.id),
                 },
             )
@@ -1317,19 +1333,24 @@ mod tests {
         let rendered = transcript.logical_lines();
         assert!(rendered
             .iter()
-            .any(|line| line.text == "> Hooki · SessionStart · 2 zakończone"));
+            .any(|line| line.text.starts_with("› SYSTEM · Harness")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.text == "Hooki · SessionStart · 2 zakończone"));
         assert_eq!(rendered.iter().filter(|line| line.header).count(), 1);
 
         let group = transcript.selected_entry().cloned().unwrap();
         transcript.toggle_expanded(&group);
-        assert!(transcript
-            .logical_lines()
-            .iter()
-            .any(|line| { line.text == "v Hooki · SessionStart · 2 zakończone" }));
         let expanded = transcript.logical_lines();
         assert!(expanded
             .iter()
-            .any(|line| line.text.starts_with("  12:00:00 · hook_started")));
+            .any(|line| line.text.starts_with("⌄ SYSTEM · Harness")));
+        assert!(expanded
+            .iter()
+            .any(|line| line.text == "Hooki · SessionStart · 2 zakończone"));
+        assert!(expanded
+            .iter()
+            .any(|line| line.text.starts_with("12:00:00 · hook_started")));
         assert_eq!(
             expanded
                 .iter()
@@ -1375,10 +1396,13 @@ mod tests {
         let rendered = transcript.logical_lines();
         assert!(rendered
             .iter()
-            .any(|line| line.text == "> Narzędzie · bash · zakończone"));
+            .any(|line| line.text.starts_with("› TECHNICZNE · Harness")));
         assert!(rendered
             .iter()
-            .any(|line| line.text == "> Narzędzie · search · zakończone"));
+            .any(|line| line.text == "Narzędzie · bash · zakończone"));
+        assert!(rendered
+            .iter()
+            .any(|line| line.text == "Narzędzie · search · zakończone"));
         assert_eq!(rendered.iter().filter(|line| line.header).count(), 2);
     }
 
@@ -1392,7 +1416,7 @@ mod tests {
         assert!(transcript
             .logical_lines()
             .iter()
-            .any(|line| line.text == "> Narzędzie · bash · zakończone · błąd"));
+            .any(|line| line.text == "Narzędzie · bash · zakończone · błąd"));
     }
 
     #[test]
@@ -1461,12 +1485,13 @@ mod tests {
             .logical_lines()
             .iter()
             .filter(|line| line.entry_id == TranscriptEntryId::from("same"))
-            .all(|line| !line.text.starts_with("> ")));
+            .filter(|line| line.header)
+            .all(|line| line.text.starts_with("· ")));
         transcript.line_down();
         assert!(transcript
             .logical_lines()
             .iter()
-            .any(|line| line.text == "> summary"));
+            .any(|line| line.text == "› "));
         let id = transcript.selected_entry().cloned().unwrap();
         transcript.toggle_expanded(&id);
         assert_eq!(
@@ -1477,6 +1502,42 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn disclosure_state_is_in_header_and_every_body_line_is_indented() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![
+            TranscriptEntry::new(
+                TranscriptEntryId::from("expandable"),
+                vec!["first".into(), "second".into()],
+                Vec::new(),
+            )
+            .with_header("AGENT · Agent")
+            .with_detail_lines(vec!["extra".into()]),
+            TranscriptEntry::new(
+                TranscriptEntryId::from("plain"),
+                vec!["plain body".into()],
+                Vec::new(),
+            )
+            .with_header("SYSTEM · Harness"),
+        ]);
+
+        let collapsed = transcript.logical_lines();
+        assert_eq!(collapsed[0].text, "› AGENT · Agent");
+        assert_eq!(collapsed[1].text, "first");
+        assert_eq!(collapsed[2].text, "second");
+        assert!(collapsed[1].indented && collapsed[2].indented);
+        assert!(!collapsed[0].indented);
+        assert_eq!(collapsed[4].text, "· SYSTEM · Harness");
+        assert_eq!(collapsed[5].text, "plain body");
+        assert!(collapsed[5].indented);
+
+        transcript.toggle_expanded(&TranscriptEntryId::from("expandable"));
+        let expanded = transcript.logical_lines();
+        assert_eq!(expanded[0].text, "⌄ AGENT · Agent");
+        assert_eq!(expanded[3].text, "extra");
+        assert!(expanded[3].indented);
     }
 
     #[test]
@@ -1499,17 +1560,60 @@ mod tests {
         assert!(transcript
             .logical_lines()
             .iter()
-            .any(|line| line.text == "> Status:"));
+            .any(|line| line.text == "› "));
 
         transcript.toggle_expanded(&id);
         assert_eq!(
             transcript
                 .logical_lines()
                 .iter()
-                .filter(|line| line.text.trim_start_matches("v ") == "ok")
+                .filter(|line| line.text == "ok")
                 .count(),
             6
         );
+    }
+
+    #[test]
+    fn wrapped_body_continuations_keep_the_two_space_indent() {
+        let lines = [TranscriptLine {
+            entry_id: TranscriptEntryId::from("wrapped"),
+            logical_line: 0,
+            text: "abcdefghijk".into(),
+            presentation: TranscriptPresentation::Agent,
+            header: false,
+            indented: true,
+            selected: true,
+        }];
+        let wrapped = wrap_visible_lines(&lines, 8, 0, 3);
+        assert_eq!(
+            wrapped
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["abcdef", "ghijk"]
+        );
+    }
+
+    #[test]
+    fn bottom_scroll_reaches_the_last_wrapped_indented_line() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.set_width(10);
+        transcript.set_viewport(3);
+        transcript.load(vec![TranscriptEntry::new(
+            TranscriptEntryId::from("long"),
+            vec![
+                "abcdefghij".into(),
+                "klmnopqrst".into(),
+                "uvwxyzABCD".into(),
+            ],
+            Vec::new(),
+        )]);
+
+        let logical = transcript.logical_lines();
+        let visible = wrap_visible_lines(&logical, 10, transcript.scroll_offset(), 3);
+        assert_eq!(visible.len(), 3);
+        assert_eq!(visible.last().unwrap().text, "CD");
+        assert!(visible.last().unwrap().indented);
     }
 
     #[test]
@@ -1523,7 +1627,9 @@ mod tests {
 
         let rendered = transcript.logical_lines();
         assert_eq!(rendered.iter().filter(|line| line.header).count(), 3);
-        assert!(rendered.iter().any(|line| line.text == "hook_started"));
+        assert!(rendered
+            .iter()
+            .any(|line| line.text.ends_with("hook_started")));
     }
 
     #[test]
@@ -1539,7 +1645,10 @@ mod tests {
         assert_eq!(rendered.iter().filter(|line| line.header).count(), 1);
         assert!(rendered
             .iter()
-            .any(|line| line.text == "> Hooki · SessionStart · 1 zakończone · 1 w toku"));
+            .any(|line| line.text.starts_with("› SYSTEM · Harness")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.text == "Hooki · SessionStart · 1 zakończone · 1 w toku"));
     }
 
     #[test]
@@ -1558,7 +1667,7 @@ mod tests {
             .into_iter()
             .map(|line| line.text)
             .collect();
-        assert!(lines.iter().any(|line| line == "hook_started"));
+        assert!(lines.iter().any(|line| line.ends_with("hook_started")));
         assert_eq!(
             lines
                 .iter()
@@ -1568,7 +1677,7 @@ mod tests {
         );
         assert!(lines
             .iter()
-            .any(|line| line == "v Hooki · SessionStart · 2 w toku"));
+            .any(|line| line.starts_with("⌄ SYSTEM · Harness")));
     }
 
     #[test]
@@ -1613,7 +1722,7 @@ mod tests {
                 .iter()
                 .filter(|line| line.header)
                 .count(),
-            0
+            2
         );
         assert_eq!(
             transcript

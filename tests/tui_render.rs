@@ -2121,9 +2121,17 @@ mod task_app_detail_render {
 
     /// The bar beside the transcript row holding `needle`: the cell two
     /// columns to the left of its text.
-    fn bar_of(buffer: &Buffer, needle: &str) -> (String, Color) {
+    fn bar_position(buffer: &Buffer, needle: &str) -> (u16, u16) {
         let (y, x) = spot(buffer, needle);
-        cell_at(buffer, x - 2, y)
+        (
+            x.checked_sub(4).expect("body indent and rail precede text"),
+            y,
+        )
+    }
+
+    fn bar_of(buffer: &Buffer, needle: &str) -> (String, Color) {
+        let (bar_x, y) = bar_position(buffer, needle);
+        cell_at(buffer, bar_x, y)
     }
 
     fn entry(id: &str, lines: &[&str]) -> TranscriptEntry {
@@ -2225,9 +2233,9 @@ mod task_app_detail_render {
         let (y, x) = spot(&on_the_axis, "● review #1 w toku");
         assert_eq!(cell_at(&on_the_axis, x - 2, y).0, "│");
         assert!(bold_at(&on_the_axis, x - 2, y));
-        let (entry_y, entry_x) = spot(&on_the_axis, "line 3");
-        assert_eq!(cell_at(&on_the_axis, entry_x - 2, entry_y).0, "│");
-        assert!(on_the_axis[(entry_x - 2, entry_y)]
+        let (entry_bar_x, entry_y) = bar_position(&on_the_axis, "line 3");
+        assert_eq!(cell_at(&on_the_axis, entry_bar_x, entry_y).0, "│");
+        assert!(on_the_axis[(entry_bar_x, entry_y)]
             .modifier
             .contains(Modifier::DIM));
 
@@ -2235,13 +2243,13 @@ mod task_app_detail_render {
         let reading = render(&mut app, &Styles::new(true));
         assert_eq!(cell_at(&reading, x - 2, y).0, "│");
         assert!(reading[(x - 2, y)].modifier.contains(Modifier::DIM));
-        assert_eq!(cell_at(&reading, entry_x - 2, entry_y).0, "│");
-        assert!(bold_at(&reading, entry_x - 2, entry_y));
+        assert_eq!(cell_at(&reading, entry_bar_x, entry_y).0, "│");
+        assert!(bold_at(&reading, entry_bar_x, entry_y));
         assert!(no_reversed_on_the_axis(&reading, "● review #1 w toku"));
         assert!(none_reversed(row_cells(
             &reading,
             entry_y,
-            entry_x - 2..entry_x + 6
+            entry_bar_x..entry_bar_x + 8
         )));
     }
 
@@ -2433,7 +2441,7 @@ mod task_app_detail_render {
         assert_eq!(wrapped.len(), 3, "{}", screen(&buffer));
         for &y in &wrapped {
             assert_eq!(
-                cell_at(&buffer, x - 2, y),
+                cell_at(&buffer, bar_position(&buffer, "word word").0, y),
                 ("│".to_string(), Color::Cyan),
                 "{}",
                 screen(&buffer)
@@ -2443,7 +2451,7 @@ mod task_app_detail_render {
 
         let stale = draw_conversation(&mut tab, &Styles::new(false), true, true);
         assert_eq!(
-            cell_at(&stale, x - 2, first),
+            cell_at(&stale, bar_position(&stale, "word word").0, first),
             ("│".to_string(), Color::Cyan)
         );
         assert_eq!(
@@ -2471,7 +2479,7 @@ mod task_app_detail_render {
         assert!(text.contains("first line"), "{text}");
         assert!(text.contains("second line"), "{text}");
         assert!(
-            text.contains("v"),
+            text.contains("⌄"),
             "expanded marker remains visible: {text}"
         );
         assert_eq!(
@@ -2502,10 +2510,13 @@ mod task_app_detail_render {
 
         let buffer = draw_conversation_at(30, 12, &mut tab, &Styles::new(false), false, true);
         let text = screen(&buffer);
-        assert!(text.contains("v Hooki"), "{text}");
+        assert!(text.contains("⌄ SYSTEM"), "{text}");
+        assert!(text.contains("Hooki · SessionStart"), "{text}");
         assert!(text.contains("hook_started"), "{text}");
-        let row = row_of(&buffer, "hook_started") as u16;
-        assert_eq!(cell_at(&buffer, 0, row), ("│".into(), Color::Cyan));
+        assert_eq!(
+            bar_of(&buffer, "Hooki · SessionStart"),
+            ("│".into(), Color::Cyan)
+        );
     }
 
     /// *Zdarzenia*: the selected event has the bar in the first column of
@@ -3652,7 +3663,7 @@ mod task_app_conductor_render {
             let row = row_of(buffer, "Wybrano revise");
             let text = &rows(buffer)[row];
             let column = text[..text.find("Wybrano revise").unwrap()].chars().count();
-            cell_at(buffer, u16::try_from(column).unwrap() - 2, row as u16)
+            cell_at(buffer, u16::try_from(column).unwrap() - 4, row as u16)
         };
         let reading = draw_app(&mut app, 120, 30, false);
         assert_eq!(

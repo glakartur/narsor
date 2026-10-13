@@ -567,6 +567,7 @@ fn transcript_row(
     };
     Line::from(vec![
         bar_prefix(styles, line.selected, focused),
+        Span::raw(if line.indented { "  " } else { "" }),
         Span::styled(
             crate::domain::display::without_unsafe_chars(&line.text),
             style,
