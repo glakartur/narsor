@@ -539,7 +539,7 @@ impl TranscriptState {
             return;
         }
         let anchor = self.anchor();
-        let following = self.following_end;
+        let following = false;
         let source = self
             .selected_source
             .clone()
@@ -577,7 +577,7 @@ impl TranscriptState {
             return;
         };
         let anchor = self.anchor();
-        let following = self.following_end;
+        let following = false;
         let identity = self.expansion_identity(&entry);
         if !self.raw_entries.insert(identity.clone()) {
             self.raw_entries.remove(&identity);
@@ -633,7 +633,7 @@ impl TranscriptState {
 
     pub fn toggle_expanded(&mut self, entry: &TranscriptEntryId) {
         let anchor = self.anchor();
-        let following = self.following_end;
+        let following = false;
         let identity = self.expansion_identity(entry);
         if !self.expanded.insert(identity.clone()) {
             self.expanded.remove(&identity);
@@ -657,11 +657,15 @@ impl TranscriptState {
     }
 
     pub fn page_down(&mut self) {
-        self.move_selected(self.scroll.viewport() as isize);
+        self.scroll.page_down(self.total_lines());
+        self.following_end = false;
+        self.select_at_scroll();
     }
 
     pub fn page_up(&mut self) {
-        self.move_selected(-(self.scroll.viewport() as isize));
+        self.scroll.page_up(self.total_lines());
+        self.following_end = false;
+        self.select_at_scroll();
     }
 
     pub fn to_top(&mut self) {
@@ -674,7 +678,23 @@ impl TranscriptState {
         if let Some(entry) = self.projected_entries().last() {
             self.select(entry.id.clone());
         }
-        self.following_end = true;
+        self.scroll.to_bottom(self.total_lines());
+        self.following_end = false;
+    }
+
+    /// `f`: turn end-following on, or pause it while leaving the reading
+    /// position where it is.
+    pub fn toggle_follow(&mut self) {
+        if self.following_end {
+            self.following_end = false;
+        } else {
+            self.scroll.to_bottom(self.total_lines());
+            if let Some(entry) = self.projected_entries().last() {
+                self.selected = Some(entry.id.clone());
+                self.selected_source = entry.source_ids.last().cloned();
+            }
+            self.following_end = true;
+        }
     }
 
     pub fn logical_lines(&self) -> Vec<TranscriptLine> {
@@ -700,14 +720,30 @@ impl TranscriptState {
     }
 
     pub fn anchor(&self) -> Option<TranscriptAnchor> {
-        let entry_id = self.selected.as_ref()?;
         let entries = self.projected_entries();
-        let entry_index = entries.iter().position(|entry| entry.id == *entry_id)?;
-        Some(TranscriptAnchor {
-            entry_id: entry_id.clone(),
-            logical_line: 0,
-            entry_index,
-        })
+        let mut offset = self.scroll.offset();
+        for (entry_index, entry) in entries.iter().enumerate() {
+            let visual_lines = self.visual_line_count_for(entry);
+            if offset < visual_lines {
+                return Some(TranscriptAnchor {
+                    entry_id: entry.id.clone(),
+                    logical_line: offset,
+                    entry_index,
+                });
+            }
+            offset = offset.saturating_sub(visual_lines);
+            if entry_index + 1 < entries.len() {
+                if offset == 0 {
+                    return Some(TranscriptAnchor {
+                        entry_id: entry.id.clone(),
+                        logical_line: visual_lines.saturating_sub(1),
+                        entry_index,
+                    });
+                }
+                offset = offset.saturating_sub(1);
+            }
+        }
+        None
     }
 
     fn restore_after_change(&mut self, anchor: Option<TranscriptAnchor>, following: bool) {
@@ -746,6 +782,21 @@ impl TranscriptState {
         self.select(entries[next].id.clone());
     }
 
+    /// Keeps the cursor on a visible entry after paging, without moving the
+    /// viewport back to the entry's first line.
+    fn select_at_scroll(&mut self) {
+        let mut offset = self.scroll.offset();
+        for entry in self.projected_entries() {
+            let lines = self.visual_line_count_for(&entry);
+            if offset < lines {
+                self.selected = Some(entry.id.clone());
+                self.selected_source = entry.source_ids.first().cloned();
+                return;
+            }
+            offset = offset.saturating_sub(lines.saturating_add(1));
+        }
+    }
+
     fn select(&mut self, entry: TranscriptEntryId) {
         let entries = self.projected_entries();
         let source = entries
@@ -768,7 +819,7 @@ impl TranscriptState {
                 .sum();
             self.scroll.set_offset(preceding, self.total_lines());
         }
-        self.following_end = entries.last().is_some_and(|last| last.id == entry);
+        self.following_end = false;
     }
 
     fn restore_anchor(&mut self, anchor: Option<TranscriptAnchor>) {
@@ -788,7 +839,7 @@ impl TranscriptState {
         let entry = &entries[index];
         let local_line = anchor
             .logical_line
-            .min(self.lines_for(entry).len().saturating_sub(1));
+            .min(self.visual_line_count_for(entry).saturating_sub(1));
         let preceding = entries[..index]
             .iter()
             .map(|item| self.visual_line_count_for(item) + 1)

@@ -33,6 +33,7 @@
 //! without rules (R15, R16).
 
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
@@ -195,5 +196,15 @@ fn draw_line(
             line.clone(),
             Rect::new(area.x + prefix_width, y, content_width, 1),
         );
+    }
+    if selected {
+        // A low contrast fill makes the selected row easier to track while
+        // leaving each label's semantic foreground colour intact.
+        let background = Style::default().bg(Color::Indexed(236));
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                cell.set_style(background);
+            }
+        }
     }
 }

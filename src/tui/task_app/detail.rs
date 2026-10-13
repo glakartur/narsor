@@ -637,7 +637,9 @@ impl TaskApp {
                 }
             }
             DetailTab::Conversation => self.sync_conversation(&id, revision).await,
-            DetailTab::Events => self.sync_events(&id, revision).await,
+            DetailTab::Events => {
+                self.sync_events(&id, revision).await;
+            }
             DetailTab::Conductor | DetailTab::Info => {}
         }
     }
@@ -665,6 +667,7 @@ impl TaskApp {
     }
 
     async fn sync_conversation(&mut self, id: &str, revision: u64) {
+        let mut changed = self.sync_events(id, revision).await;
         let attempts: Vec<String> = self
             .detail
             .view_mut(id)
@@ -673,22 +676,23 @@ impl TaskApp {
             .iter()
             .filter_map(recorded_attempt)
             .collect();
-        let mut read = false;
         for attempt in &attempts {
-            read |= self.sync_attempt(id, revision, attempt).await;
+            changed |= self.sync_attempt(id, revision, attempt).await;
         }
         let view = self.detail.view_mut(id);
-        if read || !view.conversation.is_built() {
+        if changed || !view.conversation.is_built() {
             let positions = view.progress.positions().to_vec();
-            view.conversation.rebuild(&positions, &view.attempts);
+            view.conversation
+                .rebuild_with_events(&positions, &view.attempts, view.events.events());
         }
     }
 
-    async fn sync_events(&mut self, id: &str, revision: u64) {
+    async fn sync_events(&mut self, id: &str, revision: u64) -> bool {
         if !self.detail.view_mut(id).events.needs_read(revision) {
-            return;
+            return false;
         }
         let client = self.client.clone();
+        let mut read = false;
         for _ in 0..events::MAX_PAGES {
             let after = self.detail.view_mut(id).events.after();
             let query = ExecutionEventsQuery {
@@ -706,10 +710,12 @@ impl TaskApp {
                     if !events.is_empty()
             );
             self.on_detail_read(id, revision, DetailRead::Events { after, result });
+            read = true;
             if !more {
                 break;
             }
         }
+        read
     }
 }
 
@@ -860,7 +866,13 @@ pub(super) fn render_view(
         link_spots(frame.buffer_mut(), parts.header, &spots);
     }
     frame.render_widget(
-        Paragraph::new(tab_bar(view.tab, &view.detail.progress, focused, styles)),
+        Paragraph::new(tab_bar(
+            view.tab,
+            &view.detail.progress,
+            view.detail.conversation.transcript().is_following_end(),
+            focused,
+            styles,
+        )),
         parts.tabs,
     );
 
@@ -947,6 +959,7 @@ pub(super) fn render_view(
 fn tab_bar(
     active: DetailTab,
     progress: &Progress,
+    conversation_follows: bool,
     focused: bool,
     styles: &Styles,
 ) -> Line<'static> {
@@ -966,6 +979,13 @@ fn tab_bar(
             ("↧ podąża", Role::Live)
         } else {
             ("· ręcznie", Role::Done)
+        };
+        spans.push(Span::styled(text, styles.of(role)));
+    } else if active == DetailTab::Conversation {
+        let (text, role) = if conversation_follows {
+            ("↧ śledzi · f wyłącz", Role::Live)
+        } else {
+            ("⏸ ręcznie · f śledź", Role::Attention)
         };
         spans.push(Span::styled(text, styles.of(role)));
     }

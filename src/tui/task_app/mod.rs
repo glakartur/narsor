@@ -217,7 +217,7 @@ pub struct DetailState {
 impl DetailState {
     fn new() -> Self {
         Self {
-            tab: DetailTab::Progress,
+            tab: DetailTab::Conversation,
             drafts: BTreeMap::new(),
             views: BTreeMap::new(),
             hyperlinks: false,

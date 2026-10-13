@@ -30,6 +30,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::api::{ApiClient, ClientError, ConversationResponse as Page};
+use crate::domain::{Event, EventData};
 use crate::cli::task_text::RecordAge;
 use crate::controller_protocol::{
     ConversationPageQuery, ExecutionEventsSource, CONVERSATION_RECORD_UNREADABLE,
@@ -428,7 +429,8 @@ pub fn transcript_action(transcript: &mut TranscriptState, action: Action) {
         Action::PageDown => transcript.page_down(),
         Action::PageUp => transcript.page_up(),
         Action::Top => transcript.to_top(),
-        Action::Bottom | Action::Follow => transcript.to_bottom(),
+        Action::Bottom => transcript.to_bottom(),
+        Action::Follow => transcript.toggle_follow(),
         Action::Expand if transcript.mode() != DisplayMode::Raw => {
             if let Some(entry) = transcript.selected_entry().cloned() {
                 transcript.toggle_expanded(&entry);
@@ -501,10 +503,23 @@ impl Conversation {
     /// order of the `positions`. The cursor and the expanded entries stay
     /// where they were; a reader at the end stays at the end.
     pub fn rebuild(&mut self, positions: &[Position], attempts: &Attempts) {
+        self.rebuild_with_events(positions, attempts, &[]);
+    }
+
+    /// Rebuilds the transcript and includes workflow output choices made by
+    /// the agent, conductor, or operator.
+    pub fn rebuild_with_events(
+        &mut self,
+        positions: &[Position],
+        attempts: &Attempts,
+        events: &[Event],
+    ) {
         let mut entries = Vec::new();
         self.loading = false;
         self.failure = None;
         self.record = None;
+        let workflow_choices: Vec<_> = events.iter().filter_map(workflow_choice_entry).collect();
+        let mut seen_attempts = std::collections::HashSet::new();
         for position in positions {
             let (ConversationState::Recorded, Some(attempt_id)) = (
                 &position.conversation,
@@ -512,6 +527,11 @@ impl Conversation {
             ) else {
                 continue;
             };
+            // A workflow retry may point at the same chat as the preceding
+            // position. Show that transcript once, at its first occurrence.
+            if !seen_attempts.insert(attempt_id) {
+                continue;
+            }
             let Some(attempt) = attempts.get(attempt_id) else {
                 self.loading = true;
                 continue;
@@ -543,9 +563,56 @@ impl Conversation {
                 entry
             }));
         }
+        // Keep choices at the current end of the transcript, where they are
+        // visible when a conversation is opened at its newest content.
+        entries.extend(workflow_choices);
         self.full.replace_entries(entries);
         self.built = true;
     }
+}
+
+/// Projects only events that record a person or decision-maker choosing a
+/// workflow output. Routine lifecycle events remain in the dedicated log.
+fn workflow_choice_entry(event: &Event) -> Option<TranscriptEntry> {
+    use crate::domain::ConductorDecisionKind;
+    use crate::domain::event::AnsweredBy;
+    use TranscriptPresentation::{Agent, Conductor, Operator};
+
+    let (actor, choice, presentation) = match &event.data {
+        EventData::DecisionMade {
+            provider,
+            output_label,
+            ..
+        } => (format!("agent · {}", one_line(provider)), output_label.clone(), Agent),
+        EventData::ConductorDecision {
+            kind,
+            output_label: Some(output),
+            ..
+        } if *kind == ConductorDecisionKind::ChooseOutput => {
+            ("konduktor".to_string(), output.clone(), Conductor)
+        }
+        EventData::HumanInputReceived {
+            answered_by,
+            output_label: Some(output),
+            ..
+        } if answered_by.unwrap_or_default() == AnsweredBy::Operator => {
+            ("użytkownik".to_string(), output.clone(), Operator)
+        }
+        EventData::HumanTransitionSelected { to_state, .. } => {
+            ("użytkownik".to_string(), to_state.clone(), Operator)
+        }
+        _ => return None,
+    };
+
+    Some(
+        TranscriptEntry::new(
+            TranscriptEntryId::from(format!("workflow-choice/{}", event.sequence)),
+            vec![format!("{actor} wybrał opcję: {}", one_line(&choice))],
+            Vec::new(),
+        )
+        .with_header(format!("WYBÓR WORKFLOW · {}", event.timestamp.format("%H:%M:%S")))
+        .with_presentation(presentation),
+    )
 }
 
 /// One row of a transcript: the bar of the selected entry — in the focus role

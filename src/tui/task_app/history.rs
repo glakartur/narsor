@@ -679,9 +679,16 @@ impl TaskApp {
                         plan.attempts.push((attempt, from));
                     }
                 }
+                if detail.events.needs_read(revision) {
+                    plan.events_after = Some(detail.events.after());
+                }
                 if plan.attempts.is_empty() && !detail.conversation.is_built() {
                     let positions = detail.progress.positions().to_vec();
-                    detail.conversation.rebuild(&positions, &detail.attempts);
+                    detail.conversation.rebuild_with_events(
+                        &positions,
+                        &detail.attempts,
+                        detail.events.events(),
+                    );
                 }
             }
             DetailTab::Events => {
@@ -751,6 +758,7 @@ impl TaskApp {
         if let Some(result) = conductor {
             detail.conductor.apply(revision, Instant::now(), result);
         }
+        let read_events = !events.is_empty();
         for (after, result) in events {
             detail.events.apply(revision, after, result);
         }
@@ -758,9 +766,13 @@ impl TaskApp {
         for (attempt, from, result) in attempts {
             detail.attempts.apply(&attempt, revision, from, result);
         }
-        if read_attempts && tab == DetailTab::Conversation {
+        if (read_attempts || read_events) && tab == DetailTab::Conversation {
             let positions = detail.progress.positions().to_vec();
-            detail.conversation.rebuild(&positions, &detail.attempts);
+            detail.conversation.rebuild_with_events(
+                &positions,
+                &detail.attempts,
+                detail.events.events(),
+            );
         }
         let Some(label) = held else {
             return;
