@@ -67,31 +67,31 @@ pub(super) fn routes() -> Router<AppState> {
             "/control/v1/repositories",
             get(get_repositories).post(post_repository),
         )
-        .route("/control/v1/repositories/:id", delete(delete_repository))
+        .route("/control/v1/repositories/{id}", delete(delete_repository))
         .route("/control/v1/executions", get(get_history))
-        .route("/control/v1/executions/:execution_id", get(get_history_one))
+        .route("/control/v1/executions/{execution_id}", get(get_history_one))
         .route(
-            "/control/v1/executions/:execution_id/events",
+            "/control/v1/executions/{execution_id}/events",
             get(get_history_events),
         )
         .route(
-            "/control/v1/executions/:execution_id/timeline",
+            "/control/v1/executions/{execution_id}/timeline",
             get(get_history_timeline),
         )
         .route(
-            "/control/v1/executions/:execution_id/attempts/:attempt_id/conversation",
+            "/control/v1/executions/{execution_id}/attempts/{attempt_id}/conversation",
             get(get_history_conversation),
         )
         .route(
-            "/control/v1/executions/:execution_id/conductor",
+            "/control/v1/executions/{execution_id}/conductor",
             get(get_history_conductor),
         )
         .route(
-            "/control/v1/executions/:execution_id/conductor/chat",
+            "/control/v1/executions/{execution_id}/conductor/chat",
             get(get_history_conductor_chat),
         )
         .route(
-            "/control/v1/executions/:execution_id/recover",
+            "/control/v1/executions/{execution_id}/recover",
             post(post_history_recover),
         )
 }
@@ -627,7 +627,7 @@ fn history_view(state: &AppState, execution_id: &str) -> Result<LegacyExecutionV
     })
 }
 
-/// `GET /control/v1/executions/:execution_id/events?after=<sequence>`.
+/// `GET /control/v1/executions/{execution_id}/events?after=<sequence>`.
 async fn get_history_events(
     State(state): State<AppState>,
     Path(execution_id): Path<String>,
@@ -637,7 +637,7 @@ async fn get_history_events(
     Ok(Json(read_events(&store, &execution_id, query.after)?))
 }
 
-/// `GET /control/v1/executions/:execution_id/timeline`.
+/// `GET /control/v1/executions/{execution_id}/timeline`.
 async fn get_history_timeline(
     State(state): State<AppState>,
     Path(execution_id): Path<String>,
@@ -646,7 +646,7 @@ async fn get_history_timeline(
     Ok(Json(read_timeline(&store, &execution_id)?))
 }
 
-/// `GET /control/v1/executions/:execution_id/attempts/:attempt_id/conversation`.
+/// `GET /control/v1/executions/{execution_id}/attempts/{attempt_id}/conversation`.
 async fn get_history_conversation(
     State(state): State<AppState>,
     Path((execution_id, attempt_id)): Path<(String, String)>,
@@ -662,7 +662,7 @@ async fn get_history_conversation(
     )?))
 }
 
-/// `GET /control/v1/executions/:execution_id/conductor`.
+/// `GET /control/v1/executions/{execution_id}/conductor`.
 async fn get_history_conductor(
     State(state): State<AppState>,
     Path(execution_id): Path<String>,
@@ -671,7 +671,7 @@ async fn get_history_conductor(
     Ok(Json(read_conductor_state(&store, &execution_id)?))
 }
 
-/// `GET /control/v1/executions/:execution_id/conductor/chat?after=<sequence>`.
+/// `GET /control/v1/executions/{execution_id}/conductor/chat?after=<sequence>`.
 async fn get_history_conductor_chat(
     State(state): State<AppState>,
     Path(execution_id): Path<String>,
@@ -685,7 +685,7 @@ async fn get_history_conductor_chat(
     )?))
 }
 
-/// `POST /control/v1/executions/:execution_id/recover` — starts a fresh
+/// `POST /control/v1/executions/{execution_id}/recover` — starts a fresh
 /// attempt of a failed legacy execution. One that cannot be recovered is
 /// refused with its reason (`409`, `not_recoverable`), not a bare status.
 async fn post_history_recover(

@@ -119,53 +119,53 @@ where
 {
     Router::new()
         .route("/control/v1/tasks", get(list_tasks).post(create_task))
-        .route("/control/v1/tasks/:task_id", get(get_task))
-        .route("/control/v1/tasks/:task_id/commands", post(post_command))
-        .route("/control/v1/tasks/:task_id/move", post(post_move))
+        .route("/control/v1/tasks/{task_id}", get(get_task))
+        .route("/control/v1/tasks/{task_id}/commands", post(post_command))
+        .route("/control/v1/tasks/{task_id}/move", post(post_move))
         .route(
             "/control/v1/default-backend",
             get(get_default_backend).put(put_default_backend),
         )
-        .route("/control/v1/tasks/:task_id/timeline", get(get_timeline))
+        .route("/control/v1/tasks/{task_id}/timeline", get(get_timeline))
         .route(
-            "/control/v1/tasks/:task_id/execution-events",
+            "/control/v1/tasks/{task_id}/execution-events",
             get(get_execution_events),
         )
-        .route("/control/v1/tasks/:task_id/conductor", get(get_conductor))
+        .route("/control/v1/tasks/{task_id}/conductor", get(get_conductor))
         .route(
-            "/control/v1/tasks/:task_id/conversation",
+            "/control/v1/tasks/{task_id}/conversation",
             get(get_conversation),
         )
         .route(
-            "/control/v1/tasks/:task_id/attempts/:attempt_id/conversation",
+            "/control/v1/tasks/{task_id}/attempts/{attempt_id}/conversation",
             get(get_conversation_page),
         )
-        .route("/control/v1/tasks/:task_id/input", post(post_input))
+        .route("/control/v1/tasks/{task_id}/input", post(post_input))
         .route(
-            "/control/v1/tasks/:task_id/operator-commands",
+            "/control/v1/tasks/{task_id}/operator-commands",
             post(post_operator_command),
         )
         .route(
-            "/control/v1/tasks/:task_id/materials",
+            "/control/v1/tasks/{task_id}/materials",
             get(list_materials).post(post_material),
         )
         .route(
-            "/control/v1/tasks/:task_id/materials/:material_id",
+            "/control/v1/tasks/{task_id}/materials/{material_id}",
             get(get_material).delete(delete_material),
         )
         .route(
-            "/control/v1/tasks/:task_id/materials/:material_id/blobs/:sha256",
+            "/control/v1/tasks/{task_id}/materials/{material_id}/blobs/{sha256}",
             get(get_material_blob),
         )
-        .route("/control/v1/tasks/:task_id/events", get(get_events))
+        .route("/control/v1/tasks/{task_id}/events", get(get_events))
         .route("/control/v1/events/stream", get(get_stream))
         .route(
-            "/control/v1/backends/:backend_id/enrollments",
+            "/control/v1/backends/{backend_id}/enrollments",
             post(post_enrollment),
         )
         .route("/control/v1/controllers", get(list_controllers))
         .route(
-            "/control/v1/controllers/:controller_id/revoke",
+            "/control/v1/controllers/{controller_id}/revoke",
             post(post_revoke_controller),
         )
         .with_state(service)
@@ -187,7 +187,7 @@ where
         .route("/controller/v1/acks", post(post_acks))
         .route("/controller/v1/reports", post(post_report))
         .route(
-            "/controller/v1/tasks/:task_id/runner-credentials",
+            "/controller/v1/tasks/{task_id}/runner-credentials",
             post(post_runner_credential),
         )
         .layer(middleware::from_fn_with_state(
@@ -209,38 +209,38 @@ where
         .route("/runner/v1/snapshots", post(post_snapshot))
         .route("/runner/v1/poll", get(get_poll))
         .route("/runner/v1/renew", post(post_renew))
-        .route("/runner/v1/inputs/:input_id/ack", post(post_input_ack))
+        .route("/runner/v1/inputs/{input_id}/ack", post(post_input_ack))
         .route(
-            "/runner/v1/commands/:command_id/ack",
+            "/runner/v1/commands/{command_id}/ack",
             post(post_command_ack),
         )
         .route(
-            "/runner/v1/conversation-pages/:request_id",
+            "/runner/v1/conversation-pages/{request_id}",
             post(post_conversation_page),
         )
         .route(
-            "/runner/v1/execution-events/:request_id",
+            "/runner/v1/execution-events/{request_id}",
             post(post_execution_events),
         )
         .route(
-            "/runner/v1/conductor-reads/:request_id",
+            "/runner/v1/conductor-reads/{request_id}",
             post(post_conductor_read),
         )
         .route(
-            "/runner/v1/relay-failures/:request_id",
+            "/runner/v1/relay-failures/{request_id}",
             post(post_relay_failure),
         )
         .route("/runner/v1/materials", post(post_runner_material))
         .route(
-            "/runner/v1/materials/:material_id",
+            "/runner/v1/materials/{material_id}",
             get(get_runner_material),
         )
         .route(
-            "/runner/v1/materials/:material_id/blobs/:sha256",
+            "/runner/v1/materials/{material_id}/blobs/{sha256}",
             get(get_runner_material_blob),
         )
         .route(
-            "/runner/v1/materials/:material_id/ack",
+            "/runner/v1/materials/{material_id}/ack",
             post(post_runner_material_ack),
         )
         .layer(middleware::from_fn_with_state(

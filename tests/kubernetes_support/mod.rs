@@ -153,15 +153,15 @@ impl MockCluster {
         });
         let router = Router::new()
             .route(
-                "/api/v1/namespaces/:namespace/:plural",
+                "/api/v1/namespaces/{namespace}/{plural}",
                 get(collection).post(collection),
             )
             .route(
-                "/api/v1/namespaces/:namespace/:plural/:name",
+                "/api/v1/namespaces/{namespace}/{plural}/{name}",
                 get(object).delete(object),
             )
             .route(
-                "/apis/storage.k8s.io/v1/storageclasses/:name",
+                "/apis/storage.k8s.io/v1/storageclasses/{name}",
                 get(storage_class),
             )
             .with_state(Arc::clone(&cluster));

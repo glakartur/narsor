@@ -226,8 +226,8 @@ struct AppState {
 
 /// Builds the router: the three original read-only endpoints (U5/U2) plus
 /// the mutating surface U3 adds — `POST /tasks`, `POST
-/// /executions/:id/resume`, `POST /executions/:id/input`, `POST
-/// /executions/:id/transition` and `GET /executions` — all behind the same
+/// /executions/{id}/resume`, `POST /executions/{id}/input`, `POST
+/// /executions/{id}/transition` and `GET /executions` — all behind the same
 /// owner gate (`auth`: the process token, or the owner's OIDC token).
 ///
 /// The identity routes (`/auth/v1/…`) sit outside it: a caller who is not
@@ -273,31 +273,31 @@ pub fn router(
         local_launch: services.local_launch,
     };
     let mut owner = Router::new()
-        .route("/executions/:execution_id/events", get(get_events))
-        .route("/executions/:execution_id/timeline", get(get_timeline))
+        .route("/executions/{execution_id}/events", get(get_events))
+        .route("/executions/{execution_id}/timeline", get(get_timeline))
         .route(
-            "/executions/:execution_id/attempts/:attempt_id/conversation",
+            "/executions/{execution_id}/attempts/{attempt_id}/conversation",
             get(get_conversation),
         )
         .route("/executions", get(get_executions))
         .route(
-            "/executions/:execution_id/conductor",
+            "/executions/{execution_id}/conductor",
             get(get_conductor_state),
         )
         .route(
-            "/executions/:execution_id/conductor/chat",
+            "/executions/{execution_id}/conductor/chat",
             get(get_conductor_chat).post(post_conductor_chat),
         )
         .route(
-            "/executions/:execution_id/conductor/proposals/:proposal_id/confirm",
+            "/executions/{execution_id}/conductor/proposals/{proposal_id}/confirm",
             post(post_confirm_proposal),
         )
         .route(
-            "/executions/:execution_id/conductor/proposals/:proposal_id/reject",
+            "/executions/{execution_id}/conductor/proposals/{proposal_id}/reject",
             post(post_reject_proposal),
         )
         .route(
-            "/executions/:execution_id/conductor/decisions/:decision_id/undo",
+            "/executions/{execution_id}/conductor/decisions/{decision_id}/undo",
             post(post_undo_decision),
         )
         .route(
@@ -307,21 +307,21 @@ pub fn router(
                 .delete(delete_harness_selection),
         )
         .route(
-            "/executions/:execution_id/stream",
+            "/executions/{execution_id}/stream",
             get(get_execution_stream),
         )
         .route("/events/stream", get(get_global_stream))
         .route("/tasks", post(post_start_task))
-        .route("/executions/:execution_id/resume", post(post_resume))
-        .route("/executions/:execution_id/recover", post(post_recover))
+        .route("/executions/{execution_id}/resume", post(post_resume))
+        .route("/executions/{execution_id}/recover", post(post_recover))
         .route(
-            "/executions/:execution_id/operator-note",
+            "/executions/{execution_id}/operator-note",
             post(post_operator_note),
         )
-        .route("/executions/:execution_id/interrupt", post(post_interrupt))
-        .route("/executions/:execution_id/input", post(post_input))
+        .route("/executions/{execution_id}/interrupt", post(post_interrupt))
+        .route("/executions/{execution_id}/input", post(post_input))
         .route(
-            "/executions/:execution_id/transition",
+            "/executions/{execution_id}/transition",
             post(post_transition),
         );
     if let Some(control) = &control {
@@ -722,7 +722,7 @@ struct EventsQuery {
     after: u64,
 }
 
-/// `GET /executions/:execution_id/events?after=<sequence>`
+/// `GET /executions/{execution_id}/events?after=<sequence>`
 ///
 /// Events with `sequence > after`, in the same shape as the event log
 /// itself — the transport changes, the contract does not.
@@ -737,7 +737,7 @@ async fn get_events(
 }
 
 /// The events of `execution_id` with `sequence > after` — shared by
-/// `/executions/:id/events` and the history route of the control API.
+/// `/executions/{id}/events` and the history route of the control API.
 fn read_events(
     store: &ExecutionStore,
     execution_id: &str,
@@ -749,7 +749,7 @@ fn read_events(
         .0)
 }
 
-/// `GET /executions/:execution_id/conductor`
+/// `GET /executions/{execution_id}/conductor`
 ///
 /// Read straight from the conductor's store (D55): its state file is
 /// replaced atomically and its chat is append-only, so a reader needs no
@@ -780,7 +780,7 @@ fn read_conductor_state(
     ))
 }
 
-/// `GET /executions/:execution_id/conductor/chat?after=<sequence>`
+/// `GET /executions/{execution_id}/conductor/chat?after=<sequence>`
 ///
 /// The chat history (R26) after `after`, in the order it was written.
 async fn get_conductor_chat(
@@ -820,7 +820,7 @@ fn require_conductor(state: &AppState) -> Result<Arc<ConductorRegistry>, ApiErro
         .ok_or_else(|| ApiError::Internal("no conductor runs behind this API server".into()))
 }
 
-/// `POST /executions/:execution_id/conductor/chat` — the operator writes to
+/// `POST /executions/{execution_id}/conductor/chat` — the operator writes to
 /// the conductor (F4).
 ///
 /// Answers `202` with the entry as written, at once: the conductor's answer
@@ -844,7 +844,7 @@ async fn post_conductor_chat(
     Ok((StatusCode::ACCEPTED, Json(entry.into())))
 }
 
-/// `POST /executions/:execution_id/conductor/proposals/:proposal_id/confirm`
+/// `POST /executions/{execution_id}/conductor/proposals/{proposal_id}/confirm`
 /// — carries out a proposal of the conductor's (R28).
 ///
 /// Idempotent: a second confirmation answers the first one's outcome with
@@ -870,7 +870,7 @@ async fn post_confirm_proposal(
     Ok(Json(confirmed.outcome))
 }
 
-/// `POST /executions/:execution_id/conductor/proposals/:proposal_id/reject`
+/// `POST /executions/{execution_id}/conductor/proposals/{proposal_id}/reject`
 /// — the operator turns a proposal down; it can no longer be confirmed.
 async fn post_reject_proposal(
     State(state): State<AppState>,
@@ -883,7 +883,7 @@ async fn post_reject_proposal(
     ))
 }
 
-/// `POST /executions/:execution_id/conductor/decisions/:decision_id/undo` —
+/// `POST /executions/{execution_id}/conductor/decisions/{decision_id}/undo` —
 /// undoes a chosen output of the conductor's (KTD13).
 ///
 /// A pass driving the execution is interrupted first; the answer carries a
@@ -964,7 +964,7 @@ impl From<UndoError> for ApiError {
     }
 }
 
-/// `GET /executions/:execution_id/timeline`
+/// `GET /executions/{execution_id}/timeline`
 ///
 /// The step timeline ([`narsor_engine::engine::build_timeline`]) computed from the
 /// execution's event log and its conversation store's presence — the real
@@ -1018,7 +1018,7 @@ fn default_byte_budget() -> usize {
     DEFAULT_BYTE_BUDGET
 }
 
-/// `GET /executions/:execution_id/attempts/:attempt_id/conversation?from=<n>&byte_budget=<bytes>`
+/// `GET /executions/{execution_id}/attempts/{attempt_id}/conversation?from=<n>&byte_budget=<bytes>`
 async fn get_conversation(
     State(state): State<AppState>,
     Extension(owner): Extension<OwnerRef>,
@@ -1132,7 +1132,7 @@ async fn post_start_task(
     Ok((StatusCode::ACCEPTED, Json(StartTaskResponse { task })))
 }
 
-/// `POST /executions/:execution_id/resume` — resumes a paused execution.
+/// `POST /executions/{execution_id}/resume` — resumes a paused execution.
 ///
 /// Phase 1 ([`Engine::try_begin_resume`]) runs synchronously: if another pass
 /// already holds this execution, this returns `409` immediately, with
@@ -1158,7 +1158,7 @@ async fn post_resume(
     ))
 }
 
-/// `POST /executions/:execution_id/recover` — explicitly starts a new attempt
+/// `POST /executions/{execution_id}/recover` — explicitly starts a new attempt
 /// from the failed or interrupted state. This is separate from `/resume` so a
 /// crash is never replayed merely because the daemon restarted.
 async fn post_recover(
@@ -1174,7 +1174,7 @@ async fn post_recover(
 }
 
 /// Starts the recovery of a legacy execution and drives it in the
-/// background — the one body of `/executions/:id/recover` and the control
+/// background — the one body of `/executions/{id}/recover` and the control
 /// API's recover.
 fn begin_recovery(
     state: &AppState,
@@ -1259,7 +1259,7 @@ where
     state.active_tasks.spawn(execution_id, future);
 }
 
-/// `POST /executions/:execution_id/input` — delivers a person's answer to a
+/// `POST /executions/{execution_id}/input` — delivers a person's answer to a
 /// paused execution.
 ///
 /// The body is a [`HumanInputDelivery`] verbatim — it already derives
@@ -1330,7 +1330,7 @@ async fn post_input(
     ))
 }
 
-/// `POST /executions/:execution_id/transition` — a manual or forced
+/// `POST /executions/{execution_id}/transition` — a manual or forced
 /// transition, server-side.
 ///
 /// Reimplements `src/tui/app.rs`'s `write_transition` (reached today only
@@ -1584,7 +1584,7 @@ fn sse_event_stream(
     })
 }
 
-/// `GET /executions/:execution_id/stream` — an SSE stream of every event the
+/// `GET /executions/{execution_id}/stream` — an SSE stream of every event the
 /// engine publishes for this one execution (AE5), filtered from the same
 /// broadcast every other subscriber (including the global stream below) also
 /// reads from.
