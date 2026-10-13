@@ -374,7 +374,7 @@ fn transcript_reanchors_across_detail_mode_resize_and_missing_entry() {
     transcript.load(vec![
         transcript_entry("one", &["one-a", "one-b"]),
         transcript_entry("two", &["two-a", "two-b"])
-            .with_technical_lines(vec!["detail-a".into(), "detail-b".into()]),
+            .with_detail_lines(vec!["detail-a".into(), "detail-b".into()]),
     ]);
     transcript.to_top();
     transcript.line_down();
@@ -406,7 +406,7 @@ fn transcript_expansion_is_scoped_to_its_conversation() {
     let entry = TranscriptEntryId::from("1");
     let mut first = TranscriptState::new(TranscriptId::from("attempt-a"));
     first.load(vec![
-        transcript_entry("1", &["body"]).with_technical_lines(vec!["detail".into()])
+        transcript_entry("1", &["body"]).with_detail_lines(vec!["detail".into()])
     ]);
     first.toggle_expanded(&entry);
     assert!(first.is_expanded(&entry));

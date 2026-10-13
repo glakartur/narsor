@@ -288,7 +288,6 @@ pub fn tab_entry(item: &ChatItem, proposal: Option<&ProposalView>) -> Transcript
             if conductor { "Dyrygent" } else { "Operator" },
             item.entry.at,
         ))
-        .with_technical_lines(vec![format!("wpis #{}", item.entry.sequence)])
         .with_presentation(presentation)
 }
 

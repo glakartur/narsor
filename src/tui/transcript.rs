@@ -109,8 +109,11 @@ pub struct TranscriptEntry {
     pub rendered_lines: Vec<String>,
     /// Role/type treatment shared by every renderer in rendered mode.
     pub presentation: TranscriptPresentation,
-    /// Optional technical detail included only when expanded in rendered mode.
-    pub technical_lines: Vec<String>,
+    /// Additional lines included only when expanded in rendered mode.
+    pub detail_lines: Vec<String>,
+    /// Presentation selected for each expanded detail line. Missing entries
+    /// default to technical presentation for compatibility with adapters.
+    pub detail_presentations: Vec<TranscriptPresentation>,
     /// Normalized adapter fields, formatted only while this entry is expanded.
     pub details: Option<Value>,
     /// Exact retained source bytes. This is never replaced by decoded text.
@@ -144,7 +147,8 @@ impl TranscriptEntry {
             header: String::new(),
             rendered_lines,
             presentation: TranscriptPresentation::Neutral,
-            technical_lines: Vec::new(),
+            detail_lines: Vec::new(),
+            detail_presentations: Vec::new(),
             details: None,
             raw,
             grouping: None,
@@ -157,8 +161,9 @@ impl TranscriptEntry {
         self
     }
 
-    pub fn with_technical_lines(mut self, technical_lines: Vec<String>) -> Self {
-        self.technical_lines = technical_lines;
+    pub fn with_detail_lines(mut self, detail_lines: Vec<String>) -> Self {
+        self.detail_lines = detail_lines;
+        self.detail_presentations.clear();
         self
     }
 
@@ -325,6 +330,39 @@ pub struct TranscriptState {
     revealed_members: HashMap<ExpansionIdentity, HashSet<TranscriptEntryId>>,
     selected: Option<TranscriptEntryId>,
     selected_source: Option<TranscriptEntryId>,
+}
+
+fn grouped_detail_lines<'a>(
+    members: impl IntoIterator<Item = &'a TranscriptEntry>,
+    omitted_line: Option<&str>,
+) -> Vec<String> {
+    members
+        .into_iter()
+        .flat_map(|member| {
+            let time = member
+                .header
+                .split(" · ")
+                .nth(2)
+                .and_then(|stamp| stamp.split_whitespace().nth(1))
+                .unwrap_or("");
+            member.rendered_lines.iter().filter_map(move |line| {
+                let line = line.trim();
+                let keep = !line.is_empty() && omitted_line != Some(line);
+                keep.then(|| {
+                    let attribution = if member.presentation == TranscriptPresentation::Error {
+                        "BŁĄD · "
+                    } else {
+                        ""
+                    };
+                    if time.is_empty() {
+                        format!("  {attribution}{line}")
+                    } else {
+                        format!("  {time} · {attribution}{line}")
+                    }
+                })
+            })
+        })
+        .collect()
 }
 
 impl TranscriptState {
@@ -847,14 +885,8 @@ impl TranscriptState {
                     summary.push_str(" · błąd");
                 }
                 operation.rendered_lines = vec![summary];
-                operation.technical_lines = included
-                    .iter()
-                    .flat_map(|member| {
-                        let mut lines = vec![member.header.clone()];
-                        lines.extend(member.rendered_lines.clone());
-                        lines
-                    })
-                    .collect();
+                operation.detail_lines = grouped_detail_lines(included.iter().copied(), None);
+                operation.detail_presentations.clear();
                 operation.raw = included
                     .iter()
                     .enumerate()
@@ -942,22 +974,21 @@ impl TranscriptState {
             let in_progress = operations.values().filter(|done| !**done).count();
             let mut summary = format!("{} · {}", grouping.family, grouping.name);
             if !operations.is_empty() {
-                summary.push_str(&format!(" · {completed} zakończone · {in_progress} w toku"));
+                if completed > 0 {
+                    summary.push_str(&format!(" · {completed} zakończone"));
+                }
+                if in_progress > 0 {
+                    summary.push_str(&format!(" · {in_progress} w toku"));
+                }
             } else {
                 summary.push_str(&format!(" · {} wpisy", included.len()));
             }
             if has_error {
                 summary.push_str(" · błąd");
             }
-            group.rendered_lines = vec![summary];
-            group.technical_lines = included
-                .iter()
-                .flat_map(|member| {
-                    let mut lines = vec![member.header.clone()];
-                    lines.extend(member.rendered_lines.clone());
-                    lines
-                })
-                .collect();
+            group.rendered_lines = vec![summary.clone()];
+            group.detail_lines = grouped_detail_lines(included.iter().copied(), Some(&summary));
+            group.detail_presentations.clear();
             group.raw = included
                 .iter()
                 .enumerate()
@@ -1018,31 +1049,38 @@ impl TranscriptState {
                         .rendered_lines
                         .iter()
                         .cloned()
-                        .map(|text| {
-                            let presentation = match entry.presentation {
-                                TranscriptPresentation::Technical
-                                | TranscriptPresentation::System
-                                | TranscriptPresentation::Error => entry.presentation,
-                                _ => TranscriptPresentation::Neutral,
-                            };
-                            (text, presentation, false)
-                        })
+                        .map(|text| (text, entry.presentation, false))
                         .collect::<Vec<_>>();
                     if lines.is_empty() {
                         lines.push((String::new(), TranscriptPresentation::Neutral, false));
                     }
                     let expanded = self.is_expanded(&entry.id);
-                    if entry.source_ids.len() > 1 {
+                    let has_details = !entry.detail_lines.is_empty()
+                        && !entry
+                            .detail_lines
+                            .iter()
+                            .map(String::as_str)
+                            .eq(entry.rendered_lines.iter().map(String::as_str));
+                    if has_details {
                         lines[0].0 = format!("{} {}", if expanded { "v" } else { ">" }, lines[0].0);
                     }
                     if expanded {
-                        lines.extend(
-                            entry
-                                .technical_lines
-                                .iter()
-                                .cloned()
-                                .map(|text| (text, TranscriptPresentation::Technical, false)),
-                        );
+                        let has_additional_block = has_details;
+                        if has_additional_block {
+                            lines.extend(entry.detail_lines.iter().cloned().enumerate().map(
+                                |(index, text)| {
+                                    (
+                                        text,
+                                        entry
+                                            .detail_presentations
+                                            .get(index)
+                                            .copied()
+                                            .unwrap_or(TranscriptPresentation::Technical),
+                                        false,
+                                    )
+                                },
+                            ));
+                        }
                     }
                     // Conversation and Chronology intentionally share the
                     // same card header. The source timestamp is already
@@ -1263,7 +1301,7 @@ mod tests {
         let rendered = transcript.logical_lines();
         assert!(rendered
             .iter()
-            .any(|line| line.text == "> Hooki · SessionStart · 2 zakończone · 0 w toku"));
+            .any(|line| line.text == "> Hooki · SessionStart · 2 zakończone"));
         assert_eq!(rendered.iter().filter(|line| line.header).count(), 1);
 
         let group = transcript.selected_entry().cloned().unwrap();
@@ -1271,7 +1309,18 @@ mod tests {
         assert!(transcript
             .logical_lines()
             .iter()
-            .any(|line| { line.text == "v Hooki · SessionStart · 2 zakończone · 0 w toku" }));
+            .any(|line| { line.text == "v Hooki · SessionStart · 2 zakończone" }));
+        let expanded = transcript.logical_lines();
+        assert!(expanded
+            .iter()
+            .any(|line| line.text.starts_with("  12:00:00 · hook_started")));
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|line| line.text.contains("SYSTEM · Harness"))
+                .count(),
+            1
+        );
 
         transcript.next_conversation_view();
         let chronology = transcript.logical_lines();
@@ -1280,6 +1329,21 @@ mod tests {
             transcript.selected_entry(),
             Some(&TranscriptEntryId::from("one"))
         );
+    }
+
+    #[test]
+    fn grouped_error_member_keeps_a_compact_error_attribution() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![
+            hook("one", "hook_started"),
+            hook("two", "hook_response").with_presentation(TranscriptPresentation::Error),
+        ]);
+        let group = transcript.selected_entry().cloned().unwrap();
+        transcript.toggle_expanded(&group);
+        assert!(transcript
+            .logical_lines()
+            .iter()
+            .any(|line| line.text.contains("BŁĄD · hook_response")));
     }
 
     #[test]
@@ -1360,6 +1424,79 @@ mod tests {
     }
 
     #[test]
+    fn disclosure_marker_only_appears_when_expansion_adds_content() {
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![
+            TranscriptEntry::new(
+                TranscriptEntryId::from("same"),
+                vec!["already visible".into()],
+                Vec::new(),
+            )
+            .with_detail_lines(vec!["already visible".into()]),
+            TranscriptEntry::new(
+                TranscriptEntryId::from("extra"),
+                vec!["summary".into()],
+                Vec::new(),
+            )
+            .with_detail_lines(vec!["additional detail".into()]),
+        ]);
+        transcript.line_up();
+        assert!(transcript
+            .logical_lines()
+            .iter()
+            .filter(|line| line.entry_id == TranscriptEntryId::from("same"))
+            .all(|line| !line.text.starts_with("> ")));
+        transcript.line_down();
+        assert!(transcript
+            .logical_lines()
+            .iter()
+            .any(|line| line.text == "> summary"));
+        let id = transcript.selected_entry().cloned().unwrap();
+        transcript.toggle_expanded(&id);
+        assert_eq!(
+            transcript
+                .logical_lines()
+                .iter()
+                .filter(|line| line.text == "additional detail")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_tail_lines_still_show_a_disclosure_marker_and_expand() {
+        let body = vec![
+            "Status:".to_owned(),
+            "ok".to_owned(),
+            "ok".to_owned(),
+            "ok".to_owned(),
+            "ok".to_owned(),
+        ];
+        let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+        transcript.load(vec![TranscriptEntry::new(
+            TranscriptEntryId::from("repeated"),
+            body,
+            Vec::new(),
+        )
+        .with_detail_lines(vec!["ok".into(), "ok".into()])]);
+        let id = transcript.selected_entry().cloned().unwrap();
+        assert!(transcript
+            .logical_lines()
+            .iter()
+            .any(|line| line.text == "> Status:"));
+
+        transcript.toggle_expanded(&id);
+        assert_eq!(
+            transcript
+                .logical_lines()
+                .iter()
+                .filter(|line| line.text.trim_start_matches("v ") == "ok")
+                .count(),
+            6
+        );
+    }
+
+    #[test]
     fn conversation_keeps_different_hook_families_separate() {
         let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
         transcript.load(vec![
@@ -1407,12 +1544,15 @@ mod tests {
             .collect();
         assert!(lines.iter().any(|line| line == "hook_started"));
         assert_eq!(
-            lines.iter().filter(|line| *line == "hook_started").count(),
+            lines
+                .iter()
+                .filter(|line| line.ends_with("hook_started"))
+                .count(),
             3
         );
         assert!(lines
             .iter()
-            .any(|line| line == "v Hooki · SessionStart · 0 zakończone · 2 w toku"));
+            .any(|line| line == "v Hooki · SessionStart · 2 w toku"));
     }
 
     #[test]
@@ -1432,7 +1572,7 @@ mod tests {
             transcript
                 .logical_lines()
                 .iter()
-                .filter(|line| line.text == "hook_started")
+                .filter(|line| line.text.ends_with("hook_started"))
                 .count(),
             3
         );

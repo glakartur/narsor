@@ -2386,7 +2386,18 @@ mod task_app_detail_render {
         stale: bool,
         focused: bool,
     ) -> Buffer {
-        draw(60, 12, |frame| {
+        draw_conversation_at(60, 12, conversation, styles, stale, focused)
+    }
+
+    fn draw_conversation_at(
+        width: u16,
+        height: u16,
+        conversation: &mut Conversation,
+        styles: &Styles,
+        stale: bool,
+        focused: bool,
+    ) -> Buffer {
+        draw(width, height, |frame| {
             conversation::render(frame, frame.area(), styles, conversation, stale, focused);
         })
     }
@@ -2440,6 +2451,58 @@ mod task_app_detail_render {
             Color::DarkGray,
             "the text is grey"
         );
+    }
+
+    #[test]
+    fn expanded_multiline_entry_remains_readable_at_narrow_width() {
+        let mut narrow_entry = entry("1", &["first line remains visible when wrapped"]);
+        narrow_entry.detail_lines = vec!["second line remains visible when wrapped".into()];
+        narrow_entry.detail_presentations =
+            vec![narsor::tui::transcript::TranscriptPresentation::Operator];
+        let mut tab = conversation_tab(vec![narrow_entry]);
+        let id = tab.transcript().selected_entry().cloned().unwrap();
+        tab.transcript_mut().toggle_expanded(&id);
+
+        let buffer = draw_conversation_at(20, 12, &mut tab, &Styles::new(false), false, true);
+        let text = screen(&buffer);
+        assert!(text.contains("first line"), "{text}");
+        assert!(text.contains("second line"), "{text}");
+        assert!(
+            text.contains("v"),
+            "expanded marker remains visible: {text}"
+        );
+        assert_eq!(
+            cell_at(&buffer, 0, row_of(&buffer, "first") as u16),
+            ("│".into(), Color::Cyan)
+        );
+    }
+
+    #[test]
+    fn expanded_group_keeps_its_selection_rail_and_event_text_at_narrow_width() {
+        let hook = |id: &str, event: &str, phase: &str| {
+            entry(id, &[event])
+                .with_header("SYSTEM · Harness · 2026-10-13 12:00:00")
+                .with_presentation(narsor::tui::transcript::TranscriptPresentation::System)
+                .with_operation_grouping(
+                    Some("session"),
+                    Some("SessionStart"),
+                    Some(phase),
+                    Some(id),
+                )
+        };
+        let mut tab = conversation_tab(vec![
+            hook("1", "hook_started", "started"),
+            hook("2", "hook_response", "completed"),
+        ]);
+        let id = tab.transcript().selected_entry().cloned().unwrap();
+        tab.transcript_mut().toggle_expanded(&id);
+
+        let buffer = draw_conversation_at(30, 12, &mut tab, &Styles::new(false), false, true);
+        let text = screen(&buffer);
+        assert!(text.contains("v Hooki"), "{text}");
+        assert!(text.contains("hook_started"), "{text}");
+        let row = row_of(&buffer, "hook_started") as u16;
+        assert_eq!(cell_at(&buffer, 0, row), ("│".into(), Color::Cyan));
     }
 
     /// *Zdarzenia*: the selected event has the bar in the first column of

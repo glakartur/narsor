@@ -965,24 +965,93 @@ pub(crate) fn agent_transcript_entry(entry: &TranscriptEvent) -> TranscriptEntry
         }
         EntryKind::System => (TranscriptPresentation::System, "Harness"),
     };
-    let mut body: Vec<String> = sanitize(&entry.summary)
+    let speech = matches!(
+        entry.kind,
+        EntryKind::Narsor | EntryKind::User | EntryKind::Assistant | EntryKind::Result
+    ) && (entry.kind != EntryKind::Narsor || workflow_event == Some("agent_input"))
+        || entry.kind == EntryKind::System
+            && entry
+                .details
+                .get("message.content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty());
+    let consumed_content = if speech {
+        entry
+            .details
+            .get("message.content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|_| "message.content")
+            .or_else(|| {
+                (entry.kind == EntryKind::Narsor && workflow_event == Some("agent_input"))
+                    .then(|| {
+                        entry
+                            .details
+                            .get("workflow.message")
+                            .and_then(Value::as_str)
+                    })
+                    .flatten()
+                    .map(|_| "workflow.message")
+            })
+    } else {
+        None
+    };
+    let body_source = if speech {
+        entry
+            .details
+            .get("message.content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                (entry.kind == EntryKind::Narsor && workflow_event == Some("agent_input"))
+                    .then(|| {
+                        entry
+                            .details
+                            .get("workflow.message")
+                            .and_then(Value::as_str)
+                            .map(|text| text.strip_prefix("prompt:").unwrap_or(text).trim_start())
+                    })
+                    .flatten()
+            })
+            .unwrap_or(&entry.summary)
+    } else {
+        &entry.summary
+    };
+    let mut body = sanitize(body_source)
         .lines()
         .map(str::to_owned)
-        .collect();
-    if matches!(
-        presentation,
-        TranscriptPresentation::Technical | TranscriptPresentation::Error
-    ) {
-        body.truncate(1);
-    }
+        .collect::<Vec<_>>();
+    let extra_body = if speech && body.len() > 5 {
+        body.split_off(5)
+    } else {
+        if matches!(
+            presentation,
+            TranscriptPresentation::Technical | TranscriptPresentation::Error
+        ) {
+            body.truncate(1);
+        }
+        Vec::new()
+    };
+    let detail_lines = semantic_detail_lines(&entry.details, &body, consumed_content);
     let mut transcript = TranscriptEntry::new(
         TranscriptEntryId::from(entry.entry_number.to_string()),
         body,
         entry.raw.clone(),
     )
     .with_header(utterance_header(presentation, speaker, entry.timestamp))
-    .with_technical_lines(semantic_detail_lines(&entry.details, &entry.summary))
+    .with_detail_lines(detail_lines)
     .with_presentation(presentation);
+    if !extra_body.is_empty() {
+        let technical = std::mem::take(&mut transcript.detail_lines);
+        transcript.detail_lines = extra_body;
+        transcript.detail_presentations = vec![presentation; transcript.detail_lines.len()];
+        transcript.detail_lines.extend(technical);
+        transcript.detail_presentations.extend(vec![
+            TranscriptPresentation::Technical;
+            transcript.detail_lines.len()
+                - transcript.detail_presentations.len()
+        ]);
+    }
     // The adapter has already converted hook envelopes into this neutral
     // correlation tuple; transcript rendering never reads harness fields.
     let group_session = entry
@@ -1025,7 +1094,11 @@ pub(crate) fn agent_transcript_entry(entry: &TranscriptEvent) -> TranscriptEntry
 /// fields as their own lines and the identifying fields as `label: value`.
 /// Normalized keys and the source payload never appear here — only RAW shows
 /// those.
-fn semantic_detail_lines(details: &serde_json::Value, summary: &str) -> Vec<String> {
+fn semantic_detail_lines(
+    details: &serde_json::Value,
+    visible_body: &[String],
+    consumed_content: Option<&str>,
+) -> Vec<String> {
     const CONTENT: [&str; 5] = [
         "message.content",
         "tool.output",
@@ -1067,16 +1140,20 @@ fn semantic_detail_lines(details: &serde_json::Value, summary: &str) -> Vec<Stri
     }
     lines.extend(labelled);
     for key in CONTENT {
+        if consumed_content == Some(key) {
+            continue;
+        }
         let Some(value) = details.get(key) else {
             continue;
         };
-        let sanitized = sanitize(&text(value));
-        let mut content = sanitized.lines().peekable();
-        // The summary already shows a content's first line.
-        if content.peek() == Some(&summary) {
-            content.next();
+        let content = sanitize(&text(value));
+        let mut content_lines = content.lines().map(str::to_owned).collect::<Vec<_>>();
+        for body_line in visible_body {
+            if let Some(index) = content_lines.iter().position(|line| line == body_line) {
+                content_lines.remove(index);
+            }
         }
-        lines.extend(content.map(str::to_owned));
+        lines.extend(content_lines);
     }
     lines
 }
@@ -1350,6 +1427,129 @@ mod utterance_tests {
     }
 
     #[test]
+    fn workflow_prompt_previews_five_lines_and_expands_the_remaining_text_once() {
+        let prompt = "one\ntwo\nthree\nfour\nfive\nsix\nseven";
+        let raw = format!(
+            r#"{{"event":"prompt","prompt":{}}}"#,
+            serde_json::to_string(prompt).unwrap()
+        );
+        let projected = agent_transcript_entry(&classify(&ConversationEntryDto {
+            entry_number: 1,
+            timestamp: chrono::Utc::now(),
+            source: ConversationEntrySource::Narsor,
+            raw_base64: BASE64.encode(raw.as_bytes()),
+        }));
+        assert_eq!(
+            projected.rendered_lines,
+            ["one", "two", "three", "four", "five"]
+        );
+        let mut transcript = TranscriptState::new(TranscriptId::from("t"));
+        let id = projected.id.clone();
+        transcript.load(vec![projected]);
+        transcript.toggle_expanded(&id);
+        let lines = transcript.logical_lines();
+        for expected in ["one", "two", "three", "four", "five", "six", "seven"] {
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| {
+                        line.text.trim_start_matches("> ").trim_start_matches("v ") == expected
+                    })
+                    .count(),
+                1
+            );
+        }
+        assert!(lines
+            .iter()
+            .filter(|line| line.text.ends_with("six") || line.text == "seven")
+            .all(|line| line.presentation == TranscriptPresentation::Operator));
+    }
+
+    #[test]
+    fn plain_text_workflow_prompt_is_rendered_as_operator_speech() {
+        let projected = entry_from(
+            ConversationEntrySource::Narsor,
+            "prompt: first line\nsecond line",
+        );
+        assert_eq!(projected.rendered_lines, ["first line", "second line"]);
+        assert_eq!(projected.presentation, TranscriptPresentation::Operator);
+        let expanded = lines_of(projected, true);
+        for expected in ["first line", "second line"] {
+            assert_eq!(
+                expanded
+                    .iter()
+                    .filter(|line| line.as_str() == expected)
+                    .count(),
+                1,
+                "{expanded:?}"
+            );
+        }
+        assert!(!expanded.iter().any(String::is_empty), "{expanded:?}");
+    }
+
+    #[test]
+    fn assistant_text_with_tool_block_keeps_the_tool_details_expandable() {
+        let projected = entry_from(
+            ConversationEntrySource::Stdout,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Checking files."},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
+        );
+        let expanded = lines_of(projected, true);
+        assert!(
+            expanded.iter().any(|line| line.contains("tool_call")),
+            "{expanded:?}"
+        );
+        assert!(
+            expanded.iter().any(|line| line.contains("Bash")),
+            "{expanded:?}"
+        );
+    }
+
+    #[test]
+    fn expanded_speech_keeps_its_role_and_diagnostics_stay_technical() {
+        let user = entry_from(
+            ConversationEntrySource::Stdout,
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"operator text"}]}}"#,
+        );
+        let user_lines = lines_of(user, true);
+        assert!(user_lines.iter().any(|line| line == "operator text"));
+
+        let raw =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"agent text"}]}}"#;
+        let projected = agent_transcript_entry(&classify(&ConversationEntryDto {
+            entry_number: 2,
+            timestamp: chrono::Utc::now(),
+            source: ConversationEntrySource::Stdout,
+            raw_base64: BASE64.encode(raw.as_bytes()),
+        }));
+        let mut transcript = TranscriptState::new(TranscriptId::from("t"));
+        let id = projected.id.clone();
+        transcript.load(vec![projected]);
+        transcript.toggle_expanded(&id);
+        let lines = transcript.logical_lines();
+        assert!(lines.iter().any(|line| {
+            line.text == "agent text" && line.presentation == TranscriptPresentation::Agent
+        }));
+
+        let raw = r#"{"event":"message","message":"system text"}"#;
+        let mut event = classify(&ConversationEntryDto {
+            entry_number: 3,
+            timestamp: chrono::Utc::now(),
+            source: ConversationEntrySource::Narsor,
+            raw_base64: BASE64.encode(raw.as_bytes()),
+        });
+        event.kind = EntryKind::System;
+        event.details["message.content"] = Value::String("system text".into());
+        let projected = agent_transcript_entry(&event);
+        let mut transcript = TranscriptState::new(TranscriptId::from("t"));
+        let id = projected.id.clone();
+        transcript.load(vec![projected]);
+        transcript.toggle_expanded(&id);
+        assert!(transcript.logical_lines().iter().any(|line| {
+            line.text == "system text" && line.presentation == TranscriptPresentation::System
+        }));
+    }
+
+    #[test]
     fn claude_hook_adapter_normalizes_session_start_for_grouping() {
         let entries = [
             r#"{"type":"system","subtype":"hook_started","session_id":"session","hook_id":"one","hook_name":"SessionStart:startup"}"#,
@@ -1424,8 +1624,10 @@ mod utterance_tests {
         let raw = r#"{"event":"agent_input","prompt":"Implement the feature\nthen run the tests\nand report"}"#;
 
         let collapsed = lines_of(entry_from(ConversationEntrySource::Narsor, raw), false);
-        assert_eq!(collapsed.len(), 2, "{collapsed:?}");
+        assert_eq!(collapsed.len(), 4, "{collapsed:?}");
         assert_eq!(collapsed[1], "Implement the feature");
+        assert_eq!(collapsed[2], "then run the tests");
+        assert_eq!(collapsed[3], "and report");
 
         let expanded = lines_of(entry_from(ConversationEntrySource::Narsor, raw), true);
         assert_eq!(
