@@ -37,7 +37,8 @@ use crate::api::{ConversationEntryDto, ConversationEntrySource};
 
 use super::scroll::{one_line, sanitize};
 use super::transcript::{
-    utterance_header, TranscriptEntry, TranscriptEntryId, TranscriptPresentation,
+    utterance_header, TranscriptDetailLine, TranscriptEntry, TranscriptEntryId,
+    TranscriptPresentation,
 };
 
 /// The kind of one conversation entry, per the plan's list: user, assistant,
@@ -1039,19 +1040,18 @@ pub(crate) fn agent_transcript_entry(entry: &TranscriptEvent) -> TranscriptEntry
         entry.raw.clone(),
     )
     .with_header(utterance_header(presentation, speaker, entry.timestamp))
-    .with_detail_lines(detail_lines)
+    .with_details(
+        extra_body
+            .into_iter()
+            .map(|text| TranscriptDetailLine::new(text, presentation))
+            .chain(
+                detail_lines
+                    .into_iter()
+                    .map(|text| TranscriptDetailLine::new(text, TranscriptPresentation::Technical)),
+            )
+            .collect(),
+    )
     .with_presentation(presentation);
-    if !extra_body.is_empty() {
-        let technical = std::mem::take(&mut transcript.detail_lines);
-        transcript.detail_lines = extra_body;
-        transcript.detail_presentations = vec![presentation; transcript.detail_lines.len()];
-        transcript.detail_lines.extend(technical);
-        transcript.detail_presentations.extend(vec![
-            TranscriptPresentation::Technical;
-            transcript.detail_lines.len()
-                - transcript.detail_presentations.len()
-        ]);
-    }
     // The adapter has already converted hook envelopes into this neutral
     // correlation tuple; transcript rendering never reads harness fields.
     let group_session = entry

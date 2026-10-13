@@ -2455,10 +2455,13 @@ mod task_app_detail_render {
 
     #[test]
     fn expanded_multiline_entry_remains_readable_at_narrow_width() {
-        let mut narrow_entry = entry("1", &["first line remains visible when wrapped"]);
-        narrow_entry.detail_lines = vec!["second line remains visible when wrapped".into()];
-        narrow_entry.detail_presentations =
-            vec![narsor::tui::transcript::TranscriptPresentation::Operator];
+        let narrow_entry =
+            entry("1", &["first line remains visible when wrapped"]).with_details(vec![
+                narsor::tui::transcript::TranscriptDetailLine::new(
+                    "second line remains visible when wrapped",
+                    narsor::tui::transcript::TranscriptPresentation::Operator,
+                ),
+            ]);
         let mut tab = conversation_tab(vec![narrow_entry]);
         let id = tab.transcript().selected_entry().cloned().unwrap();
         tab.transcript_mut().toggle_expanded(&id);

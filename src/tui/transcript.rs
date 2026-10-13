@@ -98,6 +98,22 @@ pub fn utterance_header(
     )
 }
 
+/// One expanded transcript line and its semantic presentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptDetailLine {
+    pub text: String,
+    pub presentation: TranscriptPresentation,
+}
+
+impl TranscriptDetailLine {
+    pub fn new(text: impl Into<String>, presentation: TranscriptPresentation) -> Self {
+        Self {
+            text: text.into(),
+            presentation,
+        }
+    }
+}
+
 /// One source-neutral chronological entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptEntry {
@@ -110,10 +126,7 @@ pub struct TranscriptEntry {
     /// Role/type treatment shared by every renderer in rendered mode.
     pub presentation: TranscriptPresentation,
     /// Additional lines included only when expanded in rendered mode.
-    pub detail_lines: Vec<String>,
-    /// Presentation selected for each expanded detail line. Missing entries
-    /// default to technical presentation for compatibility with adapters.
-    pub detail_presentations: Vec<TranscriptPresentation>,
+    pub detail_lines: Vec<TranscriptDetailLine>,
     /// Normalized adapter fields, formatted only while this entry is expanded.
     pub details: Option<Value>,
     /// Exact retained source bytes. This is never replaced by decoded text.
@@ -148,7 +161,6 @@ impl TranscriptEntry {
             rendered_lines,
             presentation: TranscriptPresentation::Neutral,
             detail_lines: Vec::new(),
-            detail_presentations: Vec::new(),
             details: None,
             raw,
             grouping: None,
@@ -161,9 +173,17 @@ impl TranscriptEntry {
         self
     }
 
-    pub fn with_detail_lines(mut self, detail_lines: Vec<String>) -> Self {
+    pub fn with_detail_lines(self, detail_lines: Vec<String>) -> Self {
+        self.with_details(
+            detail_lines
+                .into_iter()
+                .map(|text| TranscriptDetailLine::new(text, TranscriptPresentation::Technical))
+                .collect(),
+        )
+    }
+
+    pub fn with_details(mut self, detail_lines: Vec<TranscriptDetailLine>) -> Self {
         self.detail_lines = detail_lines;
-        self.detail_presentations.clear();
         self
     }
 
@@ -335,7 +355,7 @@ pub struct TranscriptState {
 fn grouped_detail_lines<'a>(
     members: impl IntoIterator<Item = &'a TranscriptEntry>,
     omitted_line: Option<&str>,
-) -> Vec<String> {
+) -> Vec<TranscriptDetailLine> {
     members
         .into_iter()
         .flat_map(|member| {
@@ -355,9 +375,15 @@ fn grouped_detail_lines<'a>(
                         ""
                     };
                     if time.is_empty() {
-                        format!("  {attribution}{line}")
+                        TranscriptDetailLine::new(
+                            format!("  {attribution}{line}"),
+                            TranscriptPresentation::Technical,
+                        )
                     } else {
-                        format!("  {time} · {attribution}{line}")
+                        TranscriptDetailLine::new(
+                            format!("  {time} · {attribution}{line}"),
+                            TranscriptPresentation::Technical,
+                        )
                     }
                 })
             })
@@ -886,7 +912,6 @@ impl TranscriptState {
                 }
                 operation.rendered_lines = vec![summary];
                 operation.detail_lines = grouped_detail_lines(included.iter().copied(), None);
-                operation.detail_presentations.clear();
                 operation.raw = included
                     .iter()
                     .enumerate()
@@ -988,7 +1013,6 @@ impl TranscriptState {
             }
             group.rendered_lines = vec![summary.clone()];
             group.detail_lines = grouped_detail_lines(included.iter().copied(), Some(&summary));
-            group.detail_presentations.clear();
             group.raw = included
                 .iter()
                 .enumerate()
@@ -1059,7 +1083,7 @@ impl TranscriptState {
                         && !entry
                             .detail_lines
                             .iter()
-                            .map(String::as_str)
+                            .map(|detail| detail.text.as_str())
                             .eq(entry.rendered_lines.iter().map(String::as_str));
                     if has_details {
                         lines[0].0 = format!("{} {}", if expanded { "v" } else { ">" }, lines[0].0);
@@ -1067,19 +1091,11 @@ impl TranscriptState {
                     if expanded {
                         let has_additional_block = has_details;
                         if has_additional_block {
-                            lines.extend(entry.detail_lines.iter().cloned().enumerate().map(
-                                |(index, text)| {
-                                    (
-                                        text,
-                                        entry
-                                            .detail_presentations
-                                            .get(index)
-                                            .copied()
-                                            .unwrap_or(TranscriptPresentation::Technical),
-                                        false,
-                                    )
-                                },
-                            ));
+                            lines.extend(
+                                entry.detail_lines.iter().map(|detail| {
+                                    (detail.text.clone(), detail.presentation, false)
+                                }),
+                            );
                         }
                     }
                     // Conversation and Chronology intentionally share the
