@@ -1,84 +1,28 @@
-# Rust-specific ignores
-target/
-Cargo.lock
+# Rust build output
+/target/
 **/*.rs.bk
-**/*.tmp
 
-# Dependencies
-**/node_modules/
-**/.venv/
-**/venv/
-**/__pycache__/
-**/.mypy_cache/
-**/.pytest_cache/
-**/.gradle/
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
 
-# Build artifacts
-dist/
-build/
-*.o
-*.obj
-*.exe
-*.dll
-*.so
-*.a
-*.out
+# Narsor runtime data
+/.narsor/
+/.orchestrator/
 
-# Editor/IDE files
+# Agent worktrees and local agent state
+/.claude/worktrees/
+/.worktrees/
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Editors and operating systems
 .vscode/
 .idea/
 *.swp
 *.swo
-*.tmp
-
-# Logs
-*.log
-
-# Coverage
-coverage/
-htmlcov/
-.coverage
-
-# Environment
-.env
-.env.local
-*.env.*
-
-# System files
 .DS_Store
 Thumbs.db
-
-# Compressed files
-*.zip
-*.gz
-*.tar
-*.tgz
-*.bz2
-*.xz
-*.7z
-*.rar
-*.zst
-*.lz4
-*.lzh
-*.cab
-*.arj
-*.rpm
-*.deb
-*.Z
-*.lz
-*.lzo
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.zst
-node_modules/
-.next/
-
-# Narsor runtime state
-.narsor/
-# The pre-rename name, so a checkout mid-migration stays quiet
-.orchestrator/
-
-# Agent worktrees
-.claude/worktrees/
-.worktrees/
