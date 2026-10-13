@@ -6,14 +6,14 @@
 #![allow(dead_code)]
 
 use chrono::{DateTime, TimeZone, Utc};
-use narsor::controller_protocol::{
+use narsor_engine::controller_protocol::{
     ControlEventEnvelope, Freshness, QueueView, RunnerView, TaskListResponse, TaskSummary,
     TimelineResponse,
 };
-use narsor::domain::display::DisplayLink;
-use narsor::domain::{Event, EventData, ExecutionStatus, TaskId};
-use narsor::engine::{ConversationState, Position, PositionStatus, Timeline};
-use narsor::orchestration::{
+use narsor_engine::domain::display::DisplayLink;
+use narsor_engine::domain::{Event, EventData, ExecutionStatus, TaskId};
+use narsor_engine::engine::{ConversationState, Position, PositionStatus, Timeline};
+use narsor_engine::orchestration::{
     AttentionItem, AttentionKind, ExecutionCursor, QueueReason, ResumeExhaustion, ResumeState,
     TaskEvent, TaskEventKind, TaskLifecycle, WorkloadLoss,
 };
@@ -204,7 +204,7 @@ pub fn position(state: &str, status: PositionStatus) -> Position {
 /// step it is at.
 pub fn timeline(task: &str, positions: Vec<Position>, current: Option<&str>) -> TimelineResponse {
     TimelineResponse {
-        task_id: TaskId::parse(task).expect("a task id"),
+        task_id: task.to_owned(),
         freshness: Freshness::Live,
         observed_at: Some(at()),
         timeline: Some(Timeline {
@@ -212,7 +212,7 @@ pub fn timeline(task: &str, positions: Vec<Position>, current: Option<&str>) -> 
             positions,
             ..Timeline::default()
         }),
-        execution_status: Some(ExecutionStatus::Running),
+        execution_status: Some(narsor_protocol::api::ExecutionStatusDto::Running),
         current_state: None,
         current_position: current.map(str::to_string),
     }
@@ -237,21 +237,22 @@ pub fn execution_events(n: u64) -> Vec<Event> {
 /// an engine `PendingHumanInput`: the task's runner holds it and the row says
 /// it waits (the kind follows the form's `continuation`).
 pub fn with_pending(mut task: TaskSummary, form: serde_json::Value) -> TaskSummary {
-    let form: narsor::engine::PendingHumanInput =
+    let wire_form = form.clone();
+    let form: narsor_engine::engine::PendingHumanInput =
         serde_json::from_value(form).expect("a pending input");
     let kind = match form.continuation {
-        narsor::engine::InputContinuation::ResolveOutput => AttentionKind::Problem,
-        narsor::engine::InputContinuation::ApproveOutput => AttentionKind::Approval,
+        narsor_engine::engine::InputContinuation::ResolveOutput => AttentionKind::Problem,
+        narsor_engine::engine::InputContinuation::ApproveOutput => AttentionKind::Approval,
         _ => AttentionKind::Question,
     };
     let id = form.episode_key().to_string();
     let runner = task
         .runner
         .get_or_insert_with(|| runner(ExecutionStatus::InputNeeded, &form.state_id));
-    runner.pending_input = Some(narsor::orchestration::PendingInputRef {
+    runner.pending_input = Some(narsor_engine::controller_protocol::PendingInputRefView {
         id: id.clone(),
         attempt_id: None,
-        form: form.clone(),
+        form: wire_form,
     });
     task.attention.push(AttentionItem {
         kind,
@@ -287,17 +288,17 @@ pub fn with_transitions(
     exits: &[(&str, &str, Option<&str>)],
     override_targets: Option<&[&str]>,
 ) -> TaskSummary {
-    task.manual_transitions = Some(narsor::controller_protocol::TransitionOffer {
+    task.manual_transitions = Some(narsor_engine::controller_protocol::TransitionOffer {
         from_state: from.to_string(),
         exits: exits
             .iter()
-            .map(
-                |(label, target, description)| narsor::controller_protocol::TransitionExit {
+            .map(|(label, target, description)| {
+                narsor_engine::controller_protocol::TransitionExit {
                     label: (*label).to_string(),
                     target: (*target).to_string(),
                     description: description.map(str::to_string),
-                },
-            )
+                }
+            })
             .collect(),
         override_allowed: override_targets.is_some(),
         override_targets: override_targets
@@ -336,11 +337,12 @@ pub fn with_harness_unavailable(
     reason: &str,
 ) -> TaskSummary {
     if let Some(runner) = task.runner.as_mut() {
-        runner.default_harness_unavailable = Some(narsor::orchestration::HarnessUnavailable {
-            harness: harness.to_string(),
-            kept: kept.to_string(),
-            reason: reason.to_string(),
-        });
+        runner.default_harness_unavailable =
+            Some(narsor_engine::orchestration::HarnessUnavailable {
+                harness: harness.to_string(),
+                kept: kept.to_string(),
+                reason: reason.to_string(),
+            });
     }
     task
 }
@@ -370,7 +372,7 @@ pub fn chat_entry(
 pub fn conductor_view(
     chat: Vec<serde_json::Value>,
     extra: serde_json::Value,
-) -> narsor::conductor::ConductorView {
+) -> narsor_protocol::controller::ConductorView {
     let mut view = serde_json::json!({
         "available": true,
         "harness": "claude-code",
@@ -388,12 +390,14 @@ pub fn conductor_view(
 // The new-task form, the history and the repositories (U13)
 // ---------------------------------------------------------------------------
 
-use narsor::controller_protocol::{
-    CapabilitiesView, LegacyExecutionView, RepositoryListResponse, RepositoryView,
-    WorkflowInputView, WorkflowListResponse, WorkflowSource, WorkflowView,
+use narsor::api::LegacyExecutionView;
+use narsor_engine::domain::ParamType;
+use narsor_engine::orchestration::ArchiveTombstone;
+use narsor_protocol::controller::WorkflowInputType;
+use narsor_protocol::controller::{
+    CapabilitiesView, RepositoryListResponse, RepositoryView, WorkflowInputView,
+    WorkflowListResponse, WorkflowSource, WorkflowView,
 };
-use narsor::domain::ParamType;
-use narsor::orchestration::ArchiveTombstone;
 
 /// An input a workflow declares.
 pub fn workflow_input(
@@ -404,7 +408,13 @@ pub fn workflow_input(
 ) -> WorkflowInputView {
     WorkflowInputView {
         name: name.to_string(),
-        input_type: kind,
+        input_type: match kind {
+            ParamType::String => WorkflowInputType::String,
+            ParamType::Text => WorkflowInputType::Text,
+            ParamType::Integer => WorkflowInputType::Integer,
+            ParamType::Boolean => WorkflowInputType::Boolean,
+            ParamType::Repository => WorkflowInputType::Repository,
+        },
         required,
         description: description.map(str::to_string),
         default: None,
@@ -422,10 +432,15 @@ pub fn catalogue_workflow(
         source: WorkflowSource::BuiltIn,
         description: Some(description.to_string()),
         version: Some(1),
+        state_count: 1,
+        initial_state: Some("start".to_string()),
         inputs,
         valid: true,
         violations: Vec::new(),
         overrides: false,
+        origin_label: "built-in".to_string(),
+        shadow_labels: Vec::new(),
+        has_builtin: Some(true),
     }
 }
 
@@ -512,8 +527,8 @@ pub fn harness_selection(
     configured: &str,
     override_harness: Option<&str>,
     supported: &[&str],
-) -> narsor::api::HarnessSelectionSnapshot {
-    narsor::api::HarnessSelectionSnapshot {
+) -> narsor_engine::api::HarnessSelectionSnapshot {
+    narsor_engine::api::HarnessSelectionSnapshot {
         supported: supported.iter().map(|name| (*name).to_string()).collect(),
         configured: configured.to_string(),
         override_harness: override_harness.map(str::to_string),

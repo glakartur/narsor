@@ -59,7 +59,7 @@ use crate::controller_protocol::{
     OwnerCommandRequest, SubmitOperatorCommandRequest, TaskSummary, TransitionExit,
 };
 use crate::domain::display::safe_link_url;
-use crate::orchestration::{
+use narsor_protocol::controller::{
     AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskLifecycle,
 };
 
@@ -72,7 +72,7 @@ use super::list::{title_of, CommandResolved};
 use super::notify::Severity;
 use super::waiting::AnswerRequest;
 use super::{failure_reason, idempotency_key, is_transport, Request, TaskApp};
-use crate::orchestration::{loss_state, LossState};
+use narsor_protocol::display::{loss_state, LossState};
 
 // ---------------------------------------------------------------------
 // What can be done, and when

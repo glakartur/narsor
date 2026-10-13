@@ -1123,9 +1123,7 @@ impl TranscriptState {
     fn group_identity_for(&self, entry: &TranscriptEntryId) -> Option<ExpansionIdentity> {
         let index = self.entries.iter().position(|source| source.id == *entry)?;
         let grouping = self.entries[index].grouping.as_ref()?;
-        if grouping.correlation_id.is_none() {
-            return None;
-        }
+        grouping.correlation_id.as_ref()?;
         let primary = if grouping.operation {
             self.entries
                 .iter()
@@ -1232,7 +1230,7 @@ mod tests {
             vec![event.to_owned()],
             format!("{{\"hook_id\":\"{id}\"}}").into_bytes(),
         )
-        .with_header(format!("SYSTEM · Harness · 2026-10-11 12:00:00"))
+        .with_header("SYSTEM · Harness · 2026-10-11 12:00:00".to_string())
         .with_presentation(TranscriptPresentation::System)
         .with_operation_grouping(Some("session"), Some(group_name), Some(phase), Some(id))
     }

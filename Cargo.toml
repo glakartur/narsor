@@ -5,6 +5,10 @@ edition = "2021"
 default-run = "narsor"
 autobins = false
 
+[lib]
+name = "narsor"
+path = "src/client_lib.rs"
+
 [[bin]]
 name = "narsor"
 path = "src/bin/narsor.rs"
@@ -16,9 +20,12 @@ path = "src/main.rs"
 [workspace]
 members = [
     ".",
+    "crates/narsor-api-client",
     "crates/narsor-controller",
     "crates/narsor-controller-runtime",
+    "crates/narsor-engine",
     "crates/narsor-protocol",
+    "crates/narsor-shared",
     "crates/narsor-runner",
     "crates/narsor-server",
 ]
@@ -26,109 +33,59 @@ resolver = "2"
 
 [dependencies]
 narsor-protocol = { path = "crates/narsor-protocol" }
+narsor-shared = { path = "crates/narsor-shared" }
+narsor-api-client = { path = "crates/narsor-api-client" }
 
-# Web framework
-axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
 
 # Filesystem & Path handling
-path-absolutize = "3"
-
 # Error handling
-thiserror = "1"
 anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+libc = "0.2"
 
 # Logging & Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# UUID generation
-uuid = { version = "1", features = ["v4", "serde"] }
-
-# Unix syscalls (PID liveness check, process detach in the daemon)
-libc = "0.2"
-
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
 
 # Git integration is done by invoking the `git` command-line tool
-# (see src/workspace/provisioner.rs), which is a runtime prerequisite.
+# (see crates/narsor-engine/src/workspace/provisioner.rs), which is a runtime prerequisite.
 
-# Validation
-validator = { version = "0.16", features = ["derive"] }
-
-# SSE support
-axum-extra = { version = "0.9", features = ["typed-header"] }
+# Async streams used by the client and task presentation.
 futures = "0.3"
-tokio-stream = { version = "0.1", features = ["sync"] }
-# "env": `narsor controller` reads its settings from flags or environment
+# "env": `narsor-controller` reads its settings from flags or environment
 # variables (a Deployment sets env, an operator types flags).
 clap = { version = "4.6.7", features = ["derive", "env"] }
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 
-# Conversation log compression (closed attempts only, see src/persistence/conversation.rs)
-zstd = "0.13"
-
-# Hashing of enrollment codes, runner credentials and the owner claim code
-# before they are stored (src/controller_protocol/credentials.rs,
-# src/auth/owner.rs), and of signed controller request bodies
-# (src/auth/pop.rs): the control plane keeps only a digest of each secret, so
-# its state directory never holds a usable credential. Already in the lock
-# file through other crates.
+# Client payloads and transcript decoding.
 sha2 = "0.10"
-
-# Lossless byte-for-byte encoding of raw harness lines inside a JSONL envelope
 base64 = "0.22"
 
-# HTTP client for the embedded API (src/api/client.rs), the controller and
-# runner protocol clients, OIDC discovery (src/auth/oidc.rs) and the
-# Kubernetes adapter's API client (src/backends/kubernetes/client.rs). The
-# adapter deliberately does not pull in `kube` + `k8s-openapi`: it uses five
-# resource kinds through a dozen plain REST calls, and the generated API
-# surface would cost far more compile time than the hand-written minimal
-# types it needs (src/backends/kubernetes/objects.rs). No default
-# middleware. "rustls-tls": a controller or runner reaches a network-mode
-# control plane over HTTPS, and an OIDC issuer is only ever reached over
-# HTTPS; rustls keeps the build free of a system OpenSSL.
-# "stream" adds `Response::bytes_stream`/`chunk`, needed by the SSE
-# integration tests (tests/sse.rs, tests/auth.rs) to read a streaming
-# response body; the embedded client itself (src/api/client.rs) only ever
-# reads whole bodies and does not use it.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-
-# Named explicitly so `src/api/client.rs`'s hand-rolled SSE parser can name
-# `bytes::Bytes` (the item type of `reqwest::Response::bytes_stream()`)
-# without going through reqwest's own re-export surface, which does not
-# expose it. Already pulled in transitively by reqwest/hyper.
+# Byte buffers returned by the API client.
 bytes = "1"
 
-# OIDC access-token verification in network mode (src/auth/oidc.rs):
-# signature, algorithm and registered-claim checks against the issuer's
-# JWKS. `rust_crypto` keeps it pure Rust (no C toolchain for aws-lc); PEM
-# support is off because keys only ever arrive as JWKs.
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
-
-# Controller proof-of-possession (src/auth/pop.rs): each controller holds an
-# Ed25519 key it generated itself and signs every request. Already pulled in
-# by jsonwebtoken's `rust_crypto`; named here for key generation.
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-# The OS random source for generating those keys.
-rand_core = { version = "0.6", features = ["getrandom"] }
-
-# Trusted-proxy address ranges of the network mode's TLS-termination policy
-# (src/auth/settings.rs). Already in the lock file through reqwest.
-ipnet = "2"
 
 [dev-dependencies]
+axum = { version = "0.7", features = ["macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde_yaml = "0.9"
+narsor-server = { path = "crates/narsor-server" }
+narsor-controller = { path = "crates/narsor-controller" }
+narsor-controller-runtime = { path = "crates/narsor-controller-runtime" }
+narsor-engine = { path = "crates/narsor-engine" }
 # ES256 keys for the in-process mock OIDC issuer of tests/auth.rs. Already in
 # the tree through jsonwebtoken's `rust_crypto`.
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 # EdDSA test keys exported as PKCS#8, the form jsonwebtoken signs with.
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }

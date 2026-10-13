@@ -1,0 +1,24 @@
+[package]
+name = "narsor-api-client"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "narsor_api_client"
+path = "src/lib.rs"
+
+[dependencies]
+narsor-protocol = { path = "../narsor-protocol" }
+narsor-shared = { path = "../narsor-shared" }
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }

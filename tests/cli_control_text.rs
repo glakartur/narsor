@@ -5,8 +5,10 @@ use narsor::cli::control_text::{
     capabilities_lines, history_detail_lines, history_row, repository_row, typed_inputs,
     validation_lines, workflow_lines,
 };
-use narsor::controller_protocol::{ValidateWorkflowResponse, WorkflowInputView, WorkflowSource};
-use narsor::domain::ParamType;
+use narsor_engine::controller_protocol::{
+    ValidateWorkflowResponse, WorkflowInputView, WorkflowSource,
+};
+use narsor_engine::domain::ParamType;
 use serde_json::json;
 
 mod task_app_support;
@@ -110,6 +112,8 @@ fn a_verdict_lists_every_violation_or_the_definition() {
         valid: false,
         name: None,
         version: None,
+        state_count: 0,
+        initial_state: None,
         inputs: Vec::new(),
         violations: vec!["first".into(), "second".into()],
     };
@@ -121,6 +125,8 @@ fn a_verdict_lists_every_violation_or_the_definition() {
         valid: true,
         name: Some("greet".into()),
         version: Some(2),
+        state_count: 2,
+        initial_state: Some("start".into()),
         inputs: vec![input("who", ParamType::String, true)],
         violations: Vec::new(),
     };

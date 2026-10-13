@@ -18,18 +18,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use engine_support::{workflow, Harness};
-use narsor::conductor::assembly::assemble;
-use narsor::conductor::{
+use narsor_engine::conductor::assembly::assemble;
+use narsor_engine::conductor::{
     ChatEntryKind, ConductorAnswer, ConductorInvoker, ConductorRegistry, ConductorStore,
     Invocation, InvocationOutcome, SavedDecision,
 };
-use narsor::domain::{
+use narsor_engine::domain::{
     ActionConfig, ActionError, ActionResult, AnsweredBy, ConductorDecisionKind, ConductorPurpose,
     ConductorTrigger, Confidence, EventData, ExecutionStatus, ProblemKind, RepromptedBy,
     WorkflowExecution,
 };
-use narsor::engine::actions::agent::MISSING_OUTPUT_LABEL;
-use narsor::engine::{
+use narsor_engine::engine::actions::agent::MISSING_OUTPUT_LABEL;
+use narsor_engine::engine::{
     owed_output_rescue, ActionExecutor, ActionKind, ActionOutcome, ActionRequest, Engine,
     InputContinuation, OutputProblem, PendingHumanInput,
 };
@@ -1026,7 +1026,7 @@ async fn a_manual_transition_after_an_interrupted_rescue_drops_its_marker() {
         .take_manual_transition(
             &workflow("agent_problem"),
             &execution.id,
-            &narsor::engine::ManualTransition {
+            &narsor_engine::engine::ManualTransition {
                 label: Some("implemented".to_string()),
                 target: None,
                 force: false,

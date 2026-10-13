@@ -545,7 +545,9 @@ fn equivalent_harness_messages_have_the_same_rendered_contract() {
 // --- the conductor's chat (U13) ----------------------------------------------
 
 mod conductor_chat {
-    use narsor::conductor::{ChatAuthor, ChatEntry, ChatEntryKind};
+    use narsor::api::{
+        ChatAuthorDto as ChatAuthor, ChatEntryDto as ChatEntry, ChatEntryKindDto as ChatEntryKind,
+    };
     use narsor::domain::Confidence;
     use narsor::tui::chat::{chat_items, tab_entry, ProposalState, UndoState};
     use narsor::tui::transcript::TranscriptPresentation;
@@ -558,10 +560,16 @@ mod conductor_chat {
         text: &str,
         payload: Value,
     ) -> ChatEntry {
-        let mut entry = ChatEntry::new(author, kind, text);
-        entry.sequence = sequence;
-        entry.payload = Some(payload);
-        entry
+        ChatEntry {
+            id: String::new(),
+            sequence,
+            at: chrono::Utc::now(),
+            author,
+            kind,
+            text: text.to_string(),
+            in_reply_to: None,
+            payload: Some(payload),
+        }
     }
 
     fn proposal(sequence: u64) -> ChatEntry {

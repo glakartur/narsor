@@ -18,10 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use narsor::api::{
-    self, ApiClient, ApiServices, ClientError, ConversationResponse as PageResponse,
-};
-use narsor::controller_protocol::{
+use narsor_api_client::api::{ApiClient, ClientError};
+use narsor_engine::controller_protocol::{
     CommandAck, ConductorReadQuery, ConductorReadResponse, ControllerClient, ConversationPageQuery,
     ConversationResponse, ConversationUnavailableReason, CreateEnrollmentRequest,
     CreateTaskRequest, DesiredAction, ExecutionEventsPage, ExecutionEventsQuery,
@@ -30,19 +28,20 @@ use narsor::controller_protocol::{
     RunnerCredentialRequest, RunnerDirective, SubmitInputRequest, SubmitOperatorCommandRequest,
     TaskDefaultHarness, TaskSummary, LOCAL_OWNER,
 };
-use narsor::domain::{
+use narsor_engine::domain::{
     BackendId, DisplayLink, Event, EventData, ExecutionStatus, TaskDisplay, TaskId,
     WorkflowExecution, Workspace,
 };
-use narsor::engine::{Engine, HumanInputDelivery, PendingHumanInput, Timeline};
-use narsor::orchestration::{
+use narsor_engine::engine::{Engine, PendingHumanInput, Timeline};
+use narsor_engine::orchestration::{
     AttentionItem, AttentionKind, Clock, CommandRequest, ControlPlane, ConversationAttemptSummary,
     ConversationAvailability, ExecutionCursor, InputStatus, NewTask, Observation, ObservedSummary,
     OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, PendingInputRef,
     ResourceIdentity, ResumePolicy, RunnerSnapshot, TaskEventKind, TaskLifecycle,
 };
-use narsor::persistence::paths::{temp_path_for, StatePaths};
-use narsor::persistence::{DaemonInfo, DefaultHarnessSelector, ExecutionStore};
+use narsor_engine::persistence::paths::{temp_path_for, StatePaths};
+use narsor_engine::persistence::{DaemonInfo, DefaultHarnessSelector, ExecutionStore};
+use narsor_server::api::{self, ApiServices, ConversationResponse as PageResponse};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -149,10 +148,10 @@ impl Harness {
         } else {
             None
         };
-        let resolver: Arc<dyn narsor::environment::LaunchResolver> = match &selector {
+        let resolver: Arc<dyn narsor_engine::environment::LaunchResolver> = match &selector {
             Some(selector) => environment_support::seeded_catalog_resolver_with(
                 root.path(),
-                Arc::clone(selector) as Arc<dyn narsor::environment::HarnessDefaults>,
+                Arc::clone(selector) as Arc<dyn narsor_engine::environment::HarnessDefaults>,
             ),
             None => environment_support::seeded_resolver(root.path()),
         };
@@ -383,10 +382,10 @@ fn snapshot(
     }
 }
 
-fn delivery(comment: &str) -> HumanInputDelivery {
-    HumanInputDelivery {
+fn delivery(comment: &str) -> narsor_protocol::api::HumanInputDeliveryDto {
+    narsor_protocol::api::HumanInputDeliveryDto {
         comment: Some(comment.to_string()),
-        ..HumanInputDelivery::default()
+        ..narsor_protocol::api::HumanInputDeliveryDto::default()
     }
 }
 
@@ -1108,7 +1107,7 @@ async fn ae12_client_reads_and_answers_a_remote_task_through_the_control_plane()
     }
     let summary = harness.task("task-1").await;
     let waiting = summary.runner.unwrap().pending_input.unwrap();
-    assert_eq!(waiting.form.request.instruction, "Approve the plan?");
+    assert_eq!(waiting.form["instruction"], "Approve the plan?");
 
     // The answer travels owner → control plane → runner long-poll.
     let poll = {
@@ -1209,14 +1208,14 @@ async fn owner_scope_hides_other_owners_tasks() {
         .create_task(NewTask::new(
             foreign.clone(),
             OwnerRef::new("someone-else"),
-            narsor::domain::BackendId::parse("k8s").unwrap(),
-            narsor::domain::TaskLaunchSpec::new(
+            narsor_engine::domain::BackendId::parse("k8s").unwrap(),
+            narsor_engine::domain::TaskLaunchSpec::new(
                 "wf",
                 1,
                 serde_json::json!({}),
-                narsor::domain::TaskWorkspace::None,
-                narsor::domain::ResolvedEnvironment::harness_only("claude-code"),
-                narsor::domain::ResourceProfile::new(1000, 2048),
+                narsor_engine::domain::TaskWorkspace::None,
+                narsor_engine::domain::ResolvedEnvironment::harness_only("claude-code"),
+                narsor_engine::domain::ResourceProfile::new(1000, 2048),
             ),
         ))
         .expect("foreign task");
@@ -1266,15 +1265,15 @@ async fn the_daemon_recovers_the_control_plane_at_startup_and_serves_it() {
     control
         .create_task(NewTask::new(
             task.clone(),
-            OwnerRef::new(narsor::controller_protocol::LOCAL_OWNER),
-            narsor::domain::BackendId::parse("k8s").unwrap(),
-            narsor::domain::TaskLaunchSpec::new(
+            OwnerRef::new(narsor_engine::controller_protocol::LOCAL_OWNER),
+            narsor_engine::domain::BackendId::parse("k8s").unwrap(),
+            narsor_engine::domain::TaskLaunchSpec::new(
                 "wf",
                 1,
                 serde_json::json!({}),
-                narsor::domain::TaskWorkspace::None,
-                narsor::domain::ResolvedEnvironment::harness_only("claude-code"),
-                narsor::domain::ResourceProfile::new(1000, 2048),
+                narsor_engine::domain::TaskWorkspace::None,
+                narsor_engine::domain::ResolvedEnvironment::harness_only("claude-code"),
+                narsor_engine::domain::ResourceProfile::new(1000, 2048),
             ),
         ))
         .expect("create");
@@ -1381,7 +1380,7 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
 #[tokio::test]
 async fn a_launch_that_does_not_resolve_is_refused_and_stores_nothing() {
     let harness = Harness::start().await;
-    let catalog = narsor::environment::EnvironmentCatalog::new(harness.root.path());
+    let catalog = narsor_engine::environment::EnvironmentCatalog::new(harness.root.path());
     let mut bad_limits = environment_support::backend("backend-a");
     bad_limits.limits.max_concurrent_tasks = 0;
     fs::write(
@@ -1390,7 +1389,7 @@ async fn a_launch_that_does_not_resolve_is_refused_and_stores_nothing() {
     )
     .unwrap();
     catalog
-        .save_profile(&narsor::environment::ProfileRecord {
+        .save_profile(&narsor_engine::environment::ProfileRecord {
             id: "unregistered".to_string(),
             version: 1,
             secrets: vec!["aws-key".to_string()],
@@ -1481,12 +1480,15 @@ async fn an_existing_task_keeps_its_resolved_environment_after_configuration_cha
 
     let (controller, _) = harness.controller("k8s").await;
     let commands = controller.commands(0, true).await.expect("commands");
-    let spec = &commands
+    let spec = commands
         .commands
         .iter()
         .find(|command| command.task_id.as_str() == "task-1")
         .expect("task-1 command")
-        .launch_spec;
+        .launch_spec
+        .clone();
+    let spec: narsor_engine::domain::TaskLaunchSpec =
+        serde_json::from_value(spec).expect("decode protocol launch spec");
     assert_eq!(
         spec.environment.base_image.as_ref().unwrap().pinned,
         environment_support::workflow_image(),
@@ -1499,12 +1501,12 @@ async fn secret_values_never_reach_records_responses_or_events() {
     // A credential value as the backend's own store would hold it. The
     // control plane is only ever told where it lives.
     const SENTINEL: &str = "SENTINEL-s3cr3t-value-6f1c";
-    let value = narsor::domain::SecretValue::new(SENTINEL);
+    let value = narsor_engine::domain::SecretValue::new(SENTINEL);
     assert!(!format!("{value:?}").contains(SENTINEL));
 
     let harness = Harness::start().await;
-    narsor::environment::EnvironmentCatalog::new(harness.root.path())
-        .save_profile(&narsor::environment::ProfileRecord {
+    narsor_engine::environment::EnvironmentCatalog::new(harness.root.path())
+        .save_profile(&narsor_engine::environment::ProfileRecord {
             id: "default".to_string(),
             version: 1,
             secrets: vec!["github-token".to_string()],
@@ -1520,13 +1522,15 @@ async fn secret_values_never_reach_records_responses_or_events() {
         .await
         .expect("events");
 
-    let spec = &commands.commands[0].launch_spec;
+    let spec: narsor_engine::domain::TaskLaunchSpec =
+        serde_json::from_value(commands.commands[0].launch_spec.clone())
+            .expect("decode protocol launch spec");
     assert_eq!(spec.environment.secrets.len(), 1, "the reference is there");
     let mut serialized = vec![
         serde_json::to_string(&summary).unwrap(),
         serde_json::to_string(&commands).unwrap(),
         serde_json::to_string(&events).unwrap(),
-        serde_json::to_string(spec).unwrap(),
+        serde_json::to_string(&spec).unwrap(),
     ];
     for path in files_under(harness.root.path()) {
         if let Ok(text) = fs::read_to_string(&path) {
@@ -2360,21 +2364,21 @@ async fn the_timeline_names_the_status_state_and_attempt_under_way() {
     let harness = Harness::start().await;
     let Running { runner, .. } = harness.running("task-1", "k8s").await;
     let mut report = snapshot(2, ExecutionStatus::Running, 4, None);
-    report.timeline = Some(narsor::engine::Timeline {
-        positions: vec![narsor::engine::Position {
+    report.timeline = Some(narsor_engine::engine::Timeline {
+        positions: vec![narsor_engine::engine::Position {
             label: "review#1".to_string(),
             state_id: "review".to_string(),
             visit: 1,
             action_execution_id: Some("act-7".to_string()),
             action_type: Some("agent".to_string()),
-            status: narsor::engine::PositionStatus::InProgress,
+            status: narsor_engine::engine::PositionStatus::InProgress,
             started_at: None,
             ended_at: None,
             error: None,
             resumed_harness_session: None,
             harness_session_interrupted: false,
             retry_pending: false,
-            conversation: narsor::engine::ConversationState::NoRecord,
+            conversation: narsor_engine::engine::ConversationState::NoRecord,
         }],
         ..Default::default()
     });
@@ -2384,7 +2388,10 @@ async fn the_timeline_names_the_status_state_and_attempt_under_way() {
         .control_timeline("task-1")
         .await
         .expect("timeline");
-    assert_eq!(timeline.execution_status, Some(ExecutionStatus::Running));
+    assert_eq!(
+        timeline.execution_status,
+        Some(narsor_protocol::api::ExecutionStatusDto::Running)
+    );
     assert_eq!(timeline.current_state.as_deref(), Some("review"));
     assert_eq!(timeline.current_position.as_deref(), Some("review#1"));
 }
@@ -2554,13 +2561,13 @@ async fn another_owners_task_has_no_execution_events_to_read() {
             TaskId::parse("foreign").unwrap(),
             OwnerRef::new("someone-else"),
             BackendId::parse("k8s").unwrap(),
-            narsor::domain::TaskLaunchSpec::new(
+            narsor_engine::domain::TaskLaunchSpec::new(
                 "wf",
                 1,
                 serde_json::json!({}),
-                narsor::domain::TaskWorkspace::None,
-                narsor::domain::ResolvedEnvironment::harness_only("claude-code"),
-                narsor::domain::ResourceProfile::new(1000, 2048),
+                narsor_engine::domain::TaskWorkspace::None,
+                narsor_engine::domain::ResolvedEnvironment::harness_only("claude-code"),
+                narsor_engine::domain::ResourceProfile::new(1000, 2048),
             ),
         ))
         .expect("foreign task");
@@ -2618,7 +2625,7 @@ async fn a_paused_local_task_is_read_from_its_own_storage() {
             started_at: Utc::now(),
             completed_at: None,
             inputs: serde_json::json!({}),
-            context: narsor::domain::Context::new(),
+            context: narsor_engine::domain::Context::new(),
             workspace: Workspace::local_folder("/tmp/none".to_string()),
             current_action_execution: None,
             metadata: serde_json::json!({}),
@@ -2657,21 +2664,21 @@ async fn timeline_text_from_a_runner_is_cleaned_before_it_is_stored() {
     let harness = Harness::start().await;
     let Running { runner, .. } = harness.running("task-1", "k8s").await;
     let mut report = snapshot(2, ExecutionStatus::Running, 4, None);
-    report.timeline = Some(narsor::engine::Timeline {
-        positions: vec![narsor::engine::Position {
+    report.timeline = Some(narsor_engine::engine::Timeline {
+        positions: vec![narsor_engine::engine::Position {
             label: "re\u{1b}[31mview#1\u{202e}".to_string(),
             state_id: "review".to_string(),
             visit: 1,
             action_execution_id: Some("act\u{7}-7".to_string()),
             action_type: Some("ag\u{1b}]8;;x\u{7}ent".to_string()),
-            status: narsor::engine::PositionStatus::Failed,
+            status: narsor_engine::engine::PositionStatus::Failed,
             started_at: None,
             ended_at: None,
             error: Some("bad\u{1b}[2J".to_string()),
             resumed_harness_session: None,
             harness_session_interrupted: false,
             retry_pending: false,
-            conversation: narsor::engine::ConversationState::NotCreated {
+            conversation: narsor_engine::engine::ConversationState::NotCreated {
                 reason: "why\u{200b}".to_string(),
             },
         }],
@@ -2705,18 +2712,21 @@ async fn timeline_text_from_a_runner_is_cleaned_before_it_is_stored() {
 
 fn conductor_entry(
     sequence: u64,
-    author: narsor::conductor::ChatAuthor,
+    author: narsor_engine::conductor::ChatAuthor,
     text: &str,
-) -> narsor::conductor::ChatEntry {
-    let mut entry =
-        narsor::conductor::ChatEntry::new(author, narsor::conductor::ChatEntryKind::Message, text);
+) -> narsor_engine::conductor::ChatEntry {
+    let mut entry = narsor_engine::conductor::ChatEntry::new(
+        author,
+        narsor_engine::conductor::ChatEntryKind::Message,
+        text,
+    );
     entry.sequence = sequence;
     entry
 }
 
 /// The runner side of one relayed conductor read: wait for the request,
 /// upload `view`.
-async fn answer_conductor(runner: &RunnerClient, view: narsor::conductor::ConductorView) {
+async fn answer_conductor(runner: &RunnerClient, view: narsor_engine::conductor::ConductorView) {
     loop {
         let poll = runner.poll(None, 5).await.expect("poll");
         if let Some(request) = poll.conductor_reads.first() {
@@ -2748,10 +2758,11 @@ async fn the_conductor_of_a_live_runner_travels_through_the_relay_and_is_cleaned
                 .await
         })
     };
-    let mut view = narsor::conductor::ConductorView::unavailable("unused").available_on("codex");
+    let mut view =
+        narsor_engine::conductor::ConductorView::unavailable("unused").available_on("codex");
     view.chat = vec![conductor_entry(
         5,
-        narsor::conductor::ChatAuthor::Conductor,
+        narsor_engine::conductor::ChatAuthor::Conductor,
         "line one\nline\u{1b}[31m two\u{202e}",
     )];
     view.unavailable_reason = None;
@@ -2874,18 +2885,18 @@ async fn the_conductor_of_a_stopped_local_task_is_read_from_its_own_storage() {
             started_at: Utc::now(),
             completed_at: None,
             inputs: serde_json::json!({}),
-            context: narsor::domain::Context::new(),
+            context: narsor_engine::domain::Context::new(),
             workspace: Workspace::local_folder("/tmp/none".to_string()),
             current_action_execution: None,
             metadata: serde_json::json!({}),
         })
         .expect("execution");
-    let conductor = narsor::conductor::ConductorStore::new(store.paths(), "exec-1");
+    let conductor = narsor_engine::conductor::ConductorStore::new(store.paths(), "exec-1");
     for text in ["first", "second\u{1b}[2J", "third"] {
         conductor
             .append_chat(conductor_entry(
                 0,
-                narsor::conductor::ChatAuthor::Operator,
+                narsor_engine::conductor::ChatAuthor::Operator,
                 text,
             ))
             .expect("chat");
@@ -3035,7 +3046,7 @@ async fn what_a_runner_says_of_its_problem_and_its_conductor_is_cleaned() {
     let harness = Harness::start().await;
     let Running { runner, .. } = harness.running("task-1", "k8s").await;
     let mut report = snapshot(2, ExecutionStatus::Running, 4, None);
-    report.problem = Some(narsor::orchestration::RunnerProblem {
+    report.problem = Some(narsor_engine::orchestration::RunnerProblem {
         code: "base\u{1b}_image".to_string(),
         message: "no git\u{1b}[2J\u{202e} here".to_string(),
     });
@@ -3120,7 +3131,7 @@ async fn a_backend_that_does_not_run_the_default_hears_why_and_the_owner_sees_it
     }
 
     let mut report = snapshot(2, ExecutionStatus::Running, 4, None);
-    report.default_harness_unavailable = Some(narsor::orchestration::HarnessUnavailable {
+    report.default_harness_unavailable = Some(narsor_engine::orchestration::HarnessUnavailable {
         harness: "opencode".to_string(),
         kept: "claude-code".to_string(),
         reason: "backend 'k8s' runs only\u{1b}[2J claude-code".to_string(),
@@ -3170,8 +3181,8 @@ async fn a_change_of_the_default_answers_an_open_long_poll_at_once() {
 }
 
 /// A long-poll of a runner that says it runs on `on`.
-fn poll_on(on: &str, wait_secs: u64) -> narsor::controller_protocol::RunnerPollQuery {
-    narsor::controller_protocol::RunnerPollQuery {
+fn poll_on(on: &str, wait_secs: u64) -> narsor_engine::controller_protocol::RunnerPollQuery {
+    narsor_engine::controller_protocol::RunnerPollQuery {
         wait_secs: Some(wait_secs),
         harness: Some(on.to_string()),
         ..Default::default()
@@ -3243,7 +3254,7 @@ async fn an_unavailable_default_does_not_answer_the_poll_at_once() {
 /// reads; one without it does not send the field.
 #[test]
 fn a_poll_without_the_runners_harness_still_reads() {
-    let query: narsor::controller_protocol::RunnerPollQuery =
+    let query: narsor_engine::controller_protocol::RunnerPollQuery =
         serde_json::from_value(serde_json::json!({ "wait_secs": 5 })).expect("an old poll");
     assert_eq!(query.harness, None);
     assert_eq!(query.wait_secs, Some(5));
@@ -3269,7 +3280,7 @@ async fn without_a_selector_the_answers_carry_no_default_harness() {
 /// Answers and views from before U7 still read.
 #[test]
 fn answers_and_views_without_the_default_harness_still_read() {
-    let poll: narsor::controller_protocol::RunnerPollResponse =
+    let poll: narsor_engine::controller_protocol::RunnerPollResponse =
         serde_json::from_value(serde_json::json!({
             "directive": "continue",
             "generation": 1,
@@ -3365,7 +3376,7 @@ async fn the_daemons_periodic_pass_resumes_a_due_interrupted_task() {
         .await
         .expect("loss");
 
-    let pass = narsor::cli::daemon::run_periodic_pass(&harness.service);
+    let pass = narsor_server::runtime::run_periodic_pass(&harness.service);
 
     assert_eq!(pass.resumed, vec![TaskId::parse("task-1").unwrap()]);
     let record = harness
@@ -3427,7 +3438,7 @@ async fn the_resume_policy_resumes_a_lost_task_once_in_one_mutation() {
     assert_eq!(resumes.len(), 1);
     assert_eq!(
         resumes[0].actor,
-        narsor::orchestration::CommandActor::Policy
+        narsor_engine::orchestration::CommandActor::Policy
     );
     assert_eq!(resumes[0].idempotency_key, "auto-resume:1");
     assert_eq!(record.resume.consecutive_losses, 1, "the count stays");
@@ -3463,7 +3474,7 @@ async fn the_resume_policy_resumes_a_lost_task_once_in_one_mutation() {
     assert_eq!(answer.launch.authorized_by, Some(OwnerCommand::Resume));
     assert_eq!(
         answer.launch.authorized_by_actor,
-        Some(narsor::orchestration::CommandActor::Policy)
+        Some(narsor_engine::orchestration::CommandActor::Policy)
     );
 }
 
@@ -3516,7 +3527,7 @@ async fn an_owner_command_first_makes_the_policy_step_aside() {
     assert!(
         matches!(
             refused,
-            Err(narsor::orchestration::OrchestrationError::StaleGeneration { .. })
+            Err(narsor_engine::orchestration::OrchestrationError::StaleGeneration { .. })
         ),
         "{refused:?}"
     );
@@ -3716,7 +3727,7 @@ fn record_attempt(store: &ExecutionStore, entries: usize) {
             started_at: Utc::now(),
             completed_at: None,
             inputs: serde_json::json!({}),
-            context: narsor::domain::Context::new(),
+            context: narsor_engine::domain::Context::new(),
             workspace: Workspace::local_folder("/tmp/none".to_string()),
             current_action_execution: None,
             metadata: serde_json::json!({}),
@@ -3867,7 +3878,7 @@ async fn answer_page_from(runner: &RunnerClient, store: &ExecutionStore) {
             let accepted = runner
                 .upload_conversation_page(
                     &request.request_id,
-                    &narsor::api::conversation_response_from_snapshot(read),
+                    &narsor_engine::api::conversation_response_from_snapshot(read),
                 )
                 .await
                 .expect("upload");
@@ -4270,7 +4281,7 @@ fn a_task_summary_from_a_server_before_the_resume_policy_decodes_empty() {
 
 #[test]
 fn a_runner_launch_from_a_control_plane_before_the_policy_has_no_actor() {
-    let launch: narsor::controller_protocol::RunnerLaunchView =
+    let launch: narsor_engine::controller_protocol::RunnerLaunchView =
         serde_json::from_value(serde_json::json!({
             "incarnation": "inc-1",
             "launch_generation": 2,
@@ -4325,7 +4336,7 @@ fn an_unavailable_reason_of_a_newer_server_decodes_as_unrecognized() {
 
 #[test]
 fn a_newer_servers_event_and_observation_kinds_decode_as_unrecognized() {
-    let envelope: narsor::controller_protocol::ControlEventEnvelope =
+    let envelope: narsor_engine::controller_protocol::ControlEventEnvelope =
         serde_json::from_value(serde_json::json!({
             "cursor": "task-1:9",
             "event": {

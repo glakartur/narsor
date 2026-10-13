@@ -10,18 +10,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use narsor::domain::{
+use narsor_engine::domain::{
     ActionConfig, Event, EventData, ExecutionStatus, HumanActionConfig, HumanInputField,
     HumanInputType, OutputDefinition, WorkflowExecution, Workspace,
 };
-use narsor::engine::actions::human::{
+use narsor_engine::engine::actions::human::{
     self, HumanActionError, PendingHumanInput, ResumedHumanAction,
 };
-use narsor::engine::{
+use narsor_engine::engine::{
     ActionExecutor, ActionOutcome, ActionRequest, HumanExecutor, HumanInputDelivery,
     SuspendedAction,
 };
-use narsor::persistence::ExecutionStore;
+use narsor_engine::persistence::ExecutionStore;
 use serde_json::{json, Map, Value};
 
 // ---------------------------------------------------------------------------
@@ -130,7 +130,7 @@ fn start_execution(store: &ExecutionStore, workspace_path: &Path) -> WorkflowExe
         started_at: chrono::Utc::now(),
         completed_at: None,
         inputs: json!({}),
-        context: narsor::domain::Context::new(),
+        context: narsor_engine::domain::Context::new(),
         workspace: Workspace::local_folder(workspace_path.to_string_lossy().into_owned()),
         current_action_execution: None,
         metadata: json!({}),
@@ -228,7 +228,7 @@ async fn executor_suspends_instead_of_running_anything() {
 
 #[tokio::test]
 async fn executor_rejects_an_action_of_another_type() {
-    let action = ActionConfig::Script(narsor::domain::ScriptActionConfig {
+    let action = ActionConfig::Script(narsor_engine::domain::ScriptActionConfig {
         command: "true".to_string(),
         args: Vec::new(),
         working_dir: None,
@@ -783,11 +783,11 @@ async fn a_pending_request_of_a_non_paused_execution_is_not_offered() {
 // Problems: the `ResolveOutput` request (U5)
 // ---------------------------------------------------------------------------
 
-use narsor::domain::{AnsweredBy, InputCloseReason};
-use narsor::engine::actions::human::{
+use narsor_engine::domain::{AnsweredBy, InputCloseReason};
+use narsor_engine::engine::actions::human::{
     InputContinuation, OutputProblem, OutputRequirement, RejectedAnswer,
 };
-use narsor::engine::HumanInputRequest;
+use narsor_engine::engine::HumanInputRequest;
 
 /// Suspends `execution` on a problem of state `work`: labels `implemented`
 /// (needs `variables.summary`) and `needs_human_decision` (needs

@@ -1,0 +1,1 @@
+{"reviewer":"reliability","status":"complete","findings":[],"testing_gaps":["No installed-style integration test covers narsor daemon stop resolving and launching an adjacent narsor-server binary."]}

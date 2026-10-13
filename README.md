@@ -37,10 +37,29 @@ Design documentation (written in Polish, and normative):
 ### Building and testing
 
 ```bash
-cargo build              # builds target/debug/narsor
-cargo test               # the whole suite (unit + integration), without daemon tests
-cargo test -- --include-ignored   # also the tests that start a real `narsor daemon`
-cargo build --release    # release build
+cargo build --workspace --bins
+cargo test --workspace
+cargo test --workspace -- --include-ignored  # also process lifecycle tests
+cargo build --workspace --bins --release
+```
+
+The include-ignored run also exercises three CLI cases that remain marked
+ignored because conductor status/chat and problem recovery are not yet wired
+to scheduler-admitted runner executions. It therefore currently reports those
+three failures; they await the unified task scheduler follow-up. The
+live-cluster Kubernetes smoke test also requires its documented environment
+variables and a reachable cluster.
+
+The workspace build keeps `narsor`, `narsor-cli`, `narsor-server`,
+`narsor-runner`, and `narsor-controller` together in `target/debug` (or
+`target/release`), so the client can find the server and the server can find
+the local runner. To install all process binaries into the same directory:
+
+```bash
+cargo install --path . --bins
+cargo install --path crates/narsor-server
+cargo install --path crates/narsor-runner
+cargo install --path crates/narsor-controller
 ```
 
 The integration tests run against a real filesystem and spawn real child
@@ -52,22 +71,22 @@ processes — always in temporary directories, never inside the repository.
 
 ```bash
 # 1. Check the definition
-narsor validate tests/fixtures/cli/greet.yaml
+narsor-cli validate tests/fixtures/cli/greet.yaml
 
 # 2. Run the workflow
-narsor run tests/fixtures/cli/greet.yaml \
+narsor-cli run tests/fixtures/cli/greet.yaml \
     --input "greeting=Good morning" \
     --input "script_path=$PWD/tests/fixtures/cli/announce.sh"
 
 # 3. See what is going on
-narsor list
-narsor show <EXECUTION_ID>
+narsor-cli list
+narsor-cli show <EXECUTION_ID>
 
 # 4. Answer the question the workflow asked
-narsor input <EXECUTION_ID> --field approval_status=approved
+narsor-cli input <EXECUTION_ID> --field approval_status=approved
 
-# …or drive all of that from the full-screen interface
-narsor tui
+# …or open the full-screen interface
+narsor
 ```
 
 ---
@@ -76,20 +95,27 @@ narsor tui
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--root <DIRECTORY>` | `./.narsor` | The data directory: executions and workspaces. Applies to every subcommand, `tui` included. |
+| `--root <DIRECTORY>` | `./.narsor` | The data directory: executions and workspaces. Used by the TUI and by CLI commands that need local state. |
 | `--config <FILE>` | searched for | The configuration file to read instead of searching. A path that is not there is a usage error, not a fall-through. |
-| `--server <URL>` | `NARSOR_SERVER`, else the local daemon | The control plane for `task`, `backend`, `auth`, `controller` and `tui`: `https://` (plain `http://` only for loopback). See [Remote tasks](#remote-tasks-and-backends). |
+| `--server <URL>` | `NARSOR_SERVER`, else the local server | The control plane for `narsor` and `narsor-cli`: `https://` (plain `http://` only for loopback). See [Remote tasks](#remote-tasks-and-backends). |
 | `--token-file <FILE>`, `--token-command <CMD>` | `NARSOR_TOKEN_FILE`, `NARSOR_TOKEN_COMMAND`, `NARSOR_TOKEN` | Where the OIDC token for `--server` comes from; a file or command is read again after a `401`. Never a command-line value. |
 | `--help`, `--version` | — | Help and version. |
 
 `tracing` logs go to **stderr** and the output of the command to **stdout**, so
-that `narsor list | grep paused` keeps working with `RUST_LOG=debug` set.
-The exception is `tui`, which owns the whole terminal: see
-[`tui`](#tui) below.
+that `narsor-cli list | grep paused` keeps working with `RUST_LOG=debug` set.
+The TUI is the `narsor` binary and owns the whole terminal; operator commands
+run through `narsor-cli`.
 
 ---
 
-## Subcommands
+## CLI commands (`narsor-cli`)
+
+Task commands use the local `narsor-server` discovered for `--root`, starting
+the sibling server when needed. To run the server in the foreground, use
+`narsor-server --root <DIRECTORY>`. `narsor-cli daemon stop` sends a graceful
+stop signal to the server recorded for that state directory; it does not start
+the server. The same lifecycle operation is available as
+`narsor-server stop --root <DIRECTORY>`.
 
 ### `validate <FILE>`
 
@@ -98,10 +124,10 @@ consistency, well-formed actions and decisions, references to variables. It
 reports **every** violation at once, not just the first one it meets.
 
 ```console
-$ narsor validate tests/fixtures/implement_feature.yaml
+$ narsor-cli validate tests/fixtures/implement_feature.yaml
 The definition is valid: implement-feature (version 1), states: 9, initial state: analyze.
 
-$ narsor validate tests/fixtures/invalid/five_violations.yaml
+$ narsor-cli validate tests/fixtures/invalid/five_violations.yaml
 Definition 'tests/fixtures/invalid/five_violations.yaml' is invalid — 5 violations found:
   - ...
 ```
@@ -120,7 +146,7 @@ the context as a boolean and not as a string. Missing required inputs are
 reported **before** anything is written to disk.
 
 ```console
-$ narsor run tests/fixtures/cli/greet.yaml \
+$ narsor-cli run tests/fixtures/cli/greet.yaml \
       --input "greeting=Good morning" \
       --input "script_path=$PWD/tests/fixtures/cli/announce.sh" \
       --input is_experimental=true
@@ -167,7 +193,7 @@ Lists the executions in the data directory, newest first. An empty store is not
 an error.
 
 ```console
-$ narsor list
+$ narsor-cli list
 ID                                     STATUS     STATE                  WORKFLOW
 4f1c8f0e-...-9b21                      paused     approve                cli-greet
 ```
@@ -189,7 +215,7 @@ the same when they return.
 > them; only executions that predate the scheduler have them.
 
 ```console
-$ narsor show 4f1c8f0e-...-9b21
+$ narsor-cli show 4f1c8f0e-...-9b21
 Execution:     4f1c8f0e-...-9b21
 Workflow:      cli-greet (version 1)
 Status:        paused
@@ -234,7 +260,7 @@ for an agent step — whether its conversation was recorded, never created (with
 why), or is unavailable because the log predates conversation records.
 
 ```console
-$ narsor steps 4f1c8f0e-...-9b21
+$ narsor-cli steps 4f1c8f0e-...-9b21
 plan #1        failed             agent      2026-09-26T10:00:00+00:00  ->  2026-09-26T10:00:01+00:00
     error: harness exited without a result
 plan #2        succeeded          agent      2026-09-26T10:00:02+00:00  ->  2026-09-26T10:00:20+00:00
@@ -255,7 +281,7 @@ never started, or a step from a log written before this feature existed — is
 a readable failure, not silent empty output.
 
 ```console
-$ narsor conversation 4f1c8f0e-...-9b21 3f9c2e10-...-77aa
+$ narsor-cli conversation 4f1c8f0e-...-9b21 3f9c2e10-...-77aa
     1  2026-09-26T10:00:02+00:00  narsor     prompt: implement the feature…
     2  2026-09-26T10:00:03+00:00  assistant  I'll start by reading the existing tests.
     3  2026-09-26T10:00:04+00:00  tool call  {"name":"bash","input":{"command":"cargo test"}}
@@ -290,12 +316,12 @@ closed in the meantime (another window, a transition), it is refused rather
 than applied to whatever the execution waits on next.
 
 ```console
-$ narsor input 4f1c8f0e-...-9b21 --label implemented --data units_completed=3
+$ narsor-cli input 4f1c8f0e-...-9b21 --label implemented --data units_completed=3
 Input delivered to execution 4f1c8f0e-...-9b21.
 ```
 
 ```console
-$ narsor input 4f1c8f0e-...-9b21 --field approval_status=approved
+$ narsor-cli input 4f1c8f0e-...-9b21 --field approval_status=approved
 Input delivered to execution 4f1c8f0e-...-9b21.
 Status: completed
 Current state: completed
@@ -319,7 +345,7 @@ with a readable message instead of starting the step twice. Like `resume`, it
 waits for the execution to stop and exits `1` if it failed again.
 
 ```console
-$ narsor recover 4f1c8f0e-...-9b21 --comment "The script is back in place."
+$ narsor-cli recover 4f1c8f0e-...-9b21 --comment "The script is back in place."
 Recovered execution 4f1c8f0e-...-9b21.
 Status: completed
 Current state: completed
@@ -343,8 +369,8 @@ Every setting, its effective value and where that value came from. See
 environment variables.
 
 ```bash
-narsor config show
-narsor config show --format json | jq '.settings.data_dir.source'
+narsor-cli config show
+narsor-cli config show --format json | jq '.settings.data_dir.source'
 ```
 
 It creates nothing, needs no writable home and no existing data directory, and
@@ -375,7 +401,7 @@ reads as an option) or using the `ext::` transport (which makes `git` run an
 arbitrary command) is refused here rather than halfway through a run.
 
 ```console
-$ narsor repo add acme-api \
+$ narsor-cli repo add acme-api \
       --remote https://github.com/acme/api.git \
       --name "ACME API" \
       --provider github \
@@ -383,7 +409,7 @@ $ narsor repo add acme-api \
       --description "The public API service."
 Registered repository 'acme-api' -> https://github.com/acme/api.git
 
-$ narsor repo add acme-api --remote https://github.com/acme/other.git
+$ narsor-cli repo add acme-api --remote https://github.com/acme/other.git
 Could not register the repository: repository 'acme-api' is already registered in '…/repositories.json'
 ```
 
@@ -392,7 +418,7 @@ Could not register the repository: repository 'acme-api' is already registered i
 Every registered repository, ordered by id. An empty registry is not an error.
 
 ```console
-$ narsor repo list
+$ narsor-cli repo list
 ID                       PROVIDER   DEFAULT BRANCH   REMOTE
 acme-api                 github     main             https://github.com/acme/api.git
 acme-web                 gitlab     -                git@gitlab.com:acme/web.git
@@ -403,7 +429,7 @@ acme-web                 gitlab     -                git@gitlab.com:acme/web.git
 Every field of one entry. An unknown id is exit code `1`.
 
 ```console
-$ narsor repo show acme-api
+$ narsor-cli repo show acme-api
 Repository:     acme-api
 Name:           ACME API
 Provider:       github
@@ -419,7 +445,7 @@ silently accepted — an operator who mistypes an id would otherwise be told the
 repository is gone while it is still there.
 
 ```console
-$ narsor repo remove acme-web
+$ narsor-cli repo remove acme-web
 Removed repository 'acme-web'.
 ```
 
@@ -438,20 +464,20 @@ is resolved in this order:
 `RUST_LOG=debug` says which of the two was taken, on stderr.
 
 ```console
-$ narsor repo add acme-api --remote /srv/git/api --default-branch main
-$ narsor run pipeline.yaml --input repository=acme-api   # clones /srv/git/api
-$ narsor run pipeline.yaml --input repository=/srv/git/other   # raw remote
+$ narsor-cli repo add acme-api --remote /srv/git/api --default-branch main
+$ narsor-cli run pipeline.yaml --input repository=acme-api   # clones /srv/git/api
+$ narsor-cli run pipeline.yaml --input repository=/srv/git/other   # raw remote
 ```
 
-### `tui`
+### TUI (`narsor`)
 
 The full-screen terminal interface: a `lazygit`-shaped console over the
 control plane (`/control/v1`). There is one mode. The backend is the one the
-configuration names: the local daemon of `--root` (started when none runs, as
-for every other command), or a remote control plane with `--server` /
+configuration names: the local server of `--root` (started when none runs),
+or a remote control plane with `--server` /
 `NARSOR_SERVER` and a token (see [Remote tasks](#remote-tasks-and-backends)).
-`narsor tui --remote` is an ignored alias — it prints a warning on stderr and
-starts the same interface.
+Run `narsor --server https://control.example` to open the TUI against a remote
+server. Use `narsor-cli --server https://control.example ...` for CLI commands.
 
 ```text
 narsor · local ● live             harness claude-code (konfiguracja) · sloty 2/3 · ? 1 · ! 1
@@ -484,7 +510,7 @@ repositories use the same frames.
 
 **The list** is the queue: tasks stand in the order of the scheduler (`rank`),
 are never grouped or sorted by state, and change place only by an explicit
-action (`K` / `J` / `m`, the TUI's `narsor task move`). A row takes two lines.
+action (`K` / `J` / `m`, the TUI's `narsor-cli task move`). A row takes two lines.
 The first holds the attention mark (`?` a question or an approval, `!` a
 problem, a failed step or a failed provisioning), the state icon (`●` running,
 `◷` queued, `⟳` provisioning, `‖` paused, `✗` failed or interrupted, `✓` done,
@@ -549,30 +575,30 @@ reason. An action marked `!` asks `y` / `n` first.
 
 | Key | Action | The CLI it stands for |
 |---|---|---|
-| `K` / `J` / `m` | move in the queue (a place preview, `Enter` confirms) | `narsor task move` |
-| `p` | pause or resume | `narsor task pause` / `resume` |
-| `x` | interrupt the running step (`!`) | `narsor task interrupt` |
-| `t` | manual transition; with a reason, an override where the state allows it | `narsor task transition [--override --reason]` |
-| `s` | start again an interrupted task or a failed provisioning | `narsor task start` |
-| `a` | archive (`!`) | `narsor task archive` |
+| `K` / `J` / `m` | move in the queue (a place preview, `Enter` confirms) | `narsor-cli task move` |
+| `p` | pause or resume | `narsor-cli task pause` / `resume` |
+| `x` | interrupt the running step (`!`) | `narsor-cli task interrupt` |
+| `t` | manual transition; with a reason, an override where the state allows it | `narsor-cli task transition [--override --reason]` |
+| `s` | start again an interrupted task or a failed provisioning | `narsor-cli task start` |
+| `a` | archive (`!`) | `narsor-cli task archive` |
 | `o` | open a link of the task (`display.links`) in the browser | — |
-| `c` (*Dyrygent*) | write to the conductor | `narsor task conductor chat` |
-| `u` (*Dyrygent*) | undo a decision of the conductor (`!`) | `narsor task conductor undo` |
-| the panel | confirm / reject a proposal, restart a failed step with a note | `narsor task conductor confirm` / `reject`, `narsor task restart-step` |
-| `n` | new task (a catalogue workflow, or the path of a definition) | `narsor task create <workflow>`, `narsor task create --file <path>`; the catalogue is `narsor task workflows`, the check of a file `narsor task validate <path>` |
-| `i` / the panel | answer what waits: fields, `data`, `variables`, label, comment | `narsor task input <task> --field … --data … --variable … [--waiting-id ID]` |
-| `Space` | the next task that waits | `narsor task show` ends with `Next       waiting: <task>` |
-| `H` | history: archived tasks, and executions from before the scheduler (`w` recovers a failed one) | `narsor task list --archived`; `narsor task history list` / `show` / `events` / `steps` / `conversation` / `conductor` / `recover` |
-| `R` | repositories: `a` registers, `d` removes (`!`) | `narsor task repo list` / `add` / `remove` (the same registry on any server; `narsor repo …` is the local one) |
-| `h` | the installation's default agent harness: choose one, or go back to the configured one | `narsor harness default set <harness>` / `reset` (`narsor harness default` shows it) |
-| the header | what the connection offers | `narsor task capabilities` |
+| `c` (*Dyrygent*) | write to the conductor | `narsor-cli task conductor chat` |
+| `u` (*Dyrygent*) | undo a decision of the conductor (`!`) | `narsor-cli task conductor undo` |
+| the panel | confirm / reject a proposal, restart a failed step with a note | `narsor-cli task conductor confirm` / `reject`, `narsor-cli task restart-step` |
+| `n` | new task (a catalogue workflow, or the path of a definition) | `narsor-cli task create <workflow>`, `narsor-cli task create --file <path>`; the catalogue is `narsor-cli task workflows`, the check of a file `narsor-cli task validate <path>` |
+| `i` / the panel | answer what waits: fields, `data`, `variables`, label, comment | `narsor-cli task input <task> --field … --data … --variable … [--waiting-id ID]` |
+| `Space` | the next task that waits | `narsor-cli task show` ends with `Next       waiting: <task>` |
+| `H` | history: archived tasks, and executions from before the scheduler (`w` recovers a failed one) | `narsor-cli task list --archived`; `narsor-cli task history list` / `show` / `events` / `steps` / `conversation` / `conductor` / `recover` |
+| `R` | repositories: `a` registers, `d` removes (`!`) | `narsor-cli task repo list` / `add` / `remove` (the same registry on any server; `narsor-cli repo …` is the local one) |
+| `h` | the installation's default agent harness: choose one, or go back to the configured one | `narsor-cli harness default set <harness>` / `reset` (`narsor-cli harness default` shows it) |
+| the header | what the connection offers | `narsor-cli task capabilities` |
 
-The CLI of the remote-aware commands has a machine form too: `narsor task list
---json` and `narsor task show <task> --json` print the task summaries of the
+The CLI of the remote-aware commands has a machine form too: `narsor-cli task list
+--json` and `narsor-cli task show <task> --json` print the task summaries of the
 control plane as JSON (text an agent or a runner wrote is cleaned of what a
 terminal would act on). A workflow file, a file validation and the old
 executions of the history belong to the local daemon: any other server refuses
-them with the reason `narsor task capabilities` gives, and a repository is
+them with the reason `narsor-cli task capabilities` gives, and a repository is
 registered there by a remote git URL only.
 
 `n` opens the catalogue of workflows (built-in, user and root ones, with the
@@ -581,7 +607,7 @@ one as the form: the declared `type` decides what a value is (`boolean` and
 `repository` are choices, `integer` is checked) and a missing required input
 is reported next to the field. The last entry takes the path of a definition
 you are writing — validated first, every violation listed, as
-`narsor validate` does — which only a local daemon accepts. A new task is a
+`narsor-cli validate` does — which only a local server accepts. A new task is a
 row at the end of the list (`↻ wysyłanie…`) until the server lists it; one
 whose answer was lost is sent again with the same id, and `r` sends one that
 did not arrive.
@@ -637,31 +663,31 @@ resumed and archived through one owner API — clients never talk to a backend
 or a runner directly.
 
 ```bash
-narsor backend default                        # which backend new tasks get (set/reset to change)
-narsor harness default [--json]               # the default agent harness, for new and running tasks (set/reset to change)
-narsor task create implement-feature --input ticket=NAR-1 [--backend k8s]
-narsor task create --file ./my-workflow.yaml --input name=value   # a workflow file of the local daemon, checked first
-narsor task list [--archived] [--json]        # queue position (#n), `?`/`!` attention mark, backend, lifecycle, title; --archived: the history
-narsor task move <task> --before|--after <other> | --top | --bottom   # reorder a queued task
-narsor task show <task> [--json]              # title and links, what it waits on, observations with their age, timeline, conversation
-narsor task pause|resume|start|archive <task> # archive deletes the workload and its storage
-narsor task input <task> --field reason=ok [--data k=v] [--variable k=v] [--label L] [--waiting-id ID]   # answer the input the runner waits for
-narsor task interrupt <task>                      # cut short the step the runner works on
-narsor task transition <task> <state> [--override --reason <why>]   # manual transition; an override is audited
-narsor task restart-step <task> [--note <text>] [--failure-key K]   # run the failed or interrupted step again
-narsor task conversation <task> [<attempt>]   # read through the control plane
-narsor task watch                             # follow every task's events
-narsor task history list|show|events|steps|conversation|conductor|recover <execution>   # executions from before the scheduler (local daemon)
-narsor task repo list|add|remove              # the control plane's repository registry
-narsor task workflows | validate <path> | capabilities   # the catalogue, a file's violations, what the server offers
-narsor tui                                    # the interface over the same control plane (`--server` for a remote one)
+narsor-cli backend default                        # which backend new tasks get (set/reset to change)
+narsor-cli harness default [--json]               # the default agent harness, for new and running tasks (set/reset to change)
+narsor-cli task create implement-feature --input ticket=NAR-1 [--backend k8s]
+narsor-cli task create --file ./my-workflow.yaml --input name=value   # a workflow file of the local daemon, checked first
+narsor-cli task list [--archived] [--json]        # queue position (#n), `?`/`!` attention mark, backend, lifecycle, title; --archived: the history
+narsor-cli task move <task> --before|--after <other> | --top | --bottom   # reorder a queued task
+narsor-cli task show <task> [--json]              # title and links, what it waits on, observations with their age, timeline, conversation
+narsor-cli task pause|resume|start|archive <task> # archive deletes the workload and its storage
+narsor-cli task input <task> --field reason=ok [--data k=v] [--variable k=v] [--label L] [--waiting-id ID]   # answer the input the runner waits for
+narsor-cli task interrupt <task>                      # cut short the step the runner works on
+narsor-cli task transition <task> <state> [--override --reason <why>]   # manual transition; an override is audited
+narsor-cli task restart-step <task> [--note <text>] [--failure-key K]   # run the failed or interrupted step again
+narsor-cli task conversation <task> [<attempt>]   # read through the control plane
+narsor-cli task watch                             # follow every task's events
+narsor-cli task history list|show|events|steps|conversation|conductor|recover <execution>   # executions from before the scheduler (local daemon)
+narsor-cli task repo list|add|remove              # the control plane's repository registry
+narsor-cli task workflows | validate <path> | capabilities   # the catalogue, a file's violations, what the server offers
+narsor [--server URL]                         # the TUI over the same control plane
 ```
 
 Without `--server` these use the local daemon (trusted mode). For a network
 deployment pass `--server https://…` (or `NARSOR_SERVER`) and an OIDC access
 token via `NARSOR_TOKEN_FILE`, `NARSOR_TOKEN_COMMAND` or `NARSOR_TOKEN`; a
-fresh installation is claimed once with `narsor auth claim <code>`, and the
-owner enrolls controllers with `narsor controller enroll-code <backend>`.
+fresh installation is claimed once with `narsor-cli auth claim <code>`, and the
+owner enrolls controllers with `narsor-cli controller enroll-code <backend>`.
 
 Installation, network mode (OIDC, owner claim, TLS proxy), the backend and
 image catalogue, secrets, the Kubernetes manifests, controller enrollment and
@@ -672,7 +698,7 @@ credential rotation, lifecycle and scheduling semantics are described in
 
 The daemon runs a **conductor** beside every execution: an assistant on the
 installation's default harness (the operator's choice — `h` in the interface,
-`narsor harness default set` — or else the one `agent_harness` names) that
+`narsor-cli harness default set` — or else the one `agent_harness` names) that
 reads the task and never writes it. There is no per-task choice: a changed
 default reaches the conductor of every task, running ones included, from its
 next invocation; the *Dyrygent* tab names the harness it runs on. It has one history per
@@ -701,10 +727,10 @@ repeated once — also across a daemon restart — and then the operator gets a
 problem with the raw error; a failure of the conductor never triggers the
 conductor again.
 
-**The chat** (`c` in the task view, or `narsor conductor chat|history`) lets
+**The chat** (`c` in the task view, or `narsor-cli conductor chat|history`) lets
 you ask about the task. Whatever it proposes — answering the pending input,
 telling the agent something, restarting the failed step, taking a transition,
-cancelling — happens only once you confirm it (`narsor conductor confirm`,
+cancelling — happens only once you confirm it (`narsor-cli conductor confirm`,
 `reject`, `undo`). A proposal about a moment the execution has moved on from
 is refused (`409`). Only the conductor's latest choice of an output can be
 undone, and never on a cancelled execution.
@@ -745,19 +771,19 @@ analyze:
 ```
 
 `harness` is **optional**. An action that names none uses the installation's
-default harness: the operator's choice (`narsor harness default set <harness>`,
+default harness: the operator's choice (`narsor-cli harness default set <harness>`,
 or `h` in the TUI) when there is one, otherwise the configured
 `agent_harness`, and failing that the built-in `claude-code` — so a workflow
 without it is portable and still passes `validate`. The other side of that
 bargain: its behaviour then depends on the environment, and the same file may
 run a different agent on a laptop than in a container. Read the effective value
-with `narsor harness default` (the configured one with `narsor config show`); a
+with `narsor-cli harness default` (the configured one with `narsor-cli config show`); a
 workflow meant to run reproducibly should declare `harness:` explicitly.
 
 ```bash
-narsor harness default               # get: effective, configured, override, supported (--json: as JSON)
-narsor harness default set codex     # the operator's choice, until changed or reset
-narsor harness default reset         # back to the configured agent_harness
+narsor-cli harness default               # get: effective, configured, override, supported (--json: as JSON)
+narsor-cli harness default set codex     # the operator's choice, until changed or reset
+narsor-cli harness default reset         # back to the configured agent_harness
 ```
 
 **A change of the default reaches work already under way**, not only new
@@ -770,7 +796,7 @@ profile's) is the task's fallback, not a pin: the task follows the default
 like any other. A remote task's runner hears the default with every answer of
 the control plane; when the task's backend does not run that harness, or its
 binary is not on the runner's `PATH`, the task stays on the harness it has and
-reports it in its runner view (`default_harness_unavailable` in `narsor task
+reports it in its runner view (`default_harness_unavailable` in `narsor-cli task
 show --json`; one line in the TUI's details) — information, not a failure of a
 step.
 
@@ -781,7 +807,7 @@ that setting — a script state that declares no limit still has none.
 An agent that needs a person's answer without changing workflow stage returns
 `{"status":"awaiting_input","question":"...","options":["..."]}` rather than an output label.
 Narsor leaves the execution on that same agent state with status `input_needed`; the
-normal `narsor input <id> --field answer='...'` command resumes that state and
+normal `narsor-cli input <id> --field answer='...'` command resumes that state and
 adds the answer to the next agent prompt. Harness, sandbox, permission and tool
 failures remain action failures: the execution is `failed` on the current state
 and no workflow transition is taken.
@@ -887,7 +913,7 @@ attempt is open, compressed to `.jsonl.zst` once it closes. `AgentMessage`
 still carries only the harness's final text — the event log is not a place
 for megabytes of tool chatter — but nothing said over the stream is lost: the
 conversation record is the byte-for-byte source of truth for what the harness
-actually said, in order, prompt included. `narsor conversation <id> <attempt>`
+actually said, in order, prompt included. `narsor-cli conversation <id> <attempt>`
 (and the TUI's *Rozmowa* tab) read it; nothing else in narsor reads it. A conversation
 record's key is the attempt's `action_execution_id` — the same idempotency key
 D24 already assigns fresh on every attempt — so a retried step never shares
@@ -1025,7 +1051,7 @@ sits right there is the failure this layer exists to prevent.
 ```yaml
 # ~/.config/narsor/config.yaml — every key is optional
 data_dir: /srv/narsor        # executions, workspaces, the registry
-agent_harness: claude-code   # for an agent action that names none itself (unless `narsor harness default set` overrides it)
+agent_harness: claude-code   # for an agent action that names none itself (unless `narsor-cli harness default set` overrides it)
 agent_timeout: 30m           # for an agent action that declares none; `none` for no limit
 log_level: info              # off, error, warn, info, debug, trace
 tui_refresh_interval: 10s    # how often the TUI re-reads the daemon; `none` turns it off
@@ -1058,8 +1084,8 @@ the environment, or from a mounted `.env`.
 ### Seeing what is in force
 
 ```bash
-narsor config show                  # a table: setting, value, source
-narsor config show --format json    # the same, for a script
+narsor-cli config show                  # a table: setting, value, source
+narsor-cli config show --format json    # the same, for a script
 ```
 
 ```
@@ -1144,11 +1170,12 @@ version of the file intact.
 ## Workflows: built in, by name, overridable
 
 The two shipped workflows — `compound-engineering` and `open-mercato-sdlc` —
-are compiled into the binary, so `cargo install --path .` is enough to run them
-from anywhere:
+are compiled into `narsor-cli`; install the workspace process binaries as
+shown under [Building and testing](#building-and-testing) to run them from
+anywhere:
 
 ```bash
-narsor run compound-engineering \
+narsor-cli run compound-engineering \
   --input feature_description="rate-limit the public API" \
   --input target_repo=acme-api
 ```
@@ -1164,7 +1191,7 @@ hit wins:
 | 3 | `$XDG_CONFIG_HOME/narsor/workflows/<name>.yaml`, else `$HOME/.config/narsor/workflows/<name>.yaml` | `user` |
 | 4 | the workflow built into the binary | `built-in` |
 
-A path always wins, so `narsor run ./draft.yaml` keeps meaning exactly
+A path always wins, so `narsor-cli run ./draft.yaml` keeps meaning exactly
 that file. A copy in one of the directories **overrides** the built-in of the
 same name. When nothing matches, the error lists every place that was tried and
 names the built-ins.
@@ -1201,7 +1228,7 @@ your version.
 
 ### Starting one from the interface
 
-`narsor tui`, then `n`: the catalogue opens as a list, each row naming its
+`narsor`, then `n`: the catalogue opens as a list, each row naming its
 source (`built-in`, `user`, `root`, and `overrides: …` where a copy shadows a
 built-in). `j` / `k` change the selection and the inputs of the highlighted
 workflow are described beside it. `Enter` on a workflow goes into its inputs and
@@ -1219,7 +1246,7 @@ daemon only; the path is validated first and every violation is listed).
 An execution records both the definition's path (when it came from a file) and
 its workflow name, in `metadata.cli.definition_path` and
 `metadata.cli.definition_name`. A built-in has no path, so the name is what makes
-`narsor input` and `narsor resume` — and the interface — find the
+`narsor-cli input` and `narsor-cli resume` — and the interface — find the
 definition again in a later process. The path is used first when it is still
 there, so executions created before this existed keep resolving unchanged;
 `--file <WORKFLOW>` overrides both and accepts a name as well as a path.
@@ -1237,15 +1264,15 @@ and modelled on real agentic development processes rather than invented ones:
 | `workflows/open-mercato-sdlc.yaml` | Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | Open Mercato's `SDLC.md` and the `om-*` skills |
 
 ```sh
-narsor validate open-mercato-sdlc        # by name, from anywhere
+narsor-cli validate open-mercato-sdlc        # by name, from anywhere
 
-narsor repo add acme-web --remote git@github.com:acme/web.git   # once
-narsor run compound-engineering \
+narsor-cli repo add acme-web --remote git@github.com:acme/web.git   # once
+narsor-cli run compound-engineering \
   --input feature_description="let a reviewer subscribe to a run" \
   --input target_repo=acme-web
 
-narsor show <execution-id>          # where it is waiting
-narsor input <execution-id> ...     # answer the gate and resume
+narsor-cli show <execution-id>          # where it is waiting
+narsor-cli input <execution-id> ...     # answer the gate and resume
 ```
 
 Neither pipeline is autonomous end to end, and that is the point: both stop for a

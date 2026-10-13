@@ -1,5 +1,5 @@
 use clap::Parser;
-use narsor::runner::cli::{run_command, RunnerArgs};
+use narsor_runner::runner::cli::{run_command, RunnerArgs};
 
 #[derive(Debug, Parser)]
 #[command(name = "narsor-runner", about = "Run one task workload")]

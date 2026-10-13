@@ -14,17 +14,17 @@ use std::time::Duration;
 
 use chrono::Utc;
 use engine_support::{workflow, Harness};
-use narsor::conductor::assembly::{assemble, restore_at_startup};
-use narsor::conductor::{
+use narsor_engine::conductor::assembly::{assemble, restore_at_startup};
+use narsor_engine::conductor::{
     Annotation, ChatAuthor, ChatEntry, ChatEntryKind, ConductorActor, ConductorAnswer,
     ConductorInvoker, ConductorRegistry, ConductorState, ConductorStore, Invocation,
     InvocationOutcome, InvocationQueue, PendingInvocation, QueuedRequest, SavedDecision,
 };
-use narsor::domain::{
+use narsor_engine::domain::{
     ConductorDecisionKind, ConductorOutcome, ConductorPurpose, ConductorTrigger, Confidence,
     EventData,
 };
-use narsor::engine::Engine;
+use narsor_engine::engine::Engine;
 use serde_json::json;
 use tokio::sync::{oneshot, Notify};
 
@@ -954,7 +954,7 @@ fn a_conductor_decision_without_optional_fields_reads_with_low_confidence() {
 
 #[test]
 fn conductor_events_describe_themselves_on_one_line() {
-    let event = narsor::domain::Event::new(
+    let event = narsor_engine::domain::Event::new(
         "execution".to_string(),
         EventData::ConductorDecision {
             decision_id: "decision-1".to_string(),

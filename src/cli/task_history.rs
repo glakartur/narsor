@@ -7,8 +7,9 @@
 
 use clap::Subcommand;
 
-use crate::api::{ApiClient, ConversationResponse as PageResponse};
-use crate::conductor::{ChatAuthor, ChatEntryKind};
+use crate::api::{
+    ApiClient, ChatAuthorDto, ChatEntryKindDto, ConversationResponse as PageResponse,
+};
 use crate::domain::{without_unsafe_chars, without_unsafe_chars_multiline};
 
 use super::commands::{print_event, print_position, CliError, Result};
@@ -211,14 +212,14 @@ async fn conductor(client: &ApiClient, execution_id: &str, after: u64) -> Result
         .map_err(|error| failure("The conductor's chat cannot be read", error))?;
     for entry in &chat.entries {
         let who = match entry.author {
-            ChatAuthor::Operator => "operator",
-            ChatAuthor::Conductor => "conductor",
+            ChatAuthorDto::Operator => "operator",
+            ChatAuthorDto::Conductor => "conductor",
         };
         let what = match entry.kind {
-            ChatEntryKind::Message => "",
-            ChatEntryKind::Error => " (error)",
-            ChatEntryKind::Decision => " (decision)",
-            ChatEntryKind::Proposal => " (proposal)",
+            ChatEntryKindDto::Message => "",
+            ChatEntryKindDto::Error => " (error)",
+            ChatEntryKindDto::Decision => " (decision)",
+            ChatEntryKindDto::Proposal => " (proposal)",
         };
         println!(
             "#{:<4} {}  {who}{what}: {}",

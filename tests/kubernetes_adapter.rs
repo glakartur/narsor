@@ -28,18 +28,18 @@ use std::time::Duration;
 
 use backend_contract_support::{ContractTarget, Harness};
 use kubernetes_support::{MockCluster, DELETE_CLASS, NAMESPACE, RETAIN_CLASS};
-use narsor::backends::kubernetes::manifest::{self, check_pod_shape, KubernetesBackendConfig};
-use narsor::backends::kubernetes::{launched_under_epoch, names, KubernetesBackend};
-use narsor::backends::{
+use narsor_controller::kubernetes::manifest::{self, check_pod_shape, KubernetesBackendConfig};
+use narsor_controller::kubernetes::{launched_under_epoch, names, KubernetesBackend};
+use narsor_engine::backends::{
     BackendErrorKind, ExecutionBackend, Removal, RunnerCredential, StorageState, TaskResources,
     WorkloadLaunch, WorkloadPhase,
 };
-use narsor::domain::{
+use narsor_engine::domain::{
     BackendId, GitIdentity, ImageDigest, ImageSource, ResolvedEnvironment, ResolvedImage,
     ResourceProfile, SecretDelivery, SecretReference, TaskId, TaskLaunchSpec, TaskWorkspace,
 };
-use narsor::orchestration::{Observation, OwnerCommand, TaskLifecycle};
-use narsor::runner::{HarnessHome, HomeMode};
+use narsor_engine::orchestration::{Observation, OwnerCommand, TaskLifecycle};
+use narsor_engine::runner::{HarnessHome, HomeMode};
 use serde_json::Value;
 
 /// Registry prefix every test image comes from.
@@ -99,7 +99,7 @@ fn environment() -> ResolvedEnvironment {
 }
 
 fn spec_with(environment: ResolvedEnvironment, resources: ResourceProfile) -> TaskLaunchSpec {
-    let definition = narsor::workflow::load_from_str(WORKFLOW).expect("a valid workflow");
+    let definition = narsor_engine::workflow::load_from_str(WORKFLOW).expect("a valid workflow");
     TaskLaunchSpec::new(
         definition.id.clone(),
         definition.version,
@@ -132,7 +132,7 @@ fn launch_of(task: &str, generation: u64, spec: TaskLaunchSpec) -> WorkloadLaunc
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         ),
         lease_epoch: 7,
-        launch_spec: spec,
+        launch_spec: serde_json::to_value(spec).unwrap(),
         control_plane_url: "https://narsor.example".into(),
         credential: RunnerCredential::new("nsr.secret-runner-credential"),
     }
@@ -823,7 +823,7 @@ async fn invalid_launches_are_rejected_before_any_api_call() {
 fn resource_names_are_dns_safe_and_injective() {
     let dir = scratch();
     let backend = KubernetesBackend::new(
-        &narsor::backends::kubernetes::client::ClusterAccess::explicit(
+        &narsor_controller::kubernetes::client::ClusterAccess::explicit(
             "http://127.0.0.1:1",
             NAMESPACE,
         ),
@@ -910,7 +910,7 @@ async fn provision_creates_once_and_reconciles_by_name() {
     );
     let stored: TaskLaunchSpec =
         serde_json::from_str(secret["stringData"]["launch-spec.json"].as_str().unwrap()).unwrap();
-    assert_eq!(stored, launch.launch_spec);
+    assert_eq!(serde_json::to_value(stored).unwrap(), launch.launch_spec);
 
     let pvc = quiet.cluster.pvc(&task.storage).expect("the PVC");
     assert!(
@@ -1358,7 +1358,8 @@ terminal_states:
 "#;
 
 fn gated_spec() -> TaskLaunchSpec {
-    let definition = narsor::workflow::load_from_str(GATED_WORKFLOW).expect("a valid workflow");
+    let definition =
+        narsor_engine::workflow::load_from_str(GATED_WORKFLOW).expect("a valid workflow");
     TaskLaunchSpec::new(
         definition.id.clone(),
         definition.version,
@@ -1490,7 +1491,7 @@ async fn archive_leaves_nothing_of_the_task_behind() {
     h.restore(index);
     h.wait_for("the workflow to finish", |h| {
         h.record("task-1").runner.is_some_and(|runner| {
-            runner.snapshot.execution_status == narsor::domain::ExecutionStatus::Completed
+            runner.snapshot.execution_status == narsor_engine::domain::ExecutionStatus::Completed
         })
     })
     .await;
@@ -1512,8 +1513,8 @@ async fn archive_leaves_nothing_of_the_task_behind() {
 /// credential `0600`, and loads it on every later start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_controller_command_enrolls_once_and_then_loads_its_credential() {
-    use narsor::cli::controller::load_or_enroll;
-    use narsor::controller_protocol::CreateEnrollmentRequest;
+    use narsor_engine::controller_protocol::CreateEnrollmentRequest;
+    use narsor_engine::controller_runtime::load_or_enroll;
     use std::os::unix::fs::PermissionsExt;
 
     let Some(h) = Harness::<KubernetesTarget>::new().await else {
@@ -1912,7 +1913,7 @@ fn the_controller_deployment_is_locked_down() {
 #[tokio::test]
 #[ignore = "needs a live cluster (NARSOR_K8S_SMOKE_*)"]
 async fn live_cluster_smoke() {
-    use narsor::backends::kubernetes::client::{ClusterAccess, TokenSource};
+    use narsor_controller::kubernetes::client::{ClusterAccess, TokenSource};
     let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
     let mut access = ClusterAccess::explicit(
         var("NARSOR_K8S_SMOKE_API_SERVER"),

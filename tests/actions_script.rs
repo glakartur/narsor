@@ -11,13 +11,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use narsor::domain::{
+use narsor_engine::domain::{
     ActionConfig, ActionError, ActionResult, Context, ScriptActionConfig, Workspace,
 };
-use narsor::engine::actions::script::{MAX_CAPTURED_OUTPUT_BYTES, TRUNCATION_MARKER};
-use narsor::engine::actions::TIMEOUT_LABEL;
-use narsor::engine::{ActionExecutor, ActionOutcome, ActionRequest, ScriptExecutor};
-use narsor::workflow::TemplateScope;
+use narsor_engine::engine::actions::script::{MAX_CAPTURED_OUTPUT_BYTES, TRUNCATION_MARKER};
+use narsor_engine::engine::actions::TIMEOUT_LABEL;
+use narsor_engine::engine::{ActionExecutor, ActionOutcome, ActionRequest, ScriptExecutor};
+use narsor_engine::workflow::TemplateScope;
 use serde_json::{json, Map, Value};
 
 // ---------------------------------------------------------------------------

@@ -18,15 +18,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use narsor::domain::{
+use narsor_engine::domain::{
     ActionConfig, ExecutionStatus, HumanInputType, State, TerminalStatus, WorkflowDefinition,
     Workspace,
 };
-use narsor::engine::actions::agent::output_contract;
-use narsor::engine::{
+use narsor_engine::engine::actions::agent::output_contract;
+use narsor_engine::engine::{
     ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, HarnessRegistry, HumanInputDelivery,
 };
-use narsor::workflow::{load_from_file, validate_path};
+use narsor_engine::workflow::{load_from_file, validate_path};
 use serde_json::{json, Map, Value};
 
 // ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ impl FakeHarness {
             AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(Arc::new(
                 ClaudeCodeAdapter::with_program(self.program.to_string_lossy().into_owned()),
             )));
-        Engine::new(narsor::persistence::ExecutionStore::new(store_root))
+        Engine::new(narsor_engine::persistence::ExecutionStore::new(store_root))
             .with_executor(ActionKind::Agent, Arc::new(executor))
     }
 }
@@ -154,7 +154,7 @@ impl Answer {
         }
         let delivery = HumanInputDelivery::with_values(values);
         if self.approve {
-            delivery.with_action(narsor::engine::actions::human::HumanInputAction::Approve)
+            delivery.with_action(narsor_engine::engine::actions::human::HumanInputAction::Approve)
         } else {
             delivery
         }
@@ -493,7 +493,7 @@ async fn run_to_terminal(
     inputs: Value,
     workspace: Workspace,
     answers: &[Answer],
-) -> narsor::domain::WorkflowExecution {
+) -> narsor_engine::domain::WorkflowExecution {
     let mut execution = engine
         .start_and_run(definition, inputs, workspace)
         .await

@@ -1,0 +1,1 @@
+{"reviewer":"maintainability","status":"complete","findings":[],"resolved_findings":["Deleted orphaned src/api/active.rs, src/api/routes.rs, and src/api/routes/control.rs; live server implementation is in narsor-server."],"testing_gaps":[]}

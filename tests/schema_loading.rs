@@ -3,12 +3,12 @@
 //! The reference fixture is `tests/fixtures/implement_feature.yaml`, copied
 //! verbatim from `WORKFLOW_SCHEMA.md` §4.
 
-use narsor::domain::{
+use narsor_engine::domain::{
     ActionConfig, ExecutionStatus, HumanInputType, ParamType, State, TerminalStatus,
     WorkflowDefinition, WorkspaceAccess, WorkspaceSpec,
 };
-use narsor::engine::terminal_status;
-use narsor::workflow::{load_from_file, load_from_str};
+use narsor_engine::engine::terminal_status;
+use narsor_engine::workflow::{load_from_file, load_from_str};
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -628,7 +628,7 @@ terminal_states: [done]
 
 #[test]
 fn human_decision_message_is_not_lost() {
-    use narsor::domain::DecisionConfig;
+    use narsor_engine::domain::DecisionConfig;
 
     let yaml = r#"
 name: decision-demo
@@ -661,7 +661,7 @@ terminal_states: [done]
 
 #[test]
 fn rules_and_agent_decisions_load() {
-    use narsor::domain::DecisionConfig;
+    use narsor_engine::domain::DecisionConfig;
 
     let yaml = r#"
 name: decisions
@@ -956,7 +956,7 @@ terminal_states:
 /// and a record written since, without the field, reads as "use the default".
 #[test]
 fn an_agent_action_stored_before_the_harness_became_optional_still_reads() {
-    use narsor::domain::AgentActionConfig;
+    use narsor_engine::domain::AgentActionConfig;
 
     let old = serde_json::json!({
         "harness": "claude-code",
@@ -1134,14 +1134,17 @@ terminal_states: [done]
     let definition = load_from_str(&yaml).expect("loads");
 
     let workflow_image = definition.globals.image.as_ref().expect("globals.image");
-    assert_eq!(workflow_image, &narsor::domain::ImageSpec::pinned(PINNED));
+    assert_eq!(
+        workflow_image,
+        &narsor_engine::domain::ImageSpec::pinned(PINNED)
+    );
     let step = state(&definition, "build")
         .image
         .as_ref()
         .expect("step image");
     assert_eq!(
         step,
-        &narsor::domain::ImageSpec::resolve("ghcr.io/acme/builder:2026.10")
+        &narsor_engine::domain::ImageSpec::resolve("ghcr.io/acme/builder:2026.10")
     );
     assert!(
         state(&definition, "done").image.is_none(),

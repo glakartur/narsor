@@ -14,9 +14,9 @@ use crate::conductor::{
     ConductorView, FailureOutcome, FailureReport, ProposalKind, ProposalState, ProposalView,
 };
 use crate::domain::Confidence;
-use crate::orchestration::OperatorCommand;
 use crate::tui::chooser::{ChooserField, ChooserItem, Submission};
 use crate::tui::input_form::ContextLine;
+use narsor_protocol::controller::OperatorCommand;
 
 /// The field a restart's note is typed into.
 pub const NOTE_FIELD: &str = "Notatka dla następnej próby";

@@ -11,24 +11,26 @@ mod engine_support;
 use std::sync::Arc;
 
 use engine_support::{workflow, Harness};
-use narsor::conductor::assembly::assemble;
-use narsor::conductor::{
+use narsor_engine::conductor::assembly::assemble;
+use narsor_engine::conductor::{
     ConductorInvoker, ConductorRegistry, ConductorState, ConductorStore, Invocation,
     InvocationOutcome, PendingInvocation, QueuedRequest, SavedDecision,
 };
-use narsor::domain::{
+use narsor_engine::domain::{
     ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Confidence, EventData,
     ExecutionStatus, RepromptedBy, WorkflowExecution,
 };
-use narsor::engine::{
+use narsor_engine::engine::{
     owed_output_rescue, step_failure, ActionKind, Engine, EngineError, PendingHumanInput,
     PendingStep, Recovery, StepFailure,
 };
-use narsor::persistence::{
+use narsor_engine::persistence::{
     reconcile, reconcile_all, recover, sweep_orphaned_workspaces, OrphanReason,
     ReconciliationOutcome,
 };
-use narsor::workspace::{CleanupPolicy, RepositorySpec, WorkspaceProvisioner, WorkspaceRequest};
+use narsor_engine::workspace::{
+    CleanupPolicy, RepositorySpec, WorkspaceProvisioner, WorkspaceRequest,
+};
 use serde_json::json;
 
 /// Writes the log of an execution that died while its first action ran.
@@ -920,7 +922,7 @@ async fn a_restart_after_the_choices_result_takes_only_the_decision() {
     let pending = PendingStep {
         state_id: "work".to_string(),
         action_execution_id: "attempt-rejected".to_string(),
-        result: narsor::domain::ActionResult {
+        result: narsor_engine::domain::ActionResult {
             output_label: "implemented".to_string(),
             data: decision.data.clone(),
             variables: decision.variables.as_object().cloned().unwrap_or_default(),

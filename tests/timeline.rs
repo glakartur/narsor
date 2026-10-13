@@ -6,8 +6,8 @@
 
 use std::collections::HashSet;
 
-use narsor::domain::{Event, EventData, ExecutionStatus, RepromptedBy};
-use narsor::engine::{build_timeline, ConversationState, EventLink, PositionStatus};
+use narsor_engine::domain::{Event, EventData, ExecutionStatus, RepromptedBy};
+use narsor_engine::engine::{build_timeline, ConversationState, EventLink, PositionStatus};
 use serde_json::json;
 
 const EXEC: &str = "exec-1";

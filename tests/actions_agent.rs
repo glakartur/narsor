@@ -17,22 +17,22 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use narsor::domain::{
+use narsor_engine::domain::{
     ActionConfig, ActionError, AgentActionConfig, Context, EventData, ExecutionStatus,
     OutputDefinition, RepromptedBy, Workspace, WorkspaceAccess,
 };
-use narsor::engine::actions::agent::{output_contract, AgentEventSink, SESSION_ID_VARIABLE};
-use narsor::engine::{
+use narsor_engine::engine::actions::agent::{output_contract, AgentEventSink, SESSION_ID_VARIABLE};
+use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
     CodexAdapter, DefaultHarnessSource, Engine, HarnessAdapter, HarnessRegistry, InputContinuation,
     LoggingEventSink, OpenCodeAdapter, OutputProblem, OutputRejection, PendingHumanInput,
     METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY,
 };
-use narsor::persistence::{
+use narsor_engine::persistence::{
     recover, ConversationEntry, ConversationSource, ConversationStore, DefaultHarnessSelector,
     ExecutionStore, ReconciliationOutcome, StatePaths,
 };
-use narsor::workflow::{load_from_file, TemplateScope};
+use narsor_engine::workflow::{load_from_file, TemplateScope};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -392,7 +392,7 @@ async fn complete(
     executor: &AgentExecutor,
     config: AgentActionConfig,
     workspace: &Workspace,
-) -> narsor::domain::ActionResult {
+) -> narsor_engine::domain::ActionResult {
     match execute(executor, config, workspace, None).await {
         Ok(ActionOutcome::Completed(result)) => result,
         Ok(other) => panic!("expected a completed action, got {other:?}"),
@@ -494,9 +494,9 @@ async fn an_agent_question_suspends_the_same_action_for_human_input() {
     .await
     .expect("the question is a suspension, not an action failure");
 
-    let ActionOutcome::Suspended(narsor::engine::actions::SuspendedAction::AwaitingAgentInput(
-        request,
-    )) = outcome
+    let ActionOutcome::Suspended(
+        narsor_engine::engine::actions::SuspendedAction::AwaitingAgentInput(request),
+    ) = outcome
     else {
         panic!("expected an agent-input suspension");
     };
@@ -523,9 +523,9 @@ async fn an_agent_question_can_offer_choices_with_an_optional_comment() {
     .await
     .expect("the menu is a suspension, not an action failure");
 
-    let ActionOutcome::Suspended(narsor::engine::actions::SuspendedAction::AwaitingAgentInput(
-        request,
-    )) = outcome
+    let ActionOutcome::Suspended(
+        narsor_engine::engine::actions::SuspendedAction::AwaitingAgentInput(request),
+    ) = outcome
     else {
         panic!("expected an agent-input suspension");
     };
@@ -1391,7 +1391,7 @@ impl EngineFixture {
     }
 
     /// Writes a workflow definition into the root and loads it.
-    fn workflow(&self, yaml: &str) -> narsor::domain::WorkflowDefinition {
+    fn workflow(&self, yaml: &str) -> narsor_engine::domain::WorkflowDefinition {
         let path = self.root.path().join("workflow.yaml");
         fs::write(&path, yaml).expect("write the workflow");
         load_from_file(&path).expect("load the workflow")
@@ -1814,7 +1814,9 @@ async fn a_missing_label_is_asked_for_again_in_the_same_read_only_session() {
 }
 
 /// Runs [`REPROMPT_WORKFLOW`] on the fixture's engine.
-async fn run_reprompt_workflow(fixture: &EngineFixture) -> narsor::domain::WorkflowExecution {
+async fn run_reprompt_workflow(
+    fixture: &EngineFixture,
+) -> narsor_engine::domain::WorkflowExecution {
     let definition = fixture.workflow(REPROMPT_WORKFLOW);
     fixture
         .engine()
@@ -1827,7 +1829,7 @@ async fn run_reprompt_workflow(fixture: &EngineFixture) -> narsor::domain::Workf
 /// `ResolveOutput` request, announced by `ProblemRaised`, and did not fail.
 fn output_problem(
     fixture: &EngineFixture,
-    execution: &narsor::domain::WorkflowExecution,
+    execution: &narsor_engine::domain::WorkflowExecution,
 ) -> (PendingHumanInput, OutputProblem) {
     assert_eq!(execution.status, ExecutionStatus::InputNeeded);
     let pending: PendingHumanInput = fixture
@@ -2996,7 +2998,7 @@ async fn run_with_default(
     adapter: Arc<dyn HarnessAdapter>,
     source: Arc<dyn DefaultHarnessSource>,
     workflow: &str,
-) -> narsor::domain::WorkflowExecution {
+) -> narsor_engine::domain::WorkflowExecution {
     let store = fixture.store();
     let executor = AgentExecutor::with_harnesses(HarnessRegistry::defaults().with_adapter(adapter))
         .with_event_sink(Arc::new(LoggingEventSink::new(store.clone(), None)));

@@ -25,16 +25,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use narsor::api;
-use narsor::controller_protocol::{
+use narsor_engine::controller_protocol::{
     ControlEventEnvelope, CreateTaskRequest, LaunchRequest, OwnerCommandRequest, ProtocolService,
 };
-use narsor::domain::{Event, Workspace};
-use narsor::engine::Engine;
-use narsor::orchestration::{ControlPlane, OwnerCommand};
-use narsor::persistence::paths::StatePaths;
-use narsor::persistence::ExecutionStore;
-use narsor::workflow::load_from_file;
+use narsor_engine::domain::{Event, Workspace};
+use narsor_engine::engine::Engine;
+use narsor_engine::orchestration::{ControlPlane, OwnerCommand};
+use narsor_engine::persistence::paths::StatePaths;
+use narsor_engine::persistence::ExecutionStore;
+use narsor_engine::workflow::load_from_file;
+use narsor_server::api;
 
 /// A temporary directory that deletes itself when it goes out of scope —
 /// same stand-in `tests/api.rs` uses in place of the `tempfile` crate.
@@ -78,7 +78,7 @@ impl Drop for TempRoot {
 fn write_script_to_done_workflow(
     root: &TempRoot,
     name: &str,
-) -> narsor::domain::WorkflowDefinition {
+) -> narsor_engine::domain::WorkflowDefinition {
     let script_path = root.join(&format!("{name}-succeed.sh"));
     fs::write(&script_path, "#!/bin/sh\nexit 0\n").expect("write script");
     let mut permissions = fs::metadata(&script_path)

@@ -17,9 +17,9 @@ use std::{fs, io};
 
 use chrono::Utc;
 use narsor::api::ensure_daemon_running;
-use narsor::config::Flags;
-use narsor::daemon::launch::set_exe_override_for_tests;
-use narsor::persistence::{DaemonInfo, StatePaths};
+use narsor::api::launch::set_exe_override_for_tests;
+use narsor_engine::config::Flags;
+use narsor_engine::persistence::{DaemonInfo, StatePaths};
 
 /// A temporary directory that deletes itself when it goes out of scope —
 /// same stand-in every other integration test in this crate uses in place
@@ -48,7 +48,7 @@ impl Drop for TempRoot {
     }
 }
 
-/// Points [`narsor::daemon::launch::spawn_detached`] at the real, compiled
+/// Points [`narsor::api::launch::spawn_detached`] at the real, compiled
 /// `narsor` binary instead of this test binary itself.
 ///
 /// `current_exe()` inside a `cargo test` process resolves to the test
@@ -426,7 +426,7 @@ async fn connecting_without_a_server_to_a_network_mode_daemon_asks_for_one() {
 
     let error = narsor::api::connect(
         &narsor::api::ServerTarget::default(),
-        &paths,
+        paths.root(),
         &flags_for(&root),
     )
     .await
@@ -443,7 +443,7 @@ async fn a_remote_target_needs_a_token_and_https() {
         server: Some("https://narsor.example.com".to_string()),
         token: None,
     };
-    let error = narsor::api::connect(&without_token, &paths, &flags_for(&root))
+    let error = narsor::api::connect(&without_token, paths.root(), &flags_for(&root))
         .await
         .expect_err("a token is required");
     assert!(error.contains("NARSOR_TOKEN"), "{error}");
@@ -452,7 +452,7 @@ async fn a_remote_target_needs_a_token_and_https() {
         server: Some("http://narsor.example.com".to_string()),
         token: Some(narsor::api::TokenSource::Static("t".to_string())),
     };
-    let error = narsor::api::connect(&clear_text, &paths, &flags_for(&root))
+    let error = narsor::api::connect(&clear_text, paths.root(), &flags_for(&root))
         .await
         .expect_err("plain http to another host is refused");
     assert!(error.contains("https"), "{error}");

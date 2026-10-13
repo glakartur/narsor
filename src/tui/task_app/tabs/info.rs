@@ -13,9 +13,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::controller_protocol::{Freshness, TaskSummary};
-use crate::orchestration::QueueReason;
 use crate::tui::keymap::Action;
 use crate::tui::style::{Role, Styles};
+use narsor_protocol::controller::QueueReason;
 
 use super::super::super::scroll::one_line;
 use super::super::detail::short_age;

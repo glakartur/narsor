@@ -1,0 +1,17 @@
+[package]
+name = "narsor-shared"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "narsor_shared"
+path = "src/lib.rs"
+
+[dependencies]
+narsor-protocol = { path = "../narsor-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+ipnet = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

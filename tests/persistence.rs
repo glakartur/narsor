@@ -4,13 +4,13 @@
 //! layer lies in real file operations, so nothing here is mocked.
 
 use chrono::Utc;
-use narsor::domain::{
+use narsor_engine::domain::{
     Context, Event, EventData, ExecutionStatus, RepositoryInfo, WorkflowExecution, Workspace,
     WorkspaceType,
 };
-use narsor::persistence::atomic::{read_json, write_json_atomic};
-use narsor::persistence::paths::{event_file_name, temp_path_for};
-use narsor::persistence::{EventLog, ExecutionStore, PersistenceError};
+use narsor_engine::persistence::atomic::{read_json, write_json_atomic};
+use narsor_engine::persistence::paths::{event_file_name, temp_path_for};
+use narsor_engine::persistence::{EventLog, ExecutionStore, PersistenceError};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -718,7 +718,7 @@ fn a_temp_file_in_the_events_directory_is_not_read_as_an_event() {
 /// assert nothing at all.
 #[test]
 fn the_three_roots_on_one_directory_reproduce_the_previous_layout() {
-    use narsor::persistence::{CatalogPaths, StatePaths, WorkPaths};
+    use narsor_engine::persistence::{CatalogPaths, StatePaths, WorkPaths};
 
     let root = Path::new("/srv/narsor");
     let state = StatePaths::new(root);
@@ -772,7 +772,7 @@ fn the_three_roots_on_one_directory_reproduce_the_previous_layout() {
 /// R2 — all three share one built-in value, so an unconfigured run is unmoved.
 #[test]
 fn all_three_roots_default_to_the_same_directory() {
-    use narsor::persistence::{CatalogPaths, StatePaths, WorkPaths, DEFAULT_ROOT};
+    use narsor_engine::persistence::{CatalogPaths, StatePaths, WorkPaths, DEFAULT_ROOT};
 
     assert_eq!(StatePaths::default().root(), Path::new(DEFAULT_ROOT));
     assert_eq!(CatalogPaths::default().root(), Path::new(DEFAULT_ROOT));
@@ -790,7 +790,7 @@ fn workspace_without_a_base_commit_still_reads() {
         "path": "/tmp/ws",
     });
 
-    let workspace: narsor::domain::Workspace =
+    let workspace: narsor_engine::domain::Workspace =
         serde_json::from_value(json).expect("deserialize legacy workspace");
 
     assert_eq!(workspace.base_commit, None);
@@ -798,11 +798,12 @@ fn workspace_without_a_base_commit_still_reads() {
 
 #[test]
 fn workspace_round_trips_its_base_commit() {
-    let mut workspace = narsor::domain::Workspace::local_folder("/tmp/ws".to_string());
+    let mut workspace = narsor_engine::domain::Workspace::local_folder("/tmp/ws".to_string());
     workspace.base_commit = Some("0123456789abcdef0123456789abcdef01234567".to_string());
 
     let encoded = serde_json::to_value(&workspace).expect("serialize");
-    let decoded: narsor::domain::Workspace = serde_json::from_value(encoded).expect("deserialize");
+    let decoded: narsor_engine::domain::Workspace =
+        serde_json::from_value(encoded).expect("deserialize");
 
     assert_eq!(
         decoded.base_commit.as_deref(),
@@ -810,14 +811,14 @@ fn workspace_round_trips_its_base_commit() {
     );
 }
 
-fn sample_launch_spec(feature: &str) -> narsor::domain::TaskLaunchSpec {
-    narsor::domain::TaskLaunchSpec::new(
+fn sample_launch_spec(feature: &str) -> narsor_engine::domain::TaskLaunchSpec {
+    narsor_engine::domain::TaskLaunchSpec::new(
         "implement-feature",
         3,
         serde_json::json!({ "feature": feature }),
-        narsor::domain::TaskWorkspace::None,
-        narsor::domain::ResolvedEnvironment::harness_only("claude-code"),
-        narsor::domain::ResourceProfile::new(1000, 2048),
+        narsor_engine::domain::TaskWorkspace::None,
+        narsor_engine::domain::ResolvedEnvironment::harness_only("claude-code"),
+        narsor_engine::domain::ResourceProfile::new(1000, 2048),
     )
 }
 
@@ -825,7 +826,7 @@ fn sample_launch_spec(feature: &str) -> narsor::domain::TaskLaunchSpec {
 fn a_launch_spec_initializes_task_storage_exactly_once() {
     let root = TempRoot::new();
     let store = root.store();
-    let task_id = narsor::domain::TaskId::parse("task-1").unwrap();
+    let task_id = narsor_engine::domain::TaskId::parse("task-1").unwrap();
     let spec = sample_launch_spec("remote backends");
 
     assert_eq!(store.load_task_launch_spec(&task_id).unwrap(), None);
@@ -844,7 +845,7 @@ fn a_launch_spec_initializes_task_storage_exactly_once() {
 fn a_launch_spec_that_does_not_match_its_digest_is_refused() {
     let root = TempRoot::new();
     let store = root.store();
-    let task_id = narsor::domain::TaskId::parse("task-1").unwrap();
+    let task_id = narsor_engine::domain::TaskId::parse("task-1").unwrap();
     let mut spec = sample_launch_spec("remote backends");
     spec.inputs = serde_json::json!({ "feature": "tampered" });
 
@@ -859,7 +860,7 @@ fn a_launch_spec_that_does_not_match_its_digest_is_refused() {
 fn launch_specs_are_not_executions_and_their_temp_files_are_swept() {
     let root = TempRoot::new();
     let store = root.store();
-    let task_id = narsor::domain::TaskId::parse("task-1").unwrap();
+    let task_id = narsor_engine::domain::TaskId::parse("task-1").unwrap();
     store
         .initialize_task_launch_spec(&task_id, &sample_launch_spec("x"))
         .unwrap();

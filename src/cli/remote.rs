@@ -27,7 +27,8 @@ use super::task_text::{
     PAGE_BYTE_BUDGET,
 };
 use crate::api::{
-    ApiClient, ClientError, ConversationResponse as PageResponse, ServerTarget, TokenSource,
+    ApiClient, ClientError, ConversationResponse as PageResponse, HumanInputDeliveryDto,
+    ServerTarget, TokenSource,
 };
 use crate::conductor::{ChatAuthor, ChatEntry, ConductorView};
 use crate::config::Flags;
@@ -37,24 +38,172 @@ use crate::controller_protocol::{
     MoveTaskRequest, OwnerCommandRequest, SetDefaultBackendRequest, SubmitInputRequest,
     SubmitOperatorCommandRequest, TaskSummary, WorkspaceRequest,
 };
-use crate::domain::{without_unsafe_chars, TaskId};
-use crate::engine::HumanInputDelivery;
-use crate::materials::{snapshot_paths, write_files, MaterialLimits, MaterialOrigin, WriteMode};
-use crate::orchestration::{
-    MoveTarget, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskEvent,
-};
-use crate::persistence::StatePaths;
+use crate::domain::without_unsafe_chars;
+use crate::materials::{snapshot_paths, write_files, MaterialLimits, WriteMode};
 use crate::tui::conversation::classify;
-use crate::workflows::WorkflowResolver;
+use narsor_protocol::api::MaterialOrigin;
+use narsor_protocol::controller::{
+    MoveTaskTarget, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskEvent,
+};
+use narsor_protocol::identifier::TaskId;
 
 use super::commands::{CliError, Result};
 use super::task_history::{history, HistoryCommand};
 use super::task_registry::{
     capabilities, create_from_file, repo, validate, workflows, RepoCommand,
 };
+use super::WorkflowCommand;
 
 /// The environment variable holding a fixed token.
 pub const TOKEN_ENV: &str = "NARSOR_TOKEN";
+
+/// Workflow inspection uses the server's resolved catalogue through its owner API.
+pub(super) async fn workflow(
+    command: WorkflowCommand,
+    target: &ServerTarget,
+    state: &Path,
+    flags: &Flags,
+) -> Result<()> {
+    let client = client(target, state, flags).await?;
+    match command {
+        WorkflowCommand::List => {
+            let listing = client
+                .control_workflows()
+                .await
+                .map_err(|error| failure("Could not load workflows", error))?;
+            if listing.workflows.is_empty() {
+                println!("No workflows are reachable.");
+                return Ok(());
+            }
+            println!("{:<28} {:<10} DESCRIPTION", "NAME", "SOURCE");
+            for workflow in listing.workflows {
+                println!(
+                    "{:<28} {:<10} {}",
+                    workflow.name,
+                    workflow.origin_label,
+                    workflow.description.as_deref().unwrap_or("-")
+                );
+                if !workflow.shadow_labels.is_empty() {
+                    println!(
+                        "{:<28} {:<10} overrides: {}",
+                        "",
+                        "",
+                        workflow.shadow_labels.join(", ")
+                    );
+                }
+            }
+            Ok(())
+        }
+        WorkflowCommand::Show { workflow } => {
+            if Path::new(&workflow).is_file() {
+                let content = std::fs::read_to_string(&workflow).map_err(|error| {
+                    CliError::failure(format!("Could not read '{workflow}': {error}"))
+                })?;
+                print!("{content}");
+                if !content.ends_with('\n') {
+                    println!();
+                }
+                return Ok(());
+            }
+            let found = client
+                .control_workflow_source(&workflow, false)
+                .await
+                .map_err(|error| {
+                    failure(&format!("Could not resolve workflow '{workflow}'"), error)
+                })?;
+            eprintln!("Workflow '{}' — {}.", found.name, found.origin_label);
+            print!("{}", found.content);
+            if !found.content.ends_with('\n') {
+                println!();
+            }
+            Ok(())
+        }
+        WorkflowCommand::Eject { name, to, force } => {
+            let listing = client
+                .control_workflows()
+                .await
+                .map_err(|error| failure("Could not load workflows", error))?;
+            let canonical = name
+                .strip_suffix(".yaml")
+                .or_else(|| name.strip_suffix(".yml"))
+                .unwrap_or(&name);
+            if listing
+                .workflows
+                .iter()
+                .any(|item| item.has_builtin.is_none())
+            {
+                return Err(CliError::failure(
+                    "The connected narsor-server is too old for workflow eject; upgrade narsor-server and try again.",
+                ));
+            }
+            let names = listing
+                .workflows
+                .iter()
+                .filter(|item| item.has_builtin == Some(true))
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let found = listing
+                .workflows
+                .iter()
+                .find(|item| item.name == canonical && item.has_builtin == Some(true));
+            if found.is_none() {
+                return Err(CliError::usage(format!(
+                    "There is no built-in workflow named '{canonical}'. Available built-in workflows: {}.",
+                    names
+                )));
+            }
+            let directory = match to {
+                Some(path) => path,
+                None => crate::config::client_paths::user_workflows_dir().ok_or_else(|| {
+                    CliError::usage("No user configuration directory; specify --to.")
+                })?,
+            };
+            let content = client
+                .control_workflow_source(canonical, true)
+                .await
+                .map_err(|error| {
+                    failure(
+                        &format!("Could not load built-in workflow '{canonical}'"),
+                        error,
+                    )
+                })?;
+            std::fs::create_dir_all(&directory).map_err(|error| {
+                CliError::failure(format!(
+                    "Could not create '{}': {error}",
+                    directory.display()
+                ))
+            })?;
+            let path = directory.join(format!("{canonical}.yaml"));
+            if path.exists() && !force {
+                return Err(CliError::failure(format!(
+                    "'{}' already exists — pass --force to overwrite it.",
+                    path.display()
+                )));
+            }
+            std::fs::write(&path, content.content).map_err(|error| {
+                CliError::failure(format!("Could not write '{}': {error}", path.display()))
+            })?;
+            println!("Wrote {}", path.display());
+            let refreshed = client
+                .control_workflows()
+                .await
+                .map_err(|error| failure("Could not check the workflow search order", error))?;
+            if let Some(selected) = refreshed
+                .workflows
+                .iter()
+                .find(|item| item.name == canonical)
+            {
+                if selected.source == narsor_protocol::controller::WorkflowSource::User {
+                    println!("'{canonical}' now resolves to this copy instead of the built-in.");
+                } else {
+                    println!("Note: '{canonical}' still resolves to {} — that copy has precedence over this one.", selected.origin_label);
+                }
+            }
+            Ok(())
+        }
+    }
+}
 
 /// `narsor task …` — remote tasks on any backend.
 #[derive(Debug, Subcommand)]
@@ -566,9 +715,40 @@ pub fn server_target(
 }
 
 async fn client(target: &ServerTarget, state: &Path, flags: &Flags) -> Result<ApiClient> {
-    crate::api::connect(target, &StatePaths::new(state), flags)
+    crate::api::connect(target, state, flags)
         .await
         .map_err(CliError::failure)
+}
+
+/// Runs the top-level repository commands through the configured control-plane API.
+pub async fn repo_admin(
+    command: crate::cli::RepoCommand,
+    target: &ServerTarget,
+    state: &Path,
+    flags: &Flags,
+) -> Result<()> {
+    let command = match command {
+        crate::cli::RepoCommand::List => RepoCommand::List,
+        crate::cli::RepoCommand::Show { id } => RepoCommand::Show { id },
+        crate::cli::RepoCommand::Add {
+            id,
+            remote,
+            name,
+            provider,
+            default_branch,
+            description,
+        } => RepoCommand::Add {
+            id,
+            remote,
+            name,
+            provider,
+            default_branch,
+            description,
+        },
+        crate::cli::RepoCommand::Remove { id } => RepoCommand::Remove { id },
+    };
+    let client = client(target, state, flags).await?;
+    repo(&client, command).await
 }
 
 /// A [`ClientError`] as the operator reads it.
@@ -624,17 +804,15 @@ fn input_delivery(
     variables: &[String],
     label: &Option<String>,
     comment: &Option<String>,
-) -> Result<HumanInputDelivery> {
-    let mut delivery = HumanInputDelivery::with_values(field_values(fields)?)
-        .with_data(parse_pairs("data", data)?)
-        .with_variables(parse_pairs("variable", variables)?);
-    if let Some(label) = label {
-        delivery = delivery.choosing(label.clone());
-    }
-    if let Some(comment) = comment {
-        delivery = delivery.with_comment(comment.clone());
-    }
-    Ok(delivery)
+) -> Result<HumanInputDeliveryDto> {
+    Ok(HumanInputDeliveryDto {
+        values: field_values(fields)?,
+        data: parse_pairs("data", data)?,
+        variables: parse_pairs("variable", variables)?,
+        chosen_label: label.clone(),
+        comment: comment.clone(),
+        ..HumanInputDeliveryDto::default()
+    })
 }
 
 /// The `--field name=value` pairs of a form. A form takes text (that is what
@@ -695,7 +873,6 @@ pub async fn task(
     command: TaskCommand,
     target: &ServerTarget,
     state: &Path,
-    catalog: &Path,
     flags: &Flags,
 ) -> Result<()> {
     // Parse everything local before connecting: a usage error never needs
@@ -712,25 +889,27 @@ pub async fn task(
             commit,
             task_id,
             ..
-        } => Some(CreateTaskRequest {
-            task_id: task_id.clone(),
-            backend_id: backend.clone(),
-            launch: LaunchRequest {
-                workflow_id: workflow.clone(),
-                workflow_version: match workflow_version {
-                    Some(version) => *version,
-                    None => local_workflow_version(catalog, workflow)?,
+        } => Some((
+            CreateTaskRequest {
+                task_id: task_id.clone(),
+                backend_id: backend.clone(),
+                launch: LaunchRequest {
+                    workflow_id: workflow.clone(),
+                    workflow_version: workflow_version.unwrap_or_default(),
+                    inputs: Value::Object(parse_pairs("input", inputs)?),
+                    workspace: (repository.is_some() || commit.is_some()).then(|| {
+                        WorkspaceRequest {
+                            repository: repository.clone(),
+                            commit: commit.clone(),
+                        }
+                    }),
+                    profile: profile.clone(),
+                    harness: harness.clone(),
+                    resources: None,
                 },
-                inputs: Value::Object(parse_pairs("input", inputs)?),
-                workspace: (repository.is_some() || commit.is_some()).then(|| WorkspaceRequest {
-                    repository: repository.clone(),
-                    commit: commit.clone(),
-                }),
-                profile: profile.clone(),
-                harness: harness.clone(),
-                resources: None,
             },
-        }),
+            *workflow_version,
+        )),
         _ => None,
     };
     let delivery = match &command {
@@ -754,7 +933,24 @@ pub async fn task(
             ..
         } => create_from_file(&client, &file, &inputs, task_id).await,
         TaskCommand::Create { .. } => {
-            let request = create.expect("built above");
+            let (mut request, requested_version) = create.expect("built above");
+            if requested_version.is_none() {
+                let listing = client
+                    .control_workflows()
+                    .await
+                    .map_err(|error| failure("Could not list workflows", error))?;
+                request.launch.workflow_version = listing
+                    .workflows
+                    .iter()
+                    .find(|workflow| workflow.name == request.launch.workflow_id)
+                    .and_then(|workflow| workflow.version)
+                    .ok_or_else(|| {
+                        CliError::usage(format!(
+                            "Workflow '{}' is not in the server catalogue; pass --workflow-version.",
+                            request.launch.workflow_id
+                        ))
+                    })?;
+            }
             let task = client
                 .create_control_task(&request)
                 .await
@@ -891,9 +1087,8 @@ pub async fn task(
                     without_unsafe_chars(&waiting_summary(&task.attention))
                 )));
             }
-            let delivery = delivery
-                .expect("built above")
-                .for_episode(pending.id.clone());
+            let mut delivery = delivery.expect("built above");
+            delivery.episode = Some(pending.id.clone());
             let response = client
                 .control_input(
                     &task_id,
@@ -1194,7 +1389,7 @@ async fn materials(client: &ApiClient, command: MaterialsCommand) -> Result<()> 
             ttl_secs,
         } => {
             let limits = MaterialLimits::default();
-            let snapshot = snapshot_paths(&paths, &limits, limits.max_total_bytes)
+            let snapshot = snapshot_paths(&paths, &limits)
                 .map_err(|error| CliError::failure(format!("Nothing was uploaded: {error}")))?;
             for skipped in &snapshot.skipped {
                 eprintln!("skipped {}: {}", skipped.path.display(), skipped.reason);
@@ -1432,15 +1627,15 @@ fn move_target(
     after: Option<String>,
     top: bool,
     bottom: bool,
-) -> Result<MoveTarget> {
+) -> Result<MoveTaskTarget> {
     let anchor = |id: String| {
         TaskId::parse(id).map_err(|error| CliError::failure(format!("Invalid task id: {error}")))
     };
     match (before, after, top, bottom) {
-        (Some(id), None, false, false) => Ok(MoveTarget::Before(anchor(id)?)),
-        (None, Some(id), false, false) => Ok(MoveTarget::After(anchor(id)?)),
-        (None, None, true, false) => Ok(MoveTarget::Top),
-        (None, None, false, true) => Ok(MoveTarget::Bottom),
+        (Some(id), None, false, false) => Ok(MoveTaskTarget::Before(anchor(id)?.to_string())),
+        (None, Some(id), false, false) => Ok(MoveTaskTarget::After(anchor(id)?.to_string())),
+        (None, None, true, false) => Ok(MoveTaskTarget::Top),
+        (None, None, false, true) => Ok(MoveTaskTarget::Bottom),
         _ => Err(CliError::usage(
             "Give exactly one of --before, --after, --top and --bottom.",
         )),
@@ -1480,23 +1675,6 @@ fn split_pair<'a>(flag: &str, pair: &'a str) -> Result<(&'a str, &'a str)> {
                 "Invalid --{flag} '{pair}' — expected the form name=value."
             ))
         })
-}
-
-/// The version of `workflow` in the local catalogue, for a create without
-/// `--workflow-version`. The control plane refuses a version its own
-/// catalogue does not hold, so a stale local copy fails loudly, never runs
-/// something unexpected.
-fn local_workflow_version(catalog: &Path, workflow: &str) -> Result<u32> {
-    let resolved = WorkflowResolver::new(catalog)
-        .resolve(workflow)
-        .map_err(|_| {
-            CliError::usage(format!(
-                "Workflow '{workflow}' is not in the local catalogue; pass --workflow-version."
-            ))
-        })?;
-    crate::tasks::load_resolved(&resolved)
-        .map(|definition| definition.version)
-        .map_err(|error| CliError::usage(format!("{error}; pass --workflow-version.")))
 }
 
 // ---------------------------------------------------------------------------

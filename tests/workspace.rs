@@ -5,8 +5,8 @@
 //! permissions and actual checkouts, so nothing is mocked and nothing touches
 //! the network.
 
-use narsor::domain::{WorkflowExecution, WorkspaceType};
-use narsor::workspace::{
+use narsor_engine::domain::{WorkflowExecution, WorkspaceType};
+use narsor_engine::workspace::{
     checked_out_commit, clone_pinned_commit, CleanupOutcome, CleanupPolicy, RepositorySpec,
     WorkspaceError, WorkspaceProvisioner, WorkspaceRequest,
 };
@@ -204,17 +204,17 @@ fn repo_with_feature_branch(path: &Path) -> PathBuf {
 }
 
 /// Builds a throwaway execution record carrying a provisioned workspace.
-fn execution_with(workspace: narsor::domain::Workspace) -> WorkflowExecution {
+fn execution_with(workspace: narsor_engine::domain::Workspace) -> WorkflowExecution {
     WorkflowExecution {
         id: "exec-1".to_string(),
         workflow_id: "implement-feature".to_string(),
         workflow_version: 1,
-        status: narsor::domain::ExecutionStatus::Running,
+        status: narsor_engine::domain::ExecutionStatus::Running,
         current_state: None,
         started_at: chrono::Utc::now(),
         completed_at: None,
         inputs: serde_json::Value::Null,
-        context: narsor::domain::Context::new(),
+        context: narsor_engine::domain::Context::new(),
         workspace,
         current_action_execution: None,
         metadata: serde_json::Value::Null,

@@ -1,6 +1,6 @@
 //! Durable default-harness selection, exercised against the real filesystem.
 
-use narsor::persistence::{DefaultHarnessSelector, StatePaths};
+use narsor_engine::persistence::{DefaultHarnessSelector, StatePaths};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -43,7 +43,7 @@ async fn missing_file_uses_configured_harness_without_an_override() {
 
     assert_eq!(
         selector.snapshot().await,
-        narsor::persistence::HarnessSelectionSnapshot {
+        narsor_engine::persistence::HarnessSelectionSnapshot {
             supported: supported(),
             configured: "claude-code".into(),
             override_harness: None,

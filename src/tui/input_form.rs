@@ -3,7 +3,7 @@
 //! problem — and the inputs a workflow declares (the new-task form).
 //!
 //! Like the rest of the TUI's state, this holds no terminal. [`InputPanel`]
-//! turns a [`PendingHumanInput`] into the entries of a
+//! turns a [`PendingHumanInputView`] into the entries of a
 //! [`crate::tui::chooser::Chooser`] and their fields (the label picker, the
 //! declared fields, a problem's `data` and `variables`, the comment), and the
 //! chosen entry turns back into the [`HumanInputDelivery`] the server
@@ -34,13 +34,13 @@ use std::collections::HashSet;
 use serde_json::{Map, Value};
 
 use crate::conductor::Annotation;
-use crate::controller_protocol::WorkflowInputView;
-use crate::domain::{
-    AnsweredBy, EventData, HumanInputField, HumanInputType, InputCloseReason, OutputDefinition,
-    ParamType,
-};
-use crate::engine::{HumanInputDelivery, InputContinuation, PendingHumanInput};
 use crate::tui::chooser::{ChooserField, ChooserItem, Submission};
+use narsor_protocol::api::{
+    HumanInputActionDto, HumanInputDeliveryDto, HumanInputFieldView, HumanInputTypeView,
+    InputContinuationView, OutputDefinitionView, PendingHumanInputView,
+};
+use narsor_protocol::controller::{WorkflowInputType, WorkflowInputView};
+use narsor_protocol::event::{AnsweredBy, EventData, InputCloseReason};
 
 /// What kind of wait the form answers, as the operator reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,12 +57,12 @@ pub enum InputKind {
 
 impl InputKind {
     /// The kind a pending request's continuation names.
-    pub fn of(continuation: InputContinuation) -> Self {
+    pub fn of(continuation: InputContinuationView) -> Self {
         match continuation {
-            InputContinuation::CompleteStep => Self::Gate,
-            InputContinuation::ResumeAgent => Self::AgentQuestion,
-            InputContinuation::ResolveOutput => Self::Problem,
-            InputContinuation::ApproveOutput => Self::Approval,
+            InputContinuationView::CompleteStep => Self::Gate,
+            InputContinuationView::ResumeAgent => Self::AgentQuestion,
+            InputContinuationView::ResolveOutput => Self::Problem,
+            InputContinuationView::ApproveOutput => Self::Approval,
         }
     }
 
@@ -231,18 +231,18 @@ fn remove_char(text: &mut String, character: usize) {
 }
 
 /// Whether a single `select` field lets the engine infer the output label.
-fn infers_label(fields: &[HumanInputField]) -> bool {
+fn infers_label(fields: &[HumanInputFieldView]) -> bool {
     fields
         .iter()
-        .filter(|field| field.field_type == HumanInputType::Select)
+        .filter(|field| field.field_type == HumanInputTypeView::Select)
         .count()
         == 1
 }
 
 /// Whether `field` is a `select` whose options are exactly `outputs`, in any
 /// order (KTD17).
-fn offers_exactly(field: &HumanInputField, outputs: &[OutputDefinition]) -> bool {
-    if field.field_type != HumanInputType::Select
+fn offers_exactly(field: &HumanInputFieldView, outputs: &[OutputDefinitionView]) -> bool {
+    if field.field_type != HumanInputTypeView::Select
         || outputs.is_empty()
         || field.options.len() != outputs.len()
     {
@@ -387,7 +387,7 @@ impl InputPanel {
     /// agent attempt belongs to, for the `↩ wraca do agenta <stan>` of an
     /// output that resumes one.
     pub fn new(
-        pending: &PendingHumanInput,
+        pending: &PendingHumanInputView,
         resumed_state: &dyn Fn(&str) -> Option<String>,
     ) -> Self {
         let kind = InputKind::of(pending.continuation);
@@ -405,12 +405,12 @@ impl InputPanel {
         panel
             .context
             .push(ContextLine::plain(pending.instruction()));
-        if let Some(question) = &pending.request.question {
+        if let Some(question) = &pending.question {
             panel
                 .context
                 .push(ContextLine::plain(format!("„{question}”")));
         }
-        if let Some(tail) = &pending.request.answer_tail {
+        if let Some(tail) = &pending.answer_tail {
             panel
                 .context
                 .push(ContextLine::dim(format!("agent: …{tail}")));
@@ -473,7 +473,7 @@ impl InputPanel {
     }
 
     /// The delivery that choosing `submission` sends.
-    pub fn delivery(&self, submission: &Submission) -> Result<HumanInputDelivery, String> {
+    pub fn delivery(&self, submission: &Submission) -> Result<HumanInputDeliveryDto, String> {
         let plan = self
             .plans
             .get(submission.index)
@@ -482,15 +482,32 @@ impl InputPanel {
             Plan::Complete(label) => self.complete(label.as_deref(), submission),
             Plan::Answer => self.answer(submission)?,
             Plan::Output(label) => self.output(label, submission)?,
-            Plan::Message => HumanInputDelivery::default()
-                .with_agent_message(Self::value_of(submission, MESSAGE_FIELD).unwrap_or_default()),
-            Plan::Approve => HumanInputDelivery::default()
-                .with_action(crate::engine::actions::human::HumanInputAction::Approve),
-            Plan::Return => HumanInputDelivery::default()
-                .with_comment(Self::value_of(submission, COMMENT_TO_AGENT).unwrap_or_default())
-                .with_action(crate::engine::actions::human::HumanInputAction::Resume),
+            Plan::Message => HumanInputDeliveryDto {
+                agent_message: Some(
+                    Self::value_of(submission, MESSAGE_FIELD)
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+                ..HumanInputDeliveryDto::default()
+            },
+            Plan::Approve => HumanInputDeliveryDto {
+                action: Some(HumanInputActionDto::Approve),
+                ..HumanInputDeliveryDto::default()
+            },
+            Plan::Return => HumanInputDeliveryDto {
+                comment: Some(
+                    Self::value_of(submission, COMMENT_TO_AGENT)
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+                action: Some(HumanInputActionDto::Resume),
+                ..HumanInputDeliveryDto::default()
+            },
         };
-        Ok(delivery.for_episode(&self.episode))
+        Ok(HumanInputDeliveryDto {
+            episode: Some(self.episode.clone()),
+            ..delivery
+        })
     }
 
     /// What the notification says after `submission` was sent, without the
@@ -534,7 +551,7 @@ impl InputPanel {
 
     fn build_gate(
         &mut self,
-        pending: &PendingHumanInput,
+        pending: &PendingHumanInputView,
         resumed_state: &dyn Fn(&str) -> Option<String>,
     ) {
         let fields = pending.fields();
@@ -543,7 +560,7 @@ impl InputPanel {
             .iter()
             .find(|field| offers_exactly(field, outputs))
             .map(|field| field.name.clone());
-        let others: Vec<&HumanInputField> = fields
+        let others: Vec<&HumanInputFieldView> = fields
             .iter()
             .filter(|field| Some(&field.name) != self.label_field.as_ref())
             .collect();
@@ -594,7 +611,7 @@ impl InputPanel {
             .unwrap_or(0);
     }
 
-    fn complete(&self, label: Option<&str>, submission: &Submission) -> HumanInputDelivery {
+    fn complete(&self, label: Option<&str>, submission: &Submission) -> HumanInputDeliveryDto {
         let mut values = Map::new();
         for (name, value) in &submission.values {
             values.insert(name.clone(), Value::String(value.clone()));
@@ -602,17 +619,17 @@ impl InputPanel {
         if let (Some(field), Some(label)) = (&self.label_field, label) {
             values.insert(field.clone(), Value::String(label.to_string()));
         }
-        let delivery = HumanInputDelivery::with_values(values);
-        match label {
-            Some(label) => delivery.choosing(label),
-            None => delivery,
+        HumanInputDeliveryDto {
+            values,
+            chosen_label: label.map(str::to_string),
+            ..HumanInputDeliveryDto::default()
         }
     }
 
     // -- an agent's question ----------------------------------------------------
 
-    fn build_question(&mut self, pending: &PendingHumanInput) {
-        let fields: Vec<&HumanInputField> = pending.fields().iter().collect();
+    fn build_question(&mut self, pending: &PendingHumanInputView) {
+        let fields: Vec<&HumanInputFieldView> = pending.fields().iter().collect();
         let mut item = declared_fields(
             ChooserItem::new("Odpowiedz agentowi", "Odpowiedź wznawia sesję agenta.")
                 .resuming(pending.state_id.to_string()),
@@ -620,7 +637,7 @@ impl InputPanel {
             &[],
             None,
         );
-        if let Some(answer) = pending.request.prefilled_answer.as_deref() {
+        if let Some(answer) = pending.prefilled_answer.as_deref() {
             // The text of an answer a refused resume gave back (2a9c6f2).
             for field in item
                 .fields
@@ -633,7 +650,7 @@ impl InputPanel {
         self.push(item, Plan::Answer);
     }
 
-    fn answer(&self, submission: &Submission) -> Result<HumanInputDelivery, String> {
+    fn answer(&self, submission: &Submission) -> Result<HumanInputDeliveryDto, String> {
         let filled = |name: &str| Self::value_of(submission, name).is_some();
         if !filled("answer") && !filled("option") {
             return Err("Wpisz odpowiedź albo wybierz opcję.".to_string());
@@ -643,12 +660,15 @@ impl InputPanel {
             .iter()
             .map(|(name, value)| (name.clone(), Value::String(value.clone())))
             .collect();
-        Ok(HumanInputDelivery::with_values(values))
+        Ok(HumanInputDeliveryDto {
+            values,
+            ..HumanInputDeliveryDto::default()
+        })
     }
 
     // -- a problem --------------------------------------------------------------
 
-    fn build_problem(&mut self, pending: &PendingHumanInput) {
+    fn build_problem(&mut self, pending: &PendingHumanInputView) {
         let Some(problem) = &pending.problem else {
             return;
         };
@@ -724,7 +744,11 @@ impl InputPanel {
         self.selected = recommended.unwrap_or(self.items.len() - 1);
     }
 
-    fn output(&self, label: &str, submission: &Submission) -> Result<HumanInputDelivery, String> {
+    fn output(
+        &self,
+        label: &str,
+        submission: &Submission,
+    ) -> Result<HumanInputDeliveryDto, String> {
         let mut maps = [Map::new(), Map::new()];
         for (name, text) in &submission.values {
             for (slot, prefix) in ["data.", "variables."].into_iter().enumerate() {
@@ -765,14 +789,15 @@ impl InputPanel {
             }
         }
         let [data, variables] = maps;
-        let mut delivery = HumanInputDelivery::default()
-            .choosing(label)
-            .with_data(data)
-            .with_variables(variables);
-        if let Some(comment) = Self::value_of(submission, COMMENT_FIELD).map(str::trim) {
-            delivery = delivery.with_comment(comment);
-        }
-        Ok(delivery)
+        Ok(HumanInputDeliveryDto {
+            chosen_label: Some(label.to_string()),
+            data,
+            variables,
+            comment: Self::value_of(submission, COMMENT_FIELD)
+                .map(str::trim)
+                .map(str::to_string),
+            ..HumanInputDeliveryDto::default()
+        })
     }
 
     /// The proposal itself while its text is untouched, the typed text
@@ -790,7 +815,7 @@ impl InputPanel {
 
     // -- an approval ------------------------------------------------------------
 
-    fn build_approval(&mut self, pending: &PendingHumanInput) {
+    fn build_approval(&mut self, pending: &PendingHumanInputView) {
         let mut resumable = false;
         if let Some(approval) = &pending.approval {
             let label = approval.result.output_label.clone();
@@ -862,8 +887,8 @@ fn insert_once(
 /// resumes an agent needs (3f3dab2).
 fn declared_fields(
     mut item: ChooserItem,
-    fields: &[&HumanInputField],
-    outputs: &[OutputDefinition],
+    fields: &[&HumanInputFieldView],
+    outputs: &[OutputDefinitionView],
     label: Option<&str>,
 ) -> ChooserItem {
     for field in fields {
@@ -875,8 +900,8 @@ fn declared_fields(
         });
         let required = field.required && !claimed_by_other;
         let mut built = match field.field_type {
-            HumanInputType::Text => ChooserField::multiline(field.name.clone()),
-            HumanInputType::Select => {
+            HumanInputTypeView::Text => ChooserField::multiline(field.name.clone()),
+            HumanInputTypeView::Select => {
                 let mut options = field.options.clone();
                 if !required {
                     options.insert(0, String::new());
@@ -930,7 +955,7 @@ pub fn workflow_input_fields(
         .iter()
         .map(|input| {
             let mut field = match input.input_type {
-                ParamType::Boolean => ChooserField::select(
+                WorkflowInputType::Boolean => ChooserField::select(
                     input.name.clone(),
                     BOOLEAN_OPTIONS
                         .iter()
@@ -938,12 +963,14 @@ pub fn workflow_input_fields(
                         .collect(),
                 )
                 .with_value(BOOLEAN_OPTIONS[1]),
-                ParamType::Repository if !repositories.is_empty() => {
+                WorkflowInputType::Repository if !repositories.is_empty() => {
                     ChooserField::select(input.name.clone(), repositories.to_vec())
                 }
-                ParamType::Integer => ChooserField::integer(input.name.clone()),
-                ParamType::Text => ChooserField::multiline(input.name.clone()),
-                ParamType::String | ParamType::Repository => ChooserField::text(input.name.clone()),
+                WorkflowInputType::Integer => ChooserField::integer(input.name.clone()),
+                WorkflowInputType::Text => ChooserField::multiline(input.name.clone()),
+                WorkflowInputType::String | WorkflowInputType::Repository => {
+                    ChooserField::text(input.name.clone())
+                }
             };
             if let Some(default) = &input.default {
                 field = field.with_value(value_as_text(default));
@@ -963,10 +990,10 @@ pub fn workflow_input_fields(
 /// what the workflow says of it.
 fn input_description(input: &WorkflowInputView) -> Option<String> {
     let kind = match input.input_type {
-        ParamType::String | ParamType::Text => None,
-        ParamType::Integer => Some("liczba całkowita"),
-        ParamType::Boolean => Some("true / false"),
-        ParamType::Repository => Some("repozytorium"),
+        WorkflowInputType::String | WorkflowInputType::Text => None,
+        WorkflowInputType::Integer => Some("liczba całkowita"),
+        WorkflowInputType::Boolean => Some("true / false"),
+        WorkflowInputType::Repository => Some("repozytorium"),
     };
     let said = input
         .description
@@ -1010,10 +1037,10 @@ pub fn workflow_input_values(
             continue;
         };
         let value = match input.input_type {
-            ParamType::String | ParamType::Text | ParamType::Repository => {
+            WorkflowInputType::String | WorkflowInputType::Text | WorkflowInputType::Repository => {
                 Value::String(raw.to_string())
             }
-            ParamType::Integer => {
+            WorkflowInputType::Integer => {
                 raw.parse::<i64>()
                     .map(Value::from)
                     .map_err(|_| InputProblem {
@@ -1021,7 +1048,7 @@ pub fn workflow_input_values(
                         message: format!("Pole '{}' wymaga liczby całkowitej.", input.name),
                     })?
             }
-            ParamType::Boolean => match raw.to_ascii_lowercase().as_str() {
+            WorkflowInputType::Boolean => match raw.to_ascii_lowercase().as_str() {
                 "true" => Value::Bool(true),
                 "false" => Value::Bool(false),
                 other => {

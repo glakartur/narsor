@@ -21,12 +21,12 @@ use std::panic;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use serde_json::{json, Value};
 
-use narsor::domain::{Event, EventData};
-use narsor::engine::actions::script::TRUNCATION_MARKER;
 use narsor::tui::event_text::{event_detail_lines, event_line};
 use narsor::tui::transcript::{
     raw_display, DisplayMode, TranscriptEntry, TranscriptEntryId, TranscriptId, TranscriptState,
 };
+use narsor_engine::domain::{Event, EventData};
+use narsor_engine::engine::actions::script::TRUNCATION_MARKER;
 
 mod engine_support;
 mod environment_support;
@@ -1367,15 +1367,16 @@ mod task_app_list {
     use tokio::net::{TcpListener, TcpStream};
 
     use narsor::api::{ApiClient, ClientError};
-    use narsor::controller_protocol::MoveTaskRequest;
-    use narsor::domain::ExecutionStatus;
-    use narsor::orchestration::{
-        AttentionKind, MoveTarget, Observation, QueueReason, TaskEventKind, TaskLifecycle,
-    };
     use narsor::tui::connection::LinkState;
     use narsor::tui::task_app::list::{Attention, StateIcon};
     use narsor::tui::task_app::notify::Severity;
     use narsor::tui::task_app::{layout, DetailTab, EventFeed, Focus, Request, TaskApp};
+    use narsor_engine::controller_protocol::MoveTaskRequest;
+    use narsor_engine::domain::ExecutionStatus;
+    use narsor_engine::orchestration::{
+        AttentionKind, Observation, QueueReason, TaskEventKind, TaskLifecycle,
+    };
+    use narsor_protocol::controller::MoveTaskTarget;
 
     use super::key;
     use super::remote_support::RemoteHarness;
@@ -1463,7 +1464,7 @@ mod task_app_list {
         backend: &str,
         lifecycle: &str,
         rank: u32,
-    ) -> narsor::controller_protocol::TaskSummary {
+    ) -> narsor_engine::controller_protocol::TaskSummary {
         with_controller(task(id, backend, lifecycle, rank))
     }
 
@@ -1647,7 +1648,7 @@ mod task_app_list {
             assert!(!app.refresh_wanted());
         }
 
-        fn narsor_runner() -> narsor::controller_protocol::RunnerView {
+        fn narsor_runner() -> narsor_engine::controller_protocol::RunnerView {
             super::super::task_app_support::runner(ExecutionStatus::Running, "review")
         }
 
@@ -1893,8 +1894,8 @@ mod task_app_list {
                 .owner
                 .control_command(
                     "t2",
-                    &narsor::controller_protocol::OwnerCommandRequest {
-                        command: narsor::orchestration::OwnerCommand::Archive,
+                    &narsor_engine::controller_protocol::OwnerCommandRequest {
+                        command: narsor_engine::orchestration::OwnerCommand::Archive,
                         idempotency_key: "archive-t2".into(),
                         expected_generation: None,
                     },
@@ -1991,9 +1992,9 @@ mod task_app_list {
             ));
             ch(&mut app, 'j');
             let up = expect_move(ch(&mut app, 'K'));
-            assert_eq!(up.target, MoveTarget::Before(ids(&["a"]).remove(0)));
+            assert_eq!(up.target, MoveTaskTarget::Before("a".into()));
             let down = expect_move(ch(&mut app, 'J'));
-            assert_eq!(down.target, MoveTarget::After(ids(&["c"]).remove(0)));
+            assert_eq!(down.target, MoveTaskTarget::After("c".into()));
             assert_eq!(down.generation, 1);
         }
 
@@ -2054,7 +2055,7 @@ mod task_app_list {
             assert_eq!(app.list().selected_id(), Some("a"));
             let request = expect_move(press(&mut app, KeyCode::Enter));
             assert_eq!(request.task_id, "a");
-            assert_eq!(request.target, MoveTarget::After(ids(&["c"]).remove(0)));
+            assert_eq!(request.target, MoveTaskTarget::After("c".into()));
             assert!(app.list().moving().is_none());
             assert_eq!(
                 titles(&app),
@@ -2076,7 +2077,7 @@ mod task_app_list {
             ch(&mut app, 'k');
             assert_eq!(titles(&app), ["c", "a", "b"]);
             let request = expect_move(press(&mut app, KeyCode::Enter));
-            assert_eq!(request.target, MoveTarget::Before(ids(&["a"]).remove(0)));
+            assert_eq!(request.target, MoveTaskTarget::Before("a".into()));
         }
 
         #[test]
@@ -2135,8 +2136,8 @@ mod task_app_list {
                 .owner
                 .control_command(
                     "t1",
-                    &narsor::controller_protocol::OwnerCommandRequest {
-                        command: narsor::orchestration::OwnerCommand::Archive,
+                    &narsor_engine::controller_protocol::OwnerCommandRequest {
+                        command: narsor_engine::orchestration::OwnerCommand::Archive,
                         idempotency_key: "archive-t1".into(),
                         expected_generation: None,
                     },
@@ -2173,7 +2174,7 @@ mod task_app_list {
             let Request::Move(move_request) = &request else {
                 panic!("a move was expected");
             };
-            assert!(matches!(move_request.target, MoveTarget::After(_)));
+            assert!(matches!(move_request.target, MoveTaskTarget::After(_)));
             app.perform(request).await;
             assert_eq!(titles(&app), ["t1", "t2", "t3"], "no read, no event yet");
             assert!(note(&app).contains("przesunięto za t3"), "{}", note(&app));
@@ -2210,7 +2211,7 @@ mod task_app_list {
             feed.ensure_open(&app);
 
             let top = MoveTaskRequest {
-                target: MoveTarget::Top,
+                target: MoveTaskTarget::Top,
                 expected_generation: None,
             };
             // A first move, seen live.
@@ -2388,12 +2389,6 @@ mod task_app_detail {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use narsor::api::{ApiClient, ClientError, ConversationEntryDto, ConversationResponse};
-    use narsor::controller_protocol::{
-        ConversationUnavailableReason, ExecutionEventsResponse, ExecutionEventsSource, RunnerClient,
-    };
-    use narsor::domain::{Event, ExecutionStatus};
-    use narsor::engine::{ConversationState, PositionStatus, Timeline};
-    use narsor::orchestration::{Observation, QueueReason, TaskEventKind, TaskLifecycle};
     use narsor::tui::style::Styles;
     use narsor::tui::task_app::detail::{
         self, hyperlinks_supported, queue_text, readiness, short_age, unstarted_message,
@@ -2406,6 +2401,12 @@ mod task_app_detail {
     use narsor::tui::task_app::tabs::info;
     use narsor::tui::task_app::{DetailTab, Focus, TaskApp};
     use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
+    use narsor_engine::controller_protocol::{
+        ConversationUnavailableReason, ExecutionEventsResponse, ExecutionEventsSource, RunnerClient,
+    };
+    use narsor_engine::domain::{Event, ExecutionStatus};
+    use narsor_engine::engine::{ConversationState, PositionStatus, Timeline};
+    use narsor_engine::orchestration::{Observation, QueueReason, TaskEventKind, TaskLifecycle};
 
     use super::remote_support::{report, snapshot, RemoteHarness};
     use super::task_app_support::{
@@ -2429,7 +2430,7 @@ mod task_app_detail {
         press(app, KeyCode::Char(character));
     }
 
-    fn running(id: &str, rank: u32) -> narsor::controller_protocol::TaskSummary {
+    fn running(id: &str, rank: u32) -> narsor_engine::controller_protocol::TaskSummary {
         with_runner(
             with_controller(task(id, "local", "running", rank)),
             ExecutionStatus::Running,
@@ -2655,9 +2656,9 @@ mod task_app_detail {
     /// step's conversation (R1–R5).
     mod step_conversation {
         use super::*;
-        use narsor::engine::Position;
         use narsor::tui::keymap::Context;
         use narsor::tui::task_app::StepFocus;
+        use narsor_engine::engine::Position;
 
         fn recorded(state: &str, status: PositionStatus) -> Position {
             let mut step = position(state, status);
@@ -2711,7 +2712,7 @@ mod task_app_detail {
                 truncated_tail: false,
                 complete: true,
                 no_record,
-                source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                source: narsor_engine::controller_protocol::ExecutionEventsSource::Runner,
                 recorded_at: None,
             }
         }
@@ -3107,7 +3108,7 @@ mod task_app_detail {
                 super::super::task_app_support::waiting_for_capacity(queued("a", 1), 2, 2, 3);
             assert_eq!(queue_text(&waiting, Some(2)), "#2 · czeka na slot (2/3)");
             let mut offline = queued("b", 2);
-            offline.queue = Some(narsor::controller_protocol::QueueView {
+            offline.queue = Some(narsor_engine::controller_protocol::QueueView {
                 reason: QueueReason::ControllerOffline,
                 message: String::new(),
                 since: offline.as_of - chrono::Duration::minutes(4),
@@ -3280,7 +3281,7 @@ mod task_app_detail {
                 truncated_tail: false,
                 complete: true,
                 no_record: false,
-                source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                source: narsor_engine::controller_protocol::ExecutionEventsSource::Runner,
                 recorded_at: None,
             }
         }
@@ -3371,8 +3372,10 @@ mod task_app_detail {
             loop {
                 let poll = runner.poll(None, 5).await.expect("poll");
                 if let Some(request) = poll.execution_events.first() {
-                    let page =
-                        narsor::controller_protocol::ExecutionEventsPage { events, has_more };
+                    let page = narsor_engine::controller_protocol::ExecutionEventsPage {
+                        events,
+                        has_more,
+                    };
                     runner
                         .upload_execution_events(&request.request_id, &page)
                         .await
@@ -3396,7 +3399,7 @@ mod task_app_detail {
             }
         }
 
-        fn live_snapshot() -> narsor::orchestration::RunnerSnapshot {
+        fn live_snapshot() -> narsor_engine::orchestration::RunnerSnapshot {
             let mut recorded = position("plan", PositionStatus::Succeeded);
             recorded.conversation = ConversationState::Recorded;
             let current = position("review", PositionStatus::InProgress);
@@ -3817,25 +3820,25 @@ mod task_app_waiting {
     use serde_json::{json, Value};
 
     use narsor::api::{ApiClient, ClientError};
-    use narsor::conductor::ConductorView;
-    use narsor::controller_protocol::{ConductorReadResponse, ExecutionEventsSource};
-    use narsor::engine::actions::human::HumanInputAction;
-    use narsor::engine::PositionStatus;
-    use narsor::orchestration::{
-        AttentionKind, OperatorCommand, OwnerCommand, TaskEventKind, TaskLifecycle,
-    };
     use narsor::tui::chooser::ChooserFocus;
     use narsor::tui::task_app::detail::DetailRead;
     use narsor::tui::task_app::notify::Severity;
     use narsor::tui::task_app::waiting::{AnswerRequest, Submit};
     use narsor::tui::task_app::{Focus, Request, TaskApp};
+    use narsor_engine::engine::actions::human::HumanInputAction;
+    use narsor_engine::engine::PositionStatus;
+    use narsor_engine::orchestration::{
+        AttentionKind, OperatorCommand, OwnerCommand, TaskEventKind, TaskLifecycle,
+    };
+    use narsor_protocol::controller::ConductorView;
+    use narsor_protocol::controller::{ConductorReadResponse, ExecutionEventsSource};
 
     use super::remote_support::{snapshot, RemoteHarness};
     use super::task_app_support::{
         event, listing, position, task, timeline, titled, waiting_on, with_controller,
         with_pending, with_runner,
     };
-    use narsor::domain::ExecutionStatus;
+    use narsor_engine::domain::ExecutionStatus;
 
     fn app() -> TaskApp {
         TaskApp::new(
@@ -3866,14 +3869,14 @@ mod task_app_waiting {
         }
     }
 
-    fn delivery(request: Request) -> narsor::engine::HumanInputDelivery {
+    fn delivery(request: Request) -> narsor_protocol::api::HumanInputDeliveryDto {
         match sent(request).submit {
             Submit::Input { delivery, .. } => delivery,
             other => panic!("an input was expected, got {other:?}"),
         }
     }
 
-    fn running(id: &str, rank: u32) -> narsor::controller_protocol::TaskSummary {
+    fn running(id: &str, rank: u32) -> narsor_engine::controller_protocol::TaskSummary {
         with_runner(
             with_controller(task(id, "local", "running", rank)),
             ExecutionStatus::InputNeeded,
@@ -3882,7 +3885,7 @@ mod task_app_waiting {
     }
 
     /// An app whose only task `a` waits; the panel is open on its actions.
-    fn opened(task: narsor::controller_protocol::TaskSummary) -> TaskApp {
+    fn opened(task: narsor_engine::controller_protocol::TaskSummary) -> TaskApp {
         let mut app = app();
         app.load(listing(vec![titled(task, "NAR-12")], "c"));
         ch(&mut app, ' ');
@@ -4331,10 +4334,10 @@ mod task_app_waiting {
 
     #[test]
     fn the_conductors_summary_of_a_gate_recommends_an_output_with_the_diamond() {
-        let pending: narsor::engine::PendingHumanInput =
+        let pending: narsor_protocol::api::PendingHumanInputView =
             serde_json::from_value(gate("ep-1")).unwrap();
         let mut panel = narsor::tui::input_form::InputPanel::new(&pending, &|_| None);
-        let annotation: narsor::conductor::Annotation = serde_json::from_value(json!({
+        let annotation: narsor::api::AnnotationDto = serde_json::from_value(json!({
             "key": "ep-1", "summary": "brak planu migracji", "recommendation": "reject",
             "created_at": "2026-10-09T12:00:00Z"
         }))
@@ -4446,7 +4449,7 @@ mod task_app_waiting {
             &mut app,
             Ok(ConductorReadResponse::Unavailable {
                 reason:
-                    narsor::controller_protocol::ConversationUnavailableReason::RunnerUnreachable,
+                    narsor_engine::controller_protocol::ConversationUnavailableReason::RunnerUnreachable,
                 message: "brak harnessu".to_string(),
             }),
         );
@@ -4800,9 +4803,9 @@ mod task_app_waiting {
     /// The timeline of `id` at `revision` with one running step,
     /// `review_scope`, whose conversation has two entries read.
     fn read_step_conversation(app: &mut TaskApp, id: &str, revision: u64) {
-        use narsor::engine::ConversationState;
         use narsor::tui::task_app::tabs::conversation::AttemptRead;
         use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
+        use narsor_engine::engine::ConversationState;
         let mut step = position("review_scope", PositionStatus::InProgress);
         step.conversation = ConversationState::Recorded;
         app.on_detail_read(
@@ -4833,7 +4836,7 @@ mod task_app_waiting {
                     truncated_tail: false,
                     complete: true,
                     no_record: false,
-                    source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                    source: narsor_engine::controller_protocol::ExecutionEventsSource::Runner,
                     recorded_at: None,
                 }),
             },
@@ -4929,21 +4932,24 @@ mod task_app_waiting {
 
     // -- against a served control plane -----------------------------------------
 
-    fn approval_snapshot(sequence: u64) -> narsor::orchestration::RunnerSnapshot {
+    fn approval_snapshot(sequence: u64) -> narsor_engine::orchestration::RunnerSnapshot {
         approval_snapshot_in(sequence, "ep-a")
     }
 
     /// An approval of the waiting `episode`.
-    fn approval_snapshot_in(sequence: u64, episode: &str) -> narsor::orchestration::RunnerSnapshot {
+    fn approval_snapshot_in(
+        sequence: u64,
+        episode: &str,
+    ) -> narsor_engine::orchestration::RunnerSnapshot {
         let mut snapshot = snapshot(sequence, None);
-        let form: narsor::engine::PendingHumanInput =
+        let form: narsor_engine::engine::PendingHumanInput =
             serde_json::from_value(approval(true)).unwrap();
-        snapshot.pending_input = Some(narsor::orchestration::PendingInputRef {
+        snapshot.pending_input = Some(narsor_engine::orchestration::PendingInputRef {
             id: episode.to_string(),
             attempt_id: None,
             form,
         });
-        snapshot.attention = vec![narsor::orchestration::AttentionItem {
+        snapshot.attention = vec![narsor_engine::orchestration::AttentionItem {
             kind: AttentionKind::Approval,
             state_id: Some("review_scope".to_string()),
             since: chrono::Utc::now(),
@@ -5071,10 +5077,10 @@ mod task_app_waiting {
     /// and the bar says why.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_answer_to_a_waiting_from_before_the_loss_is_refused_and_kept() {
-        use narsor::controller_protocol::{
+        use narsor_engine::controller_protocol::{
             OwnerCommandRequest, RunnerClient, RunnerCredentialRequest,
         };
-        use narsor::orchestration::Observation;
+        use narsor_engine::orchestration::Observation;
 
         use super::remote_support::report;
 
@@ -5177,13 +5183,14 @@ mod task_app_waiting {
         let mut form = gate("ep-1");
         form["outputs"][0]["label"] = json!("ap\u{1b}[31mpr\u{202e}oved\u{7}");
         let mut snapshot = snapshot(1, None);
-        let pending: narsor::engine::PendingHumanInput = serde_json::from_value(form).unwrap();
-        snapshot.pending_input = Some(narsor::orchestration::PendingInputRef {
+        let pending: narsor_engine::engine::PendingHumanInput =
+            serde_json::from_value(form).unwrap();
+        snapshot.pending_input = Some(narsor_engine::orchestration::PendingInputRef {
             id: "ep-1".to_string(),
             attempt_id: None,
             form: pending,
         });
-        snapshot.attention = vec![narsor::orchestration::AttentionItem {
+        snapshot.attention = vec![narsor_engine::orchestration::AttentionItem {
             kind: AttentionKind::Question,
             state_id: Some("review_scope".to_string()),
             since: chrono::Utc::now(),
@@ -5213,12 +5220,6 @@ mod task_app_actions {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use narsor::api::{ApiClient, ClientError};
-    use narsor::controller_protocol::{OperatorCommandView, RunnerClient, TaskSummary};
-    use narsor::domain::ExecutionStatus;
-    use narsor::orchestration::{
-        AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef,
-        TaskEventKind, TaskLifecycle,
-    };
     use narsor::tui::keymap::{self, Action, Context};
     use narsor::tui::task_app::actions::{
         availability, refusal_reason, verb, ActionRequest, ActionSend, Availability, Confirmed,
@@ -5226,6 +5227,12 @@ mod task_app_actions {
     };
     use narsor::tui::task_app::notify::Severity;
     use narsor::tui::task_app::{EventFeed, Request, TaskApp};
+    use narsor_engine::controller_protocol::{OperatorCommandView, RunnerClient, TaskSummary};
+    use narsor_engine::domain::ExecutionStatus;
+    use narsor_engine::orchestration::{
+        AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef,
+        TaskEventKind, TaskLifecycle,
+    };
 
     use super::remote_support::{snapshot, RemoteHarness};
     use super::task_app_support::{
@@ -5393,7 +5400,7 @@ mod task_app_actions {
             );
             let mut silent = running("a", 1);
             silent.runner.as_mut().unwrap().freshness =
-                narsor::controller_protocol::Freshness::Stale;
+                narsor_engine::controller_protocol::Freshness::Stale;
             assert!(unavailable(&silent, TaskAction::Interrupt).contains("nie odpowiada"));
         }
 
@@ -6747,15 +6754,6 @@ mod task_app_conductor {
     use serde_json::{json, Value};
 
     use narsor::api::{ApiClient, ClientError};
-    use narsor::conductor::ConductorView;
-    use narsor::controller_protocol::{
-        ConductorReadResponse, ConversationUnavailableReason, ExecutionEventsSource, RunnerClient,
-        TaskSummary,
-    };
-    use narsor::domain::ExecutionStatus;
-    use narsor::orchestration::{
-        AttentionKind, OperatorCommand, OwnerRef, TaskEventKind, TaskLifecycle,
-    };
     use narsor::tui::chat::UndoState;
     use narsor::tui::keymap::{self, Action, Context};
     use narsor::tui::task_app::actions::{ActionRequest, ActionSend, Overlay};
@@ -6764,6 +6762,15 @@ mod task_app_conductor {
     use narsor::tui::task_app::waiting::Submit;
     use narsor::tui::task_app::{DetailTab, Focus, Request, TaskApp};
     use narsor::tui::transcript::TranscriptPresentation;
+    use narsor_engine::controller_protocol::{
+        ConversationUnavailableReason, ExecutionEventsSource, RunnerClient, TaskSummary,
+    };
+    use narsor_engine::domain::ExecutionStatus;
+    use narsor_engine::orchestration::{
+        AttentionKind, OperatorCommand, OwnerRef, TaskEventKind, TaskLifecycle,
+    };
+    use narsor_protocol::controller::ConductorReadResponse;
+    use narsor_protocol::controller::ConductorView;
 
     use super::remote_support::{snapshot, RemoteHarness};
     use super::task_app_support::{
@@ -7217,7 +7224,7 @@ mod task_app_conductor {
                     "e",
                     TaskEventKind::OperatorCommandResolved {
                         command_id: "command-1".to_string(),
-                        status: narsor::orchestration::OperatorCommandStatus::Rejected,
+                        status: narsor_engine::orchestration::OperatorCommandStatus::Rejected,
                         detail: Some("a later step already ran".to_string()),
                     },
                 ),
@@ -7350,7 +7357,7 @@ mod task_app_conductor {
         fn a_settled_proposal_says_so_in_the_tab() {
             let mut app = tab_app();
             let mut view = proposal_view();
-            view.proposals[0].state = narsor::conductor::ProposalState::Executed;
+            view.proposals[0].state = narsor_protocol::controller::ProposalState::Executed;
             read(&mut app, view);
             assert!(screen(&mut app, 120, 30).contains("(propozycja: wykonana)"));
         }
@@ -7580,7 +7587,7 @@ mod task_app_conductor {
                     3,
                     TaskEventKind::OperatorCommandResolved {
                         command_id: "command-1".to_string(),
-                        status: narsor::orchestration::OperatorCommandStatus::Rejected,
+                        status: narsor_engine::orchestration::OperatorCommandStatus::Rejected,
                         detail: Some("no conductor runs for this task".to_string()),
                     },
                 ),
@@ -7704,7 +7711,7 @@ mod task_app_conductor {
     mod served {
         use super::*;
 
-        fn conducting() -> narsor::orchestration::RunnerSnapshot {
+        fn conducting() -> narsor_engine::orchestration::RunnerSnapshot {
             let mut first = snapshot(1, None);
             first.conductor_available = true;
             first
@@ -7741,7 +7748,10 @@ mod task_app_conductor {
                 let poll = runner.poll(None, 5).await.expect("poll");
                 if let Some(request) = poll.conductor_reads.first() {
                     runner
-                        .upload_conductor_read(&request.request_id, &view)
+                        .upload_conductor_read(
+                            &request.request_id,
+                            &serde_json::from_value(serde_json::to_value(view).unwrap()).unwrap(),
+                        )
                         .await
                         .expect("upload");
                     return request.after;
@@ -7857,13 +7867,6 @@ mod task_app_create {
     use serde_json::json;
 
     use narsor::api::{ApiClient, ClientError};
-    use narsor::controller_protocol::{
-        LegacyExecutionListResponse, RepositoryListResponse, TaskSummary, ValidateWorkflowResponse,
-        WorkflowListResponse,
-    };
-    use narsor::domain::ParamType;
-    use narsor::orchestration::TaskLifecycle;
-    use narsor::persistence::ExecutionStore;
     use narsor::tui::keymap::{self, Action, Context};
     use narsor::tui::task_app::history::HistoryEntry;
     use narsor::tui::task_app::list::PendingState;
@@ -7872,6 +7875,13 @@ mod task_app_create {
     };
     use narsor::tui::task_app::notify::Severity;
     use narsor::tui::task_app::{DetailTab, Request, TaskApp, ViewKind};
+    use narsor_engine::controller_protocol::{
+        RepositoryListResponse, TaskSummary, ValidateWorkflowResponse, WorkflowListResponse,
+    };
+    use narsor_engine::domain::ParamType;
+    use narsor_engine::orchestration::TaskLifecycle;
+    use narsor_engine::persistence::ExecutionStore;
+    use narsor_protocol::api::LegacyExecutionListResponse;
 
     use super::remote_support::RemoteHarness;
     use super::task_app_support::{
@@ -8033,7 +8043,7 @@ mod task_app_create {
     /// A running task `id` whose details are open on *Przebieg* with the
     /// keys in its step's conversation.
     fn running_task(id: &str, rank: u32) -> TaskSummary {
-        use narsor::domain::ExecutionStatus;
+        use narsor_engine::domain::ExecutionStatus;
         super::task_app_support::with_runner(
             super::task_app_support::with_controller(super::task_app_support::task(
                 id, "local", "running", rank,
@@ -8046,11 +8056,11 @@ mod task_app_create {
     /// Selects `id` from the list and puts the keys in its step's
     /// conversation.
     fn into_step_conversation(app: &mut TaskApp, id: &str) {
-        use narsor::engine::{ConversationState, PositionStatus};
         use narsor::tui::task_app::detail::DetailRead;
         use narsor::tui::task_app::tabs::conversation::AttemptRead;
         use narsor::tui::task_app::StepFocus;
         use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
+        use narsor_engine::engine::{ConversationState, PositionStatus};
 
         app.list_mut().select(id);
         press(app, KeyCode::Enter);
@@ -8083,7 +8093,7 @@ mod task_app_create {
                     truncated_tail: false,
                     complete: true,
                     no_record: false,
-                    source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                    source: narsor_engine::controller_protocol::ExecutionEventsSource::Runner,
                     recorded_at: None,
                 }),
             },
@@ -8440,6 +8450,8 @@ mod task_app_create {
                     valid: false,
                     name: None,
                     version: None,
+                    state_count: 0,
+                    initial_state: None,
                     inputs: vec![],
                     violations: vec![
                         "state 'plan' has no transition for output 'ok'".to_string(),
@@ -8481,6 +8493,8 @@ mod task_app_create {
                     valid: true,
                     name: Some("my-flow".to_string()),
                     version: Some(4),
+                    state_count: 2,
+                    initial_state: Some("start".to_string()),
                     inputs: vec![workflow_input("ticket", ParamType::String, true, None)],
                     violations: vec![],
                 }),
@@ -9015,11 +9029,11 @@ mod task_app_create {
         /// An execution from before the task scheduler, with a retried step
         /// and a conversation per attempt, written under `root`.
         fn seed_old_execution(root: &std::path::Path, id: &str) {
-            use narsor::domain::{
+            use narsor_engine::domain::{
                 Context as WorkflowContext, EventData, ExecutionStatus, RepositoryInfo,
                 WorkflowExecution, Workspace,
             };
-            use narsor::persistence::conversation::ConversationSource;
+            use narsor_engine::persistence::conversation::ConversationSource;
             let store = ExecutionStore::new(root);
             store
                 .save_execution(&WorkflowExecution {
@@ -9229,8 +9243,8 @@ mod task_app_create {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn an_old_step_that_leaves_the_run_drops_the_focus_to_the_axis_and_says_so() {
-            use narsor::domain::EventData;
             use narsor::tui::task_app::StepFocus;
+            use narsor_engine::domain::EventData;
             let harness = RemoteHarness::start().await;
             seed_old_execution(harness.root.path(), "exec-old");
             let mut app = in_an_old_steps_conversation(&harness).await;
@@ -9293,8 +9307,8 @@ mod task_app_create {
                 .owner
                 .control_command(
                     "NAR-9",
-                    &narsor::controller_protocol::OwnerCommandRequest {
-                        command: narsor::orchestration::OwnerCommand::Archive,
+                    &narsor_engine::controller_protocol::OwnerCommandRequest {
+                        command: narsor_engine::orchestration::OwnerCommand::Archive,
                         idempotency_key: "archive-1".to_string(),
                         expected_generation: None,
                     },
@@ -9343,7 +9357,7 @@ mod task_app_create {
             let store = ExecutionStore::new(harness.root.path());
             let mut failed = store.load_execution("exec-failed").expect("load");
             let definition_path = crate::engine_support::fixtures().join("engine/two_steps.yaml");
-            failed.status = narsor::domain::ExecutionStatus::Failed;
+            failed.status = narsor_engine::domain::ExecutionStatus::Failed;
             failed.current_state = Some("first".to_string());
             failed.metadata = json!({
                 "cli": { "definition_path": definition_path.display().to_string() },
@@ -9416,7 +9430,7 @@ mod task_app_create {
         /// part alive for as long as the test runs.
         async fn harness() -> (
             RemoteHarness,
-            (narsor::controller_protocol::ControllerClient, u64),
+            (narsor_engine::controller_protocol::ControllerClient, u64),
         ) {
             let harness = RemoteHarness::start_with(write_workflow).await;
             let controller = harness.controller("k8s").await;
@@ -9703,7 +9717,7 @@ mod task_app_create {
             let broken = "name: broken\nversion: 1\nstates:\n  work:\n    action:\n      type: script\n      \
                 command: \"true\"\n    outputs: [success]\n    transitions:\n      success: nowhere\n  \
                 island:\n    description: nobody comes here\nterminal_states: [done]\n";
-            let expected: Vec<String> = narsor::workflow::validate_source(broken)
+            let expected: Vec<String> = narsor_engine::workflow::validate_source(broken)
                 .expect("the YAML loads")
                 .iter()
                 .map(ToString::to_string)
@@ -9979,14 +9993,16 @@ mod task_app_create {
             ] {
                 harness
                     .owner
-                    .control_add_repository(&narsor::controller_protocol::CreateRepositoryRequest {
-                        id: id.to_string(),
-                        remote: remote.to_string(),
-                        name: None,
-                        provider: None,
-                        default_branch: None,
-                        description: None,
-                    })
+                    .control_add_repository(
+                        &narsor_engine::controller_protocol::CreateRepositoryRequest {
+                            id: id.to_string(),
+                            remote: remote.to_string(),
+                            name: None,
+                            provider: None,
+                            default_branch: None,
+                            description: None,
+                        },
+                    )
                     .await
                     .unwrap();
             }
@@ -10042,12 +10058,12 @@ mod task_app_harness {
     use serde_json::json;
 
     use narsor::api::ApiClient;
-    use narsor::domain::ExecutionStatus;
     use narsor::tui::keymap::{self, Action, Context, BINDINGS};
     use narsor::tui::task_app::actions::Overlay;
     use narsor::tui::task_app::harness::HarnessHeader;
     use narsor::tui::task_app::notify::Severity;
     use narsor::tui::task_app::{DetailTab, Focus, Request, TaskApp};
+    use narsor_engine::domain::ExecutionStatus;
 
     use super::remote_support::RemoteHarness;
     use super::task_app_support::{
@@ -10073,7 +10089,7 @@ mod task_app_harness {
         app
     }
 
-    fn running(id: &str) -> narsor::controller_protocol::TaskSummary {
+    fn running(id: &str) -> narsor_engine::controller_protocol::TaskSummary {
         with_runner(
             with_controller(task(id, "local", "running", 1)),
             ExecutionStatus::Running,
@@ -10324,9 +10340,9 @@ mod task_app_harness {
             "a",
             revision,
             narsor::tui::task_app::detail::DetailRead::Conductor(Ok(
-                narsor::controller_protocol::ConductorReadResponse::Available {
+                narsor_protocol::controller::ConductorReadResponse::Available {
                     conductor: Box::new(super::task_app_support::conductor_view(vec![], json!({}))),
-                    source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                    source: narsor_protocol::controller::ExecutionEventsSource::Runner,
                 },
             )),
         );
@@ -10383,7 +10399,7 @@ mod task_app_harness {
                 "Poprawka błędu.",
                 vec![super::task_app_support::workflow_input(
                     "ticket_id",
-                    narsor::domain::ParamType::String,
+                    narsor_engine::domain::ParamType::String,
                     true,
                     None,
                 )],
@@ -10483,9 +10499,6 @@ mod task_app_auto_resume {
 
     use narsor::api::ApiClient;
     use narsor::cli::task_text::RecordAge;
-    use narsor::controller_protocol::{ExecutionEventsSource, TaskSummary};
-    use narsor::engine::{ConversationState, PositionStatus};
-    use narsor::orchestration::{TaskEventKind, TaskLifecycle};
     use narsor::tui::task_app::actions::{availability, TaskAction};
     use narsor::tui::task_app::detail::DetailRead;
     use narsor::tui::task_app::list::{attention_of, Attention};
@@ -10493,6 +10506,9 @@ mod task_app_auto_resume {
     use narsor::tui::task_app::tabs::conversation::{record_badge, AttemptRead, Attempts};
     use narsor::tui::task_app::TaskApp;
     use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
+    use narsor_engine::controller_protocol::{ExecutionEventsSource, TaskSummary};
+    use narsor_engine::engine::{ConversationState, PositionStatus};
+    use narsor_engine::orchestration::{TaskEventKind, TaskLifecycle};
 
     use super::task_app_support::{
         auto_resumed, event, exhausted, interrupted, listing, position, timeline, titled,

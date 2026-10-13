@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use narsor::workspace::{capture, materialise, Base, CaptureRequest, MaterialiseRequest};
+use narsor_engine::workspace::{capture, materialise, Base, CaptureRequest, MaterialiseRequest};
 
 /// A temporary directory removed when it goes away.
 struct TempRoot {

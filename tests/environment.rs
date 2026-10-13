@@ -15,15 +15,15 @@ use environment_support::{
     backend, digest, resolver, resolver_with_local_roots, seed_catalog, workflow_image,
     workflow_yaml,
 };
-use narsor::domain::{
+use narsor_engine::domain::{
     ImageDigest, ImageSource, ImageSpec, ResolvedEnvironment, ResourceProfile, SecretDelivery,
     TaskLaunchSpec, TaskWorkspace, TASK_LAUNCH_SPEC_VERSION,
 };
-use narsor::environment::{
+use narsor_engine::environment::{
     BackendKind, BackendLimits, BackendRecord, EnvironmentCatalog, LaunchError, LaunchIntent,
     LaunchResolver, ProfileRecord, ResolvedLaunch, StaticImageResolver, TrustScope,
 };
-use narsor::registry::{RepositoryEntry, RepositoryRegistry};
+use narsor_engine::registry::{RepositoryEntry, RepositoryRegistry};
 
 /// A temporary catalogue root that deletes itself.
 struct TempRoot {

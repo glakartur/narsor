@@ -1,5 +1,5 @@
 use clap::Parser;
-use narsor::cli::controller::{run_command, ControllerArgs};
+use narsor_controller::controller::{run_command, ControllerArgs};
 
 #[derive(Debug, Parser)]
 #[command(name = "narsor-controller", about = "Reconcile one Narsor backend")]

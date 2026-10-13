@@ -4,7 +4,7 @@
 //! # Not one call to `set_var`
 //!
 //! The environment is built as a map and handed to
-//! [`resolve_with`](narsor::config::resolve::resolve_with), and the cascade is
+//! [`resolve_with`](narsor_engine::config::resolve::resolve_with), and the cascade is
 //! given both of its directories explicitly. Nothing here reads the process
 //! environment, so nothing here can race a test running beside it in the same
 //! binary — which is what `std::env::set_var` would guarantee it does.
@@ -12,9 +12,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use narsor::config::cascade::ConfigCascade;
-use narsor::config::resolve::{resolve_with, Environment, Flags};
-use narsor::config::{SettingKey, SettingValue, Source};
+use narsor_engine::config::cascade::ConfigCascade;
+use narsor_engine::config::resolve::{resolve_with, Environment, Flags};
+use narsor_engine::config::{SettingKey, SettingValue, Source};
 
 /// A temporary directory that deletes itself when it goes out of scope.
 struct TempRoot {
@@ -161,7 +161,7 @@ fn rust_log_wins_over_the_setting_and_is_the_source_reported() {
     // D-K: RUST_LOG takes per-target directives, so the sharper instrument
     // wins — and `config show` names the variable that actually took effect.
     let env = environment(&[
-        ("RUST_LOG", "narsor::engine=debug"),
+        ("RUST_LOG", "narsor_engine::engine=debug"),
         ("NARSOR_LOG_LEVEL", "warn"),
     ]);
 
@@ -173,7 +173,7 @@ fn rust_log_wins_over_the_setting_and_is_the_source_reported() {
 
     assert_eq!(
         resolved.value(SettingKey::LogLevel),
-        &SettingValue::Text("narsor::engine=debug".to_string())
+        &SettingValue::Text("narsor_engine::engine=debug".to_string())
     );
     assert_eq!(
         resolved.source(SettingKey::LogLevel),
@@ -427,7 +427,7 @@ fn a_default_backend_that_cannot_be_an_identifier_is_refused() {
 
 #[test]
 fn local_tasks_keep_the_hosts_home_unless_configured_otherwise() {
-    use narsor::runner::{HarnessHome, HomeMode};
+    use narsor_engine::runner::{HarnessHome, HomeMode};
     let root = TempRoot::new();
     let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
     assert_eq!(

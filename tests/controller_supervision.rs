@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use narsor::backends::{supervise, Supervision};
+use narsor_controller_runtime::{supervise, Supervision};
 use tokio::sync::oneshot;
 
 const FAST: Supervision = Supervision {

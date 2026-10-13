@@ -22,8 +22,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::controller_protocol::TimelineResponse;
-use crate::engine::{ConversationState, Position, PositionStatus};
 use crate::tui::style::{Role, Styles};
+use narsor_protocol::api::{ConversationState, Position, PositionStatus};
 
 use super::super::super::scroll::one_line;
 use super::super::super::selection::{render_bracketed_list, PREFIX_WIDTH};

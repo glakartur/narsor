@@ -1,0 +1,25 @@
+{
+  "status": "complete",
+  "actionable_findings": [],
+  "resolved_during_work": [
+    {
+      "title": "Eject mistakes older servers for missing built-ins",
+      "reviewer": "api-contract",
+      "resolution": "Changed has_builtin to Option<bool>, report an outdated server when support is absent, and added a legacy WorkflowView deserialization test."
+    },
+    {
+      "title": "Delete the orphaned API server implementation",
+      "reviewer": "maintainability",
+      "resolution": "Deleted src/api/active.rs, src/api/routes.rs, and src/api/routes/control.rs; live implementation remains in narsor-server."
+    },
+    {
+      "title": "Server separation smoke test does not try a start operation",
+      "reviewer": "testing",
+      "resolution": "Added an assertion that narsor-cli daemon start is rejected."
+    }
+  ],
+  "demoted_to_testing_gaps": [
+    "Package-scoped process tests can reuse an existing sibling binary in the shared target profile. Full workspace build and serial workspace test were run successfully.",
+    "The client wrapper path for narsor daemon stop launching an adjacent narsor-server binary lacks an installed-style integration test."
+  ]
+}

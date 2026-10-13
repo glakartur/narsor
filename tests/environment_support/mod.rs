@@ -12,13 +12,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use narsor::domain::{ImageSpec, ResourceProfile, SecretDelivery};
-use narsor::environment::{
+use narsor_engine::domain::{ImageSpec, ResourceProfile, SecretDelivery};
+use narsor_engine::environment::{
     BackendKind, BackendLimits, BackendRecord, BackendSecret, CatalogLaunchResolver,
     EnvironmentCatalog, HarnessDefaults, LaunchResolver, OwnerDefaults, RuntimeCatalog,
     SecretDeliveryMode, StaticHarnessDefaults, TrustScope,
 };
-use narsor::workflows::WorkflowResolver;
+use narsor_engine::workflows::WorkflowResolver;
 
 /// Backends seeded by [`seed_catalog`].
 pub const BACKENDS: [&str; 4] = ["k8s", "backend-a", "backend-b", "other-backend"];

@@ -746,9 +746,9 @@ mod task_app_render {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use narsor::api::{ApiClient, ClientError};
-    use narsor::domain::ExecutionStatus;
-    use narsor::orchestration::AttentionKind;
     use narsor::tui::task_app::{layout, TaskApp};
+    use narsor_engine::domain::ExecutionStatus;
+    use narsor_engine::orchestration::AttentionKind;
 
     use crate::task_app_support::{
         listing, queued, titled, waiting, waiting_for_capacity, with_controller, with_runner,
@@ -1382,7 +1382,7 @@ mod task_app_render {
         assert_eq!(label("Queued 4", "#2"), Color::Reset);
     }
 
-    fn long_list(count: u32) -> Vec<narsor::controller_protocol::TaskSummary> {
+    fn long_list(count: u32) -> Vec<narsor_engine::controller_protocol::TaskSummary> {
         (1..=count)
             .map(|rank| {
                 titled(
@@ -1529,14 +1529,14 @@ mod task_app_detail_render {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use narsor::api::ApiClient;
-    use narsor::controller_protocol::{ExecutionEventsResponse, QueueView};
-    use narsor::domain::ExecutionStatus;
-    use narsor::engine::{ConversationState, PositionStatus, Timeline};
-    use narsor::orchestration::QueueReason;
     use narsor::tui::task_app::detail::DetailRead;
     use narsor::tui::task_app::tabs::conversation::{self, AttemptRead, Attempts, Conversation};
     use narsor::tui::task_app::{layout, StepFocus, TaskApp};
     use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
+    use narsor_engine::controller_protocol::{ExecutionEventsResponse, QueueView};
+    use narsor_engine::domain::ExecutionStatus;
+    use narsor_engine::engine::{ConversationState, PositionStatus, Timeline};
+    use narsor_engine::orchestration::QueueReason;
 
     use crate::remote_support::{snapshot, RemoteHarness};
     use crate::task_app_support::{
@@ -1849,11 +1849,11 @@ mod task_app_detail_render {
     }
 
     fn narsor_waiting(
-        mut task: narsor::controller_protocol::TaskSummary,
+        mut task: narsor_engine::controller_protocol::TaskSummary,
         position: u32,
         running: u32,
         limit: u32,
-    ) -> narsor::controller_protocol::TaskSummary {
+    ) -> narsor_engine::controller_protocol::TaskSummary {
         let reason = QueueReason::WaitingForCapacity {
             position,
             running,
@@ -1908,7 +1908,7 @@ mod task_app_detail_render {
             DetailRead::Events {
                 after: 0,
                 result: Ok(ExecutionEventsResponse::Unavailable {
-                    reason: narsor::controller_protocol::ConversationUnavailableReason::RunnerUnreachable,
+                    reason: narsor_engine::controller_protocol::ConversationUnavailableReason::RunnerUnreachable,
                     message: "the runner has not been heard from lately".into(),
                 }),
             },
@@ -1977,7 +1977,7 @@ mod task_app_detail_render {
                 result: Ok(ExecutionEventsResponse::Available {
                     events: execution_events(4),
                     has_more: false,
-                    source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                    source: narsor_engine::controller_protocol::ExecutionEventsSource::Runner,
                 }),
             },
         );
@@ -2168,7 +2168,7 @@ mod task_app_detail_render {
                     truncated_tail: false,
                     complete: true,
                     no_record: false,
-                    source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                    source: narsor_engine::controller_protocol::ExecutionEventsSource::Runner,
                     recorded_at: None,
                 }),
             },
@@ -2371,7 +2371,7 @@ mod task_app_detail_render {
                 truncated_tail: false,
                 complete: true,
                 no_record: false,
-                source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                source: narsor_engine::controller_protocol::ExecutionEventsSource::Runner,
                 recorded_at: None,
             }),
         );
@@ -2457,7 +2457,7 @@ mod task_app_detail_render {
                 result: Ok(ExecutionEventsResponse::Available {
                     events: execution_events(4),
                     has_more: false,
-                    source: narsor::controller_protocol::ExecutionEventsSource::Runner,
+                    source: narsor_engine::controller_protocol::ExecutionEventsSource::Runner,
                 }),
             },
         );
@@ -2509,11 +2509,11 @@ mod task_app_detail_render {
     /// A read of `review`'s conversation from `source`, written three
     /// minutes ago when it is the record.
     fn read_from(
-        source: narsor::controller_protocol::ExecutionEventsSource,
+        source: narsor_engine::controller_protocol::ExecutionEventsSource,
         entries: Vec<TranscriptEntry>,
     ) -> AttemptRead {
         let next_entry = entries.len() as u64;
-        let record = source == narsor::controller_protocol::ExecutionEventsSource::Storage;
+        let record = source == narsor_engine::controller_protocol::ExecutionEventsSource::Storage;
         AttemptRead {
             entries,
             next_entry,
@@ -2543,7 +2543,7 @@ mod task_app_detail_render {
     /// page of the live runner has no badge.
     #[test]
     fn a_conversation_read_from_the_record_has_a_badge_with_its_age() {
-        use narsor::controller_protocol::ExecutionEventsSource::{Runner, Storage};
+        use narsor_engine::controller_protocol::ExecutionEventsSource::{Runner, Storage};
         for no_color in [false, true] {
             let styles = Styles::new(no_color);
             let mut record = conversation_of(read_from(Storage, three_entries()));
@@ -2575,7 +2575,7 @@ mod task_app_detail_render {
     #[test]
     fn an_interrupted_task_says_what_it_waits_for() {
         use crate::task_app_support::{exhausted, interrupted};
-        use narsor::orchestration::TaskLifecycle;
+        use narsor_engine::orchestration::TaskLifecycle;
         let cases = [
             (
                 interrupted("b", TaskLifecycle::Running, 2, true),
@@ -2630,7 +2630,7 @@ mod task_app_detail_render {
     /// A narrow terminal shortens the badge to the age.
     #[test]
     fn a_narrow_conversation_shortens_the_badge() {
-        use narsor::controller_protocol::ExecutionEventsSource::Storage;
+        use narsor_engine::controller_protocol::ExecutionEventsSource::Storage;
         let mut record = conversation_of(read_from(Storage, three_entries()));
         let buffer = draw(14, 6, |frame| {
             conversation::render(
@@ -2653,8 +2653,8 @@ mod task_app_detail_render {
     #[test]
     fn an_empty_or_unreadable_record_says_so() {
         use narsor::api::ClientError;
-        use narsor::controller_protocol::ExecutionEventsSource::Storage;
         use narsor::tui::task_app::tabs::conversation::ReadFailure;
+        use narsor_engine::controller_protocol::ExecutionEventsSource::Storage;
         let mut empty = conversation_of(read_from(Storage, Vec::new()));
         let text = screen(&draw_conversation(
             &mut empty,
@@ -2698,10 +2698,10 @@ mod task_app_waiting_render {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use narsor::api::ApiClient;
-    use narsor::domain::ExecutionStatus;
-    use narsor::orchestration::AttentionKind;
     use narsor::tui::task_app::detail::DetailRead;
     use narsor::tui::task_app::{layout, TaskApp};
+    use narsor_engine::domain::ExecutionStatus;
+    use narsor_engine::orchestration::AttentionKind;
     use serde_json::json;
 
     use crate::task_app_support::{
@@ -2713,7 +2713,7 @@ mod task_app_waiting_render {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
-    fn running() -> narsor::controller_protocol::TaskSummary {
+    fn running() -> narsor_engine::controller_protocol::TaskSummary {
         with_runner(
             with_controller(task("a", "local", "running", 1)),
             ExecutionStatus::InputNeeded,
@@ -2768,7 +2768,7 @@ mod task_app_waiting_render {
         form
     }
 
-    fn opened(task: narsor::controller_protocol::TaskSummary) -> TaskApp {
+    fn opened(task: narsor_engine::controller_protocol::TaskSummary) -> TaskApp {
         let mut app = TaskApp::new(
             ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
             "local",
@@ -2781,7 +2781,10 @@ mod task_app_waiting_render {
             1,
             DetailRead::Timeline(Ok(timeline(
                 "a",
-                vec![position("plan", narsor::engine::PositionStatus::Succeeded)],
+                vec![position(
+                    "plan",
+                    narsor_engine::engine::PositionStatus::Succeeded,
+                )],
                 None,
             ))),
         );
@@ -2968,7 +2971,10 @@ mod task_app_waiting_render {
             1,
             DetailRead::Timeline(Ok(timeline(
                 "a",
-                vec![position("plan", narsor::engine::PositionStatus::Succeeded)],
+                vec![position(
+                    "plan",
+                    narsor_engine::engine::PositionStatus::Succeeded,
+                )],
                 None,
             ))),
         );
@@ -3068,9 +3074,9 @@ mod task_app_actions_render {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use narsor::api::ApiClient;
-    use narsor::controller_protocol::TaskSummary;
-    use narsor::domain::ExecutionStatus;
     use narsor::tui::task_app::{layout, TaskApp};
+    use narsor_engine::controller_protocol::TaskSummary;
+    use narsor_engine::domain::ExecutionStatus;
 
     use crate::task_app_support::{
         displayed, listing, queued, task, titled, with_controller, with_runner, with_transitions,
@@ -3376,10 +3382,10 @@ mod task_app_conductor_render {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use narsor::api::ApiClient;
-    use narsor::controller_protocol::{ConductorReadResponse, ExecutionEventsSource};
-    use narsor::domain::ExecutionStatus;
     use narsor::tui::task_app::detail::DetailRead;
     use narsor::tui::task_app::{layout, DetailTab, TaskApp};
+    use narsor_engine::domain::ExecutionStatus;
+    use narsor_protocol::controller::{ConductorReadResponse, ExecutionEventsSource};
     use serde_json::json;
 
     use crate::task_app_support::{
@@ -3391,7 +3397,7 @@ mod task_app_conductor_render {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
-    fn running() -> narsor::controller_protocol::TaskSummary {
+    fn running() -> narsor_engine::controller_protocol::TaskSummary {
         with_conductor(with_runner(
             with_controller(task("a", "local", "running", 1)),
             ExecutionStatus::Running,
@@ -3400,7 +3406,7 @@ mod task_app_conductor_render {
     }
 
     /// The tab of task `a`, with a short conversation read.
-    fn opened(task: narsor::controller_protocol::TaskSummary, read: bool) -> TaskApp {
+    fn opened(task: narsor_engine::controller_protocol::TaskSummary, read: bool) -> TaskApp {
         let mut app = TaskApp::new(
             ApiClient::new("127.0.0.1:9".parse().unwrap(), "token"),
             "local",
@@ -3621,9 +3627,9 @@ mod task_app_create_render {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use narsor::api::ApiClient;
-    use narsor::controller_protocol::LegacyExecutionListResponse;
-    use narsor::domain::ParamType;
     use narsor::tui::task_app::{layout, Request, TaskApp};
+    use narsor_engine::domain::ParamType;
+    use narsor_protocol::api::LegacyExecutionListResponse;
 
     use crate::task_app_support::{
         archived, capabilities, catalogue, catalogue_workflow, legacy, listing, queued, registry,
@@ -3955,17 +3961,21 @@ mod task_app_create_render {
         keys(&mut app, "/srv/bad.yaml");
         app.on_path_checked(
             "/srv/bad.yaml",
-            Ok(narsor::controller_protocol::ValidateWorkflowResponse {
-                valid: false,
-                name: None,
-                version: None,
-                inputs: vec![],
-                violations: vec![
-                    "state 'plan' has no transition".to_string(),
-                    "state 'ship' is not reachable".to_string(),
-                    "input 'ticket' is declared twice".to_string(),
-                ],
-            }),
+            Ok(
+                narsor_engine::controller_protocol::ValidateWorkflowResponse {
+                    valid: false,
+                    name: None,
+                    version: None,
+                    state_count: 0,
+                    initial_state: None,
+                    inputs: vec![],
+                    violations: vec![
+                        "state 'plan' has no transition".to_string(),
+                        "state 'ship' is not reachable".to_string(),
+                        "input 'ticket' is declared twice".to_string(),
+                    ],
+                },
+            ),
         );
         let screen = draw_app(&mut app, 130, 40, false);
         for expected in [
@@ -4265,8 +4275,8 @@ mod task_app_main_screen {
     use super::*;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use narsor::orchestration::{AttentionItem, AttentionKind};
     use narsor::tui::task_app::{layout, TaskApp};
+    use narsor_engine::orchestration::{AttentionItem, AttentionKind};
 
     use crate::remote_support::{snapshot, RemoteHarness};
 

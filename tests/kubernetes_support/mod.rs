@@ -48,8 +48,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use narsor::backends::kubernetes::client::{ClusterAccess, TokenSource};
-use narsor::backends::kubernetes::manifest::RUNNER_CONTAINER;
+use narsor_controller::kubernetes::client::{ClusterAccess, TokenSource};
+use narsor_controller::kubernetes::manifest::RUNNER_CONTAINER;
 
 /// Namespace of the mock cluster.
 pub const NAMESPACE: &str = "narsor-user";

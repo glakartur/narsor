@@ -2,32 +2,21 @@
 //!
 //! # Where a `run` gets its workspace
 //!
-//! `run` owns the command line — parsing `--input name=value` pairs against the
-//! declared parameters, and printing what happened — and nothing else: creating
-//! the execution, provisioning its workspace and recording where its definition
-//! lives is [`crate::tasks::start_task`], which the interface calls too. That
-//! module documents the ordering those steps have to keep.
+//! `run` owns command-line parsing and presentation. It gets the workflow
+//! schema and queues the task through the control plane API; the server owns
+//! workflow resolution, task creation, and execution.
 //!
 //! # Where a definition comes from
 //!
-//! `validate`, `run` and `--file` all take a *workflow reference*, not a path:
-//! an existing file wins, then `{root}/workflows/<name>.yaml`, then the user
-//! directory, then the built-in of that name ([`crate::workflows`]). That is
-//! what makes `narsor run compound-engineering` work from an installed
-//! binary, which has no checkout to read from.
+//! A catalogue reference is resolved by the server's workflow endpoint. A
+//! file reference is validated by the local server and sent as an absolute
+//! path, so the client does not parse a workflow definition itself.
 //!
 //! # How `input` and `resume` find the definition
 //!
-//! The engine needs the [`WorkflowDefinition`] to continue an execution, but
-//! `state.json` stores only the workflow *id*. So `run` records both the
-//! absolute path of the file it read (when there was one) and the workflow's
-//! name, and re-resolves from that — [`crate::tasks::resolve_definition`]. A
-//! built-in has no path at all, so without the name an execution started
-//! from one could never be resumed. This resolution happens daemon-side
-//! (R4/D52): `input` and `resume` are pure `ApiClient` callers, so neither
-//! reaches for `tasks::resolve_definition` itself any more, and neither
-//! accepts `--file` — there is no way for a REST call to point the daemon at
-//! a local override path it has no filesystem relationship to.
+//! The server seals workflow definitions with accepted tasks. Follow-up
+//! commands such as `input` and `resume` use API responses and never resolve
+//! the definition or open execution storage themselves.
 
 use std::path::Path;
 use std::time::Duration;
@@ -36,58 +25,22 @@ use futures::StreamExt as _;
 use serde_json::{Map, Value};
 
 use crate::api::{
-    ApiClient, ClientError, ConversationResponse, ExecutionStatusDto, ExecutionSummary,
+    ApiClient, ChatAuthorDto, ChatEntryDto, ChatEntryKindDto, ClientError, ConversationResponse,
+    ExecutionStatusDto, ExecutionSummary, HumanInputDeliveryDto, ProblemKindDto,
 };
-use crate::conductor::{ChatAuthor, ChatEntry, ChatEntryKind};
-use crate::domain::{
-    Event, ExecutionStatus, InputParameter, ParamType, ProblemKind, WorkflowDefinition,
-    without_unsafe_chars,
-};
-use crate::engine::{
-    ConversationState, HumanInputDelivery, PendingHumanInput, Position, PositionStatus,
-};
-use crate::persistence::StatePaths;
-use crate::registry::{RepositoryEntry, RepositoryRegistry};
-use crate::tasks::{self, TaskError};
+use crate::domain::{without_unsafe_chars, Event, ExecutionStatus};
 use crate::tui::conversation::classify;
-use crate::workflows::{ResolvedWorkflow, WorkflowResolver, builtin, builtin_names};
+use narsor_protocol::api::{ConversationState, Position, PositionStatus};
+use narsor_protocol::controller::{WorkflowInputType, WorkflowInputView, WorkflowSource};
 
-use crate::config::{Flags, Resolved, SettingKey, Source, render_value};
+use crate::config::{render_value, Flags, Resolved, SettingKey, Source};
 
-use super::{ConfigFormat, EXIT_FAILURE, EXIT_USAGE};
+use super::ConfigFormat;
 
 /// How often `events --follow` looks for new entries in the log.
 const FOLLOW_INTERVAL: Duration = Duration::from_millis(250);
 
-/// A message for the operator plus the exit code it carries.
-#[derive(Debug)]
-pub struct CliError {
-    /// What is printed to stderr.
-    pub message: String,
-    /// The process exit code.
-    pub exit_code: i32,
-}
-
-impl CliError {
-    /// A validation error, a failed execution, or an unreadable store.
-    pub fn failure(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            exit_code: EXIT_FAILURE,
-        }
-    }
-
-    /// A wrong invocation: nothing ran.
-    pub fn usage(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            exit_code: EXIT_USAGE,
-        }
-    }
-}
-
-/// Result of a subcommand.
-pub type Result<T> = std::result::Result<T, CliError>;
+pub use narsor_shared::cli_error::{CliError, Result};
 
 // ---------------------------------------------------------------------------
 // validate
@@ -98,33 +51,56 @@ pub type Result<T> = std::result::Result<T, CliError>;
 ///
 /// The argument is a workflow reference: a file, a name in the search path, or
 /// a built-in.
-pub fn validate(catalog: &Path, reference: &str) -> Result<()> {
-    let resolved = resolve_workflow(catalog, reference)?;
-    let definition = tasks::load_resolved(&resolved).map_err(|error| match error {
-        TaskError::InvalidDefinition { violations } => {
-            let mut message = format!(
-                "Definition '{}' ({}) is invalid — {} {} found:",
-                resolved.name,
-                resolved.origin,
-                violations.len(),
-                violation_noun(violations.len())
-            );
-            for violation in &violations {
-                message.push_str(&format!("\n  - {violation}"));
-            }
-            CliError::failure(message)
-        }
-        other => CliError::failure(other.to_string()),
-    })?;
+pub async fn validate(config: &Resolved, flags: &Flags, reference: &str) -> Result<()> {
+    let client = daemon_client(config.state_dir(), flags).await?;
+    if Path::new(reference).is_file() {
+        let path = absolute_workflow_path(reference)?;
+        let verdict = client
+            .control_validate_workflow(&path)
+            .await
+            .map_err(|error| {
+                CliError::failure(format!("Could not validate '{reference}': {error}"))
+            })?;
+        return print_validation(
+            verdict.name.as_deref().unwrap_or(reference),
+            &path,
+            verdict.valid,
+            verdict.version,
+            verdict.state_count,
+            verdict.initial_state.as_deref(),
+            &verdict.violations,
+        );
+    }
 
-    println!(
-        "The definition is valid: {} (version {}), states: {}, initial state: {}.",
-        definition.name,
-        definition.version,
-        definition.states.len(),
-        definition.initial_state
-    );
-    Ok(())
+    let listing = client
+        .control_workflows()
+        .await
+        .map_err(|error| CliError::failure(format!("Could not list workflows: {error}")))?;
+    let Some(workflow) = listing
+        .workflows
+        .iter()
+        .find(|workflow| workflow.name == reference)
+    else {
+        let builtins = listing
+            .workflows
+            .iter()
+            .filter(|workflow| workflow.source == WorkflowSource::BuiltIn)
+            .map(|workflow| workflow.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CliError::usage(format!(
+            "Workflow '{reference}' is not in the control plane catalogue. Looked for '{reference}' in the server workflow catalogue; available built-ins: {builtins}."
+        )));
+    };
+    print_validation(
+        &workflow.name,
+        workflow_source_name(workflow.source),
+        workflow.valid,
+        workflow.version,
+        workflow.state_count,
+        workflow.initial_state.as_deref(),
+        &workflow.violations,
+    )
 }
 
 /// Singular or plural, for the violation count.
@@ -134,6 +110,35 @@ fn violation_noun(count: usize) -> &'static str {
     } else {
         "violations"
     }
+}
+
+fn print_validation(
+    name: &str,
+    source: &str,
+    valid: bool,
+    version: Option<u32>,
+    state_count: usize,
+    initial_state: Option<&str>,
+    violations: &[String],
+) -> Result<()> {
+    if !valid {
+        let mut message = format!(
+            "Definition '{name}' ({source}) is invalid — {} {} found:",
+            violations.len(),
+            violation_noun(violations.len())
+        );
+        for violation in violations {
+            message.push_str(&format!("\n  - {}", without_unsafe_chars(violation)));
+        }
+        return Err(CliError::failure(message));
+    }
+
+    println!(
+        "The definition is valid: {name} (version {}), states: {state_count}, initial state: {}.",
+        version.unwrap_or_default(),
+        initial_state.unwrap_or("-")
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -150,42 +155,27 @@ fn violation_noun(count: usize) -> &'static str {
 /// blocking until the execution stops needing a driver
 /// ([`wait_until_stopped`]).
 ///
-/// The workflow reference is still resolved and its definition still loaded
-/// locally first, exactly as before: that is what lets a missing/invalid
-/// definition or a missing required input be reported before anything talks
-/// to the daemon at all (unchanged from the pre-daemon behaviour). The
-/// *reference string itself* — not the locally resolved name — is what goes
-/// over the wire, so the daemon repeats exactly the same resolution
-/// (`WorkflowResolver::resolve`) this process just did, including the
-/// "an existing file wins" case for a bespoke local path.
+/// Workflow discovery and validation come from the control plane. A file
+/// reference is validated by the local server, and a catalogue reference is
+/// looked up through its workflow endpoint; this client never parses a
+/// workflow definition before creating the task.
 pub async fn run(
     config: &Resolved,
     flags: &Flags,
     reference: &str,
     inputs: &[String],
 ) -> Result<()> {
-    let catalog = config.catalog_dir();
-    let resolved = resolve_workflow(catalog, reference)?;
-    eprintln!("Workflow '{}' — {}.", resolved.name, resolved.origin);
-    let definition = tasks::load_resolved(&resolved).map_err(|error| match error {
-        TaskError::InvalidDefinition { violations } => {
-            let mut message = String::from("The definition is invalid — no execution was created:");
-            for violation in &violations {
-                message.push_str(&format!("\n  - {violation}"));
-            }
-            CliError::failure(message)
-        }
-        other => CliError::failure(other.to_string()),
-    })?;
+    let client = daemon_client(config.state_dir(), flags).await?;
+    let (workflow, name, source, schema) = workflow_for_run(&client, reference).await?;
+    eprintln!("Workflow '{name}' — {source}.");
 
     // Inputs first: a missing required parameter must be reported before
     // anything is written to disk.
-    let inputs = collect_inputs(&definition, inputs)?;
+    let inputs = collect_inputs(&name, &schema, inputs)?;
 
-    let client = daemon_client(config.state_dir(), flags).await?;
     let submission_id = format!("task-{}", uuid::Uuid::new_v4().simple());
 
-    let started = submit_task(&client, &submission_id, reference, inputs)
+    let started = submit_task(&client, &submission_id, &workflow, inputs)
         .await
         .map_err(|error| CliError::failure(format!("Could not start the workflow: {error}")))?;
     println!("Queued task: {}", started.task.task_id);
@@ -213,7 +203,11 @@ pub async fn run(
 
 /// Parses `--input` pairs against the declared parameters, fills in defaults and
 /// reports everything that is missing.
-fn collect_inputs(definition: &WorkflowDefinition, pairs: &[String]) -> Result<Map<String, Value>> {
+fn collect_inputs(
+    workflow_name: &str,
+    schema: &[WorkflowInputView],
+    pairs: &[String],
+) -> Result<Map<String, Value>> {
     let mut values = Map::new();
 
     for pair in pairs {
@@ -223,15 +217,14 @@ fn collect_inputs(definition: &WorkflowDefinition, pairs: &[String]) -> Result<M
             ))
         })?;
 
-        let parameter = definition
-            .inputs
+        let parameter = schema
             .iter()
             .find(|parameter| parameter.name == name)
             .ok_or_else(|| {
                 CliError::usage(format!(
                     "Workflow '{}' declares no input named '{name}'. Declared inputs: {}.",
-                    definition.name,
-                    declared_input_names(definition)
+                    workflow_name,
+                    declared_input_names(schema)
                 ))
             })?;
 
@@ -239,7 +232,7 @@ fn collect_inputs(definition: &WorkflowDefinition, pairs: &[String]) -> Result<M
     }
 
     let mut missing = Vec::new();
-    for parameter in &definition.inputs {
+    for parameter in schema {
         if values.contains_key(&parameter.name) {
             continue;
         }
@@ -261,12 +254,11 @@ fn collect_inputs(definition: &WorkflowDefinition, pairs: &[String]) -> Result<M
 }
 
 /// The declared input names, for an error message.
-fn declared_input_names(definition: &WorkflowDefinition) -> String {
-    if definition.inputs.is_empty() {
+fn declared_input_names(schema: &[WorkflowInputView]) -> String {
+    if schema.is_empty() {
         return "(none)".to_string();
     }
-    definition
-        .inputs
+    schema
         .iter()
         .map(|parameter| parameter.name.as_str())
         .collect::<Vec<_>>()
@@ -278,18 +270,18 @@ fn declared_input_names(definition: &WorkflowDefinition) -> String {
 /// This is why `--input is_experimental=true` reaches the context as a boolean
 /// and not as the string `"true"`: the type comes from the definition, never
 /// from guessing at the text.
-fn parse_input_value(parameter: &InputParameter, raw: &str) -> Result<Value> {
-    match parameter.param_type {
-        ParamType::String | ParamType::Text | ParamType::Repository => {
+fn parse_input_value(parameter: &WorkflowInputView, raw: &str) -> Result<Value> {
+    match parameter.input_type {
+        WorkflowInputType::String | WorkflowInputType::Text | WorkflowInputType::Repository => {
             Ok(Value::String(raw.to_string()))
         }
-        ParamType::Integer => raw.parse::<i64>().map(Value::from).map_err(|_| {
+        WorkflowInputType::Integer => raw.parse::<i64>().map(Value::from).map_err(|_| {
             CliError::usage(format!(
                 "Input '{}' is of type integer, and '{raw}' is not a whole number.",
                 parameter.name
             ))
         }),
-        ParamType::Boolean => match raw.to_ascii_lowercase().as_str() {
+        WorkflowInputType::Boolean => match raw.to_ascii_lowercase().as_str() {
             "true" => Ok(Value::Bool(true)),
             "false" => Ok(Value::Bool(false)),
             _ => Err(CliError::usage(format!(
@@ -666,15 +658,14 @@ pub async fn input(
         values.insert(name.to_string(), Value::String(raw.to_string()));
     }
 
-    let mut delivery = HumanInputDelivery::with_values(values)
-        .with_data(step_values("data", &answer.data)?)
-        .with_variables(step_values("variable", &answer.variables)?);
-    if let Some(label) = answer.label {
-        delivery = delivery.choosing(label);
-    }
-    if let Some(comment) = answer.comment {
-        delivery = delivery.with_comment(comment);
-    }
+    let mut delivery = HumanInputDeliveryDto {
+        values,
+        data: step_values("data", &answer.data)?,
+        variables: step_values("variable", &answer.variables)?,
+        chosen_label: answer.label,
+        comment: answer.comment,
+        ..HumanInputDeliveryDto::default()
+    };
 
     let client = daemon_client(config.state_dir(), flags).await?;
 
@@ -692,7 +683,7 @@ pub async fn input(
             current.status.as_str()
         )));
     };
-    let delivery = delivery.for_episode(pending.episode_key());
+    delivery.episode = Some(pending.episode_key().to_string());
 
     client
         .deliver_input(execution_id, delivery)
@@ -706,7 +697,7 @@ pub async fn input(
             other => client_error(execution_id, other),
         })?;
 
-    let summary = wait_until_stopped(&client, execution_id, current.status.clone()).await?;
+    let summary = wait_until_stopped(&client, execution_id, current.status).await?;
 
     println!("Input delivered to execution {}.", summary.id);
     print_summary(&summary);
@@ -823,7 +814,7 @@ pub async fn recover(
     let failure = current
         .problem
         .as_ref()
-        .filter(|problem| problem.kind == ProblemKind::Failure)
+        .filter(|problem| problem.kind == ProblemKindDto::Failure)
         .and_then(|problem| problem.episode.clone());
 
     let accepted = match &failure {
@@ -944,7 +935,7 @@ pub async fn conductor_settle(
     confirm: bool,
 ) -> Result<()> {
     let client = daemon_client(state, flags).await?;
-    let proposal_id = chat_entry_id(&client, execution_id, proposal, ChatEntryKind::Proposal)
+    let proposal_id = chat_entry_id(&client, execution_id, proposal, ChatEntryKindDto::Proposal)
         .await?
         .unwrap_or_else(|| proposal.to_string());
     let outcome = if confirm {
@@ -985,7 +976,9 @@ pub async fn conductor_undo(
                 .entries;
             entries
                 .iter()
-                .find(|entry| entry.sequence == sequence && entry.kind == ChatEntryKind::Decision)
+                .find(|entry| {
+                    entry.sequence == sequence && entry.kind == ChatEntryKindDto::Decision
+                })
                 .and_then(|entry| entry.payload.as_ref()?.get("decision_id")?.as_str())
                 .map(ToString::to_string)
                 .unwrap_or_else(|| decision.to_string())
@@ -1072,7 +1065,7 @@ async fn chat_entry_id(
     client: &ApiClient,
     execution_id: &str,
     reference: &str,
-    kind: ChatEntryKind,
+    kind: ChatEntryKindDto,
 ) -> Result<Option<String>> {
     let Ok(sequence) = reference.parse::<u64>() else {
         return Ok(None);
@@ -1090,21 +1083,21 @@ async fn chat_entry_id(
 
 /// One chat entry: its number, who wrote it and what it is, its text, and
 /// — for a proposal or a decision — the id to act on it by.
-fn print_chat_entry(entry: &ChatEntry) {
+fn print_chat_entry(entry: &ChatEntryDto) {
     let who = match entry.author {
-        ChatAuthor::Operator => "operator",
-        ChatAuthor::Conductor => "conductor",
+        ChatAuthorDto::Operator => "operator",
+        ChatAuthorDto::Conductor => "conductor",
     };
     let what = match entry.kind {
-        ChatEntryKind::Message => "",
-        ChatEntryKind::Error => " (error)",
-        ChatEntryKind::Decision => " (decision)",
-        ChatEntryKind::Proposal => " (proposal)",
+        ChatEntryKindDto::Message => "",
+        ChatEntryKindDto::Error => " (error)",
+        ChatEntryKindDto::Decision => " (decision)",
+        ChatEntryKindDto::Proposal => " (proposal)",
     };
     println!("#{:<4} {who}{what}: {}", entry.sequence, entry.text);
     match entry.kind {
-        ChatEntryKind::Proposal => println!("      proposal id: {}", entry.id),
-        ChatEntryKind::Decision => {
+        ChatEntryKindDto::Proposal => println!("      proposal id: {}", entry.id),
+        ChatEntryKindDto::Decision => {
             if let Some(id) = entry
                 .payload
                 .as_ref()
@@ -1114,245 +1107,8 @@ fn print_chat_entry(entry: &ChatEntry) {
                 println!("      decision id: {id}");
             }
         }
-        ChatEntryKind::Message | ChatEntryKind::Error => {}
+        ChatEntryKindDto::Message | ChatEntryKindDto::Error => {}
     }
-}
-
-/// `narsor repo add <id> --remote <url|path> …` — register a repository.
-///
-/// The remote is checked with the workspace provisioner's own rules, so a
-/// remote the registry accepts is one a workflow will be able to clone: a value
-/// starting with `-` or using the `ext::` transport is refused here rather than
-/// halfway through a run.
-pub fn repo_add(
-    catalog: &Path,
-    id: &str,
-    remote: &str,
-    name: Option<String>,
-    provider: Option<String>,
-    default_branch: Option<String>,
-    description: Option<String>,
-) -> Result<()> {
-    let entry = RepositoryEntry::described(id, remote, name, provider, default_branch, description);
-
-    let registry = RepositoryRegistry::new(catalog);
-    registry.add(entry).map_err(|error| {
-        CliError::failure(format!("Could not register the repository: {error}"))
-    })?;
-
-    println!("Registered repository '{id}' -> {remote}");
-    Ok(())
-}
-
-/// `narsor repo list` — every registered repository, ordered by id.
-///
-/// A file that cannot be read as an entry does not hide the ones that can: the
-/// listing prints what loaded, names what did not, and *then* fails. The
-/// pattern is `config show`'s — a diagnostic that goes silent in the situation
-/// it exists for is no diagnostic — and the exit code is what keeps a script
-/// branching on it from being misled.
-pub fn repo_list(catalog: &Path) -> Result<()> {
-    let listing = RepositoryRegistry::new(catalog)
-        .list()
-        .map_err(|error| CliError::failure(format!("Could not read the registry: {error}")))?;
-
-    if listing.is_empty() {
-        println!("No repositories registered.");
-        return Ok(());
-    }
-
-    if !listing.entries.is_empty() {
-        println!(
-            "{:<24} {:<10} {:<16} REMOTE",
-            "ID", "PROVIDER", "DEFAULT BRANCH"
-        );
-        for entry in &listing.entries {
-            println!(
-                "{:<24} {:<10} {:<16} {}",
-                entry.id,
-                entry.provider,
-                entry.default_branch.as_deref().unwrap_or("-"),
-                entry.remote
-            );
-        }
-    }
-
-    if listing.is_ok() {
-        return Ok(());
-    }
-
-    for failure in &listing.failures {
-        eprintln!("{}: {}", failure.path.display(), failure.reason);
-    }
-    Err(CliError::failure(format!(
-        "{} registry entr(y/ies) could not be read; they are named above.",
-        listing.failures.len()
-    )))
-}
-
-/// `narsor repo show <id>` — every field of one registered repository.
-pub fn repo_show(catalog: &Path, id: &str) -> Result<()> {
-    let registry = RepositoryRegistry::new(catalog);
-    let entry = registry
-        .get(id)
-        .map_err(|error| CliError::failure(format!("Could not read the registry: {error}")))?
-        .ok_or_else(|| {
-            CliError::failure(format!(
-                "Repository '{id}' is not registered in '{}'.",
-                registry.dir().display()
-            ))
-        })?;
-
-    println!("Repository:     {}", entry.id);
-    println!("Name:           {}", entry.name);
-    println!("Provider:       {}", entry.provider);
-    println!("Remote:         {}", entry.remote);
-    println!(
-        "Default branch: {}",
-        entry.default_branch.as_deref().unwrap_or("-")
-    );
-    println!(
-        "Description:    {}",
-        entry.description.as_deref().unwrap_or("-")
-    );
-    Ok(())
-}
-
-/// `narsor repo remove <id>` — drop a repository from the registry.
-pub fn repo_remove(catalog: &Path, id: &str) -> Result<()> {
-    RepositoryRegistry::new(catalog)
-        .remove(id)
-        .map_err(|error| CliError::failure(format!("Could not remove the repository: {error}")))?;
-
-    println!("Removed repository '{id}'.");
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// workflow
-// ---------------------------------------------------------------------------
-
-/// `narsor workflow list` — every workflow reachable right now.
-///
-/// One line per *name*: where the copy that wins comes from, what it overrides
-/// when it overrides something, and its `description`. A user copy shadowing a
-/// built-in is one row marked as an override, never two rows that leave the
-/// operator guessing which one would run.
-pub fn workflow_list(catalog: &Path) -> Result<()> {
-    let resolver = WorkflowResolver::new(catalog);
-    let entries = resolver.list();
-
-    if entries.is_empty() {
-        println!("No workflows are reachable.");
-        return Ok(());
-    }
-
-    println!("{:<28} {:<10} DESCRIPTION", "NAME", "SOURCE");
-    for entry in &entries {
-        let description = entry.description.as_deref().unwrap_or("-");
-        println!(
-            "{:<28} {:<10} {}",
-            entry.name,
-            entry.origin.label(),
-            truncate(description, 80)
-        );
-        if entry.is_override() {
-            println!("{:<28} {:<10} overrides: {}", "", "", entry.shadow_labels());
-        }
-        if let Some(path) = entry.origin.path() {
-            println!("{:<28} {:<10} path: {}", "", "", path.display());
-        }
-    }
-    Ok(())
-}
-
-/// `narsor workflow show <name>` — the YAML that would run.
-///
-/// The definition goes to stdout and nothing else does, so
-/// `narsor workflow show compound-engineering > mine.yaml` is a copy;
-/// where it came from is said on stderr.
-pub fn workflow_show(catalog: &Path, reference: &str) -> Result<()> {
-    let resolved = resolve_workflow(catalog, reference)?;
-    eprintln!("Workflow '{}' — {}.", resolved.name, resolved.origin);
-    print!("{}", resolved.source);
-    if !resolved.source.ends_with('\n') {
-        println!();
-    }
-    Ok(())
-}
-
-/// `narsor workflow eject <name> [--to <dir>] [--force]` — write a
-/// built-in out as a file.
-///
-/// The default target is the user directory, which the resolver searches ahead
-/// of the built-ins: the ejected copy takes precedence the moment it is
-/// written, which is the whole point of ejecting one.
-pub fn workflow_eject(catalog: &Path, name: &str, to: Option<&Path>, force: bool) -> Result<()> {
-    let builtin = builtin(name).ok_or_else(|| {
-        CliError::usage(format!(
-            "There is no built-in workflow named '{}'. Available built-in workflows: {}.",
-            crate::workflows::workflow_name(name),
-            builtin_names().join(", ")
-        ))
-    })?;
-
-    let resolver = WorkflowResolver::new(catalog);
-    let directory = match to {
-        Some(directory) => directory.to_path_buf(),
-        None => resolver.user_dir().map(Path::to_path_buf).ok_or_else(|| {
-            CliError::usage(
-                "There is no user configuration directory (neither XDG_CONFIG_HOME nor HOME is \
-                 set) — name a directory with --to."
-                    .to_string(),
-            )
-        })?,
-    };
-
-    std::fs::create_dir_all(&directory).map_err(|error| {
-        CliError::failure(format!(
-            "Could not create '{}': {error}",
-            directory.display()
-        ))
-    })?;
-
-    let target = directory.join(format!("{}.yaml", builtin.name));
-    if target.exists() && !force {
-        return Err(CliError::failure(format!(
-            "'{}' already exists — pass --force to overwrite it.",
-            target.display()
-        )));
-    }
-
-    std::fs::write(&target, builtin.source).map_err(|error| {
-        CliError::failure(format!("Could not write '{}': {error}", target.display()))
-    })?;
-
-    println!("Wrote {}", target.display());
-    match resolver.resolve_name(builtin.name) {
-        Ok(resolved) if resolved.path() == Some(target.as_path()) => println!(
-            "'{}' now resolves to this copy instead of the built-in.",
-            builtin.name
-        ),
-        Ok(resolved) => println!(
-            "Note: '{}' still resolves to {} — that copy has precedence over this one.",
-            builtin.name, resolved.origin
-        ),
-        Err(_) => println!(
-            "Note: '{}' is not on the search path from this data directory; \
-             run it by path, or point --root at the directory holding it.",
-            builtin.name
-        ),
-    }
-    Ok(())
-}
-
-/// Shortens a description to one line of a listing.
-fn truncate(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_string();
-    }
-    let kept: String = text.chars().take(limit.saturating_sub(1)).collect();
-    format!("{kept}…")
 }
 
 // ---------------------------------------------------------------------------
@@ -1369,7 +1125,7 @@ fn truncate(text: &str, limit: usize) -> String {
 /// driven on it: spawning a second runtime inside the first would panic, and
 /// the interface has to own a thread anyway — it blocks on keys.
 pub fn tui(config: &Resolved, flags: &Flags, target: &crate::api::ServerTarget) -> Result<()> {
-    let state = StatePaths::new(config.state_dir());
+    let state = config.state_dir();
     let handle = tokio::runtime::Handle::current();
     let refresh_interval = config
         .tui_refresh_interval()
@@ -1377,7 +1133,7 @@ pub fn tui(config: &Resolved, flags: &Flags, target: &crate::api::ServerTarget) 
     let connection_name = target.server.clone().unwrap_or_else(|| "local".to_string());
     tokio::task::block_in_place(move || {
         handle.block_on(async {
-            let client = crate::api::connect(target, &state, flags)
+            let client = crate::api::connect(target, state, flags)
                 .await
                 .map_err(CliError::failure)?;
             crate::tui::run(client, connection_name, refresh_interval)
@@ -1395,12 +1151,83 @@ pub fn tui(config: &Resolved, flags: &Flags, target: &crate::api::ServerTarget) 
 // shared helpers
 // ---------------------------------------------------------------------------
 
-/// Resolves a workflow reference, turning a miss into the message that names
-/// every place that was tried.
-fn resolve_workflow(catalog: &Path, reference: &str) -> Result<ResolvedWorkflow> {
-    WorkflowResolver::new(catalog)
-        .resolve(reference)
-        .map_err(|error| CliError::usage(error.to_string()))
+/// Resolves the input schema through the server, returning the original
+/// reference to submit so the server applies the same catalogue resolution.
+async fn workflow_for_run(
+    client: &ApiClient,
+    reference: &str,
+) -> Result<(String, String, String, Vec<WorkflowInputView>)> {
+    if Path::new(reference).is_file() {
+        let path = absolute_workflow_path(reference)?;
+        let verdict = client
+            .control_validate_workflow(&path)
+            .await
+            .map_err(|error| {
+                CliError::failure(format!("The file could not be validated: {error}"))
+            })?;
+        if !verdict.valid {
+            return Err(invalid_workflow_error(
+                verdict.name.as_deref().unwrap_or(reference),
+                &verdict.violations,
+            ));
+        }
+        let name = verdict
+            .name
+            .unwrap_or_else(|| Path::new(reference).display().to_string());
+        return Ok((path, name, "file".to_string(), verdict.inputs));
+    }
+
+    let listing = client
+        .control_workflows()
+        .await
+        .map_err(|error| CliError::failure(format!("Could not list workflows: {error}")))?;
+    let Some(workflow) = listing
+        .workflows
+        .iter()
+        .find(|workflow| workflow.name == reference)
+    else {
+        let builtins = listing
+            .workflows
+            .iter()
+            .filter(|workflow| workflow.source == WorkflowSource::BuiltIn)
+            .map(|workflow| workflow.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CliError::usage(format!(
+            "Workflow '{reference}' is not in the control plane catalogue. Looked for '{reference}' in the server workflow catalogue; available built-ins: {builtins}."
+        )));
+    };
+    if !workflow.valid {
+        return Err(invalid_workflow_error(&workflow.name, &workflow.violations));
+    }
+    Ok((
+        reference.to_string(),
+        workflow.name.clone(),
+        workflow_source_name(workflow.source).to_string(),
+        workflow.inputs.clone(),
+    ))
+}
+
+fn absolute_workflow_path(reference: &str) -> Result<String> {
+    std::path::absolute(reference)
+        .map(|path| path.display().to_string())
+        .map_err(|error| CliError::usage(format!("Cannot make '{reference}' absolute: {error}")))
+}
+
+fn invalid_workflow_error(name: &str, violations: &[String]) -> CliError {
+    let mut message = format!("The definition '{name}' is invalid — no task was created:");
+    for violation in violations {
+        message.push_str(&format!("\n  - {}", without_unsafe_chars(violation)));
+    }
+    CliError::failure(message)
+}
+
+fn workflow_source_name(source: WorkflowSource) -> &'static str {
+    match source {
+        WorkflowSource::BuiltIn => "built-in",
+        WorkflowSource::Catalog => "root/catalog",
+        WorkflowSource::User => "user",
+    }
 }
 
 /// The REST counterpart of the old, in-process
@@ -1427,8 +1254,7 @@ fn print_status_line(status: &ExecutionStatusDto, current_state: Option<&str>) {
 /// launches one (AE2) — the one entry point every command above goes
 /// through instead of constructing `Engine`/`ExecutionStore` itself (R4).
 async fn daemon_client(state: &Path, flags: &Flags) -> Result<ApiClient> {
-    let paths = StatePaths::new(state);
-    crate::api::ensure_daemon_running(&paths, flags)
+    crate::api::ensure_daemon_running(state, flags)
         .await
         .map_err(|error| CliError::failure(format!("Could not reach the narsor daemon: {error}")))
 }
@@ -1667,13 +1493,13 @@ fn print_open_matters(summary: &ExecutionSummary) {
 /// a `Failed` execution is a problem on (F3), the summary of the gate it
 /// waits on (R30), and what the conductor is working on right now (R11).
 ///
-/// A problem input ([`ProblemKind::Output`]) is not repeated here: the
+/// A problem input ([`ProblemKindDto::Output`]) is not repeated here: the
 /// pending input's form already says it.
 fn print_conductor_matters(summary: &ExecutionSummary) {
     if let Some(problem) = summary
         .problem
         .as_ref()
-        .filter(|problem| problem.kind == ProblemKind::Failure)
+        .filter(|problem| problem.kind == ProblemKindDto::Failure)
     {
         println!("Problem ({}): {}", problem.kind.name(), problem.reason);
         if let Some(episode) = &problem.episode {
@@ -1701,55 +1527,100 @@ fn print_conductor_matters(summary: &ExecutionSummary) {
 }
 
 /// The question an execution is waiting on, as a form the operator can fill in.
-fn print_pending_input(pending: &PendingHumanInput) {
-    println!("Human input expected: {}", pending.instruction());
-    for field in pending.fields() {
-        let requirement = if field.required {
+fn print_pending_input(pending: &impl serde::Serialize) {
+    let Ok(pending) = serde_json::to_value(pending) else {
+        println!("Human input expected: (unavailable)");
+        return;
+    };
+    println!(
+        "Human input expected: {}",
+        pending["instruction"].as_str().unwrap_or("(unavailable)")
+    );
+    for field in pending["fields"].as_array().into_iter().flatten() {
+        let requirement = if field["required"].as_bool().unwrap_or(false) {
             "required"
         } else {
             "optional"
         };
-        let options = if field.options.is_empty() {
+        let options_list = field["options"].as_array();
+        let options = if options_list.is_none_or(Vec::is_empty) {
             String::new()
         } else {
-            format!(", allowed values: {}", field.options.join(", "))
+            format!(
+                ", allowed values: {}",
+                options_list
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let field_type = match field["type"].as_str().unwrap_or_default() {
+            "text" => "Text",
+            "select" => "Select",
+            other => other,
         };
         println!(
-            "  --field {}=…  ({:?}, {requirement}{options})",
-            field.name, field.field_type
+            "  --field {}=…  ({field_type}, {requirement}{options})",
+            field["name"].as_str().unwrap_or("?")
         );
     }
-    let Some(problem) = &pending.problem else {
-        if !pending.outputs.is_empty() {
-            println!("  Output labels: {}", pending.output_labels().join(", "));
+    let outputs = pending["outputs"].as_array().cloned().unwrap_or_default();
+    let problem = &pending["problem"];
+    if problem.is_null() {
+        if !outputs.is_empty() {
+            let labels = outputs
+                .iter()
+                .filter_map(|output| output.as_str().or_else(|| output["label"].as_str()))
+                .collect::<Vec<_>>();
+            println!("  Output labels: {}", labels.join(", "));
         }
         return;
-    };
+    }
 
     // A problem: the step's output is what is asked for (KTD3).
-    println!("  Problem: {}", problem.reason);
-    for answer in &problem.answers {
-        if let Some(tail) = &answer.answer_tail {
-            println!("  Agent answered ({}):", answer.action_execution_id);
+    println!(
+        "  Problem: {}",
+        problem["reason"].as_str().unwrap_or("(unknown)")
+    );
+    for answer in problem["answers"].as_array().into_iter().flatten() {
+        if let Some(tail) = answer["answer_tail"].as_str() {
+            println!(
+                "  Agent answered ({}):",
+                answer["action_execution_id"].as_str().unwrap_or("unknown")
+            );
             for line in tail.lines() {
                 println!("    | {line}");
             }
         }
     }
     println!("  Resolve with --label and the keys that label needs:");
-    for output in &pending.outputs {
-        let description = output
-            .description
-            .as_deref()
+    for output in outputs {
+        let label = output
+            .as_str()
+            .or_else(|| output["label"].as_str())
+            .unwrap_or("?");
+        let description = output["description"]
+            .as_str()
             .map(|description| format!("  — {description}"))
             .unwrap_or_default();
-        println!("    --label {}{description}", output.label);
-        if let Some(requirement) = problem.requirement_for(&output.label) {
-            for key in &requirement.data {
-                println!("        requires --data {key}=…");
+        println!("    --label {label}{description}");
+        if let Some(requirement) = problem["requirements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|requirement| requirement["label"].as_str() == Some(label))
+        {
+            for key in requirement["data"].as_array().into_iter().flatten() {
+                if let Some(key) = key.as_str() {
+                    println!("        requires --data {key}=…");
+                }
             }
-            for key in &requirement.variables {
-                println!("        requires --variable {key}=…");
+            for key in requirement["variables"].as_array().into_iter().flatten() {
+                if let Some(key) = key.as_str() {
+                    println!("        requires --variable {key}=…");
+                }
             }
         }
     }

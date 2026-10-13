@@ -23,10 +23,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use narsor::domain::Workspace;
-use narsor::engine::Engine;
-use narsor::persistence::{ConversationSource, ExecutionStore};
-use narsor::workflow::load_from_file;
+use narsor_engine::domain::Workspace;
+use narsor_engine::engine::Engine;
+use narsor_engine::persistence::{ConversationSource, ExecutionStore};
+use narsor_engine::workflow::load_from_file;
 
 /// The exit code of a successful command.
 const EXIT_SUCCESS: i32 = 0;
@@ -1178,7 +1178,7 @@ fn steps_for_an_unknown_execution_is_a_readable_failure() {
 }
 
 /// `narsor conversation <id> <attempt>` reads through
-/// [`narsor::persistence::ConversationStore`] the same way the embedded API's
+/// [`narsor_engine::persistence::ConversationStore`] the same way the embedded API's
 /// handler does — directly against the store, without an HTTP round trip.
 /// This test writes a conversation record by hand for an arbitrary attempt id
 /// alongside a real execution (nothing ties a conversation file's name to any
@@ -1461,7 +1461,7 @@ fn stop_on_a_problem(root: &TempRoot) -> String {
 
     let store = ExecutionStore::new(root.path());
     let engine = Engine::new(store.clone()).with_executor(
-        narsor::engine::ActionKind::Agent,
+        narsor_engine::engine::ActionKind::Agent,
         std::sync::Arc::new(engine_support::LabellessAgentExecutor::answering(
             "Done: 3 units, all tests pass.",
         )),
@@ -1486,7 +1486,10 @@ fn stop_on_a_problem(root: &TempRoot) -> String {
         .expect("a runtime")
         .block_on(engine.run(&definition, &execution.id))
         .expect("run to the problem");
-    assert_eq!(stopped.status, narsor::domain::ExecutionStatus::InputNeeded);
+    assert_eq!(
+        stopped.status,
+        narsor_engine::domain::ExecutionStatus::InputNeeded
+    );
     execution.id
 }
 
@@ -1646,8 +1649,8 @@ fn the_cli_and_the_api_share_the_conductors_chat() {
     // The same history, written over the API.
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");
     runtime.block_on(async {
-        let info = narsor::persistence::DaemonInfo::read(
-            &narsor::persistence::StatePaths::new(root.path()).daemon_file(),
+        let info = narsor_engine::persistence::DaemonInfo::read(
+            &narsor_engine::persistence::StatePaths::new(root.path()).daemon_file(),
         )
         .expect("the daemon is discoverable");
         narsor::api::ApiClient::new(info.addr, info.token)
@@ -2555,15 +2558,7 @@ mod remote_cli {
         let second = remote(
             &harness,
             token,
-            &[
-                "task",
-                "create",
-                "implement-feature",
-                "--workflow-version",
-                "1",
-                "--task-id",
-                "t-2",
-            ],
+            &["task", "create", "implement-feature", "--task-id", "t-2"],
         )
         .await;
         assert_eq!(second.code, EXIT_SUCCESS, "{}", second.output());
@@ -2822,8 +2817,8 @@ mod remote_cli {
         let token = harness.handle.token().to_string();
         let token = Some(token.as_str());
         let mut asking = super::remote_support::snapshot(1, Some("ask-1"));
-        asking.attention = vec![narsor::orchestration::AttentionItem {
-            kind: narsor::orchestration::AttentionKind::Question,
+        asking.attention = vec![narsor_engine::orchestration::AttentionItem {
+            kind: narsor_engine::orchestration::AttentionKind::Question,
             state_id: Some("review".to_string()),
             since: chrono::Utc::now(),
             waiting_id: "ask-1".to_string(),
@@ -3178,8 +3173,8 @@ mod remote_cli {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn text_a_runner_sends_never_reaches_the_terminal_raw() {
-        use narsor::controller_protocol::SubmitOperatorCommandRequest;
-        use narsor::orchestration::OperatorCommand;
+        use narsor_engine::controller_protocol::SubmitOperatorCommandRequest;
+        use narsor_engine::orchestration::OperatorCommand;
 
         let harness = RemoteHarness::start().await;
         let token = harness.handle.token().to_string();
@@ -3225,21 +3220,21 @@ mod remote_cli {
 
         // A timeline whose texts carry escapes prints without them.
         let mut with_step = super::remote_support::snapshot(2, None);
-        with_step.timeline = Some(narsor::engine::Timeline {
-            positions: vec![narsor::engine::Position {
+        with_step.timeline = Some(narsor_engine::engine::Timeline {
+            positions: vec![narsor_engine::engine::Position {
                 label: "plan\u{1b}[2J#1".to_string(),
                 state_id: "plan".to_string(),
                 visit: 1,
                 action_execution_id: None,
                 action_type: Some("ag\u{1b}]8;;x\u{7}ent\u{202e}".to_string()),
-                status: narsor::engine::PositionStatus::Failed,
+                status: narsor_engine::engine::PositionStatus::Failed,
                 started_at: None,
                 ended_at: None,
                 error: Some("bad\u{1b}[31m".to_string()),
                 resumed_harness_session: None,
                 harness_session_interrupted: false,
                 retry_pending: false,
-                conversation: narsor::engine::ConversationState::NoRecord,
+                conversation: narsor_engine::engine::ConversationState::NoRecord,
             }],
             ..Default::default()
         });
@@ -3267,7 +3262,7 @@ mod remote_cli {
                 "t-esc",
                 running.epoch,
                 1,
-                narsor::orchestration::Observation::WorkloadLost { state_known: true },
+                narsor_engine::orchestration::Observation::WorkloadLost { state_known: true },
                 Some(1),
             ))
             .await
@@ -3318,8 +3313,8 @@ fn tui_without_a_server_launches_the_local_daemon_and_remote_runs_the_same_inter
     );
     assert!(!plain.stderr.contains("--remote"), "{}", plain.stderr);
 
-    let info = narsor::persistence::DaemonInfo::read(
-        &narsor::persistence::StatePaths::new(root.path()).daemon_file(),
+    let info = narsor_engine::persistence::DaemonInfo::read(
+        &narsor_engine::persistence::StatePaths::new(root.path()).daemon_file(),
     )
     .expect("`narsor tui` launched the local daemon");
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");

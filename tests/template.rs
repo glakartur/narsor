@@ -5,9 +5,9 @@
 
 use std::collections::HashMap;
 
-use narsor::domain::{ActionConfig, Context};
-use narsor::workflow::load_from_file;
-use narsor::workflow::template::{TemplateError, TemplateScope};
+use narsor_engine::domain::{ActionConfig, Context};
+use narsor_engine::workflow::load_from_file;
+use narsor_engine::workflow::template::{TemplateError, TemplateScope};
 use serde_json::{json, Map, Value};
 
 const WHERE: &str = "state 'implement', prompt";
@@ -304,7 +304,7 @@ fn implement_prompt_from_the_reference_fixture_expands_fully() {
     assert!(prompt.contains("logowanie przez OAuth"), "{prompt}");
 }
 
-fn load_reference() -> narsor::domain::WorkflowDefinition {
+fn load_reference() -> narsor_engine::domain::WorkflowDefinition {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/implement_feature.yaml");
     load_from_file(path).expect("the §4 example must load without modification")
@@ -314,7 +314,7 @@ fn load_reference() -> narsor::domain::WorkflowDefinition {
 // Static references (KTD15)
 // ---------------------------------------------------------------------------
 
-use narsor::workflow::{action_context_references, context_references};
+use narsor_engine::workflow::{action_context_references, context_references};
 
 #[test]
 fn context_references_are_listed_once_in_first_use_order() {
@@ -364,7 +364,7 @@ fn an_actions_references_cover_every_rendered_field() {
 // `display` (U2): lenient rendering, URL allow-list, sanitising
 // ---------------------------------------------------------------------------
 
-use narsor::domain::{DisplayLinkSpec, DisplaySpec, TaskDisplay};
+use narsor_engine::domain::{DisplayLinkSpec, DisplaySpec, TaskDisplay};
 
 fn link(label: &str, text: Option<&str>, url: &str) -> DisplayLinkSpec {
     DisplayLinkSpec {
@@ -535,7 +535,7 @@ fn strict_rendering_still_refuses_an_unknown_variable() {
 
 #[test]
 fn check_syntax_ignores_unset_variables_but_reports_broken_syntax() {
-    use narsor::workflow::template::check_syntax;
+    use narsor_engine::workflow::template::check_syntax;
 
     assert!(check_syntax("{{ context.variables.later }} {{ inputs.x }}", "f").is_ok());
     assert!(matches!(

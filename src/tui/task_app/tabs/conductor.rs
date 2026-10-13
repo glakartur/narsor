@@ -53,12 +53,12 @@ use ratatui::Frame;
 use crate::conductor::{ChatEntry, ConductorView, ConductorWork};
 use crate::controller_protocol::{ConductorReadResponse, TaskSummary};
 use crate::domain::ConductorPurpose;
-use crate::orchestration::{OperatorCommand, OperatorCommandStatus};
 use crate::tui::chat::{tab_entry, tab_items, undo_lines, ChatItem, TAB_KEYS};
 use crate::tui::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
 use crate::tui::keymap::{key_of, Action, Context};
 use crate::tui::style::{Role, Styles};
 use crate::tui::transcript::{DisplayMode, TranscriptId, TranscriptState};
+use narsor_protocol::controller::{OperatorCommand, OperatorCommandStatus};
 
 use super::super::super::scroll::one_line;
 use super::super::actions::{ActionSend, ConductorSent, Confirmation, Confirmed, Overlay};

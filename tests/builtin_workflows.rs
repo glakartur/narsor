@@ -4,7 +4,7 @@
 //!
 //! * the resolver itself, driven through the library, where the user directory
 //!   is handed in explicitly
-//!   ([`WorkflowResolver::with_user_dir`](narsor::workflows::WorkflowResolver::with_user_dir));
+//!   ([`WorkflowResolver::with_user_dir`](narsor_engine::workflows::WorkflowResolver::with_user_dir));
 //! * the binary, driven through `std::process::Command`, where
 //!   `XDG_CONFIG_HOME` points at a temporary directory.
 //!
@@ -30,9 +30,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use narsor::domain::ActionConfig;
-use narsor::engine::actions::agent::output_contract;
-use narsor::workflows::{
+use narsor_engine::domain::ActionConfig;
+use narsor_engine::engine::actions::agent::output_contract;
+use narsor_engine::workflows::{
     builtin, builtin_names, WorkflowOrigin, WorkflowResolver, BUILTIN_WORKFLOWS,
 };
 
@@ -254,7 +254,7 @@ fn every_builtin_is_embedded_and_validates_without_a_single_violation() {
             entry.name
         );
 
-        let violations = narsor::workflow::validate_source(entry.source)
+        let violations = narsor_engine::workflow::validate_source(entry.source)
             .unwrap_or_else(|error| panic!("the embedded '{}' compiles: {error}", entry.name));
         assert!(
             violations.is_empty(),
@@ -263,7 +263,7 @@ fn every_builtin_is_embedded_and_validates_without_a_single_violation() {
             violations
         );
 
-        let definition = narsor::workflow::load_from_str(entry.source)
+        let definition = narsor_engine::workflow::load_from_str(entry.source)
             .unwrap_or_else(|error| panic!("the embedded '{}' loads: {error}", entry.name));
         assert_eq!(
             definition.name, entry.name,
@@ -289,7 +289,7 @@ fn every_builtin_is_embedded_and_validates_without_a_single_violation() {
 #[test]
 fn builtin_agent_actions_inherit_the_operator_default_harness() {
     for entry in BUILTIN_WORKFLOWS {
-        let definition = narsor::workflow::load_from_str(entry.source)
+        let definition = narsor_engine::workflow::load_from_str(entry.source)
             .unwrap_or_else(|error| panic!("the embedded '{}' loads: {error}", entry.name));
         for (state_id, state) in definition.states {
             let Some(ActionConfig::Agent(action)) = state.action else {
@@ -310,7 +310,7 @@ fn builtin_agent_actions_inherit_the_operator_default_harness() {
 #[test]
 fn every_builtin_label_has_a_description() {
     for entry in BUILTIN_WORKFLOWS {
-        let definition = narsor::workflow::load_from_str(entry.source)
+        let definition = narsor_engine::workflow::load_from_str(entry.source)
             .unwrap_or_else(|error| panic!("the embedded '{}' loads: {error}", entry.name));
         for (state_id, state) in &definition.states {
             for output in &state.outputs {
@@ -333,7 +333,7 @@ fn every_builtin_label_has_a_description() {
 #[test]
 fn the_work_prompt_leaves_the_label_list_to_the_engine_contract() {
     let entry = builtin("compound-engineering").expect("compound-engineering is built in");
-    let definition = narsor::workflow::load_from_str(entry.source).expect("it loads");
+    let definition = narsor_engine::workflow::load_from_str(entry.source).expect("it loads");
     let work = &definition.states["work"];
     let Some(ActionConfig::Agent(action)) = &work.action else {
         panic!("'work' is an agent state");

@@ -7,7 +7,7 @@
 use serde_json::Value;
 
 use crate::domain::{Event, EventData, InputCloseReason};
-use crate::engine::actions::script::TRUNCATION_MARKER;
+use narsor_protocol::display::TRUNCATION_MARKER;
 
 use super::scroll::sanitize;
 

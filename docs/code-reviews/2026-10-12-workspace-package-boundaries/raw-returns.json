@@ -1,0 +1,120 @@
+[
+  {
+    "reviewer": "correctness",
+    "findings": [],
+    "residual_risks": [],
+    "testing_gaps": []
+  },
+  {
+    "reviewer": "security",
+    "findings": [],
+    "residual_risks": [],
+    "testing_gaps": [
+      "Add endpoint tests for POST /control/v1/workflows/source that verify unauthenticated callers are rejected and remote mode cannot retrieve user workflow files. The route is covered by owner middleware in router composition, but these endpoint cases are not explicit in tests."
+    ]
+  },
+  {
+    "reviewer": "api-contract",
+    "findings": [
+      {
+        "title": "Eject mistakes older servers for missing built-ins",
+        "severity": "P2",
+        "file": "crates/narsor-protocol/src/controller.rs",
+        "line": 1184,
+        "why_it_matters": "A newly upgraded CLI can connect to an older daemon: discovery accepts any daemon that answers the capabilities health check, and the older daemon\u2019s workflow entries lack has_builtin. Deserialization silently defaults that field to false; workflow eject then filters out every built-in and reports that the requested workflow does not exist. This turns a server-version mismatch into a false API result.",
+        "autofix_class": "gated_auto",
+        "owner": "downstream-resolver",
+        "requires_verification": true,
+        "confidence": 75,
+        "evidence": [
+          "crates/narsor-protocol/src/controller.rs:1184: #[serde(default)]",
+          "src/cli/remote.rs:133: .filter(|item| item.has_builtin)",
+          "src/api/discovery.rs:405: client.control_capabilities().await.is_ok() accepts a responsive daemon without checking support for the new workflow fields or source route."
+        ],
+        "suggested_fix": "Add an explicit workflow-source capability or protocol-version signal to the capabilities response, and have the CLI report that the connected daemon is too old before interpreting absent support as no built-in workflow. Add a test using a legacy workflow-list response.",
+        "pre_existing": false,
+        "first_evidence": "crates/narsor-protocol/src/controller.rs:1184: #[serde(default)]"
+      }
+    ],
+    "residual_risks": [],
+    "testing_gaps": [
+      "Add a compatibility test that deserializes a legacy WorkflowView response and exercises workflow eject, ensuring a missing has_builtin field is not treated as proof that no built-in exists."
+    ]
+  },
+  {
+    "reviewer": "maintainability",
+    "findings": [
+      {
+        "title": "Delete the orphaned API server implementation",
+        "severity": "P2",
+        "file": "src/api/mod.rs",
+        "line": 3,
+        "why_it_matters": "The client API module no longer includes the old route modules, while the active server implementation lives in narsor-server. The old src/api/routes.rs and src/api/routes/control.rs remain in the tree as uncompiled duplicate implementations, so future edits can land in dead code and readers must distinguish it from the live server.",
+        "suggested_fix": "Delete src/api/active.rs, src/api/routes.rs, and src/api/routes/control.rs; retain the server implementation under crates/narsor-server.",
+        "autofix_class": "gated_auto",
+        "owner": "downstream-resolver",
+        "requires_verification": true,
+        "confidence": 75,
+        "evidence": [
+          "src/api/mod.rs:3: Server routes and listener lifecycle are owned by the narsor-server package",
+          "src/api/mod.rs:6-12 declares client, connect, discovery, dto, launch, and token modules, but no active or routes modules. The old route files remain, while crates/narsor-server/src/api.rs declares its own active and routes modules."
+        ],
+        "pre_existing": false,
+        "first_evidence": "src/api/mod.rs:3: //! Server routes and listener lifecycle are owned by the `narsor-server`"
+      }
+    ],
+    "residual_risks": [],
+    "testing_gaps": []
+  },
+  {
+    "reviewer": "testing",
+    "findings": [
+      {
+        "title": "Process tests may run stale sibling binaries",
+        "severity": "P2",
+        "file": "tests/engine_support/mod.rs",
+        "line": 41,
+        "why_it_matters": "The migrated process tests locate server and runner executables by filename in the shared target profile. A package-scoped test run does not necessarily build those sibling workspace binaries; if an older artifact exists, the test can exercise stale code and pass without covering this change.",
+        "autofix_class": "manual",
+        "owner": "downstream-resolver",
+        "requires_verification": true,
+        "suggested_fix": "Run these process tests from a dedicated workspace test target that declares the server and runner binaries as test targets, or otherwise ensure the exact binaries under test are built and selected for each invocation.",
+        "confidence": 75,
+        "evidence": [
+          "tests/engine_support/mod.rs:41: let path = target_profile.join(name);",
+          "tests/engine_support/mod.rs:42-46 checks only that a file with that name exists; it does not establish that Cargo built it for the current package-scoped test run."
+        ],
+        "pre_existing": false,
+        "first_evidence": "tests/engine_support/mod.rs:41: let path = target_profile.join(name);"
+      },
+      {
+        "title": "Server separation smoke test does not try a start operation",
+        "severity": "P2",
+        "file": "tests/bin_targets.rs",
+        "line": 35,
+        "why_it_matters": "The test invokes only narsor-cli daemon without an operation and expects usage output. That proves the incomplete command is rejected, but would still pass if a server-start operation were later added to the client CLI, leaving the package boundary unprotected by this test.",
+        "autofix_class": "gated_auto",
+        "owner": "downstream-resolver",
+        "requires_verification": true,
+        "suggested_fix": "Assert that the CLI rejects the former server-start invocation (for example, daemon start) and retains only the intended stop operation.",
+        "confidence": 75,
+        "evidence": [
+          "tests/bin_targets.rs:37: .arg(\"daemon\")",
+          "tests/bin_targets.rs:42-47 assert the usage error and presence of stop, but never invoke or explicitly reject a start operation."
+        ],
+        "pre_existing": false,
+        "first_evidence": "tests/bin_targets.rs:37: .arg(\"daemon\")"
+      }
+    ],
+    "residual_risks": [],
+    "testing_gaps": []
+  },
+  {
+    "reviewer": "reliability",
+    "findings": [],
+    "residual_risks": [],
+    "testing_gaps": [
+      "Add an integration check for narsor daemon stop launching the adjacent narsor-server binary in an installed-style layout. Current lifecycle tests invoke narsor-server stop directly, so they do not cover the client wrapper\u2019s executable resolution and subprocess path."
+    ]
+  }
+]

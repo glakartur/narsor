@@ -43,7 +43,7 @@ use crate::controller_protocol::{
     TimelineResponse,
 };
 use crate::domain::{Event, ExecutionStatus, TaskId};
-use crate::engine::Timeline;
+use narsor_protocol::api::Timeline;
 
 use super::super::keymap::{self, Action, Context, Stack};
 use super::super::scroll::one_line;
@@ -638,7 +638,7 @@ impl TaskApp {
             key,
             execution_id: legacy.view.id.clone(),
             task_id: entry.summary().task_id.clone(),
-            status: legacy.view.status.clone(),
+            status: legacy.view.status,
             current_state: legacy.view.current_state.clone(),
             revision,
             timeline: false,
@@ -705,11 +705,11 @@ impl TaskApp {
         } = fetched;
         let timeline = timeline.map(|result| {
             self.settle(result).map(|timeline| TimelineResponse {
-                task_id: plan.task_id.clone(),
+                task_id: plan.task_id.to_string(),
                 freshness: Freshness::Live,
                 observed_at: None,
                 timeline: Some(timeline),
-                execution_status: Some(plan.status.clone()),
+                execution_status: Some(plan.status),
                 current_state: plan.current_state.clone(),
                 current_position: None,
             })

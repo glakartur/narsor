@@ -12,7 +12,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use narsor::config::cascade::{CandidateKind, CascadeError, ConfigCascade};
+use narsor_engine::config::cascade::{CandidateKind, CascadeError, ConfigCascade};
 
 /// A temporary directory that deletes itself when it goes out of scope.
 ///

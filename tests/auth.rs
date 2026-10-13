@@ -27,24 +27,25 @@ use base64::Engine as _;
 use chrono::Utc;
 use futures::StreamExt;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use narsor::api::{self, ApiServices, ClientError, DiscoveryError, ServerSecurity};
-use narsor::auth::{
-    parse_proxy, ControllerCredential, CorsPolicy, NetworkAuth, OidcIdentity, OidcSettings,
-    OidcVerifier, OwnerBindingSource, OwnerStore, ProxyPolicy, SecuritySettings, StartupOwnership,
+use narsor_engine::auth::{
+    parse_proxy, ControllerCredential, CorsPolicy, OidcIdentity, OidcSettings, OidcVerifier,
+    OwnerBindingSource, OwnerStore, ProxyPolicy, SecuritySettings, StartupOwnership,
 };
-use narsor::config::Flags;
-use narsor::controller_protocol::{
+use narsor_engine::config::Flags;
+use narsor_engine::controller_protocol::{
     ControllerClient, CreateEnrollmentRequest, CreateTaskRequest, LaunchRequest, ProtocolService,
     ReportRequest, RunnerClient, RunnerCredentialRequest,
 };
-use narsor::domain::{ExecutionStatus, TaskId};
-use narsor::engine::Engine;
-use narsor::orchestration::{
+use narsor_engine::domain::{ExecutionStatus, TaskId};
+use narsor_engine::engine::Engine;
+use narsor_engine::orchestration::{
     ControlPlane, ConversationAvailability, ExecutionCursor, Observation, ObservedSummary,
     OwnerRef, ResourceIdentity, RunnerSnapshot,
 };
-use narsor::persistence::paths::StatePaths;
-use narsor::persistence::{DaemonInfo, ExecutionStore};
+use narsor_engine::persistence::paths::StatePaths;
+use narsor_engine::persistence::{DaemonInfo, ExecutionStore};
+use narsor_server::api::{self, ApiServices, ClientError, DiscoveryError, ServerSecurity};
+use narsor_server::auth_gate::NetworkAuth;
 use reqwest::{Method, StatusCode};
 
 /// The audience every network-mode server here demands.
@@ -681,11 +682,11 @@ async fn a_second_identity_cannot_read_or_mutate_the_owners_tasks() {
         server
             .service
             .create_task(&other, create_request("task-1", "k8s")),
-        Err(narsor::controller_protocol::ProtocolError::NotFound)
+        Err(narsor_engine::controller_protocol::ProtocolError::NotFound)
     ));
     assert!(matches!(
         server.service.task(&other, "task-1"),
-        Err(narsor::controller_protocol::ProtocolError::NotFound)
+        Err(narsor_engine::controller_protocol::ProtocolError::NotFound)
     ));
 }
 
@@ -1700,6 +1701,17 @@ async fn a_network_server_serves_no_disk_paths_but_still_manages_remote_reposito
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("workflow_paths_unavailable"), "{body}");
+
+    let (status, body) = server
+        .call(
+            Method::POST,
+            "/control/v1/workflows/source",
+            Some(&alice),
+            Some(serde_json::json!({ "name": "private-workflow", "builtin": false })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("workflow_source_unavailable"), "{body}");
 
     // The catalogue is still served; the Historia has no old executions.
     let (status, _) = server

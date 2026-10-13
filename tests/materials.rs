@@ -22,27 +22,27 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chrono::Utc;
-use narsor::api::{self, ApiClient, ApiHandle, ApiServices, ClientError};
-use narsor::controller_protocol::{
-    AcquireLeaseRequest, ControllerIdentity, CreateEnrollmentRequest, EnrollRequest,
-    OwnerCommandRequest, ProtocolService, ReportRequest, RunnerClient, RunnerCredentialRequest,
-    LOCAL_OWNER,
+use narsor_api_client::api::{ApiClient, ClientError};
+use narsor_engine::controller_protocol::{
+    AcquireLeaseRequest, ControllerIdentity, CreateEnrollmentRequest, OwnerCommandRequest,
+    ProtocolService, ReportRequest, RunnerClient, RunnerCredentialRequest, LOCAL_OWNER,
 };
-use narsor::domain::{
+use narsor_engine::domain::{
     BackendId, GitIdentity, ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec,
     TaskWorkspace,
 };
-use narsor::engine::Engine;
-use narsor::materials::{
+use narsor_engine::engine::Engine;
+use narsor_engine::materials::{
     sha256_hex, snapshot_paths, write_files, Bundle, MaterialFile, MaterialLimits, MaterialOrigin,
     UploadManifest, WriteMode,
 };
-use narsor::orchestration::{
+use narsor_engine::orchestration::{
     ControlPlane, MaterialChange, NewTask, Observation, ObservedSummary, OwnerCommand, OwnerRef,
     TaskEventKind,
 };
-use narsor::persistence::paths::StatePaths;
-use narsor::persistence::ExecutionStore;
+use narsor_engine::persistence::paths::StatePaths;
+use narsor_engine::persistence::ExecutionStore;
+use narsor_server::api::{self, ApiHandle, ApiServices};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -118,9 +118,9 @@ impl Fixture {
             .create_enrollment(BACKEND, CreateEnrollmentRequest::default())
             .expect("enrollment");
         let enrolled = service
-            .enroll(EnrollRequest::signed(
+            .enroll(narsor_engine::auth::pop::signed_enrollment_request(
                 &code.enrollment_code,
-                &narsor::auth::ControllerKey::generate(),
+                &narsor_engine::auth::ControllerKey::generate(),
             ))
             .expect("enroll");
         let controller = ControllerIdentity {
@@ -260,7 +260,7 @@ impl Fixture {
             .collect()
     }
 
-    fn events(&self, task: &str) -> Vec<narsor::orchestration::TaskEvent> {
+    fn events(&self, task: &str) -> Vec<narsor_engine::orchestration::TaskEvent> {
         self.service
             .events(&self.owner(), task, 0)
             .expect("task events")
@@ -484,7 +484,8 @@ terminal_states:
 "#;
 
 fn spec(workspace: TaskWorkspace) -> TaskLaunchSpec {
-    let definition = narsor::workflow::load_from_str(OUTBOX_WORKFLOW).expect("a valid workflow");
+    let definition =
+        narsor_engine::workflow::load_from_str(OUTBOX_WORKFLOW).expect("a valid workflow");
     TaskLaunchSpec::new(
         definition.id.clone(),
         definition.version,
@@ -597,12 +598,7 @@ async fn materials_reach_the_runner_and_documents_come_back_without_a_commit() {
     fs::write(outside.join("private.key"), "do not send").unwrap();
     std::os::unix::fs::symlink(outside.join("private.key"), source.join("key-link")).unwrap();
     let limits = MaterialLimits::default();
-    let snapshot = snapshot_paths(
-        std::slice::from_ref(&source),
-        &limits,
-        limits.max_total_bytes,
-    )
-    .expect("snapshot");
+    let snapshot = snapshot_paths(std::slice::from_ref(&source), &limits).expect("snapshot");
     let skipped: BTreeSet<String> = snapshot
         .skipped
         .iter()
@@ -1193,26 +1189,26 @@ async fn another_owner_can_neither_submit_read_download_nor_delete() {
         .await;
     assert!(matches!(
         submitted,
-        Err(narsor::controller_protocol::ProtocolError::NotFound)
+        Err(narsor_engine::controller_protocol::ProtocolError::NotFound)
     ));
     assert!(matches!(
         fixture.service.list_materials(&intruder, "task-1"),
-        Err(narsor::controller_protocol::ProtocolError::NotFound)
+        Err(narsor_engine::controller_protocol::ProtocolError::NotFound)
     ));
     assert!(matches!(
         fixture.service.material(&intruder, "task-1", "mine"),
-        Err(narsor::controller_protocol::ProtocolError::NotFound)
+        Err(narsor_engine::controller_protocol::ProtocolError::NotFound)
     ));
     let sha256 = sha256_hex(SECRET_CONTENT.as_bytes());
     assert!(matches!(
         fixture
             .service
             .material_blob(&intruder, "task-1", "mine", &sha256),
-        Err(narsor::controller_protocol::ProtocolError::NotFound)
+        Err(narsor_engine::controller_protocol::ProtocolError::NotFound)
     ));
     assert!(matches!(
         fixture.service.delete_material(&intruder, "task-1", "mine"),
-        Err(narsor::controller_protocol::ProtocolError::NotFound)
+        Err(narsor_engine::controller_protocol::ProtocolError::NotFound)
     ));
     assert_eq!(fixture.stored_files(), before, "nothing changed");
 
@@ -1222,7 +1218,7 @@ async fn another_owner_can_neither_submit_read_download_nor_delete() {
         fixture
             .service
             .material_blob(&fixture.owner(), "task-1", "mine", &stray),
-        Err(narsor::controller_protocol::ProtocolError::NotFound)
+        Err(narsor_engine::controller_protocol::ProtocolError::NotFound)
     ));
 
     // The owner deletes it; afterwards nothing is served.
@@ -1432,11 +1428,11 @@ fn a_snapshot_refuses_an_explicitly_named_link_and_oversize_folders() {
     let link = root.path.join("link");
     std::os::unix::fs::symlink(&target, &link).unwrap();
     let limits = test_limits();
-    assert!(snapshot_paths(&[link], &limits, limits.max_total_bytes).is_err());
+    assert!(snapshot_paths(&[link], &limits).is_err());
 
     let big = root.dir("big");
     for n in 0..3 {
         fs::write(big.join(format!("{n}")), vec![b'x'; 4000]).unwrap();
     }
-    assert!(snapshot_paths(&[big], &limits, limits.max_total_bytes).is_err());
+    assert!(snapshot_paths(&[big], &limits).is_err());
 }

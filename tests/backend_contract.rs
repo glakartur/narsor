@@ -16,10 +16,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use backend_contract_support::ContractTarget;
-use narsor::backends::{
+use narsor_engine::backends::{
     ExecutionBackend, FakeBackend, LocalBackend, LocalBackendConfig, TaskResources,
 };
-use narsor::domain::{ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec, TaskWorkspace};
+use narsor_engine::domain::{
+    ResolvedEnvironment, ResourceProfile, TaskId, TaskLaunchSpec, TaskWorkspace,
+};
 
 // ---------------------------------------------------------------------------
 // The fake adapter
@@ -132,7 +134,8 @@ impl ContractTarget for LocalTarget {
     }
 
     fn launch_spec(&self) -> TaskLaunchSpec {
-        let definition = narsor::workflow::load_from_str(WORKFLOW).expect("a valid workflow");
+        let definition =
+            narsor_engine::workflow::load_from_str(WORKFLOW).expect("a valid workflow");
         TaskLaunchSpec::new(
             definition.id.clone(),
             definition.version,
@@ -188,7 +191,7 @@ contract_suite!(local, crate::LocalTarget);
 /// owner resume, and a finished step is never executed again (R13).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_engine_work_survives_loss_and_owner_resume() {
-    use narsor::orchestration::{OwnerCommand, TaskLifecycle};
+    use narsor_engine::orchestration::{OwnerCommand, TaskLifecycle};
 
     let Some(mut h) = backend_contract_support::Harness::<LocalTarget>::without_auto_resume().await
     else {
@@ -210,7 +213,7 @@ async fn local_engine_work_survives_loss_and_owner_resume() {
 /// task's history shows the loss and the automatic resume (R1, R2, AE2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_engine_work_survives_loss_and_automatic_resume() {
-    use narsor::orchestration::{Observation, TaskLifecycle};
+    use narsor_engine::orchestration::{Observation, TaskLifecycle};
 
     let Some(mut h) = backend_contract_support::Harness::<LocalTarget>::new().await else {
         return;
@@ -244,14 +247,14 @@ async fn local_engine_work_survives_loss_and_automatic_resume() {
 struct FinishedWork {
     storage: std::path::PathBuf,
     execution_id: String,
-    events: Vec<narsor::domain::Event>,
+    events: Vec<narsor_engine::domain::Event>,
     cursor: u64,
 }
 
 /// Runs task-1 until its workflow finished and records what it left.
 async fn finished_work(h: &backend_contract_support::Harness<LocalTarget>) -> FinishedWork {
-    use narsor::domain::ExecutionStatus;
-    use narsor::persistence::ExecutionStore;
+    use narsor_engine::domain::ExecutionStatus;
+    use narsor_engine::persistence::ExecutionStore;
 
     h.running("task-1").await;
     h.wait_for("the workflow to finish", |h| {
@@ -277,8 +280,8 @@ fn assert_work_continued(
     h: &backend_contract_support::Harness<LocalTarget>,
     before: &FinishedWork,
 ) {
-    use narsor::domain::ExecutionStatus;
-    use narsor::persistence::ExecutionStore;
+    use narsor_engine::domain::ExecutionStatus;
+    use narsor_engine::persistence::ExecutionStore;
 
     let record = h.record("task-1");
     let runner = record.runner.unwrap();
@@ -291,7 +294,7 @@ fn assert_work_continued(
         "the same execution, on the same storage"
     );
     let events_after = store.event_log(&before.execution_id).read_all().unwrap();
-    let sequences = |events: &[narsor::domain::Event]| -> Vec<(u64, String)> {
+    let sequences = |events: &[narsor_engine::domain::Event]| -> Vec<(u64, String)> {
         events
             .iter()
             .map(|event| (event.sequence, format!("{:?}", event.data)))
@@ -329,7 +332,7 @@ fn process_running(pid: u32) -> bool {
 /// runner.
 #[tokio::test]
 async fn removing_a_dead_runners_workload_kills_what_it_left_running() {
-    use narsor::backends::{RunnerCredential, WorkloadLaunch};
+    use narsor_engine::backends::{RunnerCredential, WorkloadLaunch};
 
     let scratch = std::env::temp_dir().join(format!("narsor-orphan-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&scratch).unwrap();
@@ -356,10 +359,13 @@ async fn removing_a_dead_runners_workload_kills_what_it_left_running() {
         generation: 1,
         incarnation: "task-1-g1".into(),
         lease_epoch: 1,
-        launch_spec: FakeTarget {
-            platform: FakeBackend::new(),
-        }
-        .launch_spec(),
+        launch_spec: serde_json::to_value(
+            FakeTarget {
+                platform: FakeBackend::new(),
+            }
+            .launch_spec(),
+        )
+        .unwrap(),
         control_plane_url: "http://127.0.0.1:9".into(),
         credential: RunnerCredential::new("nsr.test"),
     };

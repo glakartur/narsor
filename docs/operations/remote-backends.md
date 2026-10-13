@@ -26,7 +26,7 @@ Contents:
 ## 1. Architecture
 
 ```text
- TUI / CLI / Web ──REST + SSE──▶ control plane (narsor daemon)
+ TUI / CLI / Web ──REST + SSE──▶ control plane (narsor-server)
                                     │  owner API      /control/v1, /auth/v1
                                     │  controller API /controller/v1
                                     │  runner API     /runner/v1
@@ -70,7 +70,7 @@ owner API.
 
 ## 2. Server modes: trusted and network
 
-The mode is a setting, never inferred (`narsor config show` lists it). A
+The mode is a setting, never inferred (`narsor-cli config show` lists it). A
 configuration that does not hold up stops the daemon with a message naming
 every problem.
 
@@ -115,8 +115,8 @@ token together with the code owns the installation:
 ```bash
 export NARSOR_SERVER=https://narsor.example.com
 export NARSOR_TOKEN_FILE=~/.cache/narsor/token     # see "Tokens" below
-narsor auth claim <code>
-narsor auth whoami
+narsor-cli auth claim <code>
+narsor-cli auth whoami
 ```
 
 The claim is atomic and the code is spent by it; every other identity gets
@@ -217,7 +217,7 @@ Every repository used by a remote task needs a base image; a task without one
 is refused before anything is queued.
 
 ```yaml
-# {catalog}/repositories/api.yaml (narsor repo add …, then edit)
+# {catalog}/repositories/api.yaml (narsor-cli repo add …, then edit)
 remote: https://github.com/acme/api.git
 base_image: ghcr.io/acme/api-dev@sha256:<64 hex>      # pinned (default policy)
 # or, to let the control plane resolve a tag once at task creation:
@@ -497,8 +497,8 @@ any state ─▶ Archiving ─▶ Archived
   none — so an interrupted task still blocks a slot until it is resumed
   (automatically or by the owner) or archived.
 * Every task has a position (`rank`) in its backend's queue, shown as `#n` by
-  `narsor task list`. A new task joins the end; waiting tasks are admitted in
-  that order. A queued task is reordered with `narsor task move <task>
+  `narsor-cli task list`. A new task joins the end; waiting tasks are admitted in
+  that order. A queued task is reordered with `narsor-cli task move <task>
   --before <other> | --after <other> | --top | --bottom`, only while it is
   queued and conditional on its generation. Admitted and finished tasks keep
   their place in the list. Nothing running is ever preempted. Tasks stored by
@@ -517,7 +517,7 @@ any state ─▶ Archiving ─▶ Archived
   waits for the verdict and, past `--wait-secs`, reports the command as
   queued.
 * The runner follows the installation's **default agent harness**
-  (`narsor harness default`, `h` in the TUI), not only the one the task was
+  (`narsor-cli harness default`, `h` in the TUI), not only the one the task was
   created with: every poll and snapshot answer of the control plane carries
   the default as it applies to the task (`default_harness`), and setting or
   resetting it wakes open long-polls. The harness in the task's
@@ -546,7 +546,7 @@ any state ─▶ Archiving ─▶ Archived
   summarizes `human` gates, rescues a step's missing output label,
   diagnoses a failed step and answers the chat, always read-only. Without a
   usable harness there is no conductor: the runner reports
-  `conductor_available = false` with the reason (`narsor task conductor
+  `conductor_available = false` with the reason (`narsor-cli task conductor
   history`), a
   failed step waits for the owner as it is, without a diagnosis or
   proposals, and the conductor commands are refused with that reason. The
@@ -571,54 +571,54 @@ none runs). With `--server` (or `NARSOR_SERVER`) they use a remote control
 plane and a token (section 2).
 
 ```bash
-narsor backend default                       # get; also: set <backend>, reset
-narsor harness default                       # get; also: set <harness>, reset — new and running tasks
-narsor task create implement-feature --input ticket=NAR-1 \
+narsor-cli backend default                       # get; also: set <backend>, reset
+narsor-cli harness default                       # get; also: set <harness>, reset — new and running tasks
+narsor-cli task create implement-feature --input ticket=NAR-1 \
   [--backend k8s] [--profile default] [--harness codex] \
   [--repository api --commit <sha>] [--workflow-version 1] [--task-id my-id]
-narsor task create --file ./workflow.yaml --input name=value   # local daemon only
-narsor task list [--archived] [--json]       # the attention mark `?`/`!`, the title; --archived: the history
-narsor task show <task> [--json]             # title, links, what it waits on, observations
-narsor task pause|resume|start|archive <task> [--expected-generation N]
-narsor task move <task> --before <other> | --after <other> | --top | --bottom
-narsor task input <task> --field reason=ok [--data k=v] [--variable k=v] \
+narsor-cli task create --file ./workflow.yaml --input name=value   # local daemon only
+narsor-cli task list [--archived] [--json]       # the attention mark `?`/`!`, the title; --archived: the history
+narsor-cli task show <task> [--json]             # title, links, what it waits on, observations
+narsor-cli task pause|resume|start|archive <task> [--expected-generation N]
+narsor-cli task move <task> --before <other> | --after <other> | --top | --bottom
+narsor-cli task input <task> --field reason=ok [--data k=v] [--variable k=v] \
   [--label approved] [--comment …] [--waiting-id <id>]
-narsor task interrupt <task> [--wait-secs N]
-narsor task transition <task> <state> [--override --reason <why>] [--wait-secs N]
-narsor task restart-step <task> [--note <text>] [--failure-key K] [--wait-secs N]
-narsor task conductor chat <task> <text> | history <task> [--after N]
-narsor task conductor confirm|reject <task> <proposal> | undo <task> <decision>
-narsor task conversation <task> [<attempt>] [--from N]
-narsor task events <task> [--follow]
-narsor task watch [--cursor C]               # every task, reconnecting from the cursor
-narsor task workflows                        # the catalogue: source, description, inputs
-narsor task validate <path>                  # every violation of a workflow file (local daemon only)
-narsor task capabilities                     # what this server offers
-narsor task repo list | add <id> --remote <url> | remove <id>
-narsor task history list | show|events|steps|conductor <execution> \
+narsor-cli task interrupt <task> [--wait-secs N]
+narsor-cli task transition <task> <state> [--override --reason <why>] [--wait-secs N]
+narsor-cli task restart-step <task> [--note <text>] [--failure-key K] [--wait-secs N]
+narsor-cli task conductor chat <task> <text> | history <task> [--after N]
+narsor-cli task conductor confirm|reject <task> <proposal> | undo <task> <decision>
+narsor-cli task conversation <task> [<attempt>] [--from N]
+narsor-cli task events <task> [--follow]
+narsor-cli task watch [--cursor C]               # every task, reconnecting from the cursor
+narsor-cli task workflows                        # the catalogue: source, description, inputs
+narsor-cli task validate <path>                  # every violation of a workflow file (local daemon only)
+narsor-cli task capabilities                     # what this server offers
+narsor-cli task repo list | add <id> --remote <url> | remove <id>
+narsor-cli task history list | show|events|steps|conductor <execution> \
   | conversation <execution> <attempt> | recover <execution> [--comment …]   # local daemon only
-narsor task materials upload <task> <path>... [--id ID] [--label T] [--ttl-secs N]
-narsor task materials list|show <task> [<material>]
-narsor task materials download <task> <material> <dest-dir> [--force]
-narsor task materials delete <task> <material>
-narsor auth whoami | claim <code>
+narsor-cli task materials upload <task> <path>... [--id ID] [--label T] [--ttl-secs N]
+narsor-cli task materials list|show <task> [<material>]
+narsor-cli task materials download <task> <material> <dest-dir> [--force]
+narsor-cli task materials delete <task> <material>
+narsor-cli auth whoami | claim <code>
 narsor-cli controller enroll-code <backend> | list | revoke <id>
-narsor tui                                   # the interface; over --server when given
+narsor                                   # the interface; over --server when given
 ```
 
-`narsor tui` is one interface for every backend: it talks to the control plane
+`narsor` is one interface for every backend: it talks to the control plane
 only (`/control/v1`) — the local daemon without `--server`, the remote one with
 it — and the backend is whatever the configuration names. It opens even when
 the server cannot be reached and keeps trying; without a connection the data is
 greyed with its age and actions that change state are blocked with the reason.
-`narsor tui --remote` is an ignored alias that warns on stderr. Every action of
-the interface is a `narsor task …` command: `move` (`K` / `J` / `m`), `pause` /
+Every action of
+the interface is a `narsor-cli task …` command: `move` (`K` / `J` / `m`), `pause` /
 `resume` (`p`), `interrupt` (`x`), `transition` (`t`, with `--override` for a
 reasoned override), `start` (`s`), `archive` (`a`), `input` and
 `restart-step` (the answer panel), `conductor …` (the *Dyrygent* tab), `create`
 (`n`, also `create --file` for a path, with `workflows` and `validate` for the
 catalogue and the check), `list --archived` and `history …` (`H`), `repo …`
-(`R`) and `capabilities`; besides those, `h` is `narsor harness default set`
+(`R`) and `capabilities`; besides those, `h` is `narsor-cli harness default set`
 / `reset`, the installation's default harness the header names. `?` shows the keys, README.md ("`tui`") describes the screens.
 
 ### Task materials
@@ -628,7 +628,7 @@ input you hand the agent (a few files, a snapshot of a local folder) and
 small documents the task leaves for you. It is a copy, never a live mount of
 your machine, and it never becomes a commit in the product repository.
 
-* **Upload.** `narsor task materials upload <task> <path>...` snapshots the
+* **Upload.** `narsor-cli task materials upload <task> <path>...` snapshots the
   given files and folders once: each file under its own name, each folder's
   content under the folder's name. Symbolic links are never followed; links,
   sockets, FIFOs, devices and `.git` directories inside a folder are skipped
@@ -645,7 +645,7 @@ your machine, and it never becomes a commit in the product repository.
   (`{task storage}/outbox/<name>/`) is published as a material labelled
   `<name>` once no engine step runs, then removed from the outbox. A folder
   the control plane refuses is renamed `<name>.rejected`. Download it with
-  `narsor task materials download <task> <material> <dest-dir>`: it writes
+  `narsor-cli task materials download <task> <material> <dest-dir>`: it writes
   only inside `<dest-dir>`, never through a symbolic link, and refuses to
   overwrite an existing file unless `--force` (which still never replaces a
   link or a directory).
@@ -704,11 +704,11 @@ The ordinary test suite needs no cluster. Against a real cluster:
    names changed, enroll a controller, then
 
    ```bash
-   narsor task create <workflow> --backend <backend> --task-id smoke-1
-   narsor task show smoke-1          # Running; one Pod and one PVC labelled for the task
-   narsor task pause smoke-1         # Paused; the Pod is gone, the PVC remains
-   narsor task resume smoke-1        # Running again on the same PVC
-   narsor task archive smoke-1       # Archived; Pod and PVC deleted
+   narsor-cli task create <workflow> --backend <backend> --task-id smoke-1
+   narsor-cli task show smoke-1          # Running; one Pod and one PVC labelled for the task
+   narsor-cli task pause smoke-1         # Paused; the Pod is gone, the PVC remains
+   narsor-cli task resume smoke-1        # Running again on the same PVC
+   narsor-cli task archive smoke-1       # Archived; Pod and PVC deleted
    kubectl -n <ns> get pods,pvc -l app.kubernetes.io/managed-by=narsor
    ```
 
@@ -736,6 +736,6 @@ The ordinary test suite needs no cluster. Against a real cluster:
 * OIDC device-code login is not built in: use a token helper that writes a
   file or prints a token.
 * Old executions (from before the scheduler) are read, and a failed one
-  recovered, from the TUI's history (`H`) or with `narsor task history …`,
+  recovered, from the TUI's history (`H`) or with `narsor-cli task history …`,
   over the same control plane and only on the local daemon; the local
-  `/executions` routes remain for `narsor list`, `show` and the like.
+  `/executions` routes remain for `narsor-cli list`, `show` and the like.

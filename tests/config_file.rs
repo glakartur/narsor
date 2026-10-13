@@ -9,8 +9,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use narsor::config::file::{self, FileError, MAX_FILE_BYTES};
-use narsor::config::{SettingKey, SettingValue};
+use narsor_engine::config::file::{self, FileError, MAX_FILE_BYTES};
+use narsor_engine::config::{SettingKey, SettingValue};
 
 /// A temporary directory that deletes itself when it goes out of scope.
 struct TempRoot {
@@ -50,7 +50,7 @@ impl Drop for TempRoot {
 /// Returns the same `Result` shape the assertions are written against; the
 /// parser itself hands back values and errors together, because `config show`
 /// prints the rows that held up beside the rows that did not.
-fn parse(contents: &str) -> Result<narsor::config::FileValues, Vec<FileError>> {
+fn parse(contents: &str) -> Result<narsor_engine::config::FileValues, Vec<FileError>> {
     file::parse(Path::new("/etc/narsor/config.yaml"), contents).into_result()
 }
 

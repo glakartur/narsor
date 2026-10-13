@@ -4,7 +4,7 @@
 //! layer is what actually lands on disk: one JSON document, written through the
 //! atomic writer, that a missing file reads back as empty.
 
-use narsor::registry::{RegistryError, RepositoryEntry, RepositoryRegistry};
+use narsor_engine::registry::{RegistryError, RepositoryEntry, RepositoryRegistry};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -390,7 +390,7 @@ fn an_entry_converts_to_the_domain_types_without_a_third_shape() {
 /// paths label a remote identically.
 #[test]
 fn the_provider_is_inferred_from_the_remote_shape() {
-    use narsor::registry::infer_provider;
+    use narsor_engine::registry::infer_provider;
 
     assert_eq!(infer_provider("/home/artur/Projekty/narsor"), "local");
     assert_eq!(infer_provider("./relative/repo"), "local");
@@ -813,7 +813,7 @@ fn a_base_image_and_git_credential_round_trip_in_both_policies() {
     let root = TempRoot::new();
     let registry = root.registry();
     let pinned = full_entry()
-        .with_base_image(narsor::domain::ImageSpec::pinned(PINNED))
+        .with_base_image(narsor_engine::domain::ImageSpec::pinned(PINNED))
         .with_git_credential("github-token");
     registry.add(pinned.clone()).expect("add");
     assert_eq!(registry.get("acme-api").unwrap(), Some(pinned));
@@ -824,7 +824,7 @@ fn a_base_image_and_git_credential_round_trip_in_both_policies() {
         "a pinned image is written as a plain reference: {text}"
     );
 
-    let resolving = full_entry().with_base_image(narsor::domain::ImageSpec::resolve(
+    let resolving = full_entry().with_base_image(narsor_engine::domain::ImageSpec::resolve(
         "ghcr.io/acme/api-dev:2026.10",
     ));
     registry.update(resolving.clone()).expect("update");
@@ -836,9 +836,9 @@ fn an_unusable_base_image_is_refused_when_registered() {
     let root = TempRoot::new();
     let registry = root.registry();
     for image in [
-        narsor::domain::ImageSpec::pinned("ghcr.io/acme/api-dev:2026.10"),
-        narsor::domain::ImageSpec::resolve("ghcr.io/acme/api-dev"),
-        narsor::domain::ImageSpec::pinned("--privileged@sha256:00"),
+        narsor_engine::domain::ImageSpec::pinned("ghcr.io/acme/api-dev:2026.10"),
+        narsor_engine::domain::ImageSpec::resolve("ghcr.io/acme/api-dev"),
+        narsor_engine::domain::ImageSpec::pinned("--privileged@sha256:00"),
     ] {
         let error = registry
             .add(full_entry().with_base_image(image.clone()))

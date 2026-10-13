@@ -109,7 +109,7 @@ use crate::controller_protocol::{
     CapabilitiesView, ControlEventEnvelope, CreateRepositoryRequest, MoveTaskRequest,
     TaskListResponse,
 };
-use crate::orchestration::MoveTarget;
+use narsor_protocol::controller::MoveTaskTarget;
 
 use super::connection::Connection;
 use super::keymap::{self, Action, Context, Stack};
@@ -877,9 +877,9 @@ impl TaskApp {
             title: title_of(task),
             generation: task.generation,
             target: if up {
-                MoveTarget::Before(anchor)
+                MoveTaskTarget::Before(anchor.to_string())
             } else {
-                MoveTarget::After(anchor)
+                MoveTaskTarget::After(anchor.to_string())
             },
             anchor_title,
         })
@@ -948,13 +948,13 @@ impl TaskApp {
         match self.client.control_move_task(&request.task_id, &body).await {
             Ok(_) => {
                 let how = match &request.target {
-                    MoveTarget::Before(_) => "przed",
-                    MoveTarget::After(_) => "za",
-                    MoveTarget::Top => "na początek",
-                    MoveTarget::Bottom => "na koniec",
+                    MoveTaskTarget::Before(_) => "przed",
+                    MoveTaskTarget::After(_) => "za",
+                    MoveTaskTarget::Top => "na początek",
+                    MoveTaskTarget::Bottom => "na koniec",
                 };
                 let anchor = match &request.target {
-                    MoveTarget::Before(_) | MoveTarget::After(_) => {
+                    MoveTaskTarget::Before(_) | MoveTaskTarget::After(_) => {
                         format!(" {}", request.anchor_title)
                     }
                     _ => String::new(),

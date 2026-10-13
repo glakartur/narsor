@@ -62,8 +62,8 @@ use crate::controller_protocol::{
 };
 use crate::domain::display::{safe_link_url, DisplayLink, EMPTY_LINK_TEXT};
 use crate::domain::ExecutionStatus;
-use crate::engine::ConversationState;
-use crate::orchestration::{QueueReason, TaskLifecycle};
+use narsor_protocol::api::ConversationState;
+use narsor_protocol::controller::{QueueReason, TaskLifecycle};
 
 use super::super::keymap::Action;
 use super::super::scroll::one_line;
@@ -714,7 +714,7 @@ impl TaskApp {
 }
 
 /// The attempt of a position whose conversation can be read.
-pub(super) fn recorded_attempt(position: &crate::engine::Position) -> Option<String> {
+pub(super) fn recorded_attempt(position: &narsor_protocol::api::Position) -> Option<String> {
     match (&position.conversation, &position.action_execution_id) {
         (ConversationState::Recorded, Some(id)) => Some(id.clone()),
         _ => None,
@@ -1042,7 +1042,7 @@ fn header(
 /// harness's full reason is in *Info*.
 fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Option<Line<'static>> {
     let grey = |role: Role| if stale { Role::Done } else { role };
-    if let Some(loss) = crate::orchestration::loss_state(task.lifecycle, &task.resume) {
+    if let Some(loss) = narsor_protocol::display::loss_state(task.lifecycle, &task.resume) {
         let role = if loss.needs_owner() {
             Role::Problem
         } else {

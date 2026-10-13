@@ -5,16 +5,16 @@
 //! serialization, recovery after partial writes — live in file operations.
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use narsor::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
-use narsor::orchestration::{
+use narsor_engine::domain::{BackendId, ExecutionStatus, TaskId, TaskLaunchSpec};
+use narsor_engine::orchestration::{
     exhaustion_loss, loss_state, BackendCapacity, BackendLease, Clock, CommandActor,
     CommandRequest, ControlPlane, ControllerReport, LossState, MoveTarget, NewTask, Observation,
     ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity,
     ResumeExhaustion, ResumePolicy, ResumeState, RunnerSnapshot, TaskEventKind, TaskLifecycle,
     TaskRecord, WorkloadLoss,
 };
-use narsor::persistence::paths::{temp_path_for, StatePaths};
-use narsor::persistence::ExecutionStore;
+use narsor_engine::persistence::paths::{temp_path_for, StatePaths};
+use narsor_engine::persistence::ExecutionStore;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -194,8 +194,8 @@ fn backend_id(id: &str) -> BackendId {
     BackendId::parse(id).expect("valid backend id")
 }
 
-fn git_workspace() -> narsor::domain::TaskWorkspace {
-    narsor::domain::TaskWorkspace::Git(narsor::domain::GitIdentity {
+fn git_workspace() -> narsor_engine::domain::TaskWorkspace {
+    narsor_engine::domain::TaskWorkspace::Git(narsor_engine::domain::GitIdentity {
         repository: Some("narsor".to_string()),
         remote_url: "https://example.com/narsor.git".to_string(),
         commit: "614c3a8".repeat(5) + "abcde",
@@ -210,8 +210,8 @@ fn launch_spec() -> TaskLaunchSpec {
         3,
         serde_json::json!({ "feature": "remote backends" }),
         git_workspace(),
-        narsor::domain::ResolvedEnvironment::harness_only("claude-code"),
-        narsor::domain::ResourceProfile::new(1000, 2048),
+        narsor_engine::domain::ResolvedEnvironment::harness_only("claude-code"),
+        narsor_engine::domain::ResourceProfile::new(1000, 2048),
     )
 }
 
@@ -796,8 +796,8 @@ fn creating_a_task_is_idempotent_but_a_different_request_conflicts() {
             3,
             serde_json::json!({ "feature": "something else" }),
             git_workspace(),
-            narsor::domain::ResolvedEnvironment::harness_only("claude-code"),
-            narsor::domain::ResourceProfile::new(1000, 2048),
+            narsor_engine::domain::ResolvedEnvironment::harness_only("claude-code"),
+            narsor_engine::domain::ResourceProfile::new(1000, 2048),
         ),
         ..new_task("task-1", "k8s")
     };
@@ -1110,7 +1110,7 @@ fn local_crash_recovery_never_touches_orchestration_records() {
     let orphan = temp_path_for(&fx.root.paths().orchestration_task_file("task-1"));
     fs::write(&orphan, b"torn").unwrap();
 
-    let report = narsor::persistence::recover(&store).expect("local recovery");
+    let report = narsor_engine::persistence::recover(&store).expect("local recovery");
     assert!(report.reconciled.is_empty(), "no remote task is reconciled");
     assert!(
         orphan.exists(),
@@ -2092,10 +2092,10 @@ fn an_identical_create_request_returns_the_task_by_its_digest() {
 // ---------------------------------------------------------------------------
 
 fn operator_request(
-    command: narsor::orchestration::OperatorCommand,
+    command: narsor_engine::orchestration::OperatorCommand,
     key: &str,
-) -> narsor::orchestration::OperatorCommandRequest {
-    narsor::orchestration::OperatorCommandRequest {
+) -> narsor_engine::orchestration::OperatorCommandRequest {
+    narsor_engine::orchestration::OperatorCommandRequest {
         command,
         idempotency_key: key.to_string(),
         expected_generation: None,
@@ -2113,7 +2113,7 @@ fn running_with_runner(fx: &Fixture, id: &str, lease: &BackendLease) {
 
 #[test]
 fn an_operator_command_is_bound_to_the_launch_it_was_queued_for() {
-    use narsor::orchestration::{OperatorCommand, OperatorCommandStatus};
+    use narsor_engine::orchestration::{OperatorCommand, OperatorCommandStatus};
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
     running_with_runner(&fx, "task-1", &lease);
@@ -2154,7 +2154,7 @@ fn an_operator_command_is_bound_to_the_launch_it_was_queued_for() {
 
 #[test]
 fn a_superseded_runner_can_neither_poll_nor_settle_operator_commands() {
-    use narsor::orchestration::OperatorCommand;
+    use narsor_engine::orchestration::OperatorCommand;
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
     running_with_runner(&fx, "task-1", &lease);
@@ -2217,7 +2217,7 @@ fn a_task_record_written_before_operator_commands_still_reads() {
 
 #[test]
 fn a_runner_detail_is_cleaned_and_bounded_when_a_command_is_settled() {
-    use narsor::orchestration::OperatorCommand;
+    use narsor_engine::orchestration::OperatorCommand;
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
     running_with_runner(&fx, "task-1", &lease);
@@ -2260,7 +2260,7 @@ fn running_task_for_commands() -> Fixture {
 }
 
 fn queue_chat(fx: &Fixture, key: &str, text: &str) -> Result<String, OrchestrationError> {
-    use narsor::orchestration::OperatorCommand;
+    use narsor_engine::orchestration::OperatorCommand;
     fx.control
         .queue_operator_command(
             &task("task-1"),
@@ -2302,7 +2302,7 @@ fn settled_commands_are_pruned_ids_stay_unique_and_chat_text_is_dropped() {
     assert_eq!(record.operator_commands[0].command_id, "command-11");
     assert!(record.operator_commands.iter().all(|command| matches!(
         &command.command,
-        narsor::orchestration::OperatorCommand::ConductorChat { text } if text.is_empty()
+        narsor_engine::orchestration::OperatorCommand::ConductorChat { text } if text.is_empty()
     )));
 
     // A command still open is never forgotten, and the next id goes on.
@@ -2333,7 +2333,7 @@ fn retrying_a_command_key_is_safe_whether_the_command_was_kept_or_forgotten() {
         .queue_operator_command(
             &task("task-1"),
             operator_request(
-                narsor::orchestration::OperatorCommand::ConductorChat {
+                narsor_engine::orchestration::OperatorCommand::ConductorChat {
                     text: "hello".into(),
                 },
                 "chat-25",
@@ -2429,13 +2429,13 @@ fn an_old_event_log_with_a_conductor_harness_command_still_decodes() {
             "requested_by": "local"
         }
     }"#;
-    let event: narsor::orchestration::TaskEvent =
+    let event: narsor_engine::orchestration::TaskEvent =
         serde_json::from_str(line).expect("an old event decodes");
     assert_eq!(
         event.kind,
         TaskEventKind::OperatorCommandQueued {
             command_id: "command-1".to_string(),
-            command: narsor::orchestration::OperatorCommand::SetConductorHarness {
+            command: narsor_engine::orchestration::OperatorCommand::SetConductorHarness {
                 harness: "codex".to_string(),
             },
             requested_by: OwnerRef::new("local"),
@@ -2835,7 +2835,7 @@ fn newer_frame(kind: serde_json::Value) -> String {
 
 #[test]
 fn a_client_keeps_a_stream_frame_whose_event_or_observation_it_does_not_know() {
-    use narsor::controller_protocol::ControlEventEnvelope;
+    use narsor_engine::controller_protocol::ControlEventEnvelope;
 
     // An event type from a newer version.
     let frame = newer_frame(serde_json::json!({ "type": "resumed_by_magic", "extra": [1, 2] }));
@@ -3576,7 +3576,7 @@ fn the_daemons_startup_recovery_adopts_a_loss_from_before_the_policy() {
     lose(&fx, "task-1", &lease, true, "exited");
     strip_resume_fields(&fx, "task-1");
 
-    narsor::cli::daemon::recover_orchestration_at_startup(fx.reopen());
+    narsor_server::runtime::recover_orchestration_at_startup(fx.reopen());
 
     let adopted = fx.control.task(&task("task-1")).unwrap();
     assert_eq!(adopted.resume.consecutive_losses, 1);

@@ -50,11 +50,11 @@ use crate::controller_protocol::{
     Freshness, InputView, OperatorCommandView, QueueView, TaskSummary,
 };
 use crate::domain::{BackendId, ExecutionStatus};
-use crate::orchestration::{
-    exhaustion_loss, loss_state, AttentionItem, AttentionKind, LossState, MoveTarget,
-    OperatorCommand, OperatorCommandStatus, QueueReason, ResumeExhaustion, TaskEvent,
-    TaskEventKind, TaskLifecycle, UNSPECIFIED_LOSS,
+use narsor_protocol::controller::{
+    AttentionItem, AttentionKind, MoveTaskTarget, OperatorCommand, OperatorCommandStatus,
+    QueueReason, ResumeExhaustion, TaskEvent, TaskEventKind, TaskLifecycle,
 };
+use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, UNSPECIFIED_LOSS};
 
 use super::super::scroll::one_line;
 use super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
@@ -197,15 +197,13 @@ pub fn state_icon(task: &TaskSummary) -> StateIcon {
     match task.lifecycle {
         TaskLifecycle::Queued => StateIcon::Queued,
         TaskLifecycle::Provisioning => StateIcon::Provisioning,
-        TaskLifecycle::Running => match task
-            .runner
-            .as_ref()
-            .map(|runner| runner.execution_status.clone())
-        {
-            Some(ExecutionStatus::Completed) => StateIcon::Done,
-            Some(ExecutionStatus::Failed | ExecutionStatus::Cancelled) => StateIcon::Failed,
-            _ => StateIcon::Running,
-        },
+        TaskLifecycle::Running => {
+            match task.runner.as_ref().map(|runner| runner.execution_status) {
+                Some(ExecutionStatus::Completed) => StateIcon::Done,
+                Some(ExecutionStatus::Failed | ExecutionStatus::Cancelled) => StateIcon::Failed,
+                _ => StateIcon::Running,
+            }
+        }
         TaskLifecycle::PauseRequested | TaskLifecycle::Paused => StateIcon::Paused,
         TaskLifecycle::Interrupted | TaskLifecycle::Unknown => StateIcon::Failed,
         TaskLifecycle::Archiving | TaskLifecycle::Archived => StateIcon::Done,
@@ -233,10 +231,7 @@ fn controller_offline(task: &TaskSummary) -> bool {
 /// The label of a row (its second line). `queue_position` is the 1-based place among
 /// the queued tasks of the backend, in list order.
 pub fn label_of(task: &TaskSummary, queue_position: Option<usize>) -> String {
-    let runner_status = task
-        .runner
-        .as_ref()
-        .map(|runner| runner.execution_status.clone());
+    let runner_status = task.runner.as_ref().map(|runner| runner.execution_status);
     match task.lifecycle {
         TaskLifecycle::Queued => match task.queue.as_ref().map(|queue| &queue.reason) {
             Some(QueueReason::ControllerOffline) => "offline".to_string(),
@@ -405,7 +400,7 @@ pub struct MoveRequest {
     /// The desired generation the operator saw.
     pub generation: u64,
     /// Where to put it.
-    pub target: MoveTarget,
+    pub target: MoveTaskTarget,
     /// What the anchor row shows, for the notification.
     pub anchor_title: String,
 }
@@ -1129,10 +1124,10 @@ impl TaskList {
         let task = self.selected()?;
         let (target, anchor) = if mode.slot > origin {
             let anchor = &self.tasks[*rest.get(mode.slot - 1)?];
-            (MoveTarget::After(anchor.task_id.clone()), anchor)
+            (MoveTaskTarget::After(anchor.task_id.to_string()), anchor)
         } else {
             let anchor = &self.tasks[*rest.get(mode.slot)?];
-            (MoveTarget::Before(anchor.task_id.clone()), anchor)
+            (MoveTaskTarget::Before(anchor.task_id.to_string()), anchor)
         };
         Some(MoveRequest {
             task_id: task.task_id.to_string(),
@@ -1316,7 +1311,7 @@ fn patch_row(task: &mut TaskSummary, kind: &TaskEventKind, event: &TaskEvent) ->
             let Some(runner) = task.runner.as_mut() else {
                 return true;
             };
-            runner.execution_status = execution_status.clone();
+            runner.execution_status = *execution_status;
             runner.event_cursor = *event_cursor;
             if pending_input_id.is_none() {
                 runner.pending_input = None;
@@ -1354,7 +1349,7 @@ fn replace_reported_attention(
     reported: &[AttentionItem],
     inputs: &[InputView],
 ) {
-    use crate::orchestration::InputStatus;
+    use narsor_protocol::controller::InputStatus;
     let answered = |waiting_id: &str| {
         inputs.iter().any(|input| {
             input.pending_input_id == waiting_id

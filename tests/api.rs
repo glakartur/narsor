@@ -12,21 +12,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use narsor::api;
-use narsor::api::{ClientError, ExecutionSummary, StartTaskResponse};
-use narsor::conductor::assembly::assemble;
-use narsor::conductor::{
+use narsor_engine::conductor::assembly::assemble;
+use narsor_engine::conductor::{
     ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, PendingInvocation,
     QueuedRequest,
 };
-use narsor::domain::{
+use narsor_engine::domain::{
     Context, Event, EventData, ExecutionStatus, RepositoryInfo, WorkflowDefinition,
     WorkflowExecution, Workspace,
 };
-use narsor::engine::{ConversationState, Engine, HumanInputDelivery, PositionStatus};
-use narsor::persistence::conversation::ConversationSource;
-use narsor::persistence::{DefaultHarnessSelector, ExecutionStore, StatePaths};
-use narsor::workflow::load_from_file;
+use narsor_engine::engine::{ConversationState, Engine, HumanInputDelivery, PositionStatus};
+use narsor_engine::persistence::conversation::ConversationSource;
+use narsor_engine::persistence::{DefaultHarnessSelector, ExecutionStore, StatePaths};
+use narsor_engine::workflow::load_from_file;
+use narsor_protocol::api::HumanInputDeliveryDto;
+use narsor_server::api;
+use narsor_server::api::{ClientError, ExecutionSummary, StartTaskResponse};
 
 /// A temporary directory that deletes itself when it goes out of scope.
 ///
@@ -85,6 +86,19 @@ fn sample_execution(id: &str, status: ExecutionStatus) -> WorkflowExecution {
         ),
         current_action_execution: None,
         metadata: serde_json::json!({}),
+    }
+}
+
+fn wire_delivery(delivery: HumanInputDelivery) -> HumanInputDeliveryDto {
+    HumanInputDeliveryDto {
+        values: delivery.values,
+        chosen_label: delivery.chosen_label,
+        data: delivery.data,
+        variables: delivery.variables,
+        comment: delivery.comment,
+        agent_message: delivery.agent_message,
+        action: delivery.action,
+        episode: delivery.episode,
     }
 }
 
@@ -712,12 +726,15 @@ async fn conductor_endpoints_return_the_state_and_the_chat_after_a_sequence() {
         .conductor_state("exec-chat")
         .await
         .expect("conductor state");
-    assert_eq!(response.pending, state.pending);
+    assert_eq!(
+        serde_json::to_value(response.pending).expect("serialize API pending invocation"),
+        serde_json::to_value(state.pending).expect("serialize stored pending invocation")
+    );
     assert_eq!(response.unanswered_chat, vec![open.id.clone()]);
     assert!(response.used_retries.contains("episode-1"));
 
     let chat = client.conductor_chat("exec-chat", 1).await.expect("chat");
-    assert_eq!(chat.entries, vec![reply, open]);
+    assert_eq!(chat.entries, vec![reply.into(), open.into()]);
 }
 
 // --- Error paths -----------------------------------------------------------
@@ -1555,7 +1572,7 @@ async fn client_start_task_returns_a_queued_task() {
         .expect("start_task");
     assert_eq!(
         response.task.lifecycle,
-        narsor::orchestration::TaskLifecycle::Queued
+        narsor_engine::orchestration::TaskLifecycle::Queued
     );
     assert!(root.store().list_execution_ids().unwrap().is_empty());
     assert_eq!(service.control_plane().list_tasks().unwrap().len(), 1);
@@ -1648,7 +1665,7 @@ async fn client_deliver_input_answers_a_waiting_execution() {
     );
 
     let response = client
-        .deliver_input(&execution.id, delivery)
+        .deliver_input(&execution.id, wire_delivery(delivery))
         .await
         .expect("client deliver_input");
     assert_eq!(response.execution_id, execution.id);
@@ -1915,13 +1932,11 @@ async fn client_stream_execution_ends_itself_after_the_terminal_event() {
     );
     assert!(matches!(
         events.last().expect("at least one event").data,
-        narsor::domain::EventData::WorkflowCompleted { .. }
+        narsor_engine::domain::EventData::WorkflowCompleted { .. }
     ));
-    assert!(
-        events
-            .iter()
-            .all(|event| event.workflow_execution_id == execution.id)
-    );
+    assert!(events
+        .iter()
+        .all(|event| event.workflow_execution_id == execution.id));
 }
 
 /// A script-to-terminal fixture whose one action sleeps for a bit before
@@ -2090,7 +2105,7 @@ async fn client_stream_all_does_not_end_when_only_one_of_several_executions_fini
         if item.workflow_execution_id == fast_execution.id
             && matches!(
                 item.data,
-                narsor::domain::EventData::WorkflowCompleted { .. }
+                narsor_engine::domain::EventData::WorkflowCompleted { .. }
             )
         {
             saw_fast_terminal = true;
@@ -2098,7 +2113,7 @@ async fn client_stream_all_does_not_end_when_only_one_of_several_executions_fini
         if item.workflow_execution_id == slow_execution.id
             && matches!(
                 item.data,
-                narsor::domain::EventData::WorkflowCompleted { .. }
+                narsor_engine::domain::EventData::WorkflowCompleted { .. }
             )
         {
             saw_slow_terminal = true;
@@ -2118,8 +2133,8 @@ async fn client_stream_all_does_not_end_when_only_one_of_several_executions_fini
 // U3: a manual transition carries the agent's question to the gate after it
 // ---------------------------------------------------------------------------
 
-use narsor::domain::{ActionError, ActionResult};
-use narsor::engine::{
+use narsor_engine::domain::{ActionError, ActionResult};
+use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, HumanInputRequest, SuspendedAction,
 };
 
@@ -2289,8 +2304,8 @@ mod engine_support;
 mod problems {
     use super::*;
 
-    use narsor::domain::{AnsweredBy, InputCloseReason};
-    use narsor::engine::{ActionKind, InputContinuation, PendingHumanInput};
+    use narsor_engine::domain::{AnsweredBy, InputCloseReason};
+    use narsor_engine::engine::{ActionKind, InputContinuation, PendingHumanInput};
 
     /// An execution of `agent_problem` stopped on its problem, and a server
     /// over the engine that stopped it.
@@ -2427,8 +2442,10 @@ mod problems {
         let error = client
             .deliver_input(
                 &problem.execution_id,
-                HumanInputDelivery::label("needs_human_decision")
-                    .for_episode(problem.pending.episode_key()),
+                wire_delivery(
+                    HumanInputDelivery::label("needs_human_decision")
+                        .for_episode(problem.pending.episode_key()),
+                ),
             )
             .await
             .expect_err("the gate needs data.question");
@@ -2447,11 +2464,9 @@ mod problems {
         assert_eq!(execution.status, ExecutionStatus::InputNeeded);
         assert!(problem.store.has_pending_input(&problem.execution_id));
         // Only the error note the engine records for any refused call.
-        assert!(
-            events(&problem)[before..]
-                .iter()
-                .all(|event| matches!(event.data, EventData::Error { .. }))
-        );
+        assert!(events(&problem)[before..]
+            .iter()
+            .all(|event| matches!(event.data, EventData::Error { .. })));
     }
 
     #[tokio::test]
@@ -2481,11 +2496,9 @@ mod problems {
             .expect("read")
             .expect("still pending");
         assert_eq!(still.episode_key(), problem.pending.episode_key());
-        assert!(
-            !events(&problem)
-                .iter()
-                .any(|event| matches!(event.data, EventData::HumanInputReceived { .. }))
-        );
+        assert!(!events(&problem)
+            .iter()
+            .any(|event| matches!(event.data, EventData::HumanInputReceived { .. })));
     }
 
     /// Two answers to the same request at once: exactly one is taken. The
@@ -2608,9 +2621,9 @@ mod problems {
 mod failures {
     use super::*;
 
-    use narsor::conductor::{FailureOutcome, FailureReport};
-    use narsor::domain::ProblemKind;
-    use narsor::engine::StepFailure;
+    use narsor::api::ProblemKindDto;
+    use narsor_engine::conductor::{FailureOutcome, FailureReport};
+    use narsor_engine::engine::StepFailure;
 
     /// An execution of `two_steps` failed on `first` with a step failure
     /// the conductor diagnosed, and a server over it.
@@ -2683,10 +2696,14 @@ mod failures {
             root.path().to_path_buf(),
             root.path().to_path_buf(),
             api::ApiServices {
-                control: Some(Arc::new(narsor::controller_protocol::ProtocolService::new(
-                    narsor::orchestration::ControlPlane::new(StatePaths::new(root.path())),
-                    environment_support::seeded_resolver(root.path()),
-                ))),
+                control: Some(Arc::new(
+                    narsor_engine::controller_protocol::ProtocolService::new(
+                        narsor_engine::orchestration::ControlPlane::new(StatePaths::new(
+                            root.path(),
+                        )),
+                        environment_support::seeded_resolver(root.path()),
+                    ),
+                )),
                 ..api::ApiServices::default()
             },
         )
@@ -2732,7 +2749,7 @@ mod failures {
             .expect("listed");
         assert_eq!(summary.status, narsor::api::ExecutionStatusDto::Failed);
         let problem = summary.problem.clone().expect("a problem");
-        assert_eq!(problem.kind, ProblemKind::Failure);
+        assert_eq!(problem.kind, ProblemKindDto::Failure);
         assert_eq!(problem.reason, "A dependency is missing.");
         assert_eq!(problem.episode.as_deref(), Some("attempt-2"));
 
@@ -2842,13 +2859,13 @@ mod conductor_chat {
     use std::pin::Pin;
     use std::sync::Mutex;
 
-    use narsor::api::ApiServices;
-    use narsor::conductor::{
+    use narsor_engine::conductor::{
         ConductorAnswer, ConductorInvoker, ConductorRegistry, Invocation, InvocationOutcome,
         ProposalStatus,
     };
-    use narsor::domain::{AnsweredBy, ConductorPurpose, InputCloseReason};
-    use narsor::engine::{ActionExecutor, ActionKind, PendingHumanInput};
+    use narsor_engine::domain::{AnsweredBy, ConductorPurpose, InputCloseReason};
+    use narsor_engine::engine::{ActionExecutor, ActionKind};
+    use narsor_server::api::ApiServices;
 
     /// A conductor answering each purpose from a list of its own; anything
     /// unscripted fails.
@@ -3008,7 +3025,7 @@ mod conductor_chat {
             if let Some(proposal) = chat
                 .entries
                 .iter()
-                .find(|entry| entry.kind == ChatEntryKind::Proposal)
+                .find(|entry| entry.kind == narsor::api::ChatEntryKindDto::Proposal)
             {
                 return proposal.id.clone();
             }
@@ -3062,7 +3079,8 @@ mod conductor_chat {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(listed.status, narsor::api::ExecutionStatusDto::InputNeeded);
-        let pending: PendingHumanInput = listed.pending_input.clone().expect("the gate");
+        let pending: narsor_protocol::api::PendingHumanInputView =
+            listed.pending_input.clone().expect("the gate");
         let annotation = listed.annotation.expect("the gate's summary");
         assert_eq!(annotation.key, pending.episode_key());
         assert_eq!(annotation.recommendation.as_deref(), Some("approved"));
@@ -3131,13 +3149,15 @@ mod conductor_chat {
         client
             .deliver_input(
                 &served.execution_id,
-                HumanInputDelivery::with_values(
-                    serde_json::json!({"approval_status": "rejected", "comment": "no"})
-                        .as_object()
-                        .cloned()
-                        .unwrap(),
-                )
-                .for_episode(pending.episode_key()),
+                wire_delivery(
+                    HumanInputDelivery::with_values(
+                        serde_json::json!({"approval_status": "rejected", "comment": "no"})
+                            .as_object()
+                            .cloned()
+                            .unwrap(),
+                    )
+                    .for_episode(pending.episode_key()),
+                ),
             )
             .await
             .expect("the operator answers first");
@@ -3207,7 +3227,7 @@ mod conductor_chat {
             .expect("chat")
             .entries
             .into_iter()
-            .find(|entry| entry.kind == ChatEntryKind::Decision)
+            .find(|entry| entry.kind == narsor::api::ChatEntryKindDto::Decision)
             .and_then(|entry| {
                 entry
                     .payload?
@@ -3261,16 +3281,18 @@ mod conductor_chat {
 // ---------------------------------------------------------------------------
 
 async fn start_server_with_control_plane(root: &TempRoot) -> api::ApiHandle {
-    let control = narsor::orchestration::ControlPlane::new(StatePaths::new(root.path()));
+    let control = narsor_engine::orchestration::ControlPlane::new(StatePaths::new(root.path()));
     api::start_with_services(
         Arc::new(Engine::new(root.store())),
         root.path().to_path_buf(),
         root.path().to_path_buf(),
         api::ApiServices {
-            control: Some(Arc::new(narsor::controller_protocol::ProtocolService::new(
-                control,
-                environment_support::seeded_resolver(root.path()),
-            ))),
+            control: Some(Arc::new(
+                narsor_engine::controller_protocol::ProtocolService::new(
+                    control,
+                    environment_support::seeded_resolver(root.path()),
+                ),
+            )),
             ..api::ApiServices::default()
         },
     )
@@ -3278,11 +3300,14 @@ async fn start_server_with_control_plane(root: &TempRoot) -> api::ApiHandle {
     .expect("server starts")
 }
 
-fn remote_task(task_id: &str, backend_id: &str) -> narsor::controller_protocol::CreateTaskRequest {
-    narsor::controller_protocol::CreateTaskRequest {
+fn remote_task(
+    task_id: &str,
+    backend_id: &str,
+) -> narsor_engine::controller_protocol::CreateTaskRequest {
+    narsor_engine::controller_protocol::CreateTaskRequest {
         task_id: Some(task_id.to_string()),
         backend_id: Some(backend_id.to_string()),
-        launch: narsor::controller_protocol::LaunchRequest {
+        launch: narsor_engine::controller_protocol::LaunchRequest {
             workflow_id: "implement-feature".to_string(),
             workflow_version: 1,
             inputs: serde_json::json!({}),
@@ -3316,7 +3341,7 @@ async fn control_plane_routes_sit_behind_the_owner_token_beside_the_local_ones()
         .expect("create");
     assert_eq!(
         created.lifecycle,
-        narsor::orchestration::TaskLifecycle::Queued
+        narsor_engine::orchestration::TaskLifecycle::Queued
     );
     assert_eq!(created.generation, 1);
     assert!(created.runner.is_none() && created.observation.is_none());
@@ -3366,8 +3391,8 @@ async fn control_plane_refusals_are_typed() {
         other => panic!("expected a typed 409, got {other:?}"),
     }
 
-    let pause = narsor::controller_protocol::OwnerCommandRequest {
-        command: narsor::orchestration::OwnerCommand::Pause,
+    let pause = narsor_engine::controller_protocol::OwnerCommandRequest {
+        command: narsor_engine::orchestration::OwnerCommand::Pause,
         idempotency_key: "pause-1".to_string(),
         expected_generation: None,
     };
@@ -3375,8 +3400,8 @@ async fn control_plane_refusals_are_typed() {
         Err(ClientError::Refused { code, .. }) => assert_eq!(code, "illegal_command"),
         other => panic!("a queued task cannot pause, got {other:?}"),
     }
-    let stale = narsor::controller_protocol::OwnerCommandRequest {
-        command: narsor::orchestration::OwnerCommand::Archive,
+    let stale = narsor_engine::controller_protocol::OwnerCommandRequest {
+        command: narsor_engine::orchestration::OwnerCommand::Archive,
         idempotency_key: "archive-1".to_string(),
         expected_generation: Some(9),
     };
@@ -3413,11 +3438,11 @@ async fn start_scheduling_server(
     root: &TempRoot,
 ) -> (
     api::ApiHandle,
-    Arc<narsor::controller_protocol::ProtocolService>,
+    Arc<narsor_engine::controller_protocol::ProtocolService>,
 ) {
-    let control = narsor::orchestration::ControlPlane::new(StatePaths::new(root.path()));
+    let control = narsor_engine::orchestration::ControlPlane::new(StatePaths::new(root.path()));
     let launch = environment_support::seeded_catalog_resolver(root.path());
-    let service = Arc::new(narsor::controller_protocol::ProtocolService::new(
+    let service = Arc::new(narsor_engine::controller_protocol::ProtocolService::new(
         control,
         launch.clone(),
     ));
@@ -3438,7 +3463,7 @@ async fn start_scheduling_server(
 
 #[tokio::test]
 async fn post_tasks_acknowledges_a_queued_task_without_creating_an_execution() {
-    use narsor::orchestration::TaskLifecycle;
+    use narsor_engine::orchestration::TaskLifecycle;
 
     let root = TempRoot::new();
     let (handle, _service) = start_scheduling_server(&root).await;
@@ -3568,26 +3593,27 @@ async fn post_tasks_rejects_an_invalid_submission_without_queueing_anything() {
 
 /// One enrolled controller holding `backend`'s lease, called in-process.
 struct InProcessController {
-    service: Arc<narsor::controller_protocol::ProtocolService>,
-    identity: narsor::controller_protocol::ControllerIdentity,
+    service: Arc<narsor_engine::controller_protocol::ProtocolService>,
+    identity: narsor_engine::controller_protocol::ControllerIdentity,
     epoch: u64,
 }
 
 impl InProcessController {
-    fn online(service: &Arc<narsor::controller_protocol::ProtocolService>, backend: &str) -> Self {
-        use narsor::controller_protocol::{
-            AcquireLeaseRequest, CreateEnrollmentRequest, EnrollRequest,
-        };
+    fn online(
+        service: &Arc<narsor_engine::controller_protocol::ProtocolService>,
+        backend: &str,
+    ) -> Self {
+        use narsor_engine::controller_protocol::{AcquireLeaseRequest, CreateEnrollmentRequest};
         let code = service
             .create_enrollment(backend, CreateEnrollmentRequest::default())
             .expect("enrollment");
         let enrolled = service
-            .enroll(EnrollRequest::signed(
+            .enroll(narsor_engine::auth::pop::signed_enrollment_request(
                 &code.enrollment_code,
-                &narsor::auth::ControllerKey::generate(),
+                &narsor_engine::auth::ControllerKey::generate(),
             ))
             .expect("enroll");
-        let identity = narsor::controller_protocol::ControllerIdentity {
+        let identity = narsor_engine::controller_protocol::ControllerIdentity {
             controller_id: enrolled.controller_id,
             backend_id: enrolled.backend_id,
         };
@@ -3614,7 +3640,9 @@ impl InProcessController {
             .expect("commands")
             .commands
             .into_iter()
-            .filter(|command| command.action == narsor::controller_protocol::DesiredAction::Start)
+            .filter(|command| {
+                command.action == narsor_engine::controller_protocol::DesiredAction::Start
+            })
             .map(|command| command.task_id.to_string())
             .collect()
     }
@@ -3622,18 +3650,18 @@ impl InProcessController {
     fn report(
         &self,
         task: &str,
-        observation: narsor::orchestration::Observation,
-    ) -> Result<(), narsor::controller_protocol::ProtocolError> {
+        observation: narsor_engine::orchestration::Observation,
+    ) -> Result<(), narsor_engine::controller_protocol::ProtocolError> {
         let generation = self
             .service
             .control_plane()
-            .task(&narsor::domain::TaskId::parse(task).unwrap())
+            .task(&narsor_engine::domain::TaskId::parse(task).unwrap())
             .unwrap()
             .generation;
         self.service
             .report(
                 &self.identity,
-                narsor::controller_protocol::ReportRequest {
+                narsor_engine::controller_protocol::ReportRequest {
                     task_id: task.to_string(),
                     lease_epoch: self.epoch,
                     desired_generation: generation,
@@ -3647,7 +3675,7 @@ impl InProcessController {
     }
 
     fn run(&self, task: &str) {
-        use narsor::orchestration::Observation;
+        use narsor_engine::orchestration::Observation;
         self.report(task, Observation::StartAccepted)
             .expect("start accepted");
         self.report(task, Observation::RunnerReady)
@@ -3661,16 +3689,17 @@ impl InProcessController {
 /// reason, with no execution behind it.
 #[tokio::test]
 async fn local_and_control_plane_creates_share_one_ranked_queue() {
-    use narsor::controller_protocol::MoveTaskRequest;
-    use narsor::domain::TaskId;
-    use narsor::orchestration::{MoveTarget, Observation, QueueReason, TaskLifecycle};
+    use narsor_engine::controller_protocol::MoveTaskRequest;
+    use narsor_engine::domain::TaskId;
+    use narsor_engine::orchestration::{MoveTarget, Observation, QueueReason, TaskLifecycle};
 
     let root = TempRoot::new();
     let (handle, service) = start_scheduling_server(&root).await;
     set_backend_limit(&root, "k8s", 1);
     let client = handle.client();
-    let reason =
-        |summary: narsor::controller_protocol::TaskSummary| summary.queue.map(|queue| queue.reason);
+    let reason = |summary: narsor_engine::controller_protocol::TaskSummary| {
+        summary.queue.map(|queue| queue.reason)
+    };
 
     let submit_local = |task_id: &'static str| {
         let handle = &handle;
@@ -3726,7 +3755,7 @@ async fn local_and_control_plane_creates_share_one_ranked_queue() {
         .control_move_task(
             "remote-d",
             &MoveTaskRequest {
-                target: MoveTarget::Before(TaskId::parse("local-b").expect("id")),
+                target: MoveTarget::Before(TaskId::parse("local-b").expect("id")).into(),
                 expected_generation: Some(1),
             },
         )
@@ -3752,8 +3781,8 @@ async fn local_and_control_plane_creates_share_one_ranked_queue() {
     client
         .control_command(
             "first",
-            &narsor::controller_protocol::OwnerCommandRequest {
-                command: narsor::orchestration::OwnerCommand::Archive,
+            &narsor_engine::controller_protocol::OwnerCommandRequest {
+                command: narsor_engine::orchestration::OwnerCommand::Archive,
                 idempotency_key: "archive-first".to_string(),
                 expected_generation: None,
             },
@@ -3769,13 +3798,13 @@ async fn local_and_control_plane_creates_share_one_ranked_queue() {
 fn set_backend_limit(root: &TempRoot, backend: &str, limit: u32) {
     let mut record = environment_support::backend(backend);
     record.limits.max_concurrent_tasks = limit;
-    narsor::environment::EnvironmentCatalog::new(root.path())
+    narsor_engine::environment::EnvironmentCatalog::new(root.path())
         .save_backend(&record)
         .expect("save backend");
 }
 
-fn inheriting_task(task_id: &str) -> narsor::controller_protocol::CreateTaskRequest {
-    narsor::controller_protocol::CreateTaskRequest {
+fn inheriting_task(task_id: &str) -> narsor_engine::controller_protocol::CreateTaskRequest {
+    narsor_engine::controller_protocol::CreateTaskRequest {
         backend_id: None,
         ..remote_task(task_id, "unused")
     }
@@ -3783,8 +3812,8 @@ fn inheriting_task(task_id: &str) -> narsor::controller_protocol::CreateTaskRequ
 
 #[tokio::test]
 async fn new_tasks_inherit_the_owner_default_backend_and_existing_tasks_never_move() {
-    use narsor::controller_protocol::SetDefaultBackendRequest;
-    use narsor::orchestration::TaskLifecycle;
+    use narsor_engine::controller_protocol::SetDefaultBackendRequest;
+    use narsor_engine::orchestration::TaskLifecycle;
     let root = TempRoot::new();
     let (handle, service) = start_scheduling_server(&root).await;
     let client = handle.client();
@@ -3867,8 +3896,8 @@ async fn new_tasks_inherit_the_owner_default_backend_and_existing_tasks_never_mo
 
 #[tokio::test]
 async fn queued_tasks_wait_for_capacity_in_rank_order_with_a_visible_reason() {
-    use narsor::controller_protocol::MoveTaskRequest;
-    use narsor::orchestration::{
+    use narsor_engine::controller_protocol::MoveTaskRequest;
+    use narsor_engine::orchestration::{
         MoveTarget, Observation, QueueReason, TaskEventKind, TaskLifecycle,
     };
     let root = TempRoot::new();
@@ -3896,8 +3925,9 @@ async fn queued_tasks_wait_for_capacity_in_rank_order_with_a_visible_reason() {
             .await
             .expect("create");
     }
-    let reason =
-        |summary: narsor::controller_protocol::TaskSummary| summary.queue.map(|queue| queue.reason);
+    let reason = |summary: narsor_engine::controller_protocol::TaskSummary| {
+        summary.queue.map(|queue| queue.reason)
+    };
     assert_eq!(
         reason(client.control_task("high").await.unwrap()),
         Some(QueueReason::WaitingForCapacity {
@@ -3911,7 +3941,7 @@ async fn queued_tasks_wait_for_capacity_in_rank_order_with_a_visible_reason() {
         "the limit is reached"
     );
     match controller.report("high", Observation::StartAccepted) {
-        Err(narsor::controller_protocol::ProtocolError::Conflict { code, .. }) => {
+        Err(narsor_engine::controller_protocol::ProtocolError::Conflict { code, .. }) => {
             assert_eq!(code, "not_admitted")
         }
         other => panic!("an unadmitted start must be refused, got {other:?}"),
@@ -3922,7 +3952,7 @@ async fn queued_tasks_wait_for_capacity_in_rank_order_with_a_visible_reason() {
         .control_move_task(
             "low",
             &MoveTaskRequest {
-                target: MoveTarget::Top,
+                target: MoveTarget::Top.into(),
                 expected_generation: Some(1),
             },
         )
@@ -3948,7 +3978,7 @@ async fn queued_tasks_wait_for_capacity_in_rank_order_with_a_visible_reason() {
         .control_move_task(
             "first",
             &MoveTaskRequest {
-                target: MoveTarget::Bottom,
+                target: MoveTarget::Bottom.into(),
                 expected_generation: None,
             },
         )
@@ -3961,7 +3991,7 @@ async fn queued_tasks_wait_for_capacity_in_rank_order_with_a_visible_reason() {
         .control_move_task(
             "low",
             &MoveTaskRequest {
-                target: MoveTarget::Bottom,
+                target: MoveTarget::Bottom.into(),
                 expected_generation: Some(4),
             },
         )
@@ -3980,8 +4010,8 @@ async fn queued_tasks_wait_for_capacity_in_rank_order_with_a_visible_reason() {
     client
         .control_command(
             "first",
-            &narsor::controller_protocol::OwnerCommandRequest {
-                command: narsor::orchestration::OwnerCommand::Archive,
+            &narsor_engine::controller_protocol::OwnerCommandRequest {
+                command: narsor_engine::orchestration::OwnerCommand::Archive,
                 idempotency_key: "archive-first".to_string(),
                 expected_generation: None,
             },
@@ -4019,12 +4049,12 @@ async fn queued_tasks_wait_for_capacity_in_rank_order_with_a_visible_reason() {
 mod control_catalog {
     use super::*;
 
-    use narsor::controller_protocol::{
+    use narsor_engine::controller_protocol::{
         ConversationResponse, CreateRepositoryRequest, OwnerCommandRequest, WorkflowSource,
     };
-    use narsor::orchestration::{ControlPlane, OwnerCommand, TaskLifecycle};
-    use narsor::registry::RepositoryRegistry;
-    use narsor::workflows::WorkflowResolver;
+    use narsor_engine::orchestration::{ControlPlane, OwnerCommand, TaskLifecycle};
+    use narsor_engine::registry::RepositoryRegistry;
+    use narsor_engine::workflows::WorkflowResolver;
 
     async fn start(root: &TempRoot) -> api::ApiHandle {
         api::start_with_services(
@@ -4032,10 +4062,12 @@ mod control_catalog {
             root.path().to_path_buf(),
             root.path().to_path_buf(),
             api::ApiServices {
-                control: Some(Arc::new(narsor::controller_protocol::ProtocolService::new(
-                    ControlPlane::new(StatePaths::new(root.path())),
-                    environment_support::seeded_resolver(root.path()),
-                ))),
+                control: Some(Arc::new(
+                    narsor_engine::controller_protocol::ProtocolService::new(
+                        ControlPlane::new(StatePaths::new(root.path())),
+                        environment_support::seeded_resolver(root.path()),
+                    ),
+                )),
                 workflows: Some(WorkflowResolver::with_user_dir(root.path(), None)),
                 ..api::ApiServices::default()
             },
@@ -4072,12 +4104,10 @@ mod control_catalog {
         assert_eq!(workflow.source, WorkflowSource::BuiltIn);
         assert!(workflow.valid, "{:?}", workflow.violations);
         assert_eq!(workflow.version, Some(1));
-        assert!(
-            workflow
-                .description
-                .as_deref()
-                .is_some_and(|text| text.starts_with("The compound engineering chain"))
-        );
+        assert!(workflow
+            .description
+            .as_deref()
+            .is_some_and(|text| text.starts_with("The compound engineering chain")));
         let input = workflow
             .inputs
             .iter()
@@ -4087,11 +4117,9 @@ mod control_catalog {
         assert!(input.description.is_some());
         assert_eq!(workflow.inputs.len(), 2);
         // Never a path of the server.
-        assert!(
-            !serde_json::to_string(&list)
-                .unwrap()
-                .contains(root.path().to_str().unwrap())
-        );
+        assert!(!serde_json::to_string(&list)
+            .unwrap()
+            .contains(root.path().to_str().unwrap()));
     }
 
     #[tokio::test]
@@ -4187,14 +4215,12 @@ mod control_catalog {
         let root = TempRoot::new();
         let handle = start(&root).await;
         let client = handle.client();
-        assert!(
-            client
-                .control_repositories()
-                .await
-                .unwrap()
-                .repositories
-                .is_empty()
-        );
+        assert!(client
+            .control_repositories()
+            .await
+            .unwrap()
+            .repositories
+            .is_empty());
 
         let added = client
             .control_add_repository(&repository(
@@ -4289,14 +4315,12 @@ mod control_catalog {
         let root = TempRoot::new();
         let handle = start(&root).await;
         let client = handle.client();
-        assert!(
-            client
-                .control_tasks_archived(true)
-                .await
-                .unwrap()
-                .tasks
-                .is_empty()
-        );
+        assert!(client
+            .control_tasks_archived(true)
+            .await
+            .unwrap()
+            .tasks
+            .is_empty());
 
         for id in ["task-a", "task-b", "task-live"] {
             client
@@ -4321,12 +4345,10 @@ mod control_catalog {
         let archived = client.control_tasks_archived(true).await.unwrap();
         let ids: Vec<_> = archived.tasks.iter().map(|t| t.task_id.as_str()).collect();
         assert_eq!(ids, ["task-b", "task-a"], "newest archive first");
-        assert!(
-            archived
-                .tasks
-                .iter()
-                .all(|task| task.lifecycle == TaskLifecycle::Archived)
-        );
+        assert!(archived
+            .tasks
+            .iter()
+            .all(|task| task.lifecycle == TaskLifecycle::Archived));
         let rest = client.control_tasks_archived(false).await.unwrap();
         assert_eq!(rest.tasks.len(), 1);
         assert_eq!(rest.tasks[0].task_id.as_str(), "task-live");
@@ -4343,7 +4365,7 @@ mod control_catalog {
             ConversationResponse::Unavailable { reason, .. } => {
                 assert_eq!(
                     reason,
-                    narsor::controller_protocol::ConversationUnavailableReason::Archived
+                    narsor_engine::controller_protocol::ConversationUnavailableReason::Archived
                 )
             }
             other => panic!("{other:?}"),
@@ -4380,14 +4402,12 @@ mod control_catalog {
                 .len(),
             2
         );
-        assert!(
-            !client
-                .control_history_timeline("exec-old")
-                .await
-                .unwrap()
-                .positions
-                .is_empty()
-        );
+        assert!(!client
+            .control_history_timeline("exec-old")
+            .await
+            .unwrap()
+            .positions
+            .is_empty());
         assert!(matches!(
             client
                 .control_history_conversation("exec-old", "attempt-1", 1)
@@ -4396,14 +4416,12 @@ mod control_catalog {
             narsor::api::ConversationResponse::Recorded { .. }
         ));
         assert!(client.control_history_conductor("exec-old").await.is_ok());
-        assert!(
-            client
-                .control_history_conductor_chat("exec-old", 0)
-                .await
-                .unwrap()
-                .entries
-                .is_empty()
-        );
+        assert!(client
+            .control_history_conductor_chat("exec-old", 0)
+            .await
+            .unwrap()
+            .entries
+            .is_empty());
 
         match client.control_recover_execution("exec-old", None).await {
             Err(ClientError::Refused { code, message }) => {
@@ -4429,14 +4447,12 @@ mod control_catalog {
         let root = TempRoot::new();
         let handle = start(&root).await;
         let client = handle.client();
-        assert!(
-            client
-                .control_history()
-                .await
-                .unwrap()
-                .executions
-                .is_empty()
-        );
+        assert!(client
+            .control_history()
+            .await
+            .unwrap()
+            .executions
+            .is_empty());
         assert!(
             !client
                 .control_capabilities()
@@ -4467,6 +4483,21 @@ mod control_catalog {
                 .await
                 .unwrap();
             assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED, "{path}");
+        }
+
+        for token in [None, Some("wrong")] {
+            let mut request = raw
+                .post(url(&handle, "/control/v1/workflows/source"))
+                .json(&serde_json::json!({ "name": "example", "builtin": false }));
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "workflow source token={token:?}"
+            );
         }
     }
 }

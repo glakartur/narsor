@@ -13,20 +13,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, TimeZone, Utc};
-use narsor::api::{self, ApiClient, ApiServices};
-use narsor::controller_protocol::{
+use narsor::api::ApiClient;
+use narsor_engine::controller_protocol::{
     ControllerClient, CreateEnrollmentRequest, CreateTaskRequest, LaunchRequest, ProtocolService,
     ReportRequest, RunnerClient, RunnerCredentialRequest, TaskSummary,
 };
-use narsor::domain::ExecutionStatus;
-use narsor::engine::{Engine, PendingHumanInput, Timeline};
-use narsor::orchestration::{
+use narsor_engine::domain::ExecutionStatus;
+use narsor_engine::engine::{Engine, PendingHumanInput, Timeline};
+use narsor_engine::orchestration::{
     Clock, ControlPlane, ConversationAttemptSummary, ConversationAvailability, ExecutionCursor,
     Observation, ObservedSummary, PendingInputRef, ResourceIdentity, RunnerSnapshot,
 };
-use narsor::persistence::paths::StatePaths;
-use narsor::persistence::{DefaultHarnessSelector, ExecutionStore};
-use narsor::workflows::WorkflowResolver;
+use narsor_engine::persistence::paths::StatePaths;
+use narsor_engine::persistence::{DefaultHarnessSelector, ExecutionStore};
+use narsor_engine::workflows::WorkflowResolver;
+use narsor_server::api::{self, ApiServices};
 
 use super::environment_support;
 
@@ -126,12 +127,12 @@ impl RemoteHarness {
         let catalog = match &harness_selector {
             Some(selector) => environment_support::seeded_catalog_resolver_with(
                 root.path(),
-                Arc::clone(selector) as Arc<dyn narsor::environment::HarnessDefaults>,
+                Arc::clone(selector) as Arc<dyn narsor_engine::environment::HarnessDefaults>,
             ),
             None => environment_support::seeded_catalog_resolver(root.path()),
         };
         prepare(root.path());
-        let resolver: Arc<dyn narsor::environment::LaunchResolver> = catalog.clone();
+        let resolver: Arc<dyn narsor_engine::environment::LaunchResolver> = catalog.clone();
         let services = ApiServices {
             harness_selector,
             control: Some(Arc::new(ProtocolService::new(control, resolver))),
@@ -147,7 +148,7 @@ impl RemoteHarness {
         )
         .await
         .expect("server starts");
-        let owner = handle.client();
+        let owner = ApiClient::new(handle.addr(), handle.token());
         Self {
             root,
             clock,

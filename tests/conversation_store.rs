@@ -5,12 +5,12 @@
 //! nothing here is mocked.
 
 use chrono::Utc;
-use narsor::domain::{
+use narsor_engine::domain::{
     Context, EventData, ExecutionStatus, RepositoryInfo, WorkflowExecution, Workspace,
 };
-use narsor::persistence::conversation::ConversationSource;
-use narsor::persistence::recovery::compress_closed_conversations;
-use narsor::persistence::ExecutionStore;
+use narsor_engine::persistence::conversation::ConversationSource;
+use narsor_engine::persistence::recovery::compress_closed_conversations;
+use narsor_engine::persistence::ExecutionStore;
 use std::fs;
 use std::path::PathBuf;
 
@@ -482,7 +482,7 @@ fn an_open_record_is_dated_by_its_file_and_a_closed_one_by_its_last_entry() {
 
 #[test]
 fn summaries_from_storage_follow_the_timeline_and_date_the_newest_record() {
-    use narsor::engine::conversation_summary::{read_summaries, ConversationCache};
+    use narsor_engine::engine::conversation_summary::{read_summaries, ConversationCache};
 
     let root = TempRoot::new();
     let store = root.store();
@@ -538,7 +538,7 @@ fn summaries_from_storage_follow_the_timeline_and_date_the_newest_record() {
 
 #[test]
 fn an_execution_without_records_has_no_summaries_and_no_age() {
-    use narsor::engine::conversation_summary::{read_summaries, ConversationCache};
+    use narsor_engine::engine::conversation_summary::{read_summaries, ConversationCache};
 
     let root = TempRoot::new();
     let store = root.store();

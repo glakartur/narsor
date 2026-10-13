@@ -26,25 +26,24 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Router;
 use chrono::Utc;
-use narsor::controller_protocol::http::runner_routes;
-use narsor::controller_protocol::{
+use narsor_engine::controller_protocol::{
     AcquireLeaseRequest, ConductorReadQuery, ConductorReadResponse, ConversationPageQuery,
-    CreateEnrollmentRequest, EnrollRequest, OwnerCommandRequest, ProtocolService, ReportRequest,
+    CreateEnrollmentRequest, OwnerCommandRequest, ProtocolService, ReportRequest,
     RunnerCredentialRequest, SubmitInputRequest, SubmitOperatorCommandRequest, LOCAL_OWNER,
 };
-use narsor::domain::{
+use narsor_engine::domain::{
     BackendId, EventData, ExecutionStatus, GitIdentity, ResolvedEnvironment, ResourceProfile,
     SecretDelivery, SecretReference, TaskId, TaskLaunchSpec, TaskWorkspace,
 };
-use narsor::engine::HumanInputDelivery;
-use narsor::environment::HarnessDefaults;
-use narsor::orchestration::{
+use narsor_engine::environment::HarnessDefaults;
+use narsor_engine::orchestration::{
     AttentionKind, ControlPlane, NewTask, Observation, ObservedSummary, OperatorCommand,
     OperatorCommandRequest, OperatorCommandStatus, OwnerCommand, OwnerRef, QueuedOperatorCommand,
     TaskEventKind, TaskRecord,
 };
-use narsor::persistence::paths::StatePaths;
-use narsor::persistence::ExecutionStore;
+use narsor_engine::persistence::paths::StatePaths;
+use narsor_engine::persistence::ExecutionStore;
+use narsor_server::controller_protocol::http::runner_routes;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -93,7 +92,7 @@ fn running_as_root() -> bool {
 struct Fixture {
     root: TempRoot,
     service: Arc<ProtocolService>,
-    controller: narsor::controller_protocol::ControllerIdentity,
+    controller: narsor_engine::controller_protocol::ControllerIdentity,
     epoch: u64,
     addr: SocketAddr,
     server: Option<tokio::task::JoinHandle<()>>,
@@ -172,14 +171,14 @@ impl Fixture {
             .create_enrollment(BACKEND, CreateEnrollmentRequest::default())
             .expect("enrollment");
         let enrolled = service
-            .enroll(EnrollRequest::signed(
+            .enroll(narsor_engine::auth::pop::signed_enrollment_request(
                 &code.enrollment_code,
-                &narsor::auth::ControllerKey::generate(),
+                &narsor_engine::auth::ControllerKey::generate(),
             ))
             .expect("enroll");
         // The identity the controller gate would prove; this fixture calls
         // the service in-process, past the HTTP gate.
-        let controller = narsor::controller_protocol::ControllerIdentity {
+        let controller = narsor_engine::controller_protocol::ControllerIdentity {
             controller_id: enrolled.controller_id,
             backend_id: enrolled.backend_id,
         };
@@ -451,7 +450,7 @@ impl Launch {
         self.store().load_execution(&id).ok().map(|e| e.status)
     }
 
-    fn events(&self) -> Vec<narsor::domain::Event> {
+    fn events(&self) -> Vec<narsor_engine::domain::Event> {
         let id = self.execution_id().expect("an execution");
         self.store().event_log(&id).read_all().expect("events")
     }
@@ -547,7 +546,7 @@ fn fake_claude(root: &TempRoot) -> PathBuf {
 }
 
 fn spec(yaml: &str, workspace: TaskWorkspace, environment: ResolvedEnvironment) -> TaskLaunchSpec {
-    let definition = narsor::workflow::load_from_str(yaml).expect("a valid workflow");
+    let definition = narsor_engine::workflow::load_from_str(yaml).expect("a valid workflow");
     TaskLaunchSpec::new(
         definition.id.clone(),
         definition.version,
@@ -716,7 +715,7 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
 
     // The owner reads a raw conversation page through the control plane.
     let attempt = match &snapshot.conversation {
-        narsor::orchestration::ConversationAvailability::Live { attempts } => attempts
+        narsor_engine::orchestration::ConversationAvailability::Live { attempts } => attempts
             .first()
             .expect("the agent's attempt")
             .attempt_id
@@ -749,7 +748,7 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
     assert_eq!(summary.attention.len(), 1, "{:?}", summary.attention);
     assert_eq!(
         summary.attention[0].kind,
-        narsor::orchestration::AttentionKind::Question
+        narsor_engine::orchestration::AttentionKind::Question
     );
     assert_eq!(
         Some(summary.attention[0].waiting_id.as_str()),
@@ -760,17 +759,19 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
         .execution_events(
             &fixture.owner(),
             "task-1",
-            narsor::controller_protocol::ExecutionEventsQuery::default(),
+            narsor_engine::controller_protocol::ExecutionEventsQuery::default(),
         )
         .await
         .expect("events from the runner")
     {
-        narsor::controller_protocol::ExecutionEventsResponse::Available {
-            events, source, ..
+        narsor_engine::controller_protocol::ExecutionEventsResponse::Available {
+            events,
+            source,
+            ..
         } => {
             assert_eq!(
                 source,
-                narsor::controller_protocol::ExecutionEventsSource::Runner
+                narsor_engine::controller_protocol::ExecutionEventsSource::Runner
             );
             assert!(events.len() as u64 >= 1);
             assert_eq!(events.last().unwrap().sequence, cursor_at_gate);
@@ -789,7 +790,7 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
         .execution_events(
             &fixture.owner(),
             "task-1",
-            narsor::controller_protocol::ExecutionEventsQuery::default(),
+            narsor_engine::controller_protocol::ExecutionEventsQuery::default(),
         )
         .await
         .expect_err("the runner cannot read its log");
@@ -873,7 +874,10 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
             SubmitInputRequest {
                 pending_input_id: pending,
                 idempotency_key: "answer-1".to_string(),
-                delivery: HumanInputDelivery::label("ok"),
+                delivery: narsor_protocol::api::HumanInputDeliveryDto {
+                    chosen_label: Some("ok".into()),
+                    ..Default::default()
+                },
             },
         )
         .expect("queue the answer");
@@ -892,7 +896,7 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
     assert!(snapshot.event_cursor > cursor_at_gate);
     assert_eq!(
         record.inputs[0].status,
-        narsor::orchestration::InputStatus::Consumed
+        narsor_engine::orchestration::InputStatus::Consumed
     );
 
     // Nothing was cloned again and nothing was replayed.
@@ -1376,7 +1380,7 @@ async fn a_base_image_without_git_fails_before_any_work() {
     assert_eq!(waiting.len(), 1);
     assert_eq!(
         waiting[0].kind,
-        narsor::orchestration::AttentionKind::Problem
+        narsor_engine::orchestration::AttentionKind::Problem
     );
     assert_eq!(waiting[0].waiting_id, "base_image_contract");
     assert!(!launch.workspace().exists(), "nothing was cloned");
@@ -2103,7 +2107,7 @@ async fn a_declared_transition_carries_on_from_the_state_it_leads_to() {
         .control_plane()
         .queue_operator_command(
             &TaskId::parse("task-1").unwrap(),
-            narsor::orchestration::OperatorCommandRequest {
+            narsor_engine::orchestration::OperatorCommandRequest {
                 command: OperatorCommand::Transition {
                     target: "completed".to_string(),
                     forced: false,
@@ -2257,7 +2261,10 @@ terminal_states: [completed]
 "#;
 
 /// What the owner reads of the task's conductor, once the runner answers.
-async fn conductor_view(fixture: &Fixture, task: &str) -> narsor::conductor::ConductorView {
+async fn conductor_view(
+    fixture: &Fixture,
+    task: &str,
+) -> narsor_protocol::controller::ConductorView {
     match fixture
         .service
         .conductor(&fixture.owner(), task, ConductorReadQuery::default())
@@ -2275,8 +2282,8 @@ async fn wait_for_view(
     fixture: &Fixture,
     task: &str,
     what: &str,
-    mut ready: impl FnMut(&narsor::conductor::ConductorView) -> bool,
-) -> narsor::conductor::ConductorView {
+    mut ready: impl FnMut(&narsor_protocol::controller::ConductorView) -> bool,
+) -> narsor_protocol::controller::ConductorView {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let view = conductor_view(fixture, task).await;
@@ -2288,7 +2295,7 @@ async fn wait_for_view(
     }
 }
 
-fn attention_of(fixture: &Fixture, task: &str) -> Vec<narsor::orchestration::AttentionItem> {
+fn attention_of(fixture: &Fixture, task: &str) -> Vec<narsor_engine::orchestration::AttentionItem> {
     fixture
         .record(task)
         .runner
@@ -2372,7 +2379,10 @@ async fn a_failed_step_is_diagnosed_and_its_confirmed_proposal_restarts_it() {
     let failure = view.failure.as_ref().unwrap();
     assert!(failure.reason.contains("exited with 3"), "{failure:?}");
     let proposal = &view.proposals[0];
-    assert_eq!(proposal.state, narsor::conductor::ProposalState::Pending);
+    assert_eq!(
+        proposal.state,
+        narsor_protocol::controller::ProposalState::Pending
+    );
     assert_eq!(proposal.in_reply_to, None, "it came with the diagnosis");
 
     // The failed step waits, named by the key a restart of it names; the
@@ -2381,7 +2391,7 @@ async fn a_failed_step_is_diagnosed_and_its_confirmed_proposal_restarts_it() {
         .store()
         .load_execution(&launch.execution_id().unwrap())
         .unwrap();
-    let key = narsor::engine::step_failure(&execution)
+    let key = narsor_engine::engine::step_failure(&execution)
         .unwrap()
         .expect("the failure is recorded")
         .key()
@@ -2422,7 +2432,7 @@ async fn a_failed_step_is_diagnosed_and_its_confirmed_proposal_restarts_it() {
     let view = conductor_view(&fixture, "task-1").await;
     assert_eq!(
         view.proposals[0].state,
-        narsor::conductor::ProposalState::Executed
+        narsor_protocol::controller::ProposalState::Executed
     );
 
     // Settled once: confirming it again is refused, with the reason.
@@ -2567,7 +2577,7 @@ async fn a_chat_answer_and_its_proposal_are_read_back_and_a_rejection_settles_it
     .await;
     let view = wait_for_view(&fixture, "task-1", "the answer", |view| {
         view.chat.iter().any(|entry| {
-            entry.author == narsor::conductor::ChatAuthor::Conductor
+            entry.author == narsor_protocol::api::ChatAuthorDto::Conductor
                 && entry.text == "The step is still sleeping."
         })
     })
@@ -2575,7 +2585,10 @@ async fn a_chat_answer_and_its_proposal_are_read_back_and_a_rejection_settles_it
     assert_eq!(view.chat[0].text, "how is it going?", "the text is trimmed");
     assert!(view.unanswered_chat.is_empty(), "{view:?}");
     let proposal = view.proposals[0].clone();
-    assert_eq!(proposal.state, narsor::conductor::ProposalState::Pending);
+    assert_eq!(
+        proposal.state,
+        narsor_protocol::controller::ProposalState::Pending
+    );
     assert!(proposal.in_reply_to.is_some(), "it answers the message");
 
     wait_until_async(Duration::from_secs(30), "the proposal's attention", || {
@@ -2607,7 +2620,7 @@ async fn a_chat_answer_and_its_proposal_are_read_back_and_a_rejection_settles_it
     let view = conductor_view(&fixture, "task-1").await;
     assert_eq!(
         view.proposals[0].state,
-        narsor::conductor::ProposalState::Rejected
+        narsor_protocol::controller::ProposalState::Rejected
     );
 
     // A rejected proposal can neither be rejected again nor confirmed.
@@ -2695,7 +2708,7 @@ async fn a_chosen_output_is_undone_and_the_step_is_a_problem_again() {
     assert!(view.decisions[0].undone && !view.decisions[0].undoable);
     assert!(
         view.chat.iter().any(
-            |entry| entry.author == narsor::conductor::ChatAuthor::Operator
+            |entry| entry.author == narsor_protocol::api::ChatAuthorDto::Operator
                 && entry.text.contains("Undid the conductor's choice")
         ),
         "the undo is in the history: {:?}",
@@ -2972,7 +2985,10 @@ fn answer_gate(fixture: &Fixture, task: &str, pending: &str, key: &str) {
             SubmitInputRequest {
                 pending_input_id: pending.to_string(),
                 idempotency_key: key.to_string(),
-                delivery: HumanInputDelivery::label("ok"),
+                delivery: narsor_protocol::api::HumanInputDeliveryDto {
+                    chosen_label: Some("ok".into()),
+                    ..Default::default()
+                },
             },
         )
         .expect("queue the answer");
@@ -2982,7 +2998,7 @@ fn answer_gate(fixture: &Fixture, task: &str, pending: &str, key: &str) {
 fn harness_unavailable(
     fixture: &Fixture,
     task: &str,
-) -> Option<narsor::orchestration::HarnessUnavailable> {
+) -> Option<narsor_engine::orchestration::HarnessUnavailable> {
     fixture
         .record(task)
         .runner

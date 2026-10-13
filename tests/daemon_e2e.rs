@@ -38,11 +38,11 @@ use std::process::{Command, Stdio};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+use narsor::api::launch::set_exe_override_for_tests;
 use narsor::api::{ensure_daemon_running, ApiClient};
-use narsor::config::Flags;
-use narsor::daemon::launch::set_exe_override_for_tests;
-use narsor::domain::{Event, EventData};
-use narsor::persistence::{DaemonInfo, StatePaths};
+use narsor_engine::config::Flags;
+use narsor_engine::domain::{Event, EventData};
+use narsor_engine::persistence::{DaemonInfo, StatePaths};
 
 // ---------------------------------------------------------------------------
 // harness (same shapes as `tests/api_discovery.rs`/`tests/tui_state.rs`)
@@ -75,7 +75,7 @@ impl Drop for TempRoot {
     }
 }
 
-/// Points [`narsor::daemon::launch::spawn_detached`] at the real, compiled
+/// Points [`narsor::api::launch::spawn_detached`] at the real, compiled
 /// `narsor` binary instead of this test harness binary — see
 /// `tests/api_discovery.rs`'s own copy of this helper for why this is
 /// needed at all. `set_exe_override_for_tests` sets a process-wide

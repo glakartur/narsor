@@ -70,7 +70,7 @@ use crate::controller_protocol::{
     ValidateWorkflowResponse, WorkflowInputView, WorkflowListResponse, WorkflowSource,
     WorkflowView,
 };
-use crate::domain::ParamType;
+use narsor_protocol::controller::WorkflowInputType;
 
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem};
 use super::super::input_form::{workflow_input_fields, workflow_input_values};
@@ -452,15 +452,15 @@ impl Outgoing {
 /// The title a task being sent has until the server gives it one: its first
 /// text input as declared — the ticket, usually — else the workflow's name.
 fn title_for(workflow: &str, inputs: &[WorkflowInputView], values: &Map<String, Value>) -> String {
-    let first_given = |kinds: &[ParamType]| {
+    let first_given = |kinds: &[WorkflowInputType]| {
         inputs
             .iter()
             .filter(|input| kinds.contains(&input.input_type))
             .find_map(|input| values.get(&input.name).and_then(Value::as_str))
             .filter(|text| !text.trim().is_empty())
     };
-    first_given(&[ParamType::String, ParamType::Repository])
-        .or_else(|| first_given(&[ParamType::Text]))
+    first_given(&[WorkflowInputType::String, WorkflowInputType::Repository])
+        .or_else(|| first_given(&[WorkflowInputType::Text]))
         .and_then(|text| text.trim().lines().next())
         .map_or_else(|| workflow.to_string(), |line| line.trim().to_string())
 }

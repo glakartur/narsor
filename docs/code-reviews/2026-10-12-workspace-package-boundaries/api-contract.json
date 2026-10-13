@@ -1,0 +1,1 @@
+{"reviewer":"api-contract","status":"complete","findings":[],"resolved_findings":["Legacy WorkflowView capability ambiguity fixed using Option<bool>; client reports outdated server and has legacy deserialization coverage."],"testing_gaps":[]}

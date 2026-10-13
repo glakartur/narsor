@@ -14,8 +14,8 @@ use engine_support::{
     event_type, workflow, workflow_file, AnsweringAgentExecutor, Harness, LabellessAgentExecutor,
     QuestioningAgentExecutor, ResumeRejectingAgentExecutor, StubAgentExecutor, TimeoutRecorder,
 };
-use narsor::domain::{EventData, ExecutionStatus};
-use narsor::engine::{
+use narsor_engine::domain::{EventData, ExecutionStatus};
+use narsor_engine::engine::{
     ActionExecutor, ActionKind, AgentDefaults, Engine, EngineError, HumanInputDelivery,
 };
 use serde_json::{json, Map, Value};
@@ -1518,8 +1518,8 @@ async fn a_human_decision_on_an_agent_carries_its_question() {
 mod problems {
     use super::*;
 
-    use narsor::domain::{AnsweredBy, InputCloseReason, ProblemKind, WorkflowDefinition};
-    use narsor::engine::{HumanActionError, InputContinuation, PendingHumanInput};
+    use narsor_engine::domain::{AnsweredBy, InputCloseReason, ProblemKind, WorkflowDefinition};
+    use narsor_engine::engine::{HumanActionError, InputContinuation, PendingHumanInput};
 
     const ANSWER: &str = "Done: 3 units implemented, every test passes.";
 
@@ -1814,10 +1814,10 @@ mod problems {
 // ---------------------------------------------------------------------------
 
 mod operator_transitions {
-    use narsor::engine::{plan_operator_transition, EngineError, ManualTransition};
+    use narsor_engine::engine::{plan_operator_transition, EngineError, ManualTransition};
 
-    fn definition() -> narsor::domain::WorkflowDefinition {
-        narsor::workflow::load_from_str(
+    fn definition() -> narsor_engine::domain::WorkflowDefinition {
+        narsor_engine::workflow::load_from_str(
             r#"
 name: operator-plan
 version: 1

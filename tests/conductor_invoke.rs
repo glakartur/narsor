@@ -16,21 +16,21 @@ use std::time::Duration;
 
 use chrono::Utc;
 use engine_support::{fixtures, workflow, Harness};
-use narsor::conductor::snapshot::{render, ConversationTail, SnapshotBudget, SnapshotInput};
-use narsor::conductor::{
+use narsor_engine::conductor::snapshot::{render, ConversationTail, SnapshotBudget, SnapshotInput};
+use narsor_engine::conductor::{
     prompt::conductor_prompt, ChatAuthor, ChatEntry, ChatEntryKind, ConductorAccess,
     ConductorRegistry, ConductorResponse, ConductorStore, Decision, DecisionKind, HarnessInvoker,
     Invocation, InvocationOutcome, LiveHarness, QueuedRequest, ResponseError,
 };
-use narsor::domain::{
+use narsor_engine::domain::{
     ArtifactReference, ConductorOutcome, ConductorPurpose, ConductorTrigger, Confidence, Event,
     EventData, OutputDefinition,
 };
-use narsor::engine::actions::harness::{
+use narsor_engine::engine::actions::harness::{
     ClaudeCodeAdapter, CodexAdapter, HarnessRegistry, OpenCodeAdapter,
 };
-use narsor::engine::{DefaultHarnessSource, Engine};
-use narsor::persistence::DefaultHarnessSelector;
+use narsor_engine::engine::{DefaultHarnessSource, Engine};
+use narsor_engine::persistence::DefaultHarnessSelector;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -1037,7 +1037,7 @@ fn every_purpose_offers_exactly_the_decisions_it_allows() {
             let listed = contract.contains(&format!("- `{}` —", kind.name()));
             assert_eq!(
                 listed,
-                narsor::conductor::allowed_decisions(purpose).contains(&kind),
+                narsor_engine::conductor::allowed_decisions(purpose).contains(&kind),
                 "{} offered for {}",
                 kind.name(),
                 purpose.name()

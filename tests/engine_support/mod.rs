@@ -14,15 +14,15 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex;
 
-use narsor::domain::{
+use narsor_engine::domain::{
     ActionConfig, ActionError, ActionResult, Event, ExecutionStatus, HumanInputField,
     HumanInputType, WorkflowDefinition, Workspace,
 };
-use narsor::engine::actions::{HumanInputRequest, SuspendedAction};
-use narsor::engine::{ActionExecutor, ActionOutcome, ActionRequest, Engine};
-use narsor::persistence::ExecutionStore;
-use narsor::workflow::load_from_file;
-use narsor::workspace::WorkspaceProvisioner;
+use narsor_engine::engine::actions::{HumanInputRequest, SuspendedAction};
+use narsor_engine::engine::{ActionExecutor, ActionOutcome, ActionRequest, Engine};
+use narsor_engine::persistence::ExecutionStore;
+use narsor_engine::workflow::load_from_file;
+use narsor_engine::workspace::WorkspaceProvisioner;
 use serde_json::{json, Map, Value};
 
 /// Locates a sibling workspace binary from a Cargo integration-test binary.
@@ -504,7 +504,9 @@ impl ActionExecutor for LabellessAgentExecutor {
         Box::pin(async move {
             Err(ActionError {
                 message: "no output label could be extracted from the agent's answer".to_string(),
-                error_type: Some(narsor::engine::actions::agent::MISSING_OUTPUT_LABEL.to_string()),
+                error_type: Some(
+                    narsor_engine::engine::actions::agent::MISSING_OUTPUT_LABEL.to_string(),
+                ),
                 details: Some(json!({ "answer_tail": self.answer })),
             })
         })

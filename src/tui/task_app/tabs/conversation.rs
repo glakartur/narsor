@@ -35,7 +35,7 @@ use crate::controller_protocol::{
     ConversationPageQuery, ExecutionEventsSource, CONVERSATION_RECORD_UNREADABLE,
     CONVERSATION_RECORD_UNREADABLE_PREFIX, CONVERSATION_UNAVAILABLE,
 };
-use crate::engine::{ConversationState, Position};
+use narsor_protocol::api::{ConversationState, Position};
 
 use super::super::super::scroll::one_line;
 use super::super::super::selection::{bar_prefix, PREFIX_WIDTH};

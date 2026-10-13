@@ -31,15 +31,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use narsor::conductor::{
+use narsor_engine::conductor::{
     ChatAuthor, ChatEntry, ChatEntryKind, ConductorState, ConductorStore, PendingInvocation,
     QueuedRequest,
 };
-use narsor::domain::{
+use narsor_engine::domain::{
     ConductorOutcome, ConductorPurpose, ConductorTrigger, EventData, ExecutionStatus, Workspace,
 };
-use narsor::engine::{Engine, OutputRejection};
-use narsor::persistence::{DaemonInfo, ExecutionStore};
+use narsor_engine::engine::{Engine, OutputRejection};
+use narsor_engine::persistence::{DaemonInfo, ExecutionStore};
 
 /// A temporary directory that deletes itself when it goes out of scope.
 ///
@@ -136,6 +136,10 @@ fn stop_daemon_cli(root: &Path) -> (i32, String) {
         .arg(root)
         .arg("daemon")
         .arg("stop")
+        .env(
+            "NARSOR_TEST_DAEMON_EXE",
+            engine_support::workspace_binary("narsor-server"),
+        )
         .output()
         .expect("run `daemon stop`");
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -262,17 +266,19 @@ async fn daemon_starts_writes_discovery_file_and_serves_a_request() {
 
 /// The `local` backend's lease as the control plane stores it, read from the
 /// outside the way an operator's tooling would.
-fn local_lease(root: &Path) -> Option<narsor::orchestration::BackendLease> {
-    narsor::orchestration::ControlPlane::new(narsor::persistence::StatePaths::new(root))
-        .lease(&narsor::domain::BackendId::parse("local").unwrap())
-        .expect("read the lease")
+fn local_lease(root: &Path) -> Option<narsor_engine::orchestration::BackendLease> {
+    narsor_engine::orchestration::ControlPlane::new(narsor_engine::persistence::StatePaths::new(
+        root,
+    ))
+    .lease(&narsor_engine::domain::BackendId::parse("local").unwrap())
+    .expect("read the lease")
 }
 
 fn wait_for_lease(
     root: &Path,
     what: &str,
-    mut accept: impl FnMut(&Option<narsor::orchestration::BackendLease>) -> bool,
-) -> Option<narsor::orchestration::BackendLease> {
+    mut accept: impl FnMut(&Option<narsor_engine::orchestration::BackendLease>) -> bool,
+) -> Option<narsor_engine::orchestration::BackendLease> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let lease = local_lease(root);
@@ -638,7 +644,7 @@ async fn drain_active_runs_pauses_the_active_run_and_waits_for_it_to_finish() {
         "the run must still be in flight for this test to mean anything"
     );
 
-    let drained = narsor::cli::daemon::drain_active_runs(&engine, Duration::from_secs(5)).await;
+    let drained = narsor_server::runtime::drain_active_runs(&engine, Duration::from_secs(5)).await;
 
     assert!(
         drained,
@@ -785,7 +791,7 @@ async fn new_mutating_requests_are_refused_once_shutdown_begins_not_only_after_t
 // ---------------------------------------------------------------------------
 
 /// Seeds a store with a started `two_steps` execution and returns it.
-fn seed_two_steps(root: &Path) -> (ExecutionStore, narsor::domain::WorkflowExecution) {
+fn seed_two_steps(root: &Path) -> (ExecutionStore, narsor_engine::domain::WorkflowExecution) {
     fs::create_dir_all(root.join("work")).expect("create a work dir");
     let store = ExecutionStore::new(root);
     let engine = Engine::new(store.clone());
@@ -879,11 +885,11 @@ async fn a_fresh_daemon_answers_a_chat_message_left_unanswered() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert_eq!(chat.entries.len(), 2, "{:?}", chat.entries);
-    assert_eq!(chat.entries[0], message);
+    assert_eq!(chat.entries[0], message.clone().into());
     let answer = &chat.entries[1];
     assert_eq!(answer.in_reply_to.as_deref(), Some(message.id.as_str()));
-    assert_eq!(answer.author, ChatAuthor::Conductor);
-    assert_eq!(answer.kind, ChatEntryKind::Message);
+    assert_eq!(answer.author, narsor::api::ChatAuthorDto::Conductor);
+    assert_eq!(answer.kind, narsor::api::ChatEntryKindDto::Message);
     assert_eq!(answer.text, "It is about to run its first step.");
 
     let log = store.event_log(&execution.id);
@@ -1067,7 +1073,7 @@ async fn a_fresh_daemon_continues_a_reprompt_the_restart_interrupted() {
     fs::create_dir_all(&work).expect("create a work dir");
     let definition_path = root.path().join("reprompt.yaml");
     fs::write(&definition_path, REPROMPT_WORKFLOW).expect("write the workflow");
-    let definition = narsor::workflow::load_from_file(&definition_path).expect("load it");
+    let definition = narsor_engine::workflow::load_from_file(&definition_path).expect("load it");
     let store = ExecutionStore::new(root.path());
     let engine = Engine::new(store.clone());
     let mut execution = engine
@@ -1161,7 +1167,7 @@ async fn a_fresh_daemon_continues_a_reprompt_the_restart_interrupted() {
     assert!(events.iter().any(|event| matches!(
         event.data,
         EventData::OutputReprompted {
-            by: narsor::domain::RepromptedBy::Engine,
+            by: narsor_engine::domain::RepromptedBy::Engine,
             ..
         }
     )));
@@ -1177,12 +1183,12 @@ async fn a_fresh_daemon_continues_a_reprompt_the_restart_interrupted() {
 /// Seeds `REPROMPT_WORKFLOW` stopped during the rescue of its `work` state's
 /// output: the rejected attempt closed in the log, the rescue recorded in
 /// the execution, `Running`. The conductor's own leftovers are the test's.
-fn seed_rescue(root: &Path) -> (ExecutionStore, narsor::domain::WorkflowExecution) {
+fn seed_rescue(root: &Path) -> (ExecutionStore, narsor_engine::domain::WorkflowExecution) {
     let work = root.join("work");
     fs::create_dir_all(&work).expect("create a work dir");
     let definition_path = root.join("reprompt.yaml");
     fs::write(&definition_path, REPROMPT_WORKFLOW).expect("write the workflow");
-    let definition = narsor::workflow::load_from_file(&definition_path).expect("load it");
+    let definition = narsor_engine::workflow::load_from_file(&definition_path).expect("load it");
     let store = ExecutionStore::new(root);
     let engine = Engine::new(store.clone());
     let mut execution = engine
@@ -1361,7 +1367,7 @@ async fn a_fresh_daemon_makes_a_problem_when_the_repeated_rescue_fails() {
 
     let count = fs::read_to_string(bin.join("count")).expect("the conductor ran");
     assert_eq!(count.trim(), "1", "no repeat after the repeat");
-    let pending: narsor::engine::PendingHumanInput = store
+    let pending: narsor_engine::engine::PendingHumanInput = store
         .load_pending_input(&execution.id)
         .expect("read the pending input")
         .expect("a problem");
@@ -1388,15 +1394,15 @@ async fn a_fresh_daemon_applies_a_saved_choice_without_invoking_the_conductor() 
     let conductor = ConductorStore::new(store.paths(), &execution.id);
     conductor
         .save_state(&ConductorState {
-            unapplied_decisions: vec![narsor::conductor::SavedDecision {
+            unapplied_decisions: vec![narsor_engine::conductor::SavedDecision {
                 decision_id: "decision-saved".to_string(),
-                kind: narsor::domain::ConductorDecisionKind::ChooseOutput,
+                kind: narsor_engine::domain::ConductorDecisionKind::ChooseOutput,
                 episode: Some("attempt-rejected".to_string()),
                 state_id: Some("work".to_string()),
                 output_label: Some("implemented".to_string()),
                 data: serde_json::json!({}),
                 variables: serde_json::json!({}),
-                confidence: narsor::domain::Confidence::High,
+                confidence: narsor_engine::domain::Confidence::High,
                 rationale: Some("the agent said all tests pass".to_string()),
                 context_before: serde_json::json!({}),
                 answers: Vec::new(),
@@ -1713,14 +1719,14 @@ impl RestartedDaemon {
         narsor::api::ApiClient::new(info.addr, info.token)
     }
 
-    async fn task(&self) -> narsor::controller_protocol::TaskSummary {
+    async fn task(&self) -> narsor_engine::controller_protocol::TaskSummary {
         self.client()
             .control_task(RESUMED_TASK)
             .await
             .expect("read the task")
     }
 
-    async fn events(&self) -> Vec<narsor::orchestration::TaskEvent> {
+    async fn events(&self) -> Vec<narsor_engine::orchestration::TaskEvent> {
         self.client()
             .control_events(RESUMED_TASK, 0)
             .await
@@ -1733,9 +1739,9 @@ impl RestartedDaemon {
             .await
             .into_iter()
             .filter_map(|event| match event.kind {
-                narsor::orchestration::TaskEventKind::AutoResumed { attempt, limit, .. } => {
-                    Some((attempt, limit))
-                }
+                narsor_engine::orchestration::TaskEventKind::AutoResumed {
+                    attempt, limit, ..
+                } => Some((attempt, limit)),
                 _ => None,
             })
             .collect()
@@ -1754,11 +1760,14 @@ impl RestartedDaemon {
                 .filter(|runner| Some(runner.incarnation.as_str()) != replaced);
             // The gate's human decision is the owner's answer to a question.
             let approval = task.attention.iter().find(|item| {
-                item.kind == narsor::orchestration::AttentionKind::Question
+                item.kind == narsor_engine::orchestration::AttentionKind::Question
                     && item.state_id.as_deref() == Some("gate")
             });
-            if let (narsor::orchestration::TaskLifecycle::Running, Some(runner), Some(approval)) =
-                (task.lifecycle, runner, approval)
+            if let (
+                narsor_engine::orchestration::TaskLifecycle::Running,
+                Some(runner),
+                Some(approval),
+            ) = (task.lifecycle, runner, approval)
             {
                 return (runner.incarnation.clone(), approval.waiting_id.clone());
             }
@@ -1912,7 +1921,7 @@ async fn a_runner_that_survives_a_restart_keeps_its_task_without_a_resume() {
     let task = daemon.task().await;
     assert_eq!(
         task.lifecycle,
-        narsor::orchestration::TaskLifecycle::Running,
+        narsor_engine::orchestration::TaskLifecycle::Running,
         "{task:#?}"
     );
     assert_eq!(daemon.runner_pid(), pid, "the same runner");
@@ -1948,9 +1957,11 @@ async fn a_task_interrupted_before_the_resume_policy_is_resumed_at_start() {
 /// is not published yet (startup recovery publishes it), and none of the
 /// fields the policy added.
 fn interrupt_as_before_the_policy(root: &Path, task_id: &str) {
-    use narsor::orchestration::{Observation, TaskEvent, TaskEventKind, TaskLifecycle, TaskRecord};
+    use narsor_engine::orchestration::{
+        Observation, TaskEvent, TaskEventKind, TaskLifecycle, TaskRecord,
+    };
 
-    let path = narsor::persistence::StatePaths::new(root).orchestration_task_file(task_id);
+    let path = narsor_engine::persistence::StatePaths::new(root).orchestration_task_file(task_id);
     let mut record: TaskRecord =
         serde_json::from_slice(&fs::read(&path).expect("read the task record"))
             .expect("parse the task record");

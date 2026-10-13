@@ -56,8 +56,10 @@ use crate::controller_protocol::{
     ConductorReadResponse, OwnerCommandRequest, SubmitInputRequest, SubmitOperatorCommandRequest,
     TaskSummary,
 };
-use crate::engine::{HumanInputDelivery, Position, PositionStatus};
-use crate::orchestration::{AttentionItem, AttentionKind, OperatorCommand, OwnerCommand};
+use narsor_protocol::api::{
+    HumanInputDeliveryDto, PendingHumanInputView, Position, PositionStatus,
+};
+use narsor_protocol::controller::{AttentionItem, AttentionKind, OperatorCommand, OwnerCommand};
 
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserFocus, ChooserItem, Submission};
 use super::super::failure_form::OperatorPanel;
@@ -91,7 +93,7 @@ pub enum Submit {
         /// The request it answers.
         pending_input_id: String,
         /// The answer.
-        delivery: HumanInputDelivery,
+        delivery: HumanInputDeliveryDto,
     },
     /// A command for the runner: a restart, a confirmation of a proposal.
     Operator(OperatorCommand),
@@ -293,7 +295,10 @@ impl Entry {
                             })
                             .map(|position| position.state_id.clone())
                     };
-                    Model::Input(InputPanel::new(&pending.form, &state_of))
+                    serde_json::from_value::<PendingHumanInputView>(pending.form.clone())
+                        .map_or(Model::Missing, |form| {
+                            Model::Input(InputPanel::new(&form, &state_of))
+                        })
                 }),
             AttentionKind::Problem => {
                 let pending = task
@@ -311,7 +316,10 @@ impl Entry {
                                 })
                                 .map(|position| position.state_id.clone())
                         };
-                        Model::Input(InputPanel::new(&pending.form, &state_of))
+                        serde_json::from_value::<PendingHumanInputView>(pending.form.clone())
+                            .map_or(Model::Missing, |form| {
+                                Model::Input(InputPanel::new(&form, &state_of))
+                            })
                     }
                     None if task
                         .runner

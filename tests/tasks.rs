@@ -19,13 +19,13 @@ use std::process::Command;
 
 use serde_json::{json, Map, Value};
 
-use narsor::domain::{EventData, ExecutionStatus, WorkflowDefinition};
-use narsor::engine::Engine;
-use narsor::persistence::ExecutionStore;
-use narsor::registry::{RepositoryEntry, RepositoryRegistry};
-use narsor::tasks::{self, TaskError};
-use narsor::workflow::load_from_file;
-use narsor::workspace::{RepositorySource, RepositorySpec};
+use narsor_engine::domain::{EventData, ExecutionStatus, WorkflowDefinition};
+use narsor_engine::engine::Engine;
+use narsor_engine::persistence::ExecutionStore;
+use narsor_engine::registry::{RepositoryEntry, RepositoryRegistry};
+use narsor_engine::tasks::{self, TaskError};
+use narsor_engine::workflow::load_from_file;
+use narsor_engine::workspace::{RepositorySource, RepositorySpec};
 
 // ---------------------------------------------------------------------------
 // harness
@@ -687,7 +687,7 @@ terminal_states:
 fn start_greet_task(
     store: &ExecutionStore,
     definition_path: &Path,
-) -> narsor::domain::WorkflowExecution {
+) -> narsor_engine::domain::WorkflowExecution {
     let catalog = definition_path
         .parent()
         .and_then(Path::parent)
@@ -849,7 +849,7 @@ async fn a_second_driver_for_the_same_execution_is_rejected_while_the_first_runs
     assert!(
         matches!(
             second,
-            Err(narsor::engine::EngineError::AlreadyRunning { .. })
+            Err(narsor_engine::engine::EngineError::AlreadyRunning { .. })
         ),
         "the second driver is rejected instead of racing the first: {second:?}"
     );
@@ -906,7 +906,10 @@ async fn the_execution_id_is_free_again_once_the_first_pass_drops_its_guard() {
 
     let second = engine.run(&definition, &execution.id).await;
     assert!(
-        matches!(second, Err(narsor::engine::EngineError::NotRunnable { .. })),
+        matches!(
+            second,
+            Err(narsor_engine::engine::EngineError::NotRunnable { .. })
+        ),
         "a completed execution is rejected as not runnable, not as still running: {second:?}"
     );
 }

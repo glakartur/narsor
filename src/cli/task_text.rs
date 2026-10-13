@@ -19,12 +19,13 @@ use crate::controller_protocol::{
     CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
 };
 use crate::domain::{without_unsafe_chars, without_unsafe_chars_json};
-use crate::orchestration::{
-    exhaustion_loss, loss_state, AttentionItem, AttentionKind, ConversationAttemptSummary,
-    InputStatus, LossState, OperatorCommand, OwnerCommand, PendingInputRef, QueueReason, TaskEvent,
-    TaskEventKind, TaskLifecycle,
-};
 use crate::tui::task_app::list::{attention_of, Attention};
+use narsor_protocol::controller::PendingInputRefView;
+use narsor_protocol::controller::{
+    AttentionItem, AttentionKind, ConversationAttemptSummary, InputStatus, OperatorCommand,
+    OwnerCommand, QueueReason, TaskEvent, TaskEventKind, TaskLifecycle,
+};
+use narsor_protocol::display::{exhaustion_loss, loss_state, LossState};
 
 /// Soft cap on the raw bytes of one relayed conversation page.
 pub const PAGE_BYTE_BUDGET: u64 = 64 * 1024;
@@ -457,7 +458,7 @@ fn interrupted_hint(task: &TaskSummary) -> ToneLine {
 
 /// The input request the runner waits on, unless the owner already
 /// answered it (an answer queued, delivered or consumed for that request).
-pub fn awaiting_input(task: &TaskSummary) -> Option<&PendingInputRef> {
+pub fn awaiting_input(task: &TaskSummary) -> Option<&PendingInputRefView> {
     if task.lifecycle.is_archival() {
         return None;
     }
@@ -592,7 +593,11 @@ pub fn detail_lines(
                     format!(
                         "Awaiting   input {} — {} (press i to answer)",
                         pending.id,
-                        pending.form.instruction()
+                        pending
+                            .form
+                            .get("instruction")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("input details unavailable")
                     ),
                     Tone::Warning,
                 ));

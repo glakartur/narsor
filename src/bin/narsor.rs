@@ -4,8 +4,8 @@ use std::sync::Mutex;
 
 use clap::Parser;
 use narsor::cli::{self, EXIT_FAILURE, EXIT_USAGE};
+use narsor::config::ClientPaths;
 use narsor::config::{self, Flags};
-use narsor::persistence::StatePaths;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[derive(Debug, Parser)]
@@ -65,7 +65,7 @@ async fn main() {
         });
     }
     if let Some(directive) = resolved.log_directive() {
-        if let Some(file) = open_log_file(&resolved.state_paths()) {
+        if let Some(file) = open_log_file(&resolved.client_paths()) {
             let subscriber = FmtSubscriber::builder()
                 .with_env_filter(EnvFilter::builder().parse_lossy(directive))
                 .with_writer(Mutex::new(file))
@@ -85,7 +85,7 @@ async fn main() {
     }
 }
 
-fn open_log_file(paths: &StatePaths) -> Option<File> {
+fn open_log_file(paths: &ClientPaths) -> Option<File> {
     std::fs::create_dir_all(paths.root()).ok()?;
     OpenOptions::new()
         .create(true)

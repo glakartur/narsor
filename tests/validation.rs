@@ -8,9 +8,9 @@
 
 use std::collections::HashMap;
 
-use narsor::domain::{State, ValidationError, WorkflowDefinition};
-use narsor::workflow::validator::validate_path;
-use narsor::workflow::{load_from_file, load_from_str};
+use narsor_engine::domain::{State, ValidationError, WorkflowDefinition};
+use narsor_engine::workflow::validator::validate_path;
+use narsor_engine::workflow::{load_from_file, load_from_str};
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -264,7 +264,7 @@ terminal_states:
   cancelled: cancelled
 "#;
 
-    let errors = narsor::workflow::validate_source(yaml).expect("the file must compile");
+    let errors = narsor_engine::workflow::validate_source(yaml).expect("the file must compile");
     assert!(
         errors.iter().any(|err| matches!(
             err,
@@ -556,7 +556,7 @@ terminal_states:
   - completed
 "#;
 
-    let errors = narsor::workflow::validate_source(yaml).expect("the file must compile");
+    let errors = narsor_engine::workflow::validate_source(yaml).expect("the file must compile");
 
     assert!(
         errors.is_empty(),
@@ -591,7 +591,7 @@ terminal_states:
 "#;
 
     assert!(
-        narsor::workflow::validate_source(yaml).is_err(),
+        narsor_engine::workflow::validate_source(yaml).is_err(),
         "'harnes' is not a field of an agent action"
     );
 }
@@ -626,7 +626,8 @@ terminal_states:
 "#
         );
 
-        let errors = narsor::workflow::validate_source(&yaml).expect("the file must compile");
+        let errors =
+            narsor_engine::workflow::validate_source(&yaml).expect("the file must compile");
 
         assert!(
             errors.iter().any(|error| matches!(
@@ -673,7 +674,7 @@ fn every_unusable_image_is_reported_at_once() {
         "    image: Not/A/Valid:ref",
         "    image: ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     );
-    let errors = narsor::workflow::validate_source(&yaml).expect("the file loads");
+    let errors = narsor_engine::workflow::validate_source(&yaml).expect("the file loads");
     let report = describe(&errors);
 
     assert!(
@@ -706,7 +707,7 @@ fn a_tag_under_the_resolve_policy_is_valid_until_task_creation() {
         "    description: builds",
         "",
     );
-    let errors = narsor::workflow::validate_source(&yaml).expect("the file loads");
+    let errors = narsor_engine::workflow::validate_source(&yaml).expect("the file loads");
     assert!(errors.is_empty(), "{}", describe(&errors));
 }
 
@@ -725,7 +726,7 @@ fn with_display(display: &str, extra: &str) -> String {
 }
 
 fn display_errors(display: &str) -> Vec<ValidationError> {
-    narsor::workflow::validate_source(&with_display(display, "")).expect("the YAML loads")
+    narsor_engine::workflow::validate_source(&with_display(display, "")).expect("the YAML loads")
 }
 
 #[test]
@@ -780,7 +781,7 @@ fn display_violations_are_reported_together_with_the_others() {
         "globals:\n  workspace:\n    type: local\n    path: \"{{ inputs.brak }}\"\n",
     );
 
-    let errors = narsor::workflow::validate_source(&source).unwrap();
+    let errors = narsor_engine::workflow::validate_source(&source).unwrap();
 
     assert!(errors
         .iter()
@@ -844,7 +845,7 @@ fn an_unknown_field_in_display_is_rejected_at_load() {
         "display:\n  links:\n    - label: L\n      url: \"https://x.example\"\n      icon: i",
         "display:\n  links:\n    - label: L",
     ] {
-        let result = narsor::workflow::validate_source(&with_display(display, ""));
+        let result = narsor_engine::workflow::validate_source(&with_display(display, ""));
         assert!(result.is_err(), "{display:?} must not load");
     }
 }

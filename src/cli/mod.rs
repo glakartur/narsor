@@ -30,7 +30,6 @@
 
 pub mod commands;
 pub mod control_text;
-pub mod controller;
 pub mod daemon;
 pub mod remote;
 pub mod task_history;
@@ -292,19 +291,11 @@ pub enum Command {
         command: remote::AuthCommand,
     },
 
-    /// Runs the daemon that owns `Engine`/`ExecutionStore` for as long as the
-    /// machine stays up (U2), or sends the running one a graceful stop
-    /// signal.
-    ///
-    /// Bare `narsor daemon` runs in the foreground until it receives
-    /// `SIGTERM` — it does not detach itself; that is the job of the client
-    /// that discovers no daemon is running and spawns one
-    /// (`src/daemon/launch.rs`, wired in by U5). `narsor daemon stop` is the
-    /// other half: it never runs a daemon, only signals one.
+    /// Stops the local server through its discovery record.
     Daemon {
-        /// What to do about the daemon: nothing (run it) or `stop` it.
+        /// The lifecycle operation to perform.
         #[command(subcommand)]
-        command: Option<DaemonCommand>,
+        command: DaemonCommand,
     },
 
     /// Manages controller identities through the control plane.
@@ -584,13 +575,9 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
         config: cli.config.clone(),
     };
     let target = remote::server_target(cli.server, cli.token_file, cli.token_command);
-    let catalog = config.catalog_dir().to_path_buf();
     let state = config.state_dir().to_path_buf();
-    let command = match cli.command {
-        command => command,
-    };
-    let outcome = match command {
-        Command::Validate { workflow } => commands::validate(&catalog, &workflow),
+    let outcome = match cli.command {
+        Command::Validate { workflow } => commands::validate(&config, &flags, &workflow).await,
         Command::Run { workflow, inputs } => {
             commands::run(&config, &flags, &workflow, &inputs).await
         }
@@ -655,38 +642,12 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
                 decision,
             } => commands::conductor_undo(&state, &flags, &execution_id, &decision).await,
         },
-        Command::Workflow { command } => match command {
-            WorkflowCommand::List => commands::workflow_list(&catalog),
-            WorkflowCommand::Show { workflow } => commands::workflow_show(&catalog, &workflow),
-            WorkflowCommand::Eject { name, to, force } => {
-                commands::workflow_eject(&catalog, &name, to.as_deref(), force)
-            }
-        },
-        Command::Repo { command } => match command {
-            RepoCommand::Add {
-                id,
-                remote,
-                name,
-                provider,
-                default_branch,
-                description,
-            } => commands::repo_add(
-                &catalog,
-                &id,
-                &remote,
-                name,
-                provider,
-                default_branch,
-                description,
-            ),
-            RepoCommand::List => commands::repo_list(&catalog),
-            RepoCommand::Show { id } => commands::repo_show(&catalog, &id),
-            RepoCommand::Remove { id } => commands::repo_remove(&catalog, &id),
-        },
+        Command::Workflow { command } => remote::workflow(command, &target, &state, &flags).await,
+        Command::Repo { command } => remote::repo_admin(command, &target, &state, &flags).await,
         Command::Config { command } => match command {
             ConfigCommand::Show { format } => commands::config_show(&config, format),
         },
-        Command::Task { command } => remote::task(command, &target, &state, &catalog, &flags).await,
+        Command::Task { command } => remote::task(command, &target, &state, &flags).await,
         Command::Backend { command } => remote::backend(command, &target, &state, &flags).await,
         Command::Harness { command } => remote::harness(command, &target, &state, &flags).await,
         Command::Auth { command } => remote::auth(command, &target, &state, &flags).await,
@@ -696,10 +657,9 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
                 "narsor-cli controller needs an operator subcommand (enroll-code, list, revoke)",
             )),
         },
-        Command::Daemon { command } => match command {
-            None => daemon::run_daemon(&config).await,
-            Some(DaemonCommand::Stop) => daemon::stop_daemon(&config),
-        },
+        Command::Daemon {
+            command: DaemonCommand::Stop,
+        } => daemon::stop_daemon(&flags),
     };
 
     match outcome {

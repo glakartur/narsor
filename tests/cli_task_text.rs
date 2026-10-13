@@ -12,13 +12,13 @@ use narsor::cli::task_text::{
     default_harness_line, detail_lines, display_lines, event_line, lifecycle_hint, list_line,
     next_waiting, queue_badge, record_unreadable_detail, safe_json, Tone,
 };
-use narsor::controller_protocol::{
+use narsor_engine::controller_protocol::{
     ConversationResponse, ConversationUnavailableReason, ExecutionEventsSource, QueueView,
     CONVERSATION_RECORD_UNREADABLE, CONVERSATION_RECORD_UNREADABLE_PREFIX,
 };
-use narsor::domain::display::DisplayLink;
-use narsor::domain::{ExecutionStatus, TaskId};
-use narsor::orchestration::{
+use narsor_engine::domain::display::DisplayLink;
+use narsor_engine::domain::{ExecutionStatus, TaskId};
+use narsor_engine::orchestration::{
     AttentionKind, ConversationAttemptSummary, HarnessUnavailable, OwnerCommand, QueueReason,
     TaskEvent, TaskEventKind, TaskLifecycle, EXHAUSTION_REASON_PREFIX, UNSPECIFIED_LOSS,
 };
@@ -94,8 +94,8 @@ fn a_full_backend_on_resume_is_backend_full_not_a_task_failure() {
 #[test]
 fn runner_text_never_reaches_a_terminal_as_control_sequences() {
     use narsor::cli::task_text::conversation_lines;
-    use narsor::controller_protocol::ConversationResponse;
-    use narsor::orchestration::ConversationAttemptSummary;
+    use narsor_engine::controller_protocol::ConversationResponse;
+    use narsor_engine::orchestration::ConversationAttemptSummary;
 
     let hostile = "x\u{1b}]0;pwned\u{7}y\u{202e}z";
     let clean = |text: &str| !text.contains('\u{1b}') && !text.contains('\u{202e}');
@@ -293,7 +293,7 @@ fn the_details_say_when_the_task_cannot_follow_the_default_harness() {
         ExecutionStatus::Running,
         "build",
     );
-    let lines = |subject: &narsor::controller_protocol::TaskSummary| {
+    let lines = |subject: &narsor_engine::controller_protocol::TaskSummary| {
         detail_lines(subject, None, None)
             .into_iter()
             .filter(|line| line.text.starts_with("Harness "))

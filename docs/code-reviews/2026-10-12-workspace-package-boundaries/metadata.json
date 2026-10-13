@@ -1,0 +1,35 @@
+{
+  "review_id": "2026-10-12-workspace-package-boundaries",
+  "review_date": "2026-10-12",
+  "base_sha": "04c7b2ce12d0d48f774f7f3beac92bf806d59e1c",
+  "scope": "Uncommitted workspace package-boundary refactor against the implementation plan.",
+  "mode": "full",
+  "status": "complete",
+  "standards_files": [],
+  "reviewers": ["correctness", "security", "api-contract", "maintainability", "testing", "reliability"],
+  "cross_model": {
+    "provider": "Claude Opus 5 high",
+    "status": "terminal_without_artifact",
+    "job_id": "20261012T202905Z-95811367"
+  },
+  "verification": {
+    "passed": [
+      "cargo check --workspace --all-targets",
+      "cargo test --workspace -- --test-threads=1",
+      "cargo clippy --workspace --all-targets -- -D warnings",
+      "cargo build -p narsor --bins",
+      "cargo build -p narsor-server",
+      "cargo build -p narsor-runner",
+      "cargo build -p narsor-controller",
+      "cargo fmt --all -- --check",
+      "git diff --check",
+      "cargo metadata --no-deps --format-version 1",
+      "cargo tree -p narsor --edges normal confirmed no server, engine, runner, or controller implementation dependencies",
+      "Include-ignored workspace suite passed after skipping the three baseline scheduler-follow-up cases and the live-cluster smoke test."
+    ],
+    "known_exceptions": [
+      "The exact include-ignored workspace run fails in tests/cli_smoke.rs at conductor_status_prints_what_the_conductor_is_doing, recover_restarts_a_failed_step_shown_as_a_problem, and the_cli_and_the_api_share_the_conductors_chat. Each is explicitly ignored in the branch baseline because scheduler-admitted runner executions do not yet support conductor/recovery operations.",
+      "live_cluster_smoke requires a configured reachable cluster."
+    ]
+  }
+}

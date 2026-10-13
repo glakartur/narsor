@@ -19,21 +19,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use engine_support::{workflow, Harness, LabellessAgentExecutor, QuestioningAgentExecutor};
-use narsor::conductor::assembly::assemble;
-use narsor::conductor::{
+use narsor::tui::input_form::InputClosure;
+use narsor_engine::conductor::assembly::assemble;
+use narsor_engine::conductor::{
     annotation_of, ChatAuthor, ChatEntry, ChatEntryKind, ConductorAnswer, ConductorInvoker,
     ConductorRegistry, ConductorStore, Invocation, InvocationOutcome, ProposalError,
     ProposalRecord, ProposalStatus, UndoError,
 };
-use narsor::domain::{
+use narsor_engine::domain::{
     AnsweredBy, ConductorDecisionKind, ConductorPurpose, ConductorTrigger, Confidence, EventData,
     ExecutionStatus, InputCloseReason, ProblemKind, WorkflowDefinition, WorkflowExecution,
 };
-use narsor::engine::{
+use narsor_engine::engine::{
     ActionExecutor, ActionKind, Engine, EngineError, HumanInputDelivery, InputContinuation,
     PendingHumanInput,
 };
-use narsor::tui::input_form::InputClosure;
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
@@ -667,7 +667,7 @@ async fn a_running_summary_is_interrupted_when_its_gate_is_answered() {
     assert!(fixture.events(&execution.id).iter().any(|data| matches!(
         data,
         EventData::ConductorFinished {
-            outcome: narsor::domain::ConductorOutcome::Interrupted,
+            outcome: narsor_engine::domain::ConductorOutcome::Interrupted,
             ..
         }
     )));
@@ -1141,7 +1141,7 @@ async fn completed_by_a_chosen_output() -> (Fixture, WorkflowExecution, String) 
 /// Writes a later choice of the conductor's, `later-choice`, after the
 /// decision `first` — a copy of it, as a looping workflow would make.
 fn note_a_later_choice(fixture: &Fixture, execution_id: &str, first: &str) {
-    let saved: narsor::conductor::SavedDecision = fixture
+    let saved: narsor_engine::conductor::SavedDecision = fixture
         .chat(execution_id)
         .iter()
         .find(|entry| {
@@ -1154,7 +1154,7 @@ fn note_a_later_choice(fixture: &Fixture, execution_id: &str, first: &str) {
         })
         .and_then(|entry| serde_json::from_value(entry.payload.clone()?).ok())
         .expect("the saved decision");
-    let later = narsor::conductor::SavedDecision {
+    let later = narsor_engine::conductor::SavedDecision {
         decision_id: "later-choice".to_string(),
         ..saved
     };
@@ -1281,7 +1281,7 @@ async fn an_undo_interrupts_the_pass_that_drives_the_execution() {
     );
     let path = fixture.harness.root().join("slow_after_agent.yaml");
     std::fs::write(&path, SLOW_AFTER_AGENT).expect("write the workflow");
-    fixture.definition = narsor::workflow::load_from_file(&path).expect("load the workflow");
+    fixture.definition = narsor_engine::workflow::load_from_file(&path).expect("load the workflow");
 
     let execution = fixture
         .engine
@@ -1429,7 +1429,7 @@ async fn a_confirmed_retry_recovers_the_failed_step() {
     );
     let execution = fixture.run(json!({})).await;
     assert_eq!(execution.status, ExecutionStatus::Failed);
-    let failure = narsor::engine::step_failure(&execution)
+    let failure = narsor_engine::engine::step_failure(&execution)
         .expect("read")
         .expect("the failure is recorded");
     // The diagnosis (nothing scripted: it fails) is over before the chat.
@@ -1515,7 +1515,7 @@ async fn retry_confirmed_without_a_failure_record(status: ExecutionStatus) {
         .store()
         .save_execution(&stripped)
         .expect("save the execution");
-    assert!(narsor::engine::step_failure(&stripped)
+    assert!(narsor_engine::engine::step_failure(&stripped)
         .expect("read")
         .is_none());
 
@@ -1560,7 +1560,7 @@ async fn a_confirmed_retry_recovers_an_unknown_execution() {
 /// waiting.
 #[tokio::test]
 async fn the_view_tells_what_became_of_every_proposal() {
-    use narsor::conductor::{pending_chat_proposals, ConductorView, ProposalState};
+    use narsor_engine::conductor::{pending_chat_proposals, ConductorView, ProposalState};
 
     let fixture = Fixture::new(
         "human_decision",
@@ -1630,7 +1630,7 @@ async fn the_view_tells_what_became_of_every_proposal() {
 /// without the caller reading the whole history.
 #[tokio::test]
 async fn the_view_pages_the_chat_and_names_the_unanswered_messages() {
-    use narsor::conductor::ConductorView;
+    use narsor_engine::conductor::ConductorView;
 
     let fixture = Fixture::new("human_decision", None, Vec::new());
     let (execution, _) = at_the_gate(&fixture).await;
@@ -1669,7 +1669,7 @@ async fn the_view_pages_the_chat_and_names_the_unanswered_messages() {
 /// take it back; once taken back, that is shown too.
 #[tokio::test]
 async fn the_view_tells_whether_a_decision_can_still_be_undone() {
-    use narsor::conductor::ConductorView;
+    use narsor_engine::conductor::ConductorView;
 
     let fixture = Fixture::new(
         "agent_problem",
@@ -1718,7 +1718,7 @@ async fn the_view_tells_whether_a_decision_can_still_be_undone() {
 /// view; the line breaks of a diagnosis stay.
 #[test]
 fn a_cleaned_view_keeps_line_breaks_and_loses_what_a_terminal_acts_on() {
-    use narsor::conductor::ConductorView;
+    use narsor_engine::conductor::ConductorView;
 
     let mut view = ConductorView::unavailable("no\u{1b}[2J harness");
     let mut entry = ChatEntry::new(

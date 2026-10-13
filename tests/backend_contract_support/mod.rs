@@ -40,24 +40,23 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use narsor::auth::{ControllerCredential, ControllerKey};
-use narsor::backends::testkit::{ProbeCounters, Probed, SeverableLink};
-use narsor::backends::{
-    BackendErrorKind, Controller, ControllerConfig, ExecutionBackend, TaskObservation,
-    TaskResources, WorkloadPhase,
+use narsor_controller_runtime::testkit::{ProbeCounters, Probed, SeverableLink};
+use narsor_controller_runtime::{Controller, ControllerConfig};
+use narsor_engine::auth::{ControllerCredential, ControllerKey};
+use narsor_engine::backends::{
+    BackendErrorKind, ExecutionBackend, TaskObservation, TaskResources, WorkloadPhase,
 };
-use narsor::controller_protocol::http::{controller_routes, runner_routes};
-use narsor::controller_protocol::{
-    ControllerClient, CreateEnrollmentRequest, EnrollRequest, OwnerCommandRequest,
-    OwnerCommandResponse, ProtocolConfig, ProtocolError, ProtocolService,
-    SubmitOperatorCommandRequest, LOCAL_OWNER,
+use narsor_engine::controller_protocol::{
+    ControllerClient, CreateEnrollmentRequest, OwnerCommandRequest, OwnerCommandResponse,
+    ProtocolConfig, ProtocolError, ProtocolService, SubmitOperatorCommandRequest, LOCAL_OWNER,
 };
-use narsor::domain::{BackendId, TaskId, TaskLaunchSpec};
-use narsor::orchestration::{
+use narsor_engine::domain::{BackendId, TaskId, TaskLaunchSpec};
+use narsor_engine::orchestration::{
     CommandActor, NewTask, Observation, OperatorCommand, OperatorCommandStatus, OwnerCommand,
     OwnerRef, ResumePolicy, TaskEventKind, TaskLifecycle, TaskRecord,
 };
-use narsor::persistence::paths::StatePaths;
+use narsor_engine::persistence::paths::StatePaths;
+use narsor_server::controller_protocol::http::{controller_routes, runner_routes};
 use tokio::sync::oneshot;
 
 /// The backend every contract task is assigned to.
@@ -174,11 +173,11 @@ impl<T: ContractTarget> Harness<T> {
         let launch = crate::environment_support::seeded_resolver(&state);
         // The scheduler admits a task only on a registered backend, with
         // its limit read from the catalogue (U10).
-        narsor::environment::EnvironmentCatalog::new(&state)
+        narsor_engine::environment::EnvironmentCatalog::new(&state)
             .save_backend(&crate::environment_support::backend(BACKEND))
             .expect("register the contract backend");
         let service = Arc::new(ProtocolService::with_config(
-            narsor::orchestration::ControlPlane::new(StatePaths::new(&state)),
+            narsor_engine::orchestration::ControlPlane::new(StatePaths::new(&state)),
             launch,
             ProtocolConfig {
                 resume: test_resume_policy(),
@@ -220,7 +219,10 @@ impl<T: ContractTarget> Harness<T> {
         let key = ControllerKey::generate();
         let enrolled = self
             .service
-            .enroll(EnrollRequest::signed(&code.enrollment_code, &key))
+            .enroll(narsor_engine::auth::pop::signed_enrollment_request(
+                &code.enrollment_code,
+                &key,
+            ))
             .expect("enroll");
         ControllerCredential::new(enrolled.controller_id, key).expose()
     }
@@ -277,7 +279,7 @@ impl<T: ContractTarget> Harness<T> {
     pub fn set_limit(&self, limit: u32) {
         let mut record = crate::environment_support::backend(BACKEND);
         record.limits.max_concurrent_tasks = limit;
-        narsor::environment::EnvironmentCatalog::new(self.root.0.join("control"))
+        narsor_engine::environment::EnvironmentCatalog::new(self.root.0.join("control"))
             .save_backend(&record)
             .expect("save the backend");
     }
@@ -930,7 +932,7 @@ pub async fn a_finished_task_keeps_its_storage_until_archived<T: ContractTarget>
     h.running("task-1").await;
     h.wait_for("the workflow to finish", |h| {
         h.record("task-1").runner.is_some_and(|runner| {
-            runner.snapshot.execution_status == narsor::domain::ExecutionStatus::Completed
+            runner.snapshot.execution_status == narsor_engine::domain::ExecutionStatus::Completed
         })
     })
     .await;
@@ -1133,11 +1135,13 @@ pub async fn the_controller_never_starts_more_than_the_limit<T: ContractTarget>(
     );
     assert_eq!(
         h.record("task-2").queue.map(|queue| queue.reason),
-        Some(narsor::orchestration::QueueReason::WaitingForCapacity {
-            position: 1,
-            running: 1,
-            limit: 1,
-        })
+        Some(
+            narsor_engine::orchestration::QueueReason::WaitingForCapacity {
+                position: 1,
+                running: 1,
+                limit: 1,
+            }
+        )
     );
     assert_eq!(h.counters().workloads_created, 1, "{:?}", h.counters());
 

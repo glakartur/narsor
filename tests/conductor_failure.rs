@@ -23,22 +23,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use engine_support::{workflow, Harness};
-use narsor::conductor::assembly::assemble;
-use narsor::conductor::{
+use narsor_engine::conductor::assembly::assemble;
+use narsor_engine::conductor::{
     active_failure_problem, ChatEntry, ChatEntryKind, ConductorAnswer, ConductorInvoker,
     ConductorRegistry, ConductorState, ConductorStore, FailureOutcome, Invocation,
     InvocationOutcome, PassLauncher, PendingInvocation, ProposalKind, QueuedRequest,
 };
-use narsor::domain::{
+use narsor_engine::domain::{
     ConductorDecisionKind, ConductorPurpose, ConductorTrigger, EventData, ExecutionStatus,
     ProblemKind, WorkflowDefinition, WorkflowExecution, Workspace,
 };
-use narsor::engine::{
+use narsor_engine::engine::{
     step_failure, ActionKind, AgentExecutor, ClaudeCodeAdapter, Engine, EngineError,
     HarnessRegistry, LoggingEventSink, Recovery, StepFailure,
 };
-use narsor::persistence::{sweep_orphaned_workspaces, DaemonInfo, ExecutionStore};
-use narsor::workspace::{CleanupPolicy, WorkspaceProvisioner};
+use narsor_engine::persistence::{sweep_orphaned_workspaces, DaemonInfo, ExecutionStore};
+use narsor_engine::workspace::{CleanupPolicy, WorkspaceProvisioner};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
@@ -1008,7 +1008,7 @@ async fn a_diagnosis_with_its_repeat_spent_raises_the_raw_error_at_startup() {
 /// harness, first on the daemon's `PATH` as `claude`), the problem shows in
 /// `GET /executions`, and the workspace sweep keeps the task's workspace.
 #[tokio::test]
-#[ignore = "starts a narsor daemon; run with --ignored"]
+#[ignore = "starts narsor-server; run with --ignored"]
 async fn a_fresh_daemon_diagnoses_a_failed_step_again_and_the_sweep_keeps_its_workspace() {
     let harness = Harness::new();
     let root = harness.root().join("daemon");
@@ -1049,13 +1049,12 @@ async fn a_fresh_daemon_diagnoses_a_failed_step_again_and_the_sweep_keeps_its_wo
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_narsor-cli"))
+    let mut child = Command::new(engine_support::workspace_binary("narsor-server"))
         .arg("--root")
         .arg(&root)
-        .arg("daemon")
         .env("PATH", path)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn the daemon");
     let info = wait_for_daemon_info(&root).await;
@@ -1101,7 +1100,7 @@ async fn a_fresh_daemon_diagnoses_a_failed_step_again_and_the_sweep_keeps_its_wo
         .expect("the execution is listed");
     assert_eq!(summary.status, narsor::api::ExecutionStatusDto::Failed);
     let problem = summary.problem.clone().expect("a problem");
-    assert_eq!(problem.kind, ProblemKind::Failure);
+    assert_eq!(problem.kind, narsor::api::ProblemKindDto::Failure);
     assert_eq!(problem.episode.as_deref(), Some("attempt-1"));
     assert_eq!(problem.reason, "The build broke on a missing dependency.");
 
@@ -1123,7 +1122,7 @@ async fn a_fresh_daemon_diagnoses_a_failed_step_again_and_the_sweep_keeps_its_wo
 }
 
 async fn wait_for_daemon_info(root: &Path) -> DaemonInfo {
-    let file = narsor::persistence::StatePaths::new(root).daemon_file();
+    let file = narsor_engine::persistence::StatePaths::new(root).daemon_file();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(info) = DaemonInfo::read(&file) {

@@ -8,7 +8,7 @@
 mod engine_support;
 
 use engine_support::{workflow, Harness};
-use narsor::domain::ExecutionStatus;
+use narsor_engine::domain::ExecutionStatus;
 
 #[tokio::test]
 async fn an_interrupted_run_ends_where_an_uninterrupted_one_does() {
@@ -51,7 +51,7 @@ async fn an_interrupted_run_ends_where_an_uninterrupted_one_does() {
         std::fs::remove_dir_all(&execution.workspace.path).expect("destroy the work tree");
 
         let taken_over =
-            narsor::tasks::takeover(&harness.store(), &harness.provisioner(), &execution.id)
+            narsor_engine::tasks::takeover(&harness.store(), &harness.provisioner(), &execution.id)
                 .expect("take the execution over");
 
         let finished = harness
@@ -246,10 +246,15 @@ impl Origin {
 }
 
 /// Writes the git workflow into the harness root and loads it.
-fn git_workflow(harness: &Harness) -> (narsor::domain::WorkflowDefinition, std::path::PathBuf) {
+fn git_workflow(
+    harness: &Harness,
+) -> (
+    narsor_engine::domain::WorkflowDefinition,
+    std::path::PathBuf,
+) {
     let path = harness.root().join("three-steps-over-git.yaml");
     std::fs::write(&path, GIT_WORKFLOW).expect("write the git workflow");
-    let definition = narsor::workflow::load_from_file(&path).expect("load the git workflow");
+    let definition = narsor_engine::workflow::load_from_file(&path).expect("load the git workflow");
     (definition, path)
 }
 
@@ -257,10 +262,10 @@ fn git_workflow(harness: &Harness) -> (narsor::domain::WorkflowDefinition, std::
 /// workspace is provisioned — and its base commit recorded — by production code.
 fn start_git_task(
     harness: &Harness,
-    definition: &narsor::domain::WorkflowDefinition,
+    definition: &narsor_engine::domain::WorkflowDefinition,
     file: &std::path::Path,
-    engine: &narsor::engine::Engine,
-) -> narsor::domain::WorkflowExecution {
+    engine: &narsor_engine::engine::Engine,
+) -> narsor_engine::domain::WorkflowExecution {
     let catalog = harness.root().join("catalog");
     std::fs::create_dir_all(&catalog).expect("create the catalogue");
     let mut inputs = serde_json::Map::new();
@@ -268,7 +273,7 @@ fn start_git_task(
         "repository".to_string(),
         serde_json::Value::String(harness.origin_dir().display().to_string()),
     );
-    narsor::tasks::start_task(
+    narsor_engine::tasks::start_task(
         &catalog,
         &harness.root().join("work"),
         engine,
@@ -282,7 +287,7 @@ fn start_git_task(
 /// The variables the steps produced, without the `repository` input — which
 /// names each harness's own temporary origin and so differs between runs.
 fn produced_variables(
-    execution: &narsor::domain::WorkflowExecution,
+    execution: &narsor_engine::domain::WorkflowExecution,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut variables: serde_json::Map<String, serde_json::Value> = execution
         .context
@@ -362,7 +367,7 @@ async fn a_taken_over_git_workspace_is_restored_against_its_pinned_base() {
         assert_ne!(drifted, base);
 
         let taken_over =
-            narsor::tasks::takeover(&harness.store(), &harness.provisioner(), &execution.id)
+            narsor_engine::tasks::takeover(&harness.store(), &harness.provisioner(), &execution.id)
                 .expect("take the execution over");
 
         let tree = std::path::PathBuf::from(&taken_over.workspace.path);

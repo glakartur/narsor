@@ -13,7 +13,8 @@ use crate::controller_protocol::{
     CapabilitiesView, LegacyExecutionView, RepositoryView, ValidateWorkflowResponse,
     WorkflowInputView, WorkflowSource, WorkflowView,
 };
-use crate::domain::{without_unsafe_chars, ParamType};
+use crate::domain::without_unsafe_chars;
+use narsor_protocol::controller::WorkflowInputType;
 
 use super::commands::{CliError, Result};
 use super::task_text::{Tone, ToneLine};
@@ -288,14 +289,14 @@ fn declared_names(declared: &[WorkflowInputView]) -> String {
 
 fn typed_value(input: &WorkflowInputView, raw: &str) -> Result<Value> {
     match input.input_type {
-        ParamType::String | ParamType::Text | ParamType::Repository => Ok(Value::String(raw.to_string())),
-        ParamType::Integer => raw.parse::<i64>().map(Value::from).map_err(|_| {
+        WorkflowInputType::String | WorkflowInputType::Text | WorkflowInputType::Repository => Ok(Value::String(raw.to_string())),
+        WorkflowInputType::Integer => raw.parse::<i64>().map(Value::from).map_err(|_| {
             CliError::usage(format!(
                 "Input '{}' is of type integer, and '{raw}' is not a whole number.",
                 input.name
             ))
         }),
-        ParamType::Boolean => match raw.to_ascii_lowercase().as_str() {
+        WorkflowInputType::Boolean => match raw.to_ascii_lowercase().as_str() {
             "true" => Ok(Value::Bool(true)),
             "false" => Ok(Value::Bool(false)),
             _ => Err(CliError::usage(format!(

@@ -28,6 +28,12 @@ use super::remote::{failure, print_created, require_local_daemon};
 pub enum RepoCommand {
     /// Lists the registered repositories, ordered by id.
     List,
+    /// Shows every registered field.
+    Show {
+        /// The repository identifier.
+        #[arg(value_name = "ID")]
+        id: String,
+    },
     /// Registers a repository under an id workflows can name.
     Add {
         /// The identifier a workflow writes in `globals.workspace.repository`.
@@ -88,6 +94,32 @@ pub async fn repo(client: &ApiClient, command: RepoCommand) -> Result<()> {
                 "{} registry entr(y/ies) could not be read; they are named above.",
                 listing.unreadable.len()
             )))
+        }
+        RepoCommand::Show { id } => {
+            let listing = client
+                .control_repositories()
+                .await
+                .map_err(|error| failure("Could not read the repository registry", error))?;
+            let entry = listing
+                .repositories
+                .iter()
+                .find(|repository| repository.id == id)
+                .ok_or_else(|| {
+                    CliError::failure(format!("Repository '{id}' is not registered."))
+                })?;
+            println!("Repository:     {}", entry.id);
+            println!("Name:           {}", entry.name);
+            println!("Provider:       {}", entry.provider);
+            println!("Remote:         {}", entry.remote);
+            println!(
+                "Default branch: {}",
+                entry.default_branch.as_deref().unwrap_or("-")
+            );
+            println!(
+                "Description:    {}",
+                entry.description.as_deref().unwrap_or("-")
+            );
+            Ok(())
         }
         RepoCommand::Add {
             id,
