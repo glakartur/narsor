@@ -9119,10 +9119,7 @@ mod task_app_create {
             press(&mut app, KeyCode::Char(']'));
             app.sync_detail().await;
             let conversation = screen(&mut app, 130, 30);
-            assert!(
-                conversation.contains("Workflow sends input to agent"),
-                "{conversation}"
-            );
+            assert!(conversation.contains("zaplanuj zmianę"), "{conversation}");
             assert!(conversation.contains("assistant message"), "{conversation}");
 
             press(&mut app, KeyCode::Char(']'));
