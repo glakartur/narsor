@@ -93,11 +93,11 @@ struct IssuerKey {
 
 impl IssuerKey {
     fn es256(kid: &str) -> Self {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::{sec1::ToSec1Point, Generate};
         use p256::pkcs8::EncodePrivateKey;
-        let secret = p256::SecretKey::random(&mut rand_core::OsRng);
+        let secret = p256::SecretKey::generate_from_rng(&mut rand::rng());
         let der = secret.to_pkcs8_der().expect("pkcs8");
-        let point = secret.public_key().to_encoded_point(false);
+        let point = secret.public_key().to_sec1_point(false);
         Self {
             kid: kid.to_string(),
             alg: Algorithm::ES256,
@@ -112,7 +112,7 @@ impl IssuerKey {
 
     fn eddsa(kid: &str) -> Self {
         use ed25519_dalek::pkcs8::EncodePrivateKey;
-        let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let signing = ed25519_dalek::SigningKey::generate(&mut rand::rng());
         let der = signing.to_pkcs8_der().expect("pkcs8");
         let public = signing.verifying_key().as_bytes().to_vec();
         Self {

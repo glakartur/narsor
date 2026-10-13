@@ -78,7 +78,7 @@ impl ControllerKey {
     /// A new key from the operating system's random source.
     pub fn generate() -> Self {
         Self {
-            signing: SigningKey::generate(&mut rand_core::OsRng),
+            signing: SigningKey::generate(&mut rand::rng()),
         }
     }
 

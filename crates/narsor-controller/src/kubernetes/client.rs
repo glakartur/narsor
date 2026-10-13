@@ -156,10 +156,7 @@ impl KubeClient {
             }
             // Only the cluster's CA: a public CA must not be able to stand
             // in for the API server.
-            builder = builder.tls_built_in_root_certs(false);
-            for certificate in certificates {
-                builder = builder.add_root_certificate(certificate);
-            }
+            builder = builder.tls_certs_only(certificates);
         }
         let http = builder
             .build()

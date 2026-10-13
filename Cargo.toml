@@ -67,16 +67,16 @@ ratatui = "0.30.2"
 crossterm = "0.29.0"
 
 # Client payloads and transcript decoding.
-sha2 = "0.10"
-base64 = "0.22"
+sha2 = "0.11"
+base64 = "0.23"
 
 # Byte buffers returned by the API client.
 bytes = "1"
 
 
 [dev-dependencies]
-axum = { version = "0.7", features = ["macros"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+axum = { version = "0.8", features = ["macros"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls"] }
 serde_yaml = "0.9"
 narsor-server = { path = "crates/narsor-server" }
 narsor-controller = { path = "crates/narsor-controller" }
@@ -84,8 +84,8 @@ narsor-controller-runtime = { path = "crates/narsor-controller-runtime" }
 narsor-engine = { path = "crates/narsor-engine" }
 # ES256 keys for the in-process mock OIDC issuer of tests/auth.rs. Already in
 # the tree through jsonwebtoken's `rust_crypto`.
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+rand = "0.10"
 # EdDSA test keys exported as PKCS#8, the form jsonwebtoken signs with.
-ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+ed25519-dalek = { version = "3", features = ["alloc", "rand_core", "pkcs8"] }

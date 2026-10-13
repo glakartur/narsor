@@ -1562,7 +1562,10 @@ async fn secrets_reach_their_tools_without_being_copied_onto_task_storage() {
     // need not carry them).
     let digest = |value: &str| {
         use sha2::Digest;
-        format!("{:x}", sha2::Sha256::digest(value.as_bytes()))
+        sha2::Sha256::digest(value.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     };
     let seen = |file: &str| {
         fs::read_to_string(launch.home().join(file))
