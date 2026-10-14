@@ -1,17 +1,17 @@
-//! The panel "Czeka na Ciebie" (U10, origin §2): one panel at the bottom of
+//! The "Czeka na Ciebie" footer (U10, origin §2): one area at the bottom of
 //! the details that answers every kind of waiting.
 //!
 //! ```text
-//! ┌ ? Pytanie · review_scope · 6m ───────────────────────────────── 1/1 ┐
-//! │ „Czy zakres zmian obejmuje też migrację danych?”                    │
-//! │ ◆ dyrygent: raczej revise — brak planu migracji                     │
-//! │ ┌ Akcje ─────────────────┐ ┌ Opis ─────────────────────────────────┐ │
-//! │ │   approved             │ │ ↩ wraca do agenta: plan               │ │
-//! │ │ │ revise  ↩          ◆ │ │ Zakres wymaga poprawy…                │ │
-//! │ └────────────────────────┘ └───────────────────────────────────────┘ │
-//! │ Komentarz dla agenta (wymagane):                                    │
-//! │ > Uwzględnij migrację tabeli orders▏                                │
-//! └─────────────────────────────────────────────────────────────────────┘
+//! ───────────────────────────────────────────────────────────────────────
+//! ? Pytanie · review_scope · 6m · 1/1
+//!
+//! „Czy zakres zmian obejmuje też migrację danych?”
+//! ◆ dyrygent: raczej revise — brak planu migracji
+//! Akcje                       Opis
+//!   1 approved                ↩ wraca do agenta: plan
+//! | 2 | revise                Zakres wymaga poprawy…
+//! Komentarz dla agenta (wymagane):
+//! > Uwzględnij migrację tabeli orders▏
 //! ```
 //!
 //! # What the panel is made of
@@ -47,7 +47,7 @@
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::api::ClientError;
@@ -77,9 +77,9 @@ use super::{failure_reason, idempotency_key, Request, TaskApp};
 /// The most rows of the context the panel gives itself before it scrolls.
 const MAX_CONTEXT_ROWS: usize = 4;
 
-/// The fewest rows of tab content the panel leaves, with the header and the
-/// tab bar.
-const KEEP_FOR_CONTENT: u16 = 6;
+/// The fewest rows of detail content the panel leaves below the header and
+/// two-row tab bar.
+const KEEP_FOR_CONTENT: u16 = 1;
 
 // ---------------------------------------------------------------------
 // What is sent
@@ -834,17 +834,17 @@ impl WaitingPanel {
 
     /// The rows the panel would like in a details area of `area_height` rows
     /// and `width` columns; none when nothing waits.
-    pub fn preferred_height(&self, width: u16, area_height: u16) -> u16 {
-        let cap = area_height.saturating_sub(KEEP_FOR_CONTENT);
+    pub fn preferred_height(&self, width: u16, area_height: u16, header_height: u16) -> u16 {
+        let reserved = header_height + 2 + KEEP_FOR_CONTENT;
+        let cap = area_height.saturating_sub(reserved);
         let wanted = if let Some(entry) = self.entries.get(self.current) {
             if self.collapsed {
-                1
+                2
             } else {
-                let inner = width.saturating_sub(2);
-                let context = context_rows(&entry.model.context(), usize::from(inner)).len();
-                2 + context.min(MAX_CONTEXT_ROWS) as u16
+                let context = context_rows(&entry.model.context(), usize::from(width)).len();
+                3 + context.min(MAX_CONTEXT_ROWS) as u16
                     + entry.notices().len() as u16
-                    + entry.chooser.preferred_height(inner)
+                    + entry.chooser.preferred_height(width)
             }
         } else if self.released.is_empty() {
             0
@@ -854,7 +854,7 @@ impl WaitingPanel {
                 .iter()
                 .map(|released| 1 + released.text.lines().count().max(1))
                 .sum();
-            2 + lines.min(5) as u16
+            3 + lines.min(5) as u16
         };
         wanted.min(cap)
     }
@@ -862,12 +862,9 @@ impl WaitingPanel {
     /// Draws the panel into `area`. `as_of` is the server's now, which the age of
     /// the shown waiting is counted to.
     ///
-    /// The frame is always in the entry's role, focus or not (R4): whether
-    /// the keys are here shows on the frame of the details around it, and on
-    /// the bracket of the actions — in the focus role while `focused` says the
-    /// panel has the keys and they are on the actions, in the background role
-    /// otherwise (R12). The actions
-    /// scroll inside what the context and the fields leave them (R17).
+    /// The separator and heading stay in the entry's role even when the
+    /// panel has no focus; the action number's pipes show the active choice.
+    /// The actions scroll inside what the context and fields leave them (R17).
     pub fn render(
         &mut self,
         frame: &mut Frame,
@@ -877,7 +874,7 @@ impl WaitingPanel {
         focused: bool,
         as_of: chrono::DateTime<chrono::Utc>,
     ) {
-        if area.height == 0 || area.width < 4 {
+        if area.height == 0 || area.width == 0 {
             return;
         }
         if self.entries.is_empty() {
@@ -896,50 +893,69 @@ impl WaitingPanel {
             .map_or_else(String::new, |state| format!(" · {}", one_line(state)));
         let role = if stale { Role::Done } else { entry.role() };
         let mut heading = format!("{} {}{state} · {age}", entry.glyph(), entry.kind_word());
+        let separator_role = if stale { Role::Done } else { role };
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(usize::from(area.width)),
+                styles.of(separator_role),
+            )),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        if area.height < 2 {
+            return;
+        }
         if collapsed {
             if count > 1 {
                 heading.push_str(&format!(" · {}/{count}", current + 1));
             }
             let line = Line::from(vec![
-                Span::styled(format!("▸ {heading}"), styles.of(role)),
-                Span::styled("  Tab rozwiń", styles.of(Role::Done)),
+                Span::styled(format!("  ▸ {heading}"), styles.strong(role)),
+                Span::styled("  Tab rozwiń", styles.of(separator_role)),
             ]);
-            frame.render_widget(Paragraph::new(line), area);
+            frame.render_widget(
+                Paragraph::new(line),
+                Rect::new(area.x, area.y + 1, area.width, 1),
+            );
             return;
         }
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(styles.of(role))
-            .title(Line::styled(format!(" {heading} "), styles.of(role)))
-            .title(
-                Line::styled(
-                    if count > 1 {
-                        format!(" {}/{count} ", current + 1)
-                    } else {
-                        String::new()
-                    },
-                    styles.of(role),
-                )
-                .right_aligned(),
-            );
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let count_suffix = if count > 1 {
+            format!("  {}/{count}", current + 1)
+        } else {
+            String::new()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(heading, styles.strong(role)),
+                Span::styled(count_suffix, styles.of(separator_role)),
+            ])),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
+        let body = Rect::new(
+            area.x,
+            area.y.saturating_add(3),
+            area.width,
+            area.height.saturating_sub(3),
+        );
+        if body.height == 0 {
+            return;
+        }
 
-        let rows = context_rows(&entry.model.context(), usize::from(inner.width));
+        let rows = context_rows(&entry.model.context(), usize::from(body.width));
         let notices = entry.notices();
-        let notice_height = (notices.len() as u16).min(inner.height.saturating_sub(5));
+        let notice_height = (notices.len() as u16).min(body.height.saturating_sub(5));
         // The actions come first: the context takes what they leave.
         let context_height = rows
             .len()
             .min(MAX_CONTEXT_ROWS)
-            .min(usize::from(inner.height.saturating_sub(notice_height + 5)));
+            .min(usize::from(body.height.saturating_sub(notice_height + 5)));
         let [context_area, notice_area, chooser_area] = Layout::vertical([
             Constraint::Length(context_height as u16),
             Constraint::Length(notice_height),
             Constraint::Min(0),
         ])
-        .areas(inner);
+        .areas(body);
 
         render_context(
             frame,
@@ -954,19 +970,30 @@ impl WaitingPanel {
             .map(|(role, text)| Line::styled(text.clone(), styles.of(*role)))
             .collect();
         frame.render_widget(Paragraph::new(lines), notice_area);
-        chooser::render(frame, chooser_area, &mut entry.chooser, styles, focused);
+        chooser::render_footer(frame, chooser_area, &mut entry.chooser, styles, focused);
     }
 
     fn render_released(&self, frame: &mut Frame, area: Rect, styles: &Styles) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(styles.of(Role::Attention))
-            .title(Line::styled(
-                " Szkic bez oczekiwania — skopiuj; Esc go usuwa ",
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "─".repeat(usize::from(area.width)),
                 styles.of(Role::Attention),
-            ));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+            )),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "  Szkic bez oczekiwania — skopiuj; Esc go usuwa",
+                styles.strong(Role::Attention),
+            )),
+            Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+        );
+        let inner = Rect::new(
+            area.x,
+            area.y.saturating_add(3),
+            area.width,
+            area.height.saturating_sub(3),
+        );
         let mut lines = Vec::new();
         for released in &self.released {
             lines.push(Line::styled(

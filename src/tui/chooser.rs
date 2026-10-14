@@ -9,10 +9,9 @@
 //! ```text
 //! ┌ Akcje ─────────────────┐ ┌ Opis ─────────────────────────────────┐
 //! │   1 approved           │ │ ↩ wraca do agenta: plan               │
-//! │────────────────────────│ │ Zakres wymaga poprawy. Agent planu    │
-//! │ │ 2 revise ↩ ◆         │ │ wznowi swoją sesję z Twoim komentarzem│
+//! │ | 2 | revise           │ │ ◆ rekomendacja dyrygenta              │
+//! │   3 reject             │ │ Zakres wymaga poprawy. Agent planu    │
 //! │────────────────────────│ │                                       │
-//! │   3 reject !           │ │                                       │
 //! └────────────────────────┘ └───────────────────────────────────────┘
 //! Komentarz dla agenta (wymagany):
 //! > Uwzględnij migrację tabeli orders▏
@@ -21,9 +20,8 @@
 //! Beside a wide area the description sits to the right of the list; below
 //! [`SIDE_BY_SIDE_MIN_WIDTH`] columns it moves under the list.
 //!
-//! The list stacks its entries and brackets the highlighted one
-//! ([`super::selection`]): in the focus role while the keys are on it, in
-//! the background role otherwise.
+//! The list stacks its entries and puts pipes around the highlighted action
+//! number; its description carries the action's recommendation and risk.
 //! When it does not fit its pane it scrolls inside it, by whole entries,
 //! and keeps where it was across a rebuild (R17).
 //!
@@ -570,7 +568,7 @@ impl Chooser {
     /// list and the description (beside each other when wide, stacked when
     /// narrow) and the fields of the highlighted entry under them.
     pub fn preferred_height(&self, width: u16) -> u16 {
-        let list = list_rows(self.items.len());
+        let list = list_rows(self.items.len(), false);
         let top = if width >= SIDE_BY_SIDE_MIN_WIDTH {
             list.max(LIST_MIN_ROWS)
         } else {
@@ -864,55 +862,56 @@ fn focus_order_of(item: &ChooserItem, inputs_layout: bool) -> Vec<usize> {
 /// The rows of the list pane's frame.
 const LIST_FRAME_ROWS: u16 = 2;
 
-/// The rows the list pane needs for `entries` entries: the entries, the
-/// bracket's two rules and the frame.
-fn list_rows(entries: usize) -> u16 {
-    bracketed_list_rows(entries).saturating_add(LIST_FRAME_ROWS)
+/// The rows a list pane needs for `entries` choices and its frame.
+fn list_rows(entries: usize, footer: bool) -> u16 {
+    if footer {
+        (entries.min(u16::MAX as usize) as u16).saturating_add(LIST_FRAME_ROWS)
+    } else {
+        bracketed_list_rows(entries).saturating_add(LIST_FRAME_ROWS)
+    }
 }
 
-/// The rows of the smallest list pane: one entry with its bracket, and the
-/// frame.
+/// The rows of the smallest list pane: one choice and its frame.
 const LIST_MIN_ROWS: u16 = bracketed_list_rows(1) + LIST_FRAME_ROWS;
 
 /// How wide the list needs to be for its longest line.
-fn list_width(items: &[ChooserItem]) -> u16 {
+fn list_width(items: &[ChooserItem], footer: bool) -> u16 {
     let widest = items
         .iter()
         .map(|item| one_line(&item.label).chars().count())
         .max()
         .unwrap_or(0);
-    // bar, number, label, three marker slots, border.
-    (widest + usize::from(PREFIX_WIDTH) + 2 + 6 + 2) as u16
+    if footer {
+        (widest + items.len().max(1).to_string().len() + 7) as u16
+    } else {
+        // Number, label, three marker slots, and frame.
+        (widest + usize::from(PREFIX_WIDTH) + 2 + 6 + 2) as u16
+    }
 }
 
-/// One line of the list: number, label and the markers. The selection is
-/// the bracket around it, not a look of its own, so the markers keep their
-/// colours (R13).
-fn list_line(item: &ChooserItem, index: usize, styles: &Styles) -> Line<'static> {
+/// One line of the list: number, label, and a pipe around the selected number.
+/// Recommendation and irreversibility marks lead the description instead.
+fn list_line(
+    item: &ChooserItem,
+    index: usize,
+    selected: usize,
+    focused: bool,
+    styles: &Styles,
+) -> Line<'static> {
     let base = if item.unavailable.is_some() {
         styles.of(Role::Done)
     } else {
         Style::default()
     };
-    let number = if index < 9 {
-        format!("{} ", index + 1)
+    let digits = (index + 1).to_string();
+    let mut spans = Vec::new();
+    if index == selected {
+        let role = if focused { Role::Focus } else { Role::Attention };
+        spans.push(Span::styled(format!("| {digits} | "), styles.of(role)));
     } else {
-        "  ".to_string()
-    };
-    let mut spans = vec![
-        Span::styled(number, styles.of(Role::Done)),
-        Span::styled(one_line(&item.label), base),
-    ];
-    let markers: [(bool, &str, Role); 3] = [
-        (item.resumes_agent.is_some(), "↩", Role::Calm),
-        (item.recommended, "◆", Role::Conductor),
-        (item.irreversible, "!", Role::Problem),
-    ];
-    for (present, symbol, role) in markers {
-        if present {
-            spans.push(Span::styled(format!(" {symbol}"), styles.of(role)));
-        }
+        spans.push(Span::styled(format!("  {digits}   "), styles.of(Role::Done)));
     }
+    spans.push(Span::styled(one_line(&item.label), base));
     Line::from(spans)
 }
 
@@ -1007,8 +1006,30 @@ pub fn render(
     styles: &Styles,
     focused: bool,
 ) {
+    render_with_style(frame, area, chooser, styles, focused, false);
+}
+
+/// Draws the chooser as part of the details footer, without nested pane frames.
+pub fn render_footer(
+    frame: &mut Frame,
+    area: Rect,
+    chooser: &mut Chooser,
+    styles: &Styles,
+    focused: bool,
+) {
+    render_with_style(frame, area, chooser, styles, focused, true);
+}
+
+fn render_with_style(
+    frame: &mut Frame,
+    area: Rect,
+    chooser: &mut Chooser,
+    styles: &Styles,
+    focused: bool,
+    footer: bool,
+) {
     if chooser.inputs_layout && chooser.focus == ChooserFocus::Fields {
-        inputs::render(frame, area, chooser, styles);
+        inputs::render(frame, area, chooser, styles, footer);
         return;
     }
     let (fields, focus_line) = field_lines(chooser, styles);
@@ -1018,16 +1039,14 @@ pub fn render(
 
     let wide = area.width >= SIDE_BY_SIDE_MIN_WIDTH;
     let (list_area, description_area) = if wide {
-        let width = list_width(&chooser.items).clamp(20, area.width / 2);
+        let width = list_width(&chooser.items, footer).clamp(20, area.width / 2);
         let [list, description] =
             Layout::horizontal([Constraint::Length(width), Constraint::Min(10)]).areas(top);
         (list, description)
     } else {
-        // The description gives way first: down to three rows while the
-        // list scrolls, then to nothing, so that one entry with its bracket
-        // always fits. Less than three rows would be a frame with no line in
-        // it: those go to the list.
-        let mut height = list_rows(chooser.items.len())
+        // The description gives way first while the numbered choices remain
+        // visible; below that, the list uses all available rows.
+        let mut height = list_rows(chooser.items.len(), footer)
             .min(top.height.saturating_sub(3).max(LIST_MIN_ROWS))
             .min(top.height);
         if top.height - height < 3 {
@@ -1043,8 +1062,8 @@ pub fn render(
     };
 
     let list_focused = focused && chooser.focus == ChooserFocus::Actions;
-    render_list(frame, list_area, chooser, styles, list_focused);
-    render_description(frame, description_area, chooser, styles);
+    render_list(frame, list_area, chooser, styles, list_focused, footer);
+    render_description(frame, description_area, chooser, styles, footer);
     if fields_height > 0 {
         let offset = (focus_line + 1).saturating_sub(fields_height as usize) as u16;
         frame.render_widget(Paragraph::new(fields).scroll((offset, 0)), bottom);
@@ -1075,30 +1094,87 @@ fn render_list(
     chooser: &mut Chooser,
     styles: &Styles,
     focused: bool,
+    footer: bool,
 ) {
-    let block = pane("Akcje", chooser.focus == ChooserFocus::Actions, styles);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let items: Vec<Vec<Line>> = chooser
+    let inner = if footer {
+        if area.height == 0 {
+            return;
+        }
+        frame.render_widget(
+            Paragraph::new(Line::styled("  Akcje", styles.of(Role::Done))),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+    } else {
+        let block = pane("Akcje", chooser.focus == ChooserFocus::Actions, styles);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        inner
+    };
+    if !footer {
+        let items: Vec<Vec<Line>> = chooser.items.iter().enumerate()
+            .map(|(index, item)| vec![legacy_list_line(item, index, styles)])
+            .collect();
+        render_bracketed_list(frame, inner, styles, &items, Some(chooser.selected), focused, &mut chooser.top);
+        return;
+    }
+    let selected = chooser.selected;
+    let height = usize::from(inner.height);
+    if selected < chooser.top {
+        chooser.top = selected;
+    } else if height > 0 && selected >= chooser.top.saturating_add(height) {
+        chooser.top = selected + 1 - height;
+    }
+    let items: Vec<Line> = chooser
         .items
         .iter()
         .enumerate()
-        .map(|(index, item)| vec![list_line(item, index, styles)])
+        .map(|(index, item)| list_line(item, index, selected, focused, styles))
         .collect();
-    render_bracketed_list(
-        frame,
+    frame.render_widget(
+        Paragraph::new(items).scroll((chooser.top.min(u16::MAX as usize) as u16, 0)),
         inner,
-        styles,
-        &items,
-        Some(chooser.selected),
-        focused,
-        &mut chooser.top,
     );
 }
 
-fn render_description(frame: &mut Frame, area: Rect, chooser: &mut Chooser, styles: &Styles) {
-    let block = pane("Opis", false, styles);
-    let inner = block.inner(area);
+/// The general chooser keeps the established bracket selection and trailing
+/// status markers. The task details footer uses the compact pipe treatment.
+fn legacy_list_line(item: &ChooserItem, index: usize, styles: &Styles) -> Line<'static> {
+    let base = if item.unavailable.is_some() { styles.of(Role::Done) } else { Style::default() };
+    let number = if index < 9 { format!("{} ", index + 1) } else { "  ".to_string() };
+    let mut spans = vec![Span::styled(number, styles.of(Role::Done)), Span::styled(one_line(&item.label), base)];
+    for (present, symbol, role) in [
+        (item.resumes_agent.is_some(), "↩", Role::Calm),
+        (item.recommended, "◆", Role::Conductor),
+        (item.irreversible, "!", Role::Problem),
+    ] {
+        if present { spans.push(Span::styled(format!(" {symbol}"), styles.of(role))); }
+    }
+    Line::from(spans)
+}
+
+fn render_description(
+    frame: &mut Frame,
+    area: Rect,
+    chooser: &mut Chooser,
+    styles: &Styles,
+    footer: bool,
+) {
+    let inner = if footer {
+        if area.height == 0 {
+            return;
+        }
+        frame.render_widget(
+            Paragraph::new(Line::styled("  Opis", styles.of(Role::Done))),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+    } else {
+        let block = pane("Opis", false, styles);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        inner
+    };
     let text = chooser.description_text();
     chooser
         .description_scroll
@@ -1116,13 +1192,13 @@ fn render_description(frame: &mut Frame, area: Rect, chooser: &mut Chooser, styl
     let dim = chooser
         .selected_item()
         .is_some_and(|item| item.unavailable.is_some());
-    let paragraph = Paragraph::new(lines).block(block);
+    let paragraph = Paragraph::new(lines);
     frame.render_widget(
         if dim {
             paragraph.style(styles.of(Role::Done))
         } else {
             paragraph
         },
-        area,
+        inner,
     );
 }

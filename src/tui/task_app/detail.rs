@@ -1,13 +1,12 @@
-//! The details of the selected task (U9): a two-line header made of the
-//! workflow's `display` (three lines while it has a notice: what an
-//! interrupted task waits for, or a default harness it cannot follow), the
-//! tabs, and what the active tab shows.
+//! The details of the selected task (U9): a three-line header made of the
+//! workflow's `display` and an optional notice, a separator, the tabs, and
+//! what the active tab shows. The separator makes the tabs a distinct strip.
 //!
 //! ```text
 //! NAR-12  Zmiana API zamówień                             implement v3
 //! Jira NAR-12 ↗   PR: —   ● running · krok 3/5 · 14m
+//! ────────────────────────────────────────────────────────────────────
 //!  Przebieg   Rozmowa   Zdarzenia   Dyrygent   Info          podąża
-//!                     ● review_api · w toku · agent · 2m
 //!   ✓ plan ok         …
 //! ────────────────
 //! │ ● review_api w toku
@@ -47,11 +46,11 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU16;
 
+use ratatui::Frame;
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::api::ClientError;
 use crate::cli::task_text::lifecycle_name;
@@ -60,8 +59,8 @@ use crate::controller_protocol::{
     ConductorReadResponse, ExecutionEventsQuery, ExecutionEventsResponse, TaskSummary,
     TimelineResponse,
 };
-use crate::domain::display::{safe_link_url, DisplayLink, EMPTY_LINK_TEXT};
 use crate::domain::ExecutionStatus;
+use crate::domain::display::{DisplayLink, EMPTY_LINK_TEXT, safe_link_url};
 use narsor_protocol::api::ConversationState;
 use narsor_protocol::controller::{QueueReason, TaskLifecycle};
 
@@ -72,13 +71,13 @@ use super::list::{describe_loss, fit, state_icon, title_of};
 use super::notify::Severity;
 use super::tabs::conductor::{self, Conductor};
 use super::tabs::conversation::{
-    self, transcript_action, Attempt, AttemptRead, Attempts, Conversation, ReadFailure,
+    self, Attempt, AttemptRead, Attempts, Conversation, ReadFailure, transcript_action,
 };
 use super::tabs::events::{self, Events};
 use super::tabs::info::{self, Info};
 use super::tabs::progress::{self, Progress};
 use super::waiting::WaitingPanel;
-use super::{failure_reason, DetailTab, DetailView, StepFocus, TaskApp};
+use super::{DetailTab, DetailView, StepFocus, TaskApp, failure_reason};
 
 /// Everything the details of one task remember.
 #[derive(Debug, Clone)]
@@ -457,10 +456,10 @@ pub fn hyperlinks_supported(var: impl Fn(&str) -> Option<String>) -> bool {
 /// Where the parts of the details go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Areas {
-    /// The header lines: two, and a third when the task has a notice
+    /// The three header lines, their separator, and the optional notice
     /// ([`notice`]).
     pub header: Rect,
-    /// The tab titles.
+    /// The tab titles and active-tab marker.
     pub tabs: Rect,
     /// What the tab shows.
     pub content: Rect,
@@ -468,12 +467,12 @@ pub struct Areas {
     pub panel: Option<Rect>,
 }
 
-/// The lines of the header of a task without a notice.
-const HEADER_LINES: u16 = 2;
+/// Three content lines plus the separator above the tabs.
+const HEADER_LINES: u16 = 4;
 
 /// Splits the details `area`: a header `header_lines` high — one more than
-/// [`HEADER_LINES`] while the task has a notice, which moves the tabs down —
-/// the tabs, the content and — when `panel_height` is not zero — a panel at
+/// [`HEADER_LINES`] while the task has a notice, which moves the two-row tabs
+/// strip down — the content and — when `panel_height` is not zero — a panel at
 /// the bottom. The content never goes below one row.
 pub fn areas(area: Rect, header_lines: u16, panel_height: u16) -> Areas {
     let header = Rect::new(area.x, area.y, area.width, header_lines.min(area.height));
@@ -481,7 +480,7 @@ pub fn areas(area: Rect, header_lines: u16, panel_height: u16) -> Areas {
         area.x,
         area.y + header.height,
         area.width,
-        1.min(area.height - header.height),
+        2.min(area.height - header.height),
     );
     let used = header.height + tabs.height;
     let remaining = area.height - used;
@@ -844,12 +843,12 @@ pub(super) fn render_view(
         KeysAt::Panel | KeysAt::Elsewhere => None,
     };
     let focused = content_keys.is_some();
+    let notice = notice(view.task, styles, stale, area.width);
+    let header_lines = HEADER_LINES + u16::from(notice.is_some());
     let panel_height = view
         .detail
         .waiting
-        .preferred_height(area.width, area.height);
-    let notice = notice(view.task, styles, stale, area.width);
-    let header_lines = HEADER_LINES + u16::from(notice.is_some());
+        .preferred_height(area.width, area.height, header_lines);
     let parts = areas(area, header_lines, panel_height);
 
     let (mut lines, spots) = header(
@@ -861,6 +860,10 @@ pub(super) fn render_view(
         area.width,
     );
     lines.extend(notice);
+    lines.push(Line::styled(
+        "─".repeat(usize::from(area.width)),
+        styles.of(Role::Done),
+    ));
     frame.render_widget(Paragraph::new(lines), parts.header);
     if hyperlinks {
         link_spots(frame.buffer_mut(), parts.header, &spots);
@@ -872,6 +875,7 @@ pub(super) fn render_view(
             view.detail.conversation.transcript().is_following_end(),
             focused,
             styles,
+            parts.tabs.width,
         )),
         parts.tabs,
     );
@@ -962,37 +966,82 @@ fn tab_bar(
     conversation_follows: bool,
     focused: bool,
     styles: &Styles,
-) -> Line<'static> {
+    width: u16,
+) -> Vec<Line<'static>> {
+    let tabs = DetailTab::ALL;
+    let follow = if active == DetailTab::Progress && !progress.positions().is_empty() {
+        Some(if progress.follows() {
+            ("↧ podąża", Role::Live)
+        } else {
+            ("· ręcznie", Role::Done)
+        })
+    } else if active == DetailTab::Conversation {
+        Some(if conversation_follows {
+            ("↧ śledzi · f wyłącz", Role::Live)
+        } else {
+            ("⏸ ręcznie · f śledź", Role::Attention)
+        })
+    } else {
+        None
+    };
+    let names_width: usize = tabs.iter().map(|tab| Span::raw(tab.title()).width()).sum();
+    let padded_width = names_width + tabs.len() * 2 + tabs.len().saturating_sub(1);
+    let pad = usize::from(padded_width <= usize::from(width));
+    let base_width =
+        names_width + tabs.len().saturating_mul(pad * 2) + tabs.len().saturating_sub(1);
+    let show_follow = follow
+        .is_some_and(|(text, _)| base_width + 1 + Span::raw(text).width() <= usize::from(width));
     let mut spans = Vec::new();
-    for tab in DetailTab::ALL {
+    let mut column = 0usize;
+    let mut selected_start = 0usize;
+    let mut selected_width = 0usize;
+    for (index, tab) in tabs.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+            column += 1;
+        }
+        if pad > 0 {
+            spans.push(Span::raw(" "));
+            column += 1;
+        }
         let style = if tab == active {
             let role = if focused { Role::Focus } else { Role::Calm };
             styles.selected_tab(role)
         } else {
             styles.of(Role::Done)
         };
-        spans.push(Span::styled(format!(" {} ", tab.title()), style));
-        spans.push(Span::raw(" "));
+        let tab_width = Span::raw(tab.title()).width();
+        if tab == active {
+            selected_start = column;
+            selected_width = tab_width;
+        }
+        spans.push(Span::styled(tab.title().to_string(), style));
+        column += tab_width;
+        if pad > 0 {
+            spans.push(Span::raw(" "));
+            column += 1;
+        }
     }
-    if active == DetailTab::Progress && !progress.positions().is_empty() {
-        let (text, role) = if progress.follows() {
-            ("↧ podąża", Role::Live)
-        } else {
-            ("· ręcznie", Role::Done)
-        };
-        spans.push(Span::styled(text, styles.of(role)));
-    } else if active == DetailTab::Conversation {
-        let (text, role) = if conversation_follows {
-            ("↧ śledzi · f wyłącz", Role::Live)
-        } else {
-            ("⏸ ręcznie · f śledź", Role::Attention)
-        };
-        spans.push(Span::styled(text, styles.of(role)));
+    if show_follow {
+        if let Some((text, role)) = follow {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(text, styles.of(role)));
+        }
     }
-    Line::from(spans)
+    let marker = if focused { '━' } else { '─' };
+    vec![
+        Line::from(spans),
+        Line::from(vec![
+            Span::raw(" ".repeat(selected_start)),
+            Span::styled(
+                marker.to_string().repeat(selected_width),
+                styles.of(if focused { Role::Focus } else { Role::Done }),
+            ),
+        ]),
+    ]
 }
 
-/// The two header lines of `task`, and where its links are on the second.
+/// The three header lines of `task`, and where its links are on the third.
 fn header(
     task: &TaskSummary,
     queue_place: Option<usize>,
@@ -1004,30 +1053,79 @@ fn header(
     let grey = |role: Role| if stale { Role::Done } else { role };
     let width = usize::from(width);
 
-    // Line 1: the title, what the workflow calls it, the workflow.
+    // Line 1: title and task identity.
     let workflow = format!("{} v{}", one_line(&task.workflow_id), task.workflow_version);
     let title = title_of(task);
     let identity = task.task_id.to_string();
-    let room = width.saturating_sub(workflow.chars().count() + 3);
-    let mut first = vec![Span::styled(
-        fit(&title, room),
-        styles.strong(grey(Role::Calm)),
-    )];
-    let mut used = first[0].width();
-    if title != identity && used + 2 + identity.chars().count() <= room {
-        first.push(Span::styled(format!("  {identity}"), styles.of(Role::Done)));
-        used = first.iter().map(Span::width).sum();
-    }
-    let padding = width.saturating_sub(used + workflow.chars().count());
-    first.push(Span::raw(" ".repeat(padding)));
-    first.push(Span::styled(workflow, styles.of(Role::Done)));
+    let identity_is_leading = title.strip_prefix(&identity).is_some_and(|suffix| {
+        suffix.is_empty()
+            || suffix
+                .chars()
+                .next()
+                .is_some_and(|ch| !ch.is_alphanumeric() && ch != '-' && ch != '_')
+    });
+    let first_text = if identity_is_leading {
+        fit_cells(&title, width)
+    } else {
+        let identity_suffix = format!("  {identity}");
+        if Span::raw(identity_suffix.as_str()).width() <= width {
+            let title_width = width - Span::raw(identity_suffix.as_str()).width();
+            format!("{}{}", fit_cells(&title, title_width), identity_suffix)
+        } else {
+            fit_cells(&identity, width)
+        }
+    };
+    let first = Line::from(Span::styled(first_text, styles.strong(grey(Role::Calm))));
 
-    // Line 2: links, the state, the step or the queue, the time.
+    // Line 2: lifecycle, warnings, and compact step/queue context.
     let mut second: Vec<Span<'static>> = Vec::new();
+    let icon = state_icon(task);
+    let state = format!("{} {}", icon.glyph(), status_word(task));
+    second.push(Span::styled(state.clone(), styles.of(grey(icon.role()))));
+    let mut used = Span::raw(state).width();
+    let mut ordered = status_parts(task, queue_place, progress);
+    // Preserve warning cues before optional duration and secondary detail.
+    ordered.sort_by_key(|(_, role)| match role {
+        Role::Attention => 0,
+        Role::Calm => 1,
+        Role::Done => 2,
+        _ => 3,
+    });
+    for (text, role) in ordered {
+        let separator = " · ";
+        let remaining = width.saturating_sub(used);
+        let needed = Span::raw(separator).width() + Span::raw(text.as_str()).width();
+        if used + needed <= width {
+            second.push(Span::styled(separator, styles.of(Role::Done)));
+            second.push(Span::styled(text.clone(), styles.of(grey(role))));
+            used += needed;
+        } else if role == Role::Done {
+            continue;
+        } else if remaining > Span::raw(separator).width() {
+            let shortened = fit_cells(&text, remaining - Span::raw(separator).width());
+            if !shortened.is_empty() {
+                second.push(Span::styled(separator, styles.of(Role::Done)));
+                second.push(Span::styled(shortened, styles.of(grey(role))));
+            }
+            break;
+        }
+    }
+
+    // Line 3: whole links first, then workflow/version metadata.
+    let mut third: Vec<Span<'static>> = Vec::new();
     let mut spots = Vec::new();
     let mut column = 0usize;
     for link in &task.display.links {
         let (text, url) = link_text(link);
+        let text_width = Span::raw(text.as_str()).width();
+        let gap = if third.is_empty() { 0 } else { 3 };
+        if column + gap + text_width > width {
+            break;
+        }
+        if gap > 0 {
+            third.push(Span::raw("   "));
+            column += gap;
+        }
         let role = if url.is_some() {
             Role::Link
         } else {
@@ -1039,20 +1137,39 @@ fn header(
                 spots.push(LinkSpot { column, width, url });
             }
         }
-        column += span.width() + 3;
-        second.push(span);
-        second.push(Span::raw("   "));
+        column += span.width();
+        third.push(span);
     }
-    let icon = state_icon(task);
-    second.push(Span::styled(
-        format!("{} {}", icon.glyph(), status_word(task)),
-        styles.of(grey(icon.role())),
-    ));
-    for (text, role) in status_parts(task, queue_place, progress) {
-        second.push(Span::styled(" · ", styles.of(Role::Done)));
-        second.push(Span::styled(text, styles.of(grey(role))));
+    let workflow = if third.is_empty() {
+        workflow
+    } else {
+        format!("   {workflow}")
+    };
+    if column + Span::raw(workflow.as_str()).width() <= width {
+        third.push(Span::styled(workflow, styles.of(Role::Done)));
     }
-    (vec![Line::from(first), Line::from(second)], spots)
+    (vec![first, Line::from(second), Line::from(third)], spots)
+}
+
+fn fit_cells(text: &str, width: usize) -> String {
+    if Span::raw(text).width() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut output = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let cells = Span::raw(ch.to_string()).width();
+        if used + cells > width.saturating_sub(1) {
+            break;
+        }
+        used += cells;
+        output.push(ch);
+    }
+    output.push('…');
+    output
 }
 
 /// The one line under the header: what an interrupted task waits for — the
@@ -1224,10 +1341,10 @@ fn is_safe_link_target(url: &str) -> bool {
 /// draws over the cells the text spans. A link that does not fit on the line is
 /// left as plain text.
 fn link_spots(buffer: &mut Buffer, header: Rect, spots: &[LinkSpot]) {
-    if header.height < 2 {
+    if header.height < 3 {
         return;
     }
-    let y = header.y + 1;
+    let y = header.y + 2;
     for spot in spots {
         let end = u32::from(spot.column) + u32::from(spot.width);
         let (Some(width), true) = (NonZeroU16::new(spot.width), end <= u32::from(header.width))

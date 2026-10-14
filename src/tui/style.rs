@@ -153,9 +153,10 @@ impl Styles {
         self.of(role).add_modifier(Modifier::BOLD)
     }
 
-    /// The look of `role` for the tab that is open: bold and underlined.
+    /// The look of `role` for the tab that is open; the separate marker row
+    /// supplies the underline cue.
     pub fn selected_tab(&self, role: Role) -> Style {
-        self.strong(role).add_modifier(Modifier::UNDERLINED)
+        self.strong(role)
     }
 
     /// The frame of a panel titled `title` (R1–R3): the panel with the focus

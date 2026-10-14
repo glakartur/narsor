@@ -165,6 +165,12 @@ fn assert_bracketed(buffer: &Buffer, needle: &str, focused: bool, no_color: bool
     );
 }
 
+fn assert_action_number(buffer: &Buffer, needle: &str, number: usize) {
+    let row = row_of(buffer, needle);
+    let line = &rows(buffer)[row];
+    assert!(line.contains(&format!("| {number} |")), "{line}");
+}
+
 /// The whole screen of `app`, `width`×`height`, in colour or — with
 /// `no_color` — without.
 fn draw_buffer(app: &mut TaskApp, width: u16, height: u16, no_color: bool) -> Buffer {
@@ -284,7 +290,7 @@ mod chooser_render {
         let buffer = draw_chooser(100, 16, &mut chooser, &Styles::new(false));
         let screen = screen(&buffer);
         assert!(screen.contains("Akcje") && screen.contains("Opis"));
-        assert!(screen.contains("2 revise ↩ ◆"), "{screen}");
+        assert!(screen.contains("| 2 | revise"), "{screen}");
         for marker in ["↩", "◆", "!"] {
             assert!(screen.contains(marker), "{marker} is missing:\n{screen}");
         }
@@ -367,7 +373,7 @@ mod chooser_render {
                     );
                 }
                 assert!(!screen.contains('▸'), "no cursor glyph:\n{screen}");
-                assert_bracketed(&buffer, "2 revise", focused, no_color);
+                assert_action_number(&buffer, "revise", 2);
                 assert_not_bracketed(&buffer, "1 approved");
                 assert_not_bracketed(&buffer, "3 reject");
                 assert!(
@@ -410,7 +416,7 @@ mod chooser_render {
         let mut chooser = review_chooser();
         press_chooser(&mut chooser, crossterm::event::KeyCode::Tab, 1);
         let buffer = draw_chooser(100, 20, &mut chooser, &Styles::new(false));
-        assert_bracketed(&buffer, "2 revise", false, false);
+        assert_action_number(&buffer, "revise", 2);
     }
 
     /// R11, R17: a list longer than its pane scrolls inside it, and the
@@ -420,11 +426,11 @@ mod chooser_render {
         let mut chooser = six_outputs();
         // Three entries, the two rules, and the frame.
         let buffer = draw_chooser(100, 7, &mut chooser, &Styles::new(false));
-        assert_bracketed(&buffer, "1 out1", true, false);
+        assert_action_number(&buffer, "out1", 1);
         assert!(!screen(&buffer).contains("out4"), "{}", screen(&buffer));
         press_chooser(&mut chooser, crossterm::event::KeyCode::Down, 4);
         let buffer = draw_chooser(100, 7, &mut chooser, &Styles::new(false));
-        assert_bracketed(&buffer, "5 out5", true, false);
+        assert_action_number(&buffer, "out5", 5);
         assert!(!screen(&buffer).contains("1 out1"), "{}", screen(&buffer));
     }
 
@@ -435,12 +441,12 @@ mod chooser_render {
         let mut chooser = six_outputs();
         press_chooser(&mut chooser, crossterm::event::KeyCode::Down, 3);
         let roomy = draw_chooser(40, 24, &mut chooser, &Styles::new(false));
-        assert_bracketed(&roomy, "4 out4", true, false);
+        assert_action_number(&roomy, "out4", 4);
         assert!(screen(&roomy).contains("Wyjście 4."), "{}", screen(&roomy));
 
         for height in [8, 5] {
             let buffer = draw_chooser(40, height, &mut chooser, &Styles::new(false));
-            assert_bracketed(&buffer, "4 out4", true, false);
+            assert_action_number(&buffer, "out4", 4);
             let list_bottom = row_of(&buffer, "4 out4") + 2;
             assert!(
                 rows(&buffer)[list_bottom].starts_with('└'),
@@ -459,7 +465,7 @@ mod chooser_render {
         for height in [6, 7] {
             let buffer = draw_chooser(40, height, &mut chooser, &Styles::new(false));
             let screen = screen(&buffer);
-            assert_bracketed(&buffer, "4 out4", true, false);
+            assert_action_number(&buffer, "out4", 4);
             assert!(
                 !screen.contains("Opis"),
                 "height {height}: no description frame:\n{screen}"
@@ -506,7 +512,7 @@ mod chooser_render {
         let mut chooser = chooser.rebuilt(items);
         let after = draw_chooser(100, 9, &mut chooser, &Styles::new(false));
         assert_eq!(screen(&before), screen(&after));
-        assert_bracketed(&after, "5 out5", true, false);
+        assert_action_number(&after, "out5", 5);
         assert!(screen(&after).contains("6 out6"), "{}", screen(&after));
     }
 
@@ -1554,7 +1560,11 @@ mod task_app_detail_render {
     }
 
     fn render(app: &mut TaskApp, styles: &Styles) -> Buffer {
-        draw(120, 30, |frame| {
+        render_at(app, styles, 120, 30)
+    }
+
+    fn render_at(app: &mut TaskApp, styles: &Styles, width: u16, height: u16) -> Buffer {
+        draw(width, height, |frame| {
             layout::render(frame, app, styles, Instant::now())
         })
     }
@@ -1605,27 +1615,83 @@ mod task_app_detail_render {
         let mut app = running_app();
         let buffer = render(&mut app, &Styles::new(false));
         let rows = rows(&buffer);
-        // Row 0 is the header, row 1 the top of the frames; the details start
-        // on row 2.
+        // The details start on row 2, with identity, state, and metadata rows.
         assert!(
             rows[2].contains("NAR-12 Zmiana API zamówień"),
             "{}",
             rows[2]
         );
-        assert!(rows[2].contains("implement-feature v3"), "{}", rows[2]);
-        assert!(rows[3].contains("Jira NAR-12 ↗"), "{}", rows[3]);
+        assert!(rows[4].contains("implement-feature v3"), "{}", rows[4]);
+        assert!(rows[4].contains("Jira NAR-12 ↗"), "{}", rows[4]);
         assert!(
-            rows[3].contains("PR: —"),
+            rows[4].contains("PR: —"),
             "a link without a value: {}",
-            rows[3]
+            rows[4]
         );
-        assert!(!rows[3].contains("PR — ↗"));
+        assert!(!rows[4].contains("PR — ↗"));
         assert!(rows[3].contains("● running"), "{}", rows[3]);
         assert!(rows[3].contains("krok 3/5"), "{}", rows[3]);
         for tab in ["Przebieg", "Rozmowa", "Zdarzenia", "Dyrygent", "Info"] {
-            assert!(rows[4].contains(tab), "{tab} in {}", rows[4]);
+            assert!(rows[6].contains(tab), "{tab} in {}", rows[6]);
         }
-        assert!(rows[4].contains("podąża"), "{}", rows[4]);
+        assert!(rows[6].contains("śledzi"), "{}", rows[6]);
+        let selected_byte = rows[6].find("Rozmowa").unwrap();
+        let selected_start = rows[6][..selected_byte].chars().count();
+        assert_eq!(
+            rows[7]
+                .chars()
+                .skip(selected_start)
+                .take("Rozmowa".len())
+                .collect::<String>(),
+            "━━━━━━━",
+            "the focused marker spans the selected title only"
+        );
+
+        let no_color = render_at(&mut app, &Styles::new(true), 120, 30);
+        let no_color_rows = super::rows(&no_color);
+        assert_eq!(no_color_rows[7].chars().nth(selected_start), Some('━'));
+        assert!(bold_at(&no_color, selected_start as u16, 6));
+
+        press(&mut app, KeyCode::Esc);
+        let unfocused_rows = super::rows(&render(&mut app, &Styles::new(false)));
+        assert_eq!(unfocused_rows[7].chars().nth(selected_start), Some('─'));
+    }
+
+    #[test]
+    fn a_fitted_title_keeps_the_task_id_visible() {
+        let mut app = app();
+        let running = with_runner(
+            with_controller(task("RUN-1", "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        );
+        let title = format!("{} RUN-1", "a very long task title ".repeat(6));
+        app.load(listing(vec![displayed(running, &title, &[])], "c"));
+        press(&mut app, KeyCode::Enter);
+
+        let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 20));
+        assert!(
+            rows[2].contains("…  RUN-1"),
+            "identity survives fitting: {}",
+            rows[2]
+        );
+    }
+
+    #[test]
+    fn a_long_task_id_is_fitted_to_the_header_width() {
+        let mut app = app();
+        let id = "A".repeat(128);
+        let running = with_runner(
+            with_controller(task(&id, "local", "running", 1)),
+            ExecutionStatus::Running,
+            "review",
+        );
+        app.load(listing(vec![displayed(running, "short title", &[])], "c"));
+        press(&mut app, KeyCode::Enter);
+
+        let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 20));
+        assert_eq!(rows[2].chars().count(), 60);
+        assert!(rows[2].contains('…'), "long identity is marked as fitted");
     }
 
     /// `running_app`, but its runner cannot switch to `harness` and keeps
@@ -1659,16 +1725,16 @@ mod task_app_detail_render {
         let rows = rows(&buffer);
         assert!(rows[3].contains("● running"), "{}", rows[3]);
         assert!(
-            rows[4].contains("opencode niedostępny tutaj — zostaje claude-code"),
+            rows[5].contains("opencode niedostępny tutaj — zostaje claude-code"),
             "{}",
-            rows[4]
+            rows[5]
         );
         for tab in ["Przebieg", "Info"] {
-            assert!(rows[5].contains(tab), "the tabs move down: {}", rows[5]);
+            assert!(rows[7].contains(tab), "the tabs move down: {}", rows[7]);
         }
-        let column = rows[4].find("opencode").unwrap();
-        let column = u16::try_from(rows[4][..column].chars().count()).unwrap();
-        assert_eq!(buffer[(column, 4)].fg, Color::Yellow, "the attention role");
+        let column = rows[5].find("opencode").unwrap();
+        let column = u16::try_from(rows[5][..column].chars().count()).unwrap();
+        assert_eq!(buffer[(column, 5)].fg, Color::Yellow, "the attention role");
         // Not a problem: the counters and the list row carry no `!`.
         assert!(rows[0].contains("! 0"), "{}", rows[0]);
         let list_row = row_of(&buffer, "NAR-12");
@@ -1678,7 +1744,7 @@ mod task_app_detail_render {
             rows[list_row]
         );
 
-        for _ in 0..4 {
+        for _ in 0..3 {
             press(&mut app, KeyCode::Char(']'));
         }
         let info = screen(&draw(120, 50, |frame| {
@@ -1694,7 +1760,7 @@ mod task_app_detail_render {
     fn without_an_unavailable_harness_there_is_no_extra_line() {
         let mut app = running_app();
         let rows = rows(&render(&mut app, &Styles::new(false)));
-        assert!(rows[4].contains("Przebieg"), "{}", rows[4]);
+        assert!(rows[6].contains("Przebieg"), "{}", rows[6]);
         assert!(!rows.join("\n").contains("niedostępny tutaj"));
     }
 
@@ -1713,6 +1779,8 @@ mod task_app_detail_render {
     #[test]
     fn the_axis_has_a_row_per_step_and_brackets_the_selected_one() {
         let mut app = running_app();
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
         let buffer = render(&mut app, &Styles::new(false));
         let screen = screen(&buffer);
         for expected in ["✓ plan #1", "✓ edit #1", "● review #1 w toku"] {
@@ -1762,7 +1830,8 @@ mod task_app_detail_render {
     #[test]
     fn hyperlinks_are_written_only_when_the_terminal_draws_them() {
         let mut app = running_app();
-        let plain = screen(&render(&mut app, &Styles::new(false)));
+        let plain_buffer = render(&mut app, &Styles::new(false));
+        let plain = screen(&plain_buffer);
         assert!(!plain.contains('\u{1b}'));
 
         app.detail_mut().set_hyperlinks(true);
@@ -1771,13 +1840,24 @@ mod task_app_detail_render {
         assert!(
             screen.contains("\u{1b}]8;;https://jira.example/browse/NAR-12\u{1b}\\Jira NAR-12 ↗\u{1b}]8;;\u{1b}\\"),
             "{:?}",
-            rows(&buffer)[2]
+            rows(&buffer)[4]
         );
         assert_eq!(
             screen.matches("\u{1b}]8;;https").count(),
             1,
             "only the link with a target"
         );
+        let row = &rows(&plain_buffer)[4];
+        let byte = row.find("Jira NAR-12 ↗").unwrap();
+        let column = u16::try_from(row[..byte].chars().count()).unwrap();
+        let link_cell = (0..buffer.area.width)
+            .find(|&x| buffer[(x, 4)].symbol().starts_with("\u{1b}]8;;https://"));
+        assert_eq!(
+            link_cell,
+            Some(column),
+            "link hit region begins under its label"
+        );
+        assert!(buffer[(column, 4)].symbol().contains("Jira NAR-12 ↗"));
     }
 
     #[test]
@@ -1840,7 +1920,6 @@ mod task_app_detail_render {
         assert!(super::screen(&render(&mut app, &Styles::new(false)))
             .contains("jeszcze nie wystartowało"));
         press(&mut app, KeyCode::Char(']'));
-        press(&mut app, KeyCode::Char(']'));
         let info = super::screen(&render(&mut app, &Styles::new(false)));
         assert!(
             info.contains("Zapieczętowane wejścia") && info.contains("launch digest"),
@@ -1900,8 +1979,8 @@ mod task_app_detail_render {
     #[test]
     fn events_that_cannot_be_read_say_why_in_their_tab() {
         let mut app = running_app();
-        press(&mut app, KeyCode::Char(']'));
-        press(&mut app, KeyCode::Char(']'));
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Events);
         app.on_detail_read(
             "a",
             1,
@@ -1925,8 +2004,8 @@ mod task_app_detail_render {
     #[test]
     fn a_silent_runner_leaves_a_note_in_the_tab_and_the_connection_alone() {
         let mut app = running_app();
-        press(&mut app, KeyCode::Char(']'));
-        press(&mut app, KeyCode::Char(']'));
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Events);
         let before = app.connection().status(std::time::Instant::now()).text;
         app.on_detail_read(
             "a",
@@ -1967,8 +2046,8 @@ mod task_app_detail_render {
     #[test]
     fn events_are_listed_with_the_detail_of_the_selected_one() {
         let mut app = running_app();
-        press(&mut app, KeyCode::Char(']'));
-        press(&mut app, KeyCode::Char(']'));
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Events);
         app.on_detail_read(
             "a",
             1,
@@ -1996,7 +2075,8 @@ mod task_app_detail_render {
     #[test]
     fn the_conversation_tab_shows_a_message_for_a_task_without_one() {
         let mut app = running_app();
-        press(&mut app, KeyCode::Char(']'));
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Conversation);
         let screen = screen(&render(&mut app, &Styles::new(false)));
         assert!(screen.contains("brak rozmowy"), "{screen}");
     }
@@ -2061,24 +2141,23 @@ mod task_app_detail_render {
         app.refresh().await;
         press(&mut app, KeyCode::Enter);
         app.sync_detail().await;
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
 
         let buffer = render(&mut app, &Styles::new(false));
         let screen = screen(&buffer);
         let rows = rows(&buffer);
-        assert!(
-            rows[2].contains("task-1") && rows[2].contains("implement-feature v1"),
-            "{}",
-            rows[2]
-        );
+        assert!(rows[2].contains("task-1"), "{}", rows[2]);
+        assert!(rows[4].contains("implement-feature v1"), "{}", rows[4]);
         assert!(
             rows[3].contains("● running") && rows[3].contains("krok 2/2"),
             "{}",
             rows[3]
         );
         assert!(
-            rows[4].contains("Przebieg") && rows[4].contains("Info"),
+            rows[6].contains("Przebieg") && rows[6].contains("Info"),
             "{}",
-            rows[4]
+            rows[6]
         );
         assert!(
             screen.contains("✓ plan #1") && screen.contains("● review #1 w toku"),
@@ -2181,6 +2260,8 @@ mod task_app_detail_render {
                 }),
             },
         );
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.step_focus(), StepFocus::Axis);
         app
@@ -2257,6 +2338,8 @@ mod task_app_detail_render {
     #[test]
     fn with_the_keys_on_the_list_the_axis_bracket_is_grey() {
         let mut app = running_app();
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
         press(&mut app, KeyCode::Esc);
         let buffer = render(&mut app, &Styles::new(false));
         assert_axis_bracket(&buffer, "● review #1 w toku", marks(false, false));
@@ -2286,6 +2369,8 @@ mod task_app_detail_render {
                 Some("review #1"),
             ))),
         );
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
         press(&mut app, KeyCode::Enter);
         let list_row = |buffer: &Buffer| {
             (0..buffer.area.height)
@@ -2347,6 +2432,8 @@ mod task_app_detail_render {
             1,
             DetailRead::Timeline(Ok(timeline("a", positions, Some("s5 #1")))),
         );
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
         press(&mut app, KeyCode::Enter);
         let small = |app: &mut TaskApp| {
             draw(60, 20, |frame| {
@@ -2525,7 +2612,6 @@ mod task_app_detail_render {
     fn the_selected_event_has_the_bar_and_no_reverse_video() {
         let mut app = running_app();
         press(&mut app, KeyCode::Char(']'));
-        press(&mut app, KeyCode::Char(']'));
         app.on_detail_read(
             "a",
             1,
@@ -2641,6 +2727,7 @@ mod task_app_detail_render {
                     result: Ok(read_from(Storage, Vec::new())),
                 },
             );
+            press(&mut app, KeyCode::Enter);
             let text = screen(&render(&mut app, &styles));
             assert!(text.contains("zapis sprzed 3 min"), "{text}");
             assert!(text.contains("line 3"), "the entries stay: {text}");
@@ -2876,8 +2963,8 @@ mod task_app_waiting_render {
         }))
     }
 
-    /// R4: with the keys in the answer panel the details keep their thick
-    /// frame, and the panel keeps the frame of what it waits for.
+    /// The answer panel stays visible as a yellow footer separator when it
+    /// has the keys.
     #[test]
     fn with_the_focus_in_the_panel_the_details_stay_thick_and_the_panel_yellow() {
         let mut app = opened(with_pending(running(), gate()));
@@ -2888,11 +2975,11 @@ mod task_app_waiting_render {
         assert_frame(&buffer, layout::LIST_WIDTH, 119, THICK, Color::Cyan);
         let heading = row_of(&buffer, "? Pytanie · review_scope");
         let y = u16::try_from(heading).unwrap();
-        let corner = column_of(&buffer, y, layout::LIST_WIDTH + 1, "┌")
-            .unwrap_or_else(|| panic!("no panel frame:\n{}", screen(&buffer)));
-        assert_eq!(cell_at(&buffer, corner, y).1, Color::Yellow);
-        let right = column_of(&buffer, y, corner + 1, "┐").unwrap();
-        assert_eq!(cell_at(&buffer, right, y).1, Color::Yellow);
+        let separator_y = y - 1;
+        let separator = rows(&buffer)[usize::from(separator_y)];
+        assert!(separator.contains('─'), "{}", screen(&buffer));
+        let x = u16::try_from(column_in(&buffer, separator_y as usize, "─")).unwrap();
+        assert_eq!(cell_at(&buffer, x, separator_y).1, Color::Yellow);
     }
 
     #[test]
@@ -2904,7 +2991,7 @@ mod task_app_waiting_render {
             "Czy zakres zmian obejmuje też migrację danych?",
             "Akcje",
             "Opis",
-            "2 revise ↩",
+            "| 2 | revise",
             "↩ wraca do agenta: plan",
             "Zakres wymaga poprawy.",
             "comment (wymagane)",
@@ -2916,7 +3003,7 @@ mod task_app_waiting_render {
         }
         let list_row = screen
             .lines()
-            .position(|row| row.contains("2 revise ↩"))
+            .position(|row| row.contains("| 2 | revise"))
             .unwrap();
         let description_row = screen
             .lines()
@@ -2934,12 +3021,12 @@ mod task_app_waiting_render {
     fn the_bracket_on_the_actions_follows_the_focus_of_the_panel() {
         let mut app = opened(with_pending(running(), gate()));
         let buffer = draw_buffer(&mut app, 120, 40, false);
-        assert_bracketed(&buffer, "2 revise", true, false);
+        assert_action_number(&buffer, "revise", 2);
         assert_not_bracketed(&buffer, "1 approved");
 
         press(&mut app, KeyCode::Tab);
         let buffer = draw_buffer(&mut app, 120, 40, false);
-        assert_bracketed(&buffer, "2 revise", false, false);
+        assert_action_number(&buffer, "revise", 2);
     }
 
     /// R12: a panel that appears while the keys are in the tab's content has
@@ -2954,28 +3041,21 @@ mod task_app_waiting_render {
         ));
         let buffer = draw_buffer(&mut app, 120, 40, false);
         assert!(!app.panel_focused(), "{}", screen(&buffer));
-        assert_bracketed(&buffer, "2 revise", false, false);
+        assert_action_number(&buffer, "revise", 2);
     }
 
-    /// R13, R14: without colour the bracket is bold and the markers stay
-    /// beside the label.
+    /// Without colour the selected number stays visible and risk markers lead
+    /// the description.
     #[test]
     fn without_colour_the_bracket_is_bold_and_keeps_the_markers() {
         let mut app = opened(with_pending(running(), gate()));
         let buffer = draw_buffer(&mut app, 120, 40, true);
-        assert_bracketed(&buffer, "2 revise ↩", true, true);
+        assert_action_number(&buffer, "revise", 2);
 
         let mut app = opened(with_pending(running(), problem()));
         let buffer = draw_buffer(&mut app, 120, 40, false);
-        let y = row_of(&buffer, "1 implemented ◆");
-        assert_bracketed(&buffer, "1 implemented ◆", true, false);
-        let x = column_in(&buffer, y, "◆");
-        let y = u16::try_from(y).unwrap();
-        assert_eq!(
-            cell_at(&buffer, x, y).1,
-            Color::Magenta,
-            "◆ keeps its colour"
-        );
+        assert_action_number(&buffer, "implemented", 1);
+        assert!(screen(&buffer).contains("! nieodwracalne"));
     }
 
     /// AE7, R17: six actions in a panel that fits five scroll inside the
@@ -3002,7 +3082,7 @@ mod task_app_waiting_render {
             press(&mut app, KeyCode::Char('j'));
         }
         let after = draw_buffer(&mut app, 120, 24, false);
-        assert_bracketed(&after, "6 out6", true, false);
+        assert_action_number(&after, "out6", 6);
         assert!(!screen(&after).contains("1 out1"), "{}", screen(&after));
         assert_eq!(row_of(&after, "Czy zakres zmian"), question);
         assert_eq!(row_of(&after, "comment (wymagane)"), field);
@@ -3023,13 +3103,13 @@ mod task_app_waiting_render {
         };
         let buffer = draw_buffer(&mut app, 60, 20, false);
         assert_eq!(shown(&buffer), ["2 revise"], "{}", screen(&buffer));
-        assert_bracketed(&buffer, "2 revise", true, false);
+        assert_action_number(&buffer, "revise", 2);
         assert!(screen(&buffer).contains("comment"), "{}", screen(&buffer));
 
         press(&mut app, KeyCode::Char('j'));
         let buffer = draw_buffer(&mut app, 60, 20, false);
         assert_eq!(shown(&buffer), ["3 reject"], "{}", screen(&buffer));
-        assert_bracketed(&buffer, "3 reject", true, false);
+        assert_action_number(&buffer, "reject", 3);
     }
 
     /// R17: a refresh that builds the actions again keeps the highlighted
@@ -3057,7 +3137,7 @@ mod task_app_waiting_render {
         );
         let after = draw_buffer(&mut app, 120, 24, false);
         assert_eq!(screen(&before), screen(&after));
-        assert_bracketed(&after, "5 out5", true, false);
+        assert_action_number(&after, "out5", 5);
     }
 
     #[test]
@@ -4447,16 +4527,13 @@ mod task_app_main_screen {
 
         // The details of the selected task: header, tabs, and the panel of
         // what waits for the operator, with its own keys on the bar.
-        assert!(
-            rows[2].contains("NAR-12") && rows[2].contains("implement-feature v1"),
-            "{}",
-            rows[2]
-        );
+        assert!(rows[2].contains("NAR-12"), "{}", rows[2]);
+        assert!(rows[4].contains("implement-feature v1"), "{}", rows[4]);
         assert!(rows[3].contains("● running"), "{}", rows[3]);
         assert!(
-            rows[4].contains("Przebieg")
-                && rows[4].contains("Dyrygent")
-                && rows[4].contains("Info")
+            rows[6].contains("Przebieg")
+                && rows[6].contains("Dyrygent")
+                && rows[6].contains("Info")
         );
         assert!(screen.contains("? Approval · review"), "{screen}");
         assert!(screen.contains("Approve the plan?"), "{screen}");

@@ -27,7 +27,13 @@ const TOP_ROWS: u16 = 5;
 /// What the area says when there is no multi-line field.
 const NO_TEXT_FIELD: &str = "brak pola tekstowego w tym workflow";
 
-pub(super) fn render(frame: &mut Frame, area: Rect, chooser: &Chooser, styles: &Styles) {
+pub(super) fn render(
+    frame: &mut Frame,
+    area: Rect,
+    chooser: &Chooser,
+    styles: &Styles,
+    footer: bool,
+) {
     let Some(item) = chooser.selected_item() else {
         return;
     };
@@ -39,25 +45,41 @@ pub(super) fn render(frame: &mut Frame, area: Rect, chooser: &Chooser, styles: &
         Constraint::Length(1.min(head.height.saturating_sub(4))),
     ])
     .areas(head);
-    render_strip(frame, strip, item, styles);
+    render_strip(frame, strip, item, styles, footer);
     let focused = (chooser.focus == ChooserFocus::Fields).then_some(chooser.field);
     render_bar(frame, bar, item, focused, styles);
     render_status(frame, status, item, focused, styles);
     render_long_fields(frame, rest, chooser, item, focused, styles);
 }
 
-fn render_strip(frame: &mut Frame, area: Rect, item: &ChooserItem, styles: &Styles) {
+fn render_strip(
+    frame: &mut Frame,
+    area: Rect,
+    item: &ChooserItem,
+    styles: &Styles,
+    footer: bool,
+) {
     let summary = item
         .description
         .lines()
         .find(|line| !line.trim().is_empty())
         .map(|line| one_line(&sanitize(line)))
         .unwrap_or_default();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(styles.of(Role::Done))
-        .title(format!(" {} ", one_line(&item.label)));
-    frame.render_widget(Paragraph::new(summary).block(block), area);
+    if footer {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(format!("  {}", one_line(&item.label)), styles.strong(Role::Calm)),
+                Line::raw(format!("  {summary}")),
+            ]),
+            area,
+        );
+    } else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(styles.of(Role::Done))
+            .title(format!(" {} ", one_line(&item.label)));
+        frame.render_widget(Paragraph::new(summary).block(block), area);
+    }
 }
 
 /// The short fields, one line: `name: value │ name: value`.
