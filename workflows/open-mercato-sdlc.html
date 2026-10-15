@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>open-mercato-sdlc — flow</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18241f;
+      --muted: #52645b;
+      --paper: #f4f6f2;
+      --card: #fff;
+      --line: #9eafa4;
+      --green: #d9f2df;
+      --green-line: #42885a;
+      --blue: #e0edff;
+      --blue-line: #4f78ae;
+      --amber: #fff0cb;
+      --amber-line: #b88528;
+      --red: #fce2df;
+      --red-line: #b9574c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 16px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header, main { width: min(1120px, calc(100% - 40px)); margin-inline: auto; }
+    header { padding: 48px 0 24px; }
+    .eyebrow { color: #39734c; font-size: .78rem; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { margin: 8px 0; font-size: clamp(2rem, 5vw, 3.4rem); line-height: 1.08; letter-spacing: -.04em; }
+    header p { max-width: 760px; margin: 12px 0 0; color: var(--muted); font-size: 1.08rem; }
+    .legend { display: flex; flex-wrap: wrap; gap: 10px 20px; margin: 24px 0 0; color: var(--muted); font-size: .9rem; }
+    .key { display: inline-flex; align-items: center; gap: 8px; }
+    .swatch { width: 16px; height: 16px; border: 1px solid; border-radius: 5px; }
+    .swatch.agent { background: var(--green); border-color: var(--green-line); }
+    .swatch.human { background: var(--blue); border-color: var(--blue-line); }
+    .swatch.decision { background: var(--amber); border-color: var(--amber-line); }
+    .swatch.terminal { background: var(--red); border-color: var(--red-line); }
+    .canvas { overflow-x: auto; border: 1px solid #dce3dc; border-radius: 18px; background: #fbfcfa; box-shadow: 0 12px 40px #22372b0d; }
+    svg { display: block; width: 100%; min-width: 880px; height: auto; }
+    .node rect { stroke-width: 2; rx: 14; }
+    .node.agent rect { fill: var(--green); stroke: var(--green-line); }
+    .node.human rect { fill: var(--blue); stroke: var(--blue-line); }
+    .node.decision rect { fill: var(--amber); stroke: var(--amber-line); }
+    .node.terminal rect { fill: var(--red); stroke: var(--red-line); }
+    .node .title { fill: var(--ink); font-size: 16px; font-weight: 720; text-anchor: middle; }
+    .node .sub { fill: var(--muted); font-size: 12px; text-anchor: middle; }
+    .edge { fill: none; stroke: var(--line); stroke-width: 2.2; marker-end: url(#arrow); }
+    .edge-label { fill: #46584e; font-size: 12px; font-weight: 650; paint-order: stroke; stroke: #fbfcfa; stroke-width: 5px; stroke-linejoin: round; }
+    .section { fill: #e8eee8; }
+    .section-label { fill: #69796f; font-size: 12px; font-weight: 750; letter-spacing: 1.5px; }
+    .notes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 24px 0 48px; }
+    .note { padding: 18px; border: 1px solid #dce3dc; border-radius: 14px; background: var(--card); }
+    .note h2 { margin: 0 0 6px; font-size: 1rem; }
+    .note p { margin: 0; color: var(--muted); font-size: .92rem; }
+    footer { padding: 0 0 28px; color: var(--muted); font-size: .85rem; }
+    footer a { color: #39734c; }
+    @media (max-width: 700px) { .notes { grid-template-columns: 1fr; } header { padding-top: 32px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">Workflow · Narsor</div>
+    <h1>open-mercato-sdlc</h1>
+    <p>Od discovery zgłoszenia do merge i uzgodnienia trackera. Niebieskie kroki wymagają decyzji człowieka, a żółte pokazują rozgałęzienia procesu.</p>
+    <div class="legend" aria-label="Legenda diagramu">
+      <span class="key"><i class="swatch agent"></i> krok agenta / automatyzacji</span>
+      <span class="key"><i class="swatch human"></i> bramka człowieka</span>
+      <span class="key"><i class="swatch decision"></i> wybór / walidacja</span>
+      <span class="key"><i class="swatch terminal"></i> zakończenie</span>
+    </div>
+  </header>
+  <main>
+    <div class="canvas" role="region" aria-label="Diagram przepływu workflow Open Mercato; na wąskim ekranie można przewijać poziomo" tabindex="0">
+      <svg viewBox="0 0 1100 2290" role="img" aria-labelledby="diagram-title diagram-desc">
+        <title id="diagram-title">Diagram open-mercato-sdlc</title>
+        <desc id="diagram-desc">Workflow Open Mercato prowadzi od discovery i intake przez triage, implementację, review, QA oraz zatwierdzenie merge. Zawiera pętle dla braków w gotowości, projektu, walidacji, review i QA oraz trzy zakończenia.</desc>
+        <defs>
+          <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="#9eafa4"/></marker>
+        </defs>
+        <rect class="section" x="24" y="28" width="1052" height="490" rx="18"/>
+        <text class="section-label" x="48" y="56">DISCOVERY I GOTOWOŚĆ ZGŁOSZENIA</text>
+        <rect class="section" x="24" y="536" width="1052" height="570" rx="18"/>
+        <text class="section-label" x="48" y="564">TRIAGE, PROJEKT I IMPLEMENTACJA</text>
+        <rect class="section" x="24" y="1124" width="1052" height="620" rx="18"/>
+        <text class="section-label" x="48" y="1152">PULL REQUEST, REVIEW I QA</text>
+        <rect class="section" x="24" y="1762" width="1052" height="500" rx="18"/>
+        <text class="section-label" x="48" y="1790">MERGE I PORZĄDKI</text>
+
+        <!-- główna ścieżka -->
+        <path class="edge" d="M550 122V155"/><path class="edge" d="M550 227V265"/>
+        <path class="edge" d="M550 337V375"/><path class="edge" d="M550 447V485"/>
+        <path class="edge" d="M550 557V595"/><path class="edge" d="M550 667V705"/>
+        <path class="edge" d="M550 777V815"/><path class="edge" d="M550 887V925"/>
+        <path class="edge" d="M550 997V1035"/><path class="edge" d="M550 1107V1145"/>
+        <path class="edge" d="M550 1217V1255"/><path class="edge" d="M550 1327V1365"/>
+        <path class="edge" d="M550 1437V1475"/><path class="edge" d="M550 1547V1695"/>
+        <path class="edge" d="M550 1767V1805"/>
+        <path class="edge" d="M550 1877V1915"/><path class="edge" d="M550 1987V2025"/>
+        <path class="edge" d="M550 2097V2135"/>
+
+        <!-- alternatywy i pętle -->
+        <path class="edge" d="M680 301H860V143H680"/><text class="edge-label" x="700" y="290">not_ready → intake</text>
+        <path class="edge" d="M420 411H105V2200H790"/><text class="edge-label" x="112" y="650">no_action</text>
+        <path class="edge" d="M420 521H105V2200H790"/><text class="edge-label" x="112" y="705">claim_lost</text>
+        <path class="edge" d="M420 301H80V2200H150"/><text class="edge-label" x="84" y="390">abandon</text>
+        <path class="edge" d="M680 631H910V741H680"/><text class="edge-label" x="755" y="620">user-facing</text>
+        <path class="edge" d="M680 631H1010V961H680"/><text class="edge-label" x="885" y="620">not_user_facing</text>
+        <path class="edge" d="M680 851H730V741H680"/><text class="edge-label" x="740" y="805">reshape</text>
+        <path class="edge" d="M420 851H80V2200H150"/><text class="edge-label" x="84" y="875">abandon</text>
+        <path class="edge" d="M420 961H330V851H420"/><text class="edge-label" x="262" y="910">red → implement</text>
+        <path class="edge" d="M680 1289H770"/><text class="edge-label" x="690" y="1278">changes_requested</text>
+        <path class="edge" d="M1030 1291H1060V1235H390V1291H420"/><text class="edge-label" x="910" y="1228">updated</text>
+        <path class="edge" d="M680 1399H900V1475"/><text class="edge-label" x="710" y="1420">needs_qa</text>
+        <path class="edge" d="M900 1547V1621H680"/><text class="edge-label" x="910" y="1605">evidence_ready</text>
+        <path class="edge" d="M420 1621H350V1511H420"/><text class="edge-label" x="250" y="1595">qa_approved → pre-merge</text>
+        <path class="edge" d="M420 1621H80V2200H150"/><text class="edge-label" x="84" y="1578">abandon</text>
+        <path class="edge" d="M420 1621H330V961H420"/><text class="edge-label" x="215" y="1555">qa_failed → implement</text>
+        <path class="edge" d="M680 1731H735V1685H550V1695"/><text class="edge-label" x="745" y="1708">hold</text>
+        <path class="edge" d="M420 1731H80V2200H150"/><text class="edge-label" x="84" y="1718">abandon</text>
+        <path class="edge" d="M680 1731V1841"/><text class="edge-label" x="692" y="1790">merge</text>
+
+        <!-- terminal: closed no action -->
+        <path class="edge" d="M680 81H1010V2200H950"/>
+
+        <!-- nodes -->
+        <g class="node agent"><rect x="420" y="50" width="260" height="72"/><text class="title" x="550" y="81">Discovery</text><text class="sub" x="550" y="101">om-discover · om-brainstorm</text></g>
+        <g class="node agent"><rect x="420" y="155" width="260" height="72"/><text class="title" x="550" y="186">Intake</text><text class="sub" x="550" y="206">om-prepare-issue / manage-issues</text></g>
+        <g class="node human"><rect x="420" y="265" width="260" height="72"/><text class="title" x="550" y="296">Potwierdzenie gotowości</text><text class="sub" x="550" y="316">confirm_readiness</text></g>
+        <g class="node agent"><rect x="420" y="375" width="260" height="72"/><text class="title" x="550" y="406">Triage</text><text class="sub" x="550" y="426">om-triage-issue</text></g>
+        <g class="node agent"><rect x="420" y="485" width="260" height="72"/><text class="title" x="550" y="516">Claim</text><text class="sub" x="550" y="536">om-claim-issue</text></g>
+        <g class="node decision"><rect x="420" y="595" width="260" height="72"/><text class="title" x="550" y="626">Czy zmiana dotyka UI?</text><text class="sub" x="550" y="646">assess_surface</text></g>
+        <g class="node agent"><rect x="420" y="705" width="260" height="72"/><text class="title" x="550" y="736">Projekt UX</text><text class="sub" x="550" y="756">om-ux-shape · tylko zmiany user-facing</text></g>
+        <g class="node human"><rect x="420" y="815" width="260" height="72"/><text class="title" x="550" y="846">Akceptacja projektu</text><text class="sub" x="550" y="866">approve_design</text></g>
+        <g class="node agent"><rect x="420" y="925" width="260" height="72"/><text class="title" x="550" y="956">Implementacja</text><text class="sub" x="550" y="976">om-implement</text></g>
+        <g class="node decision"><rect x="420" y="1035" width="260" height="72"/><text class="title" x="550" y="1066">Walidacja</text><text class="sub" x="550" y="1086">validation_command · green / red</text></g>
+        <g class="node agent"><rect x="420" y="1145" width="260" height="72"/><text class="title" x="550" y="1176">Otwarcie pull requesta</text><text class="sub" x="550" y="1196">om-open-pr</text></g>
+        <g class="node agent"><rect x="420" y="1255" width="260" height="72"/><text class="title" x="550" y="1286">Code review</text><text class="sub" x="550" y="1306">om-review-pr</text></g>
+        <g class="node agent"><rect x="770" y="1255" width="260" height="72"/><text class="title" x="900" y="1286">Poprawki do review</text><text class="sub" x="900" y="1306">om-address-pr-feedback</text></g>
+        <g class="node agent"><rect x="420" y="1365" width="260" height="72"/><text class="title" x="550" y="1396">Routing QA</text><text class="sub" x="550" y="1416">om-qa-routing</text></g>
+        <g class="node agent"><rect x="420" y="1475" width="260" height="72"/><text class="title" x="550" y="1506">Pre-merge check</text><text class="sub" x="550" y="1526">om-merge-buddy · ścieżka bez QA</text></g>
+        <g class="node agent"><rect x="770" y="1475" width="260" height="72"/><text class="title" x="900" y="1506">Automatyczne QA</text><text class="sub" x="900" y="1526">om-auto-qa-pr · evidence only</text></g>
+        <g class="node human"><rect x="420" y="1585" width="260" height="72"/><text class="title" x="550" y="1616">Akceptacja QA</text><text class="sub" x="550" y="1636">qa_signoff · qa-approved</text></g>
+        <g class="node human"><rect x="420" y="1695" width="260" height="72"/><text class="title" x="550" y="1726">Zatwierdzenie merge</text><text class="sub" x="550" y="1746">approve_merge</text></g>
+        <g class="node agent"><rect x="420" y="1805" width="260" height="72"/><text class="title" x="550" y="1836">Merge PR</text><text class="sub" x="550" y="1856">om-approve-merge-pr</text></g>
+        <g class="node agent"><rect x="420" y="1915" width="260" height="72"/><text class="title" x="550" y="1946">Housekeeping</text><text class="sub" x="550" y="1966">om-housekeeping · tracker i follow-ups</text></g>
+        <g class="node terminal"><rect x="470" y="2025" width="160" height="72"/><text class="title" x="550" y="2067">Finished</text></g>
+        <g class="node terminal"><rect x="790" y="2164" width="160" height="72"/><text class="title" x="870" y="2194">Zamknięte</text><text class="sub" x="870" y="2213">no action</text></g>
+        <g class="node terminal"><rect x="150" y="2164" width="160" height="72"/><text class="title" x="230" y="2206">Cancelled</text></g>
+      </svg>
+    </div>
+    <section class="notes" aria-label="Opis głównych reguł procesu">
+      <article class="note"><h2>Gotowość i projekt</h2><p>Człowiek potwierdza ticket-level Definition of Ready. Zmiany user-facing wymagają też akceptacji projektu przed implementacją; pozostałe idą prosto do kodowania.</p></article>
+      <article class="note"><h2>Review i QA</h2><p>Uwagi z code review wracają do poprawy. Gdy ticket wymaga QA, agent dołącza dowody, a człowiek ustawia qa-approved; niepowodzenie wraca do implementacji.</p></article>
+      <article class="note"><h2>Merge i zakończenia</h2><p>Merge wymaga ludzkiej zgody. Workflow kończy się po uzgodnieniu trackera albo wcześniej, gdy triage nie znajduje pracy; człowiek może też anulować proces na bramkach.</p></article>
+    </section>
+    <footer>Diagram oparty na <a href="open-mercato-sdlc.yaml">workflows/open-mercato-sdlc.yaml</a>. Plik źródłowy Mermaid: <a href="open-mercato-sdlc.mmd">open-mercato-sdlc.mmd</a>. Na wąskim ekranie przewiń diagram poziomo.</footer>
+  </main>
+</body>
+</html>

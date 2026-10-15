@@ -1,0 +1,48 @@
+flowchart TD
+    start([Start]) --> discover["Discovery<br/>om-discover + om-brainstorm"]
+    discover -->|routed| intake["Intake<br/>om-prepare-issue / om-auto-manage-issues"]
+    discover -->|no_action| closed["Closed: no action"]
+
+    intake -->|ready / gaps_found| readiness{"Human gate<br/>Confirm readiness"}
+    readiness -->|confirmed / waived| triage["Triage<br/>om-triage-issue"]
+    readiness -->|not_ready| intake
+    readiness -->|abandon| cancelled["Cancelled"]
+
+    triage -->|actionable| claim["Claim<br/>om-claim-issue"]
+    triage -->|no_action / already_claimed| closed
+    claim -->|claimed| surface{"Assess surface<br/>user-facing?"}
+    claim -->|claim_lost| closed
+
+    surface -->|yes| design["Shape design<br/>om-ux-shape"]
+    surface -->|no| implement["Implement<br/>om-implement"]
+    design -->|shaped| design_gate{"Human gate<br/>Approve design"}
+    design_gate -->|approved| implement
+    design_gate -->|reshape| design
+    design_gate -->|abandon| cancelled
+
+    implement --> validation{"Validation gate<br/>validation_command"}
+    validation -->|green| pr["Open PR<br/>om-open-pr"]
+    validation -->|red| implement
+    pr -->|pr_opened| review["Code review<br/>om-review-pr"]
+    review -->|changes_requested| feedback["Address feedback<br/>om-address-pr-feedback"]
+    feedback -->|updated| review
+    review -->|approved| qa_route{"QA routing<br/>om-qa-routing"}
+
+    qa_route -->|needs_qa| qa["Run QA<br/>om-auto-qa-pr"]
+    qa_route -->|skip_qa| premerge["Pre-merge check<br/>om-merge-buddy"]
+    qa -->|evidence_ready| qa_gate{"Human gate<br/>QA sign-off"}
+    qa_gate -->|qa_approved| premerge
+    qa_gate -->|qa_failed| implement
+    qa_gate -->|abandon| cancelled
+
+    premerge -->|mergeable| merge_gate{"Human gate<br/>Approve merge"}
+    merge_gate -->|hold| merge_gate
+    merge_gate -->|abandon| cancelled
+    merge_gate -->|merge| merge["Merge PR<br/>om-approve-merge-pr"]
+    merge -->|merged| housekeeping["Housekeeping<br/>om-housekeeping"]
+    housekeeping -->|reconciled| finished["Finished"]
+
+    classDef human fill:#fff2cc,stroke:#b8860b,color:#222
+    classDef terminal fill:#d9ead3,stroke:#38761d,color:#222
+    class readiness,design_gate,qa_gate,merge_gate human
+    class finished,closed,cancelled terminal
