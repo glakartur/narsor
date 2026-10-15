@@ -57,7 +57,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -611,6 +611,10 @@ impl TaskApp {
 
     /// A key while the form is open: the chooser's own, then what it chose.
     pub(super) fn on_new_task_key(&mut self, key: KeyEvent, confirming_quit: bool) -> Request {
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.focus = Focus::List;
+            return Request::None;
+        }
         let View::NewTask(form) = &mut self.view else {
             return Request::None;
         };

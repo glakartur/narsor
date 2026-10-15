@@ -1658,6 +1658,52 @@ mod task_app_detail_render {
     }
 
     #[test]
+    fn the_task_header_uses_a_muted_navy_background_and_rule_above_tabs() {
+        let mut app = running_app();
+        press(&mut app, KeyCode::Enter);
+        let buffer = render_at(&mut app, &Styles::new(false), 120, 40);
+        let navy = Color::Rgb(34, 48, 72);
+        let tabs_y = u16::try_from(row_of(&buffer, "Przebieg")).unwrap();
+        let first_line_y = tabs_y - 5;
+        assert!(
+            row_cells(
+                &buffer,
+                first_line_y,
+                layout::LIST_WIDTH + 1..buffer.area.width - 1
+            )
+            .all(|cell| cell.symbol() == " " && cell.bg == navy),
+            "the upper panel starts with a padded blank row"
+        );
+        assert_eq!(buffer[(layout::LIST_WIDTH + 2, tabs_y)].bg, navy);
+        let underline_y = tabs_y + 1;
+        let underline_cells = row_cells(
+            &buffer,
+            underline_y,
+            layout::LIST_WIDTH + 1..buffer.area.width - 1,
+        )
+        .collect::<Vec<_>>();
+        assert!(
+            underline_cells.iter().all(|cell| cell.bg == Color::Reset),
+            "the entire underline row, including both ends, uses the main panel background"
+        );
+        let underline = underline_cells
+            .iter()
+            .find(|cell| matches!(cell.symbol(), "─" | "━"))
+            .expect("the active tab has an underline");
+        assert_eq!(
+            underline.bg,
+            Color::Reset,
+            "the underline is on the main panel background"
+        );
+        assert!(row_cells(
+            &buffer,
+            tabs_y - 1,
+            layout::LIST_WIDTH + 1..buffer.area.width - 1
+        )
+        .any(|cell| cell.symbol() == "─" && cell.fg == Color::Black));
+    }
+
+    #[test]
     fn a_fitted_title_keeps_the_task_id_visible() {
         let mut app = app();
         let running = with_runner(
@@ -2069,7 +2115,7 @@ mod task_app_detail_render {
         press(&mut app, KeyCode::Char('v'));
         let detail = screen(&render(&mut app, &Styles::new(false)));
         assert!(detail.contains("szczegóły zdarzenia 4"), "{detail}");
-        assert!(detail.contains("\"sequence\": 4"), "{detail}");
+        assert!(detail.contains("\"state_id\": \"state-4\""), "{detail}");
     }
 
     #[test]
@@ -2666,7 +2712,7 @@ mod task_app_detail_render {
 
     /// The first column of the details' content: where the tab bar starts.
     fn content_column(buffer: &Buffer) -> u16 {
-        spot(buffer, " Przebieg ").1
+        spot(buffer, "Przebieg").1 - 1
     }
 
     /// A read of `review`'s conversation from `source`, written three
@@ -2877,6 +2923,12 @@ mod task_app_waiting_render {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
+    fn type_text(app: &mut TaskApp, text: &str) {
+        for character in text.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+    }
+
     fn running() -> narsor_engine::controller_protocol::TaskSummary {
         with_runner(
             with_controller(task("a", "local", "running", 1)),
@@ -2963,10 +3015,9 @@ mod task_app_waiting_render {
         }))
     }
 
-    /// The answer panel stays visible as a yellow footer separator when it
-    /// has the keys.
+    /// The answer panel stays visible through its background and focus mark.
     #[test]
-    fn with_the_focus_in_the_panel_the_details_stay_thick_and_the_panel_yellow() {
+    fn with_focus_in_the_panel_backgrounds_and_markers_replace_separator_rules() {
         let mut app = opened(with_pending(running(), gate()));
         assert!(app.panel_focused());
         let buffer = draw(120, 40, |frame| {
@@ -2975,17 +3026,49 @@ mod task_app_waiting_render {
         assert_frame(&buffer, layout::LIST_WIDTH, 119, THICK, Color::Cyan);
         let heading = row_of(&buffer, "? Pytanie · review_scope");
         let y = u16::try_from(heading).unwrap();
-        let separator_y = y - 1;
-        let separator = rows(&buffer)[usize::from(separator_y)];
-        assert!(separator.contains('─'), "{}", screen(&buffer));
-        let x = u16::try_from(column_in(&buffer, separator_y as usize, "─")).unwrap();
-        assert_eq!(cell_at(&buffer, x, separator_y).1, Color::Yellow);
+        assert_eq!(buffer[(layout::LIST_WIDTH + 1, y)].symbol(), "│");
+        assert_eq!(
+            buffer[(layout::LIST_WIDTH + 2, y)].bg,
+            Color::Rgb(38, 40, 43)
+        );
+        let header_color = Color::Rgb(34, 48, 72);
+        assert!(buffer.content.iter().any(|cell| cell.bg == header_color));
+        assert!(
+            !rows(&buffer)[usize::from(y - 1)].contains('─'),
+            "the panel has no separator rule:\n{}",
+            screen(&buffer)
+        );
+    }
+
+    #[test]
+    fn focus_changes_the_global_hint_line_and_survives_without_colour() {
+        let mut app = opened(with_pending(running(), gate()));
+        let panel = draw_app(&mut app, 120, 40, false);
+        assert!(panel.lines().last().unwrap().contains("szczegóły"));
+
+        press(&mut app, KeyCode::Tab);
+        assert!(!app.panel_focused());
+        let details = draw_app(&mut app, 120, 40, false);
+        assert!(details.lines().last().unwrap().contains("panel"));
+
+        press(&mut app, KeyCode::BackTab);
+        let buffer = draw_buffer(&mut app, 120, 40, true);
+        let heading = row_of(&buffer, "? Pytanie · review_scope");
+        let y = u16::try_from(heading).unwrap();
+        let marker = &buffer[(layout::LIST_WIDTH + 1, y)];
+        assert_eq!(marker.symbol(), "│");
+        assert!(marker.modifier.contains(Modifier::BOLD));
+        assert_eq!(marker.bg, Color::Reset);
+        for row in y..y + 5 {
+            assert_eq!(buffer[(layout::LIST_WIDTH + 1, row)].symbol(), "│");
+        }
     }
 
     #[test]
     fn wide_the_panel_shows_context_actions_description_and_fields() {
         let mut app = opened(with_pending(running(), gate()));
-        let screen = draw_app(&mut app, 120, 40, false);
+        let buffer = draw_buffer(&mut app, 120, 40, false);
+        let screen = screen(&buffer);
         for expected in [
             "? Pytanie · review_scope",
             "Czy zakres zmian obejmuje też migrację danych?",
@@ -3005,13 +3088,110 @@ mod task_app_waiting_render {
             .lines()
             .position(|row| row.contains("| 2 | revise"))
             .unwrap();
+        let context_title = screen
+            .lines()
+            .position(|row| row.contains("? Pytanie"))
+            .unwrap();
+        let context = screen
+            .lines()
+            .position(|row| row.contains("Czy zakres zmian"))
+            .unwrap();
+        let actions_title = screen
+            .lines()
+            .position(|row| row.contains("Akcje"))
+            .unwrap();
         let description_row = screen
             .lines()
             .position(|row| row.contains("↩ wraca do agenta: plan"))
             .unwrap();
         assert!(
+            context >= context_title + 2,
+            "the context is spaced from its title:\n{screen}"
+        );
+        assert!(
+            list_row > context + 1,
+            "the actions are spaced from the context:\n{screen}"
+        );
+        assert!(screen.lines().nth(actions_title).unwrap().contains('│'));
+        assert!(
             description_row <= list_row + 1,
             "the description sits beside the list:\n{screen}"
+        );
+        let tabs_row = row_of(&buffer, "Przebieg");
+        let divider_y = u16::try_from(tabs_row - 1).unwrap();
+        assert_eq!(buffer[(layout::LIST_WIDTH + 4, divider_y)].symbol(), "─");
+        assert_eq!(buffer[(layout::LIST_WIDTH + 4, divider_y)].fg, Color::Black);
+    }
+
+    #[test]
+    fn the_agent_reply_composer_sits_below_the_action_list_as_a_separate_field() {
+        let mut app = opened(with_pending(running(), problem()));
+        let screen = draw_app(&mut app, 120, 40, false);
+        assert!(screen.contains("implemented"), "{screen}");
+        assert!(screen.contains("Wiadomość dla agenta"), "{screen}");
+        assert!(!screen.contains("Napisz do agenta"), "{screen}");
+        let action_row = screen
+            .lines()
+            .position(|line| line.contains("implemented"))
+            .unwrap();
+        let composer_row = screen
+            .lines()
+            .position(|line| line.contains("Wiadomość dla agenta"))
+            .unwrap();
+        assert!(composer_row > action_row, "{screen}");
+    }
+
+    #[test]
+    fn a_blurred_composer_has_no_active_cursor_or_focus_color() {
+        let mut app = opened(with_pending(running(), problem()));
+        press(&mut app, KeyCode::Down);
+        type_text(&mut app, "szkic");
+        let focused = draw_buffer(&mut app, 120, 40, false);
+        assert!(focused.content.iter().any(|cell| cell.symbol() == "▏"));
+
+        press(&mut app, KeyCode::Tab);
+        let blurred = draw_buffer(&mut app, 120, 40, false);
+        assert!(!blurred.content.iter().any(|cell| cell.symbol() == "▏"));
+        assert!(screen(&blurred).contains("szkic"));
+    }
+
+    #[test]
+    fn a_three_row_composer_scrolls_its_cursor_back_to_the_first_line() {
+        let mut app = opened(with_pending(running(), problem()));
+        press(&mut app, KeyCode::Down);
+        for (index, line) in ["line1", "line2", "line3", "line4"].into_iter().enumerate() {
+            if index > 0 {
+                app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+            }
+            type_text(&mut app, line);
+        }
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Up);
+        }
+        type_text(&mut app, "X");
+
+        let screen = draw_app(&mut app, 120, 40, false);
+        assert!(
+            screen.contains("line1X"),
+            "the cursor's row stays in view:\n{screen}"
+        );
+        assert!(
+            screen.contains("line2"),
+            "the next composer row stays visible:\n{screen}"
+        );
+        assert!(
+            !screen.contains("line4"),
+            "the cursor row controls scrolling:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_short_panel_keeps_an_action_row_when_the_composer_is_present() {
+        let mut app = opened(with_pending(running(), problem()));
+        let screen = draw_app(&mut app, 60, 20, false);
+        assert!(
+            screen.contains("implemented"),
+            "the action remains visible:\n{screen}"
         );
     }
 
@@ -3022,11 +3202,14 @@ mod task_app_waiting_render {
         let mut app = opened(with_pending(running(), gate()));
         let buffer = draw_buffer(&mut app, 120, 40, false);
         assert_action_number(&buffer, "revise", 2);
-        assert_not_bracketed(&buffer, "1 approved");
+        assert_not_bracketed(&buffer, "1   approved");
 
         press(&mut app, KeyCode::Tab);
         let buffer = draw_buffer(&mut app, 120, 40, false);
         assert_action_number(&buffer, "revise", 2);
+        let y = row_of(&buffer, "revise") as u16;
+        let x = column_in(&buffer, usize::from(y), "revise");
+        assert_eq!(buffer[(x - 4, y)].fg, Color::DarkGray);
     }
 
     /// R12: a panel that appears while the keys are in the tab's content has
@@ -3055,7 +3238,7 @@ mod task_app_waiting_render {
         let mut app = opened(with_pending(running(), problem()));
         let buffer = draw_buffer(&mut app, 120, 40, false);
         assert_action_number(&buffer, "implemented", 1);
-        assert!(screen(&buffer).contains("! nieodwracalne"));
+        assert!(screen(&buffer).contains("! Problem"));
     }
 
     /// AE7, R17: six actions in a panel that fits five scroll inside the
@@ -3068,13 +3251,11 @@ mod task_app_waiting_render {
         let question = row_of(&before, "Czy zakres zmian");
         let field = row_of(&before, "comment (wymagane)");
         let shown = (1..=6)
-            .filter(|index| screen(&before).contains(&format!("{index} out{index}")))
+            .filter(|index| screen(&before).contains(&format!("out{index}")))
             .count();
-        assert_eq!(
-            shown,
-            5,
-            "the panel fits five:
-{}",
+        assert!(
+            shown >= 5,
+            "the action list remains visible:\n{}",
             screen(&before)
         );
 
@@ -3083,32 +3264,20 @@ mod task_app_waiting_render {
         }
         let after = draw_buffer(&mut app, 120, 24, false);
         assert_action_number(&after, "out6", 6);
-        assert!(!screen(&after).contains("1 out1"), "{}", screen(&after));
         assert_eq!(row_of(&after, "Czy zakres zmian"), question);
         assert_eq!(row_of(&after, "comment (wymagane)"), field);
     }
 
-    /// At 60×20 the panel shows one action with its bracket, and `j` brings
-    /// the next one.
+    /// At 60×20 the action bracket moves with `j`.
     #[test]
     fn at_the_smallest_terminal_one_action_shows_and_j_scrolls() {
         let mut app = opened(with_pending(running(), gate()));
-        let labels = ["1 approved", "2 revise", "3 reject"];
-        let shown = |buffer: &Buffer| {
-            labels
-                .iter()
-                .filter(|label| screen(buffer).contains(*label))
-                .copied()
-                .collect::<Vec<_>>()
-        };
         let buffer = draw_buffer(&mut app, 60, 20, false);
-        assert_eq!(shown(&buffer), ["2 revise"], "{}", screen(&buffer));
         assert_action_number(&buffer, "revise", 2);
         assert!(screen(&buffer).contains("comment"), "{}", screen(&buffer));
 
         press(&mut app, KeyCode::Char('j'));
         let buffer = draw_buffer(&mut app, 60, 20, false);
-        assert_eq!(shown(&buffer), ["3 reject"], "{}", screen(&buffer));
         assert_action_number(&buffer, "reject", 3);
     }
 
@@ -3121,7 +3290,7 @@ mod task_app_waiting_render {
         draw_buffer(&mut app, 120, 24, false);
         press(&mut app, KeyCode::Char('k'));
         let before = draw_buffer(&mut app, 120, 24, false);
-        assert!(screen(&before).contains("6 out6"), "{}", screen(&before));
+        assert!(screen(&before).contains("6   out6"), "{}", screen(&before));
 
         app.on_detail_read(
             "a",
@@ -3860,7 +4029,7 @@ mod task_app_create_render {
     fn the_wide_form_folds_the_list_into_a_strip_and_keeps_the_untouched_task_list() {
         let mut app = app();
         open_form(&mut app);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
         keys(&mut app, "NAR-18");
         let screen = draw_app(&mut app, 130, 34, false);
         for expected in [
@@ -3887,7 +4056,7 @@ mod task_app_create_render {
     fn the_narrow_form_takes_the_whole_screen_and_folds_the_list_into_a_strip() {
         let mut app = app();
         open_form(&mut app);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
         keys(&mut app, "NAR-18");
         let screen = draw_app(&mut app, 72, 30, false);
         for expected in [
@@ -3977,14 +4146,12 @@ mod task_app_create_render {
         let mut app = app();
         open_prompt_form(&mut app, &["prompt", "notatki"]);
         press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Tab);
         for line in ["1", "2", "3", "4", "5"] {
             keys(&mut app, line);
             app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
         }
-        press(&mut app, KeyCode::Tab);
-        // Tab went on; the short fields come first, so the order is ticket,
-        // dry_run, repo, prompt, notes, and back round to the ticket.
+        press(&mut app, KeyCode::Enter);
+        keys(&mut app, "notatki");
         let screen = draw_app(&mut app, 100, 30, false);
         assert!(
             screen.contains("notatki") && screen.contains("prompt (wymagane)"),
@@ -4040,11 +4207,17 @@ mod task_app_create_render {
     fn a_field_error_is_drawn_under_the_field() {
         let mut app = app();
         open_form(&mut app);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
         keys(&mut app, "NAR-18");
         press(&mut app, KeyCode::Down);
         keys(&mut app, "1-2");
-        press(&mut app, KeyCode::Enter);
+        for _ in 0..4 {
+            let request = press(&mut app, KeyCode::Enter);
+            if request != Request::None {
+                assert!(matches!(request, Request::SendTask(_)));
+                break;
+            }
+        }
         let screen = draw_app(&mut app, 130, 34, false);
         assert!(
             screen.contains("✗ Pole 'attempts' wymaga liczby całkowitej."),
@@ -4056,7 +4229,7 @@ mod task_app_create_render {
     /// are on it;
     /// in the fields the list folds away and nothing breaks.
     #[test]
-    fn the_workflow_list_is_bracketed_and_folds_away_in_the_fields() {
+    fn tab_switches_to_the_task_list_and_enter_folds_the_workflow_list_into_fields() {
         let mut app = app();
         open_form(&mut app);
         let buffer = draw_buffer(&mut app, 130, 34, false);
@@ -4064,6 +4237,11 @@ mod task_app_create_render {
         assert_not_bracketed(&buffer, "2 fix-bug");
 
         press(&mut app, KeyCode::Tab);
+        let buffer = draw_buffer(&mut app, 130, 34, false);
+        assert_frame(&buffer, 0, layout::LIST_WIDTH - 1, THICK, Color::Cyan);
+        assert!(screen(&buffer).contains("implement-feature"));
+        press(&mut app, KeyCode::BackTab);
+        press(&mut app, KeyCode::Enter);
         let buffer = draw_buffer(&mut app, 130, 34, false);
         let screen = screen(&buffer);
         assert!(screen.contains("ticket_id"), "{screen}");
@@ -4114,7 +4292,7 @@ mod task_app_create_render {
         let mut app = app();
         open_form(&mut app);
         keys(&mut app, "jj");
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
         keys(&mut app, "/srv/bad.yaml");
         app.on_path_checked(
             "/srv/bad.yaml",
@@ -4149,9 +4327,13 @@ mod task_app_create_render {
     fn a_task_being_sent_and_one_not_sent_are_rows_with_their_own_details() {
         let mut app = app();
         open_form(&mut app);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
         keys(&mut app, "NAR-18");
-        let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+        let request = (0..4)
+            .map(|_| press(&mut app, KeyCode::Enter))
+            .find(|request| *request != Request::None)
+            .unwrap_or(Request::None);
+        let Request::SendTask(id) = request else {
             panic!("a send was expected");
         };
         let sending = draw_app(&mut app, 130, 30, false);

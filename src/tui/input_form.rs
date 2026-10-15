@@ -34,7 +34,7 @@ use std::collections::HashSet;
 use serde_json::{Map, Value};
 
 use crate::conductor::Annotation;
-use crate::tui::chooser::{ChooserField, ChooserItem, Submission};
+use crate::tui::chooser::{ChooserField, ChooserItem, FieldKind, Submission};
 use narsor_protocol::api::{
     HumanInputActionDto, HumanInputDeliveryDto, HumanInputFieldView, HumanInputTypeView,
     InputContinuationView, OutputDefinitionView, PendingHumanInputView,
@@ -442,6 +442,47 @@ impl InputPanel {
     /// The entries to choose from.
     pub fn items(&self) -> &[ChooserItem] {
         &self.items
+    }
+
+    /// A single ordinary answer can sit in its own composer below the action
+    /// list. Multi-field answers remain attached to their action.
+    pub(crate) fn composer_spec(&self) -> Option<(usize, &'static str)> {
+        let index = match self.kind {
+            InputKind::AgentQuestion => self
+                .plans
+                .iter()
+                .position(|plan| matches!(plan, Plan::Answer))?,
+            InputKind::Problem => self
+                .plans
+                .iter()
+                .position(|plan| matches!(plan, Plan::Message))?,
+            _ => return None,
+        };
+        let item = self.items.get(index)?;
+        let label = match self.plans.get(index)? {
+            Plan::Answer
+                if item.fields.len() == 1
+                    && item.fields[0].name == "answer"
+                    && matches!(&item.fields[0].kind, FieldKind::Text { multiline: true }) =>
+            {
+                "Odpowiedź agentowi"
+            }
+            Plan::Message if item.fields.len() == 1 && item.fields[0].name == MESSAGE_FIELD => {
+                "Odpowiedź do rozmowy"
+            }
+            _ => return None,
+        };
+        Some((index, label))
+    }
+
+    pub(crate) fn composer_submission(&self, value: String) -> Option<Submission> {
+        let (index, _) = self.composer_spec()?;
+        let field = self.items.get(index)?.fields.first()?.name.clone();
+        Some(Submission {
+            index,
+            label: self.items.get(index)?.label.clone(),
+            values: vec![(field, value)],
+        })
     }
 
     /// The entry the panel opens on: the conductor's recommendation, or the

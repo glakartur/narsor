@@ -442,7 +442,13 @@ pub fn render(
         history_focused,
     );
     if box_rows > 0 {
-        chooser::render_fields(frame, text_box, &conductor.composer, styles);
+        chooser::render_fields(
+            frame,
+            text_box,
+            &conductor.composer,
+            styles,
+            focused && conductor.is_typing(),
+        );
     }
     frame.render_widget(Paragraph::new(bottom), footer);
 }

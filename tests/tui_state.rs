@@ -573,7 +573,7 @@ mod foundations {
                 .into_iter()
                 .map(|(keys, _)| keys)
                 .collect();
-            for expected in ["Tab", "Enter", "Ctrl+J", "Esc"] {
+            for expected in ["Tab/Shift+Tab", "Enter", "Ctrl+J", "Esc"] {
                 assert!(
                     bar.iter().any(|keys| keys == expected),
                     "{expected}: {bar:?}"
@@ -887,6 +887,64 @@ mod foundations {
         }
 
         #[test]
+        fn enter_walks_action_fields_and_submits_from_the_last_one() {
+            let mut chooser = Chooser::new(vec![ChooserItem::new("change", "Zmienia zadanie.")
+                .with_field(ChooserField::text("title").required())
+                .with_field(ChooserField::multiline("reason").required())]);
+            focused_comment(&mut chooser);
+            type_text(&mut chooser, "Tytuł");
+            assert_eq!(chooser.on_key(press(KeyCode::Enter)), ChooserAction::None);
+            type_text(&mut chooser, "Powód");
+            match chooser.on_key(press(KeyCode::Enter)) {
+                ChooserAction::Submit(submission) => assert_eq!(
+                    submission.values,
+                    vec![
+                        ("title".to_string(), "Tytuł".to_string()),
+                        ("reason".to_string(), "Powód".to_string())
+                    ]
+                ),
+                other => panic!("expected the last field to submit, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn vertical_arrows_move_the_cursor_between_multiline_rows() {
+            let mut chooser = Chooser::new(vec![ChooserItem::new("change", "Zmienia zadanie.")
+                .with_field(ChooserField::text("title"))
+                .with_field(ChooserField::multiline("reason").required())
+                .with_field(ChooserField::multiline("follow_up"))])
+            .with_inputs_layout();
+            focused_comment(&mut chooser);
+            type_text(&mut chooser, "abc");
+            chooser.on_key(ctrl_j());
+            type_text(&mut chooser, "def");
+            chooser.on_key(press(KeyCode::Up));
+            type_text(&mut chooser, "X");
+            assert_eq!(chooser.fields_of(0)[1].value(), "abcX\ndef");
+            chooser.on_key(press(KeyCode::Down));
+            type_text(&mut chooser, "Y");
+            assert_eq!(chooser.fields_of(0)[1].value(), "abcX\ndefY");
+            chooser.on_key(press(KeyCode::Down));
+            type_text(&mut chooser, "Z");
+            assert_eq!(chooser.fields_of(0)[2].value(), "Z");
+            assert_eq!(chooser.fields_of(0)[0].value(), "");
+        }
+
+        #[test]
+        fn up_from_the_second_short_field_moves_to_the_first_field() {
+            let mut chooser = Chooser::new(vec![ChooserItem::new("change", "Zmienia zadanie.")
+                .with_field(ChooserField::text("title"))
+                .with_field(ChooserField::text("ticket"))])
+            .with_inputs_layout();
+            focused_comment(&mut chooser);
+            chooser.on_key(press(KeyCode::Down));
+            chooser.on_key(press(KeyCode::Up));
+            type_text(&mut chooser, "tytuł");
+            assert_eq!(chooser.fields_of(0)[0].value(), "tytuł");
+            assert_eq!(chooser.fields_of(0)[1].value(), "");
+        }
+
+        #[test]
         fn ctrl_j_is_a_new_line_in_every_terminal_and_does_not_send() {
             keymap::override_modifiers_distinguished(Some(false));
             let mut chooser = review_chooser().selecting(1);
@@ -925,8 +983,10 @@ mod foundations {
             assert_eq!(chooser.on_key(press(KeyCode::Enter)), ChooserAction::None);
             type_text(&mut chooser, "p");
             assert_eq!(chooser.fields_of(0)[2].value(), "p");
-            // Short fields come first in the walk; after the last, `Tab` wraps.
-            chooser.on_key(press(KeyCode::Tab));
+            // Short fields come first in the walk; arrows move between fields.
+            chooser.on_key(press(KeyCode::Backspace));
+            chooser.on_key(press(KeyCode::Up));
+            chooser.on_key(press(KeyCode::Up));
             type_text(&mut chooser, "t");
             assert_eq!(chooser.fields_of(0)[0].value(), "t");
             assert_eq!(chooser.on_key(press(KeyCode::Esc)), ChooserAction::None);
@@ -989,7 +1049,10 @@ mod foundations {
             chooser.on_key(alt_enter());
             type_text(&mut chooser, "orders");
 
-            chooser.on_key(press(KeyCode::Tab));
+            for _ in 0..15 {
+                chooser.on_key(press(KeyCode::Left));
+            }
+            chooser.on_key(press(KeyCode::Up));
             assert_eq!(chooser.focus(), ChooserFocus::Actions);
             chooser.on_key(press(KeyCode::Char('k')));
             assert_eq!(chooser.selected(), 0);
@@ -1027,6 +1090,17 @@ mod foundations {
                 }
                 other => panic!("expected a submission, got {other:?}"),
             }
+        }
+
+        #[test]
+        fn enter_sends_an_action_with_only_optional_fields() {
+            let mut chooser =
+                Chooser::new(vec![ChooserItem::new("accept", "Akceptuje.")
+                    .with_field(ChooserField::text("comment"))]);
+            assert!(matches!(
+                chooser.on_key(press(KeyCode::Enter)),
+                ChooserAction::Submit(_)
+            ));
         }
 
         #[test]
@@ -3667,9 +3741,13 @@ mod task_app_detail {
             assert_eq!(plain.panel, None);
 
             let with_panel = detail::areas(area, 4, 6);
-            assert_eq!(with_panel.content.height, 8);
+            assert_eq!(with_panel.content.height, 7);
             let panel = with_panel.panel.expect("a panel");
             assert_eq!((panel.y, panel.height), (area.y + 14, 6));
+            assert_eq!(
+                panel.y - (with_panel.content.y + with_panel.content.height),
+                1
+            );
             assert_eq!(
                 detail::areas(area, 4, 40).content.height,
                 1,
@@ -3680,11 +3758,11 @@ mod task_app_detail {
             let with_notice = detail::areas(minimum, 5, 8);
             assert_eq!(with_notice.header.height, 5);
             assert_eq!(with_notice.tabs.height, 2);
-            assert_eq!(with_notice.panel.expect("panel").height, 8);
+            assert_eq!(with_notice.panel.expect("panel").height, 7);
             assert_eq!(with_notice.content.height, 1);
 
             let without_notice = detail::areas(minimum, 4, 9);
-            assert_eq!(without_notice.panel.expect("panel").height, 9);
+            assert_eq!(without_notice.panel.expect("panel").height, 8);
             assert_eq!(without_notice.content.height, 1);
         }
 
@@ -3909,6 +3987,39 @@ mod task_app_waiting {
         app
     }
 
+    #[test]
+    fn tab_and_shift_tab_leave_the_waiting_panel_visible() {
+        for key in [KeyCode::Tab, KeyCode::BackTab] {
+            let mut app = opened(waiting_on(
+                running("a", 1),
+                AttentionKind::Problem,
+                "review",
+                None,
+            ));
+            press(&mut app, key);
+            assert!(!app.panel_focused(), "{key:?} returns focus to the details");
+            assert!(
+                !app.detail().view("a").unwrap().waiting().is_collapsed(),
+                "changing focus leaves the waiting panel visible"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_from_task_details_reenters_the_waiting_panel() {
+        let mut app = opened(waiting_on(
+            running("a", 1),
+            AttentionKind::Problem,
+            "review",
+            None,
+        ));
+        press(&mut app, KeyCode::Tab);
+        assert!(!app.panel_focused());
+        press(&mut app, KeyCode::Tab);
+        assert!(app.panel_focused());
+        assert!(!app.detail().view("a").unwrap().waiting().is_collapsed());
+    }
+
     fn chooser_of(app: &TaskApp) -> &narsor::tui::chooser::Chooser {
         app.detail()
             .view("a")
@@ -3918,12 +4029,60 @@ mod task_app_waiting {
             .expect("a panel")
     }
 
+    fn composer_of(app: &TaskApp) -> &narsor::tui::chooser::Chooser {
+        app.detail()
+            .view("a")
+            .expect("details")
+            .waiting()
+            .composer()
+            .expect("a text composer")
+    }
+
     fn selected_label(app: &TaskApp) -> String {
         chooser_of(app)
             .selected_item()
             .expect("an entry")
             .label
             .clone()
+    }
+
+    fn enter_until_answer(app: &mut TaskApp) -> Request {
+        let task_id = app.list().selected_id().expect("selected task");
+        let fields = app
+            .detail()
+            .view(task_id)
+            .and_then(|view| view.waiting().chooser())
+            .and_then(|chooser| chooser.selected_item())
+            .map_or(0, |item| item.fields.len());
+        let mut request = Request::None;
+        for _ in 0..=fields {
+            request = press(app, KeyCode::Enter);
+            if request != Request::None {
+                break;
+            }
+        }
+        request
+    }
+
+    fn enter_until_error(app: &mut TaskApp) -> bool {
+        for _ in 0..8 {
+            let request = press(app, KeyCode::Enter);
+            let task_id = app.list().selected_id().expect("selected task");
+            let waiting = app.detail().view(task_id).unwrap().waiting();
+            let field_error = waiting.chooser().is_some_and(|chooser| {
+                chooser
+                    .items()
+                    .iter()
+                    .any(|item| item.fields.iter().any(|field| field.error().is_some()))
+            });
+            if waiting.error().is_some() || field_error {
+                return true;
+            }
+            if request != Request::None {
+                return false;
+            }
+        }
+        false
     }
 
     fn screen(app: &mut TaskApp, width: u16, height: u16) -> String {
@@ -4098,6 +4257,7 @@ mod task_app_waiting {
         let mut app = gate_app();
         ch(&mut app, '1');
         assert_eq!(selected_label(&app), "approved");
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
         let request = sent(press(&mut app, KeyCode::Enter));
         assert_eq!(request.summary, "odpowiedziano approved");
         let Submit::Input {
@@ -4138,6 +4298,7 @@ mod task_app_waiting {
             .iter()
             .all(|item| item.fields.len() == 1 && item.fields[0].name == "ambiguity_answer"));
         ch(&mut app, '2');
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
         let delivery = delivery(press(&mut app, KeyCode::Enter));
         assert_eq!(delivery.chosen_label.as_deref(), Some("replan"));
         assert_eq!(delivery.values["ambiguity_decision"], "replan");
@@ -4147,12 +4308,8 @@ mod task_app_waiting {
     fn a_rejected_resume_gives_the_reply_back_in_the_field() {
         // 2a9c6f2: the text of an answer that could not be delivered returns.
         let mut app = opened(with_pending(running("a", 1), question(Some("wersja 2"))));
-        assert_eq!(chooser_of(&app).items()[0].fields[0].value(), "wersja 2");
-        assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Request::None,
-            "a required field: Enter goes to it"
-        );
+        assert_eq!(composer_of(&app).fields_of(0)[0].value(), "wersja 2");
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
         let delivery = delivery(press(&mut app, KeyCode::Enter));
         assert_eq!(delivery.values["answer"], "wersja 2");
         assert!(delivery.chosen_label.is_none(), "a question has no label");
@@ -4166,7 +4323,7 @@ mod task_app_waiting {
             Request::None,
             "the answer is required"
         );
-        assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
+        assert_eq!(composer_of(&app).focus(), ChooserFocus::Fields);
         typed(&mut app, "ab");
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         typed(&mut app, "cd");
@@ -4174,7 +4331,7 @@ mod task_app_waiting {
         press(&mut app, KeyCode::Left);
         typed(&mut app, "X");
         assert_eq!(
-            chooser_of(&app).fields_of(0)[0].value(),
+            composer_of(&app).fields_of(0)[0].value(),
             "ab\nXcd",
             "an editor, not an append-only line"
         );
@@ -4183,6 +4340,32 @@ mod task_app_waiting {
             delivery.values["answer"], "ab\nXcd",
             "typed text goes out unchanged"
         );
+    }
+
+    #[test]
+    fn an_answer_composer_keeps_its_draft_across_refresh_and_waiting_return() {
+        let waiting = || with_pending(running("a", 1), question(None));
+        let mut app = opened(waiting());
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "pierwsza linia");
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        typed(&mut app, "druga linia");
+        let answer = "pierwsza linia\ndruga linia";
+
+        app.load(listing(vec![titled(waiting(), "NAR-12")], "refresh"));
+        assert_eq!(composer_of(&app).fields_of(0)[0].value(), answer);
+
+        app.load(listing(vec![titled(running("a", 1), "NAR-12")], "gone"));
+        let panel = app.detail().view("a").unwrap().waiting();
+        assert!(panel
+            .released()
+            .iter()
+            .any(|draft| draft.text.contains(answer)));
+
+        app.load(listing(vec![titled(waiting(), "NAR-12")], "return"));
+        assert_eq!(composer_of(&app).fields_of(0)[0].value(), answer);
+        let draft = app.detail().draft("a").expect("the answer draft");
+        assert_eq!(draft.matches(answer).count(), 1, "{draft}");
     }
 
     #[test]
@@ -4236,12 +4419,25 @@ mod task_app_waiting {
     }
 
     #[test]
-    fn a_problem_opens_on_a_message_to_the_agent_and_has_no_data_to_fill() {
-        // c7f3f0d: problems start in conversation mode.
+    fn a_problem_keeps_the_reply_composer_separate_from_the_actions() {
         let mut app = opened(with_pending(running("a", 1), problem(false)));
-        assert_eq!(selected_label(&app), "Napisz do agenta");
-        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        assert!(chooser_of(&app)
+            .items()
+            .iter()
+            .all(|item| item.label != "Napisz do agenta"));
+        press(&mut app, KeyCode::Down);
         typed(&mut app, "spróbuj jeszcze raz");
+        press(&mut app, KeyCode::Tab);
+        assert!(!app.panel_focused());
+        assert!(app
+            .detail()
+            .view("a")
+            .unwrap()
+            .waiting()
+            .draft_text()
+            .contains("spróbuj jeszcze raz"));
+        press(&mut app, KeyCode::BackTab);
+        assert!(app.panel_focused());
         let delivery = delivery(press(&mut app, KeyCode::Enter));
         assert_eq!(
             delivery.agent_message.as_deref(),
@@ -4266,14 +4462,14 @@ mod task_app_waiting {
         assert_eq!(summary.value(), "all units done");
 
         // Untouched, a proposal goes out as it was: the number stays a number.
-        let delivery = delivery(press(&mut app, KeyCode::Enter));
+        let delivery = delivery(enter_until_answer(&mut app));
         assert_eq!(delivery.chosen_label.as_deref(), Some("implemented"));
         assert_eq!(delivery.variables["summary"], "all units done");
         assert_eq!(delivery.variables["files"], json!(3));
 
         // Edited, the value is the operator's and the mark is gone.
         let mut app = opened(with_pending(running("a", 1), problem(true)));
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
         typed(&mut app, "!");
         let field = &chooser_of(&app).selected_item().unwrap().fields[0];
         assert!(!field.is_proposed());
@@ -4285,13 +4481,8 @@ mod task_app_waiting {
         let mut app = opened(with_pending(running("a", 1), problem(false)));
         ch(&mut app, '2');
         assert_eq!(selected_label(&app), "needs_human_decision");
-        assert_eq!(
-            press(&mut app, KeyCode::Enter),
-            Request::None,
-            "data.question is required"
-        );
+        assert!(enter_until_error(&mut app), "data.question is required");
         assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
-        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
         let field = &chooser_of(&app).fields_of(1)[0];
         assert_eq!(field.name, "data.question");
         assert!(field
@@ -4303,7 +4494,7 @@ mod task_app_waiting {
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         typed(&mut app, "scope=account");
-        let delivery = delivery(press(&mut app, KeyCode::Enter));
+        let delivery = delivery(enter_until_answer(&mut app));
         assert_eq!(
             delivery.chosen_label.as_deref(),
             Some("needs_human_decision")
@@ -4316,13 +4507,13 @@ mod task_app_waiting {
     fn a_key_given_twice_or_without_a_value_is_refused_at_the_panel() {
         let mut app = opened(with_pending(running("a", 1), problem(false)));
         ch(&mut app, '1');
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
         typed(&mut app, "x");
         press(&mut app, KeyCode::Down);
         typed(&mut app, "x=1");
         press(&mut app, KeyCode::Down);
         typed(&mut app, "summary=again");
-        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        assert!(enter_until_error(&mut app), "duplicate keys are refused");
         let error = app
             .detail()
             .view("a")
@@ -4336,10 +4527,10 @@ mod task_app_waiting {
         // A line without `=` is refused too.
         let mut app = opened(with_pending(running("a", 1), problem(false)));
         ch(&mut app, '1');
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Down);
         typed(&mut app, "bez znaku");
-        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        assert!(enter_until_error(&mut app), "a key without '=' is refused");
         assert!(app.detail().view("a").unwrap().waiting().error().is_some());
     }
 
@@ -4411,6 +4602,32 @@ mod task_app_waiting {
     }
 
     #[test]
+    fn an_optional_waiting_action_note_opens_with_enter() {
+        let failed = waiting_on(
+            running("a", 1),
+            AttentionKind::FailedStep,
+            "fk1",
+            Some("test"),
+        );
+        let mut app = opened(failed);
+        read_conductor(&mut app, conductor(true));
+        ch(&mut app, '3');
+
+        assert_eq!(chooser_of(&app).selected(), 2);
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        assert_eq!(chooser_of(&app).focus(), ChooserFocus::Fields);
+        typed(&mut app, "powód restartu");
+        assert_eq!(chooser_of(&app).fields_of(2)[0].value(), "powód restartu");
+        assert_eq!(
+            sent(press(&mut app, KeyCode::Enter)).submit,
+            Submit::Operator(OperatorCommand::RestartStep {
+                note: Some("powód restartu".to_string()),
+                failure_key: Some("fk1".to_string()),
+            })
+        );
+    }
+
+    #[test]
     fn a_failed_step_rejects_or_restarts_with_a_note_naming_its_failure() {
         let failed = waiting_on(
             running("a", 1),
@@ -4429,7 +4646,7 @@ mod task_app_waiting {
         );
 
         ch(&mut app, '3');
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
         typed(&mut app, "użyj nowszego toolchaina");
         assert_eq!(
             sent(press(&mut app, KeyCode::Enter)).submit,
@@ -4471,7 +4688,7 @@ mod task_app_waiting {
         );
         // The raw error comes from the timeline once the entry is built again.
         assert_eq!(chooser_of(&app).items().len(), 1, "only the restart");
-        let request = sent(press(&mut app, KeyCode::Enter));
+        let request = sent(enter_until_answer(&mut app));
         assert_eq!(
             request.submit,
             Submit::Operator(OperatorCommand::RestartStep {
@@ -4612,6 +4829,8 @@ mod task_app_waiting {
         let mut app = gate_app();
         press(&mut app, KeyCode::Enter);
         typed(&mut app, "szkic");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.panel_focused(), "the first Esc returns to the actions");
         press(&mut app, KeyCode::Esc);
         assert!(!app.panel_focused());
         assert!(app.detail().view("a").unwrap().waiting().is_collapsed());
@@ -4861,6 +5080,8 @@ mod task_app_waiting {
         let mut app = gate_app();
         press(&mut app, KeyCode::Esc);
         assert!(!app.panel_focused() && app.focus() == Focus::Details);
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
         read_step_conversation(&mut app, "a", 1);
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.step_focus(), StepFocus::Conversation);
@@ -5025,6 +5246,8 @@ mod task_app_waiting {
         ch(&mut app, ' ');
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Esc);
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
         let revision = app.list().selected().unwrap().revision;
         read_step_conversation(&mut app, "NAR-12", revision);
         press(&mut app, KeyCode::Enter);
@@ -5213,7 +5436,9 @@ mod task_app_waiting {
         ch(&mut app, ' ');
         press(&mut app, KeyCode::Enter);
         ch(&mut app, '1');
-        let request = press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "safe");
+        let request = enter_until_answer(&mut app);
         app.perform(request).await;
         let text = app.notifier().latest().expect("sent").text.clone();
         assert!(text.contains("approved") || text.contains("oved"), "{text}");
@@ -5988,7 +6213,8 @@ mod task_app_actions {
             let mut app = loaded(offered(Some(&["plan", "ship"])));
             ch(&mut app, 't');
             ch(&mut app, '3');
-            // Enter goes to the fields; Enter again with no reason complains.
+            // Enter goes to the fields, then the reason, then validation runs.
+            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
             assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
             assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
             assert!(app.overlay().is_some(), "no reason, nothing to confirm");
@@ -6034,6 +6260,20 @@ mod task_app_actions {
             ch(&mut app, 't');
             ch(&mut app, '3');
             press(&mut app, KeyCode::Enter);
+            assert_eq!(
+                app.overlay().unwrap().chooser().unwrap().focus(),
+                narsor::tui::chooser::ChooserFocus::Fields
+            );
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(
+                app.overlay().unwrap().chooser().unwrap().focus(),
+                narsor::tui::chooser::ChooserFocus::Actions
+            );
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(
+                app.overlay().unwrap().chooser().unwrap().focus(),
+                narsor::tui::chooser::ChooserFocus::Fields
+            );
             press(&mut app, KeyCode::Down);
             typed(&mut app, "powód");
             press(&mut app, KeyCode::Enter);
@@ -6848,6 +7088,43 @@ mod task_app_conductor {
         assert_eq!(app.focus(), Focus::Details);
         app.detail_mut().set_tab(DetailTab::Conductor);
         app
+    }
+
+    #[test]
+    fn tab_while_composing_a_conductor_message_switches_panels_and_keeps_the_draft() {
+        let mut app = app();
+        let task = waiting_on(running("a", 1), AttentionKind::Question, "review", None);
+        app.load(listing(vec![titled(task, "NAR-12")], "c"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus(), Focus::Details);
+        app.detail_mut().set_tab(DetailTab::Conductor);
+        let revision = app.list().selected().unwrap().revision;
+        app.on_detail_read(
+            "a",
+            revision,
+            DetailRead::Conductor(Ok(ConductorReadResponse::Available {
+                conductor: Box::new(conductor_view(vec![], json!({}))),
+                source: ExecutionEventsSource::Runner,
+            })),
+        );
+        if app.panel_focused() {
+            press(&mut app, KeyCode::Tab);
+        }
+
+        ch(&mut app, 'c');
+        typed(&mut app, "zachowaj tę wiadomość");
+        assert!(app.detail().view("a").unwrap().conductor().is_typing());
+        press(&mut app, KeyCode::Tab);
+        assert!(app.panel_focused(), "Tab moves from the draft to waiting");
+        press(&mut app, KeyCode::Tab);
+        assert!(
+            app.detail().view("a").unwrap().conductor().is_typing(),
+            "Tab returns to the conductor draft"
+        );
+        assert_eq!(
+            app.detail().view("a").unwrap().conductor().draft(),
+            "zachowaj tę wiadomość"
+        );
     }
 
     fn revision(app: &TaskApp) -> u64 {
@@ -8001,8 +8278,18 @@ mod task_app_create {
     }
 
     fn fill_ticket(app: &mut TaskApp, ticket: &str) {
-        press(app, KeyCode::Tab);
+        press(app, KeyCode::Enter);
         typed(app, ticket);
+    }
+
+    fn enter_until_send(app: &mut TaskApp) -> Request {
+        for _ in 0..8 {
+            let request = press(app, KeyCode::Enter);
+            if request != Request::None {
+                return request;
+            }
+        }
+        Request::None
     }
 
     fn field_value(app: &TaskApp, label: &str, field: &str) -> String {
@@ -8075,6 +8362,8 @@ mod task_app_create {
 
         app.list_mut().select(id);
         press(app, KeyCode::Enter);
+        app.detail_mut()
+            .set_tab(narsor::tui::task_app::DetailTab::Progress);
         let revision = app.list().selected().expect("a selected task").revision;
         let mut step = super::task_app_support::position("plan", PositionStatus::InProgress);
         step.conversation = ConversationState::Recorded;
@@ -8202,8 +8491,10 @@ mod task_app_create {
         fn a_missing_required_input_is_an_error_at_the_field_and_nothing_is_sent() {
             let mut app = app_with(vec![]);
             open_form(&mut app);
-            press(&mut app, KeyCode::Tab);
-            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert_eq!(enter_until_send(&mut app), Request::None);
+            for _ in 0..4 {
+                assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            }
             let item = chooser_item(&app, "implement-feature");
             assert!(
                 item.fields[0]
@@ -8223,7 +8514,7 @@ mod task_app_create {
             fill_ticket(&mut app, "NAR-18");
             press(&mut app, KeyCode::Down);
             typed(&mut app, "1-2");
-            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert_eq!(enter_until_send(&mut app), Request::None);
             let item = chooser_item(&app, "implement-feature");
             assert!(
                 item.fields[1]
@@ -8243,14 +8534,15 @@ mod task_app_create {
             let mut app = app_with(vec![titled(queued("a", 1), "NAR-1")]);
             open_form(&mut app);
             fill_ticket(&mut app, "NAR-18");
-            // `Shift+Tab` from the first field, like `Esc`, is the way back.
+            // `Shift+Tab` returns to the adjacent panel and preserves the form.
             press(&mut app, KeyCode::BackTab);
             assert_eq!(app.view_kind(), ViewKind::NewTask);
+            assert_eq!(app.focus(), narsor::tui::task_app::Focus::List);
             assert_eq!(
-                app.new_task_form().unwrap().chooser().focus(),
-                narsor::tui::chooser::ChooserFocus::Actions
+                field_value(&app, "implement-feature", "ticket_id"),
+                "NAR-18"
             );
-            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Tab);
             assert_eq!(
                 app.new_task_form().unwrap().chooser().focus(),
                 narsor::tui::chooser::ChooserFocus::Fields,
@@ -8263,26 +8555,18 @@ mod task_app_create {
         }
 
         #[test]
-        fn tab_walks_the_fields_and_wraps_and_a_failed_send_lands_on_the_bad_field() {
+        fn arrows_walk_fields_and_tab_switches_to_the_adjacent_panel() {
             let mut app = app_with(vec![titled(queued("a", 1), "NAR-1")]);
             open_form(&mut app);
             fill_ticket(&mut app, "NAR-18");
             press(&mut app, KeyCode::Down);
             typed(&mut app, "1-2");
-            let request = press(&mut app, KeyCode::Enter);
-            assert_eq!(request, Request::None, "attempts is not a number");
-            // The error is on `attempts`, which has the focus: typing goes there.
-            typed(&mut app, "x");
-            assert_eq!(
-                field_value(&app, "implement-feature", "attempts"),
-                "1-2",
-                "a letter is no part of a number"
-            );
-            press(&mut app, KeyCode::Backspace);
-            press(&mut app, KeyCode::Backspace);
-            press(&mut app, KeyCode::Backspace);
-            typed(&mut app, "3");
-            assert_eq!(field_value(&app, "implement-feature", "attempts"), "3");
+            assert_eq!(field_value(&app, "implement-feature", "attempts"), "1-2");
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.focus(), narsor::tui::task_app::Focus::List);
+            assert_eq!(field_value(&app, "implement-feature", "attempts"), "1-2");
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.focus(), narsor::tui::task_app::Focus::Details);
         }
 
         #[test]
@@ -8342,11 +8626,39 @@ mod task_app_create {
         }
 
         #[test]
+        fn tab_switches_panels_without_losing_a_new_task_draft() {
+            let mut app = app_with(vec![titled(queued("a", 1), "NAR-1")]);
+            open_form(&mut app);
+            fill_ticket(&mut app, "NAR-18");
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.focus(), narsor::tui::task_app::Focus::List);
+            assert_eq!(app.view_kind(), ViewKind::NewTask);
+            assert_eq!(
+                field_value(&app, "implement-feature", "ticket_id"),
+                "NAR-18"
+            );
+            ch(&mut app, 'H');
+            assert_eq!(app.view_kind(), ViewKind::NewTask);
+            assert_eq!(
+                field_value(&app, "implement-feature", "ticket_id"),
+                "NAR-18",
+                "a list shortcut cannot discard the form"
+            );
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.focus(), narsor::tui::task_app::Focus::Details);
+            assert_eq!(app.key_context().base, Context::Form);
+            assert_eq!(
+                field_value(&app, "implement-feature", "ticket_id"),
+                "NAR-18"
+            );
+        }
+
+        #[test]
         fn keys_in_the_form_are_the_choosers_and_q_is_text_in_a_field() {
             let mut app = app_with(vec![]);
             open_form(&mut app);
             assert_eq!(app.key_context().base, Context::Panel);
-            press(&mut app, KeyCode::Tab);
+            press(&mut app, KeyCode::Enter);
             assert_eq!(app.key_context().base, Context::Form);
             ch(&mut app, 'q');
             assert!(!app.should_quit());
@@ -8436,7 +8748,7 @@ mod task_app_create {
             let mut app = app_with(vec![]);
             open_form(&mut app);
             choose(&mut app, PATH_LABEL);
-            press(&mut app, KeyCode::Tab);
+            press(&mut app, KeyCode::Enter);
             typed(&mut app, "/srv/workflows/wf.yaml");
             assert_eq!(
                 press(&mut app, KeyCode::Enter),
@@ -8453,7 +8765,7 @@ mod task_app_create {
             let mut app = app_with(vec![]);
             open_form(&mut app);
             choose(&mut app, PATH_LABEL);
-            press(&mut app, KeyCode::Tab);
+            press(&mut app, KeyCode::Enter);
             typed(&mut app, "/srv/bad.yaml");
             app.on_path_checked(
                 "/srv/bad.yaml",
@@ -8496,7 +8808,7 @@ mod task_app_create {
             let mut app = app_with(vec![]);
             open_form(&mut app);
             choose(&mut app, PATH_LABEL);
-            press(&mut app, KeyCode::Tab);
+            press(&mut app, KeyCode::Enter);
             typed(&mut app, "/srv/ok.yaml");
             app.on_path_checked(
                 "/srv/ok.yaml",
@@ -8546,7 +8858,7 @@ mod task_app_create {
             let mut app = app_with(vec![]);
             open_form(&mut app);
             choose(&mut app, PATH_LABEL);
-            press(&mut app, KeyCode::Tab);
+            press(&mut app, KeyCode::Enter);
             typed(&mut app, "/nope.yaml");
             app.on_path_checked(
                 "/nope.yaml",
@@ -8579,11 +8891,16 @@ mod task_app_create {
             app
         }
 
+        fn submit_filled(app: &mut TaskApp) -> Request {
+            super::enter_until_send(app)
+        }
+
         #[test]
         fn enter_makes_the_id_first_and_the_row_goes_last_and_is_selected() {
             let mut app = filled();
             let before = rows(&app);
-            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+            let request = super::enter_until_send(&mut app);
+            let Request::SendTask(id) = request else {
                 panic!("a send was expected");
             };
             assert!(id.starts_with("task-"), "{id}");
@@ -8608,7 +8925,8 @@ mod task_app_create {
             ch(&mut app, 'x'); // not a field: ignored once the form closed
             let _ = app;
             let mut app = filled();
-            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+            let request = super::enter_until_send(&mut app);
+            let Request::SendTask(id) = request else {
                 panic!("a send was expected");
             };
             let CreateHow::Catalogue(request) = &app.outgoing()[0].send else {
@@ -8637,7 +8955,9 @@ mod task_app_create {
             press(&mut app, KeyCode::Down);
             press(&mut app, KeyCode::Right);
             assert_eq!(field_value(&app, "implement-feature", "dry_run"), "true");
-            press(&mut app, KeyCode::Enter);
+            for _ in 0..3 {
+                press(&mut app, KeyCode::Enter);
+            }
             let CreateHow::Catalogue(request) = &app.outgoing()[0].send else {
                 panic!("catalogue");
             };
@@ -8650,7 +8970,7 @@ mod task_app_create {
             app.set_capabilities(capabilities(true, None));
             open_form(&mut app);
             fill_ticket(&mut app, "NAR-18");
-            assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+            assert_eq!(submit_filled(&mut app), Request::None);
             assert_eq!(app.view_kind(), ViewKind::NewTask, "the form stays");
             assert_eq!(
                 field_value(&app, "implement-feature", "ticket_id"),
@@ -8664,7 +8984,7 @@ mod task_app_create {
         #[tokio::test]
         async fn a_lost_answer_is_sent_again_with_the_same_id_and_then_stays_unsent() {
             let mut app = filled();
-            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+            let Request::SendTask(id) = submit_filled(&mut app) else {
                 panic!("a send was expected");
             };
             app.perform(Request::SendTask(id.clone())).await;
@@ -8705,7 +9025,7 @@ mod task_app_create {
         fn r_on_an_unsent_row_sends_it_again_when_the_connection_allows_and_says_why_not_otherwise()
         {
             let mut app = filled();
-            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+            let Request::SendTask(id) = submit_filled(&mut app) else {
                 panic!("a send was expected");
             };
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -8750,7 +9070,7 @@ mod task_app_create {
         #[test]
         fn the_unsent_row_has_details_that_say_where_it_stands() {
             let mut app = filled();
-            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+            let Request::SendTask(id) = submit_filled(&mut app) else {
                 panic!("a send was expected");
             };
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -8778,7 +9098,7 @@ mod task_app_create {
         #[test]
         fn what_the_server_lists_is_no_longer_waiting_to_be_confirmed() {
             let mut app = filled();
-            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+            let Request::SendTask(id) = submit_filled(&mut app) else {
                 panic!("a send was expected");
             };
             // The answer was lost, but the task is there when the list is read.
@@ -8801,7 +9121,7 @@ mod task_app_create {
         #[test]
         fn the_pending_row_can_be_moved_over_and_the_selection_stays_on_it() {
             let mut app = filled();
-            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+            let Request::SendTask(id) = submit_filled(&mut app) else {
                 panic!("a send was expected");
             };
             ch(&mut app, 'k');
@@ -9018,6 +9338,25 @@ mod task_app_create {
             assert_eq!(app.history().unwrap().tab(), DetailTab::Progress);
             press(&mut app, KeyCode::Esc);
             assert_eq!(app.key_context(), Stack::from(Context::History));
+        }
+
+        #[test]
+        fn tab_and_shift_tab_switch_history_panels_without_enabling_task_actions() {
+            let mut app = opened();
+            let selected = app.history().unwrap().selected();
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.focus(), narsor::tui::task_app::Focus::Details);
+            assert_eq!(app.key_context().base, Context::HistoryDetails);
+            assert_eq!(app.history().unwrap().selected(), selected);
+            assert_eq!(
+                narsor::tui::keymap::lookup(app.key_context(), &KeyEvent::from(KeyCode::Char('p'))),
+                None,
+                "history details expose no task mutation actions"
+            );
+            press(&mut app, KeyCode::BackTab);
+            assert_eq!(app.focus(), narsor::tui::task_app::Focus::List);
+            assert_eq!(app.key_context().base, Context::History);
+            assert_eq!(app.history().unwrap().selected(), selected);
         }
 
         #[test]
@@ -9553,7 +9892,7 @@ mod task_app_create {
                 chooser_item(&app, "implement-feature").description
             );
             fill_ticket(&mut app, "NAR-18");
-            let request = press(&mut app, KeyCode::Enter);
+            let request = enter_until_send(&mut app);
             assert!(matches!(request, Request::SendTask(_)), "{request:?}");
             app.perform(request).await;
 
@@ -9579,7 +9918,14 @@ mod task_app_create {
             let (harness, _controller) = harness().await;
             let mut app = app_behind_a_lossy_proxy(&harness, 1).await;
             open_the_form(&mut app, &harness).await;
-            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+            let mut request = Request::None;
+            for _ in 0..8 {
+                request = press(&mut app, KeyCode::Enter);
+                if request != Request::None {
+                    break;
+                }
+            }
+            let Request::SendTask(id) = request else {
                 panic!("a send was expected");
             };
             app.perform(Request::SendTask(id.clone())).await;
@@ -9615,7 +9961,7 @@ mod task_app_create {
             let (harness, _controller) = harness().await;
             let mut app = app_behind_a_lossy_proxy(&harness, 1).await;
             open_the_form(&mut app, &harness).await;
-            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+            let Request::SendTask(id) = super::enter_until_send(&mut app) else {
                 panic!("a send was expected");
             };
             app.perform(Request::SendTask(id.clone())).await;
@@ -9639,7 +9985,7 @@ mod task_app_create {
             let (harness, _controller) = harness().await;
             let mut app = app_behind_a_lossy_proxy(&harness, 2).await;
             open_the_form(&mut app, &harness).await;
-            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+            let Request::SendTask(id) = super::enter_until_send(&mut app) else {
                 panic!("a send was expected");
             };
             app.perform(Request::SendTask(id.clone())).await;
@@ -9670,7 +10016,7 @@ mod task_app_create {
             let (harness, _controller) = harness().await;
             let mut app = app_behind_a_lossy_proxy(&harness, 2).await;
             open_the_form(&mut app, &harness).await;
-            let Request::SendTask(id) = press(&mut app, KeyCode::Enter) else {
+            let Request::SendTask(id) = super::enter_until_send(&mut app) else {
                 panic!("a send was expected");
             };
             app.perform(Request::SendTask(id.clone())).await;
@@ -9704,7 +10050,7 @@ mod task_app_create {
                 implement_feature(2),
             )
             .unwrap();
-            let request = press(&mut app, KeyCode::Enter);
+            let request = super::enter_until_send(&mut app);
             app.perform(request).await;
 
             assert_eq!(app.view_kind(), ViewKind::NewTask, "the form is back");
@@ -9749,7 +10095,7 @@ mod task_app_create {
                 "a local daemon reads files"
             );
             choose(&mut app, PATH_LABEL);
-            press(&mut app, KeyCode::Tab);
+            press(&mut app, KeyCode::Enter);
             typed(&mut app, bad_path.to_str().unwrap());
             let request = press(&mut app, KeyCode::Enter);
             assert_eq!(
@@ -9783,7 +10129,7 @@ mod task_app_create {
             ));
             press(&mut app, KeyCode::Down);
             typed(&mut app, "NAR-77");
-            let request = press(&mut app, KeyCode::Enter);
+            let request = super::enter_until_send(&mut app);
             let Request::SendTask(id) = &request else {
                 panic!("{request:?}");
             };
@@ -9801,6 +10147,16 @@ mod task_app_create {
         use super::*;
 
         use super::super::environment_support::{workflow_image, workflow_yaml};
+
+        fn submit_repository_form(app: &mut TaskApp) -> Request {
+            for _ in 0..8 {
+                let request = press(app, KeyCode::Enter);
+                if request != Request::None {
+                    return request;
+                }
+            }
+            Request::None
+        }
 
         fn with_a_repository_input(root: &std::path::Path) {
             let body = workflow_yaml("implement-feature", Some(&workflow_image()));
@@ -9934,7 +10290,7 @@ mod task_app_create {
             typed(&mut app, "narsor");
             press(&mut app, KeyCode::Down);
             typed(&mut app, "git@github.com:acme/narsor.git");
-            let request = press(&mut app, KeyCode::Enter);
+            let request = submit_repository_form(&mut app);
             assert!(matches!(request, Request::AddRepository(_)), "{request:?}");
             app.perform(request).await;
 
@@ -9976,7 +10332,7 @@ mod task_app_create {
             typed(&mut app, "evil");
             press(&mut app, KeyCode::Down);
             typed(&mut app, "ext::sh -c evil");
-            let request = press(&mut app, KeyCode::Enter);
+            let request = submit_repository_form(&mut app);
             app.perform(request).await;
 
             let form = app.repositories().unwrap().form().expect("the form stays");
@@ -10383,7 +10739,7 @@ mod task_app_harness {
         ch(&mut app, ' ');
         press(&mut app, KeyCode::Enter);
         assert!(app.panel_focused());
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
         assert_eq!(app.key_context().base, Context::Form);
         assert_eq!(ch(&mut app, 'h'), Request::None);
         assert!(app.overlay().is_none());
@@ -10414,7 +10770,7 @@ mod task_app_harness {
             )]),
             registry(vec![]),
         );
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
         assert_eq!(app.key_context().base, Context::Form);
         assert_eq!(ch(&mut app, 'h'), Request::None);
         assert!(app.overlay().is_none());

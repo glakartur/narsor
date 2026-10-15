@@ -46,11 +46,11 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU16;
 
-use ratatui::Frame;
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use ratatui::Frame;
 
 use crate::api::ClientError;
 use crate::cli::task_text::lifecycle_name;
@@ -59,8 +59,8 @@ use crate::controller_protocol::{
     ConductorReadResponse, ExecutionEventsQuery, ExecutionEventsResponse, TaskSummary,
     TimelineResponse,
 };
+use crate::domain::display::{safe_link_url, DisplayLink, EMPTY_LINK_TEXT};
 use crate::domain::ExecutionStatus;
-use crate::domain::display::{DisplayLink, EMPTY_LINK_TEXT, safe_link_url};
 use narsor_protocol::api::ConversationState;
 use narsor_protocol::controller::{QueueReason, TaskLifecycle};
 
@@ -71,13 +71,13 @@ use super::list::{describe_loss, fit, state_icon, title_of};
 use super::notify::Severity;
 use super::tabs::conductor::{self, Conductor};
 use super::tabs::conversation::{
-    self, Attempt, AttemptRead, Attempts, Conversation, ReadFailure, transcript_action,
+    self, transcript_action, Attempt, AttemptRead, Attempts, Conversation, ReadFailure,
 };
 use super::tabs::events::{self, Events};
 use super::tabs::info::{self, Info};
 use super::tabs::progress::{self, Progress};
 use super::waiting::WaitingPanel;
-use super::{DetailTab, DetailView, StepFocus, TaskApp, failure_reason};
+use super::{failure_reason, DetailTab, DetailView, StepFocus, TaskApp};
 
 /// Everything the details of one task remember.
 #[derive(Debug, Clone)]
@@ -467,8 +467,8 @@ pub struct Areas {
     pub panel: Option<Rect>,
 }
 
-/// Three content lines plus the separator above the tabs.
-const HEADER_LINES: u16 = 4;
+/// The three lines of task metadata and the quiet row above the tabs.
+const HEADER_LINES: u16 = 5;
 
 /// Splits the details `area`: a header `header_lines` high — one more than
 /// [`HEADER_LINES`] while the task has a notice, which moves the two-row tabs
@@ -484,10 +484,22 @@ pub fn areas(area: Rect, header_lines: u16, panel_height: u16) -> Areas {
     );
     let used = header.height + tabs.height;
     let remaining = area.height - used;
-    let panel_height = panel_height.min(remaining.saturating_sub(1));
-    let content = Rect::new(area.x, area.y + used, area.width, remaining - panel_height);
-    let panel = (panel_height > 0)
-        .then(|| Rect::new(area.x, content.y + content.height, area.width, panel_height));
+    let panel_height = panel_height.min(remaining.saturating_sub(2));
+    let gap = u16::from(panel_height > 0);
+    let content = Rect::new(
+        area.x,
+        area.y + used,
+        area.width,
+        remaining - panel_height - gap,
+    );
+    let panel = (panel_height > 0).then(|| {
+        Rect::new(
+            area.x,
+            content.y + content.height + gap,
+            area.width,
+            panel_height,
+        )
+    });
     Areas {
         header,
         tabs,
@@ -843,13 +855,20 @@ pub(super) fn render_view(
         KeysAt::Panel | KeysAt::Elsewhere => None,
     };
     let focused = content_keys.is_some();
-    let notice = notice(view.task, styles, stale, area.width);
+    let inner_width = area.width.saturating_sub(3);
+    let notice = notice(view.task, styles, stale, inner_width);
     let header_lines = HEADER_LINES + u16::from(notice.is_some());
     let panel_height = view
         .detail
         .waiting
-        .preferred_height(area.width, area.height, header_lines);
+        .preferred_height(inner_width, area.height, header_lines);
     let parts = areas(area, header_lines, panel_height);
+    let content = Rect::new(
+        parts.content.x.saturating_add(2),
+        parts.content.y.saturating_add(1),
+        parts.content.width.saturating_sub(3),
+        parts.content.height.saturating_sub(2),
+    );
 
     let (mut lines, spots) = header(
         view.task,
@@ -857,17 +876,50 @@ pub(super) fn render_view(
         &view.detail.progress,
         styles,
         stale,
-        area.width,
+        inner_width,
     );
+    lines.insert(0, Line::default());
     lines.extend(notice);
     lines.push(Line::styled(
-        "─".repeat(usize::from(area.width)),
-        styles.of(Role::Done),
+        "─".repeat(usize::from(inner_width)),
+        styles.task_tabs_divider(),
     ));
-    frame.render_widget(Paragraph::new(lines), parts.header);
-    if hyperlinks {
-        link_spots(frame.buffer_mut(), parts.header, &spots);
+    let header_content = Rect::new(
+        parts.header.x.saturating_add(2),
+        parts.header.y,
+        parts.header.width.saturating_sub(3),
+        parts.header.height,
+    );
+    frame.render_widget(Paragraph::new(lines), header_content);
+    let header_background = styles.task_header_background().bg;
+    for y in parts.header.y..parts.header.y + parts.header.height {
+        for x in parts.header.x..parts.header.x + parts.header.width {
+            if let (Some(color), Some(cell)) =
+                (header_background, frame.buffer_mut().cell_mut((x, y)))
+            {
+                cell.bg = color;
+            }
+        }
     }
+    if hyperlinks {
+        link_spots(frame.buffer_mut(), header_content, &spots);
+    }
+    let header_background = styles.task_header_background().bg;
+    if let Some(color) = header_background {
+        for y in parts.tabs.y..parts.tabs.y.saturating_add(parts.tabs.height) {
+            for x in parts.tabs.x..parts.tabs.x.saturating_add(parts.tabs.width) {
+                if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                    cell.bg = color;
+                }
+            }
+        }
+    }
+    let tabs_content = Rect::new(
+        parts.tabs.x.saturating_add(2),
+        parts.tabs.y,
+        parts.tabs.width.saturating_sub(3),
+        parts.tabs.height,
+    );
     frame.render_widget(
         Paragraph::new(tab_bar(
             view.tab,
@@ -875,12 +927,19 @@ pub(super) fn render_view(
             view.detail.conversation.transcript().is_following_end(),
             focused,
             styles,
-            parts.tabs.width,
+            tabs_content.width,
         )),
-        parts.tabs,
+        tabs_content,
     );
+    if parts.tabs.height > 1 {
+        let underline_y = parts.tabs.y + 1;
+        for x in parts.tabs.x..parts.tabs.x.saturating_add(parts.tabs.width) {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, underline_y)) {
+                cell.bg = ratatui::style::Color::Reset;
+            }
+        }
+    }
 
-    let content = parts.content;
     let unstarted = unstarted_message(view.task, view.queue_place);
     match (view.tab, unstarted) {
         (

@@ -19,7 +19,7 @@
 //! * What the server registered is passed through [`one_line`] / the chooser's
 //!   sanitising before it is drawn.
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
@@ -283,6 +283,10 @@ impl TaskApp {
 
     /// A key while the repositories are open.
     pub(super) fn on_repositories_key(&mut self, key: KeyEvent, confirming_quit: bool) -> Request {
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.focus = Focus::List;
+            return Request::None;
+        }
         let View::Repositories(repositories) = &mut self.view else {
             return Request::None;
         };

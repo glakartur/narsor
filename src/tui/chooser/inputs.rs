@@ -32,6 +32,7 @@ pub(super) fn render(
     area: Rect,
     chooser: &Chooser,
     styles: &Styles,
+    owner_focused: bool,
     footer: bool,
 ) {
     let Some(item) = chooser.selected_item() else {
@@ -46,19 +47,13 @@ pub(super) fn render(
     ])
     .areas(head);
     render_strip(frame, strip, item, styles, footer);
-    let focused = (chooser.focus == ChooserFocus::Fields).then_some(chooser.field);
+    let focused = (owner_focused && chooser.focus == ChooserFocus::Fields).then_some(chooser.field);
     render_bar(frame, bar, item, focused, styles);
     render_status(frame, status, item, focused, styles);
     render_long_fields(frame, rest, chooser, item, focused, styles);
 }
 
-fn render_strip(
-    frame: &mut Frame,
-    area: Rect,
-    item: &ChooserItem,
-    styles: &Styles,
-    footer: bool,
-) {
+fn render_strip(frame: &mut Frame, area: Rect, item: &ChooserItem, styles: &Styles, footer: bool) {
     let summary = item
         .description
         .lines()
@@ -68,7 +63,10 @@ fn render_strip(
     if footer {
         frame.render_widget(
             Paragraph::new(vec![
-                Line::styled(format!("  {}", one_line(&item.label)), styles.strong(Role::Calm)),
+                Line::styled(
+                    format!("  {}", one_line(&item.label)),
+                    styles.strong(Role::Calm),
+                ),
                 Line::raw(format!("  {summary}")),
             ]),
             area,

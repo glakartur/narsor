@@ -410,6 +410,8 @@ pub struct Chooser {
     /// The layout of a form of inputs: with the focus in the fields, the list
     /// folds into a strip and the fields take the screen.
     inputs_layout: bool,
+    /// Whether Enter opens fields even when they are optional.
+    enter_fields_on_activate: bool,
     /// The first entry in view: the list scrolls inside its pane, and a
     /// rebuild keeps it where it was.
     top: usize,
@@ -425,16 +427,22 @@ impl Chooser {
             field: 0,
             description_scroll: ScrollState::new(),
             inputs_layout: false,
+            enter_fields_on_activate: false,
             top: 0,
         }
     }
 
     /// The same chooser in the layout of a form of inputs: `Enter` on an entry
     /// with fields goes into them; there the short fields make a bar, the
-    /// multi-line ones fill the screen, `Esc` and `Shift+Tab` from the first
-    /// field return to the list.
+    /// multi-line ones fill the screen, and `Esc` returns to the list.
     pub fn with_inputs_layout(mut self) -> Self {
         self.inputs_layout = true;
+        self
+    }
+
+    /// Enters any attached fields with Enter, including optional ones.
+    pub fn enter_fields_on_activate(mut self) -> Self {
+        self.enter_fields_on_activate = true;
         self
     }
 
@@ -649,8 +657,8 @@ impl Chooser {
         ChooserAction::None
     }
 
-    /// `Enter` on the list: a blocked entry says why, an entry with required
-    /// fields takes the operator to the first field, anything else is sent.
+    /// `Enter` on the list: a blocked entry says why, an entry with fields
+    /// takes the operator to them, and a fieldless entry is sent.
     fn activate(&mut self) -> ChooserAction {
         let Some(item) = self.selected_item() else {
             return ChooserAction::None;
@@ -658,7 +666,7 @@ impl Chooser {
         if let Some(reason) = &item.unavailable {
             return ChooserAction::Blocked(reason.clone());
         }
-        if self.inputs_layout && !item.fields.is_empty()
+        if ((self.inputs_layout || self.enter_fields_on_activate) && !item.fields.is_empty())
             || item.fields.iter().any(|field| field.required)
         {
             self.focus_fields();
@@ -713,33 +721,31 @@ impl Chooser {
     }
 
     fn on_fields_key(&mut self, event: KeyEvent) -> ChooserAction {
-        if self.inputs_layout {
-            match event.code {
-                KeyCode::Esc => {
-                    self.leave_fields();
-                    return ChooserAction::None;
-                }
-                KeyCode::BackTab => {
-                    if self.focus_order().first() == Some(&self.field) {
-                        self.leave_fields();
-                    } else {
-                        self.move_field(-1);
+        if self.inputs_layout && matches!(event.code, KeyCode::Tab | KeyCode::BackTab) {
+            if event.code == KeyCode::BackTab && self.focus_order().first() == Some(&self.field) {
+                self.leave_fields();
+            } else {
+                let order = self.focus_order();
+                if event.code == KeyCode::Tab && order.last() == Some(&self.field) {
+                    if let Some(first) = order.first() {
+                        self.field = *first;
                     }
-                    return ChooserAction::None;
+                } else {
+                    self.move_field(if event.code == KeyCode::Tab { 1 } else { -1 });
                 }
-                KeyCode::Tab => {
-                    self.step_field_wrapping();
-                    return ChooserAction::None;
-                }
-                _ => {}
             }
+            return ChooserAction::None;
+        }
+        if event.code == KeyCode::Esc && self.inputs_layout {
+            self.leave_fields();
+            return ChooserAction::None;
         }
         match lookup(Context::Panel, &event) {
             Some(Action::SwitchFocus) => {
                 self.focus = ChooserFocus::Actions;
                 return ChooserAction::None;
             }
-            Some(Action::Submit) => return self.submit(),
+            Some(Action::Submit) => return self.advance_field_or_submit(),
             Some(Action::Cancel) => return ChooserAction::Cancel,
             Some(Action::Newline) => {
                 self.edit_field(&event, true);
@@ -748,11 +754,58 @@ impl Chooser {
             _ => {}
         }
         match event.code {
-            KeyCode::Down => self.move_field(1),
-            KeyCode::Up => self.move_field(-1),
+            KeyCode::Down => self.step_field_or_cursor(1),
+            KeyCode::Up => self.step_field_or_cursor(-1),
             _ => self.edit_field(&event, false),
         }
         ChooserAction::None
+    }
+
+    fn advance_field_or_submit(&mut self) -> ChooserAction {
+        let order = self.focus_order();
+        let Some(position) = order.iter().position(|&index| index == self.field) else {
+            return self.submit();
+        };
+        if let Some(next) = order.get(position + 1) {
+            self.field = *next;
+            ChooserAction::None
+        } else {
+            self.submit()
+        }
+    }
+
+    fn step_field_or_cursor(&mut self, delta: isize) {
+        let Some(field) = self
+            .items
+            .get_mut(self.selected)
+            .and_then(|item| item.fields.get_mut(self.field))
+        else {
+            return;
+        };
+        let multiline = field.is_long();
+        let at_start = field.cursor == 0;
+        let at_end = field.cursor == field.value.chars().count();
+        if !multiline {
+            let at_first = self.focus_order().first() == Some(&self.field);
+            if delta < 0 && at_start && at_first {
+                self.focus = ChooserFocus::Actions;
+                return;
+            }
+            self.move_field(delta);
+            return;
+        }
+        if delta < 0 && at_start {
+            let current = self.field;
+            self.move_field(-1);
+            if self.field == current {
+                self.focus = ChooserFocus::Actions;
+            }
+        } else if delta > 0 && at_end {
+            self.move_field(1);
+        } else {
+            let field = &mut self.items[self.selected].fields[self.field];
+            move_cursor_vertical(field, delta);
+        }
     }
 
     fn edit_field(&mut self, event: &KeyEvent, newline: bool) {
@@ -773,14 +826,6 @@ impl Chooser {
         };
         let target = (position as isize + delta).clamp(0, order.len() as isize - 1);
         self.field = order[target as usize];
-    }
-
-    /// `Tab` in a form of inputs: the next field, the first after the last.
-    fn step_field_wrapping(&mut self) {
-        let order = self.focus_order();
-        if let Some(position) = order.iter().position(|&index| index == self.field) {
-            self.field = order[(position + 1) % order.len()];
-        }
     }
 
     fn field_count(&self) -> usize {
@@ -847,6 +892,30 @@ impl Chooser {
     }
 }
 
+fn move_cursor_vertical(field: &mut ChooserField, delta: isize) {
+    let mut remaining = field.cursor;
+    let mut line_start = 0;
+    let mut previous: Option<(usize, usize)> = None;
+    let mut lines = field.value.split('\n');
+    for line in lines.by_ref() {
+        let line_len = line.chars().count();
+        if remaining <= line_len {
+            let (target_start, target_len) = if delta < 0 {
+                let Some(previous) = previous else { return };
+                previous
+            } else {
+                let Some(next) = lines.next() else { return };
+                (line_start + line_len + 1, next.chars().count())
+            };
+            field.cursor = target_start + remaining.min(target_len);
+            return;
+        }
+        remaining -= line_len + 1;
+        previous = Some((line_start, line_len));
+        line_start += line_len + 1;
+    }
+}
+
 /// The order the focus walks the fields of `item`; see [`Chooser::focus_order`].
 fn focus_order_of(item: &ChooserItem, inputs_layout: bool) -> Vec<usize> {
     let all = 0..item.fields.len();
@@ -882,7 +951,7 @@ fn list_width(items: &[ChooserItem], footer: bool) -> u16 {
         .max()
         .unwrap_or(0);
     if footer {
-        (widest + items.len().max(1).to_string().len() + 7) as u16
+        (widest + items.len().max(1).to_string().len() + 10) as u16
     } else {
         // Number, label, three marker slots, and frame.
         (widest + usize::from(PREFIX_WIDTH) + 2 + 6 + 2) as u16
@@ -906,10 +975,13 @@ fn list_line(
     let digits = (index + 1).to_string();
     let mut spans = Vec::new();
     if index == selected {
-        let role = if focused { Role::Focus } else { Role::Attention };
+        let role = if focused { Role::Focus } else { Role::Done };
         spans.push(Span::styled(format!("| {digits} | "), styles.of(role)));
     } else {
-        spans.push(Span::styled(format!("  {digits}   "), styles.of(Role::Done)));
+        spans.push(Span::styled(
+            format!("  {digits}   "),
+            styles.of(Role::Done),
+        ));
     }
     spans.push(Span::styled(one_line(&item.label), base));
     Line::from(spans)
@@ -917,11 +989,15 @@ fn list_line(
 
 /// The lines of the fields of the highlighted entry, and the line the focus
 /// is on (for scrolling).
-fn field_lines(chooser: &Chooser, styles: &Styles) -> (Vec<Line<'static>>, usize) {
+fn field_lines(
+    chooser: &Chooser,
+    styles: &Styles,
+    owner_focused: bool,
+) -> (Vec<Line<'static>>, usize) {
     let Some(item) = chooser.selected_item() else {
         return (Vec::new(), 0);
     };
-    let focused = (chooser.focus == ChooserFocus::Fields).then_some(chooser.field);
+    let focused = (owner_focused && chooser.focus == ChooserFocus::Fields).then_some(chooser.field);
     let mut lines = Vec::new();
     let mut focus_line = 0;
     for (index, field) in item.fields.iter().enumerate() {
@@ -949,6 +1025,7 @@ fn field_lines(chooser: &Chooser, styles: &Styles) -> (Vec<Line<'static>>, usize
         lines.push(Line::from(header));
         let value = sanitize(&field.value);
         let rows = field_value_rows(field, &value, is_focused);
+        let value_start = lines.len();
         for (row, text) in rows.into_iter().enumerate() {
             let prefix = if row == 0 { PROMPT } else { "  " };
             lines.push(Line::from(vec![
@@ -957,7 +1034,13 @@ fn field_lines(chooser: &Chooser, styles: &Styles) -> (Vec<Line<'static>>, usize
             ]));
         }
         if is_focused {
-            focus_line = lines.len() - 1;
+            focus_line = value_start
+                + field
+                    .value
+                    .chars()
+                    .take(field.cursor)
+                    .filter(|ch| *ch == '\n')
+                    .count();
         }
         if let Some(error) = &field.error {
             lines.push(Line::styled(
@@ -1029,10 +1112,10 @@ fn render_with_style(
     footer: bool,
 ) {
     if chooser.inputs_layout && chooser.focus == ChooserFocus::Fields {
-        inputs::render(frame, area, chooser, styles, footer);
+        inputs::render(frame, area, chooser, styles, focused, footer);
         return;
     }
-    let (fields, focus_line) = field_lines(chooser, styles);
+    let (fields, focus_line) = field_lines(chooser, styles, focused);
     let fields_height = (fields.len() as u16).min(area.height.saturating_sub(5));
     let [top, bottom] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(fields_height)]).areas(area);
@@ -1040,9 +1123,25 @@ fn render_with_style(
     let wide = area.width >= SIDE_BY_SIDE_MIN_WIDTH;
     let (list_area, description_area) = if wide {
         let width = list_width(&chooser.items, footer).clamp(20, area.width / 2);
-        let [list, description] =
-            Layout::horizontal([Constraint::Length(width), Constraint::Min(10)]).areas(top);
-        (list, description)
+        if footer {
+            let [list, divider, description] = Layout::horizontal([
+                Constraint::Length(width),
+                Constraint::Length(1),
+                Constraint::Min(10),
+            ])
+            .areas(top);
+            for y in divider.y..divider.y.saturating_add(divider.height) {
+                frame.render_widget(
+                    Paragraph::new(Line::styled("│", styles.of(Role::Done))),
+                    Rect::new(divider.x, y, 1, 1),
+                );
+            }
+            (list, description)
+        } else {
+            let [list, description] =
+                Layout::horizontal([Constraint::Length(width), Constraint::Min(10)]).areas(top);
+            (list, description)
+        }
     } else {
         // The description gives way first while the numbered choices remain
         // visible; below that, the list uses all available rows.
@@ -1072,8 +1171,14 @@ fn render_with_style(
 
 /// Draws only the fields of the highlighted entry into `area`, scrolled so
 /// that the focused one is in view: a text box without the list around it.
-pub fn render_fields(frame: &mut Frame, area: Rect, chooser: &Chooser, styles: &Styles) {
-    let (fields, focus_line) = field_lines(chooser, styles);
+pub fn render_fields(
+    frame: &mut Frame,
+    area: Rect,
+    chooser: &Chooser,
+    styles: &Styles,
+    focused: bool,
+) {
+    let (fields, focus_line) = field_lines(chooser, styles, focused);
     let height = usize::from(area.height);
     let offset = (focus_line + 1).saturating_sub(height) as u16;
     frame.render_widget(Paragraph::new(fields).scroll((offset, 0)), area);
@@ -1104,7 +1209,12 @@ fn render_list(
             Paragraph::new(Line::styled("  Akcje", styles.of(Role::Done))),
             Rect::new(area.x, area.y, area.width, 1),
         );
-        Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+        Rect::new(
+            area.x.saturating_add(2),
+            area.y + 1,
+            area.width.saturating_sub(3),
+            area.height - 1,
+        )
     } else {
         let block = pane("Akcje", chooser.focus == ChooserFocus::Actions, styles);
         let inner = block.inner(area);
@@ -1112,10 +1222,21 @@ fn render_list(
         inner
     };
     if !footer {
-        let items: Vec<Vec<Line>> = chooser.items.iter().enumerate()
+        let items: Vec<Vec<Line>> = chooser
+            .items
+            .iter()
+            .enumerate()
             .map(|(index, item)| vec![legacy_list_line(item, index, styles)])
             .collect();
-        render_bracketed_list(frame, inner, styles, &items, Some(chooser.selected), focused, &mut chooser.top);
+        render_bracketed_list(
+            frame,
+            inner,
+            styles,
+            &items,
+            Some(chooser.selected),
+            focused,
+            &mut chooser.top,
+        );
         return;
     }
     let selected = chooser.selected;
@@ -1140,15 +1261,28 @@ fn render_list(
 /// The general chooser keeps the established bracket selection and trailing
 /// status markers. The task details footer uses the compact pipe treatment.
 fn legacy_list_line(item: &ChooserItem, index: usize, styles: &Styles) -> Line<'static> {
-    let base = if item.unavailable.is_some() { styles.of(Role::Done) } else { Style::default() };
-    let number = if index < 9 { format!("{} ", index + 1) } else { "  ".to_string() };
-    let mut spans = vec![Span::styled(number, styles.of(Role::Done)), Span::styled(one_line(&item.label), base)];
+    let base = if item.unavailable.is_some() {
+        styles.of(Role::Done)
+    } else {
+        Style::default()
+    };
+    let number = if index < 9 {
+        format!("{} ", index + 1)
+    } else {
+        "  ".to_string()
+    };
+    let mut spans = vec![
+        Span::styled(number, styles.of(Role::Done)),
+        Span::styled(one_line(&item.label), base),
+    ];
     for (present, symbol, role) in [
         (item.resumes_agent.is_some(), "↩", Role::Calm),
         (item.recommended, "◆", Role::Conductor),
         (item.irreversible, "!", Role::Problem),
     ] {
-        if present { spans.push(Span::styled(format!(" {symbol}"), styles.of(role))); }
+        if present {
+            spans.push(Span::styled(format!(" {symbol}"), styles.of(role)));
+        }
     }
     Line::from(spans)
 }
@@ -1168,7 +1302,12 @@ fn render_description(
             Paragraph::new(Line::styled("  Opis", styles.of(Role::Done))),
             Rect::new(area.x, area.y, area.width, 1),
         );
-        Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+        Rect::new(
+            area.x.saturating_add(2),
+            area.y + 2,
+            area.width.saturating_sub(3),
+            area.height.saturating_sub(2),
+        )
     } else {
         let block = pane("Opis", false, styles);
         let inner = block.inner(area);

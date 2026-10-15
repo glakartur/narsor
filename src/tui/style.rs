@@ -196,6 +196,40 @@ impl Styles {
         }
     }
 
+    /// Backgrounds that keep the task header and its answer panel distinct
+    /// without drawing separator rules between them and the content.
+    pub fn task_header_background(&self) -> Style {
+        if self.no_color {
+            Style::default()
+        } else {
+            Style::default().bg(Color::Rgb(34, 48, 72))
+        }
+    }
+
+    /// The answer panel sits on a dark neutral background; without colour,
+    /// focus remains indicated by its structural marker.
+    pub fn answer_panel_background(&self) -> Style {
+        if self.no_color {
+            Style::default()
+        } else {
+            Style::default().bg(Color::Rgb(38, 40, 43))
+        }
+    }
+
+    /// The answer panel's edge shows focus across its full height.
+    pub fn answer_panel_marker(&self, focused: bool) -> Style {
+        self.of(if focused { Role::Focus } else { Role::Done })
+    }
+
+    /// A quiet rule that separates the task tabs from the content below.
+    pub fn task_tabs_divider(&self) -> Style {
+        if self.no_color {
+            Style::default()
+        } else {
+            Style::default().fg(Color::Black)
+        }
+    }
+
     /// Draws the frame of a panel titled `title` (see [`Styles::panel`]) over
     /// `area` and returns the area inside it.
     pub fn render_panel(

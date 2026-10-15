@@ -487,6 +487,13 @@ impl TaskApp {
             Action::Quit => self.on_quit(confirming_quit),
             Action::Back if context == Context::History => self.close_view(),
             Action::Back => self.focus_history(Focus::List),
+            Action::SwitchFocus => {
+                self.focus = if self.focus == Focus::List {
+                    Focus::Details
+                } else {
+                    Focus::List
+                };
+            }
             Action::Open => self.focus_history(Focus::Details),
             Action::EnterStep => self.with_history(History::enter_step),
             Action::LeaveStep => self.with_history(History::back_to_axis),

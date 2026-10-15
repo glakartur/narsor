@@ -101,7 +101,7 @@ pub mod waiting;
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use futures::stream::{BoxStream, StreamExt as _};
 
 use crate::api::{reconnect_delay, ApiClient, ClientError, HarnessSelectionSnapshot};
@@ -583,11 +583,13 @@ impl TaskApp {
         if let Some(overlay) = &self.overlay {
             return overlay.context().into();
         }
-        if let Some(context) = self
-            .new_task_context()
-            .or_else(|| self.repositories_context())
-        {
-            return context.into();
+        if self.focus == Focus::Details {
+            if let Some(context) = self
+                .new_task_context()
+                .or_else(|| self.repositories_context())
+            {
+                return context.into();
+            }
         }
         if let Some(stack) = self.history_context() {
             return stack;
@@ -669,14 +671,23 @@ impl TaskApp {
         }
         match self.view {
             View::Tasks => {}
-            View::NewTask(_) => return self.on_new_task_key(key, confirming_quit),
+            View::NewTask(_) if self.focus == Focus::Details => {
+                return self.on_new_task_key(key, confirming_quit)
+            }
             View::History(_) => return self.on_history_key(key, confirming_quit),
-            View::Repositories(_) => return self.on_repositories_key(key, confirming_quit),
+            View::Repositories(_) if self.focus == Focus::Details => {
+                return self.on_repositories_key(key, confirming_quit)
+            }
+            View::NewTask(_) | View::Repositories(_) => {}
         }
         if self.panel_focused() {
             return self.on_panel_key(key, confirming_quit);
         }
         if self.conductor_typing() {
+            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                self.focus_panel();
+                return Request::None;
+            }
             return self.on_conductor_typing_key(key);
         }
         let keys = self.key_context();
@@ -692,6 +703,14 @@ impl TaskApp {
         match action {
             Action::Help => self.help_open = true,
             Action::Quit => self.on_quit(confirming_quit),
+            Action::NewTask | Action::History | Action::Repositories | Action::ChooseHarness
+                if !matches!(&self.view, View::Tasks) =>
+            {
+                self.notify(
+                    Severity::Warning,
+                    "zakończ bieżący formularz przed zmianą widoku",
+                );
+            }
             Action::Down | Action::Up | Action::Top | Action::Bottom => {
                 self.on_cursor(context, action)
             }
@@ -720,6 +739,9 @@ impl TaskApp {
             }
             Action::Open => self.open_selected(),
             Action::SwitchFocus if context == Context::Details => self.focus_panel(),
+            Action::SwitchFocus if context == Context::List => {
+                self.focus = Focus::Details;
+            }
             Action::Back => {
                 self.focus = Focus::List;
                 self.panel_focus = false;

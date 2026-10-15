@@ -44,7 +44,7 @@
 //! Text from the agent, the conductor and the runner is passed through
 //! [`sanitize`] before it is drawn; what the operator typed is sent as typed.
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -79,7 +79,7 @@ const MAX_CONTEXT_ROWS: usize = 4;
 
 /// The fewest rows of detail content the panel leaves below the header and
 /// two-row tab bar.
-const KEEP_FOR_CONTENT: u16 = 1;
+const KEEP_FOR_CONTENT: u16 = 2;
 
 // ---------------------------------------------------------------------
 // What is sent
@@ -216,7 +216,16 @@ impl Model {
 
     fn items(&self) -> Vec<ChooserItem> {
         match self {
-            Self::Input(panel) => panel.items().to_vec(),
+            Self::Input(panel) => {
+                let composer_index = panel.composer_spec().map(|(index, _)| index);
+                panel
+                    .items()
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| Some(*index) != composer_index)
+                    .map(|(_, item)| item.clone())
+                    .collect()
+            }
             Self::Operator(panel) => panel.items().to_vec(),
             Self::Owner(panel) => panel.items.clone(),
             Self::Missing => vec![ChooserItem::new(
@@ -229,10 +238,36 @@ impl Model {
 
     fn selected(&self) -> usize {
         match self {
-            Self::Input(panel) => panel.selected(),
+            Self::Input(panel) => panel.selected().min(self.items().len().saturating_sub(1)),
             Self::Operator(panel) => panel.selected(),
             Self::Owner(_) | Self::Missing => 0,
         }
+    }
+
+    fn has_composer(&self) -> bool {
+        matches!(self, Self::Input(panel) if panel.composer_spec().is_some())
+    }
+
+    fn composer_item(&self) -> Option<ChooserItem> {
+        let Self::Input(panel) = self else {
+            return None;
+        };
+        let (index, label) = panel.composer_spec()?;
+        let help = if panel.kind() == crate::tui::input_form::InputKind::AgentQuestion {
+            "Odpowiada agentowi."
+        } else {
+            "Wysyła wiadomość do agenta."
+        };
+        let field = panel.items().get(index)?.fields.first()?.clone();
+        Some(ChooserItem::new(label, help).with_field(field))
+    }
+
+    fn composer_submission(&self, composer: &Chooser) -> Option<Submission> {
+        let Self::Input(panel) = self else {
+            return None;
+        };
+        let value = composer.fields_of(0).first()?.value().to_string();
+        panel.composer_submission(value)
     }
 }
 
@@ -242,6 +277,7 @@ struct Entry {
     item: AttentionItem,
     model: Model,
     chooser: Chooser,
+    composer: Option<Chooser>,
     context_scroll: ScrollState,
     /// What the last send found wrong, or the server refused with.
     error: Option<String>,
@@ -262,11 +298,17 @@ impl Entry {
         conductor: Option<&ConductorView>,
     ) -> Self {
         let model = Self::model(item, task, positions, conductor);
-        let chooser = Chooser::new(model.items()).selecting(model.selected());
+        let chooser = Chooser::new(model.items())
+            .enter_fields_on_activate()
+            .selecting(model.selected());
+        let composer = model
+            .composer_item()
+            .map(|item| Chooser::new(vec![item]).with_inputs_layout());
         Self {
             item: item.clone(),
             model,
             chooser,
+            composer,
             context_scroll: ScrollState::new(),
             error: None,
             key: None,
@@ -378,6 +420,21 @@ impl Entry {
         } else {
             rebuilt
         };
+        if let Some(composer) = &mut self.composer {
+            if model.has_composer() {
+                if let Some(item) = model.composer_item() {
+                    *composer =
+                        std::mem::replace(composer, Chooser::new(Vec::new())).rebuilt(vec![item]);
+                }
+            } else {
+                self.composer = None;
+            }
+        } else if model.has_composer() {
+            let mut composer = Chooser::new(vec![model.composer_item().expect("composer spec")])
+                .with_inputs_layout();
+            composer.leave_fields();
+            self.composer = Some(composer);
+        }
         self.model = model;
     }
 
@@ -390,7 +447,29 @@ impl Entry {
     }
 
     fn is_drafted(&self) -> bool {
-        !self.sent && !self.chooser.draft_text().is_empty()
+        !self.sent
+            && (!self.chooser.draft_text().is_empty()
+                || self
+                    .composer
+                    .as_ref()
+                    .is_some_and(|composer| !composer.draft_text().is_empty()))
+    }
+
+    fn submission_for_message(&self) -> Option<Submission> {
+        self.model.composer_submission(self.composer.as_ref()?)
+    }
+
+    fn draft_text(&self) -> String {
+        [
+            self.chooser.draft_text(),
+            self.composer
+                .as_ref()
+                .map_or_else(String::new, Chooser::draft_text),
+        ]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
     }
 
     fn kind_word(&self) -> &'static str {
@@ -523,6 +602,11 @@ impl WaitingPanel {
         self.entries.get(self.current).map(|entry| &entry.chooser)
     }
 
+    /// The separate text composer for an ordinary answer or conversation reply.
+    pub fn composer(&self) -> Option<&Chooser> {
+        self.entries.get(self.current)?.composer.as_ref()
+    }
+
     /// What the last send of the waiting shown found wrong.
     pub fn error(&self) -> Option<&str> {
         self.entries
@@ -537,9 +621,9 @@ impl WaitingPanel {
 
     /// Whether keys are typed into a field: `q` and `?` are text then.
     pub fn is_typing(&self) -> bool {
-        self.entries
-            .get(self.current)
-            .is_some_and(|entry| entry.chooser.is_typing())
+        self.entries.get(self.current).is_some_and(|entry| {
+            entry.chooser.is_typing() || entry.composer.as_ref().is_some_and(Chooser::is_typing)
+        })
     }
 
     /// Unfolds the panel.
@@ -554,7 +638,7 @@ impl WaitingPanel {
             .entries
             .iter()
             .filter(|entry| entry.is_drafted())
-            .map(|entry| entry.chooser.draft_text())
+            .map(Entry::draft_text)
             .collect();
         parts.extend(self.released.iter().map(|released| released.text.clone()));
         parts.join("\n")
@@ -671,7 +755,7 @@ impl WaitingPanel {
                             .as_deref()
                             .map_or_else(String::new, one_line)
                     ),
-                    text: gone.chooser.draft_text(),
+                    text: gone.draft_text(),
                     waiting_id: gone.item.waiting_id.clone(),
                     entry: Box::new(gone),
                 });
@@ -722,6 +806,41 @@ impl WaitingPanel {
             }
         }
         let entry = &mut self.entries[self.current];
+        if let Some(composer) = entry.composer.as_mut() {
+            if composer.is_typing() {
+                let action = composer.on_key(key);
+                return match action {
+                    ChooserAction::Submit(_) => entry
+                        .submission_for_message()
+                        .map_or(PanelEffect::None, PanelEffect::Submit),
+                    ChooserAction::Cancel => PanelEffect::Collapse,
+                    ChooserAction::Blocked(reason) => PanelEffect::Notice(reason),
+                    ChooserAction::None => {
+                        entry.sent = false;
+                        entry.key = None;
+                        entry.error = None;
+                        PanelEffect::None
+                    }
+                };
+            }
+        }
+        if entry.composer.is_some()
+            && entry.chooser.focus() == ChooserFocus::Actions
+            && (entry.chooser.items().is_empty()
+                || (entry.chooser.selected() + 1 == entry.chooser.items().len()
+                    && key.code == KeyCode::Down))
+            && (key.code == KeyCode::Down
+                || (entry.chooser.items().is_empty() && key.code == KeyCode::Enter))
+        {
+            if let Some(composer) = entry.composer.as_mut() {
+                composer.enter_fields();
+                return PanelEffect::None;
+            }
+        }
+        if key.code == KeyCode::Esc && entry.chooser.focus() == ChooserFocus::Fields {
+            entry.chooser.leave_fields();
+            return PanelEffect::None;
+        }
         let action = entry.chooser.on_key(key);
         match action {
             ChooserAction::None => {
@@ -842,9 +961,10 @@ impl WaitingPanel {
                 2
             } else {
                 let context = context_rows(&entry.model.context(), usize::from(width)).len();
-                3 + context.min(MAX_CONTEXT_ROWS) as u16
+                7 + context.min(MAX_CONTEXT_ROWS) as u16
                     + entry.notices().len() as u16
                     + entry.chooser.preferred_height(width)
+                    + if entry.composer.is_some() { 3 } else { 0 }
             }
         } else if self.released.is_empty() {
             0
@@ -854,7 +974,7 @@ impl WaitingPanel {
                 .iter()
                 .map(|released| 1 + released.text.lines().count().max(1))
                 .sum();
-            3 + lines.min(5) as u16
+            5 + lines.min(5) as u16
         };
         wanted.min(cap)
     }
@@ -862,9 +982,9 @@ impl WaitingPanel {
     /// Draws the panel into `area`. `as_of` is the server's now, which the age of
     /// the shown waiting is counted to.
     ///
-    /// The separator and heading stay in the entry's role even when the
-    /// panel has no focus; the action number's pipes show the active choice.
-    /// The actions scroll inside what the context and fields leave them (R17).
+    /// The dark panel background remains visible even when it has no focus;
+    /// the left marker shows focus, and the action number's pipes show the
+    /// active choice. The actions scroll inside the remaining space (R17).
     pub fn render(
         &mut self,
         frame: &mut Frame,
@@ -879,12 +999,25 @@ impl WaitingPanel {
         }
         if self.entries.is_empty() {
             self.render_released(frame, area, styles);
+            paint_waiting_panel(frame, area, styles, focused);
             return;
         }
         let count = self.entries.len();
         let current = self.current;
         let collapsed = self.collapsed;
         let entry = &mut self.entries[current];
+        let vertical_padding = u16::from(area.height >= 16);
+        let inner = Rect::new(
+            area.x.saturating_add(2),
+            area.y.saturating_add(vertical_padding),
+            area.width.saturating_sub(3),
+            area.height
+                .saturating_sub(vertical_padding.saturating_mul(2)),
+        );
+        if inner.width == 0 || inner.height == 0 {
+            paint_waiting_panel(frame, area, styles, focused);
+            return;
+        }
         let age = short_age((as_of - entry.item.since).num_seconds());
         let state = entry
             .item
@@ -894,14 +1027,8 @@ impl WaitingPanel {
         let role = if stale { Role::Done } else { entry.role() };
         let mut heading = format!("{} {}{state} · {age}", entry.glyph(), entry.kind_word());
         let separator_role = if stale { Role::Done } else { role };
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                "─".repeat(usize::from(area.width)),
-                styles.of(separator_role),
-            )),
-            Rect::new(area.x, area.y, area.width, 1),
-        );
-        if area.height < 2 {
+        if inner.height < 1 {
+            paint_waiting_panel(frame, area, styles, focused);
             return;
         }
         if collapsed {
@@ -914,8 +1041,9 @@ impl WaitingPanel {
             ]);
             frame.render_widget(
                 Paragraph::new(line),
-                Rect::new(area.x, area.y + 1, area.width, 1),
+                Rect::new(inner.x, inner.y, inner.width, 1),
             );
+            paint_waiting_panel(frame, area, styles, focused);
             return;
         }
 
@@ -926,33 +1054,38 @@ impl WaitingPanel {
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::raw("  "),
+                Span::raw(""),
                 Span::styled(heading, styles.strong(role)),
                 Span::styled(count_suffix, styles.of(separator_role)),
             ])),
-            Rect::new(area.x, area.y + 1, area.width, 1),
+            Rect::new(inner.x, inner.y, inner.width, 1),
         );
+        let title_gap = if inner.height >= 10 { 2 } else { 1 };
         let body = Rect::new(
-            area.x,
-            area.y.saturating_add(3),
-            area.width,
-            area.height.saturating_sub(3),
+            inner.x,
+            inner.y.saturating_add(title_gap),
+            inner.width,
+            inner.height.saturating_sub(title_gap),
         );
         if body.height == 0 {
+            paint_waiting_panel(frame, area, styles, focused);
             return;
         }
 
         let rows = context_rows(&entry.model.context(), usize::from(body.width));
         let notices = entry.notices();
-        let notice_height = (notices.len() as u16).min(body.height.saturating_sub(5));
+        let notice_height = (notices.len() as u16).min(body.height.saturating_sub(8));
         // The actions come first: the context takes what they leave.
         let context_height = rows
             .len()
             .min(MAX_CONTEXT_ROWS)
-            .min(usize::from(body.height.saturating_sub(notice_height + 5)));
-        let [context_area, notice_area, chooser_area] = Layout::vertical([
+            .min(usize::from(body.height.saturating_sub(notice_height + 8)));
+        let section_gap =
+            u16::from((context_height > 0 || notice_height > 0) && inner.height >= 13);
+        let [context_area, notice_area, _gap_area, chooser_area] = Layout::vertical([
             Constraint::Length(context_height as u16),
             Constraint::Length(notice_height),
+            Constraint::Length(section_gap),
             Constraint::Min(0),
         ])
         .areas(body);
@@ -970,29 +1103,46 @@ impl WaitingPanel {
             .map(|(role, text)| Line::styled(text.clone(), styles.of(*role)))
             .collect();
         frame.render_widget(Paragraph::new(lines), notice_area);
-        chooser::render_footer(frame, chooser_area, &mut entry.chooser, styles, focused);
+        if let Some(composer) = entry.composer.as_mut() {
+            let composer_height = chooser_area.height.saturating_sub(1).min(3);
+            let action_height = chooser_area.height.saturating_sub(composer_height);
+            let [action_area, composer_area] = Layout::vertical([
+                Constraint::Length(action_height),
+                Constraint::Length(composer_height),
+            ])
+            .areas(chooser_area);
+            chooser::render_footer(
+                frame,
+                action_area,
+                &mut entry.chooser,
+                styles,
+                focused && !composer.is_typing(),
+            );
+            chooser::render_fields(frame, composer_area, composer, styles, focused);
+        } else {
+            chooser::render_footer(frame, chooser_area, &mut entry.chooser, styles, focused);
+        }
+        paint_waiting_panel(frame, area, styles, focused);
     }
 
     fn render_released(&self, frame: &mut Frame, area: Rect, styles: &Styles) {
         frame.render_widget(
             Paragraph::new(Line::styled(
-                "─".repeat(usize::from(area.width)),
-                styles.of(Role::Attention),
-            )),
-            Rect::new(area.x, area.y, area.width, 1),
-        );
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                "  Szkic bez oczekiwania — skopiuj; Esc go usuwa",
+                "Szkic bez oczekiwania — skopiuj; Esc go usuwa",
                 styles.strong(Role::Attention),
             )),
-            Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+            Rect::new(
+                area.x.saturating_add(2),
+                area.y.saturating_add(1),
+                area.width.saturating_sub(3),
+                1,
+            ),
         );
         let inner = Rect::new(
-            area.x,
+            area.x.saturating_add(2),
             area.y.saturating_add(3),
-            area.width,
-            area.height.saturating_sub(3),
+            area.width.saturating_sub(3),
+            area.height.saturating_sub(4),
         );
         let mut lines = Vec::new();
         for released in &self.released {
@@ -1005,6 +1155,31 @@ impl WaitingPanel {
             }
         }
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+fn paint_waiting_panel(frame: &mut Frame, area: Rect, styles: &Styles, focused: bool) {
+    let background = styles.answer_panel_background();
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                if let Some(color) = background.bg {
+                    cell.bg = color;
+                }
+            }
+        }
+    }
+    if area.width > 0 && area.height > 0 {
+        let marker = styles.answer_panel_marker(focused);
+        for y in area.y..area.y.saturating_add(area.height) {
+            if let Some(cell) = frame.buffer_mut().cell_mut((area.x, y)) {
+                cell.set_symbol("│");
+                if let Some(color) = marker.fg {
+                    cell.fg = color;
+                }
+                cell.modifier |= marker.add_modifier;
+            }
+        }
     }
 }
 
@@ -1166,6 +1341,12 @@ impl TaskApp {
 
     /// A key while the panel has the keyboard.
     pub(super) fn on_panel_key(&mut self, key: KeyEvent, confirming_quit: bool) -> Request {
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            // Tab changes the outer panel focus. Chooser fields use arrows and
+            // Enter, so leaving here never submits or discards a draft.
+            self.panel_focus = false;
+            return Request::None;
+        }
         let Some(id) = self.list.selected_id().map(str::to_string) else {
             return Request::None;
         };
