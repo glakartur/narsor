@@ -33,11 +33,10 @@
 //! the backend. Everything that comes from the server is passed through
 //! [`one_line`] before it is drawn.
 //!
-//! The rows are drawn as a bracketed list ([`render_bracketed_list`]): tasks
-//! stacked directly, and a bracket — full-width rules above and below, a bar
-//! beside both lines — around the selected one instead of reverse video, so
-//! its markers keep their colours. A task takes two rows of the column, the
-//! selected one four.
+//! The rows are drawn as a bar marked list ([`render_barred_list`]): tasks
+//! stay stacked directly, and the selected one keeps a left bar beside both
+//! lines instead of reverse video, so its markers keep their colours. Every
+//! task takes the same two rows.
 
 use std::collections::HashMap;
 
@@ -57,7 +56,7 @@ use narsor_protocol::controller::{
 use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, UNSPECIFIED_LOSS};
 
 use super::super::scroll::one_line;
-use super::super::selection::{render_bracketed_list, PREFIX_WIDTH};
+use super::super::selection::{render_barred_list, PREFIX_WIDTH};
 use super::super::style::{Role, Styles};
 
 /// What a row asks of the operator (column 1).
@@ -1143,9 +1142,9 @@ impl TaskList {
     // -----------------------------------------------------------------
 
     /// Draws the list into `area`: a column titled `Zadania`, one row per
-    /// task, stacked, with a bracket around the selected one
-    /// ([`render_bracketed_list`]). `focused` lights the frame and the
-    /// bracket; `stale` greys every row (no connection: the rows are a
+    /// task, stacked, with a bar beside the selected one
+    /// ([`render_barred_list`]). `focused` lights the frame and the
+    /// bar; `stale` greys every row (no connection: the rows are a
     /// memory, not news).
     pub fn render(
         &mut self,
@@ -1196,7 +1195,7 @@ impl TaskList {
                     .map(|row| (row.task_id.clone(), row.text())),
             )
             .collect();
-        let width = usize::from(inner.width.saturating_sub(PREFIX_WIDTH));
+        let width = usize::from(inner.width.saturating_sub(PREFIX_WIDTH).saturating_sub(1));
         let items: Vec<Vec<Line>> = rows
             .iter()
             .map(|(_, row)| row_text(row, width, styles, stale))
@@ -1204,7 +1203,7 @@ impl TaskList {
         let selected = rows
             .iter()
             .position(|(id, _)| self.selected.as_deref() == Some(id.as_str()));
-        render_bracketed_list(
+        render_barred_list(
             frame,
             inner,
             styles,

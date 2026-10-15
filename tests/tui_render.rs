@@ -1060,11 +1060,10 @@ mod task_app_render {
         assert!(screen(&buffer).contains("brak danych"));
     }
 
-    /// AE4: the selected task is bracketed — a cyan rule above and
-    /// below, a bar beside both of its lines — while the list has the focus,
+    /// AE1: the selected task has a cyan bar beside both lines while the list has the focus,
     /// and its markers keep their colours (R13).
     #[test]
-    fn live_markers_keep_their_colours_inside_the_bracket() {
+    fn live_markers_keep_their_colours_inside_the_barred_selection() {
         let mut app = busy_app();
         press(&mut app, KeyCode::Char('j'));
         let buffer = render(120, 30, &mut app, &Styles::new(false));
@@ -1076,7 +1075,7 @@ mod task_app_render {
             "the marker keeps its role colour"
         );
         assert_eq!(cell_at(&buffer, 5, y), ("●".to_string(), Color::Green));
-        assert_task_bracket(&buffer, row, marks(true, false));
+        assert_task_bar(&buffer, row, marks(true, false));
         let other = list_row(&buffer, "NAR-14");
         assert_eq!(bar(&buffer, other).0, " ");
         assert_eq!(bar(&buffer, other + 1).0, " ");
@@ -1095,14 +1094,14 @@ mod task_app_render {
         let y = row as u16;
         assert_eq!(cell_at(&buffer, 3, y), ("!".to_string(), Color::Red));
         assert_eq!(cell_at(&buffer, 5, y), ("✗".to_string(), Color::Red));
-        assert_task_bracket(&buffer, row, marks(true, false));
+        assert_task_bar(&buffer, row, marks(true, false));
         assert!(no_reversed_in_list(&buffer), "{}", screen(&buffer));
     }
 
-    /// AE4: with the focus gone to the details the bracket stays where it
+    /// AE1: with the focus gone to the details the bar stays where it
     /// was, grey, and no task moves.
     #[test]
-    fn enter_greys_the_bracket_and_moves_no_row() {
+    fn enter_greys_the_bar_and_moves_no_row() {
         let mut app = busy_app();
         press(&mut app, KeyCode::Char('j'));
         let titles = ["NAR-14", "NAR-12", "NAR-9 ", "NAR-16", "NAR-17", "NAR-8 "];
@@ -1114,13 +1113,13 @@ mod task_app_render {
         let rows_after: Vec<usize> = titles.iter().map(|t| list_row(&after, t)).collect();
         assert_eq!(rows_before, rows_after, "{}", screen(&after));
         let row = list_row(&after, "NAR-12");
-        assert_task_bracket(&after, row, marks(false, false));
+        assert_task_bar(&after, row, marks(false, false));
     }
 
-    /// AE6: without colour the shape and the weight of the bracket tell the
+    /// AE1: without colour the weight of the bar tells the
     /// focus apart.
     #[test]
-    fn without_colour_every_marker_and_the_bracket_survive() {
+    fn without_colour_every_marker_and_the_bar_survives() {
         let mut app = busy_app();
         press(&mut app, KeyCode::Char('j'));
         let buffer = render(120, 30, &mut app, &Styles::new(true));
@@ -1136,19 +1135,18 @@ mod task_app_render {
             "NO_COLOR draws no colour at all"
         );
         let row = list_row(&buffer, "NAR-12");
-        assert_task_bracket(&buffer, row, marks(true, true));
+        assert_task_bar(&buffer, row, marks(true, true));
         let y = row as u16;
         assert!(bold_at(&buffer, 1, y) && bold_at(&buffer, 1, y + 1));
-        assert!(bold_at(&buffer, 3, y - 1) && bold_at(&buffer, 3, y + 2));
         assert!(no_reversed_in_list(&buffer));
 
         press(&mut app, KeyCode::Enter);
         let buffer = render(120, 30, &mut app, &Styles::new(true));
         let row = list_row(&buffer, "NAR-12");
-        assert_task_bracket(&buffer, row, marks(false, true));
+        assert_task_bar(&buffer, row, marks(false, true));
         let y = row as u16;
         let dim = |x: u16, y: u16| buffer[(x, y)].modifier.contains(Modifier::DIM);
-        assert!(dim(1, y) && dim(1, y + 1) && dim(3, y - 1) && dim(3, y + 2));
+        assert!(dim(1, y) && dim(1, y + 1));
         assert!(!bold_at(&buffer, 1, y));
         assert!(no_reversed_in_list(&buffer));
     }
@@ -1215,27 +1213,30 @@ mod task_app_render {
             with_runner(
                 with_controller(crate::task_app_support::task("a", "local", "running", 1)),
                 ExecutionStatus::Running,
-                "implement",
+                "a long implementation label that fills the row",
             ),
             title,
         );
         app.load(listing(vec![long], "c"));
         let buffer = render(120, 30, &mut app, &Styles::new(true));
         let row = list_row(&buffer, "Bardzo");
-        // The list's inside is 26 columns: 2 for the bracket, 5 for the
-        // markers, so the title has 19, the ellipsis included.
-        let kept: String = title.chars().take(18).collect();
+        // The list's inside is 26 columns: 2 for the bar prefix, 5 for the
+        // markers, and 1 reserved at the right edge. The title has 18 cells.
+        let kept: String = title.chars().take(17).collect();
         assert_eq!(
             content_text(&buffer, row),
-            format!("  ●  {kept}…"),
+            format!("  ●  {kept}… "),
             "{}",
             screen(&buffer)
         );
         assert!(
-            content_text(&buffer, row + 1).starts_with("     implement"),
+            content_text(&buffer, row + 1).starts_with("     a long"),
             "{:?}",
             content_text(&buffer, row + 1)
         );
+        let right_edge = layout::LIST_WIDTH - 2;
+        assert_eq!(buffer[(right_edge, row as u16)].symbol(), " ");
+        assert_eq!(buffer[(right_edge, (row + 1) as u16)].symbol(), " ");
         assert!(
             !list_text(&buffer, row + 2).contains("mieści"),
             "the title does not wrap to a third line:\n{}",
@@ -1267,11 +1268,25 @@ mod task_app_render {
         cell_at(buffer, 1, row as u16)
     }
 
-    /// Asserts the task whose first line is screen row `row` is bracketed
-    /// with `marks`: the bar beside both its lines, the rules up to the frame.
-    fn assert_task_bracket(buffer: &Buffer, row: usize, marks: SelectionMarks) {
-        let y = u16::try_from(row).expect("a row");
-        assert_bracket(buffer, (3, y), 2, layout::LIST_WIDTH - 1, marks);
+    /// Asserts the task at `row` is marked only by the bar beside its lines.
+    fn assert_task_bar(buffer: &Buffer, row: usize, marks: SelectionMarks) {
+        for y in row..row + 2 {
+            let (symbol, color) = bar(buffer, y);
+            assert!(
+                is_mark(&buffer[(1, y as u16)], "│", marks),
+                "bar in row {y}: {symbol:?} with {color:?}\n{}",
+                screen(buffer)
+            );
+        }
+        let background = buffer[(1, row as u16)].bg;
+        assert!(
+            (row..row + 2).all(|y| {
+                row_cells(buffer, y as u16, 1..layout::LIST_WIDTH - 1)
+                    .all(|cell| cell.bg == background)
+            }),
+            "task selection does not alter its row background:\n{}",
+            screen(buffer)
+        );
     }
 
     /// Whether no cell inside the frame of the list is in reverse video (R7);
@@ -1303,20 +1318,14 @@ mod task_app_render {
         app
     }
 
-    /// A task takes two rows and the tasks stack directly; only the selected
-    /// one has a rule row above and below it, so `j` moves the rules and
-    /// shifts the neighbours by a row.
+    /// A selected task keeps its two rows and only adds the left bar; moving
+    /// the selection does not move either task.
     #[test]
-    fn a_task_takes_two_rows_and_only_the_selected_one_has_rules() {
+    fn a_task_takes_two_rows_and_selection_only_adds_the_left_bar() {
         let mut app = two_task_app();
         let buffer = render(120, 30, &mut app, &Styles::new(false));
         let first = list_row(&buffer, "Refactor parser");
-        assert_eq!(
-            first,
-            3,
-            "the rule above the selected first task:\n{}",
-            screen(&buffer)
-        );
+        assert_eq!(first, 2, "selection adds no rows:\n{}", screen(&buffer));
         assert!(
             content_text(&buffer, first).starts_with("  ●  Refactor parser"),
             "{:?}",
@@ -1328,8 +1337,8 @@ mod task_app_render {
             content_text(&buffer, first + 1)
         );
         let second = list_row(&buffer, "Fix the lexer");
-        assert_eq!(second, first + 3, "the rule below the selected task");
-        assert_task_bracket(&buffer, first, marks(true, false));
+        assert_eq!(second, first + 2, "the tasks stay adjacent");
+        assert_task_bar(&buffer, first, marks(true, false));
         assert_eq!(bar(&buffer, second).0, " ");
         assert!(
             list_text(&buffer, second + 2).trim().is_empty(),
@@ -1338,9 +1347,9 @@ mod task_app_render {
 
         press(&mut app, KeyCode::Char('j'));
         let buffer = render(120, 30, &mut app, &Styles::new(false));
-        assert_eq!(list_row(&buffer, "Refactor parser"), 2, "no rule above it");
-        assert_eq!(list_row(&buffer, "Fix the lexer"), 5);
-        assert_task_bracket(&buffer, 5, marks(true, false));
+        assert_eq!(list_row(&buffer, "Refactor parser"), first);
+        assert_eq!(list_row(&buffer, "Fix the lexer"), second);
+        assert_task_bar(&buffer, second, marks(true, false));
         assert_eq!(bar(&buffer, 2).0, " ");
         assert!(
             content_text(&buffer, 3).starts_with("     implement"),
@@ -1408,8 +1417,7 @@ mod task_app_render {
             .collect()
     }
 
-    /// R11: scrolling goes by whole tasks, and the selected one is in view
-    /// with its whole bracket.
+    /// Scrolling goes by whole tasks, with the selected one in view.
     #[test]
     fn a_long_list_scrolls_by_whole_tasks() {
         let mut app = app();
@@ -1422,12 +1430,7 @@ mod task_app_render {
             "the last task shows both lines:\n{}",
             screen(&buffer)
         );
-        assert_task_bracket(&buffer, last, marks(true, true));
-        assert!(
-            last + 2 < usize::from(buffer.area.height) - 2,
-            "the rule below is inside the frame:\n{}",
-            screen(&buffer)
-        );
+        assert_task_bar(&buffer, last, marks(true, true));
         // The first row inside the frame is a whole task.
         assert!(
             content_text(&buffer, 2).starts_with("  ●  T-"),
@@ -1437,15 +1440,14 @@ mod task_app_render {
         );
         assert!(content_text(&buffer, 3).starts_with("     implement"));
 
-        // Going up does not scroll while the bracket fits; the rules move
-        // up with the selection and the last task drops into their place.
+        // Going up does not scroll while the tasks fit; neither task moves.
         let top = content_text(&buffer, 2);
         press(&mut app, KeyCode::Char('k'));
         let buffer = render(120, 31, &mut app, &Styles::new(true));
         assert_eq!(content_text(&buffer, 2), top, "{}", screen(&buffer));
-        assert_task_bracket(&buffer, last - 2, marks(true, true));
+        assert_task_bar(&buffer, last - 2, marks(true, true));
         assert_eq!(list_row(&buffer, "T-19"), last - 2);
-        assert_eq!(list_row(&buffer, "T-20"), last + 1);
+        assert_eq!(list_row(&buffer, "T-20"), last);
     }
 
     /// A new read — a task added at the end — moves neither the view nor the
@@ -1466,7 +1468,7 @@ mod task_app_render {
         let after = render(120, 31, &mut app, &Styles::new(false));
         assert_eq!(content_text(&after, 2), top, "{}", screen(&after));
         assert_eq!(list_row(&after, "T-17"), selected);
-        assert_task_bracket(&after, selected, marks(true, false));
+        assert_task_bar(&after, selected, marks(true, false));
     }
 
     /// R10: the rows of tasks being sent have the same two lines and the
@@ -1492,17 +1494,13 @@ mod task_app_render {
             |row: usize| -> String { rows(&buffer)[row].chars().skip(3).take(width - 4).collect() };
         assert!(line(1).starts_with("  ↻  Pending p1"), "{:?}", line(1));
         assert!(line(2).starts_with("     wysyłanie…"), "{:?}", line(2));
-        assert!(line(4).starts_with("  ✗  Pending p2"), "{:?}", line(4));
-        assert!(line(5).starts_with("     nie wysłano"), "{:?}", line(5));
-        assert_eq!(buffer.content()[5 * width + 8].fg, Color::Red);
-        // The last pushed row is selected: it is bracketed.
+        assert!(line(3).starts_with("  ✗  Pending p2"), "{:?}", line(3));
+        assert!(line(4).starts_with("     nie wysłano"), "{:?}", line(4));
+        assert_eq!(buffer.content()[4 * width + 8].fg, Color::Red);
+        // The last pushed row is selected: it has only a bar.
         let cell = |x: u16, y: u16| cell_at(&buffer, x, y);
+        assert_eq!(cell(1, 3), ("│".to_string(), Color::Cyan));
         assert_eq!(cell(1, 4), ("│".to_string(), Color::Cyan));
-        assert_eq!(cell(1, 5), ("│".to_string(), Color::Cyan));
-        for x in [1, 3] {
-            assert_eq!(cell(x, 3), ("─".to_string(), Color::Cyan));
-            assert_eq!(cell(x, 6), ("─".to_string(), Color::Cyan));
-        }
         assert_eq!(cell(1, 1).0, " ");
         assert!(none_reversed(buffer.content()));
     }
@@ -1526,7 +1524,7 @@ mod task_app_render {
             screen(&buffer)
         );
         assert!(list_row(&buffer, "Queued 2") < moved);
-        assert_task_bracket(&buffer, moved, marks(true, false));
+        assert_task_bar(&buffer, moved, marks(true, false));
     }
 }
 
@@ -2392,7 +2390,7 @@ mod task_app_detail_render {
     }
 
     /// `m` from the details moves the list's row: the keys are on the list,
-    /// so its bracket is in the focus role and the axis's grey until the move
+    /// so its bar is in the focus role and the axis's grey until the move
     /// ends.
     #[test]
     fn the_move_mode_from_the_details_lights_the_list_and_greys_the_axis() {
@@ -2431,25 +2429,17 @@ mod task_app_detail_render {
         let details = render(&mut app, &Styles::new(false));
         assert_axis_bracket(&details, "● review #1 w toku", marks(true, false));
         let y = list_row(&details);
-        assert_bracket(
-            &details,
-            (3, y),
-            2,
-            layout::LIST_WIDTH - 1,
-            marks(false, false),
-        );
+        for row in y..y + 2 {
+            assert!(is_mark(&details[(1, row)], "│", marks(false, false)));
+        }
 
         press(&mut app, KeyCode::Char('m'));
         assert!(app.list().moving().is_some(), "the move mode is on");
         let moving = render(&mut app, &Styles::new(false));
         let y = list_row(&moving);
-        assert_bracket(
-            &moving,
-            (3, y),
-            2,
-            layout::LIST_WIDTH - 1,
-            marks(true, false),
-        );
+        for row in y..y + 2 {
+            assert!(is_mark(&moving[(1, row)], "│", marks(true, false)));
+        }
         assert_axis_bracket(&moving, "● review #1 w toku", marks(false, false));
 
         press(&mut app, KeyCode::Esc);

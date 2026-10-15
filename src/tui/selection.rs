@@ -1,15 +1,13 @@
 //! A list with a bracket around the selected item (R7–R14).
 //!
-//! Lists in the interface — the tasks, the history, the step axis, the
-//! choosers — do not mark the selection with reverse video, which swallows the
-//! colours of the row (R13). Their items stack directly, one under another,
-//! and the selected item is bracketed: a horizontal rule in a row of its own
-//! directly above it, another directly below it, and a vertical bar beside
-//! each of its lines (R8). The rules span the whole width of the list from
-//! column 0; the bar sits in column 0 only on the item's own lines, so the
-//! two never meet — there are no corners. Every line keeps a two-column
-//! prefix (the bar and a space, or two spaces), so the content columns are
-//! the same for every item.
+//! Most lists in the interface — the history, the step axis, and the
+//! choosers — do not mark the selection with reverse video, which swallows
+//! the colours of the row (R13). Their items stack directly, one under
+//! another, and the selected item is bracketed: a horizontal rule in a row
+//! of its own directly above it, another directly below it, and a vertical
+//! bar beside each of its lines (R8). The task list uses the bar-only variant
+//! so selection does not add rows. Every line keeps a two-column prefix (the
+//! bar and a space, or two spaces), so content columns stay aligned.
 //!
 //! ```text
 //!   ! ✗  Fix login              <- an item
@@ -21,8 +19,9 @@
 //!   ? ◆  Add docs
 //! ```
 //!
-//! Only the selected item takes the two rule rows, so moving the selection
-//! shifts its neighbours by a row; without a selection there are no rules.
+//! Bracketed selection adds two rule rows, so moving it shifts neighbours;
+//! bar-only selection adds no rows. Without a bracketed selection there are
+//! no rules.
 //!
 //! The marks are always thin: in the focus role where the keys are, in the
 //! background role elsewhere ([`Styles::selection_marks`]). They do not grey
@@ -42,6 +41,18 @@ use super::style::Styles;
 /// How many columns the bar takes on the left of every line: the bar and a
 /// space. Callers lay their lines out in the area's width minus this.
 pub const PREFIX_WIDTH: u16 = 2;
+
+#[derive(Clone, Copy)]
+enum SelectionDecoration {
+    Bracketed,
+    Barred,
+}
+
+impl SelectionDecoration {
+    const fn has_rules(self) -> bool {
+        matches!(self, Self::Bracketed)
+    }
+}
 
 /// The rows a bracketed list of `count` one-line items, one of them
 /// selected, takes whole: a row per item and the two rules around the
@@ -96,19 +107,66 @@ pub fn render_bracketed_list(
     focused: bool,
     top: &mut usize,
 ) {
+    render_list(
+        frame,
+        area,
+        styles,
+        items,
+        selected,
+        focused,
+        top,
+        SelectionDecoration::Bracketed,
+    );
+}
+
+/// Draws `items` one under another with only a left bar beside `selected`.
+/// Unlike [`render_bracketed_list`], selection adds no rows and does not fill
+/// the content background.
+pub fn render_barred_list(
+    frame: &mut Frame,
+    area: Rect,
+    styles: &Styles,
+    items: &[Vec<Line<'_>>],
+    selected: Option<usize>,
+    focused: bool,
+    top: &mut usize,
+) {
+    render_list(
+        frame,
+        area,
+        styles,
+        items,
+        selected,
+        focused,
+        top,
+        SelectionDecoration::Barred,
+    );
+}
+
+fn render_list(
+    frame: &mut Frame,
+    area: Rect,
+    styles: &Styles,
+    items: &[Vec<Line<'_>>],
+    selected: Option<usize>,
+    focused: bool,
+    top: &mut usize,
+    decoration: SelectionDecoration,
+) {
     let selected = selected.filter(|&index| index < items.len());
     let height = usize::from(area.height);
     let heights: Vec<usize> = items.iter().map(Vec::len).collect();
-    keep_in_view(top, selected, &heights, height);
+    keep_in_view(top, selected, &heights, height, decoration);
     if area.width == 0 || area.height == 0 || items.is_empty() {
         return;
     }
     let marks = styles.selection_marks(focused);
 
     if let Some(index) = selected {
-        if heights[index] + 2 > height {
+        let rules = if decoration.has_rules() { 2 } else { 0 };
+        if heights[index] + rules > height {
             for (row, line) in items[index].iter().take(height).enumerate() {
-                draw_line(frame, area, row, styles, line, true, focused);
+                draw_line(frame, area, row, styles, line, true, focused, decoration);
             }
             return;
         }
@@ -120,7 +178,7 @@ pub fn render_bracketed_list(
             break;
         }
         let is_selected = selected == Some(index);
-        if is_selected {
+        if is_selected && decoration.has_rules() {
             draw_rule(frame, area, row, marks.rule, marks.style);
             row += 1;
         }
@@ -128,10 +186,19 @@ pub fn render_bracketed_list(
             if row >= height {
                 break;
             }
-            draw_line(frame, area, row, styles, line, is_selected, focused);
+            draw_line(
+                frame,
+                area,
+                row,
+                styles,
+                line,
+                is_selected,
+                focused,
+                decoration,
+            );
             row += 1;
         }
-        if is_selected && row < height {
+        if is_selected && decoration.has_rules() && row < height {
             draw_rule(frame, area, row, marks.rule, marks.style);
             row += 1;
         }
@@ -140,27 +207,46 @@ pub fn render_bracketed_list(
 
 /// Moves `top` as little as it takes for the selected item and the rules
 /// around it to be in a view `height` rows high.
-fn keep_in_view(top: &mut usize, selected: Option<usize>, heights: &[usize], height: usize) {
+fn keep_in_view(
+    top: &mut usize,
+    selected: Option<usize>,
+    heights: &[usize],
+    height: usize,
+    decoration: SelectionDecoration,
+) {
     *top = (*top).min(heights.len().saturating_sub(1));
     if let Some(selected) = selected {
         if selected < *top {
             *top = selected;
         }
-        while *top < selected && rows_through(heights, *top, selected, Some(selected)) > height {
+        while *top < selected
+            && rows_through(heights, *top, selected, Some(selected), decoration) > height
+        {
             *top += 1;
         }
     }
-    while *top > 0 && rows_through(heights, *top - 1, heights.len() - 1, selected) <= height {
+    while *top > 0
+        && rows_through(heights, *top - 1, heights.len() - 1, selected, decoration) <= height
+    {
         *top -= 1;
     }
 }
 
 /// The rows items `first` through `last` take, with the two rules of the
 /// selected item when it is among them.
-fn rows_through(heights: &[usize], first: usize, last: usize, selected: Option<usize>) -> usize {
-    let rules = match selected {
-        Some(index) if (first..=last).contains(&index) => 2,
-        _ => 0,
+fn rows_through(
+    heights: &[usize],
+    first: usize,
+    last: usize,
+    selected: Option<usize>,
+    decoration: SelectionDecoration,
+) -> usize {
+    let rules = if decoration.has_rules()
+        && selected.is_some_and(|index| (first..=last).contains(&index))
+    {
+        2
+    } else {
+        0
     };
     heights[first..=last].iter().sum::<usize>() + rules
 }
@@ -183,6 +269,7 @@ fn draw_line(
     line: &Line<'_>,
     selected: bool,
     focused: bool,
+    decoration: SelectionDecoration,
 ) {
     let y = area.y + row as u16;
     let prefix_width = area.width.min(PREFIX_WIDTH);
@@ -197,7 +284,7 @@ fn draw_line(
             Rect::new(area.x + prefix_width, y, content_width, 1),
         );
     }
-    if selected {
+    if selected && decoration.has_rules() {
         // A low contrast fill makes the selected row easier to track while
         // leaving each label's semantic foreground colour intact.
         let background = Style::default().bg(Color::Indexed(236));
