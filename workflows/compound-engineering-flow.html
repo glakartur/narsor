@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>compound-engineering — flow</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18241f;
+      --muted: #52645b;
+      --paper: #f4f6f2;
+      --card: #fff;
+      --line: #9eafa4;
+      --green: #d9f2df;
+      --green-line: #42885a;
+      --blue: #e0edff;
+      --blue-line: #4f78ae;
+      --amber: #fff0cb;
+      --amber-line: #b88528;
+      --red: #fce2df;
+      --red-line: #b9574c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 16px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header, main { width: min(1120px, calc(100% - 40px)); margin-inline: auto; }
+    header { padding: 48px 0 24px; }
+    .eyebrow { color: #39734c; font-size: .78rem; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { margin: 8px 0; font-size: clamp(2rem, 5vw, 3.4rem); line-height: 1.08; letter-spacing: -.04em; }
+    header p { max-width: 720px; margin: 12px 0 0; color: var(--muted); font-size: 1.08rem; }
+    .legend { display: flex; flex-wrap: wrap; gap: 10px 20px; margin: 24px 0 0; color: var(--muted); font-size: .9rem; }
+    .key { display: inline-flex; align-items: center; gap: 8px; }
+    .swatch { width: 16px; height: 16px; border: 1px solid; border-radius: 5px; }
+    .swatch.agent { background: var(--green); border-color: var(--green-line); }
+    .swatch.human { background: var(--blue); border-color: var(--blue-line); }
+    .swatch.decision { background: var(--amber); border-color: var(--amber-line); }
+    .swatch.terminal { background: var(--red); border-color: var(--red-line); }
+    .canvas { overflow-x: auto; border: 1px solid #dce3dc; border-radius: 18px; background: #fbfcfa; box-shadow: 0 12px 40px #22372b0d; }
+    svg { display: block; width: 100%; min-width: 880px; height: auto; }
+    .node rect { stroke-width: 2; rx: 14; }
+    .node.agent rect { fill: var(--green); stroke: var(--green-line); }
+    .node.human rect { fill: var(--blue); stroke: var(--blue-line); }
+    .node.decision rect { fill: var(--amber); stroke: var(--amber-line); }
+    .node.terminal rect { fill: var(--red); stroke: var(--red-line); }
+    .node .title { fill: var(--ink); font-size: 16px; font-weight: 720; text-anchor: middle; }
+    .node .sub { fill: var(--muted); font-size: 12px; text-anchor: middle; }
+    .edge { fill: none; stroke: var(--line); stroke-width: 2.2; marker-end: url(#arrow); }
+    .edge-label { fill: #46584e; font-size: 12px; font-weight: 650; paint-order: stroke; stroke: #fbfcfa; stroke-width: 5px; stroke-linejoin: round; }
+    .section { fill: #e8eee8; }
+    .section-label { fill: #69796f; font-size: 12px; font-weight: 750; letter-spacing: 1.5px; }
+    .notes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 24px 0 48px; }
+    .note { padding: 18px; border: 1px solid #dce3dc; border-radius: 14px; background: var(--card); }
+    .note h2 { margin: 0 0 6px; font-size: 1rem; }
+    .note p { margin: 0; color: var(--muted); font-size: .92rem; }
+    footer { padding: 0 0 28px; color: var(--muted); font-size: .85rem; }
+    @media (max-width: 700px) { .notes { grid-template-columns: 1fr; } header { padding-top: 32px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">Workflow · Narsor</div>
+    <h1>compound-engineering</h1>
+    <p>Od doprecyzowania zakresu do otwartego PR-u i zapisanej wiedzy. Niebieskie kroki czekają na decyzję człowieka.</p>
+    <div class="legend" aria-label="Legenda diagramu">
+      <span class="key"><i class="swatch agent"></i> krok agenta</span>
+      <span class="key"><i class="swatch human"></i> bramka człowieka</span>
+      <span class="key"><i class="swatch decision"></i> wybór / poprawki</span>
+      <span class="key"><i class="swatch terminal"></i> zakończenie</span>
+    </div>
+  </header>
+  <main>
+    <div class="canvas" role="region" aria-label="Diagram przepływu workflow; na wąskim ekranie można przewijać poziomo" tabindex="0">
+      <svg viewBox="0 0 1100 1660" role="img" aria-labelledby="diagram-title diagram-desc">
+        <title id="diagram-title">Diagram compound-engineering</title>
+        <desc id="diagram-desc">Workflow prowadzi przez brainstorm, akceptację zakresu i planu, implementację, automatyczne review, push, review człowieka, zapis wiedzy, ponowny push i końcowe review człowieka.</desc>
+        <defs>
+          <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="#9eafa4"/></marker>
+        </defs>
+        <rect class="section" x="24" y="32" width="1052" height="470" rx="18"/>
+        <text class="section-label" x="48" y="60">ZAKRES I PLAN</text>
+        <rect class="section" x="24" y="520" width="1052" height="570" rx="18"/>
+        <text class="section-label" x="48" y="548">IMPLEMENTACJA I REVIEW</text>
+        <rect class="section" x="24" y="1100" width="1052" height="500" rx="18"/>
+        <text class="section-label" x="48" y="1128">ZAPIS WIEDZY I REVIEW KOŃCOWE</text>
+
+        <!-- connectors -->
+        <path class="edge" d="M550 137V175"/><path class="edge" d="M550 247V285"/>
+        <path class="edge" d="M550 357V395"/>
+        <path class="edge" d="M550 467V575"/><path class="edge" d="M550 647V685"/>
+        <path class="edge" d="M550 757V795"/><path class="edge" d="M550 867V905"/>
+        <path class="edge" d="M550 977V1015"/><path class="edge" d="M550 1087V1125"/>
+        <path class="edge" d="M550 1197V1235"/><path class="edge" d="M550 1307V1345"/>
+        <path class="edge" d="M550 1417V1455"/><text class="edge-label" x="565" y="1445">approve</text>
+        <!-- scope revision loop -->
+        <path class="edge" d="M420 211H340V103H420"/><text class="edge-label" x="286" y="160">revise</text>
+        <!-- scope / planning returns -->
+        <path class="edge" d="M680 321H790V211H680"/><text class="edge-label" x="800" y="275">needs scope revision</text>
+        <path class="edge" d="M680 431H760V465"/><text class="edge-label" x="690" y="458">revise</text>
+        <path class="edge" d="M760 465V431H680"/><text class="edge-label" x="770" y="450">plan ready</text>
+        <!-- ambiguity -->
+        <!-- automatic review loop, then human implementation review -->
+        <path class="edge" d="M680 831H760"/><text class="edge-label" x="695" y="820">findings</text>
+        <path class="edge" d="M760 867V890H390V831H420"/><text class="edge-label" x="470" y="885">fixed → review again</text>
+        <text class="edge-label" x="565" y="892">clean</text>
+        <path class="edge" d="M680 1051H1060V611H1020"/><text class="edge-label" x="900" y="1040">revise</text>
+        <path class="edge" d="M760 647V721H680"/><text class="edge-label" x="770" y="700">continue</text>
+        <path class="edge" d="M680 1381H1060V611H1020"/><text class="edge-label" x="900" y="1370">revise</text>
+        <path class="edge" d="M680 1161H730V1482H630"/><text class="edge-label" x="740" y="1205">nic do zapisania</text>
+        <!-- abandon collector -->
+        <path class="edge" d="M420 211H55V1572H790"/>
+        <path class="edge" d="M420 431H55V1572H790"/>
+        <path class="edge" d="M420 1051H55V1572H790"/>
+        <path class="edge" d="M420 1381H55V1572H790"/>
+        <text class="edge-label" x="61" y="1200">abandon</text>
+
+        <!-- nodes -->
+        <g class="node agent"><rect x="420" y="65" width="260" height="72"/><text class="title" x="550" y="96">Brainstorm</text><text class="sub" x="550" y="117">ce-brainstorm</text></g>
+        <g class="node human"><rect x="420" y="175" width="260" height="72"/><text class="title" x="550" y="206">Akceptacja zakresu</text><text class="sub" x="550" y="227">approve_scope</text></g>
+        <g class="node agent"><rect x="420" y="285" width="260" height="72"/><text class="title" x="550" y="316">Plan</text><text class="sub" x="550" y="337">ce-plan</text></g>
+        <g class="node human"><rect x="420" y="395" width="260" height="72"/><text class="title" x="550" y="426">Akceptacja planu</text><text class="sub" x="550" y="447">approve_plan</text></g>
+        <g class="node agent"><rect x="760" y="395" width="260" height="72"/><text class="title" x="890" y="426">Replan</text><text class="sub" x="890" y="447">plan_revision</text></g>
+        <g class="node agent"><rect x="420" y="575" width="260" height="72"/><text class="title" x="550" y="606">Implementacja</text><text class="sub" x="550" y="627">ce-work</text></g>
+        <g class="node agent"><rect x="420" y="685" width="260" height="72"/><text class="title" x="550" y="716">Uproszczenie</text><text class="sub" x="550" y="737">ce-simplify-code</text></g>
+        <g class="node agent"><rect x="420" y="795" width="260" height="72"/><text class="title" x="550" y="826">Code review</text><text class="sub" x="550" y="847">ce-code-review · report-only</text></g>
+        <g class="node agent"><rect x="420" y="905" width="260" height="72"/><text class="title" x="550" y="936">Commit, push i PR</text><text class="sub" x="550" y="957">publish_work</text></g>
+        <g class="node agent"><rect x="760" y="795" width="260" height="72"/><text class="title" x="890" y="826">Automatyczne poprawki</text><text class="sub" x="890" y="847">fix_review_findings</text></g>
+        <g class="node agent"><rect x="760" y="575" width="260" height="72"/><text class="title" x="890" y="606">Implementacja · dalszy ciąg</text><text class="sub" x="890" y="627">ce-work · work_revision</text></g>
+        <g class="node human"><rect x="420" y="1015" width="260" height="72"/><text class="title" x="550" y="1046">Review człowieka</text><text class="sub" x="550" y="1067">implementation_review</text></g>
+        <g class="node agent"><rect x="420" y="1125" width="260" height="72"/><text class="title" x="550" y="1156">Zapis wiedzy</text><text class="sub" x="550" y="1177">ce-compound</text></g>
+        <g class="node agent"><rect x="420" y="1235" width="260" height="72"/><text class="title" x="550" y="1266">Push aktualizacji PR</text><text class="sub" x="550" y="1287">publish_learning</text></g>
+        <g class="node human"><rect x="420" y="1345" width="260" height="72"/><text class="title" x="550" y="1376">Review końcowe</text><text class="sub" x="550" y="1397">learning_review</text></g>
+        <g class="node terminal"><rect x="470" y="1455" width="160" height="54"/><text class="title" x="550" y="1488">Finished</text></g>
+        <g class="node terminal"><rect x="790" y="1545" width="160" height="54"/><text class="title" x="870" y="1578">Cancelled</text></g>
+      </svg>
+    </div>
+    <section class="notes" aria-label="Opis głównych pętli">
+      <article class="note"><h2>Zakres i plan</h2><p>Zakres można odesłać do brainstormu. Plan wraca do akceptacji po poprawkach albo po decyzji, że nie da się go wykonać zgodnie z założeniami.</p></article>
+      <article class="note"><h2>Implementacja i review</h2><p>Przy niejasności agent pyta w kroku implementacji i po odpowiedzi wznawia ten sam krok. Automatyczne review i poprawki agenta powtarzają się aż do czystego wyniku.</p></article>
+      <article class="note"><h2>Publikacja i PR</h2><p>Po czystym automatycznym review agent publikuje branch, a człowiek przegląda PR. Po akceptacji agent zapisuje wiedzę i wypycha ją do tego samego PR-u, który trafia do końcowego review człowieka.</p></article>
+    </section>
+    <footer>Diagram oparty na <code>workflows/compound-engineering.yaml</code>. Na wąskim ekranie przewiń diagram poziomo.</footer>
+  </main>
+</body>
+</html>

@@ -536,15 +536,18 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
             "requirements_drafted", // brainstorm
             "reviewed",             // doc_review
             "plan_ready",           // plan
-            "needs_human_decision", // work — refuses to guess
-            "implemented",          // apply_clarification
+            "implemented",          // work — ambiguity uses awaiting_input in place
             "simplified",           // simplify
             "findings",             // code_review
-            "fixed",                // fix_findings
+            "fixed",                // fix_review_findings
             "clean",                // code_review again
-            "pr_opened",            // commit_push_pr
-            "resolved",             // resolve_pr_feedback
-            "documented",           // compound
+            "published",            // publish_work — opens the first PR
+            "revised",              // work_revision — addresses human review
+            "simplified",           // simplify
+            "clean",                // code_review
+            "published",            // publish_work — updates the existing PR
+            "documented",           // compound — after implementation review
+            "updated",              // publish_learning — push the knowledge doc
         ],
     );
     let engine = harness.engine(root.dir("store"));
@@ -567,18 +570,31 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
                     ("scope_notes", "one screen only, no notifications"),
                 ],
             ),
-            Answer::new("approve_plan", &[("plan_decision", "approved")]),
             Answer::new(
-                "resolve_ambiguity",
+                "approve_plan",
+                &[("plan_decision", "approved"), ("plan_feedback", "as written")],
+            ),
+            Answer::new(
+                "implementation_review",
                 &[
-                    ("ambiguity_decision", "answered"),
-                    ("ambiguity_answer", "subscribe per run, not per workflow"),
+                    ("review_decision", "revise"),
+                    ("revision_notes", "Handle the reviewer's requested change"),
                 ],
             ),
-            Answer::new("triage_findings", &[("findings_decision", "fix")]),
-            Answer::new("approve_push", &[("publish_decision", "approve")]),
-            Answer::new("pr_feedback_gate", &[("pr_outcome", "feedback_received")]),
-            Answer::new("pr_feedback_gate", &[("pr_outcome", "approved")]),
+            Answer::new(
+                "implementation_review",
+                &[
+                    ("review_decision", "approve"),
+                    ("revision_notes", "none"),
+                ],
+            ),
+            Answer::new(
+                "learning_review",
+                &[
+                    ("learning_review_decision", "approve"),
+                    ("revision_notes", "none"),
+                ],
+            ),
         ],
     )
     .await;
@@ -589,10 +605,6 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
     assert_eq!(
         execution.context.variables.get("scope_notes"),
         Some(&json!("one screen only, no notifications"))
-    );
-    assert_eq!(
-        execution.context.variables.get("ambiguity_answer"),
-        Some(&json!("subscribe per run, not per workflow"))
     );
 }
 

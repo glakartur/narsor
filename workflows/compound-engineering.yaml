@@ -2,13 +2,14 @@ name: compound-engineering
 version: 1
 description: >
   The compound engineering chain, end to end: ce-brainstorm to ce-plan to
-  ce-work to ce-code-review to ce-commit-push-pr to ce-compound, with
+  ce-work to ce-code-review to ce-commit-push-pr to human review to
+  ce-compound and a final push/review, with
   ce-doc-review over the requirements, ce-simplify-code before review and
   ce-resolve-pr-feedback on the open pull request. The pipeline stops for a
-  person wherever a decision is irreversible, outward-facing, or beyond what an
-  agent can settle on its own: the scope, the plan (before a line of code
-  exists), a genuine ambiguity during the work, what to do with review
-  findings, and the push that makes the work public.
+  person at scope and plan approval, and reviews the pushed PR after
+  implementation and again after any learning document is added. During
+  implementation an agent can pause and ask a question, then resume the same
+  action with the person's answer.
 
 inputs:
   - name: feature_description
@@ -228,8 +229,8 @@ states:
             - abandon
         - name: plan_feedback
           type: text
-          required: false
-          description: What the plan gets wrong, if anything.
+          required: true
+          description: What the plan gets wrong, or "as written" if you approve it.
     outputs:
       - label: approved
         description: the plan is right; start writing code.
@@ -239,12 +240,39 @@ states:
         description: stop before any code is written.
     transitions:
       approved: work
-      revise: plan
+      revise: plan_revision
       abandon: cancelled
 
   # -------------------------------------------------------------------------
   # Doing the work
   # -------------------------------------------------------------------------
+
+  plan_revision:
+    description: >
+      Replan after the human's feedback on the proposed implementation plan.
+    action:
+      type: agent
+      prompt: |
+        Run the `ce-plan` skill again. Revise the plan in `docs/plans/` based
+        on the approved requirements in `docs/brainstorms/` and this human
+        feedback:
+
+        {{ context.plan_feedback }}
+
+        Keep the plan concrete: repo-relative file paths, test scenarios and
+        sequencing. Write no implementation code.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "<label>", "data": {"plan_doc": "<repo-relative path>"}}
+    outputs:
+      - label: plan_ready
+        description: the revised plan is ready for approval.
+    transitions:
+      plan_ready: approve_plan
+    timeout: 1h
+    retry_policy:
+      max_attempts: 2
+      backoff: 1m
 
   work:
     description: >
@@ -256,91 +284,55 @@ states:
         Run the `ce-work` skill against the plan in `docs/plans/`. Implement
         the plan's units in order, write the tests the plan enumerates, and
         run the repository's own checks before you finish. Respect the plan's
-        scope boundaries.
+        scope boundaries. If a requirement or implementation choice is
+        ambiguous, do not guess: return an `awaiting_input` response with a
+        clear question. The workflow pauses this agent action, delivers the
+        person's answer, and resumes this same implementation step. Continue
+        until the implementation is complete.
 
         End your answer with a single JSON object and nothing after it:
           {"output": "<label>", "data": {"units_completed": <count>}}
-        Do not guess: if you take `needs_human_decision`, state the question or
-        blocker in `data.question`.
         A sandbox, harness, tool, or write-permission problem is an action
         failure, not a workflow output.
     outputs:
       - label: implemented
         description: the plan is implemented and the checks pass.
-      - label: needs_human_decision
-        description: >-
-          you hit a genuine ambiguity the plan does not settle, or the plan
-          cannot be implemented as written.
     transitions:
       implemented: simplify
-      needs_human_decision: resolve_ambiguity
     timeout: 2h
 
-  resolve_ambiguity:
+  work_revision:
     description: >
-      HUMAN GATE — the escape hatch out of guessing. `ce-work` reached a
-      question the plan does not answer, and an agent that answers it itself
-      is inventing product behaviour halfway through an implementation.
-    action:
-      type: human
-      message: >
-        The agent stopped on an ambiguity rather than guessing. Answer its
-        question, or send the work back to planning if the plan is the thing
-        that is wrong.
-      inputs:
-        - name: ambiguity_decision
-          type: select
-          required: true
-          options:
-            - answered
-            - replan
-            - abandon
-        - name: ambiguity_answer
-          type: text
-          required: true
-          description: The answer to the agent's question, or why you are replanning.
-    outputs:
-      - label: answered
-        description: the agent's question is answered; carry on with the work.
-      - label: replan
-        description: the plan is what is wrong; send the work back to planning.
-      - label: abandon
-        description: stop the pipeline here.
-    transitions:
-      answered: apply_clarification
-      replan: plan
-      abandon: cancelled
-
-  apply_clarification:
-    description: >
-      ce-work again, this time carrying the human's answer to the question
-      that stopped it.
+      Shared continuation of implementation for changes from human review or
+      PR feedback. Both routes re-enter here before simplify and automated
+      review.
     action:
       type: agent
       prompt: |
-        Continue the `ce-work` run. The question that stopped you has been
-        answered:
+        Run the `ce-work` skill against the approved plan in `docs/plans/`.
+        Continue the existing implementation and address the changes in the
+        person's review note:
 
-        {{ context.ambiguity_answer }}
+        {{ context.revision_notes }}
 
-        Apply that answer and finish the remaining implementation units of the
-        plan in `docs/plans/`, with their tests.
+        If this branch already has an open pull request, also run
+        `ce-resolve-pr-feedback`: judge each review thread on its merits,
+        incorporate valid requests and reply to each thread. Do not push here;
+        the shared simplify, automated review and human review steps run next.
+
+        Keep changes within the approved plan, add regression tests where
+        appropriate, and run the repository's checks. Do not push or open a PR.
+        Return `revised` when the requested changes are complete; report an
+        action failure if blocked.
 
         End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"units_completed": <count>}}
-        If you take `still_ambiguous`, state what is still open, or why the
-        work remains impossible, in `data.question`.
-        A sandbox, harness, tool, or write-permission problem is an action
-        failure, not a workflow output.
+          {"output": "revised", "data": {"files_touched": <count>}}
     outputs:
-      - label: implemented
-        description: the work is finished and the checks pass.
-      - label: still_ambiguous
-        description: the answer does not settle the question.
+      - label: revised
+        description: requested changes are made and checks pass.
     transitions:
-      implemented: simplify
-      still_ambiguous: resolve_ambiguity
-    timeout: 2h
+      revised: simplify
+    timeout: 1h
 
   simplify:
     description: >
@@ -377,8 +369,9 @@ states:
   code_review:
     description: >
       ce-code-review in report-only mode — tiered persona agents, confidence
-      gating, merged and deduplicated findings. Read-only on purpose: what to
-      do with the findings is the next gate's question.
+      gating, merged and deduplicated findings. Read-only on purpose; findings
+      are sent to the implementation agent for automatic fixes and another
+      review cycle.
     action:
       type: agent
       workspace_access: read-only
@@ -397,191 +390,151 @@ states:
       - label: clean
         description: no actionable findings survived the confidence gate.
       - label: findings
-        description: there are findings for a person to triage.
+        description: findings need automatic fixes before another review cycle.
     transitions:
-      clean: approve_push
-      findings: triage_findings
+      clean: publish_work
+      findings: fix_review_findings
     timeout: 1h
     retry_policy:
       max_attempts: 2
       backoff: 1m
 
-  triage_findings:
+  implementation_review:
     description: >
-      HUMAN GATE — what to do with the findings. Whether a finding is a bug to
-      fix or an accepted trade-off is a judgement about this codebase and this
-      deadline, and the reviewer that raised it is not the one who gets to
-      make it.
+      HUMAN GATE — reached after the implementation has been pushed to the
+      pull request. The person reviews that published PR and decides whether
+      to request changes, approve it, or stop.
     action:
       type: human
       message: >
-        The code review produced findings. Decide: fix them, accept them and
-        move on, or stop the work here.
+        The implementation has been pushed to the pull request. Review the PR,
+        including feedback from its reviewers. Request changes with actionable
+        notes, approve it, or stop.
       inputs:
-        - name: findings_decision
+        - name: review_decision
           type: select
           required: true
           options:
-            - fix
-            - accept
+            - revise
+            - approve
             - abandon
-        - name: findings_notes
+        - name: revision_notes
           type: text
-          required: false
-          description: Which findings to fix, and which you are accepting and why.
+          required: true
+          description: What to change, or "none" if approving or abandoning.
     outputs:
-      - label: fix
-        description: have the agent fix the findings named in the note.
-      - label: accept
-        description: accept the findings and move on to publishing.
+      - label: revise
+        description: send the PR back for changes named in the note.
+      - label: approve
+        description: the person approves the PR after reviewing the pushed changes.
       - label: abandon
         description: stop the pipeline here.
     transitions:
-      fix: fix_findings
-      accept: approve_push
+      revise: work_revision
+      approve: compound
       abandon: cancelled
 
-  fix_findings:
-    description: Address the review findings the person chose to fix.
+  fix_review_findings:
+    description: Automatically address findings from the code review.
     action:
       type: agent
       prompt: |
-        Address the code review findings the reviewer asked to be fixed. Fix
-        the cause, not the symptom, add a regression test for each behavioural
-        finding, and re-run the repository's checks. Do not take on anything
-        the reviewer accepted.
+        Address every actionable finding from the latest `ce-code-review`
+        report. Fix causes rather than symptoms, add regression tests for
+        behavioural findings, and run the repository's checks. Do not ask a
+        person to triage findings: make the fixes, then return `fixed` so the
+        workflow runs `ce-code-review` again. If a finding cannot be resolved
+        safely, report an action failure instead of claiming it is fixed.
 
         End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"fixed": <count>}}
+          {"output": "fixed", "data": {"fixed": <count>}}
     outputs:
       - label: fixed
-        description: the findings are addressed and the checks pass.
-      - label: blocked
-        description: >-
-          a finding cannot be fixed without a decision that is not yours to
-          make.
+        description: findings are fixed; run automated review again.
     transitions:
       fixed: code_review
-      blocked: triage_findings
     timeout: 1h
 
-  approve_push:
+  publish_work:
     description: >
-      HUMAN GATE — the branch is about to leave the machine. Pushing and
-      opening a pull request is the first outward-facing, hard-to-retract act
-      in this pipeline, and it carries the author's name.
+      Publish the implementation: open a PR for a new branch or update the
+      existing PR after an automated review cycle.
+    action:
+      type: agent
+      prompt: |
+        The change has passed automated review. Check whether the current
+        branch already has an open pull request. If it does not, run
+        `ce-commit-push-pr` to commit,
+        push and open one with a value-first description. If it does, commit
+        and push the reviewed updates to that existing PR; do not create a
+        duplicate. Follow the repository's commit conventions and never push
+        to the default branch.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "published", "data": {"pr_url": "<url>"}, "variables": {"pr_url": "<url>"}}
+        If commit or push fails, report an action failure.
+    outputs:
+      - label: published
+        description: the branch is pushed and the new or existing PR is current.
+    transitions:
+      published: implementation_review
+    timeout: 30m
+
+  publish_learning:
+    description: >
+      Push the learning written after human review to the existing pull
+      request, then ask for a final human review of the updated PR.
+    action:
+      type: agent
+      prompt: |
+        The pull request was already reviewed and approved by a person.
+        `ce-compound` has now written durable learning to `docs/solutions/`.
+        Commit and push that learning to the existing pull request; do not
+        create a new PR. Follow repository commit conventions and never push
+        to the default branch.
+
+        End your answer with a single JSON object and nothing after it:
+          {"output": "updated", "data": {"pr_url": "<url>"}}
+        If commit or push fails, report an action failure.
+    outputs:
+      - label: updated
+        description: the learning is pushed to the existing pull request.
+    transitions:
+      updated: learning_review
+    timeout: 30m
+
+  learning_review:
+    description: >
+      HUMAN GATE — final review after the learning document was pushed to the
+      already reviewed pull request.
     action:
       type: human
       message: >
-        The work is reviewed and ready to publish. Approving pushes the branch
-        and opens a pull request under your name; nothing has left this machine
-        yet.
+        The learning document has been added to the approved pull request and
+        pushed. Review the updated PR. Approve it, request changes, or stop.
       inputs:
-        - name: publish_decision
+        - name: learning_review_decision
           type: select
           required: true
           options:
             - approve
             - revise
             - abandon
-        - name: publish_notes
+        - name: revision_notes
           type: text
-          required: false
-          description: Anything the PR description must say.
+          required: true
+          description: What to change, or "none" if approving or abandoning.
     outputs:
       - label: approve
-        description: push the branch and open a pull request under your name.
+        description: the updated pull request is approved; finish the workflow.
       - label: revise
-        description: send the work back for more fixes before it is published.
-      - label: abandon
-        description: stop before anything leaves this machine.
-    transitions:
-      approve: commit_push_pr
-      revise: fix_findings
-      abandon: cancelled
-
-  commit_push_pr:
-    description: >
-      ce-commit-push-pr — commit with a value-first message, push the branch
-      and open the pull request with an adaptive description.
-    action:
-      type: agent
-      prompt: |
-        Run the `ce-commit-push-pr` skill. Follow the repository's commit
-        conventions, push the feature branch (never the default branch), and
-        open a pull request whose description leads with the value of the
-        change and scales in depth with its size.
-
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"pr_url": "<url>"}, "variables": {"pr_url": "<url>"}}
-        If the commit, push, or pull-request creation fails, report an action
-        failure; do not emit a workflow output for that execution error.
-    outputs:
-      - label: pr_opened
-        description: the branch is pushed and the pull request is open.
-    transitions:
-      pr_opened: pr_feedback_gate
-    timeout: 30m
-
-  pr_feedback_gate:
-    description: >
-      HUMAN GATE — the review loop. The pull request is in other people's
-      hands now; nothing here can be decided by reading the repository, so the
-      pipeline waits for the person watching the PR to report what came back.
-    action:
-      type: human
-      message: >
-        The pull request is open. When reviewers have answered, say what came
-        back: feedback to resolve, an approval, or stop.
-      inputs:
-        - name: pr_outcome
-          type: select
-          required: true
-          options:
-            - feedback_received
-            - approved
-            - abandon
-        - name: pr_feedback_summary
-          type: text
-          required: false
-          description: What the reviewers asked for, if anything.
-    outputs:
-      - label: feedback_received
-        description: reviewers asked for changes; resolve their threads.
-      - label: approved
-        description: the pull request is approved; write down what was learned.
+        description: send the updated pull request back for changes.
       - label: abandon
         description: stop the pipeline here.
     transitions:
-      feedback_received: resolve_pr_feedback
-      approved: compound
+      approve: finished
+      revise: work_revision
       abandon: cancelled
-
-  resolve_pr_feedback:
-    description: >
-      ce-resolve-pr-feedback — evaluate each review thread for validity, fix
-      what is valid, and reply on the threads.
-    action:
-      type: agent
-      prompt: |
-        Run the `ce-resolve-pr-feedback` skill on the open pull request.
-        Evaluate each review thread on its merits — a comment can be wrong —
-        fix the valid ones, reply to every thread saying what you did or why
-        you disagreed, and push the fixes.
-
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"threads_resolved": <count>}}
-    outputs:
-      - label: resolved
-        description: >-
-          every thread is answered and the fixes are pushed; the pull request
-          goes back for re-review.
-      - label: blocked
-        description: a thread asks for a decision you cannot make.
-    transitions:
-      resolved: pr_feedback_gate
-      blocked: pr_feedback_gate
-    timeout: 1h
 
   compound:
     description: >
@@ -605,7 +558,7 @@ states:
       - label: nothing_to_document
         description: this run taught nothing that is not already written down.
     transitions:
-      documented: finished
+      documented: publish_learning
       nothing_to_document: finished
     timeout: 30m
     retry_policy:

@@ -5,7 +5,7 @@ real agentic development processes rather than invented ones:
 
 | File | Process | Source material |
 |---|---|---|
-| `compound-engineering.yaml` | The compound engineering chain: brainstorm → plan → work → code review → commit/push/PR → compound | the `ce-*` skills of the `compound-engineering` plugin |
+| `compound-engineering.yaml` | The compound engineering chain: brainstorm → plan → work → code review → push/PR → human review → compound → push → final review | the `ce-*` skills of the `compound-engineering` plugin |
 | `open-mercato-sdlc.yaml` | The Open Mercato ticket lifecycle: Discovery → Intake → Triage → Claim → Design → Implement → PR → review loop → QA → Merge → housekeeping | [`SDLC.md`](https://github.com/open-mercato/skills) and the `om-*` skills |
 
 Both validate with zero violations and both are exercised end to end in
@@ -54,21 +54,28 @@ decision is **irreversible**, **outward-facing**, or **beyond what an agent can
 settle from the repository alone**. An autonomous pipeline without them drives
 straight to a merge.
 
-### `compound-engineering.yaml` — 7 gates
+### `compound-engineering.yaml` — 5 gates
 
 | Gate | Sits after | Why there |
 |---|---|---|
 | `clarify_direction` | `ce-brainstorm` returned `needs_direction` | Product direction is the one thing an agent has no basis to choose. Rather than guess, the chain stops and asks. |
 | `approve_scope` | `ce-brainstorm` + `ce-doc-review` | The requirements document is what every later step is measured against. A wrong scope caught here costs one conversation; caught after the PR it costs the whole pipeline. Your note is carried into the plan as `{{ context.scope_notes }}`. |
 | `approve_plan` | `ce-plan`, **before a line of code exists** | The cheapest correction point in the whole process. Everything after this gate is an edit to the repository. |
-| `resolve_ambiguity` | `ce-work` returned `needs_human_decision` | The escape hatch out of guessing: an agent that answers a product question halfway through an implementation is inventing behaviour. Your answer is quoted back into the follow-up run as `{{ context.ambiguity_answer }}`. |
-| `triage_findings` | `ce-code-review` (report-only) found something | Whether a finding is a bug to fix or an accepted trade-off is a judgement about this codebase and this deadline. The reviewer that raised it does not get to make it. |
-| `approve_push` | review is settled, **before push/PR** | The first outward-facing, hard-to-retract act in the pipeline — and it carries your name. |
-| `pr_feedback_gate` | the PR is open | Nothing about what reviewers said can be decided by reading the repository. The gate is also the review loop's hinge: `feedback_received` → `ce-resolve-pr-feedback` → back to this gate. |
+| `implementation_review` | implementation is pushed to the PR | The person reviews the implementation and can request changes, approve it for learning capture, or stop. |
+| `learning_review` | learning has been pushed to the already reviewed PR | The person reviews the updated PR and gives final approval. Requests for changes return to implementation. |
+
+`ce-compound` runs after the implementation review, when the result and review
+feedback are known. If it writes a learning document, the workflow pushes that
+update to the PR and asks for a final human review. If there is nothing to
+document, the approved PR is complete.
 
 Loops: `approve_scope → brainstorm`, `approve_plan → plan`,
-`resolve_ambiguity → plan`, `fix_findings → code_review → triage_findings`, and
-`resolve_pr_feedback → pr_feedback_gate`.
+`code_review → fix_review_findings → code_review` until clean,
+`code_review → publish_work → implementation_review → compound →
+publish_learning → learning_review`. A request from either review returns to
+`work_revision → simplify → code_review`; `publish_work` then updates the same
+PR. During `ce-work`, the agent can also pause its own action with
+`awaiting_input`; the answer resumes that same step.
 
 ### `open-mercato-sdlc.yaml` — 5 gates
 

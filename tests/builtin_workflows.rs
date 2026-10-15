@@ -31,7 +31,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use narsor_engine::domain::ActionConfig;
-use narsor_engine::engine::actions::agent::output_contract;
 use narsor_engine::workflows::{
     builtin, builtin_names, WorkflowOrigin, WorkflowResolver, BUILTIN_WORKFLOWS,
 };
@@ -328,10 +327,10 @@ fn every_builtin_label_has_a_description() {
     }
 }
 
-/// AE15: the `work` step no longer lists its labels by hand; the contract the
-/// engine appends names `needs_human_decision` together with its description.
+/// The implementation agent asks questions through `awaiting_input`, then
+/// resumes the same action; it does not route ambiguity through a workflow gate.
 #[test]
-fn the_work_prompt_leaves_the_label_list_to_the_engine_contract() {
+fn the_work_prompt_uses_agent_input_for_ambiguity() {
     let entry = builtin("compound-engineering").expect("compound-engineering is built in");
     let definition = narsor_engine::workflow::load_from_str(entry.source).expect("it loads");
     let work = &definition.states["work"];
@@ -344,20 +343,12 @@ fn the_work_prompt_leaves_the_label_list_to_the_engine_contract() {
         "the prompt of 'work' still carries a hand-written label list"
     );
 
-    let needs_human_decision = work
-        .outputs
-        .iter()
-        .find(|output| output.label == "needs_human_decision")
-        .expect("'work' declares needs_human_decision");
-    let description = needs_human_decision
-        .description
-        .as_deref()
-        .expect("needs_human_decision is described");
-    let contract = output_contract(&work.outputs);
     assert!(
-        contract.contains(&format!("- `needs_human_decision` — {description}")),
-        "the engine's contract lists needs_human_decision with its description: {contract}"
+        action.prompt.contains("awaiting_input"),
+        "the implementation prompt tells the agent to ask and resume in place"
     );
+    assert_eq!(work.outputs.len(), 1);
+    assert_eq!(work.outputs[0].label, "implemented");
 }
 
 /// The embedded text is the file in `workflows/`, byte for byte.
