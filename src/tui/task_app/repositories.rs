@@ -282,7 +282,7 @@ impl TaskApp {
     }
 
     /// A key while the repositories are open.
-    pub(super) fn on_repositories_key(&mut self, key: KeyEvent, confirming_quit: bool) -> Request {
+    pub(super) fn on_repositories_key(&mut self, key: KeyEvent) -> Request {
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.focus = Focus::List;
             return Request::None;
@@ -299,7 +299,7 @@ impl TaskApp {
                             return Request::None;
                         }
                         Some(Action::Quit) => {
-                            self.on_quit(confirming_quit);
+                            self.on_quit();
                             return Request::None;
                         }
                         _ => {}
@@ -319,13 +319,13 @@ impl TaskApp {
                     ChooserAction::Submit(submission) => self.submit_repository(&submission),
                 }
             }
-            None => self.on_repositories_list_key(key, confirming_quit),
+            None => self.on_repositories_list_key(key),
         };
         self.sync_repository_draft();
         request
     }
 
-    fn on_repositories_list_key(&mut self, key: KeyEvent, confirming_quit: bool) -> Request {
+    fn on_repositories_list_key(&mut self, key: KeyEvent) -> Request {
         let Some(action) = keymap::lookup(Context::Repositories, &key) else {
             return Request::None;
         };
@@ -334,7 +334,7 @@ impl TaskApp {
         };
         match action {
             Action::Help => self.help_open = true,
-            Action::Quit => self.on_quit(confirming_quit),
+            Action::Quit => self.on_quit(),
             Action::Back => self.close_view(),
             Action::AddRepository => repositories.open_form(),
             Action::RemoveRepository => self.ask_remove_repository(),

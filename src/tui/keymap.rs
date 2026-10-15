@@ -471,7 +471,7 @@ pub static BINDINGS: &[Binding] = &[
         Key::char('q'),
         Action::Quit,
         "wyjście",
-        "wyjście z narsora (z potwierdzeniem, gdy jest niewysłany szkic)",
+        "wyjście z narsora (wymaga ponownego naciśnięcia q)",
     ),
     // The task list.
     bind(

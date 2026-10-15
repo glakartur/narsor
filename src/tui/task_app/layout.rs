@@ -144,6 +144,14 @@ pub fn render(frame: &mut Frame, app: &mut TaskApp, styles: &Styles, now: Instan
     let areas = areas(frame.area(), app.focus());
     if areas.screen == Screen::TooSmall {
         render_too_small(frame, areas.outer, styles);
+        if app.quit_confirm {
+            actions::render_quit_confirmation(
+                frame,
+                areas.outer,
+                styles,
+                app.detail().has_drafts(),
+            );
+        }
         return;
     }
 
@@ -405,6 +413,16 @@ fn render_empty(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles) {
 }
 
 fn render_bar(frame: &mut Frame, area: Rect, app: &TaskApp, styles: &Styles, now: Instant) {
+    if app.quit_confirm {
+        let hints = Line::from(vec![
+            Span::styled(" q ", styles.key_cap()),
+            Span::raw("wyjdź  "),
+            Span::styled("Esc ", styles.key_cap()),
+            Span::raw("anuluj"),
+        ]);
+        frame.render_widget(Paragraph::new(hints), area);
+        return;
+    }
     let notification = app.notifier().span(styles, now);
     let note_width = notification
         .as_ref()

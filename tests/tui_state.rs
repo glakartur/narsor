@@ -4978,7 +4978,7 @@ mod task_app_waiting {
     }
 
     #[test]
-    fn quitting_with_an_unsent_draft_asks_first() {
+    fn quitting_always_requires_a_second_q_and_escape_cancels() {
         let mut app = gate_app();
         press(&mut app, KeyCode::Enter);
         typed(&mut app, "q?");
@@ -4991,21 +4991,42 @@ mod task_app_waiting {
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
         ch(&mut app, 'q');
-        assert!(!app.should_quit(), "the draft makes q ask");
-        assert!(app
-            .notifier()
-            .latest()
-            .unwrap()
-            .text
-            .contains("niewysłany szkic"));
+        assert!(!app.should_quit(), "the first q opens confirmation");
+        ch(&mut app, 'j');
+        assert!(!app.should_quit(), "other keys leave the dialog open");
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.should_quit(), "Esc cancels quitting");
+        ch(&mut app, 'q');
+        assert!(!app.should_quit(), "q must be pressed again");
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(!app.should_quit(), "modified q does not confirm quitting");
         ch(&mut app, 'q');
         assert!(app.should_quit());
 
         let mut app = gate_app();
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.is_help_open());
         ch(&mut app, 'q');
-        assert!(app.should_quit(), "no draft, no question");
+        assert!(
+            !app.should_quit(),
+            "q from help opens the exit confirmation"
+        );
+        assert!(!app.is_help_open());
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.should_quit());
+
+        let mut app = gate_app();
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        ch(&mut app, 'q');
+        assert!(
+            !app.should_quit(),
+            "confirmation is required without a draft"
+        );
+        ch(&mut app, 'q');
+        assert!(app.should_quit());
     }
 
     #[test]
@@ -7327,7 +7348,7 @@ mod task_app_conductor {
         }
 
         #[test]
-        fn q_and_the_question_mark_are_text_while_typing_and_quitting_asks_about_the_draft() {
+        fn q_and_the_question_mark_are_text_while_typing_then_quit_requires_a_second_q() {
             let mut app = tab_app();
             read(&mut app, conductor_view(vec![], json!({})));
             ch(&mut app, 'c');
@@ -7338,8 +7359,9 @@ mod task_app_conductor {
 
             press(&mut app, KeyCode::Esc);
             ch(&mut app, 'q');
-            assert!(!app.should_quit(), "an unsent message is asked about first");
-            assert!(note(&app).contains("niewysłany szkic"), "{}", note(&app));
+            assert!(!app.should_quit(), "the first q opens confirmation");
+            ch(&mut app, 'q');
+            assert!(app.should_quit());
         }
 
         #[test]

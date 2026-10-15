@@ -1340,7 +1340,7 @@ impl TaskApp {
     }
 
     /// A key while the panel has the keyboard.
-    pub(super) fn on_panel_key(&mut self, key: KeyEvent, confirming_quit: bool) -> Request {
+    pub(super) fn on_panel_key(&mut self, key: KeyEvent) -> Request {
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             // Tab changes the outer panel focus. Chooser fields use arrows and
             // Enter, so leaving here never submits or discards a draft.
@@ -1357,7 +1357,7 @@ impl TaskApp {
                     return Request::None;
                 }
                 Some(Action::Quit) => {
-                    self.on_quit(confirming_quit);
+                    self.on_quit();
                     return Request::None;
                 }
                 _ => {}

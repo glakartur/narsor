@@ -771,7 +771,7 @@ impl TaskApp {
     }
 
     /// A key while something sits over the screen.
-    pub(super) fn on_overlay_key(&mut self, key: KeyEvent, confirming_quit: bool) -> Request {
+    pub(super) fn on_overlay_key(&mut self, key: KeyEvent) -> Request {
         let Some(overlay) = self.overlay.as_ref() else {
             return Request::None;
         };
@@ -784,7 +784,7 @@ impl TaskApp {
                     return Request::None;
                 }
                 Some(Action::Quit) => {
-                    self.on_quit(confirming_quit);
+                    self.on_quit();
                     return Request::None;
                 }
                 _ => {}
@@ -1400,6 +1400,10 @@ fn launch_browser(url: &str) -> std::io::Result<()> {
 
 /// Draws what sits over the screen, if anything, centred in `area`.
 pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles) {
+    if app.quit_confirm {
+        render_quit_confirmation(frame, area, styles, app.detail().has_drafts());
+        return;
+    }
     let title = app
         .overlay
         .as_ref()
@@ -1411,41 +1415,69 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut TaskApp, styles: &Styles)
         })
         .map(title_of)
         .unwrap_or_default();
-    let Some(overlay) = app.overlay.as_mut() else {
-        return;
-    };
-    match overlay {
-        Overlay::Confirm(confirmation) => render_confirmation(frame, area, confirmation, styles),
-        Overlay::Menu(menu) => render_list(
-            frame,
-            area,
-            &format!("Akcje · {title}"),
-            &mut menu.chooser,
-            styles,
-        ),
-        Overlay::Transitions(list) => render_list(
-            frame,
-            area,
-            &format!(
-                "Przejście ręczne · {title} · z „{}”",
-                one_line(&list.from_state)
-            ),
-            &mut list.chooser,
-            styles,
-        ),
-        Overlay::Links(list) => {
-            render_list(
+    if let Some(overlay) = app.overlay.as_mut() {
+        match overlay {
+            Overlay::Confirm(confirmation) => {
+                render_confirmation(frame, area, confirmation, styles)
+            }
+            Overlay::Menu(menu) => render_list(
                 frame,
                 area,
-                &format!("Linki · {title}"),
+                &format!("Akcje · {title}"),
+                &mut menu.chooser,
+                styles,
+            ),
+            Overlay::Transitions(list) => render_list(
+                frame,
+                area,
+                &format!(
+                    "Przejście ręczne · {title} · z „{}”",
+                    one_line(&list.from_state)
+                ),
                 &mut list.chooser,
                 styles,
-            );
-        }
-        Overlay::Harness(list) => {
-            render_list(frame, area, "Domyślny harness", list.chooser_mut(), styles);
+            ),
+            Overlay::Links(list) => {
+                render_list(
+                    frame,
+                    area,
+                    &format!("Linki · {title}"),
+                    &mut list.chooser,
+                    styles,
+                );
+            }
+            Overlay::Harness(list) => {
+                render_list(frame, area, "Domyślny harness", list.chooser_mut(), styles);
+            }
         }
     }
+}
+
+pub fn render_quit_confirmation(frame: &mut Frame, area: Rect, styles: &Styles, has_drafts: bool) {
+    let width = area.width.saturating_sub(4).min(52);
+    let height = 7.min(area.height.saturating_sub(2));
+    let place = popup(area, width, height);
+    let inner = framed(frame, place, Role::Problem, "Wyjść z TUI?", styles);
+    let mut lines = vec![Line::raw("Naciśnij ponownie q, aby wyjść.")];
+    if has_drafts {
+        lines.push(Line::raw("Niewysłany szkic zostanie utracony."));
+    }
+    lines.extend([
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" q ", styles.key_cap()),
+            Span::raw("wyjdź  "),
+            Span::styled("Esc ", styles.key_cap()),
+            Span::raw("anuluj"),
+        ]),
+    ]);
+    let padded = Rect::new(
+        inner.x + 1,
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height,
+    );
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), padded);
 }
 
 fn popup(area: Rect, width: u16, height: u16) -> Rect {

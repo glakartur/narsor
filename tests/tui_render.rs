@@ -3534,6 +3534,26 @@ mod task_app_actions_render {
     }
 
     #[test]
+    fn quitting_shows_a_dialog_with_q_and_escape_choices() {
+        let mut app = opened(running(), "q");
+        let screen = draw_app(&mut app, 100, 30, false);
+        for expected in ["Wyjść z TUI?", "ponownie q", "q wyjdź", "Esc anuluj"] {
+            assert!(
+                screen.contains(expected),
+                "{expected:?} is missing:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn quitting_dialog_stays_visible_in_a_too_small_terminal() {
+        let mut app = opened(running(), "q");
+        let screen = draw_app(&mut app, 30, 10, false);
+        assert!(screen.contains("Wyjść z TUI?"), "{screen}");
+        assert!(screen.contains("Esc"), "{screen}");
+    }
+
+    #[test]
     fn the_confirmation_window_says_what_will_happen_and_what_y_and_n_do() {
         let mut app = opened(running(), "x");
         let screen = draw_app(&mut app, 120, 40, false);

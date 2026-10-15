@@ -470,11 +470,7 @@ impl TaskApp {
     }
 
     /// A key while the history is open.
-    pub(super) fn on_history_key(
-        &mut self,
-        key: crossterm::event::KeyEvent,
-        confirming_quit: bool,
-    ) -> Request {
+    pub(super) fn on_history_key(&mut self, key: crossterm::event::KeyEvent) -> Request {
         let Some(keys) = self.history_context() else {
             return Request::None;
         };
@@ -484,7 +480,7 @@ impl TaskApp {
         let context = keys.base;
         match action {
             Action::Help => self.help_open = true,
-            Action::Quit => self.on_quit(confirming_quit),
+            Action::Quit => self.on_quit(),
             Action::Back if context == Context::History => self.close_view(),
             Action::Back => self.focus_history(Focus::List),
             Action::SwitchFocus => {

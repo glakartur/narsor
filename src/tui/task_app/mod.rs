@@ -101,7 +101,7 @@ pub mod waiting;
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures::stream::{BoxStream, StreamExt as _};
 
 use crate::api::{reconnect_delay, ApiClient, ClientError, HarnessSelectionSnapshot};
@@ -417,7 +417,7 @@ pub struct TaskApp {
     /// show something else ([`Self::back_to_axis`]).
     step_focus: StepLevel,
     quit: bool,
-    /// `q` found an unsent draft and asked; the next `q` leaves.
+    /// `q` opened the exit confirmation; a second `q` leaves.
     quit_confirm: bool,
     /// What the details area shows (U13).
     view: View,
@@ -661,27 +661,43 @@ impl TaskApp {
 
     /// Folds a key into the state. Returns what needs the API.
     pub fn on_key(&mut self, key: KeyEvent) -> Request {
-        if self.help_open {
-            self.help_open = false;
+        if self.quit_confirm {
+            match key {
+                KeyEvent {
+                    code: KeyCode::Char('q'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
+                    self.quit = true;
+                    self.quit_confirm = false;
+                }
+                KeyEvent {
+                    code: KeyCode::Esc, ..
+                } => self.quit_confirm = false,
+                _ => {}
+            }
             return Request::None;
         }
-        let confirming_quit = std::mem::take(&mut self.quit_confirm);
+        if self.help_open {
+            self.help_open = false;
+            if keymap::lookup(self.key_context(), &key) != Some(Action::Quit) {
+                return Request::None;
+            }
+        }
         if self.overlay.is_some() {
-            return self.on_overlay_key(key, confirming_quit);
+            return self.on_overlay_key(key);
         }
         match self.view {
             View::Tasks => {}
-            View::NewTask(_) if self.focus == Focus::Details => {
-                return self.on_new_task_key(key, confirming_quit)
-            }
-            View::History(_) => return self.on_history_key(key, confirming_quit),
+            View::NewTask(_) if self.focus == Focus::Details => return self.on_new_task_key(key),
+            View::History(_) => return self.on_history_key(key),
             View::Repositories(_) if self.focus == Focus::Details => {
-                return self.on_repositories_key(key, confirming_quit)
+                return self.on_repositories_key(key)
             }
             View::NewTask(_) | View::Repositories(_) => {}
         }
         if self.panel_focused() {
-            return self.on_panel_key(key, confirming_quit);
+            return self.on_panel_key(key);
         }
         if self.conductor_typing() {
             if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -702,7 +718,7 @@ impl TaskApp {
         let context = keys.base;
         match action {
             Action::Help => self.help_open = true,
-            Action::Quit => self.on_quit(confirming_quit),
+            Action::Quit => self.on_quit(),
             Action::NewTask | Action::History | Action::Repositories | Action::ChooseHarness
                 if !matches!(&self.view, View::Tasks) =>
             {
@@ -770,18 +786,9 @@ impl TaskApp {
         Request::None
     }
 
-    /// `q`: leaves, unless an unsent draft asks first — then a second `q`
-    /// leaves and any other key stays.
-    fn on_quit(&mut self, confirmed: bool) {
-        if confirmed || !self.detail.has_drafts() {
-            self.quit = true;
-        } else {
-            self.quit_confirm = true;
-            self.notify(
-                Severity::Warning,
-                "niewysłany szkic — q ponownie wychodzi, inny klawisz zostaje",
-            );
-        }
+    /// `q` opens the exit confirmation; only its second `q` leaves.
+    fn on_quit(&mut self) {
+        self.quit_confirm = true;
     }
 
     fn on_cursor(&mut self, context: Context, action: Action) {
