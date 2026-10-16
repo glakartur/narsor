@@ -15,11 +15,11 @@
 //! from either source, so the next read after the runner is back continues
 //! from where the record stopped and the badge goes away by itself.
 //!
-//! Entries are the transcript model of [`crate::tui::transcript`]: an
-//! entry is projected by [`agent_transcript_entry`], with the same
-//! sanitisation and the same raw view as the conductor's chat. The colours come
-//! from [`Styles::chat_header`] and [`Styles::chat_body`], the conversation
-//! scale of the role module.
+//! Entries are the transcript model of [`crate::tui::transcript`]: every
+//! chat element of an entry is projected by [`transcript_entries`] into its
+//! own card, with the same sanitisation and the same raw view as the
+//! conductor's chat. The colours come from [`Styles::chat_header`] and
+//! [`Styles::chat_body`], the conversation scale of the role module.
 
 use std::collections::BTreeMap;
 
@@ -41,7 +41,7 @@ use narsor_protocol::api::{ConversationState, Position};
 use super::super::super::scroll::one_line;
 use super::super::super::selection::{bar_prefix, PREFIX_WIDTH};
 use super::super::layout::first_row;
-use crate::tui::conversation::{agent_transcript_entry, classify};
+use crate::tui::conversation::transcript_entries;
 use crate::tui::keymap::Action;
 use crate::tui::style::{Role, Styles};
 use crate::tui::transcript::{
@@ -132,10 +132,7 @@ where
                 recorded_at,
             } => {
                 let empty = page.is_empty();
-                entries.extend(
-                    page.iter()
-                        .map(|entry| agent_transcript_entry(&classify(entry))),
-                );
+                entries.extend(page.iter().flat_map(transcript_entries));
                 if empty || closed || truncated_tail || next_entry <= cursor {
                     return Ok(AttemptRead {
                         entries,

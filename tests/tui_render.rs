@@ -1533,6 +1533,7 @@ mod task_app_detail_render {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use narsor::api::ApiClient;
+    use narsor::tui::conversation as conversation_projection;
     use narsor::tui::task_app::detail::DetailRead;
     use narsor::tui::task_app::tabs::conversation::{self, AttemptRead, Attempts, Conversation};
     use narsor::tui::task_app::{layout, StepFocus, TaskApp};
@@ -2531,6 +2532,85 @@ mod task_app_detail_render {
         draw(width, height, |frame| {
             conversation::render(frame, frame.area(), styles, conversation, stale, focused);
         })
+    }
+
+    /// The entries of a real Claude Code recording, classified by the
+    /// harness stream parser exactly as the executor stores them.
+    fn recorded_claude_entries(name: &str) -> Vec<TranscriptEntry> {
+        use narsor_engine::engine::{ClaudeCodeAdapter, HarnessAdapter};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude-code")
+            .join(name);
+        let text = std::fs::read_to_string(&path).expect("a recording");
+        let mut parser = ClaudeCodeAdapter::new().stream_parser();
+        text.lines()
+            .enumerate()
+            .flat_map(|(index, line)| {
+                use base64::Engine as _;
+                conversation_projection::transcript_entries(&narsor::api::ConversationEntryDto {
+                    entry_number: index as u64 + 1,
+                    timestamp: chrono::Utc::now(),
+                    source: narsor::api::ConversationEntrySource::Stdout,
+                    raw_base64: base64::engine::general_purpose::STANDARD.encode(line),
+                    elements: parser.on_stdout_line(line.as_bytes()),
+                })
+            })
+            .collect()
+    }
+
+    /// U6: *Rozmowa* over every real recording shows model elements only —
+    /// no card is raw or unclassified — and draws without a panic.
+    #[test]
+    fn the_conversation_tab_of_a_real_claude_recording_has_no_raw_or_unclassified_card() {
+        let recordings = [
+            "ask_user_question.ndjson",
+            "max_turns.ndjson",
+            "plan_mode.ndjson",
+            "schema_awaiting.ndjson",
+            "schema_done.ndjson",
+            "schema_mismatch.ndjson",
+            "schema_plan_fresh.ndjson",
+            "schema_plan_resume.ndjson",
+            "schema_resume.ndjson",
+            "thinking.ndjson",
+            "tool_error.ndjson",
+            "tools.ndjson",
+        ];
+        for name in recordings {
+            let mut tab = conversation_tab(recorded_claude_entries(name));
+            let lines: Vec<String> = tab
+                .transcript()
+                .logical_lines()
+                .into_iter()
+                .map(|line| line.text)
+                .collect();
+            for label in [" · raw · ", " · unclassified · "] {
+                assert!(
+                    !lines.iter().any(|line| line.contains(label)),
+                    "{name} has a{label}card: {lines:#?}"
+                );
+            }
+            let drawn = screen(&draw_conversation_at(
+                120,
+                40,
+                &mut tab,
+                &Styles::new(false),
+                false,
+                true,
+            ));
+            assert!(!drawn.trim().is_empty(), "{name}");
+        }
+
+        let tools: Vec<String> = conversation_tab(recorded_claude_entries("tools.ndjson"))
+            .transcript()
+            .logical_lines()
+            .into_iter()
+            .map(|line| line.text)
+            .collect();
+        assert!(
+            tools.iter().any(|line| line.contains("Skill hello")),
+            "AE1: the skill call names the skill: {tools:#?}"
+        );
     }
 
     /// *Rozmowa*: the bar is cyan with the keys in the tab, grey without

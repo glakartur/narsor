@@ -1,547 +1,430 @@
-//! Tests for the TUI's per-harness conversation classification (U7,
-//! `src/tui/conversation.rs`).
+//! Tests for the TUI's conversation projection (`src/tui/conversation.rs`).
 //!
 //! Exercised through the public API type ([`narsor::api::ConversationEntryDto`])
-//! rather than the persistence layer's own envelope, because that is the
-//! shape the task view actually classifies: whatever
-//! [`narsor::api::ApiClient::conversation`] hands back.
+//! because that is what the task view projects: the chat elements the server
+//! sends next to each raw line. The projection never reads the raw line.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::Utc;
+use serde_json::json;
 
 use narsor::api::{ConversationEntryDto, ConversationEntrySource as ConversationSource};
-use narsor::tui::conversation::{classify, EntryKind};
+use narsor::tui::conversation::{classify, transcript_entries, EntryKind};
+use narsor::tui::transcript::{
+    DisplayMode, TranscriptEntry, TranscriptId, TranscriptPresentation, TranscriptState,
+};
+use narsor_protocol::chat::{
+    ChatElement, PromptPurpose, QuestionSource, TechnicalCategory, ToolResultStatus,
+    UnclassifiedReason,
+};
 
-fn entry(source: ConversationSource, raw: &str) -> ConversationEntryDto {
+fn entry(number: u64, raw: &str, elements: Vec<ChatElement>) -> ConversationEntryDto {
     ConversationEntryDto {
-        entry_number: 1,
-        timestamp: Utc::now(),
-        source,
-        raw_base64: BASE64.encode(raw.as_bytes()),
-        elements: Vec::new(),
-    }
-}
-
-// --- narsor / stderr, regardless of content --------------------------------
-
-#[test]
-fn a_narsor_line_is_the_narsor_kind_even_if_it_looks_like_json() {
-    let classified = classify(&entry(
-        ConversationSource::Narsor,
-        r#"{"type":"assistant"}"#,
-    ));
-    assert_eq!(classified.kind, EntryKind::Narsor);
-}
-
-#[test]
-fn a_stderr_line_is_the_stderr_kind_even_if_it_looks_like_json() {
-    let classified = classify(&entry(ConversationSource::Stderr, r#"{"type":"text"}"#));
-    assert_eq!(classified.kind, EntryKind::Stderr);
-}
-
-// --- Claude Code shapes ------------------------------------------------------
-
-#[test]
-fn claude_assistant_text_is_assistant() {
-    let raw =
-        r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}"#;
-    assert_eq!(
-        classify(&entry(ConversationSource::Stdout, raw)).kind,
-        EntryKind::Assistant
-    );
-}
-
-#[test]
-fn claude_assistant_thinking_is_thinking() {
-    let raw = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"thinking","thinking":"..."}]}}"#;
-    assert_eq!(
-        classify(&entry(ConversationSource::Stdout, raw)).kind,
-        EntryKind::Thinking
-    );
-}
-
-#[test]
-fn claude_assistant_tool_use_is_tool_call() {
-    let raw = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","name":"bash","input":{}}]}}"#;
-    assert_eq!(
-        classify(&entry(ConversationSource::Stdout, raw)).kind,
-        EntryKind::ToolCall
-    );
-}
-
-#[test]
-fn claude_user_tool_result_is_tool_result() {
-    let raw = r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#;
-    assert_eq!(
-        classify(&entry(ConversationSource::Stdout, raw)).kind,
-        EntryKind::ToolResult
-    );
-}
-
-#[test]
-fn claude_result_is_result() {
-    let raw = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s1"}"#;
-    assert_eq!(
-        classify(&entry(ConversationSource::Stdout, raw)).kind,
-        EntryKind::Result
-    );
-}
-
-#[test]
-fn claude_system_init_is_system() {
-    let raw = r#"{"type":"system","subtype":"init","session_id":"s1"}"#;
-    assert_eq!(
-        classify(&entry(ConversationSource::Stdout, raw)).kind,
-        EntryKind::System
-    );
-}
-
-// --- opencode shapes ---------------------------------------------------------
-
-#[test]
-fn opencode_text_is_assistant() {
-    let raw = r#"{"type":"text","timestamp":0,"sessionID":"s1","text":"hi"}"#;
-    assert_eq!(
-        classify(&entry(ConversationSource::Stdout, raw)).kind,
-        EntryKind::Assistant
-    );
-}
-
-#[test]
-fn opencode_reasoning_is_thinking() {
-    let raw = r#"{"type":"reasoning","timestamp":0,"sessionID":"s1","text":"because"}"#;
-    assert_eq!(
-        classify(&entry(ConversationSource::Stdout, raw)).kind,
-        EntryKind::Thinking
-    );
-}
-
-#[test]
-fn opencode_tool_use_is_tool_call() {
-    let raw =
-        r#"{"type":"tool_use","timestamp":0,"sessionID":"s1","state":{"input":{},"output":"ok"}}"#;
-    assert_eq!(
-        classify(&entry(ConversationSource::Stdout, raw)).kind,
-        EntryKind::ToolCall
-    );
-}
-
-#[test]
-fn opencode_step_finish_is_system() {
-    let raw = r#"{"type":"step_finish","timestamp":0,"sessionID":"s1"}"#;
-    assert_eq!(
-        classify(&entry(ConversationSource::Stdout, raw)).kind,
-        EntryKind::System
-    );
-}
-
-#[test]
-fn opencode_error_is_system() {
-    let raw = r#"{"type":"error","timestamp":0,"sessionID":"s1","message":"boom"}"#;
-    assert_eq!(
-        classify(&entry(ConversationSource::Stdout, raw)).kind,
-        EntryKind::System
-    );
-}
-
-// --- Codex JSONL shapes -----------------------------------------------------
-
-#[test]
-fn codex_messages_reasoning_tools_results_and_errors_are_distinguished() {
-    let cases = [
-        (
-            r#"{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}"#,
-            EntryKind::Assistant,
-        ),
-        (
-            r#"{"type":"item.updated","item":{"type":"reasoning","text":"because"}}"#,
-            EntryKind::Thinking,
-        ),
-        (
-            r#"{"type":"item.started","item":{"type":"command_execution","command":"git status"}}"#,
-            EntryKind::ToolCall,
-        ),
-        (
-            r#"{"type":"item.completed","item":{"type":"mcp_tool_call","status":"completed"}}"#,
-            EntryKind::ToolResult,
-        ),
-        (r#"{"type":"turn.completed","usage":{}}"#, EntryKind::Result),
-        (
-            r#"{"type":"turn.failed","error":"boom"}"#,
-            EntryKind::System,
-        ),
-    ];
-
-    for (raw, expected) in cases {
-        assert_eq!(
-            classify(&entry(ConversationSource::Stdout, raw)).kind,
-            expected
-        );
-    }
-}
-
-/// Codex can finish a turn with a direct JSON response rather than a JSONL
-/// event envelope. It is still the agent's reply, not diagnostic output.
-#[test]
-fn codex_direct_json_response_is_an_assistant_message() {
-    let raw = r#"{"output":"clean","data":{},"variables":{},"artifacts":[]}"#;
-    let classified = classify(&entry(ConversationSource::Stdout, raw));
-
-    assert_eq!(classified.kind, EntryKind::Assistant);
-    assert_eq!(classified.summary, "clean");
-    assert_eq!(classified.raw, raw.as_bytes());
-    assert_eq!(classified.details["message.content"], "clean");
-}
-
-/// R16: Codex lifecycle envelopes must describe the session stage, rather
-/// than exposing their shared JSONL event names as diagnostic placeholders.
-#[test]
-fn codex_lifecycle_events_have_distinct_readable_projections() {
-    let cases = [
-        (
-            r#"{"type":"thread.started","thread_id":"thread-1"}"#,
-            EntryKind::System,
-            "thread started",
-        ),
-        (
-            r#"{"type":"turn.started","turn":{"id":"turn-1"}}"#,
-            EntryKind::System,
-            "turn started",
-        ),
-        (
-            r#"{"type":"turn.completed","usage":{}}"#,
-            EntryKind::Result,
-            "turn completed",
-        ),
-        (
-            r#"{"type":"turn.failed","error":{"message":"rate limited"}}"#,
-            EntryKind::System,
-            "turn failed: rate limited",
-        ),
-    ];
-
-    for (raw, kind, text) in cases {
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
-        assert_eq!(classified.kind, kind, "{raw}");
-        assert_eq!(classified.summary, text, "{raw}");
-        assert_eq!(classified.raw, raw.as_bytes(), "{raw}");
-    }
-}
-
-/// R16: tool calls and completions use the available tool-specific context.
-#[test]
-fn codex_tool_events_have_distinct_readable_projections() {
-    let cases = [
-        (
-            r#"{"type":"item.started","item":{"type":"command_execution","command":"git status"}}"#,
-            EntryKind::ToolCall,
-            "running command: git status",
-        ),
-        (
-            r#"{"type":"item.completed","item":{"type":"command_execution","command":"git status","exit_code":0}}"#,
-            EntryKind::ToolResult,
-            "command completed: git status (exit 0)",
-        ),
-        (
-            r#"{"type":"item.started","item":{"type":"mcp_tool_call","server":"github","tool_name":"search_issues"}}"#,
-            EntryKind::ToolCall,
-            "calling MCP tool: github/search_issues",
-        ),
-        (
-            r#"{"type":"item.completed","item":{"type":"web_search","query":"Rust docs"}}"#,
-            EntryKind::ToolResult,
-            "web search completed: Rust docs",
-        ),
-    ];
-
-    for (raw, kind, text) in cases {
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
-        assert_eq!(classified.kind, kind, "{raw}");
-        assert_eq!(classified.summary, text, "{raw}");
-        assert_eq!(classified.raw, raw.as_bytes(), "{raw}");
-    }
-}
-
-/// KTD3: a malformed known envelope stays visible as its original decoded
-/// content instead of being replaced with an invented technical description.
-#[test]
-fn incomplete_codex_items_keep_a_standard_tool_summary() {
-    let raw = r#"{"type":"item.started","item":{"type":"command_execution"}}"#;
-    let classified = classify(&entry(ConversationSource::Stdout, raw));
-
-    assert_eq!(classified.kind, EntryKind::ToolCall);
-    assert_eq!(classified.summary, "running command: command");
-    assert_eq!(classified.raw, raw.as_bytes());
-    assert_eq!(classified.as_json()["summary"], "running command: command");
-    assert_eq!(
-        classified.as_json()["raw"],
-        serde_json::json!(raw.as_bytes())
-    );
-}
-
-// --- fallback ----------------------------------------------------------------
-
-#[test]
-fn an_unrecognized_type_has_a_readable_summary_with_full_content_preserved() {
-    let raw = r#"{"type":"api_retry","detail":"backing off"}"#;
-    let classified = classify(&entry(ConversationSource::Stdout, raw));
-    assert_eq!(classified.kind, EntryKind::Raw);
-    assert_eq!(
-        classified.summary, "event: api_retry",
-        "R9: raw retains the original while the transcript remains readable"
-    );
-}
-
-#[test]
-fn non_json_content_is_raw_with_full_content_preserved() {
-    let raw = "Traceback (most recent call last): boom";
-    let classified = classify(&entry(ConversationSource::Stdout, raw));
-    assert_eq!(classified.kind, EntryKind::Raw);
-    assert_eq!(classified.summary, raw);
-}
-
-#[test]
-fn json_with_no_type_field_is_raw() {
-    let raw = r#"{"foo":"bar"}"#;
-    let classified = classify(&entry(ConversationSource::Stdout, raw));
-    assert_eq!(classified.kind, EntryKind::Raw);
-}
-
-/// AE1/AE3: rendered mode has a concise semantic body for every supported
-/// harness role, while the diagnostic source remains byte-for-byte available.
-#[test]
-fn semantic_projection_keeps_the_complete_source_for_diagnostics() {
-    let cases = [
-        (
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Readable reply"}]}}"#,
-            EntryKind::Assistant,
-            "Readable reply",
-        ),
-        (
-            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"Check the state"}]}}"#,
-            EntryKind::Thinking,
-            "Check the state",
-        ),
-        (
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"bash","input":{"command":"git status"}}]}}"#,
-            EntryKind::ToolCall,
-            "calling bash",
-        ),
-        (
-            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"clean"}]}}"#,
-            EntryKind::ToolResult,
-            "tool result",
-        ),
-        (
-            r#"{"type":"result","subtype":"success","result":"Finished"}"#,
-            EntryKind::Result,
-            "Finished",
-        ),
-        (
-            r#"{"type":"api_retry","detail":"backing off"}"#,
-            EntryKind::Raw,
-            "event: api_retry",
-        ),
-    ];
-
-    for (raw, kind, rendered) in cases {
-        let classified = classify(&entry(ConversationSource::Stdout, raw));
-        assert_eq!(classified.kind, kind, "{raw}");
-        assert_eq!(classified.summary, rendered, "{raw}");
-        assert_eq!(
-            classified.raw,
-            raw.as_bytes(),
-            "raw mode must remain lossless"
-        );
-    }
-}
-
-#[test]
-fn unified_events_have_lossless_raw_and_normalized_details() {
-    let cases = [
-        (
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"shell","input":{"command":"pwd"}}]}}"#,
-            EntryKind::ToolCall,
-            "tool.name",
-            "shell",
-        ),
-        (
-            r#"{"type":"tool_use","name":"shell","state":{"input":{"command":"pwd"},"output":"ok"}}"#,
-            EntryKind::ToolCall,
-            "tool.name",
-            "shell",
-        ),
-        (
-            r#"{"type":"item.completed","item":{"type":"command_execution","command":"pwd","exit_code":0}}"#,
-            EntryKind::ToolResult,
-            "tool.command",
-            "pwd",
-        ),
-    ];
-    for (raw, kind, key, expected) in cases {
-        let event = classify(&entry(ConversationSource::Stdout, raw));
-        assert_eq!(event.kind, kind);
-        assert!(!event.summary.is_empty());
-        assert_eq!(event.details[key], expected);
-        assert_eq!(event.raw, raw.as_bytes());
-        let serialized = event.as_json();
-        assert!(serialized.get("kind").is_some());
-        assert!(serialized.get("summary").is_some());
-        assert!(serialized.get("details").is_some());
-        assert_eq!(serialized["raw"], serde_json::json!(raw.as_bytes()));
-    }
-
-    let bytes = [0xff, b'\n', 0x00];
-    let binary_entry = ConversationEntryDto {
-        entry_number: 2,
+        entry_number: number,
         timestamp: Utc::now(),
         source: ConversationSource::Stdout,
-        raw_base64: BASE64.encode(bytes),
-        elements: Vec::new(),
-    };
-    let event = classify(&binary_entry);
-    assert_eq!(event.raw, bytes);
-    assert_eq!(event.as_json()["raw"], serde_json::json!([255, 10, 0]));
-
-    let formatted = "{ \"b\": 2, \"a\": 1 }";
-    let event = classify(&entry(ConversationSource::Stdout, formatted));
-    assert_eq!(
-        event.as_json()["raw"],
-        serde_json::json!(formatted.as_bytes())
-    );
-}
-
-#[test]
-fn claude_expansion_retains_each_content_block_in_order() {
-    let raw = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"first"},{"type":"text","text":"second"},{"type":"tool_use","name":"shell","input":{"command":"pwd"}},{"type":"tool_use","name":"search","input":{"query":"docs"}}]}}"#;
-    let event = classify(&entry(ConversationSource::Stdout, raw));
-
-    assert_eq!(event.summary, "first");
-    assert_eq!(
-        event.details["message.blocks"][0]["message.content"],
-        "first"
-    );
-    assert_eq!(
-        event.details["message.blocks"][1]["message.content"],
-        "second"
-    );
-    assert_eq!(event.details["message.blocks"][2]["tool.name"], "shell");
-    assert_eq!(event.details["message.blocks"][3]["tool.name"], "search");
-    assert_eq!(
-        event.details["message.blocks"][3]["tool.input"]["query"],
-        "docs"
-    );
-}
-
-#[test]
-fn codex_message_and_command_do_not_invent_tool_names() {
-    for raw in [
-        r#"{"type":"item.completed","item":{"type":"agent_message","text":"Hello"}}"#,
-        r#"{"type":"item.completed","item":{"type":"command_execution","command":"pwd","exit_code":0}}"#,
-    ] {
-        let event = classify(&entry(ConversationSource::Stdout, raw));
-        assert!(event.details.get("tool.name").is_none(), "{raw}");
-    }
-
-    let raw =
-        r#"{"type":"item.started","item":{"type":"mcp_tool_call","tool_name":"search_issues"}}"#;
-    let event = classify(&entry(ConversationSource::Stdout, raw));
-    assert_eq!(event.details["tool.name"], "search_issues");
-}
-
-#[test]
-fn incomplete_harness_events_stay_semantic() {
-    let cases = [
-        (
-            r#"{"type":"assistant","message":{}}"#,
-            EntryKind::Assistant,
-            "assistant message",
-        ),
-        (
-            r#"{"type":"user","message":{}}"#,
-            EntryKind::User,
-            "user message",
-        ),
-        (r#"{"type":"reasoning"}"#, EntryKind::Thinking, "thinking"),
-        (r#"{"type":"tool_use"}"#, EntryKind::ToolCall, "tool call"),
-        (
-            r#"{"type":"item.started"}"#,
-            EntryKind::ToolCall,
-            "tool event",
-        ),
-        (
-            r#"{"type":"item.completed","item":{"type":"unknown"}}"#,
-            EntryKind::ToolResult,
-            "tool event: unknown",
-        ),
-    ];
-    for (raw, kind, summary) in cases {
-        let event = classify(&entry(ConversationSource::Stdout, raw));
-        assert_eq!(event.kind, kind, "{raw}");
-        assert_eq!(event.summary, summary, "{raw}");
-        assert_eq!(event.raw, raw.as_bytes());
+        raw_base64: BASE64.encode(raw.as_bytes()),
+        elements,
     }
 }
 
-#[test]
-fn narsor_events_use_workflow_vocabulary() {
-    let cases = [
-        (
-            r#"{"event":"prompt","harness":"codex","prompt":"Fix it"}"#,
-            "agent_input",
-            "Fix it",
-        ),
-        ("step started", "step_started", "Workflow step started"),
-        (
-            "step completed",
-            "step_completed",
-            "Workflow step completed",
-        ),
-        (
-            "harness run failed: boom",
-            "step_failed",
-            "Workflow step failed",
-        ),
-        ("retry requested", "retry", "Workflow retries agent step"),
-        (
-            "waiting for input",
-            "waiting_for_input",
-            "Workflow waits for input",
-        ),
-    ];
-    for (raw, event_name, summary) in cases {
-        let event = classify(&entry(ConversationSource::Narsor, raw));
-        assert_eq!(event.kind, EntryKind::Narsor);
-        assert_eq!(event.summary, summary);
-        assert_eq!(event.details["workflow.event"], event_name);
-        assert_eq!(event.raw, raw.as_bytes());
+fn agent_text(text: &str) -> ChatElement {
+    ChatElement::AgentText {
+        text: text.to_string(),
     }
 }
 
+fn tool_call(id: &str, tool: &str, summary: &str, input: serde_json::Value) -> ChatElement {
+    ChatElement::ToolCall {
+        call_id: Some(id.to_string()),
+        tool: tool.to_string(),
+        summary: summary.to_string(),
+        input,
+    }
+}
+
+/// The logical lines of `entries` in `mode`, every card expanded when
+/// `expand`.
+fn lines(entries: Vec<TranscriptEntry>, mode: DisplayMode, expand: bool) -> Vec<String> {
+    let mut transcript = TranscriptState::new(TranscriptId::from("attempt"));
+    let ids: Vec<_> = entries.iter().map(|entry| entry.id.clone()).collect();
+    transcript.load(entries);
+    transcript.set_mode(mode);
+    if expand {
+        for id in &ids {
+            transcript.toggle_expanded(id);
+        }
+    }
+    transcript
+        .logical_lines()
+        .into_iter()
+        .map(|line| line.text)
+        .collect()
+}
+
+/// An entry with an agent text and a tool call gives two events, each with
+/// its own label.
 #[test]
-fn equivalent_harness_messages_have_the_same_rendered_contract() {
-    let claude = classify(&entry(
-        ConversationSource::Stdout,
-        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}"#,
+fn agent_text_and_tool_call_in_one_entry_are_two_events_with_their_labels() {
+    let entry = entry(
+        4,
+        r#"{"anything":"the harness wrote"}"#,
+        vec![
+            agent_text("Let me look."),
+            tool_call("c1", "Read", "notes.txt", json!({"file_path": "notes.txt"})),
+        ],
+    );
+    let events = classify(&entry);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].kind, EntryKind::AgentText);
+    assert_eq!(events[0].kind.label(), "agent");
+    assert_eq!(events[0].summary, "Let me look.");
+    assert_eq!(events[1].kind, EntryKind::ToolCall);
+    assert_eq!(events[1].kind.label(), "tool");
+    assert_eq!(events[1].summary, "Read notes.txt");
+    assert!(events.iter().all(|event| event.entry_number == 4));
+
+    let cards = transcript_entries(&entry);
+    assert_eq!(cards.len(), 2);
+    assert!(
+        cards[0].header.contains("AGENT · Agent · agent · "),
+        "{}",
+        cards[0].header
+    );
+    assert!(
+        cards[1].header.contains(" · tool · "),
+        "{}",
+        cards[1].header
+    );
+    assert_eq!(cards[1].rendered_lines, ["Read notes.txt"]);
+}
+
+/// AE1: a `Skill` call names the skill in its description.
+#[test]
+fn a_skill_call_names_the_skill() {
+    let events = classify(&entry(
+        1,
+        "{}",
+        vec![tool_call(
+            "c1",
+            "Skill",
+            "ce-plan",
+            json!({"skill": "ce-plan"}),
+        )],
     ));
-    let opencode = classify(&entry(
-        ConversationSource::Stdout,
-        r#"{"type":"text","text":"Hello"}"#,
+    assert!(
+        events[0].summary.contains("ce-plan"),
+        "{}",
+        events[0].summary
+    );
+    let cards = transcript_entries(&entry(
+        1,
+        "{}",
+        vec![tool_call(
+            "c1",
+            "Skill",
+            "ce-plan",
+            json!({"skill": "ce-plan"}),
+        )],
     ));
-    let codex = classify(&entry(
-        ConversationSource::Stdout,
-        r#"{"type":"item.completed","item":{"type":"agent_message","text":"Hello"}}"#,
+    let rendered = lines(cards, DisplayMode::Rendered, false);
+    assert!(
+        rendered.iter().any(|line| line.contains("Skill ce-plan")),
+        "{rendered:?}"
+    );
+}
+
+/// A tool call's expansion shows its full input.
+#[test]
+fn a_tool_call_expands_to_its_full_input() {
+    let cards = transcript_entries(&entry(
+        1,
+        "{}",
+        vec![ChatElement::ToolCall {
+            call_id: None,
+            tool: "Bash".to_string(),
+            summary: "git status".to_string(),
+            input: json!({"command": "git status", "description": "Show state"}),
+        }],
     ));
-    for event in [&opencode, &codex] {
-        assert_eq!(event.kind, claude.kind);
-        assert_eq!(event.summary, claude.summary);
-        assert_eq!(
-            event.details["message.content"],
-            claude.details["message.content"]
-        );
-        assert_ne!(event.raw, claude.raw);
-    }
+    let expanded = lines(cards, DisplayMode::Rendered, true);
+    assert!(expanded.iter().any(|line| line == "input:"), "{expanded:?}");
+    assert!(
+        expanded
+            .iter()
+            .any(|line| line.contains("\"description\": \"Show state\"")),
+        "{expanded:?}"
+    );
+}
+
+/// An agent question has its own label, not the agent text one, and shows
+/// its options.
+#[test]
+fn an_agent_question_has_its_own_label() {
+    let entry = entry(
+        2,
+        "{}",
+        vec![ChatElement::AgentQuestion {
+            question: "Which database?".to_string(),
+            options: vec!["Postgres".to_string(), "SQLite".to_string()],
+            source: QuestionSource::OutputContract,
+            call_id: None,
+        }],
+    );
+    let events = classify(&entry);
+    assert_eq!(events[0].kind, EntryKind::AgentQuestion);
+    assert_eq!(events[0].kind.label(), "question");
+    assert_ne!(events[0].kind.label(), EntryKind::AgentText.label());
+
+    let card = &transcript_entries(&entry)[0];
+    assert!(card.header.contains(" · question · "), "{}", card.header);
+    assert_eq!(
+        card.rendered_lines,
+        ["Which database?", "• Postgres", "• SQLite"]
+    );
+}
+
+/// A failed tool result names the tool and the call and is marked as an
+/// error, also without the call on the same page.
+#[test]
+fn an_error_tool_result_shows_the_tool_and_the_error_status() {
+    let entry = entry(
+        9,
+        "{}",
+        vec![ChatElement::ToolResult {
+            call_id: Some("c-elsewhere".to_string()),
+            tool: Some("Bash".to_string()),
+            call_summary: Some("cat missing.txt".to_string()),
+            status: ToolResultStatus::Error,
+            content: "cat: missing.txt: No such file or directory".to_string(),
+            truncated: true,
+        }],
+    );
+    let events = classify(&entry);
+    assert_eq!(events[0].kind, EntryKind::ToolResult);
+    assert_eq!(
+        events[0].summary,
+        "Bash cat missing.txt — error: cat: missing.txt: No such file or directory"
+    );
+
+    let cards = transcript_entries(&entry);
+    assert_eq!(cards[0].presentation, TranscriptPresentation::Error);
+    let expanded = lines(cards, DisplayMode::Rendered, true);
+    assert!(
+        expanded
+            .iter()
+            .any(|line| line.contains("Bash cat missing.txt — error")),
+        "{expanded:?}"
+    );
+    assert!(
+        expanded
+            .iter()
+            .any(|line| line.contains("podgląd skrócony")),
+        "a cut preview says so: {expanded:?}"
+    );
+}
+
+/// A successful result is not an error.
+#[test]
+fn an_ok_tool_result_is_technical_with_its_status() {
+    let entry = entry(
+        3,
+        "{}",
+        vec![ChatElement::ToolResult {
+            call_id: None,
+            tool: Some("Read".to_string()),
+            call_summary: Some("notes.txt".to_string()),
+            status: ToolResultStatus::Ok,
+            content: "alpha".to_string(),
+            truncated: false,
+        }],
+    );
+    let card = &transcript_entries(&entry)[0];
+    assert_eq!(card.presentation, TranscriptPresentation::Technical);
+    assert_eq!(card.rendered_lines, ["Read notes.txt — ok"]);
+}
+
+/// An element kind from a newer version is unclassified and renders.
+#[test]
+fn an_unrecognized_element_is_unclassified_and_renders() {
+    let wire = r#"{"entry_number":5,"timestamp":"2026-10-17T10:00:00Z","source":"stdout","raw_base64":"e30=","elements":[{"kind":"hologram","beam":1},{"kind":"agent_text","text":"after"}]}"#;
+    let entry: ConversationEntryDto = serde_json::from_str(wire).expect("a newer page");
+    let events = classify(&entry);
+    assert_eq!(events[0].element, ChatElement::Unrecognized);
+    assert_eq!(events[0].kind, EntryKind::Unclassified);
+    assert_eq!(events[0].kind.label(), "unclassified");
+
+    let rendered = lines(transcript_entries(&entry), DisplayMode::Rendered, true);
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains(" · unclassified · ")),
+        "{rendered:?}"
+    );
+    assert!(rendered.iter().any(|line| line == "after"), "{rendered:?}");
+}
+
+/// An unclassified line keeps its reason and shows its text when expanded.
+#[test]
+fn an_unclassified_line_names_the_reason() {
+    let entry = entry(
+        1,
+        "not json at all",
+        vec![ChatElement::Unclassified {
+            reason: UnclassifiedReason::InvalidJson,
+        }],
+    );
+    let cards = transcript_entries(&entry);
+    assert_eq!(cards[0].rendered_lines, ["not valid JSON"]);
+    let expanded = lines(cards, DisplayMode::Rendered, true);
+    assert!(
+        expanded.iter().any(|line| line == "not json at all"),
+        "{expanded:?}"
+    );
+}
+
+/// Raw mode shows the source line of an entry with three elements once.
+#[test]
+fn raw_mode_shows_one_line_for_an_entry_with_three_elements() {
+    let raw = r#"{"type":"assistant","three":"blocks"}"#;
+    let cards: Vec<TranscriptEntry> = [
+        entry(
+            1,
+            raw,
+            vec![
+                ChatElement::Thinking {
+                    text: "hm".to_string(),
+                    redacted: false,
+                },
+                agent_text("Reading."),
+                tool_call("c1", "Read", "a.txt", json!({})),
+            ],
+        ),
+        entry(2, "second line", vec![agent_text("Done.")]),
+    ]
+    .iter()
+    .flat_map(transcript_entries)
+    .collect();
+    assert_eq!(cards.len(), 4);
+
+    let shown = lines(cards.clone(), DisplayMode::Raw, false);
+    let raw_lines: Vec<_> = shown.iter().filter(|line| !line.is_empty()).collect();
+    assert_eq!(raw_lines, [raw, "second line"], "{shown:?}");
+
+    let chronology = lines(cards, DisplayMode::Chronology, false);
+    assert_eq!(
+        chronology
+            .iter()
+            .filter(|line| line.contains(" · Harness · ") || line.contains(" · Agent · "))
+            .count(),
+        4,
+        "every element keeps its card outside raw mode: {chronology:?}"
+    );
+}
+
+/// Prompts, process outcomes and stderr carry the speaker Narsor names.
+#[test]
+fn narsor_and_stderr_entries_have_their_speakers() {
+    let mut prompt = entry(
+        1,
+        "prompt: fix it",
+        vec![ChatElement::Prompt {
+            text: "Fix it".to_string(),
+            resumed_session: Some("s-1".to_string()),
+            purpose: PromptPurpose::Step,
+        }],
+    );
+    prompt.source = ConversationSource::Narsor;
+    let mut stderr = entry(
+        2,
+        "warning",
+        vec![ChatElement::Technical {
+            category: TechnicalCategory::Stderr,
+            summary: "warning".to_string(),
+            data: None,
+        }],
+    );
+    stderr.source = ConversationSource::Stderr;
+    let process = entry(
+        3,
+        "exit",
+        vec![ChatElement::Technical {
+            category: TechnicalCategory::Process,
+            summary: "harness exited with code 0".to_string(),
+            data: None,
+        }],
+    );
+    let cards: Vec<_> = [prompt, stderr, process]
+        .iter()
+        .flat_map(transcript_entries)
+        .collect();
+    assert!(
+        cards[0].header.starts_with("USER · Narsor · sent · "),
+        "{}",
+        cards[0].header
+    );
+    assert_eq!(cards[0].rendered_lines, ["Fix it"]);
+    assert!(
+        cards[1]
+            .header
+            .starts_with("TECHNICZNE · stderr · technical · "),
+        "{}",
+        cards[1].header
+    );
+    assert_eq!(cards[1].rendered_lines, ["stderr: warning"]);
+    assert!(
+        cards[2]
+            .header
+            .starts_with("SYSTEM · Narsor · technical · "),
+        "{}",
+        cards[2].header
+    );
+
+    let expanded = lines(cards, DisplayMode::Rendered, true);
+    assert!(
+        expanded.iter().any(|line| line == "session: s-1"),
+        "{expanded:?}"
+    );
+}
+
+/// The final result speaks its text; its metadata is in the expansion.
+#[test]
+fn a_run_result_shows_its_text_and_expands_to_its_metadata() {
+    let entry = entry(
+        1,
+        "{}",
+        vec![ChatElement::RunResult {
+            text: Some("All done.".to_string()),
+            structured_output: Some(json!({"output": "done"})),
+            stop_reason: Some("end_turn".to_string()),
+            is_error: false,
+            cost_usd: Some(0.5),
+            usage: None,
+            turns: Some(3),
+            duration_ms: Some(1500),
+        }],
+    );
+    let cards = transcript_entries(&entry);
+    assert!(
+        cards[0].header.contains(" · result · "),
+        "{}",
+        cards[0].header
+    );
+    assert_eq!(cards[0].rendered_lines, ["All done."]);
+    let expanded = lines(cards, DisplayMode::Rendered, true);
+    assert!(
+        expanded
+            .iter()
+            .any(|line| line == "done · end_turn · 3 turns · 1.5s · $0.5000"),
+        "{expanded:?}"
+    );
+    assert!(
+        expanded
+            .iter()
+            .any(|line| line.contains("\"output\": \"done\"")),
+        "{expanded:?}"
+    );
 }
 
 // --- the conductor's chat (U13) ----------------------------------------------

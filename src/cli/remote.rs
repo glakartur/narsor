@@ -843,9 +843,14 @@ pub(super) fn print_conversation_entries(
     next_entry: u64,
     closed: bool,
 ) {
-    for entry in entries {
-        let classified = classify(entry);
+    for (entry, classified) in entries
+        .iter()
+        .flat_map(|entry| classify(entry).into_iter().map(move |event| (entry, event)))
+    {
         let body = if matches!(entry.source, crate::api::ConversationEntrySource::Narsor) {
+            if classified.element_index > 0 {
+                continue;
+            }
             String::from_utf8_lossy(&classified.raw).into_owned()
         } else {
             classified.summary
