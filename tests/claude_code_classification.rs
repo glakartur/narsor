@@ -772,3 +772,40 @@ fn the_harness_run_is_still_accumulated() {
     let run = parser.finish(1, "");
     assert!(run.failure.is_some());
 }
+
+// ---------------------------------------------------------------------------
+// The structured output of a `--json-schema` run (U5)
+// ---------------------------------------------------------------------------
+
+/// Feeds a whole recording to one parser and distills its run.
+fn run_of(name: &str) -> narsor_engine::engine::actions::harness::HarnessRun {
+    let mut parser = parser();
+    for line in recording(name) {
+        parser.on_stdout_line(line.as_bytes());
+    }
+    parser.finish(0, "")
+}
+
+#[test]
+fn a_schema_run_reports_its_structured_output() {
+    let run = run_of("schema_done.ndjson");
+
+    assert_eq!(run.failure, None);
+    let output = run.structured_output.expect("a structured output");
+    assert_eq!(output["output"], "done");
+    assert!(output["data"].is_object(), "{output}");
+}
+
+#[test]
+fn a_schema_question_is_reported_as_structured_output_too() {
+    let run = run_of("schema_awaiting.ndjson");
+
+    let output = run.structured_output.expect("a structured output");
+    assert_eq!(output["status"], "awaiting_input");
+    assert!(output["question"].as_str().is_some_and(|q| !q.is_empty()));
+}
+
+#[test]
+fn a_run_without_a_schema_has_no_structured_output() {
+    assert_eq!(run_of("tools.ndjson").structured_output, None);
+}

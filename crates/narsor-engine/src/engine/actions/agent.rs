@@ -12,8 +12,11 @@
 //!    `output`, and which labels (with their descriptions) it may use. D19
 //!    calls this "forcing structure on the agent"; forcing it starts with
 //!    saying it.
-//! 2. **Read robustly, guess never.** Agents wrap JSON in prose, in fences, or
-//!    in both. [`extract_output`] takes the *last* JSON object anywhere in the
+//! 2. **Read robustly, guess never.** A harness that enforces
+//!    [`output_schema`] (Claude Code) reports the answer as a structured
+//!    output, which is read first and checked by the same rules. Otherwise —
+//!    or when it is unusable — the text is read. Agents wrap JSON in prose,
+//!    in fences, or in both. [`extract_output`] takes the *last* JSON object anywhere in the
 //!    answer that has an `output` key. When there is none, the action fails
 //!    ([`ActionError`]) — it never falls back to `success`. In an unattended
 //!    pipeline a guessed label is a silently wrong transition, which is a far
@@ -48,7 +51,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use narsor_protocol::chat::{
-    ChatElement, PromptPurpose, TechnicalCategory, UnclassifiedReason, SUMMARY_MAX_CHARS,
+    ChatElement, PromptPurpose, QuestionSource, TechnicalCategory, UnclassifiedReason,
+    SUMMARY_MAX_CHARS,
 };
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
@@ -118,6 +122,47 @@ those are action failures. Do not omit the JSON object: without it the workflow 
 cannot continue."
     )
 }
+
+/// Builds the JSON Schema of the answer [`output_contract`] describes, for a
+/// harness that can enforce one (`claude-code` passes it as `--json-schema`).
+///
+/// One flat object with the optional fields of both answers — a label with
+/// `data`, `variables` and `artifacts`, or `status: awaiting_input` with a
+/// `question` and `options` — and nothing required. The two answers are not
+/// two `anyOf` branches because the API refuses `anyOf`, `oneOf` and `allOf`
+/// at the top level of a schema (measured on `claude` 2.1.302, see
+/// `tests/fixtures/claude-code/README.md`). So the schema only narrows the
+/// answer: which of the two it is, and whether it is complete, is checked by
+/// narsor itself, the same way as an answer read from text.
+///
+/// `output` is limited to the declared labels; with none declared, any
+/// string is allowed, as the text contract then asks for the label the task
+/// names. `artifacts` is an array of anything, because an entry may be a path
+/// or an object (see the engine's artifact registration).
+pub fn output_schema(outputs: &[OutputDefinition]) -> Value {
+    let mut output = serde_json::json!({ "type": "string" });
+    if !outputs.is_empty() {
+        let labels: Vec<&str> = outputs.iter().map(|output| output.label.as_str()).collect();
+        output["enum"] = serde_json::json!(labels);
+    }
+
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "output": output,
+            "data": { "type": "object" },
+            "variables": { "type": "object" },
+            "artifacts": { "type": "array" },
+            "status": { "type": "string", "enum": [AWAITING_INPUT] },
+            "question": { "type": "string" },
+            "options": { "type": "array", "items": { "type": "string" } },
+        },
+        "additionalProperties": false,
+    })
+}
+
+/// The `status` of an answer that asks a person before the task continues.
+const AWAITING_INPUT: &str = "awaiting_input";
 
 /// The `error_type` of an answer no output label could be extracted from — a
 /// format error the engine answers with a reprompt, not with `retry_policy`
@@ -515,6 +560,7 @@ impl AgentExecutor {
         let mut session = new_session(config, harness, request.execution_id);
 
         let prompt = format!("{}{}", config.prompt, output_contract(request.outputs));
+        let schema = output_schema(request.outputs);
         let workspace = Path::new(&request.workspace.path);
 
         // Opened before `invocation` (Key Technical Decisions): even an
@@ -530,6 +576,7 @@ impl AgentExecutor {
             prompt: &prompt,
             workspace,
             resume_session: resume,
+            output_schema: Some(&schema),
         }) {
             Ok(invocation) => invocation,
             Err(error) => {
@@ -626,8 +673,6 @@ impl AgentExecutor {
             }
         };
 
-        conversation.finish();
-
         let run = finished.run.clone();
 
         if let Some(session_id) = &run.session_id {
@@ -654,6 +699,7 @@ impl AgentExecutor {
         }
 
         if let Some(failure) = &run.failure {
+            conversation.finish();
             self.fail_session(
                 request.execution_id,
                 request.action_execution_id,
@@ -670,9 +716,14 @@ impl AgentExecutor {
             ));
         }
 
-        let output = match extract_response(&run.text) {
-            Ok(output) => output,
+        let output = match read_response(&run) {
+            Ok(output) => {
+                record_text_question(&conversation, &run, &output);
+                conversation.finish();
+                output
+            }
             Err(mut error) => {
+                conversation.finish();
                 // What the engine needs to ask this same session again
                 // (KTD7): the harness it ran on and the session it left.
                 record_session_in_details(&mut error, harness, run.session_id.as_deref());
@@ -1284,6 +1335,86 @@ pub fn extract_output(text: &str) -> Result<AgentOutput, ActionError> {
     }
 }
 
+/// Reads the agent's answer from a finished run: its `structured_output`
+/// first, when the harness reported one that makes a usable answer, then the
+/// text, as [`extract_response`] always did.
+///
+/// A `structured_output` that is unusable — no `output` label and no
+/// complete `awaiting_input` question — is not an error of its own: the text
+/// is read instead, and only its failure is reported. A label the state does
+/// not declare is not unusable here; like a label read from text, it is the
+/// engine's to reject.
+fn read_response(run: &HarnessRun) -> Result<AgentResponse, ActionError> {
+    if let Some(structured) = &run.structured_output {
+        match structured_response(structured) {
+            Ok(response) => return Ok(response),
+            Err(error) => tracing::warn!(
+                reason = %error.message,
+                "the harness's structured output is not a usable answer; reading the text instead"
+            ),
+        }
+    }
+    extract_response(&run.text)
+}
+
+/// Reads an answer from a harness's `structured_output` value, by the same
+/// rules as an object found in the text.
+fn structured_response(value: &Value) -> Result<AgentResponse, ActionError> {
+    let quoted = value.to_string();
+    let object = value
+        .as_object()
+        .filter(|object| is_answer_object(object))
+        .ok_or_else(|| {
+            no_label_error(
+                "the structured output has neither a string 'output' nor an 'awaiting_input' status",
+                &quoted,
+            )
+        })?;
+    response_from_object(object, &quoted)
+}
+
+/// Writes the agent's question to the conversation as a narsor entry, when
+/// the answer asks one and nothing in the stream already did.
+///
+/// A harness parser turns a `structured_output` with an `awaiting_input`
+/// status into an [`ChatElement::AgentQuestion`] itself (Claude Code); a
+/// question read from text is visible only to the executor, so it is
+/// recorded here — once, either way.
+fn record_text_question(
+    conversation: &ConversationSink,
+    run: &HarnessRun,
+    response: &AgentResponse,
+) {
+    let AgentResponse::AwaitingInput { question, options } = response else {
+        return;
+    };
+    let parser_recorded = run
+        .structured_output
+        .as_ref()
+        .and_then(|output| output.get("status"))
+        .and_then(Value::as_str)
+        == Some(AWAITING_INPUT);
+    if parser_recorded {
+        return;
+    }
+
+    let entry = serde_json::json!({
+        "event": "agent_question",
+        "question": question,
+        "options": options,
+    })
+    .to_string();
+    conversation.append_narsor(
+        &entry,
+        &[ChatElement::AgentQuestion {
+            question: question.clone(),
+            options: options.clone(),
+            source: QuestionSource::OutputContract,
+            call_id: None,
+        }],
+    );
+}
+
 /// Extracts either a normal label or a request that pauses the same agent
 /// action. The last matching object wins, following the normal output rule.
 fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
@@ -1296,21 +1427,33 @@ fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
         ));
     }
 
-    let Some(object) = objects.iter().rev().find_map(|value| {
-        let object = value.as_object()?;
-        if object.get("status").and_then(Value::as_str) == Some("awaiting_input") {
-            Some(object)
-        } else {
-            object.get("output").and_then(Value::as_str).map(|_| object)
-        }
-    }) else {
+    let Some(object) = objects
+        .iter()
+        .rev()
+        .find_map(|value| value.as_object().filter(|object| is_answer_object(object)))
+    else {
         return Err(no_label_error(
             "the agent's answer contains JSON, but no object with a string 'output' key",
             text,
         ));
     };
 
-    if object.get("status").and_then(Value::as_str) == Some("awaiting_input") {
+    response_from_object(object, text)
+}
+
+/// Whether `object` is an answer at all: a question, or a string `output`.
+fn is_answer_object(object: &Map<String, Value>) -> bool {
+    object.get("status").and_then(Value::as_str) == Some(AWAITING_INPUT)
+        || object.get("output").and_then(Value::as_str).is_some()
+}
+
+/// Turns an answer object into the response it stands for; `text` is what
+/// an error quotes back (the agent's text, or the structured output).
+fn response_from_object(
+    object: &Map<String, Value>,
+    text: &str,
+) -> Result<AgentResponse, ActionError> {
+    if object.get("status").and_then(Value::as_str) == Some(AWAITING_INPUT) {
         let Some(question) = object.get("question").and_then(Value::as_str) else {
             return Err(no_label_error(
                 "the agent requested human input without a string 'question'",

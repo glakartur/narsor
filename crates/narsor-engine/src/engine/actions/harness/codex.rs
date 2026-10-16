@@ -253,6 +253,7 @@ impl HarnessStreamParser for CodexStreamParser {
             text: self.agent_message.unwrap_or_default(),
             session_id: self.thread_id,
             failure,
+            structured_output: None,
         }
     }
 }

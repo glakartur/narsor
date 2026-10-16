@@ -235,6 +235,7 @@ impl HarnessStreamParser for OpenCodeStreamParser {
             text: self.text.unwrap_or_default(),
             session_id: self.session_id,
             failure,
+            structured_output: None,
         }
     }
 }

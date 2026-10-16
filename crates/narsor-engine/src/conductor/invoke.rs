@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::conductor::actor::{ConductorAnswer, ConductorInvoker, Invocation, InvocationOutcome};
-use crate::conductor::prompt::conductor_prompt;
+use crate::conductor::prompt::{answer_schema, conductor_prompt};
 use crate::conductor::response::ConductorResponse;
 use crate::conductor::snapshot::{render, SnapshotBudget, SnapshotInput};
 use crate::conductor::store::ConductorStore;
@@ -254,6 +254,7 @@ impl HarnessInvoker {
         let prompt = conductor_prompt(invocation.request.purpose, access, &snapshot.text);
 
         let config = conductor_config(&prompt);
+        let schema = answer_schema(invocation.request.purpose);
         let command = adapter
             .invocation(&HarnessRequest {
                 config: &config,
@@ -261,6 +262,7 @@ impl HarnessInvoker {
                 prompt: &prompt,
                 workspace: &working_dir,
                 resume_session: None,
+                output_schema: Some(&schema),
             })
             .map_err(|error| error.message)?;
 
@@ -290,8 +292,12 @@ impl HarnessInvoker {
             ));
         }
 
-        let response = ConductorResponse::parse(&finished.run.text, invocation.request.purpose)
-            .map_err(|error| error.to_string())?;
+        let response = ConductorResponse::read(
+            finished.run.structured_output,
+            &finished.run.text,
+            invocation.request.purpose,
+        )
+        .map_err(|error| error.to_string())?;
         Ok(ConductorAnswer {
             message: response.message.clone(),
             response: response.to_value(),

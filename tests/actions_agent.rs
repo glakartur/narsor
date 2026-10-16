@@ -22,7 +22,7 @@ use narsor_engine::domain::{
     OutputDefinition, RepromptedBy, Workspace, WorkspaceAccess,
 };
 use narsor_engine::engine::actions::agent::{
-    output_contract, AgentEventSink, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
+    output_contract, output_schema, AgentEventSink, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
 };
 use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
@@ -35,7 +35,9 @@ use narsor_engine::persistence::{
     ExecutionStore, ReconciliationOutcome, StatePaths,
 };
 use narsor_engine::workflow::{load_from_file, TemplateScope};
-use narsor_protocol::chat::{ChatElement, PromptPurpose, TechnicalCategory, UnclassifiedReason};
+use narsor_protocol::chat::{
+    ChatElement, PromptPurpose, QuestionSource, TechnicalCategory, UnclassifiedReason,
+};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -3112,6 +3114,363 @@ async fn a_resumed_session_reaches_the_argv_and_the_prompt_entry() {
 }
 
 // ---------------------------------------------------------------------------
+// The output contract as a JSON Schema (U5)
+// ---------------------------------------------------------------------------
+
+/// A `result` line as `claude --json-schema` prints it: the accepted answer
+/// as `structured_output`, and `text` as the result text.
+fn structured_envelope(text: &str, structured: Value) -> String {
+    json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "fake-session-1",
+        "result": text,
+        "structured_output": structured,
+    })
+    .to_string()
+}
+
+/// The `done`/`blocked` outputs of the schema tests.
+fn two_labels() -> [OutputDefinition; 2] {
+    [
+        OutputDefinition::new("done"),
+        OutputDefinition::new("blocked"),
+    ]
+}
+
+/// The schema passed with `--json-schema` in `args`, parsed, and where the
+/// flag stands.
+fn json_schema_arg(args: &[String]) -> (usize, Value) {
+    let flag = args
+        .iter()
+        .position(|arg| arg == "--json-schema")
+        .unwrap_or_else(|| panic!("no --json-schema in {args:?}"));
+    let schema = serde_json::from_str(&args[flag + 1]).expect("the schema is JSON");
+    (flag, schema)
+}
+
+/// Runs an agent action with `outputs` declared.
+async fn execute_with_outputs(
+    executor: &AgentExecutor,
+    config: AgentActionConfig,
+    workspace: &Workspace,
+    outputs: &[OutputDefinition],
+    conversation: Option<&ConversationFixture>,
+) -> Result<ActionOutcome, ActionError> {
+    let action = ActionConfig::Agent(config);
+    let mut request = ActionRequest::new(&action, workspace, ACTION_EXECUTION_ID)
+        .with_execution_id(EXECUTION_ID)
+        .with_outputs(outputs);
+    if let Some(conversation) = conversation {
+        request = request.with_conversation_store(&conversation.store);
+    }
+    executor.execute(request).await
+}
+
+/// Every agent-question element of a conversation, with its entry's source.
+fn agent_questions(entries: &[ConversationEntry]) -> Vec<(ConversationSource, ChatElement)> {
+    entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .elements
+                .iter()
+                .filter(|element| matches!(element, ChatElement::AgentQuestion { .. }))
+                .map(|element| (entry.source, element.clone()))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_claude_step_passes_its_labels_as_a_json_schema_before_the_permission_mode() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"output":"done"}"#));
+
+    execute_with_outputs(
+        &executor(&fake),
+        agent_action("do the thing"),
+        &root.workspace(),
+        &two_labels(),
+        None,
+    )
+    .await
+    .expect("the action runs");
+
+    let args = fake.args(1);
+    let (flag, schema) = json_schema_arg(&args);
+    assert_eq!(schema["type"], "object");
+    assert_eq!(
+        schema["properties"]["output"]["enum"],
+        json!(["done", "blocked"])
+    );
+    assert_eq!(
+        schema["properties"]["status"]["enum"],
+        json!(["awaiting_input"])
+    );
+    assert_eq!(schema["additionalProperties"], false);
+    for keyword in ["anyOf", "oneOf", "allOf", "required"] {
+        assert!(schema.get(keyword).is_none(), "{keyword} in {schema}");
+    }
+
+    let mode = args
+        .iter()
+        .position(|arg| arg == "--permission-mode")
+        .expect("a permission mode");
+    assert!(flag < mode, "{args:?}");
+    assert_eq!(mode + 2, args.len() - 1, "the prompt is still last");
+
+    // The text contract stays in the prompt.
+    let prompt = args.last().expect("a prompt");
+    assert!(prompt.contains("- `done`\n- `blocked`\n"), "{prompt}");
+}
+
+#[test]
+fn without_declared_outputs_the_schema_allows_any_label() {
+    let schema = output_schema(&[]);
+
+    assert_eq!(schema["properties"]["output"], json!({ "type": "string" }));
+}
+
+#[tokio::test]
+async fn a_structured_output_gives_the_label_and_data_when_the_text_has_no_json() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&structured_envelope(
+        "The work is finished.",
+        json!({ "output": "done", "data": { "units": 3 }, "variables": { "plan": "plan.md" } }),
+    ));
+
+    let outcome = execute_with_outputs(
+        &executor(&fake),
+        agent_action("do the thing"),
+        &root.workspace(),
+        &two_labels(),
+        None,
+    )
+    .await
+    .expect("the action completes");
+
+    let ActionOutcome::Completed(result) = outcome else {
+        panic!("expected a completed action, got {outcome:?}");
+    };
+    assert_eq!(result.output_label, "done");
+    assert_eq!(result.data["units"], 3);
+    assert_eq!(result.variables.get("plan"), Some(&json!("plan.md")));
+}
+
+#[tokio::test]
+async fn an_unusable_structured_output_falls_back_to_the_text() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&structured_envelope(
+        r#"Done. {"output":"blocked"}"#,
+        json!({ "data": { "units": 3 } }),
+    ));
+
+    let outcome = execute_with_outputs(
+        &executor(&fake),
+        agent_action("do the thing"),
+        &root.workspace(),
+        &two_labels(),
+        None,
+    )
+    .await
+    .expect("the action completes");
+
+    let ActionOutcome::Completed(result) = outcome else {
+        panic!("expected a completed action, got {outcome:?}");
+    };
+    assert_eq!(result.output_label, "blocked");
+}
+
+/// AE3: the agent's question in `structured_output` suspends the step for
+/// the operator, and the conversation shows the question once — the
+/// parser's element, not a second one from the executor.
+#[tokio::test]
+async fn covers_ae3_a_structured_question_waits_for_input_with_one_agent_question() {
+    let fixture = EngineFixture::new();
+    let question = json!({
+        "status": "awaiting_input",
+        "question": "Which API version should I target?",
+        "options": ["v1", "v2"],
+    });
+    fixture.fake.answers(&structured_envelope(
+        &question.to_string(),
+        question.clone(),
+    ));
+
+    let execution = run_reprompt_workflow(&fixture).await;
+
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    assert_eq!(fixture.fake.calls(), 1);
+    let snapshot = fixture
+        .store()
+        .conversation_store(&execution.id)
+        .read(&fixture.fake.action_id(1), 1, usize::MAX)
+        .expect("read the conversation")
+        .expect("a conversation");
+    let questions = agent_questions(&snapshot.entries);
+    assert_eq!(questions.len(), 1, "{questions:?}");
+    assert_eq!(questions[0].0, ConversationSource::Stdout);
+    assert_eq!(
+        questions[0].1,
+        ChatElement::AgentQuestion {
+            question: "Which API version should I target?".to_string(),
+            options: vec!["v1".to_string(), "v2".to_string()],
+            source: QuestionSource::OutputContract,
+            call_id: None,
+        }
+    );
+}
+
+/// A question read from text is visible only to the executor, which writes
+/// it to the conversation itself, before the conversation is closed.
+#[tokio::test]
+async fn a_question_in_the_text_is_recorded_as_a_narsor_agent_question() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&envelope(
+        r#"I need to know. {"status":"awaiting_input","question":"Choose a version","options":["v1","v2"]}"#,
+    ));
+
+    let outcome = execute_with_outputs(
+        &executor(&fake),
+        agent_action("do the thing"),
+        &root.workspace(),
+        &two_labels(),
+        Some(&conversation),
+    )
+    .await
+    .expect("the question is a suspension");
+    assert!(
+        matches!(outcome, ActionOutcome::Suspended(_)),
+        "{outcome:?}"
+    );
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    let questions = agent_questions(&entries);
+    assert_eq!(questions.len(), 1, "{questions:?}");
+    assert_eq!(questions[0].0, ConversationSource::Narsor);
+    assert_eq!(
+        questions[0].1,
+        ChatElement::AgentQuestion {
+            question: "Choose a version".to_string(),
+            options: vec!["v1".to_string(), "v2".to_string()],
+            source: QuestionSource::OutputContract,
+            call_id: None,
+        }
+    );
+    assert!(
+        matches!(
+            entries.last().map(|entry| entry.elements.as_slice()),
+            Some([ChatElement::AgentQuestion { .. }])
+        ),
+        "the question is the last entry, after the process outcome: {entries:?}"
+    );
+}
+
+/// AE5: with neither a structured output nor JSON in the text, the engine
+/// asks the same session again — and the reprompt carries the schema too.
+#[tokio::test]
+async fn covers_ae5_without_any_answer_the_reprompt_also_carries_the_schema() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &envelope("Done, nothing more to say."))
+        .answers_on_call(
+            2,
+            &structured_envelope("Here it is.", json!({ "output": "implemented" })),
+        );
+
+    let execution = run_reprompt_workflow(&fixture).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(fixture.fake.calls(), 2, "one attempt and one reprompt");
+    for call in [1, 2] {
+        let (_, schema) = json_schema_arg(&fixture.fake.args(call));
+        assert_eq!(
+            schema["properties"]["output"]["enum"],
+            json!(["implemented", "needs_human_decision"]),
+            "call {call}"
+        );
+    }
+    let second = fixture.fake.args(2);
+    assert!(
+        has_flag(&second, "--resume", "fake-session-1"),
+        "{second:?}"
+    );
+    assert!(has_flag(&second, "--permission-mode", "plan"), "{second:?}");
+}
+
+/// A structured label the state does not declare is handled like such a
+/// label in the text: rejected by the engine and asked for again.
+#[tokio::test]
+async fn a_structured_label_outside_the_list_is_asked_for_again_like_a_text_label() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(
+            1,
+            &structured_envelope(r#"{"output":"finished"}"#, json!({ "output": "finished" })),
+        )
+        .answers_on_call(
+            2,
+            &structured_envelope(
+                r#"{"output":"implemented"}"#,
+                json!({ "output": "implemented" }),
+            ),
+        );
+
+    let execution = run_reprompt_workflow(&fixture).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(fixture.fake.calls(), 2);
+    let reason = events_of(&fixture, &execution.id)
+        .into_iter()
+        .find_map(|data| match data {
+            EventData::ActionOutputRejected { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("an ActionOutputRejected event");
+    assert!(reason.contains("'finished'"), "{reason}");
+}
+
+/// opencode cannot enforce a schema: it gets no flag for one, and the text
+/// contract in its prompt is all it is told.
+#[tokio::test]
+async fn an_opencode_step_gets_no_schema_but_still_the_text_contract() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&opencode_stream("ses_7", r#"{"output":"done"}"#));
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(OpenCodeAdapter::with_program(fake.program()))),
+    );
+    let mut config = agent_action("do the thing");
+    config.harness = Some("opencode".to_string());
+
+    execute_with_outputs(&executor, config, &root.workspace(), &two_labels(), None)
+        .await
+        .expect("the action runs");
+
+    let args = fake.args(1);
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.contains("schema") || arg.starts_with('{')),
+        "{args:?}"
+    );
+    assert!(
+        args.iter()
+            .any(|arg| arg.contains("must be exactly one of these labels:\n- `done`\n")),
+        "{args:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The real harness — deliberately ignored
 // ---------------------------------------------------------------------------
 
@@ -3139,6 +3498,51 @@ async fn the_real_claude_binary_honours_the_output_contract() {
     let result = complete(&AgentExecutor::new(), config, &root.workspace()).await;
 
     assert_eq!(result.output_label, "ready");
+}
+
+/// Drives the actual `claude` binary with two labels: the label comes from
+/// its `structured_output` (U5). Ignored for the same reasons as above.
+#[tokio::test]
+#[ignore = "drives the real `claude` binary: costs money, needs credentials"]
+async fn the_real_claude_binary_answers_through_the_json_schema() {
+    if which("claude").is_none() {
+        eprintln!("skipping: `claude` is not on PATH");
+        return;
+    }
+
+    let root = TempRoot::new();
+    let mut config = agent_action(
+        "Do not use any tools. The work is already done: finish with the label 'done'.",
+    );
+    config.workspace_access = WorkspaceAccess::ReadOnly;
+    let conversation = ConversationFixture::new(&root);
+
+    let outcome = execute_with_outputs(
+        &AgentExecutor::new(),
+        config,
+        &root.workspace(),
+        &two_labels(),
+        Some(&conversation),
+    )
+    .await
+    .expect("the action runs");
+
+    let ActionOutcome::Completed(result) = outcome else {
+        panic!("expected a completed action, got {outcome:?}");
+    };
+    assert_eq!(result.output_label, "done");
+    let structured = conversation
+        .entries(ACTION_EXECUTION_ID)
+        .iter()
+        .flat_map(|entry| entry.elements.clone())
+        .find_map(|element| match element {
+            ChatElement::RunResult {
+                structured_output, ..
+            } => structured_output,
+            _ => None,
+        })
+        .expect("the run result carries a structured output");
+    assert_eq!(structured["output"], "done");
 }
 
 /// The first entry of `PATH` holding an executable called `name`.

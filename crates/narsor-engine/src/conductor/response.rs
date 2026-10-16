@@ -339,6 +339,27 @@ impl ConductorResponse {
         Self::from_value(object, purpose)
     }
 
+    /// Reads the answer of an invocation: its `structured_output`, when the
+    /// harness reported one that is a usable response, else its reply
+    /// `text`, as [`Self::parse`] reads it. Only the text's failure is
+    /// reported: an unusable structured output is not an error of its own.
+    pub fn read(
+        structured_output: Option<Value>,
+        text: &str,
+        purpose: ConductorPurpose,
+    ) -> Result<Self, ResponseError> {
+        if let Some(structured) = structured_output {
+            match Self::from_value(structured, purpose) {
+                Ok(response) => return Ok(response),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "the conductor's structured output is not a usable answer; reading the text instead"
+                ),
+            }
+        }
+        Self::parse(text, purpose)
+    }
+
     /// Reads and checks a response already in JSON — the parsed answer of an
     /// invocation, as [`crate::conductor::ConductorAnswer::response`] holds
     /// it, or a decision saved for later.

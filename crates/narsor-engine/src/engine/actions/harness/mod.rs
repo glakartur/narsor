@@ -58,6 +58,13 @@ pub struct HarnessRequest<'a> {
 
     /// A harness session to continue instead of starting a fresh one (D18).
     pub resume_session: Option<&'a str>,
+
+    /// The JSON Schema of the answer, for a harness that can enforce one.
+    ///
+    /// An addition to the text contract in `prompt`, never a replacement:
+    /// `claude-code` passes it as `--json-schema`, and every other adapter
+    /// ignores it.
+    pub output_schema: Option<&'a Value>,
 }
 
 /// The command line an adapter decided on.
@@ -82,6 +89,11 @@ pub struct HarnessRun {
     /// Why the run failed, when the harness says it did. `None` means the
     /// harness is content — which says nothing yet about the output label.
     pub failure: Option<String>,
+
+    /// The answer as the harness validated it against
+    /// [`HarnessRequest::output_schema`], when it reported one. The caller
+    /// still checks it, and falls back to `text` when it is absent or unusable.
+    pub structured_output: Option<Value>,
 }
 
 /// A stateful parser fed one stdout line at a time as the harness streams,

@@ -6,8 +6,13 @@
 //! decisions its purpose allows and the JSON object to end with (KTD6).
 //! The allowed decisions are those [`super::response`] checks the answer
 //! against, so the prompt never offers what the engine would reject.
+//!
+//! [`answer_schema`] says the same as the answer contract, as a JSON Schema
+//! for a harness that can enforce one (`claude-code`'s `--json-schema`).
 
 use std::fmt::Write as _;
+
+use serde_json::{json, Map, Value};
 
 use crate::conductor::invoke::ConductorAccess;
 use crate::conductor::response::{allowed_decisions, proposals_allowed, DecisionKind};
@@ -150,4 +155,88 @@ fn decision_fields(kind: DecisionKind) -> &'static str {
 have one, \"recommendation\": \"<the answer you would give>\""
         }
     }
+}
+
+/// The JSON Schema of the answer the prompt's answer contract describes for
+/// `purpose`, for a harness that can enforce one.
+///
+/// One flat object, like an agent step's
+/// ([`crate::engine::actions::agent::output_schema`]): the API refuses
+/// `anyOf`, `oneOf` and `allOf` at the top level, so the fields of every
+/// decision the purpose allows are optional properties side by side, and
+/// only `decision` is required. Which fields a decision needs is checked by
+/// [`super::response`], as for an answer read from text.
+pub fn answer_schema(purpose: ConductorPurpose) -> Value {
+    let decisions = allowed_decisions(purpose);
+
+    let mut properties = Map::new();
+    properties.insert(
+        "decision".to_string(),
+        json!({
+            "type": "string",
+            "enum": decisions.iter().map(DecisionKind::name).collect::<Vec<_>>(),
+        }),
+    );
+    properties.insert(
+        "confidence".to_string(),
+        json!({ "type": "string", "enum": ["high", "low"] }),
+    );
+    properties.insert("rationale".to_string(), json!({ "type": "string" }));
+    properties.insert("message".to_string(), json!({ "type": "string" }));
+    for kind in decisions {
+        for (field, schema) in decision_properties(*kind) {
+            properties.insert((*field).to_string(), schema.clone());
+        }
+    }
+    if proposals_allowed(purpose) {
+        properties.insert("proposals".to_string(), proposals_schema());
+    }
+
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["decision"],
+        "additionalProperties": false,
+    })
+}
+
+/// The fields a decision of `kind` takes, as JSON Schema properties — the
+/// same fields [`decision_fields`] names in the text.
+fn decision_properties(kind: DecisionKind) -> Vec<(&'static str, Value)> {
+    let text = || json!({ "type": "string" });
+    let object = || json!({ "type": "object" });
+    match kind {
+        DecisionKind::ChooseOutput | DecisionKind::Escalate => vec![
+            ("label", text()),
+            ("data", object()),
+            ("variables", object()),
+        ],
+        DecisionKind::Reprompt => vec![("prompt", text())],
+        DecisionKind::Retry => vec![("note", text()), ("diagnosis", text())],
+        DecisionKind::Diagnose => vec![("diagnosis", text())],
+        DecisionKind::Reply => Vec::new(),
+        DecisionKind::Annotate => vec![("summary", text()), ("recommendation", text())],
+    }
+}
+
+/// The schema of `proposals`, the actions the answer contract lists.
+fn proposals_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["answer_input", "message_agent", "retry", "transition", "abort"],
+                },
+                "summary": { "type": "string" },
+                "label": { "type": "string" },
+                "values": { "type": "object" },
+                "text": { "type": "string" },
+            },
+            "required": ["kind"],
+            "additionalProperties": false,
+        },
+    })
 }

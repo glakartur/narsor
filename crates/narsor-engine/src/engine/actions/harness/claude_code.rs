@@ -1,12 +1,13 @@
 //! The `claude-code` harness — Anthropic's `claude` CLI.
 //!
-//! Measured against `claude` 2.1.283. The invocation is always the
+//! Measured against `claude` 2.1.302. The invocation is always the
 //! non-interactive one:
 //!
 //! ```text
 //! claude --print --output-format stream-json --verbose \
 //!        [--add-dir <read_only_paths…>] [--model <model>] [--max-turns <n>] \
-//!        [--resume <session-id>] [--allow-dangerously-skip-permissions] \
+//!        [--append-system-prompt <text>] [--resume <session-id>] \
+//!        [--json-schema <schema>] \
 //!        --permission-mode <mode> \
 //!        <prompt>
 //! ```
@@ -24,6 +25,16 @@
 //!   *whole* stream captured, byte for byte, as it happens (U3). `--verbose`
 //!   is required by the CLI for `stream-json` under `--print`; without it the
 //!   command refuses to start.
+//! * `--json-schema <schema>` carries the output contract as a JSON Schema,
+//!   one compact argument that starts with `{`, so it can never be read as a
+//!   flag. The CLI gives the model a `StructuredOutput` tool with that input
+//!   schema, rejects a call that does not match it and lets the model try
+//!   again, and reports the accepted object as `structured_output` on the
+//!   `result` line — also after `--resume` and in `plan` mode. The API
+//!   refuses `anyOf`/`oneOf`/`allOf` at the top level of the schema and
+//!   requires `"type": "object"` there, so the schema is one flat object
+//!   (see [`crate::engine::actions::agent::output_schema`]). The text contract stays in
+//!   the prompt: the schema adds to it, and narsor checks the answer itself.
 //! * `--permission-mode` is **last** before the prompt on purpose. It takes
 //!   exactly one value, so the prompt after it can never be mistaken for a flag
 //!   argument — unlike `--add-dir`, which is variadic and would swallow the
@@ -152,6 +163,13 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             args.push(session.to_string());
         }
 
+        if let Some(schema) = request.output_schema {
+            let schema = schema.to_string();
+            reject_option_like(&schema, "output_schema", CLAUDE_CODE)?;
+            args.push("--json-schema".to_string());
+            args.push(schema);
+        }
+
         args.push("--permission-mode".to_string());
         args.push(mode.to_string());
 
@@ -178,8 +196,9 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 /// * It is accumulated into a [`HarnessRun`]: a `system`/`init` line may
 ///   carry the session id before anything else does, and the `result` line
 ///   — the last line a well-behaved run ever prints — carries the final text
-///   (or `errors`), the authoritative session id, and whether the harness
-///   itself calls the run a failure.
+///   (or `errors`), the `structured_output` when a schema was passed, the
+///   authoritative session id, and whether the harness itself calls the run
+///   a failure.
 #[derive(Debug, Default)]
 struct ClaudeCodeStreamParser {
     /// Turns lines into chat elements; remembers tool calls by id.
@@ -195,6 +214,8 @@ struct ClaudeCodeStreamParser {
     reported_error: bool,
     /// The `result` line's `subtype`, for the failure message.
     subtype: Option<String>,
+    /// The `result` line's `structured_output`, when it carried one.
+    structured_output: Option<Value>,
 }
 
 impl ClaudeCodeStreamParser {
@@ -236,6 +257,10 @@ impl ClaudeCodeStreamParser {
             .as_deref()
             .is_some_and(|subtype| subtype != "success");
         self.reported_error = is_error || non_success_subtype;
+        self.structured_output = object
+            .get("structured_output")
+            .filter(|value| !value.is_null())
+            .cloned();
 
         self.result_text = object
             .get("result")
@@ -292,6 +317,7 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
             text: self.result_text,
             session_id: self.session_id,
             failure,
+            structured_output: self.structured_output,
         }
     }
 }
