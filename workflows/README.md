@@ -59,7 +59,7 @@ straight to a merge.
 | Gate | Sits after | Why there |
 |---|---|---|
 | `clarify_direction` | `ce-brainstorm` returned `needs_direction` | Product direction is the one thing an agent has no basis to choose. Rather than guess, the chain stops and asks. |
-| `approve_scope` | `ce-brainstorm` + `ce-doc-review` | The requirements document is what every later step is measured against. A wrong scope caught here costs one conversation; caught after the PR it costs the whole pipeline. Your note is carried into the plan as `{{ context.scope_notes }}`. |
+| `approve_scope` | `ce-brainstorm` + `ce-doc-review` | The requirements document is what every later step is measured against. A wrong scope caught here costs one conversation; caught after the PR it costs the whole pipeline. An optional note is carried into the plan as `{{ context.scope_notes }}`; `revise` sends `brainstorm_feedback` back to the brainstorm. |
 | `approve_plan` | `ce-plan`, **before a line of code exists** | The cheapest correction point in the whole process. Everything after this gate is an edit to the repository. |
 | `implementation_review` | implementation is pushed to the PR | The person reviews the implementation and can request changes, approve it for learning capture, or stop. |
 | `learning_review` | learning has been pushed to the already reviewed PR | The person reviews the updated PR and gives final approval. Requests for changes return to implementation. |

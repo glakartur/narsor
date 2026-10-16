@@ -56,8 +56,11 @@ states:
         to `docs/brainstorms/<date>-<slug>-requirements.md` using
         repo-relative paths. Do not write production code.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"requirements_doc": "<repo-relative path>"}}
+        End every answer, including one after a revision request, with a
+        single JSON object and nothing after it:
+          {"output": "<label>", "variables": {"requirements_doc": "<repo-relative path>"}}
+        `requirements_doc` names the one document you wrote or revised; the
+        later steps read exactly that file.
     outputs:
       - label: requirements_drafted
         description: the requirements document is written.
@@ -108,7 +111,7 @@ states:
       type: agent
       prompt: |
         Run the `ce-doc-review` skill over the requirements document written by
-        `ce-brainstorm` in `docs/brainstorms/`. Dispatch the persona reviewers,
+        `ce-brainstorm`: `{{ context.requirements_doc }}`. Dispatch the persona reviewers,
         merge their findings and write the review back into the document as a
         review section. Change no code.
 
@@ -137,8 +140,8 @@ states:
       type: human
       message: >
         Read the requirements document and its review. Approve the scope, send
-        it back for another brainstorm, or stop. Your note is carried into the
-        plan.
+        it back for another brainstorm, or stop. An optional note is carried
+        into the plan; a revision request goes back to the brainstorm.
       inputs:
         - name: scope_decision
           type: select
@@ -149,16 +152,21 @@ states:
             - abandon
         - name: scope_notes
           type: text
+          required: false
+          description: >
+            Optional — what the plan must respect beyond the requirements
+            document: constraints or non-goals.
+        - name: brainstorm_feedback
+          type: text
           required: true
           description: >
-            What the plan must respect — constraints, non-goals, or simply
-            "as written".
+            Only for revise — what the requirements document gets wrong.
     outputs:
       - label: approved
         description: the scope is right; plan against it.
       - label: revise
         description: send the requirements back for another brainstorm.
-        resume_comment_field: scope_notes
+        resume_comment_field: brainstorm_feedback
       - label: abandon
         description: stop the pipeline here.
     transitions:
@@ -177,9 +185,13 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-plan` skill. Build from the requirements document in
-        `docs/brainstorms/` — it is the source of truth — and from the
-        reviewer's note:
+        Run the `ce-plan` skill. Build from this requirements document — it is
+        the source of truth; do not use any other document in
+        `docs/brainstorms/`:
+
+        {{ context.requirements_doc }}
+
+        Respect the reviewer's note, if there is one:
 
         {{ context.scope_notes }}
 
@@ -189,7 +201,7 @@ states:
         code: write no implementation.
 
         End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"plan_doc": "<repo-relative path>"}}
+          {"output": "<label>", "variables": {"plan_doc": "<repo-relative path>"}}
         If you take `needs_scope_revision`, explain the contradiction or
         missing dependency in `data.question` so a person can revise the scope.
         A sandbox, harness, tool, or write-permission problem is an action
@@ -253,9 +265,9 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-plan` skill again. Revise the plan in `docs/plans/` based
-        on the approved requirements in `docs/brainstorms/` and this human
-        feedback:
+        Run the `ce-plan` skill again. Revise the plan
+        `{{ context.plan_doc }}` based on the approved requirements document
+        `{{ context.requirements_doc }}` and this human feedback:
 
         {{ context.plan_feedback }}
 
@@ -263,7 +275,7 @@ states:
         sequencing. Write no implementation code.
 
         End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"plan_doc": "<repo-relative path>"}}
+          {"output": "<label>", "variables": {"plan_doc": "<repo-relative path>"}}
     outputs:
       - label: plan_ready
         description: the revised plan is ready for approval.
@@ -281,7 +293,7 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-work` skill against the plan in `docs/plans/`. Implement
+        Run the `ce-work` skill against the plan `{{ context.plan_doc }}`. Implement
         the plan's units in order, write the tests the plan enumerates, and
         run the repository's own checks before you finish. Respect the plan's
         scope boundaries. If a requirement or implementation choice is
@@ -309,7 +321,7 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-work` skill against the approved plan in `docs/plans/`.
+        Run the `ce-work` skill against the approved plan `{{ context.plan_doc }}`.
         Continue the existing implementation and address the changes in the
         person's review note:
 

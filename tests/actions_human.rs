@@ -354,7 +354,7 @@ async fn an_action_without_fields_takes_the_label_straight_from_outputs() {
 }
 
 #[tokio::test]
-async fn an_optional_field_may_be_omitted() {
+async fn an_omitted_optional_text_field_becomes_an_empty_string() {
     let root = TempRoot::new();
     let store = root.store();
     let mut execution = start_execution(&store, root.path());
@@ -373,7 +373,9 @@ async fn an_optional_field_may_be_omitted() {
     let resumed = human::resume(&store, &execution.id, &delivery).expect("resume");
 
     assert_eq!(resumed.result.output_label, "changes_requested");
-    assert!(!resumed.result.variables.contains_key("comments"));
+    // An empty answer, not a missing one: a later `{{ context.comments }}`
+    // renders as nothing instead of failing as an unknown variable.
+    assert_eq!(resumed.result.variables.get("comments"), Some(&json!("")));
 }
 
 #[tokio::test]

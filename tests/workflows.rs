@@ -97,6 +97,16 @@ impl FakeHarness {
     /// a straight `fs::copy` onto the final name is an intermittent ETXTBSY
     /// flake under parallel test threads.
     fn installed_in(dir: PathBuf, labels: &[&str]) -> Self {
+        let answers: Vec<Value> = labels
+            .iter()
+            .map(|label| json!({ "output": label, "data": {} }))
+            .collect();
+        Self::answering_in(dir, &answers)
+    }
+
+    /// Installs the fixture script and scripts one whole answer object (label,
+    /// `data`, `variables`) per call, in order.
+    fn answering_in(dir: PathBuf, answers: &[Value]) -> Self {
         let source =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/harness/fake_harness.sh");
         let program = dir.join("fake_harness.sh");
@@ -104,13 +114,13 @@ impl FakeHarness {
         fs::copy(&source, &temp).expect("copy the fake harness");
         fs::rename(&temp, &program).expect("move the fake harness into place");
 
-        for (index, label) in labels.iter().enumerate() {
+        for (index, result) in answers.iter().enumerate() {
             let answer = json!({
                 "type": "result",
                 "subtype": "success",
                 "is_error": false,
                 "session_id": "fake-session-1",
-                "result": json!({ "output": label, "data": {} }).to_string(),
+                "result": result.to_string(),
             })
             .to_string();
             fs::write(dir.join(format!("stdout.{}", index + 1)), answer)
@@ -529,25 +539,34 @@ async fn run_to_terminal(
 #[tokio::test]
 async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
     let root = TempRoot::new();
+    let harness_dir = root.dir("harness");
+    let requirements_doc = "docs/brainstorms/2026-10-16-subscribe-requirements.md";
+    let plan_doc = "docs/plans/2026-10-16-subscribe-plan.md";
+    let label = |label: &str| json!({ "output": label, "data": {} });
     // Every agent call of the path below, in order.
-    let harness = FakeHarness::installed_in(
-        root.dir("harness"),
+    let harness = FakeHarness::answering_in(
+        harness_dir.clone(),
         &[
-            "requirements_drafted", // brainstorm
-            "reviewed",             // doc_review
-            "plan_ready",           // plan
-            "implemented",          // work — ambiguity uses awaiting_input in place
-            "simplified",           // simplify
-            "findings",             // code_review
-            "fixed",                // fix_review_findings
-            "clean",                // code_review again
-            "published",            // publish_work — opens the first PR
-            "revised",              // work_revision — addresses human review
-            "simplified",           // simplify
-            "clean",                // code_review
-            "published",            // publish_work — updates the existing PR
-            "documented",           // compound — after implementation review
-            "updated",              // publish_learning — push the knowledge doc
+            // 1. brainstorm
+            json!({
+                "output": "requirements_drafted",
+                "variables": { "requirements_doc": requirements_doc },
+            }),
+            label("reviewed"), // 2. doc_review
+            // 3. plan
+            json!({ "output": "plan_ready", "variables": { "plan_doc": plan_doc } }),
+            label("implemented"), // 4. work — ambiguity uses awaiting_input in place
+            label("simplified"),  // simplify
+            label("findings"),    // code_review
+            label("fixed"),       // fix_review_findings
+            label("clean"),       // code_review again
+            label("published"),   // publish_work — opens the first PR
+            label("revised"),     // work_revision — addresses human review
+            label("simplified"),  // simplify
+            label("clean"),       // code_review
+            label("published"),   // publish_work — updates the existing PR
+            label("documented"),  // compound — after implementation review
+            label("updated"),     // publish_learning — push the knowledge doc
         ],
     );
     let engine = harness.engine(root.dir("store"));
@@ -563,16 +582,14 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
         root.workspace(),
         &[
             Answer::approval("doc_review"),
-            Answer::new(
-                "approve_scope",
-                &[
-                    ("scope_decision", "approved"),
-                    ("scope_notes", "one screen only, no notifications"),
-                ],
-            ),
+            // No note: an approval without one must still reach the plan.
+            Answer::new("approve_scope", &[("scope_decision", "approved")]),
             Answer::new(
                 "approve_plan",
-                &[("plan_decision", "approved"), ("plan_feedback", "as written")],
+                &[
+                    ("plan_decision", "approved"),
+                    ("plan_feedback", "as written"),
+                ],
             ),
             Answer::new(
                 "implementation_review",
@@ -583,10 +600,7 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
             ),
             Answer::new(
                 "implementation_review",
-                &[
-                    ("review_decision", "approve"),
-                    ("revision_notes", "none"),
-                ],
+                &[("review_decision", "approve"), ("revision_notes", "none")],
             ),
             Answer::new(
                 "learning_review",
@@ -601,11 +615,25 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
 
     assert_eq!(execution.status, ExecutionStatus::Completed);
     assert_eq!(execution.current_state.as_deref(), Some("finished"));
-    // The human's answers became context variables the later prompts read.
+    // A blank optional note is an empty answer, not a missing variable.
     assert_eq!(
         execution.context.variables.get("scope_notes"),
-        Some(&json!("one screen only, no notifications"))
+        Some(&json!(""))
     );
+    // The documents the agents returned are named in the later prompts, so no
+    // step has to guess which file in `docs/` is meant.
+    let prompt = |call: usize| {
+        fs::read_to_string(harness_dir.join(format!("args.{call}"))).expect("read the prompt")
+    };
+    assert!(
+        prompt(2).contains(requirements_doc),
+        "doc_review names the requirements"
+    );
+    assert!(
+        prompt(3).contains(requirements_doc),
+        "plan names the requirements"
+    );
+    assert!(prompt(4).contains(plan_doc), "work names the plan");
 }
 
 #[tokio::test]

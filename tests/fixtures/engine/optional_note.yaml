@@ -1,0 +1,42 @@
+name: optional-note
+version: 1
+description: >
+  A gate with an optional text note that the next state's arguments name. A
+  person who leaves the note blank has still answered it: the next state must
+  render the note as an empty string, not fail on a missing variable.
+
+states:
+  approve:
+    action:
+      type: human
+      message: Approve, with a note if you have one.
+      inputs:
+        - name: decision
+          type: select
+          required: true
+          options:
+            - approved
+        - name: note
+          type: text
+          required: false
+    outputs:
+      - approved
+    transitions:
+      approved: echo
+
+  echo:
+    action:
+      type: script
+      command: ./print_json.sh
+      args:
+        - '{"output": "ok", "variables": {"echoed": "[{{ context.note }}]"}}'
+    outputs:
+      - ok
+    transitions:
+      ok: completed
+
+  completed:
+    description: Done.
+
+terminal_states:
+  - completed

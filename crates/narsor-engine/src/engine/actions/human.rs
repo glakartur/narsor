@@ -907,9 +907,7 @@ pub fn resume(
 
     // Validation first, and before any write: a rejected delivery must leave
     // the execution exactly as paused as it was.
-    let optional_resume_fields: Vec<&str> = delivery
-        .chosen_label
-        .as_deref()
+    let optional_resume_fields: Vec<&str> = intended_label(&pending, delivery)
         .map(|label| {
             pending
                 .outputs
@@ -939,7 +937,8 @@ pub fn resume(
         InputContinuation::CompleteStep => {
             reject_step_values(delivery)?;
             let label = resolve_label(&pending, delivery, &values)?;
-            (label, Value::Object(values.clone()), values.clone())
+            let answered = with_blank_optional_text(pending.fields(), &values);
+            (label, Value::Object(answered.clone()), answered)
         }
         // This label is internal only. The engine observes `continuation` and
         // resumes the agent before any decision/transition code can read it.
@@ -1220,6 +1219,27 @@ fn validate_values(
     Ok(values)
 }
 
+/// `values` with an empty string for every optional `text` field left blank.
+///
+/// A gate that closes its step was answered in full: a blank optional note is
+/// an empty answer, not a missing one, so a later `{{ context.NAME }}` renders
+/// as nothing instead of failing the action as an unknown variable. Writing it
+/// also clears a note left by an earlier pass through the same gate.
+fn with_blank_optional_text(
+    fields: &[HumanInputField],
+    values: &Map<String, Value>,
+) -> Map<String, Value> {
+    let mut answered = values.clone();
+    for field in fields {
+        if !field.required && field.field_type == HumanInputType::Text {
+            answered
+                .entry(field.name.clone())
+                .or_insert_with(|| Value::String(String::new()));
+        }
+    }
+    answered
+}
+
 /// An agent form with a menu accepts either free text, or one selected option
 /// (with an optional comment). This is checked before any durable write so a
 /// blank submission remains answerable.
@@ -1274,6 +1294,28 @@ pub(crate) fn is_blank(value: &Value) -> bool {
 /// it has one *text* field and two outputs (`clarified`, `abort`), so the user
 /// fills a field in **and** picks a label. An explicit label therefore always
 /// wins over an inferred one.
+/// The label a delivery means before its values are validated: the one chosen
+/// explicitly, or else the value of the gate's only `select` field — the same
+/// inference [`resolve_label`] makes. It decides which resume comments the
+/// delivery may leave blank, so a gate answered through its `select` field is
+/// not held to the comment of an output it did not take.
+fn intended_label<'a>(
+    pending: &PendingHumanInput,
+    delivery: &'a HumanInputDelivery,
+) -> Option<&'a str> {
+    if let Some(label) = delivery.chosen_label.as_deref() {
+        return Some(label);
+    }
+    let mut selects = pending
+        .fields()
+        .iter()
+        .filter(|field| field.field_type == HumanInputType::Select);
+    match (selects.next(), selects.next()) {
+        (Some(field), None) => delivery.values.get(&field.name)?.as_str(),
+        _ => None,
+    }
+}
+
 fn resolve_label(
     pending: &PendingHumanInput,
     delivery: &HumanInputDelivery,

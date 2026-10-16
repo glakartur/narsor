@@ -1003,6 +1003,35 @@ async fn the_reference_workflow_pauses_for_a_person_and_carries_on() {
 }
 
 #[tokio::test]
+async fn a_blank_optional_note_reaches_the_next_prompt_as_an_empty_string() {
+    let harness = Harness::new();
+    let engine = harness.engine();
+    let definition = workflow("optional_note");
+
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .expect("run up to the gate");
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+
+    let mut values = Map::new();
+    values.insert("decision".to_string(), json!("approved"));
+    let delivery = HumanInputDelivery::with_values(values).choosing("approved");
+
+    let execution = engine
+        .deliver_human_input(&definition, &execution.id, &delivery)
+        .await
+        .expect("deliver the answer without a note");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(execution.context.variables.get("note"), Some(&json!("")));
+    assert_eq!(
+        execution.context.variables.get("echoed"),
+        Some(&json!("[]"))
+    );
+}
+
+#[tokio::test]
 async fn an_answer_cannot_be_delivered_twice() {
     let harness = Harness::new();
     let engine = harness.engine();
