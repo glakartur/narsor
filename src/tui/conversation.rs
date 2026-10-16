@@ -14,6 +14,8 @@
 //! Short text comes from [`ChatElement::summary`] and labels from
 //! [`ChatCategory::label`], so the CLI can print the same words.
 
+use std::sync::Arc;
+
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
@@ -32,6 +34,13 @@ use super::transcript::{
 
 /// How many lines of speech a collapsed card shows.
 const SPEECH_PREVIEW_LINES: usize = 5;
+
+/// How much of an unclassified line its expanded card shows. Such a line
+/// can be many MiB; raw mode shows it in full.
+const UNCLASSIFIED_PREVIEW_BYTES: usize = 4 * 1024;
+
+/// Closes a detail preview that does not show everything.
+const PREVIEW_CUT_NOTE: &str = "(podgląd skrócony, pełna treść w widoku raw)";
 
 /// Correlation scope of tool operations (call and result).
 const TOOL_SCOPE: &str = "tools";
@@ -116,7 +125,7 @@ pub struct TranscriptEvent {
     pub element: ChatElement,
     /// Exact source bytes of the whole entry, shared by all its elements.
     /// Only raw mode shows them.
-    pub raw: Vec<u8>,
+    pub raw: Arc<[u8]>,
     /// The element's one-line description ([`ChatElement::summary`]).
     pub summary: String,
 }
@@ -126,9 +135,10 @@ pub struct TranscriptEvent {
 /// An entry without elements (a page from a server older than the element
 /// model) gives one unclassified event. Invalid base64 gives empty raw bytes.
 pub fn classify(entry: &ConversationEntryDto) -> Vec<TranscriptEvent> {
-    let raw = BASE64
+    let raw: Arc<[u8]> = BASE64
         .decode(entry.raw_base64.as_bytes())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into();
     let fallback = [ChatElement::Unclassified {
         reason: UnclassifiedReason::NotRecorded,
     }];
@@ -147,7 +157,7 @@ pub fn classify(entry: &ConversationEntryDto) -> Vec<TranscriptEvent> {
             source: entry.source,
             kind: EntryKind::of(element),
             element: element.clone(),
-            raw: raw.clone(),
+            raw: Arc::clone(&raw),
             summary: element.summary(),
         })
         .collect()
@@ -189,14 +199,15 @@ pub(crate) fn agent_transcript_entry(event: &TranscriptEvent) -> TranscriptEntry
         &format!("{speaker} · {}", event.kind.label()),
         event.timestamp,
     );
-    let mut transcript = TranscriptEntry::new(TranscriptEntryId::from(id), body, event.raw.clone())
-        .with_header(header)
-        .with_details(details)
-        .with_presentation(presentation);
+    let mut transcript =
+        TranscriptEntry::new(TranscriptEntryId::from(id), body, Arc::clone(&event.raw))
+            .with_header(header)
+            .with_details(details)
+            .with_presentation(presentation);
     if event.element_index > 0 {
         transcript = transcript.sharing_previous_raw();
     }
-    group(transcript, &event.element)
+    group(transcript, event)
 }
 
 /// The presentation and the speaker of `element`.
@@ -292,7 +303,7 @@ impl Content {
             } => {
                 let mut details = text_lines(content);
                 if *truncated {
-                    details.push("(podgląd skrócony, pełna treść w widoku raw)".to_owned());
+                    details.push(PREVIEW_CUT_NOTE.to_owned());
                 }
                 Self::summary(event, details)
             }
@@ -314,7 +325,12 @@ impl Content {
                 Self::summary(event, json_block("data", data.as_ref()))
             }
             ChatElement::Unclassified { .. } | ChatElement::Unrecognized => {
-                Self::summary(event, text_lines(&String::from_utf8_lossy(&event.raw)))
+                let preview = &event.raw[..event.raw.len().min(UNCLASSIFIED_PREVIEW_BYTES)];
+                let mut details = text_lines(&String::from_utf8_lossy(preview));
+                if preview.len() < event.raw.len() {
+                    details.push(PREVIEW_CUT_NOTE.to_owned());
+                }
+                Self::summary(event, details)
             }
         }
     }
@@ -386,11 +402,11 @@ fn json_block(label: &str, value: Option<&Value>) -> Vec<String> {
 /// Attaches the grouping of `element`: a tool call and its result form one
 /// operation card, and contiguous technical events of one category form one
 /// summary card. Both stay expandable member by member.
-fn group(transcript: TranscriptEntry, element: &ChatElement) -> TranscriptEntry {
-    match element {
+fn group(transcript: TranscriptEntry, event: &TranscriptEvent) -> TranscriptEntry {
+    match &event.element {
         ChatElement::ToolCall { call_id, .. } => transcript.with_correlated_operation(
             Some(TOOL_SCOPE),
-            Some(&element.summary()),
+            Some(&event.summary),
             Some("started"),
             call_id.as_deref(),
         ),
@@ -576,7 +592,7 @@ mod tests {
         ));
         assert_eq!(entries[0].id.as_str(), "7");
         assert_eq!(entries[1].id.as_str(), "7.2");
-        assert!(entries.iter().all(|card| card.raw == b"the line"));
+        assert!(entries.iter().all(|card| *card.raw == *b"the line"));
     }
 
     #[test]

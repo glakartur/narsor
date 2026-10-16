@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use narsor_protocol::chat::{
-    ChatElement, PromptPurpose, QuestionSource, TechnicalCategory, UnclassifiedReason,
+    summary_line, ChatElement, QuestionSource, TechnicalCategory, UnclassifiedReason,
     SUMMARY_MAX_CHARS,
 };
 use serde_json::{Map, Value};
@@ -515,7 +515,6 @@ impl AgentExecutor {
         harness: &str,
         resume: Option<&str>,
         prompt: &str,
-        purpose: PromptPurpose,
     ) -> ConversationSink {
         let Some(store) = request.conversation_store else {
             return ConversationSink::none();
@@ -531,7 +530,7 @@ impl AgentExecutor {
         let element = ChatElement::Prompt {
             text: prompt.to_string(),
             resumed_session: resume.map(str::to_string),
-            purpose,
+            purpose: request.purpose,
         };
         sink.append_narsor(&entry, &[element]);
         sink
@@ -567,8 +566,7 @@ impl AgentExecutor {
         // invocation that never runs (a bad parameter, a missing binary)
         // leaves a conversation file behind, with the prompt and why the
         // harness never started.
-        let conversation =
-            self.open_conversation(&request, harness, resume, &prompt, prompt_purpose(config));
+        let conversation = self.open_conversation(&request, harness, resume, &prompt);
 
         let invocation = match adapter.invocation(&HarnessRequest {
             config,
@@ -718,7 +716,7 @@ impl AgentExecutor {
 
         let output = match read_response(&run) {
             Ok(output) => {
-                record_text_question(&conversation, &run, &output);
+                record_question(&conversation, &output);
                 conversation.finish();
                 output
             }
@@ -841,40 +839,24 @@ fn new_session(
     }
 }
 
-/// Why this attempt's prompt is sent: a reprompt — the engine's
-/// ([`reprompt_config`]) or the conductor's ([`conductor_reprompt_config`]) —
-/// or the step's own prompt, including an operator's continuation.
-///
-/// A reprompt is an ordinary [`AgentActionConfig`] with a prompt of its own,
-/// so the prompt is what tells it apart: it starts with
-/// [`OUTPUT_REPROMPT`] or ends with [`CONDUCTOR_REPROMPT_GUARD`], the texts
-/// only those two configurations write.
-fn prompt_purpose(config: &AgentActionConfig) -> PromptPurpose {
-    if config.prompt.starts_with(OUTPUT_REPROMPT)
-        || config.prompt.ends_with(CONDUCTOR_REPROMPT_GUARD)
-    {
-        PromptPurpose::Reprompt
-    } else {
-        PromptPurpose::Step
-    }
-}
-
 /// The element of a line the harness wrote to stderr: a
-/// [`TechnicalCategory::Stderr`] event summarized by the line itself.
+/// [`TechnicalCategory::Stderr`] event summarized by the line itself, as a
+/// [`summary_line`]; the raw line keeps it in full.
 ///
-/// The summary keeps one character past [`SUMMARY_MAX_CHARS`], so
-/// [`ChatElement::summary`] still marks a longer line as cut while a huge
-/// line is never stored twice; the raw line keeps it in full.
+/// Only a prefix of the line is decoded — a few bytes per summary
+/// character — so a huge line is never converted, or stored, twice.
 pub(crate) fn stderr_element(line: &[u8]) -> ChatElement {
+    let prefix = &line[..line.len().min(STDERR_SUMMARY_SOURCE_BYTES)];
     ChatElement::Technical {
         category: TechnicalCategory::Stderr,
-        summary: String::from_utf8_lossy(line)
-            .chars()
-            .take(SUMMARY_MAX_CHARS + 1)
-            .collect(),
+        summary: summary_line(&String::from_utf8_lossy(prefix)),
         data: None,
     }
 }
+
+/// How much of a stderr line [`stderr_element`] decodes: enough for a full
+/// summary of four-byte characters, with one to spare to mark it as cut.
+const STDERR_SUMMARY_SOURCE_BYTES: usize = (SUMMARY_MAX_CHARS + 1) * 4;
 
 /// The harness session this run continues, if `parameters` names one (D18).
 ///
@@ -1360,44 +1342,28 @@ fn read_response(run: &HarnessRun) -> Result<AgentResponse, ActionError> {
 /// Reads an answer from a harness's `structured_output` value, by the same
 /// rules as an object found in the text.
 fn structured_response(value: &Value) -> Result<AgentResponse, ActionError> {
-    let quoted = value.to_string();
     let object = value
         .as_object()
         .filter(|object| is_answer_object(object))
         .ok_or_else(|| {
             no_label_error(
                 "the structured output has neither a string 'output' nor an 'awaiting_input' status",
-                &quoted,
+                &value.to_string(),
             )
         })?;
-    response_from_object(object, &quoted)
+    response_from_object(object).map_err(|reason| no_label_error(reason, &value.to_string()))
 }
 
 /// Writes the agent's question to the conversation as a narsor entry, when
-/// the answer asks one and nothing in the stream already did.
+/// the accepted answer asks one.
 ///
-/// A harness parser turns a `structured_output` with an `awaiting_input`
-/// status into an [`ChatElement::AgentQuestion`] itself (Claude Code); a
-/// question read from text is visible only to the executor, so it is
-/// recorded here — once, either way.
-fn record_text_question(
-    conversation: &ConversationSink,
-    run: &HarnessRun,
-    response: &AgentResponse,
-) {
+/// The executor is the only producer of an output-contract question: it
+/// knows which answer it accepted — the structured output or the text — so
+/// the conversation shows exactly that question, once.
+fn record_question(conversation: &ConversationSink, response: &AgentResponse) {
     let AgentResponse::AwaitingInput { question, options } = response else {
         return;
     };
-    let parser_recorded = run
-        .structured_output
-        .as_ref()
-        .and_then(|output| output.get("status"))
-        .and_then(Value::as_str)
-        == Some(AWAITING_INPUT);
-    if parser_recorded {
-        return;
-    }
-
     let entry = serde_json::json!({
         "event": "agent_question",
         "question": question,
@@ -1438,7 +1404,7 @@ fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
         ));
     };
 
-    response_from_object(object, text)
+    response_from_object(object).map_err(|reason| no_label_error(reason, text))
 }
 
 /// Whether `object` is an answer at all: a question, or a string `output`.
@@ -1447,24 +1413,16 @@ fn is_answer_object(object: &Map<String, Value>) -> bool {
         || object.get("output").and_then(Value::as_str).is_some()
 }
 
-/// Turns an answer object into the response it stands for; `text` is what
-/// an error quotes back (the agent's text, or the structured output).
-fn response_from_object(
-    object: &Map<String, Value>,
-    text: &str,
-) -> Result<AgentResponse, ActionError> {
+/// Turns an answer object into the response it stands for. An error is the
+/// reason the object is unusable; the caller quotes the answer it came
+/// from (the agent's text, or the structured output) with it.
+fn response_from_object(object: &Map<String, Value>) -> Result<AgentResponse, &'static str> {
     if object.get("status").and_then(Value::as_str) == Some(AWAITING_INPUT) {
         let Some(question) = object.get("question").and_then(Value::as_str) else {
-            return Err(no_label_error(
-                "the agent requested human input without a string 'question'",
-                text,
-            ));
+            return Err("the agent requested human input without a string 'question'");
         };
         if question.trim().is_empty() {
-            return Err(no_label_error(
-                "the agent requested human input with an empty question",
-                text,
-            ));
+            return Err("the agent requested human input with an empty question");
         }
         let options = match object.get("options") {
             None => Vec::new(),
@@ -1476,18 +1434,10 @@ fn response_from_object(
                     !options.is_empty() && options.iter().all(|option| !option.trim().is_empty())
                 })
                 .map(|options| options.into_iter().map(ToString::to_string).collect())
-                .ok_or_else(|| {
-                    no_label_error(
-                        "the agent's input options must be a non-empty array of non-empty strings",
-                        text,
-                    )
-                })?,
-            Some(_) => {
-                return Err(no_label_error(
-                    "the agent's input options must be an array of strings",
-                    text,
-                ))
-            }
+                .ok_or(
+                    "the agent's input options must be a non-empty array of non-empty strings",
+                )?,
+            Some(_) => return Err("the agent's input options must be an array of strings"),
         };
         return Ok(AgentResponse::AwaitingInput {
             question: question.to_string(),

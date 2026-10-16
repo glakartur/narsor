@@ -3287,7 +3287,8 @@ async fn an_unusable_structured_output_falls_back_to_the_text() {
 
 /// AE3: the agent's question in `structured_output` suspends the step for
 /// the operator, and the conversation shows the question once — the
-/// parser's element, not a second one from the executor.
+/// executor's narsor entry for the answer it accepted; the parser's result
+/// line carries no question of its own.
 #[tokio::test]
 async fn covers_ae3_a_structured_question_waits_for_input_with_one_agent_question() {
     let fixture = EngineFixture::new();
@@ -3313,7 +3314,7 @@ async fn covers_ae3_a_structured_question_waits_for_input_with_one_agent_questio
         .expect("a conversation");
     let questions = agent_questions(&snapshot.entries);
     assert_eq!(questions.len(), 1, "{questions:?}");
-    assert_eq!(questions[0].0, ConversationSource::Stdout);
+    assert_eq!(questions[0].0, ConversationSource::Narsor);
     assert_eq!(
         questions[0].1,
         ChatElement::AgentQuestion {
@@ -3325,7 +3326,7 @@ async fn covers_ae3_a_structured_question_waits_for_input_with_one_agent_questio
     );
 }
 
-/// A question read from text is visible only to the executor, which writes
+/// A question read from text is recorded the same way: the executor writes
 /// it to the conversation itself, before the conversation is closed.
 #[tokio::test]
 async fn a_question_in_the_text_is_recorded_as_a_narsor_agent_question() {

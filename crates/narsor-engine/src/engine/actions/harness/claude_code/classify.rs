@@ -8,12 +8,12 @@
 use std::collections::HashMap;
 
 use narsor_protocol::chat::{
-    ChatElement, QuestionSource, TechnicalCategory, ToolResultStatus, UnclassifiedReason,
+    summary_line, ChatElement, QuestionSource, TechnicalCategory, ToolResultStatus,
+    UnclassifiedReason,
 };
 use serde_json::{Map, Value};
 
-use super::error_message;
-use super::tools::{call_summary, one_line, questions};
+use super::tools::{call_summary, questions};
 
 /// Upper bound, in bytes, of a tool result preview. The raw line keeps the
 /// full result; a few KiB show what a tool returned without bloating every
@@ -26,9 +26,6 @@ const SYSTEM_DATA_MAX_BYTES: usize = 1024;
 
 /// The tool name Claude Code uses for a question to the user.
 const ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
-
-/// The `structured_output.status` of an answer that asks the operator.
-const AWAITING_INPUT: &str = "awaiting_input";
 
 /// What a tool result needs to know about its call.
 #[derive(Debug)]
@@ -44,6 +41,85 @@ pub(super) struct Classifier {
     calls: HashMap<String, Call>,
 }
 
+/// What a `result` line says about how the run ended — read once, for both
+/// the run ([`super::ClaudeCodeStreamParser`]) and its
+/// [`ChatElement::RunResult`].
+#[derive(Debug)]
+pub(super) struct ResultLine {
+    /// The line's `subtype`, e.g. `success` or `error_max_turns`.
+    pub(super) subtype: Option<String>,
+    /// `is_error`, or a `subtype` naming anything other than `success`.
+    pub(super) is_error: bool,
+    /// `result`, or the non-empty `errors` joined when the run ended without
+    /// one (as `error_max_turns` does).
+    pub(super) text: Option<String>,
+    /// The `structured_output`, when it is there and not `null`.
+    pub(super) structured_output: Option<Value>,
+}
+
+impl ResultLine {
+    /// The outcome of a `result` line, moving its `result` and
+    /// `structured_output` out of `line`; `None` for any other line.
+    pub(super) fn take(line: &mut Map<String, Value>) -> Option<Self> {
+        if str_field(line, "type") != Some("result") {
+            return None;
+        }
+        let subtype = str_field(line, "subtype").map(str::to_string);
+        let is_error = line
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || subtype
+                .as_deref()
+                .is_some_and(|subtype| subtype != "success");
+        let text = match line.remove("result") {
+            Some(Value::String(text)) => Some(text),
+            _ => errors_text(line),
+        };
+        let structured_output = line
+            .remove("structured_output")
+            .filter(|value| !value.is_null());
+        Some(Self {
+            subtype,
+            is_error,
+            text,
+            structured_output,
+        })
+    }
+
+    /// The `subtype`, when it names anything other than `success`.
+    fn failed_subtype(&self) -> Option<&str> {
+        self.subtype
+            .as_deref()
+            .filter(|subtype| *subtype != "success")
+    }
+}
+
+/// The non-empty `errors` of a `result` line, joined.
+fn errors_text(line: &Map<String, Value>) -> Option<String> {
+    line.get("errors")
+        .and_then(Value::as_array)
+        .filter(|errors| !errors.is_empty())
+        .map(|errors| {
+            errors
+                .iter()
+                .map(error_message)
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+}
+
+/// One element of a `result` line's `errors` array, as readable text.
+/// Claude Code 2.1.302 sends plain strings; older versions sent objects
+/// with a `message`.
+fn error_message(error: &Value) -> String {
+    error
+        .as_str()
+        .or_else(|| error.get("message").and_then(Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string())
+}
+
 /// The element of a line that is not a JSON object.
 pub(super) fn invalid_json() -> Vec<ChatElement> {
     unclassified(UnclassifiedReason::InvalidJson)
@@ -57,47 +133,53 @@ fn str_field<'a>(object: &'a Map<String, Value>, name: &str) -> Option<&'a str> 
     object.get(name).and_then(Value::as_str)
 }
 
+/// The string `name` of a content block, empty when it has none.
+fn block_str<'a>(block: &'a Value, name: &str) -> &'a str {
+    block.get(name).and_then(Value::as_str).unwrap_or_default()
+}
+
 impl Classifier {
-    /// The elements of one parsed line, in order.
-    pub(super) fn classify(&mut self, line: &Map<String, Value>) -> Vec<ChatElement> {
-        match str_field(line, "type").unwrap_or_default() {
-            "assistant" => self.assistant(line),
-            "user" => self.user(line),
-            "system" => vec![system(line)],
-            "rate_limit_event" => vec![rate_limit(line)],
-            "result" => result(line),
+    /// The elements of one parsed line, in order. `result` is what
+    /// [`ResultLine::take`] took out of a `result` line.
+    ///
+    /// Takes the line by value, so the large parts of it (a tool's input, a
+    /// result's usage) move into the elements instead of being copied.
+    pub(super) fn classify(
+        &mut self,
+        mut line: Map<String, Value>,
+        result: Option<ResultLine>,
+    ) -> Vec<ChatElement> {
+        if let Some(result) = result {
+            return vec![run_result(line, result)];
+        }
+        match str_field(&line, "type").unwrap_or_default() {
+            "assistant" => self.assistant(take_message_content(&mut line)),
+            "user" => self.user(take_message_content(&mut line)),
+            "system" => vec![system(&mut line)],
+            "rate_limit_event" => vec![rate_limit(&line)],
             _ => unclassified(UnclassifiedReason::UnknownType),
         }
     }
 
-    fn assistant(&mut self, line: &Map<String, Value>) -> Vec<ChatElement> {
-        let Some(blocks) = message_content(line).and_then(Value::as_array) else {
+    fn assistant(&mut self, content: Option<Value>) -> Vec<ChatElement> {
+        let Some(Value::Array(blocks)) = content else {
             return unclassified(UnclassifiedReason::UnknownBlock);
         };
         blocks
-            .iter()
+            .into_iter()
             .map(|block| self.assistant_block(block))
             .collect()
     }
 
-    fn assistant_block(&mut self, block: &Value) -> ChatElement {
-        let text = |name: &str| {
-            block
-                .get(name)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
-        match block
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-        {
-            "text" => ChatElement::AgentText { text: text("text") },
+    fn assistant_block(&mut self, block: Value) -> ChatElement {
+        match block_str(&block, "type") {
+            "text" => ChatElement::AgentText {
+                text: block_str(&block, "text").to_string(),
+            },
             // Claude Code 2.1.302 streams thinking blocks with an empty text
             // and a signature only: the reasoning is withheld.
             "thinking" => {
-                let text = text("thinking");
+                let text = block_str(&block, "thinking").to_string();
                 let redacted = text.is_empty();
                 ChatElement::Thinking { text, redacted }
             }
@@ -112,14 +194,13 @@ impl Classifier {
         }
     }
 
-    fn tool_use(&mut self, block: &Value) -> ChatElement {
+    fn tool_use(&mut self, mut block: Value) -> ChatElement {
         let call_id = block.get("id").and_then(Value::as_str).map(str::to_string);
-        let tool = block
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let input = block.get("input").cloned().unwrap_or(Value::Null);
+        let tool = block_str(&block, "name").to_string();
+        let input = block
+            .as_object_mut()
+            .and_then(|block| block.remove("input"))
+            .unwrap_or(Value::Null);
 
         if tool == ASK_USER_QUESTION_TOOL {
             if let Some(element) = self.ask_user_question(call_id.clone(), &input) {
@@ -160,7 +241,7 @@ impl Classifier {
         self.remember(
             call_id.as_deref(),
             ASK_USER_QUESTION_TOOL,
-            &one_line(&first),
+            &summary_line(&first),
         );
         Some(ChatElement::AgentQuestion {
             question,
@@ -185,9 +266,9 @@ impl Classifier {
     /// A `user` line: what Claude Code sent to the agent — tool results,
     /// and text such as an injected skill body or the CLI's own
     /// `[structured-output-enforce]` nudge (both `isSynthetic`).
-    fn user(&self, line: &Map<String, Value>) -> Vec<ChatElement> {
-        match message_content(line) {
-            Some(Value::String(text)) => vec![ChatElement::UserMessage { text: text.clone() }],
+    fn user(&self, content: Option<Value>) -> Vec<ChatElement> {
+        match content {
+            Some(Value::String(text)) => vec![ChatElement::UserMessage { text }],
             Some(Value::Array(blocks)) => {
                 blocks.iter().map(|block| self.user_block(block)).collect()
             }
@@ -196,17 +277,9 @@ impl Classifier {
     }
 
     fn user_block(&self, block: &Value) -> ChatElement {
-        match block
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-        {
+        match block_str(block, "type") {
             "text" => ChatElement::UserMessage {
-                text: block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                text: block_str(block, "text").to_string(),
             },
             "tool_result" => self.tool_result(block),
             _ => ChatElement::Unclassified {
@@ -242,8 +315,9 @@ impl Classifier {
     }
 }
 
-fn message_content(line: &Map<String, Value>) -> Option<&Value> {
-    line.get("message")?.get("content")
+/// The `message.content` of a line, moved out of it.
+fn take_message_content(line: &mut Map<String, Value>) -> Option<Value> {
+    line.get_mut("message")?.as_object_mut()?.remove("content")
 }
 
 /// A tool result's content as text: a string as is, text blocks joined by
@@ -280,14 +354,15 @@ fn preview(text: &str) -> (String, bool) {
     (text[..end].to_string(), true)
 }
 
-fn system(line: &Map<String, Value>) -> ChatElement {
-    let subtype = str_field(line, "subtype").unwrap_or_default();
+/// A `system` line; its `compact_metadata` moves into the element.
+fn system(line: &mut Map<String, Value>) -> ChatElement {
+    let subtype = str_field(line, "subtype").unwrap_or_default().to_string();
     let technical = |category, summary: String, data| ChatElement::Technical {
         category,
-        summary: one_line(&summary),
+        summary: summary_line(&summary),
         data,
     };
-    match subtype {
+    match subtype.as_str() {
         "init" => ChatElement::SessionStarted {
             session_id: str_field(line, "session_id").map(str::to_string),
             model: str_field(line, "model").map(str::to_string),
@@ -299,7 +374,7 @@ fn system(line: &Map<String, Value>) -> ChatElement {
             technical(TechnicalCategory::Hook, hook_summary(line, hook), None)
         }
         compaction if compaction.contains("compact") => {
-            let metadata = line.get("compact_metadata").cloned();
+            let metadata = line.remove("compact_metadata");
             technical(
                 TechnicalCategory::Compaction,
                 compaction_summary(metadata.as_ref()),
@@ -407,51 +482,22 @@ fn rate_limit(line: &Map<String, Value>) -> ChatElement {
     }
 }
 
-/// The `result` line: the run result, followed by the agent's question
-/// when its structured output asks the operator.
-fn result(line: &Map<String, Value>) -> Vec<ChatElement> {
-    let subtype = str_field(line, "subtype");
-    let failed_subtype = subtype.filter(|subtype| *subtype != "success");
-    let is_error = line
-        .get("is_error")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || failed_subtype.is_some();
-    let structured_output = line
-        .get("structured_output")
-        .filter(|value| !value.is_null());
-
-    let mut elements = vec![ChatElement::RunResult {
-        text: result_line_text(line),
-        structured_output: structured_output.cloned(),
-        stop_reason: stop_reason(line, failed_subtype),
-        is_error,
+/// The `result` line: the run result.
+///
+/// An `awaiting_input` structured output is not turned into a question
+/// here: the executor records the question of the answer it accepts, from
+/// whichever source it read it.
+fn run_result(mut line: Map<String, Value>, result: ResultLine) -> ChatElement {
+    ChatElement::RunResult {
+        stop_reason: stop_reason(&line, result.failed_subtype()),
+        is_error: result.is_error,
         cost_usd: line.get("total_cost_usd").and_then(Value::as_f64),
-        usage: line.get("usage").filter(|usage| !usage.is_null()).cloned(),
+        usage: line.remove("usage").filter(|usage| !usage.is_null()),
         turns: line.get("num_turns").and_then(Value::as_u64),
         duration_ms: line.get("duration_ms").and_then(Value::as_u64),
-    }];
-    if let Some(question) = structured_output.and_then(awaiting_input_question) {
-        elements.push(question);
+        text: result.text,
+        structured_output: result.structured_output,
     }
-    elements
-}
-
-/// `result`, or the `errors` joined when the run ended without one (as
-/// `error_max_turns` does).
-fn result_line_text(line: &Map<String, Value>) -> Option<String> {
-    str_field(line, "result").map(str::to_string).or_else(|| {
-        line.get("errors")
-            .and_then(Value::as_array)
-            .filter(|errors| !errors.is_empty())
-            .map(|errors| {
-                errors
-                    .iter()
-                    .map(error_message)
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            })
-    })
 }
 
 /// Why the run ended, most telling first: a non-`success` `subtype`
@@ -463,31 +509,6 @@ fn stop_reason(line: &Map<String, Value>, failed_subtype: Option<&str>) -> Optio
         .or_else(|| str_field(line, "terminal_reason").filter(|reason| *reason != "completed"))
         .or_else(|| str_field(line, "stop_reason"))
         .map(str::to_string)
-}
-
-/// The question of a structured output with `status: awaiting_input`.
-fn awaiting_input_question(output: &Value) -> Option<ChatElement> {
-    if output.get("status").and_then(Value::as_str) != Some(AWAITING_INPUT) {
-        return None;
-    }
-    let options = output
-        .get("options")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect();
-    Some(ChatElement::AgentQuestion {
-        question: output
-            .get("question")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        options,
-        source: QuestionSource::OutputContract,
-        call_id: None,
-    })
 }
 
 #[cfg(test)]

@@ -552,7 +552,8 @@ fn an_api_error_reports_its_terminal_reason() {
 }
 
 #[test]
-fn awaiting_input_structured_output_is_an_agent_question() {
+fn awaiting_input_structured_output_is_only_a_run_result() {
+    // The question is the executor's to record, from the answer it accepts.
     let lines = recording("schema_awaiting.ndjson");
     let elements = classify(&lines);
     let last = elements.last().expect("lines");
@@ -561,17 +562,13 @@ fn awaiting_input_structured_output_is_an_agent_question() {
             structured_output: Some(output),
             is_error: false,
             ..
-        }, ChatElement::AgentQuestion {
-            question,
-            options,
-            source: QuestionSource::OutputContract,
-            call_id: None,
         }] => {
             assert_eq!(output["status"], "awaiting_input");
-            assert!(question.starts_with("Which file do you want to rename?"));
-            assert!(options.is_empty());
+            assert!(output["question"]
+                .as_str()
+                .is_some_and(|question| question.starts_with("Which file do you want to rename?")));
         }
-        other => panic!("expected a run result and a question, got {other:?}"),
+        other => panic!("expected only a run result, got {other:?}"),
     }
 
     // A done structured output is only a run result.

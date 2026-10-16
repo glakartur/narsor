@@ -75,6 +75,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use chrono::Utc;
+use narsor_protocol::chat::PromptPurpose;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
@@ -1992,7 +1993,14 @@ impl Engine {
 
         let kind = ActionKind::of(action);
         let outcome = self
-            .execute_rendered(execution, state, &rendered, action_execution_id, timeout)
+            .execute_rendered(
+                execution,
+                state,
+                &rendered,
+                action_execution_id,
+                PromptPurpose::Step,
+                timeout,
+            )
             .await?;
 
         match outcome {
@@ -2098,6 +2106,7 @@ impl Engine {
         state: &State,
         rendered: &ActionConfig,
         action_execution_id: &str,
+        purpose: PromptPurpose,
         timeout: Option<Duration>,
     ) -> Result<Result<ActionOutcome, ActionError>, AttemptFailure> {
         let kind = ActionKind::of(rendered);
@@ -2115,7 +2124,8 @@ impl Engine {
             .with_timeout(timeout)
             .with_execution_id(&execution.id)
             .with_conversation_store(&conversation_store)
-            .with_outputs(&state.outputs);
+            .with_outputs(&state.outputs)
+            .with_purpose(purpose);
 
         let outcome = executor.execute(request).await;
 
@@ -2317,7 +2327,14 @@ impl Engine {
 
         let rendered = ActionConfig::Agent(config);
         let outcome = match self
-            .execute_rendered(execution, state, &rendered, &action_execution_id, timeout)
+            .execute_rendered(
+                execution,
+                state,
+                &rendered,
+                &action_execution_id,
+                PromptPurpose::Reprompt,
+                timeout,
+            )
             .await
         {
             Ok(outcome) => outcome,

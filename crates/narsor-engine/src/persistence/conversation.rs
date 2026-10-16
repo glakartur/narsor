@@ -96,6 +96,14 @@ struct Envelope<'a> {
     elements: Cow<'a, [ChatElement]>,
 }
 
+/// The first fields of an [`Envelope`], read without decoding the rest:
+/// enough to skip an entry before the cursor, or to date the last one.
+#[derive(Debug, Deserialize)]
+struct EnvelopeHeader {
+    n: u64,
+    ts: DateTime<Utc>,
+}
+
 /// Whether an envelope has no elements to write.
 fn no_elements(elements: &[ChatElement]) -> bool {
     elements.is_empty()
@@ -116,42 +124,6 @@ pub struct ConversationEntry {
     /// What the line means, as recorded with it. Empty for an entry written
     /// before elements existed.
     pub elements: Vec<ChatElement>,
-}
-
-impl ConversationEntry {
-    /// What this entry costs against a read's byte budget: the raw payload
-    /// plus its elements as they go on the wire.
-    fn budget_cost(&self) -> usize {
-        self.raw.len() + elements_wire_len(&self.elements)
-    }
-}
-
-/// The serialized JSON size of `elements`, or 0 when there are none.
-fn elements_wire_len(elements: &[ChatElement]) -> usize {
-    if elements.is_empty() {
-        return 0;
-    }
-    let mut counter = ByteCounter(0);
-    match serde_json::to_writer(&mut counter, elements) {
-        Ok(()) => counter.0,
-        // An element always serializes; should one ever fail, it costs
-        // nothing rather than failing the read.
-        Err(_) => 0,
-    }
-}
-
-/// An [`io::Write`] that only counts the bytes written to it.
-struct ByteCounter(usize);
-
-impl Write for ByteCounter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0 += buf.len();
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 /// The result of reading a conversation from a given cursor.
@@ -348,8 +320,9 @@ impl ConversationStore {
     }
 
     /// Reads entries of `attempt_id` from `from_entry` (inclusive) onward, up
-    /// to `byte_budget` bytes of raw payload and serialized elements, so
-    /// elements never push a page past what its raw lines alone would.
+    /// to `byte_budget` bytes of stored lines — each one's raw payload and
+    /// elements, as they are on disk — so elements count against a page as
+    /// much as raw lines do.
     ///
     /// The first returned entry is always whole even if it alone exceeds the
     /// budget — a budget is a soft cap on the response, never a reason to
@@ -385,28 +358,29 @@ impl ConversationStore {
         let source_path = if closed { &zst_path } else { &jsonl_path };
         let (lines, trailing) = split_lines(&bytes);
         let truncated_tail = trailing.is_some();
+        let deserialize_error = |source| PersistenceError::Deserialize {
+            path: source_path.clone(),
+            source,
+        };
         let last_entry_at = lines
             .last()
-            .and_then(|line| serde_json::from_slice::<Envelope>(line).ok())
-            .map(|envelope| envelope.ts);
+            .and_then(|line| serde_json::from_slice::<EnvelopeHeader>(line).ok())
+            .map(|header| header.ts);
 
         let mut entries = Vec::new();
         let mut budget_used = 0usize;
         let mut next_entry = from_entry;
 
         for line in lines {
-            let envelope: Envelope =
-                serde_json::from_slice(line).map_err(|source| PersistenceError::Deserialize {
-                    path: source_path.clone(),
-                    source,
-                })?;
-            if envelope.n < from_entry {
+            let header: EnvelopeHeader = serde_json::from_slice(line).map_err(deserialize_error)?;
+            if header.n < from_entry {
                 continue;
             }
             if !entries.is_empty() && budget_used >= byte_budget {
                 break;
             }
 
+            let envelope: Envelope = serde_json::from_slice(line).map_err(deserialize_error)?;
             let raw = BASE64
                 .decode(envelope.raw_b64.as_bytes())
                 .map_err(|error| {
@@ -419,16 +393,15 @@ impl ConversationStore {
                     )
                 })?;
 
-            let entry = ConversationEntry {
+            entries.push(ConversationEntry {
                 entry_number: envelope.n,
                 timestamp: envelope.ts,
                 source: envelope.source,
                 raw,
                 elements: envelope.elements.into_owned(),
-            };
-            budget_used += entry.budget_cost();
+            });
+            budget_used += line.len();
             next_entry = envelope.n + 1;
-            entries.push(entry);
         }
 
         let recorded_at = if closed {

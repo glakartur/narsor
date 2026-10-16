@@ -5,6 +5,7 @@
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::scroll::{wrap_line, ScrollState};
 
@@ -130,7 +131,9 @@ pub struct TranscriptEntry {
     /// Normalized adapter fields, formatted only while this entry is expanded.
     pub details: Option<Value>,
     /// Exact retained source bytes. This is never replaced by decoded text.
-    pub raw: Vec<u8>,
+    /// Shared, not copied, by the entries of one source line and by every
+    /// projection of the transcript.
+    pub raw: Arc<[u8]>,
     /// Whether [`Self::raw`] is the same source line as the entry before
     /// it: one source line can yield several entries, and the global raw
     /// view shows that line once.
@@ -157,7 +160,11 @@ pub struct TranscriptGrouping {
 }
 
 impl TranscriptEntry {
-    pub fn new(id: TranscriptEntryId, rendered_lines: Vec<String>, raw: Vec<u8>) -> Self {
+    pub fn new(
+        id: TranscriptEntryId,
+        rendered_lines: Vec<String>,
+        raw: impl Into<Arc<[u8]>>,
+    ) -> Self {
         let source_ids = vec![id.clone()];
         Self {
             id,
@@ -166,7 +173,7 @@ impl TranscriptEntry {
             presentation: TranscriptPresentation::Neutral,
             detail_lines: Vec::new(),
             details: None,
-            raw,
+            raw: raw.into(),
             shares_previous_raw: false,
             grouping: None,
             source_ids,

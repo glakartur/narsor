@@ -285,6 +285,7 @@ pub enum ChatCategory {
 
 impl ChatCategory {
     /// Every category, in conversation display order.
+    #[cfg(test)]
     pub const ALL: [ChatCategory; 8] = [
         Self::SentToAgent,
         Self::Thinking,
@@ -336,7 +337,7 @@ impl ChatElement {
     /// tool and its key parameter (`Skill ce-plan`); a tool result gives the
     /// call and its status. The full content stays in the element.
     pub fn summary(&self) -> String {
-        bounded(&self.unbounded_summary())
+        summary_line(&self.unbounded_summary())
     }
 
     fn unbounded_summary(&self) -> String {
@@ -449,18 +450,35 @@ fn join_nonempty(parts: &[&str]) -> String {
         .join(" ")
 }
 
-/// `text` on one line, cut to [`SUMMARY_MAX_CHARS`] characters.
-fn bounded(text: &str) -> String {
-    let single: String = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    if single.chars().count() <= SUMMARY_MAX_CHARS {
-        return single;
+/// `text` as one summary line: every run of whitespace and control
+/// characters (line breaks included) becomes one space, the ends are
+/// trimmed, and a line longer than [`SUMMARY_MAX_CHARS`] characters is cut
+/// to that length, its last character replaced by `…`.
+///
+/// Reads `text` only as far as the summary needs, so a huge input costs no
+/// more than a short one.
+pub fn summary_line(text: &str) -> String {
+    let mut line: Vec<char> = Vec::with_capacity(SUMMARY_MAX_CHARS + 2);
+    let mut gap = false;
+    for c in text.chars() {
+        if c.is_whitespace() || c.is_control() {
+            gap = !line.is_empty();
+            continue;
+        }
+        if gap {
+            line.push(' ');
+            gap = false;
+        }
+        line.push(c);
+        if line.len() > SUMMARY_MAX_CHARS {
+            break;
+        }
     }
-    let mut cut: String = single.chars().take(SUMMARY_MAX_CHARS - 1).collect();
-    cut.push(SUMMARY_ELLIPSIS);
-    cut
+    if line.len() > SUMMARY_MAX_CHARS {
+        line.truncate(SUMMARY_MAX_CHARS - 1);
+        line.push(SUMMARY_ELLIPSIS);
+    }
+    line.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -685,6 +703,20 @@ mod tests {
             assert!(!summary.contains('\n'), "{summary}");
             assert!(summary.chars().count() <= SUMMARY_MAX_CHARS);
         }
+    }
+
+    #[test]
+    fn a_summary_line_collapses_whitespace_and_control_characters() {
+        assert_eq!(summary_line("  a \t\x1b b\n\nc  "), "a b c");
+        assert_eq!(summary_line(""), "");
+
+        let exact = "x".repeat(SUMMARY_MAX_CHARS);
+        assert_eq!(summary_line(&exact), exact);
+
+        let cut = summary_line(&format!("{exact} y"));
+        assert_eq!(cut.chars().count(), SUMMARY_MAX_CHARS);
+        assert!(cut.ends_with(SUMMARY_ELLIPSIS));
+        assert_eq!(summary_line(&cut), cut);
     }
 
     #[test]

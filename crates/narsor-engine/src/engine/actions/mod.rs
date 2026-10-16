@@ -40,6 +40,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use narsor_protocol::chat::PromptPurpose;
+
 use crate::domain::{
     ActionConfig, ActionError, ActionResult, OutputDefinition, OutputLabel, Workspace,
 };
@@ -115,6 +117,12 @@ pub struct ActionRequest<'a> {
     /// Empty means the caller supplied none, and the contract then asks for
     /// whatever label the task names.
     pub outputs: &'a [OutputDefinition],
+
+    /// Why this attempt's prompt is sent: the step's own prompt
+    /// ([`PromptPurpose::Step`], the default) or a reprompt asking the agent
+    /// again for its output label. Only [`AgentExecutor`] reads it, to record
+    /// the prompt in the conversation.
+    pub purpose: PromptPurpose,
 }
 
 impl<'a> ActionRequest<'a> {
@@ -132,6 +140,7 @@ impl<'a> ActionRequest<'a> {
             execution_id: None,
             conversation_store: None,
             outputs: &[],
+            purpose: PromptPurpose::Step,
         }
     }
 
@@ -156,6 +165,12 @@ impl<'a> ActionRequest<'a> {
     /// Returns the same request carrying the state's declared outputs.
     pub fn with_outputs(mut self, outputs: &'a [OutputDefinition]) -> Self {
         self.outputs = outputs;
+        self
+    }
+
+    /// Returns the same request sent for `purpose`.
+    pub fn with_purpose(mut self, purpose: PromptPurpose) -> Self {
+        self.purpose = purpose;
         self
     }
 }

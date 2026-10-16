@@ -4,11 +4,8 @@
 //! shows the tool name next to this summary, so the summary never repeats
 //! the name: `Read` gets the path, `Bash` the command, `Skill` the skill.
 
-use narsor_protocol::chat::SUMMARY_MAX_CHARS;
+use narsor_protocol::chat::summary_line;
 use serde_json::Value;
-
-/// Appended to a summary cut at [`SUMMARY_MAX_CHARS`].
-const ELLIPSIS: char = '…';
 
 /// The name of the tool the CLI adds when it is run with `--json-schema`.
 const STRUCTURED_OUTPUT_TOOL: &str = "StructuredOutput";
@@ -16,7 +13,7 @@ const STRUCTURED_OUTPUT_TOOL: &str = "StructuredOutput";
 /// The key parameter of a call to `tool` with `input`, on one bounded
 /// line. Empty for a tool without a rule.
 pub(super) fn call_summary(tool: &str, input: &Value) -> String {
-    one_line(&unbounded_summary(tool, input))
+    summary_line(&unbounded_summary(tool, input))
 }
 
 fn unbounded_summary(tool: &str, input: &Value) -> String {
@@ -94,16 +91,4 @@ pub(super) fn questions(input: &Value) -> Vec<(String, Vec<String>)> {
             Some((text.to_string(), options))
         })
         .collect()
-}
-
-/// `text` on one line (whitespace runs, line breaks included, become one
-/// space) and at most [`SUMMARY_MAX_CHARS`] characters long.
-pub(super) fn one_line(text: &str) -> String {
-    let single = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if single.chars().count() <= SUMMARY_MAX_CHARS {
-        return single;
-    }
-    let mut cut: String = single.chars().take(SUMMARY_MAX_CHARS - 1).collect();
-    cut.push(ELLIPSIS);
-    cut
 }

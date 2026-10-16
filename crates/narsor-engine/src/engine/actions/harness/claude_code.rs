@@ -221,74 +221,44 @@ struct ClaudeCodeStreamParser {
 impl ClaudeCodeStreamParser {
     /// Folds one parsed stdout line into what
     /// [`HarnessStreamParser::finish`] needs; lines that carry none of it
-    /// are ignored.
-    fn accumulate(&mut self, object: &Map<String, Value>) {
-        let line_type = object.get("type").and_then(Value::as_str).unwrap_or("");
+    /// are ignored. `result` is what [`classify::ResultLine::take`] read
+    /// from a `result` line.
+    fn accumulate(&mut self, object: &Map<String, Value>, result: Option<&classify::ResultLine>) {
+        let session_id = || {
+            object
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
 
-        if line_type == "system" {
-            if self.session_id.is_none() {
-                self.session_id = object
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+        let Some(result) = result else {
+            if self.session_id.is_none()
+                && object.get("type").and_then(Value::as_str) == Some("system")
+            {
+                self.session_id = session_id();
             }
             return;
-        }
-
-        if line_type != "result" {
-            return;
-        }
+        };
 
         self.saw_result = true;
-        if let Some(session_id) = object.get("session_id").and_then(Value::as_str) {
-            self.session_id = Some(session_id.to_string());
+        if let Some(session_id) = session_id() {
+            self.session_id = Some(session_id);
         }
-
-        self.subtype = object
-            .get("subtype")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let is_error = object
-            .get("is_error")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let non_success_subtype = self
-            .subtype
-            .as_deref()
-            .is_some_and(|subtype| subtype != "success");
-        self.reported_error = is_error || non_success_subtype;
-        self.structured_output = object
-            .get("structured_output")
-            .filter(|value| !value.is_null())
-            .cloned();
-
-        self.result_text = object
-            .get("result")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| {
-                object
-                    .get("errors")
-                    .and_then(Value::as_array)
-                    .map(|errors| {
-                        errors
-                            .iter()
-                            .map(error_message)
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    })
-            })
-            .unwrap_or_default();
+        self.subtype = result.subtype.clone();
+        self.reported_error = result.is_error;
+        self.structured_output = result.structured_output.clone();
+        self.result_text = result.text.clone().unwrap_or_default();
     }
 }
 
 impl HarnessStreamParser for ClaudeCodeStreamParser {
     fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement> {
-        let Some(object) = parse_object(line) else {
+        let Some(mut object) = parse_object(line) else {
             return classify::invalid_json();
         };
-        self.accumulate(&object);
-        self.classifier.classify(&object)
+        let result = classify::ResultLine::take(&mut object);
+        self.accumulate(&object, result.as_ref());
+        self.classifier.classify(object, result)
     }
 
     fn finish(self: Box<Self>, exit_code: i32, stderr_tail: &str) -> HarnessRun {
@@ -330,17 +300,6 @@ fn parse_object(line: &[u8]) -> Option<Map<String, Value>> {
         Value::Object(object) => Some(object),
         _ => None,
     }
-}
-
-/// One element of a `result` line's `errors` array, as readable text.
-/// Claude Code 2.1.302 sends plain strings; older versions sent objects
-/// with a `message`.
-fn error_message(error: &Value) -> String {
-    error
-        .as_str()
-        .or_else(|| error.get("message").and_then(Value::as_str))
-        .map(str::to_string)
-        .unwrap_or_else(|| error.to_string())
 }
 
 /// The permission mode of this run, validated against what the CLI accepts.

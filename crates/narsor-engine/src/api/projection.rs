@@ -17,7 +17,7 @@ pub fn conversation_response_from_snapshot(
             entries: snapshot
                 .entries
                 .into_iter()
-                .map(|entry| ConversationEntryDto {
+                .map(|mut entry| ConversationEntryDto {
                     entry_number: entry.entry_number,
                     timestamp: entry.timestamp,
                     source: match entry.source {
@@ -26,7 +26,7 @@ pub fn conversation_response_from_snapshot(
                         ConversationSource::Stderr => ConversationEntrySource::Stderr,
                     },
                     raw_base64: base64_encode(&entry.raw),
-                    elements: elements_of(&entry),
+                    elements: elements_of(&mut entry),
                 })
                 .collect(),
             next_entry: snapshot.next_entry,
@@ -44,10 +44,11 @@ pub fn conversation_response_from_snapshot(
 /// consumer always has something to show without reading the raw line.
 ///
 /// A stderr line needs no classification to say what it is; any other
-/// legacy entry is [`UnclassifiedReason::NotRecorded`].
-fn elements_of(entry: &ConversationEntry) -> Vec<ChatElement> {
+/// legacy entry is [`UnclassifiedReason::NotRecorded`]. The recorded
+/// elements are moved out of `entry`.
+fn elements_of(entry: &mut ConversationEntry) -> Vec<ChatElement> {
     if !entry.elements.is_empty() {
-        return entry.elements.clone();
+        return std::mem::take(&mut entry.elements);
     }
     match entry.source {
         ConversationSource::Stderr => {

@@ -705,10 +705,11 @@ async fn conversation_endpoint_pages_by_raw_bytes_and_elements() {
         } => (entries, next_entry),
         narsor::api::ConversationResponse::NoRecord => panic!("expected a record"),
     };
-    // 6 raw bytes in all, but over 900 bytes of elements.
+    // 6 raw bytes in all, but over 900 bytes of elements: each stored
+    // line is over 300 bytes, so two of them spend a 600-byte budget.
     let (first, next) = page(
         client
-            .conversation("exec-elements", "attempt-1", 0, 400)
+            .conversation("exec-elements", "attempt-1", 0, 600)
             .await
             .expect("first page"),
     );
@@ -719,7 +720,7 @@ async fn conversation_endpoint_pages_by_raw_bytes_and_elements() {
 
     let (rest, next) = page(
         client
-            .conversation("exec-elements", "attempt-1", next, 400)
+            .conversation("exec-elements", "attempt-1", next, 600)
             .await
             .expect("second page"),
     );
