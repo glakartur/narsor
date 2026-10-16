@@ -40,14 +40,13 @@ use crate::controller_protocol::{
 };
 use crate::domain::without_unsafe_chars;
 use crate::materials::{snapshot_paths, write_files, MaterialLimits, WriteMode};
-use crate::tui::conversation::classify;
 use narsor_protocol::api::MaterialOrigin;
 use narsor_protocol::controller::{
     MoveTaskTarget, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskEvent,
 };
 use narsor_protocol::identifier::TaskId;
 
-use super::commands::{CliError, Result};
+use super::commands::{conversation_entry_lines, CliError, Result};
 use super::task_history::{history, HistoryCommand};
 use super::task_registry::{
     capabilities, create_from_file, repo, validate, workflows, RepoCommand,
@@ -843,26 +842,8 @@ pub(super) fn print_conversation_entries(
     next_entry: u64,
     closed: bool,
 ) {
-    for (entry, classified) in entries
-        .iter()
-        .flat_map(|entry| classify(entry).into_iter().map(move |event| (entry, event)))
-    {
-        let body = if matches!(entry.source, crate::api::ConversationEntrySource::Narsor) {
-            if classified.element_index > 0 {
-                continue;
-            }
-            String::from_utf8_lossy(&classified.raw).into_owned()
-        } else {
-            classified.summary
-        };
-        let body = crate::tui::scroll::sanitize(&body);
-        println!(
-            "{:>5}  {}  {:<10} {}",
-            classified.entry_number,
-            classified.timestamp.to_rfc3339(),
-            classified.kind.label(),
-            body
-        );
+    for line in entries.iter().flat_map(conversation_entry_lines) {
+        println!("{line}");
     }
     if !closed {
         println!("(continue with --from {next_entry})");

@@ -27,6 +27,7 @@ use narsor_engine::domain::Workspace;
 use narsor_engine::engine::Engine;
 use narsor_engine::persistence::{ConversationSource, ExecutionStore};
 use narsor_engine::workflow::load_from_file;
+use narsor_protocol::chat::ChatElement;
 
 /// The exit code of a successful command.
 const EXIT_SUCCESS: i32 = 0;
@@ -1200,7 +1201,9 @@ fn conversation_prints_every_entry_in_order() {
         .append(
             ConversationSource::Stdout,
             br#"{"type":"result","subtype":"success","result":"done"}"#,
-            &[],
+            &[ChatElement::AgentText {
+                text: "done".to_string(),
+            }],
         )
         .expect("write the stdout entry");
     writer
