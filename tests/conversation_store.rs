@@ -11,6 +11,7 @@ use narsor_engine::domain::{
 use narsor_engine::persistence::conversation::ConversationSource;
 use narsor_engine::persistence::recovery::compress_closed_conversations;
 use narsor_engine::persistence::ExecutionStore;
+use narsor_protocol::chat::{ChatElement, PromptPurpose, TechnicalCategory, UnclassifiedReason};
 use std::fs;
 use std::path::PathBuf;
 
@@ -101,13 +102,13 @@ fn writing_three_entries_and_closing_leaves_only_the_compressed_file() {
 
     let mut writer = conversations.writer("attempt-1").expect("open writer");
     writer
-        .append_narsor("prompt: do the thing")
+        .append_narsor("prompt: do the thing", &[])
         .expect("append prompt");
     writer
-        .append(ConversationSource::Stdout, br#"{"type":"assistant"}"#)
+        .append(ConversationSource::Stdout, br#"{"type":"assistant"}"#, &[])
         .expect("append stdout");
     writer
-        .append_narsor("exit code: 0")
+        .append_narsor("exit code: 0", &[])
         .expect("append completion");
     writer.finish().expect("finish writer");
 
@@ -146,14 +147,167 @@ fn writing_three_entries_and_closing_leaves_only_the_compressed_file() {
 }
 
 #[test]
+fn elements_are_stored_with_their_raw_line_and_survive_compression() {
+    let root = TempRoot::new();
+    let conversations = root.store().conversation_store("exec-1");
+
+    let prompt = vec![ChatElement::Prompt {
+        text: "do the thing".to_string(),
+        resumed_session: Some("session-1".to_string()),
+        purpose: PromptPurpose::Step,
+    }];
+    let stdout = vec![
+        ChatElement::AgentText {
+            text: "on it".to_string(),
+        },
+        ChatElement::Unclassified {
+            reason: UnclassifiedReason::UnknownBlock,
+        },
+    ];
+    let raw_stdout: &[u8] = b"{\"type\":\"assistant\"}\xff\r";
+
+    let mut writer = conversations.writer("attempt-1").expect("open writer");
+    writer
+        .append_narsor("prompt: do the thing", &prompt)
+        .expect("append prompt");
+    writer
+        .append(ConversationSource::Stdout, raw_stdout, &stdout)
+        .expect("append stdout");
+    writer.finish().expect("finish writer");
+
+    let open = conversations
+        .read("attempt-1", 1, usize::MAX)
+        .expect("read")
+        .expect("a record");
+    conversations
+        .close_attempt("attempt-1")
+        .expect("close attempt");
+    let closed = conversations
+        .read("attempt-1", 1, usize::MAX)
+        .expect("read")
+        .expect("a record");
+
+    for snapshot in [open, closed] {
+        assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(snapshot.entries[0].raw, b"prompt: do the thing");
+        assert_eq!(snapshot.entries[0].elements, prompt);
+        assert_eq!(snapshot.entries[1].raw, raw_stdout, "byte for byte");
+        assert_eq!(snapshot.entries[1].elements, stdout);
+    }
+}
+
+#[test]
+fn an_entry_without_elements_is_written_without_the_field() {
+    let root = TempRoot::new();
+    let conversations = root.store().conversation_store("exec-1");
+    let mut writer = conversations.writer("attempt-1").expect("open writer");
+    writer
+        .append(ConversationSource::Stdout, b"plain", &[])
+        .expect("append");
+    writer.finish().expect("finish writer");
+
+    let line = fs::read_to_string(conversations.dir().join("attempt-1.jsonl")).expect("read");
+    let envelope: serde_json::Value = serde_json::from_str(line.trim()).expect("an envelope");
+    assert!(envelope.get("elements").is_none(), "{line}");
+}
+
+#[test]
+fn an_envelope_written_before_elements_existed_reads_with_none() {
+    let root = TempRoot::new();
+    let conversations = root.store().conversation_store("exec-1");
+    fs::create_dir_all(conversations.dir()).expect("create the directory");
+    // The exact envelope shape every record had before elements existed.
+    fs::write(
+        conversations.dir().join("attempt-old.jsonl"),
+        concat!(
+            r#"{"n":1,"ts":"2026-01-02T03:04:05Z","source":"narsor","raw_b64":"cHJvbXB0"}"#,
+            "\n",
+            r#"{"n":2,"ts":"2026-01-02T03:04:06Z","source":"stdout","raw_b64":"e30="}"#,
+            "\n",
+        ),
+    )
+    .expect("write an old record");
+
+    let snapshot = conversations
+        .read("attempt-old", 1, usize::MAX)
+        .expect("an old record is not an error")
+        .expect("a record");
+    assert_eq!(snapshot.entries.len(), 2);
+    assert_eq!(snapshot.entries[0].raw, b"prompt");
+    assert_eq!(snapshot.entries[1].raw, b"{}");
+    assert!(snapshot
+        .entries
+        .iter()
+        .all(|entry| entry.elements.is_empty()));
+    assert_eq!(snapshot.next_entry, 3);
+}
+
+#[test]
+fn the_byte_budget_counts_the_elements_too() {
+    let root = TempRoot::new();
+    let conversations = root.store().conversation_store("exec-1");
+
+    // Tiny raw lines, bulky elements: the raw bytes alone fit the budget
+    // three times over, the elements do not.
+    let bulky = |text: &str| {
+        vec![ChatElement::Technical {
+            category: TechnicalCategory::System,
+            summary: text.repeat(200),
+            data: None,
+        }]
+    };
+    let mut writer = conversations.writer("attempt-1").expect("open writer");
+    for (raw, text) in [(b"a", "x"), (b"b", "y"), (b"c", "z")] {
+        writer
+            .append(ConversationSource::Stdout, raw, &bulky(text))
+            .expect("append");
+    }
+    writer.finish().expect("finish writer");
+
+    let first = conversations
+        .read("attempt-1", 1, 100)
+        .expect("read")
+        .expect("a record");
+    assert_eq!(
+        first.entries.len(),
+        1,
+        "the page ends after the first entry"
+    );
+    assert_eq!(first.next_entry, 2, "the cursor points at the next entry");
+
+    let rest = conversations
+        .read("attempt-1", first.next_entry, 100)
+        .expect("read")
+        .expect("a record");
+    assert_eq!(rest.entries[0].entry_number, 2);
+    assert_eq!(rest.entries[0].raw, b"b");
+    assert_eq!(rest.entries[0].elements, bulky("y"));
+
+    let tiny = conversations
+        .read("attempt-1", 1, 10)
+        .expect("read")
+        .expect("a record");
+    assert_eq!(
+        tiny.entries.len(),
+        1,
+        "a budget smaller than one entry still returns that entry whole"
+    );
+    let all = conversations
+        .read("attempt-1", 1, 3 * 1024)
+        .expect("read")
+        .expect("a record");
+    assert_eq!(all.entries.len(), 3, "a budget that fits all of it");
+}
+
+#[test]
 fn reading_an_open_attempt_from_a_cursor_returns_only_new_entries() {
     let root = TempRoot::new();
     let store = root.store();
     let conversations = store.conversation_store("exec-2");
 
     let mut writer = conversations.writer("attempt-1").expect("open writer");
-    writer.append_narsor("one").expect("append 1");
-    writer.append_narsor("two").expect("append 2");
+    writer.append_narsor("one", &[]).expect("append 1");
+    writer.append_narsor("two", &[]).expect("append 2");
 
     let first_read = conversations
         .read("attempt-1", 0, 1 << 20)
@@ -164,8 +318,8 @@ fn reading_an_open_attempt_from_a_cursor_returns_only_new_entries() {
     let cursor = first_read.next_entry;
     assert_eq!(cursor, 3);
 
-    writer.append_narsor("three").expect("append 3");
-    writer.append_narsor("four").expect("append 4");
+    writer.append_narsor("three", &[]).expect("append 3");
+    writer.append_narsor("four", &[]).expect("append 4");
 
     let second_read = conversations
         .read("attempt-1", cursor, 1 << 20)
@@ -189,7 +343,7 @@ fn a_truncated_last_line_is_omitted_while_open_and_reported_incomplete_once_clos
     let conversations = store.conversation_store("exec-3");
 
     let mut writer = conversations.writer("attempt-1").expect("open writer");
-    writer.append_narsor("complete entry").expect("append");
+    writer.append_narsor("complete entry", &[]).expect("append");
     writer.finish().expect("finish writer");
 
     // Simulate a writer killed mid-`write_all`: append raw, non-newline
@@ -238,8 +392,8 @@ fn compression_between_two_reads_gives_a_correct_continuation() {
     let conversations = store.conversation_store("exec-4");
 
     let mut writer = conversations.writer("attempt-1").expect("open writer");
-    writer.append_narsor("one").expect("append 1");
-    writer.append_narsor("two").expect("append 2");
+    writer.append_narsor("one", &[]).expect("append 1");
+    writer.append_narsor("two", &[]).expect("append 2");
 
     let first_read = conversations
         .read("attempt-1", 0, 1 << 20)
@@ -248,7 +402,7 @@ fn compression_between_two_reads_gives_a_correct_continuation() {
     assert_eq!(first_read.entries.len(), 2);
     let cursor = first_read.next_entry;
 
-    writer.append_narsor("three").expect("append 3");
+    writer.append_narsor("three", &[]).expect("append 3");
     writer.finish().expect("finish writer");
     conversations
         .close_attempt("attempt-1")
@@ -272,7 +426,7 @@ fn both_files_present_prefers_the_compressed_one_and_startup_deletes_the_plain_o
 
     let conversations = store.conversation_store("exec-5");
     let mut writer = conversations.writer("attempt-1").expect("open writer");
-    writer.append_narsor("hello").expect("append");
+    writer.append_narsor("hello", &[]).expect("append");
     writer.finish().expect("finish writer");
     conversations
         .close_attempt("attempt-1")
@@ -312,10 +466,10 @@ fn raw_lines_that_are_not_json_or_not_utf8_are_preserved_exactly() {
 
     let mut writer = conversations.writer("attempt-1").expect("open writer");
     writer
-        .append(ConversationSource::Stdout, not_json)
+        .append(ConversationSource::Stdout, not_json, &[])
         .expect("append non-json line");
     writer
-        .append(ConversationSource::Stdout, invalid_utf8)
+        .append(ConversationSource::Stdout, invalid_utf8, &[])
         .expect("append invalid utf-8 line");
     writer.finish().expect("finish writer");
 
@@ -338,7 +492,7 @@ fn a_single_ten_mebibyte_entry_is_written_and_read_back_in_full() {
 
     let mut writer = conversations.writer("attempt-1").expect("open writer");
     writer
-        .append(ConversationSource::Stdout, &big)
+        .append(ConversationSource::Stdout, &big, &[])
         .expect("append big entry");
     writer.finish().expect("finish writer");
 
@@ -389,11 +543,13 @@ fn startup_leaves_a_running_executions_open_attempt_untouched_and_compresses_a_c
     let conversations = store.conversation_store("exec-9");
 
     let mut open_writer = conversations.writer("attempt-open").expect("open writer");
-    open_writer.append_narsor("still running").expect("append");
+    open_writer
+        .append_narsor("still running", &[])
+        .expect("append");
     open_writer.finish().expect("finish writer");
 
     let mut closed_writer = conversations.writer("attempt-closed").expect("open writer");
-    closed_writer.append_narsor("done").expect("append");
+    closed_writer.append_narsor("done", &[]).expect("append");
     closed_writer.finish().expect("finish writer");
 
     let compressed = compress_closed_conversations(&store).expect("compression sweep");
@@ -433,7 +589,7 @@ fn a_failed_attempt_that_will_retry_is_still_closed_for_compression() {
 
     let conversations = store.conversation_store("exec-10");
     let mut writer = conversations.writer("attempt-1").expect("open writer");
-    writer.append_narsor("will retry").expect("append");
+    writer.append_narsor("will retry", &[]).expect("append");
     writer.finish().expect("finish writer");
 
     compress_closed_conversations(&store).expect("compression sweep");
@@ -450,8 +606,8 @@ fn an_open_record_is_dated_by_its_file_and_a_closed_one_by_its_last_entry() {
     let store = root.store();
     let conversations = store.conversation_store("exec-11");
     let mut writer = conversations.writer("attempt-1").expect("open writer");
-    writer.append_narsor("first").expect("append");
-    writer.append_narsor("second").expect("append");
+    writer.append_narsor("first", &[]).expect("append");
+    writer.append_narsor("second", &[]).expect("append");
     writer.finish().expect("finish writer");
 
     let open = conversations
@@ -498,12 +654,12 @@ fn summaries_from_storage_follow_the_timeline_and_date_the_newest_record() {
     }
     let conversations = store.conversation_store("exec-12");
     let mut closed = conversations.writer("attempt-b").expect("open writer");
-    closed.append_narsor("one").expect("append");
-    closed.append_narsor("two").expect("append");
+    closed.append_narsor("one", &[]).expect("append");
+    closed.append_narsor("two", &[]).expect("append");
     closed.finish().expect("finish writer");
     conversations.close_attempt("attempt-b").expect("close");
     let mut open = conversations.writer("attempt-a").expect("open writer");
-    open.append_narsor("still going").expect("append");
+    open.append_narsor("still going", &[]).expect("append");
     open.finish().expect("finish writer");
 
     let mut cache = ConversationCache::default();

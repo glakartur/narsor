@@ -1194,16 +1194,17 @@ fn conversation_prints_every_entry_in_order() {
     let conversations = store.conversation_store(&id);
     let mut writer = conversations.writer("attempt-1").expect("open the writer");
     writer
-        .append_narsor("prompt: do the thing")
+        .append_narsor("prompt: do the thing", &[])
         .expect("write the prompt entry");
     writer
         .append(
             ConversationSource::Stdout,
             br#"{"type":"result","subtype":"success","result":"done"}"#,
+            &[],
         )
         .expect("write the stdout entry");
     writer
-        .append(ConversationSource::Stderr, b"a warning on stderr")
+        .append(ConversationSource::Stderr, b"a warning on stderr", &[])
         .expect("write the stderr entry");
     writer.finish().expect("flush the writer");
 

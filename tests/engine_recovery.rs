@@ -496,7 +496,7 @@ async fn a_running_executions_rejected_attempt_counts_as_closed() {
 
     let conversations = harness.store().conversation_store(&execution.id);
     let mut writer = conversations.writer(&rejected).expect("open a writer");
-    writer.append_narsor("the prompt").expect("append");
+    writer.append_narsor("the prompt", &[]).expect("append");
     writer.finish().expect("finish the writer");
 
     let report = recover(&harness.store()).expect("recover");

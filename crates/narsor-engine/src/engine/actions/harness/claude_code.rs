@@ -44,11 +44,13 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::{
-    integer_parameter, reject_option_like, resolve_read_only_path, string_parameter, tail,
-    HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
+    integer_parameter, not_classified, reject_option_like, resolve_read_only_path,
+    string_parameter, tail, HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun,
+    HarnessStreamParser,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
+use narsor_protocol::chat::ChatElement;
 
 /// The `harness:` value this adapter answers to.
 pub const CLAUDE_CODE: &str = "claude-code";
@@ -187,8 +189,10 @@ struct ClaudeCodeStreamParser {
     subtype: Option<String>,
 }
 
-impl HarnessStreamParser for ClaudeCodeStreamParser {
-    fn on_stdout_line(&mut self, line: &[u8]) {
+impl ClaudeCodeStreamParser {
+    /// Folds one stdout line into what [`HarnessStreamParser::finish`]
+    /// needs; lines that carry none of it are ignored.
+    fn accumulate(&mut self, line: &[u8]) {
         let Ok(text) = std::str::from_utf8(line) else {
             return;
         };
@@ -251,6 +255,15 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
                     })
             })
             .unwrap_or_default();
+    }
+}
+
+impl HarnessStreamParser for ClaudeCodeStreamParser {
+    /// Every line is unclassified for now; U4 brings the Claude Code
+    /// classification.
+    fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement> {
+        self.accumulate(line);
+        not_classified()
     }
 
     fn finish(self: Box<Self>, exit_code: i32, stderr_tail: &str) -> HarnessRun {

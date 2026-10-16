@@ -337,6 +337,16 @@ async fn claude_runs_read_only_in_the_workspace_without_an_action_attempt() {
         before,
         "the invoker itself records nothing: no ActionStarted, no session"
     );
+    let recorded = fixture
+        .harness
+        .store()
+        .conversation_store(&fixture.execution_id)
+        .recorded_attempt_ids()
+        .expect("list the conversations");
+    assert!(
+        recorded.is_empty(),
+        "no conversation is written: {recorded:?}"
+    );
     assert!(!fixture.work_dir().exists(), "no scratch directory is made");
 }
 

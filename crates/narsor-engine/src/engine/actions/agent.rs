@@ -47,6 +47,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
+use narsor_protocol::chat::{
+    ChatElement, PromptPurpose, TechnicalCategory, UnclassifiedReason, SUMMARY_MAX_CHARS,
+};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
@@ -311,20 +314,33 @@ impl ConversationSink {
         }
     }
 
-    /// Appends one entry, logging (and otherwise ignoring) a failure to.
-    fn append(&self, source: ConversationSource, raw: &[u8]) {
+    /// Appends one entry with its elements, logging (and otherwise
+    /// ignoring) a failure to.
+    fn append(&self, source: ConversationSource, raw: &[u8], elements: &[ChatElement]) {
         let Some(writer) = &self.0 else { return };
         let mut writer = writer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Err(error) = writer.append(source, raw) {
+        if let Err(error) = writer.append(source, raw, elements) {
             tracing::warn!(%error, "could not append a conversation entry");
         }
     }
 
     /// Convenience for a narsor-authored entry (the prompt, the outcome).
-    fn append_narsor(&self, text: &str) {
-        self.append(ConversationSource::Narsor, text.as_bytes());
+    fn append_narsor(&self, text: &str, elements: &[ChatElement]) {
+        self.append(ConversationSource::Narsor, text.as_bytes(), elements);
+    }
+
+    /// A narsor-authored entry about the harness process — its exit code,
+    /// timeout, or failure to run — whose one element is a
+    /// [`TechnicalCategory::Process`] event summarized by the same `text`.
+    fn append_outcome(&self, text: &str, data: Value) {
+        let element = ChatElement::Technical {
+            category: TechnicalCategory::Process,
+            summary: text.to_string(),
+            data: Some(data),
+        };
+        self.append_narsor(text, &[element]);
     }
 
     /// Flushes the writer to disk, once, at the very end of the attempt.
@@ -447,13 +463,14 @@ impl AgentExecutor {
     /// Opens this attempt's conversation file, if there is a store to open it
     /// in, and writes the prompt entry — the first line any conversation ever
     /// has: the prompt sent, the harness, and the session it continues, if
-    /// any.
+    /// any — with a [`ChatElement::Prompt`] carrying the full prompt.
     fn open_conversation(
         &self,
         request: &ActionRequest<'_>,
         harness: &str,
         resume: Option<&str>,
         prompt: &str,
+        purpose: PromptPurpose,
     ) -> ConversationSink {
         let Some(store) = request.conversation_store else {
             return ConversationSink::none();
@@ -466,7 +483,12 @@ impl AgentExecutor {
             "prompt": prompt,
         })
         .to_string();
-        sink.append_narsor(&entry);
+        let element = ChatElement::Prompt {
+            text: prompt.to_string(),
+            resumed_session: resume.map(str::to_string),
+            purpose,
+        };
+        sink.append_narsor(&entry, &[element]);
         sink
     }
 
@@ -499,7 +521,8 @@ impl AgentExecutor {
         // invocation that never runs (a bad parameter, a missing binary)
         // leaves a conversation file behind, with the prompt and why the
         // harness never started.
-        let conversation = self.open_conversation(&request, harness, resume, &prompt);
+        let conversation =
+            self.open_conversation(&request, harness, resume, &prompt, prompt_purpose(config));
 
         let invocation = match adapter.invocation(&HarnessRequest {
             config,
@@ -510,7 +533,10 @@ impl AgentExecutor {
         }) {
             Ok(invocation) => invocation,
             Err(error) => {
-                conversation.append_narsor(&format!("harness did not start: {}", error.message));
+                conversation.append_outcome(
+                    &format!("harness did not start: {}", error.message),
+                    serde_json::json!({ "error_type": error.error_type }),
+                );
                 conversation.finish();
                 return Err(error);
             }
@@ -541,16 +567,21 @@ impl AgentExecutor {
 
         let finished = match ending {
             Ok(SpawnEnding::Finished(finished)) => {
-                conversation
-                    .append_narsor(&format!("harness exited with code {}", finished.exit_code));
+                conversation.append_outcome(
+                    &format!("harness exited with code {}", finished.exit_code),
+                    serde_json::json!({ "exit_code": finished.exit_code }),
+                );
                 finished
             }
             Ok(SpawnEnding::TimedOut) => {
                 let limit = request.timeout.unwrap_or_default();
-                conversation.append_narsor(&format!(
-                    "harness timed out after {}s and was killed",
-                    limit.as_secs_f64()
-                ));
+                conversation.append_outcome(
+                    &format!(
+                        "harness timed out after {}s and was killed",
+                        limit.as_secs_f64()
+                    ),
+                    serde_json::json!({ "timed_out_after_secs": limit.as_secs_f64() }),
+                );
                 conversation.finish();
 
                 self.fail_session(
@@ -574,11 +605,14 @@ impl AgentExecutor {
                     error.error_type.as_deref(),
                     Some("harness_not_found") | Some("spawn_failed")
                 );
-                conversation.append_narsor(&if started {
-                    format!("harness run failed: {}", error.message)
-                } else {
-                    format!("harness did not start: {}", error.message)
-                });
+                conversation.append_outcome(
+                    &if started {
+                        format!("harness run failed: {}", error.message)
+                    } else {
+                        format!("harness did not start: {}", error.message)
+                    },
+                    serde_json::json!({ "error_type": error.error_type }),
+                );
                 conversation.finish();
 
                 self.fail_session(
@@ -756,6 +790,41 @@ fn new_session(
     }
 }
 
+/// Why this attempt's prompt is sent: a reprompt — the engine's
+/// ([`reprompt_config`]) or the conductor's ([`conductor_reprompt_config`]) —
+/// or the step's own prompt, including an operator's continuation.
+///
+/// A reprompt is an ordinary [`AgentActionConfig`] with a prompt of its own,
+/// so the prompt is what tells it apart: it starts with
+/// [`OUTPUT_REPROMPT`] or ends with [`CONDUCTOR_REPROMPT_GUARD`], the texts
+/// only those two configurations write.
+fn prompt_purpose(config: &AgentActionConfig) -> PromptPurpose {
+    if config.prompt.starts_with(OUTPUT_REPROMPT)
+        || config.prompt.ends_with(CONDUCTOR_REPROMPT_GUARD)
+    {
+        PromptPurpose::Reprompt
+    } else {
+        PromptPurpose::Step
+    }
+}
+
+/// The element of a line the harness wrote to stderr: a
+/// [`TechnicalCategory::Stderr`] event summarized by the line itself.
+///
+/// The summary keeps one character past [`SUMMARY_MAX_CHARS`], so
+/// [`ChatElement::summary`] still marks a longer line as cut while a huge
+/// line is never stored twice; the raw line keeps it in full.
+pub(crate) fn stderr_element(line: &[u8]) -> ChatElement {
+    ChatElement::Technical {
+        category: TechnicalCategory::Stderr,
+        summary: String::from_utf8_lossy(line)
+            .chars()
+            .take(SUMMARY_MAX_CHARS + 1)
+            .collect(),
+        data: None,
+    }
+}
+
 /// The harness session this run continues, if `parameters` names one (D18).
 ///
 /// `parameters` is **not** template-expanded (only `prompt` is, see
@@ -802,7 +871,9 @@ pub(crate) enum SpawnEnding {
 /// Runs one harness process outside any action attempt — no conversation
 /// file, no `ORCHESTRATOR_ACTION_ID` — for the conductor (U9), which reuses
 /// the spawning (through [`spawn_retrying_text_busy`]), the pipe draining and
-/// the stream parsing of an agent step without being one.
+/// the stream parsing of an agent step without being one. The elements the
+/// parser returns are discarded with the lines: there is nowhere to record
+/// them.
 pub(crate) async fn run_harness_process(
     program: &str,
     args: &[String],
@@ -823,7 +894,8 @@ pub(crate) async fn run_harness_process(
 }
 
 /// Runs the harness, draining both pipes while it goes and feeding every
-/// stdout line to the conversation store and to `parser`.
+/// stdout line to `parser` and then, with the elements it returned, to the
+/// conversation store.
 ///
 /// Reading is a line loop ([`stream_lines`]) rather than `read_capped` (used
 /// by the script executor, which has no per-line structure to preserve): a
@@ -861,10 +933,14 @@ async fn spawn_and_wait(
     let stdout_task = async {
         let mut parser = parser;
         let result = stream_lines(&mut stdout_pipe, |line| {
-            conversation.append(ConversationSource::Stdout, line);
-            if line.len() <= PARSE_LINE_LIMIT {
-                parser.on_stdout_line(line);
-            }
+            let elements = if line.len() <= PARSE_LINE_LIMIT {
+                parser.on_stdout_line(line)
+            } else {
+                vec![ChatElement::Unclassified {
+                    reason: UnclassifiedReason::TooLarge,
+                }]
+            };
+            conversation.append(ConversationSource::Stdout, line, &elements);
         })
         .await;
         (result, parser)
@@ -873,7 +949,7 @@ async fn spawn_and_wait(
     let stderr_task = async {
         let mut stderr_capture: Vec<u8> = Vec::new();
         let result = stream_lines(&mut stderr_pipe, |line| {
-            conversation.append(ConversationSource::Stderr, line);
+            conversation.append(ConversationSource::Stderr, line, &[stderr_element(line)]);
             accumulate_capped(&mut stderr_capture, line, MAX_BUFFERED_OUTPUT_BYTES);
             accumulate_capped(&mut stderr_capture, b"\n", MAX_BUFFERED_OUTPUT_BYTES);
         })

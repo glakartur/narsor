@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::chat::ChatElement;
 use crate::controller::ExecutionEventsSource;
 
 /// Discovery record published by `narsor-server` for local clients.
@@ -287,16 +288,22 @@ pub enum ConversationEntrySource {
 }
 
 /// One decoded conversation entry in the API wire format.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConversationEntryDto {
     pub entry_number: u64,
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub source: ConversationEntrySource,
+    /// The raw line, byte for byte: a diagnostic record, not for display.
     pub raw_base64: String,
+    /// What the entry says, harness-independent. A current server always
+    /// sends at least one element per entry; the list is empty only when
+    /// the page comes from a server older than the element model.
+    #[serde(default)]
+    pub elements: Vec<ChatElement>,
 }
 
 /// One raw conversation page. `NoRecord` is a successful answer.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ConversationResponse {
     Recorded {
@@ -525,6 +532,11 @@ mod tests {
                     .with_timezone(&chrono::Utc),
                 source: ConversationEntrySource::Stderr,
                 raw_base64: "AP8=".into(),
+                elements: vec![crate::chat::ChatElement::Technical {
+                    category: crate::chat::TechnicalCategory::Stderr,
+                    summary: "boom".into(),
+                    data: None,
+                }],
             }],
             next_entry: 4,
             closed: true,
@@ -537,8 +549,21 @@ mod tests {
         assert_eq!(value["status"], "recorded");
         assert_eq!(value["entries"][0]["source"], "stderr");
         assert_eq!(value["entries"][0]["raw_base64"], "AP8=");
+        assert_eq!(value["entries"][0]["elements"][0]["kind"], "technical");
         assert!(value.get("source").is_none());
         assert!(value.get("recorded_at").is_none());
+    }
+
+    #[test]
+    fn conversation_entries_from_an_older_server_read_without_elements() {
+        let entry: ConversationEntryDto = serde_json::from_value(serde_json::json!({
+            "entry_number": 1,
+            "timestamp": "2026-01-02T03:04:05Z",
+            "source": "stdout",
+            "raw_base64": "e30=",
+        }))
+        .unwrap();
+        assert!(entry.elements.is_empty());
     }
 
     #[test]

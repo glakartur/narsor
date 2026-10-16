@@ -3750,7 +3750,7 @@ fn record_attempt(store: &ExecutionStore, entries: usize) {
         .expect("writer");
     for entry in 1..=entries {
         writer
-            .append_narsor(&format!("entry {entry}"))
+            .append_narsor(&format!("entry {entry}"), &[])
             .expect("line");
     }
     writer.finish().expect("finish");

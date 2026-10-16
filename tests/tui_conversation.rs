@@ -19,6 +19,7 @@ fn entry(source: ConversationSource, raw: &str) -> ConversationEntryDto {
         timestamp: Utc::now(),
         source,
         raw_base64: BASE64.encode(raw.as_bytes()),
+        elements: Vec::new(),
     }
 }
 
@@ -397,6 +398,7 @@ fn unified_events_have_lossless_raw_and_normalized_details() {
         timestamp: Utc::now(),
         source: ConversationSource::Stdout,
         raw_base64: BASE64.encode(bytes),
+        elements: Vec::new(),
     };
     let event = classify(&binary_entry);
     assert_eq!(event.raw, bytes);

@@ -21,7 +21,9 @@ use narsor_engine::domain::{
     ActionConfig, ActionError, AgentActionConfig, Context, EventData, ExecutionStatus,
     OutputDefinition, RepromptedBy, Workspace, WorkspaceAccess,
 };
-use narsor_engine::engine::actions::agent::{output_contract, AgentEventSink, SESSION_ID_VARIABLE};
+use narsor_engine::engine::actions::agent::{
+    output_contract, AgentEventSink, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
+};
 use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
     CodexAdapter, DefaultHarnessSource, Engine, HarnessAdapter, HarnessRegistry, InputContinuation,
@@ -33,6 +35,7 @@ use narsor_engine::persistence::{
     ExecutionStore, ReconciliationOutcome, StatePaths,
 };
 use narsor_engine::workflow::{load_from_file, TemplateScope};
+use narsor_protocol::chat::{ChatElement, PromptPurpose, TechnicalCategory, UnclassifiedReason};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -323,6 +326,42 @@ impl ConversationFixture {
 /// about exact bytes compare `entry.raw` directly instead).
 fn entry_text(entry: &ConversationEntry) -> String {
     String::from_utf8_lossy(&entry.raw).into_owned()
+}
+
+/// The prompt element of a conversation's first entry.
+fn prompt_element(entry: &ConversationEntry) -> (String, Option<String>, PromptPurpose) {
+    assert_eq!(entry.source, ConversationSource::Narsor);
+    match entry.elements.as_slice() {
+        [ChatElement::Prompt {
+            text,
+            resumed_session,
+            purpose,
+        }] => (text.clone(), resumed_session.clone(), *purpose),
+        other => panic!("expected one prompt element, got {other:?}"),
+    }
+}
+
+/// The summary of an entry's single process-outcome element.
+fn process_summary(entry: &ConversationEntry) -> String {
+    assert_eq!(entry.source, ConversationSource::Narsor);
+    match entry.elements.as_slice() {
+        [ChatElement::Technical {
+            category: TechnicalCategory::Process,
+            summary,
+            ..
+        }] => summary.clone(),
+        other => panic!("expected one process element, got {other:?}"),
+    }
+}
+
+/// What a fresh parser of `adapter` returns for each of `lines`, in order —
+/// the elements the executor is expected to store with them.
+fn parsed_elements(adapter: &dyn HarnessAdapter, lines: &[String]) -> Vec<Vec<ChatElement>> {
+    let mut parser = adapter.stream_parser();
+    lines
+        .iter()
+        .map(|line| parser.on_stdout_line(line.as_bytes()))
+        .collect()
 }
 
 /// The fixed ids every test in this file runs its agent action under.
@@ -1802,15 +1841,36 @@ async fn a_missing_label_is_asked_for_again_in_the_same_read_only_session() {
     assert_eq!(reprompted.1, fixture.fake.action_id(1));
     assert_eq!(reprompted.2, RepromptedBy::Engine);
 
-    // Each attempt has its own conversation file, both closed.
+    // Each attempt has its own conversation file, both closed; the first
+    // was the step's prompt, the second the reprompt of its session.
     let conversations = fixture.store().conversation_store(&execution.id);
-    for attempt in [fixture.fake.action_id(1), fixture.fake.action_id(2)] {
+    let attempts = [
+        (fixture.fake.action_id(1), PromptPurpose::Step, None),
+        (
+            fixture.fake.action_id(2),
+            PromptPurpose::Reprompt,
+            Some("fake-session-1"),
+        ),
+    ];
+    for (attempt, expected_purpose, expected_resume) in attempts {
         let snapshot = conversations
             .read(&attempt, 1, usize::MAX)
             .expect("read the conversation")
             .unwrap_or_else(|| panic!("attempt '{attempt}' has a conversation"));
         assert!(snapshot.closed, "attempt '{attempt}' was compressed");
+        let (_, resumed, purpose) = prompt_element(&snapshot.entries[0]);
+        assert_eq!(purpose, expected_purpose, "attempt '{attempt}'");
+        assert_eq!(resumed.as_deref(), expected_resume, "attempt '{attempt}'");
     }
+    let reprompt = conversations
+        .read(&fixture.fake.action_id(2), 1, usize::MAX)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        prompt_element(&reprompt.entries[0]).0,
+        *second.last().expect("a prompt"),
+        "the prompt element holds exactly what the harness was sent"
+    );
 }
 
 /// Runs [`REPROMPT_WORKFLOW`] on the fixture's engine.
@@ -2522,6 +2582,10 @@ async fn a_claude_code_stream_is_captured_in_order_with_the_prompt_and_a_complet
     assert_eq!(entries.len(), 6, "{entries:?}");
     assert_eq!(entries[0].source, ConversationSource::Narsor);
     assert!(entry_text(&entries[0]).contains("look around"));
+    let (prompt, resumed, purpose) = prompt_element(&entries[0]);
+    assert_eq!(prompt, format!("look around{}", output_contract(&[])));
+    assert_eq!(resumed, None);
+    assert_eq!(purpose, PromptPurpose::Step);
 
     for entry in &entries[1..5] {
         assert_eq!(entry.source, ConversationSource::Stdout);
@@ -2543,6 +2607,15 @@ async fn a_claude_code_stream_is_captured_in_order_with_the_prompt_and_a_complet
         entry_text(last).contains("exited with code 0"),
         "{}",
         entry_text(last)
+    );
+    assert_eq!(process_summary(last), entry_text(last));
+    assert!(
+        matches!(
+            last.elements.as_slice(),
+            [ChatElement::Technical { data: Some(data), .. }] if data["exit_code"] == 0
+        ),
+        "{:?}",
+        last.elements
     );
 
     // Closing (and compressing) the attempt is the runner's job, done once
@@ -2586,6 +2659,130 @@ async fn an_opencode_stream_is_captured_and_the_label_comes_from_its_text_line()
     // Prompt, four stdout lines, one completion entry.
     assert_eq!(entries.len(), 6, "{entries:?}");
     assert!(!conversation.is_closed(ACTION_EXECUTION_ID));
+
+    // Covers AE8: opencode output is not classified, line by line.
+    let stdout: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.source == ConversationSource::Stdout)
+        .collect();
+    assert_eq!(stdout.len(), 4);
+    for entry in stdout {
+        assert_eq!(
+            entry.elements,
+            [ChatElement::Unclassified {
+                reason: UnclassifiedReason::HarnessNotClassified
+            }],
+            "{}",
+            entry_text(entry)
+        );
+    }
+}
+
+#[test]
+fn the_opencode_and_codex_parsers_leave_every_line_unclassified() {
+    let unclassified = vec![ChatElement::Unclassified {
+        reason: UnclassifiedReason::HarnessNotClassified,
+    }];
+    let lines = |stream: String| -> Vec<String> { stream.lines().map(str::to_string).collect() };
+    let mut lines_opencode = lines(opencode_stream("ses_7", r#"{"output":"ready"}"#));
+    lines_opencode.push("not json".to_string());
+    let mut lines_codex = lines(codex_stream("thread-1", r#"{"output":"ready"}"#));
+    lines_codex.push(String::new());
+
+    for elements in parsed_elements(&OpenCodeAdapter::with_program("opencode"), &lines_opencode)
+        .into_iter()
+        .chain(parsed_elements(
+            &CodexAdapter::with_program("codex"),
+            &lines_codex,
+        ))
+    {
+        assert_eq!(elements, unclassified);
+    }
+}
+
+#[tokio::test]
+async fn every_stdout_line_is_stored_with_the_elements_its_parser_returned() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    let lines = vec![
+        json!({ "type": "system", "subtype": "init", "session_id": "s1" }).to_string(),
+        json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "on it" }] } })
+            .to_string(),
+        envelope(r#"{"output":"ready"}"#),
+    ];
+    fake.answers(&lines.join("\n"));
+
+    let outcome = execute_with_conversation(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await
+    .expect("the run completes");
+    assert!(matches!(outcome, ActionOutcome::Completed(_)));
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    let stdout: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.source == ConversationSource::Stdout)
+        .collect();
+    assert_eq!(stdout.len(), 3, "{entries:?}");
+    let expected = parsed_elements(&ClaudeCodeAdapter::with_program("claude"), &lines);
+    for ((entry, line), elements) in stdout.iter().zip(&lines).zip(expected) {
+        assert_eq!(entry.raw, line.as_bytes());
+        assert!(!entry.elements.is_empty(), "{line}");
+        assert_eq!(entry.elements, elements, "{line}");
+    }
+}
+
+#[tokio::test]
+async fn a_line_past_the_parse_limit_is_stored_whole_as_too_large_to_parse() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+
+    let huge_line = "y".repeat(PARSE_LINE_LIMIT + 1);
+    fake.answers(&format!(
+        "{huge_line}\n{}",
+        envelope(r#"{"output":"ready"}"#)
+    ));
+
+    let outcome = execute_with_conversation(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await
+    .expect("the run completes");
+    let ActionOutcome::Completed(result) = outcome else {
+        panic!("expected a completed action");
+    };
+    assert_eq!(
+        result.output_label, "ready",
+        "the next line is still parsed"
+    );
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    let big_entry = entries
+        .iter()
+        .find(|entry| entry.raw.len() > PARSE_LINE_LIMIT)
+        .expect("the oversized line was captured");
+    assert_eq!(
+        big_entry.raw,
+        huge_line.as_bytes(),
+        "captured byte for byte"
+    );
+    assert_eq!(
+        big_entry.elements,
+        [ChatElement::Unclassified {
+            reason: UnclassifiedReason::TooLarge
+        }]
+    );
 }
 
 #[tokio::test]
@@ -2637,6 +2834,7 @@ async fn covers_ae5_two_lines_then_a_timeout_are_both_captured_plus_a_timeout_en
         "{}",
         entry_text(entries.last().unwrap())
     );
+    assert!(process_summary(entries.last().unwrap()).contains("timed out"));
 }
 
 #[tokio::test]
@@ -2752,6 +2950,8 @@ async fn a_missing_binary_still_leaves_a_conversation_file_with_the_prompt() {
         "{}",
         entry_text(&entries[1])
     );
+    assert_eq!(prompt_element(&entries[0]).2, PromptPurpose::Step);
+    assert!(process_summary(&entries[1]).contains("harness did not start"));
 }
 
 #[tokio::test]
@@ -2860,6 +3060,14 @@ async fn stderr_on_a_successful_run_is_captured_without_affecting_the_result() {
         "{}",
         entry_text(stderr_entry)
     );
+    assert_eq!(
+        stderr_entry.elements,
+        [ChatElement::Technical {
+            category: TechnicalCategory::Stderr,
+            summary: "a warning the harness printed on stderr".to_string(),
+            data: None,
+        }]
+    );
 }
 
 #[tokio::test]
@@ -2898,6 +3106,9 @@ async fn a_resumed_session_reaches_the_argv_and_the_prompt_entry() {
         "the prompt entry names the resumed session: {}",
         entry_text(&entries[0])
     );
+    let (_, resumed, purpose) = prompt_element(&entries[0]);
+    assert_eq!(resumed.as_deref(), Some("session-42"));
+    assert_eq!(purpose, PromptPurpose::Step);
 }
 
 // ---------------------------------------------------------------------------

@@ -3629,6 +3629,7 @@ mod task_app_detail {
                         base64::engine::general_purpose::STANDARD
                             .encode(r#"{"event":"prompt","prompt":"Fix it"}"#)
                     },
+                    elements: Vec::new(),
                 }],
                 next_entry: 2,
                 closed: true,
@@ -9458,10 +9459,10 @@ mod task_app_create {
             let conversations = store.conversation_store(id);
             let mut writer = conversations.writer("attempt-1").expect("writer");
             writer
-                .append_narsor("prompt: zaplanuj zmianę")
+                .append_narsor("prompt: zaplanuj zmianę", &[])
                 .expect("prompt");
             writer
-                .append(ConversationSource::Stdout, br#"{"type":"assistant"}"#)
+                .append(ConversationSource::Stdout, br#"{"type":"assistant"}"#, &[])
                 .expect("stdout");
             writer.finish().expect("finish");
             conversations.close_attempt("attempt-1").expect("close");

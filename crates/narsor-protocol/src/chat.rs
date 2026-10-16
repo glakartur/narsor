@@ -243,6 +243,9 @@ pub enum UnclassifiedReason {
     HarnessNotClassified,
     /// A content block the parser does not know.
     UnknownBlock,
+    /// The entry was recorded before Narsor stored elements with it, so
+    /// only its raw line exists.
+    NotRecorded,
     #[serde(other)]
     Unrecognized,
 }
@@ -256,6 +259,7 @@ impl UnclassifiedReason {
             Self::TooLarge => "line too large to parse",
             Self::HarnessNotClassified => "harness output not classified",
             Self::UnknownBlock => "unknown content block",
+            Self::NotRecorded => "recorded without elements",
             Self::Unrecognized => "unrecognized reason",
         }
     }
@@ -689,6 +693,16 @@ mod tests {
             reason: UnclassifiedReason::TooLarge,
         };
         assert_eq!(element.summary(), "line too large to parse");
+
+        let legacy: ChatElement =
+            serde_json::from_str(r#"{"kind":"unclassified","reason":"not_recorded"}"#).unwrap();
+        assert_eq!(
+            legacy,
+            ChatElement::Unclassified {
+                reason: UnclassifiedReason::NotRecorded
+            }
+        );
+        assert_eq!(legacy.summary(), "recorded without elements");
     }
 
     #[test]

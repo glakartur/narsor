@@ -40,6 +40,15 @@
 //! either way; whether it is reported as `truncated_tail` follows the bytes
 //! actually on disk, open or closed alike, because compression preserves
 //! whatever was there, truncation included.
+//!
+//! # Elements next to the raw line
+//!
+//! Every entry also carries the [`ChatElement`]s that say what the line
+//! means, harness-independent: the stream parser's for a stdout line, the
+//! executor's own for the prompt, stderr and the process outcome. They live
+//! in the same envelope as the raw line, so the cursor, the paging and the
+//! attempt summaries (entry counts) stay exactly what they were. An entry
+//! written before elements existed simply has none; nothing is migrated.
 
 use super::atomic::{ensure_dir, sync_parent_dir, write_and_sync};
 use super::paths::{parse_conversation_jsonl_name, unique_temp_path_for, StatePaths};
@@ -47,7 +56,9 @@ use super::{PersistenceError, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
+use narsor_protocol::chat::ChatElement;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -67,9 +78,10 @@ pub enum ConversationSource {
 /// The on-disk shape of one line: a fixed envelope plus a base64 payload.
 ///
 /// Private and deliberately minimal — anything a reader needs beyond this is
-/// derived, not stored.
+/// derived, not stored. Borrows its elements when written and owns them
+/// when read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Envelope {
+struct Envelope<'a> {
     /// Sequential entry number, starting at 1, unique within one attempt.
     n: u64,
     /// When narsor observed (or produced) this line.
@@ -78,10 +90,19 @@ struct Envelope {
     source: ConversationSource,
     /// Base64 of the raw bytes — see the module doc for why.
     raw_b64: String,
+    /// What the line means. Absent in records written before elements
+    /// existed, and omitted when there are none.
+    #[serde(default, skip_serializing_if = "no_elements")]
+    elements: Cow<'a, [ChatElement]>,
+}
+
+/// Whether an envelope has no elements to write.
+fn no_elements(elements: &[ChatElement]) -> bool {
+    elements.is_empty()
 }
 
 /// One decoded entry of a conversation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConversationEntry {
     /// Sequential entry number, starting at 1.
     pub entry_number: u64,
@@ -92,10 +113,49 @@ pub struct ConversationEntry {
     /// The raw harness line, exactly as received — preserved byte for byte,
     /// even when it is not valid JSON or not valid UTF-8.
     pub raw: Vec<u8>,
+    /// What the line means, as recorded with it. Empty for an entry written
+    /// before elements existed.
+    pub elements: Vec<ChatElement>,
+}
+
+impl ConversationEntry {
+    /// What this entry costs against a read's byte budget: the raw payload
+    /// plus its elements as they go on the wire.
+    fn budget_cost(&self) -> usize {
+        self.raw.len() + elements_wire_len(&self.elements)
+    }
+}
+
+/// The serialized JSON size of `elements`, or 0 when there are none.
+fn elements_wire_len(elements: &[ChatElement]) -> usize {
+    if elements.is_empty() {
+        return 0;
+    }
+    let mut counter = ByteCounter(0);
+    match serde_json::to_writer(&mut counter, elements) {
+        Ok(()) => counter.0,
+        // An element always serializes; should one ever fail, it costs
+        // nothing rather than failing the read.
+        Err(_) => 0,
+    }
+}
+
+/// An [`io::Write`] that only counts the bytes written to it.
+struct ByteCounter(usize);
+
+impl Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// The result of reading a conversation from a given cursor.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ConversationSnapshot {
     /// Entries from the requested cursor onward, in order.
     pub entries: Vec<ConversationEntry>,
@@ -161,14 +221,21 @@ impl ConversationWriter {
         &self.path
     }
 
-    /// Appends one entry and returns the entry number it was written as.
-    pub fn append(&mut self, source: ConversationSource, raw: &[u8]) -> Result<u64> {
+    /// Appends one entry — the raw line byte for byte and the elements that
+    /// say what it means — and returns the entry number it was written as.
+    pub fn append(
+        &mut self,
+        source: ConversationSource,
+        raw: &[u8],
+        elements: &[ChatElement],
+    ) -> Result<u64> {
         let entry_number = self.next_entry;
         let envelope = Envelope {
             n: entry_number,
             ts: Utc::now(),
             source,
             raw_b64: BASE64.encode(raw),
+            elements: Cow::Borrowed(elements),
         };
         let mut bytes =
             serde_json::to_vec(&envelope).map_err(|source| PersistenceError::Serialize {
@@ -185,8 +252,8 @@ impl ConversationWriter {
 
     /// Convenience for [`ConversationSource::Narsor`] entries: the sent
     /// prompt, or the attempt's outcome.
-    pub fn append_narsor(&mut self, text: &str) -> Result<u64> {
-        self.append(ConversationSource::Narsor, text.as_bytes())
+    pub fn append_narsor(&mut self, text: &str, elements: &[ChatElement]) -> Result<u64> {
+        self.append(ConversationSource::Narsor, text.as_bytes(), elements)
     }
 
     /// Flushes every entry written so far all the way to the device, and
@@ -281,7 +348,8 @@ impl ConversationStore {
     }
 
     /// Reads entries of `attempt_id` from `from_entry` (inclusive) onward, up
-    /// to `byte_budget` bytes of raw payload.
+    /// to `byte_budget` bytes of raw payload and serialized elements, so
+    /// elements never push a page past what its raw lines alone would.
     ///
     /// The first returned entry is always whole even if it alone exceeds the
     /// budget — a budget is a soft cap on the response, never a reason to
@@ -351,14 +419,16 @@ impl ConversationStore {
                     )
                 })?;
 
-            budget_used += raw.len();
-            next_entry = envelope.n + 1;
-            entries.push(ConversationEntry {
+            let entry = ConversationEntry {
                 entry_number: envelope.n,
                 timestamp: envelope.ts,
                 source: envelope.source,
                 raw,
-            });
+                elements: envelope.elements.into_owned(),
+            };
+            budget_used += entry.budget_cost();
+            next_entry = envelope.n + 1;
+            entries.push(entry);
         }
 
         let recorded_at = if closed {

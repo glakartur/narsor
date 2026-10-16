@@ -26,6 +26,7 @@ use narsor_engine::persistence::conversation::ConversationSource;
 use narsor_engine::persistence::{DefaultHarnessSelector, ExecutionStore, StatePaths};
 use narsor_engine::workflow::load_from_file;
 use narsor_protocol::api::HumanInputDeliveryDto;
+use narsor_protocol::chat::{ChatElement, TechnicalCategory, UnclassifiedReason};
 use narsor_server::api;
 use narsor_server::api::{ClientError, ExecutionSummary, StartTaskResponse};
 
@@ -166,10 +167,10 @@ fn seed_execution_with_retry(store: &ExecutionStore, execution_id: &str) {
     let conversations = store.conversation_store(execution_id);
     let mut first = conversations.writer("attempt-1").expect("open writer 1");
     first
-        .append_narsor("prompt: try the thing")
+        .append_narsor("prompt: try the thing", &[])
         .expect("append prompt 1");
     first
-        .append(ConversationSource::Stdout, br#"{"type":"error"}"#)
+        .append(ConversationSource::Stdout, br#"{"type":"error"}"#, &[])
         .expect("append stdout 1");
     first.finish().expect("finish writer 1");
     conversations
@@ -178,10 +179,10 @@ fn seed_execution_with_retry(store: &ExecutionStore, execution_id: &str) {
 
     let mut second = conversations.writer("attempt-2").expect("open writer 2");
     second
-        .append_narsor("prompt: try again")
+        .append_narsor("prompt: try again", &[])
         .expect("append prompt 2");
     second
-        .append(ConversationSource::Stdout, br#"{"type":"assistant"}"#)
+        .append(ConversationSource::Stdout, br#"{"type":"assistant"}"#, &[])
         .expect("append stdout 2");
     second.finish().expect("finish writer 2");
     conversations
@@ -523,9 +524,11 @@ async fn conversation_endpoint_cursor_returns_only_new_entries_for_a_running_att
     // into the server below.
     let conversations = store.conversation_store("exec-running");
     let mut writer = conversations.writer("attempt-live").expect("open writer");
-    writer.append_narsor("prompt: go").expect("append prompt");
     writer
-        .append(ConversationSource::Stdout, b"line one")
+        .append_narsor("prompt: go", &[])
+        .expect("append prompt");
+    writer
+        .append(ConversationSource::Stdout, b"line one", &[])
         .expect("append line one");
 
     let handle = start_server(store).await;
@@ -550,10 +553,10 @@ async fn conversation_endpoint_cursor_returns_only_new_entries_for_a_running_att
     // Simulate the still-running harness producing more output, then read
     // again from the cursor the first response handed back.
     writer
-        .append(ConversationSource::Stdout, b"line two")
+        .append(ConversationSource::Stdout, b"line two", &[])
         .expect("append line two");
     writer
-        .append_narsor("exit code: 0")
+        .append_narsor("exit code: 0", &[])
         .expect("append completion");
 
     let second = client
@@ -582,10 +585,10 @@ async fn conversation_endpoint_returns_a_single_oversized_entry_whole() {
     let mut writer = conversations.writer("attempt-big").expect("open writer");
     let huge = vec![b'x'; 4096];
     writer
-        .append(ConversationSource::Stdout, &huge)
+        .append(ConversationSource::Stdout, &huge, &[])
         .expect("append huge entry");
     writer
-        .append(ConversationSource::Stdout, b"small")
+        .append(ConversationSource::Stdout, b"small", &[])
         .expect("append small entry");
     writer.finish().expect("finish writer");
     conversations
@@ -614,6 +617,116 @@ async fn conversation_endpoint_returns_a_single_oversized_entry_whole() {
         }
         narsor::api::ConversationResponse::NoRecord => panic!("expected a record"),
     }
+}
+
+/// A record written before elements existed still reads, and every entry
+/// reaches the client with an element: stdout and narsor lines as
+/// not-recorded, stderr as what it is.
+#[tokio::test]
+async fn conversation_endpoint_gives_old_entries_a_stand_in_element() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let execution = sample_execution("exec-old", ExecutionStatus::Completed);
+    store.save_execution(&execution).expect("save execution");
+
+    let conversations = store.conversation_store("exec-old");
+    fs::create_dir_all(conversations.dir()).expect("create the directory");
+    fs::write(
+        conversations.dir().join("attempt-old.jsonl"),
+        concat!(
+            r#"{"n":1,"ts":"2026-01-02T03:04:05Z","source":"narsor","raw_b64":"cHJvbXB0"}"#,
+            "\n",
+            r#"{"n":2,"ts":"2026-01-02T03:04:06Z","source":"stdout","raw_b64":"e30="}"#,
+            "\n",
+            r#"{"n":3,"ts":"2026-01-02T03:04:07Z","source":"stderr","raw_b64":"b29wcw=="}"#,
+            "\n",
+        ),
+    )
+    .expect("write an old record");
+
+    let handle = start_server(store).await;
+    let response = handle
+        .client()
+        .conversation("exec-old", "attempt-old", 0, 1 << 20)
+        .await
+        .expect("conversation request");
+
+    let narsor::api::ConversationResponse::Recorded { entries, .. } = response else {
+        panic!("expected a record");
+    };
+    let not_recorded = vec![ChatElement::Unclassified {
+        reason: UnclassifiedReason::NotRecorded,
+    }];
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].elements, not_recorded);
+    assert_eq!(entries[1].elements, not_recorded);
+    assert_eq!(
+        entries[2].elements,
+        [ChatElement::Technical {
+            category: TechnicalCategory::Stderr,
+            summary: "oops".to_string(),
+            data: None,
+        }]
+    );
+}
+
+/// Elements reach the client as stored, and the page budget counts them:
+/// a page of tiny raw lines with bulky elements ends early, and its cursor
+/// continues at the next entry.
+#[tokio::test]
+async fn conversation_endpoint_pages_by_raw_bytes_and_elements() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let execution = sample_execution("exec-elements", ExecutionStatus::Completed);
+    store.save_execution(&execution).expect("save execution");
+
+    let bulky = |n: usize| {
+        vec![ChatElement::AgentText {
+            text: format!("{n}").repeat(300),
+        }]
+    };
+    let conversations = store.conversation_store("exec-elements");
+    let mut writer = conversations.writer("attempt-1").expect("open writer");
+    for n in 1..=3 {
+        writer
+            .append(ConversationSource::Stdout, b"{}", &bulky(n))
+            .expect("append");
+    }
+    writer.finish().expect("finish writer");
+
+    let handle = start_server(store).await;
+    let client = handle.client();
+
+    let page = |response: narsor::api::ConversationResponse| match response {
+        narsor::api::ConversationResponse::Recorded {
+            entries,
+            next_entry,
+            ..
+        } => (entries, next_entry),
+        narsor::api::ConversationResponse::NoRecord => panic!("expected a record"),
+    };
+    // 6 raw bytes in all, but over 900 bytes of elements.
+    let (first, next) = page(
+        client
+            .conversation("exec-elements", "attempt-1", 0, 400)
+            .await
+            .expect("first page"),
+    );
+    assert_eq!(first.len(), 2, "the budget is spent after two entries");
+    assert_eq!(first[0].elements, bulky(1));
+    assert_eq!(first[1].elements, bulky(2));
+    assert_eq!(next, 3);
+
+    let (rest, next) = page(
+        client
+            .conversation("exec-elements", "attempt-1", next, 400)
+            .await
+            .expect("second page"),
+    );
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].entry_number, 3);
+    assert_eq!(rest[0].elements, bulky(3));
+    assert_eq!(next, 4);
 }
 
 #[tokio::test]

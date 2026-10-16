@@ -1154,6 +1154,7 @@ mod tests {
             timestamp: Utc::now(),
             source,
             raw_base64: BASE64.encode(raw.as_bytes()),
+            elements: Vec::new(),
         }
     }
 
@@ -1359,6 +1360,7 @@ mod tests {
             timestamp: Utc::now(),
             source: ConversationEntrySource::Stdout,
             raw_base64: BASE64.encode(raw),
+            elements: Vec::new(),
         };
 
         let classified = classify(&entry);
@@ -1376,6 +1378,7 @@ mod tests {
             timestamp: Utc::now(),
             source: ConversationEntrySource::Stdout,
             raw_base64: BASE64.encode(raw),
+            elements: Vec::new(),
         };
 
         let classified = classify(&entry);
@@ -1397,6 +1400,7 @@ mod utterance_tests {
             timestamp: chrono::Utc::now(),
             source,
             raw_base64: BASE64.encode(raw.as_bytes()),
+            elements: Vec::new(),
         }))
     }
 
@@ -1427,6 +1431,7 @@ mod utterance_tests {
             timestamp: chrono::Utc::now(),
             source: ConversationEntrySource::Narsor,
             raw_base64: BASE64.encode(raw.as_bytes()),
+            elements: Vec::new(),
         }));
         assert_eq!(
             projected.rendered_lines,
@@ -1476,6 +1481,7 @@ mod utterance_tests {
                 timestamp: chrono::Utc::now(),
                 source: ConversationEntrySource::Stdout,
                 raw_base64: BASE64.encode(raw.as_bytes()),
+                elements: Vec::new(),
             }))
         };
         let mut transcript = TranscriptState::new(TranscriptId::from("t"));
@@ -1546,6 +1552,7 @@ mod utterance_tests {
             timestamp: chrono::Utc::now(),
             source: ConversationEntrySource::Stdout,
             raw_base64: BASE64.encode(raw.as_bytes()),
+            elements: Vec::new(),
         }));
         let mut transcript = TranscriptState::new(TranscriptId::from("t"));
         let id = projected.id.clone();
@@ -1562,6 +1569,7 @@ mod utterance_tests {
             timestamp: chrono::Utc::now(),
             source: ConversationEntrySource::Narsor,
             raw_base64: BASE64.encode(raw.as_bytes()),
+            elements: Vec::new(),
         });
         event.kind = EntryKind::System;
         event.details["message.content"] = Value::String("system text".into());
@@ -1591,6 +1599,7 @@ mod utterance_tests {
                 timestamp: chrono::Utc::now(),
                 source: ConversationEntrySource::Stdout,
                 raw_base64: BASE64.encode(raw.as_bytes()),
+                elements: Vec::new(),
             }))
         })
         .collect();

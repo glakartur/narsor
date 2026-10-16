@@ -308,7 +308,9 @@ states:
         for (attempt, lines) in [("act-2", 2), ("act-1", 3)] {
             let mut writer = conversations.writer(attempt).expect("writer");
             for line in 0..lines {
-                writer.append_narsor(&format!("line {line}")).expect("line");
+                writer
+                    .append_narsor(&format!("line {line}"), &[])
+                    .expect("line");
             }
             writer.finish().expect("finish");
         }
