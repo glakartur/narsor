@@ -39,14 +39,16 @@
 //! `acceptEdits` for read-write work and `plan` for read-only work. This keeps
 //! the workflow contract portable instead of exposing Claude-specific modes.
 
+mod classify;
+mod tools;
+
 use std::path::Path;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::{
-    integer_parameter, not_classified, reject_option_like, resolve_read_only_path,
-    string_parameter, tail, HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun,
-    HarnessStreamParser,
+    integer_parameter, reject_option_like, resolve_read_only_path, string_parameter, tail,
+    HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
@@ -166,16 +168,22 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     }
 }
 
-/// Accumulates the `stream-json` lines of one run into a [`HarnessRun`].
+/// Reads the `stream-json` lines of one run, live, line by line.
 ///
-/// Tracks lines by their `type`: a `system`/`init` line may carry the session
-/// id before anything else does, and the `result` line — the last line a
-/// well-behaved run ever prints — carries the final text (or `errors`), the
-/// authoritative session id, and whether the harness itself calls the run a
-/// failure. Every other line (`assistant`, `user`, `rate_limit_event`, …) is
-/// only ever written to the conversation file; this parser has no use for it.
+/// Each line is parsed once and used twice:
+///
+/// * It is classified into chat elements ([`classify`]): every `assistant`,
+///   `user`, `system`, `rate_limit_event` and `result` line becomes
+///   conversation elements, with tool results tied to their calls.
+/// * It is accumulated into a [`HarnessRun`]: a `system`/`init` line may
+///   carry the session id before anything else does, and the `result` line
+///   — the last line a well-behaved run ever prints — carries the final text
+///   (or `errors`), the authoritative session id, and whether the harness
+///   itself calls the run a failure.
 #[derive(Debug, Default)]
 struct ClaudeCodeStreamParser {
+    /// Turns lines into chat elements; remembers tool calls by id.
+    classifier: classify::Classifier,
     /// The earliest session id seen, from `system`/`init` or `result`.
     session_id: Option<String>,
     /// Whether a `result` line was ever seen — its absence is itself a
@@ -190,19 +198,10 @@ struct ClaudeCodeStreamParser {
 }
 
 impl ClaudeCodeStreamParser {
-    /// Folds one stdout line into what [`HarnessStreamParser::finish`]
-    /// needs; lines that carry none of it are ignored.
-    fn accumulate(&mut self, line: &[u8]) {
-        let Ok(text) = std::str::from_utf8(line) else {
-            return;
-        };
-        let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
-            return;
-        };
-        let Some(object) = value.as_object() else {
-            return;
-        };
-
+    /// Folds one parsed stdout line into what
+    /// [`HarnessStreamParser::finish`] needs; lines that carry none of it
+    /// are ignored.
+    fn accumulate(&mut self, object: &Map<String, Value>) {
         let line_type = object.get("type").and_then(Value::as_str).unwrap_or("");
 
         if line_type == "system" {
@@ -259,11 +258,12 @@ impl ClaudeCodeStreamParser {
 }
 
 impl HarnessStreamParser for ClaudeCodeStreamParser {
-    /// Every line is unclassified for now; U4 brings the Claude Code
-    /// classification.
     fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement> {
-        self.accumulate(line);
-        not_classified()
+        let Some(object) = parse_object(line) else {
+            return classify::invalid_json();
+        };
+        self.accumulate(&object);
+        self.classifier.classify(&object)
     }
 
     fn finish(self: Box<Self>, exit_code: i32, stderr_tail: &str) -> HarnessRun {
@@ -296,11 +296,23 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
     }
 }
 
+/// A stdout line as a JSON object; `None` when it is not UTF-8, not JSON,
+/// or not an object.
+fn parse_object(line: &[u8]) -> Option<Map<String, Value>> {
+    let text = std::str::from_utf8(line).ok()?;
+    match serde_json::from_str::<Value>(text.trim()).ok()? {
+        Value::Object(object) => Some(object),
+        _ => None,
+    }
+}
+
 /// One element of a `result` line's `errors` array, as readable text.
+/// Claude Code 2.1.302 sends plain strings; older versions sent objects
+/// with a `message`.
 fn error_message(error: &Value) -> String {
     error
-        .get("message")
-        .and_then(Value::as_str)
+        .as_str()
+        .or_else(|| error.get("message").and_then(Value::as_str))
         .map(str::to_string)
         .unwrap_or_else(|| error.to_string())
 }
