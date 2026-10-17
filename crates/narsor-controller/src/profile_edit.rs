@@ -245,19 +245,40 @@ fn review_warnings(path: &str, old: Option<&[u8]>, new: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// `text` with every control character (but tab) escaped, so that content
-/// from the session cannot move the cursor, rewrite earlier lines or hide
-/// itself in the user's terminal.
+/// `text` with every control character (but tab) and every invisible or
+/// direction-changing format character escaped, so that content from the
+/// session cannot move the cursor, rewrite earlier lines, reorder what is
+/// shown or hide itself in the user's terminal.
 pub fn printable(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if c.is_control() && c != '\t' {
-                c.escape_default().to_string()
+            if (c.is_control() && c != '\t') || is_invisible_format(c) {
+                c.escape_unicode().to_string()
             } else {
                 c.to_string()
             }
         })
         .collect()
+}
+
+/// Format characters that change how text around them is shown without
+/// being visible themselves: soft hyphen, zero-width and joiner characters,
+/// bidirectional marks, embeddings, overrides and isolates, line and
+/// paragraph separators, invisible operators, the byte order mark, the
+/// interlinear annotation marks and the tag characters.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
 }
 
 /// A plain line diff: `-` for removed lines, `+` for added ones, common
@@ -531,6 +552,10 @@ mod tests {
         assert!(!diff.contains('\x1b') && !diff.contains('\r'), "{diff:?}");
         assert!(diff.contains("\\u{1b}[2K"), "{diff:?}");
         assert_eq!(printable("a\tb\u{9b}c"), "a\tb\\u{9b}c");
+        assert_eq!(
+            printable("allow\u{202E}yned\u{200B}x\u{2066}é"),
+            "allow\\u{202e}yned\\u{200b}x\\u{2066}é"
+        );
     }
 
     #[test]
