@@ -246,6 +246,9 @@ pub enum UnclassifiedReason {
     /// The entry was recorded before Narsor stored elements with it, so
     /// only its raw line exists.
     NotRecorded,
+    /// The element was recorded, but this build cannot read it back: a
+    /// field is missing or has another type, or it is nested too deeply.
+    Unreadable,
     #[serde(other)]
     Unrecognized,
 }
@@ -260,6 +263,7 @@ impl UnclassifiedReason {
             Self::HarnessNotClassified => "harness output not classified",
             Self::UnknownBlock => "unknown content block",
             Self::NotRecorded => "recorded without elements",
+            Self::Unreadable => "recorded element not readable",
             Self::Unrecognized => "unrecognized reason",
         }
     }
@@ -735,6 +739,20 @@ mod tests {
             }
         );
         assert_eq!(legacy.summary(), "recorded without elements");
+
+        let unreadable: ChatElement =
+            serde_json::from_str(r#"{"kind":"unclassified","reason":"unreadable"}"#).unwrap();
+        assert_eq!(
+            unreadable,
+            ChatElement::Unclassified {
+                reason: UnclassifiedReason::Unreadable
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&unreadable).unwrap(),
+            r#"{"kind":"unclassified","reason":"unreadable"}"#
+        );
+        assert_eq!(unreadable.summary(), "recorded element not readable");
     }
 
     #[test]

@@ -49,6 +49,9 @@
 //! in the same envelope as the raw line, so the cursor, the paging and the
 //! attempt summaries (entry counts) stay exactly what they were. An entry
 //! written before elements existed simply has none; nothing is migrated.
+//! An element this build cannot read back is replaced by an
+//! [`UnclassifiedReason::Unreadable`] element, alone: the raw line and the
+//! entry's other elements still read.
 
 use super::atomic::{ensure_dir, sync_parent_dir, write_and_sync};
 use super::paths::{parse_conversation_jsonl_name, unique_temp_path_for, StatePaths};
@@ -56,9 +59,9 @@ use super::{PersistenceError, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
-use narsor_protocol::chat::ChatElement;
+use narsor_protocol::chat::{ChatElement, UnclassifiedReason};
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
+use serde_json::value::RawValue;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -78,9 +81,9 @@ pub enum ConversationSource {
 /// The on-disk shape of one line: a fixed envelope plus a base64 payload.
 ///
 /// Private and deliberately minimal — anything a reader needs beyond this is
-/// derived, not stored. Borrows its elements when written and owns them
-/// when read.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// derived, not stored. Only written: a reader decodes the same line as a
+/// [`StoredEnvelope`], which leaves each element undecoded.
+#[derive(Debug, Clone, Serialize)]
 struct Envelope<'a> {
     /// Sequential entry number, starting at 1, unique within one attempt.
     n: u64,
@@ -90,10 +93,28 @@ struct Envelope<'a> {
     source: ConversationSource,
     /// Base64 of the raw bytes — see the module doc for why.
     raw_b64: String,
-    /// What the line means. Absent in records written before elements
-    /// existed, and omitted when there are none.
-    #[serde(default, skip_serializing_if = "no_elements")]
-    elements: Cow<'a, [ChatElement]>,
+    /// What the line means. Omitted when there are none.
+    #[serde(skip_serializing_if = "<[ChatElement]>::is_empty")]
+    elements: &'a [ChatElement],
+}
+
+/// An [`Envelope`] as read back, with every element still raw JSON.
+///
+/// Each element is decoded on its own, so one this build cannot read — a
+/// field missing or of another type, or a value nested deeper than
+/// `serde_json`'s recursion limit — becomes one
+/// [`UnclassifiedReason::Unreadable`] element instead of failing the whole
+/// conversation. Skipping over the raw JSON has no recursion limit, and an
+/// element decoded on its own does not pay for the envelope's nesting.
+#[derive(Debug, Deserialize)]
+struct StoredEnvelope<'a> {
+    n: u64,
+    ts: DateTime<Utc>,
+    source: ConversationSource,
+    raw_b64: String,
+    /// Absent in records written before elements existed.
+    #[serde(default, borrow)]
+    elements: Vec<&'a RawValue>,
 }
 
 /// The first fields of an [`Envelope`], read without decoding the rest:
@@ -104,9 +125,11 @@ struct EnvelopeHeader {
     ts: DateTime<Utc>,
 }
 
-/// Whether an envelope has no elements to write.
-fn no_elements(elements: &[ChatElement]) -> bool {
-    elements.is_empty()
+/// Decodes one stored element, or stands in for it when it cannot be read.
+fn decode_element(element: &RawValue) -> ChatElement {
+    serde_json::from_str(element.get()).unwrap_or(ChatElement::Unclassified {
+        reason: UnclassifiedReason::Unreadable,
+    })
 }
 
 /// One decoded entry of a conversation.
@@ -207,7 +230,7 @@ impl ConversationWriter {
             ts: Utc::now(),
             source,
             raw_b64: BASE64.encode(raw),
-            elements: Cow::Borrowed(elements),
+            elements,
         };
         let mut bytes =
             serde_json::to_vec(&envelope).map_err(|source| PersistenceError::Serialize {
@@ -380,7 +403,8 @@ impl ConversationStore {
                 break;
             }
 
-            let envelope: Envelope = serde_json::from_slice(line).map_err(deserialize_error)?;
+            let envelope: StoredEnvelope =
+                serde_json::from_slice(line).map_err(deserialize_error)?;
             let raw = BASE64
                 .decode(envelope.raw_b64.as_bytes())
                 .map_err(|error| {
@@ -398,7 +422,7 @@ impl ConversationStore {
                 timestamp: envelope.ts,
                 source: envelope.source,
                 raw,
-                elements: envelope.elements.into_owned(),
+                elements: envelope.elements.into_iter().map(decode_element).collect(),
             });
             budget_used += line.len();
             next_entry = envelope.n + 1;

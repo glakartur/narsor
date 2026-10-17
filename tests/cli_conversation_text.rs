@@ -10,7 +10,7 @@ use serde_json::json;
 use narsor::cli::commands::conversation_entry_lines;
 use narsor::tui::conversation::classify;
 use narsor_protocol::api::{ConversationEntryDto, ConversationEntrySource};
-use narsor_protocol::chat::{ChatElement, PromptPurpose, ToolResultStatus};
+use narsor_protocol::chat::{ChatElement, PromptPurpose, ToolResultStatus, UnclassifiedReason};
 
 fn entry(
     source: ConversationEntrySource,
@@ -88,6 +88,48 @@ fn an_unrecognized_element_prints_as_unclassified() {
 
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("unclassified"), "{}", lines[0]);
+}
+
+#[test]
+fn an_unclassified_harness_line_prints_its_reason_and_its_content() {
+    let raw = br#"{"type":"text","part":{"text":"opencode says hi"}}"#;
+    let lines = conversation_entry_lines(&entry(
+        ConversationEntrySource::Stdout,
+        raw,
+        vec![ChatElement::Unclassified {
+            reason: UnclassifiedReason::HarnessNotClassified,
+        }],
+    ));
+
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].ends_with(&format!(
+            "harness output not classified: {}",
+            std::str::from_utf8(raw).unwrap()
+        )),
+        "{}",
+        lines[0]
+    );
+}
+
+#[test]
+fn a_long_unclassified_line_is_cut_and_stays_one_line() {
+    let raw = format!("start\n\x1b[31m{}end", "x".repeat(10_000));
+    let lines = conversation_entry_lines(&entry(
+        ConversationEntrySource::Stderr,
+        raw.as_bytes(),
+        vec![ChatElement::Unclassified {
+            reason: UnclassifiedReason::InvalidJson,
+        }],
+    ));
+
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert!(line.contains("not valid JSON: start "), "{line}");
+    assert!(!line.contains('\n') && !line.contains('\u{1b}'), "{line}");
+    assert!(line.ends_with('…'), "{line}");
+    assert!(!line.contains("end"), "{line}");
+    assert!(line.len() < 4 * 1024 + 200, "{} bytes", line.len());
 }
 
 #[test]

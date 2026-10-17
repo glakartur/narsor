@@ -29,8 +29,9 @@ use crate::api::{
     ExecutionStatusDto, ExecutionSummary, HumanInputDeliveryDto, ProblemKindDto,
 };
 use crate::domain::{without_unsafe_chars, Event, ExecutionStatus};
-use crate::tui::conversation::classify;
+use crate::tui::conversation::{classify, unclassified_preview};
 use narsor_protocol::api::{ConversationState, Position, PositionStatus};
+use narsor_protocol::chat::ChatElement;
 use narsor_protocol::controller::{WorkflowInputType, WorkflowInputView, WorkflowSource};
 
 use crate::config::{render_value, Flags, Resolved, SettingKey, Source};
@@ -593,7 +594,10 @@ fn print_conversation_entry(entry: &crate::api::ConversationEntryDto) {
 /// element summary — so the CLI and the TUI ([`classify`]) agree on both the
 /// label and the text. An entry narsor wrote itself (the prompt, the process
 /// outcome) is printed once, as its decoded text, as it always was: that text
-/// is narsor's own and needs no summary.
+/// is narsor's own and needs no summary. An unclassified element (an
+/// opencode or codex line, a legacy record) says why, followed by the start
+/// of its raw line on the same line — the summary alone would hide what the
+/// harness printed.
 pub fn conversation_entry_lines(entry: &crate::api::ConversationEntryDto) -> Vec<String> {
     let narsor = matches!(entry.source, crate::api::ConversationEntrySource::Narsor);
     classify(entry)
@@ -601,16 +605,25 @@ pub fn conversation_entry_lines(entry: &crate::api::ConversationEntryDto) -> Vec
         .filter(|classified| !narsor || classified.element_index == 0)
         .map(|classified| {
             let body = if narsor {
-                String::from_utf8_lossy(&classified.raw).into_owned()
+                crate::tui::scroll::sanitize(&String::from_utf8_lossy(&classified.raw))
+            } else if matches!(
+                classified.element,
+                ChatElement::Unclassified { .. } | ChatElement::Unrecognized
+            ) {
+                let (preview, cut) = unclassified_preview(&classified.raw);
+                let ellipsis = if cut { "…" } else { "" };
+                crate::tui::scroll::one_line(&format!(
+                    "{}: {preview}{ellipsis}",
+                    classified.summary
+                ))
             } else {
-                classified.summary
+                crate::tui::scroll::sanitize(&classified.summary)
             };
             format!(
-                "{:>5}  {}  {:<10} {}",
+                "{:>5}  {}  {:<10} {body}",
                 classified.entry_number,
                 classified.timestamp.to_rfc3339(),
                 classified.kind.label(),
-                crate::tui::scroll::sanitize(&body)
             )
         })
         .collect()

@@ -243,6 +243,121 @@ fn an_envelope_written_before_elements_existed_reads_with_none() {
 }
 
 #[test]
+fn an_element_that_cannot_be_read_back_stands_alone_as_unreadable() {
+    let root = TempRoot::new();
+    let conversations = root.store().conversation_store("exec-1");
+    fs::create_dir_all(conversations.dir()).expect("create the directory");
+    // Entry 2 holds a known kind without its required field, and one whose
+    // field has another type, between two elements that read fine.
+    fs::write(
+        conversations.dir().join("attempt-1.jsonl"),
+        concat!(
+            r#"{"n":1,"ts":"2026-01-02T03:04:05Z","source":"narsor","raw_b64":"cHJvbXB0","elements":[{"kind":"agent_text","text":"first"}]}"#,
+            "\n",
+            r#"{"n":2,"ts":"2026-01-02T03:04:06Z","source":"stdout","raw_b64":"e30=","elements":[{"kind":"agent_text","text":"before"},{"kind":"agent_text"},{"kind":"run_result","turns":"many"},{"kind":"agent_text","text":"after"}]}"#,
+            "\n",
+            r#"{"n":3,"ts":"2026-01-02T03:04:07Z","source":"stdout","raw_b64":"bGFzdA==","elements":[{"kind":"agent_text","text":"last"}]}"#,
+            "\n",
+        ),
+    )
+    .expect("write a record");
+
+    let snapshot = conversations
+        .read("attempt-1", 1, usize::MAX)
+        .expect("one unreadable element is not an error")
+        .expect("a record");
+
+    let text = |text: &str| ChatElement::AgentText {
+        text: text.to_string(),
+    };
+    let unreadable = ChatElement::Unclassified {
+        reason: UnclassifiedReason::Unreadable,
+    };
+    assert_eq!(snapshot.entries.len(), 3);
+    assert_eq!(snapshot.entries[0].elements, vec![text("first")]);
+    assert_eq!(snapshot.entries[1].raw, b"{}");
+    assert_eq!(snapshot.entries[1].source, ConversationSource::Stdout);
+    assert_eq!(
+        snapshot.entries[1].elements,
+        vec![
+            text("before"),
+            unreadable.clone(),
+            unreadable,
+            text("after")
+        ]
+    );
+    assert_eq!(snapshot.entries[2].raw, b"last");
+    assert_eq!(snapshot.entries[2].elements, vec![text("last")]);
+    assert_eq!(snapshot.next_entry, 4);
+}
+
+#[test]
+fn a_structured_output_nested_past_the_parse_limit_is_stored_and_reads() {
+    let root = TempRoot::new();
+    let conversations = root.store().conversation_store("exec-1");
+
+    // serde_json refuses to parse more than 128 levels; writing has no
+    // such limit, so the element is stored and only reading it back fails.
+    let mut deep = serde_json::json!("bottom");
+    for _ in 0..200 {
+        deep = serde_json::json!([deep]);
+    }
+    let elements = vec![
+        ChatElement::AgentText {
+            text: "done".to_string(),
+        },
+        ChatElement::RunResult {
+            text: None,
+            structured_output: Some(deep),
+            stop_reason: None,
+            is_error: false,
+            cost_usd: None,
+            usage: None,
+            turns: None,
+            duration_ms: None,
+        },
+    ];
+    let raw: &[u8] = b"{\"type\":\"result\"}";
+
+    let mut writer = conversations.writer("attempt-1").expect("open writer");
+    writer
+        .append(ConversationSource::Stdout, raw, &elements)
+        .expect("a deep element is written");
+    writer
+        .append(ConversationSource::Stdout, b"next", &[])
+        .expect("append next");
+    writer.finish().expect("finish writer");
+
+    let open = conversations
+        .read("attempt-1", 1, usize::MAX)
+        .expect("a deep element is not an error")
+        .expect("a record");
+    conversations
+        .close_attempt("attempt-1")
+        .expect("close attempt");
+    let closed = conversations
+        .read("attempt-1", 1, usize::MAX)
+        .expect("a deep element is not an error once closed")
+        .expect("a record");
+
+    for snapshot in [open, closed] {
+        assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(snapshot.entries[0].raw, raw, "byte for byte");
+        assert_eq!(
+            snapshot.entries[0].elements,
+            vec![
+                elements[0].clone(),
+                ChatElement::Unclassified {
+                    reason: UnclassifiedReason::Unreadable,
+                },
+            ]
+        );
+        assert_eq!(snapshot.entries[1].raw, b"next");
+        assert_eq!(snapshot.next_entry, 3);
+    }
+}
+
+#[test]
 fn the_byte_budget_counts_the_elements_too() {
     let root = TempRoot::new();
     let conversations = root.store().conversation_store("exec-1");

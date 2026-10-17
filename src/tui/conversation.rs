@@ -14,6 +14,7 @@
 //! Short text comes from [`ChatElement::summary`] and labels from
 //! [`ChatCategory::label`], so the CLI can print the same words.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -38,6 +39,14 @@ const SPEECH_PREVIEW_LINES: usize = 5;
 /// How much of an unclassified line its expanded card shows. Such a line
 /// can be many MiB; raw mode shows it in full.
 const UNCLASSIFIED_PREVIEW_BYTES: usize = 4 * 1024;
+
+/// The start of an unclassified line, decoded for display, and whether it
+/// was cut: at most [`UNCLASSIFIED_PREVIEW_BYTES`] of it, since such a line
+/// can be many MiB. Not sanitized; the caller does that for its medium.
+pub fn unclassified_preview(raw: &[u8]) -> (Cow<'_, str>, bool) {
+    let preview = &raw[..raw.len().min(UNCLASSIFIED_PREVIEW_BYTES)];
+    (String::from_utf8_lossy(preview), preview.len() < raw.len())
+}
 
 /// Closes a detail preview that does not show everything.
 const PREVIEW_CUT_NOTE: &str = "(podgląd skrócony, pełna treść w widoku raw)";
@@ -325,9 +334,9 @@ impl Content {
                 Self::summary(event, json_block("data", data.as_ref()))
             }
             ChatElement::Unclassified { .. } | ChatElement::Unrecognized => {
-                let preview = &event.raw[..event.raw.len().min(UNCLASSIFIED_PREVIEW_BYTES)];
-                let mut details = text_lines(&String::from_utf8_lossy(preview));
-                if preview.len() < event.raw.len() {
+                let (preview, cut) = unclassified_preview(&event.raw);
+                let mut details = text_lines(&preview);
+                if cut {
                     details.push(PREVIEW_CUT_NOTE.to_owned());
                 }
                 Self::summary(event, details)
