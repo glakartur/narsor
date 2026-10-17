@@ -40,6 +40,18 @@
 //! either way; whether it is reported as `truncated_tail` follows the bytes
 //! actually on disk, open or closed alike, because compression preserves
 //! whatever was there, truncation included.
+//!
+//! # Elements next to the raw line
+//!
+//! Every entry also carries the [`ChatElement`]s that say what the line
+//! means, harness-independent: the stream parser's for a stdout line, the
+//! executor's own for the prompt, stderr and the process outcome. They live
+//! in the same envelope as the raw line, so the cursor, the paging and the
+//! attempt summaries (entry counts) stay exactly what they were. An entry
+//! written before elements existed simply has none; nothing is migrated.
+//! An element this build cannot read back is replaced by an
+//! [`UnclassifiedReason::Unreadable`] element, alone: the raw line and the
+//! entry's other elements still read.
 
 use super::atomic::{ensure_dir, sync_parent_dir, write_and_sync};
 use super::paths::{parse_conversation_jsonl_name, unique_temp_path_for, StatePaths};
@@ -47,7 +59,9 @@ use super::{PersistenceError, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
+use narsor_protocol::chat::{ChatElement, UnclassifiedReason};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -67,9 +81,10 @@ pub enum ConversationSource {
 /// The on-disk shape of one line: a fixed envelope plus a base64 payload.
 ///
 /// Private and deliberately minimal — anything a reader needs beyond this is
-/// derived, not stored.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Envelope {
+/// derived, not stored. Only written: a reader decodes the same line as a
+/// [`StoredEnvelope`], which leaves each element undecoded.
+#[derive(Debug, Clone, Serialize)]
+struct Envelope<'a> {
     /// Sequential entry number, starting at 1, unique within one attempt.
     n: u64,
     /// When narsor observed (or produced) this line.
@@ -78,10 +93,47 @@ struct Envelope {
     source: ConversationSource,
     /// Base64 of the raw bytes — see the module doc for why.
     raw_b64: String,
+    /// What the line means. Omitted when there are none.
+    #[serde(skip_serializing_if = "<[ChatElement]>::is_empty")]
+    elements: &'a [ChatElement],
+}
+
+/// An [`Envelope`] as read back, with every element still raw JSON.
+///
+/// Each element is decoded on its own, so one this build cannot read — a
+/// field missing or of another type, or a value nested deeper than
+/// `serde_json`'s recursion limit — becomes one
+/// [`UnclassifiedReason::Unreadable`] element instead of failing the whole
+/// conversation. Skipping over the raw JSON has no recursion limit, and an
+/// element decoded on its own does not pay for the envelope's nesting.
+#[derive(Debug, Deserialize)]
+struct StoredEnvelope<'a> {
+    n: u64,
+    ts: DateTime<Utc>,
+    source: ConversationSource,
+    raw_b64: String,
+    /// Absent in records written before elements existed.
+    #[serde(default, borrow)]
+    elements: Vec<&'a RawValue>,
+}
+
+/// The first fields of an [`Envelope`], read without decoding the rest:
+/// enough to skip an entry before the cursor, or to date the last one.
+#[derive(Debug, Deserialize)]
+struct EnvelopeHeader {
+    n: u64,
+    ts: DateTime<Utc>,
+}
+
+/// Decodes one stored element, or stands in for it when it cannot be read.
+fn decode_element(element: &RawValue) -> ChatElement {
+    serde_json::from_str(element.get()).unwrap_or(ChatElement::Unclassified {
+        reason: UnclassifiedReason::Unreadable,
+    })
 }
 
 /// One decoded entry of a conversation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConversationEntry {
     /// Sequential entry number, starting at 1.
     pub entry_number: u64,
@@ -92,10 +144,13 @@ pub struct ConversationEntry {
     /// The raw harness line, exactly as received — preserved byte for byte,
     /// even when it is not valid JSON or not valid UTF-8.
     pub raw: Vec<u8>,
+    /// What the line means, as recorded with it. Empty for an entry written
+    /// before elements existed.
+    pub elements: Vec<ChatElement>,
 }
 
 /// The result of reading a conversation from a given cursor.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ConversationSnapshot {
     /// Entries from the requested cursor onward, in order.
     pub entries: Vec<ConversationEntry>,
@@ -161,14 +216,21 @@ impl ConversationWriter {
         &self.path
     }
 
-    /// Appends one entry and returns the entry number it was written as.
-    pub fn append(&mut self, source: ConversationSource, raw: &[u8]) -> Result<u64> {
+    /// Appends one entry — the raw line byte for byte and the elements that
+    /// say what it means — and returns the entry number it was written as.
+    pub fn append(
+        &mut self,
+        source: ConversationSource,
+        raw: &[u8],
+        elements: &[ChatElement],
+    ) -> Result<u64> {
         let entry_number = self.next_entry;
         let envelope = Envelope {
             n: entry_number,
             ts: Utc::now(),
             source,
             raw_b64: BASE64.encode(raw),
+            elements,
         };
         let mut bytes =
             serde_json::to_vec(&envelope).map_err(|source| PersistenceError::Serialize {
@@ -185,8 +247,8 @@ impl ConversationWriter {
 
     /// Convenience for [`ConversationSource::Narsor`] entries: the sent
     /// prompt, or the attempt's outcome.
-    pub fn append_narsor(&mut self, text: &str) -> Result<u64> {
-        self.append(ConversationSource::Narsor, text.as_bytes())
+    pub fn append_narsor(&mut self, text: &str, elements: &[ChatElement]) -> Result<u64> {
+        self.append(ConversationSource::Narsor, text.as_bytes(), elements)
     }
 
     /// Flushes every entry written so far all the way to the device, and
@@ -281,7 +343,9 @@ impl ConversationStore {
     }
 
     /// Reads entries of `attempt_id` from `from_entry` (inclusive) onward, up
-    /// to `byte_budget` bytes of raw payload.
+    /// to `byte_budget` bytes of stored lines — each one's raw payload and
+    /// elements, as they are on disk — so elements count against a page as
+    /// much as raw lines do.
     ///
     /// The first returned entry is always whole even if it alone exceeds the
     /// budget — a budget is a soft cap on the response, never a reason to
@@ -317,28 +381,30 @@ impl ConversationStore {
         let source_path = if closed { &zst_path } else { &jsonl_path };
         let (lines, trailing) = split_lines(&bytes);
         let truncated_tail = trailing.is_some();
+        let deserialize_error = |source| PersistenceError::Deserialize {
+            path: source_path.clone(),
+            source,
+        };
         let last_entry_at = lines
             .last()
-            .and_then(|line| serde_json::from_slice::<Envelope>(line).ok())
-            .map(|envelope| envelope.ts);
+            .and_then(|line| serde_json::from_slice::<EnvelopeHeader>(line).ok())
+            .map(|header| header.ts);
 
         let mut entries = Vec::new();
         let mut budget_used = 0usize;
         let mut next_entry = from_entry;
 
         for line in lines {
-            let envelope: Envelope =
-                serde_json::from_slice(line).map_err(|source| PersistenceError::Deserialize {
-                    path: source_path.clone(),
-                    source,
-                })?;
-            if envelope.n < from_entry {
+            let header: EnvelopeHeader = serde_json::from_slice(line).map_err(deserialize_error)?;
+            if header.n < from_entry {
                 continue;
             }
             if !entries.is_empty() && budget_used >= byte_budget {
                 break;
             }
 
+            let envelope: StoredEnvelope =
+                serde_json::from_slice(line).map_err(deserialize_error)?;
             let raw = BASE64
                 .decode(envelope.raw_b64.as_bytes())
                 .map_err(|error| {
@@ -351,14 +417,15 @@ impl ConversationStore {
                     )
                 })?;
 
-            budget_used += raw.len();
-            next_entry = envelope.n + 1;
             entries.push(ConversationEntry {
                 entry_number: envelope.n,
                 timestamp: envelope.ts,
                 source: envelope.source,
                 raw,
+                elements: envelope.elements.into_iter().map(decode_element).collect(),
             });
+            budget_used += line.len();
+            next_entry = envelope.n + 1;
         }
 
         let recorded_at = if closed {

@@ -1,12 +1,13 @@
 //! The `claude-code` harness — Anthropic's `claude` CLI.
 //!
-//! Measured against `claude` 2.1.283. The invocation is always the
+//! Measured against `claude` 2.1.302. The invocation is always the
 //! non-interactive one:
 //!
 //! ```text
 //! claude --print --output-format stream-json --verbose \
 //!        [--add-dir <read_only_paths…>] [--model <model>] [--max-turns <n>] \
-//!        [--resume <session-id>] [--allow-dangerously-skip-permissions] \
+//!        [--append-system-prompt <text>] [--resume <session-id>] \
+//!        [--json-schema <schema>] \
 //!        --permission-mode <mode> \
 //!        <prompt>
 //! ```
@@ -24,6 +25,16 @@
 //!   *whole* stream captured, byte for byte, as it happens (U3). `--verbose`
 //!   is required by the CLI for `stream-json` under `--print`; without it the
 //!   command refuses to start.
+//! * `--json-schema <schema>` carries the output contract as a JSON Schema,
+//!   one compact argument that starts with `{`, so it can never be read as a
+//!   flag. The CLI gives the model a `StructuredOutput` tool with that input
+//!   schema, rejects a call that does not match it and lets the model try
+//!   again, and reports the accepted object as `structured_output` on the
+//!   `result` line — also after `--resume` and in `plan` mode. The API
+//!   refuses `anyOf`/`oneOf`/`allOf` at the top level of the schema and
+//!   requires `"type": "object"` there, so the schema is one flat object
+//!   (see [`crate::engine::actions::agent::output_schema`]). The text contract stays in
+//!   the prompt: the schema adds to it, and narsor checks the answer itself.
 //! * `--permission-mode` is **last** before the prompt on purpose. It takes
 //!   exactly one value, so the prompt after it can never be mistaken for a flag
 //!   argument — unlike `--add-dir`, which is variadic and would swallow the
@@ -39,9 +50,12 @@
 //! `acceptEdits` for read-write work and `plan` for read-only work. This keeps
 //! the workflow contract portable instead of exposing Claude-specific modes.
 
+mod classify;
+mod tools;
+
 use std::path::Path;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::{
     integer_parameter, reject_option_like, resolve_read_only_path, string_parameter, tail,
@@ -49,6 +63,7 @@ use super::{
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
+use narsor_protocol::chat::ChatElement;
 
 /// The `harness:` value this adapter answers to.
 pub const CLAUDE_CODE: &str = "claude-code";
@@ -148,6 +163,13 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             args.push(session.to_string());
         }
 
+        if let Some(schema) = request.output_schema {
+            let schema = schema.to_string();
+            reject_option_like(&schema, "output_schema", CLAUDE_CODE)?;
+            args.push("--json-schema".to_string());
+            args.push(schema);
+        }
+
         args.push("--permission-mode".to_string());
         args.push(mode.to_string());
 
@@ -164,16 +186,23 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     }
 }
 
-/// Accumulates the `stream-json` lines of one run into a [`HarnessRun`].
+/// Reads the `stream-json` lines of one run, live, line by line.
 ///
-/// Tracks lines by their `type`: a `system`/`init` line may carry the session
-/// id before anything else does, and the `result` line — the last line a
-/// well-behaved run ever prints — carries the final text (or `errors`), the
-/// authoritative session id, and whether the harness itself calls the run a
-/// failure. Every other line (`assistant`, `user`, `rate_limit_event`, …) is
-/// only ever written to the conversation file; this parser has no use for it.
+/// Each line is parsed once and used twice:
+///
+/// * It is classified into chat elements ([`classify`]): every `assistant`,
+///   `user`, `system`, `rate_limit_event` and `result` line becomes
+///   conversation elements, with tool results tied to their calls.
+/// * It is accumulated into a [`HarnessRun`]: a `system`/`init` line may
+///   carry the session id before anything else does, and the `result` line
+///   — the last line a well-behaved run ever prints — carries the final text
+///   (or `errors`), the `structured_output` when a schema was passed, the
+///   authoritative session id, and whether the harness itself calls the run
+///   a failure.
 #[derive(Debug, Default)]
 struct ClaudeCodeStreamParser {
+    /// Turns lines into chat elements; remembers tool calls by id.
+    classifier: classify::Classifier,
     /// The earliest session id seen, from `system`/`init` or `result`.
     session_id: Option<String>,
     /// Whether a `result` line was ever seen — its absence is itself a
@@ -185,72 +214,51 @@ struct ClaudeCodeStreamParser {
     reported_error: bool,
     /// The `result` line's `subtype`, for the failure message.
     subtype: Option<String>,
+    /// The `result` line's `structured_output`, when it carried one.
+    structured_output: Option<Value>,
+}
+
+impl ClaudeCodeStreamParser {
+    /// Folds one parsed stdout line into what
+    /// [`HarnessStreamParser::finish`] needs; lines that carry none of it
+    /// are ignored. `result` is what [`classify::ResultLine::take`] read
+    /// from a `result` line.
+    fn accumulate(&mut self, object: &Map<String, Value>, result: Option<&classify::ResultLine>) {
+        let session_id = || {
+            object
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+
+        let Some(result) = result else {
+            if self.session_id.is_none()
+                && object.get("type").and_then(Value::as_str) == Some("system")
+            {
+                self.session_id = session_id();
+            }
+            return;
+        };
+
+        self.saw_result = true;
+        if let Some(session_id) = session_id() {
+            self.session_id = Some(session_id);
+        }
+        self.subtype = result.subtype.clone();
+        self.reported_error = result.is_error;
+        self.structured_output = result.structured_output.clone();
+        self.result_text = result.text.clone().unwrap_or_default();
+    }
 }
 
 impl HarnessStreamParser for ClaudeCodeStreamParser {
-    fn on_stdout_line(&mut self, line: &[u8]) {
-        let Ok(text) = std::str::from_utf8(line) else {
-            return;
+    fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement> {
+        let Some(mut object) = parse_object(line) else {
+            return classify::invalid_json();
         };
-        let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
-            return;
-        };
-        let Some(object) = value.as_object() else {
-            return;
-        };
-
-        let line_type = object.get("type").and_then(Value::as_str).unwrap_or("");
-
-        if line_type == "system" {
-            if self.session_id.is_none() {
-                self.session_id = object
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-            }
-            return;
-        }
-
-        if line_type != "result" {
-            return;
-        }
-
-        self.saw_result = true;
-        if let Some(session_id) = object.get("session_id").and_then(Value::as_str) {
-            self.session_id = Some(session_id.to_string());
-        }
-
-        self.subtype = object
-            .get("subtype")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let is_error = object
-            .get("is_error")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let non_success_subtype = self
-            .subtype
-            .as_deref()
-            .is_some_and(|subtype| subtype != "success");
-        self.reported_error = is_error || non_success_subtype;
-
-        self.result_text = object
-            .get("result")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| {
-                object
-                    .get("errors")
-                    .and_then(Value::as_array)
-                    .map(|errors| {
-                        errors
-                            .iter()
-                            .map(error_message)
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    })
-            })
-            .unwrap_or_default();
+        let result = classify::ResultLine::take(&mut object);
+        self.accumulate(&object, result.as_ref());
+        self.classifier.classify(object, result)
     }
 
     fn finish(self: Box<Self>, exit_code: i32, stderr_tail: &str) -> HarnessRun {
@@ -279,17 +287,19 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
             text: self.result_text,
             session_id: self.session_id,
             failure,
+            structured_output: self.structured_output,
         }
     }
 }
 
-/// One element of a `result` line's `errors` array, as readable text.
-fn error_message(error: &Value) -> String {
-    error
-        .get("message")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| error.to_string())
+/// A stdout line as a JSON object; `None` when it is not UTF-8, not JSON,
+/// or not an object.
+fn parse_object(line: &[u8]) -> Option<Map<String, Value>> {
+    let text = std::str::from_utf8(line).ok()?;
+    match serde_json::from_str::<Value>(text.trim()).ok()? {
+        Value::Object(object) => Some(object),
+        _ => None,
+    }
 }
 
 /// The permission mode of this run, validated against what the CLI accepts.

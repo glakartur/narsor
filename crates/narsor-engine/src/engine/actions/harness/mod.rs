@@ -6,8 +6,9 @@
 //!
 //! * the **argv** — which flags carry the model, the extra directories, the
 //!   permission mode, the session to resume, and where the prompt goes;
-//! * the **output** — what the harness prints, and where inside it the agent's
-//!   final text and the session id are.
+//! * the **output** — what the harness prints, where inside it the agent's
+//!   final text and the session id are, and which harness-independent
+//!   [`ChatElement`]s each printed line stands for.
 //!
 //! Everything above that — the output-label contract, the session bookkeeping,
 //! the process handling, the timeout — lives once in
@@ -29,6 +30,7 @@ pub mod opencode;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use narsor_protocol::chat::{ChatElement, UnclassifiedReason};
 use serde_json::Value;
 
 use crate::domain::{ActionError, AgentActionConfig, WorkspaceAccess};
@@ -56,6 +58,13 @@ pub struct HarnessRequest<'a> {
 
     /// A harness session to continue instead of starting a fresh one (D18).
     pub resume_session: Option<&'a str>,
+
+    /// The JSON Schema of the answer, for a harness that can enforce one.
+    ///
+    /// An addition to the text contract in `prompt`, never a replacement:
+    /// `claude-code` passes it as `--json-schema`, and every other adapter
+    /// ignores it.
+    pub output_schema: Option<&'a Value>,
 }
 
 /// The command line an adapter decided on.
@@ -80,25 +89,37 @@ pub struct HarnessRun {
     /// Why the run failed, when the harness says it did. `None` means the
     /// harness is content — which says nothing yet about the output label.
     pub failure: Option<String>,
+
+    /// The answer as the harness validated it against
+    /// [`HarnessRequest::output_schema`], when it reported one. The caller
+    /// still checks it, and falls back to `text` when it is absent or unusable.
+    pub structured_output: Option<Value>,
 }
 
 /// A stateful parser fed one stdout line at a time as the harness streams,
-/// which distills a [`HarnessRun`] once the process has ended.
+/// which classifies each line into [`ChatElement`]s as it arrives and
+/// distills a [`HarnessRun`] once the process has ended.
 ///
 /// Streaming means no single buffer ever holds the whole run: the executor
-/// writes every line to the conversation store as it arrives and hands only
-/// that line to the parser, so this trait's job is to remember exactly what
-/// building a [`HarnessRun`] needs (the final text, the session id, a
-/// reported failure) and nothing more. A harness line is fed here only when
-/// it is at most [`super::agent::PARSE_LINE_LIMIT`] bytes; a longer line is
-/// still written to the conversation in full (R14) but is skipped for parsing
-/// — in every observed harness the final result never arrives on an
-/// oversized line, only bulky tool output does.
+/// hands each line to the parser and writes it to the conversation store,
+/// together with the elements the parser returned for it. Beyond those
+/// elements, this trait's job is to remember exactly what building a
+/// [`HarnessRun`] needs (the final text, the session id, a reported failure)
+/// and nothing more. A harness line is fed here only when it is at most
+/// [`super::agent::PARSE_LINE_LIMIT`] bytes; a longer line is still written
+/// to the conversation in full (R14), with an
+/// [`UnclassifiedReason::TooLarge`] element instead of the parser's — in
+/// every observed harness the final result never arrives on an oversized
+/// line, only bulky tool output does.
 pub trait HarnessStreamParser: Send {
     /// Feeds one stdout line, exactly as the harness printed it (no trailing
-    /// newline). Not necessarily valid UTF-8 or valid JSON — an adapter that
-    /// cannot make sense of a line simply ignores it.
-    fn on_stdout_line(&mut self, line: &[u8]);
+    /// newline), and returns what the line stands for in the conversation:
+    /// zero, one or several elements, in order.
+    ///
+    /// Not necessarily valid UTF-8 or valid JSON — a line the adapter cannot
+    /// make sense of becomes an [`ChatElement::Unclassified`] element, never
+    /// an error.
+    fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement>;
 
     /// Distills the run once the process has exited.
     ///
@@ -106,6 +127,14 @@ pub trait HarnessStreamParser: Send {
     /// stream said, so it is passed in rather than re-derived; `stderr_tail`
     /// is quoted into a failure message the same way it always was.
     fn finish(self: Box<Self>, exit_code: i32, stderr_tail: &str) -> HarnessRun;
+}
+
+/// The elements of a line from a harness whose adapter does not classify
+/// its output yet (R15): the raw line is all there is to show.
+pub(crate) fn not_classified() -> Vec<ChatElement> {
+    vec![ChatElement::Unclassified {
+        reason: UnclassifiedReason::HarnessNotClassified,
+    }]
 }
 
 /// Runs an [`AgentActionConfig`] on one particular harness CLI.

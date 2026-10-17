@@ -27,6 +27,7 @@ use narsor_engine::domain::Workspace;
 use narsor_engine::engine::Engine;
 use narsor_engine::persistence::{ConversationSource, ExecutionStore};
 use narsor_engine::workflow::load_from_file;
+use narsor_protocol::chat::ChatElement;
 
 /// The exit code of a successful command.
 const EXIT_SUCCESS: i32 = 0;
@@ -1194,16 +1195,19 @@ fn conversation_prints_every_entry_in_order() {
     let conversations = store.conversation_store(&id);
     let mut writer = conversations.writer("attempt-1").expect("open the writer");
     writer
-        .append_narsor("prompt: do the thing")
+        .append_narsor("prompt: do the thing", &[])
         .expect("write the prompt entry");
     writer
         .append(
             ConversationSource::Stdout,
             br#"{"type":"result","subtype":"success","result":"done"}"#,
+            &[ChatElement::AgentText {
+                text: "done".to_string(),
+            }],
         )
         .expect("write the stdout entry");
     writer
-        .append(ConversationSource::Stderr, b"a warning on stderr")
+        .append(ConversationSource::Stderr, b"a warning on stderr", &[])
         .expect("write the stderr entry");
     writer.finish().expect("flush the writer");
 

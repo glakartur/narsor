@@ -3629,6 +3629,11 @@ mod task_app_detail {
                         base64::engine::general_purpose::STANDARD
                             .encode(r#"{"event":"prompt","prompt":"Fix it"}"#)
                     },
+                    elements: vec![narsor_protocol::chat::ChatElement::Prompt {
+                        text: "Fix it".to_string(),
+                        resumed_session: None,
+                        purpose: narsor_protocol::chat::PromptPurpose::Step,
+                    }],
                 }],
                 next_entry: 2,
                 closed: true,
@@ -9458,11 +9463,28 @@ mod task_app_create {
             let conversations = store.conversation_store(id);
             let mut writer = conversations.writer("attempt-1").expect("writer");
             writer
-                .append_narsor("prompt: zaplanuj zmianę")
+                .append_narsor(
+                    "prompt: zaplanuj zmianę",
+                    &[narsor_protocol::chat::ChatElement::Prompt {
+                        text: "zaplanuj zmianę".to_string(),
+                        resumed_session: None,
+                        purpose: narsor_protocol::chat::PromptPurpose::Step,
+                    }],
+                )
                 .expect("prompt");
             writer
-                .append(ConversationSource::Stdout, br#"{"type":"assistant"}"#)
+                .append(
+                    ConversationSource::Stdout,
+                    br#"{"type":"assistant"}"#,
+                    &[narsor_protocol::chat::ChatElement::AgentText {
+                        text: "plan gotowy".to_string(),
+                    }],
+                )
                 .expect("stdout");
+            // An entry recorded before the element model: shown, not lost.
+            writer
+                .append(ConversationSource::Stdout, br#"{"legacy":true}"#, &[])
+                .expect("legacy stdout");
             writer.finish().expect("finish");
             conversations.close_attempt("attempt-1").expect("close");
         }
@@ -9492,7 +9514,11 @@ mod task_app_create {
             app.sync_detail().await;
             let conversation = screen(&mut app, 130, 30);
             assert!(conversation.contains("zaplanuj zmianę"), "{conversation}");
-            assert!(conversation.contains("assistant message"), "{conversation}");
+            assert!(conversation.contains("plan gotowy"), "{conversation}");
+            assert!(
+                conversation.contains("recorded without elements"),
+                "{conversation}"
+            );
 
             press(&mut app, KeyCode::Char(']'));
             app.sync_detail().await;

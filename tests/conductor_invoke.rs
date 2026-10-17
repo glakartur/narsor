@@ -337,6 +337,16 @@ async fn claude_runs_read_only_in_the_workspace_without_an_action_attempt() {
         before,
         "the invoker itself records nothing: no ActionStarted, no session"
     );
+    let recorded = fixture
+        .harness
+        .store()
+        .conversation_store(&fixture.execution_id)
+        .recorded_attempt_ids()
+        .expect("list the conversations");
+    assert!(
+        recorded.is_empty(),
+        "no conversation is written: {recorded:?}"
+    );
     assert!(!fixture.work_dir().exists(), "no scratch directory is made");
 }
 
@@ -767,6 +777,169 @@ async fn a_chat_reply_carries_the_conductors_message() {
     }
     let prompt = fixture.claude.args(1).last().cloned().unwrap();
     assert!(prompt.contains("status?"), "the message answered is shown");
+}
+
+// ---------------------------------------------------------------------------
+// The answer as a JSON Schema (U5)
+// ---------------------------------------------------------------------------
+
+/// A Claude Code `result` line with `structured_output`, as
+/// `claude --json-schema` prints it.
+fn claude_structured_answer(text: &str, structured: Value) -> String {
+    format!(
+        "{}\n",
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "session_id": "conductor-session",
+            "result": text,
+            "structured_output": structured,
+        })
+    )
+}
+
+/// The schema passed with `--json-schema`, and where the flag stands.
+fn json_schema_arg(args: &[String]) -> (usize, Value) {
+    let flag = args
+        .iter()
+        .position(|arg| arg == "--json-schema")
+        .unwrap_or_else(|| panic!("no --json-schema in {args:?}"));
+    let schema = serde_json::from_str(&args[flag + 1]).expect("the schema is JSON");
+    (flag, schema)
+}
+
+#[tokio::test]
+async fn a_claude_conductor_gets_the_schema_of_its_purpose() {
+    let fixture = Fixture::new();
+    fixture.claude.answers(&claude_answer(CHOOSE_DONE));
+    fixture
+        .invoker("claude-code")
+        .invoke_once(&fixture.rescue())
+        .await;
+    fixture.claude.answers_on_call(
+        2,
+        &claude_answer(r#"{"decision": "diagnose", "diagnosis": "The disk is full."}"#),
+    );
+    fixture
+        .invoker("claude-code")
+        .invoke_once(&fixture.invocation(
+            ConductorTrigger::StepFailure,
+            ConductorPurpose::DiagnoseFailure,
+        ))
+        .await;
+
+    let rescue_args = fixture.claude.args(1);
+    let (flag, rescue) = json_schema_arg(&rescue_args);
+    let mode = rescue_args
+        .iter()
+        .position(|arg| arg == "--permission-mode")
+        .expect("a permission mode");
+    assert!(flag < mode, "{rescue_args:?}");
+    assert_eq!(rescue["type"], "object");
+    assert_eq!(rescue["required"], json!(["decision"]));
+    assert_eq!(rescue["additionalProperties"], false);
+    assert!(rescue.get("anyOf").is_none(), "{rescue}");
+    assert_eq!(
+        rescue["properties"]["decision"]["enum"],
+        json!(["choose_output", "reprompt", "escalate"])
+    );
+    for field in ["label", "data", "variables", "prompt"] {
+        assert!(
+            rescue["properties"].get(field).is_some(),
+            "{field}: {rescue}"
+        );
+    }
+    assert!(
+        rescue["properties"].get("proposals").is_none(),
+        "a label rescue proposes nothing: {rescue}"
+    );
+
+    let (_, diagnosis) = json_schema_arg(&fixture.claude.args(2));
+    assert_eq!(
+        diagnosis["properties"]["decision"]["enum"],
+        json!(["diagnose", "retry"])
+    );
+    assert!(
+        diagnosis["properties"].get("proposals").is_some(),
+        "{diagnosis}"
+    );
+    assert!(
+        diagnosis["properties"].get("label").is_none(),
+        "{diagnosis}"
+    );
+}
+
+#[tokio::test]
+async fn a_claude_conductors_answer_is_read_from_its_structured_output() {
+    let fixture = Fixture::new();
+    fixture.claude.answers(&claude_structured_answer(
+        "The agent finished the work.",
+        json!({
+            "decision": "choose_output",
+            "label": "done",
+            "data": { "units": 3 },
+            "confidence": "high",
+            "rationale": "The conversation ends with the work finished.",
+        }),
+    ));
+
+    let outcome = fixture
+        .invoker("claude-code")
+        .invoke_once(&fixture.rescue())
+        .await;
+    let response = answered(outcome, ConductorPurpose::ChooseOutput);
+
+    assert_eq!(
+        response.decision,
+        Decision::ChooseOutput {
+            label: "done".to_string(),
+            data: json!({ "units": 3 }),
+            variables: Default::default(),
+        }
+    );
+    assert_eq!(response.confidence, Confidence::High);
+}
+
+#[tokio::test]
+async fn an_unusable_structured_answer_falls_back_to_the_text() {
+    let fixture = Fixture::new();
+    // A diagnosis may not choose an output; the text holds an allowed one.
+    fixture.claude.answers(&claude_structured_answer(
+        r#"{"decision": "diagnose", "diagnosis": "The disk is full."}"#,
+        json!({ "decision": "choose_output", "label": "done" }),
+    ));
+
+    let outcome = fixture
+        .invoker("claude-code")
+        .invoke_once(&fixture.invocation(
+            ConductorTrigger::StepFailure,
+            ConductorPurpose::DiagnoseFailure,
+        ))
+        .await;
+    let response = answered(outcome, ConductorPurpose::DiagnoseFailure);
+
+    assert_eq!(response.kind(), DecisionKind::Diagnose);
+}
+
+#[tokio::test]
+async fn an_opencode_conductor_gets_no_schema() {
+    let fixture = Fixture::new();
+    fixture.opencode.answers(&opencode_answer(CHOOSE_DONE));
+
+    let outcome = fixture
+        .invoker("opencode")
+        .invoke_once(&fixture.rescue())
+        .await;
+    answered(outcome, ConductorPurpose::ChooseOutput);
+
+    let args = fixture.opencode.args(1);
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg == "--json-schema" || arg.starts_with('{')),
+        "{args:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

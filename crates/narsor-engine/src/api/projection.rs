@@ -1,9 +1,14 @@
 //! Client-safe projections shared with runner and controller protocol adapters.
 
-use crate::persistence::{ConversationSnapshot, ConversationSource};
+use crate::persistence::{ConversationEntry, ConversationSnapshot, ConversationSource};
 use narsor_protocol::api::{ConversationEntryDto, ConversationEntrySource, ConversationResponse};
+use narsor_protocol::chat::{ChatElement, UnclassifiedReason};
 
 /// Converts stored conversation bytes to the protocol response.
+///
+/// Every entry leaves with at least one element: one recorded before
+/// elements existed gets a stand-in (see [`elements_of`]). Nothing is
+/// migrated on disk.
 pub fn conversation_response_from_snapshot(
     snapshot: Option<ConversationSnapshot>,
 ) -> ConversationResponse {
@@ -12,7 +17,7 @@ pub fn conversation_response_from_snapshot(
             entries: snapshot
                 .entries
                 .into_iter()
-                .map(|entry| ConversationEntryDto {
+                .map(|mut entry| ConversationEntryDto {
                     entry_number: entry.entry_number,
                     timestamp: entry.timestamp,
                     source: match entry.source {
@@ -21,6 +26,7 @@ pub fn conversation_response_from_snapshot(
                         ConversationSource::Stderr => ConversationEntrySource::Stderr,
                     },
                     raw_base64: base64_encode(&entry.raw),
+                    elements: elements_of(&mut entry),
                 })
                 .collect(),
             next_entry: snapshot.next_entry,
@@ -30,6 +36,29 @@ pub fn conversation_response_from_snapshot(
             recorded_at: None,
         },
         None => ConversationResponse::NoRecord,
+    }
+}
+
+/// The elements an entry is shown with: the recorded ones, or — for an
+/// entry recorded before elements existed — a single stand-in, so a
+/// consumer always has something to show without reading the raw line.
+///
+/// A stderr line needs no classification to say what it is; any other
+/// legacy entry is [`UnclassifiedReason::NotRecorded`]. The recorded
+/// elements are moved out of `entry`.
+fn elements_of(entry: &mut ConversationEntry) -> Vec<ChatElement> {
+    if !entry.elements.is_empty() {
+        return std::mem::take(&mut entry.elements);
+    }
+    match entry.source {
+        ConversationSource::Stderr => {
+            vec![crate::engine::actions::agent::stderr_element(&entry.raw)]
+        }
+        ConversationSource::Narsor | ConversationSource::Stdout => {
+            vec![ChatElement::Unclassified {
+                reason: UnclassifiedReason::NotRecorded,
+            }]
+        }
     }
 }
 

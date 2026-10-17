@@ -21,7 +21,9 @@ use narsor_engine::domain::{
     ActionConfig, ActionError, AgentActionConfig, Context, EventData, ExecutionStatus,
     OutputDefinition, RepromptedBy, Workspace, WorkspaceAccess,
 };
-use narsor_engine::engine::actions::agent::{output_contract, AgentEventSink, SESSION_ID_VARIABLE};
+use narsor_engine::engine::actions::agent::{
+    output_contract, output_schema, AgentEventSink, PARSE_LINE_LIMIT, SESSION_ID_VARIABLE,
+};
 use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
     CodexAdapter, DefaultHarnessSource, Engine, HarnessAdapter, HarnessRegistry, InputContinuation,
@@ -33,6 +35,9 @@ use narsor_engine::persistence::{
     ExecutionStore, ReconciliationOutcome, StatePaths,
 };
 use narsor_engine::workflow::{load_from_file, TemplateScope};
+use narsor_protocol::chat::{
+    ChatElement, PromptPurpose, QuestionSource, TechnicalCategory, UnclassifiedReason,
+};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -323,6 +328,42 @@ impl ConversationFixture {
 /// about exact bytes compare `entry.raw` directly instead).
 fn entry_text(entry: &ConversationEntry) -> String {
     String::from_utf8_lossy(&entry.raw).into_owned()
+}
+
+/// The prompt element of a conversation's first entry.
+fn prompt_element(entry: &ConversationEntry) -> (String, Option<String>, PromptPurpose) {
+    assert_eq!(entry.source, ConversationSource::Narsor);
+    match entry.elements.as_slice() {
+        [ChatElement::Prompt {
+            text,
+            resumed_session,
+            purpose,
+        }] => (text.clone(), resumed_session.clone(), *purpose),
+        other => panic!("expected one prompt element, got {other:?}"),
+    }
+}
+
+/// The summary of an entry's single process-outcome element.
+fn process_summary(entry: &ConversationEntry) -> String {
+    assert_eq!(entry.source, ConversationSource::Narsor);
+    match entry.elements.as_slice() {
+        [ChatElement::Technical {
+            category: TechnicalCategory::Process,
+            summary,
+            ..
+        }] => summary.clone(),
+        other => panic!("expected one process element, got {other:?}"),
+    }
+}
+
+/// What a fresh parser of `adapter` returns for each of `lines`, in order —
+/// the elements the executor is expected to store with them.
+fn parsed_elements(adapter: &dyn HarnessAdapter, lines: &[String]) -> Vec<Vec<ChatElement>> {
+    let mut parser = adapter.stream_parser();
+    lines
+        .iter()
+        .map(|line| parser.on_stdout_line(line.as_bytes()))
+        .collect()
 }
 
 /// The fixed ids every test in this file runs its agent action under.
@@ -1802,15 +1843,36 @@ async fn a_missing_label_is_asked_for_again_in_the_same_read_only_session() {
     assert_eq!(reprompted.1, fixture.fake.action_id(1));
     assert_eq!(reprompted.2, RepromptedBy::Engine);
 
-    // Each attempt has its own conversation file, both closed.
+    // Each attempt has its own conversation file, both closed; the first
+    // was the step's prompt, the second the reprompt of its session.
     let conversations = fixture.store().conversation_store(&execution.id);
-    for attempt in [fixture.fake.action_id(1), fixture.fake.action_id(2)] {
+    let attempts = [
+        (fixture.fake.action_id(1), PromptPurpose::Step, None),
+        (
+            fixture.fake.action_id(2),
+            PromptPurpose::Reprompt,
+            Some("fake-session-1"),
+        ),
+    ];
+    for (attempt, expected_purpose, expected_resume) in attempts {
         let snapshot = conversations
             .read(&attempt, 1, usize::MAX)
             .expect("read the conversation")
             .unwrap_or_else(|| panic!("attempt '{attempt}' has a conversation"));
         assert!(snapshot.closed, "attempt '{attempt}' was compressed");
+        let (_, resumed, purpose) = prompt_element(&snapshot.entries[0]);
+        assert_eq!(purpose, expected_purpose, "attempt '{attempt}'");
+        assert_eq!(resumed.as_deref(), expected_resume, "attempt '{attempt}'");
     }
+    let reprompt = conversations
+        .read(&fixture.fake.action_id(2), 1, usize::MAX)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        prompt_element(&reprompt.entries[0]).0,
+        *second.last().expect("a prompt"),
+        "the prompt element holds exactly what the harness was sent"
+    );
 }
 
 /// Runs [`REPROMPT_WORKFLOW`] on the fixture's engine.
@@ -2522,6 +2584,10 @@ async fn a_claude_code_stream_is_captured_in_order_with_the_prompt_and_a_complet
     assert_eq!(entries.len(), 6, "{entries:?}");
     assert_eq!(entries[0].source, ConversationSource::Narsor);
     assert!(entry_text(&entries[0]).contains("look around"));
+    let (prompt, resumed, purpose) = prompt_element(&entries[0]);
+    assert_eq!(prompt, format!("look around{}", output_contract(&[])));
+    assert_eq!(resumed, None);
+    assert_eq!(purpose, PromptPurpose::Step);
 
     for entry in &entries[1..5] {
         assert_eq!(entry.source, ConversationSource::Stdout);
@@ -2543,6 +2609,15 @@ async fn a_claude_code_stream_is_captured_in_order_with_the_prompt_and_a_complet
         entry_text(last).contains("exited with code 0"),
         "{}",
         entry_text(last)
+    );
+    assert_eq!(process_summary(last), entry_text(last));
+    assert!(
+        matches!(
+            last.elements.as_slice(),
+            [ChatElement::Technical { data: Some(data), .. }] if data["exit_code"] == 0
+        ),
+        "{:?}",
+        last.elements
     );
 
     // Closing (and compressing) the attempt is the runner's job, done once
@@ -2586,6 +2661,130 @@ async fn an_opencode_stream_is_captured_and_the_label_comes_from_its_text_line()
     // Prompt, four stdout lines, one completion entry.
     assert_eq!(entries.len(), 6, "{entries:?}");
     assert!(!conversation.is_closed(ACTION_EXECUTION_ID));
+
+    // Covers AE8: opencode output is not classified, line by line.
+    let stdout: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.source == ConversationSource::Stdout)
+        .collect();
+    assert_eq!(stdout.len(), 4);
+    for entry in stdout {
+        assert_eq!(
+            entry.elements,
+            [ChatElement::Unclassified {
+                reason: UnclassifiedReason::HarnessNotClassified
+            }],
+            "{}",
+            entry_text(entry)
+        );
+    }
+}
+
+#[test]
+fn the_opencode_and_codex_parsers_leave_every_line_unclassified() {
+    let unclassified = vec![ChatElement::Unclassified {
+        reason: UnclassifiedReason::HarnessNotClassified,
+    }];
+    let lines = |stream: String| -> Vec<String> { stream.lines().map(str::to_string).collect() };
+    let mut lines_opencode = lines(opencode_stream("ses_7", r#"{"output":"ready"}"#));
+    lines_opencode.push("not json".to_string());
+    let mut lines_codex = lines(codex_stream("thread-1", r#"{"output":"ready"}"#));
+    lines_codex.push(String::new());
+
+    for elements in parsed_elements(&OpenCodeAdapter::with_program("opencode"), &lines_opencode)
+        .into_iter()
+        .chain(parsed_elements(
+            &CodexAdapter::with_program("codex"),
+            &lines_codex,
+        ))
+    {
+        assert_eq!(elements, unclassified);
+    }
+}
+
+#[tokio::test]
+async fn every_stdout_line_is_stored_with_the_elements_its_parser_returned() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    let lines = vec![
+        json!({ "type": "system", "subtype": "init", "session_id": "s1" }).to_string(),
+        json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "on it" }] } })
+            .to_string(),
+        envelope(r#"{"output":"ready"}"#),
+    ];
+    fake.answers(&lines.join("\n"));
+
+    let outcome = execute_with_conversation(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await
+    .expect("the run completes");
+    assert!(matches!(outcome, ActionOutcome::Completed(_)));
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    let stdout: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.source == ConversationSource::Stdout)
+        .collect();
+    assert_eq!(stdout.len(), 3, "{entries:?}");
+    let expected = parsed_elements(&ClaudeCodeAdapter::with_program("claude"), &lines);
+    for ((entry, line), elements) in stdout.iter().zip(&lines).zip(expected) {
+        assert_eq!(entry.raw, line.as_bytes());
+        assert!(!entry.elements.is_empty(), "{line}");
+        assert_eq!(entry.elements, elements, "{line}");
+    }
+}
+
+#[tokio::test]
+async fn a_line_past_the_parse_limit_is_stored_whole_as_too_large_to_parse() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+
+    let huge_line = "y".repeat(PARSE_LINE_LIMIT + 1);
+    fake.answers(&format!(
+        "{huge_line}\n{}",
+        envelope(r#"{"output":"ready"}"#)
+    ));
+
+    let outcome = execute_with_conversation(
+        &executor(&fake),
+        agent_action("look around"),
+        &root.workspace(),
+        &conversation,
+        None,
+    )
+    .await
+    .expect("the run completes");
+    let ActionOutcome::Completed(result) = outcome else {
+        panic!("expected a completed action");
+    };
+    assert_eq!(
+        result.output_label, "ready",
+        "the next line is still parsed"
+    );
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    let big_entry = entries
+        .iter()
+        .find(|entry| entry.raw.len() > PARSE_LINE_LIMIT)
+        .expect("the oversized line was captured");
+    assert_eq!(
+        big_entry.raw,
+        huge_line.as_bytes(),
+        "captured byte for byte"
+    );
+    assert_eq!(
+        big_entry.elements,
+        [ChatElement::Unclassified {
+            reason: UnclassifiedReason::TooLarge
+        }]
+    );
 }
 
 #[tokio::test]
@@ -2637,6 +2836,7 @@ async fn covers_ae5_two_lines_then_a_timeout_are_both_captured_plus_a_timeout_en
         "{}",
         entry_text(entries.last().unwrap())
     );
+    assert!(process_summary(entries.last().unwrap()).contains("timed out"));
 }
 
 #[tokio::test]
@@ -2752,6 +2952,8 @@ async fn a_missing_binary_still_leaves_a_conversation_file_with_the_prompt() {
         "{}",
         entry_text(&entries[1])
     );
+    assert_eq!(prompt_element(&entries[0]).2, PromptPurpose::Step);
+    assert!(process_summary(&entries[1]).contains("harness did not start"));
 }
 
 #[tokio::test]
@@ -2860,6 +3062,14 @@ async fn stderr_on_a_successful_run_is_captured_without_affecting_the_result() {
         "{}",
         entry_text(stderr_entry)
     );
+    assert_eq!(
+        stderr_entry.elements,
+        [ChatElement::Technical {
+            category: TechnicalCategory::Stderr,
+            summary: "a warning the harness printed on stderr".to_string(),
+            data: None,
+        }]
+    );
 }
 
 #[tokio::test]
@@ -2898,6 +3108,367 @@ async fn a_resumed_session_reaches_the_argv_and_the_prompt_entry() {
         "the prompt entry names the resumed session: {}",
         entry_text(&entries[0])
     );
+    let (_, resumed, purpose) = prompt_element(&entries[0]);
+    assert_eq!(resumed.as_deref(), Some("session-42"));
+    assert_eq!(purpose, PromptPurpose::Step);
+}
+
+// ---------------------------------------------------------------------------
+// The output contract as a JSON Schema (U5)
+// ---------------------------------------------------------------------------
+
+/// A `result` line as `claude --json-schema` prints it: the accepted answer
+/// as `structured_output`, and `text` as the result text.
+fn structured_envelope(text: &str, structured: Value) -> String {
+    json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "session_id": "fake-session-1",
+        "result": text,
+        "structured_output": structured,
+    })
+    .to_string()
+}
+
+/// The `done`/`blocked` outputs of the schema tests.
+fn two_labels() -> [OutputDefinition; 2] {
+    [
+        OutputDefinition::new("done"),
+        OutputDefinition::new("blocked"),
+    ]
+}
+
+/// The schema passed with `--json-schema` in `args`, parsed, and where the
+/// flag stands.
+fn json_schema_arg(args: &[String]) -> (usize, Value) {
+    let flag = args
+        .iter()
+        .position(|arg| arg == "--json-schema")
+        .unwrap_or_else(|| panic!("no --json-schema in {args:?}"));
+    let schema = serde_json::from_str(&args[flag + 1]).expect("the schema is JSON");
+    (flag, schema)
+}
+
+/// Runs an agent action with `outputs` declared.
+async fn execute_with_outputs(
+    executor: &AgentExecutor,
+    config: AgentActionConfig,
+    workspace: &Workspace,
+    outputs: &[OutputDefinition],
+    conversation: Option<&ConversationFixture>,
+) -> Result<ActionOutcome, ActionError> {
+    let action = ActionConfig::Agent(config);
+    let mut request = ActionRequest::new(&action, workspace, ACTION_EXECUTION_ID)
+        .with_execution_id(EXECUTION_ID)
+        .with_outputs(outputs);
+    if let Some(conversation) = conversation {
+        request = request.with_conversation_store(&conversation.store);
+    }
+    executor.execute(request).await
+}
+
+/// Every agent-question element of a conversation, with its entry's source.
+fn agent_questions(entries: &[ConversationEntry]) -> Vec<(ConversationSource, ChatElement)> {
+    entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .elements
+                .iter()
+                .filter(|element| matches!(element, ChatElement::AgentQuestion { .. }))
+                .map(|element| (entry.source, element.clone()))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_claude_step_passes_its_labels_as_a_json_schema_before_the_permission_mode() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"output":"done"}"#));
+
+    execute_with_outputs(
+        &executor(&fake),
+        agent_action("do the thing"),
+        &root.workspace(),
+        &two_labels(),
+        None,
+    )
+    .await
+    .expect("the action runs");
+
+    let args = fake.args(1);
+    let (flag, schema) = json_schema_arg(&args);
+    assert_eq!(schema["type"], "object");
+    assert_eq!(
+        schema["properties"]["output"]["enum"],
+        json!(["done", "blocked"])
+    );
+    assert_eq!(
+        schema["properties"]["status"]["enum"],
+        json!(["awaiting_input"])
+    );
+    assert_eq!(schema["additionalProperties"], false);
+    for keyword in ["anyOf", "oneOf", "allOf", "required"] {
+        assert!(schema.get(keyword).is_none(), "{keyword} in {schema}");
+    }
+
+    let mode = args
+        .iter()
+        .position(|arg| arg == "--permission-mode")
+        .expect("a permission mode");
+    assert!(flag < mode, "{args:?}");
+    assert_eq!(mode + 2, args.len() - 1, "the prompt is still last");
+
+    // The text contract stays in the prompt.
+    let prompt = args.last().expect("a prompt");
+    assert!(prompt.contains("- `done`\n- `blocked`\n"), "{prompt}");
+}
+
+#[test]
+fn without_declared_outputs_the_schema_allows_any_label() {
+    let schema = output_schema(&[]);
+
+    assert_eq!(schema["properties"]["output"], json!({ "type": "string" }));
+}
+
+#[tokio::test]
+async fn a_structured_output_gives_the_label_and_data_when_the_text_has_no_json() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&structured_envelope(
+        "The work is finished.",
+        json!({ "output": "done", "data": { "units": 3 }, "variables": { "plan": "plan.md" } }),
+    ));
+
+    let outcome = execute_with_outputs(
+        &executor(&fake),
+        agent_action("do the thing"),
+        &root.workspace(),
+        &two_labels(),
+        None,
+    )
+    .await
+    .expect("the action completes");
+
+    let ActionOutcome::Completed(result) = outcome else {
+        panic!("expected a completed action, got {outcome:?}");
+    };
+    assert_eq!(result.output_label, "done");
+    assert_eq!(result.data["units"], 3);
+    assert_eq!(result.variables.get("plan"), Some(&json!("plan.md")));
+}
+
+#[tokio::test]
+async fn an_unusable_structured_output_falls_back_to_the_text() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&structured_envelope(
+        r#"Done. {"output":"blocked"}"#,
+        json!({ "data": { "units": 3 } }),
+    ));
+
+    let outcome = execute_with_outputs(
+        &executor(&fake),
+        agent_action("do the thing"),
+        &root.workspace(),
+        &two_labels(),
+        None,
+    )
+    .await
+    .expect("the action completes");
+
+    let ActionOutcome::Completed(result) = outcome else {
+        panic!("expected a completed action, got {outcome:?}");
+    };
+    assert_eq!(result.output_label, "blocked");
+}
+
+/// AE3: the agent's question in `structured_output` suspends the step for
+/// the operator, and the conversation shows the question once — the
+/// executor's narsor entry for the answer it accepted; the parser's result
+/// line carries no question of its own.
+#[tokio::test]
+async fn covers_ae3_a_structured_question_waits_for_input_with_one_agent_question() {
+    let fixture = EngineFixture::new();
+    let question = json!({
+        "status": "awaiting_input",
+        "question": "Which API version should I target?",
+        "options": ["v1", "v2"],
+    });
+    fixture.fake.answers(&structured_envelope(
+        &question.to_string(),
+        question.clone(),
+    ));
+
+    let execution = run_reprompt_workflow(&fixture).await;
+
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    assert_eq!(fixture.fake.calls(), 1);
+    let snapshot = fixture
+        .store()
+        .conversation_store(&execution.id)
+        .read(&fixture.fake.action_id(1), 1, usize::MAX)
+        .expect("read the conversation")
+        .expect("a conversation");
+    let questions = agent_questions(&snapshot.entries);
+    assert_eq!(questions.len(), 1, "{questions:?}");
+    assert_eq!(questions[0].0, ConversationSource::Narsor);
+    assert_eq!(
+        questions[0].1,
+        ChatElement::AgentQuestion {
+            question: "Which API version should I target?".to_string(),
+            options: vec!["v1".to_string(), "v2".to_string()],
+            source: QuestionSource::OutputContract,
+            call_id: None,
+        }
+    );
+}
+
+/// A question read from text is recorded the same way: the executor writes
+/// it to the conversation itself, before the conversation is closed.
+#[tokio::test]
+async fn a_question_in_the_text_is_recorded_as_a_narsor_agent_question() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    let conversation = ConversationFixture::new(&root);
+    fake.answers(&envelope(
+        r#"I need to know. {"status":"awaiting_input","question":"Choose a version","options":["v1","v2"]}"#,
+    ));
+
+    let outcome = execute_with_outputs(
+        &executor(&fake),
+        agent_action("do the thing"),
+        &root.workspace(),
+        &two_labels(),
+        Some(&conversation),
+    )
+    .await
+    .expect("the question is a suspension");
+    assert!(
+        matches!(outcome, ActionOutcome::Suspended(_)),
+        "{outcome:?}"
+    );
+
+    let entries = conversation.entries(ACTION_EXECUTION_ID);
+    let questions = agent_questions(&entries);
+    assert_eq!(questions.len(), 1, "{questions:?}");
+    assert_eq!(questions[0].0, ConversationSource::Narsor);
+    assert_eq!(
+        questions[0].1,
+        ChatElement::AgentQuestion {
+            question: "Choose a version".to_string(),
+            options: vec!["v1".to_string(), "v2".to_string()],
+            source: QuestionSource::OutputContract,
+            call_id: None,
+        }
+    );
+    assert!(
+        matches!(
+            entries.last().map(|entry| entry.elements.as_slice()),
+            Some([ChatElement::AgentQuestion { .. }])
+        ),
+        "the question is the last entry, after the process outcome: {entries:?}"
+    );
+}
+
+/// AE5: with neither a structured output nor JSON in the text, the engine
+/// asks the same session again — and the reprompt carries the schema too.
+#[tokio::test]
+async fn covers_ae5_without_any_answer_the_reprompt_also_carries_the_schema() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &envelope("Done, nothing more to say."))
+        .answers_on_call(
+            2,
+            &structured_envelope("Here it is.", json!({ "output": "implemented" })),
+        );
+
+    let execution = run_reprompt_workflow(&fixture).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(fixture.fake.calls(), 2, "one attempt and one reprompt");
+    for call in [1, 2] {
+        let (_, schema) = json_schema_arg(&fixture.fake.args(call));
+        assert_eq!(
+            schema["properties"]["output"]["enum"],
+            json!(["implemented", "needs_human_decision"]),
+            "call {call}"
+        );
+    }
+    let second = fixture.fake.args(2);
+    assert!(
+        has_flag(&second, "--resume", "fake-session-1"),
+        "{second:?}"
+    );
+    assert!(has_flag(&second, "--permission-mode", "plan"), "{second:?}");
+}
+
+/// A structured label the state does not declare is handled like such a
+/// label in the text: rejected by the engine and asked for again.
+#[tokio::test]
+async fn a_structured_label_outside_the_list_is_asked_for_again_like_a_text_label() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(
+            1,
+            &structured_envelope(r#"{"output":"finished"}"#, json!({ "output": "finished" })),
+        )
+        .answers_on_call(
+            2,
+            &structured_envelope(
+                r#"{"output":"implemented"}"#,
+                json!({ "output": "implemented" }),
+            ),
+        );
+
+    let execution = run_reprompt_workflow(&fixture).await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(fixture.fake.calls(), 2);
+    let reason = events_of(&fixture, &execution.id)
+        .into_iter()
+        .find_map(|data| match data {
+            EventData::ActionOutputRejected { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .expect("an ActionOutputRejected event");
+    assert!(reason.contains("'finished'"), "{reason}");
+}
+
+/// opencode cannot enforce a schema: it gets no flag for one, and the text
+/// contract in its prompt is all it is told.
+#[tokio::test]
+async fn an_opencode_step_gets_no_schema_but_still_the_text_contract() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&opencode_stream("ses_7", r#"{"output":"done"}"#));
+    let executor = AgentExecutor::with_harnesses(
+        HarnessRegistry::defaults()
+            .with_adapter(Arc::new(OpenCodeAdapter::with_program(fake.program()))),
+    );
+    let mut config = agent_action("do the thing");
+    config.harness = Some("opencode".to_string());
+
+    execute_with_outputs(&executor, config, &root.workspace(), &two_labels(), None)
+        .await
+        .expect("the action runs");
+
+    let args = fake.args(1);
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.contains("schema") || arg.starts_with('{')),
+        "{args:?}"
+    );
+    assert!(
+        args.iter()
+            .any(|arg| arg.contains("must be exactly one of these labels:\n- `done`\n")),
+        "{args:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2928,6 +3499,51 @@ async fn the_real_claude_binary_honours_the_output_contract() {
     let result = complete(&AgentExecutor::new(), config, &root.workspace()).await;
 
     assert_eq!(result.output_label, "ready");
+}
+
+/// Drives the actual `claude` binary with two labels: the label comes from
+/// its `structured_output` (U5). Ignored for the same reasons as above.
+#[tokio::test]
+#[ignore = "drives the real `claude` binary: costs money, needs credentials"]
+async fn the_real_claude_binary_answers_through_the_json_schema() {
+    if which("claude").is_none() {
+        eprintln!("skipping: `claude` is not on PATH");
+        return;
+    }
+
+    let root = TempRoot::new();
+    let mut config = agent_action(
+        "Do not use any tools. The work is already done: finish with the label 'done'.",
+    );
+    config.workspace_access = WorkspaceAccess::ReadOnly;
+    let conversation = ConversationFixture::new(&root);
+
+    let outcome = execute_with_outputs(
+        &AgentExecutor::new(),
+        config,
+        &root.workspace(),
+        &two_labels(),
+        Some(&conversation),
+    )
+    .await
+    .expect("the action runs");
+
+    let ActionOutcome::Completed(result) = outcome else {
+        panic!("expected a completed action, got {outcome:?}");
+    };
+    assert_eq!(result.output_label, "done");
+    let structured = conversation
+        .entries(ACTION_EXECUTION_ID)
+        .iter()
+        .flat_map(|entry| entry.elements.clone())
+        .find_map(|element| match element {
+            ChatElement::RunResult {
+                structured_output, ..
+            } => structured_output,
+            _ => None,
+        })
+        .expect("the run result carries a structured output");
+    assert_eq!(structured["output"], "done");
 }
 
 /// The first entry of `PATH` holding an executable called `name`.

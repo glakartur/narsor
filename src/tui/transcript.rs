@@ -5,6 +5,7 @@
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::scroll::{wrap_line, ScrollState};
 
@@ -130,7 +131,13 @@ pub struct TranscriptEntry {
     /// Normalized adapter fields, formatted only while this entry is expanded.
     pub details: Option<Value>,
     /// Exact retained source bytes. This is never replaced by decoded text.
-    pub raw: Vec<u8>,
+    /// Shared, not copied, by the entries of one source line and by every
+    /// projection of the transcript.
+    pub raw: Arc<[u8]>,
+    /// Whether [`Self::raw`] is the same source line as the entry before
+    /// it: one source line can yield several entries, and the global raw
+    /// view shows that line once.
+    shares_previous_raw: bool,
     /// Source-neutral lifecycle metadata used to recognize a safe, contiguous
     /// summary card. Adapters decide which harness events qualify.
     grouping: Option<TranscriptGrouping>,
@@ -153,7 +160,11 @@ pub struct TranscriptGrouping {
 }
 
 impl TranscriptEntry {
-    pub fn new(id: TranscriptEntryId, rendered_lines: Vec<String>, raw: Vec<u8>) -> Self {
+    pub fn new(
+        id: TranscriptEntryId,
+        rendered_lines: Vec<String>,
+        raw: impl Into<Arc<[u8]>>,
+    ) -> Self {
         let source_ids = vec![id.clone()];
         Self {
             id,
@@ -162,10 +173,18 @@ impl TranscriptEntry {
             presentation: TranscriptPresentation::Neutral,
             detail_lines: Vec::new(),
             details: None,
-            raw,
+            raw: raw.into(),
+            shares_previous_raw: false,
             grouping: None,
             source_ids,
         }
+    }
+
+    /// Marks [`Self::raw`] as the source line of the entry before this one,
+    /// so the global raw view folds this entry into it.
+    pub fn sharing_previous_raw(mut self) -> Self {
+        self.shares_previous_raw = true;
+        self
     }
 
     pub fn with_header(mut self, header: impl Into<String>) -> Self {
@@ -873,8 +892,10 @@ impl TranscriptState {
     }
 
     fn projected_entries(&self) -> Vec<TranscriptEntry> {
-        if self.mode != DisplayMode::Rendered {
-            return self.entries.clone();
+        match self.mode {
+            DisplayMode::Rendered => {}
+            DisplayMode::Chronology => return self.entries.clone(),
+            DisplayMode::Raw => return self.raw_lines(),
         }
         let mut projected = Vec::new();
         let mut cursor = 0;
@@ -1101,6 +1122,21 @@ impl TranscriptState {
             cursor = end;
         }
         projected
+    }
+
+    /// One entry per source line: an entry sharing the previous entry's raw
+    /// line is folded into it, keeping its identity reachable.
+    fn raw_lines(&self) -> Vec<TranscriptEntry> {
+        let mut lines: Vec<TranscriptEntry> = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            match lines.last_mut() {
+                Some(line) if entry.shares_previous_raw => {
+                    line.source_ids.extend(entry.source_ids.iter().cloned());
+                }
+                _ => lines.push(entry.clone()),
+            }
+        }
+        lines
     }
 
     fn visual_line_count_for(&self, entry: &TranscriptEntry) -> usize {

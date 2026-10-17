@@ -3750,7 +3750,7 @@ fn record_attempt(store: &ExecutionStore, entries: usize) {
         .expect("writer");
     for entry in 1..=entries {
         writer
-            .append_narsor(&format!("entry {entry}"))
+            .append_narsor(&format!("entry {entry}"), &[])
             .expect("line");
     }
     writer.finish().expect("finish");
@@ -4184,7 +4184,12 @@ async fn reading_the_record_then_the_runner_from_the_cursor_loses_and_repeats_no
     let store = local_store(&storage, "task-1");
     record_attempt(&store, 5);
 
-    // The runner goes quiet: the record is read, a small page at a time.
+    // The runner goes quiet: the record is read, a small page at a time —
+    // a budget of exactly three stored lines.
+    let record =
+        std::fs::read_to_string(store.conversation_store("exec-1").dir().join("act-1.jsonl"))
+            .expect("the open record");
+    let three_lines: usize = record.lines().take(3).map(str::len).sum();
     harness.clock.advance(Duration::minutes(2));
     let small = harness
         .owner
@@ -4193,7 +4198,7 @@ async fn reading_the_record_then_the_runner_from_the_cursor_loses_and_repeats_no
             "act-1",
             &ConversationPageQuery {
                 from: 0,
-                byte_budget: Some(3 * "entry 1".len() as u64),
+                byte_budget: Some(three_lines as u64),
             },
         )
         .await

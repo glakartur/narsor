@@ -12,8 +12,11 @@
 //!    `output`, and which labels (with their descriptions) it may use. D19
 //!    calls this "forcing structure on the agent"; forcing it starts with
 //!    saying it.
-//! 2. **Read robustly, guess never.** Agents wrap JSON in prose, in fences, or
-//!    in both. [`extract_output`] takes the *last* JSON object anywhere in the
+//! 2. **Read robustly, guess never.** A harness that enforces
+//!    [`output_schema`] (Claude Code) reports the answer as a structured
+//!    output, which is read first and checked by the same rules. Otherwise —
+//!    or when it is unusable — the text is read. Agents wrap JSON in prose,
+//!    in fences, or in both. [`extract_output`] takes the *last* JSON object anywhere in the
 //!    answer that has an `output` key. When there is none, the action fails
 //!    ([`ActionError`]) — it never falls back to `success`. In an unattended
 //!    pipeline a guessed label is a silently wrong transition, which is a far
@@ -47,6 +50,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
+use narsor_protocol::chat::{
+    summary_line, ChatElement, QuestionSource, TechnicalCategory, UnclassifiedReason,
+    SUMMARY_MAX_CHARS,
+};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
@@ -115,6 +122,47 @@ those are action failures. Do not omit the JSON object: without it the workflow 
 cannot continue."
     )
 }
+
+/// Builds the JSON Schema of the answer [`output_contract`] describes, for a
+/// harness that can enforce one (`claude-code` passes it as `--json-schema`).
+///
+/// One flat object with the optional fields of both answers — a label with
+/// `data`, `variables` and `artifacts`, or `status: awaiting_input` with a
+/// `question` and `options` — and nothing required. The two answers are not
+/// two `anyOf` branches because the API refuses `anyOf`, `oneOf` and `allOf`
+/// at the top level of a schema (measured on `claude` 2.1.302, see
+/// `tests/fixtures/claude-code/README.md`). So the schema only narrows the
+/// answer: which of the two it is, and whether it is complete, is checked by
+/// narsor itself, the same way as an answer read from text.
+///
+/// `output` is limited to the declared labels; with none declared, any
+/// string is allowed, as the text contract then asks for the label the task
+/// names. `artifacts` is an array of anything, because an entry may be a path
+/// or an object (see the engine's artifact registration).
+pub fn output_schema(outputs: &[OutputDefinition]) -> Value {
+    let mut output = serde_json::json!({ "type": "string" });
+    if !outputs.is_empty() {
+        let labels: Vec<&str> = outputs.iter().map(|output| output.label.as_str()).collect();
+        output["enum"] = serde_json::json!(labels);
+    }
+
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "output": output,
+            "data": { "type": "object" },
+            "variables": { "type": "object" },
+            "artifacts": { "type": "array" },
+            "status": { "type": "string", "enum": [AWAITING_INPUT] },
+            "question": { "type": "string" },
+            "options": { "type": "array", "items": { "type": "string" } },
+        },
+        "additionalProperties": false,
+    })
+}
+
+/// The `status` of an answer that asks a person before the task continues.
+const AWAITING_INPUT: &str = "awaiting_input";
 
 /// The `error_type` of an answer no output label could be extracted from — a
 /// format error the engine answers with a reprompt, not with `retry_policy`
@@ -311,20 +359,33 @@ impl ConversationSink {
         }
     }
 
-    /// Appends one entry, logging (and otherwise ignoring) a failure to.
-    fn append(&self, source: ConversationSource, raw: &[u8]) {
+    /// Appends one entry with its elements, logging (and otherwise
+    /// ignoring) a failure to.
+    fn append(&self, source: ConversationSource, raw: &[u8], elements: &[ChatElement]) {
         let Some(writer) = &self.0 else { return };
         let mut writer = writer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Err(error) = writer.append(source, raw) {
+        if let Err(error) = writer.append(source, raw, elements) {
             tracing::warn!(%error, "could not append a conversation entry");
         }
     }
 
     /// Convenience for a narsor-authored entry (the prompt, the outcome).
-    fn append_narsor(&self, text: &str) {
-        self.append(ConversationSource::Narsor, text.as_bytes());
+    fn append_narsor(&self, text: &str, elements: &[ChatElement]) {
+        self.append(ConversationSource::Narsor, text.as_bytes(), elements);
+    }
+
+    /// A narsor-authored entry about the harness process — its exit code,
+    /// timeout, or failure to run — whose one element is a
+    /// [`TechnicalCategory::Process`] event summarized by the same `text`.
+    fn append_outcome(&self, text: &str, data: Value) {
+        let element = ChatElement::Technical {
+            category: TechnicalCategory::Process,
+            summary: text.to_string(),
+            data: Some(data),
+        };
+        self.append_narsor(text, &[element]);
     }
 
     /// Flushes the writer to disk, once, at the very end of the attempt.
@@ -447,7 +508,7 @@ impl AgentExecutor {
     /// Opens this attempt's conversation file, if there is a store to open it
     /// in, and writes the prompt entry — the first line any conversation ever
     /// has: the prompt sent, the harness, and the session it continues, if
-    /// any.
+    /// any — with a [`ChatElement::Prompt`] carrying the full prompt.
     fn open_conversation(
         &self,
         request: &ActionRequest<'_>,
@@ -466,7 +527,12 @@ impl AgentExecutor {
             "prompt": prompt,
         })
         .to_string();
-        sink.append_narsor(&entry);
+        let element = ChatElement::Prompt {
+            text: prompt.to_string(),
+            resumed_session: resume.map(str::to_string),
+            purpose: request.purpose,
+        };
+        sink.append_narsor(&entry, &[element]);
         sink
     }
 
@@ -493,6 +559,7 @@ impl AgentExecutor {
         let mut session = new_session(config, harness, request.execution_id);
 
         let prompt = format!("{}{}", config.prompt, output_contract(request.outputs));
+        let schema = output_schema(request.outputs);
         let workspace = Path::new(&request.workspace.path);
 
         // Opened before `invocation` (Key Technical Decisions): even an
@@ -507,10 +574,14 @@ impl AgentExecutor {
             prompt: &prompt,
             workspace,
             resume_session: resume,
+            output_schema: Some(&schema),
         }) {
             Ok(invocation) => invocation,
             Err(error) => {
-                conversation.append_narsor(&format!("harness did not start: {}", error.message));
+                conversation.append_outcome(
+                    &format!("harness did not start: {}", error.message),
+                    serde_json::json!({ "error_type": error.error_type }),
+                );
                 conversation.finish();
                 return Err(error);
             }
@@ -541,16 +612,21 @@ impl AgentExecutor {
 
         let finished = match ending {
             Ok(SpawnEnding::Finished(finished)) => {
-                conversation
-                    .append_narsor(&format!("harness exited with code {}", finished.exit_code));
+                conversation.append_outcome(
+                    &format!("harness exited with code {}", finished.exit_code),
+                    serde_json::json!({ "exit_code": finished.exit_code }),
+                );
                 finished
             }
             Ok(SpawnEnding::TimedOut) => {
                 let limit = request.timeout.unwrap_or_default();
-                conversation.append_narsor(&format!(
-                    "harness timed out after {}s and was killed",
-                    limit.as_secs_f64()
-                ));
+                conversation.append_outcome(
+                    &format!(
+                        "harness timed out after {}s and was killed",
+                        limit.as_secs_f64()
+                    ),
+                    serde_json::json!({ "timed_out_after_secs": limit.as_secs_f64() }),
+                );
                 conversation.finish();
 
                 self.fail_session(
@@ -574,11 +650,14 @@ impl AgentExecutor {
                     error.error_type.as_deref(),
                     Some("harness_not_found") | Some("spawn_failed")
                 );
-                conversation.append_narsor(&if started {
-                    format!("harness run failed: {}", error.message)
-                } else {
-                    format!("harness did not start: {}", error.message)
-                });
+                conversation.append_outcome(
+                    &if started {
+                        format!("harness run failed: {}", error.message)
+                    } else {
+                        format!("harness did not start: {}", error.message)
+                    },
+                    serde_json::json!({ "error_type": error.error_type }),
+                );
                 conversation.finish();
 
                 self.fail_session(
@@ -591,8 +670,6 @@ impl AgentExecutor {
                 return Err(error);
             }
         };
-
-        conversation.finish();
 
         let run = finished.run.clone();
 
@@ -620,6 +697,7 @@ impl AgentExecutor {
         }
 
         if let Some(failure) = &run.failure {
+            conversation.finish();
             self.fail_session(
                 request.execution_id,
                 request.action_execution_id,
@@ -636,9 +714,14 @@ impl AgentExecutor {
             ));
         }
 
-        let output = match extract_response(&run.text) {
-            Ok(output) => output,
+        let output = match read_response(&run) {
+            Ok(output) => {
+                record_question(&conversation, &output);
+                conversation.finish();
+                output
+            }
             Err(mut error) => {
+                conversation.finish();
                 // What the engine needs to ask this same session again
                 // (KTD7): the harness it ran on and the session it left.
                 record_session_in_details(&mut error, harness, run.session_id.as_deref());
@@ -756,6 +839,25 @@ fn new_session(
     }
 }
 
+/// The element of a line the harness wrote to stderr: a
+/// [`TechnicalCategory::Stderr`] event summarized by the line itself, as a
+/// [`summary_line`]; the raw line keeps it in full.
+///
+/// Only a prefix of the line is decoded — a few bytes per summary
+/// character — so a huge line is never converted, or stored, twice.
+pub(crate) fn stderr_element(line: &[u8]) -> ChatElement {
+    let prefix = &line[..line.len().min(STDERR_SUMMARY_SOURCE_BYTES)];
+    ChatElement::Technical {
+        category: TechnicalCategory::Stderr,
+        summary: summary_line(&String::from_utf8_lossy(prefix)),
+        data: None,
+    }
+}
+
+/// How much of a stderr line [`stderr_element`] decodes: enough for a full
+/// summary of four-byte characters, with one to spare to mark it as cut.
+const STDERR_SUMMARY_SOURCE_BYTES: usize = (SUMMARY_MAX_CHARS + 1) * 4;
+
 /// The harness session this run continues, if `parameters` names one (D18).
 ///
 /// `parameters` is **not** template-expanded (only `prompt` is, see
@@ -802,7 +904,9 @@ pub(crate) enum SpawnEnding {
 /// Runs one harness process outside any action attempt — no conversation
 /// file, no `ORCHESTRATOR_ACTION_ID` — for the conductor (U9), which reuses
 /// the spawning (through [`spawn_retrying_text_busy`]), the pipe draining and
-/// the stream parsing of an agent step without being one.
+/// the stream parsing of an agent step without being one. The elements the
+/// parser returns are discarded with the lines: there is nowhere to record
+/// them.
 pub(crate) async fn run_harness_process(
     program: &str,
     args: &[String],
@@ -823,7 +927,8 @@ pub(crate) async fn run_harness_process(
 }
 
 /// Runs the harness, draining both pipes while it goes and feeding every
-/// stdout line to the conversation store and to `parser`.
+/// stdout line to `parser` and then, with the elements it returned, to the
+/// conversation store.
 ///
 /// Reading is a line loop ([`stream_lines`]) rather than `read_capped` (used
 /// by the script executor, which has no per-line structure to preserve): a
@@ -861,10 +966,14 @@ async fn spawn_and_wait(
     let stdout_task = async {
         let mut parser = parser;
         let result = stream_lines(&mut stdout_pipe, |line| {
-            conversation.append(ConversationSource::Stdout, line);
-            if line.len() <= PARSE_LINE_LIMIT {
-                parser.on_stdout_line(line);
-            }
+            let elements = if line.len() <= PARSE_LINE_LIMIT {
+                parser.on_stdout_line(line)
+            } else {
+                vec![ChatElement::Unclassified {
+                    reason: UnclassifiedReason::TooLarge,
+                }]
+            };
+            conversation.append(ConversationSource::Stdout, line, &elements);
         })
         .await;
         (result, parser)
@@ -873,7 +982,7 @@ async fn spawn_and_wait(
     let stderr_task = async {
         let mut stderr_capture: Vec<u8> = Vec::new();
         let result = stream_lines(&mut stderr_pipe, |line| {
-            conversation.append(ConversationSource::Stderr, line);
+            conversation.append(ConversationSource::Stderr, line, &[stderr_element(line)]);
             accumulate_capped(&mut stderr_capture, line, MAX_BUFFERED_OUTPUT_BYTES);
             accumulate_capped(&mut stderr_capture, b"\n", MAX_BUFFERED_OUTPUT_BYTES);
         })
@@ -1208,6 +1317,70 @@ pub fn extract_output(text: &str) -> Result<AgentOutput, ActionError> {
     }
 }
 
+/// Reads the agent's answer from a finished run: its `structured_output`
+/// first, when the harness reported one that makes a usable answer, then the
+/// text, as [`extract_response`] always did.
+///
+/// A `structured_output` that is unusable — no `output` label and no
+/// complete `awaiting_input` question — is not an error of its own: the text
+/// is read instead, and only its failure is reported. A label the state does
+/// not declare is not unusable here; like a label read from text, it is the
+/// engine's to reject.
+fn read_response(run: &HarnessRun) -> Result<AgentResponse, ActionError> {
+    if let Some(structured) = &run.structured_output {
+        match structured_response(structured) {
+            Ok(response) => return Ok(response),
+            Err(error) => tracing::warn!(
+                reason = %error.message,
+                "the harness's structured output is not a usable answer; reading the text instead"
+            ),
+        }
+    }
+    extract_response(&run.text)
+}
+
+/// Reads an answer from a harness's `structured_output` value, by the same
+/// rules as an object found in the text.
+fn structured_response(value: &Value) -> Result<AgentResponse, ActionError> {
+    let object = value
+        .as_object()
+        .filter(|object| is_answer_object(object))
+        .ok_or_else(|| {
+            no_label_error(
+                "the structured output has neither a string 'output' nor an 'awaiting_input' status",
+                &value.to_string(),
+            )
+        })?;
+    response_from_object(object).map_err(|reason| no_label_error(reason, &value.to_string()))
+}
+
+/// Writes the agent's question to the conversation as a narsor entry, when
+/// the accepted answer asks one.
+///
+/// The executor is the only producer of an output-contract question: it
+/// knows which answer it accepted — the structured output or the text — so
+/// the conversation shows exactly that question, once.
+fn record_question(conversation: &ConversationSink, response: &AgentResponse) {
+    let AgentResponse::AwaitingInput { question, options } = response else {
+        return;
+    };
+    let entry = serde_json::json!({
+        "event": "agent_question",
+        "question": question,
+        "options": options,
+    })
+    .to_string();
+    conversation.append_narsor(
+        &entry,
+        &[ChatElement::AgentQuestion {
+            question: question.clone(),
+            options: options.clone(),
+            source: QuestionSource::OutputContract,
+            call_id: None,
+        }],
+    );
+}
+
 /// Extracts either a normal label or a request that pauses the same agent
 /// action. The last matching object wins, following the normal output rule.
 fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
@@ -1220,32 +1393,36 @@ fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
         ));
     }
 
-    let Some(object) = objects.iter().rev().find_map(|value| {
-        let object = value.as_object()?;
-        if object.get("status").and_then(Value::as_str) == Some("awaiting_input") {
-            Some(object)
-        } else {
-            object.get("output").and_then(Value::as_str).map(|_| object)
-        }
-    }) else {
+    let Some(object) = objects
+        .iter()
+        .rev()
+        .find_map(|value| value.as_object().filter(|object| is_answer_object(object)))
+    else {
         return Err(no_label_error(
             "the agent's answer contains JSON, but no object with a string 'output' key",
             text,
         ));
     };
 
-    if object.get("status").and_then(Value::as_str) == Some("awaiting_input") {
+    response_from_object(object).map_err(|reason| no_label_error(reason, text))
+}
+
+/// Whether `object` is an answer at all: a question, or a string `output`.
+fn is_answer_object(object: &Map<String, Value>) -> bool {
+    object.get("status").and_then(Value::as_str) == Some(AWAITING_INPUT)
+        || object.get("output").and_then(Value::as_str).is_some()
+}
+
+/// Turns an answer object into the response it stands for. An error is the
+/// reason the object is unusable; the caller quotes the answer it came
+/// from (the agent's text, or the structured output) with it.
+fn response_from_object(object: &Map<String, Value>) -> Result<AgentResponse, &'static str> {
+    if object.get("status").and_then(Value::as_str) == Some(AWAITING_INPUT) {
         let Some(question) = object.get("question").and_then(Value::as_str) else {
-            return Err(no_label_error(
-                "the agent requested human input without a string 'question'",
-                text,
-            ));
+            return Err("the agent requested human input without a string 'question'");
         };
         if question.trim().is_empty() {
-            return Err(no_label_error(
-                "the agent requested human input with an empty question",
-                text,
-            ));
+            return Err("the agent requested human input with an empty question");
         }
         let options = match object.get("options") {
             None => Vec::new(),
@@ -1257,18 +1434,10 @@ fn extract_response(text: &str) -> Result<AgentResponse, ActionError> {
                     !options.is_empty() && options.iter().all(|option| !option.trim().is_empty())
                 })
                 .map(|options| options.into_iter().map(ToString::to_string).collect())
-                .ok_or_else(|| {
-                    no_label_error(
-                        "the agent's input options must be a non-empty array of non-empty strings",
-                        text,
-                    )
-                })?,
-            Some(_) => {
-                return Err(no_label_error(
-                    "the agent's input options must be an array of strings",
-                    text,
-                ))
-            }
+                .ok_or(
+                    "the agent's input options must be a non-empty array of non-empty strings",
+                )?,
+            Some(_) => return Err("the agent's input options must be an array of strings"),
         };
         return Ok(AgentResponse::AwaitingInput {
             question: question.to_string(),

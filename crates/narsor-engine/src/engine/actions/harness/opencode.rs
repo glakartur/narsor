@@ -39,11 +39,12 @@
 //! permission bits on the provisioned directories, for both harnesses.
 
 use super::{
-    bool_parameter, reject_option_like, resolve_read_only_path, string_parameter, tail,
-    HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
+    bool_parameter, not_classified, reject_option_like, resolve_read_only_path, string_parameter,
+    tail, HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
+use narsor_protocol::chat::ChatElement;
 use serde_json::Value;
 
 /// The `harness:` value this adapter answers to.
@@ -164,8 +165,10 @@ struct OpenCodeStreamParser {
     error: Option<String>,
 }
 
-impl HarnessStreamParser for OpenCodeStreamParser {
-    fn on_stdout_line(&mut self, line: &[u8]) {
+impl OpenCodeStreamParser {
+    /// Folds one stdout line into what [`HarnessStreamParser::finish`]
+    /// needs; lines that carry none of it are ignored.
+    fn accumulate(&mut self, line: &[u8]) {
         let Ok(text) = std::str::from_utf8(line) else {
             return;
         };
@@ -203,6 +206,15 @@ impl HarnessStreamParser for OpenCodeStreamParser {
             _ => {}
         }
     }
+}
+
+impl HarnessStreamParser for OpenCodeStreamParser {
+    /// opencode output is not classified yet (R15): every line is one
+    /// unclassified element.
+    fn on_stdout_line(&mut self, line: &[u8]) -> Vec<ChatElement> {
+        self.accumulate(line);
+        not_classified()
+    }
 
     fn finish(self: Box<Self>, exit_code: i32, stderr_tail: &str) -> HarnessRun {
         let failure = if exit_code != 0 {
@@ -223,6 +235,7 @@ impl HarnessStreamParser for OpenCodeStreamParser {
             text: self.text.unwrap_or_default(),
             session_id: self.session_id,
             failure,
+            structured_output: None,
         }
     }
 }

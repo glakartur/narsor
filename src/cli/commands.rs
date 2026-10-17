@@ -29,8 +29,9 @@ use crate::api::{
     ExecutionStatusDto, ExecutionSummary, HumanInputDeliveryDto, ProblemKindDto,
 };
 use crate::domain::{without_unsafe_chars, Event, ExecutionStatus};
-use crate::tui::conversation::classify;
+use crate::tui::conversation::{classify, unclassified_preview};
 use narsor_protocol::api::{ConversationState, Position, PositionStatus};
+use narsor_protocol::chat::ChatElement;
 use narsor_protocol::controller::{WorkflowInputType, WorkflowInputView, WorkflowSource};
 
 use crate::config::{render_value, Flags, Resolved, SettingKey, Source};
@@ -539,10 +540,10 @@ fn position_status_name(status: PositionStatus) -> &'static str {
 /// usize::MAX`, which the server-side read never actually reaches (an
 /// attempt's conversation is nowhere near [`usize::MAX`] bytes), so this is
 /// one request, not a paginated loop, exactly as the direct store read used
-/// to be one call. Every entry is printed classified ([`classify`], reused
-/// as-is from the TUI's task view, U7) for readability, but the classified
-/// text is always the entry's full decoded content, never a summary — the
-/// raw-and-complete requirement holds regardless of the kind sniffed from it.
+/// to be one call. Every entry is printed through [`conversation_entry_lines`]:
+/// one line per chat element, with the same category label and the same
+/// summary the TUI shows (D60). The raw line stays the lossless record and is
+/// what the API returns next to the elements.
 pub async fn conversation(
     state: &Path,
     flags: &Flags,
@@ -581,19 +582,51 @@ pub async fn conversation(
 
 /// One conversation entry: number, timestamp, source/kind, decoded content.
 fn print_conversation_entry(entry: &crate::api::ConversationEntryDto) {
-    let classified = classify(entry);
-    let body = if matches!(entry.source, crate::api::ConversationEntrySource::Narsor) {
-        String::from_utf8_lossy(&classified.raw).into_owned()
-    } else {
-        classified.summary
-    };
-    println!(
-        "{:>5}  {}  {:<10} {}",
-        classified.entry_number,
-        classified.timestamp.to_rfc3339(),
-        classified.kind.label(),
-        body
-    );
+    for line in conversation_entry_lines(entry) {
+        println!("{line}");
+    }
+}
+
+/// The printed lines of one conversation entry, shared by every CLI command
+/// that prints a conversation.
+///
+/// One line per chat element — entry number, timestamp, category label,
+/// element summary — so the CLI and the TUI ([`classify`]) agree on both the
+/// label and the text. An entry narsor wrote itself (the prompt, the process
+/// outcome) is printed once, as its decoded text, as it always was: that text
+/// is narsor's own and needs no summary. An unclassified element (an
+/// opencode or codex line, a legacy record) says why, followed by the start
+/// of its raw line on the same line — the summary alone would hide what the
+/// harness printed.
+pub fn conversation_entry_lines(entry: &crate::api::ConversationEntryDto) -> Vec<String> {
+    let narsor = matches!(entry.source, crate::api::ConversationEntrySource::Narsor);
+    classify(entry)
+        .into_iter()
+        .filter(|classified| !narsor || classified.element_index == 0)
+        .map(|classified| {
+            let body = if narsor {
+                crate::tui::scroll::sanitize(&String::from_utf8_lossy(&classified.raw))
+            } else if matches!(
+                classified.element,
+                ChatElement::Unclassified { .. } | ChatElement::Unrecognized
+            ) {
+                let (preview, cut) = unclassified_preview(&classified.raw);
+                let ellipsis = if cut { "…" } else { "" };
+                crate::tui::scroll::one_line(&format!(
+                    "{}: {preview}{ellipsis}",
+                    classified.summary
+                ))
+            } else {
+                crate::tui::scroll::sanitize(&classified.summary)
+            };
+            format!(
+                "{:>5}  {}  {:<10} {body}",
+                classified.entry_number,
+                classified.timestamp.to_rfc3339(),
+                classified.kind.label(),
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
