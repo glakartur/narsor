@@ -69,7 +69,10 @@ pub(super) fn routes() -> Router<AppState> {
         )
         .route("/control/v1/repositories/{id}", delete(delete_repository))
         .route("/control/v1/executions", get(get_history))
-        .route("/control/v1/executions/{execution_id}", get(get_history_one))
+        .route(
+            "/control/v1/executions/{execution_id}",
+            get(get_history_one),
+        )
         .route(
             "/control/v1/executions/{execution_id}/events",
             get(get_history_events),

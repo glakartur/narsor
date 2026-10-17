@@ -3,8 +3,8 @@
 Plan: `docs/plans/2026-10-17-1520-feat-deferred-harness-permissions-plan.md`
 Gałąź: `feat/deferred-harness-permissions` (U6: `847711a`, U7: `2e7bc29..5a09285`)
 
-Dokument zbiera prace, które zostały po U6 i U7. Pierwsza pozycja to znany
-problem bezpieczeństwa, który świadomie odroczono.
+Dokument zbiera prace w Kubernetesie, które zostały po U6 i U7. Pierwsza
+pozycja to znany problem bezpieczeństwa, który świadomie odroczono.
 
 ## 1. Izolacja sesji edycji profilu od poświadczeń kontrolera (R15)
 
@@ -71,12 +71,3 @@ ustawienia) chroni Secret przed niezauważoną zmianą, ale nie chroni tokenu.
   plikach `.claude.json`, `settings.json` i rejestrach pluginów, czy scalanie
   per klucz daje oczekiwany wynik. Sprawdzić, czy Claude Code odtwarza pluginy
   z rejestru bez cache (limit 1 MiB Secretu).
-
-## 3. Znane problemy spoza U6/U7
-
-- [ ] **Testy jednostkowe `narsor-protocol` nie kompilują się** od `7f79c08`
-  (`InputContinuationView`, brak pola `permission_decision` w teście
-  `HumanInputDeliveryDto`). Przez to `cargo test --workspace` nie przechodzi.
-- [ ] **`cargo fmt --check` zgłasza dwa pliki** spoza tej pracy:
-  `crates/narsor-server/src/api/routes/control.rs` i
-  `src/tui/task_app/tabs/conversation.rs`.

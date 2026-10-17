@@ -30,12 +30,12 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::api::{ApiClient, ClientError, ConversationResponse as Page};
-use crate::domain::{Event, EventData};
 use crate::cli::task_text::RecordAge;
 use crate::controller_protocol::{
     ConversationPageQuery, ExecutionEventsSource, CONVERSATION_RECORD_UNREADABLE,
     CONVERSATION_RECORD_UNREADABLE_PREFIX, CONVERSATION_UNAVAILABLE,
 };
+use crate::domain::{Event, EventData};
 use narsor_protocol::api::{ConversationState, Position};
 
 use super::super::super::scroll::one_line;
@@ -571,8 +571,8 @@ impl Conversation {
 /// Projects only events that record a person or decision-maker choosing a
 /// workflow output. Routine lifecycle events remain in the dedicated log.
 fn workflow_choice_entry(event: &Event) -> Option<TranscriptEntry> {
-    use crate::domain::ConductorDecisionKind;
     use crate::domain::event::AnsweredBy;
+    use crate::domain::ConductorDecisionKind;
     use TranscriptPresentation::{Agent, Conductor, Operator};
 
     let (actor, choice, presentation) = match &event.data {
@@ -580,7 +580,11 @@ fn workflow_choice_entry(event: &Event) -> Option<TranscriptEntry> {
             provider,
             output_label,
             ..
-        } => (format!("agent · {}", one_line(provider)), output_label.clone(), Agent),
+        } => (
+            format!("agent · {}", one_line(provider)),
+            output_label.clone(),
+            Agent,
+        ),
         EventData::ConductorDecision {
             kind,
             output_label: Some(output),
@@ -607,7 +611,10 @@ fn workflow_choice_entry(event: &Event) -> Option<TranscriptEntry> {
             vec![format!("{actor} wybrał opcję: {}", one_line(&choice))],
             Vec::new(),
         )
-        .with_header(format!("WYBÓR WORKFLOW · {}", event.timestamp.format("%H:%M:%S")))
+        .with_header(format!(
+            "WYBÓR WORKFLOW · {}",
+            event.timestamp.format("%H:%M:%S")
+        ))
         .with_presentation(presentation),
     )
 }
