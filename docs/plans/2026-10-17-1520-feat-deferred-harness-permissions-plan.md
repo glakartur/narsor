@@ -15,9 +15,9 @@ execution: code
 ## Goal Capsule
 
 - **Objective:** Task Narsora może zatrzymać się na prośbie Claude Code o uprawnienie, poczekać na późniejszą decyzję użytkownika i kontynuować bez interaktywnego terminala.
-- **Means:** Narsor zapisuje prośbę jako trwały stan oczekiwania, a zgodę przekazuje wyłącznie do wznowienia danego taska. Runner K8s otrzymuje bazową konfigurację Claude Code i kopiuje ją do zapisywalnej konfiguracji prywatnej taska.
-- **Product authority:** Zgody na polecenia są lokalne dla taska i wygasają wraz z nim. Dedykowany Secret Claude Code jest źródłem prawdy: jego zewnętrzna zmiana jest przyjmowana bez weta Narsora. Zmiana inicjowana w Narsorze uruchamia edytowalną kopię konfiguracji w Claude Code, po czym Narsor zapisuje wybrane pliki z powrotem do Secretu.
-- **Open blockers:** Brak blokujących decyzji produktowych. Szczegóły protokołu wznowienia Claude Code i aktualizacji Secretu należą do planowania technicznego.
+- **Means:** Narsor zapisuje prośbę jako trwały stan oczekiwania, a zgodę przekazuje wyłącznie do wznowienia danego taska. Profil harnessu ma katalog źródłowy i katalog roboczy. Gdy są różne, Narsor przed startem harnessu kopiuje albo scala profil do katalogu roboczego.
+- **Product authority:** Zgody na polecenia są lokalne dla taska i wygasają wraz z nim. Runner jest tylko konsumentem profilu: zmiany harnessu zostają lokalne i nie są dystrybuowane. Profil w Secrecie zmienia tylko kontroler Narsor (sesja edycji) albo operator poza Narsorem. Przy zapisie ostatni zapis wygrywa.
+- **Open blockers:** Brak blokujących decyzji dla instalacji lokalnej. Szczegóły K8s (transport terminala edycji, format Secretu, reguły scalania wg typu pliku) są wstępne i zostaną dopracowane podczas praktycznych testów w K8s.
 
 ---
 
@@ -25,7 +25,7 @@ execution: code
 
 ### Summary
 
-Plan realizuje trwałe, taskowe decyzje o uprawnieniach Claude Code przez istniejące kanały Narsora, zachowanie znaczenia pominiętego `workspace_access` oraz używanie i edycję profilu Claude Code w K8s. Sekret zawiera pliki potrzebne harnessowi, w tym uwierzytelnianie, ustawienia uprawnień, MCP, pluginy i skills.
+Plan realizuje trwałe, taskowe decyzje o uprawnieniach Claude Code przez istniejące kanały Narsora, zachowanie znaczenia pominiętego `workspace_access` oraz wspólny model profilu harnessu: katalog źródłowy i katalog roboczy. W instalacji lokalnej harness używa swojego standardowego katalogu bez kopiowania. W K8s źródłem jest Secret zawierający pliki potrzebne harnessowi, w tym uwierzytelnianie, ustawienia uprawnień, MCP, pluginy i skills; edycję Secretu wykonuje kontroler Narsor.
 
 ### Problem Frame
 
@@ -33,22 +33,23 @@ Obecny adapter Claude Code potrafi zapisać `permission_denied` jako zdarzenie t
 
 Użytkownik może odpowiedzieć później, dlatego task nie może traktować braku odpowiedzi jak odmowy ani kończyć się nieczytelnym błędem. Jednocześnie decyzja o jednym poleceniu nie może stać się trwałym uprawnieniem dla kolejnych tasków.
 
-W lokalnym runnerze Claude może korzystać z konfiguracji lokalnego środowiska. W K8s nie ma dostępu do konfiguracji z komputera operatora: domyślny `HOME` jest prywatny dla taska. Potrzebny jest zatem jawny profil bazowy dostarczany podom runnerów.
+W lokalnym runnerze Claude może korzystać z konfiguracji lokalnego środowiska; tam zmiany konfiguracji mogą być wykonywane w dowolnym momencie przez wszystkie instancje harnessu. W K8s nie ma dostępu do konfiguracji z komputera operatora: domyślny `HOME` jest prywatny dla taska, a wolumen Secretu jest tylko do odczytu. Potrzebny jest zatem profil źródłowy dostarczany podom runnerów, kopiowany do zapisywalnego katalogu roboczego, oraz osobna sesja edycji, która zapisuje zmiany z powrotem do Secretu.
 
 ### Key Decisions
 
 - **Asynchroniczna obsługa uprawnień.** (session-settled: user-directed — decyzja użytkownika może nadejść po zatrzymaniu taska.) Governs R1-R8.
 - **Jedno ustawienie workflow.** (session-settled: user-directed — używamy istniejącego `workspace_access`, bez dodatkowego pola trybu uprawnień.) Governs R9-R10.
-- **Konfiguracja taska bazuje na wersji Secretu z inicjalizacji.** (session-settled: user-directed — wszystkie runnery Claude Code korzystają z profilu, a task zachowuje prywatną kopię.) Governs R11-R13.
-- **Sekret jest źródłem prawdy, a zarządzana edycja zapisuje kopię użytkownika.** (session-settled: user-directed — zewnętrznych zmian Secretu Narsor nie kwestionuje; podczas edycji Narsor przekazuje kopię do Claude Code i zapisuje wynik.) Governs R14-R17.
+- **Dwa parametry profilu: katalog źródłowy i katalog roboczy.** (session-settled: user-directed — gdy źródło jest puste albo równe katalogowi roboczemu, Narsor nie kopiuje i tylko uruchamia harness; tak działa instalacja lokalna.) Governs R11-R12.
+- **Runner jest tylko konsumentem profilu i scala go przy każdym starcie.** (session-settled: user-directed — Secret może nieść np. nową sesję OAuth, więc musi trafić do harnessu; lokalne zmiany harnessu są wykrywane i nanoszone na wersję z Secretu, ale nigdzie nie są dystrybuowane.) Governs R12-R14.
+- **Edycję i zapis Secretu wykonuje wyłącznie kontroler Narsor; ostatni zapis wygrywa.** (session-settled: user-directed — kontroler kopiuje profil, uruchamia harness dla użytkownika, po jego zamknięciu zbiera pliki i zapisuje Secret; preferowany przebieg w podzie kontrolera.) Governs R15-R17.
 - **Pierwszy zakres obejmuje Claude Code.** (inferred — rzeczywisty log i obecny parser dotyczą tego harnessu; inne adaptery można rozszerzyć, gdy dostarczą równoważny sygnał.) Governs R1, R17.
 
 ### Actors
 
 - A1. **Właściciel taska** przegląda oczekujące prośby i wybiera zakres zgody; przy edycji profilu sam uruchamia Claude Code i zmienia konfigurację.
-- A2. **Runner Narsora** obserwuje zdarzenia harnessu, zapisuje oczekiwanie, wstrzymuje task i wznawia go z lokalną decyzją.
+- A2. **Runner Narsora** obserwuje zdarzenia harnessu, zapisuje oczekiwanie, wstrzymuje task i wznawia go z lokalną decyzją; przed startem harnessu przygotowuje katalog roboczy profilu.
 - A3. **Claude Code** wykonuje narzędzia zgodnie ze swoją konfiguracją oraz zgodami przekazanymi dla bieżącego taska.
-- A4. **Narsor** zarządza cyklem życia runnerów; w zadaniu edycji kopiuje profil do zapisywalnego miejsca i publikuje wybrane pliki po zakończeniu pracy użytkownika.
+- A4. **Kontroler Narsor** ma zamontowany Secret profilu i wyłączne prawo jego zapisu; prowadzi sesję edycji: kopiuje profil, uruchamia harness, zbiera pliki i zapisuje Secret.
 - A5. **Pod runnera** wykonuje każde zadanie Claude Code w K8s i otrzymuje dedykowany Secret profilu tylko do odczytu.
 
 ### Requirements
@@ -66,14 +67,14 @@ W lokalnym runnerze Claude może korzystać z konfiguracji lokalnego środowiska
 - R9. W workflow pozostaje wyłącznie `workspace_access`. Jawne `read-only` ogranicza dostęp, jawne `read-write` wybiera tryb zapisu danego adaptera, a pominięcie pola nie wymusza trybu i pozostawia decyzję konfiguracji harnessu dostępnej w środowisku.
 - R10. Schemat workflow zachowuje informację, czy `workspace_access` podano jawnie, aby wartość domyślna nie wymuszała niejawnie trybu harnessu. Istniejące workflow otrzymują zdefiniowaną, kompatybilną interpretację.
 
-**Konfiguracja Claude Code w Kubernetesie**
+**Profil harnessu (lokalnie i w Kubernetesie)**
 
-- R11. Instalacja K8s udostępnia każdemu runnerowi Claude Code dedykowany Secret profilu jako wolumen tylko do odczytu; konfiguracja nie pochodzi z lokalnego `HOME` operatora.
-- R12. Przed pierwszym uruchomieniem Claude Code runner kopiuje pliki bazowej konfiguracji do zapisywalnego katalogu prywatnego taska i wskazuje ten katalog jako konfigurację harnessu.
-- R13. Runner nie nadpisuje konfiguracji prywatnej przy wznowieniu taska. Task używa wersji profilu, z której został zainicjalizowany; nowe taski korzystają z bieżącej zawartości Secretu.
-- R14. Każdy runner Claude Code dostaje Secret profilu tylko do odczytu, ponieważ jest on potrzebny do uruchomienia harnessu. Ten dostęp nie oznacza, że pozostałe operacje Narsora używają profilu.
-- R15. W trybie edycji Narsor kopiuje zawartość zamontowanego profilu do zapisywalnego katalogu, uruchamia Claude Code z tą kopią, a po zakończeniu zbiera pliki konfiguracji i publikuje je do Secretu. Claude Code nie zapisuje bezpośrednio do Secretu.
-- R16. Zewnętrzna zmiana dedykowanego Secretu jest nadrzędna i nie jest przez Narsor odrzucana, cofana ani zastępowana. Jeśli koliduje z trwającą publikacją Narsora, Narsor odczytuje aktualny Secret i ponawia publikację na jego aktualnej zawartości albo zgłasza konflikt użytkownikowi; nie cofa zewnętrznej zmiany.
+- R11. Konfiguracja Narsora ma dwa parametry profilu harnessu: katalog źródłowy i katalog roboczy. Gdy katalog źródłowy jest pusty albo wskazuje ten sam katalog co roboczy, Narsor nie kopiuje profilu i tylko uruchamia harness z katalogiem roboczym (lub standardowym katalogiem harnessu). Katalog roboczy jest wymagany, gdy podano katalog źródłowy albo gdy jest niestandardowy.
+- R12. Gdy katalogi są różne, runner przed każdym startem harnessu przygotowuje katalog roboczy z katalogu źródłowego i wskazuje go harnessowi (`CLAUDE_CONFIG_DIR`). W K8s katalogiem źródłowym jest wolumen dedykowanego Secretu tylko do odczytu, montowany w każdym podzie Claude Code.
+- R13. Przy ponownym starcie runner scala profil: zmiany wykonane lokalnie przez harness od poprzedniego startu są nanoszone na aktualną wersję ze źródła. Nowa wartość ze źródła (np. sesja OAuth) zawsze trafia do harnessu. Pliki spoza profilu (sesje, historia) pozostają bez zmian.
+- R14. Lokalne zmiany profilu w runnerze nie są nigdzie dystrybuowane. Runner nie ma prawa zapisu Secretu.
+- R15. Sesja edycji profilu działa w kontrolerze Narsor: kontroler kopiuje profil do katalogu zapisywalnego, uruchamia harness dla użytkownika, a po zamknięciu harnessu zbiera pliki profilu z katalogu roboczego i zapisuje je do Secretu. Harness nie zapisuje bezpośrednio do Secretu i nie dostaje uprawnień Kubernetes.
+- R16. Zewnętrzna zmiana Secretu jest przyjmowana bez weta Narsora. Przy równoległej zmianie zewnętrznej i zapisie sesji edycji ostatni zapis wygrywa.
 - R17. Do Secretu można zapisać co najmniej uwierzytelnianie, ustawienia i reguły uprawnień, MCP, pluginy oraz skills. Historia sesji i dane konkretnego taska nie są częścią współdzielonego profilu.
 - R18. Obecne zachowanie innych harnessów pozostaje bez zmian, dopóki ich adaptery nie obsłużą własnego źródła i cyklu życia próśb o uprawnienia.
 
@@ -84,9 +85,9 @@ W lokalnym runnerze Claude może korzystać z konfiguracji lokalnego środowiska
 - F3. **Zgoda na grupę:** Zgodne akcje tego taska nie tworzą ponownie tej samej prośby, ale inny task wymaga własnej decyzji. **Covers:** R3, R5, R7.
 - F4. **Odmowa użytkownika:** Agent wznawia pracę z informacją o decyzji i może dobrać alternatywę. **Covers:** R4.
 - F5. **Blokada polityki:** Narsor pokazuje nieprzekraczalną regułę `deny` bez opcji jej obejścia. **Covers:** R6.
-- F6. **Start taska K8s:** Runner kopiuje aktualną bazową konfigurację z Secretu do prywatnego `HOME` taska, następnie uruchamia Claude Code z zapisywalnym katalogiem konfiguracji. **Covers:** R11-R12, R16-R17.
-- F7. **Wznowienie poda:** Prywatna konfiguracja, sesja i oczekiwanie są zachowane, a bootstrap nie kopiuje ponownie ustawień bazowych. **Covers:** R7, R13, R16.
-- F8. **Edycja profilu:** Narsor kopiuje zamontowaną konfigurację do katalogu roboczego, uruchamia Claude Code dla użytkownika, zbiera pliki profilu i zapisuje je do Secretu. Każdy runner Claude Code dostaje montowany Secret. Zmiany dokonane poza Narsorem pozostają obowiązujące. **Covers:** R14-R17.
+- F6. **Start lokalny:** Katalog źródłowy jest pusty albo równy roboczemu; runner uruchamia harness bez kopiowania. **Covers:** R11.
+- F7. **Start i wznowienie taska K8s:** Runner scala profil z Secretu z lokalnymi zmianami harnessu w prywatnym katalogu roboczym, potem uruchamia Claude Code. Sesja i oczekiwanie są zachowane. **Covers:** R7, R12-R14.
+- F8. **Edycja profilu:** Kontroler kopiuje zamontowany profil do katalogu zapisywalnego, uruchamia Claude Code dla użytkownika; użytkownik zmienia permissions, pluginy, skills, MCP i zamyka harness; kontroler zbiera pliki profilu i zapisuje je do Secretu. **Covers:** R15-R17.
 
 ### Acceptance Examples
 
@@ -94,22 +95,23 @@ W lokalnym runnerze Claude może korzystać z konfiguracji lokalnego środowiska
 - AE2. Covers R3, R5, R7. Zgoda na grupę poleceń działa w pozostałej części taska i znika po jego zakończeniu; drugi task nadal zatrzymuje się przy analogicznej odmowie.
 - AE3. Covers R4, R6. Po odmowie użytkownika agent może kontynuować inną ścieżką, a jawna polityka `deny` nie może zostać nadpisana przez lokalną zgodę.
 - AE4. Covers R8-R10. Klient może odpowiedzieć na oczekiwanie, gdy proces runnera jest zatrzymany lub został odtworzony; workflow bez jawnego `workspace_access` nie wysyła harnessowi wymuszonego trybu, a jawne `read-only` nadal ogranicza zapis.
-- AE5. Covers R11-R13, R16-R17. Nowy pod kopiuje bazowy plik konfiguracji do katalogu prywatnego taska; wznowiony pod zachowuje tę kopię, a identyfikator wersji bazowej taska jest widoczny.
-- AE6. Covers R14-R17. Zwykły runner i runner edycji widzą skonfigurowany Secret jako read-only; edycja zapisuje kopię do Secretu przez Narsor. Zmiana Secretu wykonana poza Narsorem nie jest odrzucana ani cofana.
+- AE5. Covers R11-R14. Lokalnie przy pustym źródle runner nie kopiuje profilu. W K8s nowy pod kopiuje profil do katalogu roboczego; wznowiony pod otrzymuje nowy token OAuth z Secretu i zachowuje lokalnie dodaną regułę uprawnień.
+- AE6. Covers R15-R17. Sesja edycji w kontrolerze zapisuje zmienione pliki profilu do Secretu; historia sesji nie trafia do Secretu; runner nie ma prawa zapisu Secretu.
 - AE7. Covers R18. Harness inny niż Claude Code zachowuje dotychczasowy przebieg i nie otrzymuje nowego zachowania przez przypadkowe współdzielenie parsera zdarzeń.
 
 ### Scope Boundaries
 
 - Funkcja nie wprowadza interaktywnego terminala ani nie czeka na stdin procesu Claude Code.
 - Zgoda na polecenie nie zmienia konfiguracji Claude Code ani nie nadaje podowi nowych uprawnień infrastrukturalnych. (R5-R6)
-- Task zachowuje swoją kopię profilu do wznowienia; nowy task czyta aktualny Secret. Zewnętrzna aktualizacja nie czeka na akceptację Narsora. (R13, R16)
+- Zmiany profilu w runnerze są lokalne; nie ma ich publikacji z runnera. Zewnętrzna aktualizacja Secretu nie czeka na akceptację Narsora. (R14, R16)
+- Pierwsza dostawa nie musi zamknąć szczegółów K8s: transport terminala edycji (`kubectl exec` albo terminal po HTTPS), format Secretu i reguły scalania wg typu pliku zostaną dopracowane podczas testów w K8s. (R12-R17)
 - Zakres nie zmienia domyślnego zachowania innych harnessów. (R18)
 
 ---
 
 ## Planning Contract
 
-Product Contract unchanged.
+Product Contract zaktualizowany 2026-10-18: runner tylko konsumuje profil, edycję i zapis Secretu wykonuje kontroler, ostatni zapis wygrywa.
 
 ### High-Level Technical Design
 
@@ -119,7 +121,6 @@ sequenceDiagram
     participant N as Narsor API i stan taska
     participant R as Runner taska
     participant C as Claude Code
-    participant E as Task edycji profilu
     participant Ktrl as Kontroler Narsora
     participant K as Kubernetes Secret
 
@@ -130,18 +131,20 @@ sequenceDiagram
     N->>R: dostarcz jednorazową decyzję dla taska
     R->>C: wznów tę samą sesję z grantem w argumentach
 
-    E->>K: odczytaj zamontowany profil
-    E->>E: skopiuj profil do zapisywalnego katalogu
-    U->>C: edytuj ustawienia przez Claude Code
-    E->>N: przekaż pliki wybrane do publikacji
-    N->>Ktrl: zleć aktualizację dedykowanego Secretu
-    Ktrl->>K: zapisz nową zawartość Secretu
-    K-->>R: nowy profil dla uruchomień Claude Code
+    K-->>R: profil (wolumen read-only)
+    R->>R: scal profil z lokalnymi zmianami w katalogu roboczym
+
+    Ktrl->>K: odczytaj zamontowany profil
+    Ktrl->>Ktrl: skopiuj profil do katalogu zapisywalnego
+    Ktrl->>C: uruchom harness dla użytkownika
+    U->>C: zmień permissions, pluginy, skills, MCP; zamknij harness
+    Ktrl->>Ktrl: zbierz pliki profilu z katalogu roboczego
+    Ktrl->>K: zapisz Secret (ostatni zapis wygrywa)
 ```
 
 `permission_denied` staje się oczekiwaniem dopiero po zakończeniu nieinteraktywnego wywołania Claude Code. Narsor zapisuje request razem z sesją i identyfikatorem wywołania, a dedykowana decyzja właściciela albo odmawia, albo dodaje ograniczony grant do wznowienia. Zwykłe odpowiedzi na pytania agenta i ogólne polecenie wznowienia nie mogą tworzyć grantów.
 
-Profil K8s ma trzy odrębne warstwy: dedykowany Secret, zapisywalną kopię konfiguracji taska oraz granty przechowywane w stanie taska. Każdy runner Claude Code dostaje Secret read-only i inicjalizuje prywatną kopię na trwałym storage. W zadaniu edycji Narsor publikuje pliki z kopii przez kontroler z uprawnieniami ograniczonymi do nazwanego Secretu. Zewnętrzne zmiany Secretu pozostają źródłem prawdy i nie są przez Narsor cofane.
+Profil ma trzy odrębne warstwy: katalog źródłowy (w K8s dedykowany Secret), zapisywalny katalog roboczy harnessu oraz granty przechowywane w stanie taska. Runner przygotowuje katalog roboczy przed każdym startem harnessu i nic nie publikuje. Jedyną drogą zapisu Secretu w Narsorze jest sesja edycji w kontrolerze z uprawnieniami ograniczonymi do nazwanego Secretu.
 
 ### Key Technical Decisions
 
@@ -150,8 +153,8 @@ Profil K8s ma trzy odrębne warstwy: dedykowany Secret, zapisywalną kopię konf
 - KTD3. **Przekazuj zgodę tylko w kontekście bieżącego taska i requestu.** Decyzja ma zamknięty typ `deny` albo `allow`; `allow` wymaga jawnego zakresu `exact_operation` albo `command_group`. Zapisz grant wraz z task ID, request ID i fingerprintem strukturalnej operacji (narzędzie, executable, argumenty i katalog roboczy); `command_group` dopasowuje wyłącznie jawnie zatwierdzony executable i stały prefiks argumentów z granicą argumentu. Grupę oferuj tylko dla pojedynczej komendy, którą gramatyka Claude `--allowedTools` potrafi reprezentować równie wąsko; odrzucaj operatory sterujące powłoki, pipe, redirection, substitution, glob i inne złożone formy, jeśli mogłyby zmienić zakres. Nie interpretuj substringów ani składni powłoki jako szerszego wzorca. Grant jest jednorazowy dla wznowienia requestu; jeśli zakresu nie da się wiernie wyrazić przez `--allowedTools`, odrzuć go zamiast poszerzać. Nie zapisuj grantów do settings ani bazowego Secretu. Jawne reguły `deny` pozostają nadrzędne wobec allow rules. (session-settled: user-directed — wybrane zamiast trwałej konfiguracji harnessu, ponieważ grant dotyczy tylko bieżącego taska; governs R3-R7)
 - KTD4. **Zachowaj obecne powierzchnie decyzji i daj im wspólny typ requestu.** Każdy endpoint autoryzuje właściciela względem taska, a request permission musi należeć do tego taska. API, CLI, TUI i kontroler tasków używają tej samej struktury i walidacji; stare `/input` i `/resume` nie mogą ominąć decyzji permission. Odpowiedź wiąże się z ID oczekiwania i ma pojedynczego zwycięzcę przy równoczesnych zgłoszeniach. (governs R2-R8)
 - KTD5. **Zachowaj obecność pola workflow osobno od wartości.** Nowy workflow z pominiętym `workspace_access` nie przekazuje jawnego trybu do adaptera; jawne `read-only` i `read-write` nadal są mapowane. Rekordy wykonania zapisane przed zmianą zachowują dotychczasowe znaczenie `read-write`. (session-settled: user-directed — wybrane zamiast nowego pola trybu uprawnień, ponieważ workflow ma nadal jedno ustawienie dostępu; governs R9-R10)
-- KTD6. **Przypnij pełny profil taska przy pierwszej inicjalizacji trwałego HOME.** Runner kopiuje zawartość zamontowanego katalogu profilu i zapisuje digest; przy wznowieniu marker chroni kopię przed nadpisaniem późniejszą zmianą Secretu. Kopiowane pliki obejmują ustawienia, uwierzytelnianie i pozostałe pliki profilu. (session-settled: user-directed — task zachowuje wersję z inicjalizacji; governs R11-R13, R16-R17)
-- KTD7. **Edycja profilu odbywa się na kopii, a zapis wykonuje Narsor.** Każdy runner Claude Code, także dedykowany edytor, otrzymuje Secret profilu read-only. Narsor przygotowuje kopię w zapisywalnym miejscu, uruchamia Claude Code, a po pracy użytkownika zbiera pliki profilu i zleca kontrolerowi zapis do nazwanego Secretu. CAS może wykryć wyścig, ale nie może usuwać ani cofać zewnętrznej zmiany: Narsor odświeża bazę i ponawia zapis albo pokazuje konflikt. RBAC daje zapis tylko kontrolerowi; runner nie zapisuje Secretu bezpośrednio. (session-settled: user-directed — użytkownik edytuje konfigurację w Claude Code, Narsor publikuje rezultat; governs R14-R17)
+- KTD6. **Scalanie trójstronne profilu w runnerze.** Przy każdym starcie runner porównuje dla każdego pliku profilu trzy wersje: bazę (kopię źródła z poprzedniego startu, w bookkeepingu taska), wersję lokalną (katalog roboczy) i aktualne źródło. Plik niezmieniony lokalnie dostaje wersję ze źródła; plik niezmieniony w źródle zachowuje wersję lokalną; nowa baza jest zapisywana po scaleniu. Pliki, które zmieniły się po obu stronach, rozstrzyga typ pliku (wstępnie, do weryfikacji w K8s): plik poświadczeń (`.credentials.json`) bierze w całości wersję ze źródła, bo tokeny z różnych sesji nie mogą być mieszane; pliki ustawień JSON (`settings.json`, `.claude.json`) są scalane per klucz, listy reguł uprawnień są sumowane, a konflikt tej samej wartości rozstrzyga źródło; pozostałe pliki (skills, `CLAUDE.md`) biorą wersję ze źródła. Gdy źródło jest puste albo równe katalogowi roboczemu, krok nie działa. Wpisy wewnętrzne wolumenu Secretu (`..data`, `..<timestamp>`) nie są częścią profilu. (session-settled: user-directed — governs R11-R14)
+- KTD7. **Edycja profilu w kontrolerze, ostatni zapis wygrywa.** Rdzeń edycji (kopiuj → uruchom harness → zbierz → zapisz) jest niezależny od transportu terminala; pierwszy transport to komenda kontrolera uruchamiana przez `kubectl exec -it`, terminal po HTTPS można dodać później. Zbierane są tylko pliki profilu wg reguł include/exclude (domyślnie: ustawienia, poświadczenia, `CLAUDE.md`, skills, agents, commands, rejestry pluginów; zawsze bez `projects/`, historii, todos, snapshotów powłoki i cache pluginów). Zapis nie używa CAS. RBAC daje zapis Secretu tylko kontrolerowi. Stary przepływ „propozycja → akceptacja” jest usuwany. Format Secretu (mapowania `klucz=ścieżka` albo jeden klucz z archiwum profilu) pozostaje otwarty do testów w K8s: mapowania wymagają wpisu konfiguracji dla każdego nowego pliku, archiwum nie. (session-settled: user-directed — governs R15-R17)
 
 ### Risks and Mitigations
 
@@ -159,8 +162,9 @@ Profil K8s ma trzy odrębne warstwy: dedykowany Secret, zapisywalną kopię konf
 - **Wyciek sekretu z treści polecenia.** Polecenia i ścieżki mogą zawierać poufne wartości; przechowuj pełny request tylko w prywatnym stanie taska, autoryzuj jego odczyt przez właściciela, redaguj znane wartości Secretów w widokach i nie kopiuj treści requestu do logów ani ogólnych eventów.
 - **Zbyt szeroka zgoda dla grupy poleceń.** Pokaż dokładny zakres przed zatwierdzeniem, przechowuj grant w tasku i odrzucaj go po zamknięciu taska.
 - **Odmowa pomylona z prośbą o zgodę.** Koreluj ustrukturyzowane źródło i powód z wywołaniem narzędzia; tekst odmowy sam nie wystarcza. Nie oferuj override’u dla jawnej polityki `deny`.
-- **Zmiana konfiguracji nadpisuje konfigurację taska.** Inicjalizować prywatną kopię jednokrotnie i przypiąć task do wersji bazowej.
-- **Proces agenta modyfikuje konfigurację całego wdrożenia.** Proposer nie ma tokenu Kubernetes ani dostępu do Secretu; manager akceptuje zmianę, a wskazany controller wykonuje jej wersjonowany zapis. Wartości Secretu nie trafiają do logów, błędów ani eventów.
+- **Scalanie gubi lokalną zmianę albo nowy token.** Baza w bookkeepingu pozwala odróżnić zmianę lokalną od zmiany źródła; reguły wg typu pliku są wstępne i zostaną zweryfikowane w K8s.
+- **Proces agenta modyfikuje konfigurację całego wdrożenia.** Runner i harness nie mają tokenu Kubernetes ani prawa zapisu Secretu; zapis wykonuje tylko sesja edycji w kontrolerze. Wartości Secretu nie trafiają do logów, błędów ani eventów.
+- **Limit rozmiaru Secretu (1 MiB).** Cache i klony marketplace pluginów są wykluczone. Do sprawdzenia w K8s: czy Claude Code odtwarza pluginy z rejestru bez cache.
 - **Wyścig dwóch decyzji albo odpowiedź po zamknięciu taska.** Wymagaj aktualnego ID oczekiwania i pojedynczego warunkowego przejścia; duplikaty i spóźnione odpowiedzi kończą się czytelnym wynikiem bez grantu.
 - **Zgoda Claude Code mylona z dostępem infrastrukturalnym.** UI i kontrakt API rozróżniają zgodę harnessu od ograniczeń K8s, systemu plików i sieci.
 
@@ -196,7 +200,7 @@ Brak repozytoryjnego `STRATEGY.md` i `CONCEPTS.md`; plan używa pojęć z istnie
 - U1 ustala kontrakt zdarzeń Claude Code i może powstawać niezależnie od U5 i U6.
 - U2 zależy od U1, bo zapisuje typowane requesty z tego kontraktu. U3 zależy od U2, bo jego API, CLI, TUI i protokół kontrolera udostępniają i rozstrzygają trwały request. U4 zależy od U1-U3, bo przed wznowieniem Claude Code łączy sklasyfikowaną odmowę z zakresem zgody i trwałą decyzją.
 - U5 może powstawać równolegle z U2-U3; przed zakończeniem U4 trzeba zintegrować opcjonalne `workspace_access` na granicy wywołania Claude.
-- U6 może powstawać równolegle z U1-U5. U7 zależy od nazwy Secretu profilu i kontraktu montowania ustalonych w U6; zmiany protokołu kontrolera i RBAC muszą wejść razem z przepływem akceptacji w control plane.
+- U6 może powstawać równolegle z U1-U5. U7 zależy od parametrów profilu i kontraktu montowania ustalonych w U6; usunięcie starego przepływu propozycji musi wejść razem z RBAC i montażem Secretu w podzie kontrolera. Najpierw działanie lokalne (U6, część bez K8s), potem K8s.
 
 ### U1. Klasyfikacja i rejestracja odmów Claude Code
 
@@ -244,23 +248,25 @@ Brak repozytoryjnego `STRATEGY.md` i `CONCEPTS.md`; plan używa pojęć z istnie
 - **Test Scenarios:** nowy workflow bez pola nie dodaje flagi/ustawienia adaptera; jawne `read-only` i `read-write` mapują się zgodnie z kontraktem; rekord wykonania sprzed zmiany zachowuje dawną wartość; Claude respektuje ustawienia harnessu przy pominięciu; pozostałe harnessy nie dostają przypadkowej zmiany zachowania.
 - **Verification:** `cargo test --test schema_loading --test workflows --test agent_harness_selection`.
 
-### U6. Profil Claude Code w runnerach
+### U6. Profil harnessu w runnerach
 
-- **Goal:** dać każdemu runnerowi Claude Code pełny profil z dedykowanego Secretu, zachowując prywatną kopię taska przy wznowieniu.
-- **Requirements:** R11-R13, R16-R17; **Flows:** F6-F7; **Acceptance:** AE5.
-- **Files:** `crates/narsor-controller/src/kubernetes/manifest.rs`, `crates/narsor-controller/src/kubernetes/objects.rs`, backend configuration schema, `crates/narsor-runner/src/runner/home.rs`, `crates/narsor-runner/src/runner/storage.rs`, `crates/narsor-runner/src/runner/init.rs`, `crates/narsor-runner/src/runner/cli.rs`, `deploy/kubernetes/admission-policy.yaml`, `docs/operations/remote-backends.md`, `tests/kubernetes_adapter.rs`, `tests/runner.rs`.
-- **Approach:** montuj dedykowany Secret tylko do odczytu w każdym podzie Claude Code. Runner kopiuje wszystkie pliki z zamontowanego katalogu do prywatnego `CLAUDE_CONFIG_DIR`, zapisuje digest i zachowuje kopię przy wznowieniu. Secret zawiera wyłącznie pliki profilu, w tym dane uwierzytelniające, settings, MCP, pluginy i skills; nie zawiera historii taska.
-- **Test Scenarios:** manifest montuje Secret read-only dla każdego runnera; świeży task kopiuje wszystkie pliki i zapisuje digest; wznowienie nie nadpisuje kopii; zewnętrzna zmiana Secretu nie jest walidowana ani cofana przez runner.
-- **Verification:** `cargo test --test kubernetes_adapter --test runner`.
+- **Goal:** przygotować katalog roboczy profilu przed każdym startem harnessu: bez kopiowania lokalnie, ze scalaniem w K8s.
+- **Requirements:** R11-R14, R17; **Flows:** F6-F7; **Acceptance:** AE5.
+- **Files:** konfiguracja Narsora (parametry katalogu źródłowego i roboczego), `crates/narsor-controller/src/kubernetes/manifest.rs`, `crates/narsor-runner/src/runner/storage.rs`, `crates/narsor-runner/src/runner/mod.rs`, `crates/narsor-runner/src/runner/cli.rs`, `deploy/kubernetes/admission-policy.yaml`, `docs/operations/remote-backends.md`, `tests/kubernetes_adapter.rs`, `tests/runner.rs`.
+- **Approach:** dodaj dwa parametry profilu i regułę „brak kopiowania, gdy źródło puste albo równe roboczemu”. Zastąp jednorazowe przypięcie kopii (marker z `d27ca92`) scalaniem trójstronnym z KTD6 przy każdym starcie. Pomijaj wewnętrzne wpisy wolumenu Secretu. Pliki poświadczeń zapisuj z prawami tylko dla właściciela.
+- **Test Scenarios:** puste źródło i źródło równe roboczemu nie kopiują; świeży task kopiuje wszystkie pliki profilu bez `..data`; zmiana tylko lokalna jest zachowana po restarcie; zmiana tylko w źródle (nowy token) trafia do katalogu roboczego; zmiana po obu stronach `settings.json` scala klucze i sumuje reguły; zmiana po obu stronach `.credentials.json` bierze wersję ze źródła; sesje i historia w katalogu roboczym pozostają bez zmian.
+- **Verification:** `cargo test --test kubernetes_adapter --test runner` oraz testy jednostkowe scalania.
+- **Status:** `d27ca92` montuje Secret read-only w każdym podzie z profilem i kopiuje pliki jednorazowo; kopiuje też wewnętrzne katalogi wolumenu Secretu (`..data`, `..<timestamp>`) — do poprawy w tej jednostce.
 
-### U7. Edycja i publikacja profilu przez Narsor
+### U7. Edycja profilu w kontrolerze
 
-- **Goal:** pozwolić użytkownikowi edytować kopię profilu w Claude Code, a następnie zapisać wybrane pliki do dedykowanego Secretu przez Narsor.
-- **Requirements:** R14-R16; **Flow:** F8; **Acceptance:** AE6.
-- **Files:** `crates/narsor-server/src/`, `crates/narsor-protocol/src/controller.rs`, `crates/narsor-controller/src/kubernetes/`, `deploy/kubernetes/controller-rbac.yaml`, `deploy/kubernetes/workload-serviceaccount.yaml`, `deploy/kubernetes/admission-policy.yaml`, `docs/operations/remote-backends.md`, `tests/api.rs`, `tests/auth.rs`, `tests/kubernetes_adapter.rs`, `tests/controller_protocol.rs`.
-- **Approach:** dedykowany task edycji dostaje Secret read-only i prywatną kopię profilu. Po zakończeniu pracy Narsor zbiera profile files i zleca kontrolerowi aktualizację wyłącznie skonfigurowanego Secretu; Claude Code nie dostaje uprawnień Kubernetes. Publikacja zapisuje pliki uwierzytelniania, settings, MCP, pluginów i skills. Konflikt wersji wymusza odświeżenie kopii; nigdy nie cofa zewnętrznej aktualizacji. Kontroler zachowuje minimalne `get`/`update` do wskazanego Secretu.
-- **Test Scenarios:** edycja startuje z aktualnego Secretu; użytkownik może zmienić ustawienia, auth, MCP, pluginy, skills i reguły uprawnień; Narsor publikuje wybrane pliki; niezmieniony plik nie jest nadpisany; zewnętrzna zmiana w czasie edycji pozostaje w Secret i nie jest cofana; runner nie ma praw zapisu; kontroler modyfikuje wyłącznie nazwany Secret; wartości Secretu nie trafiają do logów ani błędów.
-- **Verification:** `cargo test --test api --test auth --test kubernetes_adapter --test controller_protocol` oraz przegląd manifestów RBAC i admission policy.
+- **Goal:** pozwolić użytkownikowi zmienić profil w harnessie uruchomionym przez kontroler i zapisać wynik do Secretu.
+- **Requirements:** R15-R17; **Flow:** F8; **Acceptance:** AE6.
+- **Files:** `crates/narsor-controller/src/` (komenda edycji, rdzeń edycji, zapis Secretu), `crates/narsor-controller/src/kubernetes/`, `crates/narsor-controller-runtime/src/`, `crates/narsor-protocol/src/controller.rs`, `crates/narsor-engine/src/controller_protocol/`, `crates/narsor-api-client/src/api/client.rs`, `deploy/kubernetes/controller-rbac.yaml`, `deploy/kubernetes/` (montaż Secretu w podzie kontrolera), `docs/operations/remote-backends.md`, `tests/kubernetes_adapter.rs`, `tests/controller_protocol.rs`.
+- **Approach:** zbuduj rdzeń edycji niezależny od transportu terminala: kopia profilu do katalogu tymczasowego, uruchomienie harnessu z `CLAUDE_CONFIG_DIR`, zbieranie plików wg reguł include/exclude, zapis do skonfigurowanego Secretu (ostatni zapis wygrywa). Pierwszy transport: komenda kontrolera dla `kubectl exec -it`. Usuń stary przepływ propozycji i akceptacji (endpointy, typy protokołu, kolejkę i walidację tylko `permissions`). Lokalnie edycja nie jest potrzebna: harness zmienia standardowy katalog bezpośrednio.
+- **Test Scenarios:** rdzeń edycji z fałszywym harnessem zmienia `settings.json`, dodaje skill i zapisuje je; `projects/` i historia nie są zbierane; zapis trafia wyłącznie do skonfigurowanego Secretu; RBAC daje `get`/`update` tylko kontrolerowi i tylko dla nazwanego Secretu; wartości Secretu nie trafiają do logów ani błędów.
+- **Verification:** `cargo test --test kubernetes_adapter --test controller_protocol` oraz przegląd manifestów RBAC i admission policy.
+- **Execution note:** szczegóły K8s (transport, format Secretu, reguły scalania) są wstępne; dopracować je w praktycznych testach w K8s, priorytetem jest działanie lokalne.
 
 ---
 
@@ -271,7 +277,7 @@ Brak repozytoryjnego `STRATEGY.md` i `CONCEPTS.md`; plan używa pojęć z istnie
 | Claude permission protocol | `cargo test --test claude_code_classification --test actions_agent` plus recorded runs of the supported real Claude CLI | Structured denial, deny-vs-approvable distinction, session/tool correlation and resumed grant all match the supported CLI. |
 | Durable request and channel parity | `cargo test --test actions_human --test engine_execution --test engine_recovery --test api --test auth --test controller_protocol --test cli_control_text --test cli_task_text --test tui_state --test tui_render` | One durable typed request is visible and answerable through all existing owner surfaces; stale, duplicate and unauthorized decisions cannot grant access. |
 | Workflow compatibility | `cargo test --test schema_loading --test workflows --test agent_harness_selection` | Explicit and omitted values differ for newly loaded workflows, while old persisted records and other harnesses retain defined behavior. |
-| Kubernetes profile lifecycle | `cargo test --test kubernetes_adapter --test runner` | Secret mount, one-time copy, task revision, restart behavior and access boundaries pass. |
+| Harness profile lifecycle | `cargo test --test kubernetes_adapter --test runner` plus merge unit tests | No copy when source is empty or equal to the work dir; Secret mount, three-way merge on restart, controller-only Secret writes and access boundaries pass. |
 | Full repository | `cargo fmt --check` and `cargo test --workspace` | Formatting and workspace tests pass with the feature enabled. |
 
 ## Definition of Done
@@ -280,8 +286,8 @@ Brak repozytoryjnego `STRATEGY.md` i `CONCEPTS.md`; plan używa pojęć z istnie
 - Only the current task receives the approved scope; explicit policy denies, sandbox limits and infrastructure permissions remain enforced.
 - The pending request and its attribution survive runner and control-plane recovery, and all existing owner channels observe the same decision state.
 - Omitted `workspace_access` remains distinct from explicit values, with legacy persisted executions preserving their previous interpretation.
-- Every Claude Code K8s runner receives the dedicated profile Secret read-only and uses a private writable copy pinned across resume.
-- External changes to the dedicated Secret remain authoritative; a Narsor-led edit copies the profile for Claude Code and Narsor publishes the resulting files back through the controller.
+- A local installation runs the harness on its standard directory without copying; every Claude Code K8s runner receives the dedicated profile Secret read-only and merges it into a private writable work directory on each start, without distributing local changes.
+- Only the Narsor controller edits the Secret: it copies the profile, runs the harness for the user, collects the profile files and writes them back; external Secret changes are accepted and the last write wins.
 - The shared profile supports authentication, permissions, MCP, plugins, and skills without including task session history.
 - Other harness permission behavior remains unchanged, documentation describes installation and operations, and the verification contract passes.
 
