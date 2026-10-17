@@ -49,13 +49,25 @@ use crate::kubernetes::client::{ClusterAccess, TokenSource};
 use crate::kubernetes::{KubernetesBackend, KubernetesBackendConfig};
 use crate::profile_edit::{EditSession, ProfileChanges};
 use narsor_controller_runtime::{Controller, ControllerConfig};
-use narsor_engine::config::{API_KEY_ENVS, CLAUDE_CONFIG_DIR_ENV};
+use narsor_engine::config::CLAUDE_CONFIG_DIR_ENV;
 use narsor_engine::controller_protocol::ControllerClient;
 use narsor_engine::controller_runtime::load_or_enroll as load_controller_identity;
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_FAILURE: i32 = 1;
 const EXIT_USAGE: i32 = 2;
+
+/// The variables of the controller's environment a profile edit session's
+/// harness inherits: what a terminal program needs, nothing else.
+const HARNESS_ENVS: [&str; 7] = [
+    "PATH",
+    "TERM",
+    "COLORTERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+];
 
 /// Platforms `narsor-controller` can drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -304,14 +316,19 @@ async fn run_claude(
     // process would die with it and leave the session's login on disk.
     let _interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|error| ControllerError::failure(format!("cannot handle Ctrl-C: {error}")))?;
+    // Nothing of the controller's environment but the terminal's: no API
+    // key, no NARSOR_* setting, no enrollment code.
     let mut command = std::process::Command::new(program);
     command
+        .env_clear()
+        .envs(
+            HARNESS_ENVS
+                .iter()
+                .filter_map(|name| std::env::var_os(name).map(|value| (*name, value))),
+        )
         .env(CLAUDE_CONFIG_DIR_ENV, session.config_dir())
         .env("HOME", session.home_dir())
         .current_dir(session.home_dir());
-    for name in API_KEY_ENVS {
-        command.env_remove(name);
-    }
     tokio::task::spawn_blocking(move || command.status())
         .await
         .map_err(|error| ControllerError::failure(error.to_string()))?
