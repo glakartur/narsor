@@ -286,10 +286,18 @@ pub async fn edit_profile(args: EditProfileArgs) -> Result<(), ControllerError> 
     let changes = session
         .changes(&current)
         .map_err(ControllerError::failure)?;
-    report_changes(&changes, &backend.config().claude_profile_mappings());
+    let mappings = backend.config().claude_profile_mappings();
+    let executing = report_changes(&changes, &current, &mappings);
     if changes.is_empty() {
         eprintln!("Nothing to save.");
         return Ok(());
+    }
+    // A change that makes Claude Code run something — in every task — is
+    // never saved unseen: `--yes` does not cover it.
+    if args.yes && executing {
+        return Err(ControllerError::usage(
+            "the changes make Claude Code run programs; review and save them without --yes",
+        ));
     }
     if !args.yes && !confirm(&format!("Save to Secret '{secret}'? [y/N] "))? {
         eprintln!("Not saved.");
@@ -337,21 +345,32 @@ async fn run_claude(
         })
 }
 
-/// Tells the user what saving would do, by key and path, never by value.
-fn report_changes(changes: &ProfileChanges, mappings: &[(String, String)]) {
-    for key in changes.updated.keys() {
-        let path = mappings
-            .iter()
-            .find(|(mapped, _)| mapped == key)
-            .map_or("", |(_, path)| path.as_str());
-        eprintln!("  changed: {path} (key {key})");
+/// Shows the user what saving would write: a diff per changed key (the
+/// login's content hidden), warnings for changes that make Claude Code run
+/// programs, and what cannot be saved. Returns whether there was such a
+/// warning.
+fn report_changes(
+    changes: &ProfileChanges,
+    current: &std::collections::BTreeMap<String, Vec<u8>>,
+    mappings: &[(String, String)],
+) -> bool {
+    let reviews = changes.review(current, mappings);
+    for review in &reviews {
+        eprintln!("changed: {} (key {})", review.path, review.key);
+        eprint!("{}", review.diff);
+    }
+    for review in &reviews {
+        for warning in &review.warnings {
+            eprintln!("WARNING: {warning}");
+        }
     }
     for path in &changes.missing {
-        eprintln!("  removed: {path} — kept in the Secret, task Pods mount every mapped key");
+        eprintln!("removed: {path} — kept in the Secret, task Pods mount every mapped key");
     }
     for path in &changes.unmapped {
-        eprintln!("  not saved: {path} — add a 'key={path}' entry to claude_profile_files");
+        eprintln!("not saved: {path} — add a 'key={path}' entry to claude_profile_files");
     }
+    reviews.iter().any(|review| !review.warnings.is_empty())
 }
 
 fn confirm(prompt: &str) -> Result<bool, ControllerError> {

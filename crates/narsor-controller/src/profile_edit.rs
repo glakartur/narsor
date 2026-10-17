@@ -141,6 +141,125 @@ impl ProfileChanges {
     }
 }
 
+/// Settings keys that make Claude Code run a program or change what its
+/// processes see: a change to one needs the user's explicit approval.
+const EXECUTING_SETTINGS: [&str; 8] = [
+    "hooks",
+    "apiKeyHelper",
+    "env",
+    "statusLine",
+    "awsAuthRefresh",
+    "awsCredentialExport",
+    "otelHeadersHelper",
+    "mcpServers",
+];
+
+/// What saving one changed key would write, for the user to review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyReview {
+    /// The Secret key.
+    pub key: String,
+    /// Its path in Claude's configuration directory.
+    pub path: String,
+    /// A line diff of the old and new content; only a note for the login.
+    pub diff: String,
+    /// Why this change can make Claude Code run something, if it can.
+    pub warnings: Vec<String>,
+}
+
+impl ProfileChanges {
+    /// One review per updated key, in key order.
+    pub fn review(
+        &self,
+        current: &BTreeMap<String, Vec<u8>>,
+        mappings: &[(String, String)],
+    ) -> Vec<KeyReview> {
+        self.updated
+            .iter()
+            .map(|(key, new)| {
+                let path = mappings
+                    .iter()
+                    .find(|(mapped, _)| mapped == key)
+                    .map_or_else(String::new, |(_, path)| path.clone());
+                let old = current.get(key).map(Vec::as_slice);
+                let diff = if path.ends_with(CREDENTIALS_FILE) {
+                    "  (login changed; content hidden)\n".to_string()
+                } else {
+                    line_diff(old.unwrap_or_default(), new)
+                };
+                let warnings = executing_changes(&path, old, new);
+                KeyReview {
+                    key: key.clone(),
+                    path,
+                    diff,
+                    warnings,
+                }
+            })
+            .collect()
+    }
+}
+
+const CREDENTIALS_FILE: &str = ".credentials.json";
+
+/// Why a change of `path` from `old` to `new` can make Claude Code run
+/// something: an executing settings key changed, a plugin registry
+/// changed, or the file is not configuration at all (a mapped script).
+fn executing_changes(path: &str, old: Option<&[u8]>, new: &[u8]) -> Vec<String> {
+    if path.starts_with("plugins/") {
+        return vec![format!("{path}: installed plugins run code")];
+    }
+    if !is_profile_path(path) {
+        return vec![format!("{path}: not a configuration file; it may be run")];
+    }
+    if !path.ends_with(".json") || path.ends_with(CREDENTIALS_FILE) {
+        return Vec::new();
+    }
+    let parse = |bytes: &[u8]| serde_json::from_slice::<serde_json::Value>(bytes).ok();
+    let old = old.and_then(parse);
+    let Some(new) = parse(new) else {
+        return vec![format!("{path}: not valid JSON")];
+    };
+    EXECUTING_SETTINGS
+        .iter()
+        .filter(|key| old.as_ref().and_then(|old| old.get(**key)) != new.get(**key))
+        .map(|key| format!("{path}: '{key}' changed; it makes Claude Code run programs"))
+        .collect()
+}
+
+/// A plain line diff: `-` for removed lines, `+` for added ones, common
+/// lines left out.
+fn line_diff(old: &[u8], new: &[u8]) -> String {
+    let old = String::from_utf8_lossy(old);
+    let new = String::from_utf8_lossy(new);
+    let old: Vec<&str> = old.lines().collect();
+    let new: Vec<&str> = new.lines().collect();
+    // Longest common subsequence, then walk it.
+    let mut common = vec![vec![0usize; new.len() + 1]; old.len() + 1];
+    for i in (0..old.len()).rev() {
+        for j in (0..new.len()).rev() {
+            common[i][j] = if old[i] == new[j] {
+                common[i + 1][j + 1] + 1
+            } else {
+                common[i + 1][j].max(common[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j, mut diff) = (0, 0, String::new());
+    while i < old.len() || j < new.len() {
+        if i < old.len() && j < new.len() && old[i] == new[j] {
+            i += 1;
+            j += 1;
+        } else if j < new.len() && (i == old.len() || common[i][j + 1] >= common[i + 1][j]) {
+            diff.push_str(&format!("  + {}\n", new[j]));
+            j += 1;
+        } else {
+            diff.push_str(&format!("  - {}\n", old[i]));
+            i += 1;
+        }
+    }
+    diff
+}
+
 /// Every profile file under `dir`: the mapped paths and the paths of
 /// [`PROFILE_FILES`] and [`PROFILE_TREES`], by path relative to `dir`.
 pub fn collect_profile(
@@ -309,6 +428,47 @@ mod tests {
         assert_eq!(changes.unmapped, vec!["skills/draft/SKILL.md".to_string()]);
         drop(session);
         let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn the_review_diffs_content_hides_the_login_and_flags_executing_changes() {
+        let current = secret();
+        let changes = ProfileChanges {
+            updated: BTreeMap::from([
+                ("auth".to_string(), br#"{"token":"stolen?"}"#.to_vec()),
+                (
+                    "settings".to_string(),
+                    b"{\n\"model\":\"opus\",\n\"hooks\":{}\n}".to_vec(),
+                ),
+                ("review-skill".to_string(), b"review\nmore".to_vec()),
+                ("hook".to_string(), b"#!/bin/sh\ncurl evil".to_vec()),
+            ]),
+            ..ProfileChanges::default()
+        };
+        let reviews = changes.review(&current, &mappings());
+        let by_key = |key: &str| reviews.iter().find(|review| review.key == key).unwrap();
+
+        let auth = by_key("auth");
+        assert!(!auth.diff.contains("stolen"), "{}", auth.diff);
+        assert!(auth.warnings.is_empty());
+
+        let settings = by_key("settings");
+        assert!(
+            settings.diff.contains("+ \"hooks\":{}"),
+            "{}",
+            settings.diff
+        );
+        assert_eq!(settings.warnings.len(), 1, "{:?}", settings.warnings);
+        assert!(settings.warnings[0].contains("hooks"));
+
+        let skill = by_key("review-skill");
+        assert_eq!(skill.diff, "  + more\n");
+        assert!(skill.warnings.is_empty());
+
+        assert!(
+            !by_key("hook").warnings.is_empty(),
+            "a mapped script may run"
+        );
     }
 
     #[test]

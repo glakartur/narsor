@@ -605,6 +605,21 @@ printf 'history' > "$CLAUDE_CONFIG_DIR/history.jsonl""#,
 }
 
 #[tokio::test]
+async fn a_change_that_runs_programs_is_never_saved_unseen() {
+    let quiet = Quiet::with(profile_config());
+    quiet
+        .cluster
+        .seed_profile_secret(&[("settings", r#"{"model":"opus"}"#)]);
+    let harness =
+        r#"printf '{"model":"opus","hooks":{"Stop":[]}}' > "$CLAUDE_CONFIG_DIR/settings.json""#;
+    let error = edit_profile(edit_args(&quiet, harness))
+        .await
+        .expect_err("--yes does not cover hooks");
+    assert!(error.message.contains("without --yes"), "{}", error.message);
+    assert!(quiet.cluster.mutations().is_empty());
+}
+
+#[tokio::test]
 async fn an_unchanged_profile_is_not_written() {
     let quiet = Quiet::with(profile_config());
     quiet
