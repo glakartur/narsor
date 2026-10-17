@@ -336,13 +336,33 @@ claude_profile_files:
 ```
 
 Each left-hand value is a Kubernetes Secret key; each right-hand value is a
-relative path in Claude's configuration directory. The runner copies all
-projected files into
-its persistent private `CLAUDE_CONFIG_DIR` on first initialization and pins
-their digest. Include the authentication, settings, MCP, plugin and skill
-files Claude Code needs in this Secret; do not include task session history.
-External changes to the Secret are used by newly initialized tasks and are
-not rejected or reverted by Narsor. A resumed task keeps its existing copy.
+relative path in Claude's configuration directory. Include the
+authentication, settings, MCP, plugin and skill files Claude Code needs in
+this Secret; do not include task session history.
+
+The mount is the profile's *source*; the task's private
+`$HOME/.claude` on the PVC is its *work directory*, exported as
+`CLAUDE_CONFIG_DIR`. Before every start of Claude Code the runner merges the
+source into the work directory, file by file, against the copy of the
+source it saw at the previous start (kept in `narsor/claude-profile/` on the
+PVC):
+
+* a file the harness did not change takes the Secret's version, so a new
+  OAuth login reaches resumed tasks;
+* a file the Secret did not change keeps the harness's version;
+* a file changed on both sides: `.credentials.json` is taken from the
+  Secret whole; other JSON files (`settings.json`, `.claude.json`, plugin
+  registries) are merged key by key, lists such as permission rules are
+  united, and a value changed on both sides is the Secret's; any other file
+  is the Secret's;
+* files the Secret never had (sessions, history, todos) are left alone.
+
+The volume's own entries (`..data`, `..<timestamp>`) are not part of the
+profile. Profile files are written readable by their owner only. Nothing is
+ever written back: changes a task's harness makes stay in that task. The
+Secret is changed by the operator outside Narsor and is not rejected or
+reverted. `harness_home.claude_profile_source` is set from
+`claude_profile_secret` and may not be set by hand.
 Set the same name in the admission ConfigMap's `profileSecret` and the
 controller Role's `resourceNames` rule.
 

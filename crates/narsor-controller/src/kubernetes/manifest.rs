@@ -64,6 +64,8 @@ pub const TOOLS_MOUNT: &str = "/opt/narsor-tools";
 pub const LAUNCH_MOUNT: &str = "/var/run/narsor/launch";
 /// The read-only tool secrets, one file per reference name.
 pub const SECRETS_MOUNT: &str = "/var/run/narsor/secrets";
+/// Where the Claude profile Secret is mounted, read-only.
+pub const CLAUDE_PROFILE_MOUNT: &str = "/var/run/narsor/claude-profile";
 /// Where a bundle image carries its payload.
 pub const BUNDLE_PAYLOAD: &str = "/narsor";
 /// What every init container runs: copy the payload into its volume.
@@ -280,6 +282,13 @@ impl KubernetesBackendConfig {
                         .into(),
                 );
             }
+        }
+        if self.harness_home.claude_profile_source.is_some() {
+            problems.push(
+                "harness_home.claude_profile_source is not set by hand; \
+                 configure claude_profile_secret"
+                    .into(),
+            );
         }
         if self.start_timeout_secs == 0 {
             problems.push("start_timeout_secs must be at least 1".to_string());
@@ -706,13 +715,19 @@ pub fn pod(
             "defaultMode": 0o440,
             "items": claude_profile_items(config),
         }}));
-        mounts.push(json!({"name": "claude-profile", "mountPath": "/var/run/narsor/claude-profile", "readOnly": true}));
-        args.push("--claude-profile-dir".into());
-        args.push("/var/run/narsor/claude-profile".into());
+        mounts.push(
+            json!({"name": "claude-profile", "mountPath": CLAUDE_PROFILE_MOUNT, "readOnly": true}),
+        );
     }
+    let harness_home = HarnessHome {
+        claude_profile_source: config
+            .claude_profile_secret
+            .as_ref()
+            .map(|_| CLAUDE_PROFILE_MOUNT.into()),
+        ..config.harness_home.clone()
+    };
     args.extend(
-        config
-            .harness_home
+        harness_home
             .runner_args()
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned()),

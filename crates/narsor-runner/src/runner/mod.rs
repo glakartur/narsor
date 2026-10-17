@@ -92,6 +92,7 @@ pub mod home;
 pub mod init;
 mod materials;
 pub mod preflight;
+pub mod profile;
 pub mod secrets;
 mod snapshot;
 pub mod storage;
@@ -160,8 +161,8 @@ pub enum RunnerError {
         #[source]
         source: std::io::Error,
     },
-    /// The configured approved Claude profile could not be copied safely.
-    #[error("Claude profile initialization failed: {0}")]
+    /// The Claude Code profile could not be brought into the work directory.
+    #[error("Claude profile preparation failed: {0}")]
     Profile(String),
     /// The Engine's store failed.
     #[error(transparent)]
@@ -272,8 +273,6 @@ pub struct RunnerConfig {
     pub secrets_dir: Option<PathBuf>,
     /// Which HOME and harness configuration every action sees.
     pub harness_home: HarnessHome,
-    /// Optional read-only deployment profile mounted by a trusted backend.
-    pub claude_profile_dir: Option<PathBuf>,
     /// This incarnation's identity, the one its credential is bound to.
     pub incarnation: String,
     /// Control-channel timing.
@@ -380,23 +379,28 @@ pub async fn run(
     }
 
     environment.task.extend(config.harness_home.variables());
-    if let Some(source) = &config.claude_profile_dir {
-        match storage.initialize_claude_profile(source) {
-            Ok(Some(path)) => environment.task.push((
+    match profile::prepare_claude_profile(
+        &config.harness_home,
+        &private_home,
+        &storage.claude_profile_base_dir(),
+    ) {
+        // A configured directory is already among the variables.
+        Ok(Some(work)) if config.harness_home.claude_config_dir.is_none() => {
+            environment.task.push((
                 CLAUDE_CONFIG_DIR_ENV.to_string(),
-                path.display().to_string(),
-            )),
-            Ok(None) => {}
-            Err(error) => {
-                return Ok(report_problem(
-                    &storage,
-                    &mut link,
-                    &config.timing,
-                    PROBLEM_INITIALIZATION,
-                    error.to_string(),
-                )
-                .await)
-            }
+                work.display().to_string(),
+            ))
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return Ok(report_problem(
+                &storage,
+                &mut link,
+                &config.timing,
+                PROBLEM_INITIALIZATION,
+                error.to_string(),
+            )
+            .await)
         }
     }
     apply_environment(&environment);

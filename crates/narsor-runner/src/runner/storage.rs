@@ -28,6 +28,8 @@
 //!         conductor.json     a per-task conductor harness an older version
 //!                            kept; neither read nor removed any more
 //!         work/              scratch of the conductor's isolated invocations
+//!         claude-profile/    the Claude profile source as the last start
+//!                            saw it, the base of the next merge (KTD6)
 //!         workspace.partial/ a clone under way, never a workspace
 //!         materials.partial/ a material delivery under way
 //! ```
@@ -165,27 +167,10 @@ impl TaskStorage {
         self.bookkeeping_dir().join("harness.json")
     }
 
-    fn claude_profile_marker(&self) -> PathBuf {
-        self.bookkeeping_dir().join("claude-profile.json")
-    }
-
-    /// Initialize the task's private Claude configuration once from the
-    /// read-only deployment profile. The mounted directory is the configured
-    /// profile Secret, so preserve its files as-is (auth, settings, MCP,
-    /// plugins and skills included) and pin the copy for task resume.
-    pub fn initialize_claude_profile(&self, source: &Path) -> Result<Option<PathBuf>, RunnerError> {
-        if self.claude_profile_marker().exists() {
-            return Ok(Some(self.home_dir().join(".claude-profile")));
-        }
-        let target = self.home_dir().join(".claude-profile");
-        fs::create_dir_all(&target).map_err(|error| RunnerError::Profile(error.to_string()))?;
-        let digest = copy_profile_tree(source, &target)?;
-        write_json_atomic(
-            &self.claude_profile_marker(),
-            &serde_json::json!({"version": 2, "digest": digest}),
-        )
-        .map_err(|error| RunnerError::Profile(error.to_string()))?;
-        Ok(Some(target))
+    /// `{root}/narsor/claude-profile`: the copy of the Claude profile
+    /// source taken at the previous start, the base of the next merge.
+    pub fn claude_profile_base_dir(&self) -> PathBuf {
+        self.bookkeeping_dir().join("claude-profile")
     }
 
     /// `{root}/narsor/work`: where the conductor keeps its scratch.
@@ -386,107 +371,6 @@ impl TaskStorage {
         commands.version = RECORD_VERSION;
         commands.progress.insert(command_id.to_string(), verdict);
         write_json_atomic(&self.commands_file(), &commands).map_err(RunnerError::from)
-    }
-}
-
-fn copy_profile_tree(source: &Path, target: &Path) -> Result<String, RunnerError> {
-    fn copy_dir(
-        root: &Path,
-        source: &Path,
-        target: &Path,
-        digest: &mut sha2::Sha256,
-    ) -> Result<(), RunnerError> {
-        let mut entries = fs::read_dir(source).map_err(|error| {
-            RunnerError::Profile(format!("cannot read Claude profile: {error}"))
-        })?;
-        let mut entries = entries
-            .by_ref()
-            .map(|entry| entry.map_err(|error| RunnerError::Profile(error.to_string())))
-            .collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let path = entry.path();
-            let name = entry.file_name();
-            let destination = target.join(&name);
-            let metadata = fs::metadata(&path).map_err(|error| {
-                RunnerError::Profile(format!("cannot inspect Claude profile: {error}"))
-            })?;
-            if metadata.is_dir() {
-                fs::create_dir_all(&destination)
-                    .map_err(|error| RunnerError::Profile(error.to_string()))?;
-                copy_dir(root, &path, &destination, digest)?;
-            } else if metadata.is_file() {
-                let bytes = fs::read(&path).map_err(|error| {
-                    RunnerError::Profile(format!("cannot read Claude profile file: {error}"))
-                })?;
-                use sha2::Digest as _;
-                let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
-                digest.update((relative.len() as u64).to_be_bytes());
-                digest.update(relative.as_bytes());
-                digest.update((bytes.len() as u64).to_be_bytes());
-                digest.update(&bytes);
-                fs::write(&destination, bytes)
-                    .map_err(|error| RunnerError::Profile(error.to_string()))?;
-            }
-        }
-        Ok(())
-    }
-
-    use sha2::Digest as _;
-    let mut hasher = sha2::Sha256::new();
-    copy_dir(source, source, target, &mut hasher)?;
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
-#[cfg(test)]
-mod claude_profile_tests {
-    use super::*;
-
-    #[test]
-    fn profile_copy_preserves_all_files_and_is_pinned_across_resume() {
-        let root =
-            std::env::temp_dir().join(format!("narsor-profile-test-{}", uuid::Uuid::new_v4()));
-        let source = root.join("mounted");
-        let storage = TaskStorage::new(root.join("task"));
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(storage.home_dir()).unwrap();
-        fs::create_dir_all(storage.bookkeeping_dir()).unwrap();
-        fs::write(
-            source.join("settings.json"),
-            r#"{"permissions":{"allow":["Read"],"deny":[]},"defaultMode":"acceptEdits"}"#,
-        )
-        .unwrap();
-        fs::write(
-            source.join(".credentials.json"),
-            r#"{"accessToken":"secret"}"#,
-        )
-        .unwrap();
-        fs::create_dir_all(source.join("skills/review")).unwrap();
-        fs::write(source.join("skills/review/SKILL.md"), "review instructions").unwrap();
-        let config = storage.initialize_claude_profile(&source).unwrap().unwrap();
-        let first = fs::read(config.join("settings.json")).unwrap();
-        assert_eq!(
-            fs::read(config.join(".credentials.json")).unwrap(),
-            br#"{"accessToken":"secret"}"#
-        );
-        assert_eq!(
-            fs::read(config.join("skills/review/SKILL.md")).unwrap(),
-            b"review instructions"
-        );
-        assert!(storage.claude_profile_marker().exists());
-        fs::write(
-            source.join("settings.json"),
-            r#"{"permissions":{"allow":["Write"]}}"#,
-        )
-        .unwrap();
-        storage.initialize_claude_profile(&source).unwrap();
-        let resumed = fs::read(config.join("settings.json")).unwrap();
-        assert_eq!(resumed, first);
-        let _ = fs::remove_dir_all(root);
     }
 }
 

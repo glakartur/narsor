@@ -436,11 +436,12 @@ fn local_tasks_keep_the_hosts_home_unless_configured_otherwise() {
             mode: HomeMode::Host,
             codex_home: None,
             claude_config_dir: None,
+            claude_profile_source: None,
         }
     );
 
     root.user_config(
-        "local_home: private\nlocal_codex_home: /home/me/.codex\nlocal_claude_config_dir: /home/me/.claude\n",
+        "local_home: private\nlocal_codex_home: /home/me/.codex\nlocal_claude_config_dir: /home/me/.claude\nlocal_claude_profile_source: /srv/claude-profile\n",
     );
     let resolved = resolve_with(&Flags::default(), &environment(&[]), &cascade(&root));
     assert!(resolved.is_ok(), "{:?}", resolved.errors());
@@ -450,6 +451,7 @@ fn local_tasks_keep_the_hosts_home_unless_configured_otherwise() {
             mode: HomeMode::Private,
             codex_home: Some(PathBuf::from("/home/me/.codex")),
             claude_config_dir: Some(PathBuf::from("/home/me/.claude")),
+            claude_profile_source: Some(PathBuf::from("/srv/claude-profile")),
         }
     );
 }

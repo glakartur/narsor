@@ -56,9 +56,15 @@ pub struct HarnessHome {
     /// `codex`'s configuration directory, when not `$HOME/.codex`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_home: Option<PathBuf>,
-    /// Claude Code's configuration directory, when not `$HOME/.claude`.
+    /// Claude Code's configuration directory, when not `$HOME/.claude`:
+    /// the work directory the harness runs on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_config_dir: Option<PathBuf>,
+    /// The Claude Code profile the work directory is brought up to date
+    /// with before every start. `None`, or the work directory itself, runs
+    /// the harness on its directory as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_profile_source: Option<PathBuf>,
 }
 
 impl HarnessHome {
@@ -71,6 +77,10 @@ impl HarnessHome {
         }
         if let Some(dir) = &self.claude_config_dir {
             args.push("--claude-config-dir".into());
+            args.push(dir.into());
+        }
+        if let Some(dir) = &self.claude_profile_source {
+            args.push("--claude-profile-source".into());
             args.push(dir.into());
         }
         args
@@ -101,6 +111,7 @@ mod tests {
             mode: HomeMode::Host,
             codex_home: Some(PathBuf::from("/home/me/.codex")),
             claude_config_dir: None,
+            claude_profile_source: None,
         };
         assert_eq!(
             home.runner_args(),
@@ -120,6 +131,7 @@ mod tests {
             mode: HomeMode::Private,
             codex_home: Some(PathBuf::from("/c")),
             claude_config_dir: Some(PathBuf::from("/a")),
+            claude_profile_source: Some(PathBuf::from("/s")),
         };
         assert_eq!(
             home.variables(),
@@ -129,5 +141,19 @@ mod tests {
             ]
         );
         assert!(HarnessHome::default().variables().is_empty());
+    }
+
+    #[test]
+    fn runner_args_carry_the_profile_source() {
+        let home = HarnessHome {
+            claude_profile_source: Some(PathBuf::from("/profile")),
+            ..HarnessHome::default()
+        };
+        assert_eq!(
+            home.runner_args(),
+            ["--home", "private", "--claude-profile-source", "/profile"]
+                .map(OsString::from)
+                .to_vec()
+        );
     }
 }

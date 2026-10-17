@@ -305,6 +305,7 @@ fn the_runner_is_told_the_backends_home_mode() {
         mode: HomeMode::Host,
         codex_home: Some("/mnt/codex".into()),
         claude_config_dir: None,
+        claude_profile_source: None,
     };
     let args = runner_args(&generated_pod_with(&config, spec()).0);
     let tail: Vec<&str> = args[args.len() - 4..].iter().map(String::as_str).collect();
@@ -476,11 +477,27 @@ fn configured_claude_profile_mounts_read_only_for_every_runner() {
         .iter()
         .any(|mount| mount["name"] == "claude-profile" && mount["readOnly"] == true));
     let args = runner["args"].as_array().unwrap();
-    assert!(args.windows(2).any(
-        |pair| pair[0] == "--claude-profile-dir" && pair[1] == "/var/run/narsor/claude-profile"
-    ));
+    assert!(args
+        .windows(2)
+        .any(|pair| pair[0] == "--claude-profile-source"
+            && pair[1] == "/var/run/narsor/claude-profile"));
     manifest::check_pod_shape(&pod, &configured.shape_policy())
         .expect("profile volume passes admission mirror");
+}
+
+#[test]
+fn the_claude_profile_source_comes_only_from_the_profile_secret() {
+    let (pod, _, _) = generated_pod(spec());
+    assert!(!runner_args(&pod)
+        .iter()
+        .any(|arg| arg == "--claude-profile-source"));
+
+    let mut configured = config();
+    configured.harness_home.claude_profile_source = Some("/mnt/profile".into());
+    assert!(configured
+        .problems()
+        .iter()
+        .any(|problem| problem.contains("claude_profile_source")));
 }
 
 /// `restartPolicy: Never`, no service-account token, and the admission
