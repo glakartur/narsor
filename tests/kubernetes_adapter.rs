@@ -558,8 +558,8 @@ async fn a_profile_edit_session_saves_changed_profile_files_to_the_secret() {
 printf '%s\n' "$CLAUDE_CONFIG_DIR" "${{ANTHROPIC_API_KEY-unset}}" > "{seen}"
 test "$(cat "$CLAUDE_CONFIG_DIR/.credentials.json")" = '{{"token":"a"}}'
 printf '{{"model":"fable"}}' > "$CLAUDE_CONFIG_DIR/settings.json"
-mkdir -p "$CLAUDE_CONFIG_DIR/skills/lint" "$CLAUDE_CONFIG_DIR/projects/-work"
-printf 'lint' > "$CLAUDE_CONFIG_DIR/skills/lint/SKILL.md"
+printf '{{"token":"b"}}' > "$CLAUDE_CONFIG_DIR/.credentials.json"
+mkdir -p "$CLAUDE_CONFIG_DIR/projects/-work"
 printf 'session' > "$CLAUDE_CONFIG_DIR/projects/-work/session.jsonl"
 printf 'history' > "$CLAUDE_CONFIG_DIR/history.jsonl""#,
         host_home = std::env::var("HOME").unwrap_or_default(),
@@ -574,8 +574,7 @@ printf 'history' > "$CLAUDE_CONFIG_DIR/history.jsonl""#,
     assert_eq!(
         data,
         std::collections::BTreeMap::from([
-            ("auth".to_string(), r#"{"token":"a"}"#.to_string()),
-            ("lint-skill".to_string(), "lint".to_string()),
+            ("auth".to_string(), r#"{"token":"b"}"#.to_string()),
             ("settings".to_string(), r#"{"model":"fable"}"#.to_string()),
             ("unmapped".to_string(), "kept".to_string()),
         ]),

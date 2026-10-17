@@ -141,17 +141,21 @@ impl ProfileChanges {
     }
 }
 
-/// Settings keys that make Claude Code run a program or change what its
-/// processes see: a change to one needs the user's explicit approval.
-const EXECUTING_SETTINGS: [&str; 8] = [
-    "hooks",
-    "apiKeyHelper",
-    "env",
-    "statusLine",
-    "awsAuthRefresh",
-    "awsCredentialExport",
-    "otelHeadersHelper",
-    "mcpServers",
+/// Top-level settings keys whose change cannot make Claude Code run
+/// anything or reach anything new. Every other change — any other settings
+/// key, skills, agents, commands, `CLAUDE.md`, plugins, a mapped script —
+/// needs the user's explicit approval: `--yes` covers only these and the
+/// login.
+const SAFE_SETTINGS: [&str; 9] = [
+    "model",
+    "theme",
+    "outputStyle",
+    "language",
+    "verbose",
+    "cleanupPeriodDays",
+    "includeCoAuthoredBy",
+    "alwaysThinkingEnabled",
+    "spinnerTipsEnabled",
 ];
 
 /// What saving one changed key would write, for the user to review.
@@ -163,7 +167,7 @@ pub struct KeyReview {
     pub path: String,
     /// A line diff of the old and new content; only a note for the login.
     pub diff: String,
-    /// Why this change can make Claude Code run something, if it can.
+    /// Why this change needs the user's explicit approval, if it does.
     pub warnings: Vec<String>,
 }
 
@@ -187,7 +191,7 @@ impl ProfileChanges {
                 } else {
                     line_diff(old.unwrap_or_default(), new)
                 };
-                let warnings = executing_changes(&path, old, new);
+                let warnings = review_warnings(&path, old, new);
                 KeyReview {
                     key: key.clone(),
                     path,
@@ -201,28 +205,58 @@ impl ProfileChanges {
 
 const CREDENTIALS_FILE: &str = ".credentials.json";
 
-/// Why a change of `path` from `old` to `new` can make Claude Code run
-/// something: an executing settings key changed, a plugin registry
-/// changed, or the file is not configuration at all (a mapped script).
-fn executing_changes(path: &str, old: Option<&[u8]>, new: &[u8]) -> Vec<String> {
-    if path.starts_with("plugins/") {
-        return vec![format!("{path}: installed plugins run code")];
-    }
-    if !is_profile_path(path) {
-        return vec![format!("{path}: not a configuration file; it may be run")];
-    }
-    if !path.ends_with(".json") || path.ends_with(CREDENTIALS_FILE) {
+/// Why a change of `path` from `old` to `new` needs the user's explicit
+/// approval: anything but the login and [`SAFE_SETTINGS`] in a settings
+/// file.
+fn review_warnings(path: &str, old: Option<&[u8]>, new: &[u8]) -> Vec<String> {
+    let shown = printable(path);
+    if path == CREDENTIALS_FILE {
         return Vec::new();
     }
-    let parse = |bytes: &[u8]| serde_json::from_slice::<serde_json::Value>(bytes).ok();
-    let old = old.and_then(parse);
-    let Some(new) = parse(new) else {
-        return vec![format!("{path}: not valid JSON")];
+    if !matches!(path, "settings.json" | "settings.local.json") {
+        return vec![format!(
+            "{shown}: instructions, tools or code for Claude Code changed"
+        )];
+    }
+    let parse = |bytes: &[u8]| {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
     };
-    EXECUTING_SETTINGS
-        .iter()
-        .filter(|key| old.as_ref().and_then(|old| old.get(**key)) != new.get(**key))
-        .map(|key| format!("{path}: '{key}' changed; it makes Claude Code run programs"))
+    let old = old.and_then(parse).unwrap_or_default();
+    let Some(new) = parse(new) else {
+        return vec![format!("{shown}: not a JSON object")];
+    };
+    let mut changed: Vec<&String> = old
+        .keys()
+        .chain(new.keys())
+        .filter(|key| !SAFE_SETTINGS.contains(&key.as_str()) && old.get(*key) != new.get(*key))
+        .collect();
+    changed.sort();
+    changed.dedup();
+    changed
+        .into_iter()
+        .map(|key| {
+            format!(
+                "{shown}: '{}' changed; it can change what Claude Code runs or reaches",
+                printable(key)
+            )
+        })
+        .collect()
+}
+
+/// `text` with every control character (but tab) escaped, so that content
+/// from the session cannot move the cursor, rewrite earlier lines or hide
+/// itself in the user's terminal.
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() && c != '\t' {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
         .collect()
 }
 
@@ -250,10 +284,10 @@ fn line_diff(old: &[u8], new: &[u8]) -> String {
             i += 1;
             j += 1;
         } else if j < new.len() && (i == old.len() || common[i][j + 1] >= common[i + 1][j]) {
-            diff.push_str(&format!("  + {}\n", new[j]));
+            diff.push_str(&format!("  + {}\n", printable(new[j])));
             j += 1;
         } else {
-            diff.push_str(&format!("  - {}\n", old[i]));
+            diff.push_str(&format!("  - {}\n", printable(old[i])));
             i += 1;
         }
     }
@@ -431,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn the_review_diffs_content_hides_the_login_and_flags_executing_changes() {
+    fn the_review_diffs_content_hides_the_login_and_flags_review_warnings() {
         let current = secret();
         let changes = ProfileChanges {
             updated: BTreeMap::from([
@@ -463,12 +497,40 @@ mod tests {
 
         let skill = by_key("review-skill");
         assert_eq!(skill.diff, "  + more\n");
-        assert!(skill.warnings.is_empty());
+        assert!(!skill.warnings.is_empty(), "a skill instructs Claude Code");
 
         assert!(
             !by_key("hook").warnings.is_empty(),
             "a mapped script may run"
         );
+    }
+
+    #[test]
+    fn only_safe_settings_and_the_login_pass_without_review() {
+        let old = br#"{"model":"opus","permissions":{"allow":[]}}"#;
+        assert!(review_warnings(
+            "settings.json",
+            Some(old),
+            br#"{"model":"fable","permissions":{"allow":[]}}"#
+        )
+        .is_empty());
+        assert!(review_warnings(".credentials.json", None, b"{}").is_empty());
+        let widened = review_warnings(
+            "settings.json",
+            Some(old),
+            br#"{"model":"opus","permissions":{"allow":["Bash"]},"enabledPlugins":{}}"#,
+        );
+        assert_eq!(widened.len(), 2, "{widened:?}");
+        assert!(!review_warnings(".claude.json", None, b"{}").is_empty());
+        assert!(!review_warnings("CLAUDE.md", None, b"be nice").is_empty());
+    }
+
+    #[test]
+    fn session_content_cannot_drive_the_terminal() {
+        let diff = line_diff(b"", b"ok\x1b[2K\x1b[1Ahidden\r");
+        assert!(!diff.contains('\x1b') && !diff.contains('\r'), "{diff:?}");
+        assert!(diff.contains("\\u{1b}[2K"), "{diff:?}");
+        assert_eq!(printable("a\tb\u{9b}c"), "a\tb\\u{9b}c");
     }
 
     #[test]

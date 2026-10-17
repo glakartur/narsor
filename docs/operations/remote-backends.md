@@ -387,12 +387,13 @@ The controller image must have Claude Code on its `PATH` (or name it with
    `CLAUDE.md`, `skills/`, `agents/`, `commands/`, `output-styles/` and the
    plugin registries; never `projects/`, history, todos, shell snapshots or
    plugin caches;
-4. shows a line diff of every changed key (the login's content stays
-   hidden), warns about changes that make Claude Code run programs (`hooks`,
-   `apiKeyHelper`, `env`, `statusLine`, `mcpServers` and similar settings,
-   plugin registries, mapped files that are not configuration), asks before
-   saving and writes the changed keys, keeping every other key of the
-   Secret. `--yes` skips the question, except when there is such a warning.
+4. shows a line diff of every changed key, with control characters escaped
+   and the login's content hidden, warns about every change but the login
+   and a few harmless settings (`model`, `theme`, `outputStyle`, `language`
+   and the like) — permissions, hooks, MCP servers, plugins, skills, agents,
+   commands, `CLAUDE.md`, mapped scripts — then asks before saving and writes
+   the changed keys, keeping every other key of the Secret. `--yes` skips
+   the question only when there is no warning, e.g. to rotate the login.
 
 A profile file with no mapping is reported as not saved: add a
 `key=path` entry to `claude_profile_files`, restart the controller and edit

@@ -47,7 +47,7 @@ use clap::{Args, ValueEnum};
 
 use crate::kubernetes::client::{ClusterAccess, TokenSource};
 use crate::kubernetes::{KubernetesBackend, KubernetesBackendConfig};
-use crate::profile_edit::{EditSession, ProfileChanges};
+use crate::profile_edit::{printable, EditSession, ProfileChanges};
 use narsor_controller_runtime::{Controller, ControllerConfig};
 use narsor_engine::config::CLAUDE_CONFIG_DIR_ENV;
 use narsor_engine::controller_protocol::ControllerClient;
@@ -296,7 +296,7 @@ pub async fn edit_profile(args: EditProfileArgs) -> Result<(), ControllerError> 
     // never saved unseen: `--yes` does not cover it.
     if args.yes && executing {
         return Err(ControllerError::usage(
-            "the changes make Claude Code run programs; review and save them without --yes",
+            "the changes need review (see the warnings); save them without --yes",
         ));
     }
     if !args.yes && !confirm(&format!("Save to Secret '{secret}'? [y/N] "))? {
@@ -356,19 +356,26 @@ fn report_changes(
 ) -> bool {
     let reviews = changes.review(current, mappings);
     for review in &reviews {
-        eprintln!("changed: {} (key {})", review.path, review.key);
+        eprintln!(
+            "changed: {} (key {})",
+            printable(&review.path),
+            printable(&review.key)
+        );
         eprint!("{}", review.diff);
     }
+    for path in &changes.missing {
+        let path = printable(path);
+        eprintln!("removed: {path} — kept in the Secret, task Pods mount every mapped key");
+    }
+    for path in &changes.unmapped {
+        let path = printable(path);
+        eprintln!("not saved: {path} — add a 'key={path}' entry to claude_profile_files");
+    }
+    // Warnings last, so that nothing printed after them pushes them away.
     for review in &reviews {
         for warning in &review.warnings {
             eprintln!("WARNING: {warning}");
         }
-    }
-    for path in &changes.missing {
-        eprintln!("removed: {path} — kept in the Secret, task Pods mount every mapped key");
-    }
-    for path in &changes.unmapped {
-        eprintln!("not saved: {path} — add a 'key={path}' entry to claude_profile_files");
     }
     reviews.iter().any(|review| !review.warnings.is_empty())
 }
