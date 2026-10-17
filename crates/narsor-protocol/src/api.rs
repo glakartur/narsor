@@ -490,11 +490,11 @@ mod tests {
         ConductorActivity, ConductorPurposeDto, ConductorTriggerDto, ConversationEntryDto,
         ConversationEntrySource, ConversationResponse, DaemonDiscoveryRecord, EventLink,
         ExecutionStatusDto, HarnessSelectionSnapshot, HumanInputActionDto, HumanInputDeliveryDto,
-        HumanInputTypeView, MaterialAnnouncement, MaterialFile, MaterialListResponse,
-        MaterialOrigin, MaterialSummary, MaterialUploadResponse, MaterialView, OwnerBindingSource,
-        OwnerView, PendingHumanInputView, Position, PositionStatus, ProblemKindDto,
-        ProposalOutcome, ProposalStatus, RecoveryRequest, Timeline, UndoOutcome, UploadManifest,
-        WhoAmIResponse, BUNDLE_CONTENT_TYPE,
+        HumanInputTypeView, InputContinuationView, MaterialAnnouncement, MaterialFile,
+        MaterialListResponse, MaterialOrigin, MaterialSummary, MaterialUploadResponse,
+        MaterialView, OwnerBindingSource, OwnerView, PendingHumanInputView, Position,
+        PositionStatus, ProblemKindDto, ProposalOutcome, ProposalStatus, RecoveryRequest, Timeline,
+        UndoOutcome, UploadManifest, WhoAmIResponse, BUNDLE_CONTENT_TYPE,
     };
 
     #[test]
@@ -762,6 +762,7 @@ mod tests {
             agent_message: Some("Use the revised draft".into()),
             action: Some(HumanInputActionDto::Resume),
             episode: Some("input-3".into()),
+            permission_decision: None,
         };
         let value = serde_json::to_value(delivery).unwrap();
         assert_eq!(value["values"]["name"], "Ada");
