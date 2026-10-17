@@ -314,23 +314,37 @@ rather than claiming success.
 | `storage_class` | `storageClass` | reclaimPolicy Delete |
 | `allowed_registries` | `allowedRegistries` | comma-separated prefixes, **each ending in `/`** |
 | `allowed_secrets` | `allowedSecrets` | `secret-name/key`, matching the backend record's `secrets[].key` |
-| `claude_profile_secret` | `profileSecret` | Optional approved Claude profile Secret; mount only `settings.json` |
-| `claude_profile_settings_key` | `profileSettingsKey` | Secret key projected as `settings.json` (default `settings.json`) |
+| `claude_profile_secret` | `profileSecret` | Optional dedicated Claude profile Secret; mounted read-only into every Claude Code runner |
+| `claude_profile_settings_key` | — | Secret key used by the profile update protocol (default `settings.json`) |
+| `claude_profile_files` | — | Optional list of `secret-key=relative/path` mappings for settings, auth, MCP, plugins and skills files |
 
 Other `backend.yaml` keys: `namespace`, `storage_mib` (PVC size, default
 10240), `run_as_user` / `run_as_group` / `fs_group` (default 1000),
 `start_timeout_secs` (default 900: how long a Pod may take to report ready
 before it counts as lost), `harness_home` (below).
 
-When `claude_profile_secret` is set, the named Secret must contain the key
-`settings.json` (or the configured `claude_profile_settings_key`). The Pod
-mounts that key read-only. On first initialization the runner copies only
-`permissions.allow` and `permissions.deny` into its persistent private
-Claude config directory and records its digest under task bookkeeping. A
-resumed task keeps that pinned copy; newly started tasks see the currently
-approved Secret. Do not put credentials, hooks, or session history in this
-profile. Set the same name in the admission ConfigMap's `profileSecret` and
-the controller Role's `resourceNames` rule.
+When `claude_profile_secret` is set, every Claude Code runner Pod mounts the
+configured files from that dedicated Secret read-only. For example:
+
+```yaml
+claude_profile_secret: narsor-claude-profile
+claude_profile_files:
+  - settings=settings.json
+  - auth=.credentials.json
+  - mcp=.mcp.json
+  - review-skill=skills/review/SKILL.md
+```
+
+Each left-hand value is a Kubernetes Secret key; each right-hand value is a
+relative path in Claude's configuration directory. The runner copies all
+projected files into
+its persistent private `CLAUDE_CONFIG_DIR` on first initialization and pins
+their digest. Include the authentication, settings, MCP, plugin and skill
+files Claude Code needs in this Secret; do not include task session history.
+External changes to the Secret are used by newly initialized tasks and are
+not rejected or reverted by Narsor. A resumed task keeps its existing copy.
+Set the same name in the admission ConfigMap's `profileSecret` and the
+controller Role's `resourceNames` rule.
 
 **`harness_home`** — which `HOME` and harness configuration the runner gives
 every action, passed as `narsor-runner` flags on every Pod start:

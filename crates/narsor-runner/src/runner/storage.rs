@@ -55,7 +55,6 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 
 use crate::persistence::{read_json, write_json_atomic, ExecutionStore};
 
@@ -171,57 +170,19 @@ impl TaskStorage {
     }
 
     /// Initialize the task's private Claude configuration once from the
-    /// read-only deployment profile. Only the permission allow/deny lists
-    /// are retained; credentials, hooks and session state never cross over.
+    /// read-only deployment profile. The mounted directory is the configured
+    /// profile Secret, so preserve its files as-is (auth, settings, MCP,
+    /// plugins and skills included) and pin the copy for task resume.
     pub fn initialize_claude_profile(&self, source: &Path) -> Result<Option<PathBuf>, RunnerError> {
         if self.claude_profile_marker().exists() {
             return Ok(Some(self.home_dir().join(".claude-profile")));
         }
-        let source_file = source.join("settings.json");
-        let bytes = fs::read(&source_file).map_err(|error| {
-            RunnerError::Profile(format!("cannot read approved Claude profile: {error}"))
-        })?;
-        let mut settings: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
-            RunnerError::Profile("approved Claude profile settings are invalid JSON".into())
-        })?;
-        let permissions = settings
-            .get("permissions")
-            .and_then(serde_json::Value::as_object)
-            .ok_or_else(|| {
-                RunnerError::Profile("approved Claude profile has no permissions object".into())
-            })?;
-        let mut safe = serde_json::Map::new();
-        let mut safe_permissions = serde_json::Map::new();
-        for key in ["allow", "deny"] {
-            if let Some(value) = permissions.get(key) {
-                if !value.is_array() {
-                    return Err(RunnerError::Profile(format!(
-                        "profile permissions.{key} must be an array"
-                    )));
-                }
-                safe_permissions.insert(key.into(), value.clone());
-            }
-        }
-        safe.insert(
-            "permissions".into(),
-            serde_json::Value::Object(safe_permissions),
-        );
-        settings = serde_json::Value::Object(safe);
-        let encoded = serde_json::to_vec_pretty(&settings)
-            .map_err(|error| RunnerError::Profile(error.to_string()))?;
         let target = self.home_dir().join(".claude-profile");
         fs::create_dir_all(&target).map_err(|error| RunnerError::Profile(error.to_string()))?;
-        let temporary = target.join("settings.json.partial");
-        fs::write(&temporary, &encoded).map_err(|error| RunnerError::Profile(error.to_string()))?;
-        fs::rename(&temporary, target.join("settings.json"))
-            .map_err(|error| RunnerError::Profile(error.to_string()))?;
-        let digest = sha2::Sha256::digest(&encoded)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let digest = copy_profile_tree(source, &target)?;
         write_json_atomic(
             &self.claude_profile_marker(),
-            &serde_json::json!({"version": 1, "digest": digest}),
+            &serde_json::json!({"version": 2, "digest": digest}),
         )
         .map_err(|error| RunnerError::Profile(error.to_string()))?;
         Ok(Some(target))
@@ -428,12 +389,65 @@ impl TaskStorage {
     }
 }
 
+fn copy_profile_tree(source: &Path, target: &Path) -> Result<String, RunnerError> {
+    fn copy_dir(
+        root: &Path,
+        source: &Path,
+        target: &Path,
+        digest: &mut sha2::Sha256,
+    ) -> Result<(), RunnerError> {
+        let mut entries = fs::read_dir(source).map_err(|error| {
+            RunnerError::Profile(format!("cannot read Claude profile: {error}"))
+        })?;
+        let mut entries = entries
+            .by_ref()
+            .map(|entry| entry.map_err(|error| RunnerError::Profile(error.to_string())))
+            .collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let name = entry.file_name();
+            let destination = target.join(&name);
+            let metadata = fs::metadata(&path).map_err(|error| {
+                RunnerError::Profile(format!("cannot inspect Claude profile: {error}"))
+            })?;
+            if metadata.is_dir() {
+                fs::create_dir_all(&destination)
+                    .map_err(|error| RunnerError::Profile(error.to_string()))?;
+                copy_dir(root, &path, &destination, digest)?;
+            } else if metadata.is_file() {
+                let bytes = fs::read(&path).map_err(|error| {
+                    RunnerError::Profile(format!("cannot read Claude profile file: {error}"))
+                })?;
+                use sha2::Digest as _;
+                let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
+                digest.update((relative.len() as u64).to_be_bytes());
+                digest.update(relative.as_bytes());
+                digest.update((bytes.len() as u64).to_be_bytes());
+                digest.update(&bytes);
+                fs::write(&destination, bytes)
+                    .map_err(|error| RunnerError::Profile(error.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    copy_dir(source, source, target, &mut hasher)?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 #[cfg(test)]
 mod claude_profile_tests {
     use super::*;
 
     #[test]
-    fn profile_copy_is_filtered_and_pinned_across_resume() {
+    fn profile_copy_preserves_all_files_and_is_pinned_across_resume() {
         let root =
             std::env::temp_dir().join(format!("narsor-profile-test-{}", uuid::Uuid::new_v4()));
         let source = root.join("mounted");
@@ -443,15 +457,25 @@ mod claude_profile_tests {
         fs::create_dir_all(storage.bookkeeping_dir()).unwrap();
         fs::write(
             source.join("settings.json"),
-            r#"{"permissions":{"allow":["Read"],"deny":[]},"hooks":{"x":"bad"},"apiKey":"secret"}"#,
+            r#"{"permissions":{"allow":["Read"],"deny":[]},"defaultMode":"acceptEdits"}"#,
         )
         .unwrap();
+        fs::write(
+            source.join(".credentials.json"),
+            r#"{"accessToken":"secret"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(source.join("skills/review")).unwrap();
+        fs::write(source.join("skills/review/SKILL.md"), "review instructions").unwrap();
         let config = storage.initialize_claude_profile(&source).unwrap().unwrap();
-        let first: serde_json::Value =
-            serde_json::from_slice(&fs::read(config.join("settings.json")).unwrap()).unwrap();
+        let first = fs::read(config.join("settings.json")).unwrap();
         assert_eq!(
-            first,
-            serde_json::json!({"permissions":{"allow":["Read"],"deny":[]}})
+            fs::read(config.join(".credentials.json")).unwrap(),
+            br#"{"accessToken":"secret"}"#
+        );
+        assert_eq!(
+            fs::read(config.join("skills/review/SKILL.md")).unwrap(),
+            b"review instructions"
         );
         assert!(storage.claude_profile_marker().exists());
         fs::write(
@@ -460,8 +484,7 @@ mod claude_profile_tests {
         )
         .unwrap();
         storage.initialize_claude_profile(&source).unwrap();
-        let resumed: serde_json::Value =
-            serde_json::from_slice(&fs::read(config.join("settings.json")).unwrap()).unwrap();
+        let resumed = fs::read(config.join("settings.json")).unwrap();
         assert_eq!(resumed, first);
         let _ = fs::remove_dir_all(root);
     }

@@ -111,7 +111,7 @@ pub struct RunnerArgs {
     #[arg(long, value_name = "DIRECTORY")]
     pub claude_config_dir: Option<PathBuf>,
 
-    /// Read-only directory containing the approved baseline Claude profile.
+    /// Read-only mount of the dedicated Claude profile Secret.
     #[arg(long, value_name = "DIRECTORY")]
     pub claude_profile_dir: Option<PathBuf>,
 

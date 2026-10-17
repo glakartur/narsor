@@ -150,13 +150,17 @@ pub struct KubernetesBackendConfig {
     /// the fixed secret mappings of KTD6.
     #[serde(default)]
     pub allowed_secrets: Vec<String>,
-    /// Optional approved Claude Code profile Secret. Only the configured
-    /// settings and policy keys are mounted into runner Pods.
+    /// Optional dedicated Claude Code profile Secret, mounted read-only into
+    /// every Claude Code runner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_profile_secret: Option<String>,
     /// Secret key containing Claude Code's settings JSON.
     #[serde(default = "default_claude_settings_key")]
     pub claude_profile_settings_key: String,
+    /// Optional `secret-key=relative/path` mappings for profile files.
+    /// Empty keeps the legacy single settings file mapping.
+    #[serde(default)]
+    pub claude_profile_files: Vec<String>,
     /// How long a Pod may stay Pending (an image that never pulls, a
     /// launch Secret that never arrived) before it counts as dead.
     #[serde(default = "default_start_timeout")]
@@ -201,6 +205,7 @@ impl KubernetesBackendConfig {
             allowed_secrets: Vec::new(),
             claude_profile_secret: None,
             claude_profile_settings_key: default_claude_settings_key(),
+            claude_profile_files: Vec::new(),
             start_timeout_secs: default_start_timeout(),
             harness_home: HarnessHome::default(),
         }
@@ -260,6 +265,13 @@ impl KubernetesBackendConfig {
             if !names::is_secret_key(&self.claude_profile_settings_key) {
                 problems.push("claude_profile_settings_key is not a valid Secret key".into());
             }
+            for mapping in &self.claude_profile_files {
+                if split_profile_file(mapping).is_none() {
+                    problems.push(format!(
+                        "Claude profile file '{mapping}' must be 'secret-key=relative/path'"
+                    ));
+                }
+            }
             if self.harness_home.mode != narsor_engine::config::HomeMode::Private
                 || self.harness_home.claude_config_dir.is_some()
             {
@@ -292,6 +304,31 @@ impl KubernetesBackendConfig {
 
 fn default_claude_settings_key() -> String {
     "settings.json".into()
+}
+
+fn split_profile_file(mapping: &str) -> Option<(&str, &str)> {
+    let (key, path) = mapping.split_once('=')?;
+    let safe_path = !path.is_empty()
+        && !path.starts_with('/')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..");
+    (names::is_secret_key(key) && safe_path).then_some((key, path))
+}
+
+fn claude_profile_items(config: &KubernetesBackendConfig) -> Vec<Value> {
+    if config.claude_profile_files.is_empty() {
+        return vec![json!({
+            "key": config.claude_profile_settings_key,
+            "path": "settings.json"
+        })];
+    }
+    config
+        .claude_profile_files
+        .iter()
+        .filter_map(|mapping| split_profile_file(mapping))
+        .map(|(key, path)| json!({"key": key, "path": path}))
+        .collect()
 }
 
 /// `secret-name/key` → its parts, when both are valid.
@@ -667,7 +704,7 @@ pub fn pod(
         volumes.push(json!({"name": "claude-profile", "secret": {
             "secretName": secret,
             "defaultMode": 0o440,
-            "items": [{"key": config.claude_profile_settings_key, "path": "settings.json"}],
+            "items": claude_profile_items(config),
         }}));
         mounts.push(json!({"name": "claude-profile", "mountPath": "/var/run/narsor/claude-profile", "readOnly": true}));
         args.push("--claude-profile-dir".into());
@@ -769,9 +806,9 @@ pub struct ShapePolicy {
     pub allowed_registries: Vec<String>,
     /// The `secret-name/key` pairs a projected volume may map.
     pub allowed_secrets: BTreeSet<String>,
-    /// The one optional profile Secret mounted with an explicit key list.
+    /// The one optional dedicated profile Secret Claude Code Pods may mount.
     pub profile_secret: Option<String>,
-    /// The only Secret key the configured profile may expose.
+    /// Retained for the controller's profile update protocol.
     pub profile_settings_key: Option<String>,
 }
 
@@ -912,17 +949,7 @@ pub fn check_pod_shape(pod: &Value, policy: &ShapePolicy) -> Result<(), Vec<Stri
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let launch = secret.starts_with(&format!("{name}{}", names::LAUNCH_INFIX));
-                let profile = policy.profile_secret.as_deref() == Some(secret)
-                    && volume
-                        .pointer("/secret/items")
-                        .and_then(Value::as_array)
-                        .is_some_and(|items| {
-                            items.len() == 1
-                                && items[0].get("key").and_then(Value::as_str)
-                                    == policy.profile_settings_key.as_deref()
-                                && items[0].get("path").and_then(Value::as_str)
-                                    == Some("settings.json")
-                        });
+                let profile = policy.profile_secret.as_deref() == Some(secret);
                 if !launch && !profile {
                     problems.push(format!(
                         "volume '{vname}': secret '{secret}' is not this Pod's launch secret"

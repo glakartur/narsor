@@ -436,10 +436,15 @@ fn the_pod_has_one_runner_one_init_container_and_separate_volumes() {
 }
 
 #[test]
-fn approved_claude_profile_mounts_only_settings_read_only() {
+fn configured_claude_profile_mounts_read_only_for_every_runner() {
     let mut configured = config();
     configured.claude_profile_secret = Some("narsor-claude-profile".into());
     configured.claude_profile_settings_key = "approved-settings".into();
+    configured.claude_profile_files = vec![
+        "approved-settings=settings.json".into(),
+        "auth=.credentials.json".into(),
+        "skill=skills/review/SKILL.md".into(),
+    ];
     let task = TaskResources {
         task_id: TaskId::parse("Task_1").unwrap(),
         resource_key: "Task_1".into(),
@@ -458,7 +463,11 @@ fn approved_claude_profile_mounts_only_settings_read_only() {
     assert_eq!(profile["secret"]["secretName"], "narsor-claude-profile");
     assert_eq!(
         profile["secret"]["items"],
-        serde_json::json!([{"key":"approved-settings","path":"settings.json"}])
+        serde_json::json!([
+            {"key":"approved-settings","path":"settings.json"},
+            {"key":"auth","path":".credentials.json"},
+            {"key":"skill","path":"skills/review/SKILL.md"}
+        ])
     );
     let runner = &pod["spec"]["containers"][0];
     assert!(runner["volumeMounts"]
