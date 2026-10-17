@@ -5,7 +5,20 @@
 //! narsor-controller --control-plane <url> --credential-file <file> \
 //!                   [--enrollment-code <code>] --kubernetes-config <file> \
 //!                   [--namespace <ns>] [--api-server <url> --token-file <file> --ca-file <file>]
+//!
+//! narsor-controller edit-claude-profile [--claude-command <program>] [--yes] …
 //! ```
+//!
+//! # Editing the Claude profile
+//!
+//! `edit-claude-profile` is the one way Narsor writes the Claude profile
+//! Secret (R15, KTD7). Run it in the controller's Pod with a terminal —
+//! `kubectl exec -it deploy/narsor-controller -- narsor-controller
+//! edit-claude-profile` — and it lays the Secret out in a private session
+//! directory, runs Claude Code on it, and, once Claude Code is closed,
+//! shows what changed and writes the changed keys back; see
+//! [`crate::profile_edit`]. The harness itself never gets the controller's
+//! Kubernetes access.
 //!
 //! Every flag can also come from the environment (`NARSOR_…`, see `--help`),
 //! which is how the Deployment in `deploy/kubernetes/` configures it.
@@ -34,7 +47,9 @@ use clap::{Args, ValueEnum};
 
 use crate::kubernetes::client::{ClusterAccess, TokenSource};
 use crate::kubernetes::{KubernetesBackend, KubernetesBackendConfig};
+use crate::profile_edit::{EditSession, ProfileChanges};
 use narsor_controller_runtime::{Controller, ControllerConfig};
+use narsor_engine::config::{API_KEY_ENVS, CLAUDE_CONFIG_DIR_ENV};
 use narsor_engine::controller_protocol::ControllerClient;
 use narsor_engine::controller_runtime::load_or_enroll as load_controller_identity;
 
@@ -83,6 +98,18 @@ pub struct ControllerArgs {
     #[arg(long, env = "NARSOR_KUBERNETES_CONFIG", value_name = "FILE")]
     pub kubernetes_config: PathBuf,
 
+    /// How the cluster is reached.
+    #[command(flatten)]
+    pub cluster: ClusterArgs,
+
+    /// Validity of the backend lease, in seconds.
+    #[arg(long, default_value_t = 60, value_name = "SECONDS")]
+    pub lease_ttl_secs: u64,
+}
+
+/// How a `narsor-controller` command reaches the cluster.
+#[derive(Debug, Clone, Args)]
+pub struct ClusterArgs {
     /// Namespace of the task objects; overrides the configuration and the
     /// in-cluster default.
     #[arg(long, env = "NARSOR_KUBERNETES_NAMESPACE", value_name = "NAMESPACE")]
@@ -99,10 +126,37 @@ pub struct ControllerArgs {
     /// CA bundle (PEM) for `--api-server`.
     #[arg(long, env = "NARSOR_KUBERNETES_CA_FILE", value_name = "FILE")]
     pub ca_file: Option<PathBuf>,
+}
 
-    /// Validity of the backend lease, in seconds.
-    #[arg(long, default_value_t = 60, value_name = "SECONDS")]
-    pub lease_ttl_secs: u64,
+/// Arguments of `narsor-controller edit-claude-profile`.
+#[derive(Debug, Clone, Args)]
+pub struct EditProfileArgs {
+    /// The Kubernetes backend configuration (YAML), naming the profile
+    /// Secret and its `key=path` mappings.
+    #[arg(long, env = "NARSOR_KUBERNETES_CONFIG", value_name = "FILE")]
+    pub kubernetes_config: PathBuf,
+
+    /// How the cluster is reached.
+    #[command(flatten)]
+    pub cluster: ClusterArgs,
+
+    /// The Claude Code program to run.
+    #[arg(
+        long,
+        env = "NARSOR_CLAUDE_COMMAND",
+        default_value = "claude",
+        value_name = "PROGRAM"
+    )]
+    pub claude_command: PathBuf,
+
+    /// Where the session directory is created; the system's temporary
+    /// directory by default.
+    #[arg(long, env = "NARSOR_PROFILE_EDIT_DIR", value_name = "DIRECTORY")]
+    pub session_parent: Option<PathBuf>,
+
+    /// Save the changes without asking.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 /// A failure of the controller command, with its exit code.
@@ -144,10 +198,10 @@ pub async fn run_command(args: ControllerArgs) -> i32 {
 async fn run(args: ControllerArgs) -> Result<(), ControllerError> {
     let ControllerBackend::Kubernetes = args.backend;
     let mut config = read_backend_config(&args.kubernetes_config)?;
-    if args.namespace.is_some() {
-        config.namespace = args.namespace.clone();
+    if args.cluster.namespace.is_some() {
+        config.namespace = args.cluster.namespace.clone();
     }
-    let access = cluster_access(&args, config.namespace.clone())?;
+    let access = cluster_access(&args.cluster, config.namespace.clone())?;
     let backend = KubernetesBackend::new(&access, config).map_err(ControllerError::usage)?;
     backend.preflight().await.map_err(|error| {
         ControllerError::failure(format!("the Kubernetes backend is not usable: {error}"))
@@ -170,6 +224,128 @@ async fn run(args: ControllerArgs) -> Result<(), ControllerError> {
         .run(shutdown_signal())
         .await;
     Ok(())
+}
+
+/// Runs one Claude profile edit session.
+pub async fn edit_profile_command(args: EditProfileArgs) -> i32 {
+    match edit_profile(args).await {
+        Ok(()) => EXIT_SUCCESS,
+        Err(error) => {
+            eprintln!("{}", error.message);
+            error.code
+        }
+    }
+}
+
+/// One edit session, its failure unprinted.
+pub async fn edit_profile(args: EditProfileArgs) -> Result<(), ControllerError> {
+    let mut config = read_backend_config(&args.kubernetes_config)?;
+    if args.cluster.namespace.is_some() {
+        config.namespace = args.cluster.namespace.clone();
+    }
+    let Some(secret) = config.claude_profile_secret.clone() else {
+        return Err(ControllerError::usage(format!(
+            "{} configures no claude_profile_secret",
+            args.kubernetes_config.display()
+        )));
+    };
+    let access = cluster_access(&args.cluster, config.namespace.clone())?;
+    let backend = KubernetesBackend::new(&access, config).map_err(ControllerError::usage)?;
+    let current = backend
+        .read_claude_profile()
+        .await
+        .map_err(|error| ControllerError::failure(error.to_string()))?;
+    let parent = args
+        .session_parent
+        .clone()
+        .unwrap_or_else(std::env::temp_dir);
+    let session = EditSession::open(
+        &parent,
+        backend.config().claude_profile_mappings(),
+        &current,
+    )
+    .map_err(ControllerError::failure)?;
+
+    eprintln!("Starting Claude Code on the profile of Secret '{secret}'. Close it to continue.");
+    let status = run_claude(&args.claude_command, &session).await?;
+    if !status.success() {
+        eprintln!("Claude Code exited with {status}; its changes can still be saved.");
+    }
+    let changes = session
+        .changes(&current)
+        .map_err(ControllerError::failure)?;
+    report_changes(&changes, &backend.config().claude_profile_mappings());
+    if changes.is_empty() {
+        eprintln!("Nothing to save.");
+        return Ok(());
+    }
+    if !args.yes && !confirm(&format!("Save to Secret '{secret}'? [y/N] "))? {
+        eprintln!("Not saved.");
+        return Ok(());
+    }
+    backend
+        .write_claude_profile(&changes.updated)
+        .await
+        .map_err(|error| ControllerError::failure(error.to_string()))?;
+    eprintln!(
+        "Saved {} key(s) to Secret '{secret}'; task Pods take them at their next start.",
+        changes.updated.len()
+    );
+    Ok(())
+}
+
+/// Runs Claude Code on the session in this terminal, with only the
+/// session's directories and no API key, until the user closes it.
+async fn run_claude(
+    program: &Path,
+    session: &EditSession,
+) -> Result<std::process::ExitStatus, ControllerError> {
+    // Ctrl-C belongs to Claude Code: without a handler of its own, this
+    // process would die with it and leave the session's login on disk.
+    let _interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .map_err(|error| ControllerError::failure(format!("cannot handle Ctrl-C: {error}")))?;
+    let mut command = std::process::Command::new(program);
+    command
+        .env(CLAUDE_CONFIG_DIR_ENV, session.config_dir())
+        .env("HOME", session.home_dir())
+        .current_dir(session.home_dir());
+    for name in API_KEY_ENVS {
+        command.env_remove(name);
+    }
+    tokio::task::spawn_blocking(move || command.status())
+        .await
+        .map_err(|error| ControllerError::failure(error.to_string()))?
+        .map_err(|error| {
+            ControllerError::failure(format!("cannot start {}: {error}", program.display()))
+        })
+}
+
+/// Tells the user what saving would do, by key and path, never by value.
+fn report_changes(changes: &ProfileChanges, mappings: &[(String, String)]) {
+    for key in changes.updated.keys() {
+        let path = mappings
+            .iter()
+            .find(|(mapped, _)| mapped == key)
+            .map_or("", |(_, path)| path.as_str());
+        eprintln!("  changed: {path} (key {key})");
+    }
+    for path in &changes.missing {
+        eprintln!("  removed: {path} — kept in the Secret, task Pods mount every mapped key");
+    }
+    for path in &changes.unmapped {
+        eprintln!("  not saved: {path} — add a 'key={path}' entry to claude_profile_files");
+    }
+}
+
+fn confirm(prompt: &str) -> Result<bool, ControllerError> {
+    use std::io::Write as _;
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| ControllerError::failure(format!("cannot read the answer: {error}")))?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
 /// Reads and checks the backend configuration file.
@@ -195,7 +371,7 @@ pub fn read_backend_config(path: &Path) -> Result<KubernetesBackendConfig, Contr
 }
 
 fn cluster_access(
-    args: &ControllerArgs,
+    args: &ClusterArgs,
     namespace: Option<String>,
 ) -> Result<ClusterAccess, ControllerError> {
     let Some(api_server) = &args.api_server else {

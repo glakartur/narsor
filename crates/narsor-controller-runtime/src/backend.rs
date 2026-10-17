@@ -317,19 +317,6 @@ pub trait ExecutionBackend: Send + Sync + 'static {
     /// The lifecycle operations this platform supports (R3).
     fn capabilities(&self) -> BackendCapabilities;
 
-    /// Applies one owner-accepted shared profile change, if this backend
-    /// supports managed Claude profiles.
-    fn apply_claude_profile_update(
-        &self,
-        _update: &narsor_protocol::controller::ClaudeProfileUpdate,
-    ) -> impl Future<Output = BackendResult<()>> + Send {
-        async {
-            Err(BackendError::rejected(
-                "this backend does not manage Claude profiles",
-            ))
-        }
-    }
-
     /// The task's resource names, derived from its resource key alone.
     ///
     /// Must be deterministic and injective over keys: two tasks never share

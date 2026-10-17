@@ -27,7 +27,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use backend_contract_support::{ContractTarget, Harness};
-use kubernetes_support::{MockCluster, DELETE_CLASS, NAMESPACE, RETAIN_CLASS};
+use kubernetes_support::{MockCluster, DELETE_CLASS, NAMESPACE, PROFILE_SECRET, RETAIN_CLASS};
+use narsor_controller::controller::{edit_profile, ClusterArgs, EditProfileArgs};
 use narsor_controller::kubernetes::manifest::{self, check_pod_shape, KubernetesBackendConfig};
 use narsor_controller::kubernetes::{launched_under_epoch, names, KubernetesBackend};
 use narsor_engine::backends::{
@@ -440,7 +441,6 @@ fn the_pod_has_one_runner_one_init_container_and_separate_volumes() {
 fn configured_claude_profile_mounts_read_only_for_every_runner() {
     let mut configured = config();
     configured.claude_profile_secret = Some("narsor-claude-profile".into());
-    configured.claude_profile_settings_key = "approved-settings".into();
     configured.claude_profile_files = vec![
         "approved-settings=settings.json".into(),
         "auth=.credentials.json".into(),
@@ -498,6 +498,163 @@ fn the_claude_profile_source_comes_only_from_the_profile_secret() {
         .problems()
         .iter()
         .any(|problem| problem.contains("claude_profile_source")));
+}
+
+// ---------------------------------------------------------------------------
+// Editing the Claude profile Secret in the controller (U7)
+// ---------------------------------------------------------------------------
+
+fn profile_config() -> KubernetesBackendConfig {
+    let mut configured = config();
+    configured.claude_profile_secret = Some(PROFILE_SECRET.into());
+    configured.claude_profile_files = vec![
+        "settings=settings.json".into(),
+        "auth=.credentials.json".into(),
+        "lint-skill=skills/lint/SKILL.md".into(),
+    ];
+    configured
+}
+
+/// `edit-claude-profile` against the mock cluster, with `harness` (a shell
+/// script) in place of Claude Code.
+fn edit_args(quiet: &Quiet, harness: &str) -> EditProfileArgs {
+    let config_file = quiet.dir.join("backend.yaml");
+    std::fs::write(
+        &config_file,
+        serde_yaml::to_string(quiet.backend.config()).unwrap(),
+    )
+    .unwrap();
+    let token_file = quiet.dir.join("token");
+    std::fs::write(&token_file, kubernetes_support::TOKEN).unwrap();
+    let script = quiet.dir.join("claude.sh");
+    std::fs::write(&script, format!("#!/bin/sh\nset -e\n{harness}\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    EditProfileArgs {
+        kubernetes_config: config_file,
+        cluster: ClusterArgs {
+            namespace: Some(NAMESPACE.into()),
+            api_server: Some(quiet.cluster.url.clone()),
+            token_file: Some(token_file),
+            ca_file: None,
+        },
+        claude_command: script,
+        session_parent: Some(quiet.dir.clone()),
+        yes: true,
+    }
+}
+
+#[tokio::test]
+async fn a_profile_edit_session_saves_changed_profile_files_to_the_secret() {
+    let quiet = Quiet::with(profile_config());
+    quiet.cluster.seed_profile_secret(&[
+        ("settings", r#"{"model":"opus"}"#),
+        ("auth", r#"{"token":"a"}"#),
+        ("unmapped", "kept"),
+    ]);
+    let seen = quiet.dir.join("seen");
+    let harness = format!(
+        r#"test "$HOME" != "{host_home}"
+printf '%s\n' "$CLAUDE_CONFIG_DIR" "${{ANTHROPIC_API_KEY-unset}}" > "{seen}"
+test "$(cat "$CLAUDE_CONFIG_DIR/.credentials.json")" = '{{"token":"a"}}'
+printf '{{"model":"fable"}}' > "$CLAUDE_CONFIG_DIR/settings.json"
+mkdir -p "$CLAUDE_CONFIG_DIR/skills/lint" "$CLAUDE_CONFIG_DIR/projects/-work"
+printf 'lint' > "$CLAUDE_CONFIG_DIR/skills/lint/SKILL.md"
+printf 'session' > "$CLAUDE_CONFIG_DIR/projects/-work/session.jsonl"
+printf 'history' > "$CLAUDE_CONFIG_DIR/history.jsonl""#,
+        host_home = std::env::var("HOME").unwrap_or_default(),
+        seen = seen.display(),
+    );
+
+    edit_profile(edit_args(&quiet, &harness))
+        .await
+        .expect("the session is saved");
+
+    let data = quiet.cluster.profile_secret_data();
+    assert_eq!(
+        data,
+        std::collections::BTreeMap::from([
+            ("auth".to_string(), r#"{"token":"a"}"#.to_string()),
+            ("lint-skill".to_string(), "lint".to_string()),
+            ("settings".to_string(), r#"{"model":"fable"}"#.to_string()),
+            ("unmapped".to_string(), "kept".to_string()),
+        ]),
+        "history and sessions never reach the Secret"
+    );
+    let writes: Vec<String> = quiet
+        .cluster
+        .mutations()
+        .into_iter()
+        .map(|request| format!("{} {}", request.method, request.path))
+        .collect();
+    assert_eq!(
+        writes,
+        vec![format!(
+            "PUT /api/v1/namespaces/{NAMESPACE}/secrets/{PROFILE_SECRET}"
+        )],
+        "the configured Secret is the only write"
+    );
+    let seen = std::fs::read_to_string(seen).unwrap();
+    let mut seen = seen.lines();
+    let config_dir = PathBuf::from(seen.next().unwrap());
+    assert_eq!(seen.next(), Some("unset"), "no API key reaches the harness");
+    assert!(
+        !config_dir.exists(),
+        "the session's login is removed after saving"
+    );
+}
+
+#[tokio::test]
+async fn an_unchanged_profile_is_not_written() {
+    let quiet = Quiet::with(profile_config());
+    quiet
+        .cluster
+        .seed_profile_secret(&[("settings", r#"{"model":"opus"}"#)]);
+    edit_profile(edit_args(&quiet, "true")).await.unwrap();
+    assert!(quiet.cluster.mutations().is_empty());
+}
+
+#[tokio::test]
+async fn the_last_profile_write_wins_over_an_external_change() {
+    let quiet = Quiet::with(profile_config());
+    quiet
+        .cluster
+        .seed_profile_secret(&[("settings", "{}"), ("auth", "old")]);
+    let read = quiet.backend.read_claude_profile().await.unwrap();
+    assert_eq!(read["auth"], b"old");
+    // An operator replaces the Secret while the session is open.
+    quiet
+        .cluster
+        .seed_profile_secret(&[("settings", "{}"), ("auth", "rotated")]);
+    let updated =
+        std::collections::BTreeMap::from([("settings".to_string(), b"{\"a\":1}".to_vec())]);
+    quiet
+        .backend
+        .write_claude_profile(&updated)
+        .await
+        .expect("no compare-and-swap refuses the write");
+    let data = quiet.cluster.profile_secret_data();
+    assert_eq!(data["settings"], r#"{"a":1}"#);
+    assert_eq!(
+        data["auth"], "rotated",
+        "keys the session did not change stay"
+    );
+}
+
+#[tokio::test]
+async fn a_profile_edit_needs_the_configured_secret() {
+    let quiet = Quiet::new();
+    let error = edit_profile(edit_args(&quiet, "true")).await.unwrap_err();
+    assert!(
+        error.message.contains("claude_profile_secret"),
+        "{}",
+        error.message
+    );
+
+    let quiet = Quiet::with(profile_config());
+    let error = edit_profile(edit_args(&quiet, "exit 9")).await.unwrap_err();
+    assert!(error.message.contains(PROFILE_SECRET), "{}", error.message);
+    assert!(quiet.cluster.mutations().is_empty());
 }
 
 /// `restartPolicy: Never`, no service-account token, and the admission

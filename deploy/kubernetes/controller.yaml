@@ -11,7 +11,13 @@
 #         narsor-controller-enrollment --from-literal=code=<code>
 #     On its first start the controller enrolls, writes its `nsk.` credential
 #     (0600) to its state volume and from then on ignores the code; delete
-#     the Secret afterwards.
+#     the Secret afterwards;
+#   * to edit the Claude profile Secret (claude_profile_secret below), use an
+#     image that also has Claude Code (`claude`) on its PATH, then run
+#       kubectl -n narsor-user exec -it deploy/narsor-controller -- \
+#         /opt/narsor/bin/narsor-controller edit-claude-profile
+#     The session runs in the controller's container, in /tmp (an emptyDir),
+#     and is removed when it ends.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -33,6 +39,14 @@ data:
     allowed_secrets:
       - narsor-github/token
     start_timeout_secs: 900
+    # Optional: the Claude Code profile every Claude Code task Pod mounts
+    # read-only, and its Secret keys as paths in Claude's configuration
+    # directory. Keep the name in step with controller-rbac.yaml and the
+    # admission ConfigMap's profileSecret.
+    # claude_profile_secret: narsor-claude-profile
+    # claude_profile_files:
+    #   - settings=settings.json
+    #   - auth=.credentials.json
 ---
 # The controller's identity lives here; it survives restarts and upgrades.
 apiVersion: v1
@@ -97,6 +111,9 @@ spec:
                   optional: true
             - name: RUST_LOG
               value: narsor=info
+            # Profile edit sessions (edit-claude-profile) live here.
+            - name: NARSOR_PROFILE_EDIT_DIR
+              value: /tmp
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -108,14 +125,21 @@ spec:
               memory: 64Mi
             limits:
               cpu: 500m
-              memory: 256Mi
+              # Room for a Claude Code profile edit session, which runs in
+              # this container next to the controller.
+              memory: 1Gi
           volumeMounts:
             - name: config
               mountPath: /etc/narsor
               readOnly: true
             - name: state
               mountPath: /var/lib/narsor-controller
+            - name: tmp
+              mountPath: /tmp
       volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
         - name: config
           configMap:
             name: narsor-controller-config

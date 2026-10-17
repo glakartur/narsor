@@ -206,7 +206,8 @@ impl KubeClient {
         }
     }
 
-    /// Replace one object with Kubernetes resourceVersion compare-and-swap.
+    /// PUT one object. With the object's `resourceVersion` the API server
+    /// refuses a stale write; without it, the last write wins.
     pub async fn replace(&self, path: &str, object: &Value) -> BackendResult<Value> {
         let (status, body) = self.send(Method::PUT, path, Some(object)).await?;
         match status {

@@ -56,6 +56,8 @@ pub const NAMESPACE: &str = "narsor-user";
 
 /// The bearer token the mock expects.
 pub const TOKEN: &str = "mock-service-account-token";
+/// The one Secret the controller's Role may read and update by name.
+pub const PROFILE_SECRET: &str = "narsor-claude-profile";
 
 /// Storage class that deletes volumes with their claims.
 pub const DELETE_CLASS: &str = "narsor-delete";
@@ -158,7 +160,7 @@ impl MockCluster {
             )
             .route(
                 "/api/v1/namespaces/{namespace}/{plural}/{name}",
-                get(object).delete(object),
+                get(object).put(object).delete(object),
             )
             .route(
                 "/apis/storage.k8s.io/v1/storageclasses/{name}",
@@ -252,6 +254,49 @@ impl MockCluster {
             name.to_string(),
             json!({ "metadata": { "name": name, "uid": uuid::Uuid::new_v4().to_string() }, "stringData": data }),
         );
+    }
+
+    /// Adds the Claude profile Secret, its values base64-encoded as the API
+    /// server keeps them.
+    pub fn seed_profile_secret(&self, data: &[(&str, &str)]) {
+        use base64::Engine as _;
+        let data: serde_json::Map<String, Value> = data
+            .iter()
+            .map(|(key, value)| {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(value);
+                (key.to_string(), Value::String(encoded))
+            })
+            .collect();
+        let mut state = self.lock();
+        state.next_version += 1;
+        let version = state.next_version.to_string();
+        state.secrets.insert(
+            PROFILE_SECRET.to_string(),
+            json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": { "name": PROFILE_SECRET, "resourceVersion": version },
+                "type": "Opaque",
+                "data": data,
+            }),
+        );
+    }
+
+    /// The Claude profile Secret's values, decoded.
+    pub fn profile_secret_data(&self) -> BTreeMap<String, String> {
+        use base64::Engine as _;
+        let state = self.lock();
+        state.secrets[PROFILE_SECRET]["data"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(key, value)| {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(value.as_str().unwrap())
+                    .unwrap();
+                (key.clone(), String::from_utf8(bytes).unwrap())
+            })
+            .collect()
     }
 
     /// Changes a storage class's reclaim policy (an operator mistake).
@@ -395,6 +440,37 @@ impl MockCluster {
                 None => not_found(name),
             },
             ("secrets", Method::POST, None) => self.create(state, "secrets", body),
+            ("secrets", Method::GET, Some(PROFILE_SECRET)) => {
+                match state.secrets.get(PROFILE_SECRET) {
+                    Some(object) => (StatusCode::OK, object.clone()),
+                    None => not_found(PROFILE_SECRET),
+                }
+            }
+            ("secrets", Method::PUT, Some(PROFILE_SECRET)) => {
+                let Some(mut object) = body else {
+                    return status(StatusCode::BAD_REQUEST, "BadRequest", "no body");
+                };
+                let Some(current) = state.secrets.get(PROFILE_SECRET) else {
+                    return not_found(PROFILE_SECRET);
+                };
+                let sent = object.pointer("/metadata/resourceVersion").cloned();
+                if sent
+                    .is_some_and(|sent| Some(&sent) != current.pointer("/metadata/resourceVersion"))
+                {
+                    return status(
+                        StatusCode::CONFLICT,
+                        "Conflict",
+                        "the object has been modified",
+                    );
+                }
+                state.next_version += 1;
+                object["metadata"]["resourceVersion"] =
+                    Value::String(state.next_version.to_string());
+                state
+                    .secrets
+                    .insert(PROFILE_SECRET.to_string(), object.clone());
+                (StatusCode::OK, object)
+            }
             ("secrets", _, _) => forbidden(),
             ("pods" | "persistentvolumeclaims", Method::POST, None) => {
                 self.create(state, plural, body)

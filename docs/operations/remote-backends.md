@@ -315,8 +315,7 @@ rather than claiming success.
 | `allowed_registries` | `allowedRegistries` | comma-separated prefixes, **each ending in `/`** |
 | `allowed_secrets` | `allowedSecrets` | `secret-name/key`, matching the backend record's `secrets[].key` |
 | `claude_profile_secret` | `profileSecret` | Optional dedicated Claude profile Secret; mounted read-only into every Claude Code runner |
-| `claude_profile_settings_key` | — | Secret key used by the profile update protocol (default `settings.json`) |
-| `claude_profile_files` | — | Optional list of `secret-key=relative/path` mappings for settings, auth, MCP, plugins and skills files |
+| `claude_profile_files` | — | Optional list of `secret-key=relative/path` mappings for settings, auth, MCP, plugins and skills files (default: the key `settings.json` at `settings.json`) |
 
 Other `backend.yaml` keys: `namespace`, `storage_mib` (PVC size, default
 10240), `run_as_user` / `run_as_group` / `fs_group` (default 1000),
@@ -359,12 +358,47 @@ PVC):
 
 The volume's own entries (`..data`, `..<timestamp>`) are not part of the
 profile. Profile files are written readable by their owner only. Nothing is
-ever written back: changes a task's harness makes stay in that task. The
-Secret is changed by the operator outside Narsor and is not rejected or
-reverted. `harness_home.claude_profile_source` is set from
-`claude_profile_secret` and may not be set by hand.
-Set the same name in the admission ConfigMap's `profileSecret` and the
-controller Role's `resourceNames` rule.
+ever written back: changes a task's harness makes stay in that task.
+`harness_home.claude_profile_source` is set from `claude_profile_secret` and
+may not be set by hand. Set the same name in the admission ConfigMap's
+`profileSecret` and the controller Role's `resourceNames` rule.
+
+**Editing the profile.** The controller is the only part of Narsor that
+writes the profile Secret; its Role may `get` and `update` that one Secret
+by name, and task Pods have no Kubernetes access at all. To change the
+profile — log Claude Code in again, add permission rules, MCP servers,
+plugins or skills — run an edit session in the controller's Pod:
+
+```bash
+kubectl -n narsor-user exec -it deploy/narsor-controller -- \
+  /opt/narsor/bin/narsor-controller edit-claude-profile
+```
+
+The controller image must have Claude Code on its `PATH` (or name it with
+`--claude-command`). The session:
+
+1. reads the Secret and writes each mapped key at its path in a private
+   directory under `NARSOR_PROFILE_EDIT_DIR` (`/tmp`, an `emptyDir`);
+2. runs Claude Code in your terminal with that directory as
+   `CLAUDE_CONFIG_DIR`, an empty private `HOME` and no API key; make your
+   changes and close it;
+3. collects the profile files — the mapped paths, plus `settings.json`,
+   `settings.local.json`, `.credentials.json`, `.claude.json`, `.mcp.json`,
+   `CLAUDE.md`, `skills/`, `agents/`, `commands/`, `output-styles/` and the
+   plugin registries; never `projects/`, history, todos, shell snapshots or
+   plugin caches;
+4. lists what changed by path and key (never by value), asks before saving
+   (`--yes` skips the question) and writes the changed keys, keeping every
+   other key of the Secret.
+
+A profile file with no mapping is reported as not saved: add a
+`key=path` entry to `claude_profile_files`, restart the controller and edit
+again. A mapped file you delete stays in the Secret, because task Pods mount
+every mapped key. The write carries no `resourceVersion`: when the Secret was
+changed outside Narsor meanwhile, the last write wins. Changes made outside
+Narsor are accepted as they are. Task Pods take the new profile at their
+next start, through the merge above. The session directory, login included,
+is removed when the command ends.
 
 **`harness_home`** — which `HOME` and harness configuration the runner gives
 every action, passed as `narsor-runner` flags on every Pod start:

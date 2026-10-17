@@ -20,9 +20,8 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use narsor_api_client::api::{ApiClient, ClientError};
 use narsor_engine::controller_protocol::{
-    ClaudeProfileChange, ClaudeProfileUpdate, CommandAck, ConductorReadQuery,
-    ConductorReadResponse, ControllerClient, ConversationPageQuery, ConversationResponse,
-    ConversationUnavailableReason, CreateClaudeProfileProposalRequest, CreateEnrollmentRequest,
+    CommandAck, ConductorReadQuery, ConductorReadResponse, ControllerClient, ConversationPageQuery,
+    ConversationResponse, ConversationUnavailableReason, CreateEnrollmentRequest,
     CreateTaskRequest, DesiredAction, ExecutionEventsPage, ExecutionEventsQuery,
     ExecutionEventsResponse, ExecutionEventsSource, Freshness, LaunchRequest, OwnerCommandRequest,
     ProtocolConfig, ProtocolService, RelayFailure, ReportRequest, RunnerClient,
@@ -505,60 +504,6 @@ async fn an_enrollment_code_enrolls_once_and_expires() {
         ControllerClient::enroll(harness.base_url(), &late.enrollment_code).await,
         Err(ClientError::Unauthorized)
     ));
-}
-
-#[tokio::test]
-async fn approved_claude_profile_update_is_queued_only_for_its_backend() {
-    let harness = Harness::start().await;
-    let base = serde_json::json!({"permissions":{"allow":["Read"],"deny":[]}});
-    let proposed =
-        serde_json::json!({"permissions":{"allow":["Read","Bash(git status)"],"deny":[]}});
-    let update = ClaudeProfileUpdate {
-        proposal_id: "profile-change-1".into(),
-        secret_name: "narsor-claude-profile".into(),
-        expected_resource_version: "17".into(),
-        expected_digest: narsor_engine::domain::canonical_sha256(&base),
-        proposed_digest: narsor_engine::domain::canonical_sha256(&proposed),
-        settings: proposed,
-    };
-    let proposal = harness
-        .service
-        .propose_claude_profile_update(
-            BackendId::parse("k8s").unwrap(),
-            CreateClaudeProfileProposalRequest {
-                update: update.clone(),
-                base_settings: base,
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        proposal.changes,
-        vec![ClaudeProfileChange {
-            permission: "allow".into(),
-            rule: "Bash(git status)".into(),
-            added: true
-        }]
-    );
-    let (controller, _) = harness.controller("k8s").await;
-    assert!(controller
-        .commands(0, true)
-        .await
-        .unwrap()
-        .profile_updates
-        .is_empty());
-    harness
-        .service
-        .accept_claude_profile_proposal(
-            &OwnerRef::new("owner"),
-            &BackendId::parse("k8s").unwrap(),
-            &update.proposal_id,
-            &update.proposed_digest,
-        )
-        .unwrap();
-    assert_eq!(
-        controller.commands(0, true).await.unwrap().profile_updates,
-        vec![update.clone()]
-    );
 }
 
 #[tokio::test]

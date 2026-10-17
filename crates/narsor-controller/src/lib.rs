@@ -2,3 +2,4 @@
 
 pub mod controller;
 pub mod kubernetes;
+pub mod profile_edit;

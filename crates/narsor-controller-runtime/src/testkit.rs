@@ -26,9 +26,8 @@ use crate::backend::{
 use crate::backend::{BackendCapabilities, BackendKind};
 use crate::controller::ControllerLink;
 use narsor_protocol::controller::{
-    AckResponse, ClaudeProfileUpdateAckRequest, ClaudeProfileUpdateAckResponse, CommandAck,
-    CommandsResponse, HeartbeatResponse, LeaseView, ReportRequest, ReportResponse,
-    RunnerCredentialRequest, RunnerCredentialResponse,
+    AckResponse, CommandAck, CommandsResponse, HeartbeatResponse, LeaseView, ReportRequest,
+    ReportResponse, RunnerCredentialRequest, RunnerCredentialResponse,
 };
 use narsor_protocol::identifier::TaskId;
 use narsor_shared::api_error::ClientError;
@@ -409,14 +408,6 @@ impl<L: ControllerLink> ControllerLink for SeverableLink<L> {
     async fn acknowledge(&self, acks: Vec<CommandAck>) -> Result<AckResponse, ClientError> {
         self.check()?;
         self.inner.acknowledge(acks).await
-    }
-
-    async fn acknowledge_profile_updates(
-        &self,
-        request: ClaudeProfileUpdateAckRequest,
-    ) -> Result<ClaudeProfileUpdateAckResponse, ClientError> {
-        self.check()?;
-        self.inner.acknowledge_profile_updates(request).await
     }
 
     async fn report(&self, report: &ReportRequest) -> Result<ReportResponse, ClientError> {

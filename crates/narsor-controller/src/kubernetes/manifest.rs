@@ -66,6 +66,8 @@ pub const LAUNCH_MOUNT: &str = "/var/run/narsor/launch";
 pub const SECRETS_MOUNT: &str = "/var/run/narsor/secrets";
 /// Where the Claude profile Secret is mounted, read-only.
 pub const CLAUDE_PROFILE_MOUNT: &str = "/var/run/narsor/claude-profile";
+/// The one profile file, key and path alike, when no mapping is configured.
+const DEFAULT_PROFILE_FILE: &str = "settings.json";
 /// Where a bundle image carries its payload.
 pub const BUNDLE_PAYLOAD: &str = "/narsor";
 /// What every init container runs: copy the payload into its volume.
@@ -156,11 +158,8 @@ pub struct KubernetesBackendConfig {
     /// every Claude Code runner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_profile_secret: Option<String>,
-    /// Secret key containing Claude Code's settings JSON.
-    #[serde(default = "default_claude_settings_key")]
-    pub claude_profile_settings_key: String,
     /// Optional `secret-key=relative/path` mappings for profile files.
-    /// Empty keeps the legacy single settings file mapping.
+    /// Empty maps the one key `settings.json` to `settings.json`.
     #[serde(default)]
     pub claude_profile_files: Vec<String>,
     /// How long a Pod may stay Pending (an image that never pulls, a
@@ -206,7 +205,6 @@ impl KubernetesBackendConfig {
             allowed_registries,
             allowed_secrets: Vec::new(),
             claude_profile_secret: None,
-            claude_profile_settings_key: default_claude_settings_key(),
             claude_profile_files: Vec::new(),
             start_timeout_secs: default_start_timeout(),
             harness_home: HarnessHome::default(),
@@ -264,9 +262,6 @@ impl KubernetesBackendConfig {
                     "claude_profile_secret '{secret}' is not a valid Secret name"
                 ));
             }
-            if !names::is_secret_key(&self.claude_profile_settings_key) {
-                problems.push("claude_profile_settings_key is not a valid Secret key".into());
-            }
             for mapping in &self.claude_profile_files {
                 if split_profile_file(mapping).is_none() {
                     problems.push(format!(
@@ -296,6 +291,19 @@ impl KubernetesBackendConfig {
         problems
     }
 
+    /// The profile Secret's keys and the paths in Claude's configuration
+    /// directory they are files at, in the order configured.
+    pub fn claude_profile_mappings(&self) -> Vec<(String, String)> {
+        if self.claude_profile_files.is_empty() {
+            return vec![(DEFAULT_PROFILE_FILE.into(), DEFAULT_PROFILE_FILE.into())];
+        }
+        self.claude_profile_files
+            .iter()
+            .filter_map(|mapping| split_profile_file(mapping))
+            .map(|(key, path)| (key.to_string(), path.to_string()))
+            .collect()
+    }
+
     /// The admission rules the generated Pod must satisfy.
     pub fn shape_policy(&self) -> ShapePolicy {
         ShapePolicy {
@@ -303,16 +311,8 @@ impl KubernetesBackendConfig {
             allowed_registries: self.allowed_registries.clone(),
             allowed_secrets: self.allowed_secrets.iter().cloned().collect(),
             profile_secret: self.claude_profile_secret.clone(),
-            profile_settings_key: self
-                .claude_profile_secret
-                .as_ref()
-                .map(|_| self.claude_profile_settings_key.clone()),
         }
     }
-}
-
-fn default_claude_settings_key() -> String {
-    "settings.json".into()
 }
 
 fn split_profile_file(mapping: &str) -> Option<(&str, &str)> {
@@ -326,16 +326,9 @@ fn split_profile_file(mapping: &str) -> Option<(&str, &str)> {
 }
 
 fn claude_profile_items(config: &KubernetesBackendConfig) -> Vec<Value> {
-    if config.claude_profile_files.is_empty() {
-        return vec![json!({
-            "key": config.claude_profile_settings_key,
-            "path": "settings.json"
-        })];
-    }
     config
-        .claude_profile_files
-        .iter()
-        .filter_map(|mapping| split_profile_file(mapping))
+        .claude_profile_mappings()
+        .into_iter()
         .map(|(key, path)| json!({"key": key, "path": path}))
         .collect()
 }
@@ -823,8 +816,6 @@ pub struct ShapePolicy {
     pub allowed_secrets: BTreeSet<String>,
     /// The one optional dedicated profile Secret Claude Code Pods may mount.
     pub profile_secret: Option<String>,
-    /// Retained for the controller's profile update protocol.
-    pub profile_settings_key: Option<String>,
 }
 
 /// Checks a Pod against the admission rules (mirrors

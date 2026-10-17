@@ -3,14 +3,17 @@
 #
 # * no pods/exec, pods/attach, pods/portforward or pods/ephemeralcontainers —
 #   the controller never enters a workload (KTD3);
-# * Secrets: create for launch Secrets. The optional Claude profile Secret
-#   is readable and updateable only by its configured name (replace the
-#   resourceName below when installing the profile integration).
-#   Secret (runner credential + launch spec), owned by its Pod so the garbage
-#   collector deletes it; it can neither read, list nor delete a Secret.
-#   Creating Pods is still a secret-injection capability — the admission
-#   policy is what limits which Secrets a Pod may mount;
-# * no update/patch of anything: a Pod is never modified, only replaced.
+# * Secrets: create only for each incarnation's launch Secret (runner
+#   credential + launch spec), owned by its Pod so the garbage collector
+#   deletes it; it can neither list nor delete a Secret. Creating Pods is
+#   still a secret-injection capability — the admission policy is what
+#   limits which Secrets a Pod may mount;
+# * the optional Claude profile Secret: get and update by its name only
+#   (set the resourceName below to backend.yaml's claude_profile_secret).
+#   The controller is its one writer in Narsor: `narsor-controller
+#   edit-claude-profile`, run in the controller Pod, writes it back after
+#   a Claude Code edit session (R15). Task Pods mount it read-only;
+# * no other update/patch: a Pod is never modified, only replaced.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

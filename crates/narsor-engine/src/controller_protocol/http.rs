@@ -46,7 +46,7 @@ use super::service::ProtocolService;
 use super::wire::*;
 use crate::auth::pop::SignedRequest;
 use crate::auth::Operator;
-use crate::domain::{BackendId, TaskId};
+use crate::domain::TaskId;
 use crate::materials::{
     MaterialAckRequest, MaterialAckResponse, MaterialListResponse, MaterialSummary,
     MaterialUploadResponse, MaterialView, BUNDLE_CONTENT_TYPE,
@@ -72,14 +72,6 @@ where
         .route("/control/v1/tasks", get(list_tasks).post(create_task))
         .route("/control/v1/tasks/{task_id}", get(get_task))
         .route("/control/v1/tasks/{task_id}/commands", post(post_command))
-        .route(
-            "/control/v1/backends/{backend_id}/claude-profile-proposals",
-            post(post_claude_profile_proposal),
-        )
-        .route(
-            "/control/v1/backends/{backend_id}/claude-profile-proposals/{proposal_id}/accept",
-            post(post_accept_claude_profile_proposal),
-        )
         .route("/control/v1/tasks/{task_id}/move", post(post_move))
         .route(
             "/control/v1/default-backend",
@@ -143,10 +135,6 @@ where
         .route("/controller/v1/lease/renew", post(post_renew_lease))
         .route("/controller/v1/lease/release", post(post_release_lease))
         .route("/controller/v1/commands", get(get_commands))
-        .route(
-            "/controller/v1/profile-updates/acks",
-            post(post_profile_update_acks),
-        )
         .route("/controller/v1/acks", post(post_acks))
         .route("/controller/v1/reports", post(post_report))
         .route(
@@ -305,50 +293,6 @@ async fn get_task(
     Path(task_id): Path<String>,
 ) -> ProtocolResult<Json<TaskSummary>> {
     Ok(Json(service.task(&owner, &task_id)?))
-}
-
-async fn post_claude_profile_proposal(
-    State(service): State<Service>,
-    Path(backend_id): Path<String>,
-    Json(request): Json<CreateClaudeProfileProposalRequest>,
-) -> ProtocolResult<Json<ClaudeProfileProposalView>> {
-    let backend_id = BackendId::parse(&backend_id)
-        .map_err(|_| ProtocolError::bad_request("invalid_backend", "backend id is invalid"))?;
-    let update = &request.update;
-    if update.secret_name.is_empty()
-        || update.expected_resource_version.is_empty()
-        || !update
-            .secret_name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
-    {
-        return Err(ProtocolError::bad_request(
-            "invalid_profile_secret",
-            "profile Secret name is invalid",
-        ));
-    }
-    Ok(Json(
-        service.propose_claude_profile_update(backend_id, request)?,
-    ))
-}
-
-async fn post_accept_claude_profile_proposal(
-    State(service): State<Service>,
-    Extension(owner): Extension<OwnerRef>,
-    operator: Option<Extension<Operator>>,
-    Path((backend_id, proposal_id)): Path<(String, String)>,
-    Json(request): Json<AcceptClaudeProfileUpdateRequest>,
-) -> ProtocolResult<StatusCode> {
-    require_operator(operator)?;
-    let backend_id = BackendId::parse(&backend_id)
-        .map_err(|_| ProtocolError::bad_request("invalid_backend", "backend id is invalid"))?;
-    service.accept_claude_profile_proposal(
-        &owner,
-        &backend_id,
-        &proposal_id,
-        &request.accepted_digest,
-    )?;
-    Ok(StatusCode::ACCEPTED)
 }
 
 async fn post_command(
@@ -665,16 +609,6 @@ async fn post_acks(
     Json(request): Json<AckRequest>,
 ) -> ProtocolResult<Json<AckResponse>> {
     Ok(Json(service.acknowledge(&identity, request)?))
-}
-
-async fn post_profile_update_acks(
-    State(service): State<Service>,
-    Extension(identity): Extension<ControllerIdentity>,
-    Json(request): Json<ClaudeProfileUpdateAckRequest>,
-) -> ProtocolResult<Json<ClaudeProfileUpdateAckResponse>> {
-    let acknowledged = request.updates.len();
-    service.acknowledge_claude_profile_updates(&identity, request)?;
-    Ok(Json(ClaudeProfileUpdateAckResponse { acknowledged }))
 }
 
 async fn post_report(

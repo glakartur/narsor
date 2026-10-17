@@ -69,10 +69,9 @@ use crate::backend::{
     RunnerCredential, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
 };
 use narsor_protocol::controller::{
-    AckResponse, ClaudeProfileUpdateAck, ClaudeProfileUpdateAckRequest,
-    ClaudeProfileUpdateAckResponse, CommandAck, CommandsResponse, DesiredAction, DesiredCommand,
-    HeartbeatResponse, LeaseView, Observation, ObservedSummary, ReportRequest, ReportResponse,
-    ResourceIdentity, RunnerCredentialRequest, RunnerCredentialResponse, TaskLifecycle,
+    AckResponse, CommandAck, CommandsResponse, DesiredAction, DesiredCommand, HeartbeatResponse,
+    LeaseView, Observation, ObservedSummary, ReportRequest, ReportResponse, ResourceIdentity,
+    RunnerCredentialRequest, RunnerCredentialResponse, TaskLifecycle,
 };
 use narsor_protocol::identifier::TaskId;
 use narsor_shared::api_error::ClientError;
@@ -121,11 +120,6 @@ pub trait ControllerLink: Send + Sync + 'static {
         &self,
         acks: Vec<CommandAck>,
     ) -> impl Future<Output = Result<AckResponse, ClientError>> + Send;
-    /// Acknowledges versioned profile updates.
-    fn acknowledge_profile_updates(
-        &self,
-        request: ClaudeProfileUpdateAckRequest,
-    ) -> impl Future<Output = Result<ClaudeProfileUpdateAckResponse, ClientError>> + Send;
     /// `POST /controller/v1/reports`.
     fn report(
         &self,
@@ -396,31 +390,6 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
                 "commands were read under epoch {}, not {epoch}",
                 response.lease_epoch
             )));
-        }
-
-        if !response.profile_updates.is_empty() {
-            let mut updates = Vec::with_capacity(response.profile_updates.len());
-            for update in &response.profile_updates {
-                let result = self.backend.apply_claude_profile_update(update).await;
-                updates.push(match result {
-                    Ok(()) => ClaudeProfileUpdateAck {
-                        proposal_id: update.proposal_id.clone(),
-                        applied: true,
-                        detail: None,
-                    },
-                    Err(error) => ClaudeProfileUpdateAck {
-                        proposal_id: update.proposal_id.clone(),
-                        applied: false,
-                        detail: Some(error.message),
-                    },
-                });
-            }
-            let _ = self
-                .call(
-                    self.link
-                        .acknowledge_profile_updates(ClaudeProfileUpdateAckRequest { updates }),
-                )
-                .await?;
         }
 
         // Archived tasks drop out of the desired state; so does what this
