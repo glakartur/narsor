@@ -1,7 +1,7 @@
 ---
 title: "feat: Zunifikowany model rozmowy i rozbudowany adapter Claude Code"
 type: feat
-status: active
+status: completed
 date: 2026-10-16
 origin: docs/brainstorms/2026-10-16-zunifikowany-model-rozmowy-claude-code-requirements.md
 ---
