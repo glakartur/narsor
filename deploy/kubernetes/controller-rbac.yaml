@@ -3,7 +3,9 @@
 #
 # * no pods/exec, pods/attach, pods/portforward or pods/ephemeralcontainers —
 #   the controller never enters a workload (KTD3);
-# * Secrets: create only. The controller writes each incarnation's launch
+# * Secrets: create for launch Secrets. The optional Claude profile Secret
+#   is readable and updateable only by its configured name (replace the
+#   resourceName below when installing the profile integration).
 #   Secret (runner credential + launch spec), owned by its Pod so the garbage
 #   collector deletes it; it can neither read, list nor delete a Secret.
 #   Creating Pods is still a secret-injection capability — the admission
@@ -30,6 +32,10 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["narsor-claude-profile"]
+    verbs: ["get", "update"]
   # Diagnostics only (why a Pod does not start); never written.
   - apiGroups: [""]
     resources: ["events"]

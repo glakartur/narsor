@@ -6,8 +6,9 @@ use narsor_controller_runtime::{
     load_or_enroll_with, ControllerLink, EnrollmentClient, EnrollmentError,
 };
 use narsor_protocol::controller::{
-    AckResponse, CommandAck, CommandsResponse, HeartbeatResponse, LeaseView, ReportRequest,
-    ReportResponse, RunnerCredentialRequest, RunnerCredentialResponse,
+    AckResponse, ClaudeProfileUpdateAckRequest, ClaudeProfileUpdateAckResponse, CommandAck,
+    CommandsResponse, HeartbeatResponse, LeaseView, ReportRequest, ReportResponse,
+    RunnerCredentialRequest, RunnerCredentialResponse,
 };
 use narsor_shared::api_error::ClientError;
 
@@ -32,6 +33,12 @@ impl ControllerLink for ControllerClient {
     }
     async fn acknowledge(&self, acks: Vec<CommandAck>) -> Result<AckResponse, ClientError> {
         ControllerClient::acknowledge(self, acks).await
+    }
+    async fn acknowledge_profile_updates(
+        &self,
+        request: ClaudeProfileUpdateAckRequest,
+    ) -> Result<ClaudeProfileUpdateAckResponse, ClientError> {
+        ControllerClient::acknowledge_profile_updates(self, request).await
     }
     async fn report(&self, report: &ReportRequest) -> Result<ReportResponse, ClientError> {
         ControllerClient::report(self, report).await

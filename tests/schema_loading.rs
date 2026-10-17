@@ -970,11 +970,11 @@ fn an_agent_action_stored_before_the_harness_became_optional_still_reads() {
     let config: AgentActionConfig =
         serde_json::from_value(new).expect("a record written since must read too");
     assert_eq!(config.harness, None);
-    assert_eq!(config.workspace_access, WorkspaceAccess::ReadWrite);
+    assert_eq!(config.workspace_access, Some(WorkspaceAccess::ReadWrite));
 }
 
 #[test]
-fn agent_workspace_access_defaults_to_read_write_and_accepts_read_only() {
+fn agent_workspace_access_keeps_omission_distinct_from_explicit_values() {
     let yaml = r#"
 name: access
 version: 1
@@ -1002,8 +1002,8 @@ terminal_states: { completed: completed }
         ActionConfig::Agent(config) => config.workspace_access,
         other => panic!("expected agent action, got {other:?}"),
     };
-    assert_eq!(access("write"), WorkspaceAccess::ReadWrite);
-    assert_eq!(access("read"), WorkspaceAccess::ReadOnly);
+    assert_eq!(access("write"), None);
+    assert_eq!(access("read"), Some(WorkspaceAccess::ReadOnly));
 }
 
 // ---------------------------------------------------------------------------

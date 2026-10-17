@@ -81,6 +81,68 @@ use narsor_engine::backends::{
     StorageState, TaskObservation, TaskResources, WorkloadLaunch, WorkloadPhase, WorkloadState,
 };
 use narsor_engine::domain::TaskId;
+
+fn validate_profile_settings(settings: &Value) -> BackendResult<()> {
+    let root = settings
+        .as_object()
+        .ok_or_else(|| BackendError::rejected("profile settings must be a JSON object"))?;
+    if root.len() != 1 || !root.contains_key("permissions") {
+        return Err(BackendError::rejected(
+            "profile settings may contain only permissions.allow and permissions.deny",
+        ));
+    }
+    let permissions = root["permissions"]
+        .as_object()
+        .ok_or_else(|| BackendError::rejected("profile permissions must be an object"))?;
+    if permissions
+        .keys()
+        .any(|key| !matches!(key.as_str(), "allow" | "deny"))
+    {
+        return Err(BackendError::rejected(
+            "profile settings may contain only permissions.allow and permissions.deny",
+        ));
+    }
+    for key in ["allow", "deny"] {
+        if let Some(value) = permissions.get(key) {
+            let entries = value.as_array().ok_or_else(|| {
+                BackendError::rejected(format!("permissions.{key} must be an array"))
+            })?;
+            if entries
+                .iter()
+                .any(|entry| !entry.as_str().is_some_and(|value| !value.trim().is_empty()))
+            {
+                return Err(BackendError::rejected(format!(
+                    "permissions.{key} entries must be non-empty strings"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod profile_update_tests {
+    use super::*;
+
+    #[test]
+    fn profile_proposals_allow_only_permission_lists() {
+        for value in [
+            serde_json::json!({"permissions":{"allow":["Read"],"deny":[]}}),
+            serde_json::json!({"permissions":{"allow":[]}}),
+        ] {
+            assert!(validate_profile_settings(&value).is_ok(), "{value}");
+        }
+        for value in [
+            serde_json::json!({"permissions":{"allow":[],"hooks":{}}}),
+            serde_json::json!({"apiKey":"secret","permissions":{"allow":[]}}),
+            serde_json::json!({"permissions":{"allow":"Read"}}),
+            serde_json::json!({"permissions":{"allow":[""]}}),
+            serde_json::json!({"permissions":{"allow":[],"deny":[],"other":[]}}),
+        ] {
+            assert!(validate_profile_settings(&value).is_err(), "{value}");
+        }
+    }
+}
 use narsor_engine::environment::{BackendCapabilities, BackendKind};
 
 /// The Kubernetes adapter. Cloning shares the HTTP client.
@@ -120,6 +182,102 @@ impl KubernetesBackend {
     /// The namespace task objects live in.
     pub fn namespace(&self) -> &str {
         self.client.namespace()
+    }
+
+    /// Applies an owner-approved profile update with a digest check and
+    /// Kubernetes resourceVersion compare-and-swap. Replays are harmless.
+    pub async fn apply_claude_profile_update(
+        &self,
+        update: &narsor_protocol::controller::ClaudeProfileUpdate,
+    ) -> BackendResult<()> {
+        if self.config.claude_profile_secret.as_deref() != Some(update.secret_name.as_str()) {
+            return Err(BackendError::rejected(
+                "profile update names a Secret outside this backend's configured profile",
+            ));
+        }
+        validate_profile_settings(&update.settings)?;
+        if narsor_engine::domain::canonical_sha256(&update.settings) != update.proposed_digest {
+            return Err(BackendError::rejected(
+                "profile update digest does not match its settings",
+            ));
+        }
+        let path = format!(
+            "/api/v1/namespaces/{}/secrets/{}",
+            self.namespace(),
+            update.secret_name
+        );
+        let mut secret = self
+            .client
+            .get(&path)
+            .await
+            .map_err(|error| BackendError {
+                kind: error.kind,
+                message: "could not read the configured profile Secret".into(),
+            })?
+            .ok_or_else(|| BackendError::rejected("configured profile Secret does not exist"))?;
+        let metadata = secret
+            .get("metadata")
+            .and_then(Value::as_object)
+            .ok_or_else(|| BackendError::rejected("profile Secret metadata is malformed"))?;
+        let annotations = metadata.get("annotations").and_then(Value::as_object);
+        if annotations
+            .and_then(|a| a.get("narsor.dev/profile-proposal-id"))
+            .and_then(Value::as_str)
+            == Some(update.proposal_id.as_str())
+            && annotations
+                .and_then(|a| a.get("narsor.dev/profile-digest"))
+                .and_then(Value::as_str)
+                == Some(update.proposed_digest.as_str())
+        {
+            return Ok(());
+        }
+        let version = metadata
+            .get("resourceVersion")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if version != update.expected_resource_version {
+            return Err(BackendError::transient(
+                "profile Secret changed after proposal review; refresh the proposal",
+            ));
+        }
+        let key = &self.config.claude_profile_settings_key;
+        let encoded = secret
+            .pointer(&format!("/data/{key}"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| BackendError::rejected("configured profile key is missing"))?;
+        let current_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).map_err(
+                |_| BackendError::rejected("configured profile key is not valid base64"),
+            )?;
+        let current: Value = serde_json::from_slice(&current_bytes)
+            .map_err(|_| BackendError::rejected("configured profile settings are invalid JSON"))?;
+        if narsor_engine::domain::canonical_sha256(&current) != update.expected_digest {
+            return Err(BackendError::transient(
+                "profile Secret content changed after proposal review; refresh the proposal",
+            ));
+        }
+        let serialized = serde_json::to_vec(&update.settings)
+            .map_err(|error| BackendError::rejected(error.to_string()))?;
+        secret["data"][key] = Value::String(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            serialized,
+        ));
+        secret["metadata"]["annotations"]["narsor.dev/profile-proposal-id"] =
+            Value::String(update.proposal_id.clone());
+        secret["metadata"]["annotations"]["narsor.dev/profile-digest"] =
+            Value::String(update.proposed_digest.clone());
+        self.client
+            .replace(&path, &secret)
+            .await
+            .map_err(|error| BackendError {
+                kind: error.kind,
+                message: if error.kind == narsor_engine::backends::BackendErrorKind::Transient {
+                    "profile Secret changed during the update; refresh the proposal".into()
+                } else {
+                    "Kubernetes refused the configured profile update".into()
+                },
+            })?;
+        Ok(())
     }
 
     /// Checks, at controller start, what would otherwise fail a task later:
@@ -390,6 +548,13 @@ impl ExecutionBackend for KubernetesBackend {
             persistent_storage: true,
             archive: true,
         }
+    }
+
+    fn apply_claude_profile_update(
+        &self,
+        update: &narsor_protocol::controller::ClaudeProfileUpdate,
+    ) -> impl std::future::Future<Output = BackendResult<()>> + Send {
+        KubernetesBackend::apply_claude_profile_update(self, update)
     }
 
     fn resources(&self, task_id: &TaskId, resource_key: &str) -> BackendResult<TaskResources> {

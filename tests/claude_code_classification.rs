@@ -806,3 +806,53 @@ fn a_schema_question_is_reported_as_structured_output_too() {
 fn a_run_without_a_schema_has_no_structured_output() {
     assert_eq!(run_of("tools.ndjson").structured_output, None);
 }
+
+#[test]
+fn a_result_preserves_structured_permission_denials_and_correlation() {
+    let mut parser = parser();
+    let denied = json!({
+        "type": "system",
+        "subtype": "permission_denied",
+        "tool_name": "Bash",
+        "tool_use_id": "tool-1",
+        "decision_reason_type": "subcommandResults",
+        "message": "Approval is required for this command."
+    })
+    .to_string();
+    parser.on_stdout_line(denied.as_bytes());
+    let line = json!({
+        "type": "result",
+        "subtype": "success",
+        "session_id": "session-1",
+        "permission_denials": [{
+            "tool_name": "Bash",
+            "tool_use_id": "tool-1",
+            "tool_input": {"command": "cargo build"}
+        }],
+        "result": "The command was blocked.",
+        "is_error": false
+    })
+    .to_string();
+    let elements = parser.on_stdout_line(line.as_bytes());
+    let run = parser.finish(0, "");
+
+    assert_eq!(run.session_id.as_deref(), Some("session-1"));
+    assert_eq!(run.permission_denials.len(), 1);
+    let denial = &run.permission_denials[0];
+    assert_eq!(denial.tool_name, "Bash");
+    assert_eq!(denial.tool_use_id, "tool-1");
+    assert_eq!(denial.input["command"], "cargo build");
+    assert_eq!(denial.reason_type.as_deref(), Some("subcommandResults"));
+    assert_eq!(
+        denial.reason.as_deref(),
+        Some("Approval is required for this command.")
+    );
+    assert!(run
+        .failure
+        .as_deref()
+        .is_some_and(|failure| failure.contains("reported an error")));
+    assert!(matches!(
+        elements.last(),
+        Some(ChatElement::RunResult { is_error: true, .. })
+    ));
+}

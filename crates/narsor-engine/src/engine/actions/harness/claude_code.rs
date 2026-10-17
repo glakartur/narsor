@@ -60,6 +60,7 @@ use serde_json::{Map, Value};
 use super::{
     integer_parameter, reject_option_like, resolve_read_only_path, string_parameter, tail,
     HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
+    PermissionDenial,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
@@ -124,6 +125,8 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             "--output-format".to_string(),
             "stream-json".to_string(),
             "--verbose".to_string(),
+            "--permission-prompts".to_string(),
+            "none".to_string(),
         ];
 
         // Variadic, so it must never be the last flag before the prompt.
@@ -170,8 +173,15 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             args.push(schema);
         }
 
-        args.push("--permission-mode".to_string());
-        args.push(mode.to_string());
+        if let Some(mode) = mode {
+            args.push("--permission-mode".to_string());
+            args.push(mode.to_string());
+        }
+
+        if let Some(rule) = &config.permission_grant {
+            args.push("--allowedTools".to_string());
+            args.push(rule.clone());
+        }
 
         args.push(request.prompt.to_string());
 
@@ -216,6 +226,8 @@ struct ClaudeCodeStreamParser {
     subtype: Option<String>,
     /// The `result` line's `structured_output`, when it carried one.
     structured_output: Option<Value>,
+    permission_denials: Vec<PermissionDenial>,
+    denial_reasons: std::collections::HashMap<String, (Option<String>, Option<String>)>,
 }
 
 impl ClaudeCodeStreamParser {
@@ -247,6 +259,7 @@ impl ClaudeCodeStreamParser {
         self.subtype = result.subtype.clone();
         self.reported_error = result.is_error;
         self.structured_output = result.structured_output.clone();
+        self.permission_denials = result.permission_denials.clone();
         self.result_text = result.text.clone().unwrap_or_default();
     }
 }
@@ -256,7 +269,34 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
         let Some(mut object) = parse_object(line) else {
             return classify::invalid_json();
         };
-        let result = classify::ResultLine::take(&mut object);
+        if object.get("type").and_then(Value::as_str) == Some("system")
+            && object.get("subtype").and_then(Value::as_str) == Some("permission_denied")
+        {
+            if let Some(id) = object.get("tool_use_id").and_then(Value::as_str) {
+                self.denial_reasons.insert(
+                    id.to_string(),
+                    (
+                        object
+                            .get("decision_reason_type")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        object
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    ),
+                );
+            }
+        }
+        let mut result = classify::ResultLine::take(&mut object);
+        if let Some(result) = result.as_mut() {
+            for denial in &mut result.permission_denials {
+                if let Some((reason_type, reason)) = self.denial_reasons.get(&denial.tool_use_id) {
+                    denial.reason_type = reason_type.clone();
+                    denial.reason = reason.clone();
+                }
+            }
+        }
         self.accumulate(&object, result.as_ref());
         self.classifier.classify(object, result)
     }
@@ -288,6 +328,7 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
             session_id: self.session_id,
             failure,
             structured_output: self.structured_output,
+            permission_denials: self.permission_denials,
         }
     }
 }
@@ -303,7 +344,7 @@ fn parse_object(line: &[u8]) -> Option<Map<String, Value>> {
 }
 
 /// The permission mode of this run, validated against what the CLI accepts.
-fn permission_mode<'a>(request: &HarnessRequest<'a>) -> Result<&'a str, ActionError> {
+fn permission_mode<'a>(request: &HarnessRequest<'a>) -> Result<Option<&'a str>, ActionError> {
     if request.config.parameters.contains_key("permission_mode")
         || request
             .config
@@ -322,10 +363,10 @@ fn permission_mode<'a>(request: &HarnessRequest<'a>) -> Result<&'a str, ActionEr
             })),
         });
     }
-    Ok(match request.workspace_access {
+    Ok(request.workspace_access.map(|access| match access {
         WorkspaceAccess::ReadWrite => DEFAULT_PERMISSION_MODE,
         WorkspaceAccess::ReadOnly => "plan",
-    })
+    }))
 }
 
 /// One `--add-dir` entry: the path as the agent will see it.

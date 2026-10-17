@@ -314,11 +314,23 @@ rather than claiming success.
 | `storage_class` | `storageClass` | reclaimPolicy Delete |
 | `allowed_registries` | `allowedRegistries` | comma-separated prefixes, **each ending in `/`** |
 | `allowed_secrets` | `allowedSecrets` | `secret-name/key`, matching the backend record's `secrets[].key` |
+| `claude_profile_secret` | `profileSecret` | Optional approved Claude profile Secret; mount only `settings.json` |
+| `claude_profile_settings_key` | `profileSettingsKey` | Secret key projected as `settings.json` (default `settings.json`) |
 
 Other `backend.yaml` keys: `namespace`, `storage_mib` (PVC size, default
 10240), `run_as_user` / `run_as_group` / `fs_group` (default 1000),
 `start_timeout_secs` (default 900: how long a Pod may take to report ready
 before it counts as lost), `harness_home` (below).
+
+When `claude_profile_secret` is set, the named Secret must contain the key
+`settings.json` (or the configured `claude_profile_settings_key`). The Pod
+mounts that key read-only. On first initialization the runner copies only
+`permissions.allow` and `permissions.deny` into its persistent private
+Claude config directory and records its digest under task bookkeeping. A
+resumed task keeps that pinned copy; newly started tasks see the currently
+approved Secret. Do not put credentials, hooks, or session history in this
+profile. Set the same name in the admission ConfigMap's `profileSecret` and
+the controller Role's `resourceNames` rule.
 
 **`harness_home`** — which `HOME` and harness configuration the runner gives
 every action, passed as `narsor-runner` flags on every Pod start:

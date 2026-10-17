@@ -111,6 +111,10 @@ pub struct RunnerArgs {
     #[arg(long, value_name = "DIRECTORY")]
     pub claude_config_dir: Option<PathBuf>,
 
+    /// Read-only directory containing the approved baseline Claude profile.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub claude_profile_dir: Option<PathBuf>,
+
     /// Long-poll wait in seconds (the control plane caps it).
     #[arg(long, value_name = "SECONDS", default_value_t = 25, hide = true)]
     pub poll_wait_secs: u64,
@@ -164,6 +168,7 @@ pub async fn run_command(args: RunnerArgs) -> i32 {
             codex_home: args.codex_home,
             claude_config_dir: args.claude_config_dir,
         },
+        claude_profile_dir: args.claude_profile_dir,
         incarnation: args.incarnation,
         timing: RunnerTiming {
             poll_wait: std::time::Duration::from_secs(args.poll_wait_secs),

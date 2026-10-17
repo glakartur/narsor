@@ -1964,10 +1964,12 @@ dependencies = [
 name = "narsor-controller"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "chrono",
  "clap",
  "narsor-controller-runtime",
  "narsor-engine",
+ "narsor-protocol",
  "reqwest",
  "serde",
  "serde_json",
@@ -2042,8 +2044,10 @@ dependencies = [
  "clap",
  "libc",
  "narsor-engine",
+ "narsor-protocol",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

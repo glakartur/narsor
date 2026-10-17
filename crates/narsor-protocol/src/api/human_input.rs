@@ -34,6 +34,38 @@ pub struct HumanInputDeliveryDto {
     pub action: Option<HumanInputActionDto>,
     #[serde(default)]
     pub episode: Option<String>,
+    #[serde(default)]
+    pub permission_decision: Option<PermissionDecisionDto>,
+}
+
+/// Decision scoped to one denial in a pending permission request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionDecisionDto {
+    pub denial_index: usize,
+    pub decision: PermissionDecisionKindDto,
+    #[serde(default)]
+    pub scope: Option<PermissionGrantScopeDto>,
+}
+
+/// Request body for the dedicated permission endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionDecisionRequestDto {
+    pub episode: String,
+    pub permission_decision: PermissionDecisionDto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecisionKindDto {
+    Deny,
+    Allow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionGrantScopeDto {
+    ExactOperation,
+    CommandGroup,
 }
 
 /// A pending form as exposed to clients, independent of the engine's durable
@@ -56,6 +88,8 @@ pub struct PendingHumanInputView {
     pub agent_session_id: Option<String>,
     #[serde(default)]
     pub prefilled_answer: Option<String>,
+    #[serde(default)]
+    pub permission: Option<PermissionRequestView>,
     #[serde(default, deserialize_with = "deserialize_output_views")]
     pub outputs: Vec<OutputDefinitionView>,
     #[serde(default)]
@@ -166,6 +200,25 @@ pub enum InputContinuationView {
     ResumeAgent,
     ResolveOutput,
     ApproveOutput,
+    ResolvePermission,
+}
+
+/// Claude Code permission denials tied to a durable pending request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionRequestView {
+    pub denials: Vec<PermissionDenialView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionDenialView {
+    pub tool_name: String,
+    pub tool_use_id: String,
+    pub input: Value,
+    pub cwd: String,
+    #[serde(default)]
+    pub reason_type: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// A stopped action that asks an operator to supply its output.

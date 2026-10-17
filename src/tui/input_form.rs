@@ -37,7 +37,8 @@ use crate::conductor::Annotation;
 use crate::tui::chooser::{ChooserField, ChooserItem, FieldKind, Submission};
 use narsor_protocol::api::{
     HumanInputActionDto, HumanInputDeliveryDto, HumanInputFieldView, HumanInputTypeView,
-    InputContinuationView, OutputDefinitionView, PendingHumanInputView,
+    InputContinuationView, OutputDefinitionView, PendingHumanInputView, PermissionDecisionDto,
+    PermissionDecisionKindDto, PermissionGrantScopeDto,
 };
 use narsor_protocol::controller::{WorkflowInputType, WorkflowInputView};
 use narsor_protocol::event::{AnsweredBy, EventData, InputCloseReason};
@@ -53,6 +54,7 @@ pub enum InputKind {
     /// is the output it did not give.
     Problem,
     Approval,
+    Permission,
 }
 
 impl InputKind {
@@ -63,6 +65,7 @@ impl InputKind {
             InputContinuationView::ResumeAgent => Self::AgentQuestion,
             InputContinuationView::ResolveOutput => Self::Problem,
             InputContinuationView::ApproveOutput => Self::Approval,
+            InputContinuationView::ResolvePermission => Self::Permission,
         }
     }
 
@@ -73,6 +76,7 @@ impl InputKind {
             Self::AgentQuestion => " Reply to the agent ",
             Self::Problem => " Resolve the problem ",
             Self::Approval => " Approve agent output ",
+            Self::Permission => " Permission decision ",
         }
     }
 }
@@ -361,6 +365,7 @@ enum Plan {
     Approve,
     /// Returns the result to the agent with a comment.
     Return,
+    Permission(PermissionDecisionDto),
 }
 
 /// A pending human input as the panel offers it: what it is about, the
@@ -420,6 +425,7 @@ impl InputPanel {
             InputKind::AgentQuestion => panel.build_question(pending),
             InputKind::Problem => panel.build_problem(pending),
             InputKind::Approval => panel.build_approval(pending),
+            InputKind::Permission => panel.build_permission_info(pending),
         }
         panel
     }
@@ -544,6 +550,10 @@ impl InputPanel {
                 action: Some(HumanInputActionDto::Resume),
                 ..HumanInputDeliveryDto::default()
             },
+            Plan::Permission(permission_decision) => HumanInputDeliveryDto {
+                permission_decision: Some(permission_decision.clone()),
+                ..HumanInputDeliveryDto::default()
+            },
         };
         Ok(HumanInputDeliveryDto {
             episode: Some(self.episode.clone()),
@@ -572,6 +582,18 @@ impl InputPanel {
                 None => "zaakceptowano".to_string(),
             },
             Some(Plan::Return) => "zwrócono agentowi".to_string(),
+            Some(Plan::Permission(decision)) => match decision.decision {
+                PermissionDecisionKindDto::Deny => "odmówiono dostępu agentowi".to_string(),
+                PermissionDecisionKindDto::Allow => match decision.scope {
+                    Some(PermissionGrantScopeDto::ExactOperation) => {
+                        "zezwolono na tę operację".to_string()
+                    }
+                    Some(PermissionGrantScopeDto::CommandGroup) => {
+                        "zezwolono na grupę poleceń w tym tasku".to_string()
+                    }
+                    None => "zezwolono agentowi".to_string(),
+                },
+            },
         }
     }
 
@@ -856,6 +878,90 @@ impl InputPanel {
 
     // -- an approval ------------------------------------------------------------
 
+    fn build_permission_info(&mut self, pending: &PendingHumanInputView) {
+        if let Some(permission) = &pending.permission {
+            for (index, denial) in permission.denials.iter().enumerate() {
+                self.context.push(ContextLine::problem(format!(
+                    "{} · {}",
+                    denial.tool_name, denial.tool_use_id
+                )));
+                self.context.push(ContextLine::dim(format!(
+                    "{} · {}",
+                    denial.input, denial.cwd
+                )));
+                if let Some(reason) = denial.reason.as_deref() {
+                    self.context.push(ContextLine::plain(reason));
+                }
+                self.push(
+                    ChooserItem::new(
+                        format!("Odmów: {}", denial.tool_name),
+                        "Agent wznowi tę sesję bez zgody na zablokowaną operację.",
+                    ),
+                    Plan::Permission(PermissionDecisionDto {
+                        denial_index: index,
+                        decision: PermissionDecisionKindDto::Deny,
+                        scope: None,
+                    }),
+                );
+                if let Some(command) = pending
+                    .agent_session_id
+                    .as_ref()
+                    .and_then(|_| approvable_command(denial))
+                {
+                    self.push(
+                        ChooserItem::new(
+                            format!("Zezwól dokładnie: {command}"),
+                            "Zgoda obejmie tylko dokładnie to polecenie w bieżącym tasku.",
+                        ),
+                        Plan::Permission(PermissionDecisionDto {
+                            denial_index: index,
+                            decision: PermissionDecisionKindDto::Allow,
+                            scope: Some(PermissionGrantScopeDto::ExactOperation),
+                        }),
+                    );
+                    let mut words = command.split_whitespace();
+                    if let (Some(executable), Some(subcommand)) = (words.next(), words.next()) {
+                        let name = executable.rsplit('/').next().unwrap_or(executable);
+                        if !matches!(
+                            name,
+                            "sh" | "bash"
+                                | "zsh"
+                                | "fish"
+                                | "dash"
+                                | "ksh"
+                                | "csh"
+                                | "env"
+                                | "sudo"
+                                | "doas"
+                                | "xargs"
+                                | "find"
+                                | "python"
+                                | "python3"
+                                | "node"
+                                | "ruby"
+                                | "perl"
+                                | "pwsh"
+                                | "powershell"
+                        ) {
+                            let group = format!("{executable} {subcommand}");
+                            self.push(
+                                ChooserItem::new(
+                                    format!("Zezwól na grupę: {group} …"),
+                                    "Zgoda obejmie tę grupę poleceń do końca bieżącego tasku.",
+                                ),
+                                Plan::Permission(PermissionDecisionDto {
+                                    denial_index: index,
+                                    decision: PermissionDecisionKindDto::Allow,
+                                    scope: Some(PermissionGrantScopeDto::CommandGroup),
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn build_approval(&mut self, pending: &PendingHumanInputView) {
         let mut resumable = false;
         if let Some(approval) = &pending.approval {
@@ -909,6 +1015,22 @@ pub const MESSAGE_FIELD: &str = "Wiadomość dla agenta";
 
 /// The field a return to the agent is explained in.
 pub const COMMENT_TO_AGENT: &str = "Komentarz dla agenta";
+
+fn approvable_command(denial: &narsor_protocol::api::PermissionDenialView) -> Option<&str> {
+    if denial.tool_name != "Bash" || denial.reason_type.as_deref() != Some("subcommandResults") {
+        return None;
+    }
+    let command = denial.input.get("command")?.as_str()?.trim();
+    if command.is_empty()
+        || !command.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, ' ' | '\t' | '_' | '-' | '.' | '/' | ':' | '=')
+        })
+    {
+        return None;
+    }
+    Some(command)
+}
 
 /// Puts `value` under `key` in `map`, refusing a second one.
 fn insert_once(

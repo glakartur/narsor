@@ -435,6 +435,45 @@ fn the_pod_has_one_runner_one_init_container_and_separate_volumes() {
     );
 }
 
+#[test]
+fn approved_claude_profile_mounts_only_settings_read_only() {
+    let mut configured = config();
+    configured.claude_profile_secret = Some("narsor-claude-profile".into());
+    configured.claude_profile_settings_key = "approved-settings".into();
+    let task = TaskResources {
+        task_id: TaskId::parse("Task_1").unwrap(),
+        resource_key: "Task_1".into(),
+        workload: names::workload("Task_1"),
+        storage: names::storage("Task_1"),
+    };
+    let launch = launch_of("Task_1", 3, spec());
+    let plan = manifest::plan(&configured, &launch).expect("valid plan");
+    let pod = manifest::pod(&configured, "narsor-user", &task, &launch, &plan);
+    let profile = pod["spec"]["volumes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|volume| volume["name"] == "claude-profile")
+        .unwrap();
+    assert_eq!(profile["secret"]["secretName"], "narsor-claude-profile");
+    assert_eq!(
+        profile["secret"]["items"],
+        serde_json::json!([{"key":"approved-settings","path":"settings.json"}])
+    );
+    let runner = &pod["spec"]["containers"][0];
+    assert!(runner["volumeMounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|mount| mount["name"] == "claude-profile" && mount["readOnly"] == true));
+    let args = runner["args"].as_array().unwrap();
+    assert!(args.windows(2).any(
+        |pair| pair[0] == "--claude-profile-dir" && pair[1] == "/var/run/narsor/claude-profile"
+    ));
+    manifest::check_pod_shape(&pod, &configured.shape_policy())
+        .expect("profile volume passes admission mirror");
+}
+
 /// `restartPolicy: Never`, no service-account token, and the admission
 /// check refuses privileged, host, foreign-volume, foreign-image,
 /// foreign-account and unapproved-secret shapes (U5 scenario 2).
@@ -1637,11 +1676,26 @@ fn controller_rbac_is_namespaced_and_minimal() {
         .filter(|(r, _)| r == "secrets")
         .map(|(_, v)| v.as_str())
         .collect();
-    assert_eq!(
-        secrets,
-        BTreeSet::from(["create"]),
-        "Secrets: create only, never read"
+    assert!(
+        secrets.contains("create"),
+        "launch Secret creation remains available"
     );
+    let profile_rule = role["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|rule| {
+            rule["resources"] == serde_json::json!(["secrets"])
+                && rule["resourceNames"] == serde_json::json!(["narsor-claude-profile"])
+        })
+        .expect("profile Secret access is name-scoped");
+    let profile_verbs: BTreeSet<&str> = profile_rule["verbs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(profile_verbs, BTreeSet::from(["get", "update"]));
     for (resource, verb) in [
         ("pods", "get"),
         ("pods", "create"),

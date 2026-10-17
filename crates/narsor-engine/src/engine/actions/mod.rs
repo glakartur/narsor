@@ -56,8 +56,9 @@ pub use harness::{
 };
 pub use human::{
     ConductorAnalysis, HumanActionError, HumanExecutor, HumanInputDelivery, HumanInputRequest,
-    InputContinuation, OutputProblem, OutputRequirement, PendingHumanInput, RejectedAnswer,
-    ResumedHumanAction,
+    InputContinuation, OutputProblem, OutputRequirement, PendingHumanInput, PermissionDecision,
+    PermissionDecisionKind, PermissionDenialDetails, PermissionGrantScope,
+    PermissionRequestDetails, RejectedAnswer, ResumedHumanAction,
 };
 pub use script::ScriptExecutor;
 

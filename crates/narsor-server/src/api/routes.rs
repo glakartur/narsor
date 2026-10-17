@@ -142,6 +142,28 @@ fn pending_input_view(
 
 /// Converts a client wire answer into the engine-owned delivery value.
 fn engine_delivery(delivery: HumanInputDeliveryDto) -> HumanInputDelivery {
+    let permission_decision =
+        delivery
+            .permission_decision
+            .map(|decision| narsor_engine::engine::PermissionDecision {
+                denial_index: decision.denial_index,
+                decision: match decision.decision {
+                    narsor_engine::api::PermissionDecisionKindDto::Deny => {
+                        narsor_engine::engine::PermissionDecisionKind::Deny
+                    }
+                    narsor_engine::api::PermissionDecisionKindDto::Allow => {
+                        narsor_engine::engine::PermissionDecisionKind::Allow
+                    }
+                },
+                scope: decision.scope.map(|scope| match scope {
+                    narsor_engine::api::PermissionGrantScopeDto::ExactOperation => {
+                        narsor_engine::engine::PermissionGrantScope::ExactOperation
+                    }
+                    narsor_engine::api::PermissionGrantScopeDto::CommandGroup => {
+                        narsor_engine::engine::PermissionGrantScope::CommandGroup
+                    }
+                }),
+            });
     HumanInputDelivery {
         values: delivery.values,
         chosen_label: delivery.chosen_label,
@@ -151,6 +173,7 @@ fn engine_delivery(delivery: HumanInputDeliveryDto) -> HumanInputDelivery {
         agent_message: delivery.agent_message,
         action: delivery.action,
         episode: delivery.episode,
+        permission_decision,
         answered_by: AnsweredBy::Operator,
     }
 }
@@ -166,6 +189,27 @@ fn protocol_delivery(delivery: &HumanInputDelivery) -> HumanInputDeliveryDto {
         agent_message: delivery.agent_message.clone(),
         action: delivery.action,
         episode: delivery.episode.clone(),
+        permission_decision: delivery.permission_decision.as_ref().map(|decision| {
+            narsor_engine::api::PermissionDecisionDto {
+                denial_index: decision.denial_index,
+                decision: match decision.decision {
+                    narsor_engine::engine::PermissionDecisionKind::Deny => {
+                        narsor_engine::api::PermissionDecisionKindDto::Deny
+                    }
+                    narsor_engine::engine::PermissionDecisionKind::Allow => {
+                        narsor_engine::api::PermissionDecisionKindDto::Allow
+                    }
+                },
+                scope: decision.scope.map(|scope| match scope {
+                    narsor_engine::engine::PermissionGrantScope::ExactOperation => {
+                        narsor_engine::api::PermissionGrantScopeDto::ExactOperation
+                    }
+                    narsor_engine::engine::PermissionGrantScope::CommandGroup => {
+                        narsor_engine::api::PermissionGrantScopeDto::CommandGroup
+                    }
+                }),
+            }
+        }),
     }
 }
 
@@ -320,6 +364,10 @@ pub fn router(
         )
         .route("/executions/{execution_id}/interrupt", post(post_interrupt))
         .route("/executions/{execution_id}/input", post(post_input))
+        .route(
+            "/executions/{execution_id}/permission",
+            post(post_permission_decision),
+        )
         .route(
             "/executions/{execution_id}/transition",
             post(post_transition),
@@ -1278,6 +1326,11 @@ async fn post_input(
     Json(delivery): Json<narsor_engine::api::HumanInputDeliveryDto>,
 ) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
     let delivery = engine_delivery(delivery);
+    if delivery.permission_decision.is_some() {
+        return Err(ApiError::BadRequest(
+            "permission decisions must use the dedicated /permission endpoint".into(),
+        ));
+    }
     // Runner-owned executions live on backend storage. Route their answer
     // through the task protocol so the runner consumes it on its next poll;
     // the legacy in-process engine path below remains for historic work.
@@ -1324,6 +1377,74 @@ async fn post_input(
         let _ = handle.run_to_completion(&definition).await;
     });
 
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(AcceptedResponse { execution_id }),
+    ))
+}
+
+/// `POST /executions/{execution_id}/permission` — resolves one durable
+/// Claude Code permission request. The separate route is the only HTTP path
+/// that can invoke the engine's permission continuation.
+async fn post_permission_decision(
+    State(state): State<AppState>,
+    Extension(owner): Extension<OwnerRef>,
+    Path(execution_id): Path<String>,
+    Json(dto): Json<narsor_engine::api::PermissionDecisionRequestDto>,
+) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
+    let delivery = engine_delivery(narsor_engine::api::HumanInputDeliveryDto {
+        episode: Some(dto.episode.clone()),
+        permission_decision: Some(dto.permission_decision.clone()),
+        ..Default::default()
+    });
+    let decision = delivery
+        .permission_decision
+        .clone()
+        .expect("provided above");
+    let episode = delivery.episode.as_deref().expect("provided above");
+    if let Some(control) = &state.control {
+        let tasks = control.list_tasks(&owner).map_err(protocol_error_as_api)?;
+        if let Some(task) = tasks.tasks.into_iter().find(|task| {
+            task.runner
+                .as_ref()
+                .and_then(|runner| runner.execution_cursor.execution_id.as_deref())
+                == Some(execution_id.as_str())
+        }) {
+            let pending_input_id = task
+                .runner
+                .as_ref()
+                .and_then(|runner| runner.pending_input.as_ref())
+                .map(|input| input.id.clone())
+                .ok_or_else(|| {
+                    ApiError::Conflict("execution is not waiting for permission".into())
+                })?;
+            control
+                .submit_input(
+                    &owner,
+                    task.task_id.as_str(),
+                    narsor_engine::controller_protocol::SubmitInputRequest {
+                        pending_input_id,
+                        idempotency_key: uuid::Uuid::new_v4().to_string(),
+                        delivery: protocol_delivery(&delivery),
+                    },
+                )
+                .map_err(protocol_error_as_api)?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(AcceptedResponse { execution_id }),
+            ));
+        }
+    }
+    require_legacy_execution(&state, &execution_id)?;
+    let execution = state.store.load_execution(&execution_id)?;
+    let definition = load_definition_for(&state, &execution)?;
+    let handle =
+        state
+            .engine
+            .try_begin_resolve_permission(&definition, &execution_id, decision, episode)?;
+    spawn_active(&state, execution_id.clone(), async move {
+        let _ = handle.run_to_completion(&definition).await;
+    });
     Ok((
         StatusCode::ACCEPTED,
         Json(AcceptedResponse { execution_id }),

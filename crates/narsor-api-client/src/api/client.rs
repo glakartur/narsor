@@ -63,12 +63,14 @@ use serde_json::Value;
 use narsor_protocol::api::{
     ClaimRequest, ConversationResponse as ConversationPage, HumanInputDeliveryDto, MaterialFile,
     MaterialListResponse, MaterialSummary, MaterialUploadResponse, MaterialView, OwnerView,
-    ProposalOutcome, Timeline, UndoOutcome, WhoAmIResponse, BUNDLE_CONTENT_TYPE,
+    PermissionDecisionRequestDto, ProposalOutcome, Timeline, UndoOutcome, WhoAmIResponse,
+    BUNDLE_CONTENT_TYPE,
 };
 use narsor_protocol::controller::{
-    ControlEventEnvelope, ConversationResponse as RemoteConversationResponse, MoveTaskRequest,
-    OwnerCommandResponse, SubmitInputResponse, SubmitOperatorCommandResponse, TaskEvent,
-    TaskListResponse, TaskSummary, TimelineResponse,
+    AcceptClaudeProfileUpdateRequest, ClaudeProfileProposalView, ControlEventEnvelope,
+    ConversationResponse as RemoteConversationResponse, CreateClaudeProfileProposalRequest,
+    MoveTaskRequest, OwnerCommandResponse, SubmitInputResponse, SubmitOperatorCommandResponse,
+    TaskEvent, TaskListResponse, TaskSummary, TimelineResponse,
 };
 use narsor_protocol::event::{Event, EventData};
 
@@ -336,6 +338,16 @@ impl ApiClient {
     ) -> Result<AcceptedResponse, ClientError> {
         let url = format!("{}/executions/{execution_id}/input", self.base_url);
         self.post_json(&url, &delivery).await
+    }
+
+    /// Resolves one pending Claude Code permission decision.
+    pub async fn resolve_permission(
+        &self,
+        execution_id: &str,
+        request: PermissionDecisionRequestDto,
+    ) -> Result<AcceptedResponse, ClientError> {
+        let url = format!("{}/executions/{execution_id}/permission", self.base_url);
+        self.post_json(&url, &request).await
     }
 
     /// A manual or forced transition — `POST /executions/:id/transition`.
@@ -670,6 +682,33 @@ impl ApiClient {
     pub async fn control_default_backend(&self) -> Result<DefaultBackendView, ClientError> {
         let url = format!("{}/control/v1/default-backend", self.base_url);
         self.get_json(&url).await
+    }
+
+    /// Submits a validated Claude profile proposal and returns its permission-only diff.
+    pub async fn control_propose_claude_profile(
+        &self,
+        backend_id: &str,
+        request: &CreateClaudeProfileProposalRequest,
+    ) -> Result<ClaudeProfileProposalView, ClientError> {
+        let url = format!(
+            "{}/control/v1/backends/{backend_id}/claude-profile-proposals",
+            self.base_url
+        );
+        self.post_json(&url, request).await
+    }
+
+    /// Accepts exactly the profile digest reviewed by the installation operator.
+    pub async fn control_accept_claude_profile(
+        &self,
+        backend_id: &str,
+        proposal_id: &str,
+        request: &AcceptClaudeProfileUpdateRequest,
+    ) -> Result<serde_json::Value, ClientError> {
+        let url = format!(
+            "{}/control/v1/backends/{backend_id}/claude-profile-proposals/{proposal_id}/accept",
+            self.base_url
+        );
+        self.post_json(&url, request).await
     }
 
     /// Chooses (or with `backend_id: None` clears) the default backend of

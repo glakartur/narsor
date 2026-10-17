@@ -203,6 +203,14 @@ pub enum Command {
         #[arg(long, value_name = "TEXT")]
         comment: Option<String>,
 
+        /// Resolve a Claude Code permission wait: deny, allow-exact or allow-group.
+        #[arg(long = "permission", value_name = "DECISION", value_parser = ["deny", "allow-exact", "allow-group"])]
+        permission: Option<String>,
+
+        /// Which denial in the pending request to resolve (defaults to 0).
+        #[arg(long = "denial-index", default_value_t = 0)]
+        denial_index: usize,
+
         /// Workflow file or name, for when it cannot be read back from the stored execution.
         #[arg(long = "file", value_name = "WORKFLOW")]
         file: Option<String>,
@@ -599,6 +607,8 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             data,
             variables,
             comment,
+            permission,
+            denial_index,
             file,
         } => {
             let answer = commands::InputAnswer {
@@ -607,6 +617,8 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
                 data,
                 variables,
                 comment,
+                permission,
+                denial_index,
             };
             commands::input(&config, &flags, &execution_id, answer, file.as_deref()).await
         }

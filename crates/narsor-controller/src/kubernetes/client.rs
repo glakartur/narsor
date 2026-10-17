@@ -206,6 +206,18 @@ impl KubeClient {
         }
     }
 
+    /// Replace one object with Kubernetes resourceVersion compare-and-swap.
+    pub async fn replace(&self, path: &str, object: &Value) -> BackendResult<Value> {
+        let (status, body) = self.send(Method::PUT, path, Some(object)).await?;
+        match status {
+            StatusCode::CONFLICT => Err(BackendError::transient(format!(
+                "{path} changed during the update; retry from a fresh version"
+            ))),
+            status if status.is_success() => Ok(body),
+            status => Err(failure("update", path, status, &body)),
+        }
+    }
+
     /// DELETE, only if the object still has `uid` (a precondition, so a
     /// replacement created meanwhile under the same name is never deleted
     /// by mistake). `Ok(false)` when there was nothing to delete; a failed

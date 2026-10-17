@@ -16,7 +16,8 @@ pub use narsor_protocol::api::{
     ChatMessageRequest, ConductorActivity, ConductorPurposeDto, ConductorTriggerDto,
     ConversationEntryDto, ConversationEntrySource, ConversationResponse, ExecutionListResponse,
     ExecutionStatusDto, ExecutionSummary, HarnessSelectionSnapshot, HumanInputDeliveryDto,
-    OperatorNoteRequest, PendingHumanInputView, ProblemKindDto, RecoveryRequest,
+    OperatorNoteRequest, PendingHumanInputView, PermissionDecisionDto, PermissionDecisionKindDto,
+    PermissionDecisionRequestDto, PermissionGrantScopeDto, ProblemKindDto, RecoveryRequest,
     RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
     TransitionRequest,
 };

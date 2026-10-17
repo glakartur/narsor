@@ -55,6 +55,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 use crate::persistence::{read_json, write_json_atomic, ExecutionStore};
 
@@ -163,6 +164,67 @@ impl TaskStorage {
 
     fn harness_file(&self) -> PathBuf {
         self.bookkeeping_dir().join("harness.json")
+    }
+
+    fn claude_profile_marker(&self) -> PathBuf {
+        self.bookkeeping_dir().join("claude-profile.json")
+    }
+
+    /// Initialize the task's private Claude configuration once from the
+    /// read-only deployment profile. Only the permission allow/deny lists
+    /// are retained; credentials, hooks and session state never cross over.
+    pub fn initialize_claude_profile(&self, source: &Path) -> Result<Option<PathBuf>, RunnerError> {
+        if self.claude_profile_marker().exists() {
+            return Ok(Some(self.home_dir().join(".claude-profile")));
+        }
+        let source_file = source.join("settings.json");
+        let bytes = fs::read(&source_file).map_err(|error| {
+            RunnerError::Profile(format!("cannot read approved Claude profile: {error}"))
+        })?;
+        let mut settings: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+            RunnerError::Profile("approved Claude profile settings are invalid JSON".into())
+        })?;
+        let permissions = settings
+            .get("permissions")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                RunnerError::Profile("approved Claude profile has no permissions object".into())
+            })?;
+        let mut safe = serde_json::Map::new();
+        let mut safe_permissions = serde_json::Map::new();
+        for key in ["allow", "deny"] {
+            if let Some(value) = permissions.get(key) {
+                if !value.is_array() {
+                    return Err(RunnerError::Profile(format!(
+                        "profile permissions.{key} must be an array"
+                    )));
+                }
+                safe_permissions.insert(key.into(), value.clone());
+            }
+        }
+        safe.insert(
+            "permissions".into(),
+            serde_json::Value::Object(safe_permissions),
+        );
+        settings = serde_json::Value::Object(safe);
+        let encoded = serde_json::to_vec_pretty(&settings)
+            .map_err(|error| RunnerError::Profile(error.to_string()))?;
+        let target = self.home_dir().join(".claude-profile");
+        fs::create_dir_all(&target).map_err(|error| RunnerError::Profile(error.to_string()))?;
+        let temporary = target.join("settings.json.partial");
+        fs::write(&temporary, &encoded).map_err(|error| RunnerError::Profile(error.to_string()))?;
+        fs::rename(&temporary, target.join("settings.json"))
+            .map_err(|error| RunnerError::Profile(error.to_string()))?;
+        let digest = sha2::Sha256::digest(&encoded)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        write_json_atomic(
+            &self.claude_profile_marker(),
+            &serde_json::json!({"version": 1, "digest": digest}),
+        )
+        .map_err(|error| RunnerError::Profile(error.to_string()))?;
+        Ok(Some(target))
     }
 
     /// `{root}/narsor/work`: where the conductor keeps its scratch.
@@ -363,6 +425,45 @@ impl TaskStorage {
         commands.version = RECORD_VERSION;
         commands.progress.insert(command_id.to_string(), verdict);
         write_json_atomic(&self.commands_file(), &commands).map_err(RunnerError::from)
+    }
+}
+
+#[cfg(test)]
+mod claude_profile_tests {
+    use super::*;
+
+    #[test]
+    fn profile_copy_is_filtered_and_pinned_across_resume() {
+        let root =
+            std::env::temp_dir().join(format!("narsor-profile-test-{}", uuid::Uuid::new_v4()));
+        let source = root.join("mounted");
+        let storage = TaskStorage::new(root.join("task"));
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(storage.home_dir()).unwrap();
+        fs::create_dir_all(storage.bookkeeping_dir()).unwrap();
+        fs::write(
+            source.join("settings.json"),
+            r#"{"permissions":{"allow":["Read"],"deny":[]},"hooks":{"x":"bad"},"apiKey":"secret"}"#,
+        )
+        .unwrap();
+        let config = storage.initialize_claude_profile(&source).unwrap().unwrap();
+        let first: serde_json::Value =
+            serde_json::from_slice(&fs::read(config.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(
+            first,
+            serde_json::json!({"permissions":{"allow":["Read"],"deny":[]}})
+        );
+        assert!(storage.claude_profile_marker().exists());
+        fs::write(
+            source.join("settings.json"),
+            r#"{"permissions":{"allow":["Write"]}}"#,
+        )
+        .unwrap();
+        storage.initialize_claude_profile(&source).unwrap();
+        let resumed: serde_json::Value =
+            serde_json::from_slice(&fs::read(config.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(resumed, first);
+        let _ = fs::remove_dir_all(root);
     }
 }
 

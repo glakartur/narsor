@@ -43,6 +43,7 @@ pub use actions::{
     ClaudeCodeAdapter, CodexAdapter, ConductorAnalysis, DefaultHarnessSource, HarnessAdapter,
     HarnessInvocation, HarnessRegistry, HarnessRequest, HarnessRun, HumanActionError,
     HumanExecutor, HumanInputDelivery, HumanInputRequest, InputContinuation, LoggingEventSink,
-    OpenCodeAdapter, OutputProblem, OutputRequirement, PendingHumanInput, RejectedAnswer,
-    ResumedHumanAction, ScriptExecutor, SuspendedAction, TimedOutAction, ACTION_ID_ENV_VAR,
+    OpenCodeAdapter, OutputProblem, OutputRequirement, PendingHumanInput, PermissionDecision,
+    PermissionDecisionKind, PermissionGrantScope, RejectedAnswer, ResumedHumanAction,
+    ScriptExecutor, SuspendedAction, TimedOutAction, ACTION_ID_ENV_VAR,
 };

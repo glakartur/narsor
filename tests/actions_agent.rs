@@ -28,7 +28,7 @@ use narsor_engine::engine::{
     ActionExecutor, ActionKind, ActionOutcome, ActionRequest, AgentExecutor, ClaudeCodeAdapter,
     CodexAdapter, DefaultHarnessSource, Engine, HarnessAdapter, HarnessRegistry, InputContinuation,
     LoggingEventSink, OpenCodeAdapter, OutputProblem, OutputRejection, PendingHumanInput,
-    METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY,
+    SuspendedAction, METADATA_ENGINE_KEY, METADATA_OUTPUT_REJECTION_KEY,
 };
 use narsor_engine::persistence::{
     recover, ConversationEntry, ConversationSource, ConversationStore, DefaultHarnessSelector,
@@ -393,8 +393,9 @@ async fn execute_with_conversation(
 fn agent_action(prompt: &str) -> AgentActionConfig {
     AgentActionConfig {
         harness: Some("claude-code".to_string()),
+        permission_grant: None,
         model: None,
-        workspace_access: WorkspaceAccess::ReadWrite,
+        workspace_access: Some(WorkspaceAccess::ReadWrite),
         prompt: prompt.to_string(),
         workspace: None,
         parameters: HashMap::new(),
@@ -874,6 +875,11 @@ async fn the_model_and_the_read_only_paths_reach_the_argv() {
     assert!(args.contains(&"--verbose".to_string()), "{args:?}");
     assert!(
         args.windows(2)
+            .any(|pair| pair[0] == "--permission-prompts" && pair[1] == "none"),
+        "Claude must report deferred permission denials in print mode: {args:?}"
+    );
+    assert!(
+        args.windows(2)
             .any(|pair| pair[0] == "--model" && pair[1] == "opus"),
         "{args:?}"
     );
@@ -899,6 +905,24 @@ async fn the_model_and_the_read_only_paths_reach_the_argv() {
     assert_eq!(args[mode + 1], "acceptEdits");
     assert_eq!(mode + 2, args.len() - 1);
     assert!(args.last().expect("a prompt").starts_with("look around"));
+}
+
+#[tokio::test]
+async fn a_task_permission_grant_reaches_claude_as_one_allowed_tool_rule() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"output":"ready"}"#));
+    let mut config = agent_action("continue");
+    config.permission_grant = Some("Bash(cargo build)".to_string());
+
+    complete(&executor(&fake), config, &root.workspace()).await;
+
+    let args = fake.args(1);
+    assert!(
+        args.windows(2)
+            .any(|pair| { pair[0] == "--allowedTools" && pair[1] == "Bash(cargo build)" }),
+        "{args:?}"
+    );
 }
 
 #[tokio::test]
@@ -929,7 +953,7 @@ async fn claude_maps_read_only_workspace_access_to_plan_mode() {
     fake.answers(&envelope(r#"{"output":"ready"}"#));
 
     let mut config = agent_action("look around");
-    config.workspace_access = WorkspaceAccess::ReadOnly;
+    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
 
     complete(&executor(&fake), config, &root.workspace()).await;
 
@@ -939,6 +963,68 @@ async fn claude_maps_read_only_workspace_access_to_plan_mode() {
         .position(|arg| arg == "--permission-mode")
         .unwrap();
     assert_eq!(args[mode + 1], "plan");
+}
+
+#[tokio::test]
+async fn claude_omits_the_mode_when_workspace_access_was_not_set() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(&envelope(r#"{"output":"ready"}"#));
+
+    let mut config = agent_action("look around");
+    config.workspace_access = None;
+    complete(&executor(&fake), config, &root.workspace()).await;
+
+    let args = fake.args(1);
+    assert!(
+        !args.iter().any(|arg| arg == "--permission-mode"),
+        "{args:?}"
+    );
+}
+
+#[tokio::test]
+async fn claude_structured_permission_denial_suspends_instead_of_becoming_failure() {
+    let root = TempRoot::new();
+    let fake = FakeHarness::install(root.dir("bin"));
+    fake.answers(
+        &json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "session_id": "permission-session",
+            "permission_denials": [{
+                "tool_name": "Bash",
+                "tool_use_id": "permission-call",
+                "tool_input": {"command": "cargo build"}
+            }],
+            "result": "The command was blocked."
+        })
+        .to_string(),
+    );
+
+    let outcome = execute(
+        &executor(&fake),
+        agent_action("Build the project."),
+        &root.workspace(),
+        None,
+    )
+    .await
+    .expect("a denial waits for an owner decision");
+
+    let ActionOutcome::Suspended(SuspendedAction::AwaitingAgentInput(request)) = outcome else {
+        panic!("expected a permission wait, got {outcome:?}");
+    };
+    let permission = request.permission.expect("typed permission details");
+    assert_eq!(permission.denials.len(), 1);
+    assert_eq!(permission.denials[0].tool_name, "Bash");
+    assert_eq!(permission.denials[0].tool_use_id, "permission-call");
+    assert_eq!(permission.denials[0].input["command"], "cargo build");
+    assert_eq!(permission.denials[0].cwd, root.path().to_string_lossy());
+    assert_eq!(
+        request.agent_session_id.as_deref(),
+        Some("permission-session")
+    );
+    assert_eq!(fake.calls(), 1);
 }
 
 #[tokio::test]
@@ -1088,7 +1174,7 @@ async fn codex_maps_read_only_workspace_access_to_its_native_sandbox() {
     );
     let mut config = agent_action("look around");
     config.harness = Some("codex".to_string());
-    config.workspace_access = WorkspaceAccess::ReadOnly;
+    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
 
     complete(&executor, config, &root.workspace()).await;
 
@@ -3494,7 +3580,7 @@ async fn the_real_claude_binary_honours_the_output_contract() {
         "Do not use any tools. Answer with the label 'ready' and nothing else \
          beyond the required JSON object.",
     );
-    config.workspace_access = WorkspaceAccess::ReadOnly;
+    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
 
     let result = complete(&AgentExecutor::new(), config, &root.workspace()).await;
 
@@ -3515,7 +3601,7 @@ async fn the_real_claude_binary_answers_through_the_json_schema() {
     let mut config = agent_action(
         "Do not use any tools. The work is already done: finish with the label 'done'.",
     );
-    config.workspace_access = WorkspaceAccess::ReadOnly;
+    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
     let conversation = ConversationFixture::new(&root);
 
     let outcome = execute_with_outputs(

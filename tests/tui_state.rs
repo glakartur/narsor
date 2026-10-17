@@ -4565,6 +4565,56 @@ mod task_app_waiting {
         assert!(other.items().iter().all(|item| !item.recommended));
     }
 
+    #[test]
+    fn permission_panel_offers_only_scoped_choices_for_resolvable_bash_denials() {
+        let pending: narsor_protocol::api::PendingHumanInputView = serde_json::from_value(json!({
+            "execution_id": "exec-1",
+            "state_id": "implement",
+            "action_execution_id": "act-8",
+            "instruction": "Claude Code needs permission.",
+            "fields": [],
+            "continuation": "resolve_permission",
+            "permission": {"denials": [{
+                "tool_name": "Bash",
+                "tool_use_id": "tool-8",
+                "input": {"command": "cargo test"},
+                "cwd": "/tmp/task",
+                "reason_type": "subcommandResults",
+                "reason": "This command requires approval."
+            }, {
+                "tool_name": "Bash",
+                "tool_use_id": "tool-9",
+                "input": {"command": "rm -rf /"},
+                "cwd": "/tmp/task",
+                "reason_type": "other",
+                "reason": "Blocked by policy."
+            }]},
+            "episode": "ep-8",
+            "requested_at": "2026-10-09T11:54:00Z"
+        }))
+        .unwrap();
+        let panel = narsor::tui::input_form::InputPanel::new(&pending, &|_| None);
+        assert_eq!(panel.items().len(), 4);
+        assert!(panel.items()[0].label.starts_with("Odmów:"));
+        assert!(panel.items()[1].label.starts_with("Zezwól dokładnie:"));
+        assert!(panel.items()[2].label.starts_with("Zezwól na grupę:"));
+        assert!(panel.items()[3].label.starts_with("Odmów:"));
+        let delivery = panel
+            .delivery(&narsor::tui::chooser::Submission {
+                index: 1,
+                label: panel.items()[1].label.clone(),
+                values: Vec::new(),
+            })
+            .unwrap();
+        let decision = delivery.permission_decision.unwrap();
+        assert_eq!(decision.denial_index, 0);
+        assert_eq!(
+            decision.scope,
+            Some(narsor_protocol::api::PermissionGrantScopeDto::ExactOperation)
+        );
+        assert_eq!(delivery.episode.as_deref(), Some("ep-8"));
+    }
+
     // -- the panel ------------------------------------------------------------
 
     #[test]

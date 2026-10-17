@@ -258,7 +258,7 @@ impl HarnessInvoker {
         let command = adapter
             .invocation(&HarnessRequest {
                 config: &config,
-                workspace_access: WorkspaceAccess::ReadOnly,
+                workspace_access: Some(WorkspaceAccess::ReadOnly),
                 prompt: &prompt,
                 workspace: &working_dir,
                 resume_session: None,
@@ -385,8 +385,9 @@ fn pinned_source(
 fn conductor_config(prompt: &str) -> AgentActionConfig {
     AgentActionConfig {
         harness: None,
+        permission_grant: None,
         model: None,
-        workspace_access: WorkspaceAccess::ReadOnly,
+        workspace_access: Some(WorkspaceAccess::ReadOnly),
         prompt: prompt.to_string(),
         workspace: None,
         parameters: Default::default(),

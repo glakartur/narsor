@@ -21,6 +21,10 @@ use narsor_engine::domain::{
     Context, Event, EventData, ExecutionStatus, RepositoryInfo, WorkflowDefinition,
     WorkflowExecution, Workspace,
 };
+use narsor_engine::engine::actions::human::{
+    self as human, HumanInputRequest, PendingHumanInput, PermissionDenialDetails,
+    PermissionRequestDetails,
+};
 use narsor_engine::engine::{ConversationState, Engine, HumanInputDelivery, PositionStatus};
 use narsor_engine::persistence::conversation::ConversationSource;
 use narsor_engine::persistence::{DefaultHarnessSelector, ExecutionStore, StatePaths};
@@ -100,6 +104,27 @@ fn wire_delivery(delivery: HumanInputDelivery) -> HumanInputDeliveryDto {
         agent_message: delivery.agent_message,
         action: delivery.action,
         episode: delivery.episode,
+        permission_decision: delivery.permission_decision.map(|decision| {
+            narsor_protocol::api::PermissionDecisionDto {
+                denial_index: decision.denial_index,
+                decision: match decision.decision {
+                    narsor_engine::engine::PermissionDecisionKind::Deny => {
+                        narsor_protocol::api::PermissionDecisionKindDto::Deny
+                    }
+                    narsor_engine::engine::PermissionDecisionKind::Allow => {
+                        narsor_protocol::api::PermissionDecisionKindDto::Allow
+                    }
+                },
+                scope: decision.scope.map(|scope| match scope {
+                    narsor_engine::engine::PermissionGrantScope::ExactOperation => {
+                        narsor_protocol::api::PermissionGrantScopeDto::ExactOperation
+                    }
+                    narsor_engine::engine::PermissionGrantScope::CommandGroup => {
+                        narsor_protocol::api::PermissionGrantScopeDto::CommandGroup
+                    }
+                }),
+            }
+        }),
     }
 }
 
@@ -1182,6 +1207,77 @@ async fn post_input_delivers_an_answer_to_a_waiting_execution() {
 }
 
 #[tokio::test]
+async fn ordinary_input_cannot_resolve_permission_and_unapprovable_denial_stays_pending() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = sample_execution("permission-api", ExecutionStatus::Running);
+    execution.current_state = Some("review".to_string());
+    store.save_execution(&execution).expect("save execution");
+    pin_definition_path(&store, &execution.id, &pipeline_definition_path());
+    execution = store.load_execution(&execution.id).expect("reload");
+    let request = HumanInputRequest {
+        action_execution_id: "attempt-permission".to_string(),
+        instruction: "Claude Code needs a permission decision.".to_string(),
+        fields: Vec::new(),
+        question: None,
+        answer_tail: None,
+        agent_harness: Some("claude-code".to_string()),
+        agent_session_id: Some("session-permission".to_string()),
+        prefilled_answer: None,
+        permission: Some(PermissionRequestDetails {
+            denials: vec![PermissionDenialDetails {
+                tool_name: "Bash".to_string(),
+                tool_use_id: "tool-permission".to_string(),
+                input: serde_json::json!({"command":"cargo build"}),
+                cwd: "/tmp/task".to_string(),
+                reason_type: Some("other".to_string()),
+                reason: Some("A policy rule blocked this action.".to_string()),
+            }],
+        }),
+    };
+    let pending = PendingHumanInput::for_permission(execution.id.clone(), "review", request);
+    human::suspend(&store, &mut execution, &pending).expect("persist permission wait");
+    let server = start_server_with_engine(
+        Arc::new(Engine::new(store.clone())),
+        root.path().to_path_buf(),
+        root.path().to_path_buf(),
+    )
+    .await;
+    let client = server.client();
+    let pending = store
+        .load_pending_input::<PendingHumanInput>(&execution.id)
+        .expect("load pending")
+        .expect("permission wait");
+    let decision = narsor_protocol::api::PermissionDecisionDto {
+        denial_index: 0,
+        decision: narsor_protocol::api::PermissionDecisionKindDto::Allow,
+        scope: Some(narsor_protocol::api::PermissionGrantScopeDto::ExactOperation),
+    };
+    assert!(client
+        .resolve_permission(
+            &execution.id,
+            narsor_protocol::api::PermissionDecisionRequestDto {
+                episode: pending.episode_key().to_string(),
+                permission_decision: decision.clone(),
+            }
+        )
+        .await
+        .is_err());
+    assert!(client
+        .deliver_input(
+            &execution.id,
+            HumanInputDeliveryDto {
+                episode: Some(pending.episode_key().to_string()),
+                permission_decision: Some(decision),
+                ..HumanInputDeliveryDto::default()
+            }
+        )
+        .await
+        .is_err());
+    assert!(store.has_pending_input(&execution.id));
+}
+
+#[tokio::test]
 async fn post_transition_happy_path_writes_the_expected_events_and_state() {
     let root = TempRoot::new();
     let store = root.store();
@@ -2249,7 +2345,7 @@ async fn client_stream_all_does_not_end_when_only_one_of_several_executions_fini
 
 use narsor_engine::domain::{ActionError, ActionResult};
 use narsor_engine::engine::{
-    ActionExecutor, ActionKind, ActionOutcome, ActionRequest, HumanInputRequest, SuspendedAction,
+    ActionExecutor, ActionKind, ActionOutcome, ActionRequest, SuspendedAction,
 };
 
 /// An agent that either finishes with a question in its `data` or stops to
@@ -2287,6 +2383,7 @@ impl ActionExecutor for AgentReply {
                         agent_harness: None,
                         agent_session_id: None,
                         prefilled_answer: None,
+                        permission: None,
                     },
                 )),
             })

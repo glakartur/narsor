@@ -328,6 +328,16 @@ impl ControllerClient {
             .await
     }
 
+    /// Acknowledges profile updates after the backend applies or refuses them.
+    pub async fn acknowledge_profile_updates(
+        &self,
+        request: ClaudeProfileUpdateAckRequest,
+    ) -> Result<ClaudeProfileUpdateAckResponse, ClientError> {
+        self.transport
+            .post("/controller/v1/profile-updates/acks", &request)
+            .await
+    }
+
     /// `POST /controller/v1/reports`.
     pub async fn report(&self, report: &ReportRequest) -> Result<ReportResponse, ClientError> {
         self.transport.post("/controller/v1/reports", report).await

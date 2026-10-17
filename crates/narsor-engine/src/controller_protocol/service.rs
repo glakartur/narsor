@@ -7,7 +7,8 @@
 //! views, and announces every accepted mutation on an in-process channel —
 //! which is what wakes long-polls and live event streams.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
@@ -49,6 +50,28 @@ use relay::Relay;
 pub use auto_resume::AutoResumePass;
 
 fn engine_delivery(delivery: narsor_protocol::api::HumanInputDeliveryDto) -> HumanInputDelivery {
+    let permission_decision =
+        delivery
+            .permission_decision
+            .map(|decision| crate::engine::actions::PermissionDecision {
+                denial_index: decision.denial_index,
+                decision: match decision.decision {
+                    narsor_protocol::api::PermissionDecisionKindDto::Deny => {
+                        crate::engine::actions::PermissionDecisionKind::Deny
+                    }
+                    narsor_protocol::api::PermissionDecisionKindDto::Allow => {
+                        crate::engine::actions::PermissionDecisionKind::Allow
+                    }
+                },
+                scope: decision.scope.map(|scope| match scope {
+                    narsor_protocol::api::PermissionGrantScopeDto::ExactOperation => {
+                        crate::engine::actions::PermissionGrantScope::ExactOperation
+                    }
+                    narsor_protocol::api::PermissionGrantScopeDto::CommandGroup => {
+                        crate::engine::actions::PermissionGrantScope::CommandGroup
+                    }
+                }),
+            });
     HumanInputDelivery {
         values: delivery.values,
         chosen_label: delivery.chosen_label,
@@ -58,6 +81,7 @@ fn engine_delivery(delivery: narsor_protocol::api::HumanInputDeliveryDto) -> Hum
         agent_message: delivery.agent_message,
         action: delivery.action,
         episode: delivery.episode,
+        permission_decision,
         answered_by: AnsweredBy::Operator,
     }
 }
@@ -72,6 +96,27 @@ fn protocol_delivery(delivery: &HumanInputDelivery) -> narsor_protocol::api::Hum
         agent_message: delivery.agent_message.clone(),
         action: delivery.action,
         episode: delivery.episode.clone(),
+        permission_decision: delivery.permission_decision.as_ref().map(|decision| {
+            narsor_protocol::api::PermissionDecisionDto {
+                denial_index: decision.denial_index,
+                decision: match decision.decision {
+                    crate::engine::actions::PermissionDecisionKind::Deny => {
+                        narsor_protocol::api::PermissionDecisionKindDto::Deny
+                    }
+                    crate::engine::actions::PermissionDecisionKind::Allow => {
+                        narsor_protocol::api::PermissionDecisionKindDto::Allow
+                    }
+                },
+                scope: decision.scope.map(|scope| match scope {
+                    crate::engine::actions::PermissionGrantScope::ExactOperation => {
+                        narsor_protocol::api::PermissionGrantScopeDto::ExactOperation
+                    }
+                    crate::engine::actions::PermissionGrantScope::CommandGroup => {
+                        narsor_protocol::api::PermissionGrantScopeDto::CommandGroup
+                    }
+                }),
+            }
+        }),
     }
 }
 
@@ -200,6 +245,19 @@ pub struct ProtocolService {
     /// Closed attempts' summaries of the local tasks read from storage.
     stored_conversations: Mutex<conversation::StoredSummaries>,
     materials: MaterialStore,
+    /// Owner-approved shared profile updates, partitioned by backend.
+    profile_updates: Mutex<Vec<QueuedClaudeProfileUpdate>>,
+    profile_proposals:
+        Mutex<HashMap<String, (BackendId, ClaudeProfileUpdate, ClaudeProfileProposalView)>>,
+    profile_updates_file: PathBuf,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct QueuedClaudeProfileUpdate {
+    backend_id: BackendId,
+    update: ClaudeProfileUpdate,
+    #[serde(default)]
+    acknowledged: bool,
 }
 
 impl std::fmt::Debug for ProtocolService {
@@ -235,8 +293,20 @@ impl ProtocolService {
         let credentials = CredentialStore::new(control.clone());
         let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
         let materials = MaterialStore::new(control.store().paths(), MaterialLimits::default());
+        let profile_updates_file = control
+            .store()
+            .paths()
+            .root()
+            .join("claude-profile-updates.json");
+        let profile_updates = std::fs::read(&profile_updates_file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<QueuedClaudeProfileUpdate>>(&bytes).ok())
+            .unwrap_or_default();
         Self {
             materials,
+            profile_updates: Mutex::new(profile_updates),
+            profile_proposals: Mutex::default(),
+            profile_updates_file,
             controller_auth: Arc::new(credentials.clone()),
             runner_auth: Arc::new(credentials.clone()),
             control,
@@ -316,6 +386,194 @@ impl ProtocolService {
     pub fn notify(&self, task_id: &TaskId) {
         // No receiver is not an error: nobody is listening right now.
         let _ = self.changes.send(task_id.clone());
+    }
+
+    /// Enqueues an already owner-approved profile change. The API layer
+    /// calls this only after validating and recording explicit acceptance.
+    pub fn queue_claude_profile_update(
+        &self,
+        _owner: &OwnerRef,
+        backend_id: BackendId,
+        update: ClaudeProfileUpdate,
+    ) -> ProtocolResult<()> {
+        let mut queue = self
+            .profile_updates
+            .lock()
+            .expect("profile update queue poisoned");
+        if let Some(existing) = queue
+            .iter()
+            .find(|queued| queued.update.proposal_id == update.proposal_id)
+        {
+            if existing.backend_id == backend_id && existing.update == update {
+                return Ok(());
+            }
+            return Err(ProtocolError::bad_request(
+                "profile_proposal_replay",
+                "proposal id was already used for different content",
+            ));
+        }
+        let mut updated = queue.clone();
+        updated.push(QueuedClaudeProfileUpdate {
+            backend_id,
+            update,
+            acknowledged: false,
+        });
+        std::fs::create_dir_all(
+            self.profile_updates_file
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        )
+        .map_err(|error| {
+            ProtocolError::Internal(format!(
+                "could not persist accepted profile update: {error}"
+            ))
+        })?;
+        crate::persistence::write_json_atomic(&self.profile_updates_file, &updated).map_err(
+            |error| {
+                ProtocolError::Internal(format!(
+                    "could not persist accepted profile update: {error}"
+                ))
+            },
+        )?;
+        *queue = updated;
+        Ok(())
+    }
+
+    /// Validates and stages a proposer result without changing the profile.
+    pub fn propose_claude_profile_update(
+        &self,
+        backend_id: BackendId,
+        request: CreateClaudeProfileProposalRequest,
+    ) -> ProtocolResult<ClaudeProfileProposalView> {
+        if crate::domain::canonical_sha256(&request.base_settings) != request.update.expected_digest
+            || crate::domain::canonical_sha256(&request.update.settings)
+                != request.update.proposed_digest
+        {
+            return Err(ProtocolError::bad_request(
+                "profile_digest_mismatch",
+                "profile proposal digest does not match its content",
+            ));
+        }
+        validate_profile_policy(&request.base_settings)?;
+        validate_profile_policy(&request.update.settings)?;
+        let mut changes = Vec::new();
+        for permission in ["allow", "deny"] {
+            let before = policy_rules(&request.base_settings, permission);
+            let after = policy_rules(&request.update.settings, permission);
+            for rule in before.difference(&after) {
+                changes.push(ClaudeProfileChange {
+                    permission: permission.into(),
+                    rule: rule.clone(),
+                    added: false,
+                });
+            }
+            for rule in after.difference(&before) {
+                changes.push(ClaudeProfileChange {
+                    permission: permission.into(),
+                    rule: rule.clone(),
+                    added: true,
+                });
+            }
+        }
+        let view = ClaudeProfileProposalView {
+            proposal_id: request.update.proposal_id.clone(),
+            base_digest: request.update.expected_digest.clone(),
+            proposed_digest: request.update.proposed_digest.clone(),
+            expected_resource_version: request.update.expected_resource_version.clone(),
+            changes,
+        };
+        let mut proposals = self
+            .profile_proposals
+            .lock()
+            .expect("profile proposal queue poisoned");
+        if let Some((existing_backend, existing, existing_view)) =
+            proposals.get(&request.update.proposal_id)
+        {
+            if existing_backend == &backend_id && existing == &request.update {
+                return Ok(existing_view.clone());
+            }
+            return Err(ProtocolError::conflict(
+                "profile_proposal_replay",
+                "proposal id was already used for different content",
+            ));
+        }
+        proposals.insert(
+            request.update.proposal_id.clone(),
+            (backend_id, request.update, view.clone()),
+        );
+        Ok(view)
+    }
+
+    /// Applies the installation operator's acceptance to the exact reviewed
+    /// digest and moves that proposal onto the controller's durable queue.
+    pub fn accept_claude_profile_proposal(
+        &self,
+        owner: &OwnerRef,
+        requested_backend: &BackendId,
+        proposal_id: &str,
+        accepted_digest: &str,
+    ) -> ProtocolResult<()> {
+        let (backend_id, update) = {
+            let proposals = self
+                .profile_proposals
+                .lock()
+                .expect("profile proposal queue poisoned");
+            let (backend, update, view) =
+                proposals.get(proposal_id).ok_or(ProtocolError::NotFound)?;
+            if backend != requested_backend {
+                return Err(ProtocolError::NotFound);
+            }
+            if view.proposed_digest != accepted_digest {
+                return Err(ProtocolError::conflict(
+                    "profile_digest_changed",
+                    "acceptance must match the exact reviewed profile digest",
+                ));
+            }
+            (backend.clone(), update.clone())
+        };
+        self.queue_claude_profile_update(owner, backend_id, update)?;
+        self.profile_proposals
+            .lock()
+            .expect("profile proposal queue poisoned")
+            .remove(proposal_id);
+        Ok(())
+    }
+
+    /// Acknowledges accepted profile changes applied by the current
+    /// controller. Rejected writes are removed from delivery as well; the
+    /// owner must submit a fresh proposal against the new Secret version.
+    pub fn acknowledge_claude_profile_updates(
+        &self,
+        identity: &ControllerIdentity,
+        request: ClaudeProfileUpdateAckRequest,
+    ) -> ProtocolResult<()> {
+        self.require_lease(identity)?;
+        let ids: std::collections::HashSet<_> = request
+            .updates
+            .iter()
+            .map(|ack| ack.proposal_id.as_str())
+            .collect();
+        let mut queue = self
+            .profile_updates
+            .lock()
+            .expect("profile update queue poisoned");
+        let mut updated = queue.clone();
+        for queued in updated.iter_mut() {
+            if queued.backend_id == identity.backend_id
+                && ids.contains(queued.update.proposal_id.as_str())
+            {
+                queued.acknowledged = true;
+            }
+        }
+        crate::persistence::write_json_atomic(&self.profile_updates_file, &updated).map_err(
+            |error| {
+                ProtocolError::Internal(format!(
+                    "could not persist profile update acknowledgement: {error}"
+                ))
+            },
+        )?;
+        *queue = updated;
+        Ok(())
     }
 
     /// The controller a signed request proves, if any.
@@ -1252,6 +1510,14 @@ impl ProtocolService {
         Ok(CommandsResponse {
             lease_epoch: lease.epoch,
             commands,
+            profile_updates: self
+                .profile_updates
+                .lock()
+                .expect("profile update queue poisoned")
+                .iter()
+                .filter(|queued| queued.backend_id == identity.backend_id && !queued.acknowledged)
+                .map(|queued| queued.update.clone())
+                .collect(),
         })
     }
 
@@ -2228,6 +2494,55 @@ fn bounded_ttl(requested: Option<u64>, default: Duration, max: Duration) -> Dura
         }
         None => default,
     }
+}
+
+fn validate_profile_policy(value: &serde_json::Value) -> ProtocolResult<()> {
+    let root = value.as_object().ok_or_else(|| {
+        ProtocolError::bad_request("invalid_profile", "profile must be a JSON object")
+    })?;
+    let permissions = root
+        .get("permissions")
+        .and_then(serde_json::Value::as_object);
+    if root.len() != 1
+        || permissions.is_none_or(|permissions| {
+            permissions
+                .keys()
+                .any(|key| !matches!(key.as_str(), "allow" | "deny"))
+        })
+    {
+        return Err(ProtocolError::bad_request(
+            "invalid_profile",
+            "only permissions.allow and permissions.deny are accepted",
+        ));
+    }
+    for key in ["allow", "deny"] {
+        if permissions.is_some_and(|permissions| {
+            permissions.get(key).is_some_and(|items| {
+                !items.as_array().is_some_and(|items| {
+                    items
+                        .iter()
+                        .all(|item| item.as_str().is_some_and(|item| !item.trim().is_empty()))
+                })
+            })
+        }) {
+            return Err(ProtocolError::bad_request(
+                "invalid_profile",
+                format!("permissions.{key} must be a list of non-empty strings"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn policy_rules(value: &serde_json::Value, key: &str) -> BTreeSet<String> {
+    value
+        .pointer(&format!("/permissions/{key}"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect()
 }
 
 /// Digest of a create request — what an identical retry presents again.

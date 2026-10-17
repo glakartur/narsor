@@ -157,6 +157,7 @@ struct AgentInput {
     answer: String,
     harness: Option<String>,
     session: Option<String>,
+    permission_rule: Option<String>,
 }
 
 /// How an execution ends when it enters the terminal state `state`.
@@ -1355,6 +1356,75 @@ impl Engine {
         .await
     }
 
+    /// Applies a permission decision through the dedicated path and resumes
+    /// the same agent session. Generic human input cannot call this operation.
+    pub async fn resolve_permission(
+        &self,
+        definition: &WorkflowDefinition,
+        execution_id: &str,
+        decision: crate::engine::actions::PermissionDecision,
+        episode: &str,
+    ) -> Result<WorkflowExecution, EngineError> {
+        self.observed(execution_id, async {
+            let _guard = self.begin_run(execution_id)?;
+            match self.prepare_resolve_permission(definition, execution_id, decision, episode)? {
+                HandleState::Done(execution) => Ok(execution),
+                HandleState::Ready(execution) => self.run_loop(definition, execution).await,
+            }
+        })
+        .await
+    }
+
+    fn prepare_resolve_permission(
+        &self,
+        definition: &WorkflowDefinition,
+        execution_id: &str,
+        decision: crate::engine::actions::PermissionDecision,
+        episode: &str,
+    ) -> Result<HandleState, EngineError> {
+        let from = self.store.event_log(execution_id).next_sequence()?;
+        let resumed = human::resolve_permission(&self.store, execution_id, decision, episode)?;
+        self.publish_from(execution_id, from)?;
+        self.lock_pause_requests().remove(execution_id);
+        let mut execution = resumed.execution;
+        let state_id = self.current_state_id(&execution)?;
+        let _state = self.state_of(definition, &execution, &state_id)?;
+        let answer = agent_reply(&resumed.result.variables).ok_or_else(|| {
+            EngineError::HumanInput(HumanActionError::MissingRequiredField {
+                field: "permission decision".to_string(),
+            })
+        })?;
+        let permission_rule = match resumed.permission_decision.as_ref() {
+            Some(crate::engine::actions::PermissionDecision {
+                denial_index,
+                decision: crate::engine::actions::PermissionDecisionKind::Allow,
+                scope: Some(scope),
+            }) => {
+                let denial = &resumed
+                    .pending
+                    .request
+                    .permission
+                    .as_ref()
+                    .expect("permission continuation carries denial details")
+                    .denials[*denial_index];
+                Some(
+                    crate::engine::actions::human::claude_permission_rule(denial, *scope)
+                        .ok_or(HumanActionError::PermissionDecisionRequired)?,
+                )
+            }
+            _ => None,
+        };
+        self.store_agent_input(
+            &mut execution,
+            &state_id,
+            &answer,
+            resumed.pending.request.agent_harness.as_deref(),
+            resumed.pending.request.agent_session_id.as_deref(),
+            permission_rule,
+        )?;
+        Ok(HandleState::Ready(execution))
+    }
+
     /// The synchronous half of [`Engine::deliver_human_input`]: records the
     /// answer, applies it (as a decision or as an action's own result,
     /// depending on what was pending), and reports whether the step already
@@ -1423,6 +1493,7 @@ impl Engine {
                 &answer,
                 candidate.agent_harness.as_deref(),
                 candidate.agent_session_id.as_deref(),
+                None,
             )?;
             return Ok(HandleState::Ready(execution));
         }
@@ -1439,6 +1510,7 @@ impl Engine {
                 &answer,
                 resumed.pending.request.agent_harness.as_deref(),
                 resumed.pending.request.agent_session_id.as_deref(),
+                None,
             )?;
             return Ok(HandleState::Ready(execution));
         }
@@ -1463,6 +1535,7 @@ impl Engine {
                 &answer,
                 resumed.pending.request.agent_harness.as_deref(),
                 resumed.pending.request.agent_session_id.as_deref(),
+                None,
             )?;
             return Ok(HandleState::Ready(execution));
         }
@@ -1580,6 +1653,7 @@ impl Engine {
                             agent_harness: None,
                             agent_session_id: None,
                             prefilled_answer: Some(comment),
+                            permission: None,
                         };
                         let target_state = self.state_of(definition, &execution, &target)?;
                         self.suspend_for_agent_input(&mut execution, target_state, request)?;
@@ -1593,6 +1667,7 @@ impl Engine {
                         provenance
                             .as_ref()
                             .map(|session| session.session_id.as_str()),
+                        None,
                     )?;
                     return Ok(HandleState::Ready(execution));
                 }
@@ -1643,6 +1718,29 @@ impl Engine {
     ) -> Result<RunHandle, EngineError> {
         let claim = self.claim_active_run(execution_id)?;
         match self.prepare_deliver_human_input(definition, execution_id, delivery) {
+            Ok(state) => Ok(RunHandle {
+                engine: Arc::clone(self),
+                execution_id: execution_id.to_string(),
+                claim,
+                state,
+            }),
+            Err(error) => {
+                self.note_engine_error(execution_id, &error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Two-phase claim for the dedicated permission decision operation.
+    pub fn try_begin_resolve_permission(
+        self: &Arc<Self>,
+        definition: &WorkflowDefinition,
+        execution_id: &str,
+        decision: crate::engine::actions::PermissionDecision,
+        episode: &str,
+    ) -> Result<RunHandle, EngineError> {
+        let claim = self.claim_active_run(execution_id)?;
+        match self.prepare_resolve_permission(definition, execution_id, decision, episode) {
             Ok(state) => Ok(RunHandle {
                 engine: Arc::clone(self),
                 execution_id: execution_id.to_string(),
@@ -1983,6 +2081,7 @@ impl Engine {
                         .push_str("\n\nHuman answer to your question:\n");
                     config.prompt.push_str(&input.answer);
                 }
+                config.permission_grant = input.permission_rule.clone();
                 resumed_input = Some(input);
             }
             if let Some(note) = self.take_operator_recovery_note(execution)? {
@@ -2055,6 +2154,7 @@ impl Engine {
                     agent_harness: None,
                     agent_session_id: None,
                     prefilled_answer: Some(input.answer),
+                    permission: None,
                 }))
             }
             Err(error) => match OutputRejection::from_error(state, action_execution_id, &error) {
@@ -2501,6 +2601,7 @@ impl Engine {
             agent_harness: session.as_ref().and_then(|(harness, _)| harness.clone()),
             agent_session_id: session.and_then(|(_, session)| session),
             prefilled_answer: None,
+            permission: None,
         };
         let pending = PendingHumanInput::for_problem(
             execution.id.clone(),
@@ -2619,6 +2720,7 @@ impl Engine {
                 agent_harness: agent_harness.clone(),
                 agent_session_id: agent_session_id.clone(),
                 prefilled_answer: None,
+                permission: None,
             };
             let approval = ApprovalCandidate {
                 action_execution_id: pending.action_execution_id,
@@ -2667,6 +2769,7 @@ impl Engine {
                     agent_harness: None,
                     agent_session_id: None,
                     prefilled_answer: None,
+                    permission: None,
                 };
                 self.suspend_for_input(
                     execution,
@@ -2997,7 +3100,11 @@ impl Engine {
         state: &State,
         request: HumanInputRequest,
     ) -> Result<(), EngineError> {
-        let pending = PendingHumanInput::for_agent(execution.id.clone(), state.id.clone(), request);
+        let pending = if request.permission.is_some() {
+            PendingHumanInput::for_permission(execution.id.clone(), state.id.clone(), request)
+        } else {
+            PendingHumanInput::for_agent(execution.id.clone(), state.id.clone(), request)
+        };
         let from = self.store.event_log(&execution.id).next_sequence()?;
         human::suspend(&self.store, execution, &pending)?;
         self.publish_from(&execution.id, from)
@@ -3157,6 +3264,7 @@ impl Engine {
         answer: &str,
         harness: Option<&str>,
         session: Option<&str>,
+        permission_rule: Option<String>,
     ) -> Result<(), EngineError> {
         engine_metadata_mut(execution).insert(
             METADATA_AGENT_INPUT_KEY.to_string(),
@@ -3165,6 +3273,7 @@ impl Engine {
                 "answer": answer,
                 "harness": harness,
                 "session": session,
+                "permission_rule": permission_rule,
             }),
         );
         self.store.save_execution(execution)?;
@@ -3207,6 +3316,10 @@ impl Engine {
                 .map(ToString::to_string),
             session: record
                 .get("session")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            permission_rule: record
+                .get("permission_rule")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
         });
@@ -3701,6 +3814,7 @@ pub fn record_manual_transition(
                     }),
                     InputContinuation::CompleteStep => None,
                     InputContinuation::ApproveOutput => None,
+                    InputContinuation::ResolvePermission => None,
                 })
         }
     } else {

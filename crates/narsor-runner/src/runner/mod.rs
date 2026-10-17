@@ -122,6 +122,7 @@ use crate::orchestration::{
 };
 use crate::persistence::{reconcile, PersistenceError, ReconciliationOutcome};
 use crate::workspace::WorkspaceError;
+use home::CLAUDE_CONFIG_DIR_ENV;
 
 pub use home::{HarnessHome, HomeMode};
 pub use init::{initialize, Initialization};
@@ -159,6 +160,9 @@ pub enum RunnerError {
         #[source]
         source: std::io::Error,
     },
+    /// The configured approved Claude profile could not be copied safely.
+    #[error("Claude profile initialization failed: {0}")]
+    Profile(String),
     /// The Engine's store failed.
     #[error(transparent)]
     Persistence(#[from] PersistenceError),
@@ -268,6 +272,8 @@ pub struct RunnerConfig {
     pub secrets_dir: Option<PathBuf>,
     /// Which HOME and harness configuration every action sees.
     pub harness_home: HarnessHome,
+    /// Optional read-only deployment profile mounted by a trusted backend.
+    pub claude_profile_dir: Option<PathBuf>,
     /// This incarnation's identity, the one its credential is bound to.
     pub incarnation: String,
     /// Control-channel timing.
@@ -362,9 +368,6 @@ pub async fn run(
         OUTBOX_ENV.to_string(),
         storage.outbox_dir().display().to_string(),
     ));
-    environment.task.extend(config.harness_home.variables());
-    apply_environment(&environment);
-
     if let Err(error) = initialize(&storage, &store, &config.task_id, &spec, &secrets) {
         return Ok(report_problem(
             &storage,
@@ -375,6 +378,28 @@ pub async fn run(
         )
         .await);
     }
+
+    environment.task.extend(config.harness_home.variables());
+    if let Some(source) = &config.claude_profile_dir {
+        match storage.initialize_claude_profile(source) {
+            Ok(Some(path)) => environment.task.push((
+                CLAUDE_CONFIG_DIR_ENV.to_string(),
+                path.display().to_string(),
+            )),
+            Ok(None) => {}
+            Err(error) => {
+                return Ok(report_problem(
+                    &storage,
+                    &mut link,
+                    &config.timing,
+                    PROBLEM_INITIALIZATION,
+                    error.to_string(),
+                )
+                .await)
+            }
+        }
+    }
+    apply_environment(&environment);
 
     // One live harness for the Engine and the conductor (U7): the default
     // this storage last switched to, else the one the task was created with,
@@ -1209,6 +1234,28 @@ impl Session {
         let Some(execution_id) = self.execution_id.clone() else {
             return Ok(());
         };
+        let permission_decision = input.delivery.permission_decision.map(|decision| {
+            narsor_engine::engine::PermissionDecision {
+                denial_index: decision.denial_index,
+                decision: match decision.decision {
+                    narsor_protocol::api::PermissionDecisionKindDto::Deny => {
+                        narsor_engine::engine::PermissionDecisionKind::Deny
+                    }
+                    narsor_protocol::api::PermissionDecisionKindDto::Allow => {
+                        narsor_engine::engine::PermissionDecisionKind::Allow
+                    }
+                },
+                scope: decision.scope.map(|scope| match scope {
+                    narsor_protocol::api::PermissionGrantScopeDto::ExactOperation => {
+                        narsor_engine::engine::PermissionGrantScope::ExactOperation
+                    }
+                    narsor_protocol::api::PermissionGrantScopeDto::CommandGroup => {
+                        narsor_engine::engine::PermissionGrantScope::CommandGroup
+                    }
+                }),
+            }
+        });
+        let episode = input.delivery.episode.clone();
         let delivery = HumanInputDelivery {
             values: input.delivery.values,
             chosen_label: input.delivery.chosen_label,
@@ -1218,19 +1265,37 @@ impl Session {
             agent_message: input.delivery.agent_message,
             action: input.delivery.action,
             episode: input.delivery.episode,
+            permission_decision: permission_decision.clone(),
             answered_by: AnsweredBy::Operator,
         };
-        let verdict = match self.engine.try_begin_deliver_human_input(
-            &self.definition,
-            &execution_id,
-            &delivery,
-        ) {
+        let started = if let Some(decision) = permission_decision {
+            episode
+                .as_deref()
+                .ok_or_else(|| {
+                    RunnerError::LaunchSpec("permission decision has no request id".into())
+                })
+                .and_then(|episode| {
+                    self.engine
+                        .try_begin_resolve_permission(
+                            &self.definition,
+                            &execution_id,
+                            decision,
+                            episode,
+                        )
+                        .map_err(RunnerError::from)
+                })
+        } else {
+            self.engine
+                .try_begin_deliver_human_input(&self.definition, &execution_id, &delivery)
+                .map_err(RunnerError::from)
+        };
+        let verdict = match started {
             Ok(handle) => {
                 self.storage.record_consumed_input(&input.input_id)?;
                 self.spawn_pass(handle);
                 (true, None)
             }
-            Err(EngineError::AlreadyRunning { .. }) => return Ok(()),
+            Err(RunnerError::Engine(EngineError::AlreadyRunning { .. })) => return Ok(()),
             Err(error) => (false, Some(error.to_string())),
         };
         if let Err(error) = client

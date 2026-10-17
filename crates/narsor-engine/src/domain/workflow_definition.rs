@@ -251,6 +251,11 @@ pub struct AgentActionConfig {
     #[serde(default)]
     pub harness: Option<String>,
 
+    /// One-shot Claude Code allow rule attached by a resolved task permission
+    /// request. Never loaded from workflow source or persisted definitions.
+    #[serde(skip)]
+    pub permission_grant: Option<String>,
+
     /// Model specification (optional)
     #[serde(default)]
     pub model: Option<String>,
@@ -259,8 +264,8 @@ pub struct AgentActionConfig {
     ///
     /// This is intentionally independent of a particular harness: each
     /// adapter translates it to its native permission mechanism.
-    #[serde(default)]
-    pub workspace_access: WorkspaceAccess,
+    #[serde(default = "legacy_workspace_access")]
+    pub workspace_access: Option<WorkspaceAccess>,
 
     /// Prompt to send to the agent
     pub prompt: String,
@@ -276,6 +281,12 @@ pub struct AgentActionConfig {
     /// Extra paths mounted read-only, relative to the workspace
     #[serde(default)]
     pub read_only_paths: Vec<String>,
+}
+
+fn legacy_workspace_access() -> Option<WorkspaceAccess> {
+    // Records written before omitted access was preserved serialized the
+    // schema's read-write default as an explicit value.
+    Some(WorkspaceAccess::ReadWrite)
 }
 
 /// The workflow-level workspace permission for an agent action.

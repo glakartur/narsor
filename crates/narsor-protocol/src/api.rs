@@ -797,6 +797,39 @@ mod tests {
     }
 
     #[test]
+    fn pending_permission_details_survive_the_client_wire_view() {
+        let value = serde_json::json!({
+            "execution_id": "execution-1",
+            "state_id": "build",
+            "action_execution_id": "attempt-1",
+            "instruction": "Permission decision required",
+            "permission": {
+                "denials": [{
+                    "tool_name": "Bash",
+                    "tool_use_id": "tool-1",
+                    "input": {"command": "cargo build"},
+                    "cwd": "/workspace",
+                    "reason_type": "subcommandResults",
+                    "reason": "Approval required"
+                }]
+            },
+            "continuation": "resolve_permission",
+            "episode": "permission-1",
+            "requested_at": "2026-01-02T03:04:05Z"
+        });
+        let pending: PendingHumanInputView = serde_json::from_value(value).unwrap();
+
+        assert_eq!(
+            pending.continuation,
+            InputContinuationView::ResolvePermission
+        );
+        let denial = &pending.permission.unwrap().denials[0];
+        assert_eq!(denial.tool_use_id, "tool-1");
+        assert_eq!(denial.input["command"], "cargo build");
+        assert_eq!(denial.cwd, "/workspace");
+    }
+
+    #[test]
     fn auth_api_values_keep_their_wire_fields() {
         let claim = ClaimRequest {
             claim_code: "nsclaim-once".into(),

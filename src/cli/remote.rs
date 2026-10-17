@@ -361,6 +361,12 @@ pub enum TaskCommand {
         /// A remark kept with the answer.
         #[arg(long, value_name = "TEXT")]
         comment: Option<String>,
+        /// Resolve a Claude permission wait: deny, allow-exact or allow-group.
+        #[arg(long = "permission", value_name = "DECISION", value_parser = ["deny", "allow-exact", "allow-group"])]
+        permission: Option<String>,
+        /// Which denial in the request to resolve (defaults to 0).
+        #[arg(long = "denial-index", default_value_t = 0)]
+        denial_index: usize,
         /// The wait to answer (its id as `show` lists it): refused when the
         /// task waits on something else.
         #[arg(long = "waiting-id", value_name = "ID")]
@@ -803,13 +809,34 @@ fn input_delivery(
     variables: &[String],
     label: &Option<String>,
     comment: &Option<String>,
+    permission: &Option<String>,
+    denial_index: usize,
 ) -> Result<HumanInputDeliveryDto> {
+    let permission_decision = permission.as_deref().map(|decision| {
+        let (decision, scope) = match decision {
+            "deny" => (narsor_protocol::api::PermissionDecisionKindDto::Deny, None),
+            "allow-exact" => (
+                narsor_protocol::api::PermissionDecisionKindDto::Allow,
+                Some(narsor_protocol::api::PermissionGrantScopeDto::ExactOperation),
+            ),
+            _ => (
+                narsor_protocol::api::PermissionDecisionKindDto::Allow,
+                Some(narsor_protocol::api::PermissionGrantScopeDto::CommandGroup),
+            ),
+        };
+        narsor_protocol::api::PermissionDecisionDto {
+            denial_index,
+            decision,
+            scope,
+        }
+    });
     Ok(HumanInputDeliveryDto {
         values: field_values(fields)?,
         data: parse_pairs("data", data)?,
         variables: parse_pairs("variable", variables)?,
         chosen_label: label.clone(),
         comment: comment.clone(),
+        permission_decision,
         ..HumanInputDeliveryDto::default()
     })
 }
@@ -905,8 +932,18 @@ pub async fn task(
             variables,
             label,
             comment,
+            permission,
+            denial_index,
             ..
-        } => Some(input_delivery(fields, data, variables, label, comment)?),
+        } => Some(input_delivery(
+            fields,
+            data,
+            variables,
+            label,
+            comment,
+            permission,
+            *denial_index,
+        )?),
         _ => None,
     };
     let client = client(target, state, flags).await?;
@@ -1054,6 +1091,7 @@ pub async fn task(
         TaskCommand::Input {
             task_id,
             waiting_id,
+            permission,
             ..
         } => {
             let task = client
@@ -1072,6 +1110,18 @@ pub async fn task(
                     without_unsafe_chars(&wanted),
                     without_unsafe_chars(&waiting_summary(&task.attention))
                 )));
+            }
+            let permission_wait = pending.form.get("continuation").and_then(Value::as_str)
+                == Some("resolve_permission");
+            if permission_wait && permission.is_none() {
+                return Err(CliError::failure(
+                    "This task needs a permission decision. Use --permission deny, allow-exact, or allow-group.",
+                ));
+            }
+            if !permission_wait && permission.is_some() {
+                return Err(CliError::failure(
+                    "--permission can only answer a Claude Code permission request.",
+                ));
             }
             let mut delivery = delivery.expect("built above");
             delivery.episode = Some(pending.id.clone());

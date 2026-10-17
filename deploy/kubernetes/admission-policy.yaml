@@ -30,6 +30,9 @@ data:
   allowedRegistries: registry.example/,ghcr.io/narsor/
   # Comma-separated `secret-name/key` pairs a task may mount.
   allowedSecrets: narsor-github/token
+  # Optional name of the read-only approved Claude profile Secret.
+  profileSecret: narsor-claude-profile
+  profileSettingsKey: settings.json
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -126,8 +129,12 @@ spec:
       message: "a task Pod mounts only its own task storage"
     - expression: >-
         variables.volumes.all(v, !has(v.secret) ||
-        v.secret.secretName.startsWith(object.metadata.name + '-launch-'))
-      message: "a task Pod mounts only its own launch Secret"
+        (v.secret.secretName.startsWith(object.metadata.name + '-launch-') ||
+        (has(params.data.profileSecret) && v.secret.secretName == params.data.profileSecret &&
+        has(v.secret.items) && size(v.secret.items) == 1 &&
+        v.secret.items[0].key == params.data.profileSettingsKey &&
+        v.secret.items[0].path == 'settings.json')))
+      message: "a task Pod mounts only its own launch Secret or the named profile key"
     - expression: >-
         variables.volumes.all(v, !has(v.projected) ||
         v.projected.sources.all(s, has(s.secret) && has(s.secret.items) &&

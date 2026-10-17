@@ -63,7 +63,7 @@ use uuid::Uuid;
 use super::harness::{
     HarnessAdapter, HarnessRegistry, HarnessRequest, HarnessRun, HarnessStreamParser,
 };
-use super::human::HumanInputRequest;
+use super::human::{HumanInputRequest, PermissionDenialDetails, PermissionRequestDetails};
 use super::script::{truncate, MAX_BUFFERED_OUTPUT_BYTES};
 use super::{
     ActionExecutor, ActionOutcome, ActionRequest, SuspendedAction, TimedOutAction,
@@ -196,7 +196,7 @@ pub fn reprompt_config(
 ) -> AgentActionConfig {
     let mut config = original.clone();
     config.harness = Some(harness.to_string());
-    config.workspace_access = WorkspaceAccess::ReadOnly;
+    config.workspace_access = Some(WorkspaceAccess::ReadOnly);
     config.prompt = format!("{OUTPUT_REPROMPT}\n\nWhy it was rejected: {reason}");
     config.parameters.insert(
         RESUME_SESSION_PARAMETER.to_string(),
@@ -696,6 +696,49 @@ impl AgentExecutor {
             );
         }
 
+        if !run.permission_denials.is_empty() {
+            conversation.finish();
+            session.status = AgentSessionStatus::Completed;
+            session.ended_at = Some(Utc::now());
+            self.emit(
+                request.execution_id,
+                EventData::AgentSessionCompleted {
+                    session_id: session.id.clone(),
+                    action_execution_id: Some(request.action_execution_id.to_string()),
+                    harness_session_id: run.session_id.clone(),
+                },
+            );
+            let cwd = request.workspace.path.clone();
+            return Ok(ActionOutcome::Suspended(
+                SuspendedAction::AwaitingAgentInput(HumanInputRequest {
+                    action_execution_id: request.action_execution_id.to_string(),
+                    instruction:
+                        "Claude Code needs a permission decision before this task can continue."
+                            .to_string(),
+                    fields: Vec::new(),
+                    question: None,
+                    answer_tail: Some(run.text.clone()),
+                    agent_harness: Some(harness.to_string()),
+                    agent_session_id: run.session_id.clone(),
+                    prefilled_answer: None,
+                    permission: Some(PermissionRequestDetails {
+                        denials: run
+                            .permission_denials
+                            .iter()
+                            .map(|denial| PermissionDenialDetails {
+                                tool_name: denial.tool_name.clone(),
+                                tool_use_id: denial.tool_use_id.clone(),
+                                input: denial.input.clone(),
+                                cwd: cwd.clone(),
+                                reason_type: denial.reason_type.clone(),
+                                reason: denial.reason.clone(),
+                            })
+                            .collect(),
+                    }),
+                }),
+            ));
+        }
+
         if let Some(failure) = &run.failure {
             conversation.finish();
             self.fail_session(
@@ -761,6 +804,7 @@ impl AgentExecutor {
                     agent_harness: Some(harness.to_string()),
                     agent_session_id: run.session_id.clone(),
                     prefilled_answer: None,
+                    permission: None,
                 }),
             )),
         }
