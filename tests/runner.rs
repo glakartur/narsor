@@ -160,11 +160,12 @@ impl Fixture {
         let state = root.dir("control");
         let control = ControlPlane::new(StatePaths::new(&state));
         let default = Arc::new(LiveDefault::default());
-        // Several scenarios look at a finished task's live runner (undo a
-        // decision, read the conductor); the policy that would stop it is
-        // off here and has its own tests. Work sent to a stopped task
-        // resumes it (U6), but reading the conductor of a stopped task
-        // needs the read-only runner (phase 2), so these stay off.
+        // Several scenarios work on a finished task's live runner (undo a
+        // decision, a harness that changes under a task that waits at its
+        // end); the policy that would stop it is off here and has its own
+        // tests. Reading a stopped task needs a read-only runner (D63, see
+        // the reader tests below), but these scenarios need the runner that
+        // works, so they stay off.
         let service = Arc::new(ProtocolService::with_config(
             control,
             environment_support::seeded_catalog_resolver_with(
@@ -333,6 +334,30 @@ impl Fixture {
                 },
             )
             .expect("runner credential");
+        let path = self
+            .root
+            .dir("credentials")
+            .join(format!("{task}-{incarnation}"));
+        fs::write(&path, issued.credential).expect("write the credential");
+        path
+    }
+
+    /// Issues the credential of a read-only runner for a stopped task an
+    /// owner is reading, the way a controller asks for it (D63), and writes
+    /// it to a file.
+    fn reader_credential(&self, task: &str, incarnation: &str) -> PathBuf {
+        let issued = self
+            .service
+            .issue_reader_credential(
+                &self.controller,
+                task,
+                RunnerCredentialRequest {
+                    lease_epoch: self.epoch,
+                    generation: self.record(task).generation,
+                    incarnation: incarnation.to_string(),
+                },
+            )
+            .expect("reader credential");
         let path = self
             .root
             .dir("credentials")
@@ -842,9 +867,11 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
         "the safe point was acknowledged for the pause"
     );
     fixture.report("task-1", Observation::PausedAtSafePoint);
-    // With its compute gone, the transcript is explicitly unavailable;
-    // nothing was replicated to serve it from.
-    let refused = fixture
+    // With its compute gone, the transcript is read by a read-only runner
+    // the controller starts for the reader's lease (D63): the first read
+    // leases it and is told it is starting, the control plane reads nothing
+    // from the storage itself.
+    let starting = fixture
         .service
         .conversation_page(
             &fixture.owner(),
@@ -853,14 +880,61 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
             ConversationPageQuery::default(),
         )
         .await
-        .expect_err("no live runner to relay from");
+        .expect_err("the reader is not connected yet");
     assert!(
-        refused.to_string().contains("conversation_unavailable"),
-        "{refused}"
+        starting
+            .to_string()
+            .contains("conversation_reader_starting"),
+        "{starting}"
     );
+    let mut reader_launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    reader_launch.storage = launch.storage.clone();
+    reader_launch.args = vec!["--read-only".to_string()];
+    let credential = fixture.reader_credential("task-1", "reader-1");
+    let reader = fixture.spawn(&reader_launch, "reader-1", &credential);
+    // The reader's first poll is what connects it; until then the read is
+    // told to ask again.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let read = loop {
+        match fixture
+            .service
+            .conversation_page(
+                &fixture.owner(),
+                "task-1",
+                &attempt,
+                ConversationPageQuery::default(),
+            )
+            .await
+        {
+            Ok(page) => break page,
+            Err(error)
+                if error.to_string().contains("conversation_reader_starting")
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("the reader's page: {error}"),
+        }
+    };
+    match read {
+        narsor::api::ConversationResponse::Recorded {
+            entries, source, ..
+        } => {
+            assert!(!entries.is_empty());
+            assert_eq!(
+                source,
+                Some(narsor_engine::controller_protocol::ExecutionEventsSource::Runner)
+            );
+        }
+        other => panic!("no record: {other:?}"),
+    }
 
-    // Resume: a new incarnation on the same storage.
+    // Resume: a new incarnation on the same storage. The resume ends the
+    // reader's lease and its credential, and the reader lets go of the
+    // storage before the controller would start the runner (R15).
     fixture.command("task-1", OwnerCommand::Resume, "resume-1");
+    let status = fixture.wait_exit(reader, Duration::from_secs(30));
+    assert!(status.success(), "the reader leaves cleanly: {status:?}");
     let credential = fixture.credential("task-1", "pod-2");
     fixture.spawn(&launch, "pod-2", &credential);
     wait_until_async(Duration::from_secs(30), "the resumed runner", || {

@@ -182,8 +182,10 @@ impl<T: ContractTarget> Harness<T> {
             ProtocolConfig {
                 resume: test_resume_policy(),
                 // The contract's workflow finishes at once and its runner
-                // idles; these scenarios use that runner, so the policy
-                // that would stop it is off (it has its own tests).
+                // idles; these scenarios use that runner (loss, resume,
+                // archive of a task that looks finished), so the policy
+                // that would stop it is off (it has its own tests). Reading
+                // a stopped task is the reader's contract (U10).
                 slot_release: false,
                 ..ProtocolConfig::default()
             },

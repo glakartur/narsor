@@ -32,6 +32,17 @@ pub fn slot_release_extension_threshold() -> chrono::Duration {
     chrono::Duration::seconds(30)
 }
 
+/// An owner's reading of a stopped task, as the control plane remembers it
+/// (D63).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReaderLease {
+    /// When the lease began: a reader credential issued before this belongs
+    /// to an earlier reading and is not the one an owner now waits for.
+    pub since: DateTime<Utc>,
+    /// The lease holds until then, unless a read moves it later.
+    pub until: DateTime<Utc>,
+}
+
 /// What the execution status of a task's last snapshot means for its slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotReleaseClass {
@@ -311,6 +322,13 @@ pub struct TaskRecord {
     /// record so a restart of the daemon neither loses nor shortens it.
     #[serde(default)]
     pub slot_release_due_at: Option<DateTime<Utc>>,
+    /// The control plane's want of a read-only runner for the stopped task
+    /// (D63): set by a read of its details, moved later by the next one,
+    /// removed when it ran out and by any command that resumes or archives
+    /// the task, in that command's own mutation (R15). The controller starts
+    /// and removes the reader by it; the reader is no slot.
+    #[serde(default)]
+    pub reader_lease: Option<ReaderLease>,
     /// The event of revision [`Self::revision`]: an outbox of one, so a crash
     /// between writing the record and appending the event is repaired from
     /// the record itself (see `OrchestrationStore::publish_last_event`).
@@ -346,6 +364,36 @@ impl TaskRecord {
         self.runner
             .as_ref()
             .map(|runner| SlotReleaseClass::of(runner.snapshot.execution_status))
+    }
+
+    /// Whether a read-only runner is wanted for the task now: its lease
+    /// has not run out and the task has no workload of its own (`Stopped`,
+    /// `Interrupted`). The same test decides what the controller is told and
+    /// whether the reader's credential is issued and its directive
+    /// `Continue`, so they never disagree.
+    pub fn reader_lease_active(&self, now: DateTime<Utc>) -> bool {
+        self.reader_may_read()
+            && self
+                .reader_lease
+                .as_ref()
+                .is_some_and(|lease| lease.until > now)
+    }
+
+    /// Whether the task is in a state a read-only runner may read it in:
+    /// stopped, or interrupted with its workload known to be gone. `Unknown`
+    /// is not: its previous runner may still be alive.
+    pub fn reader_may_read(&self) -> bool {
+        matches!(
+            self.runner_state,
+            RunnerState::Stopped | RunnerState::Interrupted
+        )
+    }
+
+    /// Whether a lease is recorded that no longer wants a reader (it ran
+    /// out, or the task left the states it is read in): the periodic pass
+    /// removes it.
+    pub fn reader_lease_stale(&self, now: DateTime<Utc>) -> bool {
+        self.reader_lease.is_some() && !self.reader_lease_active(now)
     }
 
     /// Whether the owner's work waits for the runner: an answer not yet

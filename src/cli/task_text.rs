@@ -725,6 +725,9 @@ pub fn unavailable_reason(reason: ConversationUnavailableReason) -> &'static str
         }
         ConversationUnavailableReason::RunnerReported => "the runner cannot serve it right now",
         ConversationUnavailableReason::StorageUnreadable => "its record could not be read",
+        ConversationUnavailableReason::ReaderStarting => {
+            "the task is stopped; its read-only runner is starting"
+        }
         ConversationUnavailableReason::Unrecognized => {
             "the server gave a reason this version does not know"
         }
@@ -900,6 +903,13 @@ pub fn event_line(event: &TaskEvent) -> String {
                 "slot freed for a reason this version does not know".to_string()
             }
         },
+        TaskEventKind::ReaderLeased { until } => format!(
+            "a read-only runner is wanted for the stopped task until {}",
+            until.format("%H:%M:%S")
+        ),
+        TaskEventKind::ReaderLeaseEnded => {
+            "the read-only runner ran idle and is no longer wanted".to_string()
+        }
         TaskEventKind::Unrecognized => "an event this version does not know".to_string(),
     };
     // Notes, reasons and details come from operators and runners: nothing a

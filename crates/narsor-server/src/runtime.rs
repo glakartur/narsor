@@ -73,7 +73,7 @@ use narsor_engine::controller_protocol::{
     AutoResumePass, CreateEnrollmentRequest, ProtocolService,
 };
 use narsor_engine::controller_runtime::load_or_enroll;
-use narsor_engine::domain::{BackendId, ExecutionStatus, WorkflowDefinition, WorkflowExecution};
+use narsor_engine::domain::{ExecutionStatus, WorkflowDefinition, WorkflowExecution};
 use narsor_engine::engine::{owed_output_rescue, owed_reprompt, Engine, HarnessRegistry};
 use narsor_engine::environment::{
     BackendKind, BackendRecord, CatalogLaunchResolver, EnvironmentCatalog, HarnessDefaults,
@@ -167,14 +167,9 @@ pub async fn run_daemon(config: &Resolved) -> Result<()> {
         OwnerDefaults::from_config(config),
         Arc::clone(&selector) as Arc<dyn HarnessDefaults>,
     ));
-    // The local backend's task storages are on this host: a task of it
-    // whose runner is not running can still be read from its storage.
-    let control = Arc::new(
-        ProtocolService::new(control_plane, launch.clone()).with_local_storage(
-            BackendId::parse("local").expect("'local' is a valid backend id"),
-            crate::api::local_task_storage_root(config.work_dir()),
-        ),
-    );
+    // A stopped task is read by a read-only runner its controller starts
+    // (D63): the control plane reads no task storage, local backend or not.
+    let control = Arc::new(ProtocolService::new(control_plane, launch.clone()));
     let _scheduler = spawn_periodic_admission(Arc::clone(&control));
     let agent_timeout_secs = defaults.timeout_secs;
     let engine = Arc::new(
@@ -417,13 +412,16 @@ fn spawn_periodic_admission(control: Arc<ProtocolService>) -> tokio::task::JoinH
 
 /// One tick of the daemon's periodic pass: admission, then the resume
 /// policy, then the slot-release policy (D62), then task materials whose
-/// time to live ran out (U9). Returns what the resume policy did.
+/// time to live ran out (U9), and the reader leases that ran idle (D63). Returns what the resume policy did.
 pub fn run_periodic_pass(control: &ProtocolService) -> AutoResumePass {
     control.reschedule_all();
     let resumed = control.auto_resume_pass();
     // Stops tasks whose deadline came; the slot itself goes on once the
     // runner reached its safe point, and that report re-runs admission.
     control.slot_release_pass();
+    // Ends the leases of read-only runners that ran idle, so the desired
+    // state stops asking the controller for them.
+    control.reader_lease_pass();
     control.sweep_materials();
     resumed
 }

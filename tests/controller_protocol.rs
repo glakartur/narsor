@@ -30,7 +30,6 @@ use narsor_engine::controller_protocol::{
 };
 use narsor_engine::domain::{
     BackendId, DisplayLink, Event, EventData, ExecutionStatus, TaskDisplay, TaskId,
-    WorkflowExecution, Workspace,
 };
 use narsor_engine::engine::{Engine, PendingHumanInput, Timeline};
 use narsor_engine::orchestration::{
@@ -92,6 +91,15 @@ impl Clock for ManualClock {
     }
 }
 
+/// The policy the tests run under: the default, but a read that finds no
+/// reader connected does not wait for one long (D63).
+fn test_config() -> ProtocolConfig {
+    ProtocolConfig {
+        reader_connect_wait: StdDuration::from_millis(50),
+        ..ProtocolConfig::default()
+    }
+}
+
 /// A served control plane plus an owner client.
 struct Harness {
     root: TempRoot,
@@ -112,26 +120,21 @@ struct Running {
 
 impl Harness {
     async fn start() -> Self {
-        Self::start_with(ProtocolConfig::default(), None).await
+        Self::start_with(test_config()).await
     }
 
-    /// A harness with its own timing policy, and optionally a backend whose
-    /// task storages this host holds under the given root.
-    async fn start_with(config: ProtocolConfig, local: Option<(&str, PathBuf)>) -> Self {
-        Self::start_inner(config, local, false).await
+    /// A harness with its own timing policy.
+    async fn start_with(config: ProtocolConfig) -> Self {
+        Self::start_inner(config, false).await
     }
 
     /// A harness whose daemon has a default-harness selector (configured
     /// `claude-code`) that running tasks follow (U7).
     async fn start_with_default_harness() -> Self {
-        Self::start_inner(ProtocolConfig::default(), None, true).await
+        Self::start_inner(test_config(), true).await
     }
 
-    async fn start_inner(
-        config: ProtocolConfig,
-        local: Option<(&str, PathBuf)>,
-        with_selector: bool,
-    ) -> Self {
+    async fn start_inner(config: ProtocolConfig, with_selector: bool) -> Self {
         let root = TempRoot::new();
         let clock = ManualClock::new();
         let control = ControlPlane::with_clock(StatePaths::new(root.path()), clock.clone());
@@ -155,12 +158,7 @@ impl Harness {
             ),
             None => environment_support::seeded_resolver(root.path()),
         };
-        let mut service = ProtocolService::with_config(control, resolver, config);
-        if let Some((backend, storage_root)) = local {
-            service = service
-                .with_local_storage(BackendId::parse(backend).expect("backend id"), storage_root);
-        }
-        let service = Arc::new(service);
+        let service = Arc::new(ProtocolService::with_config(control, resolver, config));
         let services = ApiServices {
             control: Some(Arc::clone(&service)),
             harness_selector: selector,
@@ -2568,7 +2566,7 @@ async fn a_runner_that_does_not_answer_in_time_is_a_503_with_the_reason() {
         conversation_page_timeout: StdDuration::from_millis(200),
         ..ProtocolConfig::default()
     };
-    let harness = Harness::start_with(config, None).await;
+    let harness = Harness::start_with(config).await;
     harness.running("task-1", "k8s").await;
     match harness
         .owner
@@ -2633,7 +2631,7 @@ async fn a_runner_that_cannot_read_fails_the_request_at_once_and_it_stops_being_
 }
 
 #[tokio::test]
-async fn a_remote_task_without_a_running_runner_answers_unavailable_not_an_error() {
+async fn a_task_without_a_runner_answers_unavailable_or_a_starting_reader_not_an_error() {
     let harness = Harness::start().await;
     // Before any runner: nothing to read.
     harness.create("task-0", "k8s").await;
@@ -2662,6 +2660,42 @@ async fn a_remote_task_without_a_running_runner_answers_unavailable_not_an_error
         ))
         .await
         .expect("lost");
+    // Interrupted: its workload is known to be gone, a reader may read it.
+    match harness
+        .owner
+        .control_execution_events("task-1", &ExecutionEventsQuery::default())
+        .await
+        .expect("an answer")
+    {
+        ExecutionEventsResponse::Unavailable { reason, .. } => {
+            assert_eq!(reason, ConversationUnavailableReason::ReaderStarting);
+        }
+        other => panic!("expected a starting reader, got {other:?}"),
+    }
+}
+
+/// `Unknown` is not read: its previous runner may still be alive and hold
+/// the storage. The answer is today's, and no reader is leased.
+#[tokio::test]
+async fn an_unknown_task_is_unavailable_and_leases_no_reader() {
+    let harness = Harness::start().await;
+    let Running {
+        controller, epoch, ..
+    } = harness.running("task-1", "k8s").await;
+    controller
+        .report(&report(
+            "task-1",
+            epoch,
+            1,
+            Observation::WorkloadLost { state_known: false },
+            Some(1),
+        ))
+        .await
+        .expect("lost");
+    assert_eq!(
+        harness.task("task-1").await.runner_state,
+        RunnerState::Unknown
+    );
     match harness
         .owner
         .control_execution_events("task-1", &ExecutionEventsQuery::default())
@@ -2674,6 +2708,19 @@ async fn a_remote_task_without_a_running_runner_answers_unavailable_not_an_error
         }
         other => panic!("expected unavailable, got {other:?}"),
     }
+    match harness
+        .owner
+        .control_conductor("task-1", &ConductorReadQuery::default())
+        .await
+        .expect("an answer")
+    {
+        ConductorReadResponse::Unavailable { reason, .. } => {
+            assert_eq!(reason, ConversationUnavailableReason::Interrupted)
+        }
+        other => panic!("expected unavailable, got {other:?}"),
+    }
+    assert!(control_task(&harness, "task-1").reader_lease.is_none());
+    assert!(!desired(&controller, "task-1").await.reader_needed);
 }
 
 #[tokio::test]
@@ -2706,81 +2753,61 @@ async fn another_owners_task_has_no_execution_events_to_read() {
     }
 }
 
+/// AE6 (D63): a stopped task is read through a read-only runner the control
+/// plane has the controller start; it reads no storage itself.
 #[tokio::test]
-async fn a_paused_local_task_is_read_from_its_own_storage() {
-    let storage = TempRoot::new();
-    let harness = Harness::start_with(
-        ProtocolConfig::default(),
-        Some(("k8s", storage.path().to_path_buf())),
-    )
-    .await;
-    let Running {
-        controller, epoch, ..
-    } = harness.running("task-1", "k8s").await;
-    controller
-        .report(&report(
-            "task-1",
-            epoch,
-            1,
-            Observation::WorkloadLost { state_known: true },
-            Some(1),
-        ))
+async fn ae6_a_stopped_tasks_events_are_read_through_a_reader() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    assert_eq!(
+        harness.task("task-1").await.runner_state,
+        RunnerState::Stopped
+    );
+    assert!(control_task(&harness, "task-1").reader_lease.is_none());
+
+    // The first read leases a reader and says it is starting.
+    match harness
+        .owner
+        .control_execution_events("task-1", &ExecutionEventsQuery::default())
         .await
-        .expect("lost");
-
-    // No storage yet for the execution the runner named.
-    assert!(matches!(
-        harness
-            .owner
-            .control_execution_events("task-1", &ExecutionEventsQuery::default())
-            .await
-            .expect("an answer"),
-        ExecutionEventsResponse::Unavailable { .. }
-    ));
-
-    let store = ExecutionStore::new(storage.path().join("task-1").join("state"));
-    store
-        .save_execution(&WorkflowExecution {
-            id: "exec-1".to_string(),
-            workflow_id: "wf".to_string(),
-            workflow_version: 1,
-            status: ExecutionStatus::Running,
-            current_state: Some("review".to_string()),
-            started_at: Utc::now(),
-            completed_at: None,
-            inputs: serde_json::json!({}),
-            context: narsor_engine::domain::Context::new(),
-            workspace: Workspace::local_folder("/tmp/none".to_string()),
-            current_action_execution: None,
-            metadata: serde_json::json!({}),
-        })
-        .expect("execution");
-    for sequence in 1..=5 {
-        store
-            .event_log("exec-1")
-            .append(&execution_event(sequence))
-            .expect("event");
+        .expect("an answer")
+    {
+        ExecutionEventsResponse::Unavailable { reason, .. } => {
+            assert_eq!(reason, ConversationUnavailableReason::ReaderStarting)
+        }
+        other => panic!("expected the reader to be starting, got {other:?}"),
     }
-    let page = |after, limit| {
+    assert!(control_task(&harness, "task-1").reader_lease_active(harness.clock.now()));
+    assert!(
+        desired(&running.controller, "task-1").await.reader_needed,
+        "the controller is told a reader is wanted"
+    );
+
+    // The controller starts it; once it polls, the same read is answered.
+    let reader = start_reader(&harness, &running, "reader-1").await;
+    let read = {
         let owner = harness.owner.clone();
-        async move {
+        tokio::spawn(async move {
             owner
                 .control_execution_events(
                     "task-1",
                     &ExecutionEventsQuery {
-                        after,
-                        limit: Some(limit),
+                        after: 0,
+                        limit: Some(3),
                     },
                 )
                 .await
-                .expect("events")
-        }
+        })
     };
-    let (first, more, source) = sequences(page(0, 3).await);
-    assert_eq!((first, more), (vec![1, 2, 3], true));
-    assert_eq!(source, ExecutionEventsSource::Storage);
-    let (rest, more, _) = sequences(page(3, 3).await);
-    assert_eq!((rest, more), (vec![4, 5], false));
+    answer_events(&reader, (1..=3).map(execution_event).collect(), true).await;
+    let (found, more, source) = sequences(read.await.unwrap().expect("events"));
+    assert_eq!((found, more), (vec![1, 2, 3], true));
+    assert_eq!(
+        source,
+        ExecutionEventsSource::Runner,
+        "a reader is a runner; the control plane read nothing"
+    );
 }
 
 #[tokio::test]
@@ -2912,7 +2939,7 @@ async fn a_runner_that_does_not_answer_the_conductor_request_is_a_503() {
         conversation_page_timeout: StdDuration::from_millis(200),
         ..ProtocolConfig::default()
     };
-    let harness = Harness::start_with(config, None).await;
+    let harness = Harness::start_with(config).await;
     harness.running("task-1", "k8s").await;
     match harness
         .owner
@@ -2928,7 +2955,7 @@ async fn a_runner_that_does_not_answer_the_conductor_request_is_a_503() {
 }
 
 #[tokio::test]
-async fn a_remote_task_without_a_running_runner_has_no_conductor_to_read() {
+async fn a_task_without_a_running_runner_has_no_conductor_to_read_until_a_reader_starts() {
     let harness = Harness::start().await;
     harness.create("task-0", "k8s").await;
     assert!(matches!(
@@ -2961,11 +2988,10 @@ async fn a_remote_task_without_a_running_runner_has_no_conductor_to_read() {
         .await
         .expect("an answer")
     {
-        ConductorReadResponse::Unavailable { reason, message } => {
-            assert_eq!(reason, ConversationUnavailableReason::Interrupted);
-            assert!(message.contains("runner is not running"), "{message}");
+        ConductorReadResponse::Unavailable { reason, .. } => {
+            assert_eq!(reason, ConversationUnavailableReason::ReaderStarting);
         }
-        other => panic!("expected unavailable, got {other:?}"),
+        other => panic!("expected a starting reader, got {other:?}"),
     }
     assert!(matches!(
         harness
@@ -2977,91 +3003,53 @@ async fn a_remote_task_without_a_running_runner_has_no_conductor_to_read() {
 }
 
 #[tokio::test]
-async fn the_conductor_of_a_stopped_local_task_is_read_from_its_own_storage() {
-    let storage = TempRoot::new();
-    let harness = Harness::start_with(
-        ProtocolConfig::default(),
-        Some(("k8s", storage.path().to_path_buf())),
-    )
-    .await;
-    let Running {
-        controller, epoch, ..
-    } = harness.running("task-1", "k8s").await;
-    controller
-        .report(&report(
-            "task-1",
-            epoch,
-            1,
-            Observation::WorkloadLost { state_known: true },
-            Some(1),
-        ))
+async fn the_conductor_of_a_stopped_task_is_read_through_a_reader() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+
+    match harness
+        .owner
+        .control_conductor("task-1", &ConductorReadQuery::default())
         .await
-        .expect("lost");
-
-    let store = ExecutionStore::new(storage.path().join("task-1").join("state"));
-    store
-        .save_execution(&WorkflowExecution {
-            id: "exec-1".to_string(),
-            workflow_id: "wf".to_string(),
-            workflow_version: 1,
-            status: ExecutionStatus::Running,
-            current_state: Some("review".to_string()),
-            started_at: Utc::now(),
-            completed_at: None,
-            inputs: serde_json::json!({}),
-            context: narsor_engine::domain::Context::new(),
-            workspace: Workspace::local_folder("/tmp/none".to_string()),
-            current_action_execution: None,
-            metadata: serde_json::json!({}),
-        })
-        .expect("execution");
-    let conductor = narsor_engine::conductor::ConductorStore::new(store.paths(), "exec-1");
-    for text in ["first", "second\u{1b}[2J", "third"] {
-        conductor
-            .append_chat(conductor_entry(
-                0,
-                narsor_engine::conductor::ChatAuthor::Operator,
-                text,
-            ))
-            .expect("chat");
+        .expect("an answer")
+    {
+        ConductorReadResponse::Unavailable { reason, .. } => {
+            assert_eq!(reason, ConversationUnavailableReason::ReaderStarting)
+        }
+        other => panic!("expected a starting reader, got {other:?}"),
     }
-
-    let read = |after| {
+    let reader = start_reader(&harness, &running, "reader-1").await;
+    let read = {
         let owner = harness.owner.clone();
-        async move {
-            match owner
+        tokio::spawn(async move {
+            owner
                 .control_conductor(
                     "task-1",
                     &ConductorReadQuery {
-                        after,
+                        after: 0,
                         limit: Some(2),
                     },
                 )
                 .await
-                .expect("the conductor")
-            {
-                ConductorReadResponse::Available { conductor, source } => (*conductor, source),
-                other => panic!("expected the conductor, got {other:?}"),
-            }
-        }
+        })
     };
-    let (first, source) = read(0).await;
-    assert_eq!(source, ExecutionEventsSource::Storage);
-    assert!(!first.available, "nothing runs it now");
-    assert!(
-        first
-            .unavailable_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("runner is not running")),
-        "{first:?}"
-    );
-    let texts: Vec<_> = first.chat.iter().map(|entry| entry.text.as_str()).collect();
-    assert_eq!(texts, vec!["first", "second[2J"], "cleaned and bounded");
-    assert!(first.chat_has_more);
-    assert_eq!(first.unanswered_chat.len(), 3);
-    let (rest, _) = read(2).await;
-    assert_eq!(rest.chat.len(), 1);
-    assert!(!rest.chat_has_more);
+    // What the reader reads from storage: the conductor, not running now.
+    let mut view = narsor_engine::conductor::ConductorView::unavailable("the task is stopped");
+    view.chat = vec![conductor_entry(
+        1,
+        narsor_engine::conductor::ChatAuthor::Operator,
+        "second\u{1b}[2J",
+    )];
+    answer_conductor(&reader, view).await;
+    match read.await.unwrap().expect("the conductor") {
+        ConductorReadResponse::Available { conductor, source } => {
+            assert_eq!(source, ExecutionEventsSource::Runner);
+            assert!(!conductor.available, "nothing runs it now");
+            assert_eq!(conductor.chat[0].text, "second[2J", "cleaned on the way in");
+        }
+        other => panic!("expected the conductor, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -3741,16 +3729,13 @@ async fn paused_tasks_and_losses_while_pausing_wait_for_the_owner() {
 
 #[tokio::test]
 async fn an_exhausted_task_is_announced_exactly_once() {
-    let harness = Harness::start_with(
-        ProtocolConfig {
-            resume: ResumePolicy {
-                attempt_delays: vec![Duration::zero()],
-                stability_window: Duration::minutes(10),
-            },
-            ..ProtocolConfig::default()
+    let harness = Harness::start_with(ProtocolConfig {
+        resume: ResumePolicy {
+            attempt_delays: vec![Duration::zero()],
+            stability_window: Duration::minutes(10),
         },
-        None,
-    )
+        ..ProtocolConfig::default()
+    })
     .await;
     let Running {
         controller, epoch, ..
@@ -3821,64 +3806,8 @@ async fn an_owner_key_in_the_policys_namespace_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// The conversation of a local task without a live runner (U6)
+// A stopped task's conversation is read through a reader (D63, U9)
 // ---------------------------------------------------------------------------
-
-/// A harness whose `k8s` backend keeps its task storages on this host.
-async fn local_harness(storage: &TempRoot) -> Harness {
-    Harness::start_with(
-        ProtocolConfig::default(),
-        Some(("k8s", storage.path().to_path_buf())),
-    )
-    .await
-}
-
-/// The task's own storage, as the daemon holding it reads it.
-fn local_store(storage: &TempRoot, task: &str) -> ExecutionStore {
-    ExecutionStore::new(storage.path().join(task).join("state"))
-}
-
-/// `exec-1` — the execution the test runner names — with its attempt
-/// `act-1` of `review`, open, holding `entries` lines.
-fn record_attempt(store: &ExecutionStore, entries: usize) {
-    store
-        .save_execution(&WorkflowExecution {
-            id: "exec-1".to_string(),
-            workflow_id: "wf".to_string(),
-            workflow_version: 1,
-            status: ExecutionStatus::Running,
-            current_state: Some("review".to_string()),
-            started_at: Utc::now(),
-            completed_at: None,
-            inputs: serde_json::json!({}),
-            context: narsor_engine::domain::Context::new(),
-            workspace: Workspace::local_folder("/tmp/none".to_string()),
-            current_action_execution: None,
-            metadata: serde_json::json!({}),
-        })
-        .expect("execution");
-    store
-        .event_log("exec-1")
-        .append_next(
-            &"exec-1".to_string(),
-            EventData::ActionStarted {
-                action_execution_id: "act-1".to_string(),
-                state_id: "review".to_string(),
-                action_type: "agent".to_string(),
-            },
-        )
-        .expect("event");
-    let mut writer = store
-        .conversation_store("exec-1")
-        .writer("act-1")
-        .expect("writer");
-    for entry in 1..=entries {
-        writer
-            .append_narsor(&format!("entry {entry}"), &[])
-            .expect("line");
-    }
-    writer.finish().expect("finish");
-}
 
 /// Drives a running task to `Stopped` at a safe point.
 async fn pause(harness: &Harness, running: &Running) {
@@ -3919,6 +3848,56 @@ async fn lose(running: &Running) {
         .expect("lost");
 }
 
+/// The desired state of `task` as a controller reads it.
+async fn desired(
+    controller: &ControllerClient,
+    task: &str,
+) -> narsor_engine::controller_protocol::DesiredCommand {
+    controller
+        .commands(0, true)
+        .await
+        .expect("commands")
+        .commands
+        .into_iter()
+        .find(|command| command.task_id.as_str() == task)
+        .expect("the task's desired state")
+}
+
+/// How a reader polls: for reads only.
+fn reader_poll(wait_secs: u64) -> narsor_engine::controller_protocol::RunnerPollQuery {
+    narsor_engine::controller_protocol::RunnerPollQuery {
+        wait_secs: Some(wait_secs),
+        defer_materials: true,
+        read_only: true,
+        ..Default::default()
+    }
+}
+
+/// The controller's side of starting a read-only runner for `task-1`: it
+/// asks for the reader's credential at the task's current generation, the
+/// reader's first poll then tells the control plane it is connected.
+async fn start_reader(harness: &Harness, running: &Running, incarnation: &str) -> RunnerClient {
+    let generation = harness.task("task-1").await.generation;
+    let issued = running
+        .controller
+        .issue_reader_credential(
+            "task-1",
+            &RunnerCredentialRequest {
+                lease_epoch: running.epoch,
+                generation,
+                incarnation: incarnation.to_string(),
+            },
+        )
+        .await
+        .expect("a reader credential");
+    let reader = RunnerClient::new(harness.base_url(), issued.credential);
+    reader
+        .poll_with(&reader_poll(0))
+        .await
+        .expect("the reader connects");
+    reader
+}
+
 async fn page_from(
     harness: &Harness,
     attempt: &str,
@@ -3937,73 +3916,34 @@ async fn page_from(
         .await
 }
 
-/// Entry numbers, the cursor, the source and the record's time of a page.
-fn page_of(
-    page: PageResponse,
-) -> (
-    Vec<u64>,
-    u64,
-    Option<ExecutionEventsSource>,
-    Option<DateTime<Utc>>,
-) {
-    match page {
-        PageResponse::Recorded {
-            entries,
-            next_entry,
-            source,
-            recorded_at,
-            ..
-        } => (
-            entries.iter().map(|entry| entry.entry_number).collect(),
-            next_entry,
-            source,
-            recorded_at,
-        ),
-        PageResponse::NoRecord => panic!("expected a record"),
+/// A page of `entries` lines of one attempt, as a runner reads it.
+fn recorded_page(entries: std::ops::RangeInclusive<u64>) -> PageResponse {
+    PageResponse::Recorded {
+        entries: entries
+            .clone()
+            .map(|number| narsor_engine::api::ConversationEntryDto {
+                entry_number: number,
+                timestamp: Utc::now(),
+                source: narsor_engine::api::ConversationEntrySource::Narsor,
+                raw_base64: String::new(),
+                elements: Vec::new(),
+            })
+            .collect(),
+        next_entry: entries.end() + 1,
+        closed: false,
+        truncated_tail: false,
+        source: None,
+        recorded_at: None,
     }
 }
 
-/// The attempts and the record's time of a summary read from storage.
-fn stored_summary(response: ConversationResponse) -> (Vec<(String, u64)>, Option<DateTime<Utc>>) {
-    match response {
-        ConversationResponse::Available {
-            attempts,
-            source,
-            recorded_at,
-            ..
-        } => {
-            assert_eq!(source, ExecutionEventsSource::Storage);
-            (
-                attempts
-                    .into_iter()
-                    .map(|attempt| (attempt.attempt_id, attempt.entries))
-                    .collect(),
-                recorded_at,
-            )
-        }
-        other => panic!("expected a summary from storage, got {other:?}"),
-    }
-}
-
-/// The runner side of one relayed page, read from the storage exactly as
-/// the runner reads it.
-async fn answer_page_from(runner: &RunnerClient, store: &ExecutionStore) {
+/// The runner side of one relayed page: wait for the request, upload `page`.
+async fn answer_page(runner: &RunnerClient, page: &PageResponse) {
     loop {
         let poll = runner.poll(None, 5).await.expect("poll");
         if let Some(request) = poll.conversation_pages.first() {
-            let read = store
-                .conversation_store("exec-1")
-                .read(
-                    &request.attempt_id,
-                    request.from_entry,
-                    request.byte_budget as usize,
-                )
-                .expect("read");
             let accepted = runner
-                .upload_conversation_page(
-                    &request.request_id,
-                    &narsor_engine::api::conversation_response_from_snapshot(read),
-                )
+                .upload_conversation_page(&request.request_id, page)
                 .await
                 .expect("upload");
             assert!(accepted.delivered);
@@ -4012,129 +3952,26 @@ async fn answer_page_from(runner: &RunnerClient, store: &ExecutionStore) {
     }
 }
 
-/// AE5: a paused local task's conversation is read from its record, marked
-/// as such and dated.
+fn page_entries(page: PageResponse) -> (Vec<u64>, Option<ExecutionEventsSource>) {
+    match page {
+        PageResponse::Recorded {
+            entries, source, ..
+        } => (
+            entries.iter().map(|entry| entry.entry_number).collect(),
+            source,
+        ),
+        PageResponse::NoRecord => panic!("expected a record"),
+    }
+}
+
 #[tokio::test]
-async fn ae5_a_paused_local_task_reads_its_conversation_from_its_record() {
-    let storage = TempRoot::new();
-    let harness = local_harness(&storage).await;
+async fn a_stopped_tasks_pages_wait_for_a_reader_and_then_come_from_it() {
+    let harness = Harness::start().await;
     let running = harness.running("task-1", "k8s").await;
-    record_attempt(&local_store(&storage, "task-1"), 3);
     pause(&harness, &running).await;
-    assert_eq!(
-        harness.task("task-1").await.runner_state,
-        RunnerState::Stopped
-    );
 
-    let (attempts, summary_at) = stored_summary(
-        harness
-            .owner
-            .control_conversation("task-1")
-            .await
-            .expect("conversation"),
-    );
-    assert_eq!(
-        attempts,
-        vec![("act-1".to_string(), 3)],
-        "the record, not the last report"
-    );
-    assert!(summary_at.is_some());
-
-    let (entries, next, source, page_at) =
-        page_of(page_from(&harness, "act-1", 0).await.expect("a page"));
-    assert_eq!((entries, next), (vec![1, 2, 3], 4));
-    assert_eq!(source, Some(ExecutionEventsSource::Storage));
-    assert_eq!(page_at, summary_at);
-}
-
-#[tokio::test]
-async fn interrupted_and_provisioning_local_tasks_read_their_record() {
-    let storage = TempRoot::new();
-    let harness = local_harness(&storage).await;
-    let running = harness.running("task-1", "k8s").await;
-    record_attempt(&local_store(&storage, "task-1"), 2);
-    lose(&running).await;
-    assert_eq!(
-        harness.task("task-1").await.runner_state,
-        RunnerState::Interrupted
-    );
-    let read = |expected: RunnerState| {
-        let harness = &harness;
-        async move {
-            assert_eq!(harness.task("task-1").await.runner_state, expected);
-            let (attempts, _) = stored_summary(
-                harness
-                    .owner
-                    .control_conversation("task-1")
-                    .await
-                    .expect("conversation"),
-            );
-            assert_eq!(attempts, vec![("act-1".to_string(), 2)], "{expected:?}");
-            let (entries, _, source, _) =
-                page_of(page_from(harness, "act-1", 0).await.expect("a page"));
-            assert_eq!(entries, vec![1, 2], "{expected:?}");
-            assert_eq!(source, Some(ExecutionEventsSource::Storage));
-        }
-    };
-    read(RunnerState::Interrupted).await;
-
-    // Restarted: the old runner's report no longer speaks for the task.
-    harness
-        .command("task-1", OwnerCommand::Start, "start-again")
-        .await;
-    read(RunnerState::Provisioning).await;
-}
-
-#[tokio::test]
-async fn a_provisioning_local_task_without_a_report_has_an_empty_record() {
-    let storage = TempRoot::new();
-    let harness = local_harness(&storage).await;
-    harness.create("task-1", "k8s").await;
-    let (controller, epoch) = harness.controller("k8s").await;
-    controller
-        .report(&report(
-            "task-1",
-            epoch,
-            1,
-            Observation::StartAccepted,
-            None,
-        ))
-        .await
-        .expect("start accepted");
-    assert_eq!(
-        harness.task("task-1").await.runner_state,
-        RunnerState::Provisioning
-    );
-
-    let (attempts, recorded_at) = stored_summary(
-        harness
-            .owner
-            .control_conversation("task-1")
-            .await
-            .expect("conversation"),
-    );
-    assert!(attempts.is_empty());
-    assert_eq!(recorded_at, None);
-    assert!(matches!(
-        page_from(&harness, "act-1", 0).await.expect("an answer"),
-        PageResponse::NoRecord
-    ));
-}
-
-/// AE6: a remote task keeps today's answer.
-#[tokio::test]
-async fn ae6_a_remote_interrupted_task_cannot_be_read_right_now() {
-    let storage = TempRoot::new();
-    // The daemon holds the storages of another backend only.
-    let harness = Harness::start_with(
-        ProtocolConfig::default(),
-        Some(("local", storage.path().to_path_buf())),
-    )
-    .await;
-    let running = harness.running("task-1", "k8s").await;
-    record_attempt(&local_store(&storage, "task-1"), 2);
-    lose(&running).await;
-
+    // The summary is the last the runner reported, and says why it is not
+    // live; it starts nothing.
     match harness
         .owner
         .control_conversation("task-1")
@@ -4144,30 +3981,75 @@ async fn ae6_a_remote_interrupted_task_cannot_be_read_right_now() {
         ConversationResponse::Unavailable {
             reason,
             last_attempts,
-            message,
             ..
         } => {
-            assert_eq!(reason, ConversationUnavailableReason::Interrupted);
+            assert_eq!(reason, ConversationUnavailableReason::Paused);
             assert_eq!(last_attempts[0].attempt_id, "act-6", "the last report");
-            assert_eq!(message, None);
         }
         other => panic!("expected unavailable, got {other:?}"),
     }
+    assert!(control_task(&harness, "task-1").reader_lease.is_none());
+
+    // A page leases a reader and is refused with the retryable code.
     match page_from(&harness, "act-1", 0).await {
-        Err(ClientError::Refused { code, message }) => {
-            assert_eq!(code, "conversation_unavailable");
-            assert!(message.contains("cannot be read right now"), "{message}");
+        Err(ClientError::Refused { code, .. }) => {
+            assert_eq!(code, "conversation_reader_starting")
         }
         other => panic!("expected a 409, got {other:?}"),
     }
+    assert!(control_task(&harness, "task-1").reader_lease.is_some());
+
+    let reader = start_reader(&harness, &running, "reader-1").await;
+    let read = {
+        let owner = harness.owner.clone();
+        tokio::spawn(async move {
+            owner
+                .control_conversation_page("task-1", "act-1", &ConversationPageQuery::default())
+                .await
+        })
+    };
+    answer_page(&reader, &recorded_page(1..=3)).await;
+    let (entries, source) = page_entries(read.await.unwrap().expect("a page"));
+    assert_eq!(entries, vec![1, 2, 3]);
+    assert_eq!(source, Some(ExecutionEventsSource::Runner));
 }
 
 #[tokio::test]
-async fn an_archived_local_task_cannot_be_read_right_now() {
-    let storage = TempRoot::new();
-    let harness = local_harness(&storage).await;
+async fn an_interrupted_task_is_read_through_a_reader_too() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    lose(&running).await;
+    assert_eq!(
+        harness.task("task-1").await.runner_state,
+        RunnerState::Interrupted
+    );
+    match page_from(&harness, "act-1", 0).await {
+        Err(ClientError::Refused { code, .. }) => {
+            assert_eq!(code, "conversation_reader_starting")
+        }
+        other => panic!("expected a 409, got {other:?}"),
+    }
+    assert!(desired(&running.controller, "task-1").await.reader_needed);
+    let reader = start_reader(&harness, &running, "reader-1").await;
+    let read = {
+        let owner = harness.owner.clone();
+        tokio::spawn(async move {
+            owner
+                .control_conversation_page("task-1", "act-1", &ConversationPageQuery::default())
+                .await
+        })
+    };
+    answer_page(&reader, &recorded_page(1..=2)).await;
+    assert_eq!(
+        page_entries(read.await.unwrap().expect("a page")).0,
+        vec![1, 2]
+    );
+}
+
+#[tokio::test]
+async fn an_archived_task_cannot_be_read_right_now() {
+    let harness = Harness::start().await;
     harness.create("task-1", "k8s").await;
-    record_attempt(&local_store(&storage, "task-1"), 2);
     harness
         .command("task-1", OwnerCommand::Archive, "archive-1")
         .await;
@@ -4190,96 +4072,17 @@ async fn an_archived_local_task_cannot_be_read_right_now() {
         }
         other => panic!("expected a 409, got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn an_unreadable_record_says_why_instead_of_being_unavailable() {
-    let storage = TempRoot::new();
-    let harness = local_harness(&storage).await;
-    let running = harness.running("task-1", "k8s").await;
-    let store = local_store(&storage, "task-1");
-    record_attempt(&store, 1);
-    // A line in the middle that is not an entry: the record is damaged,
-    // not merely being written.
-    let file = store.conversation_store("exec-1").dir().join("act-1.jsonl");
-    let mut bytes = fs::read(&file).unwrap();
-    bytes.extend_from_slice(b"not an entry\n");
-    bytes.extend_from_slice(&fs::read(&file).unwrap());
-    fs::write(&file, bytes).unwrap();
-    lose(&running).await;
-
-    match harness
-        .owner
-        .control_conversation("task-1")
-        .await
-        .expect("conversation")
-    {
-        ConversationResponse::Unavailable {
-            reason, message, ..
-        } => {
-            assert_eq!(reason, ConversationUnavailableReason::StorageUnreadable);
-            let message = message.expect("why");
-            assert!(message.contains("could not be read"), "{message}");
-            assert!(message.contains("act-1.jsonl"), "{message}");
-        }
-        other => panic!("expected unreadable, got {other:?}"),
-    }
-    match page_from(&harness, "act-1", 0).await {
-        Err(ClientError::Refused { code, message }) => {
-            assert_eq!(code, "conversation_record_unreadable");
-            assert!(message.contains("could not be read"), "{message}");
-            assert!(!message.contains("right now"), "{message}");
-        }
-        other => panic!("expected the read error, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn a_record_being_written_is_read_up_to_its_last_whole_line() {
-    let storage = TempRoot::new();
-    let harness = local_harness(&storage).await;
-    let running = harness.running("task-1", "k8s").await;
-    let store = local_store(&storage, "task-1");
-    record_attempt(&store, 2);
-    let file = store.conversation_store("exec-1").dir().join("act-1.jsonl");
-    let mut bytes = fs::read(&file).unwrap();
-    bytes.extend_from_slice(br#"{"n":3,"ts":"2026-10-03T12:00:00Z","source":"stdout","raw_"#);
-    fs::write(&file, bytes).unwrap();
-    lose(&running).await;
-
-    let (attempts, _) = stored_summary(
-        harness
-            .owner
-            .control_conversation("task-1")
-            .await
-            .expect("conversation"),
-    );
-    assert_eq!(attempts, vec![("act-1".to_string(), 2)]);
-    match page_from(&harness, "act-1", 0).await.expect("a page") {
-        PageResponse::Recorded {
-            entries,
-            next_entry,
-            truncated_tail,
-            ..
-        } => {
-            assert_eq!(entries.len(), 2);
-            assert_eq!(next_entry, 3);
-            assert!(truncated_tail);
-        }
-        other => panic!("expected a record, got {other:?}"),
-    }
+    assert!(control_task(&harness, "task-1").reader_lease.is_none());
 }
 
 #[tokio::test]
 async fn an_attempt_id_that_would_walk_the_path_is_refused() {
-    let storage = TempRoot::new();
-    let harness = local_harness(&storage).await;
+    let harness = Harness::start().await;
     let running = harness.running("task-1", "k8s").await;
-    record_attempt(&local_store(&storage, "task-1"), 1);
     lose(&running).await;
 
     let owner = OwnerRef::new(LOCAL_OWNER);
-    for attempt in ["..", "../act-1", "act/1", "a..b", ".hidden"] {
+    for attempt in ["..", "../act-1", "act/1", ".hidden"] {
         let refused = harness
             .service
             .conversation_page(&owner, "task-1", attempt, ConversationPageQuery::default())
@@ -4297,83 +4100,450 @@ async fn an_attempt_id_that_would_walk_the_path_is_refused() {
     );
 }
 
-/// The record and the live runner number entries alike: a reader that
-/// continues from `next_entry` across the switch neither loses nor repeats
-/// an entry.
+/// The lease is the control plane's want of a reader; the controller reads
+/// it from the desired state, which follows the clock without a pass.
 #[tokio::test]
-async fn reading_the_record_then_the_runner_from_the_cursor_loses_and_repeats_nothing() {
-    let storage = TempRoot::new();
-    let harness = local_harness(&storage).await;
+async fn a_reader_lease_runs_out_when_nobody_reads_and_the_desired_state_says_so() {
+    let harness = Harness::start().await;
     let running = harness.running("task-1", "k8s").await;
-    let store = local_store(&storage, "task-1");
-    record_attempt(&store, 5);
+    pause(&harness, &running).await;
+    assert!(!desired(&running.controller, "task-1").await.reader_needed);
 
-    // The runner goes quiet: the record is read, a small page at a time —
-    // a budget of exactly three stored lines.
-    let record =
-        std::fs::read_to_string(store.conversation_store("exec-1").dir().join("act-1.jsonl"))
-            .expect("the open record");
-    let three_lines: usize = record.lines().take(3).map(str::len).sum();
-    harness.clock.advance(Duration::minutes(2));
-    let small = harness
+    let _ = page_from(&harness, "act-1", 0).await;
+    let record = control_task(&harness, "task-1");
+    let lease = record.reader_lease.expect("leased");
+    assert_eq!(
+        lease.until - lease.since,
+        Duration::seconds(120),
+        "the backend's idle period"
+    );
+    assert!(desired(&running.controller, "task-1").await.reader_needed);
+
+    // The controller keeps its own lease (a minute) alive meanwhile.
+    harness.clock.advance(Duration::seconds(59));
+    running
+        .controller
+        .renew_lease(running.epoch, None)
+        .await
+        .expect("renew");
+    harness.clock.advance(Duration::seconds(60));
+    running
+        .controller
+        .renew_lease(running.epoch, None)
+        .await
+        .expect("renew");
+    assert!(desired(&running.controller, "task-1").await.reader_needed);
+    harness.clock.advance(Duration::seconds(2));
+    running
+        .controller
+        .renew_lease(running.epoch, None)
+        .await
+        .expect("renew");
+    assert!(
+        !desired(&running.controller, "task-1").await.reader_needed,
+        "not wanted any more, before any pass removed the lease"
+    );
+    assert!(control_task(&harness, "task-1").reader_lease.is_some());
+
+    // The daemon's pass removes it and leaves a trace.
+    narsor_server::runtime::run_periodic_pass(&harness.service);
+    assert!(control_task(&harness, "task-1").reader_lease.is_none());
+    assert_eq!(
+        task_events(&harness, "task-1")
+            .into_iter()
+            .filter(|kind| matches!(kind, TaskEventKind::ReaderLeaseEnded))
+            .count(),
+        1
+    );
+    narsor_server::runtime::run_periodic_pass(&harness.service);
+    assert_eq!(
+        task_events(&harness, "task-1")
+            .into_iter()
+            .filter(|kind| matches!(kind, TaskEventKind::ReaderLeaseEnded))
+            .count(),
+        1,
+        "a second pass adds nothing"
+    );
+}
+
+/// R7's counterpart for the reader: reads move the lease later, but a
+/// client refreshing every few seconds does not write the record each time.
+#[tokio::test]
+async fn reads_move_the_lease_later_but_do_not_write_the_record_each_time() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+
+    let _ = page_from(&harness, "act-1", 0).await;
+    let first = control_task(&harness, "task-1");
+    harness.clock.advance(Duration::seconds(10));
+    let _ = page_from(&harness, "act-1", 0).await;
+    let second = control_task(&harness, "task-1");
+    assert_eq!(
+        second.revision, first.revision,
+        "10 s is under the threshold"
+    );
+
+    harness.clock.advance(Duration::seconds(60));
+    let _ = page_from(&harness, "act-1", 0).await;
+    let third = control_task(&harness, "task-1");
+    assert!(third.revision > second.revision);
+    let (before, after) = (first.reader_lease.unwrap(), third.reader_lease.unwrap());
+    assert_eq!(after.since, before.since, "the same reading");
+    assert!(after.until > before.until);
+}
+
+/// The reader's directive follows its lease: `Continue` while an owner
+/// reads, `Stop` when it ran idle — where `directive(Stopped)` alone would
+/// have sent a reader away the moment it started.
+#[tokio::test]
+async fn a_readers_directive_follows_its_lease() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    let _ = page_from(&harness, "act-1", 0).await;
+    let reader = start_reader(&harness, &running, "reader-1").await;
+
+    let poll = reader.poll_with(&reader_poll(0)).await.expect("poll");
+    assert_eq!(poll.directive, RunnerDirective::Continue);
+    assert_eq!(poll.runner_state, RunnerState::Stopped);
+    assert_eq!(poll.launch.authorized_by, None, "a reader is no launch");
+
+    harness.clock.advance(Duration::seconds(121));
+    let poll = reader.poll_with(&reader_poll(0)).await.expect("poll");
+    assert_eq!(poll.directive, RunnerDirective::Stop);
+    // The working runner of the same task is told what it always was.
+    let worker = running.runner.poll(None, 0).await.expect("poll");
+    assert_eq!(worker.directive, RunnerDirective::Stop);
+}
+
+#[tokio::test]
+async fn a_reader_may_not_write_anything() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    harness.task("task-1").await;
+    pause(&harness, &running).await;
+    let _ = page_from(&harness, "act-1", 0).await;
+    let reader = start_reader(&harness, &running, "reader-1").await;
+    let before = control_task(&harness, "task-1");
+
+    assert!(matches!(
+        reader
+            .snapshot(&snapshot(9, ExecutionStatus::Running, 9, None))
+            .await,
+        Err(ClientError::Forbidden)
+    ));
+    assert!(matches!(
+        reader.ack_input("input-1", true, None).await,
+        Err(ClientError::Forbidden)
+    ));
+    assert!(matches!(
+        reader.ack_command("command-1", true, None).await,
+        Err(ClientError::Forbidden)
+    ));
+    assert!(matches!(
+        reader.material("material-1").await,
+        Err(ClientError::Forbidden)
+    ));
+    assert!(matches!(
+        reader.ack_material("material-1", "sha256:x").await,
+        Err(ClientError::Forbidden)
+    ));
+    assert!(matches!(
+        reader.publish_material(vec![0; 4]).await,
+        Err(ClientError::Forbidden)
+    ));
+    let after = control_task(&harness, "task-1");
+    assert_eq!(after.revision, before.revision, "nothing was written");
+    assert_eq!(after.runner, before.runner);
+
+    // Reading and renewing are what a reader does.
+    reader.renew().await.expect("renew");
+    reader.poll_with(&reader_poll(0)).await.expect("poll");
+}
+
+/// A reader is handed no answer and no command, whatever its query says:
+/// the credential decides, not the flag.
+#[tokio::test]
+async fn a_readers_poll_is_read_only_whatever_it_asks() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    running
+        .runner
+        .snapshot(&snapshot(2, ExecutionStatus::InputNeeded, 4, Some("ep-1")))
+        .await
+        .expect("waiting");
+    harness
         .owner
-        .control_conversation_page(
+        .control_input("task-1", &input_request("ep-1", "answer-1"))
+        .await
+        .expect("queued");
+    // The answer waits for the working runner, which then stops: the task
+    // is stopped with an unsettled answer.
+    harness
+        .command("task-1", OwnerCommand::Pause, "pause-1")
+        .await;
+    let mut at_safe_point = snapshot(3, ExecutionStatus::InputNeeded, 5, Some("ep-1"));
+    at_safe_point.safe_point = true;
+    running
+        .runner
+        .snapshot(&at_safe_point)
+        .await
+        .expect("safe point");
+    running
+        .controller
+        .report(&report(
             "task-1",
-            "act-1",
-            &ConversationPageQuery {
-                from: 0,
-                byte_budget: Some(three_lines as u64),
+            running.epoch,
+            2,
+            Observation::PausedAtSafePoint,
+            Some(2),
+        ))
+        .await
+        .expect("paused");
+    let _ = page_from(&harness, "act-1", 0).await;
+    let reader = start_reader(&harness, &running, "reader-1").await;
+
+    let asks_for_everything = narsor_engine::controller_protocol::RunnerPollQuery {
+        pending_input_id: Some("ep-1".into()),
+        wait_secs: Some(0),
+        read_only: false,
+        ..Default::default()
+    };
+    let poll = reader.poll_with(&asks_for_everything).await.expect("poll");
+    assert!(poll.inputs.is_empty());
+    assert!(poll.commands.is_empty());
+    assert!(poll.materials.is_empty());
+    let record = control_task(&harness, "task-1");
+    assert!(
+        record
+            .inputs
+            .iter()
+            .all(|input| input.status == InputStatus::Queued),
+        "the answer is still waiting for its runner"
+    );
+}
+
+/// R15: the command that resumes the task ends the reader's lease in its
+/// own mutation, and its credential stops working with it.
+#[tokio::test]
+async fn a_resume_ends_the_reader_lease_in_the_same_mutation() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    let _ = page_from(&harness, "act-1", 0).await;
+    let reader = start_reader(&harness, &running, "reader-1").await;
+    let before = control_task(&harness, "task-1");
+    assert!(before.reader_lease_active(harness.clock.now()));
+
+    let resumed = harness
+        .command("task-1", OwnerCommand::Resume, "resume-1")
+        .await;
+    assert_eq!(resumed.runner_state, RunnerState::Provisioning);
+    let after = control_task(&harness, "task-1");
+    assert!(after.reader_lease.is_none());
+    assert_eq!(
+        after.revision,
+        before.revision + 1,
+        "one mutation, one revision"
+    );
+    assert!(
+        !task_events(&harness, "task-1")
+            .iter()
+            .any(|kind| matches!(kind, TaskEventKind::ReaderLeaseEnded)),
+        "it ended with the resume, not in a mutation of its own"
+    );
+
+    // The controller is no longer asked for a reader, and the one running
+    // is turned away.
+    assert!(!desired(&running.controller, "task-1").await.reader_needed);
+    assert!(matches!(
+        reader.poll_with(&reader_poll(0)).await,
+        Err(ClientError::Unauthorized)
+    ));
+    // A reader credential is not issued for a task nobody reads.
+    match running
+        .controller
+        .issue_reader_credential(
+            "task-1",
+            &RunnerCredentialRequest {
+                lease_epoch: running.epoch,
+                generation: after.generation,
+                incarnation: "reader-2".into(),
             },
         )
         .await
-        .expect("a page");
-    let (first, next, source, _) = page_of(small);
-    assert_eq!((first.clone(), next), (vec![1, 2, 3], 4));
-    assert_eq!(source, Some(ExecutionEventsSource::Storage));
-    let (whole_record, record_next, _, _) =
-        page_of(page_from(&harness, "act-1", 0).await.expect("a page"));
+    {
+        Err(ClientError::Refused { code, .. }) => assert_eq!(code, "reader_not_wanted"),
+        other => panic!("expected a 409, got {other:?}"),
+    }
+}
 
-    // It speaks again: the reader continues live from the cursor.
-    running
-        .runner
-        .snapshot(&snapshot(2, ExecutionStatus::Running, 4, None))
+#[tokio::test]
+async fn an_archive_ends_the_reader_lease_too() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    let _ = page_from(&harness, "act-1", 0).await;
+    assert!(control_task(&harness, "task-1").reader_lease.is_some());
+    harness
+        .command("task-1", OwnerCommand::Archive, "archive-1")
+        .await;
+    assert!(control_task(&harness, "task-1").reader_lease.is_none());
+}
+
+/// A reader credential is a session of its own: issuing either kind leaves
+/// the other as it was, and neither touches the task's record.
+#[tokio::test]
+async fn a_readers_credential_and_a_runners_do_not_invalidate_each_other() {
+    use narsor_engine::controller_protocol::RunnerRole;
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    let _ = page_from(&harness, "act-1", 0).await;
+    let task = TaskId::parse("task-1").unwrap();
+    let ttl = Duration::minutes(15);
+    let credentials = harness.service.credentials();
+    let revision = control_task(&harness, "task-1").revision;
+
+    let (_, worker_1) = credentials
+        .issue_runner_session(RunnerRole::Worker, &task, "worker-1", 2, 1, ttl)
+        .expect("worker");
+    let (_, reader_1) = credentials
+        .issue_runner_session(RunnerRole::Reader, &task, "reader-1", 2, 1, ttl)
+        .expect("reader");
+    let role_of = |token: &narsor_engine::controller_protocol::credentials::BearerToken| {
+        harness
+            .service
+            .authenticate_runner(token.expose())
+            .map(|identity| (identity.role, identity.incarnation))
+    };
+    assert_eq!(
+        role_of(&worker_1),
+        Some((RunnerRole::Worker, "worker-1".into()))
+    );
+    assert_eq!(
+        role_of(&reader_1),
+        Some((RunnerRole::Reader, "reader-1".into()))
+    );
+
+    // A newer reader replaces the older reader only.
+    let (_, reader_2) = credentials
+        .issue_runner_session(RunnerRole::Reader, &task, "reader-2", 2, 1, ttl)
+        .expect("reader");
+    assert_eq!(role_of(&reader_1), None);
+    assert_eq!(
+        role_of(&reader_2),
+        Some((RunnerRole::Reader, "reader-2".into()))
+    );
+    assert_eq!(
+        role_of(&worker_1),
+        Some((RunnerRole::Worker, "worker-1".into()))
+    );
+
+    // A newer worker replaces the older worker only.
+    let (_, worker_2) = credentials
+        .issue_runner_session(RunnerRole::Worker, &task, "worker-2", 2, 1, ttl)
+        .expect("worker");
+    assert_eq!(role_of(&worker_1), None);
+    assert_eq!(
+        role_of(&worker_2),
+        Some((RunnerRole::Worker, "worker-2".into()))
+    );
+    assert_eq!(
+        role_of(&reader_2),
+        Some((RunnerRole::Reader, "reader-2".into()))
+    );
+
+    assert_eq!(
+        control_task(&harness, "task-1").revision,
+        revision,
+        "the record is not touched"
+    );
+}
+
+/// AE5, the control plane's part: a running reader is no slot and no
+/// runner of the task's record.
+#[tokio::test]
+async fn ae5_a_reader_takes_no_slot_and_changes_nothing_the_owner_sees_of_the_runner() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    let stopped = harness.task("task-1").await;
+    let _ = page_from(&harness, "act-1", 0).await;
+    let _reader = start_reader(&harness, &running, "reader-1").await;
+
+    let reading = harness.task("task-1").await;
+    assert!(!reading.holds_slot, "a reader holds no slot");
+    assert_eq!(reading.runner_state, RunnerState::Stopped);
+    assert_eq!(
+        reading
+            .runner
+            .as_ref()
+            .map(|runner| runner.incarnation.clone()),
+        stopped
+            .runner
+            .as_ref()
+            .map(|runner| runner.incarnation.clone()),
+        "the task's runner is still the working one"
+    );
+    assert_eq!(reading.generation, stopped.generation);
+}
+
+/// The controller's long-poll wakes when a reader becomes wanted, though no
+/// generation moved: otherwise a reader would start only on the controller's
+/// next full pass.
+#[tokio::test]
+async fn a_reader_becoming_wanted_wakes_the_controllers_long_poll() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    pause(&harness, &running).await;
+    // Everything so far acknowledged: nothing new by generation.
+    let all = running
+        .controller
+        .commands(0, true)
         .await
-        .expect("back");
-    let continued = {
-        let owner = harness.owner.clone();
-        tokio::spawn(async move {
-            owner
-                .control_conversation_page(
-                    "task-1",
-                    "act-1",
-                    &ConversationPageQuery {
-                        from: next,
-                        byte_budget: None,
-                    },
-                )
-                .await
-        })
-    };
-    answer_page_from(&running.runner, &store).await;
-    let (rest, _, source, recorded_at) = page_of(continued.await.unwrap().expect("live"));
-    assert_eq!(source, Some(ExecutionEventsSource::Runner));
-    assert_eq!(recorded_at, None);
-    let mut read: Vec<u64> = first;
-    read.extend(rest);
-    assert_eq!(read, vec![1, 2, 3, 4, 5]);
+        .expect("commands");
+    running
+        .controller
+        .acknowledge(
+            all.commands
+                .iter()
+                .map(|command| CommandAck {
+                    task_id: command.task_id.to_string(),
+                    generation: command.generation,
+                })
+                .collect(),
+        )
+        .await
+        .expect("ack");
+    assert!(running
+        .controller
+        .commands(0, false)
+        .await
+        .expect("commands")
+        .commands
+        .is_empty());
 
-    // The same attempt read whole from either side is the same.
-    let live = {
-        let owner = harness.owner.clone();
+    let waiting = {
+        let controller = running.controller.clone();
         tokio::spawn(async move {
-            owner
-                .control_conversation_page("task-1", "act-1", &ConversationPageQuery::default())
-                .await
+            let started = Instant::now();
+            let response = controller.commands(20, false).await.expect("long-poll");
+            (started.elapsed(), response)
         })
     };
-    answer_page_from(&running.runner, &store).await;
-    let (live_entries, live_next, _, _) = page_of(live.await.unwrap().expect("live"));
-    assert_eq!((live_entries, live_next), (whole_record, record_next));
+    tokio::time::sleep(StdDuration::from_millis(200)).await;
+    let _ = page_from(&harness, "act-1", 0).await;
+    let (waited, response) = waiting.await.unwrap();
+    assert!(
+        waited < StdDuration::from_secs(10),
+        "woken, not timed out: {waited:?}"
+    );
+    assert!(
+        response.commands.is_empty(),
+        "it only wakes the controller; the desired state is read as usual"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4473,6 +4643,52 @@ fn a_conversation_from_a_server_before_storage_reads_comes_from_the_runner() {
     };
     assert_eq!(source, ExecutionEventsSource::Runner);
     assert_eq!(recorded_at, None);
+}
+
+#[test]
+fn a_desired_command_from_a_server_before_the_reader_wants_no_reader() {
+    use narsor_engine::controller_protocol::DesiredCommand;
+    let command = DesiredCommand {
+        task_id: TaskId::parse("task-1").unwrap(),
+        generation: 2,
+        runner_state: RunnerState::Stopped,
+        action: DesiredAction::KeepPaused,
+        resource_key: "task-1".into(),
+        launch_spec: serde_json::json!({}),
+        runner: None,
+        reader_needed: false,
+    };
+    let json = serde_json::to_value(&command).unwrap();
+    assert!(
+        json.get("reader_needed").is_none(),
+        "an older controller is sent what it knows"
+    );
+    assert!(
+        !serde_json::from_value::<DesiredCommand>(json)
+            .unwrap()
+            .reader_needed
+    );
+    let wanted = DesiredCommand {
+        reader_needed: true,
+        ..command
+    };
+    let json = serde_json::to_value(&wanted).unwrap();
+    assert_eq!(json["reader_needed"], true);
+    assert!(
+        serde_json::from_value::<DesiredCommand>(json)
+            .unwrap()
+            .reader_needed
+    );
+}
+
+#[test]
+fn the_reader_starting_reason_round_trips_and_an_unknown_one_stays_unrecognized() {
+    let reason: ConversationUnavailableReason =
+        serde_json::from_value(serde_json::json!("reader_starting")).unwrap();
+    assert_eq!(reason, ConversationUnavailableReason::ReaderStarting);
+    let reason: ConversationUnavailableReason =
+        serde_json::from_value(serde_json::json!("reader_on_fire")).unwrap();
+    assert_eq!(reason, ConversationUnavailableReason::Unrecognized);
 }
 
 #[test]

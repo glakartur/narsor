@@ -4568,3 +4568,216 @@ fn a_resumed_task_waiting_for_a_slot_keeps_commands_for_its_start() {
     let started = report_now(&fx, "task-1", &lease, Observation::StartAccepted).unwrap();
     assert_eq!(started.generation, record.generation);
 }
+
+// ---------------------------------------------------------------------------
+// The reader lease (D63, U9)
+// ---------------------------------------------------------------------------
+
+const READER_IDLE: i64 = 120;
+
+fn lease_reader(
+    fx: &Fixture,
+    id: &str,
+) -> Option<(narsor_engine::orchestration::ReaderLease, bool)> {
+    fx.control
+        .lease_reader(&task(id), Duration::seconds(READER_IDLE))
+        .expect("lease a reader")
+}
+
+#[test]
+fn a_read_of_a_stopped_task_leases_a_reader_and_leaves_one_event() {
+    let fx = stopped_fixture();
+    let (lease, written) = lease_reader(&fx, "task-1").expect("a stopped task is read by a reader");
+    assert!(written);
+    assert_eq!(lease.since, fx.clock.now());
+    assert_eq!(lease.until, fx.clock.now() + Duration::seconds(READER_IDLE));
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(record.reader_lease, Some(lease));
+    assert!(record.reader_lease_active(fx.clock.now()));
+    assert!(!record.holds_capacity(), "a reader is no slot");
+    let leased = fx
+        .control
+        .events_since(&task("task-1"), 0)
+        .unwrap()
+        .into_iter()
+        .filter(|event| matches!(event.kind, TaskEventKind::ReaderLeased { .. }))
+        .count();
+    assert_eq!(leased, 1);
+}
+
+#[test]
+fn only_a_stopped_or_interrupted_task_has_a_reader_lease() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.create("queued");
+    fx.running("running", &lease);
+    fx.running("unknown", &lease);
+    lose(&fx, "unknown", &lease, false, "the node went away");
+    fx.running("interrupted", &lease);
+    lose(&fx, "interrupted", &lease, true, "exited");
+    fx.running("archived", &lease);
+    fx.command("archived", OwnerCommand::Archive, "archive-1");
+
+    for id in ["queued", "running", "unknown", "archived"] {
+        assert!(lease_reader(&fx, id).is_none(), "{id}");
+        assert!(fx.control.task(&task(id)).unwrap().reader_lease.is_none());
+    }
+    assert!(lease_reader(&fx, "interrupted").is_some());
+}
+
+#[test]
+fn reads_extend_the_lease_by_more_than_the_threshold_only() {
+    let fx = stopped_fixture();
+    let (first, _) = lease_reader(&fx, "task-1").unwrap();
+    let revision = fx.control.task(&task("task-1")).unwrap().revision;
+
+    for _ in 0..20 {
+        fx.clock.advance(Duration::seconds(1));
+        let (lease, written) = lease_reader(&fx, "task-1").unwrap();
+        assert!(!written);
+        assert_eq!(lease, first, "unchanged within the threshold");
+    }
+    assert_eq!(fx.control.task(&task("task-1")).unwrap().revision, revision);
+
+    fx.clock.advance(Duration::seconds(20));
+    let (moved, written) = lease_reader(&fx, "task-1").unwrap();
+    assert!(written);
+    assert_eq!(moved.since, first.since, "the same reading");
+    assert!(moved.until > first.until);
+}
+
+#[test]
+fn a_lease_that_ran_out_is_ended_once_and_a_new_read_begins_a_new_one() {
+    let fx = stopped_fixture();
+    let (first, _) = lease_reader(&fx, "task-1").unwrap();
+
+    assert!(
+        !fx.control.end_reader_lease(&task("task-1")).unwrap(),
+        "still held"
+    );
+    fx.clock.advance(Duration::seconds(READER_IDLE + 1));
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert!(!record.reader_lease_active(fx.clock.now()));
+    assert!(record.reader_lease_stale(fx.clock.now()));
+    assert!(fx.control.end_reader_lease(&task("task-1")).unwrap());
+    assert!(
+        !fx.control.end_reader_lease(&task("task-1")).unwrap(),
+        "once"
+    );
+    assert!(fx
+        .control
+        .task(&task("task-1"))
+        .unwrap()
+        .reader_lease
+        .is_none());
+
+    let (second, written) = lease_reader(&fx, "task-1").unwrap();
+    assert!(written);
+    assert!(
+        second.since > first.since,
+        "a reader of the earlier lease is not this one's"
+    );
+}
+
+#[test]
+fn a_lease_that_ran_out_and_is_read_again_before_the_pass_begins_a_new_reading() {
+    let fx = stopped_fixture();
+    let (first, _) = lease_reader(&fx, "task-1").unwrap();
+    fx.clock.advance(Duration::seconds(READER_IDLE + 5));
+    let (second, written) = lease_reader(&fx, "task-1").unwrap();
+    assert!(written);
+    assert!(second.since > first.since);
+}
+
+/// AE5, the control plane's part: the slot count does not change while a
+/// reader runs, so the queue goes on.
+#[test]
+fn a_reader_holds_no_slot_so_the_queue_goes_on() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    fx.running("task-a", &lease);
+    fx.command("task-a", OwnerCommand::Pause, "pause-a");
+    fx.observe("task-a", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    fx.create("task-b");
+    lease_reader(&fx, "task-a").expect("leased");
+
+    let changed = fx.control.schedule(&k8s(), &limit(1)).expect("admission");
+    assert_eq!(
+        changed,
+        vec![task("task-b")],
+        "B is admitted beside the reader"
+    );
+    let a = fx.control.task(&task("task-a")).unwrap();
+    assert!(!a.holds_capacity());
+    assert!(a.reader_lease_active(fx.clock.now()));
+}
+
+/// R15: the command that resumes the task takes the lease away in its own
+/// mutation — one revision, one event — and so does an archive.
+#[test]
+fn a_resume_or_an_archive_ends_the_lease_in_the_same_mutation() {
+    for command in [OwnerCommand::Resume, OwnerCommand::Archive] {
+        let fx = stopped_fixture();
+        lease_reader(&fx, "task-1").unwrap();
+        let before = fx.control.task(&task("task-1")).unwrap();
+
+        let after = fx.command("task-1", command, "k-1");
+
+        assert_eq!(after.reader_lease, None, "{command:?}");
+        assert_eq!(after.revision, before.revision + 1, "{command:?}");
+        assert!(!fx
+            .control
+            .events_since(&task("task-1"), 0)
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.kind, TaskEventKind::ReaderLeaseEnded)));
+    }
+}
+
+#[test]
+fn work_that_resumes_a_stopped_task_through_the_queue_ends_the_lease_too() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    stopped_waiting_on_input(&fx, &lease);
+    run_in_single_slot(&fx, "other", &lease);
+    lease_reader(&fx, "task-1").unwrap();
+
+    let queued = fx
+        .control
+        .command_with_capacity(
+            &task("task-1"),
+            CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+            &limit(1),
+        )
+        .unwrap()
+        .task;
+
+    assert_eq!(queued.runner_state, RunnerState::Queued);
+    assert_eq!(queued.reader_lease, None);
+}
+
+#[test]
+fn a_record_from_before_the_reader_lease_loads_without_one() {
+    let fx = stopped_fixture();
+    let path = fx.root.paths().orchestration_task_file("task-1");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    json.as_object_mut().unwrap().remove("reader_lease");
+    fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+    let record = fx.reopen().task(&task("task-1")).unwrap();
+    assert_eq!(record.reader_lease, None);
+}
+
+#[test]
+fn the_reader_events_decode_in_an_older_reader_as_unrecognized() {
+    let leased: TaskEventKind = serde_json::from_value(serde_json::json!({
+        "type": "reader_leased", "until": "2026-10-03T12:02:00Z"
+    }))
+    .expect("leased");
+    assert!(matches!(leased, TaskEventKind::ReaderLeased { .. }));
+    let ended: TaskEventKind =
+        serde_json::from_value(serde_json::json!({ "type": "reader_lease_ended" })).expect("ended");
+    assert_eq!(ended, TaskEventKind::ReaderLeaseEnded);
+}

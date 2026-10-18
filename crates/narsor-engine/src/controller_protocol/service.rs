@@ -19,12 +19,13 @@ mod conductor;
 mod conversation;
 mod events;
 mod materials;
+mod reader;
 mod relay;
 mod slot_release;
 
 use super::credentials::{
     ControllerAuthenticator, ControllerIdentity, ControllerRecord, CredentialStore,
-    RunnerAuthenticator, RunnerIdentity,
+    RunnerAuthenticator, RunnerIdentity, RunnerRole,
 };
 use super::error::{ProtocolError, ProtocolResult};
 use super::wire::*;
@@ -44,10 +45,10 @@ use crate::orchestration::{
     RETIRED_CONDUCTOR_HARNESS,
 };
 use crate::workflow::TemplateScope;
-use events::LocalTaskStorage;
 use relay::Relay;
 
 pub use auto_resume::AutoResumePass;
+pub use reader::ReaderLeasePass;
 pub use slot_release::SlotReleasePass;
 
 fn engine_delivery(delivery: narsor_protocol::api::HumanInputDeliveryDto) -> HumanInputDelivery {
@@ -195,6 +196,17 @@ type EventsRelay = Relay<ExecutionEventsRequest, ExecutionEventsPage>;
 /// Conductor-state requests owners are waiting on (U5), relayed the same way.
 type ConductorRelay = Relay<ConductorReadRequest, crate::conductor::ConductorView>;
 
+/// Why a read of a task's content cannot go to its live runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadBlocker {
+    /// Nobody can serve the read now; the reason says why.
+    Unavailable(ConversationUnavailableReason),
+    /// The task has no runner of its own and is one a read-only runner may
+    /// read (`Stopped`, `Interrupted`, D63). The reason is what to say if the
+    /// task stops being one meanwhile.
+    Reader(ConversationUnavailableReason),
+}
+
 /// Timing policy of the protocol.
 #[derive(Debug, Clone)]
 pub struct ProtocolConfig {
@@ -225,6 +237,10 @@ pub struct ProtocolConfig {
     /// or waits for its owner (D62). On everywhere but in tests that hold a
     /// finished task's runner alive on purpose to look at it.
     pub slot_release: bool,
+    /// How long a read of a stopped task waits for its read-only runner to
+    /// connect before it answers "starting" and leaves the retry to the
+    /// client (D63).
+    pub reader_connect_wait: std::time::Duration,
 }
 
 impl Default for ProtocolConfig {
@@ -241,6 +257,7 @@ impl Default for ProtocolConfig {
             conversation_page_timeout: std::time::Duration::from_secs(20),
             resume: ResumePolicy::default(),
             slot_release: true,
+            reader_connect_wait: std::time::Duration::from_secs(2),
         }
     }
 }
@@ -257,9 +274,6 @@ pub struct ProtocolService {
     pages: Mutex<PageRelay>,
     event_reads: Mutex<EventsRelay>,
     conductor_reads: Mutex<ConductorRelay>,
-    local_storage: Option<LocalTaskStorage>,
-    /// Closed attempts' summaries of the local tasks read from storage.
-    stored_conversations: Mutex<conversation::StoredSummaries>,
     materials: MaterialStore,
 }
 
@@ -308,18 +322,7 @@ impl ProtocolService {
             pages: Mutex::new(PageRelay::default()),
             event_reads: Mutex::new(EventsRelay::default()),
             conductor_reads: Mutex::new(ConductorRelay::default()),
-            local_storage: None,
-            stored_conversations: Mutex::default(),
         }
-    }
-
-    /// Tells the service where a backend's task storages live on this host,
-    /// so a task of that backend whose runner is not running can still be
-    /// read from its own storage (U4). Only the daemon that owns the local
-    /// backend knows; a service without it answers such reads "unavailable".
-    pub fn with_local_storage(mut self, backend_id: BackendId, root: std::path::PathBuf) -> Self {
-        self.local_storage = Some(LocalTaskStorage { backend_id, root });
-        self
     }
 
     /// Replaces how controller requests are verified (the default checks
@@ -859,36 +862,40 @@ impl ProtocolService {
         })
     }
 
-    /// Why the task's runner cannot be asked for content right now (a
+    /// Why the task's own runner cannot be asked for content right now (a
     /// conversation page, execution events), or `None` when it is live.
-    /// Archived, paused, interrupted, not yet started, unreachable, or
-    /// saying so itself — never by recreating compute (KTD4).
+    ///
+    /// A stopped or interrupted task has none, and its content is read by a
+    /// read-only runner ([`ReadBlocker::Reader`], D63) — never by the control
+    /// plane reading storage, and never by starting the task's own runner.
+    /// `Unknown` is not read that way: its previous runner may still be
+    /// alive and hold the storage.
     fn live_read_blocker(
         &self,
         record: &TaskRecord,
         now: DateTime<Utc>,
-    ) -> ProtocolResult<Option<ConversationUnavailableReason>> {
+    ) -> ProtocolResult<Option<ReadBlocker>> {
+        use ConversationUnavailableReason as Reason;
         let runner = record.runner.as_ref();
         Ok(match record.runner_state {
             RunnerState::Archiving | RunnerState::Archived => {
-                Some(ConversationUnavailableReason::Archived)
+                Some(ReadBlocker::Unavailable(Reason::Archived))
             }
-            RunnerState::Stopped => Some(ConversationUnavailableReason::Paused),
-            RunnerState::Interrupted | RunnerState::Unknown => {
-                Some(ConversationUnavailableReason::Interrupted)
-            }
+            RunnerState::Stopped => Some(ReadBlocker::Reader(Reason::Paused)),
+            RunnerState::Interrupted => Some(ReadBlocker::Reader(Reason::Interrupted)),
+            RunnerState::Unknown => Some(ReadBlocker::Unavailable(Reason::Interrupted)),
             RunnerState::Queued
             | RunnerState::Provisioning
             | RunnerState::Running
             | RunnerState::PauseRequested => match runner {
-                None => Some(ConversationUnavailableReason::NotStarted),
+                None => Some(ReadBlocker::Unavailable(Reason::NotStarted)),
                 Some(runner) if self.runner_freshness(record, runner, now)? == Freshness::Stale => {
-                    Some(ConversationUnavailableReason::RunnerUnreachable)
+                    Some(ReadBlocker::Unavailable(Reason::RunnerUnreachable))
                 }
                 Some(runner) => match &runner.snapshot.conversation {
                     ConversationAvailability::Live { .. } => None,
                     ConversationAvailability::Unavailable { .. } => {
-                        Some(ConversationUnavailableReason::RunnerReported)
+                        Some(ReadBlocker::Unavailable(Reason::RunnerReported))
                     }
                 },
             },
@@ -1366,6 +1373,7 @@ impl ProtocolService {
         // Decide admission before answering: the controller asking is the
         // proof its backend is online, and its limit is read fresh.
         self.reschedule(&identity.backend_id);
+        let now = self.control.now();
         let acknowledged = self
             .credentials
             .controller(&identity.controller_id)?
@@ -1387,7 +1395,7 @@ impl ProtocolService {
             .filter(|record| {
                 record.runner_state != RunnerState::Queued || record.reservation.is_some()
             })
-            .map(desired_command)
+            .map(|record| desired_command(record, now))
             .collect::<ProtocolResult<Vec<_>>>()?
             .into_iter()
             .flatten()
@@ -1406,16 +1414,39 @@ impl ProtocolService {
         query: CommandsQuery,
     ) -> ProtocolResult<CommandsResponse> {
         let wait = self.long_poll(query.wait_secs);
+        // A reader the control plane starts or stops asking for changes no
+        // generation, so no acknowledged-generation filter would ever show
+        // it: the controller is woken by the set of wanted readers changing.
+        let readers_at_start = self.readers_wanted(&identity.backend_id)?;
         let found = self
             .wait_for(wait, None, || {
                 let response = self.commands(identity, query.all)?;
-                Ok((!response.commands.is_empty()).then_some(response))
+                let readers_changed =
+                    self.readers_wanted(&identity.backend_id)? != readers_at_start;
+                Ok((!response.commands.is_empty() || readers_changed).then_some(response))
             })
             .await?;
         match found {
             Some(response) => Ok(response),
             None => self.commands(identity, query.all),
         }
+    }
+
+    /// The tasks of `backend_id` a read-only runner is wanted for now.
+    fn readers_wanted(
+        &self,
+        backend_id: &BackendId,
+    ) -> ProtocolResult<std::collections::BTreeSet<TaskId>> {
+        let now = self.control.now();
+        Ok(self
+            .control
+            .list_tasks()?
+            .into_iter()
+            .filter(|record| {
+                record.assignment.backend_id == *backend_id && record.reader_lease_active(now)
+            })
+            .map(|record| record.task_id)
+            .collect())
     }
 
     /// Records acknowledgements; duplicates and reorderings are harmless.
@@ -1543,14 +1574,9 @@ impl ProtocolService {
                 ),
             ));
         }
-        let incarnation = request.incarnation.trim();
-        if incarnation.is_empty() || incarnation.len() > MAX_INCARNATION_LEN {
-            return Err(ProtocolError::bad_request(
-                "invalid_incarnation",
-                "an incarnation is a non-empty identifier of at most 256 characters",
-            ));
-        }
+        let incarnation = self.checked_incarnation(&request.incarnation)?;
         let (session, credential) = self.credentials.issue_runner_session(
+            RunnerRole::Worker,
             &record.task_id,
             incarnation,
             record.generation,
@@ -1566,9 +1592,31 @@ impl ProtocolService {
         })
     }
 
+    /// The incarnation a controller names for a credential, trimmed, or a
+    /// `400` when it is not one.
+    fn checked_incarnation<'a>(&self, incarnation: &'a str) -> ProtocolResult<&'a str> {
+        let incarnation = incarnation.trim();
+        if incarnation.is_empty() || incarnation.len() > MAX_INCARNATION_LEN {
+            return Err(ProtocolError::bad_request(
+                "invalid_incarnation",
+                "an incarnation is a non-empty identifier of at most 256 characters",
+            ));
+        }
+        Ok(incarnation)
+    }
+
     // -----------------------------------------------------------------
     // Runner side
     // -----------------------------------------------------------------
+
+    /// Refuses a call that writes the task's work state when the caller is
+    /// a read-only runner (D63): its credential reads and nothing else.
+    fn require_worker(identity: &RunnerIdentity) -> ProtocolResult<()> {
+        match identity.role {
+            RunnerRole::Worker => Ok(()),
+            RunnerRole::Reader => Err(ProtocolError::Forbidden),
+        }
+    }
 
     /// Accepts a runner snapshot.
     pub fn runner_snapshot(
@@ -1576,6 +1624,7 @@ impl ProtocolService {
         identity: &RunnerIdentity,
         snapshot: RunnerSnapshotRequest,
     ) -> ProtocolResult<RunnerSnapshotResponse> {
+        Self::require_worker(identity)?;
         let snapshot = super::wire::runner_snapshot_from_request(snapshot).map_err(|error| {
             ProtocolError::bad_request("invalid_runner_snapshot", error.to_string())
         })?;
@@ -1624,7 +1673,8 @@ impl ProtocolService {
             .ok_or(ProtocolError::Unauthorized)?;
         let pending = query.pending_input_id.as_deref();
         let defer_materials = query.defer_materials;
-        let read_only = query.read_only;
+        // A reader's credential reads whatever its query says.
+        let read_only = query.read_only || identity.role == RunnerRole::Reader;
         let poll = || -> ProtocolResult<RunnerPollResponse> {
             // A read-only runner is handed nothing it would have to act on:
             // delivering an answer or a command to it would spend them.
@@ -1651,8 +1701,9 @@ impl ProtocolService {
                 self.notify(&identity.task_id);
             }
             let record = self.control.task(&identity.task_id)?;
+            let now = self.control.now();
             Ok(RunnerPollResponse {
-                directive: directive(record.runner_state),
+                directive: directive_for(identity, &record, now),
                 generation: record.generation,
                 runner_state: record.runner_state,
                 inputs: inputs
@@ -1803,6 +1854,7 @@ impl ProtocolService {
         input_id: &str,
         request: InputAckRequest,
     ) -> ProtocolResult<InputAckResponse> {
+        Self::require_worker(identity)?;
         let (input, changed) = self.control.settle_input(
             &identity.task_id,
             &identity.incarnation,
@@ -1826,6 +1878,7 @@ impl ProtocolService {
         command_id: &str,
         request: OperatorCommandAckRequest,
     ) -> ProtocolResult<OperatorCommandAckResponse> {
+        Self::require_worker(identity)?;
         let (command, changed) = self.control.settle_operator_command(
             &identity.task_id,
             &identity.incarnation,
@@ -2304,7 +2357,13 @@ fn task_display(record: &TaskRecord) -> TaskDisplay {
     TemplateScope::from_parts(&inputs, &no_variables).render_display(&spec)
 }
 
-fn desired_command(record: &TaskRecord) -> ProtocolResult<Option<DesiredCommand>> {
+/// The desired state of one task as of `now`. `reader_needed` is the reader
+/// lease as it stands now, so a lease that ran out stops being asked for
+/// without waiting for the periodic pass to remove it.
+fn desired_command(
+    record: &TaskRecord,
+    now: DateTime<Utc>,
+) -> ProtocolResult<Option<DesiredCommand>> {
     let action = match record.runner_state {
         RunnerState::Queued => DesiredAction::Start,
         RunnerState::Provisioning => DesiredAction::Provision,
@@ -2332,6 +2391,7 @@ fn desired_command(record: &TaskRecord) -> ProtocolResult<Option<DesiredCommand>
             safe_point_acknowledged: runner.safe_point_generation == Some(record.generation),
             received_at: runner.received_at,
         }),
+        reader_needed: record.reader_lease_active(now),
     }))
 }
 
@@ -2348,12 +2408,34 @@ fn is_attempt_id(value: &str) -> bool {
 
 /// The calling runner's launch, as the record knows it.
 fn launch_view(identity: &RunnerIdentity, record: &TaskRecord) -> RunnerLaunchView {
-    let receipt = record.launch_receipt(identity.launch_generation);
+    // A reader is no launch: nothing authorized it to run work.
+    let receipt = match identity.role {
+        RunnerRole::Worker => record.launch_receipt(identity.launch_generation),
+        RunnerRole::Reader => None,
+    };
     RunnerLaunchView {
         incarnation: identity.incarnation.clone(),
         launch_generation: identity.launch_generation,
         authorized_by: receipt.map(|receipt| receipt.command),
         authorized_by_actor: receipt.map(|receipt| receipt.actor),
+    }
+}
+
+/// What the runner of `identity` should do now.
+///
+/// A working runner follows the task's state. A reader follows its lease
+/// alone: it goes on while an owner is reading (`Continue`) and stops when
+/// the lease ran out or the task is no longer one it reads — which
+/// `directive(Stopped)` would say at once, to a runner that has just started.
+fn directive_for(
+    identity: &RunnerIdentity,
+    record: &TaskRecord,
+    now: DateTime<Utc>,
+) -> RunnerDirective {
+    match identity.role {
+        RunnerRole::Worker => directive(record.runner_state),
+        RunnerRole::Reader if record.reader_lease_active(now) => RunnerDirective::Continue,
+        RunnerRole::Reader => RunnerDirective::Stop,
     }
 }
 

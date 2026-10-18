@@ -1,40 +1,28 @@
 //! The task's conversation for owners: its per-attempt summary and one
-//! attempt's pages — from the live runner (KTD4), or, for the daemon's own
-//! local backend when its runner is not running, straight from the task's
-//! storage, marked as such and with the time the record was last written.
+//! attempt's pages — from the runner, which is the task's own while it runs
+//! and a read-only runner while the task is stopped (D63). The control plane
+//! never reads task storage itself.
 //!
-//! The same shape as the execution events (see [`super::events`]). A local
-//! task without a live runner is never "unavailable right now": it has a
-//! record (possibly without attempts), or its storage could not be read and
-//! the answer says why. Only remote and archived tasks keep the old answer.
-
-use std::collections::HashMap;
+//! A stopped task's summary is the last one its runner reported (and says
+//! why it is not live); the pages of its attempts come from the reader.
 
 use chrono::{DateTime, Utc};
 
-use super::events::{is_safe_component, LocalTaskStorage};
+use super::reader::ReaderReady;
 use super::relay::RelayGuard;
-use super::{is_attempt_id, ProtocolService, DEFAULT_PAGE_BUDGET, MAX_PAGE_BUDGET};
+use super::{is_attempt_id, ProtocolService, ReadBlocker, DEFAULT_PAGE_BUDGET, MAX_PAGE_BUDGET};
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::wire::*;
 use crate::domain::TaskId;
-use crate::engine::conversation_summary::{read_summaries, AttemptSummaries, ConversationCache};
-use crate::orchestration::{
-    ConversationAttemptSummary, ConversationAvailability, OwnerRef, TaskRecord,
-};
-
-/// The closed attempts' summaries per local task execution read from
-/// storage — the daemon's own cache, apart from every runner's.
-pub(super) type StoredSummaries = HashMap<(TaskId, String), ConversationCache>;
+use crate::orchestration::{ConversationAttemptSummary, ConversationAvailability, OwnerRef};
 
 impl ProtocolService {
     /// The task's conversation summary, or why it is unavailable.
     ///
-    /// A live runner's last report is the summary. Without one, the daemon's
-    /// local backend reads the task's own storage (`source: storage`, with
-    /// the record's age); any other backend, and an archived task, answers
-    /// with the last safe summary and an explicit reason — never by
-    /// recreating compute (KTD4).
+    /// A live runner's last report is the summary. Without one — the task
+    /// is stopped, interrupted, archived — the answer says why, with the
+    /// last safe summary the runner reported (R12). It does not start a
+    /// read-only runner: its pages, which a client reads next, do.
     pub async fn conversation(
         &self,
         owner: &OwnerRef,
@@ -44,11 +32,12 @@ impl ProtocolService {
         self.note_details_read(&record);
         let now = self.control.now();
         let runner = record.runner.as_ref();
-        let last_attempts = match runner.map(|runner| &runner.snapshot.conversation) {
-            Some(ConversationAvailability::Live { attempts }) => attempts.clone(),
-            _ => Vec::new(),
-        };
-        let observed_at = runner.map(|runner| runner.snapshot.observed_at);
+        let last_attempts: Vec<ConversationAttemptSummary> =
+            match runner.map(|runner| &runner.snapshot.conversation) {
+                Some(ConversationAvailability::Live { attempts }) => attempts.clone(),
+                _ => Vec::new(),
+            };
+        let observed_at: Option<DateTime<Utc>> = runner.map(|runner| runner.snapshot.observed_at);
         let reason = match self.live_read_blocker(&record, now)? {
             None => {
                 if let Some(observed_at) = observed_at {
@@ -61,18 +50,7 @@ impl ProtocolService {
                 }
                 ConversationUnavailableReason::NotStarted
             }
-            Some(ConversationUnavailableReason::Archived) => {
-                self.forget_stored_conversations(&record.task_id);
-                ConversationUnavailableReason::Archived
-            }
-            Some(reason) => match self.local_storage_of(&record) {
-                Some(local) => {
-                    return self
-                        .stored_conversation(&record, local, now, last_attempts, observed_at)
-                        .await;
-                }
-                None => reason,
-            },
+            Some(ReadBlocker::Unavailable(reason) | ReadBlocker::Reader(reason)) => reason,
         };
         Ok(ConversationResponse::Unavailable {
             reason,
@@ -82,68 +60,17 @@ impl ProtocolService {
         })
     }
 
-    /// The summary from the task's storage: every attempt with a record,
-    /// none when the runner has not named an execution yet or the storage
-    /// holds none, or why the storage could not be read.
-    async fn stored_conversation(
-        &self,
-        record: &TaskRecord,
-        local: &LocalTaskStorage,
-        now: DateTime<Utc>,
-        last_attempts: Vec<ConversationAttemptSummary>,
-        observed_at: Option<DateTime<Utc>>,
-    ) -> ProtocolResult<ConversationResponse> {
-        let unreadable = |message: String| ConversationResponse::Unavailable {
-            reason: ConversationUnavailableReason::StorageUnreadable,
-            last_attempts: last_attempts.clone(),
-            observed_at,
-            message: Some(message),
-        };
-        let Some(execution_id) = execution_id(record) else {
-            return Ok(stored_summary(now, AttemptSummaries::default()));
-        };
-        // The id comes from a runner's report: it must never walk the path.
-        if !is_safe_component(&execution_id) {
-            return Ok(unreadable(
-                "the execution id the runner reported is not valid".to_string(),
-            ));
-        }
-        let key = (record.task_id.clone(), execution_id.clone());
-        let mut cache = self
-            .lock_stored_conversations()
-            .remove(&key)
-            .unwrap_or_default();
-        let store = local.store_of(&record.task_id);
-        let (read, cache) = tokio::task::spawn_blocking(move || {
-            let read = if store.exists(&execution_id) {
-                read_summaries(&store, &execution_id, &mut cache)
-            } else {
-                Ok(AttemptSummaries::default())
-            };
-            (read, cache)
-        })
-        .await
-        .map_err(|error| ProtocolError::Internal(error.to_string()))?;
-        self.lock_stored_conversations().insert(key, cache);
-        Ok(match read {
-            Ok(summaries) => stored_summary(now, summaries),
-            Err(error) => unreadable(format!(
-                "the conversation record could not be read: {error}"
-            )),
-        })
-    }
-
     /// One bounded page of an attempt's raw conversation.
     ///
-    /// From the live runner (KTD4): the request waits in memory until the
+    /// From the runner (KTD4): the request waits in memory until the
     /// runner's next poll picks it up and uploads the page, which is handed
     /// to this caller and kept nowhere — and gives up after
-    /// [`super::ProtocolConfig::conversation_page_timeout`]. Without a live
-    /// runner, the daemon's local backend reads the task's storage (the
-    /// page says so, with the record's age); entry numbers are the same
-    /// either way, so a reader continues from `next_entry` across the
-    /// switch. Refused at once for any other backend and for an archived
-    /// task.
+    /// [`super::ProtocolConfig::conversation_page_timeout`]. A stopped task
+    /// is served by a read-only runner the control plane has the controller
+    /// start (D63); until it is connected the request is refused with
+    /// [`CONVERSATION_READER_STARTING`] and the client asks again. Entry
+    /// numbers are the same whichever runner answers, so a reader continues
+    /// from `next_entry`. Refused at once for any state nobody can serve.
     pub async fn conversation_page(
         &self,
         owner: &OwnerRef,
@@ -158,12 +85,16 @@ impl ProtocolService {
         }
         let blocker = match self.live_read_blocker(&record, self.control.now())? {
             None => return self.relayed_page(&record.task_id, attempt_id, query).await,
-            Some(ConversationUnavailableReason::Archived) => {
-                ConversationUnavailableReason::Archived
-            }
-            Some(reason) => match self.local_storage_of(&record) {
-                Some(local) => return self.stored_page(&record, local, attempt_id, query).await,
-                None => reason,
+            Some(ReadBlocker::Unavailable(reason)) => reason,
+            Some(ReadBlocker::Reader(reason)) => match self.reader_ready(&record).await? {
+                ReaderReady::Ready => {
+                    return self.relayed_page(&record.task_id, attempt_id, query).await
+                }
+                ReaderReady::Starting => return Err(ProtocolError::conflict(
+                    CONVERSATION_READER_STARTING,
+                    "the task is stopped and its read-only runner is starting; ask again shortly",
+                )),
+                ReaderReady::NotReadable => reason,
             },
         };
         Err(ProtocolError::conflict(
@@ -205,91 +136,6 @@ impl ProtocolService {
                 "the runner did not upload the conversation page in time",
             )),
         }
-    }
-
-    /// Reads the page from the task's storage, exactly as the runner would.
-    async fn stored_page(
-        &self,
-        record: &TaskRecord,
-        local: &LocalTaskStorage,
-        attempt_id: &str,
-        query: ConversationPageQuery,
-    ) -> ProtocolResult<ConversationPage> {
-        // Both ids name files: neither may walk the path.
-        if !is_safe_component(attempt_id) {
-            return Err(invalid_attempt());
-        }
-        let Some(execution_id) = execution_id(record) else {
-            return Ok(ConversationPage::NoRecord);
-        };
-        if !is_safe_component(&execution_id) {
-            return Err(ProtocolError::conflict(
-                CONVERSATION_RECORD_UNREADABLE,
-                "the execution id the runner reported is not valid",
-            ));
-        }
-        let store = local.store_of(&record.task_id);
-        let attempt_id = attempt_id.to_string();
-        let budget = usize::try_from(page_budget(&query)).unwrap_or(usize::MAX);
-        let read = tokio::task::spawn_blocking(move || {
-            if !store.exists(&execution_id) {
-                return Ok(None);
-            }
-            store
-                .conversation_store(&execution_id)
-                .read(&attempt_id, query.from, budget)
-        })
-        .await
-        .map_err(|error| ProtocolError::Internal(error.to_string()))?
-        .map_err(|error| {
-            ProtocolError::conflict(
-                CONVERSATION_RECORD_UNREADABLE,
-                format!("{CONVERSATION_RECORD_UNREADABLE_PREFIX}{error}"),
-            )
-        })?;
-        let recorded_at = read.as_ref().and_then(|snapshot| snapshot.recorded_at);
-        Ok(with_source(
-            crate::api::conversation_response_from_snapshot(read),
-            ExecutionEventsSource::Storage,
-            recorded_at,
-        ))
-    }
-
-    /// The storage this host holds for the task, when its backend is the
-    /// daemon's own.
-    fn local_storage_of(&self, record: &TaskRecord) -> Option<&LocalTaskStorage> {
-        self.local_storage
-            .as_ref()
-            .filter(|local| local.backend_id == record.assignment.backend_id)
-    }
-
-    /// Drops what was cached of an archived task: its storage is gone.
-    fn forget_stored_conversations(&self, task_id: &TaskId) {
-        self.lock_stored_conversations()
-            .retain(|(task, _), _| task != task_id);
-    }
-
-    fn lock_stored_conversations(&self) -> std::sync::MutexGuard<'_, StoredSummaries> {
-        self.stored_conversations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-/// The execution the runner last named.
-fn execution_id(record: &TaskRecord) -> Option<String> {
-    record
-        .runner
-        .as_ref()
-        .and_then(|runner| runner.snapshot.execution_cursor.execution_id.clone())
-}
-
-fn stored_summary(now: DateTime<Utc>, summaries: AttemptSummaries) -> ConversationResponse {
-    ConversationResponse::Available {
-        attempts: summaries.attempts,
-        observed_at: now,
-        source: ExecutionEventsSource::Storage,
-        recorded_at: summaries.recorded_at,
     }
 }
 

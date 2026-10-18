@@ -3808,7 +3808,7 @@ mod task_app_detail {
                     "task-1",
                     running.epoch,
                     1,
-                    Observation::WorkloadLost { state_known: true },
+                    Observation::WorkloadLost { state_known: false },
                     Some(1),
                 ))
                 .await
@@ -3816,7 +3816,7 @@ mod task_app_detail {
             let mut app = app_over(&harness).await;
             assert_eq!(
                 app.list().selected().unwrap().runner_state,
-                RunnerState::Interrupted
+                RunnerState::Unknown
             );
             press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.detail().tab(), DetailTab::Events);
@@ -3898,7 +3898,7 @@ mod task_app_detail {
                     "task-1",
                     running.epoch,
                     1,
-                    Observation::WorkloadLost { state_known: true },
+                    Observation::WorkloadLost { state_known: false },
                     Some(1),
                 ))
                 .await

@@ -21,7 +21,7 @@ use super::lifecycle::{command_effect, observation_effect, CommandEffect, Observ
 use super::model::{
     slot_release_extension_threshold, ArchiveTombstone, BackendLease, CommandActor, CommandOutcome,
     CommandReceipt, CommandRequest, ControllerReport, LeaseToken, MaterialChange, NewTask,
-    Observation, ObservedState, OwnerCommand, ReportOutcome, ResumeState, RunnerState,
+    Observation, ObservedState, OwnerCommand, ReaderLease, ReportOutcome, ResumeState, RunnerState,
     SlotReleaseClass, SlotReleaseReason, TaskAssignment, TaskEvent, TaskEventKind, TaskRecord,
     WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
 };
@@ -195,6 +195,7 @@ impl ControlPlane {
             workload_epoch: None,
             resume: ResumeState::default(),
             slot_release_due_at: None,
+            reader_lease: None,
             last_event: TaskEvent {
                 sequence: 1,
                 task_id: request.task_id.clone(),
@@ -351,6 +352,10 @@ impl ControlPlane {
                     // A new desired state ends whatever the last snapshot
                     // made the policy wait for.
                     record.slot_release_due_at = None;
+                    // Nothing else may read the storage the task's own
+                    // runner is about to take (R15): the reader's lease
+                    // ends in the very mutation that resumes or archives.
+                    record.reader_lease = None;
                     if matches!(previous, RunnerState::Interrupted | RunnerState::Unknown) {
                         leave_loss(record, request.actor);
                     }
@@ -469,6 +474,57 @@ impl ControlPlane {
             ))
         })?;
         Ok(moved)
+    }
+
+    /// A read of the stopped task's details wants a read-only runner (D63):
+    /// leases it until `idle` from now, or moves a lease already there later,
+    /// unless that would move it by no more than
+    /// [`slot_release_extension_threshold`] (a client that refreshes often
+    /// does not write the record each time). Returns the lease in force
+    /// afterwards, and whether this call wrote it; `None` for a task that
+    /// may not be read this way (running, queued, `Unknown`, archival).
+    pub fn lease_reader(
+        &self,
+        task_id: &TaskId,
+        idle: Duration,
+    ) -> Result<Option<(ReaderLease, bool)>> {
+        let (_, leased) = self.mutate(task_id, |record, now| {
+            if !record.reader_may_read() {
+                return Ok(Mutation::Unchanged(None));
+            }
+            let until = now + idle;
+            let current = record
+                .reader_lease
+                .filter(|_| record.reader_lease_active(now));
+            if let Some(current) = current {
+                if until - current.until <= slot_release_extension_threshold() {
+                    return Ok(Mutation::Unchanged(Some((current, false))));
+                }
+            }
+            let lease = ReaderLease {
+                since: current.map_or(now, |current| current.since),
+                until,
+            };
+            record.reader_lease = Some(lease);
+            Ok(Mutation::Changed(
+                TaskEventKind::ReaderLeased { until },
+                Some((lease, true)),
+            ))
+        })?;
+        Ok(leased)
+    }
+
+    /// Removes the reader lease of a task that has a stale one (see
+    /// [`TaskRecord::reader_lease_stale`]). Returns whether it did.
+    pub fn end_reader_lease(&self, task_id: &TaskId) -> Result<bool> {
+        let (_, ended) = self.mutate(task_id, |record, now| {
+            if !record.reader_lease_stale(now) {
+                return Ok(Mutation::Unchanged(false));
+            }
+            record.reader_lease = None;
+            Ok(Mutation::Changed(TaskEventKind::ReaderLeaseEnded, true))
+        })?;
+        Ok(ended)
     }
 
     /// Publishes [`TaskEventKind::AutoResumeExhausted`] for the task's

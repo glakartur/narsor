@@ -48,7 +48,7 @@ pub use narsor_protocol::controller::{
     TaskListResponse, TaskState, TaskSummary, TimelineResponse, TransitionExit, TransitionOffer,
     ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowInputType, WorkflowInputView,
     WorkflowListResponse, WorkflowSource, WorkflowSourceRequest, WorkflowSourceResponse,
-    WorkflowView, WorkspaceRequest, CONVERSATION_RECORD_UNREADABLE,
+    WorkflowView, WorkspaceRequest, CONVERSATION_READER_STARTING, CONVERSATION_RECORD_UNREADABLE,
     CONVERSATION_RECORD_UNREADABLE_PREFIX, CONVERSATION_UNAVAILABLE,
 };
 

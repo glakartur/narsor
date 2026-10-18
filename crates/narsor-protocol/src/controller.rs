@@ -237,6 +237,13 @@ pub struct DesiredCommand {
     pub resource_key: String,
     pub launch_spec: Value,
     pub runner: Option<RunnerProgress>,
+    /// Whether the control plane wants a read-only runner for the task
+    /// alongside (D63): an owner is reading a stopped or interrupted task and
+    /// its reader lease has not run out. The controller starts one, or
+    /// removes the one it started, to match. Absent from an older control
+    /// plane, which never asks for one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reader_needed: bool,
 }
 
 /// Controller command response.
@@ -997,6 +1004,14 @@ pub enum TaskEventKind {
     SlotReleased {
         reason: SlotReleaseReason,
     },
+    /// An owner is reading a stopped task: the control plane asked for a
+    /// read-only runner until `until` (D63).
+    ReaderLeased {
+        until: DateTime<Utc>,
+    },
+    /// The read-only runner's lease ended, because it ran idle: the control
+    /// plane no longer asks for it.
+    ReaderLeaseEnded,
     #[serde(other)]
     Unrecognized,
 }
@@ -1502,6 +1517,9 @@ pub enum ConversationUnavailableReason {
     RunnerUnreachable,
     RunnerReported,
     StorageUnreadable,
+    /// The task is stopped and the control plane asked for a read-only
+    /// runner to read it; the runner is not connected yet. Retry shortly.
+    ReaderStarting,
     #[serde(other)]
     Unrecognized,
 }
@@ -1764,6 +1782,11 @@ pub struct TransitionExit {
 }
 
 pub const CONVERSATION_UNAVAILABLE: &str = "conversation_unavailable";
+/// The code of the `409` a conversation page is refused with while the
+/// read-only runner of a stopped task is not connected yet (D63): the client
+/// asks again shortly. The page's own form of
+/// [`ConversationUnavailableReason::ReaderStarting`].
+pub const CONVERSATION_READER_STARTING: &str = "conversation_reader_starting";
 pub const CONVERSATION_RECORD_UNREADABLE: &str = "conversation_record_unreadable";
 pub const CONVERSATION_RECORD_UNREADABLE_PREFIX: &str =
     "the conversation record could not be read: ";
