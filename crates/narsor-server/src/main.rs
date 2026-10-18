@@ -17,7 +17,7 @@ struct Args {
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 
-    /// Optional server runner_state operation; no operation starts the server.
+    /// Optional server lifecycle operation; no operation starts the server.
     #[command(subcommand)]
     command: Option<ServerCommand>,
 }
@@ -72,7 +72,7 @@ async fn main() {
 
 /// Stop the daemon named by this installation's discovery record.
 ///
-/// This runner_state operation belongs to the server executable so the client
+/// This lifecycle operation belongs to the server executable so the client
 /// does not open server persistence records or signal process IDs itself.
 fn stop_daemon(config: &narsor_engine::config::Resolved) -> Result<(), String> {
     let daemon_file = narsor_engine::persistence::StatePaths::new(config.state_dir()).daemon_file();

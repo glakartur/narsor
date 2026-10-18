@@ -886,7 +886,7 @@ pub struct TaskListResponse {
     pub cursor: String,
 }
 
-/// Actor recorded for a runner_state command receipt.
+/// Actor recorded for a runner state command receipt.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandActor {
@@ -1020,7 +1020,7 @@ pub enum SlotReleaseReason {
     Unrecognized,
 }
 
-/// Material runner_state change recorded in a task event.
+/// Material runner state change recorded in a task event.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MaterialChange {
@@ -1305,7 +1305,7 @@ pub struct MoveTaskRequest {
     pub expected_generation: Option<u64>,
 }
 
-/// An owner's requested change to a task's desired runner_state.
+/// An owner's requested change to a task's desired runner state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnerCommand {

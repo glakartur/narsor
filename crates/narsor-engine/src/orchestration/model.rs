@@ -285,7 +285,7 @@ pub struct TaskRecord {
     /// The capacity slot the scheduler granted while the task is queued
     /// (U10). Only a task holding one is offered `Start`, and only such a
     /// task may be accepted by its controller; cleared once the task leaves
-    /// `Queued`, from where its runner_state itself holds the slot.
+    /// `Queued`, from where its runner state itself holds the slot.
     #[serde(default)]
     pub reservation: Option<CapacityReservation>,
     /// Why the queued task waits, or that it was admitted; `None` outside

@@ -657,7 +657,7 @@ impl ControlPlane {
     /// not older than the last accepted report; the desired generation is the
     /// current one; the resource version is not older than the last accepted
     /// one of the same incarnation; and the observation is legal from the
-    /// current runner_state; `PausedAtSafePoint` additionally needs the runner's
+    /// current runner state; `PausedAtSafePoint` additionally needs the runner's
     /// safe-point acknowledgement for the current generation
     /// ([`OrchestrationError::SafePointNotAcknowledged`]). A pure redelivery
     /// is absorbed with `applied: false`.
@@ -834,7 +834,7 @@ impl ControlPlane {
     ///
     /// Removes orphaned temporary files and appends any event a record
     /// committed but a crash kept out of the log. Nothing else is judged:
-    /// unlike local recovery, a remote task's runner_state changes only through
+    /// unlike local recovery, a remote task's runner state changes only through
     /// controller reconciliation, never because this process restarted.
     ///
     /// The material store (U9) is repaired here too, so the one startup
@@ -893,7 +893,7 @@ impl ControlPlane {
     /// the loss its event log shows, counted as a fresh one, so the resume
     /// policy resumes it — unless it was lost while pausing. Call under the
     /// task's lock. Like rank repair, it announces nothing: the record's
-    /// runner_state does not change, and clients' next read shows the state.
+    /// runner state does not change, and clients' next read shows the state.
     fn adopt_loss(&self, record: &mut TaskRecord) -> Result<bool> {
         let lost = matches!(
             record.runner_state,
@@ -943,7 +943,7 @@ impl ControlPlane {
             Mutation::Unchanged(value) => Ok((record, value)),
             Mutation::Changed(kind, value) => {
                 // A reservation and a queue verdict mean something only
-                // while queued: once the task leaves `Queued` its runner_state
+                // while queued: once the task leaves `Queued` its runner state
                 // holds (or releases) the slot by itself (U10).
                 if record.runner_state != RunnerState::Queued {
                     record.reservation = None;

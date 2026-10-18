@@ -70,7 +70,7 @@ impl ToneLine {
 // Pure presentation
 // ---------------------------------------------------------------------------
 
-/// A runner_state as people read it.
+/// A runner state as people read it.
 pub fn runner_state_name(runner_state: RunnerState) -> &'static str {
     match runner_state {
         RunnerState::Queued => "queued",
@@ -819,7 +819,7 @@ fn attempt_line(attempt: &ConversationAttemptSummary) -> ToneLine {
     )
 }
 
-/// One line of `narsor task events`: sequence, time, task, runner_state and
+/// One line of `narsor task events`: sequence, time, task, runner state and
 /// what happened.
 pub fn event_line(event: &TaskEvent) -> String {
     let kind = match &event.kind {

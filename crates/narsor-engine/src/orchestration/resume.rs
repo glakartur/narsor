@@ -171,7 +171,7 @@ fn exhaustion_reason(loss_reason: Option<&str>) -> String {
 }
 
 /// The loss of a task that went `Interrupted` or `Unknown` before losses
-/// were remembered, read from its event log: the runner_state before the last
+/// were remembered, read from its event log: the runner state before the last
 /// move into either. A log that does not show it reads as a loss while
 /// running, which the policy resumes.
 pub(crate) fn loss_from_history(record: &TaskRecord, events: &[TaskEvent]) -> WorkloadLoss {

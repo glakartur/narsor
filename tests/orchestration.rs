@@ -4103,13 +4103,14 @@ fn a_read_moves_the_wait_later_and_only_by_more_than_the_threshold() {
     }
     assert_eq!(fx.control.task(&task("task-1")).unwrap().revision, revision);
 
-    fx.clock.advance(Duration::seconds(20));
-    // t+5 min 30 s from the first snapshot: past the original wait, not past the moved one.
+    fx.clock.advance(Duration::seconds(70));
+    // 5 min 30 s after the first snapshot: past the original 5-min wait, but
+    // not past the one the read moved.
     assert!(matches!(
         release_slot(&fx, "task-1"),
         Err(OrchestrationError::IllegalCommand { .. })
     ));
-    // 31 s after the last move a read moves it again.
+    // 90 s after the last move (past the threshold) a read moves it again.
     assert!(fx
         .control
         .extend_slot_release(&task("task-1"), extension)

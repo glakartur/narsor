@@ -1,7 +1,7 @@
 //! The runner's side of a task record: snapshots and owner input (KTD3,
 //! KTD4).
 //!
-//! A runner never changes the orchestration runner_state — only a lease-fenced
+//! A runner never changes the orchestration runner state — only a lease-fenced
 //! controller observation does. What it changes is the *last safe summary*
 //! clients read ([`TaskRecord::runner`]) and the queue of owner answers
 //! waiting for it ([`TaskRecord::inputs`]). Both go through the same
@@ -148,7 +148,7 @@ impl ControlPlane {
     /// slot): the answer waits on the record for the next runner.
     ///
     /// Refused — without touching the record, let alone the runner — when
-    /// the task cannot take input in its runner_state, when the last runner
+    /// the task cannot take input in its runner state, when the last runner
     /// snapshot waits on another request (or none), or when another answer
     /// to the same request is already queued. A retry with the same key and
     /// answer returns the original input.

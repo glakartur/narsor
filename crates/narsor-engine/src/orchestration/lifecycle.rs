@@ -27,7 +27,7 @@
 
 use super::model::{Observation, OwnerCommand, RunnerState};
 
-/// What an owner command does to a runner_state.
+/// What an owner command does to a runner state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandEffect {
     /// Move to this state and bump the desired generation.
@@ -53,13 +53,13 @@ pub(crate) fn command_effect(current: RunnerState, command: OwnerCommand) -> Com
     }
 }
 
-/// What a controller observation does to a runner_state.
+/// What a controller observation does to a runner state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ObservationEffect {
     /// Move to this state; the desired generation stays.
     Transition(RunnerState),
-    /// Valid, but the runner_state is already where the observation leads (a
-    /// redelivery) or the observation carries no runner_state meaning.
+    /// Valid, but the runner state is already where the observation leads (a
+    /// redelivery) or the observation carries no runner state meaning.
     Unchanged,
     /// Contradicts the current state.
     Illegal,

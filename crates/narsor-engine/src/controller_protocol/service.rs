@@ -10,6 +10,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use std::time::Duration as StdDuration;
+
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, watch};
@@ -46,6 +48,12 @@ use crate::orchestration::{
 };
 use crate::workflow::TemplateScope;
 use relay::Relay;
+
+/// Converts a configured period; one too large for the calendar counts as
+/// the largest one.
+fn chrono_duration(period: StdDuration) -> Duration {
+    Duration::from_std(period).unwrap_or(Duration::MAX)
+}
 
 pub use auto_resume::AutoResumePass;
 pub use reader::ReaderLeasePass;
@@ -1642,7 +1650,7 @@ impl ProtocolService {
             &identity.incarnation,
             identity.launch_generation,
             snapshot,
-            slot_release::chrono_duration(grace),
+            chrono_duration(grace),
         )?;
         self.credentials
             .touch_runner(identity, None)?

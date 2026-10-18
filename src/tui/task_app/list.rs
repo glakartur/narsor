@@ -2,7 +2,7 @@
 //!
 //! The list is the queue (D-T3). The server hands the tasks over in queue
 //! order — grouped by backend, in `rank` order within each — and **the client
-//! never sorts** (KTD "Kolejność listy liczy serwer"): a runner_state event
+//! never sorts** (KTD "Kolejność listy liczy serwer"): a runner state event
 //! changes a row's icon and label in place, and only a [`TaskEventKind::Moved`]
 //! event, which carries the backend's whole new order, reorders rows. State is
 //! an attribute of a row, never a reason for it to move (D-T2, D-T5).
@@ -873,7 +873,7 @@ impl TaskList {
 
     /// Applies one stream event to the row it names, at once and in place.
     ///
-    /// * runner_state, generation and revision are always patched — that is what
+    /// * runner state, generation and revision are always patched — that is what
     ///   the stream is for;
     /// * [`TaskEventKind::QueueChanged`] replaces the scheduler verdict;
     /// * [`TaskEventKind::Moved`] reorders the task's backend to the order it

@@ -1129,7 +1129,7 @@ fn header(
     };
     let first = Line::from(Span::styled(first_text, styles.strong(grey(Role::Calm))));
 
-    // Line 2: runner_state, warnings, and compact step/queue context.
+    // Line 2: runner state, warnings, and compact step/queue context.
     let mut second: Vec<Span<'static>> = Vec::new();
     let icon = state_icon(task);
     let state = format!("{} {}", icon.glyph(), status_word(task));

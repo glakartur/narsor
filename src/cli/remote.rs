@@ -256,7 +256,7 @@ pub enum TaskCommand {
         #[arg(long = "task-id", value_name = "ID")]
         task_id: Option<String>,
     },
-    /// Lists your tasks with backend, runner_state and queue state, the
+    /// Lists your tasks with backend, runner state and queue state, the
     /// attention mark (`?` asks, `!` is wrong) and the title.
     List {
         /// Only the archived tasks, newest archive first (the TUI's history).
@@ -528,7 +528,7 @@ pub enum MaterialsCommand {
     },
 }
 
-/// Arguments of a runner_state command.
+/// Arguments of a runner state command.
 #[derive(Debug, clap::Args)]
 pub struct CommandArgs {
     /// The task id.

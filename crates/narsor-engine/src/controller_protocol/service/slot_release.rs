@@ -16,11 +16,8 @@
 //! that safe point already re-runs admission for the backend.
 
 use std::collections::HashMap;
-use std::time::Duration as StdDuration;
 
-use chrono::Duration;
-
-use super::ProtocolService;
+use super::{chrono_duration, ProtocolService};
 use crate::domain::{BackendId, TaskId};
 use crate::environment::SlotReleaseTimings;
 use crate::orchestration::{OrchestrationError, RunnerState, TaskRecord};
@@ -32,12 +29,6 @@ pub struct SlotReleasePass {
     pub released: Vec<TaskId>,
     /// Tasks whose missing deadline this pass planned.
     pub scheduled: Vec<TaskId>,
-}
-
-/// Converts a configured period; one too large for the calendar counts as
-/// the largest one.
-pub(super) fn chrono_duration(period: StdDuration) -> Duration {
-    Duration::from_std(period).unwrap_or(Duration::MAX)
 }
 
 impl ProtocolService {

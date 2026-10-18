@@ -75,25 +75,25 @@ pub enum OrchestrationError {
         presented: u64,
     },
 
-    /// The owner command is not legal from the current runner_state.
+    /// The owner command is not legal from the current runner state.
     #[error("task '{task_id}' cannot {command:?} while {runner_state:?}")]
     IllegalCommand {
         /// The task.
         task_id: TaskId,
         /// The command.
         command: OwnerCommand,
-        /// Its runner_state.
+        /// Its runner state.
         runner_state: RunnerState,
     },
 
-    /// The observation contradicts the current runner_state.
+    /// The observation contradicts the current runner state.
     #[error("task '{task_id}' cannot accept observation {observation:?} while {runner_state:?}")]
     IllegalObservation {
         /// The task.
         task_id: TaskId,
         /// The observation.
         observation: Observation,
-        /// Its runner_state.
+        /// Its runner state.
         runner_state: RunnerState,
     },
 
@@ -243,12 +243,12 @@ pub enum OrchestrationError {
         status: super::model::InputStatus,
     },
 
-    /// The task's runner_state does not let a runner take input.
+    /// The task's runner state does not let a runner take input.
     #[error("task '{task_id}' does not accept input while {runner_state:?}")]
     TaskNotAcceptingInput {
         /// The task.
         task_id: TaskId,
-        /// Its runner_state.
+        /// Its runner state.
         runner_state: RunnerState,
     },
 
@@ -314,7 +314,7 @@ pub enum OrchestrationError {
     TaskNotQueued {
         /// The task.
         task_id: TaskId,
-        /// Its runner_state.
+        /// Its runner state.
         runner_state: RunnerState,
     },
 

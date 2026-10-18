@@ -195,7 +195,7 @@ pub struct BackendRecord {
     pub description: Option<String>,
     /// Trust scope.
     pub trust_scope: TrustScope,
-    /// Supported runner_state operations.
+    /// Supported lifecycle operations.
     #[serde(default)]
     pub capabilities: BackendCapabilities,
     /// Limits.

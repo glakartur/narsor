@@ -1,4 +1,4 @@
-//! API server process runtime and runner_state.
+//! API server process runtime and lifecycle.
 
 pub mod api;
 pub mod auth_gate;

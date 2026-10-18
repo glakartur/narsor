@@ -10,7 +10,7 @@
 
 use std::time::Duration as StdDuration;
 
-use super::slot_release::chrono_duration;
+use super::chrono_duration;
 use super::ProtocolService;
 use crate::controller_protocol::credentials::{ControllerIdentity, RunnerRole};
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};

@@ -1,4 +1,4 @@
-//! The daemon process runner_state (U2).
+//! The daemon process lifecycle (U2).
 //!
 //! # Why recovery moved here
 //!
@@ -504,7 +504,7 @@ fn recover_at_startup(store: &ExecutionStore) -> Option<RecoveryReport> {
 /// Repairs the control plane's own records (U2) — orphaned temporary files
 /// and events a crash kept out of a task's log — before the API serves
 /// them, so a stream replay never skips one. Unlike local recovery it judges
-/// no task: a remote task's runner_state changes only through its controller's
+/// no task: a remote task's runner state changes only through its controller's
 /// reconciliation, never because this process restarted. Best-effort like
 /// [`recover_at_startup`]: a failure is logged and the daemon still starts.
 pub fn recover_orchestration_at_startup(control: ControlPlane) -> ControlPlane {
@@ -698,7 +698,7 @@ fn cleanup_discovery_file(path: &Path) {
 ///
 /// Returns `true` when everything drained in time, `false` when the timeout
 /// elapsed first. A free function taking `&Engine` rather than a method on
-/// `Engine` itself: the polling/timeout policy is a daemon runner_state
+/// `Engine` itself: the polling/timeout policy is a daemon lifecycle
 /// concern (U2), not something every engine consumer needs — and keeping it
 /// here lets `tests/daemon_lifecycle.rs` exercise exactly this logic
 /// in-process, against a real `Engine` driving a real long-running action,

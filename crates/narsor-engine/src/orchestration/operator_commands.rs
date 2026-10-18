@@ -6,7 +6,7 @@
 //! runner receives it with its long-poll — again and again until it
 //! acknowledges — and its verdict becomes a second event the owner's stream
 //! shows. The control plane never executes anything: it validates what it
-//! can know (runner_state, generation, idempotency) and relays; the runner
+//! can know (runner state, generation, idempotency) and relays; the runner
 //! decides under the Engine's own claim on the execution.
 //!
 //! A command is meant for one runner launch. When the task stops being

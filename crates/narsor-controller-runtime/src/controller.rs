@@ -1,5 +1,5 @@
 //! The generic environment controller: reconciles a backend with the
-//! control plane's desired task runner_state over the controller protocol
+//! control plane's desired task runner state over the controller protocol
 //! (R3-R5, R12-R14, R34, R37; KTD1-KTD3).
 //!
 //! # One step

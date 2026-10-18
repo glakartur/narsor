@@ -27,7 +27,7 @@
 //! # What goes where
 //!
 //! * pause, resume, start and archive are owner commands
-//!   (`POST …/commands`) — the answer is the new runner_state, which the stream
+//!   (`POST …/commands`) — the answer is the new runner state, which the stream
 //!   shows in the row;
 //! * interrupt and the transitions are operator commands
 //!   (`POST …/operator-commands`): the control plane queues them and the
@@ -368,7 +368,7 @@ pub fn verb(task: &TaskSummary, action: TaskAction) -> &'static str {
 /// What an action sends.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActionSend {
-    /// A runner_state command of the owner: pause, resume, start, archive.
+    /// A runner state command of the owner: pause, resume, start, archive.
     Owner(OwnerCommand),
     /// A command for the runner: interrupt, a transition.
     Operator(OperatorCommand),
@@ -1151,7 +1151,7 @@ impl TaskApp {
     // -----------------------------------------------------------------
 
     /// Sends an action. An owner command is answered with the task's new
-    /// runner_state, which the stream puts in the row; an operator command is
+    /// runner state, which the stream puts in the row; an operator command is
     /// answered with "queued", and the runner's verdict follows as an event.
     /// A refusal says why on the bar and reads the tasks again.
     pub(super) async fn act(&mut self, request: ActionRequest) {

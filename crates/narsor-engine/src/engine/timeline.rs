@@ -75,7 +75,7 @@
 //! Every event either belongs to a position (by its own
 //! `action_execution_id` when the variant carries one, or positionally to
 //! the last attempt of the current visit otherwise) or it does not — workflow
-//! runner_state events, human input, external events, and `StateEntered` itself
+//! runner state events, human input, external events, and `StateEntered` itself
 //! are never part of an agent conversation, and the link map says why.
 
 use std::collections::{BTreeMap, HashMap, HashSet};

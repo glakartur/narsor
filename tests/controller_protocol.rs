@@ -4212,6 +4212,10 @@ async fn a_reader_may_not_write_anything() {
         Err(ClientError::Forbidden)
     ));
     assert!(matches!(
+        reader.material_blob("material-1", "sha256:x").await,
+        Err(ClientError::Forbidden)
+    ));
+    assert!(matches!(
         reader.ack_material("material-1", "sha256:x").await,
         Err(ClientError::Forbidden)
     ));

@@ -1,4 +1,4 @@
-//! Client-side invocation of the server's explicit runner_state command.
+//! Client-side invocation of the server's explicit lifecycle command.
 
 use std::io::Write;
 use std::process::Command;
