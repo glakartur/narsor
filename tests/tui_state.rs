@@ -3389,6 +3389,306 @@ mod task_app_detail {
         }
     }
 
+    /// *Rozmowa* puts a workflow choice after the conversation of the step
+    /// entry it followed, before the heading of the next step.
+    mod choice_order {
+        use super::*;
+
+        use narsor_engine::domain::{ConductorDecisionKind, EventData};
+        use narsor_protocol::api::Position;
+
+        fn read(ids: &[&str]) -> AttemptRead {
+            AttemptRead {
+                entries: ids
+                    .iter()
+                    .map(|id| {
+                        TranscriptEntry::new(
+                            TranscriptEntryId::from(*id),
+                            vec![format!("line {id}")],
+                            id.as_bytes().to_vec(),
+                        )
+                        .with_header(format!("AGENT · {id}"))
+                    })
+                    .collect(),
+                next_entry: 1,
+                closed: true,
+                truncated_tail: false,
+                complete: true,
+                no_record: false,
+                source: narsor_engine::controller_protocol::ExecutionEventsSource::Runner,
+                recorded_at: None,
+            }
+        }
+
+        /// A recorded attempt `attempt` of `state`'s `visit`.
+        fn recorded(state: &str, visit: u32, attempt: &str) -> Position {
+            let mut step = position(state, PositionStatus::Succeeded);
+            step.visit = visit;
+            step.action_execution_id = Some(attempt.to_string());
+            step.conversation = ConversationState::Recorded;
+            step
+        }
+
+        fn attempts(ids: &[&str]) -> Attempts {
+            let mut attempts = Attempts::default();
+            for id in ids {
+                attempts.apply(id, 1, 0, Ok(read(&["m"])));
+            }
+            attempts
+        }
+
+        fn ev(sequence: u64, data: EventData) -> Event {
+            Event::new("e".to_string(), data, sequence)
+        }
+
+        fn entered(sequence: u64, state: &str) -> Event {
+            ev(
+                sequence,
+                EventData::StateEntered {
+                    state_id: state.to_string(),
+                },
+            )
+        }
+
+        fn agent_chose(sequence: u64, label: &str) -> Event {
+            ev(
+                sequence,
+                EventData::DecisionMade {
+                    provider: "claude".to_string(),
+                    output_label: label.to_string(),
+                    reasoning: None,
+                },
+            )
+        }
+
+        fn conductor_chose(sequence: u64, label: &str) -> Event {
+            ev(
+                sequence,
+                EventData::ConductorDecision {
+                    decision_id: format!("d{sequence}"),
+                    kind: ConductorDecisionKind::ChooseOutput,
+                    state_id: None,
+                    output_label: Some(label.to_string()),
+                    episode: None,
+                    confidence: Default::default(),
+                    rationale: None,
+                },
+            )
+        }
+
+        fn human_chose(sequence: u64, from: &str, to: &str) -> Event {
+            ev(
+                sequence,
+                EventData::HumanTransitionSelected {
+                    from_state: from.to_string(),
+                    to_state: to.to_string(),
+                },
+            )
+        }
+
+        /// The transcript as a list of tags: a heading is `step:<attempt>`, a
+        /// choice `choice:<sequence>`, an entry its own id.
+        fn order(positions: &[Position], attempts: &Attempts, events: &[Event]) -> Vec<String> {
+            let mut conversation = Conversation::new("a");
+            conversation.rebuild_with_events(positions, attempts, events);
+            tags(&conversation)
+        }
+
+        fn tags(conversation: &Conversation) -> Vec<String> {
+            conversation
+                .transcript()
+                .entries()
+                .iter()
+                .map(|entry| {
+                    let id = entry.id.as_str();
+                    if let Some(attempt) = id.strip_suffix("/step") {
+                        format!("step:{attempt}")
+                    } else if let Some(sequence) = id.strip_prefix("workflow-choice/") {
+                        format!("choice:{sequence}")
+                    } else {
+                        id.to_string()
+                    }
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_choice_follows_the_conversation_of_its_step_and_precedes_the_next_heading() {
+            let positions = vec![
+                recorded("plan", 1, "p"),
+                recorded("code_review", 1, "r"),
+                recorded("fix", 1, "f"),
+            ];
+            let events = vec![
+                entered(1, "plan"),
+                entered(2, "code_review"),
+                agent_chose(3, "revise"),
+                conductor_chose(4, "fix"),
+                entered(5, "fix"),
+            ];
+            assert_eq!(
+                order(&positions, &attempts(&["p", "r", "f"]), &events),
+                ["step:p", "p/m", "step:r", "r/m", "choice:3", "choice:4", "step:f", "f/m"]
+            );
+        }
+
+        #[test]
+        fn a_choice_of_a_step_without_a_conversation_stands_between_its_neighbours() {
+            let events = vec![
+                entered(1, "plan"),
+                entered(2, "gate"),
+                human_chose(3, "gate", "implement"),
+                entered(4, "implement"),
+            ];
+            let expected = ["step:p", "p/m", "choice:3", "step:i", "i/m"];
+            let attempts = attempts(&["p", "i"]);
+            // The gate has no position at all.
+            let positions = vec![recorded("plan", 1, "p"), recorded("implement", 1, "i")];
+            assert_eq!(order(&positions, &attempts, &events), expected);
+            // The gate has a position without a conversation.
+            let positions = vec![
+                recorded("plan", 1, "p"),
+                position("gate", PositionStatus::Succeeded),
+                recorded("implement", 1, "i"),
+            ];
+            assert_eq!(order(&positions, &attempts, &events), expected);
+        }
+
+        #[test]
+        fn each_visit_of_a_loop_keeps_its_own_choice() {
+            let positions = vec![
+                recorded("code_review", 1, "r1"),
+                recorded("fix", 1, "f"),
+                recorded("code_review", 2, "r2"),
+            ];
+            let events = vec![
+                entered(1, "code_review"),
+                agent_chose(2, "revise"),
+                entered(3, "fix"),
+                agent_chose(4, "done"),
+                entered(5, "code_review"),
+                agent_chose(6, "approved"),
+            ];
+            assert_eq!(
+                order(&positions, &attempts(&["r1", "f", "r2"]), &events),
+                [
+                    "step:r1", "r1/m", "choice:2", "step:f", "f/m", "choice:4", "step:r2", "r2/m",
+                    "choice:6"
+                ]
+            );
+        }
+
+        #[test]
+        fn the_attempts_of_one_entry_stay_together_and_the_choice_follows_the_last() {
+            let positions = vec![
+                recorded("implement", 1, "i1"),
+                recorded("implement", 1, "i2"),
+                recorded("implement", 1, "i3"),
+                recorded("code_review", 1, "r"),
+            ];
+            let events = vec![
+                entered(1, "implement"),
+                agent_chose(5, "done"),
+                entered(6, "code_review"),
+            ];
+            assert_eq!(
+                order(&positions, &attempts(&["i1", "i2", "i3", "r"]), &events),
+                [
+                    "step:i1", "i1/m", "step:i2", "i2/m", "step:i3", "i3/m", "choice:5", "step:r",
+                    "r/m"
+                ]
+            );
+        }
+
+        #[test]
+        fn the_last_choice_ends_the_transcript_and_a_reader_at_the_end_stays_there() {
+            let positions = vec![recorded("plan", 1, "p")];
+            let attempts = attempts(&["p"]);
+            let mut events = vec![entered(1, "plan"), agent_chose(2, "done")];
+            let mut conversation = Conversation::new("a");
+            conversation.transcript_mut().set_viewport(2);
+            conversation.rebuild_with_events(&positions, &attempts, &events);
+            assert_eq!(tags(&conversation).last().unwrap(), "choice:2");
+            assert!(conversation.transcript().is_following_end());
+
+            events.push(conductor_chose(3, "again"));
+            conversation.rebuild_with_events(&positions, &attempts, &events);
+            assert_eq!(tags(&conversation).last().unwrap(), "choice:3");
+            assert!(conversation.transcript().is_following_end());
+        }
+
+        #[test]
+        fn a_choice_before_every_entry_stands_before_the_first_heading() {
+            let positions = vec![recorded("plan", 1, "p")];
+            let events = vec![
+                agent_chose(1, "early"),
+                entered(2, "plan"),
+                agent_chose(3, "done"),
+            ];
+            assert_eq!(
+                order(&positions, &attempts(&["p"]), &events),
+                ["choice:1", "step:p", "p/m", "choice:3"]
+            );
+        }
+
+        #[test]
+        fn choices_of_one_entry_keep_the_order_of_their_sequence() {
+            let positions = vec![recorded("plan", 1, "p")];
+            let events = vec![
+                conductor_chose(4, "b"),
+                agent_chose(3, "a"),
+                entered(1, "plan"),
+            ];
+            assert_eq!(
+                order(&positions, &attempts(&["p"]), &events),
+                ["step:p", "p/m", "choice:3", "choice:4"]
+            );
+        }
+
+        #[test]
+        fn without_step_entries_the_choices_stay_at_the_end() {
+            let positions = vec![recorded("plan", 1, "p"), recorded("fix", 1, "f")];
+            let events = vec![agent_chose(1, "a"), conductor_chose(2, "b")];
+            assert_eq!(
+                order(&positions, &attempts(&["p", "f"]), &events),
+                ["step:p", "p/m", "step:f", "f/m", "choice:1", "choice:2"]
+            );
+            assert_eq!(
+                order(&positions, &attempts(&["p", "f"]), &[]),
+                ["step:p", "p/m", "step:f", "f/m"]
+            );
+        }
+
+        #[test]
+        fn a_choice_keeps_its_text_header_and_id() {
+            let positions = vec![recorded("plan", 1, "p")];
+            let events = vec![entered(1, "plan"), agent_chose(2, "done")];
+            let mut conversation = Conversation::new("a");
+            conversation.rebuild_with_events(&positions, &attempts(&["p"]), &events);
+            let choice = conversation.transcript().entries().last().unwrap();
+            assert_eq!(choice.id.as_str(), "workflow-choice/2");
+            assert!(choice.header.starts_with("WYBÓR WORKFLOW · "), "{choice:?}");
+            assert_eq!(
+                choice.rendered_lines,
+                ["agent · claude wybrał opcję: done".to_string()]
+            );
+        }
+
+        #[test]
+        fn an_unread_attempt_is_loading_and_its_choices_are_kept() {
+            let positions = vec![recorded("plan", 1, "p"), recorded("fix", 1, "f")];
+            let events = vec![
+                entered(1, "plan"),
+                agent_chose(2, "revise"),
+                entered(3, "fix"),
+            ];
+            let mut conversation = Conversation::new("a");
+            conversation.rebuild_with_events(&positions, &attempts(&["p"]), &events);
+            assert!(conversation.is_loading());
+            assert_eq!(tags(&conversation), ["step:p", "p/m", "choice:2"]);
+        }
+    }
+
     mod events_and_conversation {
         use super::*;
 

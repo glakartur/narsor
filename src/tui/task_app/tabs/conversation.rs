@@ -504,7 +504,10 @@ impl Conversation {
     }
 
     /// Rebuilds the transcript and includes workflow output choices made by
-    /// the agent, conductor, or operator.
+    /// the agent, conductor, or operator. A choice stands after the
+    /// conversation of the step entry it followed and before the heading of
+    /// the next one; the newest choice, with no step after it, ends the
+    /// transcript.
     pub fn rebuild_with_events(
         &mut self,
         positions: &[Position],
@@ -515,57 +518,154 @@ impl Conversation {
         self.loading = false;
         self.failure = None;
         self.record = None;
-        let workflow_choices: Vec<_> = events.iter().filter_map(workflow_choice_entry).collect();
-        let mut seen_attempts = std::collections::HashSet::new();
+        let visits = step_entries(events);
+        let mut by_visit: BTreeMap<(&str, u32), Vec<&Position>> = BTreeMap::new();
         for position in positions {
-            let (ConversationState::Recorded, Some(attempt_id)) = (
-                &position.conversation,
-                position.action_execution_id.as_deref(),
-            ) else {
-                continue;
-            };
-            // A workflow retry may point at the same chat as the preceding
-            // position. Show that transcript once, at its first occurrence.
-            if !seen_attempts.insert(attempt_id) {
-                continue;
-            }
-            let Some(attempt) = attempts.get(attempt_id) else {
-                self.loading = true;
-                continue;
-            };
-            if self.failure.is_none() {
-                self.failure = attempt
-                    .failure()
-                    .map(|failure| (position.label.clone(), failure.clone()));
-            }
-            if attempt.from_record() {
-                let newest = self.record.flatten().max(attempt.recorded_at());
-                self.record = Some(newest);
-            }
-            if attempt.entries.is_empty() {
-                continue;
-            }
-            entries.push(
-                TranscriptEntry::new(
-                    TranscriptEntryId::from(format!("{attempt_id}/step")),
-                    Vec::new(),
-                    Vec::new(),
-                )
-                .with_header(format!("── {} ──", one_line(&position.label)))
-                .with_presentation(TranscriptPresentation::System),
-            );
-            entries.extend(attempt.entries.iter().map(|entry| {
-                let mut entry = entry.clone();
-                entry.prefix_source_ids(attempt_id);
-                entry
-            }));
+            by_visit
+                .entry((position.state_id.as_str(), position.visit))
+                .or_default()
+                .push(position);
         }
-        // Keep choices at the current end of the transcript, where they are
-        // visible when a conversation is opened at its newest content.
-        entries.extend(workflow_choices);
+        let mut seen_attempts = std::collections::HashSet::new();
+        if visits.is_empty() {
+            // No step entry to anchor a choice to (an old or partial log):
+            // the conversation as it is, the choices at its end.
+            for position in positions {
+                self.push_position(&mut entries, &mut seen_attempts, position, attempts);
+            }
+            entries.extend(workflow_choices(events).into_iter().map(|(_, entry)| entry));
+        } else {
+            let mut choices = workflow_choices(events).into_iter().peekable();
+            let mut until = |entries: &mut Vec<TranscriptEntry>, next: Option<u64>| {
+                while let Some((_, entry)) =
+                    choices.next_if(|(sequence, _)| next.is_none_or(|next| *sequence < next))
+                {
+                    entries.push(entry);
+                }
+            };
+            until(&mut entries, Some(visits[0].sequence));
+            for (index, visit) in visits.iter().enumerate() {
+                for position in by_visit
+                    .get(&(visit.state_id.as_str(), visit.visit))
+                    .into_iter()
+                    .flatten()
+                {
+                    self.push_position(&mut entries, &mut seen_attempts, position, attempts);
+                }
+                until(
+                    &mut entries,
+                    visits.get(index + 1).map(|next| next.sequence),
+                );
+            }
+            // A step the events do not tell the entry of: shown, with no
+            // choice of its own.
+            for position in positions {
+                if !visits.iter().any(|visit| {
+                    visit.state_id == position.state_id && visit.visit == position.visit
+                }) {
+                    self.push_position(&mut entries, &mut seen_attempts, position, attempts);
+                }
+            }
+        }
         self.full.replace_entries(entries);
         self.built = true;
     }
+
+    /// Adds the heading and the entries of `position`'s attempt, and notes
+    /// what its read says: still loading, failed, from the record.
+    fn push_position<'a>(
+        &mut self,
+        entries: &mut Vec<TranscriptEntry>,
+        seen_attempts: &mut std::collections::HashSet<&'a str>,
+        position: &'a Position,
+        attempts: &Attempts,
+    ) {
+        let (ConversationState::Recorded, Some(attempt_id)) = (
+            &position.conversation,
+            position.action_execution_id.as_deref(),
+        ) else {
+            return;
+        };
+        // A workflow retry may point at the same chat as the preceding
+        // position. Show that transcript once, at its first occurrence.
+        if !seen_attempts.insert(attempt_id) {
+            return;
+        }
+        let Some(attempt) = attempts.get(attempt_id) else {
+            self.loading = true;
+            return;
+        };
+        if self.failure.is_none() {
+            self.failure = attempt
+                .failure()
+                .map(|failure| (position.label.clone(), failure.clone()));
+        }
+        if attempt.from_record() {
+            let newest = self.record.flatten().max(attempt.recorded_at());
+            self.record = Some(newest);
+        }
+        if attempt.entries.is_empty() {
+            return;
+        }
+        entries.push(
+            TranscriptEntry::new(
+                TranscriptEntryId::from(format!("{attempt_id}/step")),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_header(format!("── {} ──", one_line(&position.label)))
+            .with_presentation(TranscriptPresentation::System),
+        );
+        entries.extend(attempt.entries.iter().map(|entry| {
+            let mut entry = entry.clone();
+            entry.prefix_source_ids(attempt_id);
+            entry
+        }));
+    }
+}
+
+/// One entry into a step, as the events tell it: the same `(state, visit)`
+/// that a timeline position carries, and where in the event order it began.
+struct StepEntry {
+    state_id: String,
+    visit: u32,
+    sequence: u64,
+}
+
+/// The step entries of `events`, in the order they happened. The n-th entry
+/// into a state is its visit n, as the timeline counts them.
+fn step_entries(events: &[Event]) -> Vec<StepEntry> {
+    let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
+    let mut entered: Vec<(u64, &str)> = events
+        .iter()
+        .filter_map(|event| match &event.data {
+            EventData::StateEntered { state_id } => Some((event.sequence, state_id.as_str())),
+            _ => None,
+        })
+        .collect();
+    entered.sort_by_key(|(sequence, _)| *sequence);
+    entered
+        .into_iter()
+        .map(|(sequence, state_id)| {
+            let visit = counts.entry(state_id).or_default();
+            *visit += 1;
+            StepEntry {
+                state_id: state_id.to_string(),
+                visit: *visit,
+                sequence,
+            }
+        })
+        .collect()
+}
+
+/// The workflow choices of `events` with their sequence, in that order.
+fn workflow_choices(events: &[Event]) -> Vec<(u64, TranscriptEntry)> {
+    let mut choices: Vec<_> = events
+        .iter()
+        .filter_map(|event| Some((event.sequence, workflow_choice_entry(event)?)))
+        .collect();
+    choices.sort_by_key(|(sequence, _)| *sequence);
+    choices
 }
 
 /// Projects only events that record a person or decision-maker choosing a
