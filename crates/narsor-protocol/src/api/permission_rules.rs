@@ -29,7 +29,7 @@ fn is_pattern_or_control(c: char) -> bool {
 
 /// Programs that run other programs: a group rule for one of them would
 /// allow anything, so only the exact command is granted.
-const RUNNERS: [&str; 41] = [
+const RUNNERS: [&str; 59] = [
     "sh",
     "bash",
     "zsh",
@@ -71,6 +71,43 @@ const RUNNERS: [&str; 41] = [
     "kubectl",
     "make",
     "just",
+    "uvx",
+    "bun",
+    "deno",
+    "nodejs",
+    "busybox",
+    "setsid",
+    "chroot",
+    "flock",
+    "ionice",
+    "taskset",
+    "su",
+    "runuser",
+    "pkexec",
+    "strace",
+    "ltrace",
+    "gdb",
+    "script",
+    "unbuffer",
+];
+
+/// Prefixes of versioned interpreters (`python3.12`, `ruby3.3`, `node22`).
+const RUNNER_PREFIXES: [&str; 5] = ["python", "ruby", "node", "perl", "php"];
+
+/// Subcommands that run whatever command follows them.
+const RUNNING_SUBCOMMANDS: [(&str, &str); 12] = [
+    ("npm", "exec"),
+    ("npm", "x"),
+    ("pnpm", "dlx"),
+    ("pnpm", "exec"),
+    ("yarn", "dlx"),
+    ("yarn", "exec"),
+    ("git", "submodule"),
+    ("cargo", "run"),
+    ("cargo", "watch"),
+    ("go", "run"),
+    ("dotnet", "run"),
+    ("dotnet", "exec"),
 ];
 
 /// The parts of `command`, each as its words in their source spelling, or
@@ -227,11 +264,20 @@ pub fn bash_grant_rules(command: &str, scope: BashGrantScope) -> Option<Vec<Stri
                     word.chars()
                         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
                 };
-                if !plain(program) || RUNNERS.contains(&name) {
+                if !plain(program)
+                    || RUNNERS.contains(&name)
+                    || RUNNER_PREFIXES
+                        .iter()
+                        .any(|prefix| name.starts_with(prefix))
+                {
                     return None;
                 }
                 match words.get(1) {
-                    Some(argument) if plain(argument) && !argument.starts_with('-') => {
+                    Some(argument)
+                        if plain(argument)
+                            && !argument.starts_with('-')
+                            && !RUNNING_SUBCOMMANDS.contains(&(name, argument.as_str())) =>
+                    {
                         format!("Bash({program} {argument} *)")
                     }
                     Some(_) => return None,
@@ -369,6 +415,13 @@ mod tests {
             "awk prog",
             "git -c core.pager=x log",
             "npm run:test",
+            "python3.12 -m x",
+            "node22 app.js",
+            "npm exec cowsay",
+            "pnpm dlx x",
+            "git submodule foreach ls",
+            "cargo run --bin x",
+            "uvx ruff",
             r#"git "log""#,
         ] {
             assert_eq!(group(command), None, "{command}");
