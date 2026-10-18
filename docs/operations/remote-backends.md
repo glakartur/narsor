@@ -526,14 +526,15 @@ Kubernetes backend in v1: one task runs in one container on one image.
 ## 9. Task lifecycle
 
 ```text
-Queued ─▶ Provisioning ─▶ Running ─▶ PauseRequested ─▶ Paused ─▶ (resume) Provisioning
+(runner state; the owner's `state` is computed from it and the execution, §10)
+Queued ─▶ Provisioning ─▶ Running ─▶ PauseRequested ─▶ Stopped ─▶ (resume) Provisioning
                              │
                              └─▶ Interrupted / Unknown ─▶ (resume or start) Provisioning
                                    Unknown ─▶ (loss confirmed) Interrupted ─▶ (automatic resume) Provisioning
 any state ─▶ Archiving ─▶ Archived
 ```
 
-* **Pause** asks the runner for a safe point; only after it acknowledges does
+* **Pause** (the owner's, or the slot-release policy's, §10) asks the runner for a safe point; only after it acknowledges does
   the controller delete the Pod. The PVC — workspace, engine state, private
   `$HOME`, the harness the runner last switched to — stays.
 * **Resume** creates a new Pod on the same PVC; nothing is cloned again.
@@ -570,28 +571,57 @@ any state ─▶ Archiving ─▶ Archived
 * **Archive** stops everything and deletes the Pod **and the PVC**. It wins
   over every other state and cannot be undone; there is no automatic
   retention cleanup.
-* While a remote task is paused, interrupted or archived its conversation is
+* While a remote task is stopped (paused by the owner or freed by the slot
+  policy), interrupted or archived its conversation is
   explicitly unavailable; clients show the last safe summary and its time. A
   task of the daemon's own `local` backend without a live runner is read
   from its storage instead, marked with the age of the record (D59).
   Observations that are no longer current are shown as stale with their age,
-  never turned into another state.
+  never turned into another state. This is the state of phase 1 of D62; phase 2
+  replaces the read from storage with a read-only runner.
 
 ## 10. Scheduling
 
 The slot-release periods (`slot_release_grace_secs`,
 `slot_release_read_extension_secs`, `slot_reader_idle_secs`) are settings of
-`limits`. Omit them to get 300 s, 180 s and 120 s. Each must be a whole number
+`limits`. Omit them to get 300 s, 180 s and 120 s. The third one,
+`slot_reader_idle_secs`, is for the read-only runner of phase 2 and has no
+effect yet. Each must be a whole number
 from 1 to 86400; a negative or non-numeric value makes the backend file
 unreadable, and 0 or more than 86400 makes the backend unusable with a clear
 message. The control plane reads them again at every decision, so a change
 applies without a restart.
 
-* Each backend has `max_concurrent_tasks` slots. Slots are held by tasks in
+* Each backend has `max_concurrent_tasks` slots (D62). A slot is held by
+  work, not by a live process alone. Slots are held by tasks in
   `Provisioning`, `Running`, `PauseRequested`, `Interrupted`, `Unknown`,
-  `Archiving`, and by an admitted `Queued` task. `Paused` and `Archived` hold
-  none — so an interrupted task still blocks a slot until it is resumed
-  (automatically or by the owner) or archived.
+  `Archiving`, and by an admitted `Queued` task. `Stopped` and `Archived` hold
+  none. An interrupted task still blocks a slot until it is resumed
+  (automatically or by the owner) or archived. The task list shows whether a
+  task holds a slot (`holds_slot`), and the `slots N/M` counter counts only
+  those that do.
+* **Who frees a slot.** Only the control plane decides, from the execution
+  state in the runner's last snapshot. A task that **completed or was
+  cancelled** frees its slot at once. A task that waits for its owner (**input
+  needed**) or **failed** frees it after the wait `slot_release_grace_secs`;
+  opening the task's details moves that deadline later by
+  `slot_release_read_extension_secs`. The control plane does not free a slot
+  while an answer or an operator command of the owner waits for the runner.
+  Freeing a slot is a pause issued by the policy (idempotency key
+  `slot-release:<generation>`): the runner stops at a safe point, the
+  controller removes the Pod or process and keeps the storage, and the freed
+  slot goes to the next task in the queue. It is not a lost workload, so it
+  never starts an automatic resume (D58). The deadline is kept in the task's
+  record, so a restart of the daemon neither loses nor shortens it. The
+  history shows `SlotReleaseScheduled` and `SlotReleased` (`terminal` or
+  `grace_elapsed`).
+* **What the owner sees.** The control plane computes one `state` for each
+  task: `Queued`, `Running`, `HumanNeeded`, `Paused`, `Finished`, `Error` or
+  `Archived`. A task stopped to free its slot keeps the state of its work
+  (for example `Finished`); `Paused` means only the owner's own pause. The
+  runner and its resources are a separate field, `runner_state` (older
+  versions called it `lifecycle`, and `Stopped` was `Paused`; both old names
+  are still read).
 * Every task has a position (`rank`) in its backend's queue, shown as `#n` by
   `narsor-cli task list`. A new task joins the end; waiting tasks are admitted in
   that order. A queued task is reordered with `narsor-cli task move <task>
@@ -655,9 +685,20 @@ applies without a restart.
 * A queued task shows why it waits: `waiting for capacity` (position,
   slots in use / limit), `controller offline` (no controller holds the lease),
   `backend unknown`, or `admitted` (starting).
-* Resuming a paused task needs a free slot; on a full backend the task goes to
+* Resuming a stopped task needs a free slot; on a full backend the task goes to
   the front of the queue (state `queued`, no reservation) and starts on the
-  first slot released. The command response says `queued_for_slot`.
+  first slot released. The command response says `queued_for_slot`. The
+  error `backend_at_capacity` no longer applies to a resume.
+* A command that needs the runner to work (an answer to an input, an operator
+  command, a message to the conductor) sent to a stopped task is stored and
+  resumes the task (idempotency key `work-resume:<key of the command>`), so
+  the owner does not resume it first. It runs through the queue like any
+  resume, and never without a slot. The keys `slot-release:` and
+  `work-resume:` (like `auto-resume:`) are reserved: an owner key that starts
+  with one is refused with `400 reserved_idempotency_key`.
+* Until phase 2 (a read-only runner, not yet built) reading the details of a
+  stopped task works as before: a `local` task from its storage (D59), a
+  remote one only as the last snapshot. Freed slots do not change that.
 * The default backend applies to tasks created afterwards only; existing
   tasks never move.
 
