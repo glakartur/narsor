@@ -175,7 +175,8 @@ pub struct ReportResponse {
     /// False for an absorbed duplicate.
     pub applied: bool,
     /// Lifecycle afterwards.
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
     /// Desired generation afterwards.
     pub generation: u64,
 }
@@ -220,7 +221,8 @@ pub struct RunnerProgress {
 pub struct DesiredCommand {
     pub task_id: TaskId,
     pub generation: u64,
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
     pub action: DesiredAction,
     pub resource_key: String,
     pub launch_spec: Value,
@@ -462,22 +464,25 @@ pub enum ConductorReadResponse {
     },
 }
 
-/// Orchestration state of a task as stored and exposed by the control plane.
+/// State of a task's runner and its resources (slot, workload, storage) as
+/// stored and exposed by the control plane. Older records and events spell
+/// `Stopped` as `paused`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskLifecycle {
+pub enum RunnerState {
     Queued,
     Provisioning,
     Running,
     PauseRequested,
-    Paused,
+    #[serde(alias = "paused")]
+    Stopped,
     Interrupted,
     Unknown,
     Archiving,
     Archived,
 }
 
-impl TaskLifecycle {
+impl RunnerState {
     /// True for `Archiving` and `Archived`.
     pub fn is_archival(self) -> bool {
         matches!(self, Self::Archiving | Self::Archived)
@@ -576,7 +581,7 @@ impl ResumeState {
 /// Where and when a task lost its workload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkloadLoss {
-    pub from: TaskLifecycle,
+    pub from: RunnerState,
     pub at: DateTime<Utc>,
     pub lease_epoch: u64,
     #[serde(default)]
@@ -717,7 +722,8 @@ pub struct RunnerSnapshotResponse {
     pub applied: bool,
     pub directive: RunnerDirective,
     pub generation: u64,
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
     pub launch: RunnerLaunchView,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_harness: Option<TaskDefaultHarness>,
@@ -745,7 +751,8 @@ pub struct DeliveredOperatorCommand {
 pub struct RunnerPollResponse {
     pub directive: RunnerDirective,
     pub generation: u64,
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
     pub inputs: Vec<DeliveredInput>,
     #[serde(default)]
     pub commands: Vec<DeliveredOperatorCommand>,
@@ -806,7 +813,8 @@ pub struct ConversationPageAccepted {
 pub struct TaskSummary {
     pub task_id: crate::identifier::TaskId,
     pub backend_id: crate::identifier::BackendId,
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
     pub generation: u64,
     pub revision: u64,
     pub rank: u32,
@@ -843,7 +851,7 @@ pub struct TaskListResponse {
     pub cursor: String,
 }
 
-/// Actor recorded for a lifecycle command receipt.
+/// Actor recorded for a runner_state command receipt.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandActor {
@@ -871,7 +879,8 @@ pub struct CommandReceipt {
     pub expected_generation: Option<u64>,
     pub accepted_at: DateTime<Utc>,
     pub generation_after: u64,
-    pub lifecycle_after: TaskLifecycle,
+    #[serde(alias = "lifecycle_after")]
+    pub runner_state_after: RunnerState,
     pub revision: u64,
     #[serde(default)]
     pub actor: CommandActor,
@@ -945,7 +954,7 @@ pub enum TaskEventKind {
     Unrecognized,
 }
 
-/// Material lifecycle change recorded in a task event.
+/// Material runner_state change recorded in a task event.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MaterialChange {
@@ -969,7 +978,8 @@ pub struct TaskEvent {
     pub sequence: u64,
     pub task_id: crate::identifier::TaskId,
     pub at: DateTime<Utc>,
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
     pub generation: u64,
     pub kind: TaskEventKind,
 }
@@ -1223,7 +1233,7 @@ pub struct MoveTaskRequest {
     pub expected_generation: Option<u64>,
 }
 
-/// An owner's requested change to a task's desired lifecycle.
+/// An owner's requested change to a task's desired runner_state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnerCommand {
@@ -1706,11 +1716,10 @@ mod tests {
         Observation, ObservationView, ObservedSummary, OperatorCommand, OperatorCommandStatus,
         OperatorCommandView, OwnerCommand, OwnerCommandRequest, QueueReason, QueueView,
         RepositoryListResponse, RepositoryView, ResourceIdentity, ResourceProfileRequest,
-        SetDefaultBackendRequest, SubmitInputRequest, SubmitInputResponse,
+        RunnerState, SetDefaultBackendRequest, SubmitInputRequest, SubmitInputResponse,
         SubmitOperatorCommandRequest, SubmitOperatorCommandResponse, TaskDefaultHarness,
-        TaskLifecycle, TimelineResponse, ValidateWorkflowRequest, ValidateWorkflowResponse,
-        WorkflowInputType, WorkflowInputView, WorkflowListResponse, WorkflowSource, WorkflowView,
-        WorkspaceRequest,
+        TimelineResponse, ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowInputType,
+        WorkflowInputView, WorkflowListResponse, WorkflowSource, WorkflowView, WorkspaceRequest,
     };
 
     #[test]
@@ -2222,12 +2231,12 @@ mod tests {
     #[test]
     fn task_lifecycle_keeps_snake_case_states_and_archival_classification() {
         assert_eq!(
-            serde_json::to_string(&TaskLifecycle::PauseRequested).unwrap(),
+            serde_json::to_string(&RunnerState::PauseRequested).unwrap(),
             "\"pause_requested\""
         );
-        assert!(!TaskLifecycle::Paused.is_archival());
-        assert!(TaskLifecycle::Archiving.is_archival());
-        assert!(TaskLifecycle::Archived.is_archival());
+        assert!(!RunnerState::Stopped.is_archival());
+        assert!(RunnerState::Archiving.is_archival());
+        assert!(RunnerState::Archived.is_archival());
     }
 
     #[test]

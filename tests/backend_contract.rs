@@ -191,7 +191,7 @@ contract_suite!(local, crate::LocalTarget);
 /// owner resume, and a finished step is never executed again (R13).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_engine_work_survives_loss_and_owner_resume() {
-    use narsor_engine::orchestration::{OwnerCommand, TaskLifecycle};
+    use narsor_engine::orchestration::{OwnerCommand, RunnerState};
 
     let Some(mut h) = backend_contract_support::Harness::<LocalTarget>::without_auto_resume().await
     else {
@@ -201,9 +201,10 @@ async fn local_engine_work_survives_loss_and_owner_resume() {
     let before = finished_work(&h).await;
 
     h.kill_workload("task-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Interrupted).await;
+    h.wait_runner_state("task-1", RunnerState::Interrupted)
+        .await;
     h.must("task-1", OwnerCommand::Resume, "resume-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-1", RunnerState::Running).await;
 
     assert_work_continued(&h, &before);
 }
@@ -213,7 +214,7 @@ async fn local_engine_work_survives_loss_and_owner_resume() {
 /// task's history shows the loss and the automatic resume (R1, R2, AE2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_engine_work_survives_loss_and_automatic_resume() {
-    use narsor_engine::orchestration::{Observation, TaskLifecycle};
+    use narsor_engine::orchestration::{Observation, RunnerState};
 
     let Some(mut h) = backend_contract_support::Harness::<LocalTarget>::new().await else {
         return;
@@ -225,7 +226,7 @@ async fn local_engine_work_survives_loss_and_automatic_resume() {
     h.kill_workload("task-1");
     h.wait_for("a new runner", |h| {
         let record = h.record("task-1");
-        record.lifecycle == TaskLifecycle::Running
+        record.runner_state == RunnerState::Running
             && record
                 .runner
                 .is_some_and(|runner| runner.incarnation != first)

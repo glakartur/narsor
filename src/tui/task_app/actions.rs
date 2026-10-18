@@ -27,7 +27,7 @@
 //! # What goes where
 //!
 //! * pause, resume, start and archive are owner commands
-//!   (`POST …/commands`) — the answer is the new lifecycle, which the stream
+//!   (`POST …/commands`) — the answer is the new runner_state, which the stream
 //!   shows in the row;
 //! * interrupt and the transitions are operator commands
 //!   (`POST …/operator-commands`): the control plane queues them and the
@@ -60,7 +60,7 @@ use crate::controller_protocol::{
 };
 use crate::domain::display::safe_link_url;
 use narsor_protocol::controller::{
-    AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, TaskLifecycle,
+    AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, RunnerState,
 };
 
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
@@ -178,23 +178,23 @@ impl Availability {
 
 /// What the task is, as a clause that begins a reason.
 fn state_phrase(task: &TaskSummary) -> &'static str {
-    match task.lifecycle {
-        TaskLifecycle::Queued => "zadanie jest w kolejce",
-        TaskLifecycle::Provisioning => "zadanie jest przygotowywane",
-        TaskLifecycle::Running if is_finished(task) => "zadanie jest zakończone",
-        TaskLifecycle::Running => "zadanie działa",
-        TaskLifecycle::PauseRequested => "zadanie jest wstrzymywane",
-        TaskLifecycle::Paused => "zadanie jest wstrzymane",
-        TaskLifecycle::Interrupted | TaskLifecycle::Unknown => "zadanie jest przerwane",
-        TaskLifecycle::Archiving | TaskLifecycle::Archived => "zadanie jest archiwizowane",
+    match task.runner_state {
+        RunnerState::Queued => "zadanie jest w kolejce",
+        RunnerState::Provisioning => "zadanie jest przygotowywane",
+        RunnerState::Running if is_finished(task) => "zadanie jest zakończone",
+        RunnerState::Running => "zadanie działa",
+        RunnerState::PauseRequested => "zadanie jest wstrzymywane",
+        RunnerState::Stopped => "zadanie jest wstrzymane",
+        RunnerState::Interrupted | RunnerState::Unknown => "zadanie jest przerwane",
+        RunnerState::Archiving | RunnerState::Archived => "zadanie jest archiwizowane",
     }
 }
 
 /// Whether the execution ended: completed, failed or cancelled.
 fn is_finished(task: &TaskSummary) -> bool {
     matches!(
-        task.lifecycle,
-        TaskLifecycle::Running | TaskLifecycle::Provisioning
+        task.runner_state,
+        RunnerState::Running | RunnerState::Provisioning
     ) && task
         .runner
         .as_ref()
@@ -212,12 +212,12 @@ fn provisioning_failed(task: &TaskSummary) -> bool {
 /// running a step.
 fn not_running(task: &TaskSummary) -> Option<String> {
     let phrase = state_phrase(task);
-    match task.lifecycle {
-        TaskLifecycle::Running if is_finished(task) => Some(phrase.to_string()),
-        TaskLifecycle::Running => None,
-        TaskLifecycle::Paused => Some(format!("{phrase} — wznów je (p)")),
-        TaskLifecycle::Interrupted | TaskLifecycle::Unknown => {
-            Some(match loss_state(task.lifecycle, &task.resume) {
+    match task.runner_state {
+        RunnerState::Running if is_finished(task) => Some(phrase.to_string()),
+        RunnerState::Running => None,
+        RunnerState::Stopped => Some(format!("{phrase} — wznów je (p)")),
+        RunnerState::Interrupted | RunnerState::Unknown => {
+            Some(match loss_state(task.runner_state, &task.resume) {
                 Some(LossState::AutoResume { attempt, limit }) => format!(
                 "{phrase} — wznowi się samo (próba {attempt}/{limit}) albo uruchom je od nowa (s)"
             ),
@@ -246,13 +246,13 @@ fn runner_unreachable(task: &TaskSummary) -> Option<&'static str> {
 /// connection — that gate is [`TaskApp::mutation_allowed`].
 pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
     match action {
-        TaskAction::Move => match task.lifecycle {
-            TaskLifecycle::Queued => Availability::Available,
+        TaskAction::Move => match task.runner_state {
+            RunnerState::Queued => Availability::Available,
             _ => Availability::because("zadanie nie jest w kolejce"),
         },
-        TaskAction::PauseResume => match task.lifecycle {
-            TaskLifecycle::Paused => Availability::Available,
-            TaskLifecycle::PauseRequested => Availability::because("zadanie jest już wstrzymywane"),
+        TaskAction::PauseResume => match task.runner_state {
+            RunnerState::Stopped => Availability::Available,
+            RunnerState::PauseRequested => Availability::because("zadanie jest już wstrzymywane"),
             _ => not_running(task).map_or(Availability::Available, Availability::because),
         },
         TaskAction::Interrupt => {
@@ -277,19 +277,19 @@ pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
                 Some(_) => Availability::Available,
             }
         }
-        TaskAction::Restart => match task.lifecycle {
-            TaskLifecycle::Interrupted | TaskLifecycle::Unknown => Availability::Available,
+        TaskAction::Restart => match task.runner_state {
+            RunnerState::Interrupted | RunnerState::Unknown => Availability::Available,
             _ if provisioning_failed(task) => Availability::Available,
-            TaskLifecycle::Running if !is_finished(task) => Availability::because(
+            RunnerState::Running if !is_finished(task) => Availability::because(
                 "zadanie działa — jest co przerwać (x), nie ma co uruchamiać od nowa",
             ),
-            TaskLifecycle::Paused | TaskLifecycle::PauseRequested => {
+            RunnerState::Stopped | RunnerState::PauseRequested => {
                 Availability::because(format!("{} — wznów je (p)", state_phrase(task)))
             }
             _ => Availability::because(state_phrase(task)),
         },
-        TaskAction::Archive => match task.lifecycle {
-            TaskLifecycle::Interrupted | TaskLifecycle::Unknown => Availability::Available,
+        TaskAction::Archive => match task.runner_state {
+            RunnerState::Interrupted | RunnerState::Unknown => Availability::Available,
             _ if is_finished(task) || provisioning_failed(task) => Availability::Available,
             _ => Availability::because(format!(
                 "{} — archiwizować można zakończone lub przerwane",
@@ -328,7 +328,7 @@ fn openable_links(task: &TaskSummary) -> impl Iterator<Item = (&str, &str, Strin
 pub fn verb(task: &TaskSummary, action: TaskAction) -> &'static str {
     match action {
         TaskAction::Move => "przesuń",
-        TaskAction::PauseResume if task.lifecycle == TaskLifecycle::Paused => "wznowienie",
+        TaskAction::PauseResume if task.runner_state == RunnerState::Stopped => "wznowienie",
         TaskAction::PauseResume => "pauza",
         TaskAction::Interrupt => "przerwanie",
         TaskAction::Transition => "przejście",
@@ -345,7 +345,7 @@ pub fn verb(task: &TaskSummary, action: TaskAction) -> &'static str {
 /// What an action sends.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActionSend {
-    /// A lifecycle command of the owner: pause, resume, start, archive.
+    /// A runner_state command of the owner: pause, resume, start, archive.
     Owner(OwnerCommand),
     /// A command for the runner: interrupt, a transition.
     Operator(OperatorCommand),
@@ -556,7 +556,7 @@ fn menu_text(task: &TaskSummary, action: TaskAction) -> (String, String) {
              zatwierdza, `Esc` anuluje."
                 .to_string(),
         ),
-        TaskAction::PauseResume if task.lifecycle == TaskLifecycle::Paused => (
+        TaskAction::PauseResume if task.runner_state == RunnerState::Stopped => (
             "wznów".to_string(),
             "Wznawia zadanie na tym samym storage: runner zaczyna od zapisanego stanu. Backend \
              może odmówić, gdy nie ma wolnego slotu."
@@ -1001,7 +1001,7 @@ impl TaskApp {
                 Request::None
             }
             TaskAction::PauseResume => {
-                let (command, summary) = if task.lifecycle == TaskLifecycle::Paused {
+                let (command, summary) = if task.runner_state == RunnerState::Stopped {
                     (OwnerCommand::Resume, "wznowienie zlecone")
                 } else {
                     (OwnerCommand::Pause, "wstrzymanie zlecone")
@@ -1128,7 +1128,7 @@ impl TaskApp {
     // -----------------------------------------------------------------
 
     /// Sends an action. An owner command is answered with the task's new
-    /// lifecycle, which the stream puts in the row; an operator command is
+    /// runner_state, which the stream puts in the row; an operator command is
     /// answered with "queued", and the runner's verdict follows as an event.
     /// A refusal says why on the bar and reads the tasks again.
     pub(super) async fn act(&mut self, request: ActionRequest) {

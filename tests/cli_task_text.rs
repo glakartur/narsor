@@ -9,8 +9,8 @@ use chrono::{Duration, TimeZone, Utc};
 use narsor::api::{ClientError, HarnessSelectionSnapshot};
 use narsor::cli::task_text::{
     age, attention_lines, command_outcome, conversation_lines, conversation_origin,
-    default_harness_line, detail_lines, display_lines, event_line, lifecycle_hint, list_line,
-    next_waiting, queue_badge, record_unreadable_detail, safe_json, Tone,
+    default_harness_line, detail_lines, display_lines, event_line, list_line, next_waiting,
+    queue_badge, record_unreadable_detail, runner_state_hint, safe_json, Tone,
 };
 use narsor_engine::controller_protocol::{
     ConversationResponse, ConversationUnavailableReason, ExecutionEventsSource, QueueView,
@@ -20,7 +20,7 @@ use narsor_engine::domain::display::DisplayLink;
 use narsor_engine::domain::{ExecutionStatus, TaskId};
 use narsor_engine::orchestration::{
     AttentionKind, ConversationAttemptSummary, HarnessUnavailable, OwnerCommand, QueueReason,
-    TaskEvent, TaskEventKind, TaskLifecycle, EXHAUSTION_REASON_PREFIX, UNSPECIFIED_LOSS,
+    RunnerState, TaskEvent, TaskEventKind, EXHAUSTION_REASON_PREFIX, UNSPECIFIED_LOSS,
 };
 
 mod task_app_support;
@@ -466,7 +466,7 @@ fn resume_event(kind: TaskEventKind) -> TaskEvent {
         sequence: 7,
         task_id: TaskId::parse("t-1").unwrap(),
         at: at(),
-        lifecycle: TaskLifecycle::Interrupted,
+        runner_state: RunnerState::Interrupted,
         generation: 2,
         kind,
     }
@@ -529,9 +529,9 @@ fn an_exhaustion_event_names_the_attempts_and_the_loss_once() {
 
 #[test]
 fn show_on_an_interrupted_task_tells_what_it_waits_for() {
-    let hint = |subject| lifecycle_hint(&subject).unwrap();
+    let hint = |subject| runner_state_hint(&subject).unwrap();
 
-    let planned = hint(interrupted("t-1", TaskLifecycle::Running, 2, true));
+    let planned = hint(interrupted("t-1", RunnerState::Running, 2, true));
     assert!(
         planned.text.contains("resumed automatically (attempt 2/5)"),
         "{planned:?}"
@@ -539,7 +539,7 @@ fn show_on_an_interrupted_task_tells_what_it_waits_for() {
     assert_eq!(planned.tone, Tone::Warning);
 
     let gave_up = hint(exhausted(
-        interrupted("t-1", TaskLifecycle::Running, 5, false),
+        interrupted("t-1", RunnerState::Running, 5, false),
         &format!("{EXHAUSTION_REASON_PREFIX}pod evicted"),
     ));
     assert!(
@@ -550,7 +550,7 @@ fn show_on_an_interrupted_task_tells_what_it_waits_for() {
     );
     assert_eq!(gave_up.tone, Tone::Error);
 
-    let pausing = hint(interrupted("t-1", TaskLifecycle::PauseRequested, 1, false));
+    let pausing = hint(interrupted("t-1", RunnerState::PauseRequested, 1, false));
     assert!(
         pausing
             .text
@@ -571,7 +571,7 @@ fn show_on_an_interrupted_task_tells_what_it_waits_for() {
     }
 
     let detail = detail_lines(
-        &interrupted("t-1", TaskLifecycle::Running, 3, true),
+        &interrupted("t-1", RunnerState::Running, 3, true),
         None,
         None,
     );

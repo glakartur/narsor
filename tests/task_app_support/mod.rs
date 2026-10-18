@@ -15,20 +15,20 @@ use narsor_engine::domain::{Event, EventData, ExecutionStatus, TaskId};
 use narsor_engine::engine::{ConversationState, Position, PositionStatus, Timeline};
 use narsor_engine::orchestration::{
     AttentionItem, AttentionKind, ExecutionCursor, QueueReason, ResumeExhaustion, ResumeState,
-    TaskEvent, TaskEventKind, TaskLifecycle, WorkloadLoss,
+    RunnerState, TaskEvent, TaskEventKind, WorkloadLoss,
 };
 
 pub fn at() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 9, 12, 0, 0).unwrap()
 }
 
-/// A task of `backend` in `lifecycle` (a snake_case word) at queue position
+/// A task of `backend` in `runner_state` (a snake_case word) at queue position
 /// `rank`, revision 1, generation 1.
-pub fn task(id: &str, backend: &str, lifecycle: &str, rank: u32) -> TaskSummary {
+pub fn task(id: &str, backend: &str, runner_state: &str, rank: u32) -> TaskSummary {
     serde_json::from_value(serde_json::json!({
         "task_id": id,
         "backend_id": backend,
-        "lifecycle": lifecycle,
+        "runner_state": runner_state,
         "generation": 1,
         "revision": 1,
         "rank": rank,
@@ -142,7 +142,7 @@ pub fn event(
     cursor: &str,
     task: &str,
     sequence: u64,
-    lifecycle: TaskLifecycle,
+    runner_state: RunnerState,
     kind: TaskEventKind,
 ) -> Option<Result<ControlEventEnvelope, narsor::api::ClientError>> {
     Some(Ok(ControlEventEnvelope {
@@ -151,7 +151,7 @@ pub fn event(
             sequence,
             task_id: TaskId::parse(task).expect("a task id"),
             at: at(),
-            lifecycle,
+            runner_state,
             generation: 1,
             kind,
         },
@@ -542,7 +542,7 @@ pub const HARNESSES: [&str; 3] = ["claude-code", "codex", "opencode"];
 
 /// An `Interrupted` task whose loss the control plane counted as `losses`
 /// in a row, lost from `from`; `planned` says an automatic resume is due.
-pub fn interrupted(id: &str, from: TaskLifecycle, losses: u32, planned: bool) -> TaskSummary {
+pub fn interrupted(id: &str, from: RunnerState, losses: u32, planned: bool) -> TaskSummary {
     let mut task = task(id, "local", "interrupted", 1);
     task.resume = ResumeState {
         consecutive_losses: losses,
@@ -581,7 +581,7 @@ pub fn auto_resumed(
         cursor,
         task,
         sequence,
-        TaskLifecycle::Provisioning,
+        RunnerState::Provisioning,
         TaskEventKind::AutoResumed {
             attempt,
             limit: 5,

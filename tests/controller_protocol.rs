@@ -37,7 +37,7 @@ use narsor_engine::orchestration::{
     AttentionItem, AttentionKind, Clock, CommandRequest, ControlPlane, ConversationAttemptSummary,
     ConversationAvailability, ExecutionCursor, InputStatus, NewTask, Observation, ObservedSummary,
     OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, PendingInputRef,
-    ResourceIdentity, ResumePolicy, RunnerSnapshot, TaskEventKind, TaskLifecycle,
+    ResourceIdentity, ResumePolicy, RunnerSnapshot, RunnerState, TaskEventKind,
 };
 use narsor_engine::persistence::paths::{temp_path_for, StatePaths};
 use narsor_engine::persistence::{DaemonInfo, DefaultHarnessSelector, ExecutionStore};
@@ -556,8 +556,8 @@ async fn a_controller_scoped_to_one_backend_cannot_see_or_touch_another() {
         Err(ClientError::NotFound)
     ));
     assert_eq!(
-        harness.task("task-b").await.lifecycle,
-        TaskLifecycle::Queued
+        harness.task("task-b").await.runner_state,
+        RunnerState::Queued
     );
 
     // Its lease is its own backend's, and leaves backend-b free.
@@ -665,8 +665,8 @@ async fn a_stale_lease_epoch_report_is_refused_over_http() {
     .await
     .expect("current lease and generation");
     assert_eq!(
-        harness.task("task-1").await.lifecycle,
-        TaskLifecycle::Provisioning
+        harness.task("task-1").await.runner_state,
+        RunnerState::Provisioning
     );
 }
 
@@ -723,8 +723,8 @@ async fn a_reconnecting_controller_receives_only_commands_newer_than_its_acknowl
         "an unaccepted task archives at once"
     );
     assert_eq!(
-        harness.task("task-1").await.lifecycle,
-        TaskLifecycle::Archived
+        harness.task("task-1").await.runner_state,
+        RunnerState::Archived
     );
 
     // An acknowledgement older than the one recorded never lowers it.
@@ -769,7 +769,7 @@ async fn archive_racing_start_refuses_the_late_start_acceptance() {
     let archived = harness
         .command("task-1", OwnerCommand::Archive, "archive-1")
         .await;
-    assert_eq!(archived.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(archived.runner_state, RunnerState::Archived);
 
     // The controller had not reported StartAccepted yet, so it must not
     // create anything: its late report is refused.
@@ -914,8 +914,8 @@ async fn an_offline_runner_leaves_an_explicitly_stale_last_observation() {
     let stale = harness.task("task-1").await;
     let runner = stale.runner.expect("last runner observation kept");
     assert_eq!(
-        stale.lifecycle,
-        TaskLifecycle::Running,
+        stale.runner_state,
+        RunnerState::Running,
         "no fabricated state"
     );
     assert_eq!(runner.execution_status, ExecutionStatus::Running);
@@ -1139,7 +1139,7 @@ async fn ae12_client_reads_and_answers_a_remote_task_through_the_control_plane()
     let paused = harness
         .command("task-1", OwnerCommand::Pause, "pause-1")
         .await;
-    assert_eq!(paused.lifecycle, TaskLifecycle::PauseRequested);
+    assert_eq!(paused.runner_state, RunnerState::PauseRequested);
     assert_eq!(
         refused_code(
             controller
@@ -1194,7 +1194,7 @@ async fn ae12_client_reads_and_answers_a_remote_task_through_the_control_plane()
         other => panic!("expected unavailable, got {other:?}"),
     }
     let summary = harness.task("task-1").await;
-    assert_eq!(summary.lifecycle, TaskLifecycle::Paused);
+    assert_eq!(summary.runner_state, RunnerState::Stopped);
     assert_eq!(summary.inputs[0].status, InputStatus::Consumed);
     assert_eq!(summary.runner.unwrap().freshness, Freshness::Stale);
 }
@@ -1246,8 +1246,8 @@ async fn owner_scope_hides_other_owners_tasks() {
         Err(ClientError::NotFound)
     ));
     assert_eq!(
-        control.task(&foreign).unwrap().lifecycle,
-        TaskLifecycle::Queued
+        control.task(&foreign).unwrap().runner_state,
+        RunnerState::Queued
     );
 }
 
@@ -2353,7 +2353,7 @@ async fn a_task_the_backend_could_not_provision_asks_for_the_owner() {
         .await
         .expect("lost");
     let summary = harness.task("task-1").await;
-    assert_eq!(summary.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(summary.runner_state, RunnerState::Interrupted);
     assert!(summary.runner.is_none(), "no execution ever existed");
     let kinds: Vec<_> = summary.attention.iter().map(|item| item.kind).collect();
     assert_eq!(kinds, vec![AttentionKind::ProvisioningFailed]);
@@ -3384,7 +3384,7 @@ async fn the_daemons_periodic_pass_resumes_a_due_interrupted_task() {
         .control_plane()
         .task(&TaskId::parse("task-1").unwrap())
         .unwrap();
-    assert_eq!(record.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(record.runner_state, RunnerState::Provisioning);
     assert_eq!(auto_resumed(&task_events(&harness, "task-1")), 1);
 }
 
@@ -3408,7 +3408,7 @@ async fn the_resume_policy_resumes_a_lost_task_once_in_one_mutation() {
         .control_plane()
         .task(&TaskId::parse("task-1").unwrap())
         .unwrap();
-    assert_eq!(before.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(before.runner_state, RunnerState::Interrupted);
 
     let pass = harness.service.auto_resume_pass();
     assert_eq!(pass.resumed, vec![TaskId::parse("task-1").unwrap()]);
@@ -3427,7 +3427,7 @@ async fn the_resume_policy_resumes_a_lost_task_once_in_one_mutation() {
         .control_plane()
         .task(&TaskId::parse("task-1").unwrap())
         .unwrap();
-    assert_eq!(record.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(record.runner_state, RunnerState::Provisioning);
     assert_eq!(record.generation, 2);
     assert_eq!(record.revision, before.revision + 1, "one mutation");
     let resumes: Vec<_> = record
@@ -3497,7 +3497,7 @@ async fn the_resume_policy_waits_for_a_controller_to_launch_the_workload() {
         .control_plane()
         .task(&TaskId::parse("task-1").unwrap())
         .unwrap();
-    assert_eq!(record.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(record.runner_state, RunnerState::Interrupted);
     assert_eq!(record.resume.consecutive_losses, 1);
     assert!(record.resume.next_attempt_at.is_some(), "still planned");
     assert_eq!(auto_resumed(&task_events(&harness, "task-1")), 0);
@@ -3537,7 +3537,7 @@ async fn an_owner_command_first_makes_the_policy_step_aside() {
         .control_plane()
         .task(&TaskId::parse("task-1").unwrap())
         .unwrap();
-    assert_eq!(record.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(record.runner_state, RunnerState::Provisioning);
     assert_eq!(record.generation, 2, "one launch");
     assert_eq!(auto_resumed(&task_events(&harness, "task-1")), 0);
 }
@@ -3604,12 +3604,12 @@ async fn paused_tasks_and_losses_while_pausing_wait_for_the_owner() {
         controller.renew_lease(epoch, None).await.expect("renew");
     }
     assert_eq!(
-        harness.task("task-1").await.lifecycle,
-        TaskLifecycle::Paused
+        harness.task("task-1").await.runner_state,
+        RunnerState::Stopped
     );
     assert_eq!(
-        harness.task("task-2").await.lifecycle,
-        TaskLifecycle::Interrupted
+        harness.task("task-2").await.runner_state,
+        RunnerState::Interrupted
     );
     assert_eq!(auto_resumed(&task_events(&harness, "task-1")), 0);
     assert_eq!(auto_resumed(&task_events(&harness, "task-2")), 0);
@@ -3670,7 +3670,7 @@ async fn an_exhausted_task_is_announced_exactly_once() {
         .control_plane()
         .task(&TaskId::parse("task-1").unwrap())
         .unwrap();
-    assert_eq!(record.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(record.runner_state, RunnerState::Interrupted);
     assert!(record.resume.exhausted.unwrap().announced);
 }
 
@@ -3691,8 +3691,8 @@ async fn an_owner_key_in_the_policys_namespace_is_refused() {
         .await;
     assert_eq!(bad_request_code(refused), "reserved_idempotency_key");
     assert_eq!(
-        harness.task("task-1").await.lifecycle,
-        TaskLifecycle::Queued
+        harness.task("task-1").await.runner_state,
+        RunnerState::Queued
     );
 }
 
@@ -3756,7 +3756,7 @@ fn record_attempt(store: &ExecutionStore, entries: usize) {
     writer.finish().expect("finish");
 }
 
-/// Drives a running task to `Paused` at a safe point.
+/// Drives a running task to `Stopped` at a safe point.
 async fn pause(harness: &Harness, running: &Running) {
     harness
         .command("task-1", OwnerCommand::Pause, "pause-1")
@@ -3898,8 +3898,8 @@ async fn ae5_a_paused_local_task_reads_its_conversation_from_its_record() {
     record_attempt(&local_store(&storage, "task-1"), 3);
     pause(&harness, &running).await;
     assert_eq!(
-        harness.task("task-1").await.lifecycle,
-        TaskLifecycle::Paused
+        harness.task("task-1").await.runner_state,
+        RunnerState::Stopped
     );
 
     let (attempts, summary_at) = stored_summary(
@@ -3931,13 +3931,13 @@ async fn interrupted_and_provisioning_local_tasks_read_their_record() {
     record_attempt(&local_store(&storage, "task-1"), 2);
     lose(&running).await;
     assert_eq!(
-        harness.task("task-1").await.lifecycle,
-        TaskLifecycle::Interrupted
+        harness.task("task-1").await.runner_state,
+        RunnerState::Interrupted
     );
-    let read = |expected: TaskLifecycle| {
+    let read = |expected: RunnerState| {
         let harness = &harness;
         async move {
-            assert_eq!(harness.task("task-1").await.lifecycle, expected);
+            assert_eq!(harness.task("task-1").await.runner_state, expected);
             let (attempts, _) = stored_summary(
                 harness
                     .owner
@@ -3952,13 +3952,13 @@ async fn interrupted_and_provisioning_local_tasks_read_their_record() {
             assert_eq!(source, Some(ExecutionEventsSource::Storage));
         }
     };
-    read(TaskLifecycle::Interrupted).await;
+    read(RunnerState::Interrupted).await;
 
     // Restarted: the old runner's report no longer speaks for the task.
     harness
         .command("task-1", OwnerCommand::Start, "start-again")
         .await;
-    read(TaskLifecycle::Provisioning).await;
+    read(RunnerState::Provisioning).await;
 }
 
 #[tokio::test]
@@ -3978,8 +3978,8 @@ async fn a_provisioning_local_task_without_a_report_has_an_empty_record() {
         .await
         .expect("start accepted");
     assert_eq!(
-        harness.task("task-1").await.lifecycle,
-        TaskLifecycle::Provisioning
+        harness.task("task-1").await.runner_state,
+        RunnerState::Provisioning
     );
 
     let (attempts, recorded_at) = stored_summary(
@@ -4284,6 +4284,38 @@ fn a_task_summary_from_a_server_before_the_resume_policy_decodes_empty() {
     assert!(summary.resume.is_empty());
 }
 
+/// A server from before the rename spells the runner state `lifecycle` and
+/// the stopped one `paused`; a newer client must still read it.
+#[test]
+fn a_task_summary_from_a_server_before_the_rename_reads_its_lifecycle() {
+    let summary: TaskSummary = serde_json::from_value(serde_json::json!({
+        "task_id": "task-1",
+        "backend_id": "k8s",
+        "lifecycle": "paused",
+        "generation": 2,
+        "revision": 4,
+        "rank": 1,
+        "created_at": "2026-10-10T12:00:00Z",
+        "queue_sequence": 1,
+        "workflow_id": "implement-feature",
+        "workflow_version": 3,
+        "launch_digest": "digest",
+        "environment_identity": "env",
+        "archive": null,
+        "observation": null,
+        "runner": null,
+        "controller": null,
+        "inputs": [],
+        "as_of": "2026-10-10T12:00:00Z"
+    }))
+    .expect("an older summary decodes");
+
+    assert_eq!(summary.runner_state, RunnerState::Stopped);
+    let written = serde_json::to_value(&summary).unwrap();
+    assert_eq!(written["runner_state"], "stopped");
+    assert!(written.get("lifecycle").is_none());
+}
+
 #[test]
 fn a_runner_launch_from_a_control_plane_before_the_policy_has_no_actor() {
     let launch: narsor_engine::controller_protocol::RunnerLaunchView =
@@ -4348,7 +4380,7 @@ fn a_newer_servers_event_and_observation_kinds_decode_as_unrecognized() {
                 "sequence": 9,
                 "task_id": "task-1",
                 "at": "2026-10-10T12:00:00Z",
-                "lifecycle": "interrupted",
+                "runner_state": "interrupted",
                 "generation": 2,
                 "kind": { "type": "resumed_by_magic" }
             }

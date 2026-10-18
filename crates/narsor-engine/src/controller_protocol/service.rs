@@ -39,7 +39,7 @@ use crate::orchestration::{
     AttentionItem, AttentionKind, BackendCapacity, BackendLease, CommandActor, CommandRequest,
     ControlPlane, ControllerReport, ConversationAvailability, InputRequest, InputStatus,
     LeaseToken, MoveTarget, NewTask, Observation, OperatorCommand, OperatorCommandRequest,
-    OwnerRef, ResumePolicy, RunnerObservation, TaskEvent, TaskLifecycle, TaskRecord,
+    OwnerRef, ResumePolicy, RunnerObservation, RunnerState, TaskEvent, TaskRecord,
     RETIRED_CONDUCTOR_HARNESS,
 };
 use crate::workflow::TemplateScope;
@@ -552,7 +552,7 @@ impl ProtocolService {
                 continue;
             }
             cursor.advance(&record.task_id, record.revision);
-            if archived.is_none_or(|wanted| wanted == record.lifecycle.is_archival()) {
+            if archived.is_none_or(|wanted| wanted == record.runner_state.is_archival()) {
                 kept.push(record);
             }
         }
@@ -756,7 +756,7 @@ impl ProtocolService {
         let backends: std::collections::BTreeSet<BackendId> = match self.control.list_tasks() {
             Ok(tasks) => tasks
                 .into_iter()
-                .filter(|task| task.lifecycle == TaskLifecycle::Queued)
+                .filter(|task| task.runner_state == RunnerState::Queued)
                 .map(|task| task.assignment.backend_id)
                 .collect(),
             Err(error) => {
@@ -835,18 +835,18 @@ impl ProtocolService {
         now: DateTime<Utc>,
     ) -> ProtocolResult<Option<ConversationUnavailableReason>> {
         let runner = record.runner.as_ref();
-        Ok(match record.lifecycle {
-            TaskLifecycle::Archiving | TaskLifecycle::Archived => {
+        Ok(match record.runner_state {
+            RunnerState::Archiving | RunnerState::Archived => {
                 Some(ConversationUnavailableReason::Archived)
             }
-            TaskLifecycle::Paused => Some(ConversationUnavailableReason::Paused),
-            TaskLifecycle::Interrupted | TaskLifecycle::Unknown => {
+            RunnerState::Stopped => Some(ConversationUnavailableReason::Paused),
+            RunnerState::Interrupted | RunnerState::Unknown => {
                 Some(ConversationUnavailableReason::Interrupted)
             }
-            TaskLifecycle::Queued
-            | TaskLifecycle::Provisioning
-            | TaskLifecycle::Running
-            | TaskLifecycle::PauseRequested => match runner {
+            RunnerState::Queued
+            | RunnerState::Provisioning
+            | RunnerState::Running
+            | RunnerState::PauseRequested => match runner {
                 None => Some(ConversationUnavailableReason::NotStarted),
                 Some(runner) if self.runner_freshness(record, runner, now)? == Freshness::Stale => {
                     Some(ConversationUnavailableReason::RunnerUnreachable)
@@ -1296,7 +1296,7 @@ impl ProtocolService {
             })
             // A queued task is offered only once the scheduler admitted it.
             .filter(|record| {
-                record.lifecycle != TaskLifecycle::Queued || record.reservation.is_some()
+                record.runner_state != RunnerState::Queued || record.reservation.is_some()
             })
             .map(desired_command)
             .collect::<ProtocolResult<Vec<_>>>()?
@@ -1381,7 +1381,7 @@ impl ProtocolService {
     ) -> ProtocolResult<ReportResponse> {
         let record = self.backend_task(identity, &request.task_id)?;
         if request.observation == Observation::StartAccepted
-            && record.lifecycle == TaskLifecycle::Queued
+            && record.runner_state == RunnerState::Queued
             && record.reservation.is_none()
         {
             // A start may only be accepted with a reservation; give the
@@ -1405,7 +1405,7 @@ impl ProtocolService {
         }
         Ok(ReportResponse {
             applied: outcome.applied,
-            lifecycle: outcome.task.lifecycle,
+            runner_state: outcome.task.runner_state,
             generation: outcome.task.generation,
         })
     }
@@ -1443,14 +1443,14 @@ impl ProtocolService {
             ));
         }
         if !matches!(
-            record.lifecycle,
-            TaskLifecycle::Provisioning | TaskLifecycle::Running
+            record.runner_state,
+            RunnerState::Provisioning | RunnerState::Running
         ) {
             return Err(ProtocolError::conflict(
                 "runner_launch_not_allowed",
                 format!(
                     "task '{}' cannot launch a runner while {:?}",
-                    record.task_id, record.lifecycle
+                    record.task_id, record.runner_state
                 ),
             ));
         }
@@ -1504,9 +1504,9 @@ impl ProtocolService {
         }
         Ok(RunnerSnapshotResponse {
             applied: outcome.applied,
-            directive: directive(outcome.task.lifecycle),
+            directive: directive(outcome.task.runner_state),
             generation: outcome.task.generation,
-            lifecycle: outcome.task.lifecycle,
+            runner_state: outcome.task.runner_state,
             launch: launch_view(identity, &outcome.task),
             default_harness: self.default_harness_of(&outcome.task),
         })
@@ -1542,9 +1542,9 @@ impl ProtocolService {
             }
             let record = self.control.task(&identity.task_id)?;
             Ok(RunnerPollResponse {
-                directive: directive(record.lifecycle),
+                directive: directive(record.runner_state),
                 generation: record.generation,
-                lifecycle: record.lifecycle,
+                runner_state: record.runner_state,
                 inputs: inputs
                     .into_iter()
                     .filter_map(|input| {
@@ -1790,7 +1790,7 @@ impl ProtocolService {
         Ok(TaskSummary {
             task_id: record.task_id.clone(),
             backend_id: record.assignment.backend_id.clone(),
-            lifecycle: record.lifecycle,
+            runner_state: record.runner_state,
             generation: record.generation,
             revision: record.revision,
             rank: record.rank,
@@ -1835,8 +1835,8 @@ impl ProtocolService {
         now: DateTime<Utc>,
     ) -> ProtocolResult<Freshness> {
         let expects_runner = matches!(
-            record.lifecycle,
-            TaskLifecycle::Provisioning | TaskLifecycle::Running | TaskLifecycle::PauseRequested
+            record.runner_state,
+            RunnerState::Provisioning | RunnerState::Running | RunnerState::PauseRequested
         );
         if !expects_runner || record.supersedes_launch(runner.launch_generation) {
             return Ok(Freshness::Stale);
@@ -2050,7 +2050,7 @@ fn check_conductor_command(command: &OperatorCommand) -> ProtocolResult<()> {
 /// the owner has answered since (an answer queued, delivered or consumed)
 /// — plus a provisioning that failed. Oldest first.
 fn task_attention(record: &TaskRecord) -> Vec<AttentionItem> {
-    if record.lifecycle.is_archival() {
+    if record.runner_state.is_archival() {
         return Vec::new();
     }
     let answered = |waiting_id: &str| {
@@ -2077,8 +2077,8 @@ fn task_attention(record: &TaskRecord) -> Vec<AttentionItem> {
         .as_ref()
         .is_some_and(|runner| runner.snapshot.execution_cursor.execution_id.is_some());
     if matches!(
-        record.lifecycle,
-        TaskLifecycle::Interrupted | TaskLifecycle::Unknown
+        record.runner_state,
+        RunnerState::Interrupted | RunnerState::Unknown
     ) && !has_execution
     {
         items.push(AttentionItem {
@@ -2118,7 +2118,7 @@ fn current_position(timeline: &Timeline) -> Option<String> {
 /// reported: read from the sealed workflow snapshot, only while the task is
 /// running (nothing else can carry one out).
 fn manual_transitions(record: &TaskRecord) -> Option<TransitionOffer> {
-    if record.lifecycle != TaskLifecycle::Running {
+    if record.runner_state != RunnerState::Running {
         return None;
     }
     let current = record
@@ -2189,22 +2189,22 @@ fn task_display(record: &TaskRecord) -> TaskDisplay {
 }
 
 fn desired_command(record: &TaskRecord) -> ProtocolResult<Option<DesiredCommand>> {
-    let action = match record.lifecycle {
-        TaskLifecycle::Queued => DesiredAction::Start,
-        TaskLifecycle::Provisioning => DesiredAction::Provision,
-        TaskLifecycle::Running => DesiredAction::Run,
-        TaskLifecycle::PauseRequested => DesiredAction::PauseAtSafePoint,
-        TaskLifecycle::Paused => DesiredAction::KeepPaused,
-        TaskLifecycle::Interrupted | TaskLifecycle::Unknown => DesiredAction::Hold,
-        TaskLifecycle::Archiving => DesiredAction::Archive,
-        TaskLifecycle::Archived => return Ok(None),
+    let action = match record.runner_state {
+        RunnerState::Queued => DesiredAction::Start,
+        RunnerState::Provisioning => DesiredAction::Provision,
+        RunnerState::Running => DesiredAction::Run,
+        RunnerState::PauseRequested => DesiredAction::PauseAtSafePoint,
+        RunnerState::Stopped => DesiredAction::KeepPaused,
+        RunnerState::Interrupted | RunnerState::Unknown => DesiredAction::Hold,
+        RunnerState::Archiving => DesiredAction::Archive,
+        RunnerState::Archived => return Ok(None),
     };
     let launch_spec = serde_json::to_value(&record.launch_spec)
         .map_err(|error| ProtocolError::Internal(error.to_string()))?;
     Ok(Some(DesiredCommand {
         task_id: record.task_id.clone(),
         generation: record.generation,
-        lifecycle: record.lifecycle,
+        runner_state: record.runner_state,
         action,
         resource_key: record.assignment.resource_key.clone(),
         launch_spec,
@@ -2241,18 +2241,18 @@ fn launch_view(identity: &RunnerIdentity, record: &TaskRecord) -> RunnerLaunchVi
     }
 }
 
-/// What a runner should do while the task is in `lifecycle`.
-fn directive(lifecycle: TaskLifecycle) -> RunnerDirective {
-    match lifecycle {
-        TaskLifecycle::PauseRequested => RunnerDirective::PauseAtSafePoint,
-        TaskLifecycle::Paused | TaskLifecycle::Archiving | TaskLifecycle::Archived => {
+/// What a runner should do while the task is in `runner_state`.
+fn directive(runner_state: RunnerState) -> RunnerDirective {
+    match runner_state {
+        RunnerState::PauseRequested => RunnerDirective::PauseAtSafePoint,
+        RunnerState::Stopped | RunnerState::Archiving | RunnerState::Archived => {
             RunnerDirective::Stop
         }
-        TaskLifecycle::Queued
-        | TaskLifecycle::Provisioning
-        | TaskLifecycle::Running
-        | TaskLifecycle::Interrupted
-        | TaskLifecycle::Unknown => RunnerDirective::Continue,
+        RunnerState::Queued
+        | RunnerState::Provisioning
+        | RunnerState::Running
+        | RunnerState::Interrupted
+        | RunnerState::Unknown => RunnerDirective::Continue,
     }
 }
 

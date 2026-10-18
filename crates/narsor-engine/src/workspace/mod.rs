@@ -1,4 +1,4 @@
-//! Per-execution workspace lifecycle.
+//! Per-execution workspace runner_state.
 //!
 //! Each execution works in its own directory tree under a configurable root,
 //! laid out as `DOMAIN_MODEL.md` §2.8 describes:

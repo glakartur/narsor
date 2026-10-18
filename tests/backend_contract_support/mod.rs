@@ -1,4 +1,4 @@
-//! The backend-neutral contract suite (U4, AE2): one set of lifecycle
+//! The backend-neutral contract suite (U4, AE2): one set of runner_state
 //! scenarios every execution adapter must pass unchanged.
 //!
 //! # Plugging an adapter in
@@ -53,7 +53,7 @@ use narsor_engine::controller_protocol::{
 use narsor_engine::domain::{BackendId, TaskId, TaskLaunchSpec};
 use narsor_engine::orchestration::{
     CommandActor, NewTask, Observation, OperatorCommand, OperatorCommandStatus, OwnerCommand,
-    OwnerRef, ResumePolicy, TaskEventKind, TaskLifecycle, TaskRecord,
+    OwnerRef, ResumePolicy, RunnerState, TaskEventKind, TaskRecord,
 };
 use narsor_engine::persistence::paths::StatePaths;
 use narsor_server::controller_protocol::http::{controller_routes, runner_routes};
@@ -87,7 +87,7 @@ pub trait ContractTarget: Send + Sync + Sized + 'static {
     /// servers). Called when a scenario ends, pass or fail.
     fn cleanup(&self, _backend: &Self::Backend) {}
 
-    /// How long one lifecycle transition may take on this target.
+    /// How long one runner_state transition may take on this target.
     fn patience(&self) -> Duration {
         Duration::from_secs(30)
     }
@@ -351,9 +351,9 @@ impl<T: ContractTarget> Harness<T> {
             .expect("task record")
     }
 
-    /// The task's lifecycle.
-    pub fn lifecycle(&self, task: &str) -> TaskLifecycle {
-        self.record(task).lifecycle
+    /// The task's runner_state.
+    pub fn runner_state(&self, task: &str) -> RunnerState {
+        self.record(task).runner_state
     }
 
     /// The task's resource names.
@@ -422,18 +422,18 @@ impl<T: ContractTarget> Harness<T> {
         }
     }
 
-    /// Waits for the task to reach `lifecycle`.
-    pub async fn wait_lifecycle(&self, task: &str, lifecycle: TaskLifecycle) {
+    /// Waits for the task to reach `runner_state`.
+    pub async fn wait_runner_state(&self, task: &str, runner_state: RunnerState) {
         let deadline = Instant::now() + self.target.patience();
         loop {
             let record = self.record(task);
-            if record.lifecycle == lifecycle {
+            if record.runner_state == runner_state {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "{task} did not reach {lifecycle:?}: it is {:?} (observed {:?}, runner {:?}); counters {:?}",
-                record.lifecycle,
+                "{task} did not reach {runner_state:?}: it is {:?} (observed {:?}, runner {:?}); counters {:?}",
+                record.runner_state,
                 record.observed,
                 record.runner.as_ref().map(|r| (&r.incarnation, r.safe_point_generation)),
                 self.counters()
@@ -482,7 +482,7 @@ impl<T: ContractTarget> Harness<T> {
     /// Creates a task and waits until it runs.
     pub async fn running(&self, task: &str) {
         self.create(task);
-        self.wait_lifecycle(task, TaskLifecycle::Running).await;
+        self.wait_runner_state(task, RunnerState::Running).await;
     }
 }
 
@@ -558,7 +558,7 @@ pub async fn lifecycle_round_trip<T: ContractTarget>() {
     let cursor_before = first.runner.as_ref().unwrap().snapshot.event_cursor;
 
     h.must("task-1", OwnerCommand::Pause, "pause-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Paused).await;
+    h.wait_runner_state("task-1", RunnerState::Stopped).await;
     let paused = h.record("task-1");
     assert_eq!(
         paused.runner.as_ref().unwrap().safe_point_generation,
@@ -570,7 +570,7 @@ pub async fn lifecycle_round_trip<T: ContractTarget>() {
     assert!(observed.storage.exists(), "storage kept through the pause");
 
     h.must("task-1", OwnerCommand::Resume, "resume-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-1", RunnerState::Running).await;
     let resumed = h.record("task-1");
     let runner = resumed.runner.as_ref().unwrap();
     assert_ne!(runner.incarnation, first_incarnation, "a new incarnation");
@@ -581,7 +581,7 @@ pub async fn lifecycle_round_trip<T: ContractTarget>() {
     );
 
     h.must("task-1", OwnerCommand::Archive, "archive-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Archived).await;
+    h.wait_runner_state("task-1", RunnerState::Archived).await;
     let observed = h.observe("task-1").await;
     assert!(
         observed.workload.is_none() && !observed.storage.exists(),
@@ -611,7 +611,7 @@ pub async fn reconnect_reconciles_instead_of_duplicating<T: ContractTarget>() {
     h.settle().await;
     let before = h.counters();
     h.settle().await;
-    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Running);
+    assert_eq!(h.runner_state("task-1"), RunnerState::Running);
     assert!(
         alive(&h.observe("task-1").await),
         "the workload keeps running"
@@ -624,7 +624,7 @@ pub async fn reconnect_reconciles_instead_of_duplicating<T: ContractTarget>() {
 
     h.restore(first);
     h.settle().await;
-    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Running);
+    assert_eq!(h.runner_state("task-1"), RunnerState::Running);
 
     // A crash and a restart with the same identity: a new epoch, a full
     // resync, and still the one workload.
@@ -636,7 +636,7 @@ pub async fn reconnect_reconciles_instead_of_duplicating<T: ContractTarget>() {
     })
     .await;
     h.settle().await;
-    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Running);
+    assert_eq!(h.runner_state("task-1"), RunnerState::Running);
     assert!(alive(&h.observe("task-1").await));
     let counters = h.counters();
     assert_eq!(counters.workloads_created, 1, "{counters:?}");
@@ -650,7 +650,7 @@ pub async fn reconnect_reconciles_instead_of_duplicating<T: ContractTarget>() {
 
     // The restarted controller still drives the task.
     h.must("task-1", OwnerCommand::Pause, "pause-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Paused).await;
+    h.wait_runner_state("task-1", RunnerState::Stopped).await;
 }
 
 /// A create whose answer was lost is found by identity on the next round,
@@ -682,7 +682,7 @@ pub async fn a_dead_workload_is_resumed_automatically<T: ContractTarget>() {
     h.probe.delay_deletions(8);
     h.kill_workload("task-1");
     h.wait_for("the replacement workload", |h| {
-        h.counters().workloads_created == 2 && h.lifecycle("task-1") == TaskLifecycle::Running
+        h.counters().workloads_created == 2 && h.runner_state("task-1") == RunnerState::Running
     })
     .await;
     let counters = h.counters();
@@ -724,13 +724,14 @@ pub async fn workload_death_waits_for_the_owner_without_the_policy<T: ContractTa
     h.running("task-1").await;
 
     h.kill_workload("task-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Interrupted).await;
+    h.wait_runner_state("task-1", RunnerState::Interrupted)
+        .await;
     h.settle().await;
-    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Interrupted);
+    assert_eq!(h.runner_state("task-1"), RunnerState::Interrupted);
     assert_eq!(h.counters().workloads_created, 1, "nothing replaces it");
 
     h.must("task-1", OwnerCommand::Resume, "resume-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-1", RunnerState::Running).await;
     let counters = h.counters();
     assert_eq!(counters.workloads_created, 2, "{counters:?}");
     assert_eq!(counters.launches_over_existing, 0, "{counters:?}");
@@ -749,14 +750,14 @@ pub async fn a_failed_observation_reports_unknown_and_waits<T: ContractTarget>()
     h.running("task-1").await;
 
     h.probe.fail_observes(2);
-    h.wait_lifecycle("task-1", TaskLifecycle::Unknown).await;
+    h.wait_runner_state("task-1", RunnerState::Unknown).await;
     assert!(h
         .reported("task-1")
         .contains(&Observation::WorkloadLost { state_known: false }));
     h.observed_again(3).await;
     assert_eq!(
-        h.lifecycle("task-1"),
-        TaskLifecycle::Unknown,
+        h.runner_state("task-1"),
+        RunnerState::Unknown,
         "a live workload is no confirmed loss"
     );
     assert_eq!(h.counters().workloads_created, 1);
@@ -765,7 +766,7 @@ pub async fn a_failed_observation_reports_unknown_and_waits<T: ContractTarget>()
 
     // The owner retries: the old launch goes, one new one comes.
     h.must("task-1", OwnerCommand::Start, "start-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-1", RunnerState::Running).await;
     let counters = h.counters();
     assert_eq!(counters.workloads_created, 2, "{counters:?}");
     assert_eq!(counters.workload_deletions, 1, "{counters:?}");
@@ -784,12 +785,12 @@ pub async fn a_confirmed_loss_of_an_unknown_task_is_resumed<T: ContractTarget>()
     h.running("task-1").await;
 
     h.probe.fail_observes(2);
-    h.wait_lifecycle("task-1", TaskLifecycle::Unknown).await;
+    h.wait_runner_state("task-1", RunnerState::Unknown).await;
     // The runner dies while the backend still cannot be observed.
     h.probe.fail_observes(u32::MAX / 2);
     h.kill_workload("task-1");
     h.observed_again(2).await;
-    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Unknown);
+    assert_eq!(h.runner_state("task-1"), RunnerState::Unknown);
     let losses = |h: &Harness<T>| {
         h.reported("task-1")
             .into_iter()
@@ -800,7 +801,7 @@ pub async fn a_confirmed_loss_of_an_unknown_task_is_resumed<T: ContractTarget>()
 
     h.probe.clear_faults();
     h.wait_for("the replacement workload", |h| {
-        h.counters().workloads_created == 2 && h.lifecycle("task-1") == TaskLifecycle::Running
+        h.counters().workloads_created == 2 && h.runner_state("task-1") == RunnerState::Running
     })
     .await;
     let reported = h.reported("task-1");
@@ -831,7 +832,7 @@ pub async fn an_unknown_task_without_storage_stays_unknown<T: ContractTarget>() 
     h.running("task-1").await;
 
     h.probe.fail_observes(2);
-    h.wait_lifecycle("task-1", TaskLifecycle::Unknown).await;
+    h.wait_runner_state("task-1", RunnerState::Unknown).await;
     // Workload and storage vanish behind the controller's back — unseen
     // until both are gone, since a platform may remove them one by one.
     h.probe.fail_observes(u32::MAX / 2);
@@ -853,7 +854,7 @@ pub async fn an_unknown_task_without_storage_stays_unknown<T: ContractTarget>() 
     h.probe.clear_faults();
 
     h.observed_again(3).await;
-    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Unknown);
+    assert_eq!(h.runner_state("task-1"), RunnerState::Unknown);
     assert!(!h.reported("task-1").contains(&Observation::LossConfirmed));
     assert!(auto_resumes(&h.events("task-1")).is_empty());
     let counters = h.counters();
@@ -861,7 +862,7 @@ pub async fn an_unknown_task_without_storage_stays_unknown<T: ContractTarget>() 
     assert_eq!(counters.storages_created, 1, "{counters:?}");
 
     h.must("task-1", OwnerCommand::Archive, "archive-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Archived).await;
+    h.wait_runner_state("task-1", RunnerState::Archived).await;
 }
 
 /// Transient launch failures are retried; a refusal interrupts the task,
@@ -905,7 +906,7 @@ pub async fn archive_deletes_exactly_once<T: ContractTarget>() {
 
     h.must("task-1", OwnerCommand::Archive, "archive-1");
     h.must("task-1", OwnerCommand::Archive, "archive-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Archived).await;
+    h.wait_runner_state("task-1", RunnerState::Archived).await;
     h.must("task-1", OwnerCommand::Archive, "archive-2");
     h.settle().await;
 
@@ -919,7 +920,7 @@ pub async fn archive_deletes_exactly_once<T: ContractTarget>() {
     assert_eq!(counters.workloads_created, 1, "{counters:?}");
     let observed = h.observe("task-1").await;
     assert!(observed.workload.is_none() && !observed.storage.exists());
-    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Archived);
+    assert_eq!(h.runner_state("task-1"), RunnerState::Archived);
 }
 
 /// AE9: a task whose workflow finished keeps its storage and stays
@@ -937,12 +938,12 @@ pub async fn a_finished_task_keeps_its_storage_until_archived<T: ContractTarget>
     })
     .await;
     h.settle().await;
-    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Running);
+    assert_eq!(h.runner_state("task-1"), RunnerState::Running);
     assert!(h.observe("task-1").await.storage.exists());
     assert_eq!(h.counters().storage_deletions, 0);
 
     h.must("task-1", OwnerCommand::Archive, "archive-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Archived).await;
+    h.wait_runner_state("task-1", RunnerState::Archived).await;
     let observed = h.observe("task-1").await;
     assert!(observed.workload.is_none() && !observed.storage.exists());
 }
@@ -975,8 +976,8 @@ pub async fn delayed_deletion_and_resume_during_pause<T: ContractTarget>() {
     })
     .await;
     assert_eq!(
-        h.lifecycle("task-1"),
-        TaskLifecycle::PauseRequested,
+        h.runner_state("task-1"),
+        RunnerState::PauseRequested,
         "the pause completes only once compute is gone"
     );
     let refused = h
@@ -993,10 +994,10 @@ pub async fn delayed_deletion_and_resume_during_pause<T: ContractTarget>() {
         "{refused:?}"
     );
 
-    h.wait_lifecycle("task-1", TaskLifecycle::Paused).await;
+    h.wait_runner_state("task-1", RunnerState::Stopped).await;
     assert!(h.observe("task-1").await.workload.is_none());
     h.must("task-1", OwnerCommand::Resume, "resume-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-1", RunnerState::Running).await;
     let counters = h.counters();
     assert_eq!(counters.workloads_created, 2, "{counters:?}");
     assert_eq!(counters.workload_deletions, 1, "{counters:?}");
@@ -1024,7 +1025,7 @@ pub async fn lease_handoff_between_controllers<T: ContractTarget>() {
     })
     .await;
     h.must("task-1", OwnerCommand::Pause, "pause-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Paused).await;
+    h.wait_runner_state("task-1", RunnerState::Stopped).await;
     let counters = h.counters();
     assert_eq!(
         counters.workloads_created, 1,
@@ -1041,10 +1042,10 @@ pub async fn lease_handoff_between_controllers<T: ContractTarget>() {
     assert_eq!(after.workload_deletions, before.workload_deletions);
     assert_eq!(after.storage_deletions, before.storage_deletions);
     assert_ne!(h.lease_holder().unwrap().0, first_id, "the takeover holds");
-    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Paused);
+    assert_eq!(h.runner_state("task-1"), RunnerState::Stopped);
 
     h.must("task-1", OwnerCommand::Resume, "resume-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-1", RunnerState::Running).await;
     assert_eq!(h.counters().workloads_created, 2);
 }
 
@@ -1057,16 +1058,16 @@ pub async fn archive_racing_start_creates_nothing<T: ContractTarget>() {
     };
     h.create("early");
     h.must("early", OwnerCommand::Archive, "archive-early");
-    assert_eq!(h.lifecycle("early"), TaskLifecycle::Archived);
+    assert_eq!(h.runner_state("early"), RunnerState::Archived);
 
     h.probe
         .fail_launches(std::iter::repeat_n(BackendErrorKind::Transient, 100_000));
     h.start_controller();
     h.create("racing");
-    h.wait_lifecycle("racing", TaskLifecycle::Provisioning)
+    h.wait_runner_state("racing", RunnerState::Provisioning)
         .await;
     h.must("racing", OwnerCommand::Archive, "archive-racing");
-    h.wait_lifecycle("racing", TaskLifecycle::Archived).await;
+    h.wait_runner_state("racing", RunnerState::Archived).await;
     h.probe.clear_faults();
     h.settle().await;
     h.settle().await;
@@ -1080,7 +1081,7 @@ pub async fn archive_racing_start_creates_nothing<T: ContractTarget>() {
             observed.workload.is_none() && !observed.storage.exists(),
             "{task}: {observed:?}"
         );
-        assert_eq!(h.lifecycle(task), TaskLifecycle::Archived);
+        assert_eq!(h.runner_state(task), RunnerState::Archived);
     }
 }
 
@@ -1093,17 +1094,17 @@ pub async fn parallel_tasks_are_isolated<T: ContractTarget>() {
     h.start_controller();
     h.create("task-a");
     h.create("task-b");
-    h.wait_lifecycle("task-a", TaskLifecycle::Running).await;
-    h.wait_lifecycle("task-b", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-a", RunnerState::Running).await;
+    h.wait_runner_state("task-b", RunnerState::Running).await;
     let (a, b) = (h.resources("task-a"), h.resources("task-b"));
     assert_ne!(a.storage, b.storage, "separate storage");
     assert_ne!(a.workload, b.workload, "separate workloads");
 
     h.must("task-a", OwnerCommand::Pause, "pause-a");
-    h.wait_lifecycle("task-a", TaskLifecycle::Paused).await;
+    h.wait_runner_state("task-a", RunnerState::Stopped).await;
     let paused = h.observe("task-a").await;
     assert!(paused.workload.is_none() && paused.storage.exists());
-    assert_eq!(h.lifecycle("task-b"), TaskLifecycle::Running);
+    assert_eq!(h.runner_state("task-b"), RunnerState::Running);
     assert!(
         alive(&h.observe("task-b").await),
         "the other task keeps running"
@@ -1124,11 +1125,11 @@ pub async fn the_controller_never_starts_more_than_the_limit<T: ContractTarget>(
     h.set_limit(1);
     h.start_controller();
     h.create("task-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-1", RunnerState::Running).await;
     h.create("task-2");
     h.settle().await;
 
-    assert_eq!(h.lifecycle("task-2"), TaskLifecycle::Queued);
+    assert_eq!(h.runner_state("task-2"), RunnerState::Queued);
     assert!(
         h.reported("task-2").is_empty(),
         "no start was even accepted"
@@ -1147,8 +1148,8 @@ pub async fn the_controller_never_starts_more_than_the_limit<T: ContractTarget>(
 
     // Pausing releases the compute and its slot: the waiting task starts.
     h.must("task-1", OwnerCommand::Pause, "pause-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Paused).await;
-    h.wait_lifecycle("task-2", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-1", RunnerState::Stopped).await;
+    h.wait_runner_state("task-2", RunnerState::Running).await;
 
     // Resuming now would exceed the limit: refused, nothing stops.
     match h.command("task-1", OwnerCommand::Resume, "resume-1") {
@@ -1156,14 +1157,14 @@ pub async fn the_controller_never_starts_more_than_the_limit<T: ContractTarget>(
         other => panic!("a resume beyond the limit must be refused: {other:?}"),
     }
     h.settle().await;
-    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Paused);
-    assert_eq!(h.lifecycle("task-2"), TaskLifecycle::Running);
+    assert_eq!(h.runner_state("task-1"), RunnerState::Stopped);
+    assert_eq!(h.runner_state("task-2"), RunnerState::Running);
     assert!(alive(&h.observe("task-2").await));
 
     h.must("task-2", OwnerCommand::Archive, "archive-2");
-    h.wait_lifecycle("task-2", TaskLifecycle::Archived).await;
+    h.wait_runner_state("task-2", RunnerState::Archived).await;
     h.must("task-1", OwnerCommand::Resume, "resume-2");
-    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-1", RunnerState::Running).await;
     let counters = h.counters();
     assert_eq!(counters.workloads_created, 3, "{counters:?}");
 }
@@ -1224,7 +1225,7 @@ pub async fn operator_commands_reach_the_runner_and_come_back_with_a_verdict<T: 
     )));
 
     h.must("task-1", OwnerCommand::Pause, "pause-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Paused).await;
+    h.wait_runner_state("task-1", RunnerState::Stopped).await;
     match h.service.submit_operator_command(
         &owner,
         "task-1",

@@ -311,7 +311,7 @@ impl ProtocolService {
     /// Refuses materials for a task that is archived (or being archived).
     fn admit_material(&self, task_id: &TaskId) -> MaterialResult<()> {
         match self.control.task(task_id) {
-            Ok(record) if record.lifecycle.is_archival() => {
+            Ok(record) if record.runner_state.is_archival() => {
                 Err(MaterialError::TaskArchived(task_id.clone()))
             }
             Ok(_) => Ok(()),

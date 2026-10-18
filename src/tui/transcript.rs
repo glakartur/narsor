@@ -138,7 +138,7 @@ pub struct TranscriptEntry {
     /// it: one source line can yield several entries, and the global raw
     /// view shows that line once.
     shares_previous_raw: bool,
-    /// Source-neutral lifecycle metadata used to recognize a safe, contiguous
+    /// Source-neutral runner_state metadata used to recognize a safe, contiguous
     /// summary card. Adapters decide which harness events qualify.
     grouping: Option<TranscriptGrouping>,
     /// Source identities represented by this item. A normal card has one;
@@ -906,7 +906,7 @@ impl TranscriptState {
                 cursor += 1;
                 continue;
             };
-            // A lifecycle card is only safe when the adapter supplied an
+            // A runner_state card is only safe when the adapter supplied an
             // operation identity. Similar-looking records without one stay
             // individually reachable rather than being guessed into a group.
             if grouping.correlation_id.is_none() {

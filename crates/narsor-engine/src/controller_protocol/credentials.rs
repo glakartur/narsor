@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use crate::auth::pop::{self, Proof, ReplayGuard, SignedRequest};
 use crate::domain::{BackendId, TaskId};
-use crate::orchestration::{ControlPlane, OrchestrationError, Result, TaskLifecycle};
+use crate::orchestration::{ControlPlane, OrchestrationError, Result, RunnerState};
 use crate::persistence::{read_json, write_json_atomic_with_mode};
 
 /// Current schema version of [`ControllerRecord`]. Version 1 identities
@@ -591,7 +591,7 @@ impl CredentialStore {
             return Ok(None);
         }
         let record = self.control.task(&task_id)?;
-        if record.lifecycle == TaskLifecycle::Archived
+        if record.runner_state == RunnerState::Archived
             || record.supersedes_launch(session.launch_generation)
         {
             return Ok(None);

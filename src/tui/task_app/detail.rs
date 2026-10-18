@@ -53,7 +53,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::api::ClientError;
-use crate::cli::task_text::lifecycle_name;
+use crate::cli::task_text::runner_state_name;
 pub use crate::cli::task_text::short_age;
 use crate::controller_protocol::{
     ConductorReadResponse, ExecutionEventsQuery, ExecutionEventsResponse, TaskSummary,
@@ -62,7 +62,7 @@ use crate::controller_protocol::{
 use crate::domain::display::{safe_link_url, DisplayLink, EMPTY_LINK_TEXT};
 use crate::domain::ExecutionStatus;
 use narsor_protocol::api::ConversationState;
-use narsor_protocol::controller::{QueueReason, TaskLifecycle};
+use narsor_protocol::controller::{QueueReason, RunnerState};
 
 use super::super::keymap::Action;
 use super::super::scroll::one_line;
@@ -392,12 +392,12 @@ pub enum Readiness {
 
 /// Whether there is an execution to read for `task`.
 pub fn readiness(task: &TaskSummary) -> Readiness {
-    if task.lifecycle.is_archival() {
+    if task.runner_state.is_archival() {
         Readiness::Archived
     } else if task.runner.is_none()
         && matches!(
-            task.lifecycle,
-            TaskLifecycle::Queued | TaskLifecycle::Provisioning
+            task.runner_state,
+            RunnerState::Queued | RunnerState::Provisioning
         )
     {
         Readiness::NotStarted
@@ -413,10 +413,10 @@ pub fn unstarted_message(task: &TaskSummary, queue_place: Option<usize>) -> Opti
         Readiness::Started => None,
         Readiness::Archived => Some("storage usunięty przy archiwizacji".to_string()),
         Readiness::NotStarted => {
-            let place = match (task.lifecycle, queue_place) {
-                (TaskLifecycle::Queued, Some(place)) => format!("#{place} w kolejce"),
-                (TaskLifecycle::Queued, None) => "w kolejce".to_string(),
-                (other, _) => lifecycle_name(other).to_string(),
+            let place = match (task.runner_state, queue_place) {
+                (RunnerState::Queued, Some(place)) => format!("#{place} w kolejce"),
+                (RunnerState::Queued, None) => "w kolejce".to_string(),
+                (other, _) => runner_state_name(other).to_string(),
             };
             Some(format!("jeszcze nie wystartowało, {place}"))
         }
@@ -1136,7 +1136,7 @@ fn header(
     };
     let first = Line::from(Span::styled(first_text, styles.strong(grey(Role::Calm))));
 
-    // Line 2: lifecycle, warnings, and compact step/queue context.
+    // Line 2: runner_state, warnings, and compact step/queue context.
     let mut second: Vec<Span<'static>> = Vec::new();
     let icon = state_icon(task);
     let state = format!("{} {}", icon.glyph(), status_word(task));
@@ -1238,7 +1238,7 @@ fn fit_cells(text: &str, width: usize) -> String {
 /// harness's full reason is in *Info*.
 fn notice(task: &TaskSummary, styles: &Styles, stale: bool, width: u16) -> Option<Line<'static>> {
     let grey = |role: Role| if stale { Role::Done } else { role };
-    if let Some(loss) = narsor_protocol::display::loss_state(task.lifecycle, &task.resume) {
+    if let Some(loss) = narsor_protocol::display::loss_state(task.runner_state, &task.resume) {
         let role = if loss.needs_owner() {
             Role::Problem
         } else {
@@ -1275,13 +1275,13 @@ fn link_text(link: &DisplayLink) -> (String, Option<String>) {
     }
 }
 
-/// The lifecycle in a word, except that a runner that finished says how.
+/// The runner_state in a word, except that a runner that finished says how.
 fn status_word(task: &TaskSummary) -> &'static str {
     match task.runner.as_ref().map(|runner| &runner.execution_status) {
         Some(ExecutionStatus::Completed) => "completed",
         Some(ExecutionStatus::Failed) => "failed",
         Some(ExecutionStatus::Cancelled) => "cancelled",
-        _ => lifecycle_name(task.lifecycle),
+        _ => runner_state_name(task.runner_state),
     }
 }
 
@@ -1293,7 +1293,7 @@ fn status_parts(
     progress: &Progress,
 ) -> Vec<(String, Role)> {
     let mut parts = Vec::new();
-    if task.lifecycle == TaskLifecycle::Queued {
+    if task.runner_state == RunnerState::Queued {
         parts.push((queue_text(task, queue_place), Role::Calm));
         return parts;
     }
@@ -1312,8 +1312,8 @@ fn status_parts(
         parts.push((short_age(seconds), Role::Done));
     }
     if matches!(
-        task.lifecycle,
-        TaskLifecycle::Provisioning | TaskLifecycle::Running
+        task.runner_state,
+        RunnerState::Provisioning | RunnerState::Running
     ) {
         if let Some(offline) = controller_offline(task) {
             parts.push((offline, Role::Attention));

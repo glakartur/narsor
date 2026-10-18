@@ -10,7 +10,7 @@ use narsor_engine::orchestration::{
     exhaustion_loss, loss_state, BackendCapacity, BackendLease, Clock, CommandActor,
     CommandRequest, ControlPlane, ControllerReport, LossState, MoveTarget, NewTask, Observation,
     ObservedSummary, OrchestrationError, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity,
-    ResumeExhaustion, ResumePolicy, ResumeState, RunnerSnapshot, TaskEventKind, TaskLifecycle,
+    ResumeExhaustion, ResumePolicy, ResumeState, RunnerSnapshot, RunnerState, TaskEventKind,
     TaskRecord, WorkloadLoss,
 };
 use narsor_engine::persistence::paths::{temp_path_for, StatePaths};
@@ -152,7 +152,7 @@ impl Fixture {
     /// for one: the control plane completes a pause only after that (KTD2).
     fn acknowledge_safe_point(&self, id: &str) {
         let record = self.control.task(&task(id)).unwrap();
-        if record.lifecycle != TaskLifecycle::PauseRequested {
+        if record.runner_state != RunnerState::PauseRequested {
             return;
         }
         let launch_generation = record
@@ -280,7 +280,7 @@ fn creating_a_task_records_a_queued_assignment_with_generation_and_queue_order()
     let first = fx.create("task-a");
     let second = fx.control.create_task(new_task("task-b", "k8s")).unwrap();
 
-    assert_eq!(first.lifecycle, TaskLifecycle::Queued);
+    assert_eq!(first.runner_state, RunnerState::Queued);
     assert_eq!(first.generation, 1);
     assert_eq!(first.revision, 1);
     assert_eq!(first.rank, 1, "the first task is first in the queue");
@@ -301,33 +301,33 @@ fn desired_generation_grows_monotonically_through_the_whole_lifecycle() {
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
     let running = fx.running("task-1", &lease);
-    assert_eq!(running.lifecycle, TaskLifecycle::Running);
+    assert_eq!(running.runner_state, RunnerState::Running);
     assert_eq!(running.generation, 1, "observations never bump generation");
 
     let pausing = fx.command("task-1", OwnerCommand::Pause, "pause-1");
-    assert_eq!(pausing.lifecycle, TaskLifecycle::PauseRequested);
+    assert_eq!(pausing.runner_state, RunnerState::PauseRequested);
     assert_eq!(pausing.generation, 2);
 
     let paused = fx
         .observe("task-1", &lease, Observation::PausedAtSafePoint)
         .unwrap();
-    assert_eq!(paused.lifecycle, TaskLifecycle::Paused);
+    assert_eq!(paused.runner_state, RunnerState::Stopped);
 
     let resumed = fx.command("task-1", OwnerCommand::Resume, "resume-1");
-    assert_eq!(resumed.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(resumed.runner_state, RunnerState::Provisioning);
     assert_eq!(resumed.generation, 3);
     let running = fx
         .observe("task-1", &lease, Observation::RunnerReady)
         .unwrap();
-    assert_eq!(running.lifecycle, TaskLifecycle::Running);
+    assert_eq!(running.runner_state, RunnerState::Running);
 
     let archiving = fx.command("task-1", OwnerCommand::Archive, "archive-1");
-    assert_eq!(archiving.lifecycle, TaskLifecycle::Archiving);
+    assert_eq!(archiving.runner_state, RunnerState::Archiving);
     assert_eq!(archiving.generation, 4);
     let archived = fx
         .observe("task-1", &lease, Observation::ResourcesDeleted)
         .unwrap();
-    assert_eq!(archived.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(archived.runner_state, RunnerState::Archived);
     let tombstone = archived.archive.expect("tombstone");
     assert!(tombstone.completed_at.is_some());
     assert!(!tombstone.resources_never_created);
@@ -340,7 +340,7 @@ fn owner_commands_need_no_controller_lease() {
     assert!(fx.control.lease(&backend_id("k8s")).unwrap().is_none());
 
     let archived = fx.command("task-1", OwnerCommand::Archive, "archive-1");
-    assert_eq!(archived.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(archived.runner_state, RunnerState::Archived);
     assert!(
         fx.control.lease(&backend_id("k8s")).unwrap().is_none(),
         "an owner command neither needs nor creates a lease"
@@ -374,7 +374,7 @@ fn repeating_a_command_with_its_idempotency_key_leaves_one_receipt_and_one_state
     let replay = fx.control.command(&task("task-1"), resume).unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.receipt, resumed.receipt);
-    assert_eq!(replay.task.lifecycle, TaskLifecycle::Running);
+    assert_eq!(replay.task.runner_state, RunnerState::Running);
 
     let archive = CommandRequest::new(OwnerCommand::Archive, "archive-1");
     fx.control
@@ -415,8 +415,8 @@ fn reusing_an_idempotency_key_for_a_different_command_is_refused() {
         }
     ));
     assert_eq!(
-        fx.control.task(&task("task-1")).unwrap().lifecycle,
-        TaskLifecycle::PauseRequested
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::PauseRequested
     );
 }
 
@@ -463,7 +463,7 @@ fn illegal_transitions_are_rejected_with_a_typed_error_and_change_nothing() {
         assert!(matches!(
             error,
             OrchestrationError::IllegalCommand {
-                lifecycle: TaskLifecycle::Queued,
+                runner_state: RunnerState::Queued,
                 ..
             }
         ));
@@ -475,7 +475,7 @@ fn illegal_transitions_are_rejected_with_a_typed_error_and_change_nothing() {
         error,
         OrchestrationError::IllegalObservation {
             observation: Observation::RunnerReady,
-            lifecycle: TaskLifecycle::Queued,
+            runner_state: RunnerState::Queued,
             ..
         }
     ));
@@ -522,8 +522,8 @@ fn a_stale_backend_lease_epoch_cannot_report() {
         .unwrap_err();
     assert!(matches!(renew, OrchestrationError::StaleLease { .. }));
     assert_eq!(
-        fx.control.task(&task("task-1")).unwrap().lifecycle,
-        TaskLifecycle::Provisioning
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::Provisioning
     );
 }
 
@@ -561,7 +561,7 @@ fn an_older_generation_report_cannot_overwrite_an_archival_intent() {
     // The controller fetched the start at generation 1, the owner archives
     // before it claims it: the late claim is fenced.
     let archived = fx.command("task-1", OwnerCommand::Archive, "archive-1");
-    assert_eq!(archived.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(archived.runner_state, RunnerState::Archived);
 
     let error = fx
         .control
@@ -639,7 +639,7 @@ fn an_unexpected_workload_loss_interrupts_without_creating_a_replacement() {
             Observation::WorkloadLost { state_known: true },
         )
         .unwrap();
-    assert_eq!(lost.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(lost.runner_state, RunnerState::Interrupted);
     assert_eq!(lost.generation, running.generation, "no new desired work");
 
     // Nothing but the owner leads out of Interrupted.
@@ -648,14 +648,14 @@ fn an_unexpected_workload_loss_interrupts_without_creating_a_replacement() {
         assert!(matches!(
             error,
             OrchestrationError::IllegalObservation {
-                lifecycle: TaskLifecycle::Interrupted,
+                runner_state: RunnerState::Interrupted,
                 ..
             }
         ));
     }
 
     let retried = fx.command("task-1", OwnerCommand::Start, "retry-1");
-    assert_eq!(retried.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(retried.runner_state, RunnerState::Provisioning);
     assert_eq!(retried.generation, running.generation + 1);
 }
 
@@ -671,9 +671,9 @@ fn an_uncertain_workload_loss_becomes_unknown_and_waits_for_resume() {
             Observation::WorkloadLost { state_known: false },
         )
         .unwrap();
-    assert_eq!(unknown.lifecycle, TaskLifecycle::Unknown);
+    assert_eq!(unknown.runner_state, RunnerState::Unknown);
     let resumed = fx.command("task-1", OwnerCommand::Resume, "resume-1");
-    assert_eq!(resumed.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(resumed.runner_state, RunnerState::Provisioning);
 }
 
 #[test]
@@ -684,7 +684,7 @@ fn archiving_queued_provisioning_or_pause_requested_work_fences_it() {
     // Queued: nothing was ever created, so it is clean at once.
     fx.create("queued");
     let queued = fx.command("queued", OwnerCommand::Archive, "archive");
-    assert_eq!(queued.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(queued.runner_state, RunnerState::Archived);
     assert!(queued.archive.as_ref().unwrap().resources_never_created);
 
     // Provisioning: resources may exist, so archive waits for deletion and
@@ -693,7 +693,7 @@ fn archiving_queued_provisioning_or_pause_requested_work_fences_it() {
     fx.observe("provisioning", &lease, Observation::StartAccepted)
         .unwrap();
     let archiving = fx.command("provisioning", OwnerCommand::Archive, "archive");
-    assert_eq!(archiving.lifecycle, TaskLifecycle::Archiving);
+    assert_eq!(archiving.runner_state, RunnerState::Archiving);
     let late = fx
         .control
         .report(report(
@@ -716,7 +716,7 @@ fn archiving_queued_provisioning_or_pause_requested_work_fences_it() {
     let clean = fx
         .observe("provisioning", &lease, Observation::ResourcesDeleted)
         .unwrap();
-    assert_eq!(clean.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(clean.runner_state, RunnerState::Archived);
 
     // PauseRequested: the pending safe point of the pause is fenced.
     fx.running("pausing", &lease);
@@ -734,8 +734,8 @@ fn archiving_queued_provisioning_or_pause_requested_work_fences_it() {
         .unwrap_err();
     assert!(matches!(late, OrchestrationError::StaleGeneration { .. }));
     assert_eq!(
-        fx.control.task(&task("pausing")).unwrap().lifecycle,
-        TaskLifecycle::Archiving
+        fx.control.task(&task("pausing")).unwrap().runner_state,
+        RunnerState::Archiving
     );
 }
 
@@ -748,19 +748,19 @@ fn repeating_archive_converges_on_the_tombstone_and_keeps_the_audit_trail() {
     let tombstone = first.archive.clone().expect("tombstone");
 
     let second = fx.command("task-1", OwnerCommand::Archive, "archive-2");
-    assert_eq!(second.lifecycle, TaskLifecycle::Archiving);
+    assert_eq!(second.runner_state, RunnerState::Archiving);
     assert_eq!(second.generation, first.generation);
     assert_eq!(second.archive, Some(tombstone.clone()));
 
     fx.observe("task-1", &lease, Observation::ResourcesDeleted)
         .unwrap();
     let third = fx.command("task-1", OwnerCommand::Archive, "archive-3");
-    assert_eq!(third.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(third.runner_state, RunnerState::Archived);
     assert_eq!(third.archive.unwrap().idempotency_key, "archive-1");
     let redelivered = fx
         .observe("task-1", &lease, Observation::ResourcesDeleted)
         .unwrap();
-    assert_eq!(redelivered.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(redelivered.runner_state, RunnerState::Archived);
 
     let resume = fx
         .control
@@ -772,7 +772,7 @@ fn repeating_archive_converges_on_the_tombstone_and_keeps_the_audit_trail() {
     assert!(matches!(
         resume,
         OrchestrationError::IllegalCommand {
-            lifecycle: TaskLifecycle::Archived,
+            runner_state: RunnerState::Archived,
             ..
         }
     ));
@@ -929,19 +929,19 @@ fn listing_returns_every_task_in_creation_order_including_tombstones() {
     // A directory without a record is debris, not a task.
     fs::create_dir_all(fx.root.paths().orchestration_task_dir("debris")).unwrap();
 
-    let listed: Vec<(String, TaskLifecycle)> = fx
+    let listed: Vec<(String, RunnerState)> = fx
         .control
         .list_tasks()
         .unwrap()
         .into_iter()
-        .map(|task| (task.task_id.to_string(), task.lifecycle))
+        .map(|task| (task.task_id.to_string(), task.runner_state))
         .collect();
     assert_eq!(
         listed,
         [
-            ("zeta".to_string(), TaskLifecycle::Queued),
-            ("alpha".to_string(), TaskLifecycle::Archived),
-            ("mid".to_string(), TaskLifecycle::Queued),
+            ("zeta".to_string(), RunnerState::Queued),
+            ("alpha".to_string(), RunnerState::Archived),
+            ("mid".to_string(), RunnerState::Queued),
         ]
     );
 }
@@ -1014,8 +1014,8 @@ fn a_pause_completes_only_after_the_runner_acknowledged_a_safe_point() {
         "{refused:?}"
     );
     assert_eq!(
-        fx.control.task(&task("task-1")).unwrap().lifecycle,
-        TaskLifecycle::PauseRequested
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::PauseRequested
     );
 
     fx.acknowledge_safe_point("task-1");
@@ -1029,7 +1029,7 @@ fn a_pause_completes_only_after_the_runner_acknowledged_a_safe_point() {
             None,
         ))
         .expect("acknowledged pause");
-    assert_eq!(paused.task.lifecycle, TaskLifecycle::Paused);
+    assert_eq!(paused.task.runner_state, RunnerState::Stopped);
 }
 
 #[test]
@@ -1259,8 +1259,8 @@ fn a_controller_cannot_start_a_task_the_scheduler_did_not_admit() {
     );
     assert_eq!(reason(&fx, "task-1"), Some(QueueReason::Admitted));
     let started = report_now(&fx, "task-1", &lease, Observation::StartAccepted).unwrap();
-    assert_eq!(started.lifecycle, TaskLifecycle::Provisioning);
-    // Leaving the queue drops the reservation: the lifecycle holds the slot.
+    assert_eq!(started.runner_state, RunnerState::Provisioning);
+    // Leaving the queue drops the reservation: the runner_state holds the slot.
     assert_eq!(started.reservation, None);
     assert_eq!(started.queue, None);
     assert_eq!(fx.control.capacity_in_use(&k8s()).unwrap(), 1);
@@ -1290,7 +1290,7 @@ fn at_capacity_rank_orders_the_waiting_and_a_move_reorders_them_without_preempti
     assert_eq!(reason(&fx, "third"), Some(waiting(3)));
     // A full backend never stops what runs (R11).
     let running = fx.control.task(&task("running")).unwrap();
-    assert_eq!(running.lifecycle, TaskLifecycle::Running);
+    assert_eq!(running.runner_state, RunnerState::Running);
     assert_eq!(running.generation, 1);
 
     // A repeated pass over an unchanged backend writes nothing.
@@ -1434,7 +1434,7 @@ fn archive_releases_an_admitted_or_provisioning_task_deterministically() {
     // An admitted task never accepted by a controller: archived at once,
     // its slot free for the next pass.
     let archived = fx.command("admitted", OwnerCommand::Archive, "archive-a");
-    assert_eq!(archived.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(archived.runner_state, RunnerState::Archived);
     assert_eq!(archived.reservation, None);
     fx.control.schedule(&k8s(), &limit(2)).unwrap();
     assert_eq!(reason(&fx, "waiting"), Some(QueueReason::Admitted));
@@ -1570,7 +1570,7 @@ fn tasks_that_hold_a_slot_or_finished_keep_their_place_when_a_queued_one_passes_
     move_to(&fx, "late", MoveTarget::Bottom).unwrap();
     assert_eq!(queue_order(&fx, "k8s"), ["running", "queued", "late"]);
     let finished = fx.control.task(&task("running")).unwrap();
-    assert_eq!(finished.lifecycle, TaskLifecycle::Archived);
+    assert_eq!(finished.runner_state, RunnerState::Archived);
     assert_eq!(
         finished.revision, archived.revision,
         "a task that was passed gets no event"
@@ -1622,7 +1622,7 @@ fn a_move_is_generation_checked_and_only_for_the_queued() {
     assert!(matches!(
         refused,
         OrchestrationError::TaskNotQueued {
-            lifecycle: TaskLifecycle::Running,
+            runner_state: RunnerState::Running,
             ..
         }
     ));
@@ -2021,15 +2021,15 @@ fn resuming_a_paused_task_needs_a_free_slot() {
         }
     ));
     assert_eq!(
-        fx.control.task(&task("paused")).unwrap().lifecycle,
-        TaskLifecycle::Paused
+        fx.control.task(&task("paused")).unwrap().runner_state,
+        RunnerState::Stopped
     );
 
     let resumed = fx
         .control
         .command_with_capacity(&task("paused"), resume.clone(), &limit(2))
         .expect("a free slot");
-    assert_eq!(resumed.task.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(resumed.task.runner_state, RunnerState::Provisioning);
     // A retry is answered from its receipt, whatever the capacity now.
     let retried = fx
         .control
@@ -2444,7 +2444,7 @@ fn an_old_event_log_with_a_conductor_harness_command_still_decodes() {
 }
 
 // ---------------------------------------------------------------------------
-// Automatic resume: model and lifecycle
+// Automatic resume: model and runner_state
 // ---------------------------------------------------------------------------
 
 /// Drives a running task to `Unknown`: its controller lost track of the
@@ -2460,13 +2460,13 @@ fn a_confirmed_loss_moves_an_unknown_task_to_interrupted() {
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
     let before = unknown(&fx, "task-1", &lease);
-    assert_eq!(before.lifecycle, TaskLifecycle::Unknown);
+    assert_eq!(before.runner_state, RunnerState::Unknown);
 
     let confirmed = fx
         .observe("task-1", &lease, Observation::LossConfirmed)
         .expect("a confirmation on Unknown is legal");
 
-    assert_eq!(confirmed.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(confirmed.runner_state, RunnerState::Interrupted);
     assert_eq!(
         confirmed.generation, before.generation,
         "no new desired work"
@@ -2514,18 +2514,18 @@ fn a_confirmed_loss_changes_no_other_lifecycle() {
     fx.running("archiving", &lease);
     fx.command("archiving", OwnerCommand::Archive, "archive-1");
 
-    for (id, lifecycle) in [
-        ("running", TaskLifecycle::Running),
-        ("paused", TaskLifecycle::Paused),
-        ("interrupted", TaskLifecycle::Interrupted),
-        ("archiving", TaskLifecycle::Archiving),
+    for (id, runner_state) in [
+        ("running", RunnerState::Running),
+        ("paused", RunnerState::Stopped),
+        ("interrupted", RunnerState::Interrupted),
+        ("archiving", RunnerState::Archiving),
     ] {
         let before = fx.control.task(&task(id)).unwrap();
-        assert_eq!(before.lifecycle, lifecycle, "{id} set up");
+        assert_eq!(before.runner_state, runner_state, "{id} set up");
         let after = fx
             .observe(id, &lease, Observation::LossConfirmed)
             .unwrap_or_else(|error| panic!("{id}: a late confirmation is not an error: {error}"));
-        assert_eq!(after.lifecycle, lifecycle, "{id} stays where it was");
+        assert_eq!(after.runner_state, runner_state, "{id} stays where it was");
         assert_eq!(after.generation, before.generation, "{id} gets no new work");
         assert_eq!(after.commands, before.commands, "{id} is not resumed");
     }
@@ -2554,7 +2554,7 @@ fn a_repeated_loss_confirmation_is_absorbed_as_a_redelivery() {
 
     assert!(!outcome.applied);
     assert_eq!(outcome.task.revision, first.revision);
-    assert_eq!(outcome.task.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(outcome.task.runner_state, RunnerState::Interrupted);
 }
 
 #[test]
@@ -2571,7 +2571,7 @@ fn an_observation_this_version_does_not_know_is_refused_in_a_report() {
         error,
         OrchestrationError::IllegalObservation {
             observation: Observation::Unrecognized,
-            lifecycle: TaskLifecycle::Unknown,
+            runner_state: RunnerState::Unknown,
             ..
         }
     ));
@@ -2713,7 +2713,7 @@ fn a_partial_resume_state_fills_the_rest_with_defaults() {
     assert_eq!(state.uncounted_losses, 0);
     assert!(!state.last_loss_uncounted);
     let loss = state.last_loss.expect("the loss");
-    assert_eq!(loss.from, TaskLifecycle::Running);
+    assert_eq!(loss.from, RunnerState::Running);
     assert_eq!(loss.lease_epoch, 4);
     assert_eq!(loss.reason, None);
 }
@@ -2725,7 +2725,7 @@ fn a_full_resume_state_round_trips() {
         consecutive_losses: 6,
         next_attempt_at: Some(at + Duration::minutes(2)),
         last_loss: Some(WorkloadLoss {
-            from: TaskLifecycle::PauseRequested,
+            from: RunnerState::PauseRequested,
             at,
             lease_epoch: 3,
             reason: Some("pod deleted".to_string()),
@@ -2825,7 +2825,7 @@ fn newer_frame(kind: serde_json::Value) -> String {
             "sequence": 9,
             "task_id": "task-1",
             "at": "2026-10-10T12:00:00Z",
-            "lifecycle": "interrupted",
+            "runner_state": "interrupted",
             "generation": 2,
             "kind": kind
         }
@@ -2843,7 +2843,7 @@ fn a_client_keeps_a_stream_frame_whose_event_or_observation_it_does_not_know() {
         serde_json::from_str(&frame).expect("a newer event type still decodes");
     assert_eq!(envelope.event.kind, TaskEventKind::Unrecognized);
     assert_eq!(envelope.cursor, "task-1:9", "the cursor still advances");
-    assert_eq!(envelope.event.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(envelope.event.runner_state, RunnerState::Interrupted);
 
     // A controller report of an observation from a newer version.
     let frame = newer_frame(serde_json::json!({
@@ -2950,12 +2950,12 @@ fn a_loss_after_a_stable_run_starts_the_count_anew_and_is_due_now() {
 
     let lost = lose(&fx, "task-1", &lease, true, "the runner's workload exited");
 
-    assert_eq!(lost.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(lost.runner_state, RunnerState::Interrupted);
     assert_eq!(lost.resume.consecutive_losses, 1);
     assert_eq!(lost.resume.next_attempt_at, Some(fx.clock.now()));
     assert_eq!(lost.resume.exhausted, None);
     let loss = lost.resume.last_loss.expect("the loss is remembered");
-    assert_eq!(loss.from, TaskLifecycle::Running);
+    assert_eq!(loss.from, RunnerState::Running);
     assert_eq!(loss.at, fx.clock.now());
     assert_eq!(loss.lease_epoch, lease.epoch);
     assert_eq!(loss.reason.as_deref(), Some("the runner's workload exited"));
@@ -3008,7 +3008,7 @@ fn a_loss_while_provisioning_counts_and_follows_the_delay_table() {
     assert_eq!(first.resume.next_attempt_at, Some(fx.clock.now()));
     assert_eq!(
         first.resume.last_loss.as_ref().unwrap().from,
-        TaskLifecycle::Provisioning
+        RunnerState::Provisioning
     );
 
     let expected = [
@@ -3050,7 +3050,7 @@ fn the_sixth_consecutive_loss_exhausts_the_policy_with_the_last_reason() {
         "the runner's workload failed before it was ready",
     );
 
-    assert_eq!(sixth.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(sixth.runner_state, RunnerState::Interrupted);
     assert_eq!(sixth.resume.consecutive_losses, 6);
     assert_eq!(sixth.resume.next_attempt_at, None, "no further attempt");
     let exhausted = sixth.resume.exhausted.expect("the policy gave up");
@@ -3124,13 +3124,13 @@ fn a_loss_while_pausing_plans_no_resume() {
 
     let lost = lose(&fx, "task-1", &lease, true, "exited before a safe point");
 
-    assert_eq!(lost.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(lost.runner_state, RunnerState::Interrupted);
     assert_eq!(lost.resume.next_attempt_at, None, "waits for the owner");
     assert_eq!(lost.resume.consecutive_losses, 0);
     assert_eq!(lost.resume.exhausted, None);
     assert_eq!(
         lost.resume.last_loss.unwrap().from,
-        TaskLifecycle::PauseRequested
+        RunnerState::PauseRequested
     );
 }
 
@@ -3141,11 +3141,11 @@ fn a_loss_while_pausing_confirmed_through_unknown_plans_no_resume() {
     fx.running("task-1", &lease);
     fx.command("task-1", OwnerCommand::Pause, "pause-1");
     let unknown = lose(&fx, "task-1", &lease, false, "cannot observe");
-    assert_eq!(unknown.lifecycle, TaskLifecycle::Unknown);
+    assert_eq!(unknown.runner_state, RunnerState::Unknown);
     assert_eq!(unknown.resume.next_attempt_at, None);
     assert_eq!(
         unknown.resume.last_loss.as_ref().unwrap().from,
-        TaskLifecycle::PauseRequested,
+        RunnerState::PauseRequested,
         "the origin is remembered before the confirmation"
     );
     fx.clock.advance(Duration::minutes(3));
@@ -3154,12 +3154,12 @@ fn a_loss_while_pausing_confirmed_through_unknown_plans_no_resume() {
         .observe("task-1", &lease, Observation::LossConfirmed)
         .unwrap();
 
-    assert_eq!(confirmed.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(confirmed.runner_state, RunnerState::Interrupted);
     assert_eq!(confirmed.resume.next_attempt_at, None);
     assert_eq!(confirmed.resume.consecutive_losses, 0);
     assert_eq!(
         confirmed.resume.last_loss.unwrap().from,
-        TaskLifecycle::PauseRequested
+        RunnerState::PauseRequested
     );
 }
 
@@ -3183,7 +3183,7 @@ fn a_confirmed_loss_is_counted_as_of_when_the_workload_was_lost() {
     assert_eq!(confirmed.resume.consecutive_losses, 1);
     assert_eq!(confirmed.resume.next_attempt_at, Some(fx.clock.now()));
     let loss = confirmed.resume.last_loss.unwrap();
-    assert_eq!(loss.from, TaskLifecycle::Running);
+    assert_eq!(loss.from, RunnerState::Running);
     assert_eq!(loss.at, lost_at);
     assert_eq!(loss.reason.as_deref(), Some("cannot observe"));
 }
@@ -3381,7 +3381,7 @@ fn an_owner_start_or_resume_resets_an_exhausted_resume_state() {
 
         let resumed = fx.command("task-1", command, "owner-retry");
 
-        assert_eq!(resumed.lifecycle, TaskLifecycle::Provisioning);
+        assert_eq!(resumed.runner_state, RunnerState::Provisioning);
         assert!(resumed.resume.is_empty(), "{command:?} resets the count");
         assert_eq!(resumed.running_since, None);
         let lost = lose(&fx, "task-1", &lease, true, "exited");
@@ -3412,7 +3412,7 @@ fn a_policy_resume_keeps_the_count_and_uses_up_the_planned_attempt() {
 
     let resumed = policy_resume(&fx, "task-1");
 
-    assert_eq!(resumed.lifecycle, TaskLifecycle::Provisioning);
+    assert_eq!(resumed.runner_state, RunnerState::Provisioning);
     assert_eq!(resumed.resume.consecutive_losses, 2);
     assert_eq!(resumed.resume.next_attempt_at, None);
     assert!(resumed.resume.last_loss.is_some());
@@ -3493,11 +3493,11 @@ fn a_task_interrupted_before_the_policy_is_resumed_unless_lost_while_pausing() {
 
     assert_eq!(recovery.adopted_losses.len(), 2);
     let running = fx.control.task(&task("running-1")).unwrap();
-    assert_eq!(running.lifecycle, TaskLifecycle::Interrupted);
+    assert_eq!(running.runner_state, RunnerState::Interrupted);
     assert_eq!(running.resume.consecutive_losses, 1, "a fresh loss");
     assert_eq!(running.resume.next_attempt_at, Some(fx.clock.now()));
     let loss = running.resume.last_loss.unwrap();
-    assert_eq!(loss.from, TaskLifecycle::Running);
+    assert_eq!(loss.from, RunnerState::Running);
     assert_eq!(loss.at, lost_at, "read from the event log");
     assert_eq!(loss.lease_epoch, lease.epoch);
     assert_eq!(loss.reason.as_deref(), Some("the runner's workload exited"));
@@ -3506,7 +3506,7 @@ fn a_task_interrupted_before_the_policy_is_resumed_unless_lost_while_pausing() {
     assert_eq!(pausing.resume.next_attempt_at, None, "waits for the owner");
     assert_eq!(
         pausing.resume.last_loss.unwrap().from,
-        TaskLifecycle::PauseRequested
+        RunnerState::PauseRequested
     );
 
     // Adopted once: a second recovery changes nothing.
@@ -3526,14 +3526,14 @@ fn a_task_unknown_before_the_policy_is_counted_once_confirmed() {
 
     assert_eq!(recovery.adopted_losses, vec![task("task-1")]);
     let adopted = fx.control.task(&task("task-1")).unwrap();
-    assert_eq!(adopted.lifecycle, TaskLifecycle::Unknown);
+    assert_eq!(adopted.runner_state, RunnerState::Unknown);
     assert_eq!(
         adopted.resume.next_attempt_at, None,
         "nothing confirmed yet"
     );
     assert_eq!(
         adopted.resume.last_loss.as_ref().unwrap().from,
-        TaskLifecycle::Running
+        RunnerState::Running
     );
 
     let confirmed = fx
@@ -3608,10 +3608,10 @@ fn the_loss_state_tells_what_an_interrupted_task_waits_for() {
     let fx = Fixture::new();
     let lease = long_lease(&fx, "controller-a");
     let running = fx.running("task-1", &lease);
-    assert_eq!(loss_state(running.lifecycle, &running.resume), None);
+    assert_eq!(loss_state(running.runner_state, &running.resume), None);
 
     let lost = lose(&fx, "task-1", &lease, true, "exited");
-    let state = loss_state(lost.lifecycle, &lost.resume).expect("a loss state");
+    let state = loss_state(lost.runner_state, &lost.resume).expect("a loss state");
     assert_eq!(
         state,
         LossState::AutoResume {
@@ -3629,11 +3629,99 @@ fn the_loss_state_tells_what_an_interrupted_task_waits_for() {
         }),
         ..ResumeState::default()
     };
-    let state = loss_state(TaskLifecycle::Interrupted, &exhausted).unwrap();
+    let state = loss_state(RunnerState::Interrupted, &exhausted).unwrap();
     assert!(state.needs_owner());
     let LossState::Exhausted(reason) = state else {
         panic!("exhausted: {state:?}");
     };
     assert_eq!(exhaustion_loss(&reason), "pod evicted");
     assert_eq!(exhaustion_loss("in other words"), "in other words");
+}
+
+// ---------------------------------------------------------------------------
+// Rename compatibility: `lifecycle`/`paused` became `runner_state`/`stopped`
+// ---------------------------------------------------------------------------
+
+/// Drives a task to `Stopped` and returns the fixture.
+fn stopped_fixture() -> Fixture {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    fx.running("task-1", &lease);
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    let stopped = fx
+        .observe("task-1", &lease, Observation::PausedAtSafePoint)
+        .expect("paused at a safe point");
+    assert_eq!(stopped.runner_state, RunnerState::Stopped);
+    fx
+}
+
+/// Rewrites every `runner_state`/`stopped` in `file` the way a build from
+/// before the rename wrote it.
+fn rewrite_as_old_build(file: &Path) {
+    let text = fs::read_to_string(file).expect("read file");
+    let old = text
+        .replace("\"runner_state_after\"", "\"lifecycle_after\"")
+        .replace("\"runner_state\"", "\"lifecycle\"")
+        .replace("\"stopped\"", "\"paused\"");
+    assert_ne!(old, text, "the file names the runner state");
+    fs::write(file, old).expect("write file");
+}
+
+#[test]
+fn a_task_record_is_written_with_the_new_runner_state_names() {
+    let fx = stopped_fixture();
+    let text = fs::read_to_string(fx.root.paths().orchestration_task_file("task-1")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["runner_state"], "stopped");
+    assert!(json.get("lifecycle").is_none());
+}
+
+#[test]
+fn a_task_record_written_before_the_rename_loads_as_stopped() {
+    let fx = stopped_fixture();
+    let paths = fx.root.paths();
+    rewrite_as_old_build(&paths.orchestration_task_file("task-1"));
+    let text = fs::read_to_string(paths.orchestration_task_file("task-1")).unwrap();
+    assert!(
+        text.contains("\"lifecycle\": \"paused\"") || text.contains("\"lifecycle\":\"paused\"")
+    );
+
+    let reopened = fx.reopen();
+    assert_eq!(
+        reopened.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::Stopped
+    );
+}
+
+#[test]
+fn an_event_log_written_before_the_rename_replays_on_recover() {
+    let fx = stopped_fixture();
+    let paths = fx.root.paths();
+    let events = fs::read_dir(paths.orchestration_task_events_dir("task-1"))
+        .expect("event directory")
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert!(!events.is_empty());
+    for event in &events {
+        if fs::read_to_string(event)
+            .unwrap()
+            .contains("\"runner_state\"")
+        {
+            rewrite_as_old_build(event);
+        }
+    }
+    rewrite_as_old_build(&paths.orchestration_task_file("task-1"));
+
+    let reopened = fx.reopen();
+    reopened.recover().expect("recover reads the old records");
+    let replayed = reopened
+        .events_since(&task("task-1"), 0)
+        .expect("old events decode");
+    assert!(replayed
+        .iter()
+        .any(|event| event.runner_state == RunnerState::Stopped));
+    assert_eq!(
+        reopened.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::Stopped
+    );
 }

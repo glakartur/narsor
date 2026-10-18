@@ -2963,7 +2963,7 @@ mod remote_cli {
             remote(&harness, token, &["task", "list", "--archived", "--json"]).await;
         let tasks: serde_json::Value = serde_json::from_str(&archived_json.stdout).expect("JSON");
         assert_eq!(tasks.as_array().unwrap().len(), 2);
-        assert_eq!(tasks[0]["lifecycle"], "archived");
+        assert_eq!(tasks[0]["runner_state"], "archived");
         let one = remote(&harness, token, &["task", "show", "t-keep", "--json"]).await;
         let task: serde_json::Value = serde_json::from_str(&one.stdout).expect("JSON");
         assert_eq!(task["task_id"], "t-keep");

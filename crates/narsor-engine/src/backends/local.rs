@@ -2,10 +2,10 @@
 //! storage as a local directory (U4).
 //!
 //! This is how the local machine becomes a backend like any other: the same
-//! control-plane lifecycle, the same controller, the same contract suite.
+//! control-plane runner_state, the same controller, the same contract suite.
 //! The existing daemon's `/executions` path is untouched — it keeps running
 //! the Engine in-process with its own recovery; this adapter is the
-//! lifecycle-managed route to the very same Engine, through the portable
+//! runner_state-managed route to the very same Engine, through the portable
 //! runner (U3).
 //!
 //! # Layout under the adapter's root

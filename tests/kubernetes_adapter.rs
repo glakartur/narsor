@@ -39,7 +39,7 @@ use narsor_engine::domain::{
     BackendId, GitIdentity, ImageDigest, ImageSource, ResolvedEnvironment, ResolvedImage,
     ResourceProfile, SecretDelivery, SecretReference, TaskId, TaskLaunchSpec, TaskWorkspace,
 };
-use narsor_engine::orchestration::{Observation, OwnerCommand, TaskLifecycle};
+use narsor_engine::orchestration::{Observation, OwnerCommand, RunnerState};
 use narsor_engine::runner::{HarnessHome, HomeMode};
 use serde_json::Value;
 
@@ -1428,8 +1428,8 @@ async fn two_tasks_share_pinned_images_but_nothing_writable() {
     h.start_controller();
     h.create("task-a");
     h.create("task-b");
-    h.wait_lifecycle("task-a", TaskLifecycle::Running).await;
-    h.wait_lifecycle("task-b", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-a", RunnerState::Running).await;
+    h.wait_runner_state("task-b", RunnerState::Running).await;
     let cluster = Arc::clone(&h.target.cluster);
     let (a, b) = (h.resources("task-a"), h.resources("task-b"));
 
@@ -1495,19 +1495,19 @@ async fn two_tasks_share_pinned_images_but_nothing_writable() {
     );
 
     h.must("task-a", OwnerCommand::Pause, "pause-a");
-    h.wait_lifecycle("task-a", TaskLifecycle::Paused).await;
+    h.wait_runner_state("task-a", RunnerState::Stopped).await;
     assert!(cluster.pod(&a.workload).is_none());
     assert!(
         cluster.pvc(&a.storage).is_some(),
         "storage kept through the pause"
     );
     assert!(cluster.pod(&b.workload).is_some());
-    assert_eq!(h.lifecycle("task-b"), TaskLifecycle::Running);
+    assert_eq!(h.runner_state("task-b"), RunnerState::Running);
 
     // Resume: one new Pod on the same claim, the same HOME.
     let home = cluster.volume_dir(&a.storage).unwrap().join("home");
     h.must("task-a", OwnerCommand::Resume, "resume-a");
-    h.wait_lifecycle("task-a", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-a", RunnerState::Running).await;
     assert_eq!(cluster.volume_dir(&a.storage).unwrap().join("home"), home);
     assert_eq!(cluster.created_of("PersistentVolumeClaim").len(), 2);
     assert_eq!(cluster.created_of("Pod").len(), 3);
@@ -1527,7 +1527,7 @@ async fn an_evicted_pod_is_replaced_automatically() {
     let task = h.resources("task-1");
     assert!(cluster.evict(&task.workload));
     h.wait_for("the replacement Pod", |h| {
-        cluster.created_of("Pod").len() == 2 && h.lifecycle("task-1") == TaskLifecycle::Running
+        cluster.created_of("Pod").len() == 2 && h.runner_state("task-1") == RunnerState::Running
     })
     .await;
     assert_eq!(cluster.created_of("PersistentVolumeClaim").len(), 1);
@@ -1551,9 +1551,10 @@ async fn an_evicted_pod_waits_for_the_owner_without_the_policy() {
     let cluster = Arc::clone(&h.target.cluster);
     let task = h.resources("task-1");
     assert!(cluster.evict(&task.workload));
-    h.wait_lifecycle("task-1", TaskLifecycle::Interrupted).await;
+    h.wait_runner_state("task-1", RunnerState::Interrupted)
+        .await;
     h.settle().await;
-    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Interrupted);
+    assert_eq!(h.runner_state("task-1"), RunnerState::Interrupted);
     assert!(
         cluster.pod(&task.workload).is_none(),
         "no replacement without the policy"
@@ -1561,7 +1562,7 @@ async fn an_evicted_pod_waits_for_the_owner_without_the_policy() {
     assert_eq!(cluster.created_of("Pod").len(), 1);
 
     h.must("task-1", OwnerCommand::Resume, "resume-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Running).await;
+    h.wait_runner_state("task-1", RunnerState::Running).await;
     assert_eq!(cluster.created_of("Pod").len(), 2);
     assert_eq!(cluster.created_of("PersistentVolumeClaim").len(), 1);
 }
@@ -1630,7 +1631,7 @@ async fn a_partitioned_pod_waits_until_its_failure_is_reported() {
     h.start_controller();
     h.create_with("task-1", gated_spec());
     h.wait_for("the runner at its approval", |h| {
-        h.lifecycle("task-1") == TaskLifecycle::Running && waiting_on(h, "task-1").is_some()
+        h.runner_state("task-1") == RunnerState::Running && waiting_on(h, "task-1").is_some()
     })
     .await;
     let waiting = waiting_on(&h, "task-1").unwrap();
@@ -1639,11 +1640,11 @@ async fn a_partitioned_pod_waits_until_its_failure_is_reported() {
     let task = h.resources("task-1");
 
     assert!(cluster.partition(&task.workload));
-    h.wait_lifecycle("task-1", TaskLifecycle::Unknown).await;
+    h.wait_runner_state("task-1", RunnerState::Unknown).await;
     h.observed_again(3).await;
     assert_eq!(
-        h.lifecycle("task-1"),
-        TaskLifecycle::Unknown,
+        h.runner_state("task-1"),
+        RunnerState::Unknown,
         "a Pod in phase Unknown is no confirmed loss"
     );
     assert_eq!(cluster.created_of("Pod").len(), 1);
@@ -1652,7 +1653,7 @@ async fn a_partitioned_pod_waits_until_its_failure_is_reported() {
     assert!(cluster.kill_runner(&task.workload));
     h.wait_for("the resumed runner at the same approval", |h| {
         let record = h.record("task-1");
-        record.lifecycle == TaskLifecycle::Running
+        record.runner_state == RunnerState::Running
             && record
                 .runner
                 .as_ref()
@@ -1696,12 +1697,13 @@ async fn a_deleted_pod_confirms_the_loss_of_an_unknown_task() {
     let task = h.resources("task-1");
 
     assert!(cluster.partition(&task.workload));
-    h.wait_lifecycle("task-1", TaskLifecycle::Unknown).await;
+    h.wait_runner_state("task-1", RunnerState::Unknown).await;
     assert!(cluster.evict(&task.workload));
-    h.wait_lifecycle("task-1", TaskLifecycle::Interrupted).await;
+    h.wait_runner_state("task-1", RunnerState::Interrupted)
+        .await;
     assert!(h.reported("task-1").contains(&Observation::LossConfirmed));
     h.settle().await;
-    assert_eq!(h.lifecycle("task-1"), TaskLifecycle::Interrupted);
+    assert_eq!(h.runner_state("task-1"), RunnerState::Interrupted);
     assert_eq!(cluster.created_of("Pod").len(), 1, "nothing replaced it");
     assert!(cluster.pvc(&task.storage).is_some());
 }
@@ -1738,7 +1740,7 @@ async fn archive_leaves_nothing_of_the_task_behind() {
     );
 
     h.must("task-1", OwnerCommand::Archive, "archive-1");
-    h.wait_lifecycle("task-1", TaskLifecycle::Archived).await;
+    h.wait_runner_state("task-1", RunnerState::Archived).await;
     assert!(cluster.pod_names().is_empty());
     assert!(cluster.pvc(&task.storage).is_none());
     assert!(cluster.secret_names().is_empty());

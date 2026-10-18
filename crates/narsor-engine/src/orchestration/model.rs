@@ -14,7 +14,7 @@ pub use narsor_protocol::controller::{
     ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
     InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary, OperatorCommand,
     OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity, ResumeExhaustion,
-    ResumeState, RunnerProblem, TaskEvent, TaskEventKind, TaskLifecycle, WorkloadLoss,
+    ResumeState, RunnerProblem, RunnerState, TaskEvent, TaskEventKind, WorkloadLoss,
 };
 
 /// Current schema version of [`TaskRecord`].
@@ -140,7 +140,8 @@ pub struct TaskRecord {
     /// (U10). Strictly increasing, never reused.
     pub queue_sequence: u64,
     /// Current orchestration state.
-    pub lifecycle: TaskLifecycle,
+    #[serde(alias = "lifecycle")]
+    pub runner_state: RunnerState,
     /// Desired generation: starts at 1, grows with every owner command that
     /// changes desired state. Controllers must report against the current one.
     pub generation: u64,
@@ -186,7 +187,7 @@ pub struct TaskRecord {
     /// The capacity slot the scheduler granted while the task is queued
     /// (U10). Only a task holding one is offered `Start`, and only such a
     /// task may be accepted by its controller; cleared once the task leaves
-    /// `Queued`, from where its lifecycle itself holds the slot.
+    /// `Queued`, from where its runner_state itself holds the slot.
     #[serde(default)]
     pub reservation: Option<CapacityReservation>,
     /// Why the queued task waits, or that it was admitted; `None` outside
@@ -239,7 +240,7 @@ impl TaskRecord {
     /// interrupted, its planned attempt is due and the policy has not given
     /// up on it.
     pub fn auto_resume_due(&self, now: DateTime<Utc>) -> bool {
-        self.lifecycle == TaskLifecycle::Interrupted
+        self.runner_state == RunnerState::Interrupted
             && self.resume.exhausted.is_none()
             && self.resume.next_attempt_at.is_some_and(|at| at <= now)
     }
@@ -269,19 +270,19 @@ impl TaskRecord {
     ///   explicitly, so a retry never has to wait for capacity;
     /// * `Archiving` — deletion is requested but not confirmed.
     ///
-    /// `Paused` releases its slot: the safe point was acknowledged and the
+    /// `Stopped` releases its slot: the safe point was acknowledged and the
     /// compute removed (R12). `Archived` and an unadmitted `Queued` task
     /// hold nothing.
     pub fn holds_capacity(&self) -> bool {
-        match self.lifecycle {
-            TaskLifecycle::Queued => self.reservation.is_some(),
-            TaskLifecycle::Provisioning
-            | TaskLifecycle::Running
-            | TaskLifecycle::PauseRequested
-            | TaskLifecycle::Interrupted
-            | TaskLifecycle::Unknown
-            | TaskLifecycle::Archiving => true,
-            TaskLifecycle::Paused | TaskLifecycle::Archived => false,
+        match self.runner_state {
+            RunnerState::Queued => self.reservation.is_some(),
+            RunnerState::Provisioning
+            | RunnerState::Running
+            | RunnerState::PauseRequested
+            | RunnerState::Interrupted
+            | RunnerState::Unknown
+            | RunnerState::Archiving => true,
+            RunnerState::Stopped | RunnerState::Archived => false,
         }
     }
 
@@ -345,20 +346,18 @@ impl TaskRecord {
     /// right now, or `None` when it can: only a running task with a runner
     /// of its current launch has someone to carry it out.
     pub fn operator_command_refusal(&self) -> Option<String> {
-        let reason = match self.lifecycle {
-            TaskLifecycle::Running => None,
-            TaskLifecycle::Queued | TaskLifecycle::Provisioning => {
-                Some("the task has not started yet")
-            }
-            TaskLifecycle::PauseRequested => Some("the task is pausing"),
-            TaskLifecycle::Paused => Some("the task is paused; resume it first"),
-            TaskLifecycle::Interrupted | TaskLifecycle::Unknown => {
+        let reason = match self.runner_state {
+            RunnerState::Running => None,
+            RunnerState::Queued | RunnerState::Provisioning => Some("the task has not started yet"),
+            RunnerState::PauseRequested => Some("the task is pausing"),
+            RunnerState::Stopped => Some("the task is paused; resume it first"),
+            RunnerState::Interrupted | RunnerState::Unknown => {
                 Some("the task's runner is gone; start or resume the task first")
             }
-            TaskLifecycle::Archiving | TaskLifecycle::Archived => Some("the task is archived"),
+            RunnerState::Archiving | RunnerState::Archived => Some("the task is archived"),
         };
         if let Some(reason) = reason {
-            return Some(format!("{reason} (lifecycle: {:?})", self.lifecycle));
+            return Some(format!("{reason} (lifecycle: {:?})", self.runner_state));
         }
         match &self.runner {
             None => Some("the task's runner has not reported yet".to_string()),

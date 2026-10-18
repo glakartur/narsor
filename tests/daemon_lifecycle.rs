@@ -1767,10 +1767,10 @@ impl RestartedDaemon {
                     && item.state_id.as_deref() == Some("gate")
             });
             if let (
-                narsor_engine::orchestration::TaskLifecycle::Running,
+                narsor_engine::orchestration::RunnerState::Running,
                 Some(runner),
                 Some(approval),
-            ) = (task.lifecycle, runner, approval)
+            ) = (task.runner_state, runner, approval)
             {
                 return (runner.incarnation.clone(), approval.waiting_id.clone());
             }
@@ -1923,8 +1923,8 @@ async fn a_runner_that_survives_a_restart_keeps_its_task_without_a_resume() {
 
     let task = daemon.task().await;
     assert_eq!(
-        task.lifecycle,
-        narsor_engine::orchestration::TaskLifecycle::Running,
+        task.runner_state,
+        narsor_engine::orchestration::RunnerState::Running,
         "{task:#?}"
     );
     assert_eq!(daemon.runner_pid(), pid, "the same runner");
@@ -1961,21 +1961,21 @@ async fn a_task_interrupted_before_the_resume_policy_is_resumed_at_start() {
 /// fields the policy added.
 fn interrupt_as_before_the_policy(root: &Path, task_id: &str) {
     use narsor_engine::orchestration::{
-        Observation, TaskEvent, TaskEventKind, TaskLifecycle, TaskRecord,
+        Observation, RunnerState, TaskEvent, TaskEventKind, TaskRecord,
     };
 
     let path = narsor_engine::persistence::StatePaths::new(root).orchestration_task_file(task_id);
     let mut record: TaskRecord =
         serde_json::from_slice(&fs::read(&path).expect("read the task record"))
             .expect("parse the task record");
-    assert_eq!(record.lifecycle, TaskLifecycle::Running);
-    record.lifecycle = TaskLifecycle::Interrupted;
+    assert_eq!(record.runner_state, RunnerState::Running);
+    record.runner_state = RunnerState::Interrupted;
     record.revision += 1;
     record.last_event = TaskEvent {
         sequence: record.revision,
         task_id: record.task_id.clone(),
         at: chrono::Utc::now(),
-        lifecycle: TaskLifecycle::Interrupted,
+        runner_state: RunnerState::Interrupted,
         generation: record.generation,
         kind: TaskEventKind::ControllerReported {
             observation: Observation::WorkloadLost { state_known: true },

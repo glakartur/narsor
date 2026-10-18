@@ -872,8 +872,13 @@ mod task_app_render {
     /// an approval, a failed one, two queued, a finished one.
     fn busy_app() -> TaskApp {
         let mut app = app();
-        let controlled = |id: &str, lifecycle: &str, rank| {
-            with_controller(crate::task_app_support::task(id, "local", lifecycle, rank))
+        let controlled = |id: &str, runner_state: &str, rank| {
+            with_controller(crate::task_app_support::task(
+                id,
+                "local",
+                runner_state,
+                rank,
+            ))
         };
         app.load(listing(
             vec![
@@ -2999,23 +3004,23 @@ mod task_app_detail_render {
     #[test]
     fn an_interrupted_task_says_what_it_waits_for() {
         use crate::task_app_support::{exhausted, interrupted};
-        use narsor_engine::orchestration::TaskLifecycle;
+        use narsor_engine::orchestration::RunnerState;
         let cases = [
             (
-                interrupted("b", TaskLifecycle::Running, 2, true),
+                interrupted("b", RunnerState::Running, 2, true),
                 "wznowienie automatyczne, próba 2/5",
                 false,
             ),
             (
                 exhausted(
-                    interrupted("b", TaskLifecycle::Running, 6, false),
+                    interrupted("b", RunnerState::Running, 6, false),
                     "could not resume automatically: pod evicted",
                 ),
                 "nie udało się wznowić automatycznie: pod evicted, uruchom od nowa (s)",
                 true,
             ),
             (
-                interrupted("b", TaskLifecycle::PauseRequested, 0, false),
+                interrupted("b", RunnerState::PauseRequested, 0, false),
                 "utracone podczas wstrzymywania, czeka na Ciebie (s)",
                 true,
             ),

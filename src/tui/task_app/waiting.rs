@@ -97,7 +97,7 @@ pub enum Submit {
     },
     /// A command for the runner: a restart, a confirmation of a proposal.
     Operator(OperatorCommand),
-    /// A lifecycle command of the owner: `start`, `archive`.
+    /// A runner_state command of the owner: `start`, `archive`.
     Owner(OwnerCommand),
 }
 

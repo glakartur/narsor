@@ -1,5 +1,5 @@
 //! The generic environment controller: reconciles a backend with the
-//! control plane's desired task lifecycle over the controller protocol
+//! control plane's desired task runner_state over the controller protocol
 //! (R3-R5, R12-R14, R34, R37; KTD1-KTD3).
 //!
 //! # One step
@@ -71,7 +71,7 @@ use crate::backend::{
 use narsor_protocol::controller::{
     AckResponse, CommandAck, CommandsResponse, DesiredAction, DesiredCommand, HeartbeatResponse,
     LeaseView, Observation, ObservedSummary, ReportRequest, ReportResponse, ResourceIdentity,
-    RunnerCredentialRequest, RunnerCredentialResponse, TaskLifecycle,
+    RunnerCredentialRequest, RunnerCredentialResponse, RunnerState,
 };
 use narsor_protocol::identifier::TaskId;
 use narsor_shared::api_error::ClientError;
@@ -532,7 +532,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             // Unknown: is the runner really gone? Nothing here creates or
             // removes anything; a confirmed loss only makes the task
             // Interrupted.
-            DesiredAction::Hold if command.lifecycle == TaskLifecycle::Unknown => {
+            DesiredAction::Hold if command.runner_state == RunnerState::Unknown => {
                 self.confirm_loss(&context).await
             }
             // Interrupted: the owner or the resume policy decides (R13).
@@ -553,9 +553,9 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             .report(context, Observation::StartAccepted, None, summary)
             .await?;
         match accepted {
-            Some(response) if response.lifecycle == TaskLifecycle::Provisioning => {
+            Some(response) if response.runner_state == RunnerState::Provisioning => {
                 let provisioning = DesiredCommand {
-                    lifecycle: TaskLifecycle::Provisioning,
+                    runner_state: RunnerState::Provisioning,
                     action: DesiredAction::Provision,
                     ..context.command.clone()
                 };
@@ -852,7 +852,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         Ok(Progress::Settled)
     }
 
-    /// Paused: no compute may exist; storage stays.
+    /// Stopped: no compute may exist; storage stays.
     async fn keep_paused(&mut self, context: &TaskContext<'_>) -> Result<Progress, Interrupt> {
         let Some(observed) = self.observe(context, false).await? else {
             return Ok(Progress::Settling);

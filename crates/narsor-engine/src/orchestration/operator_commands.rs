@@ -6,7 +6,7 @@
 //! runner receives it with its long-poll — again and again until it
 //! acknowledges — and its verdict becomes a second event the owner's stream
 //! shows. The control plane never executes anything: it validates what it
-//! can know (lifecycle, generation, idempotency) and relays; the runner
+//! can know (runner_state, generation, idempotency) and relays; the runner
 //! decides under the Engine's own claim on the execution.
 //!
 //! A command is meant for one runner launch. When the task stops being
@@ -18,7 +18,7 @@ use super::control_plane::{ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
     OperatorCommand, OperatorCommandOutcome, OperatorCommandRequest, OperatorCommandStatus,
-    QueuedOperatorCommand, TaskEventKind, TaskLifecycle, TaskRecord,
+    QueuedOperatorCommand, RunnerState, TaskEventKind, TaskRecord,
 };
 use super::runner_state::fence_runner;
 use crate::domain::display::bounded_detail;
@@ -153,7 +153,7 @@ impl ControlPlane {
         fence_runner(&record, incarnation, launch_generation)?;
         if !record.operator_commands.iter().any(|command| {
             !command.status.is_settled()
-                && obsolete_reason(command, record.lifecycle, launch_generation).is_some()
+                && obsolete_reason(command, record.runner_state, launch_generation).is_some()
         }) {
             return Ok((open_commands(&record), false));
         }
@@ -161,14 +161,14 @@ impl ControlPlane {
         loop {
             let (record, rejected) = self.mutate(task_id, |record, now| {
                 fence_runner(record, incarnation, launch_generation)?;
-                let lifecycle = record.lifecycle;
+                let runner_state = record.runner_state;
                 let Some(command) = record.operator_commands.iter_mut().find(|command| {
                     !command.status.is_settled()
-                        && obsolete_reason(command, lifecycle, launch_generation).is_some()
+                        && obsolete_reason(command, runner_state, launch_generation).is_some()
                 }) else {
                     return Ok(Mutation::Unchanged(false));
                 };
-                let detail = obsolete_reason(command, lifecycle, launch_generation);
+                let detail = obsolete_reason(command, runner_state, launch_generation);
                 command.status = OperatorCommandStatus::Rejected;
                 command.updated_at = now;
                 command.detail = detail.clone();
@@ -324,12 +324,12 @@ fn open_commands(record: &TaskRecord) -> Vec<QueuedOperatorCommand> {
 /// `launch_generation`, if it cannot.
 fn obsolete_reason(
     command: &QueuedOperatorCommand,
-    lifecycle: TaskLifecycle,
+    runner_state: RunnerState,
     launch_generation: u64,
 ) -> Option<String> {
-    if lifecycle != TaskLifecycle::Running {
+    if runner_state != RunnerState::Running {
         return Some(format!(
-            "the task stopped running before the runner took the command (lifecycle: {lifecycle:?})"
+            "the task stopped running before the runner took the command (lifecycle: {runner_state:?})"
         ));
     }
     (command.launch_generation != launch_generation)

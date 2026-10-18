@@ -1635,7 +1635,7 @@ mod task_app_list {
     use narsor_engine::controller_protocol::MoveTaskRequest;
     use narsor_engine::domain::ExecutionStatus;
     use narsor_engine::orchestration::{
-        AttentionKind, Observation, QueueReason, TaskEventKind, TaskLifecycle,
+        AttentionKind, Observation, QueueReason, RunnerState, TaskEventKind,
     };
     use narsor_protocol::controller::MoveTaskTarget;
 
@@ -1681,7 +1681,7 @@ mod task_app_list {
             "c1",
             "c",
             2,
-            TaskLifecycle::Queued,
+            RunnerState::Queued,
             TaskEventKind::Moved {
                 rank: 1,
                 order: ids(&["c", "a", "b"]),
@@ -1694,7 +1694,7 @@ mod task_app_list {
             "c1",
             "c",
             1,
-            TaskLifecycle::Queued,
+            RunnerState::Queued,
             TaskEventKind::Moved {
                 rank: 3,
                 order: ids(&["a", "b", "c"]),
@@ -1723,10 +1723,10 @@ mod task_app_list {
     fn controlled(
         id: &str,
         backend: &str,
-        lifecycle: &str,
+        runner_state: &str,
         rank: u32,
     ) -> narsor_engine::controller_protocol::TaskSummary {
-        with_controller(task(id, backend, lifecycle, rank))
+        with_controller(task(id, backend, runner_state, rank))
     }
 
     mod order {
@@ -1759,7 +1759,7 @@ mod task_app_list {
                     &format!("p{id}"),
                     id,
                     sequence,
-                    TaskLifecycle::Provisioning,
+                    RunnerState::Provisioning,
                     TaskEventKind::ControllerReported {
                         observation: Observation::StartAccepted,
                         lease_epoch: 1,
@@ -1779,7 +1779,7 @@ mod task_app_list {
                     &format!("r{id}"),
                     id,
                     sequence,
-                    TaskLifecycle::Running,
+                    RunnerState::Running,
                     TaskEventKind::ControllerReported {
                         observation: Observation::RunnerReady,
                         lease_epoch: 1,
@@ -1801,7 +1801,7 @@ mod task_app_list {
                     &format!("d{id}"),
                     id,
                     sequence,
-                    TaskLifecycle::Running,
+                    RunnerState::Running,
                     TaskEventKind::RunnerReported {
                         incarnation: "pod-1".into(),
                         event_cursor: 9,
@@ -1828,7 +1828,7 @@ mod task_app_list {
                 "old",
                 "a",
                 5,
-                TaskLifecycle::Queued,
+                RunnerState::Queued,
                 TaskEventKind::Created,
             ));
             assert_eq!(row(&app, "a").1, StateIcon::Running);
@@ -1863,7 +1863,7 @@ mod task_app_list {
                 "n",
                 "new",
                 1,
-                TaskLifecycle::Queued,
+                RunnerState::Queued,
                 TaskEventKind::Created,
             ));
             assert!(app.refresh_wanted());
@@ -1887,7 +1887,7 @@ mod task_app_list {
                 "i",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::InputQueued {
                     input_id: "in-1".into(),
                     pending_input_id: waiting_id,
@@ -1900,7 +1900,7 @@ mod task_app_list {
                 "q",
                 "b",
                 2,
-                TaskLifecycle::Queued,
+                RunnerState::Queued,
                 TaskEventKind::QueueChanged {
                     reason: QueueReason::ControllerOffline,
                 },
@@ -2117,7 +2117,7 @@ mod task_app_list {
                 "arch",
                 "b",
                 2,
-                TaskLifecycle::Archived,
+                RunnerState::Archived,
                 TaskEventKind::Created,
             ));
             assert_eq!(titles(&app), ["a", "c"]);
@@ -2545,7 +2545,7 @@ mod task_app_list {
                 "e",
                 "a",
                 2,
-                TaskLifecycle::Provisioning,
+                RunnerState::Provisioning,
                 TaskEventKind::Created,
             ));
             assert_eq!(status(&app), "● live");
@@ -2667,7 +2667,7 @@ mod task_app_detail {
     };
     use narsor_engine::domain::{Event, ExecutionStatus};
     use narsor_engine::engine::{ConversationState, PositionStatus, Timeline};
-    use narsor_engine::orchestration::{Observation, QueueReason, TaskEventKind, TaskLifecycle};
+    use narsor_engine::orchestration::{Observation, QueueReason, RunnerState, TaskEventKind};
 
     use super::remote_support::{report, snapshot, RemoteHarness};
     use super::task_app_support::{
@@ -2768,7 +2768,7 @@ mod task_app_detail {
                 "e",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::Created,
             ));
             assert!(app.detail().view("a").unwrap().progress().needs_read(2));
@@ -3733,7 +3733,7 @@ mod task_app_detail {
             harness.clock.advance(chrono::Duration::minutes(10));
             app.refresh().await;
             let task = app.list().selected().expect("a selected task");
-            assert_eq!(task.lifecycle, TaskLifecycle::Running, "never invented");
+            assert_eq!(task.runner_state, RunnerState::Running, "never invented");
             let stale = sheet(&app);
             assert!(
                 stale.iter().any(|line| line.contains("offline")),
@@ -3790,8 +3790,8 @@ mod task_app_detail {
                 .expect("lost");
             let mut app = app_over(&harness).await;
             assert_eq!(
-                app.list().selected().unwrap().lifecycle,
-                TaskLifecycle::Interrupted
+                app.list().selected().unwrap().runner_state,
+                RunnerState::Interrupted
             );
             press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.detail().tab(), DetailTab::Events);
@@ -4126,7 +4126,7 @@ mod task_app_waiting {
     use narsor_engine::engine::actions::human::HumanInputAction;
     use narsor_engine::engine::PositionStatus;
     use narsor_engine::orchestration::{
-        AttentionKind, OperatorCommand, OwnerCommand, TaskEventKind, TaskLifecycle,
+        AttentionKind, OperatorCommand, OwnerCommand, RunnerState, TaskEventKind,
     };
     use narsor_protocol::controller::ConductorView;
     use narsor_protocol::controller::{ConductorReadResponse, ExecutionEventsSource};
@@ -5422,7 +5422,7 @@ mod task_app_waiting {
             "e",
             "a",
             2,
-            TaskLifecycle::Running,
+            RunnerState::Running,
             TaskEventKind::Created,
         ));
         app.load(listing(vec![titled(waiting, "NAR-12")], "e"));
@@ -6103,8 +6103,8 @@ mod task_app_actions {
     use narsor_engine::controller_protocol::{OperatorCommandView, RunnerClient, TaskSummary};
     use narsor_engine::domain::ExecutionStatus;
     use narsor_engine::orchestration::{
-        AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef,
-        TaskEventKind, TaskLifecycle,
+        AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, OwnerRef, RunnerState,
+        TaskEventKind,
     };
 
     use super::remote_support::{snapshot, RemoteHarness};
@@ -6158,7 +6158,7 @@ mod task_app_actions {
         )
     }
 
-    fn lifecycle(word: &str) -> TaskSummary {
+    fn runner_state(word: &str) -> TaskSummary {
         with_controller(task("a", "local", word, 1))
     }
 
@@ -6224,7 +6224,7 @@ mod task_app_actions {
             assert!(available(&queued("a", 1), TaskAction::Move));
             for word in ["running", "paused", "interrupted", "provisioning"] {
                 assert_eq!(
-                    unavailable(&lifecycle(word), TaskAction::Move),
+                    unavailable(&runner_state(word), TaskAction::Move),
                     "zadanie nie jest w kolejce",
                     "{word}"
                 );
@@ -6236,7 +6236,7 @@ mod task_app_actions {
             let running = running("a", 1);
             assert!(available(&running, TaskAction::PauseResume));
             assert_eq!(verb(&running, TaskAction::PauseResume), "pauza");
-            let paused = lifecycle("paused");
+            let paused = runner_state("paused");
             assert!(available(&paused, TaskAction::PauseResume));
             assert_eq!(verb(&paused, TaskAction::PauseResume), "wznowienie");
             assert_eq!(
@@ -6244,16 +6244,16 @@ mod task_app_actions {
                 "zadanie jest w kolejce"
             );
             assert_eq!(
-                unavailable(&lifecycle("provisioning"), TaskAction::PauseResume),
+                unavailable(&runner_state("provisioning"), TaskAction::PauseResume),
                 "zadanie jest przygotowywane"
             );
             assert!(
-                unavailable(&lifecycle("interrupted"), TaskAction::PauseResume)
+                unavailable(&runner_state("interrupted"), TaskAction::PauseResume)
                     .contains("uruchom je od nowa")
             );
             assert!(unavailable(&finished("a", 1), TaskAction::PauseResume).contains("zakończone"));
             assert!(
-                unavailable(&lifecycle("pause_requested"), TaskAction::PauseResume)
+                unavailable(&runner_state("pause_requested"), TaskAction::PauseResume)
                     .contains("wstrzymywane")
             );
         }
@@ -6265,10 +6265,10 @@ mod task_app_actions {
                 unavailable(&queued("a", 1), TaskAction::Interrupt),
                 "zadanie jest w kolejce"
             );
-            assert!(unavailable(&lifecycle("paused"), TaskAction::Interrupt).contains("wznów"));
+            assert!(unavailable(&runner_state("paused"), TaskAction::Interrupt).contains("wznów"));
             assert!(unavailable(&finished("a", 1), TaskAction::Interrupt).contains("zakończone"));
             assert_eq!(
-                unavailable(&lifecycle("running"), TaskAction::Interrupt),
+                unavailable(&runner_state("running"), TaskAction::Interrupt),
                 "runner jeszcze się nie zgłosił"
             );
             let mut silent = running("a", 1);
@@ -6303,10 +6303,10 @@ mod task_app_actions {
 
         #[test]
         fn start_again_is_for_interrupted_tasks_and_a_failed_provisioning() {
-            assert!(available(&lifecycle("interrupted"), TaskAction::Restart));
-            assert!(available(&lifecycle("unknown"), TaskAction::Restart));
+            assert!(available(&runner_state("interrupted"), TaskAction::Restart));
+            assert!(available(&runner_state("unknown"), TaskAction::Restart));
             let failed = waiting_on(
-                lifecycle("provisioning"),
+                runner_state("provisioning"),
                 AttentionKind::ProvisioningFailed,
                 "p-1",
                 None,
@@ -6317,25 +6317,25 @@ mod task_app_actions {
                 unavailable(&queued("a", 1), TaskAction::Restart),
                 "zadanie jest w kolejce"
             );
-            assert!(unavailable(&lifecycle("paused"), TaskAction::Restart).contains("wznów"));
+            assert!(unavailable(&runner_state("paused"), TaskAction::Restart).contains("wznów"));
         }
 
         #[test]
         fn archive_is_for_finished_and_interrupted_tasks() {
             assert!(available(&finished("a", 1), TaskAction::Archive));
-            assert!(available(&lifecycle("interrupted"), TaskAction::Archive));
+            assert!(available(&runner_state("interrupted"), TaskAction::Archive));
             let failed = waiting_on(
-                lifecycle("provisioning"),
+                runner_state("provisioning"),
                 AttentionKind::ProvisioningFailed,
                 "p-1",
                 None,
             );
             assert!(available(&failed, TaskAction::Archive));
-            for blocked in [running("a", 1), queued("a", 1), lifecycle("paused")] {
+            for blocked in [running("a", 1), queued("a", 1), runner_state("paused")] {
                 assert!(
                     unavailable(&blocked, TaskAction::Archive).contains("zakończone lub przerwane"),
                     "{:?}",
-                    blocked.lifecycle
+                    blocked.runner_state
                 );
             }
         }
@@ -6523,7 +6523,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Paused,
+                RunnerState::Stopped,
                 TaskEventKind::Created,
             ));
             let chooser = app.overlay().unwrap().chooser().unwrap();
@@ -6538,7 +6538,7 @@ mod task_app_actions {
                 "e",
                 "a",
                 3,
-                TaskLifecycle::Archived,
+                RunnerState::Archived,
                 TaskEventKind::Created,
             ));
             assert!(app.overlay().is_none(), "the task left the list");
@@ -6584,14 +6584,14 @@ mod task_app_actions {
             assert!(!pause.key.is_empty());
             assert!(app.overlay().is_none(), "no window for a plain action");
 
-            let mut app = loaded(lifecycle("paused"));
+            let mut app = loaded(runner_state("paused"));
             let resume = act(ch(&mut app, 'p'));
             assert_eq!(resume.send, ActionSend::Owner(OwnerCommand::Resume));
         }
 
         #[test]
         fn s_starts_an_interrupted_task_again_and_says_why_for_a_running_one() {
-            let mut app = loaded(lifecycle("interrupted"));
+            let mut app = loaded(runner_state("interrupted"));
             let start = act(ch(&mut app, 's'));
             assert_eq!(start.send, ActionSend::Owner(OwnerCommand::Start));
 
@@ -6728,7 +6728,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Archived,
+                RunnerState::Archived,
                 TaskEventKind::Created,
             ));
             assert!(app.overlay().is_none());
@@ -7078,7 +7078,7 @@ mod task_app_actions {
                 ('p', running("a", 1)),
                 ('x', running("a", 1)),
                 ('a', finished("a", 1)),
-                ('s', lifecycle("interrupted")),
+                ('s', runner_state("interrupted")),
                 (
                     't',
                     with_transitions(running("a", 1), "review", &[("ok", "ship", None)], None),
@@ -7126,7 +7126,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::Created,
             ));
             let chooser = app.overlay().unwrap().chooser().unwrap();
@@ -7174,7 +7174,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandQueued {
                     command_id: "command-1".to_string(),
                     command: OperatorCommand::Interrupt,
@@ -7188,7 +7188,7 @@ mod task_app_actions {
                 "e",
                 "a",
                 3,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandResolved {
                     command_id: "command-1".to_string(),
                     status: OperatorCommandStatus::Applied,
@@ -7208,7 +7208,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandQueued {
                     command_id: "command-1".to_string(),
                     command: OperatorCommand::Transition {
@@ -7223,7 +7223,7 @@ mod task_app_actions {
                 "e",
                 "a",
                 3,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandResolved {
                     command_id: "command-1".to_string(),
                     status: OperatorCommandStatus::Rejected,
@@ -7253,7 +7253,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandResolved {
                     command_id: "command-1".to_string(),
                     status: OperatorCommandStatus::Rejected,
@@ -7279,7 +7279,7 @@ mod task_app_actions {
                     cursor,
                     "a",
                     sequence,
-                    TaskLifecycle::Running,
+                    RunnerState::Running,
                     TaskEventKind::OperatorCommandResolved {
                         command_id: "command-1".to_string(),
                         status: OperatorCommandStatus::Applied,
@@ -7292,7 +7292,7 @@ mod task_app_actions {
                 "e",
                 "a",
                 3,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::Created,
             ));
             let before = app.notifier().latest().unwrap().at;
@@ -7311,7 +7311,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandResolved {
                     command_id: "command-9".to_string(),
                     status: OperatorCommandStatus::Applied,
@@ -7344,7 +7344,7 @@ mod task_app_actions {
                 "d",
                 "a",
                 2,
-                TaskLifecycle::Running,
+                RunnerState::Running,
                 TaskEventKind::OperatorCommandResolved {
                     command_id: "command-1".to_string(),
                     status: OperatorCommandStatus::Applied,
@@ -7591,14 +7591,14 @@ mod task_app_actions {
             app.perform(request).await;
             assert_eq!(note(&app), "NAR-12: wstrzymanie zlecone");
             for _ in 0..8 {
-                if app.list().tasks()[0].lifecycle != TaskLifecycle::Running {
+                if app.list().tasks()[0].runner_state != RunnerState::Running {
                     break;
                 }
                 next_event(&mut app, &mut feed).await;
             }
             assert_eq!(
-                app.list().tasks()[0].lifecycle,
-                TaskLifecycle::PauseRequested
+                app.list().tasks()[0].runner_state,
+                RunnerState::PauseRequested
             );
         }
 
@@ -7708,7 +7708,7 @@ mod task_app_conductor {
     };
     use narsor_engine::domain::ExecutionStatus;
     use narsor_engine::orchestration::{
-        AttentionKind, OperatorCommand, OwnerRef, TaskEventKind, TaskLifecycle,
+        AttentionKind, OperatorCommand, OwnerRef, RunnerState, TaskEventKind,
     };
     use narsor_protocol::controller::ConductorReadResponse;
     use narsor_protocol::controller::ConductorView;
@@ -8263,7 +8263,7 @@ mod task_app_conductor {
                 ),
             ] {
                 let sequence = if cursor == "d" { 2 } else { 3 };
-                app.on_stream(event(cursor, "a", sequence, TaskLifecycle::Running, kind));
+                app.on_stream(event(cursor, "a", sequence, RunnerState::Running, kind));
             }
             let text = note(&app);
             assert!(
@@ -8625,7 +8625,7 @@ mod task_app_conductor {
                     },
                 ),
             ] {
-                app.on_stream(event(cursor, "a", sequence, TaskLifecycle::Running, kind));
+                app.on_stream(event(cursor, "a", sequence, RunnerState::Running, kind));
             }
             let text = note(&app);
             assert!(
@@ -8912,7 +8912,7 @@ mod task_app_create {
         RepositoryListResponse, TaskSummary, ValidateWorkflowResponse, WorkflowListResponse,
     };
     use narsor_engine::domain::ParamType;
-    use narsor_engine::orchestration::TaskLifecycle;
+    use narsor_engine::orchestration::RunnerState;
     use narsor_engine::persistence::ExecutionStore;
     use narsor_protocol::api::LegacyExecutionListResponse;
 
@@ -10448,7 +10448,7 @@ mod task_app_create {
             assert_eq!(app.view_kind(), ViewKind::History);
             assert_eq!(titles(&app), ["NAR-9"]);
             let entry = app.history().unwrap().selected_entry().unwrap();
-            assert_eq!(entry.summary().lifecycle, TaskLifecycle::Archived);
+            assert_eq!(entry.summary().runner_state, RunnerState::Archived);
 
             // The details are read-only and read nothing: the storage is gone.
             press(&mut app, KeyCode::Enter);
@@ -11767,7 +11767,7 @@ mod task_app_auto_resume {
     use narsor::tui::transcript::{TranscriptEntry, TranscriptEntryId};
     use narsor_engine::controller_protocol::{ExecutionEventsSource, TaskSummary};
     use narsor_engine::engine::{ConversationState, PositionStatus};
-    use narsor_engine::orchestration::{TaskEventKind, TaskLifecycle};
+    use narsor_engine::orchestration::{RunnerState, TaskEventKind};
 
     use super::task_app_support::{
         auto_resumed, event, exhausted, interrupted, listing, position, timeline, titled,
@@ -11787,7 +11787,7 @@ mod task_app_auto_resume {
         (1..=count)
             .map(|n| {
                 let mut task = titled(
-                    interrupted(&format!("t{n}"), TaskLifecycle::Running, 1, true),
+                    interrupted(&format!("t{n}"), RunnerState::Running, 1, true),
                     &format!("NAR-{n}"),
                 );
                 task.rank = n;
@@ -11827,7 +11827,7 @@ mod task_app_auto_resume {
         assert_eq!(order(&app), ["t1", "t2", "t3"]);
         assert_eq!(app.list().selected_id().map(str::to_string), selected);
         let row = &app.list().tasks()[1];
-        assert_eq!(row.lifecycle, TaskLifecycle::Provisioning);
+        assert_eq!(row.runner_state, RunnerState::Provisioning);
         assert_eq!(attention_of(row), Attention::None);
     }
 
@@ -11883,7 +11883,7 @@ mod task_app_auto_resume {
             "e3",
             "t1",
             5,
-            TaskLifecycle::Interrupted,
+            RunnerState::Interrupted,
             TaskEventKind::AutoResumeExhausted {
                 attempts: 5,
                 reason: "could not resume automatically: pod evicted".to_string(),
@@ -11902,7 +11902,7 @@ mod task_app_auto_resume {
             "e1",
             "t2",
             2,
-            TaskLifecycle::Interrupted,
+            RunnerState::Interrupted,
             TaskEventKind::AutoResumeExhausted {
                 attempts: 5,
                 reason: "could not resume automatically: pod evicted".to_string(),
@@ -11922,7 +11922,7 @@ mod task_app_auto_resume {
             "e2",
             "t3",
             2,
-            TaskLifecycle::Interrupted,
+            RunnerState::Interrupted,
             TaskEventKind::AutoResumeExhausted {
                 attempts: 5,
                 reason: "could not resume automatically: the workload was lost".to_string(),
@@ -11937,12 +11937,12 @@ mod task_app_auto_resume {
     /// Only the two cases that wait for the owner mark the row.
     #[test]
     fn the_row_is_marked_only_when_the_owner_has_to_act() {
-        let planned = interrupted("a", TaskLifecycle::Running, 2, true);
+        let planned = interrupted("a", RunnerState::Running, 2, true);
         assert_eq!(attention_of(&planned), Attention::None);
-        let pausing = interrupted("a", TaskLifecycle::PauseRequested, 0, false);
+        let pausing = interrupted("a", RunnerState::PauseRequested, 0, false);
         assert_eq!(attention_of(&pausing), Attention::Problem);
         let given_up = exhausted(
-            interrupted("a", TaskLifecycle::Running, 6, false),
+            interrupted("a", RunnerState::Running, 6, false),
             "could not resume automatically: pod evicted",
         );
         assert_eq!(attention_of(&given_up), Attention::Problem);
@@ -11951,7 +11951,7 @@ mod task_app_auto_resume {
     /// The menu's reason for an interrupted task mentions a planned resume.
     #[test]
     fn an_action_of_a_task_resuming_on_its_own_says_so() {
-        let planned = interrupted("a", TaskLifecycle::Running, 2, true);
+        let planned = interrupted("a", RunnerState::Running, 2, true);
         let reason = availability(&planned, TaskAction::Interrupt);
         assert_eq!(
             reason.reason(),
@@ -11959,7 +11959,7 @@ mod task_app_auto_resume {
                 "zadanie jest przerwane — wznowi się samo (próba 2/5) albo uruchom je od nowa (s)"
             )
         );
-        let pausing = interrupted("a", TaskLifecycle::PauseRequested, 0, false);
+        let pausing = interrupted("a", RunnerState::PauseRequested, 0, false);
         assert_eq!(
             availability(&pausing, TaskAction::Interrupt).reason(),
             Some("zadanie jest przerwane — uruchom je od nowa (s)")
@@ -12016,7 +12016,7 @@ mod task_app_auto_resume {
         let mut app = app();
         app.load(listing(
             vec![titled(
-                interrupted("a", TaskLifecycle::Running, 1, true),
+                interrupted("a", RunnerState::Running, 1, true),
                 "NAR-1",
             )],
             "c",
@@ -12045,7 +12045,7 @@ mod task_app_auto_resume {
             "e1",
             "a",
             2,
-            TaskLifecycle::Running,
+            RunnerState::Running,
             TaskEventKind::Created,
         ));
         let revision = app.list().selected().unwrap().revision;

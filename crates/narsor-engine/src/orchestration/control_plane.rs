@@ -21,8 +21,8 @@ use super::lifecycle::{command_effect, observation_effect, CommandEffect, Observ
 use super::model::{
     ArchiveTombstone, BackendLease, CommandActor, CommandOutcome, CommandReceipt, CommandRequest,
     ControllerReport, LeaseToken, MaterialChange, NewTask, Observation, ObservedState,
-    OwnerCommand, ReportOutcome, ResumeState, TaskAssignment, TaskEvent, TaskEventKind,
-    TaskLifecycle, TaskRecord, WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
+    OwnerCommand, ReportOutcome, ResumeState, RunnerState, TaskAssignment, TaskEvent,
+    TaskEventKind, TaskRecord, WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
 };
 use super::resume::{auto_resume_key, count_loss, loss_from_history, ResumePolicy};
 use super::store::OrchestrationStore;
@@ -172,7 +172,7 @@ impl ControlPlane {
             legacy_priority: None,
             created_at: now,
             queue_sequence,
-            lifecycle: TaskLifecycle::Queued,
+            runner_state: RunnerState::Queued,
             generation: 1,
             revision: 1,
             resources_may_exist: false,
@@ -195,7 +195,7 @@ impl ControlPlane {
                 sequence: 1,
                 task_id: request.task_id.clone(),
                 at: now,
-                lifecycle: TaskLifecycle::Queued,
+                runner_state: RunnerState::Queued,
                 generation: 1,
                 kind: TaskEventKind::Created,
             },
@@ -267,7 +267,7 @@ impl ControlPlane {
                 return Err(OrchestrationError::IllegalCommand {
                     task_id: record.task_id.clone(),
                     command: request.command,
-                    lifecycle: record.lifecycle,
+                    runner_state: record.runner_state,
                 });
             }
             let event = match request.actor {
@@ -290,27 +290,24 @@ impl ControlPlane {
                 },
             };
 
-            match command_effect(record.lifecycle, request.command) {
+            match command_effect(record.runner_state, request.command) {
                 CommandEffect::Illegal => {
                     return Err(OrchestrationError::IllegalCommand {
                         task_id: record.task_id.clone(),
                         command: request.command,
-                        lifecycle: record.lifecycle,
+                        runner_state: record.runner_state,
                     })
                 }
                 // Recorded for the audit trail; the tombstone already holds.
                 CommandEffect::ArchiveConverged => {}
                 CommandEffect::Transition(next) => {
-                    let previous = record.lifecycle;
+                    let previous = record.runner_state;
                     record.generation += 1;
-                    record.lifecycle = next;
-                    if matches!(
-                        previous,
-                        TaskLifecycle::Interrupted | TaskLifecycle::Unknown
-                    ) {
+                    record.runner_state = next;
+                    if matches!(previous, RunnerState::Interrupted | RunnerState::Unknown) {
                         leave_loss(record, request.actor);
                     }
-                    if next == TaskLifecycle::Provisioning {
+                    if next == RunnerState::Provisioning {
                         self.order_launch(record)?;
                     }
                     if request.command == OwnerCommand::Archive {
@@ -325,7 +322,7 @@ impl ControlPlane {
                 expected_generation: request.expected_generation,
                 accepted_at: now,
                 generation_after: record.generation,
-                lifecycle_after: record.lifecycle,
+                runner_state_after: record.runner_state,
                 revision: record.revision + 1,
                 actor: request.actor,
             };
@@ -489,7 +486,7 @@ impl ControlPlane {
     /// not older than the last accepted report; the desired generation is the
     /// current one; the resource version is not older than the last accepted
     /// one of the same incarnation; and the observation is legal from the
-    /// current lifecycle; `PausedAtSafePoint` additionally needs the runner's
+    /// current runner_state; `PausedAtSafePoint` additionally needs the runner's
     /// safe-point acknowledgement for the current generation
     /// ([`OrchestrationError::SafePointNotAcknowledged`]). A pure redelivery
     /// is absorbed with `applied: false`.
@@ -522,7 +519,7 @@ impl ControlPlane {
             record.check_generation(report.desired_generation)?;
             check_resource_order(record, &report)?;
 
-            let effect = observation_effect(record.lifecycle, report.observation);
+            let effect = observation_effect(record.runner_state, report.observation);
             let observed = ObservedState {
                 observation: report.observation,
                 summary: report.summary.clone(),
@@ -537,7 +534,7 @@ impl ControlPlane {
                     return Err(OrchestrationError::IllegalObservation {
                         task_id: record.task_id.clone(),
                         observation: report.observation,
-                        lifecycle: record.lifecycle,
+                        runner_state: record.runner_state,
                     })
                 }
                 ObservationEffect::Unchanged if is_redelivery(record, &observed) => {
@@ -565,8 +562,8 @@ impl ControlPlane {
                     {
                         return Err(OrchestrationError::NotAdmitted(record.task_id.clone()));
                     }
-                    let previous = record.lifecycle;
-                    record.lifecycle = next;
+                    let previous = record.runner_state;
+                    record.runner_state = next;
                     match report.observation {
                         Observation::StartAccepted => record.resources_may_exist = true,
                         Observation::RunnerReady => record.running_since = Some(now),
@@ -593,12 +590,12 @@ impl ControlPlane {
                             reason: report.summary.detail.clone(),
                         });
                     }
-                    if next == TaskLifecycle::Interrupted {
+                    if next == RunnerState::Interrupted {
                         count_loss(record, &self.resume_policy, now);
                     }
                 }
             }
-            if holds_workload(record.lifecycle) && !reports_loss(report.observation) {
+            if holds_workload(record.runner_state) && !reports_loss(report.observation) {
                 record.workload_epoch = record.workload_epoch.max(Some(report.lease.epoch));
             }
             record.observed = Some(observed);
@@ -625,11 +622,11 @@ impl ControlPlane {
         task_storage: &ExecutionStore,
     ) -> Result<bool> {
         let record = self.store.load_task(task_id)?;
-        if record.lifecycle.is_archival() {
+        if record.runner_state.is_archival() {
             return Err(OrchestrationError::IllegalCommand {
                 task_id: task_id.clone(),
                 command: OwnerCommand::Start,
-                lifecycle: record.lifecycle,
+                runner_state: record.runner_state,
             });
         }
         Ok(task_storage.initialize_task_launch_spec(task_id, &record.launch_spec)?)
@@ -666,7 +663,7 @@ impl ControlPlane {
     ///
     /// Removes orphaned temporary files and appends any event a record
     /// committed but a crash kept out of the log. Nothing else is judged:
-    /// unlike local recovery, a remote task's lifecycle changes only through
+    /// unlike local recovery, a remote task's runner_state changes only through
     /// controller reconciliation, never because this process restarted.
     ///
     /// The material store (U9) is repaired here too, so the one startup
@@ -703,7 +700,7 @@ impl ControlPlane {
         );
         let removed_material_leftovers = materials
             .recover(|task_id| match self.store.load_task(task_id) {
-                Ok(record) => record.lifecycle.is_archival(),
+                Ok(record) => record.runner_state.is_archival(),
                 // Materials of a task that does not exist belong to nobody.
                 Err(OrchestrationError::TaskNotFound(_)) => true,
                 // An unreadable record is no proof of archival: keep them.
@@ -725,18 +722,18 @@ impl ControlPlane {
     /// the loss its event log shows, counted as a fresh one, so the resume
     /// policy resumes it — unless it was lost while pausing. Call under the
     /// task's lock. Like rank repair, it announces nothing: the record's
-    /// lifecycle does not change, and clients' next read shows the state.
+    /// runner_state does not change, and clients' next read shows the state.
     fn adopt_loss(&self, record: &mut TaskRecord) -> Result<bool> {
         let lost = matches!(
-            record.lifecycle,
-            TaskLifecycle::Interrupted | TaskLifecycle::Unknown
+            record.runner_state,
+            RunnerState::Interrupted | RunnerState::Unknown
         );
         if !lost || record.resume.last_loss.is_some() {
             return Ok(false);
         }
         let events = self.store.events_since(&record.task_id, 0)?;
         record.resume.last_loss = Some(loss_from_history(record, &events));
-        if record.lifecycle == TaskLifecycle::Interrupted {
+        if record.runner_state == RunnerState::Interrupted {
             count_loss(record, &self.resume_policy, self.clock.now());
         }
         self.store.save_task(record)?;
@@ -775,9 +772,9 @@ impl ControlPlane {
             Mutation::Unchanged(value) => Ok((record, value)),
             Mutation::Changed(kind, value) => {
                 // A reservation and a queue verdict mean something only
-                // while queued: once the task leaves `Queued` its lifecycle
+                // while queued: once the task leaves `Queued` its runner_state
                 // holds (or releases) the slot by itself (U10).
-                if record.lifecycle != TaskLifecycle::Queued {
+                if record.runner_state != RunnerState::Queued {
                     record.reservation = None;
                     record.queue = None;
                 }
@@ -786,7 +783,7 @@ impl ControlPlane {
                     sequence: record.revision,
                     task_id: record.task_id.clone(),
                     at: now,
-                    lifecycle: record.lifecycle,
+                    runner_state: record.runner_state,
                     generation: record.generation,
                     kind,
                 };
@@ -845,11 +842,11 @@ fn leave_loss(record: &mut TaskRecord, actor: CommandActor) {
     }
 }
 
-/// Whether a task in `lifecycle` has (or is getting) a workload.
-fn holds_workload(lifecycle: TaskLifecycle) -> bool {
+/// Whether a task in `runner_state` has (or is getting) a workload.
+fn holds_workload(runner_state: RunnerState) -> bool {
     matches!(
-        lifecycle,
-        TaskLifecycle::Provisioning | TaskLifecycle::Running | TaskLifecycle::PauseRequested
+        runner_state,
+        RunnerState::Provisioning | RunnerState::Running | RunnerState::PauseRequested
     )
 }
 
@@ -872,7 +869,7 @@ fn archive(record: &mut TaskRecord, idempotency_key: &str, now: DateTime<Utc>) {
         resources_never_created: never_created,
     });
     if never_created {
-        record.lifecycle = TaskLifecycle::Archived;
+        record.runner_state = RunnerState::Archived;
     }
 }
 

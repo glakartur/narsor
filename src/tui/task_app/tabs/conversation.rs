@@ -569,7 +569,7 @@ impl Conversation {
 }
 
 /// Projects only events that record a person or decision-maker choosing a
-/// workflow output. Routine lifecycle events remain in the dedicated log.
+/// workflow output. Routine runner_state events remain in the dedicated log.
 fn workflow_choice_entry(event: &Event) -> Option<TranscriptEntry> {
     use crate::domain::event::AnsweredBy;
     use crate::domain::ConductorDecisionKind;

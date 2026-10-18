@@ -32,7 +32,7 @@
 //!
 //! See [`TaskRecord::holds_capacity`]: everything that has or may have
 //! compute, conservatively including `Interrupted`, `Unknown` and
-//! `Archiving`; a `Paused` task released its compute and its slot.
+//! `Archiving`; a `Stopped` task released its compute and its slot.
 //!
 //! # An offline controller
 //!
@@ -49,7 +49,7 @@ use super::error::{OrchestrationError, Result};
 use super::lifecycle::{command_effect, CommandEffect};
 use super::model::{
     BackendCapacity, CapacityReservation, CommandOutcome, CommandRequest, DefaultBackendSelection,
-    MoveTarget, OwnerCommand, QueueReason, QueueStatus, TaskEventKind, TaskLifecycle, TaskRecord,
+    MoveTarget, OwnerCommand, QueueReason, QueueStatus, RunnerState, TaskEventKind, TaskRecord,
     DEFAULT_BACKEND_SELECTION_VERSION,
 };
 use super::{control_plane::Mutation, ControlPlane};
@@ -83,13 +83,13 @@ impl ControlPlane {
 
         let mut waiting: Vec<&TaskRecord> = tasks
             .iter()
-            .filter(|task| task.lifecycle == TaskLifecycle::Queued && task.reservation.is_none())
+            .filter(|task| task.runner_state == RunnerState::Queued && task.reservation.is_none())
             .collect();
         waiting.sort_by_key(|task| (task.rank, task.queue_sequence));
 
         let mut verdicts: Vec<(TaskId, Verdict)> = tasks
             .iter()
-            .filter(|task| task.lifecycle == TaskLifecycle::Queued && task.reservation.is_some())
+            .filter(|task| task.runner_state == RunnerState::Queued && task.reservation.is_some())
             .map(|task| (task.task_id.clone(), Verdict::Admit))
             .collect();
         let mut still_waiting = Vec::new();
@@ -151,7 +151,7 @@ impl ControlPlane {
     /// [`ControlPlane::command`], refusing a command that would take a
     /// capacity slot the backend does not have free.
     ///
-    /// Only resuming a `Paused` task needs one — every other command keeps
+    /// Only resuming a `Stopped` task needs one — every other command keeps
     /// or frees the task's slot — and it is decided under the backend's
     /// schedule lock, like an admission. A full backend refuses it with
     /// [`OrchestrationError::BackendAtCapacity`] rather than stopping
@@ -171,11 +171,11 @@ impl ControlPlane {
             && matches!(
                 (
                     request.command,
-                    command_effect(record.lifecycle, request.command)
+                    command_effect(record.runner_state, request.command)
                 ),
                 (
                     OwnerCommand::Start | OwnerCommand::Resume,
-                    CommandEffect::Transition(TaskLifecycle::Provisioning)
+                    CommandEffect::Transition(RunnerState::Provisioning)
                 )
             );
         if takes_slot {
@@ -393,7 +393,7 @@ impl ControlPlane {
     /// left `Queued` meanwhile (archived, say) is left alone.
     fn apply_verdict(&self, task_id: &TaskId, verdict: Verdict) -> Result<bool> {
         let (_, changed) = self.mutate(task_id, |record, now| {
-            if record.lifecycle != TaskLifecycle::Queued {
+            if record.runner_state != RunnerState::Queued {
                 return Ok(Mutation::Unchanged(false));
             }
             let mut granted = false;
@@ -432,10 +432,10 @@ fn check_movable(record: &TaskRecord, expected_generation: Option<u64>) -> Resul
     if let Some(expected) = expected_generation {
         record.check_generation(expected)?;
     }
-    if record.lifecycle != TaskLifecycle::Queued {
+    if record.runner_state != RunnerState::Queued {
         return Err(OrchestrationError::TaskNotQueued {
             task_id: record.task_id.clone(),
-            lifecycle: record.lifecycle,
+            runner_state: record.runner_state,
         });
     }
     Ok(())

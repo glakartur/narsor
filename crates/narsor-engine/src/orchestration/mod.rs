@@ -1,6 +1,6 @@
 //! Durable, backend-neutral orchestration of remote tasks (KTD1, KTD3).
 //!
-//! The control plane owns *assignment*, *desired lifecycle*, the *fenced
+//! The control plane owns *assignment*, *desired runner state*, the *fenced
 //! controller leases* and the *last observed* backend/runner summary of every
 //! task. It never reads or writes a `WorkflowExecution`: the runner's work
 //! state stays authoritative on task storage, and nothing here can be used to

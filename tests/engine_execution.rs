@@ -1105,7 +1105,7 @@ async fn the_reference_workflow_runs_end_to_end_on_stubs() {
     assert_eq!(execution.status, ExecutionStatus::Completed);
     assert_eq!(execution.current_state.as_deref(), Some("completed"));
 
-    // The §4 lifecycle, state by state.
+    // The §4 runner_state, state by state.
     assert_eq!(
         harness.event_types(&execution.id),
         vec![

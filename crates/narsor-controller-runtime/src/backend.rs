@@ -307,14 +307,14 @@ pub type BackendResult<T> = Result<T, BackendError>;
 ///
 /// Every operation is idempotent and safe to repeat after a crash or a lost
 /// response: the controller observes before it acts and retries what it
-/// could not confirm. An adapter never decides lifecycle — it never
+/// could not confirm. An adapter never decides runner_state — it never
 /// recreates a lost workload, never removes compute on its own and never
 /// deletes storage outside [`Self::archive`].
 pub trait ExecutionBackend: Send + Sync + 'static {
     /// The platform kind (matches the backend's catalogue record).
     fn kind(&self) -> BackendKind;
 
-    /// The lifecycle operations this platform supports (R3).
+    /// The runner_state operations this platform supports (R3).
     fn capabilities(&self) -> BackendCapabilities;
 
     /// The task's resource names, derived from its resource key alone.

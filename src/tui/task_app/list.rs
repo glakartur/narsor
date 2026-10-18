@@ -2,7 +2,7 @@
 //!
 //! The list is the queue (D-T3). The server hands the tasks over in queue
 //! order — grouped by backend, in `rank` order within each — and **the client
-//! never sorts** (KTD "Kolejność listy liczy serwer"): a lifecycle event
+//! never sorts** (KTD "Kolejność listy liczy serwer"): a runner_state event
 //! changes a row's icon and label in place, and only a [`TaskEventKind::Moved`]
 //! event, which carries the backend's whole new order, reorders rows. State is
 //! an attribute of a row, never a reason for it to move (D-T2, D-T5).
@@ -44,14 +44,14 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
-use crate::cli::task_text::lifecycle_name;
+use crate::cli::task_text::runner_state_name;
 use crate::controller_protocol::{
     Freshness, InputView, OperatorCommandView, QueueView, TaskSummary,
 };
 use crate::domain::{BackendId, ExecutionStatus};
 use narsor_protocol::controller::{
     AttentionItem, AttentionKind, MoveTaskTarget, OperatorCommand, OperatorCommandStatus,
-    QueueReason, ResumeExhaustion, TaskEvent, TaskEventKind, TaskLifecycle,
+    QueueReason, ResumeExhaustion, RunnerState, TaskEvent, TaskEventKind,
 };
 use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, UNSPECIFIED_LOSS};
 
@@ -170,7 +170,7 @@ pub fn attention_of(task: &TaskSummary) -> Attention {
         .as_ref()
         .is_some_and(|runner| runner.problem.is_some());
     let owner_decides =
-        loss_state(task.lifecycle, &task.resume).is_some_and(|loss| loss.needs_owner());
+        loss_state(task.runner_state, &task.resume).is_some_and(|loss| loss.needs_owner());
     if runner_problem
         || owner_decides
         || is(&[
@@ -193,19 +193,17 @@ pub fn attention_of(task: &TaskSummary) -> Attention {
 
 /// What the second column shows for `task`.
 pub fn state_icon(task: &TaskSummary) -> StateIcon {
-    match task.lifecycle {
-        TaskLifecycle::Queued => StateIcon::Queued,
-        TaskLifecycle::Provisioning => StateIcon::Provisioning,
-        TaskLifecycle::Running => {
-            match task.runner.as_ref().map(|runner| runner.execution_status) {
-                Some(ExecutionStatus::Completed) => StateIcon::Done,
-                Some(ExecutionStatus::Failed | ExecutionStatus::Cancelled) => StateIcon::Failed,
-                _ => StateIcon::Running,
-            }
-        }
-        TaskLifecycle::PauseRequested | TaskLifecycle::Paused => StateIcon::Paused,
-        TaskLifecycle::Interrupted | TaskLifecycle::Unknown => StateIcon::Failed,
-        TaskLifecycle::Archiving | TaskLifecycle::Archived => StateIcon::Done,
+    match task.runner_state {
+        RunnerState::Queued => StateIcon::Queued,
+        RunnerState::Provisioning => StateIcon::Provisioning,
+        RunnerState::Running => match task.runner.as_ref().map(|runner| runner.execution_status) {
+            Some(ExecutionStatus::Completed) => StateIcon::Done,
+            Some(ExecutionStatus::Failed | ExecutionStatus::Cancelled) => StateIcon::Failed,
+            _ => StateIcon::Running,
+        },
+        RunnerState::PauseRequested | RunnerState::Stopped => StateIcon::Paused,
+        RunnerState::Interrupted | RunnerState::Unknown => StateIcon::Failed,
+        RunnerState::Archiving | RunnerState::Archived => StateIcon::Done,
     }
 }
 
@@ -231,20 +229,21 @@ fn controller_offline(task: &TaskSummary) -> bool {
 /// the queued tasks of the backend, in list order.
 pub fn label_of(task: &TaskSummary, queue_position: Option<usize>) -> String {
     let runner_status = task.runner.as_ref().map(|runner| runner.execution_status);
-    match task.lifecycle {
-        TaskLifecycle::Queued => match task.queue.as_ref().map(|queue| &queue.reason) {
+    match task.runner_state {
+        RunnerState::Queued => match task.queue.as_ref().map(|queue| &queue.reason) {
             Some(QueueReason::ControllerOffline) => "offline".to_string(),
             _ => queue_position.map_or_else(|| "queued".to_string(), |place| format!("#{place}")),
         },
-        TaskLifecycle::Provisioning | TaskLifecycle::Running => match runner_status {
+        RunnerState::Provisioning | RunnerState::Running => match runner_status {
             Some(ExecutionStatus::Completed) => "done".to_string(),
             Some(ExecutionStatus::Failed) => "failed".to_string(),
             Some(ExecutionStatus::Cancelled) => "cancelled".to_string(),
             _ if controller_offline(task) => "offline".to_string(),
-            _ => current_step(task).unwrap_or_else(|| lifecycle_name(task.lifecycle).to_string()),
+            _ => current_step(task)
+                .unwrap_or_else(|| runner_state_name(task.runner_state).to_string()),
         },
-        TaskLifecycle::Archiving | TaskLifecycle::Archived => "done".to_string(),
-        other => lifecycle_name(other).to_string(),
+        RunnerState::Archiving | RunnerState::Archived => "done".to_string(),
+        other => runner_state_name(other).to_string(),
     }
 }
 
@@ -573,7 +572,7 @@ impl TaskList {
         let mut seen: HashMap<&BackendId, usize> = HashMap::new();
         let mut positions = HashMap::new();
         for (index, task) in self.tasks.iter().enumerate() {
-            if task.lifecycle == TaskLifecycle::Queued {
+            if task.runner_state == RunnerState::Queued {
                 let place = seen.entry(&task.backend_id).or_insert(0);
                 *place += 1;
                 positions.insert(index, *place);
@@ -685,7 +684,7 @@ impl TaskList {
         let queued = self
             .tasks
             .iter()
-            .filter(|task| task.lifecycle == TaskLifecycle::Queued)
+            .filter(|task| task.runner_state == RunnerState::Queued)
             .count();
         queued + self.pending.len() + 1
     }
@@ -871,7 +870,7 @@ impl TaskList {
 
     /// Applies one stream event to the row it names, at once and in place.
     ///
-    /// * lifecycle, generation and revision are always patched — that is what
+    /// * runner_state, generation and revision are always patched — that is what
     ///   the stream is for;
     /// * [`TaskEventKind::QueueChanged`] replaces the scheduler verdict;
     /// * [`TaskEventKind::Moved`] reorders the task's backend to the order it
@@ -920,9 +919,9 @@ impl TaskList {
         {
             let task = &mut self.tasks[index];
             task.revision = event.sequence;
-            task.lifecycle = event.lifecycle;
+            task.runner_state = event.runner_state;
             task.generation = event.generation;
-            if task.lifecycle != TaskLifecycle::Queued {
+            if task.runner_state != RunnerState::Queued {
                 task.queue = None;
             }
         }
@@ -931,7 +930,7 @@ impl TaskList {
             ..EventEffect::default()
         };
 
-        if event.lifecycle.is_archival() {
+        if event.runner_state.is_archival() {
             let before = self.all_ids();
             let departed_title = self.selected().map(title_of);
             self.tasks.remove(index);
@@ -1100,7 +1099,7 @@ impl TaskList {
     fn cancel_move_if_gone(&mut self) {
         let still_movable = self.moving.as_ref().is_none_or(|mode| {
             self.tasks.iter().any(|task| {
-                task.task_id.as_str() == mode.task_id && task.lifecycle == TaskLifecycle::Queued
+                task.task_id.as_str() == mode.task_id && task.runner_state == RunnerState::Queued
             })
         });
         if !still_movable {
@@ -1284,7 +1283,7 @@ fn patch_operator_command(
 fn patch_row(task: &mut TaskSummary, kind: &TaskEventKind, event: &TaskEvent) -> bool {
     match kind {
         TaskEventKind::QueueChanged { reason } => {
-            if task.lifecycle == TaskLifecycle::Queued {
+            if task.runner_state == RunnerState::Queued {
                 task.queue = Some(QueueView {
                     message: reason.describe(),
                     reason: reason.clone(),
@@ -1326,17 +1325,17 @@ fn patch_row(task: &mut TaskSummary, kind: &TaskEventKind, event: &TaskEvent) ->
 /// Whether the task occupies a slot of its backend: it holds compute, or it
 /// was admitted and waits for its start, or it was lost but not released.
 fn holds_a_slot(task: &TaskSummary) -> bool {
-    match task.lifecycle {
-        TaskLifecycle::Provisioning
-        | TaskLifecycle::Running
-        | TaskLifecycle::PauseRequested
-        | TaskLifecycle::Interrupted
-        | TaskLifecycle::Unknown => true,
-        TaskLifecycle::Queued => task
+    match task.runner_state {
+        RunnerState::Provisioning
+        | RunnerState::Running
+        | RunnerState::PauseRequested
+        | RunnerState::Interrupted
+        | RunnerState::Unknown => true,
+        RunnerState::Queued => task
             .queue
             .as_ref()
             .is_some_and(|queue| queue.reason == QueueReason::Admitted),
-        TaskLifecycle::Paused | TaskLifecycle::Archiving | TaskLifecycle::Archived => false,
+        RunnerState::Stopped | RunnerState::Archiving | RunnerState::Archived => false,
     }
 }
 

@@ -1788,8 +1788,8 @@ async fn client_start_task_returns_a_queued_task() {
         .await
         .expect("start_task");
     assert_eq!(
-        response.task.lifecycle,
-        narsor_engine::orchestration::TaskLifecycle::Queued
+        response.task.runner_state,
+        narsor_engine::orchestration::RunnerState::Queued
     );
     assert!(root.store().list_execution_ids().unwrap().is_empty());
     assert_eq!(service.control_plane().list_tasks().unwrap().len(), 1);
@@ -3559,8 +3559,8 @@ async fn control_plane_routes_sit_behind_the_owner_token_beside_the_local_ones()
         .await
         .expect("create");
     assert_eq!(
-        created.lifecycle,
-        narsor_engine::orchestration::TaskLifecycle::Queued
+        created.runner_state,
+        narsor_engine::orchestration::RunnerState::Queued
     );
     assert_eq!(created.generation, 1);
     assert!(created.runner.is_none() && created.observation.is_none());
@@ -3682,7 +3682,7 @@ async fn start_scheduling_server(
 
 #[tokio::test]
 async fn post_tasks_acknowledges_a_queued_task_without_creating_an_execution() {
-    use narsor_engine::orchestration::TaskLifecycle;
+    use narsor_engine::orchestration::RunnerState;
 
     let root = TempRoot::new();
     let (handle, _service) = start_scheduling_server(&root).await;
@@ -3701,7 +3701,7 @@ async fn post_tasks_acknowledges_a_queued_task_without_creating_an_execution() {
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
     let created: StartTaskResponse = response.json().await.expect("task acknowledgement");
     assert_eq!(created.task.task_id.as_str(), "local-create-1");
-    assert_eq!(created.task.lifecycle, TaskLifecycle::Queued);
+    assert_eq!(created.task.runner_state, RunnerState::Queued);
     assert!(root.store().list_execution_ids().unwrap().is_empty());
 }
 
@@ -3910,7 +3910,7 @@ impl InProcessController {
 async fn local_and_control_plane_creates_share_one_ranked_queue() {
     use narsor_engine::controller_protocol::MoveTaskRequest;
     use narsor_engine::domain::TaskId;
-    use narsor_engine::orchestration::{MoveTarget, Observation, QueueReason, TaskLifecycle};
+    use narsor_engine::orchestration::{MoveTarget, Observation, QueueReason, RunnerState};
 
     let root = TempRoot::new();
     let (handle, service) = start_scheduling_server(&root).await;
@@ -3942,7 +3942,7 @@ async fn local_and_control_plane_creates_share_one_ranked_queue() {
 
     // No controller yet: queued, offline, and nothing was started.
     let first = submit_local("first").await;
-    assert_eq!(first.lifecycle, TaskLifecycle::Queued);
+    assert_eq!(first.runner_state, RunnerState::Queued);
     assert_eq!(first.rank, 1, "a local task joins the end of the queue");
     assert_eq!(
         reason(first.clone()),
@@ -4032,7 +4032,7 @@ fn inheriting_task(task_id: &str) -> narsor_engine::controller_protocol::CreateT
 #[tokio::test]
 async fn new_tasks_inherit_the_owner_default_backend_and_existing_tasks_never_move() {
     use narsor_engine::controller_protocol::SetDefaultBackendRequest;
-    use narsor_engine::orchestration::TaskLifecycle;
+    use narsor_engine::orchestration::RunnerState;
     let root = TempRoot::new();
     let (handle, service) = start_scheduling_server(&root).await;
     let client = handle.client();
@@ -4067,7 +4067,7 @@ async fn new_tasks_inherit_the_owner_default_backend_and_existing_tasks_never_mo
     let controller = InProcessController::online(&service, "backend-a");
     controller.run("inherits");
     let running = client.control_task("inherits").await.expect("task");
-    assert_eq!(running.lifecycle, TaskLifecycle::Running);
+    assert_eq!(running.runner_state, RunnerState::Running);
 
     // AE3: changing the default moves nothing and stops nothing.
     client
@@ -4078,7 +4078,7 @@ async fn new_tasks_inherit_the_owner_default_backend_and_existing_tasks_never_mo
         .expect("choose backend-b");
     let after = client.control_task("inherits").await.expect("task");
     assert_eq!(after.backend_id.as_str(), "backend-a");
-    assert_eq!(after.lifecycle, TaskLifecycle::Running);
+    assert_eq!(after.runner_state, RunnerState::Running);
     assert_eq!(after.generation, running.generation);
 
     // An identical create retry returns the existing task instead of
@@ -4117,7 +4117,7 @@ async fn new_tasks_inherit_the_owner_default_backend_and_existing_tasks_never_mo
 async fn queued_tasks_wait_for_capacity_in_rank_order_with_a_visible_reason() {
     use narsor_engine::controller_protocol::MoveTaskRequest;
     use narsor_engine::orchestration::{
-        MoveTarget, Observation, QueueReason, TaskEventKind, TaskLifecycle,
+        MoveTarget, Observation, QueueReason, RunnerState, TaskEventKind,
     };
     let root = TempRoot::new();
     let (handle, service) = start_scheduling_server(&root).await;
@@ -4221,8 +4221,8 @@ async fn queued_tasks_wait_for_capacity_in_rank_order_with_a_visible_reason() {
     }
     let running = client.control_task("first").await.unwrap();
     assert_eq!(
-        (running.lifecycle, running.generation),
-        (TaskLifecycle::Running, 1)
+        (running.runner_state, running.generation),
+        (RunnerState::Running, 1)
     );
 
     // Archiving the running task frees the slot for the first in line.
@@ -4271,7 +4271,7 @@ mod control_catalog {
     use narsor_engine::controller_protocol::{
         ConversationResponse, CreateRepositoryRequest, OwnerCommandRequest, WorkflowSource,
     };
-    use narsor_engine::orchestration::{ControlPlane, OwnerCommand, TaskLifecycle};
+    use narsor_engine::orchestration::{ControlPlane, OwnerCommand, RunnerState};
     use narsor_engine::registry::RepositoryRegistry;
     use narsor_engine::workflows::WorkflowResolver;
 
@@ -4567,7 +4567,7 @@ mod control_catalog {
         assert!(archived
             .tasks
             .iter()
-            .all(|task| task.lifecycle == TaskLifecycle::Archived));
+            .all(|task| task.runner_state == RunnerState::Archived));
         let rest = client.control_tasks_archived(false).await.unwrap();
         assert_eq!(rest.tasks.len(), 1);
         assert_eq!(rest.tasks[0].task_id.as_str(), "task-live");

@@ -1,4 +1,4 @@
-//! Integration tests for the workspace lifecycle (U8).
+//! Integration tests for the workspace runner_state (U8).
 //!
 //! Everything here runs against a real temporary directory and real git
 //! repositories built on the fly: the value of this layer is in actual file
