@@ -203,6 +203,19 @@ pub enum InputContinuationView {
     ResolvePermission,
 }
 
+/// Claude Code's `decision_reason_type`s of a denial an allow rule for the
+/// task can lift: the command only lacked approval and nobody could give it
+/// (`asyncAgent` under `--permission-prompts none`, `subcommandResults` for a
+/// part of a compound command). Any other reason — an explicit `deny` rule,
+/// a hook, a safety check, and `other`, which does not say which — stays a
+/// block the owner cannot override (R6).
+pub const APPROVABLE_PERMISSION_REASONS: [&str; 2] = ["asyncAgent", "subcommandResults"];
+
+/// Whether a denial with this `decision_reason_type` can be approved.
+pub fn is_approvable_permission_reason(reason_type: Option<&str>) -> bool {
+    reason_type.is_some_and(|reason| APPROVABLE_PERMISSION_REASONS.contains(&reason))
+}
+
 /// Claude Code permission denials tied to a durable pending request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequestView {

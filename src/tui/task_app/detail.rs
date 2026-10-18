@@ -1400,10 +1400,11 @@ fn is_safe_link_target(url: &str) -> bool {
 /// draws over the cells the text spans. A link that does not fit on the line is
 /// left as plain text.
 fn link_spots(buffer: &mut Buffer, header: Rect, spots: &[LinkSpot]) {
-    if header.height < 3 {
+    // Below the padding row, the identity and the state.
+    if header.height < 4 {
         return;
     }
-    let y = header.y + 2;
+    let y = header.y + 3;
     for spot in spots {
         let end = u32::from(spot.column) + u32::from(spot.width);
         let (Some(width), true) = (NonZeroU16::new(spot.width), end <= u32::from(header.width))

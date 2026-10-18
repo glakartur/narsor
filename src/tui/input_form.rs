@@ -1017,7 +1017,9 @@ pub const MESSAGE_FIELD: &str = "Wiadomość dla agenta";
 pub const COMMENT_TO_AGENT: &str = "Komentarz dla agenta";
 
 fn approvable_command(denial: &narsor_protocol::api::PermissionDenialView) -> Option<&str> {
-    if denial.tool_name != "Bash" || denial.reason_type.as_deref() != Some("subcommandResults") {
+    if denial.tool_name != "Bash"
+        || !narsor_protocol::api::is_approvable_permission_reason(denial.reason_type.as_deref())
+    {
         return None;
     }
     let command = denial.input.get("command")?.as_str()?.trim();

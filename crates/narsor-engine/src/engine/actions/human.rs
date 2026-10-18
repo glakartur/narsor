@@ -230,7 +230,9 @@ pub fn claude_permission_rule(
     denial: &PermissionDenialDetails,
     scope: PermissionGrantScope,
 ) -> Option<String> {
-    if denial.tool_name != "Bash" || denial.reason_type.as_deref() != Some("subcommandResults") {
+    if denial.tool_name != "Bash"
+        || !narsor_protocol::api::is_approvable_permission_reason(denial.reason_type.as_deref())
+    {
         return None;
     }
     let command = denial.input.get("command")?.as_str()?.trim();

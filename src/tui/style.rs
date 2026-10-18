@@ -6,9 +6,10 @@
 //!
 //! * colour means something, it does not decorate: only what needs attention
 //!   or is happening now is loud, calm states keep the terminal's text colour;
-//! * only the 16 ANSI colours, so the interface inherits the terminal theme
-//!   and reads on a light background as well as a dark one — no RGB, and a
-//!   background only for the key caps on the shortcut bar;
+//! * text in the 16 ANSI colours only, so the interface inherits the terminal
+//!   theme and reads on a light background as well as a dark one; the few
+//!   fixed backgrounds (key caps, the task header, the answer panel, the
+//!   selected row) live here and never colour text;
 //! * colour never carries information alone: every role is shown with an icon
 //!   and a word, which is why `NO_COLOR` can take all colour away
 //!   ([`Styles::new`]) and leave bold, dim and reverse video behind without
@@ -194,6 +195,13 @@ impl Styles {
             bar: "│",
             style: self.of(role),
         }
+    }
+
+    /// The low-contrast fill behind the selected item of a bracketed list: it
+    /// makes the row easier to track while each label keeps its own
+    /// foreground role. It is drawn in both modes.
+    pub fn selection_fill(&self) -> Style {
+        Style::default().bg(Color::Indexed(236))
     }
 
     /// Backgrounds that keep the task header and its answer panel distinct

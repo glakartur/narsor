@@ -349,11 +349,13 @@ fn transcript_opens_at_end_and_preserves_an_older_anchor_on_append() {
         transcript_entry("one", &["one-a", "one-b"]),
         transcript_entry("two", &["two-a", "two-b"]),
     ]);
-    assert_eq!(transcript.scroll_offset(), 3);
+    // Each entry is a header and its lines, with a blank line between
+    // entries: 3 + 1 + 3 lines, the last two in view.
+    assert_eq!(transcript.scroll_offset(), 5);
     assert!(transcript.is_following_end());
 
     transcript.append(vec![transcript_entry("three", &["three-a"])]);
-    assert_eq!(transcript.scroll_offset(), 5);
+    assert_eq!(transcript.scroll_offset(), 8);
     assert!(transcript.is_following_end());
 
     transcript.to_top();
@@ -380,17 +382,30 @@ fn transcript_reanchors_across_detail_mode_resize_and_missing_entry() {
     transcript.line_down();
     let anchor = transcript.anchor().unwrap();
 
+    assert_eq!(anchor.entry_id, TranscriptEntryId::from("two"));
+
     transcript.toggle_expanded(&TranscriptEntryId::from("two"));
     assert_eq!(transcript.anchor(), Some(anchor));
+    // The anchor is the top of the viewport, not the cursor. Raw mode has
+    // one line per entry, so the viewport of two lines cannot start on `two`
+    // and stops on the blank line after `one`; the cursor stays on `two`.
     transcript.set_mode(DisplayMode::Raw);
     assert_eq!(
         transcript.anchor().unwrap().entry_id,
-        TranscriptEntryId::from("two")
+        TranscriptEntryId::from("one")
+    );
+    assert_eq!(
+        transcript.selected_entry(),
+        Some(&TranscriptEntryId::from("two"))
     );
     transcript.set_viewport(1);
     assert_eq!(
         transcript.anchor().unwrap().entry_id,
-        TranscriptEntryId::from("two")
+        TranscriptEntryId::from("one")
+    );
+    assert_eq!(
+        transcript.selected_entry(),
+        Some(&TranscriptEntryId::from("two"))
     );
 
     transcript.replace_entries(vec![transcript_entry("two", &["replacement"])]);
@@ -484,7 +499,8 @@ fn transcript_separates_adjacent_entries() {
         .into_iter()
         .map(|line| line.text)
         .collect();
-    assert_eq!(lines, vec!["first", "", "second"]);
+    // Each entry opens with its header line: here a bare marker.
+    assert_eq!(lines, vec!["· ", "first", "", "· ", "second"]);
 }
 
 /// U7: the building blocks of the redesigned interface — key map, colour
@@ -1855,7 +1871,7 @@ mod task_app_list {
             app.detail_mut().set_draft("b", "Uwzględnij migrację");
             assert_eq!(app.list().selected_id(), Some("b"));
             assert_eq!(app.focus(), Focus::Details);
-            assert_eq!(app.detail().tab(), DetailTab::Conversation);
+            assert_eq!(app.detail().tab(), DetailTab::Events);
 
             let mut moved = vec![
                 controlled("a", "local", "running", 1),
@@ -1867,7 +1883,7 @@ mod task_app_list {
 
             assert_eq!(app.list().selected_id(), Some("b"));
             assert_eq!(app.focus(), Focus::Details);
-            assert_eq!(app.detail().tab(), DetailTab::Conversation);
+            assert_eq!(app.detail().tab(), DetailTab::Events);
             assert_eq!(app.detail().draft("b"), Some("Uwzględnij migrację"));
             assert_eq!(app.cursor(), Some("c2"));
         }
@@ -2512,7 +2528,8 @@ mod task_app_detail {
         )
     }
 
-    /// An app over running `a` and `b`, with the details of `a` open.
+    /// An app over running `a` and `b`, with the details of `a` open on the
+    /// tab they open on: *Rozmowa*.
     fn details_app() -> TaskApp {
         let mut app = app();
         app.load(listing(
@@ -2524,6 +2541,15 @@ mod task_app_detail {
         ));
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.focus(), Focus::Details);
+        assert_eq!(app.detail().tab(), DetailTab::Conversation);
+        app
+    }
+
+    /// [`details_app`] on *Przebieg*, the timeline.
+    fn progress_app() -> TaskApp {
+        let mut app = details_app();
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(app.detail().tab(), DetailTab::Progress);
         app
     }
 
@@ -2557,7 +2583,7 @@ mod task_app_detail {
 
         #[test]
         fn follows_a_new_step_after_an_event() {
-            let mut app = details_app();
+            let mut app = progress_app();
             read_timeline(&mut app, "a", 1, &["plan", "edit", "review"], "review #1");
             assert_eq!(selected_step(&app, "a").as_deref(), Some("review #1"));
             assert_eq!(
@@ -2591,7 +2617,7 @@ mod task_app_detail {
 
         #[test]
         fn f_stops_following_and_the_cursor_stays_on_its_step() {
-            let mut app = details_app();
+            let mut app = progress_app();
             read_timeline(&mut app, "a", 1, &["plan", "edit", "review"], "review #1");
             assert!(app.detail().view("a").unwrap().progress().follows());
 
@@ -2620,7 +2646,7 @@ mod task_app_detail {
 
         #[test]
         fn moving_by_hand_ends_the_following_and_a_refresh_changes_neither() {
-            let mut app = details_app();
+            let mut app = progress_app();
             read_timeline(&mut app, "a", 1, &["plan", "edit", "review"], "review #1");
             ch(&mut app, 'k');
             assert_eq!(selected_step(&app, "a").as_deref(), Some("edit #1"));
@@ -2645,7 +2671,7 @@ mod task_app_detail {
 
         #[test]
         fn coming_back_to_a_task_finds_its_tab_and_cursor() {
-            let mut app = details_app();
+            let mut app = progress_app();
             read_timeline(&mut app, "a", 1, &["plan", "edit", "review"], "review #1");
             ch(&mut app, 'k');
             ch(&mut app, 'k');
@@ -2695,7 +2721,7 @@ mod task_app_detail {
 
         #[test]
         fn a_failed_timeline_read_is_a_message_in_the_tab_and_the_rest_works() {
-            let mut app = details_app();
+            let mut app = progress_app();
             app.on_detail_read(
                 "a",
                 1,
@@ -2807,7 +2833,7 @@ mod task_app_detail {
         /// The details of `a` on *Przebieg*: `plan` done, `implement` running,
         /// both with three entries read.
         fn on_the_axis() -> TaskApp {
-            let mut app = details_app();
+            let mut app = progress_app();
             read_recorded(&mut app, 1, &["plan", "implement"], "implement #1");
             for state in ["plan", "implement"] {
                 read_step(
@@ -2892,7 +2918,7 @@ mod task_app_detail {
 
         #[test]
         fn a_step_without_a_record_keeps_the_focus_on_the_axis_and_says_nothing() {
-            let mut app = details_app();
+            let mut app = progress_app();
             read_timeline(&mut app, "a", 1, &["analyze"], "analyze #1");
             let before = note(&app);
             press(&mut app, KeyCode::Enter);
@@ -2905,13 +2931,13 @@ mod task_app_detail {
         #[test]
         fn a_step_with_nothing_to_show_cannot_be_entered() {
             // Not read yet.
-            let mut app = details_app();
+            let mut app = progress_app();
             read_recorded(&mut app, 1, &["plan"], "plan #1");
             press(&mut app, KeyCode::Enter);
             assert_eq!(app.step_focus(), StepFocus::Axis, "not read yet");
 
             // Recorded, but without the attempt's id.
-            let mut app = details_app();
+            let mut app = progress_app();
             let mut step = recorded("plan", PositionStatus::Succeeded);
             step.action_execution_id = None;
             read_positions(&mut app, 1, vec![step], "plan #1");
@@ -2919,7 +2945,7 @@ mod task_app_detail {
             assert_eq!(app.step_focus(), StepFocus::Axis, "no attempt");
 
             // Never created.
-            let mut app = details_app();
+            let mut app = progress_app();
             let mut step = position("plan", PositionStatus::Failed);
             step.conversation = ConversationState::NotCreated {
                 reason: "the harness did not start".into(),
@@ -2929,14 +2955,14 @@ mod task_app_detail {
             assert_eq!(app.step_focus(), StepFocus::Axis, "never created");
 
             // The runner holds no record of it.
-            let mut app = details_app();
+            let mut app = progress_app();
             read_recorded(&mut app, 1, &["plan"], "plan #1");
             read_step(&mut app, 1, "plan", 0, attempt_read(&[], 0, true));
             press(&mut app, KeyCode::Enter);
             assert_eq!(app.step_focus(), StepFocus::Axis, "no record");
 
             // Running, nothing said yet.
-            let mut app = details_app();
+            let mut app = progress_app();
             read_recorded(&mut app, 1, &["plan"], "plan #1");
             read_step(&mut app, 1, "plan", 0, attempt_read(&[], 0, false));
             press(&mut app, KeyCode::Enter);
@@ -2950,7 +2976,7 @@ mod task_app_detail {
 
         #[test]
         fn a_new_step_does_not_move_the_axis_while_its_conversation_is_read() {
-            let mut app = details_app();
+            let mut app = progress_app();
             read_recorded(&mut app, 1, &["plan"], "plan #1");
             read_step(&mut app, 1, "plan", 0, attempt_read(&["1"], 1, false));
             assert!(app.detail().view("a").unwrap().progress().follows());
@@ -3562,7 +3588,6 @@ mod task_app_detail {
             let running = harness.running("task-1", "k8s", live_snapshot()).await;
             let mut app = app_over(&harness).await;
             press(&mut app, KeyCode::Char(']'));
-            press(&mut app, KeyCode::Char(']'));
             assert_eq!(app.detail().tab(), DetailTab::Events);
 
             let (_, ()) = tokio::join!(
@@ -3598,7 +3623,7 @@ mod task_app_detail {
                 TaskLifecycle::Interrupted
             );
             press(&mut app, KeyCode::Char(']'));
-            press(&mut app, KeyCode::Char(']'));
+            assert_eq!(app.detail().tab(), DetailTab::Events);
 
             app.sync_detail().await;
             match app.detail().view("task-1").unwrap().events().availability() {
@@ -3616,8 +3641,11 @@ mod task_app_detail {
             let harness = RemoteHarness::start().await;
             let running = harness.running("task-1", "k8s", live_snapshot()).await;
             let mut app = app_over(&harness).await;
-            press(&mut app, KeyCode::Char(']'));
-            assert_eq!(app.detail().tab(), DetailTab::Conversation);
+            assert_eq!(
+                app.detail().tab(),
+                DetailTab::Conversation,
+                "the details open on the conversation"
+            );
 
             let page = ConversationResponse::Recorded {
                 entries: vec![ConversationEntryDto {
@@ -3680,8 +3708,11 @@ mod task_app_detail {
                 .await
                 .expect("lost");
             let mut app = app_over(&harness).await;
-            press(&mut app, KeyCode::Char(']'));
-            assert_eq!(app.detail().tab(), DetailTab::Conversation);
+            assert_eq!(
+                app.detail().tab(),
+                DetailTab::Conversation,
+                "the details open on the conversation"
+            );
 
             app.sync_detail().await;
             let conversation = app.detail().view("task-1").unwrap().conversation();
@@ -3823,17 +3854,19 @@ mod task_app_detail {
         #[test]
         fn brackets_switch_the_tabs_and_wrap_round() {
             let mut app = details_app();
-            assert_eq!(app.detail().tab(), DetailTab::Progress);
-            ch(&mut app, ']');
             assert_eq!(app.detail().tab(), DetailTab::Conversation);
+            ch(&mut app, ']');
+            assert_eq!(app.detail().tab(), DetailTab::Events);
             ch(&mut app, '[');
+            ch(&mut app, '[');
+            assert_eq!(app.detail().tab(), DetailTab::Progress);
             ch(&mut app, '[');
             assert_eq!(app.detail().tab(), DetailTab::Info, "wraps round");
         }
 
         #[test]
         fn przebieg_has_the_axis_layer_and_every_other_tab_the_reading_one() {
-            let mut app = details_app();
+            let mut app = progress_app();
             assert_eq!(
                 app.key_context(),
                 Stack::layered(Context::Axis, Context::Details)
@@ -3871,7 +3904,7 @@ mod task_app_detail {
 
         #[test]
         fn on_the_axis_j_picks_the_step_and_enter_stays_on_it() {
-            let mut app = details_app();
+            let mut app = progress_app();
             read_timeline(&mut app, "a", 1, &["plan", "edit", "review"], "review #1");
             ch(&mut app, 'k');
             assert_eq!(selected_step(&app, "a").as_deref(), Some("edit #1"));
@@ -3887,7 +3920,7 @@ mod task_app_detail {
 
         #[test]
         fn the_bar_of_the_axis_offers_the_step_conversation() {
-            let mut app = details_app();
+            let mut app = progress_app();
             let screen = screen(&mut app, 120, 30);
             assert!(screen.contains("Enter/→ rozmowa kroku"), "{screen}");
             assert!(!screen.contains("rozwiń"), "{screen}");
@@ -4579,7 +4612,7 @@ mod task_app_waiting {
                 "tool_use_id": "tool-8",
                 "input": {"command": "cargo test"},
                 "cwd": "/tmp/task",
-                "reason_type": "subcommandResults",
+                "reason_type": "asyncAgent",
                 "reason": "This command requires approval."
             }, {
                 "tool_name": "Bash",
@@ -4589,6 +4622,8 @@ mod task_app_waiting {
                 "reason_type": "other",
                 "reason": "Blocked by policy."
             }]},
+            "agent_harness": "claude-code",
+            "agent_session_id": "session-8",
             "episode": "ep-8",
             "requested_at": "2026-10-09T11:54:00Z"
         }))
@@ -4613,6 +4648,15 @@ mod task_app_waiting {
             Some(narsor_protocol::api::PermissionGrantScopeDto::ExactOperation)
         );
         assert_eq!(delivery.episode.as_deref(), Some("ep-8"));
+
+        // Without a session to resume, a grant could not reach the agent.
+        let mut unresumable = pending.clone();
+        unresumable.agent_session_id = None;
+        let panel = narsor::tui::input_form::InputPanel::new(&unresumable, &|_| None);
+        assert!(panel
+            .items()
+            .iter()
+            .all(|item| item.label.starts_with("Odmów:")));
     }
 
     // -- the panel ------------------------------------------------------------
@@ -8676,10 +8720,16 @@ mod task_app_create {
             );
             assert!(app.remembered_new_task().is_some());
 
-            // `q` asks before throwing the data away.
+            // `q` asks before throwing the data away, and Esc keeps it.
             ch(&mut app, 'q');
             assert!(!app.should_quit());
-            assert!(note(&app).contains("szkic"), "{}", note(&app));
+            let asked = screen(&mut app, 120, 30);
+            assert!(
+                asked.contains("Niewysłany szkic zostanie utracony."),
+                "{asked}"
+            );
+            press(&mut app, KeyCode::Esc);
+            assert!(!app.should_quit());
 
             ch(&mut app, 'n');
             app.open_new_task(workflows(), narsor_registry());

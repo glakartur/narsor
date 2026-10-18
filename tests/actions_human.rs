@@ -387,9 +387,22 @@ fn permission_grant_rules_refuse_compound_shell_syntax_and_unsupported_denials()
     assert!(
         human::claude_permission_rule(&compound, PermissionGrantScope::ExactOperation).is_none()
     );
-    let mut policy = denial;
-    policy.reason_type = Some("other".into());
-    assert!(human::claude_permission_rule(&policy, PermissionGrantScope::ExactOperation).is_none());
+    // What `--permission-prompts none` reports for a command nobody could
+    // approve (Claude Code 2.1.3xx).
+    let mut unattended = denial.clone();
+    unattended.reason_type = Some("asyncAgent".into());
+    assert_eq!(
+        human::claude_permission_rule(&unattended, PermissionGrantScope::ExactOperation).as_deref(),
+        Some("Bash(cargo test)")
+    );
+    for reason in ["other", "rule", "hook"] {
+        let mut policy = denial.clone();
+        policy.reason_type = Some(reason.into());
+        assert!(
+            human::claude_permission_rule(&policy, PermissionGrantScope::ExactOperation).is_none(),
+            "{reason}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

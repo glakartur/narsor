@@ -91,6 +91,19 @@ fn none_reversed<'a>(cells: impl IntoIterator<Item = &'a Cell>) -> bool {
         .all(|cell| !cell.modifier.contains(Modifier::REVERSED))
 }
 
+/// Whether `cells` are drawn without colour: every foreground is the
+/// terminal's own, and the only background is the fill behind a selected
+/// row ([`Styles::selection_fill`]), which `styles` draws in both modes.
+fn no_colour_but_the_selection_fill<'a>(
+    cells: impl IntoIterator<Item = &'a Cell>,
+    styles: &Styles,
+) -> bool {
+    let fill = styles.selection_fill().bg.unwrap_or(Color::Reset);
+    cells
+        .into_iter()
+        .all(|cell| cell.fg == Color::Reset && [Color::Reset, fill].contains(&cell.bg))
+}
+
 /// The selection marks: thin, in the focus role where the keys are
 /// (`focused`), in colour or — with `no_color` — in weight only.
 fn marks(focused: bool, no_color: bool) -> SelectionMarks {
@@ -290,7 +303,7 @@ mod chooser_render {
         let buffer = draw_chooser(100, 16, &mut chooser, &Styles::new(false));
         let screen = screen(&buffer);
         assert!(screen.contains("Akcje") && screen.contains("Opis"));
-        assert!(screen.contains("| 2 | revise"), "{screen}");
+        assert!(screen.contains("2 revise ↩ ◆"), "{screen}");
         for marker in ["↩", "◆", "!"] {
             assert!(screen.contains(marker), "{marker} is missing:\n{screen}");
         }
@@ -373,7 +386,7 @@ mod chooser_render {
                     );
                 }
                 assert!(!screen.contains('▸'), "no cursor glyph:\n{screen}");
-                assert_action_number(&buffer, "revise", 2);
+                assert_bracketed(&buffer, "2 revise", focused, no_color);
                 assert_not_bracketed(&buffer, "1 approved");
                 assert_not_bracketed(&buffer, "3 reject");
                 assert!(
@@ -382,11 +395,8 @@ mod chooser_render {
                 );
                 if no_color {
                     assert!(
-                        buffer
-                            .content()
-                            .iter()
-                            .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset),
-                        "NO_COLOR draws no colour at all"
+                        no_colour_but_the_selection_fill(buffer.content(), &styles),
+                        "NO_COLOR draws no colour but the selection fill"
                     );
                 }
             }
@@ -416,7 +426,7 @@ mod chooser_render {
         let mut chooser = review_chooser();
         press_chooser(&mut chooser, crossterm::event::KeyCode::Tab, 1);
         let buffer = draw_chooser(100, 20, &mut chooser, &Styles::new(false));
-        assert_action_number(&buffer, "revise", 2);
+        assert_bracketed(&buffer, "2 revise", false, false);
     }
 
     /// R11, R17: a list longer than its pane scrolls inside it, and the
@@ -426,11 +436,11 @@ mod chooser_render {
         let mut chooser = six_outputs();
         // Three entries, the two rules, and the frame.
         let buffer = draw_chooser(100, 7, &mut chooser, &Styles::new(false));
-        assert_action_number(&buffer, "out1", 1);
+        assert_bracketed(&buffer, "1 out1", true, false);
         assert!(!screen(&buffer).contains("out4"), "{}", screen(&buffer));
         press_chooser(&mut chooser, crossterm::event::KeyCode::Down, 4);
         let buffer = draw_chooser(100, 7, &mut chooser, &Styles::new(false));
-        assert_action_number(&buffer, "out5", 5);
+        assert_bracketed(&buffer, "5 out5", true, false);
         assert!(!screen(&buffer).contains("1 out1"), "{}", screen(&buffer));
     }
 
@@ -441,12 +451,12 @@ mod chooser_render {
         let mut chooser = six_outputs();
         press_chooser(&mut chooser, crossterm::event::KeyCode::Down, 3);
         let roomy = draw_chooser(40, 24, &mut chooser, &Styles::new(false));
-        assert_action_number(&roomy, "out4", 4);
+        assert_bracketed(&roomy, "4 out4", true, false);
         assert!(screen(&roomy).contains("Wyjście 4."), "{}", screen(&roomy));
 
         for height in [8, 5] {
             let buffer = draw_chooser(40, height, &mut chooser, &Styles::new(false));
-            assert_action_number(&buffer, "out4", 4);
+            assert_bracketed(&buffer, "4 out4", true, false);
             let list_bottom = row_of(&buffer, "4 out4") + 2;
             assert!(
                 rows(&buffer)[list_bottom].starts_with('└'),
@@ -465,7 +475,7 @@ mod chooser_render {
         for height in [6, 7] {
             let buffer = draw_chooser(40, height, &mut chooser, &Styles::new(false));
             let screen = screen(&buffer);
-            assert_action_number(&buffer, "out4", 4);
+            assert_bracketed(&buffer, "4 out4", true, false);
             assert!(
                 !screen.contains("Opis"),
                 "height {height}: no description frame:\n{screen}"
@@ -512,7 +522,7 @@ mod chooser_render {
         let mut chooser = chooser.rebuilt(items);
         let after = draw_chooser(100, 9, &mut chooser, &Styles::new(false));
         assert_eq!(screen(&before), screen(&after));
-        assert_action_number(&after, "out5", 5);
+        assert_bracketed(&after, "5 out5", true, false);
         assert!(screen(&after).contains("6 out6"), "{}", screen(&after));
     }
 
@@ -585,12 +595,19 @@ mod shortcut_bar_and_help {
         });
         let screen = screen(&buffer);
         assert!(screen.contains("Pomoc"));
+        // A description too long for the overlay wraps onto the next row, so
+        // the text is read with the frame taken off and the rows joined.
+        let text = rows(&buffer)
+            .iter()
+            .map(|row| row.trim_matches(|c: char| c == '│' || c.is_whitespace()))
+            .collect::<Vec<_>>()
+            .join(" ");
         for description in keymap::help_entries(Context::List)
             .iter()
             .map(|entry| entry.description)
         {
             assert!(
-                screen.contains(description),
+                text.contains(description),
                 "{description:?} is missing:\n{screen}"
             );
         }
@@ -669,7 +686,9 @@ mod colour_discipline {
             let text = fs::read_to_string(directory.join(source))
                 .unwrap_or_else(|error| panic!("{source}: {error}"));
             for (number, line) in text.lines().enumerate() {
-                if line.contains("Color::") || line.contains("Color::Rgb") {
+                // `Color::Reset` hands a cell back to the terminal's own
+                // colours: it names no colour.
+                if line.replace("Color::Reset", "").contains("Color::") {
                     found.push(format!("{source}:{}: {}", number + 1, line.trim()));
                 }
             }
@@ -727,7 +746,11 @@ mod colour_discipline {
         let directory =
             std::env::temp_dir().join(format!("narsor-colour-scan-{}", std::process::id()));
         fs::create_dir_all(&directory).expect("a scratch directory");
-        fs::write(directory.join("view.rs"), "let x = Color::Red;\n").expect("write");
+        fs::write(
+            directory.join("view.rs"),
+            "let x = Color::Red;\ncell.bg = Color::Reset;\n",
+        )
+        .expect("write");
         fs::write(directory.join("style.rs"), "let y = Color::Green;\n").expect("write");
         let sources = vec!["view.rs".to_string(), "style.rs".to_string()];
         let found = colour_references(&directory, &sources);
@@ -736,12 +759,23 @@ mod colour_discipline {
         assert!(found[0].starts_with("view.rs:1:"));
     }
 
+    /// Text stays in the 16 ANSI colours, so it inherits the terminal theme.
+    /// A colour outside them — RGB or one of the 256 — only ever fills a
+    /// background: the task header, the answer panel, the selected row.
     #[test]
     fn the_role_module_is_where_the_colours_are() {
         let style = fs::read_to_string(tui_dir().join(ROLE_MODULE)).expect("style.rs");
         assert!(style.contains("Color::Cyan"));
-        assert!(!style.contains("Color::Rgb"), "only the 16 ANSI colours");
-        assert!(!style.contains("Color::Indexed"));
+        for line in style
+            .lines()
+            .filter(|line| line.contains("Color::Rgb") || line.contains("Color::Indexed"))
+        {
+            assert!(
+                line.contains(".bg(") && !line.contains(".fg("),
+                "only the 16 ANSI colours for text: {}",
+                line.trim()
+            );
+        }
     }
 }
 
@@ -1562,6 +1596,16 @@ mod task_app_detail_render {
         render_at(app, styles, 120, 30)
     }
 
+    // The rows of the details header under the top bar and the frame: a
+    // padded blank row, the identity, the state and the metadata (links and
+    // workflow); then a rule, the tabs and the marker under the open tab. A
+    // notice (an unavailable harness) adds a row under the metadata.
+    const IDENTITY_ROW: usize = 3;
+    const STATE_ROW: usize = 4;
+    const METADATA_ROW: usize = 5;
+    const TABS_ROW: usize = 7;
+    const TAB_MARKER_ROW: usize = 8;
+
     fn render_at(app: &mut TaskApp, styles: &Styles, width: u16, height: u16) -> Buffer {
         draw(width, height, |frame| {
             layout::render(frame, app, styles, Instant::now())
@@ -1614,30 +1658,33 @@ mod task_app_detail_render {
         let mut app = running_app();
         let buffer = render(&mut app, &Styles::new(false));
         let rows = rows(&buffer);
-        // The details start on row 2, with identity, state, and metadata rows.
+        // The details start under a padded blank row, with identity, state,
+        // and metadata rows.
         assert!(
-            rows[2].contains("NAR-12 Zmiana API zamówień"),
+            rows[IDENTITY_ROW].contains("NAR-12 Zmiana API zamówień"),
             "{}",
-            rows[2]
+            rows[IDENTITY_ROW]
         );
-        assert!(rows[4].contains("implement-feature v3"), "{}", rows[4]);
-        assert!(rows[4].contains("Jira NAR-12 ↗"), "{}", rows[4]);
+        let metadata = &rows[METADATA_ROW];
+        assert!(metadata.contains("implement-feature v3"), "{metadata}");
+        assert!(metadata.contains("Jira NAR-12 ↗"), "{metadata}");
         assert!(
-            rows[4].contains("PR: —"),
-            "a link without a value: {}",
-            rows[4]
+            metadata.contains("PR: —"),
+            "a link without a value: {metadata}"
         );
-        assert!(!rows[4].contains("PR — ↗"));
-        assert!(rows[3].contains("● running"), "{}", rows[3]);
-        assert!(rows[3].contains("krok 3/5"), "{}", rows[3]);
+        assert!(!metadata.contains("PR — ↗"));
+        let state = &rows[STATE_ROW];
+        assert!(state.contains("● running"), "{state}");
+        assert!(state.contains("krok 3/5"), "{state}");
+        let tabs = &rows[TABS_ROW];
         for tab in ["Przebieg", "Rozmowa", "Zdarzenia", "Dyrygent", "Info"] {
-            assert!(rows[6].contains(tab), "{tab} in {}", rows[6]);
+            assert!(tabs.contains(tab), "{tab} in {tabs}");
         }
-        assert!(rows[6].contains("śledzi"), "{}", rows[6]);
-        let selected_byte = rows[6].find("Rozmowa").unwrap();
-        let selected_start = rows[6][..selected_byte].chars().count();
+        assert!(tabs.contains("śledzi"), "{tabs}");
+        let selected_byte = tabs.find("Rozmowa").unwrap();
+        let selected_start = tabs[..selected_byte].chars().count();
         assert_eq!(
-            rows[7]
+            rows[TAB_MARKER_ROW]
                 .chars()
                 .skip(selected_start)
                 .take("Rozmowa".len())
@@ -1648,12 +1695,18 @@ mod task_app_detail_render {
 
         let no_color = render_at(&mut app, &Styles::new(true), 120, 30);
         let no_color_rows = super::rows(&no_color);
-        assert_eq!(no_color_rows[7].chars().nth(selected_start), Some('━'));
-        assert!(bold_at(&no_color, selected_start as u16, 6));
+        assert_eq!(
+            no_color_rows[TAB_MARKER_ROW].chars().nth(selected_start),
+            Some('━')
+        );
+        assert!(bold_at(&no_color, selected_start as u16, TABS_ROW as u16));
 
         press(&mut app, KeyCode::Esc);
         let unfocused_rows = super::rows(&render(&mut app, &Styles::new(false)));
-        assert_eq!(unfocused_rows[7].chars().nth(selected_start), Some('─'));
+        assert_eq!(
+            unfocused_rows[TAB_MARKER_ROW].chars().nth(selected_start),
+            Some('─')
+        );
     }
 
     #[test]
@@ -1716,9 +1769,9 @@ mod task_app_detail_render {
 
         let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 20));
         assert!(
-            rows[2].contains("…  RUN-1"),
+            rows[IDENTITY_ROW].contains("…  RUN-1"),
             "identity survives fitting: {}",
-            rows[2]
+            rows[IDENTITY_ROW]
         );
     }
 
@@ -1735,8 +1788,12 @@ mod task_app_detail_render {
         press(&mut app, KeyCode::Enter);
 
         let rows = rows(&render_at(&mut app, &Styles::new(false), 60, 20));
-        assert_eq!(rows[2].chars().count(), 60);
-        assert!(rows[2].contains('…'), "long identity is marked as fitted");
+        assert_eq!(rows[IDENTITY_ROW].chars().count(), 60);
+        assert!(
+            rows[IDENTITY_ROW].contains('…'),
+            "long identity is marked as fitted: {}",
+            rows[IDENTITY_ROW]
+        );
     }
 
     /// `running_app`, but its runner cannot switch to `harness` and keeps
@@ -1768,18 +1825,27 @@ mod task_app_detail_render {
         let mut app = app_without_the_default_harness("opencode");
         let buffer = render(&mut app, &Styles::new(false));
         let rows = rows(&buffer);
-        assert!(rows[3].contains("● running"), "{}", rows[3]);
+        assert!(rows[STATE_ROW].contains("● running"), "{}", rows[STATE_ROW]);
+        let notice = METADATA_ROW + 1;
         assert!(
-            rows[5].contains("opencode niedostępny tutaj — zostaje claude-code"),
+            rows[notice].contains("opencode niedostępny tutaj — zostaje claude-code"),
             "{}",
-            rows[5]
+            rows[notice]
         );
         for tab in ["Przebieg", "Info"] {
-            assert!(rows[7].contains(tab), "the tabs move down: {}", rows[7]);
+            assert!(
+                rows[TABS_ROW + 1].contains(tab),
+                "the tabs move down: {}",
+                rows[TABS_ROW + 1]
+            );
         }
-        let column = rows[5].find("opencode").unwrap();
-        let column = u16::try_from(rows[5][..column].chars().count()).unwrap();
-        assert_eq!(buffer[(column, 5)].fg, Color::Yellow, "the attention role");
+        let column = rows[notice].find("opencode").unwrap();
+        let column = u16::try_from(rows[notice][..column].chars().count()).unwrap();
+        assert_eq!(
+            buffer[(column, notice as u16)].fg,
+            Color::Yellow,
+            "the attention role"
+        );
         // Not a problem: the counters and the list row carry no `!`.
         assert!(rows[0].contains("! 0"), "{}", rows[0]);
         let list_row = row_of(&buffer, "NAR-12");
@@ -1805,7 +1871,7 @@ mod task_app_detail_render {
     fn without_an_unavailable_harness_there_is_no_extra_line() {
         let mut app = running_app();
         let rows = rows(&render(&mut app, &Styles::new(false)));
-        assert!(rows[6].contains("Przebieg"), "{}", rows[6]);
+        assert!(rows[TABS_ROW].contains("Przebieg"), "{}", rows[TABS_ROW]);
         assert!(!rows.join("\n").contains("niedostępny tutaj"));
     }
 
@@ -1885,24 +1951,25 @@ mod task_app_detail_render {
         assert!(
             screen.contains("\u{1b}]8;;https://jira.example/browse/NAR-12\u{1b}\\Jira NAR-12 ↗\u{1b}]8;;\u{1b}\\"),
             "{:?}",
-            rows(&buffer)[4]
+            rows(&buffer)[METADATA_ROW]
         );
         assert_eq!(
             screen.matches("\u{1b}]8;;https").count(),
             1,
             "only the link with a target"
         );
-        let row = &rows(&plain_buffer)[4];
+        let row = &rows(&plain_buffer)[METADATA_ROW];
         let byte = row.find("Jira NAR-12 ↗").unwrap();
         let column = u16::try_from(row[..byte].chars().count()).unwrap();
+        let y = METADATA_ROW as u16;
         let link_cell = (0..buffer.area.width)
-            .find(|&x| buffer[(x, 4)].symbol().starts_with("\u{1b}]8;;https://"));
+            .find(|&x| buffer[(x, y)].symbol().starts_with("\u{1b}]8;;https://"));
         assert_eq!(
             link_cell,
             Some(column),
             "link hit region begins under its label"
         );
-        assert!(buffer[(column, 4)].symbol().contains("Jira NAR-12 ↗"));
+        assert!(buffer[(column, y)].symbol().contains("Jira NAR-12 ↗"));
     }
 
     #[test]
@@ -1950,7 +2017,11 @@ mod task_app_detail_render {
 
         let buffer = render(&mut app, &Styles::new(false));
         let rows = rows(&buffer);
-        assert!(rows[3].contains("#2 · czeka na slot (2/3)"), "{}", rows[3]);
+        assert!(
+            rows[STATE_ROW].contains("#2 · czeka na slot (2/3)"),
+            "{}",
+            rows[STATE_ROW]
+        );
         let screen = screen(&buffer);
         assert!(
             screen.contains("jeszcze nie wystartowało, #2 w kolejce"),
@@ -2003,9 +2074,9 @@ mod task_app_detail_render {
         app.load(listing(vec![waiting], "c"));
         let buffer = render(&mut app, &Styles::new(false));
         assert!(
-            rows(&buffer)[3].contains("kontroler offline 4m"),
+            rows(&buffer)[STATE_ROW].contains("kontroler offline 4m"),
             "{}",
-            rows(&buffer)[3]
+            rows(&buffer)[STATE_ROW]
         );
     }
 
@@ -2192,17 +2263,25 @@ mod task_app_detail_render {
         let buffer = render(&mut app, &Styles::new(false));
         let screen = screen(&buffer);
         let rows = rows(&buffer);
-        assert!(rows[2].contains("task-1"), "{}", rows[2]);
-        assert!(rows[4].contains("implement-feature v1"), "{}", rows[4]);
         assert!(
-            rows[3].contains("● running") && rows[3].contains("krok 2/2"),
+            rows[IDENTITY_ROW].contains("task-1"),
             "{}",
-            rows[3]
+            rows[IDENTITY_ROW]
         );
         assert!(
-            rows[6].contains("Przebieg") && rows[6].contains("Info"),
+            rows[METADATA_ROW].contains("implement-feature v1"),
             "{}",
-            rows[6]
+            rows[METADATA_ROW]
+        );
+        assert!(
+            rows[STATE_ROW].contains("● running") && rows[STATE_ROW].contains("krok 2/2"),
+            "{}",
+            rows[STATE_ROW]
+        );
+        assert!(
+            rows[TABS_ROW].contains("Przebieg") && rows[TABS_ROW].contains("Info"),
+            "{}",
+            rows[TABS_ROW]
         );
         assert!(
             screen.contains("✓ plan #1") && screen.contains("● review #1 w toku"),
@@ -3906,7 +3985,10 @@ mod task_app_conductor_render {
         let mut app = opened(running(), true);
         let text = screen(&draw_app(&mut app, 60, 20, false));
         assert!(text.contains("◆ dyrygent"), "{text}");
-        assert!(text.contains("Raczej revise"), "{text}");
+        // The header takes its rows first; the conversation follows its end,
+        // so the latest entry — the conductor's decision — is the one in view.
+        assert!(text.contains("KONDUKTOR · Dyrygent"), "{text}");
+        assert!(text.contains("Wybrano revise"), "{text}");
         assert!(text.contains("c napisz"), "{text}");
     }
 
@@ -4797,21 +4879,24 @@ mod task_app_main_screen {
             .collect();
         assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
 
-        // The details of the selected task: header, tabs, and the panel of
+        // The details of the selected task: header (under a padded blank
+        // row: identity, state, metadata, a rule), tabs, and the panel of
         // what waits for the operator, with its own keys on the bar.
-        assert!(rows[2].contains("NAR-12"), "{}", rows[2]);
-        assert!(rows[4].contains("implement-feature v1"), "{}", rows[4]);
-        assert!(rows[3].contains("● running"), "{}", rows[3]);
+        assert!(rows[3].contains("NAR-12"), "{}", rows[3]);
+        assert!(rows[4].contains("● running"), "{}", rows[4]);
+        assert!(rows[5].contains("implement-feature v1"), "{}", rows[5]);
         assert!(
-            rows[6].contains("Przebieg")
-                && rows[6].contains("Dyrygent")
-                && rows[6].contains("Info")
+            rows[7].contains("Przebieg")
+                && rows[7].contains("Dyrygent")
+                && rows[7].contains("Info"),
+            "{}",
+            rows[7]
         );
         assert!(screen.contains("? Approval · review"), "{screen}");
         assert!(screen.contains("Approve the plan?"), "{screen}");
         let bar = &rows[rows.len() - 1];
         assert!(
-            bar.contains("Enter wyślij") && bar.contains("Esc zwiń"),
+            bar.contains("Enter wyślij") && bar.contains("Esc wstecz"),
             "{bar}"
         );
     }
@@ -5099,10 +5184,11 @@ mod bracketed_list_render {
         }
         for buffer in [&focused, &unfocused] {
             assert!(none_reversed(buffer.content()), "{}", screen(buffer));
-            assert!(buffer
-                .content()
-                .iter()
-                .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset));
+            assert!(
+                no_colour_but_the_selection_fill(buffer.content(), &styles),
+                "{}",
+                screen(buffer)
+            );
         }
     }
 
