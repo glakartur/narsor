@@ -207,6 +207,7 @@ async fn run(
         exit_code: Some(exit_code),
         stdout: truncate(&stdout),
         stderr: truncate(&stderr),
+        reply: None,
     };
 
     match parse_json_output(&stdout) {

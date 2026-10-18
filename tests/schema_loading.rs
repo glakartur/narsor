@@ -95,6 +95,32 @@ terminal_states: [finished]
 }
 
 #[test]
+fn required_variables_and_entry_limit_load() {
+    let yaml = r#"
+name: entry-contract
+version: 1
+states:
+  agent:
+    max_entries: 3
+    action: { type: agent, prompt: return data }
+    outputs:
+      - label: ready
+        requires_variables:
+          - summary
+          - { name: report, description: Full report text }
+    transitions: { ready: done }
+  done: { description: done }
+terminal_states: [done]
+"#;
+    let definition = load_from_str(yaml).expect("new metadata is valid");
+    assert_eq!(state(&definition, "agent").max_entries, Some(3));
+    let required = &state(&definition, "agent").outputs[0].requires_variables;
+    assert_eq!(required.len(), 2);
+    assert_eq!(required[0].name(), "summary");
+    assert_eq!(required[1].description(), Some("Full report text"));
+}
+
+#[test]
 fn inputs_keep_their_declared_types() {
     let definition = load_reference();
 

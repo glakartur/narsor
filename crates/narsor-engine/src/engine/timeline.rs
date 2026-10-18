@@ -152,6 +152,7 @@ pub fn build_timeline(
         let seq = event.sequence;
 
         match &event.data {
+            EventData::Unrecognized => {}
             EventData::WorkflowStarted { .. }
             | EventData::WorkflowPaused { .. }
             | EventData::WorkflowResumed
@@ -422,6 +423,17 @@ pub fn build_timeline(
             }
 
             EventData::DecisionRequested { .. } => {
+                links.insert(
+                    seq,
+                    EventLink::NoLink {
+                        reason: reasons::WORKFLOW_LIFECYCLE.to_string(),
+                    },
+                );
+            }
+
+            EventData::EntryLimitReached { .. }
+            | EventData::EntryLimitDecision { .. }
+            | EventData::EntryLimitCounterReset { .. } => {
                 links.insert(
                     seq,
                     EventLink::NoLink {

@@ -1,0 +1,29 @@
+# `{{ steps.X.reply }}` must name an agent state: a human gate has no reply.
+name: step-reply-from-human-state
+version: 1
+
+states:
+  gate:
+    action:
+      type: human
+      message: Zatwierdź.
+    outputs:
+      - approved
+    transitions:
+      approved: work
+
+  work:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: "Popraw: {{ steps.gate.reply }}"
+    outputs:
+      - done
+    transitions:
+      done: finished
+
+  finished:
+    description: Koniec.
+
+terminal_states:
+  - finished

@@ -1,0 +1,29 @@
+name: entry-limit-paths
+version: 1
+description: >
+  A limited agent step reached again in ways that are not entries: answers,
+  permission decisions, retries, approval rejections and a gate's comment
+  sent back to it.
+states:
+  work:
+    action: { type: agent, prompt: work }
+    max_entries: 2
+    retry_policy: { max_attempts: 2, backoff: 0s }
+    outputs:
+      - label: done
+        requires_human_approval: true
+      - checked
+    transitions: { done: gate, checked: gate }
+  gate:
+    action:
+      type: human
+      message: review the work
+      inputs:
+        - { name: note, type: text, required: true }
+    outputs:
+      - label: revise
+        resume_comment_field: note
+      - finish
+    transitions: { revise: work, finish: completed }
+  completed: { description: done }
+terminal_states: [completed]

@@ -240,6 +240,14 @@ pub struct SavedDecision {
     /// Why the step had no label, for the problem an undo raises again.
     #[serde(default)]
     pub reason: Option<String>,
+    /// The step's reply from the answers (R3), for the problem an undo
+    /// raises again.
+    #[serde(default)]
+    pub reply: Option<String>,
+    /// The execution's entry counts (R10) before the decision, to restore
+    /// on undo: its transition counted an entry into the target.
+    #[serde(default)]
+    pub state_entries_before: Value,
     /// When it was saved.
     pub saved_at: DateTime<Utc>,
 }

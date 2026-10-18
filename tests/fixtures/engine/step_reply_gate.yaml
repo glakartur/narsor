@@ -1,0 +1,23 @@
+name: step-reply-gate
+version: 1
+description: >
+  A human gate showing the review's reply, then a fix step reading it.
+states:
+  review:
+    action: { type: agent, prompt: review the changes }
+    outputs: [findings]
+    transitions: { findings: gate }
+  gate:
+    action:
+      type: human
+      message: "The review says: {{ steps.review.reply }}"
+    outputs: [fix]
+    transitions: { fix: fix }
+  fix:
+    action:
+      type: agent
+      prompt: "Fix these findings: {{ steps.review.reply }}"
+    outputs: [done]
+    transitions: { done: completed }
+  completed: { description: done }
+terminal_states: [completed]

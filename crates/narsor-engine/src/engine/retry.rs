@@ -166,6 +166,7 @@ mod tests {
 
         let mut state = State {
             id: "s".to_string(),
+            max_entries: None,
             description: None,
             action: None,
             outputs: Vec::new(),

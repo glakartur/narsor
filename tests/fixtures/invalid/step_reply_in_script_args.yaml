@@ -1,0 +1,31 @@
+# A step reply is prose for a prompt, never a script parameter.
+name: step-reply-in-script-args
+version: 1
+
+states:
+  work:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: Zaimplementuj.
+    outputs:
+      - done
+    transitions:
+      done: check
+
+  check:
+    action:
+      type: script
+      command: echo
+      args:
+        - "{{ steps.work.reply }}"
+    outputs:
+      - success
+    transitions:
+      success: finished
+
+  finished:
+    description: Koniec.
+
+terminal_states:
+  - finished

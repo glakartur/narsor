@@ -165,6 +165,7 @@ Serce definicji workflow. Każdy klucz w sekcji `states` to unikalny identyfikat
   retry_policy:                       # Nadpisanie globalnej polityki retry
     max_attempts: 3
     backoff: 5s
+  max_entries: 5                     # limit wejść; oczekiwanie na decyzję operatora
   image: <image>                      # Nadpisanie obrazu bazowego dla tego kroku (§3.2)
 ```
 
@@ -183,6 +184,11 @@ go wszędzie tam, gdzie etykieta jest do wyboru: w kontrakcie wyjścia doklejany
 do promptu agenta (§3.3.A), w oczekującym inpucie (`pending_input.json`) i w
 menu ręcznego przejścia TUI (`t`). Pusty opis znaczy tyle co jego brak.
 Etykieta może wystąpić w `outputs` tylko raz, niezależnie od formy (§5).
+
+Obiekt wyjścia może też zawierać `requires_variables`: listę nazw zmiennych
+wymaganych dla tej etykiety. Element może być nazwą (`- plan_doc`) albo
+obiektem `{name, description}`. Brak klucza, `null` i pusty tekst są
+odrzucane. Wymagania pojawiają się w kontrakcie agenta i formularzu operatora.
 
 Obiekt wyjścia może też wyrażać dwa opcjonalne zachowania sterujące:
 
@@ -338,10 +344,18 @@ action:
 
 #### Zakres szablonów `{{ }}`
 
-Szablony są podstawiane tuż przed wykonaniem akcji — w promptach, komendach, argumentach, zmiennych środowiskowych i filtrach zdarzeń. Obsługiwane są wyłącznie dwie formy odwołań:
+Szablony są podstawiane tuż przed wykonaniem akcji. Obsługiwane są następujące formy odwołań:
 
 - `{{ inputs.NAZWA }}` — wejście workflow zadeklarowane w sekcji `inputs`,
 - `{{ context.variables.NAZWA }}` — zmienna kontekstu, wraz ze skrótem `{{ context.NAZWA }}`, który znaczy dokładnie to samo.
+- `{{ steps.ID.reply }}` — końcowa odpowiedź tekstowa udanej próby kroku agenta `ID`.
+
+Odwołanie `steps.ID.reply` dozwolone jest tylko w promptach agentów i treści
+akcji `human`; krok źródłowy musi istnieć i być akcją `agent`. Odpowiedź jest
+zapisywana tylko dla kroków faktycznie użytych jako źródło. Brak wcześniejszej
+udanej odpowiedzi jest błędem szablonu. `max_entries` jest opcjonalnym limitem
+wejść w krok agentowy (wartość co najmniej 1); po osiągnięciu limitu workflow
+czeka na decyzję operatora.
 
 Białe znaki wewnątrz `{{ }}` są ignorowane. Nie ma filtrów (`| default(...)`), wyrażeń, warunków ani pętli — to świadomie prosty mechanizm podstawiania, a nie silnik szablonów. Odwołanie do nieistniejącego wejścia lub nieistniejącej zmiennej jest **błędem**, który przerywa akcję; narsor nigdy nie podstawia po cichu pustego stringa. Podstawianie jest jednoprzebiegowe: jeśli wartość zmiennej sama zawiera `{{ ... }}`, nie jest rozwijana ponownie.
 
@@ -612,6 +626,8 @@ Przed uruchomieniem workflow, definicja musi przejść walidację:
         więc „brak harnessu gdziekolwiek" nie może zaistnieć, a walidacja
         pozostaje funkcją samego źródła.
     *   Dla `AgentAction` i `ScriptAction` lista `outputs` nie może być pusta.
+    *   `max_entries` jest dozwolone wyłącznie dla akcji `agent` i musi być >= 1.
+    *   Nazwy w `requires_variables` muszą być poprawnymi identyfikatorami zmiennych.
 
 3.  **Poprawność Decyzji:**
     *   Typ dostawcy decyzji musi być poprawny.
@@ -619,6 +635,8 @@ Przed uruchomieniem workflow, definicja musi przejść walidację:
 
 4.  **Zmienne i Kontekst:**
     *   Odwołania do zmiennych (np. `{{ inputs.xxx }}`) muszą dotyczyć zdefiniowanych wejść lub pól kontekstu.
+    *   `steps.ID.reply` musi wskazywać istniejący krok `agent`; jest dozwolone tylko w promptach agentów i treści akcji `human`.
+    *   Po `steps.ID.` może być tylko pole `reply`. Inne pole (np. `steps.ID.data`) jest błędem.
 
 5.  **Display (§3.6):**
     *   `{{ inputs.xxx }}` w `title`, `text` i `url` musi dotyczyć zdefiniowanego wejścia; zmienna kontekstu bez wartości nie jest błędem.

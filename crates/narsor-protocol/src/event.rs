@@ -346,6 +346,19 @@ pub enum EventData {
         to_state: String,
         output_label: String,
     },
+    EntryLimitReached {
+        state_id: String,
+        entries: u32,
+        max_entries: u32,
+    },
+    EntryLimitDecision {
+        state_id: String,
+        decision: String,
+    },
+    EntryLimitCounterReset {
+        state_id: String,
+        previous_entries: u32,
+    },
 
     // Artifact events
     ArtifactCreated {
@@ -359,6 +372,9 @@ pub enum EventData {
         message: String,
         context: serde_json::Value,
     },
+    /// Event written by a newer server version.
+    #[serde(other)]
+    Unrecognized,
 }
 
 /// Who asked an agent again for its output label (KTD7).
@@ -805,6 +821,22 @@ impl Event {
             } => {
                 format!("Transition {from_state} -> {to_state} on '{output_label}'")
             }
+            EventData::EntryLimitReached {
+                state_id,
+                entries,
+                max_entries,
+            } => {
+                format!("State '{state_id}' reached its entry limit ({entries}/{max_entries})")
+            }
+            EventData::EntryLimitDecision { state_id, decision } => {
+                format!("Entry limit decision for '{state_id}': {decision}")
+            }
+            EventData::EntryLimitCounterReset {
+                state_id,
+                previous_entries,
+            } => {
+                format!("Entry counter for '{state_id}' reset from {previous_entries}")
+            }
 
             EventData::ArtifactCreated {
                 artifact_type,
@@ -815,6 +847,7 @@ impl Event {
             }
 
             EventData::Error { message, .. } => format!("Error: {message}"),
+            EventData::Unrecognized => "Unknown event from a newer version".to_string(),
         }
     }
 }
@@ -889,5 +922,31 @@ mod tests {
         assert_eq!(value["workflow_execution_id"], "execution-1");
         assert_eq!(value["sequence"], 7);
         assert_eq!(value["data"]["type"], "workflow_resumed");
+    }
+
+    #[test]
+    fn unknown_event_type_decodes_to_fallback_variant() {
+        let data: EventData =
+            serde_json::from_value(serde_json::json!({"type":"future_event","value":1})).unwrap();
+        assert!(matches!(data, EventData::Unrecognized));
+    }
+
+    #[test]
+    fn entry_limit_events_have_stable_wire_names_and_operator_descriptions() {
+        let reached = Event::new(
+            "execution-1".into(),
+            EventData::EntryLimitReached {
+                state_id: "review".into(),
+                entries: 5,
+                max_entries: 5,
+            },
+            8,
+        );
+        assert_eq!(
+            reached.description(),
+            "State 'review' reached its entry limit (5/5)"
+        );
+        let value = serde_json::to_value(reached).unwrap();
+        assert_eq!(value["data"]["type"], "entry_limit_reached");
     }
 }

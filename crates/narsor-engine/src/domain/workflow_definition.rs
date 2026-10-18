@@ -174,6 +174,10 @@ pub struct State {
     /// Unique identifier within the workflow
     pub id: StateId,
 
+    /// Maximum number of workflow entries before operator intervention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_entries: Option<u32>,
+
     /// Optional human-readable description
     #[serde(default)]
     pub description: Option<String>,
@@ -440,6 +444,9 @@ pub enum WorkspaceRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputDefinition {
     pub label: OutputLabel,
+    /// Variables that must be present when this output is selected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_variables: Vec<RequiredVariable>,
     /// What choosing this label means, shown wherever the label is offered
     /// (the agent's output contract, the input form, the transition menu).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -454,11 +461,34 @@ pub struct OutputDefinition {
     pub resume_comment_field: Option<String>,
 }
 
+/// A variable required for one output, optionally with prompt guidance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequiredVariable {
+    Name(String),
+    Described { name: String, description: String },
+}
+
+impl RequiredVariable {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Name(name) | Self::Described { name, .. } => name,
+        }
+    }
+    pub fn description(&self) -> Option<&str> {
+        match self {
+            Self::Name(_) => None,
+            Self::Described { description, .. } => Some(description),
+        }
+    }
+}
+
 impl OutputDefinition {
     /// An output with no description.
     pub fn new(label: impl Into<OutputLabel>) -> Self {
         Self {
             label: label.into(),
+            requires_variables: Vec::new(),
             description: None,
             requires_human_approval: false,
             resume_comment_field: None,
@@ -594,6 +624,37 @@ pub enum ValidationError {
     EmptyOutputs {
         state: StateId,
         action_type: &'static str,
+    },
+
+    #[error(
+        "State '{state}' has invalid max_entries {value}; expected at least 1 on an agent action"
+    )]
+    InvalidMaxEntries { state: StateId, value: u32 },
+
+    #[error("Output '{label}' in state '{state}' has invalid required variable name '{name}'")]
+    InvalidRequiredVariable {
+        state: StateId,
+        label: OutputLabel,
+        name: String,
+    },
+
+    #[error("State '{state}' field '{field}' cannot reference step replies")]
+    StepReplyNotAllowed { state: StateId, field: String },
+
+    #[error("State '{state}' references unknown or non-agent step '{step_id}' in '{field}'")]
+    InvalidStepReplySource {
+        state: StateId,
+        step_id: String,
+        field: String,
+    },
+
+    #[error(
+        "State '{state}' field '{field}' references '{reference}'; only steps.<id>.reply is supported"
+    )]
+    UnsupportedStepReference {
+        state: StateId,
+        field: String,
+        reference: String,
     },
 
     #[error("Output '{label}' in state '{state}' has invalid approval/resume behavior: {reason}")]

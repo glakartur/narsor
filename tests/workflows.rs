@@ -524,7 +524,7 @@ async fn run_to_terminal(
             .expect("a request is pending");
         assert_eq!(
             pending.state_id, answer.state,
-            "the pipeline paused at an unexpected gate"
+            "the pipeline paused at an unexpected gate; pending request: {pending:#?}"
         );
 
         execution = engine
@@ -555,22 +555,19 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
             label("reviewed"), // 2. doc_review
             // 3. plan
             json!({ "output": "plan_ready", "variables": { "plan_doc": plan_doc } }),
-            label("implemented"), // 4. work — ambiguity uses awaiting_input in place
-            label("simplified"),  // simplify
-            // code_review — the residual findings travel to the fix step
             json!({
-                "output": "findings",
-                "variables": { "review_findings": "#1 P1 src/app.rs:10 unchecked input" },
-            }),
-            label("fixed"),       // fix_review_findings
-            label("clean"),       // code_review again
-            label("published"),   // publish_work — opens the first PR
-            label("revised"),     // work_revision — addresses human review
-            label("simplified"),  // simplify
-            label("clean"),       // code_review
-            label("published"),   // publish_work — updates the existing PR
-            label("documented"),  // compound — after implementation review
-            label("updated"),     // publish_learning — push the knowledge doc
+                "output": "implemented",
+                "variables": { "test_baseline": "all relevant checks passed before changes" },
+            }), // 4. work — ambiguity uses awaiting_input in place
+            label("simplified"), // simplify
+            label("clean"),      // code_review
+            json!({ "output": "published", "variables": { "pr_url": "https://example.test/pr/1" } }), // publish_work
+            label("revised"),    // work_revision — addresses human review
+            label("simplified"), // simplify
+            label("clean"),      // code_review
+            json!({ "output": "published", "variables": { "pr_url": "https://example.test/pr/1" } }), // publish_work
+            label("documented"), // compound — after implementation review
+            label("updated"),    // publish_learning — push the knowledge doc
         ],
     );
     let engine = harness.engine(root.dir("store"));

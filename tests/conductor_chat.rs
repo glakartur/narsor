@@ -18,7 +18,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use engine_support::{workflow, Harness, LabellessAgentExecutor, QuestioningAgentExecutor};
+use engine_support::{
+    workflow, AgentTurn, Harness, LabellessAgentExecutor, QuestioningAgentExecutor,
+    ScriptedAgentExecutor,
+};
 use narsor::tui::input_form::InputClosure;
 use narsor_engine::conductor::assembly::assemble;
 use narsor_engine::conductor::{
@@ -1102,6 +1105,83 @@ async fn undoing_a_chosen_output_makes_the_step_a_problem_again() {
         settled.context.variables.get("summary"),
         Some(&json!("settled by hand"))
     );
+}
+
+/// KTD13, R3, R10: an undone choice raises the problem again with the
+/// step's reply, so settling it hands the original prose on, and the entry
+/// its transition counted into the next step is taken back.
+#[tokio::test]
+async fn undoing_a_chosen_output_keeps_the_reply_and_takes_back_the_entry() {
+    let agent = Arc::new(ScriptedAgentExecutor::new(vec![
+        AgentTurn::NoLabel {
+            reply: Some("The original prose."),
+            session: true,
+        },
+        AgentTurn::NoLabel {
+            reply: None,
+            session: true,
+        },
+        AgentTurn::label("fixed", "Fixed once."),
+        AgentTurn::label("fixed", "Fixed again."),
+    ]));
+    let fixture = Fixture::new(
+        "step_reply_problem",
+        Some(agent.clone()),
+        vec![(
+            ConductorPurpose::ChooseOutput,
+            Script::Answer(json!({
+                "decision": "choose_output",
+                "label": "done",
+                "confidence": "high",
+            })),
+        )],
+    );
+    let execution = fixture.run(json!({})).await;
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let entries = |execution: &WorkflowExecution| {
+        execution.metadata["engine"]["state_entries"]["fix"].clone()
+    };
+    assert_eq!(entries(&execution), json!(1));
+    let decision_id = fixture
+        .events(&execution.id)
+        .iter()
+        .find_map(|data| match data {
+            EventData::ConductorDecision {
+                decision_id,
+                kind: ConductorDecisionKind::ChooseOutput,
+                ..
+            } => Some(decision_id.clone()),
+            _ => None,
+        })
+        .expect("the conductor chose the output");
+
+    fixture
+        .registry
+        .undo_decision(&fixture.definition, &execution.id, &decision_id, || {})
+        .await
+        .expect("undo the decision");
+    let now = fixture.load(&execution.id);
+    assert_eq!(entries(&now), Value::Null, "the entry is taken back");
+    let pending = fixture.pending(&execution.id);
+    let problem = pending.problem.clone().expect("a problem");
+    assert_eq!(problem.reply.as_deref(), Some("The original prose."));
+
+    let settled = fixture
+        .engine
+        .deliver_human_input(
+            &fixture.definition,
+            &execution.id,
+            &HumanInputDelivery::default()
+                .choosing("done")
+                .for_episode(pending.episode_key()),
+        )
+        .await
+        .expect("settle the problem");
+    assert_eq!(settled.status, ExecutionStatus::Completed);
+    assert_eq!(entries(&settled), json!(1));
+    let prompts = agent.prompts();
+    assert_eq!(prompts.len(), 4, "{prompts:?}");
+    assert!(prompts[3].contains("The original prose."), "{}", prompts[3]);
 }
 
 /// The `agent_problem` fixture whose conductor completes the step with its

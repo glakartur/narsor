@@ -103,6 +103,19 @@ pub fn output_contract(outputs: &[OutputDefinition]) -> String {
                 }
                 _ => list.push_str(&format!("- `{}`\n", output.label)),
             }
+            for required in &output.requires_variables {
+                match required
+                    .description()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    Some(description) => list.push_str(&format!(
+                        "  - Set `variables.{}`: {description}\n",
+                        required.name()
+                    )),
+                    None => list.push_str(&format!("  - Set `variables.{}`\n", required.name())),
+                }
+            }
         }
         list
     };
@@ -768,6 +781,7 @@ impl AgentExecutor {
                 // What the engine needs to ask this same session again
                 // (KTD7): the harness it ran on and the session it left.
                 record_session_in_details(&mut error, harness, run.session_id.as_deref());
+                record_reply_in_details(&mut error, &run);
                 self.fail_session(
                     request.execution_id,
                     request.action_execution_id,
@@ -1555,57 +1569,54 @@ fn record_session_in_details(error: &mut ActionError, harness: &str, session_id:
     }
 }
 
+/// How many `{` that never close a scan of an agent's text skips, and how
+/// many candidates it tries from the right, before it gives up.
+///
+/// Each one costs a scan to the end of the text, so without a bound a text
+/// full of stray braces takes quadratic time. Prose has a few; the contract
+/// is near the end.
+const MAX_BRACE_CANDIDATES: usize = 64;
+
 /// Every top-level JSON object in `text`, in the order they appear.
 ///
 /// Scanning for balanced braces — string- and escape-aware, so a `}` inside a
 /// string never ends an object — rather than looking for fences: it finds the
-/// fenced case too, since the fence markers are outside the braces.
+/// fenced case too, since the fence markers are outside the braces. A `{`
+/// that never closes (a brace in the prose) is skipped, and the scan goes on
+/// from the next one, so it cannot hide an object after it — up to
+/// [`MAX_BRACE_CANDIDATES`] of them.
 pub(crate) fn json_objects(text: &str) -> Vec<Value> {
-    let bytes = text.as_bytes();
     let mut found = Vec::new();
-
-    let mut start = None;
-    let mut depth = 0_usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for (index, byte) in bytes.iter().enumerate() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if *byte == b'\\' {
-                escaped = true;
-            } else if *byte == b'"' {
-                in_string = false;
+    for (start, end) in top_level_objects(text) {
+        if let Ok(value) = serde_json::from_str::<Value>(&text[start..end]) {
+            if value.is_object() {
+                found.push(value);
             }
-            continue;
-        }
-
-        match byte {
-            b'"' if depth > 0 => in_string = true,
-            b'{' => {
-                if depth == 0 {
-                    start = Some(index);
-                }
-                depth += 1;
-            }
-            b'}' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(begin) = start.take() {
-                        if let Ok(value) = serde_json::from_str::<Value>(&text[begin..=index]) {
-                            if value.is_object() {
-                                found.push(value);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
     }
-
     found
+}
+
+/// The spans of the top-level balanced objects of `text`, skipping at most
+/// [`MAX_BRACE_CANDIDATES`] braces that never close.
+fn top_level_objects(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let (mut from, mut unclosed) = (0, 0);
+    while let Some(offset) = text[from..].find('{') {
+        let start = from + offset;
+        match object_end(text, start) {
+            Some(end) => {
+                spans.push((start, end));
+                from = end;
+            }
+            None if unclosed < MAX_BRACE_CANDIDATES => {
+                unclosed += 1;
+                from = start + 1;
+            }
+            None => break,
+        }
+    }
+    spans
 }
 
 /// Builds the action result of a successful run.
@@ -1643,5 +1654,280 @@ fn build_result(
         exit_code: Some(finished.exit_code),
         stdout: truncate(&run.text),
         stderr: truncate(&finished.stderr),
+        reply: run_reply(run),
+    }
+}
+
+/// Adds the attempt's reply to the details of an extraction failure, so a
+/// format reprompt can keep it instead of its own text (R3).
+fn record_reply_in_details(error: &mut ActionError, run: &HarnessRun) {
+    let Some(reply) = run_reply(run) else {
+        return;
+    };
+    if let Some(Value::Object(details)) = error.details.as_mut() {
+        details.insert("reply".to_string(), Value::String(reply));
+    }
+}
+
+/// The step's reply of `run`: the reply its harness read, or else its final
+/// text, without the output-contract object (R3).
+pub(crate) fn run_reply(run: &HarnessRun) -> Option<String> {
+    clean_reply(run.reply.as_deref().unwrap_or(&run.text))
+}
+
+/// The agent's reply: its text without the output-contract object, and
+/// without the code fence around that object (R3). `None` when nothing else
+/// is left.
+fn clean_reply(text: &str) -> Option<String> {
+    let reply = match final_contract_start(text) {
+        Some(cut) => text[..cut].to_string(),
+        None => {
+            let mut reply = text.to_string();
+            if let Some((begin, end)) = last_contract_span(text) {
+                reply.replace_range(begin..end, "");
+            }
+            reply
+        }
+    };
+    let trimmed = reply.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate(trimmed))
+    }
+}
+
+/// Where the text's closing output-contract object starts — or the code
+/// fence wrapping it, when one does.
+///
+/// The object is the one that ends where the text ends (but for whitespace
+/// and a closing fence), found from the right, so a brace in the prose
+/// before it never hides it. At most [`MAX_BRACE_CANDIDATES`] braces are
+/// tried.
+fn final_contract_start(text: &str) -> Option<usize> {
+    let trimmed = text.trim_end();
+    let (body, fenced) = match trimmed.strip_suffix("```") {
+        Some(rest) => (rest.trim_end(), true),
+        None => (trimmed, false),
+    };
+    let mut candidates = body;
+    let mut tried = 0;
+    while let Some(start) = candidates.rfind('{') {
+        tried += 1;
+        if tried > MAX_BRACE_CANDIDATES {
+            return None;
+        }
+        candidates = &body[..start];
+        if object_end(body, start) != Some(body.len()) || !is_contract(&body[start..]) {
+            continue;
+        }
+        if !fenced {
+            return Some(start);
+        }
+        let before = body[..start].trim_end();
+        let opening = before.strip_suffix("```").or_else(|| {
+            let split = before.len().checked_sub("```json".len())?;
+            before
+                .get(split..)
+                .filter(|tail| tail.eq_ignore_ascii_case("```json"))
+                .map(|_| &before[..split])
+        });
+        // A closing fence that does not wrap the object belongs to
+        // something else.
+        return opening.map(str::len);
+    }
+    None
+}
+
+/// The end (exclusive) of the JSON object opening at `start`: string- and
+/// escape-aware brace matching. `None` when it never closes.
+fn object_end(text: &str, start: usize) -> Option<usize> {
+    let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
+    for (index, ch) in text[start..].char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + index + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `object` is an output-contract object: an answer or a question.
+fn is_contract(object: &str) -> bool {
+    serde_json::from_str::<Value>(object)
+        .ok()
+        .and_then(|value| value.as_object().map(is_answer_object))
+        .unwrap_or(false)
+}
+
+/// The last output-contract object among the text's top-level objects, for
+/// a text that goes on after it.
+fn last_contract_span(text: &str) -> Option<(usize, usize)> {
+    top_level_objects(text)
+        .into_iter()
+        .rev()
+        .find(|&(start, end)| is_contract(&text[start..end]))
+}
+
+#[cfg(test)]
+mod json_object_tests {
+    use super::{extract_response, json_objects, AgentResponse};
+    use serde_json::json;
+
+    fn label_of(text: &str) -> String {
+        match extract_response(text).expect("a response") {
+            AgentResponse::Completed(output) => output.output_label,
+            AgentResponse::AwaitingInput { .. } => panic!("not an output"),
+        }
+    }
+
+    #[test]
+    fn an_unbalanced_brace_in_the_prose_does_not_hide_the_label() {
+        assert_eq!(
+            label_of("The parser misses a `{` on line 3.\n{\"output\":\"findings\"}"),
+            "findings"
+        );
+        assert_eq!(
+            label_of("Open { and a \"quote.\n```json\n{\"output\":\"clean\"}\n```"),
+            "clean"
+        );
+    }
+
+    #[test]
+    fn braces_in_strings_stay_inside_their_object() {
+        let objects = json_objects(
+            "Report.\n{\"output\":\"findings\",\"data\":{\"note\":\"a } and a {\",\
+             \"nested\":{\"output\":\"inner\"}}}",
+        );
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0]["output"], json!("findings"));
+        assert_eq!(objects[0]["data"]["note"], json!("a } and a {"));
+    }
+
+    #[test]
+    fn a_text_full_of_unclosed_braces_is_read_in_linear_time() {
+        let text = format!("{}\n{{\"output\":\"findings\"}}", "{".repeat(200_000));
+        let started = std::time::Instant::now();
+        let _ = json_objects(&text);
+        let _ = super::clean_reply(&text);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "stray braces must not make the scan quadratic: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_last_object_still_wins() {
+        assert_eq!(
+            label_of("{\"output\":\"first\"} then { and {\"output\":\"second\"}"),
+            "second"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::clean_reply;
+    use crate::engine::actions::script::{MAX_CAPTURED_OUTPUT_BYTES, TRUNCATION_MARKER};
+
+    #[test]
+    fn a_long_reply_keeps_its_beginning_and_is_marked_cut() {
+        let text = format!("{}\n{{\"output\":\"findings\"}}", "a".repeat(70 * 1024));
+        let reply = clean_reply(&text).expect("a reply");
+        assert!(reply.ends_with(TRUNCATION_MARKER));
+        assert_eq!(
+            reply.len(),
+            MAX_CAPTURED_OUTPUT_BYTES + TRUNCATION_MARKER.len()
+        );
+        assert!(reply.starts_with("aaa"));
+    }
+
+    #[test]
+    fn reply_removes_the_contract_object_and_json_fence() {
+        assert_eq!(
+            clean_reply("Report here.\n```json\n{\"output\":\"findings\"}\n```"),
+            Some("Report here.".to_string())
+        );
+    }
+
+    #[test]
+    fn contract_only_text_has_no_reply() {
+        assert_eq!(clean_reply("{\"output\":\"clean\"}"), None);
+    }
+
+    #[test]
+    fn an_unbalanced_brace_in_the_prose_does_not_hide_the_contract() {
+        assert_eq!(
+            clean_reply("The parser misses a `{` on line 3.\n{\"output\":\"findings\"}"),
+            Some("The parser misses a `{` on line 3.".to_string())
+        );
+    }
+
+    #[test]
+    fn braces_inside_the_contract_are_part_of_it() {
+        assert_eq!(
+            clean_reply(
+                "Report.\n{\"output\":\"findings\",\"data\":{\"note\":\"a } and a {\",\
+                 \"nested\":{\"output\":\"inner\"}}}"
+            ),
+            Some("Report.".to_string())
+        );
+    }
+
+    #[test]
+    fn a_fenced_json_block_goes_with_the_contract() {
+        assert_eq!(
+            clean_reply("Report.\n\n```JSON\n{\"output\":\"clean\"}\n```\n"),
+            Some("Report.".to_string())
+        );
+        assert_eq!(
+            clean_reply("Report.\n```\n{\"output\":\"clean\"}\n```"),
+            Some("Report.".to_string())
+        );
+    }
+
+    #[test]
+    fn an_earlier_code_block_stays_in_the_reply() {
+        let text = "Fix it like this:\n```rust\nfn main() { println!(\"{}\", 1); }\n```\n\
+                    Done.\n{\"output\":\"findings\"}";
+        assert_eq!(
+            clean_reply(text),
+            Some(
+                "Fix it like this:\n```rust\nfn main() { println!(\"{}\", 1); }\n```\nDone."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_reply_that_is_a_code_block_keeps_its_fences() {
+        let text = "```text\nreport\n```\n{\"output\":\"findings\"}";
+        assert_eq!(clean_reply(text), Some("```text\nreport\n```".to_string()));
+    }
+
+    #[test]
+    fn a_contract_followed_by_prose_is_still_removed() {
+        assert_eq!(
+            clean_reply("Report.\n{\"output\":\"findings\"}\nThanks."),
+            Some("Report.\n\nThanks.".to_string())
+        );
     }
 }

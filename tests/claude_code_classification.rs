@@ -760,6 +760,7 @@ fn the_harness_run_is_still_accumulated() {
     let run = parser.finish(0, "");
     assert_eq!(run.failure, None);
     assert_eq!(run.text, r#"{"output":"done","data":{"lines":3}}"#);
+    assert_eq!(run.reply.as_deref(), Some("Plik `notes.txt` ma 3 linie (`wc -l` zwróciło 3). Treść: `alpha`, `beta`, `gamma needle`."));
     assert!(run.session_id.is_some());
 
     let mut parser = self::parser();
@@ -855,4 +856,61 @@ fn a_result_preserves_structured_permission_denials_and_correlation() {
         elements.last(),
         Some(ChatElement::RunResult { is_error: true, .. })
     ));
+}
+
+/// The run of `lines`, ending with a `result` line carrying `result`.
+fn run_of_lines(
+    lines: &[String],
+    result: &str,
+) -> narsor_engine::engine::actions::harness::HarnessRun {
+    let mut parser = parser();
+    for line in lines {
+        parser.on_stdout_line(line.as_bytes());
+    }
+    let end = json!({
+        "type": "result",
+        "subtype": "success",
+        "session_id": "s-1",
+        "result": result,
+        "is_error": false
+    })
+    .to_string();
+    parser.on_stdout_line(end.as_bytes());
+    parser.finish(0, "")
+}
+
+#[test]
+fn a_subagents_messages_are_not_the_reply() {
+    let subagent = json!({
+        "type": "assistant",
+        "parent_tool_use_id": "task-1",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "subagent notes"}]},
+        "session_id": "s-1",
+    })
+    .to_string();
+    let run = run_of_lines(
+        &[
+            subagent,
+            assistant(json!([{"type": "text", "text": "The final report."}])),
+        ],
+        r#"{"output":"done"}"#,
+    );
+
+    assert_eq!(run.reply.as_deref(), Some("The final report."));
+}
+
+#[test]
+fn only_the_prose_after_the_last_tool_call_is_the_reply() {
+    let run = run_of_lines(
+        &[
+            assistant(json!([
+                {"type": "text", "text": "Let me run the tests first."},
+                {"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {"command": "cargo test"}},
+            ])),
+            assistant(json!([{"type": "text", "text": "All green."}])),
+        ],
+        r#"{"output":"done"}"#,
+    );
+
+    assert_eq!(run.reply.as_deref(), Some("All green."));
 }

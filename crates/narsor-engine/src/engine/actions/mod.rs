@@ -267,6 +267,7 @@ impl TimedOutAction {
                 exit_code: None,
                 stdout: String::new(),
                 stderr: String::new(),
+                reply: None,
             });
         }
 

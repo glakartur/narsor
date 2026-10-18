@@ -980,6 +980,7 @@ async fn output_descriptions_survive_in_the_pending_record() {
     let outputs = vec![
         OutputDefinition {
             label: "ignore".to_string(),
+            requires_variables: Vec::new(),
             description: Some("The failures are known and harmless.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
@@ -1134,6 +1135,7 @@ fn raise_problem(store: &ExecutionStore, execution: &mut WorkflowExecution) -> P
             },
         ],
         analysis: None,
+        reply: None,
     };
     let pending = PendingHumanInput::for_problem(
         execution.id.clone(),

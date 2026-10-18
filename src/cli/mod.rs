@@ -699,6 +699,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_entry_limit_says_how_to_decide() {
+        let pending = serde_json::json!({
+            "state_id": "fix",
+            "instruction": "Krok 'fix' osiągnął limit wejść: 2/2.",
+            "fields": [{
+                "name": "entry_limit_decision",
+                "type": "select",
+                "options": ["continue", "reset_counter"],
+                "required": false,
+            }],
+            "outputs": [{"label": "fixed"}, {"label": "manual_complete"}],
+            "continuation": "entry_limit",
+            "entry_limit": {"entries": 2, "max_entries": 2},
+            "problem": {
+                "reason": "entry limit reached (2/2)",
+                "answers": [],
+                "requirements": [{"label": "manual_complete", "data": [], "variables": ["summary"]}],
+            },
+        });
+        let text = commands::pending_input_lines(&pending).join("\n");
+        assert!(
+            text.contains("Entry limit: step 'fix' entered 2/2 times."),
+            "{text}"
+        );
+        assert!(
+            text.contains("--field entry_limit_decision=continue"),
+            "{text}"
+        );
+        assert!(
+            text.contains("--field entry_limit_decision=reset_counter"),
+            "{text}"
+        );
+        assert!(text.contains("Or choose an output with --label"), "{text}");
+        assert!(text.contains("    --label fixed"), "{text}");
+        assert!(
+            text.contains("    --label manual_complete\n        requires --variable summary=…"),
+            "{text}"
+        );
+        assert!(!text.contains("Resolve with --label"), "{text}");
+    }
+
+    #[test]
     fn a_pattern_goes_only_with_allow_pattern_and_the_comment_reaches_the_agent() {
         use narsor_protocol::api::PermissionGrantScopeDto;
         let decision =

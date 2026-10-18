@@ -1,0 +1,19 @@
+name: step-reply-problem
+version: 1
+description: >
+  An agent whose answer may carry no output label, followed by a step that
+  reads its reply and counts its entries.
+states:
+  work:
+    action: { type: agent, prompt: implement the feature }
+    outputs: [done]
+    transitions: { done: fix }
+  fix:
+    action:
+      type: agent
+      prompt: "Fix after: {{ steps.work.reply }}"
+    max_entries: 2
+    outputs: [fixed]
+    transitions: { fixed: completed }
+  completed: { description: done }
+terminal_states: [completed]

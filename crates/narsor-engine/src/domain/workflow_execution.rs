@@ -133,6 +133,10 @@ pub struct ActionResult {
     /// Standard error (for script/agent actions)
     #[serde(default)]
     pub stderr: String,
+
+    /// Final human-readable agent response, with the output-contract object removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
 }
 
 /// Error information for a failed action

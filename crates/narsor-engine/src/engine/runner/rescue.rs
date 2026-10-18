@@ -179,6 +179,8 @@ impl Engine {
                                     .unwrap_or(Value::Null),
                                 answers: rescue.answers.clone(),
                                 reason: Some(rescue.reason.clone()),
+                                reply: rescue.reply.clone(),
+                                state_entries_before: state_entries_value(execution)?,
                                 saved_at: Utc::now(),
                             };
                             conductor.save_decision(
@@ -258,6 +260,7 @@ impl Engine {
                             state,
                             config,
                             &previous,
+                            rescue.reply.as_deref(),
                             RepromptedBy::Conductor,
                             timeout,
                         )
@@ -376,6 +379,9 @@ impl Engine {
                         .find_map(|answer| answer.answer_tail.clone())
                         .unwrap_or_default(),
                     stderr: String::new(),
+                    // The conductor settles the label, not what the agent
+                    // said (R3).
+                    reply: rescue.reply.clone(),
                 };
                 match self.record_result(execution, state, rescue.episode().to_string(), result)? {
                     Some(pending) => {
@@ -567,6 +573,8 @@ fn unsaved_decision(
         context_before: Value::Null,
         answers: Vec::new(),
         reason: None,
+        reply: None,
+        state_entries_before: Value::Null,
         saved_at: Utc::now(),
     }
 }

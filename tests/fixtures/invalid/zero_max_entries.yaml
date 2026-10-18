@@ -1,0 +1,21 @@
+# `max_entries` must be at least 1.
+name: zero-max-entries
+version: 1
+
+states:
+  work:
+    max_entries: 0
+    action:
+      type: agent
+      harness: claude-code
+      prompt: Zaimplementuj.
+    outputs:
+      - done
+    transitions:
+      done: finished
+
+  finished:
+    description: Koniec.
+
+terminal_states:
+  - finished

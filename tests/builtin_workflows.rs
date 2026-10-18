@@ -14,8 +14,7 @@
 //! it: the store, `{root}/workflows`, and the "user" configuration directory.
 //! No test lets the resolver read the environment as it finds it — the library
 //! tests pass the directory in, and the process tests set `XDG_CONFIG_HOME` and
-//! `HOME` on the child. `workflow eject` without `--to` writes into that
-//! directory and nowhere else.
+//! `HOME` on the child.
 //!
 //! # The assertions about the built-ins are made against the embedded strings
 //!
@@ -38,12 +37,6 @@ use narsor_engine::workflows::{
 
 /// The exit code of a successful command.
 const EXIT_SUCCESS: i32 = 0;
-
-/// The exit code of a validation or execution failure.
-const EXIT_FAILURE: i32 = 1;
-
-/// The exit code of a wrong invocation.
-const EXIT_USAGE: i32 = 2;
 
 // ---------------------------------------------------------------------------
 // harness
@@ -328,6 +321,52 @@ fn every_builtin_label_has_a_description() {
     }
 }
 
+#[test]
+fn compound_engineering_uses_step_replies_required_variables_and_a_review_limit() {
+    let definition = narsor_engine::workflow::load_from_str(
+        BUILTIN_WORKFLOWS
+            .iter()
+            .find(|entry| entry.name == "compound-engineering")
+            .expect("built-in")
+            .source,
+    )
+    .expect("workflow loads");
+    assert_eq!(definition.states["code_review"].max_entries, Some(5));
+    let narsor_engine::domain::ActionConfig::Agent(fix) = definition.states["fix_review_findings"]
+        .action
+        .as_ref()
+        .expect("agent action")
+    else {
+        panic!("fix step is an agent")
+    };
+    assert!(fix.prompt.contains("{{ steps.code_review.reply }}"));
+    assert!(!fix.prompt.contains("context.review_findings"));
+    assert!(fix.prompt.contains("{{ context.test_baseline }}"));
+
+    let required = |state: &str, label: &str| {
+        definition.states[state]
+            .outputs
+            .iter()
+            .find(|output| output.label == label)
+            .expect("output exists")
+            .requires_variables
+            .iter()
+            .map(|variable| variable.name())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        required("brainstorm", "requirements_drafted"),
+        vec!["requirements_doc"]
+    );
+    assert_eq!(required("plan", "plan_ready"), vec!["plan_doc"]);
+    assert_eq!(required("plan_revision", "plan_ready"), vec!["plan_doc"]);
+    assert_eq!(required("work", "implemented"), vec!["test_baseline"]);
+    assert!(required("work", "implemented")
+        .iter()
+        .all(|name| *name != "pr_url"));
+    assert_eq!(required("publish_work", "published"), vec!["pr_url"]);
+}
+
 /// The implementation agent asks questions through `awaiting_input`, then
 /// resumes the same action; it does not route ambiguity through a workflow gate.
 /// The engine's output contract teaches `awaiting_input`, so the prompt leaves
@@ -552,216 +591,6 @@ fn the_listing_reports_an_override_rather_than_two_rows() {
     assert_eq!(overridden.origin.label(), "root");
     assert!(overridden.is_override());
     assert_eq!(overridden.shadow_labels(), "built-in");
-}
-
-// ---------------------------------------------------------------------------
-// the workflow subcommand
-// ---------------------------------------------------------------------------
-
-/// `workflow list` shows the built-ins, and marks a copy that shadows one.
-#[test]
-fn workflow_list_shows_the_builtins_and_marks_an_override() {
-    let root = TempRoot::new();
-
-    let listing = cli(&root, &["workflow", "list"]);
-    assert_eq!(listing.code, EXIT_SUCCESS, "stderr: {}", listing.stderr);
-    for name in builtin_names() {
-        assert!(
-            listing.stdout.contains(name),
-            "'{name}' is listed:\n{}",
-            listing.stdout
-        );
-    }
-    assert!(
-        listing.stdout.contains("built-in"),
-        "the source is shown:\n{}",
-        listing.stdout
-    );
-    assert!(
-        !listing.stdout.contains("overrides:"),
-        "nothing overrides anything yet:\n{}",
-        listing.stdout
-    );
-
-    write_workflow(
-        &root.root_workflows(),
-        "compound-engineering.yaml",
-        &marked_definition("from-the-root"),
-    );
-
-    let listing = cli(&root, &["workflow", "list"]);
-    assert!(
-        listing.stdout.contains("overrides: built-in"),
-        "the copy is reported as an override:\n{}",
-        listing.stdout
-    );
-    assert!(
-        listing.stdout.contains("open-mercato-sdlc"),
-        "the other built-in is still listed:\n{}",
-        listing.stdout
-    );
-}
-
-/// `workflow show` prints the YAML on stdout and the source on stderr.
-#[test]
-fn workflow_show_prints_the_definition_and_says_where_it_came_from() {
-    let root = TempRoot::new();
-
-    let shown = cli(&root, &["workflow", "show", "open-mercato-sdlc"]);
-    assert_eq!(shown.code, EXIT_SUCCESS, "stderr: {}", shown.stderr);
-    assert_eq!(
-        shown.stdout,
-        builtin("open-mercato-sdlc")
-            .expect("the built-in exists")
-            .source,
-        "stdout is the definition and nothing else, so it can be piped into a file"
-    );
-    assert!(
-        shown.stderr.contains("built-in"),
-        "where it came from is said on stderr: {}",
-        shown.stderr
-    );
-}
-
-/// `workflow eject` writes the built-in out, refuses to clobber it, and the
-/// copy then takes precedence.
-#[test]
-fn workflow_eject_writes_refuses_a_second_time_and_then_takes_precedence() {
-    let root = TempRoot::new();
-
-    let ejected = cli(&root, &["workflow", "eject", "compound-engineering"]);
-    assert_eq!(ejected.code, EXIT_SUCCESS, "stderr: {}", ejected.stderr);
-
-    let target = root
-        .config()
-        .join("narsor/workflows/compound-engineering.yaml");
-    assert!(
-        target.is_file(),
-        "the file was written to {}",
-        target.display()
-    );
-    assert_eq!(
-        fs::read_to_string(&target).expect("read the ejected copy"),
-        builtin("compound-engineering")
-            .expect("the built-in exists")
-            .source,
-        "the ejected copy is the built-in, byte for byte"
-    );
-    assert!(
-        ejected.stdout.contains(&target.display().to_string()),
-        "the path written is printed:\n{}",
-        ejected.stdout
-    );
-    assert!(
-        ejected.stdout.contains("now resolves to this copy"),
-        "it says the copy has precedence:\n{}",
-        ejected.stdout
-    );
-
-    // Nothing outside the temporary directory was touched.
-    assert!(
-        target.starts_with(root.path()),
-        "the default target is the redirected config directory"
-    );
-
-    let again = cli(&root, &["workflow", "eject", "compound-engineering"]);
-    assert_eq!(
-        again.code,
-        EXIT_FAILURE,
-        "a second eject is refused: {}",
-        again.output()
-    );
-    assert!(
-        again.stderr.contains("--force"),
-        "the refusal says how to overwrite: {}",
-        again.stderr
-    );
-
-    // The ejected copy is now what resolves.
-    fs::write(&target, marked_definition("from-the-ejected-copy")).expect("edit the ejected copy");
-    let shown = cli(&root, &["workflow", "show", "compound-engineering"]);
-    assert!(
-        shown.stdout.contains("from-the-ejected-copy"),
-        "the edited copy is what would run:\n{}",
-        shown.stdout
-    );
-    assert!(
-        shown.stderr.contains("user"),
-        "and it is reported as coming from the user directory: {}",
-        shown.stderr
-    );
-
-    let forced = cli(
-        &root,
-        &["workflow", "eject", "compound-engineering", "--force"],
-    );
-    assert_eq!(forced.code, EXIT_SUCCESS, "stderr: {}", forced.stderr);
-    assert_eq!(
-        fs::read_to_string(&target).expect("read the restored copy"),
-        builtin("compound-engineering")
-            .expect("the built-in exists")
-            .source,
-        "--force restores the built-in's text"
-    );
-}
-
-/// `workflow eject --to` writes where it is told, and refuses an unknown name.
-#[test]
-fn workflow_eject_honours_to_and_refuses_a_name_that_is_not_built_in() {
-    let root = TempRoot::new();
-    let target_dir = root.path().join("elsewhere/nested");
-
-    let ejected = cli(
-        &root,
-        &[
-            "workflow",
-            "eject",
-            "open-mercato-sdlc",
-            "--to",
-            &target_dir.display().to_string(),
-        ],
-    );
-    assert_eq!(ejected.code, EXIT_SUCCESS, "stderr: {}", ejected.stderr);
-    assert!(
-        target_dir.join("open-mercato-sdlc.yaml").is_file(),
-        "the directory was created and the file written"
-    );
-
-    let refused = cli(&root, &["workflow", "eject", "not-a-builtin"]);
-    assert_eq!(refused.code, EXIT_USAGE, "output: {}", refused.output());
-    for name in builtin_names() {
-        assert!(
-            refused.stderr.contains(name),
-            "the refusal names the built-in '{name}': {}",
-            refused.stderr
-        );
-    }
-}
-
-/// An unknown workflow is a usage error that names the built-ins.
-#[test]
-fn running_an_unknown_name_is_a_usage_error_that_names_the_builtins() {
-    let root = TempRoot::new();
-
-    let invocation = cli(&root, &["run", "no-such-workflow"]);
-    assert_eq!(
-        invocation.code,
-        EXIT_USAGE,
-        "output: {}",
-        invocation.output()
-    );
-    for name in builtin_names() {
-        assert!(
-            invocation.stderr.contains(name),
-            "the message names the built-in '{name}': {}",
-            invocation.stderr
-        );
-    }
-    assert!(
-        invocation.stderr.contains("Looked for"),
-        "the message says where it looked: {}",
-        invocation.stderr
-    );
 }
 
 // ---------------------------------------------------------------------------

@@ -234,6 +234,7 @@ impl HarnessStreamParser for OpenCodeStreamParser {
 
         HarnessRun {
             text: self.text.unwrap_or_default(),
+            reply: None,
             session_id: self.session_id,
             failure,
             structured_output: None,
@@ -318,4 +319,32 @@ fn extract_session_id(value: &Value) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::actions::agent::run_reply;
+
+    #[test]
+    fn the_reply_is_the_final_text_without_the_contract() {
+        let mut parser: Box<dyn HarnessStreamParser> = Box::new(OpenCodeStreamParser::default());
+        for line in [
+            serde_json::json!({ "type": "text", "sessionID": "ses-1", "text": "Looking." }),
+            serde_json::json!({
+                "type": "text",
+                "sessionID": "ses-1",
+                "text": "P1: validate the request body.\n```json\n{\"output\":\"findings\"}\n```",
+            }),
+        ] {
+            parser.on_stdout_line(line.to_string().as_bytes());
+        }
+        let run = parser.finish(0, "");
+
+        assert_eq!(run.failure, None);
+        assert_eq!(
+            run_reply(&run).as_deref(),
+            Some("P1: validate the request body.")
+        );
+    }
 }

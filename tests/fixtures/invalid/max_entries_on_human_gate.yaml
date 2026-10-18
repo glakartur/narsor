@@ -1,0 +1,20 @@
+# `max_entries` is allowed only on an agent action.
+name: max-entries-on-human-gate
+version: 1
+
+states:
+  gate:
+    max_entries: 3
+    action:
+      type: human
+      message: Zatwierdź.
+    outputs:
+      - approved
+    transitions:
+      approved: finished
+
+  finished:
+    description: Koniec.
+
+terminal_states:
+  - finished

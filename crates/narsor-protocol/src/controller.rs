@@ -1125,9 +1125,12 @@ pub enum AttentionKind {
     Question,
     Approval,
     Problem,
+    EntryLimit,
     FailedStep,
     ConductorProposal,
     ProvisioningFailed,
+    #[serde(other)]
+    Unrecognized,
 }
 
 /// Metadata about one thing a task waits on its owner to resolve.
@@ -1709,6 +1712,18 @@ mod tests {
         WorkflowInputType, WorkflowInputView, WorkflowListResponse, WorkflowSource, WorkflowView,
         WorkspaceRequest,
     };
+
+    #[test]
+    fn entry_limit_attention_kind_round_trips_and_unknown_kinds_fall_back() {
+        assert_eq!(
+            serde_json::from_value::<AttentionKind>(serde_json::json!("entry_limit")).unwrap(),
+            AttentionKind::EntryLimit
+        );
+        assert_eq!(
+            serde_json::from_value::<AttentionKind>(serde_json::json!("future_kind")).unwrap(),
+            AttentionKind::Unrecognized
+        );
+    }
 
     #[test]
     fn task_event_keeps_the_durable_tagged_wire_shape() {

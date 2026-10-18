@@ -114,6 +114,7 @@ pub enum TemplateError {
 pub struct TemplateScope<'a> {
     inputs: &'a Map<String, Value>,
     variables: &'a HashMap<String, Value>,
+    step_replies: Option<&'a HashMap<String, Value>>,
 }
 
 impl<'a> TemplateScope<'a> {
@@ -122,6 +123,7 @@ impl<'a> TemplateScope<'a> {
         Self {
             inputs,
             variables: &context.variables,
+            step_replies: None,
         }
     }
 
@@ -131,7 +133,17 @@ impl<'a> TemplateScope<'a> {
         inputs: &'a Map<String, Value>,
         variables: &'a HashMap<String, Value>,
     ) -> Self {
-        Self { inputs, variables }
+        Self {
+            inputs,
+            variables,
+            step_replies: None,
+        }
+    }
+
+    /// Adds persisted replies keyed by workflow step id.
+    pub fn with_step_replies(mut self, replies: &'a HashMap<String, Value>) -> Self {
+        self.step_replies = Some(replies);
+        self
     }
 
     /// Builds a scope from `WorkflowExecution::inputs`, which is stored as an
@@ -383,6 +395,16 @@ impl<'a> TemplateScope<'a> {
                 self.variables.get(name).ok_or_else(unknown)
             }
 
+            "steps" => {
+                let (step, field) = path.split_once('.').ok_or_else(unsupported)?;
+                if field != "reply" || !plain_name(step).is_some() {
+                    return Err(unsupported());
+                }
+                self.step_replies
+                    .and_then(|replies| replies.get(step))
+                    .ok_or_else(unknown)
+            }
+
             _ => Err(unsupported()),
         }
     }
@@ -394,7 +416,12 @@ impl<'a> TemplateScope<'a> {
 pub fn check_syntax(template: &str, location: &str) -> Result<(), TemplateError> {
     let inputs = Map::new();
     let variables = HashMap::new();
+    let replies = step_reply_references(template)
+        .into_iter()
+        .map(|id| (id, Value::String(String::new())))
+        .collect();
     TemplateScope::from_parts(&inputs, &variables)
+        .with_step_replies(&replies)
         .render_with(template, location, Unknown::Blank)
         .map(|_| ())
 }
@@ -412,6 +439,48 @@ pub fn context_references(template: &str) -> Vec<String> {
     let mut names = Vec::new();
     collect_context_references(template, &mut names);
     names
+}
+
+/// Workflow step ids referenced through `steps.<id>.reply`, in first-use order.
+pub fn step_reply_references(template: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for path in step_paths(template) {
+        if let Some((id, "reply")) = path.split_once('.') {
+            if plain_name(id).is_some() && !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids
+}
+
+/// The `steps.*` expressions of a template that are not `steps.<id>.reply`
+/// (`steps.a.data`, `steps.a`), in order of use.
+pub fn unsupported_step_references(template: &str) -> Vec<String> {
+    step_paths(template)
+        .into_iter()
+        .filter(
+            |path| !matches!(path.split_once('.'), Some((id, "reply")) if plain_name(id).is_some()),
+        )
+        .map(|path| format!("steps.{path}"))
+        .collect()
+}
+
+/// What follows `steps.` in each `{{ steps.… }}` expression of a template.
+fn step_paths(template: &str) -> Vec<&str> {
+    let mut paths = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find(OPEN) {
+        let after_open = &rest[start + OPEN.len()..];
+        let Some(end) = after_open.find(CLOSE) else {
+            break;
+        };
+        if let Some(path) = after_open[..end].trim().strip_prefix("steps.") {
+            paths.push(path);
+        }
+        rest = &after_open[end + CLOSE.len()..];
+    }
+    paths
 }
 
 /// The context variables an action's templates refer to, over exactly the

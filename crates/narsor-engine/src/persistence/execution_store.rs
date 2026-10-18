@@ -3,7 +3,7 @@
 use super::{PersistenceError, Result};
 use crate::domain::{Context, ExecutionId, TaskId, TaskLaunchSpec, WorkflowExecution};
 use crate::persistence::atomic::{
-    cleanup_orphaned_temp_files, ensure_dir, read_json, write_json_atomic,
+    cleanup_orphaned_temp_files, ensure_dir, read_json, write_atomic, write_json_atomic,
     write_json_atomic_exclusive,
 };
 use crate::persistence::conversation::ConversationStore;
@@ -235,6 +235,25 @@ impl ExecutionStore {
     /// attempt, keyed by `action_execution_id`.
     pub fn conversation_store(&self, execution_id: &str) -> ConversationStore {
         ConversationStore::new(self.paths.clone(), execution_id)
+    }
+
+    /// Atomically stores one final agent reply before its state pointer is saved.
+    pub fn write_step_reply(
+        &self,
+        execution_id: &str,
+        attempt_id: &str,
+        reply: &str,
+    ) -> Result<()> {
+        write_atomic(
+            &self.paths.step_reply_file(execution_id, attempt_id),
+            reply.as_bytes(),
+        )
+    }
+
+    /// Reads a reply selected by the execution's durable attempt pointer.
+    pub fn read_step_reply(&self, execution_id: &str, attempt_id: &str) -> Result<String> {
+        let path = self.paths.step_reply_file(execution_id, attempt_id);
+        fs::read_to_string(&path).map_err(|source| PersistenceError::io(&path, source))
     }
 
     /// Creates and returns the directory for one artifact of an execution.

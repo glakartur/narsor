@@ -1,0 +1,29 @@
+# `{{ steps.X.reply }}` must name an agent state: a script has no reply.
+name: step-reply-from-script-state
+version: 1
+
+states:
+  check:
+    action:
+      type: script
+      command: cargo test
+    outputs:
+      - success
+    transitions:
+      success: work
+
+  work:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: "Popraw: {{ steps.check.reply }}"
+    outputs:
+      - done
+    transitions:
+      done: finished
+
+  finished:
+    description: Koniec.
+
+terminal_states:
+  - finished

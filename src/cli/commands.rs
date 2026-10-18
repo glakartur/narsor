@@ -30,7 +30,10 @@ use crate::api::{
 };
 use crate::domain::{without_unsafe_chars, Event, ExecutionStatus};
 use crate::tui::conversation::{classify, unclassified_preview};
-use narsor_protocol::api::{ConversationState, Position, PositionStatus};
+use narsor_protocol::api::{
+    ConversationState, Position, PositionStatus, ENTRY_LIMIT_CONTINUE, ENTRY_LIMIT_DECISION_FIELD,
+    ENTRY_LIMIT_RESET_COUNTER,
+};
 use narsor_protocol::chat::ChatElement;
 use narsor_protocol::controller::{WorkflowInputType, WorkflowInputView, WorkflowSource};
 
@@ -1641,14 +1644,25 @@ fn print_conductor_matters(summary: &ExecutionSummary) {
 
 /// The question an execution is waiting on, as a form the operator can fill in.
 fn print_pending_input(pending: &impl serde::Serialize) {
-    let Ok(pending) = serde_json::to_value(pending) else {
-        println!("Human input expected: (unavailable)");
-        return;
+    for line in pending_input_lines(pending) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_pending_input`] prints.
+pub(super) fn pending_input_lines(pending: &impl serde::Serialize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Ok(mut pending) = serde_json::to_value(pending) else {
+        lines.push("Human input expected: (unavailable)".to_string());
+        return lines;
     };
-    println!(
+    // The instruction can carry a step's reply and the problem an agent's
+    // answer: text from an agent, never handed to a terminal as it is.
+    narsor_protocol::display::without_unsafe_chars_json(&mut pending);
+    lines.push(format!(
         "Human input expected: {}",
         pending["instruction"].as_str().unwrap_or("(unavailable)")
-    );
+    ));
     for field in pending["fields"].as_array().into_iter().flatten() {
         let requirement = if field["required"].as_bool().unwrap_or(false) {
             "required"
@@ -1674,29 +1688,32 @@ fn print_pending_input(pending: &impl serde::Serialize) {
             "select" => "Select",
             other => other,
         };
-        println!(
+        lines.push(format!(
             "  --field {}=…  ({field_type}, {requirement}{options})",
             field["name"].as_str().unwrap_or("?")
-        );
+        ));
     }
     if let Some(denials) = pending["permission"]["denials"].as_array() {
         for (index, denial) in denials.iter().enumerate() {
             let operation = serde_json::to_string(&denial["input"])
                 .unwrap_or_else(|_| "(unavailable)".to_string());
-            println!(
+            lines.push(format!(
                 "  Permission denial {index}: {} {}",
                 without_unsafe_chars(denial["tool_name"].as_str().unwrap_or("tool")),
                 without_unsafe_chars(&operation),
-            );
-            println!(
+            ));
+            lines.push(format!(
                 "    cwd: {}",
                 without_unsafe_chars(denial["cwd"].as_str().unwrap_or("(unknown)")),
-            );
+            ));
             if let Some(reason) = denial["reason"].as_str() {
-                println!("    reason: {}", without_unsafe_chars(reason));
+                lines.push(format!("    reason: {}", without_unsafe_chars(reason)));
             }
         }
-        println!("  Decide with --permission deny, allow-exact, allow-group, or allow-pattern --pattern TEXT.");
+        lines.push(
+            "  Decide with --permission deny, allow-exact, allow-group, or allow-pattern --pattern TEXT."
+                .to_string(),
+        );
     }
     let outputs = pending["outputs"].as_array().cloned().unwrap_or_default();
     let problem = &pending["problem"];
@@ -1706,28 +1723,52 @@ fn print_pending_input(pending: &impl serde::Serialize) {
                 .iter()
                 .filter_map(|output| output.as_str().or_else(|| output["label"].as_str()))
                 .collect::<Vec<_>>();
-            println!("  Output labels: {}", labels.join(", "));
+            lines.push(format!("  Output labels: {}", labels.join(", ")));
         }
-        return;
+        return lines;
     }
 
     // A problem: the step's output is what is asked for (KTD3).
-    println!(
+    lines.push(format!(
         "  Problem: {}",
         problem["reason"].as_str().unwrap_or("(unknown)")
-    );
+    ));
     for answer in problem["answers"].as_array().into_iter().flatten() {
         if let Some(tail) = answer["answer_tail"].as_str() {
-            println!(
+            lines.push(format!(
                 "  Agent answered ({}):",
                 answer["action_execution_id"].as_str().unwrap_or("unknown")
-            );
+            ));
             for line in tail.lines() {
-                println!("    | {line}");
+                lines.push(format!("    | {line}"));
             }
         }
     }
-    println!("  Resolve with --label and the keys that label needs:");
+    if let Some(limit) = pending["entry_limit"].as_object() {
+        // The step's entry limit (R10): the operator lets it run again, or
+        // chooses its output instead.
+        lines.push(format!(
+            "  Entry limit: step '{}' entered {}/{} times.",
+            pending["state_id"].as_str().unwrap_or("?"),
+            limit
+                .get("entries")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            limit
+                .get("max_entries")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        ));
+        lines.push(format!(
+            "  Decide with --field {ENTRY_LIMIT_DECISION_FIELD}={ENTRY_LIMIT_CONTINUE} (run the \
+             step once more) or --field {ENTRY_LIMIT_DECISION_FIELD}={ENTRY_LIMIT_RESET_COUNTER} \
+             (start its counter again; the limit no longer guards the loop until it is reached \
+             again)."
+        ));
+        lines.push("  Or choose an output with --label and the keys that label needs:".to_string());
+    } else {
+        lines.push("  Resolve with --label and the keys that label needs:".to_string());
+    }
     for output in outputs {
         let label = output
             .as_str()
@@ -1737,7 +1778,7 @@ fn print_pending_input(pending: &impl serde::Serialize) {
             .as_str()
             .map(|description| format!("  — {description}"))
             .unwrap_or_default();
-        println!("    --label {label}{description}");
+        lines.push(format!("    --label {label}{description}"));
         if let Some(requirement) = problem["requirements"]
             .as_array()
             .into_iter()
@@ -1746,16 +1787,17 @@ fn print_pending_input(pending: &impl serde::Serialize) {
         {
             for key in requirement["data"].as_array().into_iter().flatten() {
                 if let Some(key) = key.as_str() {
-                    println!("        requires --data {key}=…");
+                    lines.push(format!("        requires --data {key}=…"));
                 }
             }
             for key in requirement["variables"].as_array().into_iter().flatten() {
                 if let Some(key) = key.as_str() {
-                    println!("        requires --variable {key}=…");
+                    lines.push(format!("        requires --variable {key}=…"));
                 }
             }
         }
     }
+    lines
 }
 
 // ---------------------------------------------------------------------------

@@ -42,7 +42,8 @@ use narsor_protocol::api::{
     bash_grant_rules, bash_pattern_rule, is_approvable_permission_reason, BashGrantScope,
     HumanInputActionDto, HumanInputDeliveryDto, HumanInputFieldView, HumanInputTypeView,
     InputContinuationView, OutputDefinitionView, PendingHumanInputView, PermissionDecisionDto,
-    PermissionDecisionKindDto, PermissionDenialView, PermissionGrantScopeDto,
+    PermissionDecisionKindDto, PermissionDenialView, PermissionGrantScopeDto, ENTRY_LIMIT_CONTINUE,
+    ENTRY_LIMIT_DECISION_FIELD, ENTRY_LIMIT_RESET_COUNTER,
 };
 use narsor_protocol::controller::{WorkflowInputType, WorkflowInputView};
 use narsor_protocol::event::{AnsweredBy, EventData, InputCloseReason};
@@ -59,6 +60,8 @@ pub enum InputKind {
     Problem,
     Approval,
     Permission,
+    EntryLimit,
+    Unsupported,
 }
 
 impl InputKind {
@@ -70,6 +73,8 @@ impl InputKind {
             InputContinuationView::ResolveOutput => Self::Problem,
             InputContinuationView::ApproveOutput => Self::Approval,
             InputContinuationView::ResolvePermission => Self::Permission,
+            InputContinuationView::EntryLimit => Self::EntryLimit,
+            InputContinuationView::Unrecognized => Self::Unsupported,
         }
     }
 
@@ -81,6 +86,8 @@ impl InputKind {
             Self::Problem => " Resolve the problem ",
             Self::Approval => " Approve agent output ",
             Self::Permission => " Permission decision ",
+            Self::EntryLimit => " Entry limit ",
+            Self::Unsupported => " Unsupported wait ",
         }
     }
 }
@@ -455,6 +462,8 @@ enum Plan {
     /// Returns the result to the agent with a comment.
     Return,
     Permission(PermissionDecisionDto),
+    EntryLimitContinue,
+    EntryLimitReset,
 }
 
 /// A pending human input as the panel offers it: what it is about, the
@@ -513,8 +522,10 @@ impl InputPanel {
             InputKind::Gate => panel.build_gate(pending, resumed_state),
             InputKind::AgentQuestion => panel.build_question(pending),
             InputKind::Problem => panel.build_problem(pending),
+            InputKind::EntryLimit => panel.build_entry_limit(pending),
             InputKind::Approval => panel.build_approval(pending),
             InputKind::Permission => panel.build_permission_info(pending),
+            InputKind::Unsupported => {}
         }
         panel
     }
@@ -650,6 +661,20 @@ impl InputPanel {
                 }),
                 ..HumanInputDeliveryDto::default()
             },
+            Plan::EntryLimitContinue => HumanInputDeliveryDto {
+                values: Map::from_iter([(
+                    ENTRY_LIMIT_DECISION_FIELD.to_string(),
+                    Value::String(ENTRY_LIMIT_CONTINUE.to_string()),
+                )]),
+                ..HumanInputDeliveryDto::default()
+            },
+            Plan::EntryLimitReset => HumanInputDeliveryDto {
+                values: Map::from_iter([(
+                    ENTRY_LIMIT_DECISION_FIELD.to_string(),
+                    Value::String(ENTRY_LIMIT_RESET_COUNTER.to_string()),
+                )]),
+                ..HumanInputDeliveryDto::default()
+            },
         };
         Ok(HumanInputDeliveryDto {
             episode: Some(self.episode.clone()),
@@ -693,6 +718,8 @@ impl InputPanel {
                     None => "zezwolono agentowi".to_string(),
                 },
             },
+            Some(Plan::EntryLimitContinue) => "kontynuowano po limicie".to_string(),
+            Some(Plan::EntryLimitReset) => "wyzerowano licznik i kontynuowano".to_string(),
         }
     }
 
@@ -925,6 +952,45 @@ impl InputPanel {
         self.push(message, Plan::Message);
         // The conductor's label, or — without one — talking to the agent.
         self.selected = recommended.unwrap_or(self.items.len() - 1);
+    }
+
+    fn build_entry_limit(&mut self, pending: &PendingHumanInputView) {
+        if let Some(limit) = &pending.entry_limit {
+            self.context.push(ContextLine::problem(format!(
+                "Wejścia: {}/{}",
+                limit.entries, limit.max_entries
+            )));
+        }
+        self.build_problem(pending);
+        if self.plans.last() == Some(&Plan::Message) {
+            self.plans.pop();
+            self.items.pop();
+        }
+        let continue_index = self.items.len();
+        self.push(
+            ChooserItem::new(
+                "Kontynuuj",
+                "Uruchom krok jeszcze raz, zwiększając licznik.",
+            ),
+            Plan::EntryLimitContinue,
+        );
+        // The reset takes the loop guard away for a whole new round of
+        // entries; the option says so.
+        let reset = match &pending.entry_limit {
+            Some(limit) => format!(
+                "Wyzeruj licznik wejść i uruchom krok. Limit przestaje chronić przed pętlą, \
+                 aż licznik znów dojdzie do {}.",
+                limit.max_entries
+            ),
+            None => "Wyzeruj licznik wejść i uruchom krok. Limit przestaje chronić przed pętlą, \
+                     aż licznik znów dojdzie do limitu."
+                .to_string(),
+        };
+        self.push(
+            ChooserItem::new("Wyzeruj licznik", reset),
+            Plan::EntryLimitReset,
+        );
+        self.selected = continue_index;
     }
 
     fn output(

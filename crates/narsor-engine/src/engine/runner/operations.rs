@@ -192,6 +192,11 @@ pub struct OutputDecisionUndo {
     pub answers: Vec<RejectedAnswer>,
     /// Why the step had no label.
     pub reason: Option<String>,
+    /// The step's reply from the answers (R3), for the problem again.
+    pub reply: Option<String>,
+    /// The entry counts (R10) from before it; `null` leaves them as they
+    /// are.
+    pub state_entries_before: Value,
     /// The choice being undone, shown on the problem as the conductor's
     /// reading of the answers.
     pub analysis: ConductorAnalysis,
@@ -396,6 +401,9 @@ impl Engine {
             (target, label)
         };
         let target_state = self.state_of(definition, &execution, &target)?;
+        if is_agent(target_state) && target_state.max_entries.is_some() {
+            count_entry(&mut execution, &target_state.id)?;
+        }
 
         // What the agent in the state being left said, for a gate the target
         // may be (KTD8). Read before anything is written: the pending request
@@ -527,6 +535,8 @@ impl Engine {
 
         let moved = execution.current_state.as_deref() != Some(undo.state_id.as_str());
         execution.context = context;
+        // The decision's transition counted an entry into its target.
+        restore_state_entries(&mut execution, &undo.state_entries_before)?;
         execution.completed_at = None;
         execution.current_state = Some(undo.state_id.clone());
         if let Some(last) = undo.answers.last() {
@@ -555,6 +565,21 @@ impl Engine {
                 .as_deref()
                 .unwrap_or("The agent did not give a usable output label.")
         );
+        // The rescue as the decision found it: the problem takes the step's
+        // reply from it, so an answer to it hands the reply on again (R3).
+        write_engine_record(
+            &mut execution,
+            METADATA_OUTPUT_RESCUE_KEY,
+            &OutputRescue {
+                state_id: undo.state_id.clone(),
+                answers: undo.answers.clone(),
+                reason: reason.clone(),
+                harness: None,
+                harness_session_id: None,
+                conductor_reprompted: true,
+                reply: undo.reply.clone(),
+            },
+        )?;
         self.raise_output_problem(
             definition,
             &mut execution,
