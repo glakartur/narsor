@@ -7,6 +7,7 @@
 //! Queued ──controller accepts──▶ Provisioning ──runner ready──▶ Running
 //! Running ──owner pause──▶ PauseRequested ──safe point + compute removed──▶ Stopped
 //! Stopped ──owner resume──▶ Provisioning
+//! Stopped ──owner resume, backend full──▶ Queued (front, no reservation)
 //! Provisioning | Running | PauseRequested ──workload lost──▶ Interrupted | Unknown
 //! Unknown ──loss confirmed (workload dead, storage present)──▶ Interrupted
 //! Interrupted ──resume policy──▶ Provisioning                     (automatic)

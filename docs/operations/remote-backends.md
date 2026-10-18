@@ -655,8 +655,9 @@ applies without a restart.
 * A queued task shows why it waits: `waiting for capacity` (position,
   slots in use / limit), `controller offline` (no controller holds the lease),
   `backend unknown`, or `admitted` (starting).
-* Resuming a paused task needs a free slot; on a full backend the resume is
-  refused with `backend_at_capacity` — the task stays paused, try again later.
+* Resuming a paused task needs a free slot; on a full backend the task goes to
+  the front of the queue (state `queued`, no reservation) and starts on the
+  first slot released. The command response says `queued_for_slot`.
 * The default backend applies to tasks created afterwards only; existing
   tasks never move.
 

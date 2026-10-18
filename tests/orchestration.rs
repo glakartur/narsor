@@ -1997,34 +1997,32 @@ fn a_priority_changed_event_from_an_old_log_still_reads() {
     );
 }
 
+/// Drives `id` to `Running` under a limit of one slot, as the control
+/// plane admits it.
+fn run_in_single_slot(fx: &Fixture, id: &str, lease: &BackendLease) {
+    fx.create(id);
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    report_now(fx, id, lease, Observation::StartAccepted).unwrap();
+    report_now(fx, id, lease, Observation::RunnerReady).unwrap();
+}
+
+/// A task that ran and was paused (`Stopped`), then another one that holds
+/// the only slot.
+fn stopped_beside_a_running_task(fx: &Fixture, lease: &BackendLease) {
+    run_in_single_slot(fx, "paused", lease);
+    fx.command("paused", OwnerCommand::Pause, "pause-1");
+    fx.observe("paused", lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    run_in_single_slot(fx, "other", lease);
+}
+
 #[test]
-fn resuming_a_paused_task_needs_a_free_slot() {
+fn resuming_a_paused_task_with_a_free_slot_provisions_it() {
     let fx = Fixture::new();
     let lease = fx.lease("k8s", "controller-a");
-    fx.running("paused", &lease);
-    fx.command("paused", OwnerCommand::Pause, "pause-1");
-    fx.observe("paused", &lease, Observation::PausedAtSafePoint)
-        .unwrap();
-    fx.running("other", &lease);
+    stopped_beside_a_running_task(&fx, &lease);
 
     let resume = CommandRequest::new(OwnerCommand::Resume, "resume-1");
-    let refused = fx
-        .control
-        .command_with_capacity(&task("paused"), resume.clone(), &limit(1))
-        .unwrap_err();
-    assert!(matches!(
-        refused,
-        OrchestrationError::BackendAtCapacity {
-            running: 1,
-            limit: 1,
-            ..
-        }
-    ));
-    assert_eq!(
-        fx.control.task(&task("paused")).unwrap().runner_state,
-        RunnerState::Stopped
-    );
-
     let resumed = fx
         .control
         .command_with_capacity(&task("paused"), resume.clone(), &limit(2))
@@ -2036,6 +2034,10 @@ fn resuming_a_paused_task_needs_a_free_slot() {
         .command_with_capacity(&task("paused"), resume, &limit(1))
         .expect("retry");
     assert!(retried.replayed);
+    assert_eq!(
+        retried.receipt.runner_state_after,
+        RunnerState::Provisioning
+    );
 
     // Retrying an interrupted task keeps the slot it holds: no check.
     fx.observe(
@@ -2051,6 +2053,175 @@ fn resuming_a_paused_task_needs_a_free_slot() {
             &limit(2),
         )
         .expect("an interrupted task already holds its slot");
+}
+
+#[test]
+fn resuming_on_a_full_backend_queues_the_task_ahead_of_the_waiting() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    stopped_beside_a_running_task(&fx, &lease);
+    fx.create("older");
+    fx.create("newer");
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    let generation_before = fx.control.task(&task("paused")).unwrap().generation;
+
+    let outcome = fx
+        .control
+        .command_with_capacity(
+            &task("paused"),
+            CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+            &limit(1),
+        )
+        .expect("a full backend queues the resume instead of refusing it");
+    assert_eq!(outcome.task.runner_state, RunnerState::Queued);
+    assert_eq!(outcome.receipt.runner_state_after, RunnerState::Queued);
+    assert_eq!(outcome.task.generation, generation_before + 1);
+    assert!(outcome.task.reservation.is_none(), "no slot is held yet");
+    assert!(!outcome.task.holds_capacity());
+    assert_eq!(fx.control.capacity_in_use(&k8s()).unwrap(), 1);
+    assert_eq!(
+        queue_order(&fx, "k8s"),
+        ["paused", "other", "older", "newer"]
+    );
+    // The running task is untouched (R11).
+    let other = fx.control.task(&task("other")).unwrap();
+    assert_eq!(other.runner_state, RunnerState::Running);
+
+    // A retry replays the receipt and changes nothing.
+    let retried = fx
+        .control
+        .command_with_capacity(
+            &task("paused"),
+            CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+            &limit(1),
+        )
+        .expect("retry");
+    assert!(retried.replayed);
+    assert_eq!(retried.task.generation, generation_before + 1);
+
+    // The first slot released goes to the resumed task, not to the older
+    // waiting ones.
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    assert_eq!(
+        reason(&fx, "paused"),
+        Some(QueueReason::WaitingForCapacity {
+            position: 1,
+            running: 1,
+            limit: 1
+        })
+    );
+    fx.command("other", OwnerCommand::Pause, "pause-other");
+    fx.observe("other", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    assert_eq!(reason(&fx, "paused"), Some(QueueReason::Admitted));
+    assert_eq!(
+        reason(&fx, "older"),
+        Some(QueueReason::WaitingForCapacity {
+            position: 1,
+            running: 1,
+            limit: 1
+        })
+    );
+    assert!(fx
+        .control
+        .task(&task("paused"))
+        .unwrap()
+        .reservation
+        .is_some());
+}
+
+#[test]
+fn a_resume_through_the_queue_keeps_its_launch_authorization() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    stopped_beside_a_running_task(&fx, &lease);
+    fx.control
+        .command_with_capacity(
+            &task("paused"),
+            CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+            &limit(1),
+        )
+        .unwrap();
+    fx.command("other", OwnerCommand::Pause, "pause-other");
+    fx.observe("other", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+
+    let queued = fx.control.task(&task("paused")).unwrap();
+    let accepted = report_now(&fx, "paused", &lease, Observation::StartAccepted).unwrap();
+    assert_eq!(accepted.runner_state, RunnerState::Provisioning);
+    // Admission does not move the desired generation, so the launch the
+    // controller orders (`backend.resume`, storage exists) is still the one
+    // the owner's resume authorized.
+    assert_eq!(accepted.generation, queued.generation);
+    let receipt = accepted
+        .launch_receipt(accepted.generation)
+        .expect("the launch finds the resume that authorized it");
+    assert_eq!(receipt.command, OwnerCommand::Resume);
+    assert_eq!(receipt.generation_after, accepted.generation);
+    assert_eq!(receipt.actor, CommandActor::Owner);
+}
+
+#[test]
+fn two_resumes_through_the_queue_put_the_later_one_first() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    stopped_beside_a_running_task(&fx, &lease);
+    // A second stopped task: run it after the first slot holder paused.
+    fx.command("other", OwnerCommand::Pause, "pause-other");
+    fx.observe("other", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    run_in_single_slot(&fx, "holder", &lease);
+    fx.create("waiting");
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+
+    for (id, key) in [("paused", "resume-a"), ("other", "resume-b")] {
+        let outcome = fx
+            .control
+            .command_with_capacity(
+                &task(id),
+                CommandRequest::new(OwnerCommand::Resume, key),
+                &limit(1),
+            )
+            .unwrap();
+        assert_eq!(outcome.task.runner_state, RunnerState::Queued);
+    }
+    assert_eq!(
+        queue_order(&fx, "k8s"),
+        ["other", "paused", "holder", "waiting"]
+    );
+
+    // The owner can still move the queue as usual.
+    move_to(&fx, "waiting", MoveTarget::Top).expect("move");
+    assert_eq!(
+        queue_order(&fx, "k8s"),
+        ["waiting", "other", "paused", "holder"]
+    );
+}
+
+#[test]
+fn resuming_a_task_in_the_wrong_state_still_fails_on_a_full_backend() {
+    let fx = Fixture::new();
+    let lease = fx.lease("k8s", "controller-a");
+    run_in_single_slot(&fx, "running", &lease);
+    let archived = fx.command("running", OwnerCommand::Archive, "archive-1");
+    assert_eq!(archived.runner_state, RunnerState::Archiving);
+    fx.observe("running", &lease, Observation::ResourcesDeleted)
+        .unwrap();
+    run_in_single_slot(&fx, "other", &lease);
+
+    for id in ["running", "other"] {
+        let error = fx
+            .control
+            .command_with_capacity(
+                &task(id),
+                CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+                &limit(1),
+            )
+            .unwrap_err();
+        assert!(matches!(error, OrchestrationError::IllegalCommand { .. }));
+    }
 }
 
 #[test]

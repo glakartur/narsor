@@ -659,10 +659,13 @@ impl ProtocolService {
             self.reschedule(&record.assignment.backend_id);
             task = self.control.task(&record.task_id)?;
         }
+        let queued_for_slot = outcome.receipt.command == crate::orchestration::OwnerCommand::Resume
+            && outcome.receipt.runner_state_after == RunnerState::Queued;
         Ok(OwnerCommandResponse {
             task: self.summarize(&task)?,
             receipt: outcome.receipt,
             replayed: outcome.replayed,
+            queued_for_slot,
         })
     }
 

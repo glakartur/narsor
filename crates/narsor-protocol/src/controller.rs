@@ -1047,6 +1047,12 @@ pub struct OwnerCommandResponse {
     pub receipt: CommandReceipt,
     pub replayed: bool,
     pub task: TaskSummary,
+    /// The command was a resume that found the backend full: the task waits
+    /// in the queue (at its front) for a slot instead of starting now.
+    /// Derived from the receipt, so a replay says the same. Absent from an
+    /// older control plane, which refused such a resume instead.
+    #[serde(default)]
+    pub queued_for_slot: bool,
 }
 
 /// One attempt's conversation, summarized without transcript content.

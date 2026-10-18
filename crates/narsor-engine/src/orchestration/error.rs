@@ -299,19 +299,6 @@ pub enum OrchestrationError {
     #[error("task '{0}' has not been admitted by the scheduler yet")]
     NotAdmitted(TaskId),
 
-    /// Resuming would take a capacity slot the backend does not have free
-    /// (U10). Queued tasks never preempt running ones, and neither does a
-    /// resume: the owner retries once a slot is released.
-    #[error("backend '{backend_id}' has no free capacity ({running} of {limit} slots in use)")]
-    BackendAtCapacity {
-        /// The backend.
-        backend_id: BackendId,
-        /// Slots in use.
-        running: u32,
-        /// Its limit.
-        limit: u32,
-    },
-
     /// The backend cannot take tasks right now (not registered, misconfigured).
     #[error("backend '{backend_id}' is unavailable: {detail}")]
     BackendUnavailable {

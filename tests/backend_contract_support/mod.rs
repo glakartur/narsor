@@ -1155,22 +1155,29 @@ pub async fn the_controller_never_starts_more_than_the_limit<T: ContractTarget>(
     h.wait_runner_state("task-1", RunnerState::Stopped).await;
     h.wait_runner_state("task-2", RunnerState::Running).await;
 
-    // Resuming now would exceed the limit: refused, nothing stops.
-    match h.command("task-1", OwnerCommand::Resume, "resume-1") {
-        Err(ProtocolError::Conflict { code, .. }) => assert_eq!(code, "backend_at_capacity"),
-        other => panic!("a resume beyond the limit must be refused: {other:?}"),
-    }
+    // Resuming now would exceed the limit: the task waits for a slot
+    // instead, and nothing stops.
+    let response = h
+        .command("task-1", OwnerCommand::Resume, "resume-1")
+        .expect("a resume beyond the limit is queued");
+    assert!(response.queued_for_slot);
     h.settle().await;
-    assert_eq!(h.runner_state("task-1"), RunnerState::Stopped);
+    assert_eq!(h.runner_state("task-1"), RunnerState::Queued);
     assert_eq!(h.runner_state("task-2"), RunnerState::Running);
     assert!(alive(&h.observe("task-2").await));
 
+    // The slot task-2 frees goes to the waiting resume, which continues on
+    // its own storage (`backend.resume`), not to a fresh provision.
     h.must("task-2", OwnerCommand::Archive, "archive-2");
     h.wait_runner_state("task-2", RunnerState::Archived).await;
-    h.must("task-1", OwnerCommand::Resume, "resume-2");
     h.wait_runner_state("task-1", RunnerState::Running).await;
     let counters = h.counters();
     assert_eq!(counters.workloads_created, 3, "{counters:?}");
+    assert_eq!(counters.resume_calls, 1, "{counters:?}");
+    assert_eq!(
+        counters.storages_created, 2,
+        "no second clone: {counters:?}"
+    );
 }
 
 /// U3: an operator command queued for a running task reaches its runner

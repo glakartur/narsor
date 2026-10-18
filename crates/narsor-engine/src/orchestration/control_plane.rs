@@ -248,6 +248,20 @@ impl ControlPlane {
     /// announced as [`TaskEventKind::AutoResumed`] instead of
     /// `OwnerCommandAccepted`, in the same mutation.
     pub fn command(&self, task_id: &TaskId, request: CommandRequest) -> Result<CommandOutcome> {
+        self.command_routed(task_id, request, false)
+    }
+
+    /// [`Self::command`] with the scheduler's decision on where a resume of
+    /// a `Stopped` task goes: `queue_resume` sends it to the front of the
+    /// queue (`Queued`, no reservation) instead of straight to
+    /// `Provisioning`, because the backend has no free slot (R20). Decided
+    /// by the caller under the backend's schedule lock.
+    pub(crate) fn command_routed(
+        &self,
+        task_id: &TaskId,
+        request: CommandRequest,
+        queue_resume: bool,
+    ) -> Result<CommandOutcome> {
         let (task, (receipt, replayed)) = self.mutate(task_id, |record, now| {
             if let Some(receipt) = record.receipt(&request.idempotency_key) {
                 if receipt.command != request.command
@@ -317,6 +331,21 @@ impl ControlPlane {
                 CommandEffect::ArchiveConverged => {}
                 CommandEffect::Transition(next) => {
                     let previous = record.runner_state;
+                    // No free slot: the resume waits in the queue, ahead of
+                    // everyone, holding nothing (R20). The ranks of the
+                    // others are shifted by the caller under the schedule
+                    // lock; rank 0 is before every dense rank.
+                    let next = if queue_resume
+                        && previous == RunnerState::Stopped
+                        && next == RunnerState::Provisioning
+                    {
+                        record.rank = 0;
+                        record.reservation = None;
+                        record.queue = None;
+                        RunnerState::Queued
+                    } else {
+                        next
+                    };
                     record.generation += 1;
                     record.runner_state = next;
                     // A new desired state ends whatever the last snapshot
@@ -325,7 +354,7 @@ impl ControlPlane {
                     if matches!(previous, RunnerState::Interrupted | RunnerState::Unknown) {
                         leave_loss(record, request.actor);
                     }
-                    if next == RunnerState::Provisioning {
+                    if matches!(next, RunnerState::Provisioning | RunnerState::Queued) {
                         self.order_launch(record)?;
                     }
                     if request.command == OwnerCommand::Archive {

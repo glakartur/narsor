@@ -148,15 +148,19 @@ impl ControlPlane {
             .is_some_and(|lease| now < lease.expires_at))
     }
 
-    /// [`ControlPlane::command`], refusing a command that would take a
-    /// capacity slot the backend does not have free.
+    /// [`ControlPlane::command`], deciding what a command that would take a
+    /// capacity slot does when the backend has none free.
     ///
-    /// Only resuming a `Stopped` task needs one — every other command keeps
-    /// or frees the task's slot — and it is decided under the backend's
-    /// schedule lock, like an admission. A full backend refuses it with
-    /// [`OrchestrationError::BackendAtCapacity`] rather than stopping
-    /// anything (R11). A retry of an accepted command is answered from its
-    /// receipt as always, whatever the capacity now.
+    /// Only resuming a `Stopped` task needs a slot — every other command
+    /// keeps or frees the task's slot — and it is decided under the
+    /// backend's schedule lock, like an admission. With a free slot the
+    /// resume goes straight to `Provisioning`. On a full backend it does not
+    /// fail and stops nothing (R11): the task goes to `Queued` holding
+    /// nothing, at the front of the queue (like [`MoveTarget::Top`]), and
+    /// the next [`ControlPlane::schedule`] pass gives it the first slot
+    /// released (R20). A second such resume goes in front of the first.
+    /// A retry of an accepted command is answered from its receipt as
+    /// always, whatever the capacity now.
     pub fn command_with_capacity(
         &self,
         task_id: &TaskId,
@@ -178,6 +182,7 @@ impl ControlPlane {
                     CommandEffect::Transition(RunnerState::Provisioning)
                 )
             );
+        let mut queue_resume = false;
         if takes_slot {
             match capacity {
                 BackendCapacity::Unavailable(detail) => {
@@ -187,18 +192,37 @@ impl ControlPlane {
                     })
                 }
                 BackendCapacity::Limit(limit) => {
-                    let running = self.capacity_in_use(&backend_id)?;
-                    if running >= *limit {
-                        return Err(OrchestrationError::BackendAtCapacity {
-                            backend_id,
-                            running,
-                            limit: *limit,
-                        });
-                    }
+                    queue_resume = self.capacity_in_use(&backend_id)? >= *limit;
                 }
             }
         }
-        self.command(task_id, request)
+        let outcome = self.command_routed(task_id, request, queue_resume)?;
+        if queue_resume && !outcome.replayed {
+            self.put_first_in_queue(&backend_id, task_id)?;
+            return Ok(CommandOutcome {
+                task: self.task(task_id)?,
+                ..outcome
+            });
+        }
+        Ok(outcome)
+    }
+
+    /// Gives `task_id` (just sent to the queue at rank 0) rank 1 and
+    /// renumbers the others behind it in their queue order. Under the
+    /// backend's schedule lock. The task's own rank is written last, so a
+    /// crash in between leaves at worst equal ranks, which the next pass
+    /// renumbers.
+    fn put_first_in_queue(&self, backend_id: &BackendId, task_id: &TaskId) -> Result<()> {
+        let mut others = self.backend_tasks(backend_id)?;
+        others.retain(|task| task.task_id != *task_id);
+        others.sort_by_key(|task| (task.rank, task.queue_sequence));
+        for (index, task) in others.iter().enumerate() {
+            let rank = u32::try_from(index + 2).unwrap_or(u32::MAX);
+            if task.rank != rank {
+                self.set_rank(&task.task_id, rank)?;
+            }
+        }
+        self.set_rank(task_id, 1)
     }
 
     /// Moves a queued task within its backend's queue.
