@@ -26,7 +26,7 @@ use narsor_engine::controller_protocol::{
     ExecutionEventsResponse, ExecutionEventsSource, Freshness, LaunchRequest, OwnerCommandRequest,
     ProtocolConfig, ProtocolService, RelayFailure, ReportRequest, RunnerClient,
     RunnerCredentialRequest, RunnerDirective, SubmitInputRequest, SubmitOperatorCommandRequest,
-    TaskDefaultHarness, TaskSummary, LOCAL_OWNER,
+    TaskDefaultHarness, TaskState, TaskSummary, LOCAL_OWNER,
 };
 use narsor_engine::domain::{
     BackendId, DisplayLink, Event, EventData, ExecutionStatus, TaskDisplay, TaskId,
@@ -878,6 +878,98 @@ async fn a_resume_supersedes_the_paused_runners_credential() {
         runner.renew().await,
         Err(ClientError::Unauthorized)
     ));
+}
+
+#[tokio::test]
+async fn the_summary_tells_the_owner_the_task_state_and_whether_it_holds_a_slot() {
+    let harness = Harness::start().await;
+    let queued = harness.create("task-1", "k8s").await;
+    assert_eq!(queued.state, TaskState::Queued);
+
+    let Running {
+        controller,
+        epoch,
+        runner,
+    } = harness.running("task-1", "k8s").await;
+    let running = harness.task("task-1").await;
+    assert_eq!(running.state, TaskState::Running);
+    assert!(running.holds_slot);
+
+    runner
+        .snapshot(&snapshot(
+            2,
+            ExecutionStatus::InputNeeded,
+            4,
+            Some("input-1"),
+        ))
+        .await
+        .expect("input needed");
+    let waiting = harness.task("task-1").await;
+    assert_eq!(waiting.state, TaskState::HumanNeeded);
+    assert!(waiting.holds_slot);
+
+    // A finished run still holds its slot until the runner stops.
+    runner
+        .snapshot(&snapshot(3, ExecutionStatus::Completed, 5, None))
+        .await
+        .expect("completed");
+    let finished = harness.task("task-1").await;
+    assert_eq!(finished.state, TaskState::Finished);
+    assert!(finished.holds_slot);
+
+    // Stopped at a safe point, the task is still finished and holds nothing.
+    harness
+        .command("task-1", OwnerCommand::Pause, "pause-1")
+        .await;
+    let mut at_safe_point = snapshot(4, ExecutionStatus::Completed, 6, None);
+    at_safe_point.safe_point = true;
+    runner.snapshot(&at_safe_point).await.expect("safe point");
+    controller
+        .report(&report(
+            "task-1",
+            epoch,
+            2,
+            Observation::PausedAtSafePoint,
+            Some(2),
+        ))
+        .await
+        .expect("paused");
+    let stopped = harness.task("task-1").await;
+    assert_eq!(stopped.runner_state, RunnerState::Stopped);
+    assert_eq!(stopped.state, TaskState::Finished);
+    assert!(!stopped.holds_slot);
+}
+
+#[test]
+fn a_summary_from_before_state_and_slot_were_sent_still_loads() {
+    let at = Utc.with_ymd_and_hms(2026, 10, 9, 12, 0, 0).unwrap();
+    let summary: TaskSummary = serde_json::from_value(serde_json::json!({
+        "task_id": "task-1",
+        "backend_id": "k8s",
+        "runner_state": "running",
+        "generation": 1,
+        "revision": 1,
+        "rank": 1,
+        "created_at": at,
+        "queue_sequence": 1,
+        "workflow_id": "implement-feature",
+        "workflow_version": 3,
+        "launch_digest": "digest",
+        "environment_identity": "env",
+        "archive": null,
+        "observation": null,
+        "runner": null,
+        "controller": null,
+        "inputs": [],
+        "as_of": at,
+    }))
+    .expect("an old summary");
+    assert_eq!(summary.state, TaskState::Unrecognized);
+    assert!(!summary.holds_slot);
+
+    let unknown: TaskState =
+        serde_json::from_value(serde_json::json!("from_the_future")).expect("an unknown state");
+    assert_eq!(unknown, TaskState::Unrecognized);
 }
 
 #[tokio::test]

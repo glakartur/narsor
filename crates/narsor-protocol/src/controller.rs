@@ -482,6 +482,27 @@ pub enum RunnerState {
     Archived,
 }
 
+/// The stage of a task's work as the owner sees it, worked out by the control
+/// plane from the runner state, the runner's last execution status and the
+/// resume policy. Clients show it and never work it out themselves.
+///
+/// A client that meets a state it does not know reads `Unrecognized`, which
+/// is also what a summary from before the field existed reads.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    Queued,
+    Running,
+    HumanNeeded,
+    Paused,
+    Finished,
+    Error,
+    Archived,
+    #[default]
+    #[serde(other)]
+    Unrecognized,
+}
+
 impl RunnerState {
     /// True for `Archiving` and `Archived`.
     pub fn is_archival(self) -> bool {
@@ -815,6 +836,12 @@ pub struct TaskSummary {
     pub backend_id: crate::identifier::BackendId,
     #[serde(alias = "lifecycle")]
     pub runner_state: RunnerState,
+    /// What the owner sees; see [`TaskState`].
+    #[serde(default)]
+    pub state: TaskState,
+    /// Whether the task occupies one of its backend's capacity slots.
+    #[serde(default)]
+    pub holds_slot: bool,
     pub generation: u64,
     pub revision: u64,
     pub rank: u32,

@@ -14,7 +14,7 @@ pub use narsor_protocol::controller::{
     ConversationAttemptSummary, ConversationAvailability, ExecutionCursor, HarnessUnavailable,
     InputStatus, InputUpdate, MaterialChange, Observation, ObservedSummary, OperatorCommand,
     OperatorCommandStatus, OwnerCommand, OwnerRef, QueueReason, ResourceIdentity, ResumeExhaustion,
-    ResumeState, RunnerProblem, RunnerState, TaskEvent, TaskEventKind, WorkloadLoss,
+    ResumeState, RunnerProblem, RunnerState, TaskEvent, TaskEventKind, TaskState, WorkloadLoss,
 };
 
 /// Current schema version of [`TaskRecord`].
@@ -23,6 +23,49 @@ pub use narsor_protocol::controller::{
 /// [`TaskRecord::rank`]; the store migrates a version 1 record when it first
 /// reads it (see [`super::store`]).
 pub const TASK_RECORD_VERSION: u32 = 2;
+
+/// Works out the [`TaskState`] of a task from its runner state, the execution
+/// status of the runner's last snapshot (`None`: no snapshot yet) and the
+/// resume policy (D58). The first matching rule wins:
+///
+/// 1. `Archived` is `Archived`; 2. `Archiving` is `Finished`;
+/// 3. `Queued` is `Queued`, whatever the last snapshot says;
+/// 4. `Unknown`, or `Interrupted` with the resume limit used up, is `Error`;
+/// 5. execution `Completed` or `Cancelled` is `Finished`;
+/// 6. execution `Failed` is `Error`;
+/// 7. execution `InputNeeded` is `HumanNeeded`;
+/// 8. `Stopped` or `PauseRequested` is `Paused`;
+/// 9. `Provisioning` without a snapshot is `Queued`;
+/// 10. the rest is `Running`: `Running`, `Provisioning` with a snapshot, and
+///     `Interrupted` while the resume policy still waits to try again.
+///
+/// Rules 5 to 7 come before 8, so a task stopped to free its slot keeps the
+/// state its work reached. Rule 8 does not yet tell a pause the owner asked
+/// for from one the slot-release policy asked for (U4 may refine that).
+pub fn derive_task_state(
+    runner_state: RunnerState,
+    execution: Option<ExecutionStatus>,
+    resume: &ResumeState,
+) -> TaskState {
+    match runner_state {
+        RunnerState::Archived => return TaskState::Archived,
+        RunnerState::Archiving => return TaskState::Finished,
+        RunnerState::Queued => return TaskState::Queued,
+        RunnerState::Unknown => return TaskState::Error,
+        RunnerState::Interrupted if resume.exhausted.is_some() => return TaskState::Error,
+        _ => {}
+    }
+    match execution {
+        Some(ExecutionStatus::Completed | ExecutionStatus::Cancelled) => TaskState::Finished,
+        Some(ExecutionStatus::Failed) => TaskState::Error,
+        Some(ExecutionStatus::InputNeeded) => TaskState::HumanNeeded,
+        _ => match runner_state {
+            RunnerState::Stopped | RunnerState::PauseRequested => TaskState::Paused,
+            RunnerState::Provisioning if execution.is_none() => TaskState::Queued,
+            _ => TaskState::Running,
+        },
+    }
+}
 
 /// Current schema version of [`BackendLease`].
 pub const BACKEND_LEASE_VERSION: u32 = 1;
@@ -284,6 +327,17 @@ impl TaskRecord {
             | RunnerState::Archiving => true,
             RunnerState::Stopped | RunnerState::Archived => false,
         }
+    }
+
+    /// What the owner sees of the task; see [`derive_task_state`].
+    pub fn task_state(&self) -> TaskState {
+        derive_task_state(
+            self.runner_state,
+            self.runner
+                .as_ref()
+                .map(|runner| runner.snapshot.execution_status),
+            &self.resume,
+        )
     }
 
     /// Finds the receipt of an idempotency key.
@@ -764,4 +818,123 @@ pub enum MoveTarget {
     Top,
     /// Last of the backend's tasks.
     Bottom,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use RunnerState as R;
+    use TaskState as T;
+
+    fn exhausted() -> ResumeState {
+        ResumeState {
+            exhausted: Some(ResumeExhaustion {
+                reason: "the limit was used up".to_string(),
+                at: Utc::now(),
+                announced: false,
+            }),
+            ..ResumeState::default()
+        }
+    }
+
+    fn derive(runner: RunnerState, execution: Option<ExecutionStatus>) -> TaskState {
+        derive_task_state(runner, execution, &ResumeState::default())
+    }
+
+    #[test]
+    fn a_finished_run_is_finished_with_or_without_a_runner() {
+        assert_eq!(
+            derive(R::Running, Some(ExecutionStatus::Completed)),
+            T::Finished
+        );
+        assert_eq!(
+            derive(R::Stopped, Some(ExecutionStatus::Completed)),
+            T::Finished
+        );
+        assert_eq!(
+            derive(R::Running, Some(ExecutionStatus::Cancelled)),
+            T::Finished
+        );
+        assert_eq!(
+            derive(R::PauseRequested, Some(ExecutionStatus::Completed)),
+            T::Finished
+        );
+    }
+
+    #[test]
+    fn a_run_waiting_for_a_human_needs_one_with_or_without_a_runner() {
+        assert_eq!(
+            derive(R::Running, Some(ExecutionStatus::InputNeeded)),
+            T::HumanNeeded
+        );
+        assert_eq!(
+            derive(R::Stopped, Some(ExecutionStatus::InputNeeded)),
+            T::HumanNeeded
+        );
+    }
+
+    #[test]
+    fn a_stopped_task_with_work_left_is_paused() {
+        assert_eq!(
+            derive(R::Stopped, Some(ExecutionStatus::Running)),
+            T::Paused
+        );
+        assert_eq!(derive(R::Stopped, None), T::Paused);
+        assert_eq!(
+            derive(R::PauseRequested, Some(ExecutionStatus::Running)),
+            T::Paused
+        );
+    }
+
+    #[test]
+    fn a_queued_task_is_queued_whatever_its_last_snapshot_says() {
+        assert_eq!(
+            derive(R::Queued, Some(ExecutionStatus::InputNeeded)),
+            T::Queued
+        );
+        assert_eq!(
+            derive(R::Queued, Some(ExecutionStatus::Completed)),
+            T::Queued
+        );
+        assert_eq!(derive(R::Queued, None), T::Queued);
+    }
+
+    #[test]
+    fn provisioning_is_queued_until_the_runner_has_reported() {
+        assert_eq!(derive(R::Provisioning, None), T::Queued);
+        assert_eq!(
+            derive(R::Provisioning, Some(ExecutionStatus::Running)),
+            T::Running
+        );
+    }
+
+    #[test]
+    fn a_lost_or_failed_task_is_an_error_unless_the_policy_still_retries() {
+        assert_eq!(derive(R::Unknown, Some(ExecutionStatus::Running)), T::Error);
+        assert_eq!(derive(R::Running, Some(ExecutionStatus::Failed)), T::Error);
+        assert_eq!(
+            derive_task_state(R::Interrupted, Some(ExecutionStatus::Running), &exhausted()),
+            T::Error
+        );
+        assert_eq!(
+            derive_task_state(
+                R::Interrupted,
+                Some(ExecutionStatus::Running),
+                &ResumeState::default()
+            ),
+            T::Running
+        );
+    }
+
+    #[test]
+    fn archival_wins_over_everything() {
+        assert_eq!(
+            derive(R::Archiving, Some(ExecutionStatus::Running)),
+            T::Finished
+        );
+        assert_eq!(
+            derive(R::Archived, Some(ExecutionStatus::Failed)),
+            T::Archived
+        );
+    }
 }

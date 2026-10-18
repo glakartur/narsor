@@ -1791,6 +1791,8 @@ impl ProtocolService {
             task_id: record.task_id.clone(),
             backend_id: record.assignment.backend_id.clone(),
             runner_state: record.runner_state,
+            state: record.task_state(),
+            holds_slot: record.holds_capacity(),
             generation: record.generation,
             revision: record.revision,
             rank: record.rank,

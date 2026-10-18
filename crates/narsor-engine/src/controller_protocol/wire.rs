@@ -45,7 +45,7 @@ pub use narsor_protocol::controller::{
     RunnerSnapshotRequest, RunnerSnapshotResponse, RunnerState, RunnerView,
     SetDefaultBackendRequest, SubmitInputRequest, SubmitInputResponse,
     SubmitOperatorCommandRequest, SubmitOperatorCommandResponse, TaskEvent, TaskEventKind,
-    TaskListResponse, TaskSummary, TimelineResponse, TransitionExit, TransitionOffer,
+    TaskListResponse, TaskState, TaskSummary, TimelineResponse, TransitionExit, TransitionOffer,
     ValidateWorkflowRequest, ValidateWorkflowResponse, WorkflowInputType, WorkflowInputView,
     WorkflowListResponse, WorkflowSource, WorkflowSourceRequest, WorkflowSourceResponse,
     WorkflowView, WorkspaceRequest, CONVERSATION_RECORD_UNREADABLE,
