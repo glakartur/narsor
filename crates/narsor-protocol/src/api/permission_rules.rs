@@ -27,88 +27,67 @@ fn is_pattern_or_control(c: char) -> bool {
     c.is_control() || matches!(c, '*' | '?' | '(' | ')' | '[' | ']' | ',')
 }
 
-/// Programs that run other programs: a group rule for one of them would
-/// allow anything, so only the exact command is granted.
-const RUNNERS: [&str; 59] = [
-    "sh",
-    "bash",
-    "zsh",
-    "fish",
-    "dash",
-    "ksh",
-    "csh",
-    "env",
-    "sudo",
-    "doas",
-    "xargs",
-    "find",
-    "python",
-    "python3",
-    "node",
-    "ruby",
-    "perl",
-    "pwsh",
-    "powershell",
-    "command",
-    "exec",
-    "eval",
-    "source",
-    ".",
-    "nice",
-    "nohup",
-    "timeout",
-    "time",
-    "stdbuf",
-    "watch",
-    "npx",
-    "uv",
-    "bunx",
-    "awk",
-    "gawk",
-    "sed",
-    "ssh",
-    "docker",
-    "kubectl",
-    "make",
-    "just",
-    "uvx",
-    "bun",
-    "deno",
-    "nodejs",
-    "busybox",
-    "setsid",
-    "chroot",
-    "flock",
-    "ionice",
-    "taskset",
-    "su",
-    "runuser",
-    "pkexec",
-    "strace",
-    "ltrace",
-    "gdb",
-    "script",
-    "unbuffer",
+/// The only groups a grant may name: a program and one of its subcommands
+/// that does not run a command it is handed. Everything else is granted
+/// exactly or not at all — a list of what may be widened, because the list
+/// of programs that run other programs never ends.
+const GROUP_SUBCOMMANDS: [(&str, &[&str]); 7] = [
+    (
+        "cargo",
+        &[
+            "build", "check", "test", "clippy", "fmt", "doc", "tree", "metadata", "bench",
+            "nextest",
+        ],
+    ),
+    (
+        "git",
+        &[
+            "status",
+            "diff",
+            "log",
+            "show",
+            "add",
+            "commit",
+            "checkout",
+            "switch",
+            "branch",
+            "fetch",
+            "pull",
+            "push",
+            "stash",
+            "restore",
+            "rev-parse",
+            "ls-files",
+            "merge",
+            "tag",
+            "remote",
+            "blame",
+            "grep",
+            "mv",
+            "rm",
+        ],
+    ),
+    ("npm", &["test", "ci", "install", "run"]),
+    ("pnpm", &["test", "install", "run"]),
+    ("yarn", &["test", "install", "run"]),
+    ("dotnet", &["build", "test", "restore", "format"]),
+    ("go", &["build", "test", "vet", "fmt", "mod"]),
 ];
 
-/// Prefixes of versioned interpreters (`python3.12`, `ruby3.3`, `node22`).
-const RUNNER_PREFIXES: [&str; 5] = ["python", "ruby", "node", "perl", "php"];
-
-/// Subcommands that run whatever command follows them.
-const RUNNING_SUBCOMMANDS: [(&str, &str); 12] = [
-    ("npm", "exec"),
-    ("npm", "x"),
-    ("pnpm", "dlx"),
-    ("pnpm", "exec"),
-    ("yarn", "dlx"),
-    ("yarn", "exec"),
-    ("git", "submodule"),
-    ("cargo", "run"),
-    ("cargo", "watch"),
-    ("go", "run"),
-    ("dotnet", "run"),
-    ("dotnet", "exec"),
+/// Tools that read or arrange files and run nothing: a group of one names
+/// the tool and its first argument.
+const GROUP_TOOLS: [&str; 15] = [
+    "ls", "cat", "head", "wc", "grep", "rg", "sort", "uniq", "echo", "pwd", "mkdir", "touch",
+    "diff", "cp", "mv",
 ];
+
+/// Whether `program argument …` may be granted as a group.
+fn groupable(program: &str, argument: &str) -> bool {
+    GROUP_TOOLS.contains(&program)
+        || GROUP_SUBCOMMANDS
+            .iter()
+            .any(|(name, subcommands)| *name == program && subcommands.contains(&argument))
+}
 
 /// The parts of `command`, each as its words in their source spelling, or
 /// `None` when the command is not plain (see the module documentation).
@@ -254,34 +233,22 @@ pub fn bash_grant_rules(command: &str, scope: BashGrantScope) -> Option<Vec<Stri
         let rule = match scope {
             BashGrantScope::Exact => format!("Bash({})", words.join(" ")),
             BashGrantScope::Group => {
-                // A group is a program and a plain subcommand word: a quoted
-                // program could hide a runner, an option (`git -c …`) could
-                // configure one in, and `:` could read as the legacy
-                // `prefix:*` rule syntax.
+                // A group is a known program and a plain subcommand word
+                // ([`GROUP_SUBCOMMANDS`], [`GROUP_TOOLS`]); anything else is
+                // granted exactly or not at all.
                 let program = &words[0];
-                let name = program.rsplit('/').next().unwrap_or(program);
-                let plain = |word: &str| {
-                    word.chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
-                };
-                if !plain(program)
-                    || RUNNERS.contains(&name)
-                    || RUNNER_PREFIXES
-                        .iter()
-                        .any(|prefix| name.starts_with(prefix))
-                {
-                    return None;
-                }
                 match words.get(1) {
-                    Some(argument)
-                        if plain(argument)
-                            && !argument.starts_with('-')
-                            && !RUNNING_SUBCOMMANDS.contains(&(name, argument.as_str())) =>
-                    {
+                    None => format!("Bash({program})"),
+                    Some(argument) if groupable(program, argument) => {
+                        let plain = argument.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')
+                        });
+                        if !plain || argument.starts_with('-') {
+                            return None;
+                        }
                         format!("Bash({program} {argument} *)")
                     }
                     Some(_) => return None,
-                    None => format!("Bash({program})"),
                 }
             }
         };
@@ -400,6 +367,19 @@ mod tests {
         ] {
             assert_eq!(exact(command), None, "{command}");
         }
+    }
+
+    #[test]
+    fn only_known_programs_have_a_group() {
+        assert_eq!(
+            group("cargo build --release"),
+            rules(&["Bash(cargo build *)"])
+        );
+        assert_eq!(group("git status"), rules(&["Bash(git status *)"]));
+        assert_eq!(group("cat Cargo.toml"), rules(&["Bash(cat Cargo.toml *)"]));
+        assert_eq!(group("frobnicate now"), None, "an unknown program");
+        assert_eq!(group("git rebase -x ls"), None, "a subcommand not listed");
+        assert_eq!(exact("frobnicate now"), rules(&["Bash(frobnicate now)"]));
     }
 
     #[test]
