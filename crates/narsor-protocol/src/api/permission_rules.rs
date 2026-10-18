@@ -27,10 +27,15 @@ fn is_pattern_or_control(c: char) -> bool {
     c.is_control() || matches!(c, '*' | '?' | '(' | ')' | '[' | ']' | ',')
 }
 
-/// The only groups a grant may name: a program and one of its subcommands
-/// that does not run a command it is handed. Everything else is granted
-/// exactly or not at all — a list of what may be widened, because the list
-/// of programs that run other programs never ends.
+/// The only groups a grant may name: a program and one of its subcommands.
+/// A group allows any further arguments, so a subcommand is listed only
+/// when none of its options runs a command it is handed (`git fetch
+/// --upload-pack`, `git diff --ext-diff`, `rg --pre`, `sort
+/// --compress-program` do) and it names no arbitrary script (`npm run`).
+/// Build and test tools still run the project's own code — which the
+/// owner sees in the group's name. Everything else is granted exactly or
+/// not at all: a list of what may be widened, because the list of programs
+/// that run other programs never ends.
 const GROUP_SUBCOMMANDS: [(&str, &[&str]); 7] = [
     (
         "cargo",
@@ -43,42 +48,31 @@ const GROUP_SUBCOMMANDS: [(&str, &[&str]); 7] = [
         "git",
         &[
             "status",
-            "diff",
-            "log",
-            "show",
             "add",
             "commit",
             "checkout",
             "switch",
             "branch",
-            "fetch",
-            "pull",
-            "push",
             "stash",
             "restore",
             "rev-parse",
             "ls-files",
-            "merge",
             "tag",
-            "remote",
-            "blame",
-            "grep",
             "mv",
             "rm",
         ],
     ),
-    ("npm", &["test", "ci", "install", "run"]),
-    ("pnpm", &["test", "install", "run"]),
-    ("yarn", &["test", "install", "run"]),
+    ("npm", &["test", "ci", "install"]),
+    ("pnpm", &["test", "install"]),
+    ("yarn", &["test", "install"]),
     ("dotnet", &["build", "test", "restore", "format"]),
     ("go", &["build", "test", "vet", "fmt", "mod"]),
 ];
 
-/// Tools that read or arrange files and run nothing: a group of one names
-/// the tool and its first argument.
-const GROUP_TOOLS: [&str; 15] = [
-    "ls", "cat", "head", "wc", "grep", "rg", "sort", "uniq", "echo", "pwd", "mkdir", "touch",
-    "diff", "cp", "mv",
+/// Tools that read files or make empty ones and have no option that runs a
+/// program: a group of one names the tool and its first argument.
+const GROUP_TOOLS: [&str; 11] = [
+    "ls", "cat", "head", "wc", "grep", "uniq", "echo", "pwd", "mkdir", "touch", "diff",
 ];
 
 /// Whether `program argument …` may be granted as a group.
@@ -379,6 +373,21 @@ mod tests {
         assert_eq!(group("cat Cargo.toml"), rules(&["Bash(cat Cargo.toml *)"]));
         assert_eq!(group("frobnicate now"), None, "an unknown program");
         assert_eq!(group("git rebase -x ls"), None, "a subcommand not listed");
+        for command in [
+            "git fetch origin",
+            "git diff HEAD",
+            "git grep x",
+            "rg x",
+            "sort x",
+            "cp a b",
+            "npm run build",
+        ] {
+            assert_eq!(
+                group(command),
+                None,
+                "an option of it runs a program: {command}"
+            );
+        }
         assert_eq!(exact("frobnicate now"), rules(&["Bash(frobnicate now)"]));
     }
 
