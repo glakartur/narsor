@@ -51,11 +51,12 @@ states:
 
         {{ inputs.feature_description }}
 
-        ---
-        Set `variables.requirements_doc` to the repo-relative path of the requirements document you wrote or revised.
     outputs:
       - label: requirements_drafted
         description: the requirements document is written.
+        requires_variables:
+          - name: requirements_doc
+            description: repo-relative path of the requirements document you wrote or revised.
       - label: needs_direction
         description: >-
           the request is too open to write requirements for without a human
@@ -174,11 +175,13 @@ states:
         {{ context.scope_notes }}
 
         ---
-        Set `variables.plan_doc` to the repo-relative path of the plan.
         For `needs_scope_revision`, put the contradiction or missing dependency in `data.question`.
     outputs:
       - label: plan_ready
         description: the plan is written and an implementer could start.
+        requires_variables:
+          - name: plan_doc
+            description: repo-relative path of the plan.
       - label: needs_scope_revision
         description: >-
           the approved requirements cannot be planned as written.
@@ -242,10 +245,12 @@ states:
         {{ context.plan_feedback }}
 
         ---
-        Set `variables.plan_doc` to the repo-relative path of the plan.
     outputs:
       - label: plan_ready
         description: the revised plan is ready for approval.
+        requires_variables:
+          - name: plan_doc
+            description: repo-relative path of the revised plan.
     transitions:
       plan_ready: approve_plan
     timeout: 1h
@@ -263,11 +268,16 @@ states:
       prompt: |
         Run the `ce-work` skill with these arguments: {{ context.plan_doc }}
 
+        Run the plan's relevant checks before implementation and record their concise result as `test_baseline` in the final output. Preserve that baseline: do not repair pre-existing failures or investigate them as part of this plan.
+
         ---
         Set `variables.pr_url` to the pull request URL, if one was opened.
     outputs:
       - label: implemented
         description: the plan is implemented and the checks pass.
+        requires_variables:
+          - name: test_baseline
+            description: concise result of checks run before implementation, including pre-existing failures or “all passed”.
     transitions:
       implemented: simplify
     timeout: 2h
@@ -281,6 +291,10 @@ states:
       type: agent
       prompt: |
         Run the `ce-work` skill with these arguments: {{ context.plan_doc }}
+
+        Test baseline captured before implementation:
+        {{ context.test_baseline }}
+        Preserve this baseline: do not repair pre-existing failures or investigate them as part of this plan.
 
         Changes requested in review:
         {{ context.revision_notes }}
@@ -322,15 +336,13 @@ states:
     description: >
       ce-code-review in autofix mode — tiered persona agents, confidence
       gating, merged and deduplicated findings. Safe fixes are applied in
-      bounded rounds; the residual findings are passed in
-      `review_findings` to the fix step and another review cycle.
+      bounded rounds; the residual findings are passed to the fix step and
+      another review cycle.
     action:
       type: agent
       prompt: |
         Run the `ce-code-review` skill with these arguments: mode:autofix plan:{{ context.plan_doc }}
 
-        ---
-        Set `variables.review_findings` to the skill's "Residual actionable work" summary, verbatim (or `none`).
     outputs:
       - label: clean
         description: no actionable findings survived the confidence gate.
@@ -340,6 +352,7 @@ states:
       clean: publish_work
       findings: fix_review_findings
     timeout: 1h
+    max_entries: 5
     retry_policy:
       max_attempts: 2
       backoff: 1m
@@ -384,9 +397,13 @@ states:
     action:
       type: agent
       prompt: |
-        Fix these findings from the code review:
+        Fix these findings from the code review. Do not perform an independent review of the diff; only address the listed residual actionable work.
 
-        {{ context.review_findings }}
+        {{ steps.code_review.reply }}
+
+        Test baseline captured before implementation:
+        {{ context.test_baseline }}
+        Preserve this baseline: do not repair pre-existing failures or investigate them as part of this plan.
     outputs:
       - label: fixed
         description: findings are fixed; run automated review again.
@@ -403,11 +420,12 @@ states:
       prompt: |
         Run the `ce-commit-push-pr` skill. If the branch already has an open pull request, do not rewrite its description: add a pull request comment that describes the new changes.
 
-        ---
-        Set `variables.pr_url` to the pull request URL.
     outputs:
       - label: published
         description: the branch is pushed and the new or existing PR is current.
+        requires_variables:
+          - name: pr_url
+            description: URL of the current pull request.
     transitions:
       published: implementation_review
     timeout: 30m

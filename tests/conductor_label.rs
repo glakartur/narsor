@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use engine_support::{workflow, Harness};
+use engine_support::{workflow, AgentTurn, Harness, ScriptedAgentExecutor};
 use narsor_engine::conductor::assembly::assemble;
 use narsor_engine::conductor::{
     ChatEntryKind, ConductorAnswer, ConductorInvoker, ConductorRegistry, ConductorStore,
@@ -31,7 +31,7 @@ use narsor_engine::domain::{
 use narsor_engine::engine::actions::agent::MISSING_OUTPUT_LABEL;
 use narsor_engine::engine::{
     owed_output_rescue, ActionExecutor, ActionKind, ActionOutcome, ActionRequest, Engine,
-    InputContinuation, OutputProblem, PendingHumanInput,
+    HumanInputDelivery, InputContinuation, OutputProblem, PendingHumanInput,
 };
 use serde_json::{json, Map, Value};
 use tokio::sync::Notify;
@@ -121,6 +121,7 @@ impl ActionExecutor for ScriptedAgent {
                     exit_code: None,
                     stdout: String::new(),
                     stderr: String::new(),
+                    reply: None,
                 })),
             }
         })
@@ -1136,4 +1137,180 @@ async fn without_a_conductor_the_step_is_a_problem_at_once() {
 
     assert_eq!(execution.status, ExecutionStatus::InputNeeded);
     assert!(fixture.conductor.calls().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The step's reply survives the rescue (R3)
+// ---------------------------------------------------------------------------
+
+const REVIEW_REPORT: &str = "P1: validate the request body";
+
+/// `step_reply` (`review` → `fix`, which reads `steps.review.reply`) on the
+/// scripted `turns`, with the scripted conductor attached when `scripts` is
+/// given.
+async fn run_step_reply(
+    harness: &Harness,
+    turns: Vec<AgentTurn>,
+    scripts: Option<Vec<Script>>,
+) -> (Arc<Engine>, Arc<ScriptedAgentExecutor>, WorkflowExecution) {
+    run_scripted(harness, "step_reply", turns, scripts).await
+}
+
+/// `name` on the scripted `turns`, with the scripted conductor attached when
+/// `scripts` is given.
+async fn run_scripted(
+    harness: &Harness,
+    name: &str,
+    turns: Vec<AgentTurn>,
+    scripts: Option<Vec<Script>>,
+) -> (Arc<Engine>, Arc<ScriptedAgentExecutor>, WorkflowExecution) {
+    let agent = Arc::new(ScriptedAgentExecutor::new(turns));
+    let engine = Arc::new(
+        harness
+            .engine()
+            .with_executor(ActionKind::Agent, agent.clone()),
+    );
+    let registry =
+        scripts.map(|scripts| assemble(&engine, Arc::new(ScriptedConductor::new(scripts)), None));
+    let execution = engine
+        .start_and_run(&workflow(name), json!({}), harness.workspace())
+        .await
+        .expect("run the workflow");
+    drop(registry);
+    (engine, agent, execution)
+}
+
+/// The rejected attempt's report, then a reprompt with nothing to say.
+fn report_without_label() -> Vec<AgentTurn> {
+    vec![
+        AgentTurn::NoLabel {
+            reply: Some(REVIEW_REPORT),
+            session: true,
+        },
+        AgentTurn::NoLabel {
+            reply: None,
+            session: true,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_label_the_conductor_chooses_keeps_the_rejected_attempts_reply() {
+    let harness = Harness::new();
+    let mut turns = report_without_label();
+    turns.push(AgentTurn::label("done", "fixed"));
+    let (_engine, agent, execution) = run_step_reply(
+        &harness,
+        turns,
+        Some(vec![choose("findings", "high", json!({}), json!({}))]),
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let prompts = agent.prompts();
+    assert_eq!(prompts.len(), 3);
+    assert!(prompts[2].contains(REVIEW_REPORT), "{}", prompts[2]);
+}
+
+#[tokio::test]
+async fn a_label_the_operator_settles_keeps_the_rejected_attempts_reply() {
+    let harness = Harness::new();
+    let mut turns = report_without_label();
+    turns.push(AgentTurn::label("done", "fixed"));
+    let (engine, agent, execution) = run_step_reply(&harness, turns, None).await;
+
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    let pending: PendingHumanInput = harness
+        .store()
+        .load_pending_input(&execution.id)
+        .expect("read the pending input")
+        .expect("a problem");
+    assert_eq!(pending.continuation, InputContinuation::ResolveOutput);
+    let delivery = HumanInputDelivery::label("findings").for_episode(pending.episode_key());
+    let execution = engine
+        .deliver_human_input(&workflow("step_reply"), &execution.id, &delivery)
+        .await
+        .expect("settle the problem");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let prompts = agent.prompts();
+    assert_eq!(prompts.len(), 3);
+    assert!(prompts[2].contains(REVIEW_REPORT), "{}", prompts[2]);
+}
+
+#[tokio::test]
+async fn a_conductor_reprompt_keeps_the_earlier_reply() {
+    let harness = Harness::new();
+    let mut turns = report_without_label();
+    turns.push(AgentTurn::label("findings", "only the output object"));
+    turns.push(AgentTurn::label("done", "fixed"));
+    let (_engine, agent, execution) = run_step_reply(
+        &harness,
+        turns,
+        Some(vec![Script::Answer(json!({
+            "decision": "reprompt",
+            "prompt": "Which label describes the review?",
+        }))]),
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let calls = agent.calls();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(calls[2].resume_session.as_deref(), Some("agent-session"));
+    assert!(
+        calls[3].prompt.contains(REVIEW_REPORT),
+        "{}",
+        calls[3].prompt
+    );
+    assert!(!calls[3].prompt.contains("only the output object"));
+}
+
+/// A label still without its required variable after the engine's reprompt
+/// is handed to the conductor (U5), never failed.
+#[tokio::test]
+async fn a_required_variable_missing_twice_goes_to_the_conductor() {
+    let harness = Harness::new();
+    let (_engine, agent, execution) = run_scripted(
+        &harness,
+        "required_variable",
+        vec![
+            AgentTurn::with_variables("plan_ready", json!({})),
+            AgentTurn::with_variables("plan_ready", json!({})),
+        ],
+        Some(vec![choose(
+            "plan_ready",
+            "high",
+            json!({}),
+            json!({ "plan_doc": "docs/plan.md" }),
+        )]),
+    )
+    .await;
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(agent.calls().len(), 2);
+    let events: Vec<EventData> = harness
+        .events(&execution.id)
+        .into_iter()
+        .map(|event| event.data)
+        .collect();
+    assert_eq!(
+        decisions(&events),
+        vec![(
+            ConductorDecisionKind::ChooseOutput,
+            Some("plan_ready".to_string()),
+            Confidence::High
+        )]
+    );
+    assert_eq!(
+        count(&events, |data| matches!(
+            data,
+            EventData::ActionFailed { .. }
+        )),
+        0
+    );
+    assert_eq!(
+        execution.context.variables.get("plan_doc"),
+        Some(&json!("docs/plan.md"))
+    );
 }

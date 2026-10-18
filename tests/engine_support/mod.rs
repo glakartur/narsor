@@ -290,6 +290,7 @@ impl ActionExecutor for StubAgentExecutor {
                 exit_code: None,
                 stdout: String::new(),
                 stderr: String::new(),
+                reply: None,
             }))
         })
     }
@@ -299,6 +300,7 @@ impl ActionExecutor for StubAgentExecutor {
 /// label together with the `data` and the answer text a real agent returns.
 pub struct AnsweringAgentExecutor {
     replies: Mutex<VecDeque<(String, Value, String)>>,
+    prompts: Mutex<Vec<String>>,
 }
 
 impl AnsweringAgentExecutor {
@@ -311,16 +313,27 @@ impl AnsweringAgentExecutor {
                     .map(|(label, data, answer)| (label.to_string(), data, answer.to_string()))
                     .collect(),
             ),
+            prompts: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().expect("prompts").clone()
     }
 }
 
 impl ActionExecutor for AnsweringAgentExecutor {
     fn execute<'a>(
         &'a self,
-        _request: ActionRequest<'a>,
+        request: ActionRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
         Box::pin(async move {
+            if let narsor_engine::domain::ActionConfig::Agent(config) = request.action {
+                self.prompts
+                    .lock()
+                    .expect("prompts")
+                    .push(config.prompt.clone());
+            }
             let (output_label, data, stdout) = self
                 .replies
                 .lock()
@@ -333,8 +346,9 @@ impl ActionExecutor for AnsweringAgentExecutor {
                 data,
                 variables: Map::new(),
                 exit_code: Some(0),
-                stdout,
+                stdout: stdout.clone(),
                 stderr: String::new(),
+                reply: Some(stdout),
             }))
         })
     }
@@ -405,6 +419,7 @@ impl ActionExecutor for ResumeRejectingAgentExecutor {
                     exit_code: None,
                     stdout: String::new(),
                     stderr: String::new(),
+                    reply: None,
                 })),
             }
         })
@@ -477,6 +492,7 @@ impl ActionExecutor for QuestioningAgentExecutor {
                 exit_code: None,
                 stdout: String::new(),
                 stderr: String::new(),
+                reply: None,
             }))
         })
     }
@@ -558,6 +574,7 @@ impl ActionExecutor for TimeoutRecorder {
                 exit_code: None,
                 stdout: String::new(),
                 stderr: String::new(),
+                reply: None,
             }))
         })
     }
@@ -618,5 +635,214 @@ pub fn kill_processes_under(root: &Path) {
                 libc::kill(pid as libc::pid_t, libc::SIGKILL);
             }
         }
+    }
+}
+
+/// One turn of a [`ScriptedAgentExecutor`].
+#[derive(Debug, Clone)]
+pub enum AgentTurn {
+    /// The output `label`, with these variables and this reply; `session`
+    /// says whether the harness reported a session.
+    Label {
+        label: &'static str,
+        variables: Value,
+        reply: Option<&'static str>,
+        session: bool,
+    },
+    /// No output label (a format error); `session` says whether the harness
+    /// reported a session to ask again in.
+    NoLabel {
+        reply: Option<&'static str>,
+        session: bool,
+    },
+    /// An action failure.
+    Fail,
+    /// A question to the person.
+    Ask(&'static str),
+    /// A permission request for one Bash command.
+    Permission,
+}
+
+impl AgentTurn {
+    /// The output `label` with no variables and `reply`.
+    pub fn label(label: &'static str, reply: &'static str) -> Self {
+        Self::Label {
+            label,
+            variables: json!({}),
+            reply: Some(reply),
+            session: true,
+        }
+    }
+
+    /// The output `label` from a harness that reported no session.
+    pub fn sessionless(label: &'static str) -> Self {
+        Self::Label {
+            label,
+            variables: json!({}),
+            reply: None,
+            session: false,
+        }
+    }
+
+    /// The output `label` with `variables` and no reply.
+    pub fn with_variables(label: &'static str, variables: Value) -> Self {
+        Self::Label {
+            label,
+            variables,
+            reply: None,
+            session: true,
+        }
+    }
+}
+
+/// What a [`ScriptedAgentExecutor`] was handed on one call.
+#[derive(Debug, Clone)]
+pub struct AgentCall {
+    pub prompt: String,
+    pub resume_session: Option<String>,
+    pub action_execution_id: String,
+}
+
+/// An `agent` executor that plays [`AgentTurn`]s in order and records every
+/// call.
+pub struct ScriptedAgentExecutor {
+    turns: Mutex<VecDeque<AgentTurn>>,
+    calls: Mutex<Vec<AgentCall>>,
+}
+
+impl ScriptedAgentExecutor {
+    pub fn new(turns: Vec<AgentTurn>) -> Self {
+        Self {
+            turns: Mutex::new(turns.into()),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn calls(&self) -> Vec<AgentCall> {
+        self.calls.lock().expect("calls").clone()
+    }
+
+    pub fn prompts(&self) -> Vec<String> {
+        self.calls().into_iter().map(|call| call.prompt).collect()
+    }
+}
+
+impl ActionExecutor for ScriptedAgentExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: ActionRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<ActionOutcome, ActionError>> + Send + 'a>> {
+        let ActionConfig::Agent(config) = request.action else {
+            panic!("the scripted agent only runs agent actions");
+        };
+        let action_execution_id = request.action_execution_id.to_string();
+        self.calls.lock().expect("calls").push(AgentCall {
+            prompt: config.prompt.clone(),
+            resume_session: config
+                .parameters
+                .get("resume_session")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            action_execution_id: action_execution_id.clone(),
+        });
+        let turn = self
+            .turns
+            .lock()
+            .expect("turns")
+            .pop_front()
+            .expect("the agent was called more often than scripted");
+        let question = |instruction: &str, permission: Option<_>| HumanInputRequest {
+            action_execution_id: action_execution_id.clone(),
+            instruction: instruction.to_string(),
+            // A permission request is decided, not answered.
+            fields: if permission.is_some() {
+                Vec::new()
+            } else {
+                vec![HumanInputField {
+                    name: "answer".to_string(),
+                    field_type: HumanInputType::Text,
+                    required: true,
+                    description: None,
+                    options: Vec::new(),
+                }]
+            },
+            question: None,
+            answer_tail: None,
+            agent_harness: Some("claude-code".to_string()),
+            agent_session_id: Some("agent-session".to_string()),
+            prefilled_answer: None,
+            permission,
+        };
+        let outcome = match turn {
+            AgentTurn::Label {
+                label,
+                variables,
+                reply,
+                session,
+            } => Ok(ActionOutcome::Completed(ActionResult {
+                output_label: label.to_string(),
+                // The session a reprompt of a rejected result resumes.
+                data: if session {
+                    json!({
+                        "agent_session": {
+                            "harness": "claude-code",
+                            "config": { "harness_session_id": "agent-session" },
+                        },
+                    })
+                } else {
+                    json!({})
+                },
+                variables: match variables {
+                    Value::Object(variables) => variables,
+                    _ => Map::new(),
+                },
+                exit_code: None,
+                stdout: reply.unwrap_or_default().to_string(),
+                stderr: String::new(),
+                reply: reply.map(ToString::to_string),
+            })),
+            AgentTurn::NoLabel { reply, session } => {
+                let mut details = json!({ "answer_tail": reply.unwrap_or_default() });
+                if let Some(reply) = reply {
+                    details["reply"] = json!(reply);
+                }
+                if session {
+                    details["harness"] = json!("claude-code");
+                    details["harness_session_id"] = json!("agent-session");
+                }
+                Err(ActionError {
+                    message: "no output label could be extracted from the agent's answer"
+                        .to_string(),
+                    error_type: Some(
+                        narsor_engine::engine::actions::agent::MISSING_OUTPUT_LABEL.to_string(),
+                    ),
+                    details: Some(details),
+                })
+            }
+            AgentTurn::Fail => Err(ActionError {
+                message: "the scripted agent failed on purpose".to_string(),
+                error_type: None,
+                details: None,
+            }),
+            AgentTurn::Ask(instruction) => Ok(ActionOutcome::Suspended(
+                SuspendedAction::AwaitingAgentInput(question(instruction, None)),
+            )),
+            AgentTurn::Permission => Ok(ActionOutcome::Suspended(
+                SuspendedAction::AwaitingAgentInput(question(
+                    "Claude Code needs a permission decision.",
+                    Some(narsor_engine::engine::actions::PermissionRequestDetails {
+                        denials: vec![narsor_engine::engine::actions::PermissionDenialDetails {
+                            tool_name: "Bash".to_string(),
+                            tool_use_id: "tool-permission".to_string(),
+                            input: json!({ "command": "cargo build" }),
+                            cwd: "/tmp".to_string(),
+                            reason_type: Some("asyncAgent".to_string()),
+                            reason: Some("The command needs approval.".to_string()),
+                        }],
+                    }),
+                )),
+            )),
+        };
+        Box::pin(async move { outcome })
     }
 }

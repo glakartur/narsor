@@ -17,6 +17,7 @@ use engine_support::{
 use narsor_engine::domain::{EventData, ExecutionStatus};
 use narsor_engine::engine::{
     ActionExecutor, ActionKind, AgentDefaults, Engine, EngineError, HumanInputDelivery,
+    ManualTransition,
 };
 use serde_json::{json, Map, Value};
 
@@ -49,6 +50,225 @@ async fn a_linear_workflow_runs_to_its_terminal_state() {
     assert_eq!(variables.get("first"), Some(&json!("one")));
     assert_eq!(variables.get("second"), Some(&json!("orchestration")));
     assert_eq!(variables.get("third"), Some(&json!("after one")));
+}
+
+#[tokio::test]
+async fn a_later_step_receives_the_previous_agent_reply() {
+    let harness = Harness::new();
+    let agent = Arc::new(AnsweringAgentExecutor::new(vec![
+        ("findings", json!({}), "P1: validate the request body"),
+        ("done", json!({}), "fixed"),
+    ]));
+    let engine = harness
+        .engine()
+        .with_executor(narsor_engine::engine::ActionKind::Agent, agent.clone());
+    let definition = workflow("step_reply");
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .unwrap();
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    let prompts = agent.prompts();
+    assert!(
+        prompts[1].contains("P1: validate the request body"),
+        "{}",
+        prompts[1]
+    );
+}
+
+#[tokio::test]
+async fn an_entry_limit_waits_before_starting_the_limited_action_and_can_continue() {
+    let harness = Harness::new();
+    let agent = Arc::new(AnsweringAgentExecutor::new(vec![
+        ("findings", json!({}), "first findings"),
+        ("fixed", json!({}), "fixed once"),
+        ("findings", json!({}), "second findings"),
+        ("fixed", json!({}), "fixed twice"),
+        ("clean", json!({ "summary": "clean now" }), "clean now"),
+    ]));
+    let engine = harness
+        .engine()
+        .with_executor(ActionKind::Agent, agent.clone());
+    let definition = workflow("entry_limit");
+    let mut execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .unwrap();
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    assert_eq!(execution.current_state.as_deref(), Some("review"));
+    assert_eq!(execution.metadata["engine"]["state_entries"]["review"], 2);
+    assert_eq!(
+        agent.prompts().len(),
+        4,
+        "the limited third entry has not started"
+    );
+    let pending = harness
+        .store()
+        .load_pending_input::<narsor_engine::engine::PendingHumanInput>(&execution.id)
+        .unwrap()
+        .expect("entry-limit decision is durable");
+    assert_eq!(
+        pending.continuation,
+        narsor_engine::engine::InputContinuation::EntryLimit
+    );
+    let delivery = HumanInputDelivery::with_values(Map::from_iter([(
+        "entry_limit_decision".to_string(),
+        json!("continue"),
+    )]))
+    .for_episode(pending.episode_key());
+    let recovered_engine = harness
+        .engine()
+        .with_executor(ActionKind::Agent, agent.clone());
+    execution = recovered_engine
+        .deliver_human_input(&definition, &execution.id, &delivery)
+        .await
+        .unwrap();
+    assert_eq!(
+        execution.status,
+        ExecutionStatus::Completed,
+        "state={:?}, entries={}, events={:?}",
+        execution.current_state,
+        execution.metadata["engine"]["state_entries"]["review"],
+        harness
+            .events(&execution.id)
+            .iter()
+            .map(event_type)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(execution.metadata["engine"]["state_entries"]["review"], 3);
+    assert_eq!(agent.prompts().len(), 5);
+}
+
+#[tokio::test]
+async fn an_entry_limit_can_reset_or_choose_an_output_with_required_variables() {
+    let harness = Harness::new();
+    let agent = Arc::new(AnsweringAgentExecutor::new(vec![
+        ("findings", json!({}), "first findings"),
+        ("fixed", json!({}), "fixed once"),
+        ("findings", json!({}), "second findings"),
+        ("fixed", json!({}), "fixed twice"),
+    ]));
+    let engine = harness
+        .engine()
+        .with_executor(ActionKind::Agent, agent.clone());
+    let definition = workflow("entry_limit");
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .unwrap();
+    let pending = harness
+        .store()
+        .load_pending_input::<narsor_engine::engine::PendingHumanInput>(&execution.id)
+        .unwrap()
+        .unwrap();
+
+    let missing = HumanInputDelivery::label("manual_complete").for_episode(pending.episode_key());
+    let error = engine
+        .deliver_human_input(&definition, &execution.id, &missing)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("summary"));
+    assert_eq!(
+        harness
+            .store()
+            .load_execution(&execution.id)
+            .unwrap()
+            .status,
+        ExecutionStatus::InputNeeded
+    );
+
+    let chosen = HumanInputDelivery::label("manual_complete")
+        .with_variables(Map::from_iter([(
+            "summary".to_string(),
+            json!("review complete"),
+        )]))
+        .for_episode(pending.episode_key());
+    let finished = engine
+        .deliver_human_input(&definition, &execution.id, &chosen)
+        .await
+        .unwrap();
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+    assert_eq!(
+        finished.context.variables.get("summary"),
+        Some(&json!("review complete"))
+    );
+    assert_eq!(finished.metadata["engine"]["state_entries"]["review"], 2);
+}
+
+#[tokio::test]
+async fn resetting_an_entry_limit_counter_is_audited_before_the_decision() {
+    let harness = Harness::new();
+    let agent = Arc::new(AnsweringAgentExecutor::new(vec![
+        ("findings", json!({}), "first findings"),
+        ("fixed", json!({}), "fixed once"),
+        ("findings", json!({}), "second findings"),
+        ("fixed", json!({}), "fixed twice"),
+        (
+            "clean",
+            json!({ "summary": "clean after reset" }),
+            "clean after reset",
+        ),
+    ]));
+    let engine = harness.engine().with_executor(ActionKind::Agent, agent);
+    let definition = workflow("entry_limit");
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .unwrap();
+    let pending = harness
+        .store()
+        .load_pending_input::<narsor_engine::engine::PendingHumanInput>(&execution.id)
+        .unwrap()
+        .unwrap();
+    let delivery = HumanInputDelivery::with_values(Map::from_iter([(
+        "entry_limit_decision".to_string(),
+        json!("reset_counter"),
+    )]))
+    .for_episode(pending.episode_key());
+    let finished = engine
+        .deliver_human_input(&definition, &execution.id, &delivery)
+        .await
+        .unwrap();
+    assert_eq!(finished.status, ExecutionStatus::Completed);
+    assert_eq!(finished.metadata["engine"]["state_entries"]["review"], 1);
+    let events = harness.events(&execution.id);
+    let reset = events
+        .iter()
+        .position(|event| matches!(event.data, EventData::EntryLimitCounterReset { .. }))
+        .unwrap();
+    let decision = events
+        .iter()
+        .position(|event| matches!(event.data, EventData::EntryLimitDecision { .. }))
+        .unwrap();
+    assert!(reset < decision);
+}
+
+#[tokio::test]
+async fn manual_transition_counts_a_limited_target_without_stopping_on_its_limit() {
+    let harness = Harness::new();
+    let agent = Arc::new(AnsweringAgentExecutor::new(vec![
+        ("findings", json!({}), "first findings"),
+        ("fixed", json!({}), "fixed once"),
+        ("findings", json!({}), "second findings"),
+        ("fixed", json!({}), "fixed twice"),
+        ("fixed", json!({}), "manual restart"),
+    ]));
+    let engine = harness
+        .engine()
+        .with_executor(ActionKind::Agent, agent.clone());
+    let definition = workflow("entry_limit");
+    let execution = engine
+        .start_and_run(&definition, json!({}), harness.workspace())
+        .await
+        .unwrap();
+    assert_eq!(execution.status, ExecutionStatus::InputNeeded);
+    let transition = ManualTransition::by_operator(None, Some("fix".to_string()), true);
+    let moved = engine
+        .take_manual_transition(&definition, &execution.id, &transition)
+        .unwrap();
+    assert_eq!(moved.current_state.as_deref(), Some("fix"));
+    assert_eq!(moved.metadata["engine"]["state_entries"]["fix"], 3);
+    assert_eq!(moved.status, ExecutionStatus::Paused);
 }
 
 #[tokio::test]

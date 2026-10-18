@@ -83,6 +83,9 @@ pub struct HarnessRun {
     /// The agent's final text, which the output label is extracted from.
     pub text: String,
 
+    /// Assistant prose collected independently of the structured result.
+    pub reply: Option<String>,
+
     /// The harness's own session id, when it reported one (D18/D19).
     pub session_id: Option<String>,
 

@@ -2379,6 +2379,7 @@ impl ActionExecutor for AgentReply {
                     exit_code: Some(0),
                     stdout: "the agent's answer".to_string(),
                     stderr: String::new(),
+                    reply: Some("the agent's answer".to_string()),
                 }),
                 Self::Ask => ActionOutcome::Suspended(SuspendedAction::AwaitingAgentInput(
                     HumanInputRequest {

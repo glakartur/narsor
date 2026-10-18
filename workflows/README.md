@@ -71,7 +71,8 @@ document, the approved PR is complete.
 
 Loops: `approve_scope → brainstorm`, `approve_plan → plan`,
 `code_review → fix_review_findings → code_review` until clean (the
-residual findings travel as `{{ context.review_findings }}`),
+residual findings travel as `{{ steps.code_review.reply }}`, and
+`max_entries` on `code_review` asks a person once the loop runs too long),
 `code_review → publish_work → implementation_review → compound →
 publish_learning → learning_review`. A request from either review returns to
 `work_revision → simplify → code_review`; `publish_work` then updates the same

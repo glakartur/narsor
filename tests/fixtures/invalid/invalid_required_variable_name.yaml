@@ -1,0 +1,22 @@
+# A required variable name must be a plain name: letters, digits and `_`.
+name: invalid-required-variable-name
+version: 1
+
+states:
+  work:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: Zaimplementuj.
+    outputs:
+      - label: done
+        requires_variables:
+          - pr-url
+    transitions:
+      done: finished
+
+  finished:
+    description: Koniec.
+
+terminal_states:
+  - finished

@@ -1,0 +1,23 @@
+# A display is rendered before any step replies: `steps.*` is not allowed.
+name: step-reply-in-display-title
+version: 1
+
+display:
+  title: "{{ steps.work.reply }}"
+
+states:
+  work:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: Zaimplementuj.
+    outputs:
+      - done
+    transitions:
+      done: finished
+
+  finished:
+    description: Koniec.
+
+terminal_states:
+  - finished

@@ -342,7 +342,7 @@ impl Entry {
                             Model::Input(InputPanel::new(&form, &state_of))
                         })
                 }),
-            AttentionKind::Problem => {
+            AttentionKind::Problem | AttentionKind::EntryLimit => {
                 let pending = task
                     .runner
                     .as_ref()
@@ -393,6 +393,7 @@ impl Entry {
                 Model::Operator(OperatorPanel::proposal(&item.waiting_id, conductor))
             }
             AttentionKind::ProvisioningFailed => Model::Owner(OwnerPanel::provisioning(task)),
+            AttentionKind::Unrecognized => Model::Missing,
         }
     }
 
@@ -477,9 +478,11 @@ impl Entry {
             AttentionKind::Question => "Pytanie",
             AttentionKind::Approval => "Approval",
             AttentionKind::Problem => "Problem",
+            AttentionKind::EntryLimit => "Limit wejść",
             AttentionKind::FailedStep => "Nieudany krok",
             AttentionKind::ConductorProposal => "Propozycja dyrygenta",
             AttentionKind::ProvisioningFailed => "Nieudany provisioning",
+            AttentionKind::Unrecognized => "Nieobsługiwane oczekiwanie",
         }
     }
 
@@ -488,10 +491,12 @@ impl Entry {
         match self.item.kind {
             AttentionKind::Question
             | AttentionKind::Approval
+            | AttentionKind::EntryLimit
             | AttentionKind::ConductorProposal => '?',
             AttentionKind::Problem
             | AttentionKind::FailedStep
             | AttentionKind::ProvisioningFailed => '!',
+            AttentionKind::Unrecognized => '?',
         }
     }
 

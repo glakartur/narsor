@@ -121,6 +121,8 @@ impl ConductorRegistry {
             context_before: decision.context_before.clone(),
             answers: decision.answers.clone(),
             reason: decision.reason.clone(),
+            reply: decision.reply.clone(),
+            state_entries_before: decision.state_entries_before.clone(),
             analysis: ConductorAnalysis {
                 label: decision.output_label.clone(),
                 data: object_of(&decision.data),

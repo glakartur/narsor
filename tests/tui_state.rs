@@ -4401,6 +4401,36 @@ mod task_app_waiting {
         })
     }
 
+    fn entry_limit() -> Value {
+        json!({
+            "execution_id": "exec-1",
+            "state_id": "code_review",
+            "action_execution_id": "act-limit",
+            "instruction": "Krok osiągnął limit wejść.",
+            "fields": [{
+                "name": "entry_limit_decision",
+                "type": "select",
+                "options": ["continue", "reset_counter"],
+                "required": false
+            }],
+            "outputs": [
+                { "label": "clean", "description": "Brak ustaleń." },
+                { "label": "findings", "description": "Są ustalenia." }
+            ],
+            "continuation": "entry_limit",
+            "problem": {
+                "reason": "entry limit reached (5/5)",
+                "requirements": [
+                    { "label": "clean", "data": [], "variables": [] },
+                    { "label": "findings", "data": [], "variables": ["manual_note"] }
+                ]
+            },
+            "entry_limit": { "entries": 5, "max_entries": 5 },
+            "episode": "ep-limit",
+            "requested_at": "2026-10-18T12:00:00Z"
+        })
+    }
+
     fn gate_app() -> TaskApp {
         opened(with_pending(running("a", 1), gate("ep-1")))
     }
@@ -4804,6 +4834,49 @@ mod task_app_waiting {
             Some("spróbuj jeszcze raz")
         );
         assert!(delivery.chosen_label.is_none());
+    }
+
+    #[test]
+    fn an_entry_limit_panel_shows_counts_and_offers_continue_reset_and_outputs() {
+        let pending: narsor_protocol::api::PendingHumanInputView =
+            serde_json::from_value(entry_limit()).expect("entry limit view");
+        let panel = narsor::tui::input_form::InputPanel::new(&pending, &|_| None);
+        assert_eq!(panel.kind(), narsor::tui::input_form::InputKind::EntryLimit);
+        assert!(panel.context().iter().any(|line| line.text.contains("5/5")));
+        let labels: Vec<_> = panel
+            .items()
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            ["clean", "findings", "Kontynuuj", "Wyzeruj licznik"]
+        );
+        assert!(
+            panel.items()[3]
+                .description
+                .contains("Limit przestaje chronić przed pętlą, aż licznik znów dojdzie do 5."),
+            "{}",
+            panel.items()[3].description
+        );
+        let continue_delivery = panel
+            .delivery(&narsor::tui::chooser::Submission {
+                index: 2,
+                label: "Kontynuuj".to_string(),
+                values: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(continue_delivery.values["entry_limit_decision"], "continue");
+        assert_eq!(continue_delivery.episode.as_deref(), Some("ep-limit"));
+        let output_delivery = panel
+            .delivery(&narsor::tui::chooser::Submission {
+                index: 1,
+                label: "findings".to_string(),
+                values: vec![("variables.manual_note".to_string(), "triage".to_string())],
+            })
+            .unwrap();
+        assert_eq!(output_delivery.chosen_label.as_deref(), Some("findings"));
+        assert_eq!(output_delivery.variables["manual_note"], "triage");
     }
 
     #[test]

@@ -1,0 +1,19 @@
+name: entry-limit
+version: 1
+states:
+  review:
+    action: { type: agent, prompt: review }
+    max_entries: 2
+    outputs:
+      - label: findings
+      - clean
+      - label: manual_complete
+        requires_variables: [summary]
+    transitions: { findings: fix, clean: completed, manual_complete: completed }
+  fix:
+    action: { type: agent, prompt: "fix {{ steps.review.reply }}" }
+    max_entries: 2
+    outputs: [fixed]
+    transitions: { fixed: review }
+  completed: { description: done }
+terminal_states: [completed]

@@ -78,6 +78,23 @@ fn sample_execution(id: &str) -> WorkflowExecution {
     }
 }
 
+#[test]
+fn step_replies_are_stored_as_atomic_attempt_files() {
+    let root = TempRoot::new();
+    let store = root.store();
+    store
+        .write_step_reply("exec-1", "attempt-2", "review prose")
+        .unwrap();
+    assert_eq!(
+        store.read_step_reply("exec-1", "attempt-2").unwrap(),
+        "review prose"
+    );
+    assert!(!root
+        .path()
+        .join("executions/exec-1/step-replies/attempt-1.txt")
+        .exists());
+}
+
 fn sample_event(execution_id: &str, sequence: u64, state_id: &str) -> Event {
     Event::new(
         execution_id.to_string(),

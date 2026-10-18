@@ -1,0 +1,18 @@
+name: step-reply-loop
+version: 1
+description: >
+  A review that may run more than once, and a fix step reading its newest
+  reply.
+states:
+  review:
+    action: { type: agent, prompt: review the changes }
+    outputs: [findings, clean]
+    transitions: { findings: fix, clean: completed }
+  fix:
+    action:
+      type: agent
+      prompt: "Fix these findings: {{ steps.review.reply }}"
+    outputs: [fixed]
+    transitions: { fixed: review }
+  completed: { description: done }
+terminal_states: [completed]

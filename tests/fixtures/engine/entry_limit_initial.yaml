@@ -1,0 +1,11 @@
+name: entry-limit-initial
+version: 1
+description: An initial state that may be entered once.
+states:
+  review:
+    action: { type: agent, prompt: review }
+    max_entries: 1
+    outputs: [again, done]
+    transitions: { again: review, done: completed }
+  completed: { description: done }
+terminal_states: [completed]

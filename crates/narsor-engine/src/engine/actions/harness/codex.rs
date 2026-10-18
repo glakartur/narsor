@@ -254,6 +254,7 @@ impl HarnessStreamParser for CodexStreamParser {
         };
         HarnessRun {
             text: self.agent_message.unwrap_or_default(),
+            reply: None,
             session_id: self.thread_id,
             failure,
             structured_output: None,
@@ -275,4 +276,33 @@ fn error_text(value: &Value) -> String {
         .or_else(|| value.get("message").and_then(Value::as_str))
         .map(str::to_string)
         .unwrap_or_else(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::actions::agent::run_reply;
+
+    #[test]
+    fn the_reply_is_the_final_message_without_the_contract() {
+        let mut parser: Box<dyn HarnessStreamParser> = Box::new(CodexStreamParser::default());
+        let message = "P1: validate the request body.\n\n{\"output\":\"findings\"}";
+        for line in [
+            serde_json::json!({ "type": "thread.started", "thread_id": "thread-1" }),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": { "type": "agent_message", "text": message },
+            }),
+            serde_json::json!({ "type": "turn.completed" }),
+        ] {
+            parser.on_stdout_line(line.to_string().as_bytes());
+        }
+        let run = parser.finish(0, "");
+
+        assert_eq!(run.failure, None);
+        assert_eq!(
+            run_reply(&run).as_deref(),
+            Some("P1: validate the request body.")
+        );
+    }
 }

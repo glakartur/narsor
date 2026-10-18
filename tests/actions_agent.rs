@@ -1345,6 +1345,7 @@ async fn the_output_contract_lists_the_declared_labels_with_their_descriptions()
     let outputs = [
         OutputDefinition {
             label: "ready".to_string(),
+            requires_variables: Vec::new(),
             description: Some("The plan is written and nothing is unclear.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,
@@ -1367,6 +1368,28 @@ async fn the_output_contract_lists_the_declared_labels_with_their_descriptions()
     );
 }
 
+#[tokio::test]
+async fn output_contract_lists_required_variables_only_at_their_label() {
+    use narsor_engine::domain::RequiredVariable;
+    let outputs = [
+        OutputDefinition {
+            label: "findings".to_string(),
+            requires_variables: vec![RequiredVariable::Described {
+                name: "report".to_string(),
+                description: "Complete review report".to_string(),
+            }],
+            description: None,
+            requires_human_approval: false,
+            resume_comment_field: None,
+        },
+        OutputDefinition::new("clean"),
+    ];
+    let prompt = prompt_sent_with_outputs(&outputs).await;
+    assert!(prompt.contains("Set `variables.report`: Complete review report"));
+    let clean = prompt.split("- `clean`").nth(1).unwrap();
+    assert!(!clean.contains("variables.report"));
+}
+
 /// A state without descriptions gets a plain list — no dangling dashes.
 #[test]
 fn a_contract_without_descriptions_lists_bare_labels_only() {
@@ -1374,6 +1397,7 @@ fn a_contract_without_descriptions_lists_bare_labels_only() {
         OutputDefinition::new("approved"),
         OutputDefinition {
             label: "rejected".to_string(),
+            requires_variables: Vec::new(),
             // Blank is treated as no description at all.
             description: Some("   ".to_string()),
             requires_human_approval: false,
@@ -2005,6 +2029,98 @@ async fn a_missing_label_is_asked_for_again_in_the_same_read_only_session() {
     );
 }
 
+/// [`REPROMPT_WORKFLOW`] with a second agent step that reads the reply of
+/// `work`, so the engine keeps that reply.
+fn reply_reading_reprompt_workflow() -> String {
+    REPROMPT_WORKFLOW
+        .replace("      implemented: done\n", "      implemented: check\n")
+        .replace(
+            "  done:\n    description: Success.\n",
+            r#"  check:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: "Check: {{ steps.work.reply }}"
+    outputs:
+      - label: checked
+        description: Checked.
+    transitions:
+      checked: done
+  done:
+    description: Success.
+"#,
+        )
+}
+
+/// The reply the engine kept for `work`.
+fn kept_work_reply(
+    fixture: &EngineFixture,
+    execution: &narsor_engine::domain::WorkflowExecution,
+) -> String {
+    let attempt = execution.metadata[METADATA_ENGINE_KEY]["step_replies"]["work"]
+        .as_str()
+        .expect("a reply pointer for work");
+    fixture
+        .store()
+        .read_step_reply(&execution.id, attempt)
+        .expect("read the kept reply")
+}
+
+/// R3: a format reprompt does not replace the reply of the attempt it asks
+/// again — its own text ("Here is JSON") is not the step's reply.
+#[tokio::test]
+async fn a_format_reprompt_keeps_the_reply_of_the_earlier_attempt() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &envelope("Review report: two findings."))
+        .answers_on_call(2, &envelope(r#"Here is JSON {"output":"implemented"}"#))
+        .answers_on_call(3, &envelope(r#"{"output":"checked"}"#));
+
+    let definition = fixture.workflow(&reply_reading_reprompt_workflow());
+    let execution = fixture
+        .engine()
+        .start_and_run(&definition, json!({}), fixture.workspace())
+        .await
+        .expect("run the workflow");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(fixture.fake.calls(), 3, "attempt, reprompt and check");
+    assert_eq!(
+        kept_work_reply(&fixture, &execution),
+        "Review report: two findings."
+    );
+}
+
+/// R3: when the earlier attempt had no prose — only an undeclared label —
+/// the reprompt's own text is the step's reply.
+#[tokio::test]
+async fn a_format_reprompt_supplies_the_reply_when_the_earlier_attempt_had_none() {
+    let fixture = EngineFixture::new();
+    fixture
+        .fake
+        .answers_on_call(1, &envelope(r#"{"output":"finished"}"#))
+        .answers_on_call(
+            2,
+            &envelope(r#"Review report: one finding. {"output":"implemented"}"#),
+        )
+        .answers_on_call(3, &envelope(r#"{"output":"checked"}"#));
+
+    let definition = fixture.workflow(&reply_reading_reprompt_workflow());
+    let execution = fixture
+        .engine()
+        .start_and_run(&definition, json!({}), fixture.workspace())
+        .await
+        .expect("run the workflow");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert_eq!(fixture.fake.calls(), 3, "attempt, reprompt and check");
+    assert_eq!(
+        kept_work_reply(&fixture, &execution),
+        "Review report: one finding."
+    );
+}
+
 /// Runs [`REPROMPT_WORKFLOW`] on the fixture's engine.
 async fn run_reprompt_workflow(
     fixture: &EngineFixture,
@@ -2570,6 +2686,7 @@ async fn a_reprompt_after_a_restart_runs_on_the_recorded_harness_not_the_new_def
         action_execution_id: "attempt-1".to_string(),
         reason: "no output label".to_string(),
         answer_tail: None,
+        reply: None,
         harness: Some("claude-code".to_string()),
         harness_session_id: Some("session-7".to_string()),
     };
@@ -2638,6 +2755,7 @@ async fn a_restart_between_rejection_and_reprompt_continues_with_the_reprompt() 
         action_execution_id: "attempt-1".to_string(),
         reason: "no output label".to_string(),
         answer_tail: None,
+        reply: None,
         harness: Some("claude-code".to_string()),
         harness_session_id: Some("session-7".to_string()),
     };

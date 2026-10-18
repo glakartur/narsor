@@ -484,6 +484,11 @@ fn answer_delivery(
                 crate::engine::actions::human::HumanActionError::PermissionDecisionRequired,
             ))
         }
+        InputContinuation::EntryLimit => {
+            return Err(EngineError::HumanInput(
+                crate::engine::actions::human::HumanActionError::UnexpectedStepValues,
+            ))
+        }
     };
     if pending.continuation != InputContinuation::ResumeAgent {
         if let Some(label) = &proposal.label {

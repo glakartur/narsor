@@ -95,9 +95,10 @@ use crate::engine::actions::agent::{
 };
 use crate::engine::actions::harness;
 use crate::engine::actions::human::{
-    self, AgentSessionProvenance, ApprovalCandidate, ConductorAnalysis, HumanActionError,
-    HumanInputDelivery, HumanInputRequest, InputContinuation, OutputProblem, OutputRequirement,
-    PendingHumanInput, RejectedAnswer, APPROVE_OUTPUT_LABEL, RESUME_AGENT_LABEL,
+    self, AgentSessionProvenance, ApprovalCandidate, ConductorAnalysis, EntryLimitDetails,
+    HumanActionError, HumanInputDelivery, HumanInputRequest, InputContinuation, OutputProblem,
+    OutputRequirement, PendingHumanInput, RejectedAnswer, APPROVE_OUTPUT_LABEL,
+    ENTRY_LIMIT_CONTINUE_LABEL, ENTRY_LIMIT_RESET_LABEL, RESUME_AGENT_LABEL,
 };
 use crate::engine::actions::{
     ActionExecutor, ActionOutcome, ActionRequest, AgentExecutor, HumanExecutor, LoggingEventSink,
@@ -106,6 +107,7 @@ use crate::engine::actions::{
 use crate::engine::decision::{self, DecisionError, DecisionOutcome, DecisionRequest};
 use crate::engine::retry::RetrySchedule;
 use crate::persistence::{read_json, ExecutionStore, PersistenceError};
+use crate::workflow::template::step_reply_references;
 use crate::workflow::{action_context_references, TemplateScope};
 
 mod failure;
@@ -149,6 +151,8 @@ const ANSWER_TAIL_BYTES: usize = 2 * 1024;
 const METADATA_OPERATOR_RECOVERY_NOTE_KEY: &str = "operator_recovery_note";
 const METADATA_AGENT_INPUT_KEY: &str = "agent_input";
 const METADATA_AGENT_SESSIONS_KEY: &str = "completed_agent_sessions";
+const METADATA_STEP_REPLIES_KEY: &str = "step_replies";
+const METADATA_STATE_ENTRIES_KEY: &str = "state_entries";
 
 /// The one-shot instruction delivered by an operator to an agent step.
 /// `harness` and `session` are optional for records written before
@@ -311,6 +315,10 @@ pub struct OutputRejection {
     #[serde(default)]
     pub answer_tail: Option<String>,
 
+    /// Full response retained across a format reprompt.
+    #[serde(default)]
+    pub reply: Option<String>,
+
     /// The harness the attempt ran on — where its session can be resumed.
     #[serde(default)]
     pub harness: Option<String>,
@@ -340,6 +348,7 @@ impl OutputRejection {
             action_execution_id: action_execution_id.to_string(),
             reason: error.message.clone(),
             answer_tail: detail("answer_tail").filter(|tail| !tail.is_empty()),
+            reply: detail("reply"),
             harness: detail("harness"),
             harness_session_id: detail("harness_session_id"),
         })
@@ -352,9 +361,33 @@ impl OutputRejection {
         action_execution_id: &str,
         result: &ActionResult,
     ) -> Option<Self> {
-        let error = match decision::check_label(state, &result.output_label) {
-            Err(error @ DecisionError::LabelNotDeclared { .. }) => error,
-            _ => return None,
+        let reason = match decision::check_label(state, &result.output_label) {
+            Err(error @ DecisionError::LabelNotDeclared { .. }) => error.to_string(),
+            Ok(_) => {
+                let missing = state
+                    .outputs
+                    .iter()
+                    .find(|output| output.label == result.output_label)
+                    .into_iter()
+                    .flat_map(|output| output.requires_variables.iter())
+                    .filter(|required| {
+                        result
+                            .variables
+                            .get(required.name())
+                            .is_none_or(human::is_blank)
+                    })
+                    .map(|required| required.name())
+                    .collect::<Vec<_>>();
+                if missing.is_empty() {
+                    return None;
+                }
+                format!(
+                    "output '{}' is missing required variables: {}",
+                    result.output_label,
+                    missing.join(", ")
+                )
+            }
+            Err(_) => return None,
         };
         let session = result.data.get(SESSION_DATA_KEY);
         let session_field = |pointer: &str| {
@@ -366,9 +399,10 @@ impl OutputRejection {
         Some(Self {
             state_id: state.id.clone(),
             action_execution_id: action_execution_id.to_string(),
-            reason: error.to_string(),
+            reason,
             answer_tail: Some(harness::tail(&result.stdout, ANSWER_TAIL_BYTES))
                 .filter(|tail| !tail.is_empty()),
+            reply: result.reply.clone(),
             harness: session_field("/harness"),
             harness_session_id: session_field("/config/harness_session_id"),
         })
@@ -385,6 +419,7 @@ impl OutputRejection {
                 "the agent asked for human input instead of giving its output label: {question}"
             ),
             answer_tail: None,
+            reply: None,
             harness: None,
             harness_session_id: None,
         }
@@ -424,6 +459,11 @@ pub struct OutputRescue {
     /// Whether the conductor's one reprompt was used (R17).
     #[serde(default)]
     pub conductor_reprompted: bool,
+
+    /// The step's reply from the rejected attempts (R3): the first that had
+    /// one, kept for whatever settles the label.
+    #[serde(default)]
+    pub reply: Option<String>,
 }
 
 impl OutputRescue {
@@ -436,6 +476,7 @@ impl OutputRescue {
             harness: rejection.harness.clone(),
             harness_session_id: rejection.harness_session_id.clone(),
             conductor_reprompted: false,
+            reply: non_blank(rejection.reply.as_deref()),
         }
     }
 
@@ -443,6 +484,10 @@ impl OutputRescue {
     fn record(&mut self, failure: &UnlabelledAnswer) {
         self.answers.push(failure.answer.clone());
         self.reason = failure.reason.clone();
+        // A reprompt's text counts only when no earlier attempt had any (R3).
+        if self.reply.is_none() {
+            self.reply = non_blank(failure.reply.as_deref());
+        }
         if failure.harness_session_id.is_some() {
             self.harness = failure.harness.clone().or_else(|| self.harness.clone());
             self.harness_session_id = failure.harness_session_id.clone();
@@ -690,6 +735,8 @@ pub(super) struct UnlabelledAnswer {
     harness: Option<String>,
     /// The session it ran in, when it said.
     harness_session_id: Option<String>,
+    /// The attempt's reply, when it had one.
+    reply: Option<String>,
 }
 
 /// How a reprompt ended without a label the state accepts.
@@ -1019,6 +1066,12 @@ impl Engine {
             })?;
 
         let mut execution = WorkflowExecution::new(definition, inputs, workspace);
+
+        if let Some(initial) = definition.states.get(&definition.initial_state) {
+            if is_agent(initial) && initial.max_entries.is_some() {
+                count_entry(&mut execution, &initial.id)?;
+            }
+        }
 
         if let Some(object) = execution.inputs.as_object() {
             execution.context.update_variables(object.clone());
@@ -1486,6 +1539,36 @@ impl Engine {
             return Ok(HandleState::Ready(execution));
         }
 
+        if resumed.pending.continuation == InputContinuation::EntryLimit {
+            if resumed.result.output_label == ENTRY_LIMIT_CONTINUE_LABEL
+                || resumed.result.output_label == ENTRY_LIMIT_RESET_LABEL
+            {
+                return Ok(HandleState::Ready(execution));
+            }
+
+            let outcome = DecisionOutcome {
+                label: resumed.result.output_label.clone(),
+                provider: DecisionProviderType::Human,
+                reasoning: delivery.comment.clone(),
+            };
+            let flow = self.apply_decision(
+                definition,
+                &mut execution,
+                state,
+                PendingStep {
+                    state_id: state_id.clone(),
+                    action_execution_id: resumed.pending.action_execution_id().to_string(),
+                    result: resumed.result,
+                    artifacts: Vec::new(),
+                },
+                outcome,
+            )?;
+            return Ok(match flow {
+                Flow::Stop => HandleState::Done(execution),
+                Flow::Continue => HandleState::Ready(execution),
+            });
+        }
+
         if resumed.pending.continuation == InputContinuation::ResumeAgent {
             let answer = agent_reply(&resumed.result.variables).ok_or_else(|| {
                 EngineError::HumanInput(HumanActionError::MissingRequiredField {
@@ -1561,6 +1644,13 @@ impl Engine {
                         .find_map(|answer| answer.answer_tail.clone())
                 })
                 .unwrap_or_default();
+            // The reply of the rejected attempts: the operator settles the
+            // label, not what the agent said (R3).
+            result.reply = resumed
+                .pending
+                .problem
+                .as_ref()
+                .and_then(|problem| problem.reply.clone());
             let flow = match self.record_result(
                 &mut execution,
                 state,
@@ -2046,8 +2136,30 @@ impl Engine {
 
         // Lazily, on entering the state, so that `{{ context.variables.x }}`
         // picks up the value current at this moment (D31).
+        let mut step_replies = HashMap::new();
+        for source in action_step_reply_sources(action) {
+            if let Some(attempt) = step_reply_attempt(execution, &source) {
+                match self.store.read_step_reply(&execution.id, attempt) {
+                    Ok(reply) => {
+                        step_replies.insert(source, Value::String(reply));
+                    }
+                    // A pointer without its file is a reply that is not
+                    // there: rendering names the step as an unknown variable.
+                    Err(PersistenceError::Io { source: error, .. })
+                        if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(AttemptFailure::retriable(format!(
+                            "could not read the reply of step '{source}' (attempt {attempt}): \
+                             {error}"
+                        ))
+                        .side_effect_free_if(true));
+                    }
+                }
+            }
+        }
         let scope = TemplateScope::from_execution(&execution.inputs, &execution.context)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
+        let scope = scope.with_step_replies(&step_replies);
         let mut rendered = scope
             .render_action(action, &location)
             .map_err(|error| AttemptFailure::permanent(error.to_string()))?;
@@ -2352,6 +2464,7 @@ impl Engine {
                 state,
                 config,
                 &rejection.action_execution_id,
+                rejection.reply.as_deref(),
                 RepromptedBy::Engine,
                 timeout,
             )
@@ -2387,12 +2500,14 @@ impl Engine {
     /// An attempt that ends without a label is returned as it is, still
     /// open: closing it with `ActionOutputRejected` is the caller's, after
     /// it recorded what comes next.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn reprompt_attempt(
         &self,
         execution: &mut WorkflowExecution,
         state: &State,
         config: crate::domain::AgentActionConfig,
         previous_attempt: &str,
+        previous_reply: Option<&str>,
         by: RepromptedBy,
         timeout: Option<Duration>,
     ) -> Result<RepromptEnd, EngineError> {
@@ -2438,8 +2553,8 @@ impl Engine {
                     None => {
                         return Ok(RepromptEnd::Labelled {
                             action_execution_id,
-                            result,
-                        })
+                            result: keep_previous_reply(result, previous_reply),
+                        });
                     }
                     Some(rejection) => RepromptFailure::Rejected(rejection),
                 }
@@ -2449,7 +2564,7 @@ impl Engine {
                     Ok(result) => {
                         return Ok(RepromptEnd::Labelled {
                             action_execution_id,
-                            result,
+                            result: keep_previous_reply(result, previous_reply),
                         })
                     }
                     Err(error) => RepromptFailure::Failed(error.message),
@@ -2481,6 +2596,7 @@ impl Engine {
                 ),
                 harness: rejection.harness,
                 harness_session_id: rejection.harness_session_id,
+                reply: rejection.reply,
             },
             RepromptFailure::Failed(message) => {
                 let reason =
@@ -2494,6 +2610,7 @@ impl Engine {
                     reason,
                     harness: None,
                     harness_session_id: None,
+                    reply: None,
                 }
             }
         }))
@@ -2556,8 +2673,9 @@ impl Engine {
         // Keep the historical harness/session on the durable input record.
         // `OutputRescue` is about to be cleared, but the operator may choose
         // conversation rather than the manual output that originally ended it.
-        let session = stored_output_rescue(execution, &state.id)?
-            .map(|rescue| (rescue.harness, rescue.harness_session_id));
+        let rescue = stored_output_rescue(execution, &state.id)?;
+        let reply = rescue.as_ref().and_then(|rescue| rescue.reply.clone());
+        let session = rescue.map(|rescue| (rescue.harness, rescue.harness_session_id));
         clear_engine_metadata(execution, METADATA_OUTPUT_REJECTION_KEY);
         clear_engine_metadata(execution, METADATA_OUTPUT_RESCUE_KEY);
 
@@ -2575,6 +2693,7 @@ impl Engine {
             answers,
             requirements: output_requirements(definition, execution, state),
             analysis,
+            reply,
         };
         let request = HumanInputRequest {
             action_execution_id: action_execution_id.clone(),
@@ -2788,6 +2907,10 @@ impl Engine {
                 return Ok(Flow::Stop);
             }
         };
+        let continues_target_session = state
+            .outputs
+            .iter()
+            .any(|output| output.label == outcome.label && output.resume_comment_field.is_some());
 
         self.emit(
             &execution.id,
@@ -2804,6 +2927,30 @@ impl Engine {
         execution
             .context
             .update_variables(pending.result.variables.clone());
+        if pending
+            .result
+            .reply
+            .as_deref()
+            .is_some_and(|reply| !reply.trim().is_empty())
+            && workflow_step_reply_sources(definition).contains(&state.id)
+        {
+            let reply = pending.result.reply.as_deref().expect("checked above");
+            self.store
+                .write_step_reply(&execution.id, &pending.action_execution_id, reply)?;
+            let attempts = engine_metadata_mut(execution)
+                .entry(METADATA_STEP_REPLIES_KEY.to_string())
+                .or_insert_with(|| json!({}));
+            if !attempts.is_object() {
+                *attempts = json!({});
+            }
+            attempts
+                .as_object_mut()
+                .expect("reply pointers are an object")
+                .insert(
+                    state.id.clone(),
+                    Value::String(pending.action_execution_id.clone()),
+                );
+        }
         for artifact in &pending.artifacts {
             let key = artifact.name.clone().unwrap_or_else(|| artifact.id.clone());
             execution.context.add_artifact(
@@ -2846,11 +2993,97 @@ impl Engine {
 
         execution.current_state = Some(target);
         execution.current_action_execution = Some(pending.action_execution_id);
+        let target_state = definition
+            .states
+            .get(execution.current_state.as_deref().expect("target was set"))
+            .expect("validated transition target exists");
+        if is_agent(target_state) && !continues_target_session {
+            if let Some(max_entries) = target_state.max_entries {
+                let entries = state_entry_count(execution, &target_state.id)?;
+                if entries >= max_entries {
+                    // `suspend` saves the execution once, after the pending
+                    // input exists: a crash before then cannot start the step
+                    // past its limit.
+                    self.wait_on_entry_limit(
+                        definition,
+                        execution,
+                        target_state,
+                        entries,
+                        max_entries,
+                    )?;
+                    return Ok(Flow::Stop);
+                }
+                count_entry(execution, &target_state.id)?;
+            }
+        }
         self.store.save_execution(execution)?;
 
         self.write_checkpoint(definition, execution);
 
         Ok(Flow::Continue)
+    }
+
+    fn wait_on_entry_limit(
+        &self,
+        definition: &WorkflowDefinition,
+        execution: &mut WorkflowExecution,
+        state: &State,
+        entries: u32,
+        max_entries: u32,
+    ) -> Result<(), EngineError> {
+        let attempt_id = Uuid::new_v4().to_string();
+        let request = HumanInputRequest {
+            action_execution_id: attempt_id,
+            instruction: format!(
+                "Krok '{}' osiągnął limit wejść: {entries}/{max_entries}. Wybierz kontynuację albo wyjście.",
+                state.id
+            ),
+            fields: vec![HumanInputField {
+                name: human::ENTRY_LIMIT_DECISION_FIELD.to_string(),
+                field_type: HumanInputType::Select,
+                options: vec![
+                    human::ENTRY_LIMIT_CONTINUE.to_string(),
+                    human::ENTRY_LIMIT_RESET_COUNTER.to_string(),
+                ],
+                required: false,
+                description: Some("Kontynuuj albo rozpocznij licznik od nowa".to_string()),
+            }],
+            question: None,
+            answer_tail: None,
+            agent_harness: None,
+            agent_session_id: None,
+            prefilled_answer: None,
+            permission: None,
+        };
+        let requirements = output_requirements(definition, execution, state);
+        let problem = OutputProblem {
+            reason: format!("entry limit reached ({entries}/{max_entries})"),
+            answers: Vec::new(),
+            requirements,
+            analysis: None,
+            reply: None,
+        };
+        let pending = PendingHumanInput::for_entry_limit(
+            execution.id.clone(),
+            state.id.clone(),
+            request,
+            state.outputs.clone(),
+            problem,
+            EntryLimitDetails {
+                entries,
+                max_entries,
+            },
+        );
+        human::suspend(&self.store, execution, &pending)?;
+        self.emit(
+            &execution.id,
+            EventData::EntryLimitReached {
+                state_id: state.id.clone(),
+                entries,
+                max_entries,
+            },
+        )?;
+        Ok(())
     }
 
     /// Captures the workspace at a step boundary, if checkpointing is on.
@@ -3560,6 +3793,22 @@ pub fn owed_output_rescue(
     }
 }
 
+/// `reply`, unless it is missing or only whitespace.
+fn non_blank(reply: Option<&str>) -> Option<String> {
+    reply
+        .filter(|reply| !reply.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+/// `result` of a format reprompt, with the earlier attempt's reply in place
+/// of its own when there was one: a reprompt never replaces it (R3).
+fn keep_previous_reply(mut result: ActionResult, previous_reply: Option<&str>) -> ActionResult {
+    if let Some(previous) = non_blank(previous_reply) {
+        result.reply = Some(previous);
+    }
+    result
+}
+
 /// The rescue of `execution`'s output label under way, when it belongs to
 /// `state_id`.
 fn stored_output_rescue(
@@ -3630,6 +3879,52 @@ fn clear_engine_metadata(execution: &mut WorkflowExecution, key: &str) {
     }
 }
 
+fn state_entry_count(execution: &WorkflowExecution, state_id: &str) -> Result<u32, EngineError> {
+    let counts: BTreeMap<String, u32> =
+        read_engine_record(execution, METADATA_STATE_ENTRIES_KEY)?.unwrap_or_default();
+    Ok(counts.get(state_id).copied().unwrap_or_default())
+}
+
+/// Counts one more entry into `state_id` (R10), in the record the next save
+/// of `execution` writes.
+///
+/// It checks no limit: the transition the engine takes checks it first, and
+/// the operator's manual transition counts without checking it (R10a).
+fn count_entry(execution: &mut WorkflowExecution, state_id: &str) -> Result<(), EngineError> {
+    let mut counts: BTreeMap<String, u32> =
+        read_engine_record(execution, METADATA_STATE_ENTRIES_KEY)?.unwrap_or_default();
+    let count = counts.entry(state_id.to_string()).or_default();
+    *count = count.saturating_add(1);
+    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)
+}
+
+/// The entry counts of `execution` (R10), as a decision saves them for an
+/// undo to restore.
+fn state_entries_value(execution: &WorkflowExecution) -> Result<Value, EngineError> {
+    let counts: BTreeMap<String, u32> =
+        read_engine_record(execution, METADATA_STATE_ENTRIES_KEY)?.unwrap_or_default();
+    Ok(json!(counts))
+}
+
+/// Puts back the entry counts `saved` by [`state_entries_value`]; a
+/// decision saved before the counts were kept (`null`) leaves them as they
+/// are.
+fn restore_state_entries(
+    execution: &mut WorkflowExecution,
+    saved: &Value,
+) -> Result<(), EngineError> {
+    if saved.is_null() {
+        return Ok(());
+    }
+    let counts: BTreeMap<String, u32> = serde_json::from_value(saved.clone()).map_err(|error| {
+        EngineError::CorruptEngineMetadata {
+            execution_id: execution.id.clone(),
+            message: format!("the entry counts saved with the decision are unreadable: {error}"),
+        }
+    })?;
+    write_engine_record(execution, METADATA_STATE_ENTRIES_KEY, &counts)
+}
+
 /// What choosing each label of `state` requires of an answer to a problem
 /// (KTD15, R18), worked out from the state each label leads to.
 ///
@@ -3655,18 +3950,27 @@ fn output_requirements(
                 Some(ActionConfig::Human(_)) => vec!["question".to_string()],
                 _ => Vec::new(),
             };
-            let variables = action
-                .map(action_context_references)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|name| {
-                    !execution
-                        .context
-                        .variables
-                        .get(name)
-                        .is_some_and(|value| !human::is_blank(value))
-                })
-                .collect();
+            let mut variables = output
+                .requires_variables
+                .iter()
+                .map(|required| required.name().to_string())
+                .collect::<Vec<_>>();
+            variables.extend(
+                action
+                    .map(action_context_references)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|name| {
+                        !execution
+                            .context
+                            .variables
+                            .get(name)
+                            .is_some_and(|value| !human::is_blank(value))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            variables.sort();
+            variables.dedup();
             OutputRequirement {
                 label: output.label.clone(),
                 data,
@@ -3812,6 +4116,7 @@ pub fn record_manual_transition(
                     InputContinuation::CompleteStep => None,
                     InputContinuation::ApproveOutput => None,
                     InputContinuation::ResolvePermission => None,
+                    InputContinuation::EntryLimit => None,
                 })
         }
     } else {
@@ -3847,6 +4152,41 @@ fn engine_metadata_mut(execution: &mut WorkflowExecution) -> &mut serde_json::Ma
         .expect("engine metadata was just made an object")
 }
 
+fn step_reply_attempt<'a>(execution: &'a WorkflowExecution, state_id: &str) -> Option<&'a str> {
+    execution
+        .metadata
+        .get(METADATA_ENGINE_KEY)?
+        .get(METADATA_STEP_REPLIES_KEY)?
+        .get(state_id)?
+        .as_str()
+}
+
+fn action_step_reply_sources(action: &ActionConfig) -> Vec<String> {
+    let mut sources = Vec::new();
+    let templates: Vec<&str> = match action {
+        ActionConfig::Agent(config) => vec![config.prompt.as_str()],
+        ActionConfig::Human(config) => vec![config.instruction.as_str()],
+        _ => Vec::new(),
+    };
+    for template in templates {
+        for source in step_reply_references(template) {
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+        }
+    }
+    sources
+}
+
+fn workflow_step_reply_sources(definition: &WorkflowDefinition) -> HashSet<String> {
+    definition
+        .states
+        .values()
+        .flat_map(|state| state.action.as_ref().into_iter())
+        .flat_map(action_step_reply_sources)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3856,6 +4196,7 @@ mod tests {
     fn terminal(id: &str, declared: Option<TerminalStatus>) -> State {
         State {
             id: id.to_string(),
+            max_entries: None,
             description: None,
             action: None,
             outputs: Vec::new(),

@@ -819,6 +819,8 @@ fn saved_choice() -> SavedDecision {
         context_before: json!({}),
         answers: Vec::new(),
         reason: None,
+        reply: None,
+        state_entries_before: serde_json::Value::Null,
         saved_at: chrono::Utc::now(),
     }
 }
@@ -929,6 +931,7 @@ async fn a_restart_after_the_choices_result_takes_only_the_decision() {
             exit_code: None,
             stdout: String::new(),
             stderr: String::new(),
+            reply: None,
         },
         artifacts: Vec::new(),
     };

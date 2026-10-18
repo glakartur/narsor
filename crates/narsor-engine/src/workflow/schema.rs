@@ -341,6 +341,9 @@ pub struct LocalWorkspaceSchema {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateSchema {
+    /// Maximum number of entries before operator intervention.
+    #[serde(default)]
+    pub max_entries: Option<u32>,
     #[serde(default)]
     pub description: Option<String>,
 
@@ -401,9 +404,17 @@ pub struct StateSchema {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputSchema {
     pub label: String,
+    pub requires_variables: Vec<RequiredVariableSchema>,
     pub description: Option<String>,
     pub requires_human_approval: bool,
     pub resume_comment_field: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum RequiredVariableSchema {
+    Name(String),
+    Described { name: String, description: String },
 }
 
 /// The object form of an [`OutputSchema`]. `deny_unknown_fields` keeps a
@@ -412,6 +423,8 @@ pub struct OutputSchema {
 #[serde(deny_unknown_fields)]
 struct OutputObjectSchema {
     label: String,
+    #[serde(default)]
+    requires_variables: Vec<RequiredVariableSchema>,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
@@ -439,6 +452,7 @@ impl<'de> Deserialize<'de> for OutputSchema {
             fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
                 Ok(OutputSchema {
                     label: value.to_string(),
+                    requires_variables: Vec::new(),
                     description: None,
                     requires_human_approval: false,
                     resume_comment_field: None,
@@ -453,6 +467,7 @@ impl<'de> Deserialize<'de> for OutputSchema {
                     OutputObjectSchema::deserialize(de::value::MapAccessDeserializer::new(map))?;
                 Ok(OutputSchema {
                     label: object.label,
+                    requires_variables: object.requires_variables,
                     description: object.description,
                     requires_human_approval: object.requires_human_approval,
                     resume_comment_field: object.resume_comment_field,

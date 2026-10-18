@@ -273,9 +273,11 @@ pub fn attention_kind_name(kind: AttentionKind) -> &'static str {
         AttentionKind::Question => "question",
         AttentionKind::Approval => "approval",
         AttentionKind::Problem => "problem",
+        AttentionKind::EntryLimit => "entry limit",
         AttentionKind::FailedStep => "failed step",
         AttentionKind::ConductorProposal => "conductor proposal",
         AttentionKind::ProvisioningFailed => "provisioning failed",
+        AttentionKind::Unrecognized => "unsupported wait",
     }
 }
 
@@ -346,6 +348,8 @@ fn attention_glyph(kind: AttentionKind) -> char {
         AttentionKind::Problem | AttentionKind::FailedStep | AttentionKind::ProvisioningFailed => {
             '!'
         }
+        AttentionKind::EntryLimit => '?',
+        AttentionKind::Unrecognized => '?',
     }
 }
 

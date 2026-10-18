@@ -14,6 +14,7 @@ use super::scroll::sanitize;
 /// A one-line description of an event, for the stream panel.
 pub fn event_line(event: &Event) -> String {
     let detail = match &event.data {
+        EventData::Unrecognized => "unknown_event".to_string(),
         EventData::WorkflowStarted { workflow_id, .. } => {
             format!("workflow_started  {workflow_id}")
         }
@@ -140,6 +141,18 @@ pub fn event_line(event: &Event) -> String {
             to_state,
             output_label,
         } => format!("transition_taken  {from_state} → {to_state} ({output_label})"),
+        EventData::EntryLimitReached {
+            state_id,
+            entries,
+            max_entries,
+        } => format!("entry_limit_reached  {state_id} ({entries}/{max_entries})"),
+        EventData::EntryLimitDecision { state_id, decision } => {
+            format!("entry_limit_decision  {state_id} → {decision}")
+        }
+        EventData::EntryLimitCounterReset {
+            state_id,
+            previous_entries,
+        } => format!("entry_limit_reset  {state_id} ({previous_entries})"),
         EventData::ArtifactCreated { artifact_id, .. } => {
             format!("artifact_created  {artifact_id}")
         }

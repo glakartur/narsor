@@ -284,6 +284,7 @@ fn initial_state_that_does_not_exist_is_rejected() {
         "done".to_string(),
         State {
             id: "done".to_string(),
+            max_entries: None,
             description: None,
             action: None,
             outputs: Vec::new(),
@@ -320,6 +321,188 @@ fn initial_state_that_does_not_exist_is_rejected() {
         "got: {}",
         describe(&errors)
     );
+}
+
+#[test]
+fn validates_step_reply_sources_and_agent_entry_limits() {
+    let valid = r#"
+name: replies
+version: 1
+states:
+  review:
+    action: { type: agent, prompt: review }
+    outputs: [done]
+    transitions: { done: fix }
+  fix:
+    max_entries: 3
+    action:
+      type: agent
+      prompt: "Fix: {{ steps.review.reply }}"
+    outputs: [done]
+    transitions: { done: finished }
+  finished: { description: done }
+terminal_states: [finished]
+"#;
+    assert!(load_from_str(valid).unwrap().validate().is_ok());
+
+    let invalid = valid
+        .replace("steps.review.reply", "steps.finished.reply")
+        .replace("max_entries: 3", "max_entries: 0");
+    let errors = load_from_str(&invalid).unwrap().validate().unwrap_err();
+    assert!(errors
+        .iter()
+        .any(|error| error.to_string().contains("max_entries")));
+    assert!(errors
+        .iter()
+        .any(|error| error.to_string().contains("finished")));
+}
+
+#[test]
+fn a_step_reply_from_a_human_state_is_rejected() {
+    let errors = errors_of("step_reply_from_human_state.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InvalidStepReplySource { state, step_id, field }
+                if state == "work" && step_id == "gate" && field == "action.prompt"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_step_reply_from_a_script_state_is_rejected() {
+    let errors = errors_of("step_reply_from_script_state.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InvalidStepReplySource { state, step_id, field }
+                if state == "work" && step_id == "check" && field == "action.prompt"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_step_field_other_than_reply_is_rejected() {
+    let errors = errors_of("step_field_other_than_reply.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::UnsupportedStepReference { state, field, reference }
+                if state == "work" && field == "action.prompt" && reference == "steps.review.data"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_step_reply_in_the_display_title_is_rejected() {
+    let errors = errors_of("step_reply_in_display_title.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InvalidDisplay { field, reason }
+                if field == "display.title" && reason.contains("step replies")
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_step_reply_in_the_workspace_is_rejected() {
+    let errors = errors_of("step_reply_in_workspace.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InvalidDisplay { field, reason }
+                if field == "globals.workspace.path" && reason.contains("step replies")
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_step_reply_in_script_args_is_rejected() {
+    let errors = errors_of("step_reply_in_script_args.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::StepReplyNotAllowed { state, field }
+                if state == "check" && field == "action.args[0]"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn zero_max_entries_is_rejected() {
+    let errors = errors_of("zero_max_entries.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InvalidMaxEntries { state, value } if state == "work" && *value == 0
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn max_entries_on_a_human_gate_is_rejected() {
+    let errors = errors_of("max_entries_on_human_gate.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InvalidMaxEntries { state, value } if state == "gate" && *value == 3
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn an_invalid_required_variable_name_is_rejected() {
+    let errors = errors_of("invalid_required_variable_name.yaml");
+    assert!(
+        errors.iter().any(|err| matches!(
+            err,
+            ValidationError::InvalidRequiredVariable { state, label, name }
+                if state == "work" && label == "done" && name == "pr-url"
+        )),
+        "got: {}",
+        describe(&errors)
+    );
+}
+
+#[test]
+fn a_step_reading_its_own_reply_passes() {
+    let yaml = r#"
+name: self-reply
+version: 1
+states:
+  review:
+    action:
+      type: agent
+      prompt: "Review again. Last time: {{ steps.review.reply }}"
+    outputs: [again, done]
+    transitions: { again: review, done: finished }
+  finished: { description: done }
+terminal_states: [finished]
+"#;
+    let definition = load_from_str(yaml).unwrap();
+    if let Err(errors) = definition.validate() {
+        panic!(
+            "a step may read its own earlier reply, got: {}",
+            describe(&errors)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

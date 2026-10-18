@@ -109,6 +109,8 @@ pub struct PendingHumanInputView {
     #[serde(default)]
     pub problem: Option<OutputProblemView>,
     #[serde(default)]
+    pub entry_limit: Option<EntryLimitView>,
+    #[serde(default)]
     pub approval: Option<ApprovalCandidateView>,
     #[serde(default)]
     pub resume_targets: BTreeMap<String, AgentSessionProvenanceView>,
@@ -211,7 +213,23 @@ pub enum InputContinuationView {
     ResolveOutput,
     ApproveOutput,
     ResolvePermission,
+    EntryLimit,
+    #[serde(other)]
+    Unrecognized,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryLimitView {
+    pub entries: u32,
+    pub max_entries: u32,
+}
+
+/// The field of an entry-limit wait that carries the operator's decision.
+pub const ENTRY_LIMIT_DECISION_FIELD: &str = "entry_limit_decision";
+/// The entry-limit decision that lets the step run once more.
+pub const ENTRY_LIMIT_CONTINUE: &str = "continue";
+/// The entry-limit decision that starts the step's counter again.
+pub const ENTRY_LIMIT_RESET_COUNTER: &str = "reset_counter";
 
 /// Claude Code's `decision_reason_type`s of a denial an allow rule for the
 /// task can lift: the command only lacked approval and nobody could give it

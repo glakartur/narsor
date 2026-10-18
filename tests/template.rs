@@ -78,6 +78,16 @@ fn context_shorthand_is_an_alias_for_variables() {
 }
 
 #[test]
+fn substitutes_a_named_step_reply_once() {
+    let replies = HashMap::from([("review".to_string(), json!("finding {{ context.secret }}"))]);
+    let rendered = TemplateScope::new(&Map::new(), &Context::new())
+        .with_step_replies(&replies)
+        .render("Report: {{ steps.review.reply }}", WHERE)
+        .unwrap();
+    assert_eq!(rendered, "Report: finding {{ context.secret }}");
+}
+
+#[test]
 fn substitutes_two_occurrences_independently() {
     let inputs = inputs(&[("feature", json!("login"))]);
     let context = context(&[("branch", json!("feat/login"))]);

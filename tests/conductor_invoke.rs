@@ -1073,6 +1073,7 @@ fn a_long_tasks_snapshot_fits_its_budget_with_the_definition_and_pending_input_w
         current_state: Some("implement".to_string()),
         state_outputs: vec![OutputDefinition {
             label: "implemented".to_string(),
+            requires_variables: Vec::new(),
             description: Some("The work is done.".to_string()),
             requires_human_approval: false,
             resume_comment_field: None,

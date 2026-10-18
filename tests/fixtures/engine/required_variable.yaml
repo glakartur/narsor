@@ -1,0 +1,21 @@
+name: required-variable
+version: 1
+description: >
+  A plan step whose labels need variables the agent must give: `plan_ready`
+  and `approved_plan` need `plan_doc`, `clean` needs nothing.
+states:
+  plan:
+    action: { type: agent, prompt: plan the work }
+    max_entries: 5
+    outputs:
+      - label: plan_ready
+        requires_variables:
+          - name: plan_doc
+            description: Path of the plan document.
+      - label: approved_plan
+        requires_variables: [plan_doc]
+        requires_human_approval: true
+      - clean
+    transitions: { plan_ready: completed, approved_plan: completed, clean: completed }
+  completed: { description: done }
+terminal_states: [completed]

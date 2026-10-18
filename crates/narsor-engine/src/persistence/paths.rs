@@ -333,6 +333,13 @@ impl StatePaths {
         self.execution_dir(execution_id).join(CONTEXT_FILE)
     }
 
+    /// `{root}/executions/{execution_id}/step-replies/{attempt_id}.txt`.
+    pub fn step_reply_file(&self, execution_id: &str, attempt_id: &str) -> PathBuf {
+        self.execution_dir(execution_id)
+            .join("step-replies")
+            .join(format!("{attempt_id}.txt"))
+    }
+
     /// `{root}/orchestration`
     pub fn orchestration_dir(&self) -> PathBuf {
         self.root.join(ORCHESTRATION_DIR)

@@ -1,0 +1,30 @@
+# Only `reply` can be read from a step: `steps.X.data` is not a field.
+name: step-field-other-than-reply
+version: 1
+
+states:
+  review:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: Przejrzyj zmiany.
+    outputs:
+      - findings
+    transitions:
+      findings: work
+
+  work:
+    action:
+      type: agent
+      harness: claude-code
+      prompt: "Popraw: {{ steps.review.data }}"
+    outputs:
+      - done
+    transitions:
+      done: finished
+
+  finished:
+    description: Koniec.
+
+terminal_states:
+  - finished

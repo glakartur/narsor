@@ -174,6 +174,11 @@ Niezmienny rekord faktu, który wydarzył się w systemie. Podstawa obserwowalno
 - `ActionFailed`
 - `DecisionMade` (z wybraną transition)
 - `TransitionTaken`
+- `EntryLimitReached` (`state_id`, `entries`, `max_entries`): przejście doszło do kroku,
+  który osiągnął `max_entries`; krok nie startuje. Kolejność opisuje sekcja 6.
+- `EntryLimitCounterReset` (`state_id`, `previous_entries`): operator wyzerował licznik.
+- `EntryLimitDecision` (`state_id`, `decision`: `continue` albo `reset_counter`): decyzja
+  operatora na limicie.
 - `WorkflowPaused` / `WorkflowResumed`
 - `WorkflowCompleted` / `WorkflowFailed`
 - `HumanInputRequested` / `HumanInputProvided`
@@ -342,6 +347,38 @@ System musi zapewniać następujące inwarianty:
 ---
 
 ## 6. Rozszerzalność modelu
+
+### Odpowiedzi kroków i limity wejść
+
+`metadata.engine.step_replies` przechowuje mapę `state_id → action_execution_id`.
+Treść odpowiedzi znajduje się w `step-replies/{action_execution_id}.txt` i jest
+zapisywana atomowo przed zatwierdzeniem wskaźnika w `state.json`. Nieudane
+wejście nie zastępuje ostatniej odpowiedzi. `metadata.engine.state_entries`
+przechowuje liczbę wejść do kroków; licznik jest aktualizowany razem z
+przejściem i przetrwa restart procesu.
+
+Oczekiwanie na limicie pozostaje w statusie `InputNeeded` i używa trwałego
+`pending_input.json`. Historia zdarzeń opisuje zatrzymanie, decyzję operatora
+i ewentualne wyzerowanie licznika. Wybór etykiety na limicie rozstrzyga wynik
+kroku przez ścieżkę `ResolveOutput`, z walidacją wymaganych zmiennych.
+
+Kolejność zdarzeń na limicie:
+
+1. `TransitionTaken` do kroku na limicie.
+2. `HumanInputRequested`, potem `EntryLimitReached`. Brak `StateEntered` i
+   `ActionStarted`: krok nie startuje.
+3. Po decyzji operatora: `HumanInputReceived`, potem `EntryLimitCounterReset`
+   (tylko dla `reset_counter`), potem `EntryLimitDecision`.
+4. Krok startuje: `StateEntered`, `ActionStarted`. `continue` zwiększa licznik
+   o 1, `reset_counter` ustawia go na 1.
+
+Wybór etykiety na limicie nie emituje `EntryLimitDecision`: krok kończy się
+wybranym wynikiem i nie startuje.
+
+Cofnięcie wyboru wyjścia przez dyrygenta (KTD13) przywraca `context` i
+`metadata.engine.state_entries` sprzed decyzji. Problem otwarty ponownie
+zawiera odpowiedź kroku (`reply`), więc nowe rozstrzygnięcie zapisuje ją
+znowu we wskaźniku `metadata.engine.step_replies`.
 
 Model został zaprojektowany z myślą o przyszłych rozszerzeniach:
 

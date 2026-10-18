@@ -372,6 +372,10 @@ pub struct PendingHumanInput {
     #[serde(default)]
     pub problem: Option<OutputProblem>,
 
+    /// Entry count and configured limit for an entry-limit wait.
+    #[serde(default)]
+    pub entry_limit: Option<EntryLimitDetails>,
+
     /// The completed agent result held for an explicit approval decision.
     #[serde(default)]
     pub approval: Option<ApprovalCandidate>,
@@ -407,6 +411,17 @@ pub struct OutputProblem {
     /// The conductor's reading of the answers, when it made one (U10).
     #[serde(default)]
     pub analysis: Option<ConductorAnalysis>,
+
+    /// The step's reply from the rejected attempts, kept as the reply of
+    /// the output the operator settles (R3).
+    #[serde(default)]
+    pub reply: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryLimitDetails {
+    pub entries: u32,
+    pub max_entries: u32,
 }
 
 impl OutputProblem {
@@ -487,6 +502,8 @@ pub enum InputContinuation {
     /// step as if the agent had kept to its output contract.
     ResolveOutput,
     ApproveOutput,
+    /// The workflow reached a state's configured entry limit.
+    EntryLimit,
     /// A Claude Code permission request; only the dedicated permission
     /// resolution operation may close it.
     ResolvePermission,
@@ -528,6 +545,7 @@ impl PendingHumanInput {
             continuation: InputContinuation::CompleteStep,
             episode: new_episode(),
             problem: None,
+            entry_limit: None,
             approval: None,
             resume_targets: BTreeMap::new(),
             requested_at: Utc::now(),
@@ -548,6 +566,7 @@ impl PendingHumanInput {
             continuation: InputContinuation::ResumeAgent,
             episode: new_episode(),
             problem: None,
+            entry_limit: None,
             approval: None,
             resume_targets: BTreeMap::new(),
             requested_at: Utc::now(),
@@ -569,6 +588,7 @@ impl PendingHumanInput {
             continuation: InputContinuation::ResolvePermission,
             episode: new_episode(),
             problem: None,
+            entry_limit: None,
             approval: None,
             resume_targets: BTreeMap::new(),
             requested_at: Utc::now(),
@@ -592,6 +612,7 @@ impl PendingHumanInput {
             continuation: InputContinuation::ResolveOutput,
             episode: new_episode(),
             problem: Some(problem),
+            entry_limit: None,
             approval: None,
             resume_targets: BTreeMap::new(),
             requested_at: Utc::now(),
@@ -612,10 +633,25 @@ impl PendingHumanInput {
             continuation: InputContinuation::ApproveOutput,
             episode: new_episode(),
             problem: None,
+            entry_limit: None,
             approval: Some(candidate),
             resume_targets: BTreeMap::new(),
             requested_at: Utc::now(),
         }
+    }
+
+    pub fn for_entry_limit(
+        execution_id: impl Into<ExecutionId>,
+        state_id: impl Into<StateId>,
+        request: HumanInputRequest,
+        outputs: Vec<OutputDefinition>,
+        problem: OutputProblem,
+        details: EntryLimitDetails,
+    ) -> Self {
+        let mut pending = Self::for_problem(execution_id, state_id, request, outputs, problem);
+        pending.continuation = InputContinuation::EntryLimit;
+        pending.entry_limit = Some(details);
+        pending
     }
 
     /// The key a delivery names this request by (KTD9).
@@ -836,6 +872,8 @@ pub struct ResumedHumanAction {
 /// Everything that can go wrong around a human action.
 #[derive(Debug, Error)]
 pub enum HumanActionError {
+    #[error("invalid pending continuation: {reason}")]
+    InvalidContinuation { reason: String },
     /// A permission wait must be resolved through its dedicated decision
     /// operation; ordinary human input must never grant harness access.
     #[error("this request requires a permission decision")]
@@ -1312,6 +1350,34 @@ fn resume_inner(
                 delivery.variables.clone(),
             )
         }
+        InputContinuation::EntryLimit => {
+            let decision = values
+                .get(ENTRY_LIMIT_DECISION_FIELD)
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if delivery.chosen_label.is_none() {
+                let label = match decision {
+                    ENTRY_LIMIT_CONTINUE => ENTRY_LIMIT_CONTINUE_LABEL,
+                    ENTRY_LIMIT_RESET_COUNTER => ENTRY_LIMIT_RESET_LABEL,
+                    _ => {
+                        return Err(HumanActionError::NoLabelChosen {
+                            outputs: vec![ENTRY_LIMIT_CONTINUE, ENTRY_LIMIT_RESET_COUNTER]
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect(),
+                        })
+                    }
+                };
+                (label.to_string(), Value::Object(Map::new()), Map::new())
+            } else {
+                let label = resolve_output(&pending, delivery, &execution)?;
+                (
+                    label,
+                    Value::Object(delivery.data.clone()),
+                    delivery.variables.clone(),
+                )
+            }
+        }
         InputContinuation::ApproveOutput => {
             reject_step_values(delivery)?;
             match delivery.action {
@@ -1348,7 +1414,9 @@ fn resume_inner(
         }
     };
 
-    let resolves_output = pending.continuation == InputContinuation::ResolveOutput;
+    let resolves_output = pending.continuation == InputContinuation::ResolveOutput
+        || (pending.continuation == InputContinuation::EntryLimit
+            && delivery.chosen_label.is_some());
     store.event_log(execution_id).append_next(
         &execution.id,
         EventData::HumanInputReceived {
@@ -1356,11 +1424,14 @@ fn resume_inner(
             answered_by: Some(delivery.answered_by),
             close_reason: Some(InputCloseReason::Answered),
             episode: Some(pending.episode_key().to_string()),
+            // The entry-limit decisions are internal labels, never a
+            // declared output.
             output_label: (!matches!(
                 pending.continuation,
                 InputContinuation::ResumeAgent | InputContinuation::ApproveOutput
-            ))
-            .then(|| label.clone()),
+            ) && label != ENTRY_LIMIT_CONTINUE_LABEL
+                && label != ENTRY_LIMIT_RESET_LABEL)
+                .then(|| label.clone()),
             data: resolves_output.then(|| data.clone()),
             variables: resolves_output.then(|| Value::Object(variables.clone())),
             comment: delivery
@@ -1371,6 +1442,60 @@ fn resume_inner(
                 .map(ToString::to_string),
         },
     )?;
+
+    if pending.continuation == InputContinuation::EntryLimit
+        && (label == ENTRY_LIMIT_CONTINUE_LABEL || label == ENTRY_LIMIT_RESET_LABEL)
+    {
+        let details =
+            pending
+                .entry_limit
+                .as_ref()
+                .ok_or_else(|| HumanActionError::InvalidContinuation {
+                    reason: "entry-limit wait is missing its details".to_string(),
+                })?;
+        let reset = label == ENTRY_LIMIT_RESET_LABEL;
+        let count = if reset {
+            1
+        } else {
+            details.entries.saturating_add(1)
+        };
+        let engine = execution
+            .metadata
+            .as_object_mut()
+            .expect("execution metadata is an object")
+            .entry("engine".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let entries = engine
+            .as_object_mut()
+            .expect("engine metadata is an object")
+            .entry("state_entries".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        entries
+            .as_object_mut()
+            .expect("state entry counters are an object")
+            .insert(pending.state_id.clone(), Value::from(count));
+        if reset {
+            store.event_log(execution_id).append_next(
+                &execution.id,
+                EventData::EntryLimitCounterReset {
+                    state_id: pending.state_id.clone(),
+                    previous_entries: details.entries,
+                },
+            )?;
+        }
+        store.event_log(execution_id).append_next(
+            &execution.id,
+            EventData::EntryLimitDecision {
+                state_id: pending.state_id.clone(),
+                decision: if reset {
+                    ENTRY_LIMIT_RESET_COUNTER
+                } else {
+                    ENTRY_LIMIT_CONTINUE
+                }
+                .to_string(),
+            },
+        )?;
+    }
 
     execution.status = ExecutionStatus::Running;
     store.save_execution(&execution)?;
@@ -1386,6 +1511,7 @@ fn resume_inner(
         exit_code: None,
         stdout: String::new(),
         stderr: String::new(),
+        reply: None,
     };
 
     Ok(ResumedHumanAction {
@@ -1442,6 +1568,11 @@ pub fn close_pending(
 /// The label [`resume`] reports for an agent's answer to its own question:
 /// internal only, never checked against a state or taken as a transition.
 pub(crate) const RESUME_AGENT_LABEL: &str = "__resume_agent__";
+pub(crate) const ENTRY_LIMIT_CONTINUE_LABEL: &str = "__entry_limit_continue__";
+pub(crate) const ENTRY_LIMIT_RESET_LABEL: &str = "__entry_limit_reset__";
+pub use narsor_protocol::api::{
+    ENTRY_LIMIT_CONTINUE, ENTRY_LIMIT_DECISION_FIELD, ENTRY_LIMIT_RESET_COUNTER,
+};
 
 /// Refuses `data`/`variables` on a request that is not a problem: nothing
 /// would read them, and silently dropping an operator's values is worse than

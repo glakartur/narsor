@@ -1113,6 +1113,7 @@ async fn a_fresh_daemon_continues_a_reprompt_the_restart_interrupted() {
         action_execution_id: "attempt-rejected".to_string(),
         reason: "the answer has no 'output'".to_string(),
         answer_tail: Some("Done.".to_string()),
+        reply: None,
         harness: Some("claude-code".to_string()),
         harness_session_id: Some("fake-session-1".to_string()),
     };
@@ -1407,6 +1408,8 @@ async fn a_fresh_daemon_applies_a_saved_choice_without_invoking_the_conductor() 
                 context_before: serde_json::json!({}),
                 answers: Vec::new(),
                 reason: None,
+                reply: None,
+                state_entries_before: serde_json::Value::Null,
                 saved_at: chrono::Utc::now(),
             }],
             ..ConductorState::default()

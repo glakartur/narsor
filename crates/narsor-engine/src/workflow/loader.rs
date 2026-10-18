@@ -219,6 +219,7 @@ fn compile_state(
 
     State {
         id,
+        max_entries: state.max_entries,
         description: state.description,
         action: state.action.map(compile_action),
         outputs: state
@@ -226,6 +227,19 @@ fn compile_state(
             .into_iter()
             .map(|output| OutputDefinition {
                 label: output.label,
+                requires_variables: output
+                    .requires_variables
+                    .into_iter()
+                    .map(|variable| match variable {
+                        crate::workflow::schema::RequiredVariableSchema::Name(name) => {
+                            crate::domain::RequiredVariable::Name(name)
+                        }
+                        crate::workflow::schema::RequiredVariableSchema::Described {
+                            name,
+                            description,
+                        } => crate::domain::RequiredVariable::Described { name, description },
+                    })
+                    .collect(),
                 // A blank description says nothing; treating it as absent
                 // keeps an empty dash out of every place labels are listed.
                 description: output

@@ -190,17 +190,20 @@ mod tests {
 
         State {
             id: "check".to_string(),
+            max_entries: None,
             description: None,
             action: None,
             outputs: vec![
                 OutputDefinition {
                     label: "success".to_string(),
+                    requires_variables: Vec::new(),
                     description: None,
                     requires_human_approval: false,
                     resume_comment_field: None,
                 },
                 OutputDefinition {
                     label: "orphan".to_string(),
+                    requires_variables: Vec::new(),
                     description: None,
                     requires_human_approval: false,
                     resume_comment_field: None,
@@ -225,6 +228,7 @@ mod tests {
             exit_code: None,
             stdout: String::new(),
             stderr: String::new(),
+            reply: None,
         }
     }
 

@@ -31,7 +31,7 @@ use crate::domain::{
 
 use super::loader::{compile, LoadError};
 use super::schema::WorkflowFile;
-use super::template::check_syntax;
+use super::template::{check_syntax, step_reply_references, unsupported_step_references};
 
 /// Validates a compiled workflow definition.
 ///
@@ -321,6 +321,29 @@ fn states_that_reach_a_terminal<'a>(
 // ---------------------------------------------------------------------------
 
 fn validate_action(state: &State, errors: &mut Vec<ValidationError>) {
+    if let Some(limit) = state.max_entries {
+        if limit == 0 || !matches!(state.action.as_ref(), Some(ActionConfig::Agent(_))) {
+            errors.push(ValidationError::InvalidMaxEntries {
+                state: state.id.clone(),
+                value: limit,
+            });
+        }
+    }
+    for output in &state.outputs {
+        for variable in &output.requires_variables {
+            let name = variable.name();
+            if name.is_empty()
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                || name.as_bytes()[0].is_ascii_digit()
+            {
+                errors.push(ValidationError::InvalidRequiredVariable {
+                    state: state.id.clone(),
+                    label: output.label.clone(),
+                    name: name.to_string(),
+                });
+            }
+        }
+    }
     let Some(action) = &state.action else {
         return;
     };
@@ -509,6 +532,30 @@ fn validate_state_templates(
     templated.sort_by(|left, right| left.0.cmp(&right.0));
 
     for (field, text) in templated {
+        let allowed = field == "action.prompt" || field == "action.message";
+        for source in step_reply_references(text) {
+            if !allowed {
+                errors.push(ValidationError::StepReplyNotAllowed {
+                    state: state.id.clone(),
+                    field: field.clone(),
+                });
+            } else if !definition.states.get(&source).is_some_and(|source_state| {
+                matches!(source_state.action.as_ref(), Some(ActionConfig::Agent(_)))
+            }) {
+                errors.push(ValidationError::InvalidStepReplySource {
+                    state: state.id.clone(),
+                    step_id: source,
+                    field: field.clone(),
+                });
+            }
+        }
+        for reference in unsupported_step_references(text) {
+            errors.push(ValidationError::UnsupportedStepReference {
+                state: state.id.clone(),
+                field: field.clone(),
+                reference,
+            });
+        }
         for variable in extract_input_references(text) {
             if !declares_input(definition, &variable) {
                 errors.push(ValidationError::UnknownInputReference {
@@ -537,6 +584,12 @@ fn validate_workflow_templates(definition: &WorkflowDefinition, errors: &mut Vec
         if !declares_input(definition, &variable) {
             errors.push(ValidationError::UnknownInputReferenceInGlobals { field, variable });
         }
+    }
+    if !step_reply_references(text).is_empty() {
+        errors.push(ValidationError::InvalidDisplay {
+            field: field.to_string(),
+            reason: "step replies are not supported in workspace fields".to_string(),
+        });
     }
 }
 
@@ -581,6 +634,12 @@ fn validate_display(definition: &WorkflowDefinition, errors: &mut Vec<Validation
             errors.push(ValidationError::InvalidDisplay {
                 field: field.clone(),
                 reason: error.to_string(),
+            });
+        }
+        if !step_reply_references(text).is_empty() {
+            errors.push(ValidationError::InvalidDisplay {
+                field: field.clone(),
+                reason: "step replies are not supported in display fields".to_string(),
             });
         }
         for variable in extract_input_references(text) {

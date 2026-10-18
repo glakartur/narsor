@@ -227,6 +227,7 @@ struct ClaudeCodeStreamParser {
     saw_result: bool,
     /// `result`/`errors` of the `result` line, already turned into text.
     result_text: String,
+    reply_text: String,
     /// `is_error`, or `subtype` naming anything other than `success`.
     reported_error: bool,
     /// The `result` line's `subtype`, for the failure message.
@@ -251,6 +252,37 @@ impl ClaudeCodeStreamParser {
         };
 
         let Some(result) = result else {
+            if object.get("type").and_then(Value::as_str) == Some("assistant")
+                && object.get("parent_tool_use_id").is_none_or(Value::is_null)
+            {
+                if let Some(content) = object
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_array)
+                {
+                    // In order: a tool call drops the prose before it, even
+                    // within one message.
+                    for block in content {
+                        match block.get("type").and_then(Value::as_str) {
+                            Some("tool_use")
+                                if block.get("name").and_then(Value::as_str)
+                                    != Some("StructuredOutput") =>
+                            {
+                                self.reply_text.clear();
+                            }
+                            Some("text") => {
+                                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                    if !self.reply_text.is_empty() {
+                                        self.reply_text.push('\n');
+                                    }
+                                    self.reply_text.push_str(text);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             if self.session_id.is_none()
                 && object.get("type").and_then(Value::as_str) == Some("system")
             {
@@ -330,8 +362,14 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
             None
         };
 
+        let reply = if self.reply_text.trim().is_empty() {
+            self.result_text.clone()
+        } else {
+            self.reply_text
+        };
         HarnessRun {
             text: self.result_text,
+            reply: Some(reply),
             session_id: self.session_id,
             failure,
             structured_output: self.structured_output,

@@ -1,0 +1,15 @@
+name: step-reply
+version: 1
+states:
+  review:
+    action: { type: agent, prompt: review the changes }
+    outputs: [findings]
+    transitions: { findings: fix }
+  fix:
+    action:
+      type: agent
+      prompt: "Fix these findings: {{ steps.review.reply }}"
+    outputs: [done]
+    transitions: { done: completed }
+  completed: { description: done }
+terminal_states: [completed]
