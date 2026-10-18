@@ -325,6 +325,21 @@ impl TaskApp {
         request
     }
 
+    /// A paste while the view has the keys: into the field of the form being
+    /// filled, if there is one; the list takes none.
+    pub(super) fn on_repositories_paste(&mut self, pasted: &str) {
+        let View::Repositories(repositories) = &mut self.view else {
+            return;
+        };
+        if repositories
+            .adding
+            .as_mut()
+            .is_some_and(|form| form.paste(pasted))
+        {
+            self.sync_repository_draft();
+        }
+    }
+
     fn on_repositories_list_key(&mut self, key: KeyEvent) -> Request {
         let Some(action) = keymap::lookup(Context::Repositories, &key) else {
             return Request::None;

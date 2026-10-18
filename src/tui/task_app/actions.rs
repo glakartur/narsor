@@ -866,6 +866,21 @@ impl TaskApp {
         }
     }
 
+    /// A paste while something sits over the screen: only a text field of a
+    /// list (the override's reason) takes it, as [`Self::on_list_key`] gives
+    /// it the keys. A menu, a harness list or a `y` / `n` window ignores it.
+    pub(super) fn on_overlay_paste(&mut self, pasted: &str) {
+        match &mut self.overlay {
+            Some(Overlay::Transitions(list)) => {
+                list.chooser.paste(pasted);
+            }
+            Some(Overlay::Links(list)) => {
+                list.chooser.paste(pasted);
+            }
+            _ => {}
+        }
+    }
+
     /// A key in the list of exits or the list of links: the list's own keys.
     fn on_list_key(&mut self, key: KeyEvent) -> Request {
         let chooser = match &mut self.overlay {

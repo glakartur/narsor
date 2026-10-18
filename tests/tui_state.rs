@@ -902,6 +902,177 @@ mod foundations {
             assert_eq!(chooser.focus(), ChooserFocus::Fields);
         }
 
+        /// One entry with `field`, the keys in it.
+        fn typing_into(field: ChooserField) -> Chooser {
+            let mut chooser =
+                Chooser::new(vec![ChooserItem::new("go", "Start.").with_field(field)]);
+            chooser.enter_fields();
+            assert!(chooser.is_typing());
+            chooser
+        }
+
+        fn pasted(field: ChooserField, text: &str) -> ChooserField {
+            let mut chooser = typing_into(field);
+            chooser.paste(text);
+            chooser.fields_of(0)[0].clone()
+        }
+
+        #[test]
+        fn a_paste_of_lines_stays_lines_with_the_cursor_after_it_and_sends_nothing() {
+            let mut chooser = typing_into(ChooserField::multiline("prompt").required());
+            assert!(chooser.paste("a\nb\nc"));
+            let field = &chooser.fields_of(0)[0];
+            assert_eq!(field.value(), "a\nb\nc");
+            assert_eq!(field.cursor(), 5);
+            assert_eq!(chooser.focus(), ChooserFocus::Fields);
+            assert!(
+                matches!(
+                    chooser.on_key(press(KeyCode::Enter)),
+                    ChooserAction::Submit(_)
+                ),
+                "Enter after a paste still sends"
+            );
+        }
+
+        #[test]
+        fn carriage_returns_in_a_paste_are_one_new_line_each() {
+            let multiline = || ChooserField::multiline("prompt");
+            assert_eq!(pasted(multiline(), "a\r\nb\r\nc").value(), "a\nb\nc");
+            assert_eq!(pasted(multiline(), "a\rb").value(), "a\nb");
+        }
+
+        #[test]
+        fn a_paste_into_a_one_line_field_has_spaces_for_line_breaks() {
+            assert_eq!(
+                pasted(ChooserField::text("ticket"), "ABC-123\n").value(),
+                "ABC-123 "
+            );
+            assert_eq!(
+                pasted(ChooserField::text("ticket"), "x\r\ny").value(),
+                "x y"
+            );
+        }
+
+        #[test]
+        fn a_paste_goes_in_at_the_cursor_counted_in_characters() {
+            let mut chooser = typing_into(ChooserField::multiline("prompt").with_value("ab"));
+            chooser.on_key(press(KeyCode::Left));
+            chooser.paste("XY");
+            assert_eq!(chooser.fields_of(0)[0].value(), "aXYb");
+            assert_eq!(chooser.fields_of(0)[0].cursor(), 3);
+
+            let mut chooser = typing_into(ChooserField::text("name").with_value("zażółć"));
+            for _ in 0..4 {
+                chooser.on_key(press(KeyCode::Left));
+            }
+            chooser.paste("🦀ę");
+            assert_eq!(chooser.fields_of(0)[0].value(), "za🦀ężółć");
+            assert_eq!(chooser.fields_of(0)[0].cursor(), 4);
+        }
+
+        #[test]
+        fn a_paste_keeps_tabs_and_drops_escapes_and_control_characters() {
+            assert_eq!(pasted(ChooserField::text("t"), "a\tb").value(), "a\tb");
+            assert_eq!(
+                pasted(ChooserField::multiline("t"), "\x1b[31mred\x1b[0m\x07!\x00").value(),
+                "red!"
+            );
+        }
+
+        #[test]
+        fn a_broken_escape_in_a_paste_takes_no_pasted_text_with_it() {
+            let multiline = || ChooserField::multiline("t");
+            assert_eq!(
+                pasted(multiline(), "line1\x1b\nline2").value(),
+                "line1\nline2",
+                "a lone ESC keeps the line break after it"
+            );
+            assert_eq!(pasted(multiline(), "a\x1bż").value(), "aż");
+            assert_eq!(
+                pasted(multiline(), "log\x1b]0;tytuł\nreszta logu").value(),
+                "log\nreszta logu",
+                "a cut-off OSC ends at the line break"
+            );
+            assert_eq!(
+                pasted(multiline(), "a\x1b]8;;http://x\x1b\\b").value(),
+                "ab",
+                "an OSC ended by ST leaves no backslash"
+            );
+            assert_eq!(
+                pasted(multiline(), "\x1b[12, 34\nfoo").value(),
+                "\nfoo",
+                "a cut-off CSI stops at the line break; the next line stays whole"
+            );
+            assert_eq!(pasted(multiline(), "\x1bcok").value(), "cok");
+            assert_eq!(pasted(multiline(), "\x1bMok").value(), "ok");
+        }
+
+        #[test]
+        fn a_paste_drops_what_the_field_would_not_show() {
+            assert_eq!(
+                pasted(
+                    ChooserField::multiline("t"),
+                    "a\u{200b}b\u{202e}c\u{feff}d\u{e0041}e"
+                )
+                .value(),
+                "abcde"
+            );
+            assert_eq!(
+                pasted(ChooserField::multiline("t"), "a\u{2028}b\u{2029}c\u{85}d").value(),
+                "a\nb\nc\nd",
+                "the Unicode line breaks are new lines"
+            );
+            assert_eq!(
+                pasted(ChooserField::text("t"), "word\u{2028}word").value(),
+                "word word"
+            );
+        }
+
+        #[test]
+        fn a_number_field_takes_only_digits_and_a_choice_takes_no_paste() {
+            assert_eq!(
+                pasted(ChooserField::integer("count"), "4a2\n").value(),
+                "42"
+            );
+            let mut chooser = Chooser::new(vec![ChooserItem::new("go", "Start.")
+                .with_field(ChooserField::select("mode", vec!["a".into(), "b".into()]))]);
+            chooser.enter_fields();
+            assert_eq!(chooser.focus(), ChooserFocus::Fields);
+            assert!(!chooser.paste("b"));
+            assert_eq!(chooser.fields_of(0)[0].value(), "a");
+        }
+
+        #[test]
+        fn an_empty_paste_or_one_of_control_characters_changes_nothing() {
+            let field = ChooserField::text("x").proposed("v");
+            let mut chooser = typing_into(field);
+            assert!(!chooser.paste(""));
+            assert!(!chooser.paste("\x1b[0m\x07"));
+            let field = &chooser.fields_of(0)[0];
+            assert_eq!(field.value(), "v");
+            assert!(field.is_proposed());
+        }
+
+        #[test]
+        fn a_paste_clears_the_proposal_mark_and_the_complaint() {
+            let mut chooser = typing_into(ChooserField::text("x").proposed("v"));
+            assert!(chooser.set_field_error(0, "x", "zła wartość"));
+            assert!(chooser.paste("w"));
+            let field = &chooser.fields_of(0)[0];
+            assert_eq!(field.value(), "vw");
+            assert!(!field.is_proposed());
+            assert_eq!(field.error(), None);
+        }
+
+        #[test]
+        fn a_paste_with_the_keys_on_the_list_changes_nothing() {
+            let mut chooser = review_chooser().selecting(1);
+            assert_eq!(chooser.focus(), ChooserFocus::Actions);
+            assert!(!chooser.paste("q\n"));
+            assert_eq!(chooser.fields_of(1)[0].value(), "");
+            assert_eq!(chooser.selected(), 1);
+        }
+
         #[test]
         fn enter_walks_action_fields_and_submits_from_the_last_one() {
             let mut chooser = Chooser::new(vec![ChooserItem::new("change", "Zmienia zadanie.")
@@ -4381,6 +4552,157 @@ mod task_app_waiting {
     }
 
     #[test]
+    fn lines_pasted_into_an_answer_stay_in_the_field_until_enter_sends_them() {
+        let mut app = opened(with_pending(running("a", 1), question(None)));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(composer_of(&app).focus(), ChooserFocus::Fields);
+        app.on_paste("wersja 2\r\nbez zmian\r\n");
+        assert_eq!(
+            composer_of(&app).fields_of(0)[0].value(),
+            "wersja 2\nbez zmian\n"
+        );
+        assert!(app.panel_focused(), "the keys stay in the panel");
+        assert!(app
+            .detail()
+            .draft("a")
+            .is_some_and(|draft| draft.contains("wersja 2\nbez zmian")));
+        let delivery = delivery(press(&mut app, KeyCode::Enter));
+        assert_eq!(delivery.values["answer"], "wersja 2\nbez zmian\n");
+    }
+
+    #[test]
+    fn a_paste_into_the_note_of_a_failed_step_is_sent_only_by_enter() {
+        let failed = waiting_on(
+            running("a", 1),
+            AttentionKind::FailedStep,
+            "fk1",
+            Some("test"),
+        );
+        let mut app = opened(failed);
+        read_conductor(&mut app, conductor(true));
+        ch(&mut app, '3');
+        press(&mut app, KeyCode::Enter);
+        app.on_paste("użyj\tnowszego toolchaina");
+        assert_eq!(
+            sent(press(&mut app, KeyCode::Enter)).submit,
+            Submit::Operator(OperatorCommand::RestartStep {
+                note: Some("użyj\tnowszego toolchaina".to_string()),
+                failure_key: Some("fk1".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_paste_into_a_refused_answer_clears_the_refusal_as_typing_does() {
+        let mut app = opened(with_pending(running("a", 1), problem(false)));
+        ch(&mut app, '1');
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Down);
+        typed(&mut app, "bez znaku");
+        assert!(enter_until_error(&mut app), "a key without '=' is refused");
+        let error = |app: &TaskApp| {
+            app.detail()
+                .view("a")
+                .unwrap()
+                .waiting()
+                .error()
+                .map(str::to_string)
+        };
+        assert!(error(&app).is_some());
+
+        app.on_paste("=1");
+        assert_eq!(
+            error(&app),
+            None,
+            "the refusal was about the text before the paste"
+        );
+    }
+
+    #[test]
+    fn a_paste_on_the_actions_of_the_panel_is_ignored() {
+        let mut app = opened(with_pending(running("a", 1), gate("ep-1")));
+        let before = selected_label(&app);
+        app.on_paste("2\n");
+        assert_eq!(selected_label(&app), before);
+        assert_eq!(chooser_of(&app).focus(), ChooserFocus::Actions);
+        assert!(chooser_of(&app)
+            .items()
+            .iter()
+            .all(|item| item.fields.iter().all(|field| field.value().is_empty())));
+        assert_eq!(app.detail().draft("a").unwrap_or_default(), "");
+    }
+
+    #[test]
+    fn a_paste_on_the_task_list_runs_no_key_it_holds() {
+        let mut app = app();
+        app.load(listing(
+            vec![
+                titled(running("a", 1), "NAR-12"),
+                titled(running("b", 2), "NAR-13"),
+            ],
+            "c",
+        ));
+        assert_eq!(app.focus(), Focus::List);
+        let selected = app.list().selected_id().map(str::to_string);
+        app.on_paste("j\nq\nq\n");
+        assert_eq!(app.focus(), Focus::List, "no details opened");
+        assert_eq!(app.list().selected_id(), selected.as_deref());
+        assert!(!app.should_quit());
+        ch(&mut app, 'q');
+        assert!(
+            !app.should_quit(),
+            "the paste did not open the exit question"
+        );
+    }
+
+    #[test]
+    fn a_paste_leaves_the_exit_question_and_the_help_open() {
+        let loaded = || {
+            let mut loaded = app();
+            loaded.load(listing(vec![titled(running("a", 1), "NAR-12")], "c"));
+            loaded
+        };
+        let mut quitting = loaded();
+        ch(&mut quitting, 'q');
+        quitting.on_paste("q");
+        assert!(!quitting.should_quit());
+        ch(&mut quitting, 'q');
+        assert!(quitting.should_quit(), "the exit question was still open");
+
+        let mut helped = loaded();
+        ch(&mut helped, '?');
+        assert!(helped.is_help_open());
+        helped.on_paste("tekst");
+        assert!(helped.is_help_open());
+    }
+
+    #[test]
+    fn a_paste_does_not_answer_a_confirmation_window() {
+        let failed = waiting_on(
+            task("a", "local", "interrupted", 1),
+            AttentionKind::ProvisioningFailed,
+            "provisioning-1",
+            None,
+        );
+        let mut app = opened(failed);
+        ch(&mut app, '2');
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        assert!(app
+            .overlay()
+            .and_then(|overlay| overlay.confirmation())
+            .is_some());
+        app.on_paste("y\n");
+        assert!(
+            app.overlay()
+                .and_then(|overlay| overlay.confirmation())
+                .is_some(),
+            "the window waits for its own y / n"
+        );
+        ch(&mut app, 'n');
+        assert!(app.overlay().is_none());
+    }
+
+    #[test]
     fn an_answer_composer_keeps_its_draft_across_refresh_and_waiting_return() {
         let waiting = || with_pending(running("a", 1), question(None));
         let mut app = opened(waiting());
@@ -6497,6 +6819,32 @@ mod task_app_actions {
         }
 
         #[test]
+        fn a_paste_fills_the_override_reason_and_sends_nothing() {
+            let mut app = loaded(offered(Some(&["plan", "ship"])));
+            ch(&mut app, 't');
+            app.on_paste("z listy");
+            let chooser = app.overlay().unwrap().chooser().unwrap();
+            assert!(
+                chooser.fields_of(2)[1].value().is_empty(),
+                "with the keys on the list a paste goes nowhere"
+            );
+
+            ch(&mut app, '3');
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Down);
+            app.on_paste("CI nie ruszy\r\nbez tego\n");
+            let Some(Overlay::Transitions(_)) = app.overlay() else {
+                panic!("a paste neither sends nor closes the list");
+            };
+            let chooser = app.overlay().unwrap().chooser().unwrap();
+            assert_eq!(
+                chooser.fields_of(2)[1].value(),
+                "CI nie ruszy bez tego ",
+                "the one-line reason gets the paste, its line breaks as spaces"
+            );
+        }
+
+        #[test]
         fn n_in_the_override_window_sends_nothing() {
             let mut app = loaded(offered(Some(&["plan"])));
             ch(&mut app, 't');
@@ -6595,6 +6943,33 @@ mod task_app_actions {
             assert_eq!(link.url, "https://docs.example/x");
             assert_eq!(link.label, "Docs");
             assert!(app.overlay().is_none());
+        }
+
+        #[test]
+        fn a_paste_on_the_links_opens_none_and_leaves_the_list_open() {
+            let task = displayed(
+                running("a", 1),
+                "NAR-12",
+                &[
+                    ("Jira", "NAR-12", Some("https://jira.example/browse/NAR-12")),
+                    ("Docs", "doc", Some("https://docs.example/x")),
+                ],
+            );
+            let mut app = loaded(task);
+            ch(&mut app, 'o');
+            app.on_paste("2\n");
+            let Some(Overlay::Links(_)) = app.overlay() else {
+                panic!("a paste neither opens a link nor closes the list");
+            };
+            assert_eq!(
+                app.overlay().unwrap().chooser().unwrap().selected(),
+                0,
+                "a paste picks nothing from the list"
+            );
+            let Request::OpenLink(link) = press(&mut app, KeyCode::Enter) else {
+                panic!("a link was expected");
+            };
+            assert_eq!(link.label, "Jira", "the list's own keys still work");
         }
 
         #[tokio::test]
@@ -7443,6 +7818,60 @@ mod task_app_conductor {
             "undone": undone,
             "undoable": undoable
         })
+    }
+
+    // -- a paste -----------------------------------------------------------
+
+    mod paste {
+        use super::*;
+
+        #[test]
+        fn a_paste_into_the_message_box_is_a_draft_not_a_message() {
+            let mut app = tab_app();
+            read(&mut app, conductor_view(vec![], json!({})));
+            ch(&mut app, 'c');
+            app.on_paste("Czy revise?\nq");
+            assert_eq!(conductor(&app).draft(), "Czy revise?\nq");
+            assert!(conductor(&app).is_typing(), "the keys stay in the box");
+            assert!(app
+                .detail()
+                .draft("a")
+                .is_some_and(|draft| draft.contains("Czy revise?\nq")));
+            let request = act(press(&mut app, KeyCode::Enter));
+            assert_eq!(
+                request.send,
+                ActionSend::Operator(OperatorCommand::ConductorChat {
+                    text: "Czy revise?\nq".to_string()
+                })
+            );
+        }
+
+        #[test]
+        fn a_paste_outside_the_message_box_is_ignored() {
+            let mut app = tab_app();
+            read(&mut app, conductor_view(vec![], json!({})));
+            assert!(!conductor(&app).is_typing());
+            app.on_paste("c\nq\nq\n");
+            assert_eq!(conductor(&app).draft(), "");
+            assert!(!conductor(&app).is_typing());
+            assert!(!app.should_quit());
+        }
+
+        #[test]
+        fn a_paste_picks_nothing_from_the_menu() {
+            let mut app = app();
+            app.load(listing(vec![titled(running("a", 1), "NAR-12")], "c"));
+            ch(&mut app, '.');
+            let Some(Overlay::Menu(_)) = app.overlay() else {
+                panic!("the menu should be open");
+            };
+            let before = app.overlay().unwrap().chooser().unwrap().selected();
+            app.on_paste("2\n");
+            let Some(Overlay::Menu(_)) = app.overlay() else {
+                panic!("the menu is still open");
+            };
+            assert_eq!(app.overlay().unwrap().chooser().unwrap().selected(), before);
+        }
     }
 
     // -- the chat ----------------------------------------------------------
@@ -10412,6 +10841,129 @@ mod task_app_create {
     }
 
     // -- the repositories ------------------------------------------------------
+
+    // -- a paste ----------------------------------------------------------------
+
+    mod paste {
+        use super::*;
+
+        /// The form over a workflow with a short field and a required prompt,
+        /// the keys in the prompt.
+        fn prompt_form(app: &mut TaskApp) {
+            ch(app, 'n');
+            app.open_new_task(
+                catalogue(vec![catalogue_workflow(
+                    "write",
+                    "Pisze.",
+                    vec![
+                        workflow_input("ticket_id", ParamType::String, false, None),
+                        workflow_input("prompt", ParamType::Text, true, None),
+                    ],
+                )]),
+                narsor_registry(),
+            );
+            press(app, KeyCode::Enter);
+            assert_eq!(app.key_context().base, Context::Form);
+        }
+
+        #[test]
+        fn lines_pasted_into_the_prompt_stay_lines_and_send_nothing() {
+            let mut app = app_with(vec![]);
+            prompt_form(&mut app);
+            app.on_paste("pierwsza\ndruga\ntrzecia");
+            assert_eq!(
+                field_value(&app, "write", "prompt"),
+                "pierwsza\ndruga\ntrzecia"
+            );
+            assert_eq!(app.view_kind(), ViewKind::NewTask);
+            assert!(app.outgoing().is_empty(), "a paste sends nothing");
+            typed(&mut app, "!");
+            assert_eq!(
+                field_value(&app, "write", "prompt"),
+                "pierwsza\ndruga\ntrzecia!",
+                "the cursor is after the pasted text"
+            );
+        }
+
+        #[test]
+        fn pasted_lines_can_be_edited_and_enter_sends_them() {
+            let mut app = app_with(vec![]);
+            prompt_form(&mut app);
+            app.on_paste("a\nb\nc");
+            press(&mut app, KeyCode::Up);
+            typed(&mut app, "X");
+            let Request::SendTask(_) = press(&mut app, KeyCode::Enter) else {
+                panic!("Enter after a paste still sends");
+            };
+            let CreateHow::Catalogue(request) = &app.outgoing()[0].send else {
+                panic!("a workflow of the catalogue");
+            };
+            assert_eq!(request.launch.inputs["prompt"], json!("a\nbX\nc"));
+        }
+
+        #[test]
+        fn a_pasted_prompt_is_a_draft_that_outlives_closing_the_form() {
+            let mut app = app_with(vec![]);
+            prompt_form(&mut app);
+            app.on_paste("długi\nlog");
+            assert!(app
+                .detail()
+                .draft(DRAFT_KEY)
+                .is_some_and(|text| text.contains("długi\nlog")));
+            press(&mut app, KeyCode::Esc);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.view_kind(), ViewKind::Tasks);
+            prompt_form(&mut app);
+            assert_eq!(field_value(&app, "write", "prompt"), "długi\nlog");
+        }
+
+        #[test]
+        fn a_paste_on_the_list_of_workflows_is_ignored() {
+            let mut app = app_with(vec![]);
+            open_form(&mut app);
+            let before = app.new_task_form().unwrap().chooser().selected();
+            app.on_paste("q\nj\n");
+            assert_eq!(app.view_kind(), ViewKind::NewTask);
+            assert!(!app.should_quit());
+            assert_eq!(app.new_task_form().unwrap().chooser().selected(), before);
+            assert_eq!(field_value(&app, "implement-feature", "ticket_id"), "");
+            assert!(!app.detail().has_drafts());
+        }
+
+        #[test]
+        fn a_path_pasted_into_the_repository_form_stays_on_one_line() {
+            let mut app = app_with(vec![]);
+            ch(&mut app, 'R');
+            app.open_repositories(narsor_registry());
+            ch(&mut app, 'a');
+            press(&mut app, KeyCode::Enter);
+            app.on_paste("/srv/git/narsor\n");
+            let form = app.repositories().unwrap().form().expect("the form");
+            assert_eq!(form.fields_of(0)[0].value(), "/srv/git/narsor ");
+            assert!(form.is_typing(), "the keys stay in the field");
+            assert!(app.detail().has_drafts(), "the pasted text is a draft");
+        }
+
+        #[test]
+        fn a_paste_on_the_list_of_repositories_or_in_the_history_is_ignored() {
+            let mut app = app_with(vec![]);
+            ch(&mut app, 'R');
+            app.open_repositories(narsor_registry());
+            app.on_paste("a\nd\n");
+            assert!(app.repositories().unwrap().form().is_none());
+            assert_eq!(app.view_kind(), ViewKind::Repositories);
+
+            let mut app = app_with(vec![]);
+            ch(&mut app, 'H');
+            app.open_history(
+                listing(vec![archived("old", "NAR-9", 5)], "c"),
+                Ok(LegacyExecutionListResponse { executions: vec![] }),
+            );
+            app.on_paste("q\nq\n");
+            assert_eq!(app.view_kind(), ViewKind::History);
+            assert!(!app.should_quit());
+        }
+    }
 
     mod repositories {
         use super::*;

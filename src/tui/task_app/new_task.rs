@@ -647,6 +647,17 @@ impl TaskApp {
         request
     }
 
+    /// A paste while the form has the keys: into the field being typed in,
+    /// kept as the draft, never sent.
+    pub(super) fn on_new_task_paste(&mut self, pasted: &str) {
+        let View::NewTask(form) = &mut self.view else {
+            return;
+        };
+        if form.chooser.paste(pasted) {
+            self.sync_new_task_draft();
+        }
+    }
+
     /// The context whose keys apply while the form is open.
     pub(super) fn new_task_context(&self) -> Option<Context> {
         match &self.view {

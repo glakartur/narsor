@@ -30,10 +30,13 @@
 //! and the chosen label, so the two can never disagree.
 
 use std::collections::HashSet;
+use std::iter::Peekable;
+use std::str::Chars;
 
 use serde_json::{Map, Value};
 
 use crate::conductor::Annotation;
+use crate::domain::display::is_invisible_format;
 use crate::tui::chooser::{ChooserField, ChooserItem, FieldKind, Submission};
 use narsor_protocol::api::{
     bash_grant_rules, bash_pattern_rule, is_approvable_permission_reason, BashGrantScope,
@@ -190,6 +193,91 @@ pub fn text_insert(value: &mut String, cursor: &mut usize, inserted: char) {
     *cursor += 1;
 }
 
+/// Inserts `inserted` at the character `cursor` in one go and moves the
+/// cursor past it — a paste, which may be a long log.
+pub fn text_insert_str(value: &mut String, cursor: &mut usize, inserted: &str) {
+    value.insert_str(char_byte_index(value, *cursor), inserted);
+    *cursor += inserted.chars().count();
+}
+
+/// What a paste puts into a field of `kind`: nothing for a `select`, and for
+/// the others only what could have been typed — no escape sequence, no
+/// control character but `\n` and `\t`, no invisible format character the
+/// field would not show, every line break one `\n`. A one-line field gets a
+/// space for each line break, a number field only its digits and `-`.
+pub fn pasted_text(kind: &FieldKind, pasted: &str) -> Option<String> {
+    if matches!(kind, FieldKind::Select(_)) {
+        return None;
+    }
+    let mut text = String::with_capacity(pasted.len());
+    let mut chars = pasted.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\u{1b}' => skip_pasted_escape(&mut chars),
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                text.push('\n');
+            }
+            // NEL, the line and the paragraph separator break a line too.
+            '\n' | '\u{85}' | '\u{2028}' | '\u{2029}' => text.push('\n'),
+            '\t' => text.push(character),
+            c if c.is_control() => {}
+            // The field does not draw these (see `scroll::sanitize`), so the
+            // value would differ from what the operator sees and sends.
+            c if is_invisible_format(c) || is_unicode_tag(c) => {}
+            c => text.push(c),
+        }
+    }
+    Some(match kind {
+        FieldKind::Text { multiline: true } => text,
+        FieldKind::Text { multiline: false } => text.replace('\n', " "),
+        _ => text
+            .chars()
+            .filter(|character| character.is_ascii_digit() || *character == '-')
+            .collect(),
+    })
+}
+
+/// Skips the escape sequence a pasted ESC starts, and never more: pasted
+/// text is the operator's data, not display output, so a lone or cut-off
+/// sequence must not eat the text after it.
+///
+/// A CSI ends at its first byte that is not a parameter or an intermediate
+/// byte, and only a final byte is taken with it. An OSC ends at BEL, at ST
+/// (`ESC \`) or before a line break. Any other ESC takes only a following
+/// `@`..=`_` byte, the one-character escapes.
+fn skip_pasted_escape(chars: &mut Peekable<Chars<'_>>) {
+    match chars.peek() {
+        Some('[') => {
+            chars.next();
+            while chars.next_if(|c| (' '..='?').contains(c)).is_some() {}
+            chars.next_if(|c| ('@'..='~').contains(c));
+        }
+        Some(']') => {
+            chars.next();
+            while let Some(c) = chars.next_if(|c| !matches!(c, '\n' | '\r')) {
+                match c {
+                    '\u{7}' => break,
+                    '\u{1b}' => {
+                        chars.next_if_eq(&'\\');
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {
+            chars.next_if(|c| ('@'..='_').contains(c));
+        }
+    }
+}
+
+/// A character of the Unicode tag block: invisible, and a known way to hide
+/// text inside text.
+fn is_unicode_tag(character: char) -> bool {
+    ('\u{E0000}'..='\u{E007F}').contains(&character)
+}
+
 /// Deletes the character before `cursor`, if there is one.
 pub fn text_backspace(value: &mut String, cursor: &mut usize) {
     if *cursor > 0 {
@@ -218,7 +306,7 @@ pub fn cycle_option(options: &[String], current: &str, delta: isize) -> Option<S
     Some(options[next].clone())
 }
 
-fn char_byte_index(text: &str, character: usize) -> usize {
+pub(crate) fn char_byte_index(text: &str, character: usize) -> usize {
     text.char_indices()
         .nth(character)
         .map(|(index, _)| index)

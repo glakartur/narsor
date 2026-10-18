@@ -866,6 +866,25 @@ impl WaitingPanel {
         }
     }
 
+    /// Folds pasted text into the field being typed in — the text box or a
+    /// field of the chosen action — as a key that edits it would: the last
+    /// send's verdict goes. Never sends. Returns whether a field took it.
+    pub fn paste(&mut self, pasted: &str) -> bool {
+        let Some(entry) = self.entries.get_mut(self.current) else {
+            return false;
+        };
+        let used = match entry.composer.as_mut() {
+            Some(composer) if composer.is_typing() => composer.paste(pasted),
+            _ => entry.chooser.paste(pasted),
+        };
+        if used {
+            entry.sent = false;
+            entry.key = None;
+            entry.error = None;
+        }
+        used
+    }
+
     fn step(&mut self, by: isize) -> PanelEffect {
         let count = self.entries.len();
         self.current = (self.current as isize + by).rem_euclid(count as isize) as usize;
@@ -1389,6 +1408,22 @@ impl TaskApp {
             self.detail.set_draft(&id, text);
         }
         request
+    }
+
+    /// A paste while the panel has the keyboard: into the field being typed
+    /// in, and nowhere else.
+    pub(super) fn on_panel_paste(&mut self, pasted: &str) {
+        let Some(id) = self.list.selected_id().map(str::to_string) else {
+            return;
+        };
+        let used = self
+            .detail
+            .views
+            .get_mut(&id)
+            .is_some_and(|view| view.waiting.paste(pasted));
+        if used {
+            self.sync_draft(&id);
+        }
     }
 
     /// An action that cannot be undone: the request is prepared as for any

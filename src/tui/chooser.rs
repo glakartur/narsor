@@ -53,7 +53,10 @@ use ratatui::Frame;
 
 mod inputs;
 
-use super::input_form::{cycle_option, text_backspace, text_insert, text_step};
+use super::input_form::{
+    char_byte_index, cycle_option, pasted_text, text_backspace, text_insert, text_insert_str,
+    text_step,
+};
 use super::keymap::{digit_of, lookup, Action, Context};
 use super::scroll::{one_line, sanitize, wrap_visible, ScrollState};
 use super::selection::{bracketed_list_rows, render_bracketed_list, PREFIX_WIDTH};
@@ -200,6 +203,23 @@ impl ChooserField {
     /// The complaint about the field, if the last send found one.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    /// Where the cursor is, in characters of the value.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Puts pasted text at the cursor, as one edit, and the cursor after it.
+    /// A `select` takes no paste. Returns whether anything was inserted.
+    pub fn paste(&mut self, pasted: &str) -> bool {
+        let Some(text) = pasted_text(&self.kind, pasted).filter(|text| !text.is_empty()) else {
+            return false;
+        };
+        text_insert_str(&mut self.value, &mut self.cursor, &text);
+        self.proposed = false;
+        self.error = None;
+        true
     }
 
     /// Whether the field takes several lines.
@@ -634,6 +654,20 @@ impl Chooser {
         }
     }
 
+    /// Folds pasted text into the field being typed in. A paste never sends
+    /// and never moves the focus; with the keys on the list, or on a
+    /// `select`, it is ignored. Returns whether a field took it.
+    pub fn paste(&mut self, pasted: &str) -> bool {
+        if self.focus != ChooserFocus::Fields {
+            return false;
+        }
+        let index = self.field;
+        self.items
+            .get_mut(self.selected)
+            .and_then(|item| item.fields.get_mut(index))
+            .is_some_and(|field| field.paste(pasted))
+    }
+
     fn on_actions_key(&mut self, event: KeyEvent) -> ChooserAction {
         let total = self.items.len();
         let Some(action) = lookup(Context::Panel, &event) else {
@@ -1066,13 +1100,21 @@ fn field_value_rows(field: &ChooserField, value: &str, focused: bool) -> Vec<Str
             if focused {
                 let byte = text
                     .char_indices()
-                    .nth(field.cursor)
+                    .nth(drawn_cursor(field))
                     .map_or(text.len(), |(index, _)| index);
                 text.insert(byte, CURSOR);
             }
         }
     }
     text.split('\n').map(str::to_string).collect()
+}
+
+/// Where the cursor falls in the drawn value. The drawing turns a tab into
+/// spaces, so the cursor counts what the text before it draws as, not its
+/// characters.
+fn drawn_cursor(field: &ChooserField) -> usize {
+    let byte = char_byte_index(&field.value, field.cursor);
+    sanitize(&field.value[..byte]).chars().count()
 }
 
 /// Draws `chooser` into `area`: the list and the description (side by side,

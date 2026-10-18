@@ -9,7 +9,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use super::{field_value_rows, Chooser, ChooserField, ChooserFocus, ChooserItem, CURSOR, PROMPT};
+use super::{
+    drawn_cursor, field_value_rows, Chooser, ChooserField, ChooserFocus, ChooserItem, CURSOR,
+    PROMPT,
+};
 use crate::tui::scroll::{one_line, sanitize};
 use crate::tui::style::{Role, Styles};
 
@@ -366,7 +369,7 @@ fn main_body(field: &ChooserField, width: usize, focused: bool, height: usize) -
 /// The value hard-wrapped to `width` columns, and the row the cursor is on.
 fn wrapped(field: &ChooserField, value: &str, width: usize, focused: bool) -> (Vec<String>, usize) {
     let logical = field_value_rows(field, value, focused);
-    let cursor = focused.then_some(field.cursor);
+    let cursor = focused.then(|| drawn_cursor(field));
     let mut rows = Vec::new();
     let mut cursor_row = 0;
     let mut consumed = 0;
