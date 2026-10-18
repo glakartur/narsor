@@ -325,6 +325,11 @@ impl Conductor {
         self.composer.on_key(key)
     }
 
+    /// Folds pasted text into the text box. Returns whether it took it.
+    pub fn compose_paste(&mut self, pasted: &str) -> bool {
+        self.composer.paste(pasted)
+    }
+
     /// What was typed and not sent.
     pub fn draft(&self) -> &str {
         self.composer
@@ -651,6 +656,16 @@ impl TaskApp {
         };
         self.sync_draft(&id);
         request
+    }
+
+    /// A paste into the text box: it stays there as a draft, never sent.
+    pub(in crate::tui::task_app) fn on_conductor_paste(&mut self, pasted: &str) {
+        let Some(id) = self.list.selected_id().map(str::to_string) else {
+            return;
+        };
+        if self.detail.view_mut(&id).conductor.compose_paste(pasted) {
+            self.sync_draft(&id);
+        }
     }
 
     /// Keeps the draft the application remembers for `task_id` true to what

@@ -331,6 +331,71 @@ mod chooser_render {
         assert!(screen(&buffer).contains("> Uwzględnij migrację▏"));
     }
 
+    /// One entry with `field`, the keys in it, in the list layout or in the
+    /// layout of a form of inputs.
+    fn typing_into(field: ChooserField, inputs_layout: bool) -> Chooser {
+        let chooser = Chooser::new(vec![ChooserItem::new("go", "Start.").with_field(field)]);
+        let mut chooser = if inputs_layout {
+            chooser.with_inputs_layout()
+        } else {
+            chooser
+        };
+        chooser.enter_fields();
+        chooser
+    }
+
+    #[test]
+    fn after_a_long_paste_the_field_shows_its_last_line_and_the_cursor() {
+        let text: Vec<String> = (1..=200).map(|line| format!("linia {line}")).collect();
+        for inputs_layout in [false, true] {
+            let mut chooser = typing_into(ChooserField::multiline("prompt"), inputs_layout);
+            assert!(chooser.paste(&text.join("\n")));
+            let screen = screen(&draw_chooser(100, 20, &mut chooser, &Styles::new(false)));
+            assert!(
+                screen.contains("linia 200▏"),
+                "inputs layout {inputs_layout}:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cursor_after_a_pasted_tab_is_after_the_text_it_follows() {
+        for inputs_layout in [false, true] {
+            for field in [
+                ChooserField::multiline("prompt"),
+                ChooserField::text("ticket"),
+            ] {
+                let mut chooser = typing_into(field, inputs_layout);
+                assert!(chooser.paste("a\tb"));
+                let screen = screen(&draw_chooser(100, 20, &mut chooser, &Styles::new(false)));
+                assert!(
+                    screen.contains("a   b▏"),
+                    "inputs layout {inputs_layout}:\n{screen}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lines_pasted_into_a_one_line_field_draw_as_one_line() {
+        for inputs_layout in [false, true] {
+            let mut chooser = typing_into(ChooserField::text("ticket"), inputs_layout);
+            assert!(chooser.paste("x\ny\r\nz"));
+            let buffer = draw_chooser(100, 20, &mut chooser, &Styles::new(false));
+            let screen = screen(&buffer);
+            assert!(
+                screen.contains("x y z▏"),
+                "inputs layout {inputs_layout}:\n{screen}"
+            );
+            assert!(
+                !rows(&buffer)
+                    .iter()
+                    .any(|row| row.trim_start().starts_with('y')),
+                "{screen}"
+            );
+        }
+    }
+
     #[test]
     fn an_unavailable_action_says_why_in_words() {
         let mut chooser =

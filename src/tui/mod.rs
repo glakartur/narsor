@@ -9,12 +9,14 @@
 //! the control plane (`/control/v1`) of whichever backend the configuration
 //! names — the local daemon, launched when none runs, or a remote server. This
 //! module is the terminal lifecycle and the event loop that joins the
-//! application to the terminal: keys in, control-plane events in, a redraw out.
+//! application to the terminal: keys and pastes in, control-plane events in,
+//! a redraw out.
 //!
 //! # Why the terminal is restored twice over
 //!
-//! Raw mode and the alternate screen are process-global state that a crashing
-//! program does not clean up by itself. An operator whose first panic leaves
+//! Raw mode, the alternate screen, the keyboard enhancement flags and
+//! bracketed paste are terminal state that a crashing program does not clean
+//! up by itself. An operator whose first panic leaves
 //! them with an unusable console will not trust the tool again, so restoration
 //! is arranged on two independent paths: [`TerminalGuard`] restores on every
 //! exit from [`run`], normal or unwinding, and [`install_panic_hook`] restores
@@ -45,15 +47,15 @@ pub mod style;
 pub mod task_app;
 pub mod transcript;
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    self, Event as TerminalEvent, KeyEventKind, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event as TerminalEvent, KeyEventKind,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -87,6 +89,10 @@ static RESTORE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// popped; the terminal keeps them after the process ends if nobody pops.
 static ENHANCEMENT_ARMED: AtomicBool = AtomicBool::new(false);
 
+/// Whether bracketed paste was switched on and still waits to be switched
+/// off; a shell would otherwise see its pastes wrapped in `200~` / `201~`.
+static PASTE_ARMED: AtomicBool = AtomicBool::new(false);
+
 /// Guards against chaining the panic hook onto itself.
 static PANIC_HOOK: Once = Once::new();
 
@@ -106,19 +112,29 @@ pub fn install_panic_hook() {
     });
 }
 
-/// Leaves the alternate screen, disables raw mode and shows the cursor.
+/// Leaves the alternate screen, disables raw mode and bracketed paste, and
+/// shows the cursor.
 ///
 /// Every failure is deliberately swallowed: this runs on the way out, often
 /// from a panic hook, and there is nowhere left to report to. It is safe to
 /// call when no terminal was ever entered, which is what makes it usable from
 /// a test.
 pub fn restore_terminal() {
+    restore_terminal_to(&mut io::stdout());
+}
+
+/// [`restore_terminal`], with the escape sequences written to `out` — the
+/// seam a test reads them from.
+pub fn restore_terminal_to(out: &mut impl Write) {
     if ENHANCEMENT_ARMED.swap(false, Ordering::SeqCst) {
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
+    if PASTE_ARMED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(out, DisableBracketedPaste);
     }
     keymap::set_modifiers_distinguished(false);
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+    let _ = execute!(out, LeaveAlternateScreen, Show);
     RESTORE_COUNT.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -136,11 +152,21 @@ pub struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    /// Takes over the screen: raw mode, alternate screen, hidden cursor.
+    /// Takes over the screen: raw mode, alternate screen, hidden cursor, and
+    /// bracketed paste where the terminal has it.
+    ///
+    /// A failure part way gives back what was already taken: no guard exists
+    /// yet to do it on drop, so raw mode or bracketed paste would outlive the
+    /// error.
     pub fn enter() -> io::Result<Self> {
+        Self::take_over().inspect_err(|_| restore_terminal())
+    }
+
+    fn take_over() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, Hide)?;
+        arm_bracketed_paste(&mut stdout);
         arm_modifier_reporting(&mut stdout);
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal })
@@ -171,6 +197,18 @@ fn arm_modifier_reporting(stdout: &mut Stdout) {
         ENHANCEMENT_ARMED.store(true, Ordering::SeqCst);
     }
     keymap::set_modifiers_distinguished(armed);
+}
+
+/// Switches bracketed paste on, so a paste arrives as one event and not as
+/// keys — a pasted new line would otherwise be an `Enter` that sends.
+///
+/// A best effort: a terminal that refuses is a terminal without it, where a
+/// paste still comes as keys, and nothing is left for [`restore_terminal`]
+/// to switch off.
+pub fn arm_bracketed_paste(out: &mut impl Write) {
+    if execute!(out, EnableBracketedPaste).is_ok() {
+        PASTE_ARMED.store(true, Ordering::SeqCst);
+    }
 }
 
 impl Drop for TerminalGuard {
@@ -229,6 +267,8 @@ pub async fn run(
                     let request = app.on_key(key);
                     app.perform(request).await;
                 }
+                // A paste is text for the field being typed in, never keys.
+                Some(TerminalEvent::Paste(text)) => app.on_paste(&text),
                 // A resize needs no state change: the next draw re-derives the
                 // whole layout from the new area.
                 Some(_) => {}

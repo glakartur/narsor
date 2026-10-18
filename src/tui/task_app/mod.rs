@@ -659,6 +659,29 @@ impl TaskApp {
     // Keys
     // -----------------------------------------------------------------
 
+    /// Folds pasted text into the field that has the keys, in the order
+    /// [`Self::on_key`] routes them. A paste is text, never a key: it does
+    /// not send, does not close a window and, with no field being typed in,
+    /// does nothing at all — so needs nothing of the API.
+    pub fn on_paste(&mut self, pasted: &str) {
+        if self.quit_confirm || self.help_open {
+            return;
+        }
+        if self.overlay.is_some() {
+            self.on_overlay_paste(pasted);
+            return;
+        }
+        match self.view {
+            View::NewTask(_) if self.focus == Focus::Details => self.on_new_task_paste(pasted),
+            View::Repositories(_) if self.focus == Focus::Details => {
+                self.on_repositories_paste(pasted)
+            }
+            View::Tasks if self.panel_typing() => self.on_panel_paste(pasted),
+            View::Tasks if self.conductor_typing() => self.on_conductor_paste(pasted),
+            _ => {}
+        }
+    }
+
     /// Folds a key into the state. Returns what needs the API.
     pub fn on_key(&mut self, key: KeyEvent) -> Request {
         if self.quit_confirm {
