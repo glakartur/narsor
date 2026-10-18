@@ -21,9 +21,15 @@ pub enum BashGrantScope {
     Group,
 }
 
+/// Characters that mean something in a rule's pattern or a terminal: refused
+/// inside quotes too, where the shell would take them literally.
+fn is_pattern_or_control(c: char) -> bool {
+    c.is_control() || matches!(c, '*' | '?' | '(' | ')' | '[' | ']' | ',')
+}
+
 /// Programs that run other programs: a group rule for one of them would
 /// allow anything, so only the exact command is granted.
-const RUNNERS: [&str; 19] = [
+const RUNNERS: [&str; 41] = [
     "sh",
     "bash",
     "zsh",
@@ -43,6 +49,28 @@ const RUNNERS: [&str; 19] = [
     "perl",
     "pwsh",
     "powershell",
+    "command",
+    "exec",
+    "eval",
+    "source",
+    ".",
+    "nice",
+    "nohup",
+    "timeout",
+    "time",
+    "stdbuf",
+    "watch",
+    "npx",
+    "uv",
+    "bunx",
+    "awk",
+    "gawk",
+    "sed",
+    "ssh",
+    "docker",
+    "kubectl",
+    "make",
+    "just",
 ];
 
 /// The parts of `command`, each as its words in their source spelling, or
@@ -71,6 +99,9 @@ pub fn bash_command_parts(command: &str) -> Option<Vec<Vec<String>>> {
                 word.push(c);
                 loop {
                     let next = chars.next()?;
+                    if is_pattern_or_control(next) {
+                        return None;
+                    }
                     word.push(next);
                     if next == '\'' {
                         break;
@@ -81,7 +112,7 @@ pub fn bash_command_parts(command: &str) -> Option<Vec<Vec<String>>> {
                 word.push(c);
                 loop {
                     let next = chars.next()?;
-                    if matches!(next, '$' | '`' | '\\') {
+                    if matches!(next, '$' | '`' | '\\') || is_pattern_or_control(next) {
                         return None;
                     }
                     word.push(next);
@@ -125,7 +156,10 @@ pub fn bash_command_parts(command: &str) -> Option<Vec<Vec<String>>> {
                         chars.next();
                         descriptor = true;
                     }
-                    if !descriptor {
+                    let ends = chars
+                        .peek()
+                        .is_none_or(|c| matches!(c, ' ' | '\t' | ';' | '|' | '&' | '\n'));
+                    if !descriptor || !ends {
                         return None;
                     }
                 } else {
@@ -183,13 +217,21 @@ pub fn bash_grant_rules(command: &str, scope: BashGrantScope) -> Option<Vec<Stri
         let rule = match scope {
             BashGrantScope::Exact => format!("Bash({})", words.join(" ")),
             BashGrantScope::Group => {
+                // A group is a program and a plain subcommand word: a quoted
+                // program could hide a runner, an option (`git -c …`) could
+                // configure one in, and `:` could read as the legacy
+                // `prefix:*` rule syntax.
                 let program = &words[0];
                 let name = program.rsplit('/').next().unwrap_or(program);
-                if RUNNERS.contains(&name) {
+                let plain = |word: &str| {
+                    word.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+                };
+                if !plain(program) || RUNNERS.contains(&name) {
                     return None;
                 }
                 match words.get(1) {
-                    Some(argument) if !argument.starts_with(['\'', '"']) => {
+                    Some(argument) if plain(argument) && !argument.starts_with('-') => {
                         format!("Bash({program} {argument} *)")
                     }
                     Some(_) => return None,
@@ -239,8 +281,13 @@ mod tests {
             ])
         );
         assert_eq!(
-            group("cargo test --test a 2>&1 | tail -20 || cargo test > /dev/null"),
-            rules(&["Bash(cargo test *)", "Bash(tail -20 *)"])
+            group("cargo test --test a 2>&1 | head out.txt || cargo test > /dev/null"),
+            rules(&["Bash(cargo test *)", "Bash(head out.txt *)"])
+        );
+        assert_eq!(
+            group("cargo test | tail -20"),
+            None,
+            "an option names no group"
         );
         assert_eq!(exact("make &>/dev/null"), rules(&["Bash(make)"]));
     }
@@ -253,12 +300,26 @@ mod tests {
             "an escape inside double quotes is refused"
         );
         assert_eq!(
-            exact(r#"git commit -m "fix: a b" && grep -v '#[test]' x"#),
+            exact(r#"git commit -m "fix: a b" && grep -v '# test' x"#),
             rules(&[
                 r#"Bash(git commit -m "fix: a b")"#,
-                "Bash(grep -v '#[test]' x)"
+                "Bash(grep -v '# test' x)"
             ])
         );
+        for command in [
+            "grep -v '#[test]' x",
+            r#"echo "a*b""#,
+            "echo 'a, b'",
+            "echo '(x)'",
+            "echo 'a?'",
+            "echo 'a\tb'",
+        ] {
+            assert_eq!(
+                exact(command),
+                None,
+                "a pattern character in quotes: {command}"
+            );
+        }
         assert_eq!(
             group(r#"echo "a b""#),
             None,
@@ -282,6 +343,8 @@ mod tests {
             "make &",
             "make > out.txt",
             "make 2> err.log",
+            "make 2>&1x",
+            "make >&",
             "sort < input",
             "make |& tee",
             "a && && b",
@@ -298,5 +361,26 @@ mod tests {
         assert_eq!(exact("bash -c ls"), rules(&["Bash(bash -c ls)"]));
         assert_eq!(group("bash -c ls"), None);
         assert_eq!(group("cargo test && /usr/bin/env x"), None);
+        for command in [
+            "'bash' -c ls",
+            r#""sh" x"#,
+            "timeout 5 make",
+            "npx tsc",
+            "awk prog",
+            "git -c core.pager=x log",
+            "npm run:test",
+            r#"git "log""#,
+        ] {
+            assert_eq!(group(command), None, "{command}");
+        }
+        for command in [
+            "'bash' -c ls",
+            r#""sh" x"#,
+            "timeout 5 make",
+            "npx tsc",
+            "nohup make",
+        ] {
+            assert_eq!(group(command), None, "{command}");
+        }
     }
 }

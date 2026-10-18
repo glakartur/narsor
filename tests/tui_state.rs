@@ -4647,8 +4647,8 @@ mod task_app_waiting {
         // and there is one refusal for all of them.
         let compound = pending(
             json!([
-                denial("t1", "cargo fmt --check && echo OK", "asyncAgent"),
-                denial("t2", "cargo test 2>&1 | tail -20", "asyncAgent"),
+                denial("t1", "cargo build --release && echo OK", "asyncAgent"),
+                denial("t2", "cargo test 2>&1 | sort", "asyncAgent"),
             ]),
             Some("session-8"),
         );
@@ -4658,11 +4658,12 @@ mod task_app_waiting {
             [
                 "Odmów wszystkim",
                 "Zezwól dokładnie na te polecenia",
-                "Zezwól na grupę: Bash(cargo fmt *), Bash(echo OK *), Bash(cargo test *), \
-                 Bash(tail -20 *)",
+                "Zezwól na grupę: Bash(cargo build *), Bash(echo OK *), Bash(cargo test *), Bash(sort)",
             ]
         );
-        assert!(panel.items()[1].description.contains("Bash(tail -20)"));
+        assert!(panel.items()[1]
+            .description
+            .contains("Bash(cargo build --release), Bash(echo OK), Bash(cargo test), Bash(sort)"));
         let delivery = decision(&panel, 1);
         let granted = delivery.permission_decision.unwrap();
         assert_eq!(granted.denial_index, None, "every denial");
