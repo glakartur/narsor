@@ -1569,31 +1569,54 @@ fn record_session_in_details(error: &mut ActionError, harness: &str, session_id:
     }
 }
 
+/// How many `{` that never close a scan of an agent's text skips, and how
+/// many candidates it tries from the right, before it gives up.
+///
+/// Each one costs a scan to the end of the text, so without a bound a text
+/// full of stray braces takes quadratic time. Prose has a few; the contract
+/// is near the end.
+const MAX_BRACE_CANDIDATES: usize = 64;
+
 /// Every top-level JSON object in `text`, in the order they appear.
 ///
 /// Scanning for balanced braces — string- and escape-aware, so a `}` inside a
 /// string never ends an object — rather than looking for fences: it finds the
 /// fenced case too, since the fence markers are outside the braces. A `{`
 /// that never closes (a brace in the prose) is skipped, and the scan goes on
-/// from the next one, so it cannot hide an object after it.
+/// from the next one, so it cannot hide an object after it — up to
+/// [`MAX_BRACE_CANDIDATES`] of them.
 pub(crate) fn json_objects(text: &str) -> Vec<Value> {
     let mut found = Vec::new();
-    let mut from = 0;
+    for (start, end) in top_level_objects(text) {
+        if let Ok(value) = serde_json::from_str::<Value>(&text[start..end]) {
+            if value.is_object() {
+                found.push(value);
+            }
+        }
+    }
+    found
+}
+
+/// The spans of the top-level balanced objects of `text`, skipping at most
+/// [`MAX_BRACE_CANDIDATES`] braces that never close.
+fn top_level_objects(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let (mut from, mut unclosed) = (0, 0);
     while let Some(offset) = text[from..].find('{') {
         let start = from + offset;
         match object_end(text, start) {
             Some(end) => {
-                if let Ok(value) = serde_json::from_str::<Value>(&text[start..end]) {
-                    if value.is_object() {
-                        found.push(value);
-                    }
-                }
+                spans.push((start, end));
                 from = end;
             }
-            None => from = start + 1,
+            None if unclosed < MAX_BRACE_CANDIDATES => {
+                unclosed += 1;
+                from = start + 1;
+            }
+            None => break,
         }
     }
-    found
+    spans
 }
 
 /// Builds the action result of a successful run.
@@ -1679,7 +1702,8 @@ fn clean_reply(text: &str) -> Option<String> {
 ///
 /// The object is the one that ends where the text ends (but for whitespace
 /// and a closing fence), found from the right, so a brace in the prose
-/// before it never hides it.
+/// before it never hides it. At most [`MAX_BRACE_CANDIDATES`] braces are
+/// tried.
 fn final_contract_start(text: &str) -> Option<usize> {
     let trimmed = text.trim_end();
     let (body, fenced) = match trimmed.strip_suffix("```") {
@@ -1687,7 +1711,12 @@ fn final_contract_start(text: &str) -> Option<usize> {
         None => (trimmed, false),
     };
     let mut candidates = body;
+    let mut tried = 0;
     while let Some(start) = candidates.rfind('{') {
+        tried += 1;
+        if tried > MAX_BRACE_CANDIDATES {
+            return None;
+        }
         candidates = &body[..start];
         if object_end(body, start) != Some(body.len()) || !is_contract(&body[start..]) {
             continue;
@@ -1751,21 +1780,10 @@ fn is_contract(object: &str) -> bool {
 /// The last output-contract object among the text's top-level objects, for
 /// a text that goes on after it.
 fn last_contract_span(text: &str) -> Option<(usize, usize)> {
-    let mut last = None;
-    let mut from = 0;
-    while let Some(offset) = text[from..].find('{') {
-        let start = from + offset;
-        match object_end(text, start) {
-            Some(end) => {
-                if is_contract(&text[start..end]) {
-                    last = Some((start, end));
-                }
-                from = end;
-            }
-            None => from = start + 1,
-        }
-    }
-    last
+    top_level_objects(text)
+        .into_iter()
+        .rev()
+        .find(|&(start, end)| is_contract(&text[start..end]))
 }
 
 #[cfg(test)]
@@ -1801,6 +1819,19 @@ mod json_object_tests {
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0]["output"], json!("findings"));
         assert_eq!(objects[0]["data"]["note"], json!("a } and a {"));
+    }
+
+    #[test]
+    fn a_text_full_of_unclosed_braces_is_read_in_linear_time() {
+        let text = format!("{}\n{{\"output\":\"findings\"}}", "{".repeat(200_000));
+        let started = std::time::Instant::now();
+        let _ = json_objects(&text);
+        let _ = super::clean_reply(&text);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "stray braces must not make the scan quadratic: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

@@ -1652,10 +1652,13 @@ fn print_pending_input(pending: &impl serde::Serialize) {
 /// The lines [`print_pending_input`] prints.
 pub(super) fn pending_input_lines(pending: &impl serde::Serialize) -> Vec<String> {
     let mut lines = Vec::new();
-    let Ok(pending) = serde_json::to_value(pending) else {
+    let Ok(mut pending) = serde_json::to_value(pending) else {
         lines.push("Human input expected: (unavailable)".to_string());
         return lines;
     };
+    // The instruction can carry a step's reply and the problem an agent's
+    // answer: text from an agent, never handed to a terminal as it is.
+    narsor_protocol::display::without_unsafe_chars_json(&mut pending);
     lines.push(format!(
         "Human input expected: {}",
         pending["instruction"].as_str().unwrap_or("(unavailable)")
