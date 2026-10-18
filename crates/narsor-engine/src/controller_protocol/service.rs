@@ -1624,18 +1624,29 @@ impl ProtocolService {
             .ok_or(ProtocolError::Unauthorized)?;
         let pending = query.pending_input_id.as_deref();
         let defer_materials = query.defer_materials;
+        let read_only = query.read_only;
         let poll = || -> ProtocolResult<RunnerPollResponse> {
-            let (inputs, changed) = self.control.deliver_inputs(
-                &identity.task_id,
-                &identity.incarnation,
-                identity.launch_generation,
-                pending,
-            )?;
-            let (commands, commands_changed) = self.control.deliver_operator_commands(
-                &identity.task_id,
-                &identity.incarnation,
-                identity.launch_generation,
-            )?;
+            // A read-only runner is handed nothing it would have to act on:
+            // delivering an answer or a command to it would spend them.
+            let (inputs, changed) = if read_only {
+                (Vec::new(), false)
+            } else {
+                self.control.deliver_inputs(
+                    &identity.task_id,
+                    &identity.incarnation,
+                    identity.launch_generation,
+                    pending,
+                )?
+            };
+            let (commands, commands_changed) = if read_only {
+                (Vec::new(), false)
+            } else {
+                self.control.deliver_operator_commands(
+                    &identity.task_id,
+                    &identity.incarnation,
+                    identity.launch_generation,
+                )?
+            };
             if changed || commands_changed {
                 self.notify(&identity.task_id);
             }
@@ -1668,7 +1679,11 @@ impl ProtocolService {
                 conversation_pages: self.lock_pages().requests_of(&identity.task_id),
                 execution_events: self.lock_event_reads().requests_of(&identity.task_id),
                 conductor_reads: self.lock_conductor_reads().requests_of(&identity.task_id),
-                materials: self.material_announcements(&identity.task_id),
+                materials: if read_only {
+                    Vec::new()
+                } else {
+                    self.material_announcements(&identity.task_id)
+                },
                 default_harness: self.default_harness_of(&record),
             })
         };

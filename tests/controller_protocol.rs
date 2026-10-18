@@ -1157,6 +1157,39 @@ async fn input_is_delivered_only_for_the_matching_pending_input_and_settled_once
         .is_empty());
 }
 
+/// A read-only runner polls for reads only: the answer that waits for the
+/// real runner is neither handed to it nor marked delivered, and no request
+/// naming another pending input makes it obsolete.
+#[tokio::test]
+async fn a_read_only_poll_hands_out_no_answer_and_spends_none() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    runner
+        .snapshot(&snapshot(2, ExecutionStatus::InputNeeded, 4, Some("ep-1")))
+        .await
+        .expect("waiting on ep-1");
+    harness
+        .owner
+        .control_input("task-1", &input_request("ep-1", "answer-1"))
+        .await
+        .expect("queued");
+
+    let reader = narsor_engine::controller_protocol::RunnerPollQuery {
+        wait_secs: Some(0),
+        defer_materials: true,
+        read_only: true,
+        ..Default::default()
+    };
+    let polled = runner.poll_with(&reader).await.expect("a read-only poll");
+    assert!(polled.inputs.is_empty(), "no answer for a reader");
+    assert!(polled.commands.is_empty());
+    assert!(polled.materials.is_empty());
+
+    // The answer is still there for the runner that works.
+    let polled = runner.poll(Some("ep-1"), 0).await.expect("poll");
+    assert_eq!(polled.inputs.len(), 1, "still waiting for its runner");
+}
+
 /// AE12 over the control plane: the client reads the timeline and the
 /// conversation summary, answers the runner, pauses it at a safe point and
 /// then sees the conversation explicitly unavailable — without ever
