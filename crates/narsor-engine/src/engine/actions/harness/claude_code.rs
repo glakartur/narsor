@@ -4,11 +4,12 @@
 //! non-interactive one:
 //!
 //! ```text
-//! claude --print --output-format stream-json --verbose \
-//!        [--add-dir <read_only_paths…>] [--model <model>] [--max-turns <n>] \
+//! claude --print --verbose --permission-prompts none \
+//!        [--add-dir <read_only_paths…>] [--allowedTools <rule>] \
+//!        [--model <model>] [--max-turns <n>] \
 //!        [--append-system-prompt <text>] [--resume <session-id>] \
 //!        [--json-schema <schema>] \
-//!        --permission-mode <mode> \
+//!        --output-format stream-json [--permission-mode <mode>] \
 //!        <prompt>
 //! ```
 //!
@@ -35,10 +36,12 @@
 //!   requires `"type": "object"` there, so the schema is one flat object
 //!   (see [`crate::engine::actions::agent::output_schema`]). The text contract stays in
 //!   the prompt: the schema adds to it, and narsor checks the answer itself.
-//! * `--permission-mode` is **last** before the prompt on purpose. It takes
-//!   exactly one value, so the prompt after it can never be mistaken for a flag
-//!   argument — unlike `--add-dir`, which is variadic and would swallow the
-//!   prompt if it stood there.
+//! * The flag right before the prompt always takes exactly one value —
+//!   `--permission-mode` when the workflow sets `workspace_access`, else
+//!   `--output-format` — so the prompt can never be read as a flag argument.
+//!   `--add-dir` and `--allowedTools` are variadic and come first: right
+//!   before the prompt either would swallow it, and `--resume` without a
+//!   prompt makes the CLI look for a deferred tool call to continue and fail.
 //! * `--resume <id>` is always passed *with* its value: the flag's value is
 //!   optional, and a bare `--resume` would consume the prompt.
 //!
@@ -122,14 +125,13 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 
         let mut args = vec![
             "--print".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
             "--verbose".to_string(),
             "--permission-prompts".to_string(),
             "none".to_string(),
         ];
 
-        // Variadic, so it must never be the last flag before the prompt.
+        // The variadic flags come first: each is followed by another flag,
+        // never by the prompt, which they would swallow.
         if !config.read_only_paths.is_empty() {
             args.push("--add-dir".to_string());
             // No option-like guard here: resolve_read_only_path joins a
@@ -140,6 +142,11 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             for path in &config.read_only_paths {
                 args.push(read_only_arg(request.workspace, path));
             }
+        }
+
+        if let Some(rule) = &config.permission_grant {
+            args.push("--allowedTools".to_string());
+            args.push(rule.clone());
         }
 
         if let Some(model) = &config.model {
@@ -173,14 +180,14 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             args.push(schema);
         }
 
+        // Single-valued flags close the list, so whatever stands right
+        // before the prompt takes exactly one value.
+        args.push("--output-format".to_string());
+        args.push("stream-json".to_string());
+
         if let Some(mode) = mode {
             args.push("--permission-mode".to_string());
             args.push(mode.to_string());
-        }
-
-        if let Some(rule) = &config.permission_grant {
-            args.push("--allowedTools".to_string());
-            args.push(rule.clone());
         }
 
         args.push(request.prompt.to_string());

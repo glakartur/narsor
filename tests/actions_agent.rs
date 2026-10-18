@@ -925,6 +925,47 @@ async fn a_task_permission_grant_reaches_claude_as_one_allowed_tool_rule() {
     );
 }
 
+/// `--allowedTools` and `--add-dir` take any number of values: right before
+/// the prompt they would swallow it, and `--resume` without a prompt makes
+/// Claude Code look for a deferred tool call and fail ("No deferred tool
+/// marker found"). With or without a permission mode, the flag before the
+/// prompt takes exactly one value.
+#[tokio::test]
+async fn a_resumed_grant_never_swallows_the_prompt() {
+    for workspace_access in [None, Some(WorkspaceAccess::ReadWrite)] {
+        let root = TempRoot::new();
+        let fake = FakeHarness::install(root.dir("bin"));
+        fake.answers(&envelope(r#"{"output":"ready"}"#));
+        let mut config = agent_action("The operator approved this action.");
+        config.workspace_access = workspace_access;
+        config.permission_grant = Some("Bash(git checkout -b feat/x)".to_string());
+        config.read_only_paths = vec!["../reference".to_string()];
+        config
+            .parameters
+            .insert("resume_session".to_string(), json!("session-42"));
+
+        complete(&executor(&fake), config, &root.workspace()).await;
+
+        let args = fake.args(1);
+        assert!(
+            args.last()
+                .is_some_and(|prompt| prompt.starts_with("The operator approved this action.")),
+            "{args:?}"
+        );
+        let before_prompt = &args[args.len() - 3];
+        assert!(
+            matches!(
+                before_prompt.as_str(),
+                "--permission-mode" | "--output-format"
+            ),
+            "{args:?}"
+        );
+        let grant = args.iter().position(|arg| arg == "--allowedTools").unwrap();
+        assert_eq!(args[grant + 1], "Bash(git checkout -b feat/x)");
+        assert!(args[grant + 2].starts_with("--"), "{args:?}");
+    }
+}
+
 #[tokio::test]
 async fn claude_rejects_harness_specific_workspace_permissions() {
     let root = TempRoot::new();
