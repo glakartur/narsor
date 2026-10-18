@@ -48,7 +48,7 @@ use crate::registry::{RegistryError, RepositoryEntry, RepositoryRegistry};
 use crate::workflow::TemplateScope;
 use crate::workflows::WorkflowResolver;
 
-use super::backend::BackendRecord;
+use super::backend::{BackendRecord, SlotReleaseTimings};
 use super::catalog::{CatalogError, EnvironmentCatalog};
 use super::image::{ImageResolver, NoTagResolution};
 use super::profile::{ProfileRecord, RuntimeCatalog, DEFAULT_PROFILE};
@@ -284,6 +284,10 @@ pub trait LaunchResolver: Send + Sync {
     /// from configuration on every call, so the scheduler applies a changed
     /// limit to its next decision (U10).
     fn backend_limit(&self, backend: &BackendId) -> Result<u32, LaunchError>;
+
+    /// The slot-release periods of a registered, usable backend, read fresh
+    /// from configuration on every call, like [`Self::backend_limit`].
+    fn slot_release_timings(&self, backend: &BackendId) -> Result<SlotReleaseTimings, LaunchError>;
 
     /// The configured `default_backend` — the fallback when the owner has
     /// not chosen one through the control plane (R10).
@@ -969,6 +973,10 @@ impl SecretSet {
 impl LaunchResolver for CatalogLaunchResolver {
     fn backend_limit(&self, backend: &BackendId) -> Result<u32, LaunchError> {
         Ok(self.usable_backend(backend)?.limits.max_concurrent_tasks)
+    }
+
+    fn slot_release_timings(&self, backend: &BackendId) -> Result<SlotReleaseTimings, LaunchError> {
+        Ok(self.usable_backend(backend)?.limits.slot_release_timings())
     }
 
     fn configured_default_backend(&self) -> String {

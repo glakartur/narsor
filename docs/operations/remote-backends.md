@@ -181,6 +181,10 @@ limits:
   max_concurrent_tasks: 3   # slots; see "Scheduling"
   default_resources: { cpu_millicores: 1000, memory_mib: 2048 }
   max_resources:     { cpu_millicores: 4000, memory_mib: 8192 }
+  # optional slot-release periods, in whole seconds (1 to 86400); defaults shown
+  slot_release_grace_secs: 300           # wait before a task in a transient state frees its slot
+  slot_release_read_extension_secs: 180  # what a read of the task's details adds to that wait
+  slot_reader_idle_secs: 120             # idle time after which a reader stops extending it
 harnesses: [claude-code, codex]   # optional allow list
 secret_delivery: platform         # none | platform
 secrets:
@@ -574,6 +578,14 @@ any state ─▶ Archiving ─▶ Archived
   never turned into another state.
 
 ## 10. Scheduling
+
+The slot-release periods (`slot_release_grace_secs`,
+`slot_release_read_extension_secs`, `slot_reader_idle_secs`) are settings of
+`limits`. Omit them to get 300 s, 180 s and 120 s. Each must be a whole number
+from 1 to 86400; a negative or non-numeric value makes the backend file
+unreadable, and 0 or more than 86400 makes the backend unusable with a clear
+message. The control plane reads them again at every decision, so a change
+applies without a restart.
 
 * Each backend has `max_concurrent_tasks` slots. Slots are held by tasks in
   `Provisioning`, `Running`, `PauseRequested`, `Interrupted`, `Unknown`,
