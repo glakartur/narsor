@@ -162,7 +162,11 @@ fn engine_delivery(delivery: HumanInputDeliveryDto) -> HumanInputDelivery {
                     narsor_engine::api::PermissionGrantScopeDto::CommandGroup => {
                         narsor_engine::engine::PermissionGrantScope::CommandGroup
                     }
+                    narsor_engine::api::PermissionGrantScopeDto::Pattern => {
+                        narsor_engine::engine::PermissionGrantScope::Pattern
+                    }
                 }),
+                pattern: decision.pattern,
                 message: decision.message,
             });
     HumanInputDelivery {
@@ -208,7 +212,11 @@ fn protocol_delivery(delivery: &HumanInputDelivery) -> HumanInputDeliveryDto {
                     narsor_engine::engine::PermissionGrantScope::CommandGroup => {
                         narsor_engine::api::PermissionGrantScopeDto::CommandGroup
                     }
+                    narsor_engine::engine::PermissionGrantScope::Pattern => {
+                        narsor_engine::api::PermissionGrantScopeDto::Pattern
+                    }
                 }),
+                pattern: decision.pattern.clone(),
                 message: decision.message.clone(),
             }
         }),

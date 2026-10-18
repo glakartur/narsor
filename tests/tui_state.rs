@@ -3998,7 +3998,7 @@ mod task_app_waiting {
 
     fn delivery(request: Request) -> narsor_protocol::api::HumanInputDeliveryDto {
         match sent(request).submit {
-            Submit::Input { delivery, .. } => delivery,
+            Submit::Input { delivery, .. } => *delivery,
             other => panic!("an input was expected, got {other:?}"),
         }
     }
@@ -4659,6 +4659,7 @@ mod task_app_waiting {
                 "Odmów wszystkim",
                 "Zezwól dokładnie na te polecenia",
                 "Zezwól na grupę: Bash(cargo build *), Bash(echo OK *), Bash(cargo test *), Bash(sort)",
+                "Zezwól według wzorca…",
             ]
         );
         assert!(panel.items()[1]
@@ -4718,7 +4719,7 @@ mod task_app_waiting {
             Some("session-8"),
         );
         let panel = narsor::tui::input_form::InputPanel::new(&script, &|_| None);
-        assert_eq!(labels(&panel), ["Odmów"]);
+        assert_eq!(labels(&panel), ["Odmów", "Zezwól według wzorca…"]);
         assert!(panel.items()[0].description.contains("proste polecenia"));
         let delivery = panel
             .delivery(&narsor::tui::chooser::Submission {
@@ -4743,6 +4744,41 @@ mod task_app_waiting {
             decision(&panel, 0).permission_decision.unwrap().message,
             None
         );
+
+        // The operator's own pattern starts as the denied command and is
+        // sent as typed; `*` allows every command, and a pattern no rule
+        // can carry is refused before it is sent.
+        let typed = &panel.items()[1];
+        assert_eq!(typed.fields[0].name, narsor::tui::input_form::PATTERN_FIELD);
+        assert!(typed.fields[0].required);
+        assert!(typed.fields[0]
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("KAŻDE"));
+        let with_pattern = |pattern: &str| {
+            panel.delivery(&narsor::tui::chooser::Submission {
+                index: 1,
+                label: typed.label.clone(),
+                values: vec![(
+                    narsor::tui::input_form::PATTERN_FIELD.to_string(),
+                    pattern.to_string(),
+                )],
+            })
+        };
+        let granted = with_pattern(" * ").unwrap().permission_decision.unwrap();
+        assert_eq!(
+            granted.scope,
+            Some(narsor_protocol::api::PermissionGrantScopeDto::Pattern)
+        );
+        assert_eq!(granted.pattern.as_deref(), Some("*"));
+        assert!(with_pattern("echo (x)").is_err());
+        assert!(with_pattern("  ").is_err());
+
+        // A policy block is never lifted, so no pattern is offered for it.
+        let blocked = pending(json!([denial("t1", "rm -rf /", "rule")]), Some("session-8"));
+        let panel = narsor::tui::input_form::InputPanel::new(&blocked, &|_| None);
+        assert_eq!(labels(&panel), ["Odmów"]);
     }
 
     // -- the panel ------------------------------------------------------------

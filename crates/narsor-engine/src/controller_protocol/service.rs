@@ -69,7 +69,11 @@ fn engine_delivery(delivery: narsor_protocol::api::HumanInputDeliveryDto) -> Hum
                     narsor_protocol::api::PermissionGrantScopeDto::CommandGroup => {
                         crate::engine::actions::PermissionGrantScope::CommandGroup
                     }
+                    narsor_protocol::api::PermissionGrantScopeDto::Pattern => {
+                        crate::engine::actions::PermissionGrantScope::Pattern
+                    }
                 }),
+                pattern: decision.pattern,
                 message: decision.message,
             });
     HumanInputDelivery {
@@ -114,7 +118,11 @@ fn protocol_delivery(delivery: &HumanInputDelivery) -> narsor_protocol::api::Hum
                     crate::engine::actions::PermissionGrantScope::CommandGroup => {
                         narsor_protocol::api::PermissionGrantScopeDto::CommandGroup
                     }
+                    crate::engine::actions::PermissionGrantScope::Pattern => {
+                        narsor_protocol::api::PermissionGrantScopeDto::Pattern
+                    }
                 }),
+                pattern: decision.pattern.clone(),
                 message: decision.message.clone(),
             }
         }),

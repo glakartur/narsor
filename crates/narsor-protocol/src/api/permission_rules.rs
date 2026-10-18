@@ -253,9 +253,53 @@ pub fn bash_grant_rules(command: &str, scope: BashGrantScope) -> Option<Vec<Stri
     Some(rules)
 }
 
+/// Longest pattern an operator may type: a rule, not a script.
+const MAX_PATTERN_LEN: usize = 500;
+
+/// The Claude Code allow rule for a pattern the operator typed — the whole
+/// command or its beginning followed by `*` — or `None` when it is not one.
+/// The operator chose it, so it is not narrowed: `*` allows every Bash
+/// command ([`bash_pattern_allows_everything`]). Only what would break the
+/// rule's own syntax is refused: parentheses and control characters.
+pub fn bash_pattern_rule(pattern: &str) -> Option<String> {
+    let pattern = pattern.trim();
+    let valid = !pattern.is_empty()
+        && pattern.len() <= MAX_PATTERN_LEN
+        && !pattern
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '(' | ')'));
+    valid.then(|| format!("Bash({pattern})"))
+}
+
+/// Whether `pattern` allows every Bash command: nothing in it but `*`.
+pub fn bash_pattern_allows_everything(pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    !pattern.is_empty() && pattern.chars().all(|c| c == '*' || c.is_whitespace())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_typed_pattern_becomes_one_rule_unless_it_breaks_the_rule_syntax() {
+        assert_eq!(
+            bash_pattern_rule("  npm run * "),
+            Some("Bash(npm run *)".to_string())
+        );
+        assert_eq!(bash_pattern_rule("*"), Some("Bash(*)".to_string()));
+        assert_eq!(
+            bash_pattern_rule("f=out; until grep -q x \"$f\"; do sleep 2; done"),
+            Some("Bash(f=out; until grep -q x \"$f\"; do sleep 2; done)".to_string())
+        );
+        for refused in ["", "   ", "echo (x)", "echo x)", "a\nb", &"a".repeat(501)] {
+            assert_eq!(bash_pattern_rule(refused), None, "{refused:?}");
+        }
+        assert!(bash_pattern_allows_everything(" * "));
+        assert!(bash_pattern_allows_everything("**"));
+        assert!(!bash_pattern_allows_everything("cargo *"));
+        assert!(!bash_pattern_allows_everything(""));
+    }
 
     fn exact(command: &str) -> Option<Vec<String>> {
         bash_grant_rules(command, BashGrantScope::Exact)

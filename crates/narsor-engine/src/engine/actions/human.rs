@@ -211,6 +211,9 @@ pub struct PermissionDecision {
     pub decision: PermissionDecisionKind,
     #[serde(default)]
     pub scope: Option<PermissionGrantScope>,
+    /// The Bash pattern the operator typed, for the `pattern` scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
     /// What the operator tells the agent along with the decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -228,25 +231,34 @@ pub enum PermissionDecisionKind {
 pub enum PermissionGrantScope {
     ExactOperation,
     CommandGroup,
+    /// One rule from the pattern the operator typed (`pattern`).
+    Pattern,
+}
+
+/// Whether a task grant may lift `denial` at all: a Bash command Claude Code
+/// held for approval, not a policy block (R6).
+fn is_grantable_bash(denial: &PermissionDenialDetails) -> bool {
+    denial.tool_name == "Bash"
+        && narsor_protocol::api::is_approvable_permission_reason(denial.reason_type.as_deref())
 }
 
 /// The Claude Code allow rules that grant one denial at `scope`: a rule per
 /// part of its Bash command ([`narsor_protocol::api::bash_grant_rules`]).
 /// `None` for a denial no task grant may lift (R6) or a command a rule could
-/// not pin down — never a wider rule.
+/// not pin down — never a wider rule — and for [`PermissionGrantScope::Pattern`],
+/// whose rule comes from the decision, not the command ([`granted_rules`]).
 pub fn claude_permission_rules(
     denial: &PermissionDenialDetails,
     scope: PermissionGrantScope,
 ) -> Option<Vec<String>> {
-    if denial.tool_name != "Bash"
-        || !narsor_protocol::api::is_approvable_permission_reason(denial.reason_type.as_deref())
-    {
+    if !is_grantable_bash(denial) {
         return None;
     }
     let command = denial.input.get("command")?.as_str()?;
     let scope = match scope {
         PermissionGrantScope::ExactOperation => narsor_protocol::api::BashGrantScope::Exact,
         PermissionGrantScope::CommandGroup => narsor_protocol::api::BashGrantScope::Group,
+        PermissionGrantScope::Pattern => return None,
     };
     narsor_protocol::api::bash_grant_rules(command, scope)
 }
@@ -277,7 +289,8 @@ fn decided_denials<'a>(
 
 /// The allow rules an approving `decision` grants, every decided denial's
 /// rules in order and without repeats. A denial that cannot be granted at
-/// the chosen scope refuses the whole decision.
+/// the chosen scope refuses the whole decision. The `pattern` scope grants
+/// the one rule the operator typed, for denials a task grant may lift.
 pub fn granted_rules(
     request: &HumanInputRequest,
     decision: &PermissionDecision,
@@ -285,11 +298,25 @@ pub fn granted_rules(
     let (PermissionDecisionKind::Allow, Some(scope)) = (decision.decision, decision.scope) else {
         return Ok(Vec::new());
     };
+    let typed = match scope {
+        PermissionGrantScope::Pattern => Some(
+            decision
+                .pattern
+                .as_deref()
+                .and_then(narsor_protocol::api::bash_pattern_rule)
+                .ok_or_else(|| HumanActionError::MissingRequiredField {
+                    field: "pattern".to_string(),
+                })?,
+        ),
+        _ => None,
+    };
     let mut rules: Vec<String> = Vec::new();
     for denial in decided_denials(request, decision)? {
-        for rule in claude_permission_rules(denial, scope)
-            .ok_or(HumanActionError::PermissionDecisionRequired)?
-        {
+        let denial_rules = match &typed {
+            Some(rule) => is_grantable_bash(denial).then(|| vec![rule.clone()]),
+            None => claude_permission_rules(denial, scope),
+        };
+        for rule in denial_rules.ok_or(HumanActionError::PermissionDecisionRequired)? {
             if !rules.contains(&rule) {
                 rules.push(rule);
             }
@@ -1067,8 +1094,8 @@ pub fn resolve_permission(
                 .map_or_else(|| denial.tool_name.clone(), ToString::to_string)
         })
         .collect();
-    match (decision.decision, decision.scope) {
-        (PermissionDecisionKind::Deny, None) => {}
+    let granted = match (decision.decision, decision.scope) {
+        (PermissionDecisionKind::Deny, None) => Vec::new(),
         (PermissionDecisionKind::Allow, Some(_)) => {
             if pending.request.agent_harness.as_deref() != Some("claude-code")
                 || pending
@@ -1079,14 +1106,14 @@ pub fn resolve_permission(
             {
                 return Err(HumanActionError::PermissionDecisionRequired);
             }
-            granted_rules(&pending.request, &decision)?;
+            granted_rules(&pending.request, &decision)?
         }
         _ => {
             return Err(HumanActionError::MissingRequiredField {
                 field: "scope".to_string(),
             })
         }
-    }
+    };
     let listed = |commands: &[&String]| {
         commands
             .iter()
@@ -1100,10 +1127,7 @@ pub fn resolve_permission(
             // approve: say so, and how to ask in a form that can be.
             let (unpinnable, denied): (Vec<_>, Vec<_>) =
                 denials.iter().zip(&commands).partition(|(denial, _)| {
-                    denial.tool_name == "Bash"
-                        && narsor_protocol::api::is_approvable_permission_reason(
-                            denial.reason_type.as_deref(),
-                        )
+                    is_grantable_bash(denial)
                         && claude_permission_rules(denial, PermissionGrantScope::ExactOperation)
                             .is_none()
                 });
@@ -1131,8 +1155,10 @@ pub fn resolve_permission(
         }
         PermissionDecisionKind::Allow => format!(
             "The operator approved these blocked actions for this task:\n{}\n\
+             Allow rules for the rest of this task: {}\n\
              Run them again now; they are allowed in this session.",
-            listed(&commands.iter().collect::<Vec<_>>())
+            listed(&commands.iter().collect::<Vec<_>>()),
+            granted.join(", ")
         ),
     };
     if let Some(message) = decision.message.as_deref().map(str::trim) {

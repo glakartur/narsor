@@ -36,10 +36,10 @@ use serde_json::{Map, Value};
 use crate::conductor::Annotation;
 use crate::tui::chooser::{ChooserField, ChooserItem, FieldKind, Submission};
 use narsor_protocol::api::{
-    bash_grant_rules, is_approvable_permission_reason, BashGrantScope, HumanInputActionDto,
-    HumanInputDeliveryDto, HumanInputFieldView, HumanInputTypeView, InputContinuationView,
-    OutputDefinitionView, PendingHumanInputView, PermissionDecisionDto, PermissionDecisionKindDto,
-    PermissionDenialView, PermissionGrantScopeDto,
+    bash_grant_rules, bash_pattern_rule, is_approvable_permission_reason, BashGrantScope,
+    HumanInputActionDto, HumanInputDeliveryDto, HumanInputFieldView, HumanInputTypeView,
+    InputContinuationView, OutputDefinitionView, PendingHumanInputView, PermissionDecisionDto,
+    PermissionDecisionKindDto, PermissionDenialView, PermissionGrantScopeDto,
 };
 use narsor_protocol::controller::{WorkflowInputType, WorkflowInputView};
 use narsor_protocol::event::{AnsweredBy, EventData, InputCloseReason};
@@ -553,6 +553,7 @@ impl InputPanel {
             },
             Plan::Permission(permission_decision) => HumanInputDeliveryDto {
                 permission_decision: Some(PermissionDecisionDto {
+                    pattern: Self::permission_pattern(permission_decision, submission)?,
                     message: Self::value_of(submission, MESSAGE_FIELD)
                         .map(str::trim)
                         .filter(|message| !message.is_empty())
@@ -598,10 +599,34 @@ impl InputPanel {
                     Some(PermissionGrantScopeDto::CommandGroup) => {
                         "zezwolono na grupę poleceń w tym tasku".to_string()
                     }
+                    Some(PermissionGrantScopeDto::Pattern) => {
+                        "zezwolono na polecenia według wzorca w tym tasku".to_string()
+                    }
                     None => "zezwolono agentowi".to_string(),
                 },
             },
         }
+    }
+
+    /// The pattern typed for a `pattern` grant, refused when no rule can
+    /// carry it; `None` for every other decision.
+    fn permission_pattern(
+        decision: &PermissionDecisionDto,
+        submission: &Submission,
+    ) -> Result<Option<String>, String> {
+        if decision.scope != Some(PermissionGrantScopeDto::Pattern) {
+            return Ok(None);
+        }
+        let pattern = Self::value_of(submission, PATTERN_FIELD)
+            .unwrap_or_default()
+            .trim();
+        if bash_pattern_rule(pattern).is_none() {
+            return Err(
+                "Wzorzec nie może być pusty ani zawierać nawiasów lub znaków sterujących."
+                    .to_string(),
+            );
+        }
+        Ok(Some(pattern.to_string()))
     }
 
     fn value_of<'a>(submission: &'a Submission, name: &str) -> Option<&'a str> {
@@ -964,6 +989,7 @@ impl InputPanel {
                 denial_index: None,
                 decision: PermissionDecisionKindDto::Deny,
                 scope: None,
+                pattern: None,
                 message: None,
             }),
         );
@@ -985,6 +1011,7 @@ impl InputPanel {
                     denial_index: None,
                     decision: PermissionDecisionKindDto::Allow,
                     scope: Some(PermissionGrantScopeDto::ExactOperation),
+                    pattern: None,
                     message: None,
                 }),
             );
@@ -1006,6 +1033,7 @@ impl InputPanel {
                         denial_index: Some(index),
                         decision: PermissionDecisionKindDto::Allow,
                         scope: Some(PermissionGrantScopeDto::ExactOperation),
+                        pattern: None,
                         message: None,
                     }),
                 );
@@ -1021,6 +1049,46 @@ impl InputPanel {
                     denial_index: None,
                     decision: PermissionDecisionKindDto::Allow,
                     scope: Some(PermissionGrantScopeDto::CommandGroup),
+                    pattern: None,
+                    message: None,
+                }),
+            );
+        }
+        // The operator's own rule, for what the rules above do not cover:
+        // a program outside the group list, or `*` for every command.
+        let patternable = !denials.is_empty()
+            && denials.iter().all(|denial| {
+                denial.tool_name == "Bash"
+                    && is_approvable_permission_reason(denial.reason_type.as_deref())
+            });
+        if resumable && patternable {
+            let first = denials[0]
+                .input
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            self.push(
+                ChooserItem::new(
+                    "Zezwól według wzorca…",
+                    "Wpisz całe polecenie albo jego początek z * na końcu, np. npm run *. \
+                     Zgoda obejmie pasujące polecenia Bash do końca bieżącego tasku.",
+                )
+                .with_field(
+                    ChooserField::text(PATTERN_FIELD)
+                        .required()
+                        .with_value(first)
+                        .described(
+                            "Polecenie złożone (&&, ;, |, pętla) Claude Code sprawdza \
+                             po częściach: wtedy pomoże tylko *. Sam * zezwala na KAŻDE \
+                             polecenie Bash.",
+                        ),
+                ),
+                Plan::Permission(PermissionDecisionDto {
+                    denial_index: None,
+                    decision: PermissionDecisionKindDto::Allow,
+                    scope: Some(PermissionGrantScopeDto::Pattern),
+                    pattern: None,
                     message: None,
                 }),
             );
@@ -1077,6 +1145,9 @@ impl InputPanel {
 
 /// The field a message to the agent is typed into.
 pub const MESSAGE_FIELD: &str = "Wiadomość dla agenta";
+
+/// The field the operator types a Bash pattern into.
+pub const PATTERN_FIELD: &str = "Wzorzec polecenia";
 
 /// The field a return to the agent is explained in.
 pub const COMMENT_TO_AGENT: &str = "Komentarz dla agenta";

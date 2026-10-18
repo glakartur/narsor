@@ -651,6 +651,48 @@ pub struct InputAnswer {
     /// `--denial-index` within the pending permission request; every denial
     /// when `None`.
     pub denial_index: Option<usize>,
+    /// `--pattern` for `--permission allow-pattern`.
+    pub pattern: Option<String>,
+}
+
+/// The permission decision `--permission` names, with its `--denial-index`,
+/// `--pattern` and `--comment` (the agent reads it); `None` without
+/// `--permission`.
+pub(super) fn permission_decision(
+    permission: Option<&str>,
+    denial_index: Option<usize>,
+    pattern: Option<&str>,
+    comment: Option<&str>,
+) -> Result<Option<narsor_protocol::api::PermissionDecisionDto>> {
+    use narsor_protocol::api::{
+        PermissionDecisionKindDto as Kind, PermissionGrantScopeDto as Scope,
+    };
+    let Some(permission) = permission else {
+        return match pattern {
+            Some(_) => Err(CliError::usage(
+                "--pattern needs --permission allow-pattern.",
+            )),
+            None => Ok(None),
+        };
+    };
+    let (decision, scope) = match permission {
+        "deny" => (Kind::Deny, None),
+        "allow-exact" => (Kind::Allow, Some(Scope::ExactOperation)),
+        "allow-group" => (Kind::Allow, Some(Scope::CommandGroup)),
+        _ => (Kind::Allow, Some(Scope::Pattern)),
+    };
+    if (scope == Some(Scope::Pattern)) != pattern.is_some() {
+        return Err(CliError::usage(
+            "--permission allow-pattern needs --pattern, and --pattern needs allow-pattern.",
+        ));
+    }
+    Ok(Some(narsor_protocol::api::PermissionDecisionDto {
+        denial_index,
+        decision,
+        scope,
+        pattern: pattern.map(str::to_string),
+        message: comment.map(str::to_string),
+    }))
 }
 
 /// `narsor input <id> [--field k=v]… [--label l] [--data k=v]… [--variable k=v]…
@@ -726,31 +768,23 @@ pub async fn input(
     let permission_wait =
         pending.continuation == narsor_protocol::api::InputContinuationView::ResolvePermission;
     if permission_wait {
-        let choice = answer.permission.as_deref().ok_or_else(|| CliError::usage(
-            "This execution needs a permission decision. Use --permission deny, allow-exact, or allow-group.",
-        ))?;
-        let (decision, scope) = match choice {
-            "deny" => (narsor_protocol::api::PermissionDecisionKindDto::Deny, None),
-            "allow-exact" => (
-                narsor_protocol::api::PermissionDecisionKindDto::Allow,
-                Some(narsor_protocol::api::PermissionGrantScopeDto::ExactOperation),
-            ),
-            _ => (
-                narsor_protocol::api::PermissionDecisionKindDto::Allow,
-                Some(narsor_protocol::api::PermissionGrantScopeDto::CommandGroup),
-            ),
-        };
+        let permission_decision = permission_decision(
+            answer.permission.as_deref(),
+            answer.denial_index,
+            answer.pattern.as_deref(),
+            delivery.comment.as_deref(),
+        )?
+        .ok_or_else(|| {
+            CliError::usage(
+                "This execution needs a permission decision. Use --permission deny, allow-exact, allow-group, or allow-pattern.",
+            )
+        })?;
         client
             .resolve_permission(
                 execution_id,
                 narsor_protocol::api::PermissionDecisionRequestDto {
                     episode: pending.episode_key().to_string(),
-                    permission_decision: narsor_protocol::api::PermissionDecisionDto {
-                        denial_index: answer.denial_index,
-                        decision,
-                        scope,
-                        message: delivery.comment.clone(),
-                    },
+                    permission_decision,
                 },
             )
             .await
@@ -1662,7 +1696,7 @@ fn print_pending_input(pending: &impl serde::Serialize) {
                 println!("    reason: {}", without_unsafe_chars(reason));
             }
         }
-        println!("  Decide with --permission deny, allow-exact, or allow-group.");
+        println!("  Decide with --permission deny, allow-exact, allow-group, or allow-pattern --pattern TEXT.");
     }
     let outputs = pending["outputs"].as_array().cloned().unwrap_or_default();
     let problem = &pending["problem"];

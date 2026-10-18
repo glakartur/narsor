@@ -47,6 +47,9 @@ pub struct PermissionDecisionDto {
     pub decision: PermissionDecisionKindDto,
     #[serde(default)]
     pub scope: Option<PermissionGrantScopeDto>,
+    /// The Bash pattern the operator typed, for the `pattern` scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
     /// What the operator tells the agent along with the decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -71,6 +74,8 @@ pub enum PermissionDecisionKindDto {
 pub enum PermissionGrantScopeDto {
     ExactOperation,
     CommandGroup,
+    /// One rule from the pattern the operator typed (`pattern`).
+    Pattern,
 }
 
 /// A pending form as exposed to clients, independent of the engine's durable

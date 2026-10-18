@@ -204,14 +204,21 @@ pub enum Command {
         #[arg(long, value_name = "TEXT")]
         comment: Option<String>,
 
-        /// Resolve a Claude Code permission wait: deny, allow-exact or allow-group.
-        #[arg(long = "permission", value_name = "DECISION", value_parser = ["deny", "allow-exact", "allow-group"])]
+        /// Resolve a Claude Code permission wait: deny, allow-exact,
+        /// allow-group, or allow-pattern with `--pattern`.
+        #[arg(long = "permission", value_name = "DECISION", value_parser = ["deny", "allow-exact", "allow-group", "allow-pattern"])]
         permission: Option<String>,
 
         /// Which denial in the pending request to resolve; every denial when
         /// omitted.
         #[arg(long = "denial-index")]
         denial_index: Option<usize>,
+
+        /// With `--permission allow-pattern`: the Bash command or its
+        /// beginning followed by `*` to allow for the rest of the task; `*`
+        /// allows every Bash command.
+        #[arg(long = "pattern", value_name = "TEXT")]
+        pattern: Option<String>,
 
         /// Workflow file or name, for when it cannot be read back from the stored execution.
         #[arg(long = "file", value_name = "WORKFLOW")]
@@ -611,6 +618,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
             comment,
             permission,
             denial_index,
+            pattern,
             file,
         } => {
             let answer = commands::InputAnswer {
@@ -621,6 +629,7 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
                 comment,
                 permission,
                 denial_index,
+                pattern,
             };
             commands::input(&config, &flags, &execution_id, answer, file.as_deref()).await
         }
@@ -688,6 +697,39 @@ pub async fn run(cli: Cli, config: Resolved) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pattern_goes_only_with_allow_pattern_and_the_comment_reaches_the_agent() {
+        use narsor_protocol::api::PermissionGrantScopeDto;
+        let decision =
+            commands::permission_decision(Some("allow-pattern"), None, Some("npm run *"), None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(decision.scope, Some(PermissionGrantScopeDto::Pattern));
+        assert_eq!(decision.pattern.as_deref(), Some("npm run *"));
+
+        let denied =
+            commands::permission_decision(Some("deny"), Some(1), None, Some("Use cargo build."))
+                .unwrap()
+                .unwrap();
+        assert_eq!(denied.scope, None);
+        assert_eq!(denied.denial_index, Some(1));
+        assert_eq!(denied.message.as_deref(), Some("Use cargo build."));
+
+        assert!(commands::permission_decision(None, None, None, None)
+            .unwrap()
+            .is_none());
+        for (permission, pattern) in [
+            (Some("allow-pattern"), None),
+            (Some("allow-exact"), Some("*")),
+            (None, Some("*")),
+        ] {
+            assert!(
+                commands::permission_decision(permission, None, pattern, None).is_err(),
+                "{permission:?} {pattern:?}"
+            );
+        }
+    }
 
     #[test]
     fn config_show_is_the_only_command_that_runs_on_a_broken_configuration() {

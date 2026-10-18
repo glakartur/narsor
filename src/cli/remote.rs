@@ -46,7 +46,7 @@ use narsor_protocol::controller::{
 };
 use narsor_protocol::identifier::TaskId;
 
-use super::commands::{conversation_entry_lines, CliError, Result};
+use super::commands::{conversation_entry_lines, permission_decision, CliError, Result};
 use super::task_history::{history, HistoryCommand};
 use super::task_registry::{
     capabilities, create_from_file, repo, validate, workflows, RepoCommand,
@@ -362,12 +362,18 @@ pub enum TaskCommand {
         /// the agent reads along with the decision.
         #[arg(long, value_name = "TEXT")]
         comment: Option<String>,
-        /// Resolve a Claude permission wait: deny, allow-exact or allow-group.
-        #[arg(long = "permission", value_name = "DECISION", value_parser = ["deny", "allow-exact", "allow-group"])]
+        /// Resolve a Claude permission wait: deny, allow-exact, allow-group,
+        /// or allow-pattern with `--pattern`.
+        #[arg(long = "permission", value_name = "DECISION", value_parser = ["deny", "allow-exact", "allow-group", "allow-pattern"])]
         permission: Option<String>,
         /// Which denial in the request to resolve; every denial when omitted.
         #[arg(long = "denial-index")]
         denial_index: Option<usize>,
+        /// With `--permission allow-pattern`: the Bash command or its
+        /// beginning followed by `*` to allow for the rest of the task; `*`
+        /// allows every Bash command.
+        #[arg(long = "pattern", value_name = "TEXT")]
+        pattern: Option<String>,
         /// The wait to answer (its id as `show` lists it): refused when the
         /// task waits on something else.
         #[arg(long = "waiting-id", value_name = "ID")]
@@ -810,28 +816,8 @@ fn input_delivery(
     variables: &[String],
     label: &Option<String>,
     comment: &Option<String>,
-    permission: &Option<String>,
-    denial_index: Option<usize>,
+    permission_decision: Option<narsor_protocol::api::PermissionDecisionDto>,
 ) -> Result<HumanInputDeliveryDto> {
-    let permission_decision = permission.as_deref().map(|decision| {
-        let (decision, scope) = match decision {
-            "deny" => (narsor_protocol::api::PermissionDecisionKindDto::Deny, None),
-            "allow-exact" => (
-                narsor_protocol::api::PermissionDecisionKindDto::Allow,
-                Some(narsor_protocol::api::PermissionGrantScopeDto::ExactOperation),
-            ),
-            _ => (
-                narsor_protocol::api::PermissionDecisionKindDto::Allow,
-                Some(narsor_protocol::api::PermissionGrantScopeDto::CommandGroup),
-            ),
-        };
-        narsor_protocol::api::PermissionDecisionDto {
-            denial_index,
-            decision,
-            scope,
-            message: comment.clone(),
-        }
-    });
     Ok(HumanInputDeliveryDto {
         values: field_values(fields)?,
         data: parse_pairs("data", data)?,
@@ -936,6 +922,7 @@ pub async fn task(
             comment,
             permission,
             denial_index,
+            pattern,
             ..
         } => Some(input_delivery(
             fields,
@@ -943,8 +930,12 @@ pub async fn task(
             variables,
             label,
             comment,
-            permission,
-            *denial_index,
+            permission_decision(
+                permission.as_deref(),
+                *denial_index,
+                pattern.as_deref(),
+                comment.as_deref(),
+            )?,
         )?),
         _ => None,
     };
@@ -1117,7 +1108,7 @@ pub async fn task(
                 == Some("resolve_permission");
             if permission_wait && permission.is_none() {
                 return Err(CliError::failure(
-                    "This task needs a permission decision. Use --permission deny, allow-exact, or allow-group.",
+                    "This task needs a permission decision. Use --permission deny, allow-exact, allow-group, or allow-pattern.",
                 ));
             }
             if !permission_wait && permission.is_some() {

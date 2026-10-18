@@ -355,6 +355,7 @@ fn permission_wait_survives_reload_and_rejects_ordinary_input() {
             denial_index: Some(0),
             decision: PermissionDecisionKind::Allow,
             scope: Some(PermissionGrantScope::ExactOperation),
+            pattern: None,
             message: None,
         },
         reloaded.episode_key(),
@@ -439,6 +440,7 @@ fn a_decision_without_an_index_grants_every_denial_or_none() {
         denial_index: None,
         decision: PermissionDecisionKind::Allow,
         scope: Some(PermissionGrantScope::ExactOperation),
+        pattern: None,
         message: None,
     };
     let both = request(vec![
@@ -469,6 +471,71 @@ fn a_decision_without_an_index_grants_every_denial_or_none() {
     assert_eq!(
         human::granted_rules(&one_blocked, &only_first).unwrap(),
         vec!["Bash(cargo test)".to_string()]
+    );
+}
+
+/// The operator's own pattern is one rule for every decided denial — `*`
+/// included — but it never lifts a policy block, and a pattern no rule can
+/// carry is refused.
+#[test]
+fn a_typed_pattern_grants_one_rule_but_never_lifts_a_policy_block() {
+    let denial = |command: &str, reason: &str| PermissionDenialDetails {
+        tool_name: "Bash".into(),
+        tool_use_id: format!("tool-{command}"),
+        input: json!({ "command": command }),
+        cwd: "/tmp/task".into(),
+        reason_type: Some(reason.into()),
+        reason: None,
+    };
+    let request = |denials| HumanInputRequest {
+        action_execution_id: "attempt".to_string(),
+        instruction: String::new(),
+        fields: Vec::new(),
+        question: None,
+        answer_tail: None,
+        agent_harness: Some("claude-code".to_string()),
+        agent_session_id: Some("session".to_string()),
+        prefilled_answer: None,
+        permission: Some(PermissionRequestDetails { denials }),
+    };
+    let typed = |pattern: Option<&str>| PermissionDecision {
+        denial_index: None,
+        decision: PermissionDecisionKind::Allow,
+        scope: Some(PermissionGrantScope::Pattern),
+        pattern: pattern.map(str::to_string),
+        message: None,
+    };
+    let looping = request(vec![
+        denial(
+            "f=x; until grep -q done \"$f\"; do sleep 2; done",
+            "asyncAgent",
+        ),
+        denial("npm run lint", "subcommandResults"),
+    ]);
+    assert_eq!(
+        human::granted_rules(&looping, &typed(Some(" * "))).unwrap(),
+        vec!["Bash(*)".to_string()]
+    );
+    assert_eq!(
+        human::granted_rules(&looping, &typed(Some("npm run *"))).unwrap(),
+        vec!["Bash(npm run *)".to_string()]
+    );
+    for refused in [None, Some(""), Some("echo (x)")] {
+        assert!(
+            matches!(
+                human::granted_rules(&looping, &typed(refused)),
+                Err(HumanActionError::MissingRequiredField { .. })
+            ),
+            "{refused:?}"
+        );
+    }
+    let blocked = request(vec![
+        denial("npm run lint", "asyncAgent"),
+        denial("rm -rf build", "rule"),
+    ]);
+    assert!(
+        human::granted_rules(&blocked, &typed(Some("*"))).is_err(),
+        "a policy block is never lifted by a pattern"
     );
 }
 
@@ -515,6 +582,7 @@ fn denying_an_ungrantable_command_tells_the_agent_how_to_ask_again() {
             denial_index: None,
             decision: PermissionDecisionKind::Deny,
             scope: None,
+            pattern: None,
             message: Some("Run cargo build --workspace --bins first.".to_string()),
         },
         pending.episode_key(),

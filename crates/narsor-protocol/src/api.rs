@@ -7,7 +7,10 @@ mod timeline;
 
 pub use human_input::*;
 pub use material::*;
-pub use permission_rules::{bash_command_parts, bash_grant_rules, BashGrantScope};
+pub use permission_rules::{
+    bash_command_parts, bash_grant_rules, bash_pattern_allows_everything, bash_pattern_rule,
+    BashGrantScope,
+};
 pub use timeline::*;
 
 use std::collections::{BTreeMap, HashMap};

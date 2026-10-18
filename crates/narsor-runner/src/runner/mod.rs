@@ -1256,7 +1256,11 @@ impl Session {
                     narsor_protocol::api::PermissionGrantScopeDto::CommandGroup => {
                         narsor_engine::engine::PermissionGrantScope::CommandGroup
                     }
+                    narsor_protocol::api::PermissionGrantScopeDto::Pattern => {
+                        narsor_engine::engine::PermissionGrantScope::Pattern
+                    }
                 }),
+                pattern: decision.pattern,
                 message: decision.message,
             }
         });

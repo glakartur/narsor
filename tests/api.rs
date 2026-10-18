@@ -122,7 +122,11 @@ fn wire_delivery(delivery: HumanInputDelivery) -> HumanInputDeliveryDto {
                     narsor_engine::engine::PermissionGrantScope::CommandGroup => {
                         narsor_protocol::api::PermissionGrantScopeDto::CommandGroup
                     }
+                    narsor_engine::engine::PermissionGrantScope::Pattern => {
+                        narsor_protocol::api::PermissionGrantScopeDto::Pattern
+                    }
                 }),
+                pattern: decision.pattern.clone(),
                 message: decision.message.clone(),
             }
         }),
@@ -1253,6 +1257,7 @@ async fn ordinary_input_cannot_resolve_permission_and_unapprovable_denial_stays_
         denial_index: Some(0),
         decision: narsor_protocol::api::PermissionDecisionKindDto::Allow,
         scope: Some(narsor_protocol::api::PermissionGrantScopeDto::ExactOperation),
+        pattern: None,
         message: None,
     };
     assert!(client

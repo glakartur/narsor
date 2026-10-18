@@ -92,8 +92,8 @@ pub enum Submit {
     Input {
         /// The request it answers.
         pending_input_id: String,
-        /// The answer.
-        delivery: HumanInputDeliveryDto,
+        /// The answer, boxed: it is far larger than the other variants.
+        delivery: Box<HumanInputDeliveryDto>,
     },
     /// A command for the runner: a restart, a confirmation of a proposal.
     Operator(OperatorCommand),
@@ -886,7 +886,7 @@ impl WaitingPanel {
             Model::Input(panel) => (
                 Submit::Input {
                     pending_input_id: entry.item.waiting_id.clone(),
-                    delivery: panel.delivery(submission)?,
+                    delivery: Box::new(panel.delivery(submission)?),
                 },
                 panel.summary(submission),
             ),
@@ -1462,7 +1462,7 @@ impl TaskApp {
                     &SubmitInputRequest {
                         pending_input_id,
                         idempotency_key: key,
-                        delivery,
+                        delivery: *delivery,
                     },
                 )
                 .await
