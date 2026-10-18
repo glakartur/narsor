@@ -34,6 +34,16 @@ pub fn auto_resume_key(generation: u64) -> String {
     format!("{AUTO_RESUME_KEY_PREFIX}{generation}")
 }
 
+/// The prefix of the idempotency keys of the slot-release policy's commands
+/// (`slot-release:<generation>`), reserved like [`AUTO_RESUME_KEY_PREFIX`].
+pub const SLOT_RELEASE_KEY_PREFIX: &str = "slot-release:";
+
+/// The idempotency key of the policy's pause of the task running at
+/// `generation`: one per run, however often a trigger sees it due.
+pub fn slot_release_key(generation: u64) -> String {
+    format!("{SLOT_RELEASE_KEY_PREFIX}{generation}")
+}
+
 /// How the control plane resumes a task after its workload was lost.
 ///
 /// Fixed for every backend (no per-task or per-workflow setting); only

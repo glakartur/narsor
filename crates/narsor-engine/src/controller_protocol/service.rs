@@ -20,6 +20,7 @@ mod conversation;
 mod events;
 mod materials;
 mod relay;
+mod slot_release;
 
 use super::credentials::{
     ControllerAuthenticator, ControllerIdentity, ControllerRecord, CredentialStore,
@@ -47,6 +48,7 @@ use events::LocalTaskStorage;
 use relay::Relay;
 
 pub use auto_resume::AutoResumePass;
+pub use slot_release::SlotReleasePass;
 
 fn engine_delivery(delivery: narsor_protocol::api::HumanInputDeliveryDto) -> HumanInputDelivery {
     let permission_decision =
@@ -219,6 +221,10 @@ pub struct ProtocolConfig {
     /// attempts' delays (their number is the limit) and the stability
     /// window. Installed on the service's control plane.
     pub resume: ResumePolicy,
+    /// Whether the control plane frees the slot of a task whose work ended
+    /// or waits for its owner (D62). On everywhere but in tests that hold a
+    /// finished task's runner alive on purpose to look at it.
+    pub slot_release: bool,
 }
 
 impl Default for ProtocolConfig {
@@ -234,6 +240,7 @@ impl Default for ProtocolConfig {
             max_long_poll: std::time::Duration::from_secs(30),
             conversation_page_timeout: std::time::Duration::from_secs(20),
             resume: ResumePolicy::default(),
+            slot_release: true,
         }
     }
 }
@@ -613,6 +620,18 @@ impl ProtocolService {
                 format!(
                     "idempotency keys starting with `{}` are reserved for the resume policy",
                     crate::orchestration::AUTO_RESUME_KEY_PREFIX
+                ),
+            ));
+        }
+        if request
+            .idempotency_key
+            .starts_with(crate::orchestration::SLOT_RELEASE_KEY_PREFIX)
+        {
+            return Err(ProtocolError::bad_request(
+                "reserved_idempotency_key",
+                format!(
+                    "idempotency keys starting with `{}` are reserved for the slot-release policy",
+                    crate::orchestration::SLOT_RELEASE_KEY_PREFIX
                 ),
             ));
         }
@@ -1490,25 +1509,35 @@ impl ProtocolService {
         let snapshot = super::wire::runner_snapshot_from_request(snapshot).map_err(|error| {
             ProtocolError::bad_request("invalid_runner_snapshot", error.to_string())
         })?;
-        let outcome = self.control.record_runner_snapshot(
+        let grace = self
+            .slot_release_timings(&self.control.task(&identity.task_id)?.assignment.backend_id)
+            .grace;
+        let outcome = self.control.record_runner_snapshot_with(
             &identity.task_id,
             &identity.incarnation,
             identity.launch_generation,
             snapshot,
+            slot_release::chrono_duration(grace),
         )?;
         self.credentials
             .touch_runner(identity, None)?
             .ok_or(ProtocolError::Unauthorized)?;
+        let mut task = outcome.task;
         if outcome.applied {
             self.notify(&identity.task_id);
+            // A final execution state is due at once: the snapshot that
+            // shows it frees the slot (D62). The answer carries the result.
+            if self.release_slot_if_due(&task) {
+                task = self.control.task(&identity.task_id)?;
+            }
         }
         Ok(RunnerSnapshotResponse {
             applied: outcome.applied,
-            directive: directive(outcome.task.runner_state),
-            generation: outcome.task.generation,
-            runner_state: outcome.task.runner_state,
-            launch: launch_view(identity, &outcome.task),
-            default_harness: self.default_harness_of(&outcome.task),
+            directive: directive(task.runner_state),
+            generation: task.generation,
+            runner_state: task.runner_state,
+            launch: launch_view(identity, &task),
+            default_harness: self.default_harness_of(&task),
         })
     }
 

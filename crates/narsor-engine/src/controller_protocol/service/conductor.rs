@@ -32,6 +32,7 @@ impl ProtocolService {
         query: ConductorReadQuery,
     ) -> ProtocolResult<ConductorReadResponse> {
         let record = self.owned_task(owner, task_id)?;
+        self.note_details_read(&record);
         let limit = query
             .limit
             .map_or(DEFAULT_CHAT_PAGE, |limit| limit as usize)

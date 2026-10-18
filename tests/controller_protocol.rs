@@ -908,19 +908,18 @@ async fn the_summary_tells_the_owner_the_task_state_and_whether_it_holds_a_slot(
     assert_eq!(waiting.state, TaskState::HumanNeeded);
     assert!(waiting.holds_slot);
 
-    // A finished run still holds its slot until the runner stops.
+    // A finished run is stopped at once; the task holds its slot until the
+    // runner reached its safe point.
     runner
         .snapshot(&snapshot(3, ExecutionStatus::Completed, 5, None))
         .await
         .expect("completed");
     let finished = harness.task("task-1").await;
+    assert_eq!(finished.runner_state, RunnerState::PauseRequested);
     assert_eq!(finished.state, TaskState::Finished);
     assert!(finished.holds_slot);
 
     // Stopped at a safe point, the task is still finished and holds nothing.
-    harness
-        .command("task-1", OwnerCommand::Pause, "pause-1")
-        .await;
     let mut at_safe_point = snapshot(4, ExecutionStatus::Completed, 6, None);
     at_safe_point.safe_point = true;
     runner.snapshot(&at_safe_point).await.expect("safe point");
@@ -4484,4 +4483,233 @@ fn a_newer_servers_event_and_observation_kinds_decode_as_unrecognized() {
         serde_json::from_value(serde_json::json!({ "kind": "workload_teleported" }))
             .expect("a newer observation decodes");
     assert_eq!(observation, Observation::Unrecognized);
+}
+
+// ---------------------------------------------------------------------------
+// The slot-release policy (U4, D62)
+// ---------------------------------------------------------------------------
+
+fn control_task(harness: &Harness, task: &str) -> narsor_engine::orchestration::TaskRecord {
+    harness
+        .service
+        .control_plane()
+        .task(&TaskId::parse(task).unwrap())
+        .expect("task record")
+}
+
+fn slot_releases(harness: &Harness, task: &str) -> Vec<TaskEventKind> {
+    task_events(harness, task)
+        .into_iter()
+        .filter(|kind| matches!(kind, TaskEventKind::SlotReleased { .. }))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_snapshot_of_a_finished_task_stops_its_runner_in_the_same_request() {
+    let harness = Harness::start().await;
+    let Running {
+        controller,
+        epoch,
+        runner,
+    } = harness.running("task-1", "k8s").await;
+
+    let answer = runner
+        .snapshot(&snapshot(2, ExecutionStatus::Completed, 4, None))
+        .await
+        .expect("completed snapshot");
+
+    assert_eq!(answer.directive, RunnerDirective::PauseAtSafePoint);
+    assert_eq!(answer.runner_state, RunnerState::PauseRequested);
+    let record = control_task(&harness, "task-1");
+    assert!(record.holds_capacity(), "the slot goes at the safe point");
+    assert_eq!(
+        slot_releases(&harness, "task-1"),
+        vec![TaskEventKind::SlotReleased {
+            reason: narsor_engine::orchestration::SlotReleaseReason::Terminal
+        }]
+    );
+    // The runner stops at a safe point and the controller reports it.
+    let mut at_safe_point = snapshot(3, ExecutionStatus::Completed, 4, None);
+    at_safe_point.safe_point = true;
+    runner.snapshot(&at_safe_point).await.expect("safe point");
+    controller
+        .report(&report(
+            "task-1",
+            epoch,
+            record.generation,
+            Observation::PausedAtSafePoint,
+            Some(2),
+        ))
+        .await
+        .expect("paused");
+    let stopped = harness.task("task-1").await;
+    assert_eq!(stopped.runner_state, RunnerState::Stopped);
+    assert!(!stopped.holds_slot);
+    assert_eq!(
+        stopped.state,
+        narsor_engine::orchestration::TaskState::Finished
+    );
+}
+
+#[tokio::test]
+async fn the_periodic_pass_frees_a_waiting_tasks_slot_once_the_wait_ran_out() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    runner
+        .snapshot(&snapshot(2, ExecutionStatus::InputNeeded, 4, Some("ask-1")))
+        .await
+        .expect("input needed");
+    assert_eq!(
+        control_task(&harness, "task-1").runner_state,
+        RunnerState::Running
+    );
+
+    harness.clock.advance(Duration::seconds(299));
+    narsor_server::runtime::run_periodic_pass(&harness.service);
+    assert_eq!(
+        control_task(&harness, "task-1").runner_state,
+        RunnerState::Running
+    );
+    assert!(slot_releases(&harness, "task-1").is_empty());
+
+    harness.clock.advance(Duration::seconds(2));
+    narsor_server::runtime::run_periodic_pass(&harness.service);
+    narsor_server::runtime::run_periodic_pass(&harness.service);
+
+    assert_eq!(
+        control_task(&harness, "task-1").runner_state,
+        RunnerState::PauseRequested
+    );
+    assert_eq!(
+        slot_releases(&harness, "task-1"),
+        vec![TaskEventKind::SlotReleased {
+            reason: narsor_engine::orchestration::SlotReleaseReason::GraceElapsed
+        }],
+        "a second pass adds nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_task_that_runs_again_is_not_stopped_by_the_old_wait() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    runner
+        .snapshot(&snapshot(2, ExecutionStatus::Failed, 4, None))
+        .await
+        .expect("failed");
+    harness.clock.advance(Duration::minutes(2));
+    runner
+        .snapshot(&snapshot(3, ExecutionStatus::Running, 5, None))
+        .await
+        .expect("restarted step");
+
+    harness.clock.advance(Duration::minutes(4));
+    narsor_server::runtime::run_periodic_pass(&harness.service);
+
+    assert_eq!(
+        control_task(&harness, "task-1").runner_state,
+        RunnerState::Running
+    );
+}
+
+#[tokio::test]
+async fn reading_the_conversation_holds_the_slot_longer_and_writes_the_record_rarely() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    runner
+        .snapshot(&snapshot(2, ExecutionStatus::InputNeeded, 4, Some("ask-1")))
+        .await
+        .expect("input needed");
+    harness.clock.advance(Duration::minutes(4));
+
+    for _ in 0..5 {
+        // The runner's relay is not served in this test: the read answers
+        // or fails, and either way it is a read of the details.
+        let _ = harness.owner.control_conversation("task-1").await;
+    }
+    let after_reads = control_task(&harness, "task-1");
+    let moved_to = after_reads.slot_release_due_at.expect("a deadline");
+    assert_eq!(moved_to, harness.clock.now() + Duration::seconds(180));
+    let scheduled = task_events(&harness, "task-1")
+        .into_iter()
+        .filter(|kind| matches!(kind, TaskEventKind::SlotReleaseScheduled { .. }))
+        .count();
+    assert_eq!(scheduled, 1, "five reads wrote the record once");
+
+    harness.clock.advance(Duration::seconds(90));
+    narsor_server::runtime::run_periodic_pass(&harness.service);
+    assert_eq!(
+        control_task(&harness, "task-1").runner_state,
+        RunnerState::Running
+    );
+}
+
+#[tokio::test]
+async fn an_answer_in_the_queue_keeps_the_slot_when_the_wait_runs_out() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    runner
+        .snapshot(&snapshot(2, ExecutionStatus::InputNeeded, 4, Some("ask-1")))
+        .await
+        .expect("input needed");
+    harness.clock.advance(Duration::seconds(299));
+    harness
+        .owner
+        .control_input("task-1", &input_request("ask-1", "answer-1"))
+        .await
+        .expect("the owner answers");
+
+    harness.clock.advance(Duration::seconds(2));
+    narsor_server::runtime::run_periodic_pass(&harness.service);
+
+    assert_eq!(
+        control_task(&harness, "task-1").runner_state,
+        RunnerState::Running
+    );
+    assert!(slot_releases(&harness, "task-1").is_empty());
+}
+
+#[tokio::test]
+async fn a_daemon_that_starts_after_the_deadline_frees_the_slot_on_its_first_pass() {
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    runner
+        .snapshot(&snapshot(2, ExecutionStatus::InputNeeded, 4, Some("ask-1")))
+        .await
+        .expect("input needed");
+    harness.clock.advance(Duration::minutes(30));
+    // A new daemon: another service on the same state root, with no memory.
+    let restarted = ProtocolService::with_config(
+        harness.control_plane(),
+        environment_support::seeded_resolver(harness.root.path()),
+        ProtocolConfig::default(),
+    );
+
+    let pass = restarted.slot_release_pass();
+
+    assert_eq!(pass.released, vec![TaskId::parse("task-1").unwrap()]);
+    assert_eq!(
+        control_task(&harness, "task-1").runner_state,
+        RunnerState::PauseRequested
+    );
+}
+
+#[tokio::test]
+async fn an_owner_cannot_use_the_slot_release_keys() {
+    let harness = Harness::start().await;
+    harness.running("task-1", "k8s").await;
+
+    let refused = harness
+        .owner
+        .control_command(
+            "task-1",
+            &OwnerCommandRequest {
+                command: OwnerCommand::Pause,
+                idempotency_key: "slot-release:1".to_string(),
+                expected_generation: None,
+            },
+        )
+        .await;
+
+    assert_eq!(bad_request_code(refused), "reserved_idempotency_key");
 }

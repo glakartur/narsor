@@ -42,6 +42,7 @@ impl ProtocolService {
         query: ExecutionEventsQuery,
     ) -> ProtocolResult<ExecutionEventsResponse> {
         let record = self.owned_task(owner, task_id)?;
+        self.note_details_read(&record);
         let limit = query
             .limit
             .unwrap_or(DEFAULT_EVENTS_LIMIT)

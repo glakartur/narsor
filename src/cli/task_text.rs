@@ -23,7 +23,7 @@ use crate::tui::task_app::list::{attention_of, Attention};
 use narsor_protocol::controller::PendingInputRefView;
 use narsor_protocol::controller::{
     AttentionItem, AttentionKind, ConversationAttemptSummary, InputStatus, OperatorCommand,
-    OwnerCommand, QueueReason, RunnerState, TaskEvent, TaskEventKind,
+    OwnerCommand, QueueReason, RunnerState, SlotReleaseReason, TaskEvent, TaskEventKind,
 };
 use narsor_protocol::display::{exhaustion_loss, loss_state, LossState};
 
@@ -834,6 +834,22 @@ pub fn event_line(event: &TaskEvent) -> String {
             },
             exhaustion_loss(reason)
         ),
+        TaskEventKind::SlotReleaseScheduled { due_at } => format!(
+            "the slot is freed at {} unless the task gets work before",
+            due_at.format("%H:%M:%S")
+        ),
+        TaskEventKind::SlotReleased { reason } => match reason {
+            SlotReleaseReason::Terminal => {
+                "slot freed: the task's work ended; the runner is asked to stop".to_string()
+            }
+            SlotReleaseReason::GraceElapsed => {
+                "slot freed: the task waited for its owner too long; the runner is asked to stop"
+                    .to_string()
+            }
+            SlotReleaseReason::Unrecognized => {
+                "slot freed for a reason this version does not know".to_string()
+            }
+        },
         TaskEventKind::Unrecognized => "an event this version does not know".to_string(),
     };
     // Notes, reasons and details come from operators and runners: nothing a

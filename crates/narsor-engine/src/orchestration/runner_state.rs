@@ -12,7 +12,7 @@
 //! the record *under the task lock*: a resume committed a moment earlier
 //! supersedes the old launch for good, and no report of it slips in after.
 
-use super::control_plane::{ControlPlane, Mutation};
+use super::control_plane::{refresh_slot_release_due, ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
 use super::model::{
     InputOutcome, InputRequest, InputStatus, InputUpdate, QueuedInput, RunnerObservation,
@@ -21,7 +21,8 @@ use super::model::{
 use crate::domain::display::bounded_detail;
 use crate::domain::{without_unsafe_chars, TaskId};
 use crate::engine::{ConversationState, EventLink, Timeline};
-use chrono::{DateTime, Utc};
+use crate::environment::backend::DEFAULT_SLOT_RELEASE_GRACE_SECS;
+use chrono::{DateTime, Duration, Utc};
 
 impl ControlPlane {
     /// Accepts a runner snapshot from `incarnation`, launched at
@@ -39,7 +40,29 @@ impl ControlPlane {
         task_id: &TaskId,
         incarnation: &str,
         launch_generation: u64,
+        snapshot: RunnerSnapshot,
+    ) -> Result<RunnerReportOutcome> {
+        self.record_runner_snapshot_with(
+            task_id,
+            incarnation,
+            launch_generation,
+            snapshot,
+            Duration::seconds(i64::try_from(DEFAULT_SLOT_RELEASE_GRACE_SECS).unwrap_or(i64::MAX)),
+        )
+    }
+
+    /// [`Self::record_runner_snapshot`] with the wait `grace` a transient
+    /// execution state (input needed, failed) gets before the task's slot
+    /// is freed, as the backend is configured now. The snapshot also sets
+    /// or clears the task's slot-release deadline (D62, see
+    /// [`refresh_slot_release_due`]).
+    pub fn record_runner_snapshot_with(
+        &self,
+        task_id: &TaskId,
+        incarnation: &str,
+        launch_generation: u64,
         mut snapshot: RunnerSnapshot,
+        grace: Duration,
     ) -> Result<RunnerReportOutcome> {
         // A remote runner's word is not trusted with a terminal: what the
         // attention carries is cleaned before it is stored or announced.
@@ -113,6 +136,7 @@ impl ControlPlane {
                 received_at: now,
                 safe_point_generation,
             });
+            refresh_slot_release_due(record, now, grace);
             Ok(Mutation::Changed(kind, true))
         })?;
         Ok(RunnerReportOutcome { task, applied })

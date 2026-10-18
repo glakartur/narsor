@@ -416,11 +416,14 @@ fn spawn_periodic_admission(control: Arc<ProtocolService>) -> tokio::task::JoinH
 }
 
 /// One tick of the daemon's periodic pass: admission, then the resume
-/// policy, then task materials whose time to live ran out (U9). Returns
-/// what the resume policy did.
+/// policy, then the slot-release policy (D62), then task materials whose
+/// time to live ran out (U9). Returns what the resume policy did.
 pub fn run_periodic_pass(control: &ProtocolService) -> AutoResumePass {
     control.reschedule_all();
     let resumed = control.auto_resume_pass();
+    // Stops tasks whose deadline came; the slot itself goes on once the
+    // runner reached its safe point, and that report re-runs admission.
+    control.slot_release_pass();
     control.sweep_materials();
     resumed
 }

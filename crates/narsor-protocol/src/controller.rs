@@ -977,6 +977,29 @@ pub enum TaskEventKind {
         attempts: u32,
         reason: String,
     },
+    /// The control plane planned (or moved) the time at which it frees the
+    /// slot of a task that waits for its owner.
+    SlotReleaseScheduled {
+        due_at: DateTime<Utc>,
+    },
+    /// The control plane freed the task's slot: it asked the runner to stop
+    /// at a safe point.
+    SlotReleased {
+        reason: SlotReleaseReason,
+    },
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// Why the control plane freed a task's slot.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotReleaseReason {
+    /// The task's execution ended (completed or cancelled).
+    Terminal,
+    /// The task waited for its owner (input needed, failed) and the wait
+    /// ran out.
+    GraceElapsed,
     #[serde(other)]
     Unrecognized,
 }

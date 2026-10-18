@@ -19,12 +19,15 @@
 use super::error::{OrchestrationError, Result};
 use super::lifecycle::{command_effect, observation_effect, CommandEffect, ObservationEffect};
 use super::model::{
-    ArchiveTombstone, BackendLease, CommandActor, CommandOutcome, CommandReceipt, CommandRequest,
-    ControllerReport, LeaseToken, MaterialChange, NewTask, Observation, ObservedState,
-    OwnerCommand, ReportOutcome, ResumeState, RunnerState, TaskAssignment, TaskEvent,
-    TaskEventKind, TaskRecord, WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
+    slot_release_extension_threshold, ArchiveTombstone, BackendLease, CommandActor, CommandOutcome,
+    CommandReceipt, CommandRequest, ControllerReport, LeaseToken, MaterialChange, NewTask,
+    Observation, ObservedState, OwnerCommand, ReportOutcome, ResumeState, RunnerState,
+    SlotReleaseClass, SlotReleaseReason, TaskAssignment, TaskEvent, TaskEventKind, TaskRecord,
+    WorkloadLoss, BACKEND_LEASE_VERSION, TASK_RECORD_VERSION,
 };
-use super::resume::{auto_resume_key, count_loss, loss_from_history, ResumePolicy};
+use super::resume::{
+    auto_resume_key, count_loss, loss_from_history, slot_release_key, ResumePolicy,
+};
 use super::store::OrchestrationStore;
 use crate::domain::{BackendId, TaskId};
 use crate::persistence::{ExecutionStore, StatePaths};
@@ -191,6 +194,7 @@ impl ControlPlane {
             running_since: None,
             workload_epoch: None,
             resume: ResumeState::default(),
+            slot_release_due_at: None,
             last_event: TaskEvent {
                 sequence: 1,
                 task_id: request.task_id.clone(),
@@ -261,8 +265,11 @@ impl ControlPlane {
             if let Some(expected) = request.expected_generation {
                 record.check_generation(expected)?;
             }
-            let policy_may_act =
-                request.command == OwnerCommand::Resume && record.auto_resume_due(now);
+            let policy_may_act = match request.command {
+                OwnerCommand::Resume => record.auto_resume_due(now),
+                OwnerCommand::Pause => record.slot_release_due(now),
+                _ => false,
+            };
             if request.actor == CommandActor::Policy && !policy_may_act {
                 return Err(OrchestrationError::IllegalCommand {
                     task_id: record.task_id.clone(),
@@ -275,6 +282,14 @@ impl ControlPlane {
                     command: request.command,
                     idempotency_key: request.idempotency_key.clone(),
                 },
+                CommandActor::Policy if request.command == OwnerCommand::Pause => {
+                    TaskEventKind::SlotReleased {
+                        reason: record
+                            .slot_release_class()
+                            .and_then(SlotReleaseClass::release_reason)
+                            .unwrap_or(SlotReleaseReason::GraceElapsed),
+                    }
+                }
                 CommandActor::Policy => TaskEventKind::AutoResumed {
                     attempt: if record.resume.last_loss_uncounted {
                         0
@@ -304,6 +319,9 @@ impl ControlPlane {
                     let previous = record.runner_state;
                     record.generation += 1;
                     record.runner_state = next;
+                    // A new desired state ends whatever the last snapshot
+                    // made the policy wait for.
+                    record.slot_release_due_at = None;
                     if matches!(previous, RunnerState::Interrupted | RunnerState::Unknown) {
                         leave_loss(record, request.actor);
                     }
@@ -352,6 +370,76 @@ impl ControlPlane {
                 .expecting_generation(generation)
                 .issued_by(CommandActor::Policy),
         )
+    }
+
+    /// The slot-release policy frees the slot of the task running at
+    /// `generation`: a `Pause` with [`CommandActor::Policy`], keyed
+    /// [`slot_release_key`]`(generation)` and expecting that generation.
+    ///
+    /// Allowed only while [`TaskRecord::slot_release_due`]; the pause then
+    /// goes the owner's way (`Running → PauseRequested`, a safe point, the
+    /// compute removed, `Stopped`) and `holds_capacity` is unchanged until
+    /// the safe point is acknowledged. A command of the owner that came
+    /// first moved the generation or the state, so the policy's is refused
+    /// with `StaleGeneration` or `IllegalCommand`. Needs no capacity.
+    pub fn release_slot(&self, task_id: &TaskId, generation: u64) -> Result<CommandOutcome> {
+        self.command(
+            task_id,
+            CommandRequest::new(OwnerCommand::Pause, slot_release_key(generation))
+                .expecting_generation(generation)
+                .issued_by(CommandActor::Policy),
+        )
+    }
+
+    /// Plans the slot release of a running task whose last snapshot is in a
+    /// state that frees the slot but whose deadline was never set (a task
+    /// that was `Provisioning` when the snapshot came, or a record from
+    /// before the policy existed). `grace` is the wait for a transient
+    /// state. Announces the deadline; `None` when nothing was missing.
+    pub fn arm_slot_release(
+        &self,
+        task_id: &TaskId,
+        grace: Duration,
+    ) -> Result<Option<TaskRecord>> {
+        let (record, armed) = self.mutate(task_id, |record, now| {
+            if record.slot_release_due_at.is_some() {
+                return Ok(Mutation::Unchanged(false));
+            }
+            refresh_slot_release_due(record, now, grace);
+            match record.slot_release_due_at {
+                Some(due_at) => Ok(Mutation::Changed(
+                    TaskEventKind::SlotReleaseScheduled { due_at },
+                    true,
+                )),
+                None => Ok(Mutation::Unchanged(false)),
+            }
+        })?;
+        Ok(armed.then_some(record))
+    }
+
+    /// A read of the task's details moves its slot-release deadline to
+    /// `read_extension` from now, if the task waits in a transient state
+    /// and that is later than the deadline by more than
+    /// [`slot_release_extension_threshold`]. Returns whether it moved it,
+    /// so frequent reads write the record at most once per threshold.
+    pub fn extend_slot_release(&self, task_id: &TaskId, read_extension: Duration) -> Result<bool> {
+        let (_, moved) = self.mutate(task_id, |record, now| {
+            let transient = record.runner_state == RunnerState::Running
+                && record.slot_release_class() == Some(SlotReleaseClass::Transient);
+            let Some(due_at) = record.slot_release_due_at.filter(|_| transient) else {
+                return Ok(Mutation::Unchanged(false));
+            };
+            let extended = now + read_extension;
+            if extended - due_at <= slot_release_extension_threshold() {
+                return Ok(Mutation::Unchanged(false));
+            }
+            record.slot_release_due_at = Some(extended);
+            Ok(Mutation::Changed(
+                TaskEventKind::SlotReleaseScheduled { due_at: extended },
+                true,
+            ))
+        })?;
+        Ok(moved)
     }
 
     /// Publishes [`TaskEventKind::AutoResumeExhausted`] for the task's
@@ -830,6 +918,32 @@ impl ControlPlane {
         }
         Ok(lease)
     }
+}
+
+/// Sets or clears the slot-release deadline from the runner state and the
+/// last snapshot (D62). Only a `Running` task has one:
+///
+/// * a final execution state makes it due now (or keeps an earlier one);
+/// * a transient one plans `now + grace`, unless a deadline exists already,
+///   so repeated snapshots of the same wait do not push it back;
+/// * anything else clears it.
+pub(crate) fn refresh_slot_release_due(
+    record: &mut TaskRecord,
+    now: DateTime<Utc>,
+    grace: Duration,
+) {
+    let class = record.slot_release_class();
+    record.slot_release_due_at = match (record.runner_state, class) {
+        (RunnerState::Running, Some(SlotReleaseClass::Final)) => Some(
+            record
+                .slot_release_due_at
+                .map_or(now, |due_at| due_at.min(now)),
+        ),
+        (RunnerState::Running, Some(SlotReleaseClass::Transient)) => {
+            record.slot_release_due_at.or(Some(now + grace))
+        }
+        _ => None,
+    };
 }
 
 /// A command takes the task out of `Interrupted`/`Unknown`: the planned

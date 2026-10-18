@@ -181,6 +181,10 @@ impl<T: ContractTarget> Harness<T> {
             launch,
             ProtocolConfig {
                 resume: test_resume_policy(),
+                // The contract's workflow finishes at once and its runner
+                // idles; these scenarios use that runner, so the policy
+                // that would stop it is off (it has its own tests).
+                slot_release: false,
                 ..ProtocolConfig::default()
             },
         ));

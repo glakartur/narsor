@@ -28,7 +28,7 @@ use axum::Router;
 use chrono::Utc;
 use narsor_engine::controller_protocol::{
     AcquireLeaseRequest, ConductorReadQuery, ConductorReadResponse, ConversationPageQuery,
-    CreateEnrollmentRequest, OwnerCommandRequest, ProtocolService, ReportRequest,
+    CreateEnrollmentRequest, OwnerCommandRequest, ProtocolConfig, ProtocolService, ReportRequest,
     RunnerCredentialRequest, SubmitInputRequest, SubmitOperatorCommandRequest, LOCAL_OWNER,
 };
 use narsor_engine::domain::{
@@ -160,12 +160,19 @@ impl Fixture {
         let state = root.dir("control");
         let control = ControlPlane::new(StatePaths::new(&state));
         let default = Arc::new(LiveDefault::default());
-        let service = Arc::new(ProtocolService::new(
+        // Several scenarios look at a finished task's live runner (undo a
+        // decision, read the conductor); the policy that would stop it is
+        // off here and has its own tests.
+        let service = Arc::new(ProtocolService::with_config(
             control,
             environment_support::seeded_catalog_resolver_with(
                 &state,
                 Arc::clone(&default) as Arc<dyn HarnessDefaults>,
             ),
+            ProtocolConfig {
+                slot_release: false,
+                ..ProtocolConfig::default()
+            },
         ));
         let code = service
             .create_enrollment(BACKEND, CreateEnrollmentRequest::default())

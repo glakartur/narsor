@@ -41,6 +41,7 @@ impl ProtocolService {
         task_id: &str,
     ) -> ProtocolResult<ConversationResponse> {
         let record = self.owned_task(owner, task_id)?;
+        self.note_details_read(&record);
         let now = self.control.now();
         let runner = record.runner.as_ref();
         let last_attempts = match runner.map(|runner| &runner.snapshot.conversation) {
@@ -151,6 +152,7 @@ impl ProtocolService {
         query: ConversationPageQuery,
     ) -> ProtocolResult<ConversationPage> {
         let record = self.owned_task(owner, task_id)?;
+        self.note_details_read(&record);
         if !is_attempt_id(attempt_id) {
             return Err(invalid_attempt());
         }
