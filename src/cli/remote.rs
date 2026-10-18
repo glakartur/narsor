@@ -364,9 +364,9 @@ pub enum TaskCommand {
         /// Resolve a Claude permission wait: deny, allow-exact or allow-group.
         #[arg(long = "permission", value_name = "DECISION", value_parser = ["deny", "allow-exact", "allow-group"])]
         permission: Option<String>,
-        /// Which denial in the request to resolve (defaults to 0).
-        #[arg(long = "denial-index", default_value_t = 0)]
-        denial_index: usize,
+        /// Which denial in the request to resolve; every denial when omitted.
+        #[arg(long = "denial-index")]
+        denial_index: Option<usize>,
         /// The wait to answer (its id as `show` lists it): refused when the
         /// task waits on something else.
         #[arg(long = "waiting-id", value_name = "ID")]
@@ -810,7 +810,7 @@ fn input_delivery(
     label: &Option<String>,
     comment: &Option<String>,
     permission: &Option<String>,
-    denial_index: usize,
+    denial_index: Option<usize>,
 ) -> Result<HumanInputDeliveryDto> {
     let permission_decision = permission.as_deref().map(|decision| {
         let (decision, scope) = match decision {

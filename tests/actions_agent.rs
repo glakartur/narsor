@@ -393,7 +393,7 @@ async fn execute_with_conversation(
 fn agent_action(prompt: &str) -> AgentActionConfig {
     AgentActionConfig {
         harness: Some("claude-code".to_string()),
-        permission_grant: None,
+        permission_grants: Vec::new(),
         model: None,
         workspace_access: Some(WorkspaceAccess::ReadWrite),
         prompt: prompt.to_string(),
@@ -908,19 +908,22 @@ async fn the_model_and_the_read_only_paths_reach_the_argv() {
 }
 
 #[tokio::test]
-async fn a_task_permission_grant_reaches_claude_as_one_allowed_tool_rule() {
+async fn a_task_permission_grant_reaches_claude_as_its_allowed_tool_rules() {
     let root = TempRoot::new();
     let fake = FakeHarness::install(root.dir("bin"));
     fake.answers(&envelope(r#"{"output":"ready"}"#));
     let mut config = agent_action("continue");
-    config.permission_grant = Some("Bash(cargo build)".to_string());
+    config.permission_grants = vec!["Bash(cargo build)".to_string(), "Bash(tail -5)".to_string()];
 
     complete(&executor(&fake), config, &root.workspace()).await;
 
     let args = fake.args(1);
     assert!(
-        args.windows(2)
-            .any(|pair| { pair[0] == "--allowedTools" && pair[1] == "Bash(cargo build)" }),
+        args.windows(3).any(|rules| {
+            rules[0] == "--allowedTools"
+                && rules[1] == "Bash(cargo build)"
+                && rules[2] == "Bash(tail -5)"
+        }),
         "{args:?}"
     );
 }
@@ -938,7 +941,7 @@ async fn a_resumed_grant_never_swallows_the_prompt() {
         fake.answers(&envelope(r#"{"output":"ready"}"#));
         let mut config = agent_action("The operator approved this action.");
         config.workspace_access = workspace_access;
-        config.permission_grant = Some("Bash(git checkout -b feat/x)".to_string());
+        config.permission_grants = vec!["Bash(git checkout -b feat/x)".to_string()];
         config.read_only_paths = vec!["../reference".to_string()];
         config
             .parameters

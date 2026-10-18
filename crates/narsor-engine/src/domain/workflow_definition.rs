@@ -251,10 +251,11 @@ pub struct AgentActionConfig {
     #[serde(default)]
     pub harness: Option<String>,
 
-    /// One-shot Claude Code allow rule attached by a resolved task permission
-    /// request. Never loaded from workflow source or persisted definitions.
+    /// One-shot Claude Code allow rules attached by a resolved task
+    /// permission request. Never loaded from workflow source or persisted
+    /// definitions.
     #[serde(skip)]
-    pub permission_grant: Option<String>,
+    pub permission_grants: Vec<String>,
 
     /// Model specification (optional)
     #[serde(default)]

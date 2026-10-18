@@ -1249,7 +1249,7 @@ async fn ordinary_input_cannot_resolve_permission_and_unapprovable_denial_stays_
         .expect("load pending")
         .expect("permission wait");
     let decision = narsor_protocol::api::PermissionDecisionDto {
-        denial_index: 0,
+        denial_index: Some(0),
         decision: narsor_protocol::api::PermissionDecisionKindDto::Allow,
         scope: Some(narsor_protocol::api::PermissionGrantScopeDto::ExactOperation),
     };

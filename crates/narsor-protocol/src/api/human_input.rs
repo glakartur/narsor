@@ -41,7 +41,9 @@ pub struct HumanInputDeliveryDto {
 /// Decision scoped to one denial in a pending permission request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionDecisionDto {
-    pub denial_index: usize,
+    /// The one denial decided on; absent decides every denial at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial_index: Option<usize>,
     pub decision: PermissionDecisionKindDto,
     #[serde(default)]
     pub scope: Option<PermissionGrantScopeDto>,

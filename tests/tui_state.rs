@@ -4600,63 +4600,110 @@ mod task_app_waiting {
 
     #[test]
     fn permission_panel_offers_only_scoped_choices_for_resolvable_bash_denials() {
-        let pending: narsor_protocol::api::PendingHumanInputView = serde_json::from_value(json!({
-            "execution_id": "exec-1",
-            "state_id": "implement",
-            "action_execution_id": "act-8",
-            "instruction": "Claude Code needs permission.",
-            "fields": [],
-            "continuation": "resolve_permission",
-            "permission": {"denials": [{
+        let pending = |denials: serde_json::Value, session: Option<&str>| {
+            serde_json::from_value::<narsor_protocol::api::PendingHumanInputView>(json!({
+                "execution_id": "exec-1",
+                "state_id": "implement",
+                "action_execution_id": "act-8",
+                "instruction": "Claude Code needs permission.",
+                "fields": [],
+                "continuation": "resolve_permission",
+                "permission": {"denials": denials},
+                "agent_harness": "claude-code",
+                "agent_session_id": session,
+                "episode": "ep-8",
+                "requested_at": "2026-10-09T11:54:00Z"
+            }))
+            .unwrap()
+        };
+        let denial = |id: &str, command: &str, reason_type: &str| {
+            json!({
                 "tool_name": "Bash",
-                "tool_use_id": "tool-8",
-                "input": {"command": "cargo test"},
+                "tool_use_id": id,
+                "input": {"command": command},
                 "cwd": "/tmp/task",
-                "reason_type": "asyncAgent",
+                "reason_type": reason_type,
                 "reason": "This command requires approval."
-            }, {
-                "tool_name": "Bash",
-                "tool_use_id": "tool-9",
-                "input": {"command": "rm -rf /"},
-                "cwd": "/tmp/task",
-                "reason_type": "other",
-                "reason": "Blocked by policy."
-            }]},
-            "agent_harness": "claude-code",
-            "agent_session_id": "session-8",
-            "episode": "ep-8",
-            "requested_at": "2026-10-09T11:54:00Z"
-        }))
-        .unwrap();
-        let panel = narsor::tui::input_form::InputPanel::new(&pending, &|_| None);
-        assert_eq!(panel.items().len(), 4);
-        assert!(panel.items()[0].label.starts_with("Odmów:"));
-        assert!(panel.items()[1].label.starts_with("Zezwól dokładnie:"));
-        assert!(panel.items()[2].label.starts_with("Zezwól na grupę:"));
-        assert!(panel.items()[3].label.starts_with("Odmów:"));
-        let delivery = panel
-            .delivery(&narsor::tui::chooser::Submission {
-                index: 1,
-                label: panel.items()[1].label.clone(),
-                values: Vec::new(),
             })
-            .unwrap();
-        let decision = delivery.permission_decision.unwrap();
-        assert_eq!(decision.denial_index, 0);
+        };
+        let labels = |panel: &narsor::tui::input_form::InputPanel| -> Vec<String> {
+            panel
+                .items()
+                .iter()
+                .map(|item| item.label.clone())
+                .collect()
+        };
+        let decision = |panel: &narsor::tui::input_form::InputPanel, index: usize| {
+            panel
+                .delivery(&narsor::tui::chooser::Submission {
+                    index,
+                    label: panel.items()[index].label.clone(),
+                    values: Vec::new(),
+                })
+                .unwrap()
+        };
+
+        // Compound commands are granted part by part, all denials at once,
+        // and there is one refusal for all of them.
+        let compound = pending(
+            json!([
+                denial("t1", "cargo fmt --check && echo OK", "asyncAgent"),
+                denial("t2", "cargo test 2>&1 | tail -20", "asyncAgent"),
+            ]),
+            Some("session-8"),
+        );
+        let panel = narsor::tui::input_form::InputPanel::new(&compound, &|_| None);
         assert_eq!(
-            decision.scope,
+            labels(&panel),
+            [
+                "Odmów wszystkim",
+                "Zezwól dokładnie na te polecenia",
+                "Zezwól na grupę: Bash(cargo fmt *), Bash(echo OK *), Bash(cargo test *), \
+                 Bash(tail -20 *)",
+            ]
+        );
+        assert!(panel.items()[1].description.contains("Bash(tail -20)"));
+        let delivery = decision(&panel, 1);
+        let granted = delivery.permission_decision.unwrap();
+        assert_eq!(granted.denial_index, None, "every denial");
+        assert_eq!(
+            granted.scope,
             Some(narsor_protocol::api::PermissionGrantScopeDto::ExactOperation)
         );
         assert_eq!(delivery.episode.as_deref(), Some("ep-8"));
+        let refused = decision(&panel, 0).permission_decision.unwrap();
+        assert_eq!(refused.denial_index, None);
+
+        // A policy block is never granted; the grantable denial still is,
+        // and the panel says why the other one is not.
+        let mixed = pending(
+            json!([
+                denial("t1", "cargo test", "asyncAgent"),
+                denial("t2", "rm -rf /", "rule"),
+            ]),
+            Some("session-8"),
+        );
+        let panel = narsor::tui::input_form::InputPanel::new(&mixed, &|_| None);
+        assert_eq!(
+            labels(&panel),
+            ["Odmów wszystkim", "Zezwól dokładnie: cargo test"]
+        );
+        assert_eq!(
+            decision(&panel, 1)
+                .permission_decision
+                .unwrap()
+                .denial_index,
+            Some(0)
+        );
+        assert!(panel
+            .context()
+            .iter()
+            .any(|line| line.text.contains("zgoda niedostępna: blokada polityki")));
 
         // Without a session to resume, a grant could not reach the agent.
-        let mut unresumable = pending.clone();
-        unresumable.agent_session_id = None;
+        let unresumable = pending(json!([denial("t1", "cargo test", "asyncAgent")]), None);
         let panel = narsor::tui::input_form::InputPanel::new(&unresumable, &|_| None);
-        assert!(panel
-            .items()
-            .iter()
-            .all(|item| item.label.starts_with("Odmów:")));
+        assert_eq!(labels(&panel), ["Odmów"]);
     }
 
     // -- the panel ------------------------------------------------------------

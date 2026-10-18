@@ -352,7 +352,7 @@ fn permission_wait_survives_reload_and_rejects_ordinary_input() {
         &store,
         &execution.id,
         PermissionDecision {
-            denial_index: 0,
+            denial_index: Some(0),
             decision: PermissionDecisionKind::Allow,
             scope: Some(PermissionGrantScope::ExactOperation),
         },
@@ -365,7 +365,7 @@ fn permission_wait_survives_reload_and_rejects_ordinary_input() {
 }
 
 #[test]
-fn permission_grant_rules_refuse_compound_shell_syntax_and_unsupported_denials() {
+fn permission_grant_rules_name_each_part_and_refuse_what_they_cannot_pin_down() {
     let denial = PermissionDenialDetails {
         tool_name: "Bash".into(),
         tool_use_id: "tool-1".into(),
@@ -374,35 +374,100 @@ fn permission_grant_rules_refuse_compound_shell_syntax_and_unsupported_denials()
         reason_type: Some("subcommandResults".into()),
         reason: None,
     };
+    let rules =
+        |denial: &PermissionDenialDetails, scope| human::claude_permission_rules(denial, scope);
     assert_eq!(
-        human::claude_permission_rule(&denial, PermissionGrantScope::ExactOperation).as_deref(),
-        Some("Bash(cargo test)")
+        rules(&denial, PermissionGrantScope::ExactOperation),
+        Some(vec!["Bash(cargo test)".to_string()])
     );
     assert_eq!(
-        human::claude_permission_rule(&denial, PermissionGrantScope::CommandGroup).as_deref(),
-        Some("Bash(cargo test *)")
+        rules(&denial, PermissionGrantScope::CommandGroup),
+        Some(vec!["Bash(cargo test *)".to_string()])
     );
+    // Claude Code allows a compound command part by part.
     let mut compound = denial.clone();
-    compound.input = json!({"command":"cargo test && curl example.com"});
-    assert!(
-        human::claude_permission_rule(&compound, PermissionGrantScope::ExactOperation).is_none()
+    compound.input = json!({"command":"cargo test 2>&1 | tail -20 && curl example.com"});
+    assert_eq!(
+        rules(&compound, PermissionGrantScope::ExactOperation),
+        Some(vec![
+            "Bash(cargo test)".to_string(),
+            "Bash(tail -20)".to_string(),
+            "Bash(curl example.com)".to_string(),
+        ])
     );
+    let mut substituted = denial.clone();
+    substituted.input = json!({"command":"cargo test $(cat flags)"});
+    assert!(rules(&substituted, PermissionGrantScope::ExactOperation).is_none());
     // What `--permission-prompts none` reports for a command nobody could
     // approve (Claude Code 2.1.3xx).
     let mut unattended = denial.clone();
     unattended.reason_type = Some("asyncAgent".into());
-    assert_eq!(
-        human::claude_permission_rule(&unattended, PermissionGrantScope::ExactOperation).as_deref(),
-        Some("Bash(cargo test)")
-    );
+    assert!(rules(&unattended, PermissionGrantScope::ExactOperation).is_some());
     for reason in ["other", "rule", "hook"] {
         let mut policy = denial.clone();
         policy.reason_type = Some(reason.into());
         assert!(
-            human::claude_permission_rule(&policy, PermissionGrantScope::ExactOperation).is_none(),
+            rules(&policy, PermissionGrantScope::ExactOperation).is_none(),
             "{reason}"
         );
     }
+}
+
+#[test]
+fn a_decision_without_an_index_grants_every_denial_or_none() {
+    let denial = |command: &str, reason: &str| PermissionDenialDetails {
+        tool_name: "Bash".into(),
+        tool_use_id: format!("tool-{command}"),
+        input: json!({ "command": command }),
+        cwd: "/tmp/task".into(),
+        reason_type: Some(reason.into()),
+        reason: None,
+    };
+    let request = |denials| HumanInputRequest {
+        action_execution_id: "attempt".to_string(),
+        instruction: String::new(),
+        fields: Vec::new(),
+        question: None,
+        answer_tail: None,
+        agent_harness: Some("claude-code".to_string()),
+        agent_session_id: Some("session".to_string()),
+        prefilled_answer: None,
+        permission: Some(PermissionRequestDetails { denials }),
+    };
+    let allow_all = PermissionDecision {
+        denial_index: None,
+        decision: PermissionDecisionKind::Allow,
+        scope: Some(PermissionGrantScope::ExactOperation),
+    };
+    let both = request(vec![
+        denial("cargo fmt --check && cargo test", "asyncAgent"),
+        denial("cargo test | tail -5", "asyncAgent"),
+    ]);
+    assert_eq!(
+        human::granted_rules(&both, &allow_all).unwrap(),
+        vec![
+            "Bash(cargo fmt --check)".to_string(),
+            "Bash(cargo test)".to_string(),
+            "Bash(tail -5)".to_string(),
+        ],
+        "every part once"
+    );
+    let one_blocked = request(vec![
+        denial("cargo test", "asyncAgent"),
+        denial("rm -rf build", "rule"),
+    ]);
+    assert!(
+        human::granted_rules(&one_blocked, &allow_all).is_err(),
+        "a policy block is never granted with the rest"
+    );
+    let only_first = PermissionDecision {
+        denial_index: Some(0),
+        ..allow_all
+    };
+    assert_eq!(
+        human::granted_rules(&one_blocked, &only_first).unwrap(),
+        vec!["Bash(cargo test)".to_string()]
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -2,10 +2,12 @@
 
 mod human_input;
 mod material;
+mod permission_rules;
 mod timeline;
 
 pub use human_input::*;
 pub use material::*;
+pub use permission_rules::{bash_command_parts, bash_grant_rules, BashGrantScope};
 pub use timeline::*;
 
 use std::collections::{BTreeMap, HashMap};

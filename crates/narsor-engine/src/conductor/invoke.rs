@@ -385,7 +385,7 @@ fn pinned_source(
 fn conductor_config(prompt: &str) -> AgentActionConfig {
     AgentActionConfig {
         harness: None,
-        permission_grant: None,
+        permission_grants: Vec::new(),
         model: None,
         workspace_access: Some(WorkspaceAccess::ReadOnly),
         prompt: prompt.to_string(),

@@ -648,8 +648,9 @@ pub struct InputAnswer {
     pub comment: Option<String>,
     /// `--permission` choice for a Claude Code permission wait.
     pub permission: Option<String>,
-    /// `--denial-index` within the pending permission request.
-    pub denial_index: usize,
+    /// `--denial-index` within the pending permission request; every denial
+    /// when `None`.
+    pub denial_index: Option<usize>,
 }
 
 /// `narsor input <id> [--field k=v]… [--label l] [--data k=v]… [--variable k=v]…

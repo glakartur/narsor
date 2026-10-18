@@ -204,7 +204,10 @@ pub struct PermissionDenialDetails {
 /// An owner decision for one pending Claude Code permission request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionDecision {
-    pub denial_index: usize,
+    /// The one denial decided on; `None` decides every denial of the
+    /// request at once.
+    #[serde(default)]
+    pub denial_index: Option<usize>,
     pub decision: PermissionDecisionKind,
     #[serde(default)]
     pub scope: Option<PermissionGrantScope>,
@@ -224,59 +227,72 @@ pub enum PermissionGrantScope {
     CommandGroup,
 }
 
-/// Converts a supported denial into one Claude Code allow rule. Ambiguous or
-/// composite shell input is intentionally refused instead of widened.
-pub fn claude_permission_rule(
+/// The Claude Code allow rules that grant one denial at `scope`: a rule per
+/// part of its Bash command ([`narsor_protocol::api::bash_grant_rules`]).
+/// `None` for a denial no task grant may lift (R6) or a command a rule could
+/// not pin down — never a wider rule.
+pub fn claude_permission_rules(
     denial: &PermissionDenialDetails,
     scope: PermissionGrantScope,
-) -> Option<String> {
+) -> Option<Vec<String>> {
     if denial.tool_name != "Bash"
         || !narsor_protocol::api::is_approvable_permission_reason(denial.reason_type.as_deref())
     {
         return None;
     }
-    let command = denial.input.get("command")?.as_str()?.trim();
-    if command.is_empty()
-        || !command.chars().all(|character| {
-            character.is_ascii_alphanumeric()
-                || matches!(character, ' ' | '\t' | '_' | '-' | '.' | '/' | ':' | '=')
-        })
-    {
-        return None;
+    let command = denial.input.get("command")?.as_str()?;
+    let scope = match scope {
+        PermissionGrantScope::ExactOperation => narsor_protocol::api::BashGrantScope::Exact,
+        PermissionGrantScope::CommandGroup => narsor_protocol::api::BashGrantScope::Group,
+    };
+    narsor_protocol::api::bash_grant_rules(command, scope)
+}
+
+/// The denials `decision` is about: the one it names, or all of them.
+fn decided_denials<'a>(
+    request: &'a HumanInputRequest,
+    decision: &PermissionDecision,
+) -> Result<Vec<&'a PermissionDenialDetails>, HumanActionError> {
+    let denials = request
+        .permission
+        .as_ref()
+        .map(|permission| permission.denials.as_slice())
+        .unwrap_or_default();
+    match decision.denial_index {
+        Some(index) => denials
+            .get(index)
+            .map(|denial| vec![denial])
+            .ok_or_else(|| HumanActionError::MissingRequiredField {
+                field: "denial_index".to_string(),
+            }),
+        None if denials.is_empty() => Err(HumanActionError::MissingRequiredField {
+            field: "denial_index".to_string(),
+        }),
+        None => Ok(denials.iter().collect()),
     }
-    match scope {
-        PermissionGrantScope::ExactOperation => Some(format!("Bash({command})")),
-        PermissionGrantScope::CommandGroup => {
-            let mut words = command.split_whitespace();
-            let executable = words.next()?;
-            let subcommand = words.next()?;
-            let name = executable.rsplit('/').next().unwrap_or(executable);
-            if matches!(
-                name,
-                "sh" | "bash"
-                    | "zsh"
-                    | "fish"
-                    | "dash"
-                    | "ksh"
-                    | "csh"
-                    | "env"
-                    | "sudo"
-                    | "doas"
-                    | "xargs"
-                    | "find"
-                    | "python"
-                    | "python3"
-                    | "node"
-                    | "ruby"
-                    | "perl"
-                    | "pwsh"
-                    | "powershell"
-            ) {
-                return None;
+}
+
+/// The allow rules an approving `decision` grants, every decided denial's
+/// rules in order and without repeats. A denial that cannot be granted at
+/// the chosen scope refuses the whole decision.
+pub fn granted_rules(
+    request: &HumanInputRequest,
+    decision: &PermissionDecision,
+) -> Result<Vec<String>, HumanActionError> {
+    let (PermissionDecisionKind::Allow, Some(scope)) = (decision.decision, decision.scope) else {
+        return Ok(Vec::new());
+    };
+    let mut rules: Vec<String> = Vec::new();
+    for denial in decided_denials(request, decision)? {
+        for rule in claude_permission_rules(denial, scope)
+            .ok_or(HumanActionError::PermissionDecisionRequired)?
+        {
+            if !rules.contains(&rule) {
+                rules.push(rule);
             }
-            Some(format!("Bash({executable} {subcommand} *)"))
         }
     }
+    Ok(rules)
 }
 
 /// The durable record of a question awaiting an answer — `pending_input.json`.
@@ -1037,17 +1053,17 @@ pub fn resolve_permission(
     if pending.continuation != InputContinuation::ResolvePermission {
         return Err(HumanActionError::PermissionDecisionRequired);
     }
-    if decision.denial_index
-        >= pending
-            .request
-            .permission
-            .as_ref()
-            .map_or(0, |p| p.denials.len())
-    {
-        return Err(HumanActionError::MissingRequiredField {
-            field: "denial_index".to_string(),
-        });
-    }
+    let denials = decided_denials(&pending.request, &decision)?;
+    let commands: Vec<String> = denials
+        .iter()
+        .map(|denial| {
+            denial
+                .input
+                .get("command")
+                .and_then(Value::as_str)
+                .map_or_else(|| denial.tool_name.clone(), ToString::to_string)
+        })
+        .collect();
     match (decision.decision, decision.scope) {
         (PermissionDecisionKind::Deny, None) => {}
         (PermissionDecisionKind::Allow, Some(_)) => {
@@ -1060,17 +1076,7 @@ pub fn resolve_permission(
             {
                 return Err(HumanActionError::PermissionDecisionRequired);
             }
-            let denial = &pending
-                .request
-                .permission
-                .as_ref()
-                .expect("permission continuation has details")
-                .denials[decision.denial_index];
-            if claude_permission_rule(denial, decision.scope.expect("scope checked above"))
-                .is_none()
-            {
-                return Err(HumanActionError::PermissionDecisionRequired);
-            }
+            granted_rules(&pending.request, &decision)?;
         }
         _ => {
             return Err(HumanActionError::MissingRequiredField {
@@ -1078,14 +1084,20 @@ pub fn resolve_permission(
             })
         }
     }
+    let listed = commands
+        .iter()
+        .map(|command| format!("- {command}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let answer = match decision.decision {
-        PermissionDecisionKind::Deny => {
-            "The operator denied this action. Choose another approach or explain what is blocked."
-                .to_string()
-        }
-        PermissionDecisionKind::Allow => {
-            "The operator approved this action within the selected task scope.".to_string()
-        }
+        PermissionDecisionKind::Deny => format!(
+            "The operator denied these blocked actions:\n{listed}\n\
+             Choose another approach or explain what is blocked."
+        ),
+        PermissionDecisionKind::Allow => format!(
+            "The operator approved these blocked actions for this task:\n{listed}\n\
+             Run them again now; they are allowed in this session."
+        ),
     };
     let delivery = HumanInputDelivery {
         agent_message: Some(answer),

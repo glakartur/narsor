@@ -144,9 +144,9 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             }
         }
 
-        if let Some(rule) = &config.permission_grant {
+        if !config.permission_grants.is_empty() {
             args.push("--allowedTools".to_string());
-            args.push(rule.clone());
+            args.extend(config.permission_grants.iter().cloned());
         }
 
         if let Some(model) = &config.model {

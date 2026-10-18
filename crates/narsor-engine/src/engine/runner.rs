@@ -157,7 +157,9 @@ struct AgentInput {
     answer: String,
     harness: Option<String>,
     session: Option<String>,
-    permission_rule: Option<String>,
+    /// Claude Code allow rules a resolved permission request grants this
+    /// one resumed run; empty for any other answer.
+    permission_rules: Vec<String>,
 }
 
 /// How an execution ends when it enters the terminal state `state`.
@@ -1394,25 +1396,11 @@ impl Engine {
                 field: "permission decision".to_string(),
             })
         })?;
-        let permission_rule = match resumed.permission_decision.as_ref() {
-            Some(crate::engine::actions::PermissionDecision {
-                denial_index,
-                decision: crate::engine::actions::PermissionDecisionKind::Allow,
-                scope: Some(scope),
-            }) => {
-                let denial = &resumed
-                    .pending
-                    .request
-                    .permission
-                    .as_ref()
-                    .expect("permission continuation carries denial details")
-                    .denials[*denial_index];
-                Some(
-                    crate::engine::actions::human::claude_permission_rule(denial, *scope)
-                        .ok_or(HumanActionError::PermissionDecisionRequired)?,
-                )
+        let permission_rules = match resumed.permission_decision.as_ref() {
+            Some(decision) => {
+                crate::engine::actions::human::granted_rules(&resumed.pending.request, decision)?
             }
-            _ => None,
+            None => Vec::new(),
         };
         self.store_agent_input(
             &mut execution,
@@ -1420,7 +1408,7 @@ impl Engine {
             &answer,
             resumed.pending.request.agent_harness.as_deref(),
             resumed.pending.request.agent_session_id.as_deref(),
-            permission_rule,
+            permission_rules,
         )?;
         Ok(HandleState::Ready(execution))
     }
@@ -1493,7 +1481,7 @@ impl Engine {
                 &answer,
                 candidate.agent_harness.as_deref(),
                 candidate.agent_session_id.as_deref(),
-                None,
+                Vec::new(),
             )?;
             return Ok(HandleState::Ready(execution));
         }
@@ -1510,7 +1498,7 @@ impl Engine {
                 &answer,
                 resumed.pending.request.agent_harness.as_deref(),
                 resumed.pending.request.agent_session_id.as_deref(),
-                None,
+                Vec::new(),
             )?;
             return Ok(HandleState::Ready(execution));
         }
@@ -1535,7 +1523,7 @@ impl Engine {
                 &answer,
                 resumed.pending.request.agent_harness.as_deref(),
                 resumed.pending.request.agent_session_id.as_deref(),
-                None,
+                Vec::new(),
             )?;
             return Ok(HandleState::Ready(execution));
         }
@@ -1667,7 +1655,7 @@ impl Engine {
                         provenance
                             .as_ref()
                             .map(|session| session.session_id.as_str()),
-                        None,
+                        Vec::new(),
                     )?;
                     return Ok(HandleState::Ready(execution));
                 }
@@ -2081,7 +2069,7 @@ impl Engine {
                         .push_str("\n\nHuman answer to your question:\n");
                     config.prompt.push_str(&input.answer);
                 }
-                config.permission_grant = input.permission_rule.clone();
+                config.permission_grants = input.permission_rules.clone();
                 resumed_input = Some(input);
             }
             if let Some(note) = self.take_operator_recovery_note(execution)? {
@@ -3264,7 +3252,7 @@ impl Engine {
         answer: &str,
         harness: Option<&str>,
         session: Option<&str>,
-        permission_rule: Option<String>,
+        permission_rules: Vec<String>,
     ) -> Result<(), EngineError> {
         engine_metadata_mut(execution).insert(
             METADATA_AGENT_INPUT_KEY.to_string(),
@@ -3273,7 +3261,7 @@ impl Engine {
                 "answer": answer,
                 "harness": harness,
                 "session": session,
-                "permission_rule": permission_rule,
+                "permission_rules": permission_rules,
             }),
         );
         self.store.save_execution(execution)?;
@@ -3318,10 +3306,19 @@ impl Engine {
                 .get("session")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
-            permission_rule: record
-                .get("permission_rule")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
+            // A record of an earlier version holds one rule.
+            permission_rules: match record.get("permission_rules") {
+                Some(Value::Array(rules)) => rules
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect(),
+                _ => record
+                    .get("permission_rule")
+                    .and_then(Value::as_str)
+                    .map(|rule| vec![rule.to_string()])
+                    .unwrap_or_default(),
+            },
         });
         if input.is_some() {
             engine.remove(METADATA_AGENT_INPUT_KEY);

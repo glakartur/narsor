@@ -207,9 +207,10 @@ pub enum Command {
         #[arg(long = "permission", value_name = "DECISION", value_parser = ["deny", "allow-exact", "allow-group"])]
         permission: Option<String>,
 
-        /// Which denial in the pending request to resolve (defaults to 0).
-        #[arg(long = "denial-index", default_value_t = 0)]
-        denial_index: usize,
+        /// Which denial in the pending request to resolve; every denial when
+        /// omitted.
+        #[arg(long = "denial-index")]
+        denial_index: Option<usize>,
 
         /// Workflow file or name, for when it cannot be read back from the stored execution.
         #[arg(long = "file", value_name = "WORKFLOW")]
