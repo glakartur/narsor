@@ -162,6 +162,7 @@ pub(crate) fn attention_items(
                 }
                 InputContinuation::ResolveOutput => AttentionKind::Problem,
                 InputContinuation::ApproveOutput => AttentionKind::Approval,
+                InputContinuation::ResolvePermission => AttentionKind::Problem,
             },
             state_id: Some(pending.state_id.to_string()),
             since: pending.requested_at,

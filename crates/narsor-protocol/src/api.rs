@@ -2,10 +2,12 @@
 
 mod human_input;
 mod material;
+mod permission_rules;
 mod timeline;
 
 pub use human_input::*;
 pub use material::*;
+pub use permission_rules::{bash_command_parts, bash_grant_rules, BashGrantScope};
 pub use timeline::*;
 
 use std::collections::{BTreeMap, HashMap};
@@ -490,11 +492,11 @@ mod tests {
         ConductorActivity, ConductorPurposeDto, ConductorTriggerDto, ConversationEntryDto,
         ConversationEntrySource, ConversationResponse, DaemonDiscoveryRecord, EventLink,
         ExecutionStatusDto, HarnessSelectionSnapshot, HumanInputActionDto, HumanInputDeliveryDto,
-        HumanInputTypeView, MaterialAnnouncement, MaterialFile, MaterialListResponse,
-        MaterialOrigin, MaterialSummary, MaterialUploadResponse, MaterialView, OwnerBindingSource,
-        OwnerView, PendingHumanInputView, Position, PositionStatus, ProblemKindDto,
-        ProposalOutcome, ProposalStatus, RecoveryRequest, Timeline, UndoOutcome, UploadManifest,
-        WhoAmIResponse, BUNDLE_CONTENT_TYPE,
+        HumanInputTypeView, InputContinuationView, MaterialAnnouncement, MaterialFile,
+        MaterialListResponse, MaterialOrigin, MaterialSummary, MaterialUploadResponse,
+        MaterialView, OwnerBindingSource, OwnerView, PendingHumanInputView, Position,
+        PositionStatus, ProblemKindDto, ProposalOutcome, ProposalStatus, RecoveryRequest, Timeline,
+        UndoOutcome, UploadManifest, WhoAmIResponse, BUNDLE_CONTENT_TYPE,
     };
 
     #[test]
@@ -762,6 +764,7 @@ mod tests {
             agent_message: Some("Use the revised draft".into()),
             action: Some(HumanInputActionDto::Resume),
             episode: Some("input-3".into()),
+            permission_decision: None,
         };
         let value = serde_json::to_value(delivery).unwrap();
         assert_eq!(value["values"]["name"], "Ada");
@@ -794,6 +797,39 @@ mod tests {
         assert_eq!(encoded["action_execution_id"], "attempt-1");
         assert_eq!(encoded["outputs"][0]["label"], "approve");
         assert!(encoded.get("request").is_none());
+    }
+
+    #[test]
+    fn pending_permission_details_survive_the_client_wire_view() {
+        let value = serde_json::json!({
+            "execution_id": "execution-1",
+            "state_id": "build",
+            "action_execution_id": "attempt-1",
+            "instruction": "Permission decision required",
+            "permission": {
+                "denials": [{
+                    "tool_name": "Bash",
+                    "tool_use_id": "tool-1",
+                    "input": {"command": "cargo build"},
+                    "cwd": "/workspace",
+                    "reason_type": "subcommandResults",
+                    "reason": "Approval required"
+                }]
+            },
+            "continuation": "resolve_permission",
+            "episode": "permission-1",
+            "requested_at": "2026-01-02T03:04:05Z"
+        });
+        let pending: PendingHumanInputView = serde_json::from_value(value).unwrap();
+
+        assert_eq!(
+            pending.continuation,
+            InputContinuationView::ResolvePermission
+        );
+        let denial = &pending.permission.unwrap().denials[0];
+        assert_eq!(denial.tool_use_id, "tool-1");
+        assert_eq!(denial.input["command"], "cargo build");
+        assert_eq!(denial.cwd, "/workspace");
     }
 
     #[test]

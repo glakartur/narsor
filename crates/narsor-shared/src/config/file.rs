@@ -539,7 +539,9 @@ pub fn value_from_text(setting: SettingKey, text: &str) -> Result<SettingValue, 
 
         SettingKey::LocalHome => one_of(text, "local HOME mode", &settings::LOCAL_HOME_MODES),
 
-        SettingKey::LocalCodexHome | SettingKey::LocalClaudeConfigDir => {
+        SettingKey::LocalCodexHome
+        | SettingKey::LocalClaudeConfigDir
+        | SettingKey::LocalClaudeProfileSource => {
             let dir = text.trim();
             if !dir.is_empty() && !std::path::Path::new(dir).is_absolute() {
                 return Err(format!(

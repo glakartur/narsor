@@ -254,6 +254,7 @@ fn compile_action(action: ActionSchema) -> ActionConfig {
     match action {
         ActionSchema::Agent(agent) => ActionConfig::Agent(AgentActionConfig {
             harness: agent.harness,
+            permission_grants: Vec::new(),
             model: agent.model,
             workspace_access: agent.workspace_access,
             prompt: agent.prompt,

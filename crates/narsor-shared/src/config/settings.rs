@@ -164,11 +164,15 @@ pub enum SettingKey {
     /// Claude Code's configuration directory for local tasks
     /// (`CLAUDE_CONFIG_DIR`); empty leaves it to the harness.
     LocalClaudeConfigDir,
+    /// The Claude Code profile local tasks bring their configuration
+    /// directory up to date with before every start; empty, or the
+    /// configuration directory itself, copies nothing.
+    LocalClaudeProfileSource,
 }
 
 impl SettingKey {
     /// Every setting, in the order `config show` prints them.
-    pub const ALL: [SettingKey; 21] = [
+    pub const ALL: [SettingKey; 22] = [
         SettingKey::CatalogDir,
         SettingKey::StateDir,
         SettingKey::WorkDir,
@@ -190,6 +194,7 @@ impl SettingKey {
         SettingKey::LocalHome,
         SettingKey::LocalCodexHome,
         SettingKey::LocalClaudeConfigDir,
+        SettingKey::LocalClaudeProfileSource,
     ];
 
     /// The three roots, in the order `config show` prints them.
@@ -223,6 +228,7 @@ impl SettingKey {
             SettingKey::LocalHome => "local_home",
             SettingKey::LocalCodexHome => "local_codex_home",
             SettingKey::LocalClaudeConfigDir => "local_claude_config_dir",
+            SettingKey::LocalClaudeProfileSource => "local_claude_profile_source",
         }
     }
 
@@ -266,7 +272,8 @@ impl SettingKey {
             | SettingKey::LocalWorkspaceRoots
             | SettingKey::LocalHome
             | SettingKey::LocalCodexHome
-            | SettingKey::LocalClaudeConfigDir => false,
+            | SettingKey::LocalClaudeConfigDir
+            | SettingKey::LocalClaudeProfileSource => false,
         }
     }
 
@@ -303,7 +310,8 @@ impl SettingKey {
             | SettingKey::CorsAllowedOrigins
             | SettingKey::LocalWorkspaceRoots
             | SettingKey::LocalCodexHome
-            | SettingKey::LocalClaudeConfigDir => SettingValue::Text(String::new()),
+            | SettingKey::LocalClaudeConfigDir
+            | SettingKey::LocalClaudeProfileSource => SettingValue::Text(String::new()),
         }
     }
 
@@ -556,7 +564,8 @@ mod tests {
                 "local_workspace_roots",
                 "local_home",
                 "local_codex_home",
-                "local_claude_config_dir"
+                "local_claude_config_dir",
+                "local_claude_profile_source"
             ],
             "the registry is the one place the settings live, and the three \
              roots lead because that is the order `config show` prints"

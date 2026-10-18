@@ -390,6 +390,7 @@ impl ActionExecutor for ResumeRejectingAgentExecutor {
                         agent_harness: Some("fake".to_string()),
                         agent_session_id: Some("gone-session".to_string()),
                         prefilled_answer: None,
+                        permission: None,
                     }),
                 )),
                 2 => Err(ActionError {
@@ -465,6 +466,7 @@ impl ActionExecutor for QuestioningAgentExecutor {
                         agent_harness: None,
                         agent_session_id: None,
                         prefilled_answer: None,
+                        permission: None,
                     }),
                 ));
             }

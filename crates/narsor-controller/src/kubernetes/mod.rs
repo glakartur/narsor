@@ -67,7 +67,11 @@ pub mod manifest;
 pub mod names;
 pub mod objects;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 
 use chrono::Utc;
 use serde_json::Value;
@@ -120,6 +124,67 @@ impl KubernetesBackend {
     /// The namespace task objects live in.
     pub fn namespace(&self) -> &str {
         self.client.namespace()
+    }
+
+    /// The data of the configured Claude profile Secret, key by key (R15).
+    ///
+    /// Errors name the Secret and never carry its values.
+    pub async fn read_claude_profile(&self) -> BackendResult<BTreeMap<String, Vec<u8>>> {
+        let (path, secret) = self.claude_profile_secret().await?;
+        let mut data = BTreeMap::new();
+        for (key, value) in secret
+            .get("data")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            let bytes = value
+                .as_str()
+                .and_then(|encoded| BASE64.decode(encoded).ok())
+                .ok_or_else(|| {
+                    BackendError::rejected(format!("{path}: key '{key}' is not valid base64"))
+                })?;
+            data.insert(key.clone(), bytes);
+        }
+        Ok(data)
+    }
+
+    /// Replaces the given keys of the configured Claude profile Secret and
+    /// keeps every other key. The write carries no `resourceVersion`: an
+    /// external change made meanwhile is overwritten, the last write wins
+    /// (R16, KTD7).
+    pub async fn write_claude_profile(
+        &self,
+        updated: &BTreeMap<String, Vec<u8>>,
+    ) -> BackendResult<()> {
+        let (path, mut secret) = self.claude_profile_secret().await?;
+        if let Some(metadata) = secret.get_mut("metadata").and_then(Value::as_object_mut) {
+            metadata.remove("resourceVersion");
+        }
+        if !secret.get("data").is_some_and(Value::is_object) {
+            secret["data"] = Value::Object(serde_json::Map::new());
+        }
+        for (key, bytes) in updated {
+            secret["data"][key] = Value::String(BASE64.encode(bytes));
+        }
+        self.client.replace(&path, &secret).await.map(|_| ())
+    }
+
+    async fn claude_profile_secret(&self) -> BackendResult<(String, Value)> {
+        let name = self
+            .config
+            .claude_profile_secret
+            .as_deref()
+            .ok_or_else(|| {
+                BackendError::rejected("this backend configures no claude_profile_secret")
+            })?;
+        let path = self.client.core_path("secrets", Some(name));
+        let secret = self
+            .client
+            .get(&path)
+            .await?
+            .ok_or_else(|| BackendError::rejected(format!("{path} does not exist")))?;
+        Ok((path, secret))
     }
 
     /// Checks, at controller start, what would otherwise fail a task later:

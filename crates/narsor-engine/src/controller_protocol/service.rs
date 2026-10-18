@@ -49,6 +49,28 @@ use relay::Relay;
 pub use auto_resume::AutoResumePass;
 
 fn engine_delivery(delivery: narsor_protocol::api::HumanInputDeliveryDto) -> HumanInputDelivery {
+    let permission_decision =
+        delivery
+            .permission_decision
+            .map(|decision| crate::engine::actions::PermissionDecision {
+                denial_index: decision.denial_index,
+                decision: match decision.decision {
+                    narsor_protocol::api::PermissionDecisionKindDto::Deny => {
+                        crate::engine::actions::PermissionDecisionKind::Deny
+                    }
+                    narsor_protocol::api::PermissionDecisionKindDto::Allow => {
+                        crate::engine::actions::PermissionDecisionKind::Allow
+                    }
+                },
+                scope: decision.scope.map(|scope| match scope {
+                    narsor_protocol::api::PermissionGrantScopeDto::ExactOperation => {
+                        crate::engine::actions::PermissionGrantScope::ExactOperation
+                    }
+                    narsor_protocol::api::PermissionGrantScopeDto::CommandGroup => {
+                        crate::engine::actions::PermissionGrantScope::CommandGroup
+                    }
+                }),
+            });
     HumanInputDelivery {
         values: delivery.values,
         chosen_label: delivery.chosen_label,
@@ -58,6 +80,7 @@ fn engine_delivery(delivery: narsor_protocol::api::HumanInputDeliveryDto) -> Hum
         agent_message: delivery.agent_message,
         action: delivery.action,
         episode: delivery.episode,
+        permission_decision,
         answered_by: AnsweredBy::Operator,
     }
 }
@@ -72,6 +95,27 @@ fn protocol_delivery(delivery: &HumanInputDelivery) -> narsor_protocol::api::Hum
         agent_message: delivery.agent_message.clone(),
         action: delivery.action,
         episode: delivery.episode.clone(),
+        permission_decision: delivery.permission_decision.as_ref().map(|decision| {
+            narsor_protocol::api::PermissionDecisionDto {
+                denial_index: decision.denial_index,
+                decision: match decision.decision {
+                    crate::engine::actions::PermissionDecisionKind::Deny => {
+                        narsor_protocol::api::PermissionDecisionKindDto::Deny
+                    }
+                    crate::engine::actions::PermissionDecisionKind::Allow => {
+                        narsor_protocol::api::PermissionDecisionKindDto::Allow
+                    }
+                },
+                scope: decision.scope.map(|scope| match scope {
+                    crate::engine::actions::PermissionGrantScope::ExactOperation => {
+                        narsor_protocol::api::PermissionGrantScopeDto::ExactOperation
+                    }
+                    crate::engine::actions::PermissionGrantScope::CommandGroup => {
+                        narsor_protocol::api::PermissionGrantScopeDto::CommandGroup
+                    }
+                }),
+            }
+        }),
     }
 }
 

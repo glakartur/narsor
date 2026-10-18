@@ -28,6 +28,8 @@
 //!         conductor.json     a per-task conductor harness an older version
 //!                            kept; neither read nor removed any more
 //!         work/              scratch of the conductor's isolated invocations
+//!         claude-profile/    the Claude profile source as the last start
+//!                            saw it, the base of the next merge (KTD6)
 //!         workspace.partial/ a clone under way, never a workspace
 //!         materials.partial/ a material delivery under way
 //! ```
@@ -163,6 +165,12 @@ impl TaskStorage {
 
     fn harness_file(&self) -> PathBuf {
         self.bookkeeping_dir().join("harness.json")
+    }
+
+    /// `{root}/narsor/claude-profile`: the copy of the Claude profile
+    /// source taken at the previous start, the base of the next merge.
+    pub fn claude_profile_base_dir(&self) -> PathBuf {
+        self.bookkeeping_dir().join("claude-profile")
     }
 
     /// `{root}/narsor/work`: where the conductor keeps its scratch.

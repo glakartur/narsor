@@ -7,7 +7,7 @@
 //!               --control-plane <url> --credential-file <file> \
 //!               [--launch-spec <file>] [--secrets-dir <dir>] \
 //!               [--home private|host] [--codex-home <dir>] \
-//!               [--claude-config-dir <dir>]
+//!               [--claude-config-dir <dir>] [--claude-profile-source <dir>]
 //! ```
 //!
 //! * `--task-storage` — the task's persistent volume (R9). Holds the Engine
@@ -26,6 +26,9 @@
 //!   task's.
 //! * `--codex-home`, `--claude-config-dir` — the harness configuration
 //!   directories, exported as `CODEX_HOME` and `CLAUDE_CONFIG_DIR`.
+//! * `--claude-profile-source` — the Claude Code profile (in Kubernetes the
+//!   read-only mount of the profile Secret) merged into Claude's work
+//!   directory before every start; see [`super::profile`].
 //!
 //! Inherited `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `CODEX_API_KEY` are
 //! dropped, so a harness keeps to its subscription login; a task that wants
@@ -111,6 +114,11 @@ pub struct RunnerArgs {
     #[arg(long, value_name = "DIRECTORY")]
     pub claude_config_dir: Option<PathBuf>,
 
+    /// The Claude Code profile merged into Claude's work directory before
+    /// every start (in Kubernetes, the read-only profile Secret mount).
+    #[arg(long, value_name = "DIRECTORY")]
+    pub claude_profile_source: Option<PathBuf>,
+
     /// Long-poll wait in seconds (the control plane caps it).
     #[arg(long, value_name = "SECONDS", default_value_t = 25, hide = true)]
     pub poll_wait_secs: u64,
@@ -163,6 +171,7 @@ pub async fn run_command(args: RunnerArgs) -> i32 {
             mode: args.home,
             codex_home: args.codex_home,
             claude_config_dir: args.claude_config_dir,
+            claude_profile_source: args.claude_profile_source,
         },
         incarnation: args.incarnation,
         timing: RunnerTiming {

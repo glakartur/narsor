@@ -36,8 +36,10 @@ use serde_json::{Map, Value};
 use crate::conductor::Annotation;
 use crate::tui::chooser::{ChooserField, ChooserItem, FieldKind, Submission};
 use narsor_protocol::api::{
-    HumanInputActionDto, HumanInputDeliveryDto, HumanInputFieldView, HumanInputTypeView,
-    InputContinuationView, OutputDefinitionView, PendingHumanInputView,
+    bash_grant_rules, is_approvable_permission_reason, BashGrantScope, HumanInputActionDto,
+    HumanInputDeliveryDto, HumanInputFieldView, HumanInputTypeView, InputContinuationView,
+    OutputDefinitionView, PendingHumanInputView, PermissionDecisionDto, PermissionDecisionKindDto,
+    PermissionDenialView, PermissionGrantScopeDto,
 };
 use narsor_protocol::controller::{WorkflowInputType, WorkflowInputView};
 use narsor_protocol::event::{AnsweredBy, EventData, InputCloseReason};
@@ -53,6 +55,7 @@ pub enum InputKind {
     /// is the output it did not give.
     Problem,
     Approval,
+    Permission,
 }
 
 impl InputKind {
@@ -63,6 +66,7 @@ impl InputKind {
             InputContinuationView::ResumeAgent => Self::AgentQuestion,
             InputContinuationView::ResolveOutput => Self::Problem,
             InputContinuationView::ApproveOutput => Self::Approval,
+            InputContinuationView::ResolvePermission => Self::Permission,
         }
     }
 
@@ -73,6 +77,7 @@ impl InputKind {
             Self::AgentQuestion => " Reply to the agent ",
             Self::Problem => " Resolve the problem ",
             Self::Approval => " Approve agent output ",
+            Self::Permission => " Permission decision ",
         }
     }
 }
@@ -361,6 +366,7 @@ enum Plan {
     Approve,
     /// Returns the result to the agent with a comment.
     Return,
+    Permission(PermissionDecisionDto),
 }
 
 /// A pending human input as the panel offers it: what it is about, the
@@ -420,6 +426,7 @@ impl InputPanel {
             InputKind::AgentQuestion => panel.build_question(pending),
             InputKind::Problem => panel.build_problem(pending),
             InputKind::Approval => panel.build_approval(pending),
+            InputKind::Permission => panel.build_permission_info(pending),
         }
         panel
     }
@@ -544,6 +551,10 @@ impl InputPanel {
                 action: Some(HumanInputActionDto::Resume),
                 ..HumanInputDeliveryDto::default()
             },
+            Plan::Permission(permission_decision) => HumanInputDeliveryDto {
+                permission_decision: Some(permission_decision.clone()),
+                ..HumanInputDeliveryDto::default()
+            },
         };
         Ok(HumanInputDeliveryDto {
             episode: Some(self.episode.clone()),
@@ -572,6 +583,18 @@ impl InputPanel {
                 None => "zaakceptowano".to_string(),
             },
             Some(Plan::Return) => "zwrócono agentowi".to_string(),
+            Some(Plan::Permission(decision)) => match decision.decision {
+                PermissionDecisionKindDto::Deny => "odmówiono dostępu agentowi".to_string(),
+                PermissionDecisionKindDto::Allow => match decision.scope {
+                    Some(PermissionGrantScopeDto::ExactOperation) => {
+                        "zezwolono na tę operację".to_string()
+                    }
+                    Some(PermissionGrantScopeDto::CommandGroup) => {
+                        "zezwolono na grupę poleceń w tym tasku".to_string()
+                    }
+                    None => "zezwolono agentowi".to_string(),
+                },
+            },
         }
     }
 
@@ -856,6 +879,131 @@ impl InputPanel {
 
     // -- an approval ------------------------------------------------------------
 
+    fn build_permission_info(&mut self, pending: &PendingHumanInputView) {
+        let denials = pending
+            .permission
+            .as_ref()
+            .map(|permission| permission.denials.as_slice())
+            .unwrap_or_default();
+        let resumable = pending
+            .agent_session_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty());
+        let mut exact: Vec<Option<Vec<String>>> = Vec::new();
+        let mut group: Vec<Option<Vec<String>>> = Vec::new();
+        for denial in denials {
+            let command = denial
+                .input
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::trim);
+            self.context.push(ContextLine::problem(match command {
+                Some(command) => format!("{}: {command}", denial.tool_name),
+                None => format!("{}: {}", denial.tool_name, denial.input),
+            }));
+            self.context
+                .push(ContextLine::dim(format!("katalog: {}", denial.cwd)));
+            let rules = |scope| grant_rules(denial, scope);
+            let (denial_exact, denial_group) =
+                (rules(BashGrantScope::Exact), rules(BashGrantScope::Group));
+            match (&denial_exact, why_not_grantable(denial, resumable)) {
+                (Some(rules), None) => self.context.push(ContextLine::dim(format!(
+                    "reguły zgody: {}",
+                    rules.join(", ")
+                ))),
+                (_, Some(why)) => {
+                    self.context
+                        .push(ContextLine::plain(format!("zgoda niedostępna: {why}")));
+                    if let Some(reason) = denial.reason.as_deref() {
+                        self.context.push(ContextLine::dim(reason));
+                    }
+                }
+                (None, None) => {}
+            }
+            exact.push(denial_exact.filter(|_| resumable));
+            group.push(denial_group.filter(|_| resumable));
+        }
+
+        let many = denials.len() > 1;
+        self.push(
+            ChooserItem::new(
+                if many { "Odmów wszystkim" } else { "Odmów" },
+                "Agent wznowi tę sesję z informacją, że te operacje są zablokowane.",
+            ),
+            Plan::Permission(PermissionDecisionDto {
+                denial_index: None,
+                decision: PermissionDecisionKindDto::Deny,
+                scope: None,
+            }),
+        );
+        let all = |grants: &[Option<Vec<String>>]| -> Option<Vec<String>> {
+            let mut rules: Vec<String> = Vec::new();
+            for grant in grants {
+                for rule in grant.as_ref()? {
+                    if !rules.contains(rule) {
+                        rules.push(rule.clone());
+                    }
+                }
+            }
+            (!rules.is_empty()).then_some(rules)
+        };
+        if let Some(rules) = all(&exact) {
+            self.push(
+                ChooserItem::new(
+                    if many {
+                        "Zezwól dokładnie na te polecenia"
+                    } else {
+                        "Zezwól dokładnie na to polecenie"
+                    },
+                    format!(
+                        "Agent wznowi sesję i może je uruchomić. Reguły tylko dla bieżącego \
+                         tasku: {}",
+                        rules.join(", ")
+                    ),
+                ),
+                Plan::Permission(PermissionDecisionDto {
+                    denial_index: None,
+                    decision: PermissionDecisionKindDto::Allow,
+                    scope: Some(PermissionGrantScopeDto::ExactOperation),
+                }),
+            );
+        } else if many {
+            // Not every denial can be granted: offer the ones that can.
+            for (index, rules) in exact.iter().enumerate() {
+                let (Some(rules), Some(command)) = (
+                    rules,
+                    denials[index].input.get("command").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                self.push(
+                    ChooserItem::new(
+                        format!("Zezwól dokładnie: {}", command.trim()),
+                        format!("Reguły tylko dla bieżącego tasku: {}", rules.join(", ")),
+                    ),
+                    Plan::Permission(PermissionDecisionDto {
+                        denial_index: Some(index),
+                        decision: PermissionDecisionKindDto::Allow,
+                        scope: Some(PermissionGrantScopeDto::ExactOperation),
+                    }),
+                );
+            }
+        }
+        if let Some(rules) = all(&group).filter(|rules| Some(rules) != all(&exact).as_ref()) {
+            self.push(
+                ChooserItem::new(
+                    format!("Zezwól na grupę: {}", rules.join(", ")),
+                    "Zgoda obejmie te grupy poleceń do końca bieżącego tasku.",
+                ),
+                Plan::Permission(PermissionDecisionDto {
+                    denial_index: None,
+                    decision: PermissionDecisionKindDto::Allow,
+                    scope: Some(PermissionGrantScopeDto::CommandGroup),
+                }),
+            );
+        }
+    }
+
     fn build_approval(&mut self, pending: &PendingHumanInputView) {
         let mut resumable = false;
         if let Some(approval) = &pending.approval {
@@ -909,6 +1057,40 @@ pub const MESSAGE_FIELD: &str = "Wiadomość dla agenta";
 
 /// The field a return to the agent is explained in.
 pub const COMMENT_TO_AGENT: &str = "Komentarz dla agenta";
+
+/// The allow rules that would grant `denial` at `scope`, the same the
+/// engine grants ([`narsor_protocol::api::bash_grant_rules`]).
+fn grant_rules(denial: &PermissionDenialView, scope: BashGrantScope) -> Option<Vec<String>> {
+    if denial.tool_name != "Bash" || !is_approvable_permission_reason(denial.reason_type.as_deref())
+    {
+        return None;
+    }
+    bash_grant_rules(denial.input.get("command")?.as_str()?, scope)
+}
+
+/// Why `denial` cannot be granted, in a few words; `None` when it can.
+fn why_not_grantable(denial: &PermissionDenialView, resumable: bool) -> Option<String> {
+    if !is_approvable_permission_reason(denial.reason_type.as_deref()) {
+        return Some(format!(
+            "blokada polityki Claude Code ({})",
+            denial.reason_type.as_deref().unwrap_or("bez powodu")
+        ));
+    }
+    if denial.tool_name != "Bash" {
+        return Some(format!(
+            "zgodę można dać tylko na polecenia Bash, nie na {}",
+            denial.tool_name
+        ));
+    }
+    if grant_rules(denial, BashGrantScope::Exact).is_none() {
+        return Some(
+            "polecenie ma konstrukcję, której reguła nie opisze dokładnie \
+             ($(…), zmienna, glob, przekierowanie do pliku, nawiasy)"
+                .to_string(),
+        );
+    }
+    (!resumable).then(|| "sesji agenta nie da się wznowić".to_string())
+}
 
 /// Puts `value` under `key` in `map`, refusing a second one.
 fn insert_once(

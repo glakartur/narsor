@@ -846,7 +846,12 @@ default (`local_home: host`), with the same logins as the console. `local_home:
 private` gives every local task a fresh `HOME` on its own storage instead;
 `local_codex_home` and `local_claude_config_dir` (absolute paths, exported as
 `CODEX_HOME` and `CLAUDE_CONFIG_DIR`) then point the harnesses at a login
-directory of your choice. The runner reads these on every start — they are
+directory of your choice. `local_claude_profile_source` (an absolute path,
+empty by default) names a Claude Code profile the runner merges into
+Claude's configuration directory before every start; it copies nothing when
+it is empty or the configuration directory itself, and it needs either
+`local_claude_config_dir` or `local_home: private` (then
+`$HOME/.claude` on the task storage). The runner reads these on every start — they are
 the backend's settings, not part of a task — so switching them leaves a
 running task's earlier sessions behind. Inherited `ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY` and `CODEX_API_KEY` are always dropped, so a harness never

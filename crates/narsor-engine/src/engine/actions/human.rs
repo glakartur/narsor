@@ -100,6 +100,7 @@ impl ActionExecutor for HumanExecutor {
                     agent_harness: None,
                     agent_session_id: None,
                     prefilled_answer: None,
+                    permission: None,
                 }),
             ))
         })
@@ -174,6 +175,124 @@ pub struct HumanInputRequest {
     /// resumed. Older records simply have no prefilled answer.
     #[serde(default)]
     pub prefilled_answer: Option<String>,
+
+    /// Structured Claude Code denial details. Kept in the task's private
+    /// pending record so an operator can make a later decision.
+    #[serde(default)]
+    pub permission: Option<PermissionRequestDetails>,
+}
+
+/// Details attached to a permission wait. The tool input is untrusted data;
+/// render it as text in every client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionRequestDetails {
+    pub denials: Vec<PermissionDenialDetails>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionDenialDetails {
+    pub tool_name: String,
+    pub tool_use_id: String,
+    pub input: Value,
+    pub cwd: String,
+    #[serde(default)]
+    pub reason_type: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// An owner decision for one pending Claude Code permission request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionDecision {
+    /// The one denial decided on; `None` decides every denial of the
+    /// request at once.
+    #[serde(default)]
+    pub denial_index: Option<usize>,
+    pub decision: PermissionDecisionKind,
+    #[serde(default)]
+    pub scope: Option<PermissionGrantScope>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecisionKind {
+    Deny,
+    Allow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionGrantScope {
+    ExactOperation,
+    CommandGroup,
+}
+
+/// The Claude Code allow rules that grant one denial at `scope`: a rule per
+/// part of its Bash command ([`narsor_protocol::api::bash_grant_rules`]).
+/// `None` for a denial no task grant may lift (R6) or a command a rule could
+/// not pin down — never a wider rule.
+pub fn claude_permission_rules(
+    denial: &PermissionDenialDetails,
+    scope: PermissionGrantScope,
+) -> Option<Vec<String>> {
+    if denial.tool_name != "Bash"
+        || !narsor_protocol::api::is_approvable_permission_reason(denial.reason_type.as_deref())
+    {
+        return None;
+    }
+    let command = denial.input.get("command")?.as_str()?;
+    let scope = match scope {
+        PermissionGrantScope::ExactOperation => narsor_protocol::api::BashGrantScope::Exact,
+        PermissionGrantScope::CommandGroup => narsor_protocol::api::BashGrantScope::Group,
+    };
+    narsor_protocol::api::bash_grant_rules(command, scope)
+}
+
+/// The denials `decision` is about: the one it names, or all of them.
+fn decided_denials<'a>(
+    request: &'a HumanInputRequest,
+    decision: &PermissionDecision,
+) -> Result<Vec<&'a PermissionDenialDetails>, HumanActionError> {
+    let denials = request
+        .permission
+        .as_ref()
+        .map(|permission| permission.denials.as_slice())
+        .unwrap_or_default();
+    match decision.denial_index {
+        Some(index) => denials
+            .get(index)
+            .map(|denial| vec![denial])
+            .ok_or_else(|| HumanActionError::MissingRequiredField {
+                field: "denial_index".to_string(),
+            }),
+        None if denials.is_empty() => Err(HumanActionError::MissingRequiredField {
+            field: "denial_index".to_string(),
+        }),
+        None => Ok(denials.iter().collect()),
+    }
+}
+
+/// The allow rules an approving `decision` grants, every decided denial's
+/// rules in order and without repeats. A denial that cannot be granted at
+/// the chosen scope refuses the whole decision.
+pub fn granted_rules(
+    request: &HumanInputRequest,
+    decision: &PermissionDecision,
+) -> Result<Vec<String>, HumanActionError> {
+    let (PermissionDecisionKind::Allow, Some(scope)) = (decision.decision, decision.scope) else {
+        return Ok(Vec::new());
+    };
+    let mut rules: Vec<String> = Vec::new();
+    for denial in decided_denials(request, decision)? {
+        for rule in claude_permission_rules(denial, scope)
+            .ok_or(HumanActionError::PermissionDecisionRequired)?
+        {
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        }
+    }
+    Ok(rules)
 }
 
 /// The durable record of a question awaiting an answer — `pending_input.json`.
@@ -338,6 +457,9 @@ pub enum InputContinuation {
     /// step as if the agent had kept to its output contract.
     ResolveOutput,
     ApproveOutput,
+    /// A Claude Code permission request; only the dedicated permission
+    /// resolution operation may close it.
+    ResolvePermission,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -394,6 +516,27 @@ impl PendingHumanInput {
             request,
             outputs: Vec::new(),
             continuation: InputContinuation::ResumeAgent,
+            episode: new_episode(),
+            problem: None,
+            approval: None,
+            resume_targets: BTreeMap::new(),
+            requested_at: Utc::now(),
+        }
+    }
+
+    /// Builds a permission wait that cannot be answered through ordinary
+    /// human input delivery.
+    pub fn for_permission(
+        execution_id: impl Into<ExecutionId>,
+        state_id: impl Into<StateId>,
+        request: HumanInputRequest,
+    ) -> Self {
+        Self {
+            execution_id: execution_id.into(),
+            state_id: state_id.into(),
+            request,
+            outputs: Vec::new(),
+            continuation: InputContinuation::ResolvePermission,
             episode: new_episode(),
             problem: None,
             approval: None,
@@ -563,6 +706,11 @@ pub struct HumanInputDelivery {
     #[serde(default)]
     pub episode: Option<String>,
 
+    /// Present only on the dedicated permission decision endpoint. Ordinary
+    /// human input rejects permission continuations regardless of this field.
+    #[serde(default)]
+    pub permission_decision: Option<PermissionDecision>,
+
     /// Who is answering. Never read from the wire: whoever calls the API is
     /// the operator, and only in-process callers answer as the conductor.
     #[serde(skip)]
@@ -650,11 +798,19 @@ pub struct ResumedHumanAction {
     /// `variables` carries the field values; per D10 the engine — not this
     /// module — merges them into `context.variables`.
     pub result: ActionResult,
+
+    /// Present only when the dedicated permission decision path was used.
+    pub permission_decision: Option<PermissionDecision>,
 }
 
 /// Everything that can go wrong around a human action.
 #[derive(Debug, Error)]
 pub enum HumanActionError {
+    /// A permission wait must be resolved through its dedicated decision
+    /// operation; ordinary human input must never grant harness access.
+    #[error("this request requires a permission decision")]
+    PermissionDecisionRequired,
+
     /// The execution is not awaiting input, so there is nothing to answer.
     ///
     /// This is the guard against a double delivery: once an answer has moved
@@ -878,6 +1034,87 @@ pub fn resume(
     execution_id: &str,
     delivery: &HumanInputDelivery,
 ) -> Result<ResumedHumanAction, HumanActionError> {
+    resume_inner(store, execution_id, delivery, false)
+}
+
+/// Resolves a durable Claude Code permission request. This is deliberately a
+/// separate entry point from [`resume`], which cannot answer that continuation.
+pub fn resolve_permission(
+    store: &ExecutionStore,
+    execution_id: &str,
+    decision: PermissionDecision,
+    episode: &str,
+) -> Result<ResumedHumanAction, HumanActionError> {
+    let pending = store
+        .load_pending_input::<PendingHumanInput>(execution_id)?
+        .ok_or_else(|| HumanActionError::NoPendingRequest {
+            execution_id: execution_id.to_string(),
+        })?;
+    if pending.continuation != InputContinuation::ResolvePermission {
+        return Err(HumanActionError::PermissionDecisionRequired);
+    }
+    let denials = decided_denials(&pending.request, &decision)?;
+    let commands: Vec<String> = denials
+        .iter()
+        .map(|denial| {
+            denial
+                .input
+                .get("command")
+                .and_then(Value::as_str)
+                .map_or_else(|| denial.tool_name.clone(), ToString::to_string)
+        })
+        .collect();
+    match (decision.decision, decision.scope) {
+        (PermissionDecisionKind::Deny, None) => {}
+        (PermissionDecisionKind::Allow, Some(_)) => {
+            if pending.request.agent_harness.as_deref() != Some("claude-code")
+                || pending
+                    .request
+                    .agent_session_id
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+            {
+                return Err(HumanActionError::PermissionDecisionRequired);
+            }
+            granted_rules(&pending.request, &decision)?;
+        }
+        _ => {
+            return Err(HumanActionError::MissingRequiredField {
+                field: "scope".to_string(),
+            })
+        }
+    }
+    let listed = commands
+        .iter()
+        .map(|command| format!("- {command}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let answer = match decision.decision {
+        PermissionDecisionKind::Deny => format!(
+            "The operator denied these blocked actions:\n{listed}\n\
+             Choose another approach or explain what is blocked."
+        ),
+        PermissionDecisionKind::Allow => format!(
+            "The operator approved these blocked actions for this task:\n{listed}\n\
+             Run them again now; they are allowed in this session."
+        ),
+    };
+    let delivery = HumanInputDelivery {
+        agent_message: Some(answer),
+        episode: Some(episode.to_string()),
+        permission_decision: Some(decision),
+        answered_by: AnsweredBy::Operator,
+        ..HumanInputDelivery::default()
+    };
+    resume_inner(store, execution_id, &delivery, true)
+}
+
+fn resume_inner(
+    store: &ExecutionStore,
+    execution_id: &str,
+    delivery: &HumanInputDelivery,
+    allow_permission: bool,
+) -> Result<ResumedHumanAction, HumanActionError> {
     let mut execution = store.load_execution(execution_id)?;
 
     if execution.status != ExecutionStatus::InputNeeded {
@@ -892,6 +1129,26 @@ pub fn resume(
             execution_id: execution_id.to_string(),
         }
     })?;
+
+    if pending.execution_id != execution.id {
+        return Err(HumanActionError::NoPendingRequest {
+            execution_id: execution_id.to_string(),
+        });
+    }
+
+    if pending.continuation == InputContinuation::ResolvePermission && !allow_permission {
+        return Err(HumanActionError::PermissionDecisionRequired);
+    }
+    if pending.continuation == InputContinuation::ResolvePermission
+        && execution.current_state.as_deref() != Some(pending.state_id.as_str())
+    {
+        return Err(HumanActionError::PermissionDecisionRequired);
+    }
+    if pending.continuation == InputContinuation::ResolvePermission && delivery.episode.is_none() {
+        return Err(HumanActionError::MissingRequiredField {
+            field: "episode".to_string(),
+        });
+    }
 
     // Checked on the same read the answer is applied to (KTD9): nothing
     // between here and the writes below can bring the request back.
@@ -917,7 +1174,7 @@ pub fn resume(
                 .collect()
         })
         .unwrap_or_default();
-    let values = validate_values(pending.fields(), &delivery.values, &optional_resume_fields)?;
+    let mut values = validate_values(pending.fields(), &delivery.values, &optional_resume_fields)?;
     let agent_message = delivery
         .agent_message
         .as_deref()
@@ -925,12 +1182,25 @@ pub fn resume(
         .filter(|message| !message.is_empty());
     if agent_message.is_some()
         && (pending.continuation != InputContinuation::ResolveOutput
+            && !(allow_permission && pending.continuation == InputContinuation::ResolvePermission)
             || delivery.chosen_label.is_some()
             || !delivery.data.is_empty()
             || !delivery.variables.is_empty()
             || !values.is_empty())
     {
         return Err(HumanActionError::UnexpectedStepValues);
+    }
+    if pending.continuation == InputContinuation::ResolvePermission {
+        if let Some(decision) = &delivery.permission_decision {
+            values.insert(
+                "permission_decision".to_string(),
+                serde_json::json!({
+                    "denial_index": decision.denial_index,
+                    "decision": decision.decision,
+                    "scope": decision.scope,
+                }),
+            );
+        }
     }
     validate_agent_answer(&pending, &values)?;
     let (label, data, variables) = match pending.continuation {
@@ -950,6 +1220,14 @@ pub fn resume(
                 values.clone(),
             )
         }
+        InputContinuation::ResolvePermission if allow_permission => (
+            RESUME_AGENT_LABEL.to_string(),
+            Value::Object(Map::new()),
+            Map::from_iter([(
+                "answer".to_string(),
+                Value::String(agent_message.unwrap_or_default().to_string()),
+            )]),
+        ),
         InputContinuation::ResolveOutput if agent_message.is_some() => (
             RESUME_AGENT_LABEL.to_string(),
             Value::Object(Map::new()),
@@ -997,6 +1275,9 @@ pub fn resume(
                 }
             }
         }
+        InputContinuation::ResolvePermission => {
+            return Err(HumanActionError::PermissionDecisionRequired)
+        }
     };
 
     let resolves_output = pending.continuation == InputContinuation::ResolveOutput;
@@ -1043,6 +1324,7 @@ pub fn resume(
         execution,
         pending,
         result,
+        permission_decision: delivery.permission_decision.clone(),
     })
 }
 

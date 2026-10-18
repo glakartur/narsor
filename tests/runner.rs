@@ -1494,6 +1494,58 @@ async fn the_private_home_is_the_default_and_drops_inherited_api_keys_too() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claude_profile_source_is_merged_into_the_private_work_directory() {
+    if running_as_root() {
+        return;
+    }
+    let root = TempRoot::new();
+    let host_home = root.dir("host-home");
+    let source = root.dir("profile");
+    fs::write(source.join("settings.json"), r#"{"model":"opus"}"#).unwrap();
+    fs::create_dir_all(source.join("..data")).unwrap();
+    let (seen, private_home) = seen_by_the_tools(
+        "task-home-profile",
+        &host_home,
+        &["--claude-profile-source", &source.display().to_string()],
+    )
+    .await;
+    // The storage goes with its fixture; what was merged is the profile
+    // module's to test, where the harness looks is this one's.
+    let work = private_home.join(".claude");
+    assert!(
+        seen.contains(&format!("\nclaude={}\n", work.display())),
+        "{seen}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claude_profile_source_equal_to_the_work_directory_is_not_copied() {
+    if running_as_root() {
+        return;
+    }
+    let root = TempRoot::new();
+    let host_home = root.dir("host-home");
+    let claude = root.dir("claude");
+    fs::write(claude.join("settings.json"), "{}").unwrap();
+    let claude = claude.display().to_string();
+    let (seen, private_home) = seen_by_the_tools(
+        "task-home-profile-local",
+        &host_home,
+        &[
+            "--home",
+            "host",
+            "--claude-config-dir",
+            &claude,
+            "--claude-profile-source",
+            &claude,
+        ],
+    )
+    .await;
+    assert!(seen.contains(&format!("\nclaude={claude}\n")), "{seen}");
+    assert!(!private_home.join(".claude").exists());
+}
+
 // ---------------------------------------------------------------------------
 // Secrets by reference (R19)
 // ---------------------------------------------------------------------------

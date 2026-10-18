@@ -63,7 +63,8 @@ use serde_json::Value;
 use narsor_protocol::api::{
     ClaimRequest, ConversationResponse as ConversationPage, HumanInputDeliveryDto, MaterialFile,
     MaterialListResponse, MaterialSummary, MaterialUploadResponse, MaterialView, OwnerView,
-    ProposalOutcome, Timeline, UndoOutcome, WhoAmIResponse, BUNDLE_CONTENT_TYPE,
+    PermissionDecisionRequestDto, ProposalOutcome, Timeline, UndoOutcome, WhoAmIResponse,
+    BUNDLE_CONTENT_TYPE,
 };
 use narsor_protocol::controller::{
     ControlEventEnvelope, ConversationResponse as RemoteConversationResponse, MoveTaskRequest,
@@ -336,6 +337,16 @@ impl ApiClient {
     ) -> Result<AcceptedResponse, ClientError> {
         let url = format!("{}/executions/{execution_id}/input", self.base_url);
         self.post_json(&url, &delivery).await
+    }
+
+    /// Resolves one pending Claude Code permission decision.
+    pub async fn resolve_permission(
+        &self,
+        execution_id: &str,
+        request: PermissionDecisionRequestDto,
+    ) -> Result<AcceptedResponse, ClientError> {
+        let url = format!("{}/executions/{execution_id}/permission", self.base_url);
+        self.post_json(&url, &request).await
     }
 
     /// A manual or forced transition — `POST /executions/:id/transition`.

@@ -8,9 +8,10 @@ pub use dto::{
     ChatMessageRequest, ConductorActivity, ConductorChatResponse, ConductorPurposeDto,
     ConductorStateResponse, ConductorTriggerDto, ConversationEntryDto, ConversationEntrySource,
     ConversationResponse, ExecutionListResponse, ExecutionStatusDto, ExecutionSummary,
-    HarnessSelectionSnapshot, HumanInputDeliveryDto, OperatorNoteRequest, ProblemKindDto,
-    RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest, StartTaskResponse,
-    TransitionRequest,
+    HarnessSelectionSnapshot, HumanInputDeliveryDto, OperatorNoteRequest, PermissionDecisionDto,
+    PermissionDecisionKindDto, PermissionDecisionRequestDto, PermissionGrantScopeDto,
+    ProblemKindDto, RequestErrorResponse, SetHarnessSelectionRequest, StartTaskRequest,
+    StartTaskResponse, TransitionRequest,
 };
 pub use narsor_shared::api_error::{handle_json_response, ClientError};
 mod projection;

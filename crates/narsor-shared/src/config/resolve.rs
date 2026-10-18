@@ -96,7 +96,8 @@ impl Flags {
             | SettingKey::LocalWorkspaceRoots
             | SettingKey::LocalHome
             | SettingKey::LocalCodexHome
-            | SettingKey::LocalClaudeConfigDir => None,
+            | SettingKey::LocalClaudeConfigDir
+            | SettingKey::LocalClaudeProfileSource => None,
         }
     }
 }
@@ -290,6 +291,9 @@ impl Resolved {
             codex_home: self.text(SettingKey::LocalCodexHome).map(PathBuf::from),
             claude_config_dir: self
                 .text(SettingKey::LocalClaudeConfigDir)
+                .map(PathBuf::from),
+            claude_profile_source: self
+                .text(SettingKey::LocalClaudeProfileSource)
                 .map(PathBuf::from),
         }
     }

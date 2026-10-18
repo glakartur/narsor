@@ -127,8 +127,9 @@ impl HarnessAdapter for OpenCodeAdapter {
             });
         }
 
-        if request.workspace_access == WorkspaceAccess::ReadWrite {
-            args.push("--auto".to_string());
+        match request.workspace_access {
+            Some(WorkspaceAccess::ReadWrite) => args.push("--auto".to_string()),
+            Some(WorkspaceAccess::ReadOnly) | None => {}
         }
 
         // Takes exactly one value, so the message cannot be swallowed.
@@ -236,6 +237,7 @@ impl HarnessStreamParser for OpenCodeStreamParser {
             session_id: self.session_id,
             failure,
             structured_output: None,
+            permission_denials: Vec::new(),
         }
     }
 }

@@ -4,11 +4,12 @@
 //! non-interactive one:
 //!
 //! ```text
-//! claude --print --output-format stream-json --verbose \
-//!        [--add-dir <read_only_paths…>] [--model <model>] [--max-turns <n>] \
+//! claude --print --verbose --permission-prompts none \
+//!        [--add-dir <read_only_paths…>] [--allowedTools <rule>] \
+//!        [--model <model>] [--max-turns <n>] \
 //!        [--append-system-prompt <text>] [--resume <session-id>] \
 //!        [--json-schema <schema>] \
-//!        --permission-mode <mode> \
+//!        --output-format stream-json [--permission-mode <mode>] \
 //!        <prompt>
 //! ```
 //!
@@ -35,10 +36,12 @@
 //!   requires `"type": "object"` there, so the schema is one flat object
 //!   (see [`crate::engine::actions::agent::output_schema`]). The text contract stays in
 //!   the prompt: the schema adds to it, and narsor checks the answer itself.
-//! * `--permission-mode` is **last** before the prompt on purpose. It takes
-//!   exactly one value, so the prompt after it can never be mistaken for a flag
-//!   argument — unlike `--add-dir`, which is variadic and would swallow the
-//!   prompt if it stood there.
+//! * The flag right before the prompt always takes exactly one value —
+//!   `--permission-mode` when the workflow sets `workspace_access`, else
+//!   `--output-format` — so the prompt can never be read as a flag argument.
+//!   `--add-dir` and `--allowedTools` are variadic and come first: right
+//!   before the prompt either would swallow it, and `--resume` without a
+//!   prompt makes the CLI look for a deferred tool call to continue and fail.
 //! * `--resume <id>` is always passed *with* its value: the flag's value is
 //!   optional, and a bare `--resume` would consume the prompt.
 //!
@@ -60,6 +63,7 @@ use serde_json::{Map, Value};
 use super::{
     integer_parameter, reject_option_like, resolve_read_only_path, string_parameter, tail,
     HarnessAdapter, HarnessInvocation, HarnessRequest, HarnessRun, HarnessStreamParser,
+    PermissionDenial,
 };
 use crate::domain::ActionError;
 use crate::domain::WorkspaceAccess;
@@ -121,12 +125,13 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 
         let mut args = vec![
             "--print".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
             "--verbose".to_string(),
+            "--permission-prompts".to_string(),
+            "none".to_string(),
         ];
 
-        // Variadic, so it must never be the last flag before the prompt.
+        // The variadic flags come first: each is followed by another flag,
+        // never by the prompt, which they would swallow.
         if !config.read_only_paths.is_empty() {
             args.push("--add-dir".to_string());
             // No option-like guard here: resolve_read_only_path joins a
@@ -137,6 +142,11 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             for path in &config.read_only_paths {
                 args.push(read_only_arg(request.workspace, path));
             }
+        }
+
+        if !config.permission_grants.is_empty() {
+            args.push("--allowedTools".to_string());
+            args.extend(config.permission_grants.iter().cloned());
         }
 
         if let Some(model) = &config.model {
@@ -170,8 +180,15 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             args.push(schema);
         }
 
-        args.push("--permission-mode".to_string());
-        args.push(mode.to_string());
+        // Single-valued flags close the list, so whatever stands right
+        // before the prompt takes exactly one value.
+        args.push("--output-format".to_string());
+        args.push("stream-json".to_string());
+
+        if let Some(mode) = mode {
+            args.push("--permission-mode".to_string());
+            args.push(mode.to_string());
+        }
 
         args.push(request.prompt.to_string());
 
@@ -216,6 +233,8 @@ struct ClaudeCodeStreamParser {
     subtype: Option<String>,
     /// The `result` line's `structured_output`, when it carried one.
     structured_output: Option<Value>,
+    permission_denials: Vec<PermissionDenial>,
+    denial_reasons: std::collections::HashMap<String, (Option<String>, Option<String>)>,
 }
 
 impl ClaudeCodeStreamParser {
@@ -247,6 +266,7 @@ impl ClaudeCodeStreamParser {
         self.subtype = result.subtype.clone();
         self.reported_error = result.is_error;
         self.structured_output = result.structured_output.clone();
+        self.permission_denials = result.permission_denials.clone();
         self.result_text = result.text.clone().unwrap_or_default();
     }
 }
@@ -256,7 +276,34 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
         let Some(mut object) = parse_object(line) else {
             return classify::invalid_json();
         };
-        let result = classify::ResultLine::take(&mut object);
+        if object.get("type").and_then(Value::as_str) == Some("system")
+            && object.get("subtype").and_then(Value::as_str) == Some("permission_denied")
+        {
+            if let Some(id) = object.get("tool_use_id").and_then(Value::as_str) {
+                self.denial_reasons.insert(
+                    id.to_string(),
+                    (
+                        object
+                            .get("decision_reason_type")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        object
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    ),
+                );
+            }
+        }
+        let mut result = classify::ResultLine::take(&mut object);
+        if let Some(result) = result.as_mut() {
+            for denial in &mut result.permission_denials {
+                if let Some((reason_type, reason)) = self.denial_reasons.get(&denial.tool_use_id) {
+                    denial.reason_type = reason_type.clone();
+                    denial.reason = reason.clone();
+                }
+            }
+        }
         self.accumulate(&object, result.as_ref());
         self.classifier.classify(object, result)
     }
@@ -288,6 +335,7 @@ impl HarnessStreamParser for ClaudeCodeStreamParser {
             session_id: self.session_id,
             failure,
             structured_output: self.structured_output,
+            permission_denials: self.permission_denials,
         }
     }
 }
@@ -303,7 +351,7 @@ fn parse_object(line: &[u8]) -> Option<Map<String, Value>> {
 }
 
 /// The permission mode of this run, validated against what the CLI accepts.
-fn permission_mode<'a>(request: &HarnessRequest<'a>) -> Result<&'a str, ActionError> {
+fn permission_mode<'a>(request: &HarnessRequest<'a>) -> Result<Option<&'a str>, ActionError> {
     if request.config.parameters.contains_key("permission_mode")
         || request
             .config
@@ -322,10 +370,10 @@ fn permission_mode<'a>(request: &HarnessRequest<'a>) -> Result<&'a str, ActionEr
             })),
         });
     }
-    Ok(match request.workspace_access {
+    Ok(request.workspace_access.map(|access| match access {
         WorkspaceAccess::ReadWrite => DEFAULT_PERMISSION_MODE,
         WorkspaceAccess::ReadOnly => "plan",
-    })
+    }))
 }
 
 /// One `--add-dir` entry: the path as the agent will see it.

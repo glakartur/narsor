@@ -14,6 +14,7 @@ use narsor_protocol::chat::{
 use serde_json::{Map, Value};
 
 use super::tools::{call_summary, questions};
+use super::PermissionDenial;
 
 /// Upper bound, in bytes, of a tool result preview. The raw line keeps the
 /// full result; a few KiB show what a tool returned without bloating every
@@ -55,6 +56,8 @@ pub(super) struct ResultLine {
     pub(super) text: Option<String>,
     /// The `structured_output`, when it is there and not `null`.
     pub(super) structured_output: Option<Value>,
+    /// Permission denials from the final result, if structurally complete.
+    pub(super) permission_denials: Vec<PermissionDenial>,
 }
 
 impl ResultLine {
@@ -65,7 +68,7 @@ impl ResultLine {
             return None;
         }
         let subtype = str_field(line, "subtype").map(str::to_string);
-        let is_error = line
+        let mut is_error = line
             .get("is_error")
             .and_then(Value::as_bool)
             .unwrap_or(false)
@@ -79,11 +82,44 @@ impl ResultLine {
         let structured_output = line
             .remove("structured_output")
             .filter(|value| !value.is_null());
+        let permission_denials: Vec<PermissionDenial> = line
+            .get("permission_denials")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        Some(PermissionDenial {
+                            tool_name: entry.get("tool_name")?.as_str()?.to_string(),
+                            tool_use_id: entry.get("tool_use_id")?.as_str()?.to_string(),
+                            input: entry.get("tool_input")?.clone(),
+                            reason_type: entry
+                                .get("decision_reason_type")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            reason: entry
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            session_id: line
+                                .get("session_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Claude Code can report subtype `success` after recovering from a
+        // denied tool call. Until Narsor has handled that denial, the run is
+        // not a completed success.
+        is_error |= !permission_denials.is_empty();
         Some(Self {
             subtype,
             is_error,
             text,
             structured_output,
+            permission_denials,
         })
     }
 

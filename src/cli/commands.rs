@@ -646,6 +646,11 @@ pub struct InputAnswer {
     pub variables: Vec<String>,
     /// `--comment`.
     pub comment: Option<String>,
+    /// `--permission` choice for a Claude Code permission wait.
+    pub permission: Option<String>,
+    /// `--denial-index` within the pending permission request; every denial
+    /// when `None`.
+    pub denial_index: Option<usize>,
 }
 
 /// `narsor input <id> [--field k=v]… [--label l] [--data k=v]… [--variable k=v]…
@@ -717,6 +722,46 @@ pub async fn input(
         )));
     };
     delivery.episode = Some(pending.episode_key().to_string());
+
+    let permission_wait =
+        pending.continuation == narsor_protocol::api::InputContinuationView::ResolvePermission;
+    if permission_wait {
+        let choice = answer.permission.as_deref().ok_or_else(|| CliError::usage(
+            "This execution needs a permission decision. Use --permission deny, allow-exact, or allow-group.",
+        ))?;
+        let (decision, scope) = match choice {
+            "deny" => (narsor_protocol::api::PermissionDecisionKindDto::Deny, None),
+            "allow-exact" => (
+                narsor_protocol::api::PermissionDecisionKindDto::Allow,
+                Some(narsor_protocol::api::PermissionGrantScopeDto::ExactOperation),
+            ),
+            _ => (
+                narsor_protocol::api::PermissionDecisionKindDto::Allow,
+                Some(narsor_protocol::api::PermissionGrantScopeDto::CommandGroup),
+            ),
+        };
+        client
+            .resolve_permission(
+                execution_id,
+                narsor_protocol::api::PermissionDecisionRequestDto {
+                    episode: pending.episode_key().to_string(),
+                    permission_decision: narsor_protocol::api::PermissionDecisionDto {
+                        denial_index: answer.denial_index,
+                        decision,
+                        scope,
+                    },
+                },
+            )
+            .await
+            .map_err(|error| client_error(execution_id, error))?;
+        wait_until_stopped(&client, execution_id, current.status).await?;
+        return Ok(());
+    }
+    if answer.permission.is_some() {
+        return Err(CliError::usage(
+            "--permission can only answer a permission request.",
+        ));
+    }
 
     client
         .deliver_input(execution_id, delivery)
@@ -1598,6 +1643,25 @@ fn print_pending_input(pending: &impl serde::Serialize) {
             "  --field {}=…  ({field_type}, {requirement}{options})",
             field["name"].as_str().unwrap_or("?")
         );
+    }
+    if let Some(denials) = pending["permission"]["denials"].as_array() {
+        for (index, denial) in denials.iter().enumerate() {
+            let operation = serde_json::to_string(&denial["input"])
+                .unwrap_or_else(|_| "(unavailable)".to_string());
+            println!(
+                "  Permission denial {index}: {} {}",
+                without_unsafe_chars(denial["tool_name"].as_str().unwrap_or("tool")),
+                without_unsafe_chars(&operation),
+            );
+            println!(
+                "    cwd: {}",
+                without_unsafe_chars(denial["cwd"].as_str().unwrap_or("(unknown)")),
+            );
+            if let Some(reason) = denial["reason"].as_str() {
+                println!("    reason: {}", without_unsafe_chars(reason));
+            }
+        }
+        println!("  Decide with --permission deny, allow-exact, or allow-group.");
     }
     let outputs = pending["outputs"].as_array().cloned().unwrap_or_default();
     let problem = &pending["problem"];

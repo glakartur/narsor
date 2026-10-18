@@ -47,7 +47,7 @@ pub struct HarnessRequest<'a> {
 
     /// Workflow-level workspace access, already parsed independently of the
     /// selected harness.
-    pub workspace_access: WorkspaceAccess,
+    pub workspace_access: Option<WorkspaceAccess>,
 
     /// The prompt as the harness will receive it: the state's prompt with the
     /// output-label contract appended.
@@ -94,6 +94,21 @@ pub struct HarnessRun {
     /// [`HarnessRequest::output_schema`], when it reported one. The caller
     /// still checks it, and falls back to `text` when it is absent or unusable.
     pub structured_output: Option<Value>,
+
+    /// Structured permission denials emitted by Claude Code in the final
+    /// `result` record. Other harnesses leave this empty.
+    pub permission_denials: Vec<PermissionDenial>,
+}
+
+/// A Claude Code permission denial correlated to the attempted tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionDenial {
+    pub tool_name: String,
+    pub tool_use_id: String,
+    pub input: Value,
+    pub reason_type: Option<String>,
+    pub reason: Option<String>,
+    pub session_id: Option<String>,
 }
 
 /// A stateful parser fed one stdout line at a time as the harness streams,

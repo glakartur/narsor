@@ -490,9 +490,9 @@ pub struct AgentActionSchema {
     pub model: Option<String>,
 
     /// Workspace permission, translated to native harness permissions at run
-    /// time. Omitted means `read-write`.
+    /// time. Omission leaves the harness's own configuration in effect.
     #[serde(default)]
-    pub workspace_access: crate::domain::WorkspaceAccess,
+    pub workspace_access: Option<crate::domain::WorkspaceAccess>,
 
     pub prompt: String,
 

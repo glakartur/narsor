@@ -15,7 +15,9 @@ use narsor_engine::domain::{
     HumanInputType, OutputDefinition, WorkflowExecution, Workspace,
 };
 use narsor_engine::engine::actions::human::{
-    self, HumanActionError, PendingHumanInput, ResumedHumanAction,
+    self, HumanActionError, HumanInputRequest, PendingHumanInput, PermissionDecision,
+    PermissionDecisionKind, PermissionDenialDetails, PermissionGrantScope,
+    PermissionRequestDetails, ResumedHumanAction,
 };
 use narsor_engine::engine::{
     ActionExecutor, ActionOutcome, ActionRequest, HumanExecutor, HumanInputDelivery,
@@ -287,6 +289,185 @@ async fn entering_a_human_state_pauses_logs_and_stores_the_request() {
     assert_eq!(read.state_id, "human_clarification");
     assert_eq!(read.outputs, labels(&["clarified", "abort"]));
     assert_eq!(read.fields()[0].name, "clarification_text");
+}
+
+#[test]
+fn permission_wait_survives_reload_and_rejects_ordinary_input() {
+    let root = TempRoot::new();
+    let store = root.store();
+    let mut execution = start_execution(&store, root.path());
+    let request = HumanInputRequest {
+        action_execution_id: "attempt-permission".to_string(),
+        instruction: "Claude Code needs a permission decision.".to_string(),
+        fields: Vec::new(),
+        question: None,
+        answer_tail: Some("The command was blocked.".to_string()),
+        agent_harness: Some("claude-code".to_string()),
+        agent_session_id: Some("session-permission".to_string()),
+        prefilled_answer: None,
+        permission: Some(PermissionRequestDetails {
+            denials: vec![PermissionDenialDetails {
+                tool_name: "Bash".to_string(),
+                tool_use_id: "tool-permission".to_string(),
+                input: json!({ "command": "cargo build" }),
+                cwd: root.path().to_string_lossy().into_owned(),
+                reason_type: Some("subcommandResults".to_string()),
+                reason: Some("This command requires approval.".to_string()),
+            }],
+        }),
+    };
+    let pending = PendingHumanInput::for_permission(
+        execution.id.clone(),
+        execution.current_state.clone().unwrap_or_default(),
+        request,
+    );
+    human::suspend(&store, &mut execution, &pending).expect("persist permission wait");
+
+    let reloaded: PendingHumanInput = store
+        .load_pending_input(&execution.id)
+        .expect("read pending")
+        .expect("permission wait persisted");
+    assert_eq!(
+        reloaded.continuation,
+        narsor_engine::engine::InputContinuation::ResolvePermission
+    );
+    assert_eq!(
+        reloaded.request.permission.as_ref().unwrap().denials[0].tool_use_id,
+        "tool-permission"
+    );
+    assert_eq!(
+        store.load_execution(&execution.id).unwrap().status,
+        ExecutionStatus::InputNeeded
+    );
+
+    let error = human::resume(&store, &execution.id, &HumanInputDelivery::default())
+        .expect_err("ordinary input cannot resolve a permission request");
+    assert!(matches!(
+        error,
+        HumanActionError::PermissionDecisionRequired
+    ));
+    assert!(store.has_pending_input(&execution.id));
+
+    let resumed = human::resolve_permission(
+        &store,
+        &execution.id,
+        PermissionDecision {
+            denial_index: Some(0),
+            decision: PermissionDecisionKind::Allow,
+            scope: Some(PermissionGrantScope::ExactOperation),
+        },
+        reloaded.episode_key(),
+    )
+    .expect("the dedicated operation accepts a supported exact grant");
+    assert_eq!(resumed.execution.status, ExecutionStatus::Running);
+    assert!(resumed.permission_decision.is_some());
+    assert!(!store.has_pending_input(&execution.id));
+}
+
+#[test]
+fn permission_grant_rules_name_each_part_and_refuse_what_they_cannot_pin_down() {
+    let denial = PermissionDenialDetails {
+        tool_name: "Bash".into(),
+        tool_use_id: "tool-1".into(),
+        input: json!({"command":"cargo test"}),
+        cwd: "/tmp/task".into(),
+        reason_type: Some("subcommandResults".into()),
+        reason: None,
+    };
+    let rules =
+        |denial: &PermissionDenialDetails, scope| human::claude_permission_rules(denial, scope);
+    assert_eq!(
+        rules(&denial, PermissionGrantScope::ExactOperation),
+        Some(vec!["Bash(cargo test)".to_string()])
+    );
+    assert_eq!(
+        rules(&denial, PermissionGrantScope::CommandGroup),
+        Some(vec!["Bash(cargo test *)".to_string()])
+    );
+    // Claude Code allows a compound command part by part.
+    let mut compound = denial.clone();
+    compound.input = json!({"command":"cargo test 2>&1 | tail -20 && curl example.com"});
+    assert_eq!(
+        rules(&compound, PermissionGrantScope::ExactOperation),
+        Some(vec![
+            "Bash(cargo test)".to_string(),
+            "Bash(tail -20)".to_string(),
+            "Bash(curl example.com)".to_string(),
+        ])
+    );
+    let mut substituted = denial.clone();
+    substituted.input = json!({"command":"cargo test $(cat flags)"});
+    assert!(rules(&substituted, PermissionGrantScope::ExactOperation).is_none());
+    // What `--permission-prompts none` reports for a command nobody could
+    // approve (Claude Code 2.1.3xx).
+    let mut unattended = denial.clone();
+    unattended.reason_type = Some("asyncAgent".into());
+    assert!(rules(&unattended, PermissionGrantScope::ExactOperation).is_some());
+    for reason in ["other", "rule", "hook"] {
+        let mut policy = denial.clone();
+        policy.reason_type = Some(reason.into());
+        assert!(
+            rules(&policy, PermissionGrantScope::ExactOperation).is_none(),
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn a_decision_without_an_index_grants_every_denial_or_none() {
+    let denial = |command: &str, reason: &str| PermissionDenialDetails {
+        tool_name: "Bash".into(),
+        tool_use_id: format!("tool-{command}"),
+        input: json!({ "command": command }),
+        cwd: "/tmp/task".into(),
+        reason_type: Some(reason.into()),
+        reason: None,
+    };
+    let request = |denials| HumanInputRequest {
+        action_execution_id: "attempt".to_string(),
+        instruction: String::new(),
+        fields: Vec::new(),
+        question: None,
+        answer_tail: None,
+        agent_harness: Some("claude-code".to_string()),
+        agent_session_id: Some("session".to_string()),
+        prefilled_answer: None,
+        permission: Some(PermissionRequestDetails { denials }),
+    };
+    let allow_all = PermissionDecision {
+        denial_index: None,
+        decision: PermissionDecisionKind::Allow,
+        scope: Some(PermissionGrantScope::ExactOperation),
+    };
+    let both = request(vec![
+        denial("cargo fmt --check && cargo test", "asyncAgent"),
+        denial("cargo test | tail -5", "asyncAgent"),
+    ]);
+    assert_eq!(
+        human::granted_rules(&both, &allow_all).unwrap(),
+        vec![
+            "Bash(cargo fmt --check)".to_string(),
+            "Bash(cargo test)".to_string(),
+            "Bash(tail -5)".to_string(),
+        ],
+        "every part once"
+    );
+    let one_blocked = request(vec![
+        denial("cargo test", "asyncAgent"),
+        denial("rm -rf build", "rule"),
+    ]);
+    assert!(
+        human::granted_rules(&one_blocked, &allow_all).is_err(),
+        "a policy block is never granted with the rest"
+    );
+    let only_first = PermissionDecision {
+        denial_index: Some(0),
+        ..allow_all
+    };
+    assert_eq!(
+        human::granted_rules(&one_blocked, &only_first).unwrap(),
+        vec!["Bash(cargo test)".to_string()]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -789,7 +970,6 @@ use narsor_engine::domain::{AnsweredBy, InputCloseReason};
 use narsor_engine::engine::actions::human::{
     InputContinuation, OutputProblem, OutputRequirement, RejectedAnswer,
 };
-use narsor_engine::engine::HumanInputRequest;
 
 /// Suspends `execution` on a problem of state `work`: labels `implemented`
 /// (needs `variables.summary`) and `needs_human_decision` (needs
@@ -804,6 +984,7 @@ fn raise_problem(store: &ExecutionStore, execution: &mut WorkflowExecution) -> P
         agent_harness: None,
         agent_session_id: None,
         prefilled_answer: None,
+        permission: None,
     };
     let problem = OutputProblem {
         reason: "no output label".to_string(),

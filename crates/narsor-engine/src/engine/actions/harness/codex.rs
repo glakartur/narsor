@@ -71,9 +71,10 @@ impl HarnessAdapter for CodexAdapter {
             reject_option_like(model, "model", CODEX)?;
             common.extend(["--model".to_string(), model.clone()]);
         }
+        if let Some(sandbox) = sandbox {
+            common.extend(["--sandbox".to_string(), sandbox]);
+        }
         common.extend([
-            "--sandbox".to_string(),
-            sandbox.to_string(),
             "--config".to_string(),
             format!("approval_policy={APPROVAL_POLICY}"),
         ]);
@@ -128,7 +129,7 @@ fn validate_parameters(request: &HarnessRequest<'_>) -> Result<(), ActionError> 
     Ok(())
 }
 
-fn sandbox(request: &HarnessRequest<'_>) -> Result<String, ActionError> {
+fn sandbox(request: &HarnessRequest<'_>) -> Result<Option<String>, ActionError> {
     if request.config.parameters.contains_key("sandbox") {
         return Err(ActionError {
             message: "parameter 'sandbox' is no longer supported for harness 'codex'; use workflow-level 'workspace_access'".to_string(),
@@ -136,11 +137,13 @@ fn sandbox(request: &HarnessRequest<'_>) -> Result<String, ActionError> {
             details: Some(serde_json::json!({ "harness": CODEX, "parameter": "sandbox" })),
         });
     }
-    Ok(match request.workspace_access {
-        WorkspaceAccess::ReadWrite => "workspace-write",
-        WorkspaceAccess::ReadOnly => "read-only",
-    }
-    .to_string())
+    Ok(request.workspace_access.map(|access| {
+        match access {
+            WorkspaceAccess::ReadWrite => "workspace-write",
+            WorkspaceAccess::ReadOnly => "read-only",
+        }
+        .to_string()
+    }))
 }
 
 /// Codex's `--add-dir` grants workspace access, so it must not be used for
@@ -254,6 +257,7 @@ impl HarnessStreamParser for CodexStreamParser {
             session_id: self.thread_id,
             failure,
             structured_output: None,
+            permission_denials: Vec::new(),
         }
     }
 }
