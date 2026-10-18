@@ -1729,6 +1729,25 @@ mod task_app_list {
         with_controller(task(id, backend, runner_state, rank))
     }
 
+    /// The read the application does after an event: the task as the control
+    /// plane sees it now, `change` applied and its state derived again.
+    fn reread(
+        app: &mut TaskApp,
+        id: &str,
+        revision: u64,
+        change: impl FnOnce(&mut narsor_engine::controller_protocol::TaskSummary),
+    ) {
+        let mut tasks = app.list().tasks().to_vec();
+        let task = tasks
+            .iter_mut()
+            .find(|task| task.task_id.as_str() == id)
+            .unwrap();
+        change(task);
+        task.state = super::task_app_support::served_state(task);
+        task.revision = revision;
+        app.load(listing(tasks, "read"));
+    }
+
     mod order {
         use super::*;
 
@@ -1766,7 +1785,9 @@ mod task_app_list {
                     },
                 ));
                 assert_eq!(titles(&app), order, "{id} provisioning");
-                assert_eq!(row(&app, id).1, StateIcon::Provisioning);
+                assert!(app.refresh_wanted(), "the event carries no state to show");
+                reread(&mut app, id, sequence, |task| task.holds_slot = true);
+                assert_eq!(row(&app, id).1, StateIcon::Queued);
                 // Whoever waits behind moves up in the queue, not on screen.
                 let waiting_behind = ["a", "b", "c"].iter().skip(index + 1).count();
                 if waiting_behind > 0 {
@@ -1786,6 +1807,7 @@ mod task_app_list {
                     },
                 ));
                 assert_eq!(titles(&app), order, "{id} running");
+                reread(&mut app, id, sequence, |task| task.holds_slot = true);
                 assert_eq!(row(&app, id).1, StateIcon::Running);
 
                 // The debounced read brings the runner's step.
@@ -1811,6 +1833,9 @@ mod task_app_list {
                     },
                 ));
                 assert_eq!(titles(&app), order, "{id} done");
+                reread(&mut app, id, sequence, |task| {
+                    task.runner.as_mut().unwrap().execution_status = ExecutionStatus::Completed;
+                });
                 assert_eq!(
                     row(&app, id),
                     (Attention::None, StateIcon::Done, "done".into())
@@ -3368,7 +3393,7 @@ mod task_app_detail {
             let provisioning = task("b", "local", "provisioning", 2);
             assert_eq!(
                 unstarted_message(&provisioning, None).as_deref(),
-                Some("jeszcze nie wystartowało, provisioning")
+                Some("jeszcze nie wystartowało, w kolejce")
             );
             assert_eq!(unstarted_message(&running("c", 3), None), None);
         }
@@ -4134,7 +4159,7 @@ mod task_app_waiting {
     use super::remote_support::{snapshot, RemoteHarness};
     use super::task_app_support::{
         event, listing, position, task, timeline, titled, waiting_on, with_controller,
-        with_pending, with_runner,
+        with_pending, with_runner, without_slot,
     };
     use narsor_engine::domain::ExecutionStatus;
 
@@ -4541,6 +4566,140 @@ mod task_app_waiting {
         let delivery = delivery(press(&mut app, KeyCode::Enter));
         assert_eq!(delivery.chosen_label.as_deref(), Some("replan"));
         assert_eq!(delivery.values["ambiguity_decision"], "replan");
+    }
+
+    fn note(app: &TaskApp) -> String {
+        app.notifier()
+            .latest()
+            .map(|note| note.text.clone())
+            .unwrap_or_default()
+    }
+
+    /// A control plane that answers an input with "queued" and every list of
+    /// tasks with `tasks`; anything else is not found.
+    async fn serving(tasks: Vec<narsor_engine::controller_protocol::TaskSummary>) -> ApiClient {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let tasks = serde_json::to_string(&listing(tasks, "after")).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let tasks = tasks.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (head_end, wanted) = loop {
+                        let read = stream.read(&mut chunk).await.unwrap_or(0);
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        let text = String::from_utf8_lossy(&request).to_string();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let length = text
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|value| value.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            break (end + 4, length);
+                        }
+                    };
+                    while request.len() < head_end + wanted {
+                        let read = stream.read(&mut chunk).await.unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let head = String::from_utf8_lossy(&request[..head_end]).to_string();
+                    let first = head.lines().next().unwrap_or_default().to_string();
+                    let (status, body) = if first.contains("/input") {
+                        (
+                            "200 OK",
+                            json!({
+                                "input": {
+                                    "input_id": "in-1",
+                                    "pending_input_id": "ep-1",
+                                    "status": "queued",
+                                    "submitted_at": "2026-10-09T12:00:00Z",
+                                    "updated_at": "2026-10-09T12:00:00Z",
+                                    "detail": null
+                                },
+                                "replayed": false
+                            })
+                            .to_string(),
+                        )
+                    } else if first.contains("/control/v1/tasks?") {
+                        ("200 OK", tasks)
+                    } else {
+                        ("404 Not Found", "{}".to_string())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        ApiClient::new(address, "token")
+    }
+
+    /// AE1: a task that waits for an answer holds no slot, and the panel
+    /// still takes the answer. When the backend is full the answer's resume
+    /// waits in the queue, and the bar says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_to_a_task_without_a_slot_is_taken_and_says_when_it_queues() {
+        use narsor_engine::orchestration::TaskState;
+
+        let asking = without_slot(with_pending(running("a", 1), question(None)));
+        assert_eq!(asking.state, TaskState::HumanNeeded);
+        assert!(!asking.holds_slot);
+
+        // After the answer the control plane put the task at the queue's front.
+        let mut resumed = asking.clone();
+        resumed.runner_state = RunnerState::Queued;
+        resumed.state = TaskState::Queued;
+        resumed.revision = 2;
+        let client = serving(vec![titled(resumed, "NAR-12")]).await;
+
+        let mut app = TaskApp::new(client, "local", None);
+        app.load(listing(vec![titled(asking, "NAR-12")], "c"));
+        ch(&mut app, ' ');
+        press(&mut app, KeyCode::Enter);
+        assert!(app.panel_focused(), "the answer panel is active");
+        assert_eq!(press(&mut app, KeyCode::Enter), Request::None);
+        typed(&mut app, "wersja 2");
+        let request = press(&mut app, KeyCode::Enter);
+        assert!(matches!(request, Request::Answer(_)), "{request:?}");
+        app.perform(request).await;
+        assert!(note(&app).contains("w kolejce"), "{}", note(&app));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_to_a_task_with_a_slot_does_not_say_queued() {
+        let client = serving(Vec::new()).await;
+        let mut app = TaskApp::new(client, "local", None);
+        app.load(listing(
+            vec![titled(
+                with_pending(running("a", 1), question(None)),
+                "NAR-12",
+            )],
+            "c",
+        ));
+        ch(&mut app, ' ');
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        typed(&mut app, "wersja 2");
+        let request = press(&mut app, KeyCode::Enter);
+        app.perform(request).await;
+        assert!(!note(&app).contains("w kolejce"), "{}", note(&app));
     }
 
     #[test]
@@ -6245,7 +6404,7 @@ mod task_app_actions {
             );
             assert_eq!(
                 unavailable(&runner_state("provisioning"), TaskAction::PauseResume),
-                "zadanie jest przygotowywane"
+                "zadanie jest w kolejce"
             );
             assert!(
                 unavailable(&runner_state("interrupted"), TaskAction::PauseResume)

@@ -23,7 +23,7 @@ use crate::tui::task_app::list::{attention_of, Attention};
 use narsor_protocol::controller::PendingInputRefView;
 use narsor_protocol::controller::{
     AttentionItem, AttentionKind, ConversationAttemptSummary, InputStatus, OperatorCommand,
-    OwnerCommand, QueueReason, RunnerState, SlotReleaseReason, TaskEvent, TaskEventKind,
+    OwnerCommand, QueueReason, RunnerState, SlotReleaseReason, TaskEvent, TaskEventKind, TaskState,
 };
 use narsor_protocol::display::{exhaustion_loss, loss_state, LossState};
 
@@ -85,14 +85,41 @@ pub fn runner_state_name(runner_state: RunnerState) -> &'static str {
     }
 }
 
-/// The tone of a runner_state on its own.
-pub fn runner_state_tone(runner_state: RunnerState) -> Tone {
-    match runner_state {
-        RunnerState::Running | RunnerState::Provisioning => Tone::Good,
-        RunnerState::Queued | RunnerState::PauseRequested | RunnerState::Stopped => Tone::Normal,
-        RunnerState::Interrupted | RunnerState::Unknown => Tone::Error,
-        RunnerState::Archiving | RunnerState::Archived => Tone::Muted,
+/// A [`TaskState`] as people read it: the one word every list, header and
+/// detail uses for what the owner sees.
+pub fn task_state_name(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Queued => "queued",
+        TaskState::Running => "running",
+        TaskState::HumanNeeded => "awaiting input",
+        TaskState::Paused => "paused",
+        TaskState::Finished => "done",
+        TaskState::Error => "failed",
+        TaskState::Archived => "archived",
+        TaskState::Unrecognized => "unknown",
     }
+}
+
+/// The tone of a [`TaskState`] on its own.
+pub fn task_state_tone(state: TaskState) -> Tone {
+    match state {
+        TaskState::Running => Tone::Good,
+        TaskState::Queued | TaskState::Paused | TaskState::Finished => Tone::Normal,
+        TaskState::HumanNeeded => Tone::Warning,
+        TaskState::Error => Tone::Error,
+        TaskState::Archived | TaskState::Unrecognized => Tone::Muted,
+    }
+}
+
+/// Whether the task is in a state that does not need a slot to be in and
+/// holds none: the owner sees "no slot" next to it. A task that is pausing
+/// still holds its slot, so it has no such note.
+pub fn without_slot(task: &TaskSummary) -> bool {
+    !task.holds_slot
+        && matches!(
+            task.state,
+            TaskState::Finished | TaskState::HumanNeeded | TaskState::Error | TaskState::Paused
+        )
 }
 
 /// The short badge of a queued task's scheduler verdict (U10).
@@ -206,28 +233,26 @@ pub fn record_unreadable_detail(error: &ClientError) -> Option<String> {
     }
 }
 
-/// The one-line status of a task in the list: its runner_state, then the most
-/// useful detail — the queue verdict, a pending question, a runner problem,
-/// or the runner's status — with staleness marked.
+/// The one-line status of a task in the list: its state, then the most
+/// useful detail — the queue verdict, a runner problem, a missing slot, or
+/// staleness.
 pub fn status_badge(task: &TaskSummary) -> ToneLine {
-    let runner_state = runner_state_name(task.runner_state);
-    if task.runner_state == RunnerState::Queued {
+    let state = task_state_name(task.state);
+    let tone = task_state_tone(task.state);
+    if task.state == TaskState::Queued {
         if let Some(queue) = &task.queue {
             let badge = queue_badge(queue);
-            return ToneLine::new(format!("{runner_state} · {}", badge.text), badge.tone);
+            return ToneLine::new(format!("{state} · {}", badge.text), badge.tone);
         }
     }
     if let Some(runner) = &task.runner {
         if let Some(problem) = &runner.problem {
-            return ToneLine::new(format!("{runner_state} · {}", problem.code), Tone::Error);
+            return ToneLine::new(format!("{state} · {}", problem.code), Tone::Error);
         }
-        if awaiting_input(task).is_some() {
-            return ToneLine::new(format!("{runner_state} · awaiting input"), Tone::Warning);
-        }
-        if runner.freshness == Freshness::Stale && is_live(task.runner_state) {
+        if runner.freshness == Freshness::Stale && is_live(task) {
             return ToneLine::new(
                 format!(
-                    "{runner_state} · stale ({} ago)",
+                    "{state} · stale ({} ago)",
                     age(
                         task.as_of,
                         runner.last_contact_at.unwrap_or(runner.received_at)
@@ -237,7 +262,10 @@ pub fn status_badge(task: &TaskSummary) -> ToneLine {
             );
         }
     }
-    ToneLine::new(runner_state, runner_state_tone(task.runner_state))
+    if without_slot(task) {
+        return ToneLine::new(format!("{state} · no slot"), tone);
+    }
+    ToneLine::new(state, tone)
 }
 
 /// One row of `narsor task list`: id, backend, queue place, the attention
@@ -384,49 +412,64 @@ pub fn safe_json<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&value)
 }
 
-/// Lifecycles in which a runner is expected to report.
-fn is_live(runner_state: RunnerState) -> bool {
-    matches!(
-        runner_state,
-        RunnerState::Provisioning | RunnerState::Running | RunnerState::PauseRequested
-    )
+/// Whether a runner that holds a slot is expected to report.
+fn is_live(task: &TaskSummary) -> bool {
+    task.holds_slot && matches!(task.state, TaskState::Running | TaskState::Paused)
 }
 
 /// What the owner can do about the task now, in words.
-pub fn runner_state_hint(task: &TaskSummary) -> Option<ToneLine> {
-    let hint = match task.runner_state {
-        RunnerState::Queued => {
+pub fn state_hint(task: &TaskSummary) -> Option<ToneLine> {
+    let hint = match task.state {
+        TaskState::Queued => {
             let queue = task.queue.as_ref()?;
             let tone = queue_badge(queue).tone;
             return Some(ToneLine::new(queue.message.clone(), tone));
         }
-        RunnerState::Provisioning => ToneLine::new(
-            "the backend is preparing storage and the workload",
-            Tone::Normal,
+        TaskState::Running => {
+            // A lost workload that the policy still tries to resume looks
+            // like work to the owner, and says what it waits for.
+            if task.runner_state != RunnerState::Interrupted {
+                return None;
+            }
+            interrupted_hint(task)
+        }
+        TaskState::HumanNeeded if task.holds_slot => ToneLine::new(
+            "the task waits for your answer",
+            Tone::Warning,
         ),
-        RunnerState::Running => return None,
-        RunnerState::PauseRequested => ToneLine::new(
+        TaskState::HumanNeeded => ToneLine::new(
+            "the task waits for your answer and holds no slot; answering resumes it, and it \
+             queues first when the backend is full",
+            Tone::Warning,
+        ),
+        TaskState::Paused if task.holds_slot => ToneLine::new(
             "pausing: waiting for the runner to reach a safe point",
             Tone::Normal,
         ),
-        RunnerState::Stopped => ToneLine::new(
+        TaskState::Paused => ToneLine::new(
             "paused at a safe point; storage is kept and no slot is held — resume (u) or archive (a)",
             Tone::Normal,
         ),
-        RunnerState::Interrupted => interrupted_hint(task),
-        RunnerState::Unknown => ToneLine::new(
-            "the runner is not heard from and its workload may be lost; it still holds its \
-             backend slot — resume (u), start afresh (s) or archive (a)",
+        TaskState::Finished if task.holds_slot => ToneLine::new(
+            "the work ended; the slot is freed shortly — archive (a)",
+            Tone::Normal,
+        ),
+        TaskState::Finished => ToneLine::new(
+            "the work ended; no slot is held — resume (u) or archive (a)",
+            Tone::Normal,
+        ),
+        TaskState::Error if loss_state(task.runner_state, &task.resume).is_some() => {
+            interrupted_hint(task)
+        }
+        TaskState::Error => ToneLine::new(
+            "the task ended with an error; start afresh (s), resume (u) or archive (a)",
             Tone::Error,
         ),
-        RunnerState::Archiving => ToneLine::new(
-            "archiving: deleting the workload and its storage",
-            Tone::Muted,
-        ),
-        RunnerState::Archived => ToneLine::new(
+        TaskState::Archived => ToneLine::new(
             "archived: the workload and its storage were deleted",
             Tone::Muted,
         ),
+        TaskState::Unrecognized => return None,
     };
     Some(hint)
 }
@@ -461,7 +504,7 @@ fn interrupted_hint(task: &TaskSummary) -> ToneLine {
 /// The input request the runner waits on, unless the owner already
 /// answered it (an answer queued, delivered or consumed for that request).
 pub fn awaiting_input(task: &TaskSummary) -> Option<&PendingInputRefView> {
-    if task.runner_state.is_archival() {
+    if matches!(task.state, TaskState::Archived | TaskState::Finished) {
         return None;
     }
     let pending = task.runner.as_ref()?.pending_input.as_ref()?;
@@ -488,11 +531,18 @@ pub fn detail_lines(
         ToneLine::new(format!("Backend    {}", task.backend_id), Tone::Normal),
         ToneLine::new(
             format!(
-                "Lifecycle  {} (generation {})",
-                runner_state_name(task.runner_state),
+                "State      {}{} (generation {})",
+                task_state_name(task.state),
+                if without_slot(task) {
+                    " · no slot"
+                } else if task.holds_slot {
+                    " · slot held"
+                } else {
+                    ""
+                },
                 task.generation
             ),
-            runner_state_tone(task.runner_state),
+            task_state_tone(task.state),
         ),
         ToneLine::new(
             format!(
@@ -503,7 +553,7 @@ pub fn detail_lines(
         ),
     ];
     lines.splice(1..1, display_lines(task));
-    if let Some(hint) = runner_state_hint(task) {
+    if let Some(hint) = state_hint(task) {
         lines.push(hint);
     }
     lines.extend(attention_lines(task));
@@ -926,11 +976,16 @@ pub fn command_outcome(
             } else {
                 ""
             };
+            let queued = if response.queued_for_slot {
+                " and waits first in the queue for a slot"
+            } else {
+                ""
+            };
             ToneLine::new(
                 format!(
-                    "{verb} accepted{replay}: task {} is now {} (generation {})",
+                    "{verb} accepted{replay}: task {} is now {}{queued} (generation {})",
                     response.task.task_id,
-                    runner_state_name(response.task.runner_state),
+                    task_state_name(response.task.state),
                     response.task.generation
                 ),
                 Tone::Good,

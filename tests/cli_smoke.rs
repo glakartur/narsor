@@ -2590,7 +2590,7 @@ mod remote_cli {
 
         let show = remote(&harness, token, &["task", "show", "t-1"]).await;
         assert_eq!(show.code, EXIT_SUCCESS, "{}", show.output());
-        assert!(show.stdout.contains("Lifecycle  queued"), "{}", show.stdout);
+        assert!(show.stdout.contains("State      queued"), "{}", show.stdout);
 
         // A pause of a queued task is refused readably; archive is accepted.
         let pause = remote(&harness, token, &["task", "pause", "t-1"]).await;

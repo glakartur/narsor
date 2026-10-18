@@ -23,7 +23,7 @@ use serde_json::{Map, Value};
 use super::task_text::{
     age, awaiting_input, command_outcome, conversation_lines, conversation_origin,
     default_backend_line, default_harness_line, detail_lines, event_line, list_line, next_waiting,
-    record_unreadable_detail, runner_state_name, safe_json, status_badge, waiting_summary,
+    record_unreadable_detail, safe_json, status_badge, task_state_name, waiting_summary,
     PAGE_BYTE_BUDGET,
 };
 use crate::api::{
@@ -1093,8 +1093,8 @@ pub async fn task(
                 .map_err(|error| failure(&format!("Could not load task '{task_id}'"), error))?;
             let Some(pending) = awaiting_input(&task) else {
                 return Err(CliError::failure(format!(
-                    "Task '{task_id}' is not waiting for input (lifecycle: {}).",
-                    runner_state_name(task.runner_state)
+                    "Task '{task_id}' is not waiting for input (state: {}).",
+                    task_state_name(task.state)
                 )));
             };
             if let Some(wanted) = waiting_id.filter(|wanted| *wanted != pending.id) {

@@ -1491,6 +1491,7 @@ impl TaskApp {
             summary,
             submit,
         } = request;
+        let had_slot = self.holds_slot(&task_id);
         let result = match submit {
             Submit::Input {
                 pending_input_id,
@@ -1538,7 +1539,14 @@ impl TaskApp {
                 self.focus = super::Focus::List;
                 self.panel_focus = false;
                 self.back_to_axis();
-                self.notify(Severity::Success, format!("{title}: {summary}"));
+                // An answer to a task without a slot resumes it; the resume
+                // waits when the backend is full.
+                let note = if self.queued_after_work(&task_id, had_slot).await {
+                    super::actions::QUEUED_FOR_SLOT
+                } else {
+                    ""
+                };
+                self.notify(Severity::Success, format!("{title}: {summary}{note}"));
             }
             Err(error) => {
                 let retryable = super::is_transport(&error);

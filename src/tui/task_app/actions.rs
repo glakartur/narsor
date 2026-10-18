@@ -60,7 +60,7 @@ use crate::controller_protocol::{
 };
 use crate::domain::display::safe_link_url;
 use narsor_protocol::controller::{
-    AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, RunnerState,
+    AttentionKind, OperatorCommand, OperatorCommandStatus, OwnerCommand, RunnerState, TaskState,
 };
 
 use super::super::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
@@ -178,27 +178,40 @@ impl Availability {
 
 /// What the task is, as a clause that begins a reason.
 fn state_phrase(task: &TaskSummary) -> &'static str {
-    match task.runner_state {
-        RunnerState::Queued => "zadanie jest w kolejce",
-        RunnerState::Provisioning => "zadanie jest przygotowywane",
-        RunnerState::Running if is_finished(task) => "zadanie jest zakończone",
-        RunnerState::Running => "zadanie działa",
-        RunnerState::PauseRequested => "zadanie jest wstrzymywane",
-        RunnerState::Stopped => "zadanie jest wstrzymane",
-        RunnerState::Interrupted | RunnerState::Unknown => "zadanie jest przerwane",
-        RunnerState::Archiving | RunnerState::Archived => "zadanie jest archiwizowane",
+    if task.runner_state == RunnerState::Interrupted {
+        return "zadanie jest przerwane";
+    }
+    match task.state {
+        TaskState::Queued => "zadanie jest w kolejce",
+        TaskState::Running => "zadanie działa",
+        TaskState::HumanNeeded => "zadanie czeka na odpowiedź",
+        TaskState::Paused if task.holds_slot => "zadanie jest wstrzymywane",
+        TaskState::Paused => "zadanie jest wstrzymane",
+        TaskState::Finished => "zadanie jest zakończone",
+        TaskState::Error => "zadanie jest przerwane",
+        TaskState::Archived => "zadanie jest archiwizowane",
+        TaskState::Unrecognized => "zadanie jest w nieznanym stanie",
     }
 }
 
-/// Whether the execution ended: completed, failed or cancelled.
+/// Whether the execution ended, one way or the other.
 fn is_finished(task: &TaskSummary) -> bool {
-    matches!(
-        task.runner_state,
-        RunnerState::Running | RunnerState::Provisioning
-    ) && task
-        .runner
-        .as_ref()
-        .is_some_and(|runner| runner.execution_status.is_terminal())
+    matches!(task.state, TaskState::Finished | TaskState::Error)
+}
+
+/// Whether the runner of the task is alive and asked about its step: the task
+/// runs, or waits for an answer with the slot still held.
+fn runner_alive(task: &TaskSummary) -> bool {
+    if task.runner_state == RunnerState::Interrupted {
+        // Its workload is gone, whatever the owner sees while the resume
+        // policy still tries.
+        return false;
+    }
+    match task.state {
+        TaskState::Running => true,
+        TaskState::HumanNeeded => task.holds_slot,
+        _ => false,
+    }
 }
 
 /// Whether the control plane could not prepare the workspace.
@@ -208,24 +221,30 @@ fn provisioning_failed(task: &TaskSummary) -> bool {
         .any(|item| item.kind == AttentionKind::ProvisioningFailed)
 }
 
-/// Why a task is not one whose step can be acted on — `None` when it is
-/// running a step.
+/// Why a task is not one whose step can be acted on — `None` when its
+/// runner is alive and in a step.
 fn not_running(task: &TaskSummary) -> Option<String> {
     let phrase = state_phrase(task);
-    match task.runner_state {
-        RunnerState::Running if is_finished(task) => Some(phrase.to_string()),
-        RunnerState::Running => None,
-        RunnerState::Stopped => Some(format!("{phrase} — wznów je (p)")),
-        RunnerState::Interrupted | RunnerState::Unknown => {
-            Some(match loss_state(task.runner_state, &task.resume) {
-                Some(LossState::AutoResume { attempt, limit }) => format!(
-                "{phrase} — wznowi się samo (próba {attempt}/{limit}) albo uruchom je od nowa (s)"
-            ),
-                _ => format!("{phrase} — uruchom je od nowa (s)"),
-            })
-        }
-        _ => Some(phrase.to_string()),
+    if let Some(LossState::AutoResume { attempt, limit }) =
+        loss_state(task.runner_state, &task.resume)
+    {
+        return Some(format!(
+            "{phrase} — wznowi się samo (próba {attempt}/{limit}) albo uruchom je od nowa (s)"
+        ));
     }
+    if runner_alive(task) {
+        return None;
+    }
+    if task.state == TaskState::HumanNeeded {
+        return Some(format!("{phrase} — odpowiedz, a zadanie wznowi się"));
+    }
+    if task.runner_state == RunnerState::Stopped {
+        return Some(format!("{phrase} — wznów je (p)"));
+    }
+    if task.state == TaskState::Error || task.runner_state == RunnerState::Interrupted {
+        return Some(format!("{phrase} — uruchom je od nowa (s)"));
+    }
+    Some(phrase.to_string())
 }
 
 /// Why the runner of a running task cannot be asked for anything.
@@ -246,10 +265,14 @@ fn runner_unreachable(task: &TaskSummary) -> Option<&'static str> {
 /// connection — that gate is [`TaskApp::mutation_allowed`].
 pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
     match action {
+        // Moving is an operation on the queue itself: only a task that waits
+        // there (not one admitted and about to start) can be moved.
         TaskAction::Move => match task.runner_state {
             RunnerState::Queued => Availability::Available,
             _ => Availability::because("zadanie nie jest w kolejce"),
         },
+        // Resume is a command of the stopped runner, whatever the owner sees
+        // the task as: a finished task without a slot resumes too.
         TaskAction::PauseResume => match task.runner_state {
             RunnerState::Stopped => Availability::Available,
             RunnerState::PauseRequested => Availability::because("zadanie jest już wstrzymywane"),
@@ -280,7 +303,7 @@ pub fn availability(task: &TaskSummary, action: TaskAction) -> Availability {
         TaskAction::Restart => match task.runner_state {
             RunnerState::Interrupted | RunnerState::Unknown => Availability::Available,
             _ if provisioning_failed(task) => Availability::Available,
-            RunnerState::Running if !is_finished(task) => Availability::because(
+            _ if runner_alive(task) => Availability::because(
                 "zadanie działa — jest co przerwać (x), nie ma co uruchamiać od nowa",
             ),
             RunnerState::Stopped | RunnerState::PauseRequested => {
@@ -558,8 +581,8 @@ fn menu_text(task: &TaskSummary, action: TaskAction) -> (String, String) {
         ),
         TaskAction::PauseResume if task.runner_state == RunnerState::Stopped => (
             "wznów".to_string(),
-            "Wznawia zadanie na tym samym storage: runner zaczyna od zapisanego stanu. Backend \
-             może odmówić, gdy nie ma wolnego slotu."
+            "Wznawia zadanie na tym samym storage: runner zaczyna od zapisanego stanu. Gdy \
+             backend jest pełny, zadanie czeka w kolejce na pierwszym miejscu."
                 .to_string(),
         ),
         TaskAction::PauseResume => (
@@ -1143,6 +1166,7 @@ impl TaskApp {
         } = request;
         let signature = key_signature(&task_id, &send);
         let conductor = conductor_command(&send);
+        let had_slot = self.holds_slot(&task_id);
         let result = match send {
             ActionSend::Owner(command) => self
                 .client
@@ -1155,7 +1179,12 @@ impl TaskApp {
                     },
                 )
                 .await
-                .map(|_| None),
+                .map(|response| {
+                    (
+                        None,
+                        response.queued_for_slot || response.task.state == TaskState::Queued,
+                    )
+                }),
             ActionSend::Operator(command) => self
                 .client
                 .control_operator_command(
@@ -1167,15 +1196,20 @@ impl TaskApp {
                     },
                 )
                 .await
-                .map(|response| Some(response.command)),
+                .map(|response| (Some(response.command), false)),
         };
         match result {
-            Ok(None) => {
+            Ok((None, queued)) => {
                 self.action_keys.remove(&signature);
-                self.notify(Severity::Success, format!("{title}: {summary}"));
+                let note = if queued { QUEUED_FOR_SLOT } else { "" };
+                self.notify(Severity::Success, format!("{title}: {summary}{note}"));
             }
-            Ok(Some(command)) => {
+            Ok((Some(command), _)) => {
                 self.action_keys.remove(&signature);
+                // Work for a task without a slot resumes it, and the resume
+                // waits when the backend is full.
+                let queued = command.status != OperatorCommandStatus::Rejected
+                    && self.queued_after_work(&task_id, had_slot).await;
                 if let Some(sent) = conductor {
                     self.conductor_command_sent(&task_id, sent, command.status);
                 }
@@ -1190,7 +1224,8 @@ impl TaskApp {
                     ),
                 };
                 self.list.note_operator_command(&task_id, command);
-                self.notify(severity, format!("{title}: {text}"));
+                let note = if queued { QUEUED_FOR_SLOT } else { "" };
+                self.notify(severity, format!("{title}: {text}{note}"));
             }
             Err(error) => {
                 let retryable = is_transport(&error);
@@ -1209,6 +1244,30 @@ impl TaskApp {
                 self.notify(severity, text);
             }
         }
+    }
+
+    /// Whether the task holds a slot of its backend (`true` for a task the
+    /// list does not know: nothing to wait for).
+    pub(super) fn holds_slot(&self, task_id: &str) -> bool {
+        self.list
+            .tasks()
+            .iter()
+            .find(|task| task.task_id.as_str() == task_id)
+            .is_none_or(|task| task.holds_slot)
+    }
+
+    /// After work was sent to a task that had no slot: whether the task now
+    /// waits in the queue (the backend is full), which only a read tells.
+    pub(super) async fn queued_after_work(&mut self, task_id: &str, had_slot: bool) -> bool {
+        if had_slot {
+            return false;
+        }
+        self.refresh().await;
+        self.list
+            .tasks()
+            .iter()
+            .find(|task| task.task_id.as_str() == task_id)
+            .is_some_and(|task| task.state == TaskState::Queued)
     }
 
     /// Points the browser at a link.
@@ -1241,6 +1300,9 @@ impl TaskApp {
         self.notify(severity, text);
     }
 }
+
+/// What the bar adds when the task waits for a slot after the command.
+pub(super) const QUEUED_FOR_SLOT: &str = " — w kolejce, czeka na slot";
 
 /// What the *Dyrygent* tab sent through the shared path of operator commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -902,7 +902,7 @@ mod task_app_render {
                     "NAR-12",
                 ),
                 titled(
-                    waiting(controlled("c", "interrupted", 3), AttentionKind::Problem),
+                    waiting(controlled("c", "unknown", 3), AttentionKind::Problem),
                     "NAR-9",
                 ),
                 titled(waiting_for_capacity(queued("d", 4), 1, 2, 3), "NAR-16"),
@@ -1184,6 +1184,143 @@ mod task_app_render {
         assert_eq!(bar(&buffer, other).0, " ");
         assert_eq!(bar(&buffer, other + 1).0, " ");
         assert!(no_reversed_in_list(&buffer), "{}", screen(&buffer));
+    }
+
+    /// AE1: a task whose work ended holds no slot: the header counts only the
+    /// slot of the running one, and the row says so next to its state.
+    #[test]
+    fn a_finished_task_without_a_slot_is_marked_and_not_counted() {
+        use crate::task_app_support::{task, without_slot};
+        let mut app = app();
+        let finished = without_slot(titled(
+            with_runner(
+                with_controller(task("a", "local", "running", 1)),
+                ExecutionStatus::Completed,
+                "done",
+            ),
+            "NAR-1",
+        ));
+        let running = titled(
+            with_runner(
+                with_controller(task("b", "local", "running", 2)),
+                ExecutionStatus::Running,
+                "edit",
+            ),
+            "NAR-2",
+        );
+        app.load(listing(vec![finished, running], "c"));
+        let buffer = render(120, 30, &mut app, &Styles::new(false));
+        let header = &rows(&buffer)[0];
+        assert!(header.contains("sloty 1 "), "{header:?}");
+        let list_rows: Vec<String> = rows(&buffer)
+            .iter()
+            .map(|row| row.chars().skip(3).take(25).collect::<String>())
+            .collect();
+        let at = list_rows
+            .iter()
+            .position(|row| row.contains("NAR-1"))
+            .unwrap();
+        assert!(
+            list_rows[at].starts_with("  ✓  NAR-1"),
+            "{:?}",
+            list_rows[at]
+        );
+        assert!(
+            list_rows[at + 1].contains("bez slotu"),
+            "{:?}",
+            list_rows[at + 1]
+        );
+        let at = list_rows
+            .iter()
+            .position(|row| row.contains("NAR-2"))
+            .unwrap();
+        assert!(
+            list_rows[at].starts_with("  ●  NAR-2"),
+            "{:?}",
+            list_rows[at]
+        );
+        assert!(!list_rows[at + 1].contains("bez slotu"));
+    }
+
+    /// Every state has its icon and its label; the rows keep their order.
+    #[test]
+    fn every_task_state_has_an_icon_and_a_label() {
+        use crate::task_app_support::task;
+        use narsor_engine::orchestration::TaskState;
+        let cases = [
+            (TaskState::Queued, "◷", "queued"),
+            (TaskState::Running, "●", "running"),
+            (TaskState::HumanNeeded, "◐", "awaiting input"),
+            (TaskState::Paused, "‖", "paused"),
+            (TaskState::Finished, "✓", "done"),
+            (TaskState::Error, "✗", "failed"),
+            (TaskState::Archived, "✓", "archived"),
+            (TaskState::Unrecognized, "·", "unknown"),
+        ];
+        let mut app = app();
+        let tasks = cases
+            .iter()
+            .enumerate()
+            .map(|(index, (state, _, _))| {
+                let mut one = titled(
+                    with_controller(task(
+                        &format!("t{index}"),
+                        "local",
+                        "running",
+                        index as u32 + 1,
+                    )),
+                    &format!("TASK-{index}"),
+                );
+                one.state = *state;
+                one.holds_slot = true;
+                one
+            })
+            .collect();
+        app.load(listing(tasks, "c"));
+        let buffer = render(120, 40, &mut app, &Styles::new(false));
+        let list_rows: Vec<String> = rows(&buffer)
+            .iter()
+            .map(|row| row.chars().skip(3).take(25).collect::<String>())
+            .collect();
+        let mut last = 0;
+        for (index, (state, glyph, label)) in cases.iter().enumerate() {
+            let at = list_rows
+                .iter()
+                .position(|row| row.contains(&format!("TASK-{index}")))
+                .unwrap_or_else(|| panic!("{state:?} is not shown:\n{}", screen(&buffer)));
+            assert!(
+                list_rows[at].contains(glyph),
+                "{state:?}: {:?}",
+                list_rows[at]
+            );
+            assert!(
+                list_rows[at + 1].contains(label),
+                "{state:?}: {:?}",
+                list_rows[at + 1]
+            );
+            assert!(at >= last, "the rows keep their order");
+            last = at;
+        }
+    }
+
+    /// A summary from a control plane that sends no state is drawn with the
+    /// neutral icon, and nothing panics.
+    #[test]
+    fn a_summary_without_a_state_is_drawn_neutral() {
+        use crate::task_app_support::task;
+        let mut value = serde_json::to_value(titled(task("a", "local", "running", 1), "NAR-1"))
+            .expect("a summary");
+        let object = value.as_object_mut().unwrap();
+        object.remove("state");
+        object.remove("holds_slot");
+        let old: narsor_engine::controller_protocol::TaskSummary =
+            serde_json::from_value(value).expect("a summary of an older control plane");
+        let mut app = app();
+        app.load(listing(vec![old], "c"));
+        let buffer = render(120, 30, &mut app, &Styles::new(false));
+        let text = screen(&buffer);
+        assert!(text.contains("·  NAR-1"), "{text}");
+        assert!(text.contains("unknown"), "{text}");
     }
 
     /// AE5: a selected task with a problem keeps its red markers, and no cell
@@ -3044,7 +3181,7 @@ mod task_app_detail_render {
                     .map(|row| row.chars().take(28).collect::<String>())
                     .find(|row| row.contains("NAR-2"))
                     .expect("the row");
-                assert_eq!(row.contains("! ✗"), marked, "{row}");
+                assert_eq!(row.contains("! "), marked, "{row}");
                 let order: Vec<&str> = app
                     .list()
                     .tasks()

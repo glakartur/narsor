@@ -44,14 +44,14 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
-use crate::cli::task_text::runner_state_name;
+use crate::cli::task_text::{task_state_name, without_slot};
 use crate::controller_protocol::{
     Freshness, InputView, OperatorCommandView, QueueView, TaskSummary,
 };
-use crate::domain::{BackendId, ExecutionStatus};
+use crate::domain::BackendId;
 use narsor_protocol::controller::{
     AttentionItem, AttentionKind, MoveTaskTarget, OperatorCommand, OperatorCommandStatus,
-    QueueReason, ResumeExhaustion, RunnerState, TaskEvent, TaskEventKind,
+    QueueReason, ResumeExhaustion, RunnerState, TaskEvent, TaskEventKind, TaskState,
 };
 use narsor_protocol::display::{exhaustion_loss, loss_state, LossState, UNSPECIFIED_LOSS};
 
@@ -96,14 +96,16 @@ pub enum StateIcon {
     Running,
     /// `◷` waits in the queue.
     Queued,
-    /// `⟳` the backend prepares it.
-    Provisioning,
+    /// `◐` waits for the owner's answer.
+    Waiting,
     /// `‖` paused or pausing.
     Paused,
-    /// `✗` failed, interrupted or unknown.
+    /// `✗` ended with an error.
     Failed,
     /// `✓` finished.
     Done,
+    /// `·` a state this version does not know.
+    Unknown,
     /// `↻` a new task being sent (the new-task form).
     Sending,
 }
@@ -114,10 +116,11 @@ impl StateIcon {
         match self {
             Self::Running => '●',
             Self::Queued => '◷',
-            Self::Provisioning => '⟳',
+            Self::Waiting => '◐',
             Self::Paused => '‖',
             Self::Failed => '✗',
             Self::Done => '✓',
+            Self::Unknown => '·',
             Self::Sending => '↻',
         }
     }
@@ -125,10 +128,10 @@ impl StateIcon {
     /// The role the icon is drawn in.
     pub fn role(self) -> Role {
         match self {
-            Self::Running | Self::Provisioning => Role::Live,
-            Self::Queued | Self::Paused | Self::Sending => Role::Calm,
+            Self::Running => Role::Live,
+            Self::Queued | Self::Paused | Self::Sending | Self::Waiting => Role::Calm,
             Self::Failed => Role::Problem,
-            Self::Done => Role::Done,
+            Self::Done | Self::Unknown => Role::Done,
         }
     }
 }
@@ -191,19 +194,18 @@ pub fn attention_of(task: &TaskSummary) -> Attention {
     }
 }
 
-/// What the second column shows for `task`.
+/// What the second column shows for `task`: one icon for each [`TaskState`],
+/// whatever the slot or the runner is doing. A state this version does not
+/// know (or a summary from a control plane that sends none) is neutral.
 pub fn state_icon(task: &TaskSummary) -> StateIcon {
-    match task.runner_state {
-        RunnerState::Queued => StateIcon::Queued,
-        RunnerState::Provisioning => StateIcon::Provisioning,
-        RunnerState::Running => match task.runner.as_ref().map(|runner| runner.execution_status) {
-            Some(ExecutionStatus::Completed) => StateIcon::Done,
-            Some(ExecutionStatus::Failed | ExecutionStatus::Cancelled) => StateIcon::Failed,
-            _ => StateIcon::Running,
-        },
-        RunnerState::PauseRequested | RunnerState::Stopped => StateIcon::Paused,
-        RunnerState::Interrupted | RunnerState::Unknown => StateIcon::Failed,
-        RunnerState::Archiving | RunnerState::Archived => StateIcon::Done,
+    match task.state {
+        TaskState::Queued => StateIcon::Queued,
+        TaskState::Running => StateIcon::Running,
+        TaskState::HumanNeeded => StateIcon::Waiting,
+        TaskState::Paused => StateIcon::Paused,
+        TaskState::Finished | TaskState::Archived => StateIcon::Done,
+        TaskState::Error => StateIcon::Failed,
+        TaskState::Unrecognized => StateIcon::Unknown,
     }
 }
 
@@ -225,25 +227,26 @@ fn controller_offline(task: &TaskSummary) -> bool {
         .is_none_or(|controller| controller.freshness != Freshness::Live)
 }
 
-/// The label of a row (its second line). `queue_position` is the 1-based place among
-/// the queued tasks of the backend, in list order.
+/// The label of a row (its second line): the state in a word, the step for a
+/// running task, the place for a queued one, and "bez slotu" when the task
+/// is in a state that no longer needs one. `queue_position` is the 1-based
+/// place among the queued tasks of the backend, in list order.
 pub fn label_of(task: &TaskSummary, queue_position: Option<usize>) -> String {
-    let runner_status = task.runner.as_ref().map(|runner| runner.execution_status);
-    match task.runner_state {
-        RunnerState::Queued => match task.queue.as_ref().map(|queue| &queue.reason) {
+    let label = match task.state {
+        TaskState::Queued => match task.queue.as_ref().map(|queue| &queue.reason) {
             Some(QueueReason::ControllerOffline) => "offline".to_string(),
             _ => queue_position.map_or_else(|| "queued".to_string(), |place| format!("#{place}")),
         },
-        RunnerState::Provisioning | RunnerState::Running => match runner_status {
-            Some(ExecutionStatus::Completed) => "done".to_string(),
-            Some(ExecutionStatus::Failed) => "failed".to_string(),
-            Some(ExecutionStatus::Cancelled) => "cancelled".to_string(),
-            _ if controller_offline(task) => "offline".to_string(),
-            _ => current_step(task)
-                .unwrap_or_else(|| runner_state_name(task.runner_state).to_string()),
-        },
-        RunnerState::Archiving | RunnerState::Archived => "done".to_string(),
-        other => runner_state_name(other).to_string(),
+        TaskState::Running if controller_offline(task) => "offline".to_string(),
+        TaskState::Running => {
+            current_step(task).unwrap_or_else(|| task_state_name(TaskState::Running).to_string())
+        }
+        other => task_state_name(other).to_string(),
+    };
+    if without_slot(task) {
+        format!("{label} · bez slotu")
+    } else {
+        label
     }
 }
 
@@ -721,7 +724,7 @@ impl TaskList {
                     limit: Some(*limit as usize),
                 });
             }
-            held += usize::from(holds_a_slot(task));
+            held += usize::from(task.holds_slot);
         }
         Some(Slots {
             used: held,
@@ -916,6 +919,7 @@ impl TaskList {
             }
             return EventEffect::default();
         }
+        let runner_state_changed = self.tasks[index].runner_state != event.runner_state;
         {
             let task = &mut self.tasks[index];
             task.revision = event.sequence;
@@ -979,6 +983,9 @@ impl TaskList {
             }
             kind => effect.refresh = patch_row(&mut self.tasks[index], kind, event),
         }
+        // The event carries the runner's state, not what the owner sees: the
+        // state and the slot of the row come from a read.
+        effect.refresh |= runner_state_changed;
         effect
     }
 
@@ -1319,23 +1326,6 @@ fn patch_row(task: &mut TaskSummary, kind: &TaskEventKind, event: &TaskEvent) ->
             true
         }
         _ => true,
-    }
-}
-
-/// Whether the task occupies a slot of its backend: it holds compute, or it
-/// was admitted and waits for its start, or it was lost but not released.
-fn holds_a_slot(task: &TaskSummary) -> bool {
-    match task.runner_state {
-        RunnerState::Provisioning
-        | RunnerState::Running
-        | RunnerState::PauseRequested
-        | RunnerState::Interrupted
-        | RunnerState::Unknown => true,
-        RunnerState::Queued => task
-            .queue
-            .as_ref()
-            .is_some_and(|queue| queue.reason == QueueReason::Admitted),
-        RunnerState::Stopped | RunnerState::Archiving | RunnerState::Archived => false,
     }
 }
 

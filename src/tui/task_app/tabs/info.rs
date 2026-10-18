@@ -15,11 +15,11 @@ use ratatui::Frame;
 use crate::controller_protocol::{Freshness, TaskSummary};
 use crate::tui::keymap::Action;
 use crate::tui::style::{Role, Styles};
-use narsor_protocol::controller::QueueReason;
+use narsor_protocol::controller::{QueueReason, TaskState};
 
 use super::super::super::scroll::one_line;
 use super::super::detail::short_age;
-use crate::cli::task_text::runner_state_name;
+use crate::cli::task_text::{task_state_name, without_slot};
 
 /// What the tab remembers per task: how far it is scrolled.
 #[derive(Debug, Clone)]
@@ -157,7 +157,8 @@ pub fn lines(task: &TaskSummary, styles: &Styles, stale: bool) -> Vec<Line<'stat
         format!("{} v{}", task.workflow_id, task.workflow_version),
         Role::Calm,
     );
-    sheet.row("stan", runner_state_name(task.runner_state), Role::Calm);
+    sheet.row("stan", task_state_name(task.state), Role::Calm);
+    sheet.row("slot", slot_text(task), Role::Calm);
     sheet.row(
         "pozycja",
         format!(
@@ -316,4 +317,18 @@ pub fn render(
     info.top = info.top.min(lines.len().saturating_sub(info.height));
     let shown: Vec<Line> = lines.into_iter().skip(info.top).take(info.height).collect();
     frame.render_widget(Paragraph::new(shown), area);
+}
+
+/// Whether the task holds a slot of its backend, and what that means for the
+/// state it is in.
+fn slot_text(task: &TaskSummary) -> &'static str {
+    if task.state == TaskState::Queued && task.runner.is_some() {
+        "w kolejce po wznowieniu — dostanie slot jako pierwsze"
+    } else if without_slot(task) {
+        "bez slotu — odpowiedź lub wznowienie przywraca zadanie"
+    } else if task.holds_slot {
+        "zajęty"
+    } else {
+        "brak"
+    }
 }

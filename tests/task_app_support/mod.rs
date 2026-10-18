@@ -14,8 +14,8 @@ use narsor_engine::domain::display::DisplayLink;
 use narsor_engine::domain::{Event, EventData, ExecutionStatus, TaskId};
 use narsor_engine::engine::{ConversationState, Position, PositionStatus, Timeline};
 use narsor_engine::orchestration::{
-    AttentionItem, AttentionKind, ExecutionCursor, QueueReason, ResumeExhaustion, ResumeState,
-    RunnerState, TaskEvent, TaskEventKind, WorkloadLoss,
+    derive_task_state, AttentionItem, AttentionKind, ExecutionCursor, QueueReason,
+    ResumeExhaustion, ResumeState, RunnerState, TaskEvent, TaskEventKind, TaskState, WorkloadLoss,
 };
 
 pub fn at() -> DateTime<Utc> {
@@ -45,7 +45,43 @@ pub fn task(id: &str, backend: &str, runner_state: &str, rank: u32) -> TaskSumma
         "inputs": [],
         "as_of": at(),
     }))
+    .map(|mut task: TaskSummary| {
+        task.holds_slot = held_by(&task);
+        task.state = served_state(&task);
+        task
+    })
     .expect("a task summary")
+}
+
+/// What the control plane says of a slot: compute is held in every state
+/// that has a runner (or is admitted to get one).
+fn held_by(task: &TaskSummary) -> bool {
+    matches!(
+        task.runner_state,
+        RunnerState::Provisioning
+            | RunnerState::Running
+            | RunnerState::PauseRequested
+            | RunnerState::Interrupted
+            | RunnerState::Unknown
+    )
+}
+
+/// What the control plane says the owner sees, for a summary the tests build
+/// by hand: its own derivation, from what the summary shows.
+pub fn served_state(task: &TaskSummary) -> TaskState {
+    derive_task_state(
+        task.runner_state,
+        task.runner.as_ref().map(|runner| runner.execution_status),
+        &task.resume,
+        false,
+    )
+}
+
+/// `task` with the state and the slot of a task the control plane released
+/// after the work ended: the state stays, the slot goes.
+pub fn without_slot(mut task: TaskSummary) -> TaskSummary {
+    task.holds_slot = false;
+    task
 }
 
 pub fn queued(id: &str, rank: u32) -> TaskSummary {
@@ -60,6 +96,7 @@ pub fn titled(mut task: TaskSummary, title: &str) -> TaskSummary {
 /// The runner reports `status`, in the workflow state `step`.
 pub fn with_runner(mut task: TaskSummary, status: ExecutionStatus, step: &str) -> TaskSummary {
     task.runner = Some(runner(status, step));
+    task.state = served_state(&task);
     task
 }
 
@@ -260,6 +297,7 @@ pub fn with_pending(mut task: TaskSummary, form: serde_json::Value) -> TaskSumma
         since: at(),
         waiting_id: id,
     });
+    task.state = served_state(&task);
     task
 }
 
@@ -555,6 +593,7 @@ pub fn interrupted(id: &str, from: RunnerState, losses: u32, planned: bool) -> T
         }),
         ..ResumeState::default()
     };
+    task.state = served_state(&task);
     task
 }
 
@@ -566,6 +605,7 @@ pub fn exhausted(mut task: TaskSummary, reason: &str) -> TaskSummary {
         at: at(),
         announced: true,
     });
+    task.state = served_state(&task);
     task
 }
 

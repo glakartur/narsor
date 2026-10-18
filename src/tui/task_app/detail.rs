@@ -53,16 +53,15 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::api::ClientError;
-use crate::cli::task_text::runner_state_name;
 pub use crate::cli::task_text::short_age;
+use crate::cli::task_text::{task_state_name, without_slot};
 use crate::controller_protocol::{
     ConductorReadResponse, ExecutionEventsQuery, ExecutionEventsResponse, TaskSummary,
     TimelineResponse,
 };
 use crate::domain::display::{safe_link_url, DisplayLink, EMPTY_LINK_TEXT};
-use crate::domain::ExecutionStatus;
 use narsor_protocol::api::ConversationState;
-use narsor_protocol::controller::{QueueReason, RunnerState};
+use narsor_protocol::controller::{QueueReason, TaskState};
 
 use super::super::keymap::Action;
 use super::super::scroll::one_line;
@@ -392,14 +391,9 @@ pub enum Readiness {
 
 /// Whether there is an execution to read for `task`.
 pub fn readiness(task: &TaskSummary) -> Readiness {
-    if task.runner_state.is_archival() {
+    if task.state == TaskState::Archived {
         Readiness::Archived
-    } else if task.runner.is_none()
-        && matches!(
-            task.runner_state,
-            RunnerState::Queued | RunnerState::Provisioning
-        )
-    {
+    } else if task.runner.is_none() && task.state == TaskState::Queued {
         Readiness::NotStarted
     } else {
         Readiness::Started
@@ -413,10 +407,9 @@ pub fn unstarted_message(task: &TaskSummary, queue_place: Option<usize>) -> Opti
         Readiness::Started => None,
         Readiness::Archived => Some("storage usunięty przy archiwizacji".to_string()),
         Readiness::NotStarted => {
-            let place = match (task.runner_state, queue_place) {
-                (RunnerState::Queued, Some(place)) => format!("#{place} w kolejce"),
-                (RunnerState::Queued, None) => "w kolejce".to_string(),
-                (other, _) => runner_state_name(other).to_string(),
+            let place = match queue_place {
+                Some(place) => format!("#{place} w kolejce"),
+                None => "w kolejce".to_string(),
             };
             Some(format!("jeszcze nie wystartowało, {place}"))
         }
@@ -1275,14 +1268,9 @@ fn link_text(link: &DisplayLink) -> (String, Option<String>) {
     }
 }
 
-/// The runner_state in a word, except that a runner that finished says how.
+/// The task's state in a word.
 fn status_word(task: &TaskSummary) -> &'static str {
-    match task.runner.as_ref().map(|runner| &runner.execution_status) {
-        Some(ExecutionStatus::Completed) => "completed",
-        Some(ExecutionStatus::Failed) => "failed",
-        Some(ExecutionStatus::Cancelled) => "cancelled",
-        _ => runner_state_name(task.runner_state),
-    }
+    task_state_name(task.state)
 }
 
 /// What follows the state on line 2: the queue, or the step, the time and a
@@ -1293,9 +1281,12 @@ fn status_parts(
     progress: &Progress,
 ) -> Vec<(String, Role)> {
     let mut parts = Vec::new();
-    if task.runner_state == RunnerState::Queued {
+    if task.state == TaskState::Queued {
         parts.push((queue_text(task, queue_place), Role::Calm));
         return parts;
+    }
+    if without_slot(task) {
+        parts.push(("bez slotu".to_string(), Role::Calm));
     }
     if let Some((at, of)) = progress.step_count() {
         parts.push((format!("krok {at}/{of}"), Role::Calm));
@@ -1311,10 +1302,7 @@ fn status_parts(
     if let Some(seconds) = elapsed(task) {
         parts.push((short_age(seconds), Role::Done));
     }
-    if matches!(
-        task.runner_state,
-        RunnerState::Provisioning | RunnerState::Running
-    ) {
+    if task.state == TaskState::Running {
         if let Some(offline) = controller_offline(task) {
             parts.push((offline, Role::Attention));
         }
