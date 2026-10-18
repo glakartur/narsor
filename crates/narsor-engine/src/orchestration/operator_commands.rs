@@ -13,6 +13,13 @@
 //! `Running`, or a newer launch takes over, the commands nobody settled are
 //! rejected by the next poll instead of reaching a runner they were never
 //! meant for.
+//!
+//! A task without a runner (paused, or resumed and waiting for a slot or its
+//! runner) keeps the work sent to it for the launch that comes next (R13,
+//! R14): the command is bound to that launch's generation (see
+//! [`TaskRecord::operator_command_launch`]), the poll of any other runner
+//! neither gets it nor settles it, and the poll of that launch's runner —
+//! also while the task still provisions — takes it.
 
 use super::control_plane::{ControlPlane, Mutation};
 use super::error::{OrchestrationError, Result};
@@ -86,7 +93,7 @@ impl ControlPlane {
             if let Some(expected) = request.expected_generation {
                 record.check_generation(expected)?;
             }
-            if let Some(reason) = record.operator_command_refusal() {
+            if let Some(reason) = record.operator_command_refusal(&request.command) {
                 return Err(OrchestrationError::OperatorCommandRefused {
                     task_id: record.task_id.clone(),
                     reason,
@@ -101,10 +108,18 @@ impl ControlPlane {
                     ),
                 });
             }
+            // The runner of the current launch, or the launch the task
+            // waits for: a command of a paused or queued task is carried
+            // out after the next start.
             let launch_generation = record
-                .runner
-                .as_ref()
-                .map_or(record.generation, |runner| runner.launch_generation);
+                .operator_command_launch()
+                .or_else(|| {
+                    record
+                        .runner
+                        .as_ref()
+                        .map(|runner| runner.launch_generation)
+                })
+                .unwrap_or(record.generation);
             let queued = QueuedOperatorCommand {
                 command_id: next_command_id(record),
                 idempotency_key: request.idempotency_key.clone(),
@@ -155,7 +170,7 @@ impl ControlPlane {
             !command.status.is_settled()
                 && obsolete_reason(command, record.runner_state, launch_generation).is_some()
         }) {
-            return Ok((open_commands(&record), false));
+            return Ok((commands_for(&record, launch_generation), false));
         }
         let mut changed = false;
         loop {
@@ -183,7 +198,7 @@ impl ControlPlane {
                 ))
             })?;
             if !rejected {
-                return Ok((open_commands(&record), changed));
+                return Ok((commands_for(&record, launch_generation), changed));
             }
             changed = true;
         }
@@ -320,16 +335,33 @@ fn open_commands(record: &TaskRecord) -> Vec<QueuedOperatorCommand> {
         .collect()
 }
 
+/// The open commands meant for the runner of `launch_generation`: one
+/// accepted for a later launch (a paused task's work) waits for it.
+fn commands_for(record: &TaskRecord, launch_generation: u64) -> Vec<QueuedOperatorCommand> {
+    open_commands(record)
+        .into_iter()
+        .filter(|command| command.launch_generation == launch_generation)
+        .collect()
+}
+
 /// Why an unsettled command can no longer be carried out by the runner of
-/// `launch_generation`, if it cannot.
+/// `launch_generation`, if it cannot. A command for a later launch is not
+/// obsolete: it waits for that launch's runner.
 fn obsolete_reason(
     command: &QueuedOperatorCommand,
     runner_state: RunnerState,
     launch_generation: u64,
 ) -> Option<String> {
-    if runner_state != RunnerState::Running {
+    if command.launch_generation > launch_generation {
+        return None;
+    }
+    // A runner polls from its start, while the task is still provisioning.
+    if !matches!(
+        runner_state,
+        RunnerState::Running | RunnerState::Provisioning
+    ) {
         return Some(format!(
-            "the task stopped running before the runner took the command (lifecycle: {runner_state:?})"
+            "the task stopped running before the runner took the command (runner state: {runner_state:?})"
         ));
     }
     (command.launch_generation != launch_generation)

@@ -44,6 +44,16 @@ pub fn slot_release_key(generation: u64) -> String {
     format!("{SLOT_RELEASE_KEY_PREFIX}{generation}")
 }
 
+/// The prefix of the idempotency keys of the resume that work sent to a
+/// paused task causes (`work-resume:<key of the work>`), reserved like
+/// [`AUTO_RESUME_KEY_PREFIX`]: a retry of the work resumes the task once.
+pub const WORK_RESUME_KEY_PREFIX: &str = "work-resume:";
+
+/// The idempotency key of the resume caused by the work with `work_key`.
+pub fn work_resume_key(work_key: &str) -> String {
+    format!("{WORK_RESUME_KEY_PREFIX}{work_key}")
+}
+
 /// How the control plane resumes a task after its workload was lost.
 ///
 /// Fixed for every backend (no per-task or per-workflow setting); only

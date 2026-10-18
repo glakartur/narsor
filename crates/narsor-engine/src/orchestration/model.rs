@@ -491,30 +491,87 @@ impl TaskRecord {
             .find(|command| command.command_id == command_id)
     }
 
-    /// Why an operator command cannot be queued for this task's runner
-    /// right now, or `None` when it can: only a running task with a runner
-    /// of its current launch has someone to carry it out.
-    pub fn operator_command_refusal(&self) -> Option<String> {
+    /// The launch generation of a launch that was ordered and whose runner
+    /// has not reported yet: the task was resumed (by its owner or by work
+    /// sent to it) and the runner of the older launch is superseded.
+    /// `None` when no such launch waits.
+    pub fn awaited_launch_generation(&self) -> Option<u64> {
+        let previous = self.runner.as_ref()?;
+        if !matches!(
+            self.runner_state,
+            RunnerState::Queued | RunnerState::Provisioning | RunnerState::Running
+        ) || !self.supersedes_launch(previous.launch_generation)
+        {
+            return None;
+        }
+        self.commands
+            .iter()
+            .rev()
+            .find(|receipt| matches!(receipt.command, OwnerCommand::Start | OwnerCommand::Resume))
+            .map(|receipt| receipt.generation_after)
+    }
+
+    /// The launch generation an operator command accepted now is meant for:
+    /// the running runner's, or that of the launch it waits for — for a
+    /// `Stopped` task the one its resume will order (every resume raises
+    /// the desired generation by one). `None` when nothing can take it.
+    pub fn operator_command_launch(&self) -> Option<u64> {
+        match self.runner_state {
+            RunnerState::Stopped => Some(self.generation + 1),
+            _ => self.awaited_launch_generation().or_else(|| {
+                (self.runner_state == RunnerState::Running)
+                    .then(|| self.runner.as_ref().map(|runner| runner.launch_generation))
+                    .flatten()
+            }),
+        }
+    }
+
+    /// Why `command` cannot be queued for this task right now, or `None`
+    /// when it can.
+    ///
+    /// A running task with a runner of its current launch carries out
+    /// anything. A task without a runner — paused, or resumed and waiting
+    /// for its new runner or a slot — takes the work an owner can send it
+    /// (a message to the conductor, an undo, a restart, a transition): it
+    /// is kept and carried out after the next start (R13, R14). What acts
+    /// on a live runner (interrupt, confirm or reject a proposal) is
+    /// refused, with the reason.
+    pub fn operator_command_refusal(&self, command: &OperatorCommand) -> Option<String> {
         let reason = match self.runner_state {
-            RunnerState::Running => None,
-            RunnerState::Queued | RunnerState::Provisioning => Some("the task has not started yet"),
+            RunnerState::Running | RunnerState::Stopped => None,
+            RunnerState::Queued | RunnerState::Provisioning => self
+                .awaited_launch_generation()
+                .is_none()
+                .then_some("the task has not started yet"),
             RunnerState::PauseRequested => Some("the task is pausing"),
-            RunnerState::Stopped => Some("the task is paused; resume it first"),
             RunnerState::Interrupted | RunnerState::Unknown => {
                 Some("the task's runner is gone; start or resume the task first")
             }
             RunnerState::Archiving | RunnerState::Archived => Some("the task is archived"),
         };
         if let Some(reason) = reason {
-            return Some(format!("{reason} (lifecycle: {:?})", self.runner_state));
+            return Some(format!("{reason} (runner state: {:?})", self.runner_state));
         }
-        match &self.runner {
-            None => Some("the task's runner has not reported yet".to_string()),
-            Some(runner) if self.supersedes_launch(runner.launch_generation) => {
-                Some("the task's new runner has not reported yet".to_string())
+        if self.runner.is_none() {
+            return Some("the task's runner has not reported yet".to_string());
+        }
+        if self.runner_state != RunnerState::Running || self.awaited_launch_generation().is_some() {
+            // No live runner to act on: only work that waits for the next
+            // start can be taken.
+            if matches!(
+                command,
+                OperatorCommand::Interrupt
+                    | OperatorCommand::ConfirmProposal { .. }
+                    | OperatorCommand::RejectProposal { .. }
+            ) {
+                return Some(format!(
+                    "the task has no running runner; this command acts on a live runner \
+                     (runner state: {:?})",
+                    self.runner_state
+                ));
             }
-            Some(_) => None,
         }
+        None
     }
 }
 

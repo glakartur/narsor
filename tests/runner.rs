@@ -162,7 +162,9 @@ impl Fixture {
         let default = Arc::new(LiveDefault::default());
         // Several scenarios look at a finished task's live runner (undo a
         // decision, read the conductor); the policy that would stop it is
-        // off here and has its own tests.
+        // off here and has its own tests. Work sent to a stopped task
+        // resumes it (U6), but reading the conductor of a stopped task
+        // needs the read-only runner (phase 2), so these stay off.
         let service = Arc::new(ProtocolService::with_config(
             control,
             environment_support::seeded_catalog_resolver_with(
@@ -935,6 +937,96 @@ async fn a_paused_task_resumes_on_its_own_storage_without_recloning() {
         })
         .collect();
     assert_eq!(harnesses, vec!["claude-code", "claude-code"]);
+}
+
+/// U6 (F4, AE8): the owner's answer to a stopped task is kept, resumes the
+/// task, and the runner of the next start consumes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_to_a_stopped_task_resumes_it_and_the_next_runner_consumes_it() {
+    if running_as_root() {
+        return;
+    }
+    let mut fixture = Fixture::served().await;
+    let (bare, pinned) = origin(&fixture.root);
+    let bin = fake_claude(&fixture.root);
+    let spec = spec(
+        GATED_WORKFLOW,
+        TaskWorkspace::Git(GitIdentity {
+            repository: Some("demo".to_string()),
+            remote_url: bare.display().to_string(),
+            commit: pinned,
+            git_ref: None,
+            credential: None,
+        }),
+        ResolvedEnvironment::harness_only("claude-code"),
+    );
+    fixture.create("task-1", spec.clone());
+    fixture.report("task-1", Observation::StartAccepted);
+    let launch = Launch::new(&fixture, "task-1", &spec).with_bin_first(&bin);
+    let credential = fixture.credential("task-1", "pod-1");
+    let first = fixture.spawn(&launch, "pod-1", &credential);
+    wait_until_async(Duration::from_secs(30), "the gate", || {
+        fixture.record("task-1").pending_input_id().is_some()
+    })
+    .await;
+    fixture.report("task-1", Observation::RunnerReady);
+
+    // Stopped at the gate, its compute gone.
+    fixture.command("task-1", OwnerCommand::Pause, "pause-1");
+    let status = fixture.wait_exit(first, Duration::from_secs(30));
+    assert!(
+        status.success(),
+        "a paused runner exits cleanly: {status:?}"
+    );
+    fixture.report("task-1", Observation::PausedAtSafePoint);
+    let record = fixture.record("task-1");
+    assert_eq!(
+        record.runner_state,
+        narsor_engine::orchestration::RunnerState::Stopped
+    );
+    let pending = record
+        .pending_input_id()
+        .expect("the last snapshot still shows the gate")
+        .to_string();
+
+    // The answer alone resumes the task: the owner sends no resume.
+    fixture
+        .service
+        .submit_input(
+            &fixture.owner(),
+            "task-1",
+            SubmitInputRequest {
+                pending_input_id: pending,
+                idempotency_key: "answer-1".to_string(),
+                delivery: narsor_protocol::api::HumanInputDeliveryDto {
+                    chosen_label: Some("ok".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .expect("an answer to a stopped task is kept");
+    let record = fixture.record("task-1");
+    assert_eq!(
+        record.runner_state,
+        narsor_engine::orchestration::RunnerState::Provisioning
+    );
+    assert_eq!(
+        record.inputs[0].status,
+        narsor_engine::orchestration::InputStatus::Queued,
+        "kept until a runner takes it"
+    );
+
+    let credential = fixture.credential("task-1", "pod-2");
+    fixture.spawn(&launch, "pod-2", &credential);
+    wait_until_async(Duration::from_secs(30), "completion", || {
+        runner_status(&fixture, "task-1") == Some(ExecutionStatus::Completed)
+    })
+    .await;
+    let record = fixture.record("task-1");
+    assert_eq!(
+        record.inputs[0].status,
+        narsor_engine::orchestration::InputStatus::Consumed
+    );
 }
 
 // ---------------------------------------------------------------------------

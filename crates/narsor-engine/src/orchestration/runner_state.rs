@@ -144,6 +144,9 @@ impl ControlPlane {
 
     /// Queues an owner answer for the request the runner waits on.
     ///
+    /// Also taken while the task is `Stopped` or `Queued` (waiting for a
+    /// slot): the answer waits on the record for the next runner.
+    ///
     /// Refused — without touching the record, let alone the runner — when
     /// the task cannot take input in its runner_state, when the last runner
     /// snapshot waits on another request (or none), or when another answer
@@ -173,9 +176,17 @@ impl ControlPlane {
                 }
                 return Ok(Mutation::Unchanged((existing.clone(), true)));
             }
+            // A paused task, or one resumed and waiting for a slot, keeps the
+            // answer for the runner of its next start (R13, R14); the
+            // service then resumes it. It still has to answer the request
+            // the last snapshot shows.
             if !matches!(
                 record.runner_state,
-                RunnerState::Provisioning | RunnerState::Running | RunnerState::PauseRequested
+                RunnerState::Provisioning
+                    | RunnerState::Running
+                    | RunnerState::PauseRequested
+                    | RunnerState::Stopped
+                    | RunnerState::Queued
             ) {
                 return Err(OrchestrationError::TaskNotAcceptingInput {
                     task_id: record.task_id.clone(),

@@ -4413,3 +4413,158 @@ fn the_policys_keys_are_reserved_for_it() {
     assert!(narsor_engine::orchestration::slot_release_key(7)
         .starts_with(narsor_engine::orchestration::SLOT_RELEASE_KEY_PREFIX));
 }
+
+// ---------------------------------------------------------------------------
+// Work for a task without a runner (U6, R13, R14)
+// ---------------------------------------------------------------------------
+
+/// `task-1` ran, waited on `ask-1` and was stopped; nothing else holds a slot.
+fn stopped_waiting_on_input(fx: &Fixture, lease: &BackendLease) {
+    fx.running("task-1", lease);
+    runner_reports(fx, "task-1", ExecutionStatus::InputNeeded, Some("ask-1"));
+    fx.command("task-1", OwnerCommand::Pause, "pause-1");
+    // The runner's last word, at the safe point, still shows the request.
+    let record = fx.control.task(&task("task-1")).unwrap();
+    let runner = record.runner.as_ref().unwrap();
+    let mut at_safe_point = runner.snapshot.clone();
+    at_safe_point.snapshot_sequence += 1;
+    at_safe_point.safe_point = true;
+    fx.control
+        .record_runner_snapshot(
+            &task("task-1"),
+            &runner.incarnation,
+            runner.launch_generation,
+            at_safe_point,
+        )
+        .unwrap();
+    report_now(fx, "task-1", lease, Observation::PausedAtSafePoint).unwrap();
+}
+
+fn answer(pending: &str, key: &str) -> narsor_engine::orchestration::InputRequest {
+    narsor_engine::orchestration::InputRequest {
+        pending_input_id: pending.to_string(),
+        idempotency_key: key.to_string(),
+        delivery: Default::default(),
+    }
+}
+
+#[test]
+fn a_stopped_task_keeps_an_answer_to_the_request_its_last_snapshot_shows() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    stopped_waiting_on_input(&fx, &lease);
+
+    let kept = fx
+        .control
+        .queue_input(&task("task-1"), answer("ask-1", "answer-1"))
+        .expect("kept for the next runner");
+    assert_eq!(
+        kept.input.status,
+        narsor_engine::orchestration::InputStatus::Queued
+    );
+    assert!(matches!(
+        fx.control
+            .queue_input(&task("task-1"), answer("ask-0", "answer-0"))
+            .unwrap_err(),
+        OrchestrationError::ObsoleteInput { .. }
+    ));
+    // The record still says Stopped: only the service resumes the task.
+    assert_eq!(
+        fx.control.task(&task("task-1")).unwrap().runner_state,
+        RunnerState::Stopped
+    );
+}
+
+#[test]
+fn a_task_that_never_started_takes_no_answer() {
+    let fx = Fixture::new();
+    fx.create("task-1");
+    let error = fx
+        .control
+        .queue_input(&task("task-1"), answer("ask-1", "answer-1"))
+        .unwrap_err();
+    assert!(
+        matches!(error, OrchestrationError::ObsoleteInput { .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_command_for_a_stopped_task_is_bound_to_the_launch_its_resume_orders() {
+    use narsor_engine::orchestration::{OperatorCommand, OperatorCommandStatus};
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    stopped_waiting_on_input(&fx, &lease);
+    let stopped = fx.control.task(&task("task-1")).unwrap();
+
+    let queued = queue_chat(&fx, "chat-1", "hello").expect("kept for the next start");
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(
+        record.operator_command(&queued).unwrap().launch_generation,
+        stopped.generation + 1
+    );
+    // What needs a live runner is refused with the reason.
+    let error = fx
+        .control
+        .queue_operator_command(
+            &task("task-1"),
+            operator_request(OperatorCommand::Interrupt, "interrupt-1"),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, OrchestrationError::OperatorCommandRefused { ref reason, .. } if reason.contains("no running runner")),
+        "{error:?}"
+    );
+
+    // The old runner, should it still poll, neither gets the command nor
+    // loses it.
+    let (delivered, changed) = fx
+        .control
+        .deliver_operator_commands(&task("task-1"), "pod-g1", stopped.generation)
+        .unwrap();
+    assert!(delivered.is_empty() && !changed);
+
+    // The resume orders exactly that launch; its runner takes the command,
+    // while the task still provisions.
+    let resumed = fx.command("task-1", OwnerCommand::Resume, "resume-1");
+    let (delivered, _) = fx
+        .control
+        .deliver_operator_commands(&task("task-1"), "pod-g2", resumed.generation)
+        .unwrap();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].command_id, queued);
+    assert_eq!(delivered[0].status, OperatorCommandStatus::Queued);
+}
+
+#[test]
+fn a_resumed_task_waiting_for_a_slot_keeps_commands_for_its_start() {
+    let fx = Fixture::new();
+    let lease = long_lease(&fx, "controller-a");
+    stopped_waiting_on_input(&fx, &lease);
+    // Another task fills the only slot, so the resume has to queue.
+    run_in_single_slot(&fx, "other", &lease);
+    let outcome = fx
+        .control
+        .command_with_capacity(
+            &task("task-1"),
+            CommandRequest::new(OwnerCommand::Resume, "resume-1"),
+            &limit(1),
+        )
+        .unwrap();
+    assert_eq!(outcome.task.runner_state, RunnerState::Queued);
+
+    let id = queue_chat(&fx, "chat-1", "hello").expect("kept while it waits for a slot");
+    let record = fx.control.task(&task("task-1")).unwrap();
+    assert_eq!(
+        record.operator_command(&id).unwrap().launch_generation,
+        record.generation
+    );
+    // The launch the queue leads to is the one the command is bound to: the
+    // start keeps the generation.
+    fx.command("other", OwnerCommand::Pause, "pause-other");
+    fx.observe("other", &lease, Observation::PausedAtSafePoint)
+        .unwrap();
+    fx.control.schedule(&k8s(), &limit(1)).unwrap();
+    let started = report_now(&fx, "task-1", &lease, Observation::StartAccepted).unwrap();
+    assert_eq!(started.generation, record.generation);
+}

@@ -4713,3 +4713,527 @@ async fn an_owner_cannot_use_the_slot_release_keys() {
 
     assert_eq!(bad_request_code(refused), "reserved_idempotency_key");
 }
+
+// ---------------------------------------------------------------------------
+// Work sent to a stopped task (U6, F4, R13, R14)
+// ---------------------------------------------------------------------------
+
+/// Makes `limit` the backend's `max_concurrent_tasks`; read fresh.
+fn set_backend_limit(harness: &Harness, limit: u32) {
+    let mut record = environment_support::backend("k8s");
+    record.limits.max_concurrent_tasks = limit;
+    narsor_engine::environment::EnvironmentCatalog::new(harness.root.path())
+        .save_backend(&record)
+        .expect("save the backend");
+}
+
+/// Creates `task` and brings it to `Running` under the controller that
+/// already holds the lease, as [`Harness::running`] does under a new one.
+async fn run_beside(
+    harness: &Harness,
+    running: &Running,
+    task: &str,
+    incarnation: &str,
+) -> RunnerClient {
+    harness.create(task, "k8s").await;
+    running
+        .controller
+        .report(&report(
+            task,
+            running.epoch,
+            1,
+            Observation::StartAccepted,
+            None,
+        ))
+        .await
+        .expect("start accepted");
+    let credential = running
+        .controller
+        .issue_runner_credential(
+            task,
+            &RunnerCredentialRequest {
+                lease_epoch: running.epoch,
+                generation: 1,
+                incarnation: incarnation.to_string(),
+            },
+        )
+        .await
+        .expect("runner credential");
+    let runner = RunnerClient::new(harness.base_url(), credential.credential);
+    runner
+        .snapshot(&snapshot(1, ExecutionStatus::Running, 3, None))
+        .await
+        .expect("first snapshot");
+    running
+        .controller
+        .report(&report(
+            task,
+            running.epoch,
+            1,
+            Observation::RunnerReady,
+            Some(1),
+        ))
+        .await
+        .expect("runner ready");
+    runner
+}
+
+/// Stops the running `task-1` the way the slot policy does once its
+/// execution reached `status` (and waits on `pending`): the wait runs out,
+/// the runner stops at a safe point, the controller reports it.
+async fn stop_by_policy(
+    harness: &Harness,
+    running: &Running,
+    status: ExecutionStatus,
+    pending: Option<&str>,
+) {
+    running
+        .runner
+        .snapshot(&snapshot(2, status, 4, pending))
+        .await
+        .expect("the execution's state");
+    harness.clock.advance(Duration::minutes(6));
+    running
+        .controller
+        .renew_lease(running.epoch, None)
+        .await
+        .expect("renew the lease");
+    running.runner.renew().await.expect("renew the runner");
+    narsor_server::runtime::run_periodic_pass(&harness.service);
+    let record = control_task(harness, "task-1");
+    assert_eq!(record.runner_state, RunnerState::PauseRequested);
+    let mut at_safe_point = snapshot(3, status, 4, pending);
+    at_safe_point.safe_point = true;
+    running
+        .runner
+        .snapshot(&at_safe_point)
+        .await
+        .expect("safe point");
+    running
+        .controller
+        .report(&report(
+            "task-1",
+            running.epoch,
+            record.generation,
+            Observation::PausedAtSafePoint,
+            Some(2),
+        ))
+        .await
+        .expect("paused");
+    assert_eq!(
+        control_task(harness, "task-1").runner_state,
+        RunnerState::Stopped
+    );
+}
+
+/// The runner of the launch `generation` of `task-1`, as the controller
+/// brings it up: its credential, and its first snapshot.
+async fn start_runner_of(
+    harness: &Harness,
+    running: &Running,
+    generation: u64,
+    status: ExecutionStatus,
+    pending: Option<&str>,
+) -> RunnerClient {
+    let credential = running
+        .controller
+        .issue_runner_credential(
+            "task-1",
+            &RunnerCredentialRequest {
+                lease_epoch: running.epoch,
+                generation,
+                incarnation: format!("pod-g{generation}"),
+            },
+        )
+        .await
+        .expect("runner credential");
+    let runner = RunnerClient::new(harness.base_url(), credential.credential);
+    runner
+        .snapshot(&snapshot(1, status, 4, pending))
+        .await
+        .expect("the new runner's first snapshot");
+    runner
+}
+
+fn resumes_of(record: &narsor_engine::orchestration::TaskRecord) -> usize {
+    record
+        .commands
+        .iter()
+        .filter(|receipt| receipt.command == OwnerCommand::Resume)
+        .count()
+}
+
+/// AE8: an answer to a stopped task on a full backend is kept, the task
+/// waits at the front of the queue, and the runner gets the answer once a
+/// slot frees and it starts.
+#[tokio::test]
+async fn ae8_an_answer_to_a_stopped_task_waits_for_a_slot_and_reaches_the_runner_after_the_start() {
+    let harness = Harness::start().await;
+    set_backend_limit(&harness, 1);
+    let running = harness.running("task-1", "k8s").await;
+    stop_by_policy(
+        &harness,
+        &running,
+        ExecutionStatus::InputNeeded,
+        Some("ask-1"),
+    )
+    .await;
+    let other = run_beside(&harness, &running, "task-2", "pod-b").await;
+    assert_eq!(
+        harness.task("task-1").await.state,
+        narsor_engine::orchestration::TaskState::HumanNeeded
+    );
+
+    let answered = harness
+        .owner
+        .control_input("task-1", &input_request("ask-1", "answer-1"))
+        .await
+        .expect("an answer to a stopped task is kept");
+    assert!(!answered.replayed);
+    let queued = harness.task("task-1").await;
+    assert_eq!(queued.runner_state, RunnerState::Queued);
+    assert!(!queued.holds_slot, "it never starts without a slot");
+    assert_eq!(queued.inputs[0].status, InputStatus::Queued);
+
+    // A retry resumes nothing more.
+    let retried = harness
+        .owner
+        .control_input("task-1", &input_request("ask-1", "answer-1"))
+        .await
+        .expect("retry");
+    assert!(retried.replayed);
+    let record = control_task(&harness, "task-1");
+    assert_eq!(resumes_of(&record), 1);
+    assert_eq!(record.generation, queued.generation);
+
+    // The other task stops; its slot goes to the answered one.
+    harness
+        .command("task-2", OwnerCommand::Pause, "pause-2")
+        .await;
+    let mut at_safe_point = snapshot(2, ExecutionStatus::Running, 5, None);
+    at_safe_point.safe_point = true;
+    other.snapshot(&at_safe_point).await.expect("safe point");
+    running
+        .controller
+        .report(&report(
+            "task-2",
+            running.epoch,
+            2,
+            Observation::PausedAtSafePoint,
+            Some(2),
+        ))
+        .await
+        .expect("paused");
+    let admitted = control_task(&harness, "task-1");
+    assert!(admitted.reservation.is_some(), "the slot went to it");
+    running
+        .controller
+        .report(&report(
+            "task-1",
+            running.epoch,
+            admitted.generation,
+            Observation::StartAccepted,
+            None,
+        ))
+        .await
+        .expect("start accepted");
+    let runner = start_runner_of(
+        &harness,
+        &running,
+        admitted.generation,
+        ExecutionStatus::InputNeeded,
+        Some("ask-1"),
+    )
+    .await;
+
+    let polled = runner.poll(Some("ask-1"), 0).await.expect("poll");
+    assert_eq!(polled.inputs.len(), 1);
+    assert_eq!(
+        polled.inputs[0].delivery.comment.as_deref(),
+        Some("looks good")
+    );
+    let acked = runner
+        .ack_input(&polled.inputs[0].input_id, true, None)
+        .await
+        .expect("ack");
+    assert_eq!(acked.input.status, InputStatus::Consumed);
+}
+
+/// A finished task that was stopped, on a backend with room.
+async fn finished_and_stopped(harness: &Harness) -> Running {
+    let running = harness.running("task-1", "k8s").await;
+    stop_by_policy(harness, &running, ExecutionStatus::Completed, None).await;
+    running
+}
+
+#[tokio::test]
+async fn a_message_to_the_conductor_of_a_finished_stopped_task_resumes_it_and_is_carried_out_after_the_start(
+) {
+    let harness = Harness::start().await;
+    let running = finished_and_stopped(&harness).await;
+    let chat = |text: &str| OperatorCommand::ConductorChat {
+        text: text.to_string(),
+    };
+
+    let first = harness
+        .owner
+        .control_operator_command("task-1", &operator_request(chat("first"), "chat-1"))
+        .await
+        .expect("work for a stopped task is kept");
+    assert_eq!(first.command.status, OperatorCommandStatus::Queued);
+    let resumed = control_task(&harness, "task-1");
+    assert_eq!(resumed.runner_state, RunnerState::Provisioning);
+    assert_eq!(
+        resumed.operator_commands[0].launch_generation,
+        resumed.generation
+    );
+
+    // The same key again, and a second message before the runner is up.
+    let retried = harness
+        .owner
+        .control_operator_command("task-1", &operator_request(chat("first"), "chat-1"))
+        .await
+        .expect("retry");
+    assert!(retried.replayed);
+    harness
+        .owner
+        .control_operator_command("task-1", &operator_request(chat("second"), "chat-2"))
+        .await
+        .expect("a second message while the task starts");
+    let record = control_task(&harness, "task-1");
+    assert_eq!(resumes_of(&record), 1, "one resume for all of it");
+    assert_eq!(record.operator_commands.len(), 2);
+
+    let runner = start_runner_of(
+        &harness,
+        &running,
+        record.generation,
+        ExecutionStatus::Completed,
+        None,
+    )
+    .await;
+    let polled = runner.poll(None, 0).await.expect("poll");
+    assert_eq!(
+        polled
+            .commands
+            .iter()
+            .map(|command| command.command.clone())
+            .collect::<Vec<_>>(),
+        vec![chat("first"), chat("second")],
+        "both, in the order they were sent"
+    );
+    for command in &polled.commands {
+        runner
+            .ack_command(&command.command_id, true, None)
+            .await
+            .expect("ack");
+    }
+    // The old runner never saw them.
+    assert!(running
+        .runner
+        .poll(None, 0)
+        .await
+        .map(|poll| poll.commands.is_empty())
+        .unwrap_or(true));
+}
+
+#[tokio::test]
+async fn undoing_a_decision_of_a_stopped_task_resumes_it_and_waits_for_the_runner() {
+    let harness = Harness::start().await;
+    let running = finished_and_stopped(&harness).await;
+
+    harness
+        .owner
+        .control_operator_command(
+            "task-1",
+            &operator_request(
+                OperatorCommand::UndoDecision {
+                    decision_id: "decision-1".to_string(),
+                },
+                "undo-1",
+            ),
+        )
+        .await
+        .expect("an undo for a stopped task");
+
+    let record = control_task(&harness, "task-1");
+    assert_eq!(record.runner_state, RunnerState::Provisioning);
+    let runner = start_runner_of(
+        &harness,
+        &running,
+        record.generation,
+        ExecutionStatus::Completed,
+        None,
+    )
+    .await;
+    let polled = runner.poll(None, 0).await.expect("poll");
+    assert_eq!(
+        polled.commands[0].command,
+        OperatorCommand::UndoDecision {
+            decision_id: "decision-1".to_string()
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_command_for_a_stopped_task_on_a_full_backend_queues_it_and_both_commands_survive() {
+    let harness = Harness::start().await;
+    set_backend_limit(&harness, 1);
+    let running = finished_and_stopped(&harness).await;
+    run_beside(&harness, &running, "task-2", "pod-b").await;
+
+    for (key, text) in [("chat-1", "first"), ("chat-2", "second")] {
+        harness
+            .owner
+            .control_operator_command(
+                "task-1",
+                &operator_request(
+                    OperatorCommand::ConductorChat {
+                        text: text.to_string(),
+                    },
+                    key,
+                ),
+            )
+            .await
+            .expect("kept while the task waits for a slot");
+    }
+
+    let record = control_task(&harness, "task-1");
+    assert_eq!(record.runner_state, RunnerState::Queued);
+    assert_eq!(resumes_of(&record), 1);
+    let open: Vec<_> = record
+        .operator_commands
+        .iter()
+        .map(|command| (command.status, command.launch_generation))
+        .collect();
+    assert_eq!(
+        open,
+        vec![
+            (OperatorCommandStatus::Queued, record.generation),
+            (OperatorCommandStatus::Queued, record.generation)
+        ],
+        "both are bound to the launch the queue leads to"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_to_another_request_than_the_last_snapshots_is_refused_for_a_stopped_task() {
+    let harness = Harness::start().await;
+    let running = harness.running("task-1", "k8s").await;
+    stop_by_policy(
+        &harness,
+        &running,
+        ExecutionStatus::InputNeeded,
+        Some("ask-1"),
+    )
+    .await;
+    let revision = harness.task("task-1").await.revision;
+
+    let code = refused_code(
+        harness
+            .owner
+            .control_input("task-1", &input_request("ask-0", "answer-0"))
+            .await,
+    );
+
+    assert_eq!(code, "obsolete_input");
+    let after = harness.task("task-1").await;
+    assert_eq!(after.revision, revision, "nothing was written");
+    assert_eq!(after.runner_state, RunnerState::Stopped, "and no resume");
+}
+
+#[tokio::test]
+async fn a_command_that_needs_a_live_runner_is_refused_for_a_stopped_task() {
+    let harness = Harness::start().await;
+    finished_and_stopped(&harness).await;
+    let revision = harness.task("task-1").await.revision;
+
+    for (command, key) in [
+        (OperatorCommand::Interrupt, "interrupt-1"),
+        (
+            OperatorCommand::ConfirmProposal {
+                proposal_id: "p-1".to_string(),
+            },
+            "confirm-1",
+        ),
+        (
+            OperatorCommand::RejectProposal {
+                proposal_id: "p-1".to_string(),
+            },
+            "reject-1",
+        ),
+    ] {
+        match harness
+            .owner
+            .control_operator_command("task-1", &operator_request(command, key))
+            .await
+        {
+            Err(ClientError::Refused { code, message }) => {
+                assert_eq!(code, "operator_command_refused");
+                assert!(message.contains("no running runner"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+    let task = harness.task("task-1").await;
+    assert_eq!(
+        task.revision, revision,
+        "nothing was written, nothing resumed"
+    );
+    assert_eq!(task.runner_state, RunnerState::Stopped);
+}
+
+#[tokio::test]
+async fn an_answer_in_the_wait_period_reaches_the_runner_without_a_resume_and_clears_the_deadline()
+{
+    let harness = Harness::start().await;
+    let Running { runner, .. } = harness.running("task-1", "k8s").await;
+    runner
+        .snapshot(&snapshot(2, ExecutionStatus::InputNeeded, 4, Some("ask-1")))
+        .await
+        .expect("input needed");
+    assert!(control_task(&harness, "task-1")
+        .slot_release_due_at
+        .is_some());
+
+    harness
+        .owner
+        .control_input("task-1", &input_request("ask-1", "answer-1"))
+        .await
+        .expect("the owner answers");
+    let polled = runner.poll(Some("ask-1"), 0).await.expect("poll");
+    assert_eq!(polled.inputs.len(), 1);
+    runner
+        .ack_input(&polled.inputs[0].input_id, true, None)
+        .await
+        .expect("ack");
+    runner
+        .snapshot(&snapshot(3, ExecutionStatus::Running, 5, None))
+        .await
+        .expect("it works again");
+
+    let record = control_task(&harness, "task-1");
+    assert_eq!(record.runner_state, RunnerState::Running);
+    assert_eq!(resumes_of(&record), 0, "nothing was resumed");
+    assert_eq!(record.slot_release_due_at, None);
+}
+
+#[tokio::test]
+async fn an_owner_cannot_use_the_work_resume_keys() {
+    let harness = Harness::start().await;
+    finished_and_stopped(&harness).await;
+
+    let refused = harness
+        .owner
+        .control_command(
+            "task-1",
+            &OwnerCommandRequest {
+                command: OwnerCommand::Resume,
+                idempotency_key: "work-resume:chat-1".to_string(),
+                expected_generation: None,
+            },
+        )
+        .await;
+
+    assert_eq!(bad_request_code(refused), "reserved_idempotency_key");
+}

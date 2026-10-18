@@ -32,7 +32,8 @@ pub use control_plane::{Clock, ControlPlane, OrchestrationRecovery, SystemClock}
 pub use error::{OrchestrationError, Result};
 pub use model::*;
 pub use resume::{
-    auto_resume_key, exhaustion_loss, loss_state, slot_release_key, LossState, ResumePolicy,
-    AUTO_RESUME_KEY_PREFIX, EXHAUSTION_REASON_PREFIX, SLOT_RELEASE_KEY_PREFIX, UNSPECIFIED_LOSS,
+    auto_resume_key, exhaustion_loss, loss_state, slot_release_key, work_resume_key, LossState,
+    ResumePolicy, AUTO_RESUME_KEY_PREFIX, EXHAUSTION_REASON_PREFIX, SLOT_RELEASE_KEY_PREFIX,
+    UNSPECIFIED_LOSS, WORK_RESUME_KEY_PREFIX,
 };
 pub use store::OrchestrationStore;

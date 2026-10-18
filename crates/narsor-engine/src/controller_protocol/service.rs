@@ -635,6 +635,18 @@ impl ProtocolService {
                 ),
             ));
         }
+        if request
+            .idempotency_key
+            .starts_with(crate::orchestration::WORK_RESUME_KEY_PREFIX)
+        {
+            return Err(ProtocolError::bad_request(
+                "reserved_idempotency_key",
+                format!(
+                    "idempotency keys starting with `{}` are reserved for the resume that work sent to a paused task causes",
+                    crate::orchestration::WORK_RESUME_KEY_PREFIX
+                ),
+            ));
+        }
         let capacity = self.capacity(&record.assignment.backend_id);
         let command = request.command;
         let outcome = self.control.command_with_capacity(
@@ -908,10 +920,58 @@ impl ProtocolService {
         if !outcome.replayed {
             self.notify(&record.task_id);
         }
+        if !outcome.input.status.is_settled() {
+            self.resume_for_work(&record, &outcome.input.idempotency_key)?;
+        }
         Ok(SubmitInputResponse {
             input: InputView::from(&outcome.input),
             replayed: outcome.replayed,
         })
+    }
+
+    /// Work the owner sent (an answer, an operator command) was stored for a
+    /// task that may be paused: resumes it, as the owner's resume would, so
+    /// the work reaches the runner of the next start (R13, R14).
+    ///
+    /// With no free slot the task goes to the front of the queue instead
+    /// and starts when a slot frees (R20): the work never starts an agent
+    /// without one. The resume's key derives from the work's own key, so a
+    /// retry of the work resumes the task once. A task that is not paused
+    /// (running, or already resumed or queued) needs nothing. Called for a
+    /// retry too: a first call that stored the work and failed before the
+    /// resume is repaired by it.
+    fn resume_for_work(&self, record: &TaskRecord, work_key: &str) -> ProtocolResult<()> {
+        let current = self.control.task(&record.task_id)?;
+        if current.runner_state != RunnerState::Stopped {
+            return Ok(());
+        }
+        let capacity = self.capacity(&current.assignment.backend_id);
+        let outcome = self.control.command_with_capacity(
+            &current.task_id,
+            CommandRequest {
+                command: crate::orchestration::OwnerCommand::Resume,
+                idempotency_key: crate::orchestration::work_resume_key(work_key),
+                expected_generation: None,
+                actor: CommandActor::Owner,
+            },
+            &capacity,
+        );
+        match outcome {
+            Ok(outcome) => {
+                if !outcome.replayed {
+                    self.notify(&current.task_id);
+                    self.reschedule(&current.assignment.backend_id);
+                }
+                Ok(())
+            }
+            // Someone else moved the task first (resumed it, archived it):
+            // the work is stored and goes the way the task goes.
+            Err(
+                crate::orchestration::OrchestrationError::StaleGeneration { .. }
+                | crate::orchestration::OrchestrationError::IllegalCommand { .. },
+            ) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Queues an operator command (interrupt, transition, restart) for the
@@ -957,6 +1017,9 @@ impl ProtocolService {
         if !outcome.replayed {
             self.notify(&record.task_id);
         }
+        if !outcome.command.status.is_settled() {
+            self.resume_for_work(&record, &outcome.command.idempotency_key)?;
+        }
         Ok(SubmitOperatorCommandResponse {
             command: OperatorCommandView::from(&outcome.command),
             replayed: outcome.replayed,
@@ -975,11 +1038,15 @@ impl ProtocolService {
                 RETIRED_CONDUCTOR_HARNESS,
             ));
         }
-        if let Some(reason) = record.operator_command_refusal() {
+        if let Some(reason) = record.operator_command_refusal(command) {
             return Err(ProtocolError::conflict("operator_command_refused", reason));
         }
         let runner = record.runner.as_ref().ok_or(ProtocolError::NotFound)?;
-        if self.runner_freshness(record, runner, self.control.now())? == Freshness::Stale {
+        // A paused or resumed task has no live runner to be silent: its
+        // command waits for the next start.
+        let live = record.runner_state == RunnerState::Running
+            && record.awaited_launch_generation().is_none();
+        if live && self.runner_freshness(record, runner, self.control.now())? == Freshness::Stale {
             return Err(ProtocolError::conflict(
                 "operator_command_refused",
                 "the task's runner has not been heard from lately; the command would wait for \
