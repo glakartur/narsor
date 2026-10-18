@@ -557,7 +557,11 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
             json!({ "output": "plan_ready", "variables": { "plan_doc": plan_doc } }),
             label("implemented"), // 4. work — ambiguity uses awaiting_input in place
             label("simplified"),  // simplify
-            label("findings"),    // code_review
+            // code_review — the residual findings travel to the fix step
+            json!({
+                "output": "findings",
+                "variables": { "review_findings": "#1 P1 src/app.rs:10 unchecked input" },
+            }),
             label("fixed"),       // fix_review_findings
             label("clean"),       // code_review again
             label("published"),   // publish_work — opens the first PR
@@ -584,13 +588,8 @@ async fn the_compound_engineering_pipeline_runs_through_all_of_its_gates() {
             Answer::approval("doc_review"),
             // No note: an approval without one must still reach the plan.
             Answer::new("approve_scope", &[("scope_decision", "approved")]),
-            Answer::new(
-                "approve_plan",
-                &[
-                    ("plan_decision", "approved"),
-                    ("plan_feedback", "as written"),
-                ],
-            ),
+            // No feedback: the note on the plan is optional.
+            Answer::new("approve_plan", &[("plan_decision", "approved")]),
             Answer::new(
                 "implementation_review",
                 &[

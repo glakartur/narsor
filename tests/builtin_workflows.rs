@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use narsor_engine::domain::ActionConfig;
+use narsor_engine::engine::actions::agent::output_contract;
 use narsor_engine::workflows::{
     builtin, builtin_names, WorkflowOrigin, WorkflowResolver, BUILTIN_WORKFLOWS,
 };
@@ -329,6 +330,8 @@ fn every_builtin_label_has_a_description() {
 
 /// The implementation agent asks questions through `awaiting_input`, then
 /// resumes the same action; it does not route ambiguity through a workflow gate.
+/// The engine's output contract teaches `awaiting_input`, so the prompt leaves
+/// it to the contract instead of repeating it.
 #[test]
 fn the_work_prompt_uses_agent_input_for_ambiguity() {
     let entry = builtin("compound-engineering").expect("compound-engineering is built in");
@@ -344,8 +347,12 @@ fn the_work_prompt_uses_agent_input_for_ambiguity() {
     );
 
     assert!(
-        action.prompt.contains("awaiting_input"),
-        "the implementation prompt tells the agent to ask and resume in place"
+        !action.prompt.contains("awaiting_input"),
+        "the prompt of 'work' repeats what the engine's output contract says"
+    );
+    assert!(
+        output_contract(&work.outputs).contains("awaiting_input"),
+        "the output contract tells the agent to ask and resume in place"
     );
     assert_eq!(work.outputs.len(), 1);
     assert_eq!(work.outputs[0].label, "implemented");

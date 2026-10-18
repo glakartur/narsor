@@ -70,12 +70,16 @@ update to the PR and asks for a final human review. If there is nothing to
 document, the approved PR is complete.
 
 Loops: `approve_scope → brainstorm`, `approve_plan → plan`,
-`code_review → fix_review_findings → code_review` until clean,
+`code_review → fix_review_findings → code_review` until clean (the
+residual findings travel as `{{ context.review_findings }}`),
 `code_review → publish_work → implementation_review → compound →
 publish_learning → learning_review`. A request from either review returns to
 `work_revision → simplify → code_review`; `publish_work` then updates the same
-PR. During `ce-work`, the agent can also pause its own action with
-`awaiting_input`; the answer resumes that same step.
+PR with a comment that describes the new changes. Agent prompts only invoke
+the `ce-*` skill with its arguments and name the variables later steps read;
+`ce-work` ships its own work (review, commit, push, PR). During `ce-work`, the
+agent can also pause its own action with `awaiting_input`; the answer resumes
+that same step.
 
 ### `open-mercato-sdlc.yaml` — 5 gates
 

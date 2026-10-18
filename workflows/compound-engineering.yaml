@@ -47,20 +47,12 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-brainstorm` skill for this request:
+        Run the `ce-brainstorm` skill with these arguments:
 
         {{ inputs.feature_description }}
 
-        Answer WHAT to build, not HOW. Resolve product behaviour, scope
-        boundaries and success criteria, and write the requirements document
-        to `docs/brainstorms/<date>-<slug>-requirements.md` using
-        repo-relative paths. Do not write production code.
-
-        End every answer, including one after a revision request, with a
-        single JSON object and nothing after it:
-          {"output": "<label>", "variables": {"requirements_doc": "<repo-relative path>"}}
-        `requirements_doc` names the one document you wrote or revised; the
-        later steps read exactly that file.
+        ---
+        Set `variables.requirements_doc` to the repo-relative path of the requirements document you wrote or revised.
     outputs:
       - label: requirements_drafted
         description: the requirements document is written.
@@ -110,16 +102,7 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-doc-review` skill over the requirements document written by
-        `ce-brainstorm`: `{{ context.requirements_doc }}`. Dispatch the persona reviewers,
-        merge their findings and write the review back into the document as a
-        review section. Change no code.
-
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"findings": <count>}}
-        If the review cannot be produced because the document is missing, the
-        harness fails, or a tool is unavailable, report an action failure;
-        do not emit a workflow output for an execution error.
+        Run the `ce-doc-review` skill with these arguments: mode:headless {{ context.requirements_doc }}
     outputs:
       - label: reviewed
         description: the document was reviewed and the findings recorded.
@@ -185,27 +168,14 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-plan` skill. Build from this requirements document — it is
-        the source of truth; do not use any other document in
-        `docs/brainstorms/`:
+        Run the `ce-plan` skill with these arguments: {{ context.requirements_doc }}
 
-        {{ context.requirements_doc }}
-
-        Respect the reviewer's note, if there is one:
-
+        Reviewer's note on scope:
         {{ context.scope_notes }}
 
-        Produce a plan in `docs/plans/` with a problem frame, scope
-        boundaries, repo-relative file paths, explicit test file paths,
-        enumerated test scenarios and decisions with rationale. Decisions, not
-        code: write no implementation.
-
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "variables": {"plan_doc": "<repo-relative path>"}}
-        If you take `needs_scope_revision`, explain the contradiction or
-        missing dependency in `data.question` so a person can revise the scope.
-        A sandbox, harness, tool, or write-permission problem is an action
-        failure, not `needs_scope_revision`.
+        ---
+        Set `variables.plan_doc` to the repo-relative path of the plan.
+        For `needs_scope_revision`, put the contradiction or missing dependency in `data.question`.
     outputs:
       - label: plan_ready
         description: the plan is written and an implementer could start.
@@ -241,8 +211,8 @@ states:
             - abandon
         - name: plan_feedback
           type: text
-          required: true
-          description: What the plan gets wrong, or "as written" if you approve it.
+          required: false
+          description: Optional — what the plan gets wrong.
     outputs:
       - label: approved
         description: the plan is right; start writing code.
@@ -265,17 +235,14 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-plan` skill again. Revise the plan
-        `{{ context.plan_doc }}` based on the approved requirements document
-        `{{ context.requirements_doc }}` and this human feedback:
+        Run the `ce-plan` skill with these arguments: {{ context.plan_doc }}
 
+        Requirements: {{ context.requirements_doc }}
+        Feedback on the plan:
         {{ context.plan_feedback }}
 
-        Keep the plan concrete: repo-relative file paths, test scenarios and
-        sequencing. Write no implementation code.
-
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "variables": {"plan_doc": "<repo-relative path>"}}
+        ---
+        Set `variables.plan_doc` to the repo-relative path of the plan.
     outputs:
       - label: plan_ready
         description: the revised plan is ready for approval.
@@ -289,23 +256,15 @@ states:
   work:
     description: >
       ce-work — execute the approved plan, following existing patterns and
-      keeping the tests green.
+      keeping the tests green. The skill ships its own work: it reviews,
+      commits, pushes and opens the pull request.
     action:
       type: agent
       prompt: |
-        Run the `ce-work` skill against the plan `{{ context.plan_doc }}`. Implement
-        the plan's units in order, write the tests the plan enumerates, and
-        run the repository's own checks before you finish. Respect the plan's
-        scope boundaries. If a requirement or implementation choice is
-        ambiguous, do not guess: return an `awaiting_input` response with a
-        clear question. The workflow pauses this agent action, delivers the
-        person's answer, and resumes this same implementation step. Continue
-        until the implementation is complete.
+        Run the `ce-work` skill with these arguments: {{ context.plan_doc }}
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"units_completed": <count>}}
-        A sandbox, harness, tool, or write-permission problem is an action
-        failure, not a workflow output.
+        ---
+        Set `variables.pr_url` to the pull request URL, if one was opened.
     outputs:
       - label: implemented
         description: the plan is implemented and the checks pass.
@@ -317,28 +276,16 @@ states:
     description: >
       Shared continuation of implementation for changes from human review or
       PR feedback. Both routes re-enter here before simplify and automated
-      review.
+      review; ce-resolve-pr-feedback pushes its own fixes.
     action:
       type: agent
       prompt: |
-        Run the `ce-work` skill against the approved plan `{{ context.plan_doc }}`.
-        Continue the existing implementation and address the changes in the
-        person's review note:
+        Run the `ce-work` skill with these arguments: {{ context.plan_doc }}
 
+        Changes requested in review:
         {{ context.revision_notes }}
 
-        If this branch already has an open pull request, also run
-        `ce-resolve-pr-feedback`: judge each review thread on its merits,
-        incorporate valid requests and reply to each thread. Do not push here;
-        the shared simplify, automated review and human review steps run next.
-
-        Keep changes within the approved plan, add regression tests where
-        appropriate, and run the repository's checks. Do not push or open a PR.
-        Return `revised` when the requested changes are complete; report an
-        action failure if blocked.
-
-        End your answer with a single JSON object and nothing after it:
-          {"output": "revised", "data": {"files_touched": <count>}}
+        If the current branch has an open pull request, then also run the `ce-resolve-pr-feedback` skill.
     outputs:
       - label: revised
         description: requested changes are made and checks pass.
@@ -353,14 +300,7 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-simplify-code` skill over the code changed on this branch.
-        Preserve behaviour exactly: the tests that passed before must pass
-        after. Do not add features and do not widen the diff.
-
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"files_touched": <count>}}
-        If checks cannot pass after restoring the prior implementation, report
-        an action failure; do not emit a workflow output for that error.
+        Run the `ce-simplify-code` skill.
     outputs:
       - label: simplified
         description: simplifications were applied and the checks pass.
@@ -380,24 +320,17 @@ states:
 
   code_review:
     description: >
-      ce-code-review in report-only mode — tiered persona agents, confidence
-      gating, merged and deduplicated findings. Read-only on purpose; findings
-      are sent to the implementation agent for automatic fixes and another
-      review cycle.
+      ce-code-review in autofix mode — tiered persona agents, confidence
+      gating, merged and deduplicated findings. Safe fixes are applied in
+      bounded rounds; the residual findings are passed in
+      `review_findings` to the fix step and another review cycle.
     action:
       type: agent
-      workspace_access: read-only
       prompt: |
-        Run the `ce-code-review` skill with `mode:report-only` over the changes
-        on this branch. Dispatch the persona reviewers, merge and deduplicate
-        their findings, and report them with severity and file:line. Change
-        nothing — no fixes, no commits.
+        Run the `ce-code-review` skill with these arguments: mode:autofix plan:{{ context.plan_doc }}
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"findings": <count>, "blockers": <count>}}
-        If the review cannot be produced because no diff exists, the harness
-        fails, or a tool is unavailable, report an action failure; do not emit
-        a workflow output for an execution error.
+        ---
+        Set `variables.review_findings` to the skill's "Residual actionable work" summary, verbatim (or `none`).
     outputs:
       - label: clean
         description: no actionable findings survived the confidence gate.
@@ -451,15 +384,9 @@ states:
     action:
       type: agent
       prompt: |
-        Address every actionable finding from the latest `ce-code-review`
-        report. Fix causes rather than symptoms, add regression tests for
-        behavioural findings, and run the repository's checks. Do not ask a
-        person to triage findings: make the fixes, then return `fixed` so the
-        workflow runs `ce-code-review` again. If a finding cannot be resolved
-        safely, report an action failure instead of claiming it is fixed.
+        Fix these findings from the code review:
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "fixed", "data": {"fixed": <count>}}
+        {{ context.review_findings }}
     outputs:
       - label: fixed
         description: findings are fixed; run automated review again.
@@ -469,22 +396,15 @@ states:
 
   publish_work:
     description: >
-      Publish the implementation: open a PR for a new branch or update the
-      existing PR after an automated review cycle.
+      Publish the implementation: open a PR for a new branch, or push to the
+      existing PR and describe the new changes in a PR comment.
     action:
       type: agent
       prompt: |
-        The change has passed automated review. Check whether the current
-        branch already has an open pull request. If it does not, run
-        `ce-commit-push-pr` to commit,
-        push and open one with a value-first description. If it does, commit
-        and push the reviewed updates to that existing PR; do not create a
-        duplicate. Follow the repository's commit conventions and never push
-        to the default branch.
+        Run the `ce-commit-push-pr` skill. If the branch already has an open pull request, do not rewrite its description: add a pull request comment that describes the new changes.
 
-        End your answer with a single JSON object and nothing after it:
-          {"output": "published", "data": {"pr_url": "<url>"}, "variables": {"pr_url": "<url>"}}
-        If commit or push fails, report an action failure.
+        ---
+        Set `variables.pr_url` to the pull request URL.
     outputs:
       - label: published
         description: the branch is pushed and the new or existing PR is current.
@@ -499,15 +419,7 @@ states:
     action:
       type: agent
       prompt: |
-        The pull request was already reviewed and approved by a person.
-        `ce-compound` has now written durable learning to `docs/solutions/`.
-        Commit and push that learning to the existing pull request; do not
-        create a new PR. Follow repository commit conventions and never push
-        to the default branch.
-
-        End your answer with a single JSON object and nothing after it:
-          {"output": "updated", "data": {"pr_url": "<url>"}}
-        If commit or push fails, report an action failure.
+        Run the `ce-commit-push-pr` skill. If the branch already has an open pull request, do not rewrite its description: add a pull request comment that describes the new changes.
     outputs:
       - label: updated
         description: the learning is pushed to the existing pull request.
@@ -555,15 +467,7 @@ states:
     action:
       type: agent
       prompt: |
-        Run the `ce-compound` skill over this piece of work. Write the durable
-        learning to `docs/solutions/` with the frontmatter the skill
-        prescribes, so a future `ce-learnings-researcher` can find it: the
-        problem, the root cause, what was tried, what worked, and the rule to
-        follow next time. If nothing here was worth keeping, say so rather
-        than padding the corpus.
-
-        End your answer with a single JSON object and nothing after it:
-          {"output": "<label>", "data": {"doc": "<repo-relative path or null>"}}
+        Run the `ce-compound` skill with these arguments: mode:headless
     outputs:
       - label: documented
         description: a learning document was written.
