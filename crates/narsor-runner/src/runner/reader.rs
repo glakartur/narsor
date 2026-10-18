@@ -65,9 +65,6 @@ pub(super) async fn run(config: RunnerConfig) -> Result<RunnerExit, RunnerError>
         Ok(opened) => opened,
         Err(error) => return Ok(refuse_reads(&mut link, &config.timing, error).await),
     };
-    if link.client().is_none() {
-        return Ok(exit_problem("the runner credential cannot be read".into()));
-    }
     Ok(serve(opened, link, &config.timing).await)
 }
 
@@ -117,22 +114,7 @@ async fn refuse_reads(link: &mut Link, timing: &RunnerTiming, error: RunnerError
         let query = poll_query(timing.poll_wait);
         match client.poll_with(&query).await {
             Ok(response) => {
-                let ids = response
-                    .conversation_pages
-                    .into_iter()
-                    .map(|request| request.request_id)
-                    .chain(
-                        response
-                            .execution_events
-                            .into_iter()
-                            .map(|request| request.request_id),
-                    )
-                    .chain(
-                        response
-                            .conductor_reads
-                            .into_iter()
-                            .map(|request| request.request_id),
-                    );
+                let ids = waiting_request_ids(response);
                 for request_id in ids {
                     fail_read(link, timing, &request_id, &reason).await;
                 }
@@ -143,11 +125,31 @@ async fn refuse_reads(link: &mut Link, timing: &RunnerTiming, error: RunnerError
     exit_problem(reason)
 }
 
+/// The ids of the reads an answer hands out, of every kind.
+fn waiting_request_ids(response: RunnerPollResponse) -> Vec<String> {
+    response
+        .conversation_pages
+        .into_iter()
+        .map(|request| request.request_id)
+        .chain(
+            response
+                .execution_events
+                .into_iter()
+                .map(|request| request.request_id),
+        )
+        .chain(
+            response
+                .conductor_reads
+                .into_iter()
+                .map(|request| request.request_id),
+        )
+        .collect()
+}
+
 fn poll_query(wait: Duration) -> RunnerPollQuery {
     RunnerPollQuery {
         wait_secs: Some(wait.as_secs()),
         defer_materials: true,
-        read_only: true,
         ..RunnerPollQuery::default()
     }
 }
@@ -159,7 +161,7 @@ async fn serve(opened: Opened, mut link: Link, timing: &RunnerTiming) -> RunnerE
             tokio::time::sleep_until(link.next_attempt).await;
         }
         if link.renew_due(timing.renew_margin) {
-            renew(&mut link, timing).await;
+            link.renew(timing).await;
         }
         let Some(client) = link.client() else {
             return exit_problem("the runner credential cannot be read".into());
@@ -180,19 +182,6 @@ async fn serve(opened: Opened, mut link: Link, timing: &RunnerTiming) -> RunnerE
     }
 }
 
-async fn renew(link: &mut Link, timing: &RunnerTiming) {
-    let Some(client) = link.client() else {
-        return;
-    };
-    match client.renew().await {
-        Ok(renewed) => {
-            link.succeeded();
-            link.expires_at = Some(renewed.expires_at);
-        }
-        Err(error) => link.failed(&error, timing),
-    }
-}
-
 /// Acts on one poll answer: the directive first, the reads after. `Some`
 /// when the reader is done.
 async fn answer(
@@ -208,22 +197,7 @@ async fn answer(
     }
     let store = &opened.store;
     let Some(execution_id) = opened.execution_id.as_deref() else {
-        let ids = response
-            .conversation_pages
-            .into_iter()
-            .map(|request| request.request_id)
-            .chain(
-                response
-                    .execution_events
-                    .into_iter()
-                    .map(|request| request.request_id),
-            )
-            .chain(
-                response
-                    .conductor_reads
-                    .into_iter()
-                    .map(|request| request.request_id),
-            );
+        let ids = waiting_request_ids(response);
         for request_id in ids {
             fail_read(link, timing, &request_id, "the task has no execution yet").await;
         }

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::HumanInputDeliveryDto;
 use crate::api::{ExecutionStatusDto, Timeline};
+use crate::chat::is_false;
 use crate::display::TaskDisplay;
 use crate::event::Event;
 use crate::identifier::BackendId;
@@ -82,16 +83,6 @@ pub struct RunnerPollQuery {
     pub defer_materials: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
-    /// A read-only runner polls only for reads: nothing it is offered but
-    /// page, event and conductor requests and the directive is delivered,
-    /// so no owner answer or command is marked delivered to a process that
-    /// will never carry it out.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub read_only: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

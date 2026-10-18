@@ -693,12 +693,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
             _ => {}
         }
 
-        let incarnation = format!(
-            "{}-g{}-{}",
-            context.task.workload,
-            command.generation,
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        );
+        let incarnation = new_incarnation(&context.task.workload, command.generation);
         let issued = self
             .call(self.link.issue_runner_credential(
                 command.task_id.as_str(),
@@ -944,9 +939,6 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
         let command = context.command;
         let task_id = &command.task_id;
         if !command.reader_needed {
-            if self.readers_clear.contains(task_id) {
-                return Ok(Progress::Settled);
-            }
             return Ok(if self.clear_reader(context).await {
                 Progress::Settled
             } else {
@@ -1014,12 +1006,7 @@ impl<B: ExecutionBackend, L: ControllerLink> Controller<B, L> {
                 }
             }
         }
-        let incarnation = format!(
-            "{}-g{}-{}",
-            context.task.reader,
-            command.generation,
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        );
+        let incarnation = new_incarnation(&context.task.reader, command.generation);
         let issued = self
             .call(self.link.issue_reader_credential(
                 task_id.as_str(),
@@ -1314,6 +1301,14 @@ struct TaskContext<'a> {
     epoch: u64,
     command: &'a DesiredCommand,
     task: TaskResources,
+}
+
+/// A fresh incarnation name for a workload of `pod_name` at `generation`.
+fn new_incarnation(pod_name: &str, generation: u64) -> String {
+    format!(
+        "{pod_name}-g{generation}-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    )
 }
 
 /// Whether the workload's own runner incarnation reported to the control

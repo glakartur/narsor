@@ -49,6 +49,17 @@ pub fn slot_release_key(generation: u64) -> String {
 /// [`AUTO_RESUME_KEY_PREFIX`]: a retry of the work resumes the task once.
 pub const WORK_RESUME_KEY_PREFIX: &str = "work-resume:";
 
+/// The idempotency key prefixes only a policy may use, each with what it is
+/// reserved for: an owner's command may not carry one.
+pub const RESERVED_KEY_PREFIXES: [(&str, &str); 3] = [
+    (AUTO_RESUME_KEY_PREFIX, "the resume policy"),
+    (SLOT_RELEASE_KEY_PREFIX, "the slot-release policy"),
+    (
+        WORK_RESUME_KEY_PREFIX,
+        "the resume that work sent to a paused task causes",
+    ),
+];
+
 /// The idempotency key of the resume caused by the work with `work_key`.
 pub fn work_resume_key(work_key: &str) -> String {
     format!("{WORK_RESUME_KEY_PREFIX}{work_key}")

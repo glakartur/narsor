@@ -641,6 +641,21 @@ impl Link {
         tracing::debug!(%error, ?delay, "control plane unreachable or refusing; retrying later");
     }
 
+    /// Renews the credential; a refusal or a failure is handled as in
+    /// [`Link::failed`].
+    async fn renew(&mut self, timing: &RunnerTiming) {
+        let Some(client) = self.client() else {
+            return;
+        };
+        match client.renew().await {
+            Ok(renewed) => {
+                self.succeeded();
+                self.expires_at = Some(renewed.expires_at);
+            }
+            Err(error) => self.failed(&error, timing),
+        }
+    }
+
     fn renew_due(&self, margin: Duration) -> bool {
         self.expires_at.is_some_and(|expires| {
             let margin = chrono::Duration::from_std(margin).unwrap_or_default();
@@ -803,7 +818,6 @@ impl Session {
             wait_secs: Some(wait_secs),
             defer_materials: false,
             harness: Some(harness),
-            read_only: false,
         }
     }
 
@@ -1192,16 +1206,7 @@ impl Session {
     }
 
     async fn renew(&mut self) {
-        let Some(client) = self.link.client() else {
-            return;
-        };
-        match client.renew().await {
-            Ok(renewed) => {
-                self.link.succeeded();
-                self.link.expires_at = Some(renewed.expires_at);
-            }
-            Err(error) => self.link.failed(&error, &self.timing),
-        }
+        self.link.renew(&self.timing).await;
     }
 
     /// Acts on a poll answer: the default harness first — an action the

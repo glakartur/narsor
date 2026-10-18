@@ -22,10 +22,6 @@ use chrono::Duration;
 
 use super::ProtocolService;
 use crate::domain::{BackendId, TaskId};
-use crate::environment::backend::{
-    DEFAULT_SLOT_READER_IDLE_SECS, DEFAULT_SLOT_RELEASE_GRACE_SECS,
-    DEFAULT_SLOT_RELEASE_READ_EXTENSION_SECS,
-};
 use crate::environment::SlotReleaseTimings;
 use crate::orchestration::{OrchestrationError, RunnerState, TaskRecord};
 
@@ -67,11 +63,7 @@ impl ProtocolService {
         let mut pass = SlotReleasePass::default();
         let mut timings: HashMap<BackendId, SlotReleaseTimings> = HashMap::new();
         for task in tasks {
-            if task.runner_state != RunnerState::Running
-                || task
-                    .slot_release_class()
-                    .is_none_or(|class| class == crate::orchestration::SlotReleaseClass::Other)
-            {
+            if task.runner_state != RunnerState::Running || task.slot_release_class().is_none() {
                 continue;
             }
             let mut task = task;
@@ -139,14 +131,9 @@ impl ProtocolService {
     /// (R7). Writes only when the deadline moves by more than the threshold,
     /// so a client that refreshes often does not write the record each time.
     pub(super) fn note_details_read(&self, task: &TaskRecord) {
-        let Some(due_at) = task.slot_release_due_at else {
+        let Some(due_at) = task.slot_release_waiting() else {
             return;
         };
-        if task.runner_state != RunnerState::Running
-            || task.slot_release_class() != Some(crate::orchestration::SlotReleaseClass::Transient)
-        {
-            return;
-        }
         let extension = chrono_duration(
             self.slot_release_timings(&task.assignment.backend_id)
                 .read_extension,
@@ -174,13 +161,7 @@ impl ProtocolService {
             .slot_release_timings(backend_id)
             .unwrap_or_else(|error| {
                 tracing::debug!(backend = %backend_id, %error, "slot release: using default periods");
-                SlotReleaseTimings {
-                    grace: StdDuration::from_secs(DEFAULT_SLOT_RELEASE_GRACE_SECS),
-                    read_extension: StdDuration::from_secs(
-                        DEFAULT_SLOT_RELEASE_READ_EXTENSION_SECS,
-                    ),
-                    reader_idle: StdDuration::from_secs(DEFAULT_SLOT_READER_IDLE_SECS),
-                }
+                SlotReleaseTimings::default()
             })
     }
 }

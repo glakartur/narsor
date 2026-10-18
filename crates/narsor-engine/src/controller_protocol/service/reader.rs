@@ -16,7 +16,7 @@ use crate::controller_protocol::credentials::{ControllerIdentity, RunnerRole};
 use crate::controller_protocol::error::{ProtocolError, ProtocolResult};
 use crate::controller_protocol::wire::*;
 use crate::domain::TaskId;
-use crate::orchestration::{ReaderLease, TaskRecord};
+use crate::orchestration::{ReaderLease, RunnerState, TaskRecord};
 
 /// How often a read waiting for its reader looks whether it connected.
 const CONNECT_CHECK_EVERY: StdDuration = StdDuration::from_millis(100);
@@ -110,7 +110,14 @@ impl ProtocolService {
         };
         let now = self.control.now();
         let mut pass = ReaderLeasePass::default();
-        for task in tasks.iter().filter(|task| task.reader_lease_stale(now)) {
+        // Most tasks have no lease: skip them before anything locks a record.
+        let stale = tasks
+            .iter()
+            .filter(|task| {
+                task.reader_lease.is_some() && task.runner_state != RunnerState::Archived
+            })
+            .filter(|task| task.reader_lease_stale(now));
+        for task in stale {
             match self.control.end_reader_lease(&task.task_id) {
                 Ok(true) => {
                     self.notify(&task.task_id);
@@ -140,50 +147,17 @@ impl ProtocolService {
         task_id: &str,
         request: RunnerCredentialRequest,
     ) -> ProtocolResult<RunnerCredentialResponse> {
-        let record = self.backend_task(identity, task_id)?;
-        let lease = self.require_lease(identity)?;
-        if lease.epoch != request.lease_epoch {
-            return Err(ProtocolError::conflict(
-                "stale_lease",
-                format!(
-                    "lease epoch {} is not the current epoch {}",
-                    request.lease_epoch, lease.epoch
-                ),
-            ));
-        }
-        if request.generation != record.generation {
-            return Err(ProtocolError::conflict(
-                "stale_generation",
-                format!(
-                    "task '{}' is at generation {}, not {}",
-                    record.task_id, record.generation, request.generation
-                ),
-            ));
-        }
-        if !record.reader_lease_active(self.control.now()) {
-            return Err(ProtocolError::conflict(
+        self.issue_session(identity, task_id, request, RunnerRole::Reader, |record| {
+            if record.reader_lease_active(self.control.now()) {
+                return Ok(());
+            }
+            Err(ProtocolError::conflict(
                 "reader_not_wanted",
                 format!(
                     "task '{}' ({:?}) has no reader lease: nobody is reading it",
                     record.task_id, record.runner_state
                 ),
-            ));
-        }
-        let incarnation = self.checked_incarnation(&request.incarnation)?;
-        let (session, credential) = self.credentials.issue_runner_session(
-            RunnerRole::Reader,
-            &record.task_id,
-            incarnation,
-            record.generation,
-            lease.epoch,
-            self.config.runner_credential_ttl,
-        )?;
-        Ok(RunnerCredentialResponse {
-            task_id: session.task_id,
-            generation: session.launch_generation,
-            incarnation: session.incarnation,
-            credential: credential.expose().to_string(),
-            expires_at: session.expires_at,
+            ))
         })
     }
 }

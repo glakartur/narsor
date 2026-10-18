@@ -614,40 +614,13 @@ impl ProtocolService {
                 "an owner command needs an idempotency key",
             ));
         }
-        if request
-            .idempotency_key
-            .starts_with(crate::orchestration::AUTO_RESUME_KEY_PREFIX)
+        if let Some((prefix, purpose)) = crate::orchestration::RESERVED_KEY_PREFIXES
+            .iter()
+            .find(|(prefix, _)| request.idempotency_key.starts_with(prefix))
         {
             return Err(ProtocolError::bad_request(
                 "reserved_idempotency_key",
-                format!(
-                    "idempotency keys starting with `{}` are reserved for the resume policy",
-                    crate::orchestration::AUTO_RESUME_KEY_PREFIX
-                ),
-            ));
-        }
-        if request
-            .idempotency_key
-            .starts_with(crate::orchestration::SLOT_RELEASE_KEY_PREFIX)
-        {
-            return Err(ProtocolError::bad_request(
-                "reserved_idempotency_key",
-                format!(
-                    "idempotency keys starting with `{}` are reserved for the slot-release policy",
-                    crate::orchestration::SLOT_RELEASE_KEY_PREFIX
-                ),
-            ));
-        }
-        if request
-            .idempotency_key
-            .starts_with(crate::orchestration::WORK_RESUME_KEY_PREFIX)
-        {
-            return Err(ProtocolError::bad_request(
-                "reserved_idempotency_key",
-                format!(
-                    "idempotency keys starting with `{}` are reserved for the resume that work sent to a paused task causes",
-                    crate::orchestration::WORK_RESUME_KEY_PREFIX
-                ),
+                format!("idempotency keys starting with `{prefix}` are reserved for {purpose}"),
             ));
         }
         let capacity = self.capacity(&record.assignment.backend_id);
@@ -1369,6 +1342,17 @@ impl ProtocolService {
         identity: &ControllerIdentity,
         all: bool,
     ) -> ProtocolResult<CommandsResponse> {
+        self.commands_and_readers(identity, all)
+            .map(|(response, _)| response)
+    }
+
+    /// [`Self::commands`], and the tasks a read-only runner is wanted for,
+    /// from the same read of the records.
+    fn commands_and_readers(
+        &self,
+        identity: &ControllerIdentity,
+        all: bool,
+    ) -> ProtocolResult<(CommandsResponse, std::collections::BTreeSet<TaskId>)> {
         let lease = self.require_lease(identity)?;
         // Decide admission before answering: the controller asking is the
         // proof its backend is online, and its limit is read fresh.
@@ -1379,11 +1363,17 @@ impl ProtocolService {
             .controller(&identity.controller_id)?
             .ok_or(ProtocolError::Unauthorized)?
             .acknowledged;
-        let commands = self
-            .control
-            .list_tasks()?
-            .iter()
-            .filter(|record| record.assignment.backend_id == identity.backend_id)
+        let tasks = self.control.list_tasks()?;
+        let ours = || {
+            tasks
+                .iter()
+                .filter(|record| record.assignment.backend_id == identity.backend_id)
+        };
+        let readers = ours()
+            .filter(|record| record.reader_lease_active(now))
+            .map(|record| record.task_id.clone())
+            .collect();
+        let commands = ours()
             .filter(|record| {
                 all || record.generation
                     > acknowledged
@@ -1400,10 +1390,11 @@ impl ProtocolService {
             .into_iter()
             .flatten()
             .collect();
-        Ok(CommandsResponse {
+        let response = CommandsResponse {
             lease_epoch: lease.epoch,
             commands,
-        })
+        };
+        Ok((response, readers))
     }
 
     /// [`Self::commands`] as a long-poll: answers as soon as there is at
@@ -1420,9 +1411,8 @@ impl ProtocolService {
         let readers_at_start = self.readers_wanted(&identity.backend_id)?;
         let found = self
             .wait_for(wait, None, || {
-                let response = self.commands(identity, query.all)?;
-                let readers_changed =
-                    self.readers_wanted(&identity.backend_id)? != readers_at_start;
+                let (response, readers) = self.commands_and_readers(identity, query.all)?;
+                let readers_changed = readers != readers_at_start;
                 Ok((!response.commands.is_empty() || readers_changed).then_some(response))
             })
             .await?;
@@ -1542,6 +1532,33 @@ impl ProtocolService {
         task_id: &str,
         request: RunnerCredentialRequest,
     ) -> ProtocolResult<RunnerCredentialResponse> {
+        self.issue_session(identity, task_id, request, RunnerRole::Worker, |record| {
+            if matches!(
+                record.runner_state,
+                RunnerState::Provisioning | RunnerState::Running
+            ) {
+                return Ok(());
+            }
+            Err(ProtocolError::conflict(
+                "runner_launch_not_allowed",
+                format!(
+                    "task '{}' cannot launch a runner while {:?}",
+                    record.task_id, record.runner_state
+                ),
+            ))
+        })
+    }
+
+    /// Issues a session credential of `role` to the lease holder for the
+    /// task's current generation, once `gate` accepts the task's record.
+    fn issue_session(
+        &self,
+        identity: &ControllerIdentity,
+        task_id: &str,
+        request: RunnerCredentialRequest,
+        role: RunnerRole,
+        gate: impl FnOnce(&TaskRecord) -> ProtocolResult<()>,
+    ) -> ProtocolResult<RunnerCredentialResponse> {
         let record = self.backend_task(identity, task_id)?;
         let lease = self.require_lease(identity)?;
         if lease.epoch != request.lease_epoch {
@@ -1562,21 +1579,10 @@ impl ProtocolService {
                 ),
             ));
         }
-        if !matches!(
-            record.runner_state,
-            RunnerState::Provisioning | RunnerState::Running
-        ) {
-            return Err(ProtocolError::conflict(
-                "runner_launch_not_allowed",
-                format!(
-                    "task '{}' cannot launch a runner while {:?}",
-                    record.task_id, record.runner_state
-                ),
-            ));
-        }
+        gate(&record)?;
         let incarnation = self.checked_incarnation(&request.incarnation)?;
         let (session, credential) = self.credentials.issue_runner_session(
-            RunnerRole::Worker,
+            role,
             &record.task_id,
             incarnation,
             record.generation,
@@ -1673,33 +1679,33 @@ impl ProtocolService {
             .ok_or(ProtocolError::Unauthorized)?;
         let pending = query.pending_input_id.as_deref();
         let defer_materials = query.defer_materials;
-        // A reader's credential reads whatever its query says.
-        let read_only = query.read_only || identity.role == RunnerRole::Reader;
+        let reader = identity.role == RunnerRole::Reader;
         let poll = || -> ProtocolResult<RunnerPollResponse> {
-            // A read-only runner is handed nothing it would have to act on:
+            // A reader is handed nothing it would have to act on:
             // delivering an answer or a command to it would spend them.
-            let (inputs, changed) = if read_only {
-                (Vec::new(), false)
+            let (inputs, commands, materials) = if reader {
+                (Vec::new(), Vec::new(), Vec::new())
             } else {
-                self.control.deliver_inputs(
+                let (inputs, changed) = self.control.deliver_inputs(
                     &identity.task_id,
                     &identity.incarnation,
                     identity.launch_generation,
                     pending,
-                )?
-            };
-            let (commands, commands_changed) = if read_only {
-                (Vec::new(), false)
-            } else {
-                self.control.deliver_operator_commands(
+                )?;
+                let (commands, commands_changed) = self.control.deliver_operator_commands(
                     &identity.task_id,
                     &identity.incarnation,
                     identity.launch_generation,
-                )?
+                )?;
+                if changed || commands_changed {
+                    self.notify(&identity.task_id);
+                }
+                (
+                    inputs,
+                    commands,
+                    self.material_announcements(&identity.task_id),
+                )
             };
-            if changed || commands_changed {
-                self.notify(&identity.task_id);
-            }
             let record = self.control.task(&identity.task_id)?;
             let now = self.control.now();
             Ok(RunnerPollResponse {
@@ -1730,11 +1736,7 @@ impl ProtocolService {
                 conversation_pages: self.lock_pages().requests_of(&identity.task_id),
                 execution_events: self.lock_event_reads().requests_of(&identity.task_id),
                 conductor_reads: self.lock_conductor_reads().requests_of(&identity.task_id),
-                materials: if read_only {
-                    Vec::new()
-                } else {
-                    self.material_announcements(&identity.task_id)
-                },
+                materials,
                 default_harness: self.default_harness_of(&record),
             })
         };

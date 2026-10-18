@@ -126,7 +126,7 @@ impl ProtocolService {
         let page = tokio::time::timeout(self.config.conversation_page_timeout, answer).await;
         drop(guard);
         match page {
-            Ok(Ok(page)) => Ok(with_source(page, ExecutionEventsSource::Runner, None)),
+            Ok(Ok(page)) => Ok(from_runner(page)),
             Ok(Err(_)) => Err(ProtocolError::conflict(
                 CONVERSATION_UNAVAILABLE,
                 "the runner could not read the conversation page",
@@ -147,12 +147,8 @@ fn page_budget(query: &ConversationPageQuery) -> u64 {
         .clamp(1, MAX_PAGE_BUDGET)
 }
 
-/// Marks a page with where it was read from.
-fn with_source(
-    page: ConversationPage,
-    read_from: ExecutionEventsSource,
-    when: Option<DateTime<Utc>>,
-) -> ConversationPage {
+/// Marks a page as read from a runner, which records no time of its own.
+fn from_runner(page: ConversationPage) -> ConversationPage {
     match page {
         ConversationPage::Recorded {
             entries,
@@ -165,8 +161,8 @@ fn with_source(
             next_entry,
             closed,
             truncated_tail,
-            source: Some(read_from),
-            recorded_at: when,
+            source: Some(ExecutionEventsSource::Runner),
+            recorded_at: None,
         },
         ConversationPage::NoRecord => ConversationPage::NoRecord,
     }

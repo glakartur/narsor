@@ -301,7 +301,7 @@ impl ControlPlane {
                     TaskEventKind::SlotReleased {
                         reason: record
                             .slot_release_class()
-                            .and_then(SlotReleaseClass::release_reason)
+                            .map(SlotReleaseClass::release_reason)
                             .unwrap_or(SlotReleaseReason::GraceElapsed),
                     }
                 }
@@ -458,9 +458,7 @@ impl ControlPlane {
     /// so frequent reads write the record at most once per threshold.
     pub fn extend_slot_release(&self, task_id: &TaskId, read_extension: Duration) -> Result<bool> {
         let (_, moved) = self.mutate(task_id, |record, now| {
-            let transient = record.runner_state == RunnerState::Running
-                && record.slot_release_class() == Some(SlotReleaseClass::Transient);
-            let Some(due_at) = record.slot_release_due_at.filter(|_| transient) else {
+            let Some(due_at) = record.slot_release_waiting() else {
                 return Ok(Mutation::Unchanged(false));
             };
             let extended = now + read_extension;

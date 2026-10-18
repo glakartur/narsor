@@ -369,7 +369,6 @@ async fn simulated_reader(
     let query = RunnerPollQuery {
         wait_secs: Some(RUNNER_POLL_SECS),
         defer_materials: true,
-        read_only: true,
         ..RunnerPollQuery::default()
     };
     let mut up = false;

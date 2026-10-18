@@ -15,4 +15,4 @@ pub use dto::{
 };
 pub use narsor_shared::api_error::{handle_json_response, ClientError};
 mod projection;
-pub use projection::{conversation_response_from_snapshot, local_task_storage_root};
+pub use projection::conversation_response_from_snapshot;

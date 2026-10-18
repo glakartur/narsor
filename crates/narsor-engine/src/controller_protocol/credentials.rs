@@ -27,6 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -561,11 +562,15 @@ impl CredentialStore {
         self.session_of(RunnerRole::Reader, task_id)
     }
 
-    fn session_of(&self, role: RunnerRole, task_id: &TaskId) -> Result<Option<RunnerSession>> {
-        let path = match role {
+    fn session_path(&self, role: RunnerRole, task_id: &TaskId) -> PathBuf {
+        match role {
             RunnerRole::Worker => self.paths().runner_session_file(task_id.as_str()),
             RunnerRole::Reader => self.paths().reader_session_file(task_id.as_str()),
-        };
+        }
+    }
+
+    fn session_of(&self, role: RunnerRole, task_id: &TaskId) -> Result<Option<RunnerSession>> {
+        let path = self.session_path(role, task_id);
         if !path.exists() {
             return Ok(None);
         }
@@ -606,10 +611,7 @@ impl CredentialStore {
     }
 
     fn save_session(&self, role: RunnerRole, session: &RunnerSession) -> Result<()> {
-        let path = match role {
-            RunnerRole::Worker => self.paths().runner_session_file(session.task_id.as_str()),
-            RunnerRole::Reader => self.paths().reader_session_file(session.task_id.as_str()),
-        };
+        let path = self.session_path(role, &session.task_id);
         Ok(write_json_atomic_with_mode(
             &path,
             session,
@@ -618,12 +620,11 @@ impl CredentialStore {
     }
 
     fn verify_runner(&self, bearer: &str) -> Result<Option<RunnerIdentity>> {
-        let (role, task_id) = match token_id(RUNNER_PREFIX, bearer) {
-            Some(id) => (RunnerRole::Worker, id),
-            None => match token_id(READER_PREFIX, bearer) {
-                Some(id) => (RunnerRole::Reader, id),
-                None => return Ok(None),
-            },
+        let Some((role, task_id)) = token_id(RUNNER_PREFIX, bearer)
+            .map(|id| (RunnerRole::Worker, id))
+            .or_else(|| token_id(READER_PREFIX, bearer).map(|id| (RunnerRole::Reader, id)))
+        else {
+            return Ok(None);
         };
         let Ok(task_id) = TaskId::parse(task_id) else {
             return Ok(None);

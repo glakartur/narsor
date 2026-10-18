@@ -53,26 +53,24 @@ pub enum SlotReleaseClass {
     /// The execution waits for its owner (`InputNeeded`, `Failed`): the slot
     /// is freed after a wait.
     Transient,
-    /// Any other status: the slot is kept.
-    Other,
 }
 
 impl SlotReleaseClass {
-    /// The class of an execution status.
-    pub fn of(status: ExecutionStatus) -> Self {
+    /// The class of an execution status; `None` for any other status: the
+    /// slot is kept.
+    pub fn of(status: ExecutionStatus) -> Option<Self> {
         match status {
-            ExecutionStatus::Completed | ExecutionStatus::Cancelled => Self::Final,
-            ExecutionStatus::InputNeeded | ExecutionStatus::Failed => Self::Transient,
-            _ => Self::Other,
+            ExecutionStatus::Completed | ExecutionStatus::Cancelled => Some(Self::Final),
+            ExecutionStatus::InputNeeded | ExecutionStatus::Failed => Some(Self::Transient),
+            _ => None,
         }
     }
 
-    /// Why a slot was freed in this class, `None` for [`Self::Other`].
-    pub fn release_reason(self) -> Option<SlotReleaseReason> {
+    /// Why a slot was freed in this class.
+    pub fn release_reason(self) -> SlotReleaseReason {
         match self {
-            Self::Final => Some(SlotReleaseReason::Terminal),
-            Self::Transient => Some(SlotReleaseReason::GraceElapsed),
-            Self::Other => None,
+            Self::Final => SlotReleaseReason::Terminal,
+            Self::Transient => SlotReleaseReason::GraceElapsed,
         }
     }
 }
@@ -359,11 +357,25 @@ impl TaskRecord {
     }
 
     /// How the last runner snapshot classifies the task's execution for
-    /// its slot; `None` before the first snapshot.
+    /// its slot; `None` before the first snapshot, and for a status that
+    /// keeps the slot.
     pub fn slot_release_class(&self) -> Option<SlotReleaseClass> {
         self.runner
             .as_ref()
-            .map(|runner| SlotReleaseClass::of(runner.snapshot.execution_status))
+            .and_then(|runner| SlotReleaseClass::of(runner.snapshot.execution_status))
+    }
+
+    /// The deadline of a running task whose execution waits in a transient
+    /// state (the only one a read of its details moves later); `None` when
+    /// it is not waiting so, or has no deadline yet.
+    pub fn slot_release_waiting(&self) -> Option<DateTime<Utc>> {
+        if self.runner_state == RunnerState::Running
+            && self.slot_release_class() == Some(SlotReleaseClass::Transient)
+        {
+            self.slot_release_due_at
+        } else {
+            None
+        }
     }
 
     /// Whether a read-only runner is wanted for the task now: its lease
@@ -413,9 +425,7 @@ impl TaskRecord {
     pub fn slot_release_due(&self, now: DateTime<Utc>) -> bool {
         self.runner_state == RunnerState::Running
             && self.slot_release_due_at.is_some_and(|at| at <= now)
-            && self
-                .slot_release_class()
-                .is_some_and(|class| class != SlotReleaseClass::Other)
+            && self.slot_release_class().is_some()
             && !self.owner_work_pending()
     }
 
@@ -1159,17 +1169,17 @@ mod tests {
     #[test]
     fn only_completed_and_cancelled_free_a_slot_at_once() {
         use SlotReleaseClass as C;
-        assert_eq!(C::of(ExecutionStatus::Completed), C::Final);
-        assert_eq!(C::of(ExecutionStatus::Cancelled), C::Final);
-        assert_eq!(C::of(ExecutionStatus::InputNeeded), C::Transient);
-        assert_eq!(C::of(ExecutionStatus::Failed), C::Transient);
+        assert_eq!(C::of(ExecutionStatus::Completed), Some(C::Final));
+        assert_eq!(C::of(ExecutionStatus::Cancelled), Some(C::Final));
+        assert_eq!(C::of(ExecutionStatus::InputNeeded), Some(C::Transient));
+        assert_eq!(C::of(ExecutionStatus::Failed), Some(C::Transient));
         for other in [
             ExecutionStatus::Running,
             ExecutionStatus::Paused,
             ExecutionStatus::WaitingForEvent,
             ExecutionStatus::Unknown,
         ] {
-            assert_eq!(C::of(other), C::Other);
+            assert_eq!(C::of(other), None);
         }
     }
 

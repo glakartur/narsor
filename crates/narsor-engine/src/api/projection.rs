@@ -62,11 +62,6 @@ fn elements_of(entry: &mut ConversationEntry) -> Vec<ChatElement> {
     }
 }
 
-/// Storage root for the local controller's task directories.
-pub fn local_task_storage_root(work_dir: &std::path::Path) -> std::path::PathBuf {
-    work_dir.join("local-controller").join("storage")
-}
-
 fn base64_encode(raw: &[u8]) -> String {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;

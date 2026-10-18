@@ -124,6 +124,16 @@ pub struct SlotReleaseTimings {
     pub reader_idle: Duration,
 }
 
+impl Default for SlotReleaseTimings {
+    fn default() -> Self {
+        Self {
+            grace: Duration::from_secs(DEFAULT_SLOT_RELEASE_GRACE_SECS),
+            read_extension: Duration::from_secs(DEFAULT_SLOT_RELEASE_READ_EXTENSION_SECS),
+            reader_idle: Duration::from_secs(DEFAULT_SLOT_READER_IDLE_SECS),
+        }
+    }
+}
+
 impl BackendLimits {
     /// Limits with the given capacity and resources and default slot periods.
     pub fn new(
