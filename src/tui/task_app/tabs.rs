@@ -14,6 +14,12 @@
 //! * [`conductor`] — the chat with the conductor, its decisions and harness;
 //! * [`info`] — what the control plane knows about the task.
 
+/// How long the interface waits before it asks again for a stopped task whose
+/// read-only runner is still starting (D63, R12). The server waits a moment
+/// for the reader as well, so a read of this kind is never repeated without
+/// a pause.
+pub const READER_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub mod conductor;
 pub mod conversation;
 pub mod events;

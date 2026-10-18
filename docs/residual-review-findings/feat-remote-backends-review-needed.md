@@ -140,7 +140,10 @@ reviewer should try to break.
 - **Admission.** Each backend has a schedule lock. Reservations are stored on
   the task record. `StartAccepted` is refused without a reservation.
 - **Slot holding.** Interrupted, Unknown and Archiving tasks hold a slot. An
-  ignored interrupted task blocks a slot indefinitely; this is deliberate.
+  ignored interrupted task blocks a slot indefinitely; this was deliberate.
+  [Update, D62: the deliberate holding ended for tasks that completed, were
+  cancelled, wait for input or failed; they free their slot (see
+  `ARCHITECTURE_DECISIONS.md`). Only the cases listed below still hold it.]
   Since D58 an interrupted task is resumed automatically, so only a task whose
   automatic resume is exhausted, one lost while pausing, or an `Unknown` one
   holds its slot until the owner acts.

@@ -3832,6 +3832,198 @@ mod task_app_detail {
             assert!(app.connection().is_live());
         }
 
+        /// D63, R12: a stopped task is read by a reader that is not connected
+        /// yet. The tab says it is loading, asks again after a pause (never
+        /// at once), and shows the events when an answer brings them.
+        #[tokio::test]
+        async fn events_of_a_task_whose_reader_is_starting_load_and_are_asked_again() {
+            let harness = RemoteHarness::start().await;
+            let running = harness.running("task-1", "k8s", live_snapshot()).await;
+            running
+                .controller
+                .report(&report(
+                    "task-1",
+                    running.epoch,
+                    1,
+                    Observation::WorkloadLost { state_known: true },
+                    Some(1),
+                ))
+                .await
+                .expect("lost");
+            let mut app = app_over(&harness).await;
+            press(&mut app, KeyCode::Char(']'));
+            assert_eq!(app.detail().tab(), DetailTab::Events);
+
+            app.sync_detail().await;
+            let revision = app.list().selected().unwrap().revision;
+            let events = app.detail().view("task-1").unwrap().events();
+            assert!(
+                matches!(
+                    events.availability(),
+                    Availability::Unavailable {
+                        reason: ConversationUnavailableReason::ReaderStarting,
+                        ..
+                    }
+                ),
+                "{:?}",
+                events.availability()
+            );
+            assert!(events.is_starting());
+            let now = std::time::Instant::now();
+            assert!(
+                !events.needs_read_at(revision, now),
+                "no read without a pause"
+            );
+            assert!(
+                events.needs_read_at(revision, now + std::time::Duration::from_secs(60)),
+                "asked again after a pause"
+            );
+            assert!(app.connection().is_live());
+
+            // The next answer brings a page: the events show, nothing is
+            // asked again.
+            let mut events = app.detail().view("task-1").unwrap().events().clone();
+            events.apply_at(
+                revision,
+                0,
+                Ok(ExecutionEventsResponse::Available {
+                    events: execution_events(3),
+                    has_more: false,
+                    source: ExecutionEventsSource::Runner,
+                }),
+                now,
+            );
+            assert_eq!(events.events().len(), 3);
+            assert!(!events.is_starting());
+            assert!(!events.needs_read_at(revision, now + std::time::Duration::from_secs(60)));
+        }
+
+        /// The conversation of such a task: the page is refused with the
+        /// retryable code, which is not a failure — the tab says it is loading
+        /// and asks again after a pause.
+        #[tokio::test]
+        async fn the_conversation_of_a_task_whose_reader_is_starting_loads_and_is_asked_again() {
+            let harness = RemoteHarness::start().await;
+            let running = harness.running("task-1", "k8s", live_snapshot()).await;
+            running
+                .controller
+                .report(&report(
+                    "task-1",
+                    running.epoch,
+                    1,
+                    Observation::WorkloadLost { state_known: true },
+                    Some(1),
+                ))
+                .await
+                .expect("lost");
+            let mut app = app_over(&harness).await;
+            assert_eq!(app.detail().tab(), DetailTab::Conversation);
+
+            app.sync_detail().await;
+            let revision = app.list().selected().unwrap().revision;
+            let view = app.detail().view("task-1").unwrap();
+            let failure = view.conversation().failure().expect("a note");
+            assert_eq!(*failure, ReadFailure::Starting);
+            let (text, _) = failure.note(None);
+            assert!(text.contains("wczytywanie"), "{text}");
+            let attempts = view.attempts();
+            let now = std::time::Instant::now();
+            assert!(!attempts.needs_read_at("act-plan", revision, now));
+            assert!(attempts.needs_read_at(
+                "act-plan",
+                revision,
+                now + std::time::Duration::from_secs(60)
+            ));
+        }
+
+        /// Any other reason is shown with what was read last, and is not asked
+        /// again until the task changes.
+        #[test]
+        fn an_unavailable_answer_with_another_reason_keeps_the_last_events_and_does_not_retry() {
+            let now = std::time::Instant::now();
+            let later = now + std::time::Duration::from_secs(3600);
+            let mut events = narsor::tui::task_app::tabs::events::Events::default();
+            events.apply_at(
+                1,
+                0,
+                Ok(ExecutionEventsResponse::Available {
+                    events: execution_events(2),
+                    has_more: false,
+                    source: ExecutionEventsSource::Runner,
+                }),
+                now,
+            );
+            events.apply_at(
+                1,
+                2,
+                Ok(ExecutionEventsResponse::Unavailable {
+                    reason: ConversationUnavailableReason::Archived,
+                    message: "the task is archived".to_string(),
+                }),
+                now,
+            );
+            assert_eq!(events.events().len(), 2, "the last snapshot stays");
+            assert!(!events.is_starting());
+            assert!(!events.needs_read_at(1, later), "no loop");
+            assert!(events.needs_read_at(2, now), "a new revision reads again");
+            match events.availability() {
+                Availability::Unavailable { reason, message } => {
+                    assert_eq!(*reason, ConversationUnavailableReason::Archived);
+                    assert_eq!(message, "the task is archived");
+                }
+                other => panic!("expected the reason, got {other:?}"),
+            }
+
+            let mut attempts = narsor::tui::task_app::tabs::conversation::Attempts::default();
+            attempts.apply_at(
+                "act-1",
+                1,
+                0,
+                Err(ReadFailure::Unavailable("it cannot be read".to_string())),
+                now,
+            );
+            assert!(!attempts.needs_read_at("act-1", 1, later), "no loop");
+        }
+
+        #[test]
+        fn the_conductor_of_a_task_whose_reader_is_starting_loads_and_is_asked_again() {
+            use narsor::tui::task_app::tabs::conductor::{Conductor, Standing};
+            let now = std::time::Instant::now();
+            let later = now + std::time::Duration::from_secs(60);
+            let mut conductor = Conductor::new("task-1");
+            conductor.apply(
+                1,
+                now,
+                Ok(
+                    narsor::controller_protocol::ConductorReadResponse::Unavailable {
+                        reason: ConversationUnavailableReason::ReaderStarting,
+                        message: "starting".to_string(),
+                    },
+                ),
+            );
+            assert!(conductor.is_starting());
+            assert!(conductor.note().is_none());
+            assert!(!conductor.needs_read(1, now), "no read without a pause");
+            assert!(conductor.needs_read(1, later));
+            let mut task = running("task-1", 1);
+            task.runner = None;
+            assert!(matches!(conductor.standing(&task), Standing::Loading));
+
+            conductor.apply(
+                1,
+                later,
+                Ok(
+                    narsor::controller_protocol::ConductorReadResponse::Unavailable {
+                        reason: ConversationUnavailableReason::Paused,
+                        message: "paused".to_string(),
+                    },
+                ),
+            );
+            assert!(!conductor.is_starting());
+            assert_eq!(conductor.note(), Some("paused"));
+            assert!(!conductor.needs_read(1, later + std::time::Duration::from_secs(3600)));
+        }
+
         #[tokio::test]
         async fn the_conversation_pages_of_a_recorded_step_come_through_the_relay() {
             let harness = RemoteHarness::start().await;
@@ -5450,7 +5642,7 @@ mod task_app_waiting {
         );
         read_conductor_response(
             &mut app,
-            Ok(ConductorReadResponse::Unavailable {
+            Ok(narsor::controller_protocol::ConductorReadResponse::Unavailable {
                 reason:
                     narsor_engine::controller_protocol::ConversationUnavailableReason::RunnerUnreachable,
                 message: "brak harnessu".to_string(),
@@ -8628,10 +8820,12 @@ mod task_app_conductor {
             let mut app = tab_app();
             read_response(
                 &mut app,
-                Ok(ConductorReadResponse::Unavailable {
-                    reason: ConversationUnavailableReason::NotStarted,
-                    message: "zadanie nie ma żywego runnera".to_string(),
-                }),
+                Ok(
+                    narsor::controller_protocol::ConductorReadResponse::Unavailable {
+                        reason: ConversationUnavailableReason::NotStarted,
+                        message: "zadanie nie ma żywego runnera".to_string(),
+                    },
+                ),
             );
             let text = screen(&mut app, 120, 30);
             assert!(text.contains("zadanie nie ma żywego runnera"), "{text}");

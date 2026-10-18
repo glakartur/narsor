@@ -184,7 +184,7 @@ limits:
   # optional slot-release periods, in whole seconds (1 to 86400); defaults shown
   slot_release_grace_secs: 300           # wait before a task in a transient state frees its slot
   slot_release_read_extension_secs: 180  # what a read of the task's details adds to that wait
-  slot_reader_idle_secs: 120             # idle time after which a reader stops extending it
+  slot_reader_idle_secs: 120             # idle time after which the read-only runner of a stopped task is removed
 harnesses: [claude-code, codex]   # optional allow list
 secret_delivery: platform         # none | platform
 secrets:
@@ -571,22 +571,45 @@ any state ─▶ Archiving ─▶ Archived
 * **Archive** stops everything and deletes the Pod **and the PVC**. It wins
   over every other state and cannot be undone; there is no automatic
   retention cleanup.
-* While a remote task is stopped (paused by the owner or freed by the slot
-  policy), interrupted or archived its conversation is
-  explicitly unavailable; clients show the last safe summary and its time. A
-  task of the daemon's own `local` backend without a live runner is read
-  from its storage instead, marked with the age of the record (D59).
-  Observations that are no longer current are shown as stale with their age,
-  never turned into another state. This is the state of phase 1 of D62; phase 2
-  replaces the read from storage with a read-only runner.
+* **Reading a stopped task (D63).** While a task is stopped (paused by the
+  owner or freed by the slot policy) or interrupted, its conversation,
+  events and conductor are read by a **read-only runner** (`narsor-runner
+  --read-only`), on every backend. The control plane does not read the task's
+  storage itself. Opening the task's details leases a reader on the task's
+  record (`reader_lease`). The controller sees `reader_needed` in the
+  desired state of the task and starts the reader as a workload of its own:
+  on Kubernetes a second Pod `narsor-<key>-<hash>-reader` with the task's
+  PVC mounted `readOnly`; on `local` a second process. The reader takes the
+  storage lock like a working runner, writes nothing to the storage, and
+  has its own credential (role `reader`, token prefix `nsrr.`, file
+  `reader-session.json`) that the control plane refuses for every write. It
+  takes no slot. Each read moves the lease later. After
+  `slot_reader_idle_secs` without a read the control plane ends the lease and
+  the controller removes the reader. Until the reader connects, a read
+  answers `reader_starting` (a conversation page: `409
+  conversation_reader_starting`). The TUI then shows "wczytywanie…" and asks
+  again every 2 seconds. Any other reason (for example an archived task, or
+  `Unknown`, whose runner may still hold the storage) is shown with the last
+  snapshot and is not asked again in a loop.
+* **Reader and work never run together.** Before the controller starts,
+  provisions or archives a task, it removes the reader and waits for
+  the confirmation. The command that resumes or archives the task ends the
+  lease in the same record update. The storage lock is the second guard: a
+  reader that finds the storage busy stops and reports it. If a reader cannot
+  start (for example the admission policy refuses the Pod), the reason is in
+  the **controller's log** only. The control plane answers `reader_starting`
+  for as long as the lease lasts.
+* Observations that are no longer current are shown as stale with their age,
+  never turned into another state.
 
 ## 10. Scheduling
 
 The slot-release periods (`slot_release_grace_secs`,
 `slot_release_read_extension_secs`, `slot_reader_idle_secs`) are settings of
 `limits`. Omit them to get 300 s, 180 s and 120 s. The third one,
-`slot_reader_idle_secs`, is for the read-only runner of phase 2 and has no
-effect yet. Each must be a whole number
+`slot_reader_idle_secs`, is how long the read-only runner of a stopped task
+(section 9) may idle before the control plane ends its lease and the
+controller removes it. Each must be a whole number
 from 1 to 86400; a negative or non-numeric value makes the backend file
 unreadable, and 0 or more than 86400 makes the backend unusable with a clear
 message. The control plane reads them again at every decision, so a change
@@ -678,8 +701,8 @@ applies without a restart.
   proposals, and the conductor commands are refused with that reason. The
   conductor's state — chat, proposals, decisions, the diagnosis — is read
   through the control plane from the live runner
-  (`GET /control/v1/tasks/:id/conductor`), or from the task's storage for a
-  local task whose runner is not running. A runner restarted on its storage
+  (`GET /control/v1/tasks/:id/conductor`), or, for a stopped task, from its
+  read-only runner (D63). A runner restarted on its storage
   answers the chat messages it left unanswered and diagnoses again a failed
   step it had not concluded about.
 * A queued task shows why it waits: `waiting for capacity` (position,
@@ -696,9 +719,21 @@ applies without a restart.
   resume, and never without a slot. The keys `slot-release:` and
   `work-resume:` (like `auto-resume:`) are reserved: an owner key that starts
   with one is refused with `400 reserved_idempotency_key`.
-* Until phase 2 (a read-only runner, not yet built) reading the details of a
-  stopped task works as before: a `local` task from its storage (D59), a
-  remote one only as the last snapshot. Freed slots do not change that.
+* Reading the details of a stopped task does not need a slot: a read-only
+  runner reads it (section 9, D63) on every backend. Freed slots do not
+  change that.
+* **Upgrading to the read-only runner (D63)**: upgrade in this order. First
+  the control plane (the daemon), then the controllers, then the clients
+  (CLI, TUI) together with their server. Apply the changed
+  `deploy/kubernetes/admission-policy.yaml` **together with the controller**
+  (before or at the same time): it lets a Pod named `...-reader` mount only
+  its own task PVC, and only `readOnly`. A new controller without the new
+  policy cannot create the reader Pod, and the reads of stopped tasks stay at
+  `reader_starting`. An older controller does not start readers. An older
+  client does not know `reader_starting` and shows an ordinary
+  "unavailable". Two points are not tested on a real cluster: `flock` on a
+  read-only PVC (NFS and other real volumes), and the CEL expressions of the
+  changed policy.
 * The default backend applies to tasks created afterwards only; existing
   tasks never move.
 

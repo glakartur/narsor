@@ -14,6 +14,8 @@
 //! `v` opens the detail of the selected event, `Ctrl+V` switches every row to
 //! its raw JSON.
 
+use std::time::Instant;
+
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -31,6 +33,7 @@ use crate::tui::style::{Role, Styles};
 
 use super::super::super::scroll::one_line;
 use super::super::list::fit;
+use super::READER_RETRY;
 
 /// Events asked for at once.
 pub const PAGE_LIMIT: u32 = 500;
@@ -62,6 +65,8 @@ pub struct Events {
     availability: Availability,
     failure: Option<String>,
     revision: Option<u64>,
+    /// When a read that was told "the reader is starting" is asked again.
+    retry_at: Option<Instant>,
     cursor: usize,
     top: usize,
     detail_open: bool,
@@ -78,6 +83,7 @@ impl Default for Events {
             availability: Availability::NotRead,
             failure: None,
             revision: None,
+            retry_at: None,
             cursor: 0,
             top: 0,
             detail_open: false,
@@ -136,7 +142,19 @@ impl Events {
 
     /// Whether the log must be read for a task at `revision`.
     pub fn needs_read(&self, revision: u64) -> bool {
-        self.revision != Some(revision)
+        self.needs_read_at(revision, Instant::now())
+    }
+
+    /// [`Self::needs_read`] as of `now`: a read answered "the reader is
+    /// starting" is due again once [`READER_RETRY`] has passed, whatever the
+    /// revision; any other answer waits for a new revision.
+    pub fn needs_read_at(&self, revision: u64, now: Instant) -> bool {
+        self.revision != Some(revision) || self.retry_at.is_some_and(|at| now >= at)
+    }
+
+    /// Whether the last answer was "the reader is starting".
+    pub fn is_starting(&self) -> bool {
+        self.retry_at.is_some()
     }
 
     /// Makes the next [`Self::needs_read`] true, keeping what is shown.
@@ -153,7 +171,19 @@ impl Events {
         after: u64,
         result: Result<ExecutionEventsResponse, String>,
     ) {
+        self.apply_at(revision, after, result, Instant::now());
+    }
+
+    /// [`Self::apply`] as of `now`.
+    pub fn apply_at(
+        &mut self,
+        revision: u64,
+        after: u64,
+        result: Result<ExecutionEventsResponse, String>,
+        now: Instant,
+    ) {
         self.revision = Some(revision);
+        self.retry_at = None;
         match result {
             Ok(ExecutionEventsResponse::Available {
                 events,
@@ -175,6 +205,9 @@ impl Events {
                 }
             }
             Ok(ExecutionEventsResponse::Unavailable { reason, message }) => {
+                if reason == ConversationUnavailableReason::ReaderStarting {
+                    self.retry_at = Some(now + READER_RETRY);
+                }
                 self.availability = Availability::Unavailable { reason, message };
                 self.has_more = false;
                 self.failure = None;
@@ -250,7 +283,12 @@ pub fn render(
 ) {
     let grey = |role: Role| if stale { Role::Done } else { role };
     let mut notes: Vec<Line<'static>> = Vec::new();
-    if let Availability::Unavailable { message, .. } = &events.availability {
+    if events.is_starting() {
+        notes.push(Line::styled(
+            "◌ wczytywanie zdarzeń… zadanie jest zatrzymane, czytelnik się uruchamia",
+            styles.of(Role::Attention),
+        ));
+    } else if let Availability::Unavailable { message, .. } = &events.availability {
         notes.push(Line::styled(
             format!("◌ zdarzenia niedostępne: {}", one_line(message)),
             styles.of(Role::Attention),

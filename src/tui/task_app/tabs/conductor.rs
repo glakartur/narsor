@@ -51,7 +51,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::conductor::{ChatEntry, ConductorView, ConductorWork};
-use crate::controller_protocol::{ConductorReadResponse, TaskSummary};
+use crate::controller_protocol::{
+    ConductorReadResponse, ConversationUnavailableReason, TaskSummary,
+};
 use crate::domain::ConductorPurpose;
 use crate::tui::chat::{tab_entry, tab_items, undo_lines, ChatItem, TAB_KEYS};
 use crate::tui::chooser::{self, Chooser, ChooserAction, ChooserField, ChooserItem, Submission};
@@ -68,6 +70,7 @@ use super::super::list::fit;
 use super::super::notify::Severity;
 use super::super::{DetailTab, Focus, Request, TaskApp};
 use super::conversation::{render_transcript, transcript_action};
+use super::READER_RETRY;
 
 /// Pages of the chat read in one go; a longer history is read on with `M`.
 pub const MAX_PAGES: usize = 10;
@@ -101,6 +104,9 @@ pub struct Conductor {
     note: Option<String>,
     /// Why the last read failed.
     failure: Option<String>,
+    /// The last read was told "the reader is starting" (D63): the tab says
+    /// it is loading and asks again after [`READER_RETRY`].
+    starting: bool,
     has_more: bool,
     more_wanted: bool,
     revision: Option<u64>,
@@ -118,6 +124,7 @@ impl Conductor {
             view: None,
             note: None,
             failure: None,
+            starting: false,
             has_more: false,
             more_wanted: false,
             revision: None,
@@ -215,10 +222,20 @@ impl Conductor {
         if self.more_wanted && self.has_more {
             return true;
         }
+        if self.starting {
+            return self
+                .read_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= READER_RETRY);
+        }
         self.awaits_answer()
             && self
                 .read_at
                 .is_none_or(|at| now.saturating_duration_since(at) >= POLL)
+    }
+
+    /// Whether the last read was told "the reader is starting".
+    pub fn is_starting(&self) -> bool {
+        self.starting
     }
 
     /// Makes the tab due for a new read, keeping what is shown.
@@ -243,6 +260,13 @@ impl Conductor {
         self.revision = Some(revision);
         self.read_at = Some(now);
         self.more_wanted = false;
+        self.starting = matches!(
+            result,
+            Ok(ConductorReadResponse::Unavailable {
+                reason: ConversationUnavailableReason::ReaderStarting,
+                ..
+            })
+        );
         match result {
             Ok(ConductorReadResponse::Available { conductor, .. }) => {
                 let mut view = *conductor;
@@ -255,6 +279,16 @@ impl Conductor {
                 self.note = None;
                 self.failure = None;
                 self.rebuild();
+            }
+            // What is held stays, and the tab reads "loading" until the
+            // reader answers; the next read is due after a pause.
+            Ok(ConductorReadResponse::Unavailable {
+                reason: ConversationUnavailableReason::ReaderStarting,
+                ..
+            }) => {
+                self.note = None;
+                self.failure = None;
+                self.has_more = false;
             }
             Ok(ConductorReadResponse::Unavailable { message, .. }) => {
                 self.note = Some(message);
